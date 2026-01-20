@@ -2188,6 +2188,7 @@ const ModuleLinkage = struct {
 
 pub const ParsedFileData = struct {
     const CachedSymbolTypes = std.AutoArrayHashMapUnmanaged(parser.SymbolRef, Analyzer.TypeRef);
+    const CachedFlowTypes = std.AutoArrayHashMapUnmanaged(parser.NodeRef, Analyzer.TypeRef);
 
     id: FileRef = 0,
     file_name: ?[]const u8 = null,
@@ -2198,6 +2199,7 @@ pub const ParsedFileData = struct {
     // Used by the analyzer
     // TODO (perf): maybe make symbols bigger and use a slot to cache
     cached_symbol_types: CachedSymbolTypes,
+    cached_flow_types: CachedFlowTypes,
 
     is_lib: bool = false,
     is_declaration: bool = false,
@@ -2219,6 +2221,7 @@ pub const ParsedFileData = struct {
             .ast = ast,
             .binder = binder,
             .cached_symbol_types = CachedSymbolTypes{},
+            .cached_flow_types = CachedFlowTypes{},
             .import_map = std.AutoArrayHashMap(u64, FileRef).init(_allocator),
             .unresolved_imports = std.ArrayList(u64).init(_allocator),
             .cfa_state = std.ArrayList(*CFAState).init(_allocator),
@@ -2350,6 +2353,7 @@ const CFAState = struct {
     branch_continuation_types: ?std.AutoArrayHashMap(SymbolRef, std.ArrayList(TypeRef)) = null,
     tmp_types: ?std.AutoArrayHashMap(SymbolRef, TypeRef) = null,
     tmp_start: ?NodeRef = null,
+    switch_subject: ?NodeRef = null,
 
     pub fn init(alloc: std.mem.Allocator, iter: NodeIterator) !*@This() {
         var p = try alloc.create(@This());
@@ -2364,6 +2368,7 @@ const CFAState = struct {
         p.branch_continuation_types = null;
         p.tmp_types = null;
         p.tmp_start = null;
+        p.switch_subject = null;        
 
         return p;
     }
@@ -2602,6 +2607,7 @@ pub const Analyzer = struct {
     active_types: std.AutoArrayHashMapUnmanaged(u64, bool),
 
     current_node: if (is_debug) ?struct { *ParsedFileData, NodeRef } else void = if (is_debug) null else {},
+    current_flow: ?*FlowConstructor = null,
 
     pub fn init(program: *Program) !@This() {
         var types = BumpAllocator(Type).init(program.allocator, std.heap.page_allocator);
@@ -4877,6 +4883,597 @@ pub const Analyzer = struct {
         return h.final();
     }
 
+    // Finds type narrowings (if they deviate from the inital type) for various nodes within a scope
+    //
+    // This is done using a one-pass ("wavefront") strategy, accumulating knowledge about what a symbol can
+    // possibly be as the code moves forward. When we encounter a node with a narrowed symbol, we record the 
+    // type using the node ref as the key in `self.file.cached_flow_types`
+    const FlowConstructor = struct {
+        // Stores flow state at some point in the code
+        // These can be mutated directly in two cases:
+        //  1. It is the current flow, so new information supercedes it
+        //  2. A flow exits into this label, requiring a merge (creates union types of narrowed symbols)
+        //
+        // A flow label can be created whenever it's possible for types to diverge
+        // Resolving a symbol means searching the stack for the first narrowing available. 
+        // We do not need to update a flow label if the current type does not deviate from the current narrowing.
+        const Label = struct {
+            const Types = std.AutoArrayHashMapUnmanaged(parser.SymbolRef, Analyzer.TypeRef);
+            types: Types = Types{},
+
+            // True if any flow can reach it, or if it's unconditional
+            reachable: bool = false,
+
+            // True if the flow never joins back into the current flow
+            terminal: bool = false,
+
+            pub fn create(a: std.mem.Allocator) !*@This() {
+                const self = try a.create(@This());
+                self.types = Types{};
+                self.reachable = false;
+                self.terminal = false;
+                return self;
+            }
+
+            pub fn destroy(self: *@This(), a: std.mem.Allocator) void {
+                self.types.deinit(a);
+                a.destroy(self);
+            } 
+        };
+
+        const Errors = std.AutoArrayHashMapUnmanaged(parser.NodeRef, anyerror);
+        const LabelStack = std.ArrayListUnmanaged(*Label);
+
+        analyzer: *Analyzer,
+        file: *ParsedFileData,
+        stack: LabelStack = LabelStack{},
+
+        // Used for semantic errors, e.g. `break` without being in a breakable context
+        // Exits without a flow label discard the environment i.e. assume it worked
+        errors: Errors = Errors{},
+
+        // must be initialized upon starting flow analysis
+        // if the current flow is a lexical scope, this will be at the top of the stack
+        current_flow: *Label = undefined,
+
+        // these are set by various visitors
+        // each visitor is responsible for restoring the prior value
+        break_target: ?*Label = null,
+        continue_target: ?*Label = null,
+        return_target: ?*Label = null,
+        exception_target: ?*Label = null,
+        true_target: ?*Label = null,
+        false_target: ?*Label = null,
+
+        // Set to the node ref when visiting an expression in return position
+        // This allows visitExpression to cache flow types for the return value
+        return_position: ?parser.NodeRef = null,
+        in_nullish_context: bool = false,
+        is_expression_statement: bool = false,
+
+        pub fn init(analyzer: *Analyzer, file: *ParsedFileData) FlowConstructor {
+            return .{
+                .analyzer = analyzer,
+                .file = file,
+            };
+        }
+
+        pub fn visitArrowFnBody(self: *@This(), start: parser.NodeRef) !TypeRef {
+            self.current_flow = try self.createLabel();
+            try self.stack.append(self.analyzer.allocator(), self.current_flow);
+            return self.visitExpression(start);
+        }
+
+        pub fn visitFunctionLike(self: *@This(), first_statement: parser.NodeRef) !TypeRef {
+            try self.visitEntrypoint(first_statement, true);
+            const rt = self.return_target orelse unreachable;
+            if (!rt.reachable) {
+                return @intFromEnum(Kind.void);
+            }
+            return rt.types.get(0) orelse unreachable;
+        }
+
+        // This should only be called with the first statement of a module or function.
+        // Do not use the same struct for a different entrypoint. No re-entrancy.
+        fn visitEntrypoint(self: *@This(), target: parser.NodeRef, comptime can_return: bool) !void {
+            std.debug.assert(target != 0);
+            std.debug.assert(self.stack.items.len == 0);
+
+            self.current_flow = try self.createLabel();
+            self.current_flow.reachable = true; // Always reachable
+
+            try self.stack.append(self.analyzer.allocator(), self.current_flow);
+
+            if (can_return) {
+                // Stores return types, use the nil symbol (id 0) for adding types. May be optimized later
+                self.return_target = try self.createLabel();
+            }
+
+            try self.visitStatements(target);
+        }
+
+        fn visitStatements(self: *@This(), start: parser.NodeRef) anyerror!void {
+            // all statements iterated belong to the same flow
+            var iter = NodeIterator.init(&self.file.ast.nodes, start);
+            while (iter.next()) |s| {
+                switch (s.kind) {
+                    // --- control flow ---
+                    .break_statement => {
+                        // TODO
+                        self.current_flow.terminal = true;
+                    },
+
+                    .continue_statement => {
+                        // TODO
+                        self.current_flow.terminal = true;
+                    },
+
+                    .throw_statement => {
+                        // TODO
+                        self.current_flow.terminal = true;
+                    },
+
+                    .return_statement => {
+                        const return_type = if (maybeUnwrapRef(s)) |exp_ref|
+                            try self.visitExpression(exp_ref)
+                        else
+                            @intFromEnum(Kind.void);
+
+                        if (self.return_target) |target| {
+                            const dst = try target.types.getOrPut(self.analyzer.allocator(), 0);
+                            if (dst.found_existing) {
+                                if (return_type == @intFromEnum(Kind.void) and dst.value_ptr.* != @intFromEnum(Kind.void)) {
+                                    dst.value_ptr.* = try self.analyzer.toUnion(&.{ dst.value_ptr.*, @intFromEnum(Kind.undefined) });
+                                } else {
+                                    dst.value_ptr.* = try self.analyzer.toUnion(&.{ dst.value_ptr.*, return_type });
+                                }
+                            } else {
+                                dst.value_ptr.* = return_type;
+                            }
+                            target.reachable = true;
+                        }
+
+                        self.current_flow.terminal = true;
+                    },
+
+                    // --- constructs ---
+                    .block => {
+                        const block_start = maybeUnwrapRef(s) orelse continue;
+
+                        const is_unconditional = self.stack.getLast() == self.current_flow;
+
+                        if (is_unconditional) {
+                            self.current_flow = try self.createLabel();
+                        }
+
+                        try self.stack.append(self.analyzer.allocator(), self.current_flow);
+                        try self.visitStatements(block_start);
+
+                        if (is_unconditional) {
+                            const flow = self.stack.pop();
+                            self.current_flow = self.stack.getLast();
+                            if (!flow.terminal) {
+                                try self.mergeInto(self.current_flow, flow);
+                            }
+
+                            self.current_flow.terminal = flow.terminal;
+                            self.destroyLabel(flow);
+                        } else {
+                            // Something else is managed the flow, we were just pushing it as lexical scope
+                            _ = self.stack.pop();
+                        }
+                    },
+                    
+                    .if_statement => {
+                        const d = getPackedData(s);
+                        const condition_ref = d.left;
+                        const then_ref = d.right;
+                        const else_ref: ?parser.NodeRef = if (s.len != 0) s.len else null;
+
+                        const then_label = try self.createLabel();
+                        defer self.destroyLabel(then_label);
+                        const else_label = try self.createLabel();
+                        defer self.destroyLabel(else_label);
+
+                        const prev_true_target = self.true_target;
+                        const prev_false_target = self.false_target;
+
+                        self.true_target = then_label;
+                        self.false_target = else_label;
+
+                        _ = try self.visitCondition(condition_ref);
+
+                        self.true_target = prev_true_target;
+                        self.false_target = prev_false_target;
+
+                        try self.copyFlowLabelIfNeeded(then_label, self.current_flow);
+                        const prev_flow = self.current_flow;
+                        self.current_flow = then_label;
+                        try self.visitStatements(then_ref);
+
+                        self.current_flow = else_label;
+                        if (else_ref) |else_stmt| {
+                            try self.copyFlowLabelIfNeeded(else_label, prev_flow);
+                            try self.visitStatements(else_stmt);
+                        }
+
+                        self.current_flow = prev_flow;
+                        if (!then_label.terminal) {
+                            try self.mergeInto(self.current_flow, then_label);
+                        }
+                        if (!else_label.terminal) {
+                            try self.mergeInto(self.current_flow, else_label);
+                        }
+
+                        self.current_flow.terminal = then_label.terminal and else_label.terminal;
+                    },
+
+                    .while_statement => {
+                        // TODO
+                    },
+
+                    .switch_statement => {
+                        // TODO
+                    },
+
+                    .for_statement => {
+                        // TODO
+                    },
+
+                    .for_of_statement => {
+                        // TODO
+                    },
+
+                    // ignore labeled statement for now
+                    .labeled_statement => {},
+                    
+                    // --- effects ---
+
+                    // ignore fn/class declarations for now, but we will eventually want to associate them 
+                    // with the current flow with pessimistic invalidations on scope exit so that they 
+                    // retain useful narrowings
+                    .function_declaration => {},
+                    .class_declaration => {},
+
+                    .variable_statement => {
+                        const is_const = s.hasFlag(.@"const");
+                        var decls = NodeIterator.init(&self.file.ast.nodes, maybeUnwrapRef(s) orelse continue);
+                        while (decls.next()) |decl| {
+                            const d = getPackedData(decl);
+
+                            // Respect the annotated type, do not try to narrow
+                            if (is_const and decl.len != 0) continue;
+
+                            if (d.right == 0) continue;
+
+                            const sym = self.file.binder.getSymbol(d.left) orelse continue;
+                            const init_type = try self.visitExpression(d.right);
+                            try self.current_flow.types.put(self.analyzer.allocator(), sym, init_type);
+                        }
+                    },
+
+                    .expression_statement => {
+                        self.is_expression_statement = true;
+                        const exp = try unwrapRef(s);
+                        _ = try self.visitExpression(exp); 
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Note that we don't have symbols for individual members, so narrowing always affects the root symbol
+        fn visitExpression(self: *@This(), ref: parser.NodeRef) anyerror!Analyzer.TypeRef {
+            const node = self.file.ast.nodes.at(ref);
+
+            return switch (node.kind) {
+                .identifier => {
+                    const sym = self.file.binder.getSymbol(ref) orelse return error.MissingSymbol;
+                    return try self.getFlowType(ref, sym);
+                },
+
+                .parenthesized_expression => {
+                    const inner = try parser.unwrapRef(node);
+                    return self.visitExpression(inner);
+                },
+
+                .binary_expression => {
+                    const op = @as(parser.SyntaxKind, @enumFromInt(node.len));
+                    switch (op) {
+                        .bar_bar_token,
+                        .question_question_token,
+                        .ampersand_ampersand_token => {
+                            const is_statement = self.is_expression_statement;
+                            self.is_expression_statement = false;
+
+                            // Create a label to capture narrowings from both branches
+                            const effect_label = try self.createLabel();
+                            defer self.destroyLabel(effect_label);
+
+                            const prev_true = self.true_target;
+                            const prev_false = self.false_target;
+
+                            self.true_target = effect_label;
+                            self.false_target = effect_label;
+
+                            const result_type = try self.visitCondition(ref);
+
+                            self.true_target = prev_true;
+                            self.false_target = prev_false;
+
+                            if (is_statement) {
+                                // Merge the observed types into the current flow
+                                try self.mergeInto(self.current_flow, effect_label);
+                            }
+
+                            return result_type;
+                        },
+                        else => {},
+                    }
+                    return try self.analyzer.getType(self.file, ref);
+                },
+
+                else => {
+                    // For other expressions, just get the type directly
+                    return try self.analyzer.getType(self.file, ref);
+                },
+            };
+        }
+
+        // Visits a condition expression and narrows types into true_target/false_target labels
+        // Returns the evaluated type of the condition expression
+        fn visitCondition(self: *@This(), ref: parser.NodeRef) anyerror!Analyzer.TypeRef {
+            const node = self.file.ast.nodes.at(ref);
+
+            switch (node.kind) {
+                .parenthesized_expression => {
+                    const inner = try parser.unwrapRef(node);
+                    return self.visitCondition(inner);
+                },
+
+                .identifier => {
+                    const sym = self.file.binder.getSymbol(ref) orelse return error.MissingSymbol;
+
+                    const current_type = try self.getFlowType(ref, sym);
+                    if (current_type == @intFromEnum(Analyzer.Kind.any)) return current_type;
+
+                    // In nullish context (??) we narrow by null/undefined, otherwise by truthiness
+                    const true_type = if (self.in_nullish_context)
+                        try self.analyzer.nonNullable(current_type)
+                    else
+                        try self.analyzer.truthyType(current_type);
+
+                    const false_type = try self.analyzer.excludeType(current_type, true_type);
+
+                    if (true_type != current_type) {
+                        if (self.true_target) |target| {
+                            try target.types.put(self.analyzer.allocator(), sym, true_type);
+                        }
+                    }
+
+                    if (false_type != current_type) {
+                        if (self.false_target) |target| {
+                            try target.types.put(self.analyzer.allocator(), sym, false_type);
+                        }
+                    }
+
+                    return current_type;
+                },
+
+                .binary_expression => {
+                    const d = getPackedData(node);
+                    const op = @as(parser.SyntaxKind, @enumFromInt(node.len));
+
+                    switch (op) {
+                        .ampersand_ampersand_token => {
+                            // For `a && b`:
+                            // - Result type is union of (a's falsy type, b's type)
+                            // - true_target gets: a is truthy AND b is truthy
+                            // - false_target gets: a is falsy OR b is falsy
+                            const a_true = try self.createLabel();
+                            defer self.destroyLabel(a_true);
+
+                            const prev_true = self.true_target;
+                            const prev_false = self.false_target;
+
+                            self.true_target = a_true;
+                            const a_type = try self.visitCondition(d.left);
+                            const a_falsy = try self.analyzer.falsyType(a_type);
+
+                            self.true_target = prev_true;
+                            self.false_target = prev_false;
+
+                            try self.copyFlowLabelIfNeeded(a_true, self.current_flow);
+                            const saved_flow = self.current_flow;
+                            self.current_flow = a_true;
+                            const b_type = try self.visitCondition(d.right);
+                            self.current_flow = saved_flow;
+
+                            return try self.analyzer.toUnion(&.{ a_falsy, b_type });
+                        },
+
+                        .bar_bar_token => {
+                            // For `a || b`:
+                            // - Result type is union of (a's truthy type, b's type)
+                            // - true_target gets: a is truthy OR b is truthy
+                            // - false_target gets: a is falsy AND b is falsy
+                            const a_false = try self.createLabel();
+                            defer self.destroyLabel(a_false);
+
+                            const prev_true = self.true_target;
+                            const prev_false = self.false_target;
+
+                            self.false_target = a_false;
+                            const a_type = try self.visitCondition(d.left);
+                            const a_truthy = try self.analyzer.truthyType(a_type);
+
+                            self.true_target = prev_true;
+                            self.false_target = prev_false;
+
+                            try self.copyFlowLabelIfNeeded(a_false, self.current_flow);
+                            const saved_flow = self.current_flow;
+                            self.current_flow = a_false;
+                            const b_type = try self.visitCondition(d.right);
+                            self.current_flow = saved_flow;
+
+                            return try self.analyzer.toUnion(&.{ a_truthy, b_type });
+                        },
+
+                        .question_question_token => {
+                            // For `a ?? b`:
+                            // - Result type is union of (a's non-nullable type, b's type)
+                            // - Narrows by null/undefined instead of truthiness
+                            // - If `a` is non-null, return `a`; otherwise evaluate and return `b`
+                            const a_nullish = try self.createLabel();
+                            defer self.destroyLabel(a_nullish);
+
+                            const prev_true = self.true_target;
+                            const prev_false = self.false_target;
+                            const prev_nullish = self.in_nullish_context;
+
+                            self.false_target = a_nullish;
+                            self.in_nullish_context = true;
+                            const a_type = try self.visitCondition(d.left);
+                            const a_nonnullable = try self.analyzer.nonNullable(a_type);
+
+                            self.true_target = prev_true;
+                            self.false_target = prev_false;
+                            self.in_nullish_context = prev_nullish;
+
+                            try self.copyFlowLabelIfNeeded(a_nullish, self.current_flow);
+                            const saved_flow = self.current_flow;
+                            self.current_flow = a_nullish;
+                            const b_type = try self.visitCondition(d.right);
+                            self.current_flow = saved_flow;
+
+                            return try self.analyzer.toUnion(&.{ a_nonnullable, b_type });
+                        },
+
+                        else => {
+                            // TODO: Handle equality comparisons for type narrowing
+                            return try self.visitExpression(ref);
+                        },
+                    }
+                },
+
+                .prefix_unary_expression => {
+                    const d = getPackedData(node);
+                    const op = @as(parser.SyntaxKind, @enumFromInt(d.left));
+
+                    if (op == .exclamation_token) {
+                        const inner_node = self.file.ast.nodes.at(d.right);
+                        if (inner_node.kind == .prefix_unary_expression and getPackedData(inner_node).left == @intFromEnum(parser.SyntaxKind.exclamation_token)) {
+                            // small optimization for `!!`
+                            const ty = try self.visitCondition(getPackedData(inner_node).right);
+                            if (ty == @intFromEnum(Kind.true) or ty == @intFromEnum(Kind.false)) {
+                                return ty;
+                            }
+                            return @intFromEnum(Analyzer.Kind.boolean);
+                        }
+
+                        // swap true_target and false_target
+                        const prev_true = self.true_target;
+                        const prev_false = self.false_target;
+
+                        self.true_target = prev_false;
+                        self.false_target = prev_true;
+                        const ty = try self.visitCondition(d.right);
+
+                        self.true_target = prev_true;
+                        self.false_target = prev_false;
+
+                        if (ty == @intFromEnum(Kind.false)) {
+                            return @intFromEnum(Kind.true);
+                        } else if (ty == @intFromEnum(Kind.true)) {
+                            return @intFromEnum(Kind.false);
+                        }
+
+                        // Result of `!x` is always boolean otherwise
+                        return @intFromEnum(Analyzer.Kind.boolean);
+                    }
+
+                    return try self.visitExpression(ref);
+                },
+
+                else => {
+                    return try self.visitExpression(ref);
+                },
+            }
+        }
+
+        // Merges types from `source` into `target`, creating union types for symbols that exist in both
+        fn mergeInto(self: *@This(), target: *Label, source: *Label) !void {
+            var iter = source.types.iterator();
+            while (iter.next()) |entry| {
+                const sym = entry.key_ptr.*;
+                const source_type = entry.value_ptr.*;
+                const dst = try target.types.getOrPut(self.analyzer.allocator(), sym);
+
+                if (dst.found_existing) {
+                    const merged = try self.analyzer.toUnion(&.{ dst.value_ptr.*, source_type });
+                    dst.value_ptr.* = merged;
+                } else {
+                    dst.value_ptr.* = source_type;
+                }
+            }
+        }
+
+        // Add types from `source` into `target` if `target` lacks them
+        // This can be skipped if `source` is on the stack
+        fn copyFlowLabelIfNeeded(self: *@This(), target: *Label, source: *Label) !void {
+            const stack_len = self.stack.items.len;
+            std.debug.assert(stack_len > 0);
+
+            if (self.stack.items[stack_len-1] == source) {
+                return;
+            }
+
+            var iter = source.types.iterator();
+            while (iter.next()) |entry| {
+                const dst = try target.types.getOrPut(self.analyzer.allocator(), entry.key_ptr.*);
+                if (dst.found_existing) continue;
+
+                dst.value_ptr.* = entry.value_ptr.*;
+            }
+        }
+
+        fn getFlowType(self: *@This(), ref: parser.NodeRef, sym: parser.SymbolRef) !TypeRef {
+            return self.maybeGetFlowType(sym) orelse 
+                try self.analyzer.getType(self.file, ref);
+        }
+
+        pub fn maybeGetFlowType(self: *@This(), sym: parser.SymbolRef) ?TypeRef {
+            if (self.current_flow.types.get(sym)) |t| return t;
+
+            var i: usize = self.stack.items.len-1;
+
+            // skip the current flow if needed
+            if (self.current_flow == self.stack.items[i]) {
+                if (i == 0) return null;
+                i -= 1;
+            }
+
+            // see if we have a narrowed type in the stack 
+            // could be optimized later, not all symbols need to check all frames
+            while (true) {
+                if (self.stack.items[i].types.get(sym)) |t| return t;
+
+                if (i == 0) break;
+                i -= 1;
+            }
+
+            return null;
+        }
+
+        inline fn createLabel(self: *@This()) !*Label {
+            return try Label.create(self.analyzer.allocator());
+        }
+
+        inline fn destroyLabel(self: *@This(), label: *Label) void {
+            label.destroy(self.analyzer.allocator());
+        }
+    };
+
     fn analyzeExpression(this: *@This(), file: *ParsedFileData, ref: NodeRef) anyerror!?std.AutoArrayHashMap(SymbolRef, AnalysisResult) {
         const exp = file.ast.nodes.at(ref);
         
@@ -5159,7 +5756,17 @@ pub const Analyzer = struct {
         return result;
     }
 
+    const use_one_pass_flow = true;
+
     fn analyzeBody(this: *@This(), file: *ParsedFileData, start: NodeRef) !TypeRef {
+        if (use_one_pass_flow) {
+            var f = FlowConstructor.init(this, file);
+            const old_flow = this.current_flow;
+            defer this.current_flow = old_flow;
+            this.current_flow = &f;
+            return f.visitFunctionLike(start);
+        }
+
         const prev = file.cfa_state.items.len;
         defer {
             if (prev != file.cfa_state.items.len) {
@@ -5216,6 +5823,7 @@ pub const Analyzer = struct {
                     .return_statement => {
                         if (maybeUnwrapRef(s)) |exp| {
                             const return_type = try this.getType(file, exp);
+                            // TODO: we should not do this if any symbols depend on CFA for accurate type info
                             if (return_type == @intFromEnum(Kind.any)) {
                                 return return_type;
                             }
@@ -5557,6 +6165,40 @@ pub const Analyzer = struct {
         return tmp.complete(this);
     }
 
+    pub fn falsyType(this: *@This(), from: TypeRef) anyerror!u32 {
+        if (from >= @intFromEnum(Kind.false)) {
+            if (from == @intFromEnum(Kind.zero) or from == @intFromEnum(Kind.false) or from == @intFromEnum(Kind.null) or from == @intFromEnum(Kind.undefined) or from == @intFromEnum(Kind.empty_string)) {
+                return from;
+            }
+            if (from == @intFromEnum(Kind.number)) {
+                return @intFromEnum(Kind.zero);
+            }
+            if (from == @intFromEnum(Kind.boolean)) {
+                return @intFromEnum(Kind.false);
+            }
+            return this.excludeType(from, try this.truthyType(from));
+        }
+
+        const from_type = this.types.at(from);
+        switch (from_type.getKind()) {
+            .@"union" => {
+                var tmp = try TempUnion.initCapacity(this.allocator(), from_type.slot2);
+                errdefer tmp.deinit();
+
+                for (getSlice2(from_type, TypeRef)) |el| {
+                    if (try this.addToUnion(&tmp, try this.falsyType(el))) |x| {
+                        return x;
+                    }
+                }
+
+                return tmp.complete(this);
+            },
+            else => {},
+        }
+
+        return this.excludeType(from, try this.truthyType(from));
+    }
+
     // This should be equivalent to `type Exclude<T, U> = T extends U ? never : T
     pub fn excludeType(this: *@This(), from: TypeRef, excluded: TypeRef) anyerror!u32 {
         if (from == excluded) {
@@ -5564,6 +6206,13 @@ pub const Analyzer = struct {
         }
 
         if (from >= @intFromEnum(Kind.false)) {
+            if (from == @intFromEnum(Kind.boolean)) {
+                if (excluded == @intFromEnum(Kind.true)) {
+                    return @intFromEnum(Kind.false);
+                } else if (excluded == @intFromEnum(Kind.false)) {
+                    return @intFromEnum(Kind.true);
+                }
+            }
             if (try this.isAssignableTo(from, excluded)) {
                 return @intFromEnum(Kind.never);
             }
@@ -6558,6 +7207,29 @@ pub const Analyzer = struct {
     // }
 
     fn toUnion(this: *@This(), types: []const TypeRef) !u32 {
+        if (types.len == 2) {
+            if (types[0] == types[1]) {
+                return types[0];
+            }
+            if (types[0] == @intFromEnum(Kind.boolean)) {
+                if (types[1] == @intFromEnum(Kind.false)) {
+                    return types[0];
+                } else if (types[1] == @intFromEnum(Kind.true)) {
+                    return types[0];
+                }
+            } else if (types[1] == @intFromEnum(Kind.boolean)) {
+                if (types[0] == @intFromEnum(Kind.false)) {
+                    return types[1];
+                } else if (types[0] == @intFromEnum(Kind.true)) {
+                    return types[1];
+                }
+            } else if (types[0] == @intFromEnum(Kind.false) and types[1] == @intFromEnum(Kind.true)) {
+                return @intFromEnum(Kind.boolean);
+            } else if (types[1] == @intFromEnum(Kind.false) and types[0] == @intFromEnum(Kind.true)) {
+                return @intFromEnum(Kind.boolean);
+            }
+        }
+
         var tmp = try TempUnion.initCapacity(this.allocator(), @intCast(types.len));
 
         for (types) |t| {
@@ -8055,6 +8727,13 @@ pub const Analyzer = struct {
         return error.TODO_this_type;
     }
 
+    pub inline fn getTypeAsConst(this: *@This(), file: *ParsedFileData, ref: NodeRef) anyerror!TypeRef {
+        const old_ctx = this.is_const_context;
+        this.is_const_context = true;
+        defer this.is_const_context = old_ctx;
+        return try this.getType(file, ref);
+    }
+
     pub fn getType(this: *@This(), file: *ParsedFileData, ref: NodeRef) anyerror!TypeRef {
         const node = file.ast.nodes.at(ref);
 
@@ -8311,6 +8990,13 @@ pub const Analyzer = struct {
                 if (file.binder.getSymbol(ref)) |sym_ref| {
                     const r = blk: {
                         if (maybeGetCfaType(file, sym_ref)) |t| break :blk t;
+
+                        // XXX: each file should have a flow
+                        if (this.current_flow) |f| {
+                            if (f.file.id == file.id) {
+                                if (f.maybeGetFlowType(sym_ref)) |t| break :blk t;
+                            }
+                        }
 
                         break :blk try this.getTypeOfSymbol(file, sym_ref);
                     };

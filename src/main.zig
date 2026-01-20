@@ -75,41 +75,41 @@ pub fn main() !void {
             outfile = args.next() orelse return error.ExpectedFilename;
         }
 
-        const lexer = try js_lexer.Lexer.init(s, std.heap.c_allocator);
-        var parser = js_parser.Parser.init(lexer);
-        // parser.options.allow_jsx = true;
+        // const lexer = try js_lexer.Lexer.init(s, std.heap.c_allocator);
+        // var parser = js_parser.Parser.init(lexer);
+        // // parser.options.allow_jsx = true;
 
-        const t = std.time.microTimestamp();
-        var r = try parser.parse();
-        std.debug.print("parse time (us) {d:.3}\n", .{std.time.microTimestamp() - t});
+        // const t = std.time.microTimestamp();
+        // var r = try parser.parse();
+        // std.debug.print("parse time (us) {d:.3}\n", .{std.time.microTimestamp() - t});
 
-        const t2 = std.time.microTimestamp();
-        if (args.next()) |_| {
-            const result = try js_parser.printWithSourceMap(r.data, r.root);
-            std.debug.print("{s}\n", .{result.contents});
-        } else if (outfile) |name| {
-            var result = try js_parser.printWithSourceMap(r.data, r.root);
-            try std.fs.cwd().writeFile(.{
-                .sub_path = name,
-                .data = result.contents,
-            });
-            std.debug.print("emit time (us) {d:.3}\n", .{std.time.microTimestamp() - t2});
-            const t3 = std.time.microTimestamp();
-            const name2 = try std.fmt.allocPrint(std.heap.c_allocator, "{s}.map", .{name});
-            try std.fs.cwd().writeFile(.{
-                .sub_path = name2,
-                .data = try result.source_map.toJson(std.heap.c_allocator),
-            });
-            std.debug.print("source map emit time (us) {d:.3}\n", .{std.time.microTimestamp() - t3});
-        }
+        // const t2 = std.time.microTimestamp();
+        // if (args.next()) |_| {
+        //     const result = try js_parser.printWithSourceMap(r.data, r.root);
+        //     std.debug.print("{s}\n", .{result.contents});
+        // } else if (outfile) |name| {
+        //     var result = try js_parser.printWithSourceMap(r.data, r.root);
+        //     try std.fs.cwd().writeFile(.{
+        //         .sub_path = name,
+        //         .data = result.contents,
+        //     });
+        //     std.debug.print("emit time (us) {d:.3}\n", .{std.time.microTimestamp() - t2});
+        //     const t3 = std.time.microTimestamp();
+        //     const name2 = try std.fmt.allocPrint(std.heap.c_allocator, "{s}.map", .{name});
+        //     try std.fs.cwd().writeFile(.{
+        //         .sub_path = name2,
+        //         .data = try result.source_map.toJson(std.heap.c_allocator),
+        //     });
+        //     std.debug.print("source map emit time (us) {d:.3}\n", .{std.time.microTimestamp() - t3});
+        // }
 
-        var binder = js_parser.Binder.init(&r.data.nodes, std.heap.c_allocator);
+        // var binder = js_parser.Binder.init(&r.data.nodes, std.heap.c_allocator);
 
-        const bind_start = std.time.microTimestamp();
-        try binder.visit(&r.root, r.root_ref);
-        std.debug.print("bind time (us) {d:.3}\n", .{std.time.microTimestamp() - bind_start});
+        // const bind_start = std.time.microTimestamp();
+        // try binder.visit(&r.root, r.root_ref);
+        // std.debug.print("bind time (us) {d:.3}\n", .{std.time.microTimestamp() - bind_start});
 
-        return;
+        // return;
 
     }
 

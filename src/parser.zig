@@ -953,8 +953,9 @@ pub const ImportListener = struct {
     }
 };
 
-const ParserOptions = struct {
+const ParserOptions = packed struct {
     allow_jsx: bool = false,
+    is_syn: bool = false,
 };
 
 fn Parser_(comptime skip_trivia: bool) type {
@@ -1015,12 +1016,20 @@ fn Parser_(comptime skip_trivia: bool) type {
             var node_allocator = BumpAllocator(AstNode).init(lexer.allocator, std.heap.page_allocator);
             node_allocator.preAlloc() catch unreachable;
 
-            return .{
+            var this = @This(){
                 .lexer = lexer,
                 .decorators = NodeMap{},
                 .node_allocator = node_allocator,
                 .positions = js_lexer.PositionsWriter.init(),
             };
+
+            if (lexer.source.name) |x| {
+                if (strings.endsWithComptime(x, ".syn")) {
+                    this.options.is_syn = true;
+                }
+            }
+
+            return this;
         }
 
         inline fn getLocation(this: *const @This()) u32 {
@@ -5052,7 +5061,13 @@ fn Parser_(comptime skip_trivia: bool) type {
                 n.kind = .default_clause;
             } else if (this.lexer.token == .t_case) {
                 try this.lexer.next();
-                n.data = @ptrFromInt(try this.parseExpression());
+                if (this.options.is_syn and this.lexer.isContextualKeyword("is")) {
+                    try this.lexer.next();
+                    n.data = @ptrFromInt(try this.parseType());
+                    n.flags |= @intFromEnum(NodeFlags.declare);
+                } else {
+                    n.data = @ptrFromInt(try this.parseExpression());
+                }
                 try this.lexer.expect(.t_colon);
             } else {
                 std.debug.print("{any}", .{this.lexer.token});
@@ -5063,7 +5078,6 @@ fn Parser_(comptime skip_trivia: bool) type {
                 if (this.lexer.token == .t_default or this.lexer.token == .t_case or this.lexer.token == .t_close_brace) break;
 
                 try statements.append(try this.parseStatement());
-                // try this.appendStatement(&statements, try this.parseStatement());
             }
 
             n.len = statements.head;
@@ -6513,8 +6527,7 @@ pub const Transformer = struct {
         inner_statement.data = @ptrFromInt(try this.allocator.push(inner_decl));
         const bound_statement = try this.prependStatement(d.right, try this.allocator.push(inner_statement));
 
-        const nullNode = try this.allocator.push(.{ .kind = .null_keyword });
-        const nonNullishCheck = try this.binaryExpression(this.allocator.at(tmp_ident).*, .exclamation_equals_token, nullNode);
+        const nonNullishCheck = try this.binaryExpression(this.allocator.at(tmp_ident).*, .exclamation_equals_token, .{ .kind = .null_keyword });
 
         // TODO: destructuring should also check for property existence, optimized by type analysis
 
@@ -8655,7 +8668,13 @@ pub const Binder = struct {
                 return this.visitRef(node.len);
             },
             .case_clause, .default_clause => {
-                if (node.data) |d| try this.visitRef(@intCast(@intFromPtr(d)));
+                if (node.data) |d| {
+                    if (node.hasFlag(.declare)) {
+                        try this.visitType(@intCast(@intFromPtr(d)));
+                    } else {
+                        try this.visitRef(@intCast(@intFromPtr(d)));
+                    }
+                }
 
                 var iter = NodeIterator.init(this.nodes, node.len);
                 while (iter.nextPair()) |pair| try this.visit(pair[0], pair[1]);
