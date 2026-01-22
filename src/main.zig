@@ -233,9 +233,14 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
             std.debug.print("---- d.ts ----\n{s}\n", .{text});
         }
         std.debug.print("emit time {d:.3}\n", .{std.time.microTimestamp() - emit_start});
+        std.debug.print("# of parse nodes {}\n", .{f.ast.nodes.count});
     }
 
     std.debug.print("\ntotal types: {}\n", .{a.types.count});
+    // for (0..a.types.count) |i| {
+    //     a.printTypeInfo(@intCast(i));
+    // }
+
     std.debug.print("total time: {d:.3}\n", .{std.time.microTimestamp() - start});
 
     return;

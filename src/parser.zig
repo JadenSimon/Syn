@@ -6834,6 +6834,16 @@ pub const NodeIterator = struct {
 
         return .{ n, ref };
     }
+
+    pub fn computeLength(this: *@This()) u32 {
+        const start = this.ref;
+        var c: u32 = 0;
+        while (this.next()) |_| {
+            c += 1;
+        }
+        this.ref = start;
+        return c;
+    }
 };
 
 inline fn visitList(nodes: *const BumpAllocator(AstNode), start: NodeRef, visitor: anytype) !void {
