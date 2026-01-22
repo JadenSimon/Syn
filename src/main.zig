@@ -221,9 +221,11 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
     const a = try p2.getTypeChecker();
 
     for (parsed.items) |q| {
-        const emit_start = std.time.microTimestamp();
+        const parse_start = std.time.microTimestamp();
         const id = try p2.getFileIdByPath(q.name);
         const f = try p2.getBoundFile(id);
+        std.debug.print("parse+bind time {d:.3}\n", .{std.time.microTimestamp() - parse_start});
+        const emit_start = std.time.microTimestamp();
         const text = try p2.printDeclarationText(id, f.ast.start);
         if (print_exported_types) {
             try printExportedTypes(f, &p2);
@@ -237,9 +239,11 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
     }
 
     std.debug.print("\ntotal types: {}\n", .{a.types.count});
-    // for (0..a.types.count) |i| {
-    //     a.printTypeInfo(@intCast(i));
-    // }
+    if (a.types.count > 1000) {
+        for (0..100) |i| {
+            a.printTypeInfo(@intCast(i));
+        }
+    }
 
     std.debug.print("total time: {d:.3}\n", .{std.time.microTimestamp() - start});
 
