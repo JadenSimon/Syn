@@ -160,7 +160,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     continue;
                 }
 
-                const spec2 = try getSlice(data.nodes.at(spec), u8);
+                const spec2 = getSlice(data.nodes.at(spec), u8);
                 const key = std.hash.Wyhash.hash(0, spec2);
                 const imported_file_id = f.import_map.get(key) orelse blk: {
                     const synthetic_id = b.external_imports.get(key) orelse blk2: {
@@ -239,7 +239,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                 if (bindings.kind == .namespace_import) {
                     const decl = try data.nodes.push(.{
                         .kind = .variable_declaration,
-                        .data = toBinaryDataPtrRefs(try unwrapRef(bindings), r),
+                        .data = toBinaryDataPtrRefs(unwrapRef(bindings), r),
                     });
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
@@ -326,7 +326,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     data.nodes.at(without_export).next = exp_statement;
                 } else if (pair[0].kind == .variable_statement) {
                     var tail = without_export;
-                    var decls_iter = NodeIterator.init(&data.nodes, try unwrapRef(pair[0]));
+                    var decls_iter = NodeIterator.init(&data.nodes, unwrapRef(pair[0]));
                     while (decls_iter.next()) |decl| {
                         const binding_ref = getPackedData(decl).left;
                         const binding = data.nodes.at(binding_ref);

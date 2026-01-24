@@ -12,9 +12,10 @@ fn getSource(args: *std.process.ArgIterator) !js_lexer.Source {
 
     if (eqlComptime(text, "--file")) {
         const fileName = args.next() orelse return error.MissingArg;
-        const buf = try std.fs.cwd().readFileAlloc(std.heap.c_allocator, fileName, std.math.maxInt(usize));
+        const resolved = try std.fs.cwd().realpathAlloc(std.heap.c_allocator, fileName);
+        // const buf = try std.fs.cwd().readFileAlloc(std.heap.c_allocator, resolved, std.math.maxInt(usize));
 
-        return js_lexer.Source{ .contents = buf, .name = fileName };
+        return js_lexer.Source{ .contents = &.{}, .name = resolved };
     }
 
     return js_lexer.Source{ .contents = text };
@@ -320,7 +321,7 @@ fn printExportedTypes(f: *program.ParsedFileData, p2: *program.Program) !void {
         if (js_parser.hasFlag(n, .@"export")) {
             if (n.kind != .type_alias_declaration) continue;
             if (n.kind == .variable_statement) {
-                ref = try js_parser.unwrapRef(n); // XXX
+                ref = js_parser.unwrapRef(n); // XXX
                 n = r.at(ref);
             }
             const l2 = js_parser.getLoc(r, n) orelse return error.MissingLocation;

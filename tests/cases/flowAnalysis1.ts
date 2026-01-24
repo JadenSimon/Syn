@@ -48,63 +48,6 @@
 // }
 
 
-// export function stress(
-//     a: 0 | 1 | 2 | 3 | 4 | undefined,
-//     b: 0 | 1 | 2 | 3 | undefined,
-//     c: 0 | 1 | 2 | undefined,
-//     d: 0 | 1 | undefined,
-//     e: 0 | undefined,
-//     f: boolean,
-//     g: boolean,
-//     h: boolean,
-//     i: boolean,
-//     j: boolean,
-// ) {
-//     let x: 0 | 1 | 2 | 3 | 4 | undefined = e
-//     let y: 0 | 1 | 2 | 3 | undefined = d
-//     let z: 0 | 1 | 2 | undefined = c
-
-//     if (
-//         (f && (x = 1)) ||
-//         (g && (y = 2)) ||
-//         (h && (z = 0))
-//     ) {
-//         x = y
-//         y = z
-//     }
-
-//     if (
-//         (i && x === 1 && (y = 3)) ||
-//         (j && y === 2 && (x = 4))
-//     ) {
-//         if (x === 1) {
-//             z = x
-//         }
-//     }
-
-//     if (
-//         (x === 4 && (z = 2)) ||
-//         (y === 3 && (x = 0))
-//     ) {
-//         y = z
-//     } else if (
-//         (x === 0 && (y = 1)) ||
-//         (z === 2 && (x = 3))
-//     ) {
-//         x = y
-//     }
-
-//     if (
-//         (x === 3 && y === 1 && (z = 0)) ||
-//         (x === 1 && z === 0 && (y = 2))
-//     ) {
-//         x = z
-//         y = x
-//     }
-
-//     return x || y || z
-// }
-
 export function f3(a: 1 | 2 | 3 | 4 | undefined, cond1: boolean, cond2: boolean) {
     if ((cond1 && a === 1) || (cond2 && a === 2) || a === 3) {
         return a
@@ -141,8 +84,6 @@ export function f6() {
     return x.a
 }
 
-function b(a: { a: 0 }) {}
-
 export function f7() {
     const x = {} as { a: 0 | 1 | 2 | string}
 
@@ -158,14 +99,42 @@ export function f8() {
     return x
 }
 
-// class F {
-//     foo() {}
-// }
+export function f9() {
+    const x = 1 as 1 | 2 | 3 | 4 | 5
+    let y = 1 as 1 | 2
+    switch (x) {
+        case 3:
+        case 2:
+            if (x === 2) {
+                y = 1
+                break
+            }
+            throw x
+        case 4:
+        case 5:
+        case 1:
+            throw x        
+    }
+    return y
+}
 
-// export function f7(q: { foo: () => void }) {
-//     return { ...q }
-// }
-// f7(new F()).foo() // BOOM
+export function f10() {
+    let x: 1 | 2 | 3 = 1 
+    let y: 1 | 2 | 3 = 1
+    while (x !== 3) {
+        x = y * 4
+    }
+    return x
+}
+
+export function f11(x: { a: number } | undefined) {
+    if (!x) return
+
+    if (x.a === 2) {
+        return x.a
+    }
+}
+
 
 // export function f2() {
 //     const a1 = true as boolean

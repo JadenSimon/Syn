@@ -2032,11 +2032,6 @@ fn NewLexer_(
             }
         }
 
-        // TODO: use wtf-8 encoding.
-        pub fn utf16ToStringWithValidation(lexer: *LexerType, js: JavascriptString) !string {
-            return utf16ToString(lexer, js);
-        }
-
         pub fn utf16ToString(lexer: *LexerType, js: JavascriptString) string {
             var temp: [4]u8 = undefined;
             var list = std.ArrayList(u8).initCapacity(lexer.allocator, js.len) catch unreachable;

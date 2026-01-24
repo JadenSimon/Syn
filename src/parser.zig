@@ -939,7 +939,7 @@ pub inline fn getHashFromNode(node: *const AstNode) NodeSymbolHash {
 
 inline fn getHashFromModuleNode(node: *const AstNode) !NodeSymbolHash {
     if (node.kind == .string_literal) {
-        return @truncate(std.hash.Wyhash.hash(1, try getSlice(node, u8)));
+        return @truncate(std.hash.Wyhash.hash(1, getSlice(node, u8)));
     }
     return getHashFromNode(node);
 }
@@ -1699,7 +1699,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     }
 
                     if (this.lexer.token == .t_new) {
-                        const s = try getSlice(&ident.toAstNode(), u8);
+                        const s = getSlice(&ident.toAstNode(), u8);
                         if (strings.eqlComptime(s, "abstract")) {
                             try this.lexer.next();
 
@@ -5845,7 +5845,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     const ident = try this.parseIdentifierNode();
                     if (this.lexer.token != .t_colon) {
                         if (comptime is_declaration_file) {
-                            if (this.lexer.token == .t_open_brace and strings.eqlComptime(try getSlice(&ident.toAstNode(), u8), "global")) {
+                            if (this.lexer.token == .t_open_brace and strings.eqlComptime(getSlice(&ident.toAstNode(), u8), "global")) {
                                 return this.parseNamespaceOrModule(0, .global);
                             }
                         }
@@ -6062,7 +6062,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     if (n.kind == .export_declaration or n.kind == .import_declaration) {
                         const d = getPackedData(&n.toAstNode());
                         if (d.right != 0) {
-                            const slice = try getSlice(this.node_allocator.at(d.right), u8);
+                            const slice = getSlice(this.node_allocator.at(d.right), u8);
                             try imports.append(this.lexer.allocator, slice);
                         }
                     }
@@ -6428,10 +6428,10 @@ pub const Transformer = struct {
         var is_statement = true;
         if (n.kind == .expression_statement) {
             is_statement = false;
-            r = try unwrapRef(n);
+            r = unwrapRef(n);
             n = this.allocator.at(r);
             if (n.kind == .await_expression) {
-                return .{ true, try unwrapRef(n) };
+                return .{ true, unwrapRef(n) };
             }
         }
 
@@ -6510,7 +6510,7 @@ pub const Transformer = struct {
         const tmp_name = try std.fmt.allocPrint(getAllocator(), "_tmp_{d}", .{this.tmp_counter});
         this.tmp_counter += 1;
 
-        const decl = this.allocator.at(try unwrapRef(l));
+        const decl = this.allocator.at(unwrapRef(l));
         std.debug.assert(decl.kind == .variable_declaration);
 
         const tmp_ident = try this.createIdent(tmp_name);
@@ -6560,7 +6560,7 @@ pub const Transformer = struct {
         while (true) {
             const next = this.allocator.at(n);
             switch (next.kind) {
-                .parenthesized_expression => n = try unwrapRef(next),
+                .parenthesized_expression => n = unwrapRef(next),
                 else => break,
             }
         }
@@ -6618,7 +6618,7 @@ pub const Transformer = struct {
                 if (stmt.kind != .expression_statement) continue;
 
                 // you can (unfortunately) hide the `super` call in intermediate expressions
-                const inner = this.allocator.at(try this.unwrapExpressionStatement(try unwrapRef(stmt)));
+                const inner = this.allocator.at(try this.unwrapExpressionStatement(unwrapRef(stmt)));
 
                 if (inner.kind != .call_expression) continue;
 
@@ -6656,10 +6656,12 @@ pub const Transformer = struct {
     }
 };
 
-pub fn unwrapRef(node: *const AstNode) !NodeRef {
+pub fn unwrapRef(node: *const AstNode) NodeRef {
     return @intCast(@intFromPtr(node.data orelse {
-        std.debug.print("{}\n", .{node.kind});
-        return error.MissingData;
+        if (comptime is_debug) {
+            std.debug.print("MISSING DATA {}\n", .{node.kind});
+        }
+        unreachable;
     }));
 }
 
@@ -6689,12 +6691,12 @@ pub fn hasStringFlag(node: *const AstNode, flag: StringFlags) bool {
     return (node.flags & @intFromEnum(flag)) == @intFromEnum(flag);
 }
 
-pub fn getSlice(node: *const AstNode, comptime T: type) ![]const T {
+pub fn getSlice(node: *const AstNode, comptime T: type) []const T {
     if (node.len == 0) {
         return &.{};
     }
 
-    const ptr: [*]const T = @alignCast(@ptrCast(node.data orelse return error.MissingData));
+    const ptr: [*]const T = @alignCast(@ptrCast(node.data orelse unreachable));
 
     return ptr[0..node.len];
 }
@@ -6865,7 +6867,7 @@ pub fn forEachChild(
             try visitList(nodes, maybeUnwrapRef(node) orelse 0, visitor);
         },
         .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .type_of_expression, .spread_element => {
-            const ref = try unwrapRef(node);
+            const ref = unwrapRef(node);
             try visitor.visit(nodes.at(ref), ref);
         },
         .return_statement, .yield_expression => {
@@ -6948,7 +6950,7 @@ pub fn forEachChild(
             }
         },
         .infer_type, .parenthesized_type, .rest_type, .computed_property_name => {
-            const r = try unwrapRef(node);
+            const r = unwrapRef(node);
             try visitor.visit(nodes.at(r), r);
         },
         .template_literal_type_span => {
@@ -6956,7 +6958,7 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left);
         },
         .type_query => {
-            const r = try unwrapRef(node);
+            const r = unwrapRef(node);
             try visitor.visit(nodes.at(r), r);
             try visitList(nodes, node.len, visitor);
         },
@@ -7071,6 +7073,7 @@ pub const SymbolFlags = enum(u16) {
     not_type = 1 << 3, // Only relevant for imports
 
     top_level = 1 << 4,
+    skip_narrowing = 1 << 5, // added during type analysis
 
     parameter = 1 << 8,
     @"enum" = 1 << 9,
@@ -7128,13 +7131,14 @@ pub const Exports = struct {
 // type z = ReturnType<f> // string | number
 //
 pub const Binder = struct {
-    const Scopes = std.ArrayList(std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef));
+    const SymbolTable = std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef);
+    const Scopes = std.ArrayListUnmanaged(SymbolTable);
 
     pub const Namespace = struct {
         const global_hash: u32 = @truncate(std.hash.Wyhash.hash(0, "global"));
 
-        symbols: std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef) = undefined,
-        type_symbols: std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef) = undefined,
+        symbols: SymbolTable = undefined,
+        type_symbols: SymbolTable = undefined,
         module_specifier: ?[]const u8 = null,
         is_global: bool = false,
 
@@ -7143,12 +7147,14 @@ pub const Binder = struct {
 
     const ImportedModule = struct {
         spec: []const u8,
-        bindings: std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef),
+        bindings: SymbolTable = .{},
 
         // These are linked-lists for multiple bindings
         default_binding: ?SymbolRef = null,
         namespace_binding: ?SymbolRef = null,
     };
+
+    allocator: std.mem.Allocator,
 
     nodes: *const BumpAllocator(AstNode),
 
@@ -7157,19 +7163,19 @@ pub const Binder = struct {
     scopes: Scopes,
     type_scopes: Scopes,
 
-    this_scope: std.ArrayList(SymbolRef),
+    this_scope: std.ArrayListUnmanaged(SymbolRef) = .{},
 
-    unbound_symbols: std.AutoArrayHashMap(NodeSymbolHash, SymbolRef),
-    unbound_type_symbols: std.AutoArrayHashMap(NodeSymbolHash, SymbolRef),
+    unbound_symbols: SymbolTable = .{},
+    unbound_type_symbols: SymbolTable = .{},
 
-    namespaces: std.ArrayList(Namespace),
-    ambient_modules: std.AutoArrayHashMap(u64, SymbolRef),
+    namespaces: std.ArrayListUnmanaged(Namespace) = .{},
+    ambient_modules: std.AutoArrayHashMapUnmanaged(u64, SymbolRef) = .{},
 
     default_export: ?NodeRef = null,
 
     exports: Exports = Exports{},
 
-    imports: std.AutoArrayHashMap(u64, ImportedModule),
+    imports: std.AutoArrayHashMapUnmanaged(u64, ImportedModule) = .{},
 
     type_ordinals: u32 = 0,
     param_ordinals: u32 = 0,
@@ -7192,17 +7198,20 @@ pub const Binder = struct {
         symbol_allocator.preAlloc() catch unreachable;
         _ = symbol_allocator.push(.{}) catch unreachable;
 
+        var scopes = Scopes{};
+        scopes.ensureTotalCapacity(allocator, 16) catch unreachable;
+        var type_scopes = Scopes{};
+        type_scopes.ensureTotalCapacity(allocator, 16) catch unreachable;
+        var this_scope = std.ArrayListUnmanaged(SymbolRef){};
+        this_scope.ensureTotalCapacity(allocator, 16) catch unreachable;
+
         return .{
+            .allocator = allocator,
             .nodes = nodes,
             .symbols = symbol_allocator,
-            .namespaces = std.ArrayList(Namespace).init(allocator),
-            .ambient_modules = std.AutoArrayHashMap(u64, SymbolRef).init(allocator),
-            .imports = std.AutoArrayHashMap(u64, ImportedModule).init(allocator),
-            .unbound_symbols = std.AutoArrayHashMap(NodeSymbolHash, SymbolRef).init(allocator),
-            .unbound_type_symbols = std.AutoArrayHashMap(NodeSymbolHash, SymbolRef).init(allocator),
-            .scopes = Scopes.initCapacity(allocator, 16) catch unreachable,
-            .type_scopes = Scopes.initCapacity(allocator, 16) catch unreachable,
-            .this_scope = std.ArrayList(SymbolRef).initCapacity(allocator, 16) catch unreachable,
+            .scopes = scopes,
+            .type_scopes = type_scopes,
+            .this_scope = this_scope,
         };
     }
 
@@ -7261,7 +7270,7 @@ pub const Binder = struct {
         //         this.source_name orelse "<unknown>",
         //         loc.line + 1,
         //         loc.col + 1,
-        //         try getSlice(ident, u8),
+        //         getSlice(ident, u8),
         //         s,
         //     });
         // }
@@ -7270,11 +7279,11 @@ pub const Binder = struct {
             try this.pushExport(hash, s);
         }
 
-        try current_scope.put(this.scopes.allocator, hash, s);
+        try current_scope.put(this.allocator, hash, s);
         ident.extra_data = s;
 
         if (comptime is_type_like) {
-            try this.type_scopes.items[this.type_scopes.items.len - 1].put(this.type_scopes.allocator, hash, s);
+            try this.type_scopes.items[this.type_scopes.items.len - 1].put(this.allocator, hash, s);
             if (this.should_export) {
                 try this.pushTypeExport(hash, s);
                 // try this.type_exports.put(hash, s);
@@ -7313,7 +7322,7 @@ pub const Binder = struct {
                     .ordinal = flags_and_ordinal | extra_flags | (@as(u32, @intFromEnum(SymbolFlags.global)) << 16),
                 });
                 ident.extra_data = s;
-                try current_scope.put(this.type_scopes.allocator, hash, s);
+                try current_scope.put(this.allocator, hash, s);
                 return;
             }
 
@@ -7328,14 +7337,14 @@ pub const Binder = struct {
             //         this.source_name orelse "<unknown>",
             //         loc.line + 1,
             //         loc.col + 1,
-            //         try getSlice(ident, u8),
+            //         getSlice(ident, u8),
             //         s,
             //         hash,
             //         this.type_scopes.items.len,
             //     });
             // }
 
-            try current_scope.put(this.type_scopes.allocator, hash, s);
+            try current_scope.put(this.allocator, hash, s);
 
             ident.extra_data = s;
 
@@ -7361,11 +7370,10 @@ pub const Binder = struct {
 
     fn getOrAddImportedModule(this: *@This(), spec: []const u8) !*ImportedModule {
         const key = std.hash.Wyhash.hash(0, spec);
-        const module_entry = try this.imports.getOrPut(key);
+        const module_entry = try this.imports.getOrPut(this.allocator, key);
         if (!module_entry.found_existing) {
             module_entry.value_ptr.* = ImportedModule{
                 .spec = spec,
-                .bindings = std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef){},
             };
         }
 
@@ -7387,11 +7395,11 @@ pub const Binder = struct {
         ident.extra_data = s;
 
         var current_type_scope = &this.type_scopes.items[this.type_scopes.items.len - 1];
-        try current_type_scope.put(this.type_scopes.allocator, getHashFromNode(ident), s);
+        try current_type_scope.put(this.allocator, getHashFromNode(ident), s);
 
         if (property_name) |name| {
             const hash: u32 = @truncate(std.hash.Wyhash.hash(0, name));
-            try module.bindings.put(this.imports.allocator, hash, s);
+            try module.bindings.put(this.allocator, hash, s);
         } else if (is_namespace) {
             if (module.namespace_binding) |b| {
                 var prev = this.symbols.at(b);
@@ -7402,7 +7410,7 @@ pub const Binder = struct {
             }
         } else {
             // const hash: u32 = comptime @truncate(std.hash.Wyhash.hash(0, "default"));
-            // try module.bindings.put(this.imports.allocator, hash, s);
+            // try module.bindings.put(this.allocator, hash, s);
             if (module.default_binding) |b| {
                 var prev = this.symbols.at(b);
                 this.symbols.at(s).next = prev.next;
@@ -7415,24 +7423,24 @@ pub const Binder = struct {
         if (is_type_only) return; // TODO: need flag? we can't differentiate when linking
 
         var current_scope = &this.scopes.items[this.scopes.items.len - 1];
-        try current_scope.put(this.scopes.allocator, getHashFromNode(ident), s);
+        try current_scope.put(this.allocator, getHashFromNode(ident), s);
     }
 
     inline fn pushExport(this: *@This(), hash: u32, s: SymbolRef) !void {
         if (this.ns != 0) {
             if (this.namespaces.items[this.ns - 1].exports == null) return;
-            try this.namespaces.items[this.ns - 1].exports.?.symbols.put(this.scopes.allocator, hash, s);
+            try this.namespaces.items[this.ns - 1].exports.?.symbols.put(this.allocator, hash, s);
         } else {
-            try this.exports.symbols.put(this.scopes.allocator, hash, s);
+            try this.exports.symbols.put(this.allocator, hash, s);
         }
     }
 
     inline fn pushTypeExport(this: *@This(), hash: u32, s: SymbolRef) !void {
         if (this.ns != 0) {
             if (this.namespaces.items[this.ns - 1].exports == null) return;
-            try this.namespaces.items[this.ns - 1].exports.?.type_symbols.put(this.scopes.allocator, hash, s);
+            try this.namespaces.items[this.ns - 1].exports.?.type_symbols.put(this.allocator, hash, s);
         } else {
-            try this.exports.type_symbols.put(this.scopes.allocator, hash, s);
+            try this.exports.type_symbols.put(this.allocator, hash, s);
         }
     }
 
@@ -7469,7 +7477,7 @@ pub const Binder = struct {
                 .binding = ident_ref,
                 .ordinal = flags,
             });
-            try m.put(hash, s);
+            try m.put(this.allocator, hash, s);
             ident.extra_data = s;
 
             // if (getLoc(this.nodes, ident)) |loc| {
@@ -7477,7 +7485,7 @@ pub const Binder = struct {
             //         this.source_name orelse "<unknown>",
             //         loc.line + 1,
             //         loc.col + 1,
-            //         try getSlice(ident, u8),
+            //         getSlice(ident, u8),
             //         s,
             //         hash,
             //         this.type_scopes.items.len,
@@ -7494,7 +7502,7 @@ pub const Binder = struct {
             // else 
             //     &this.type_scopes.items[this.type_scopes.items.len - 1];
 
-            // try scope.put(this.scopes.allocator, getHashFromNode(ident), s);
+            // try scope.put(this.allocator, getHashFromNode(ident), s);
         }
     }
 
@@ -7761,7 +7769,7 @@ pub const Binder = struct {
                 });
             }
 
-            if (is_static) try this.this_scope.append(static_this);
+            if (is_static) try this.this_scope.append(this.allocator, static_this);
             defer if (is_static) this.popThisScope();
 
             switch (el.kind) {
@@ -7865,19 +7873,19 @@ pub const Binder = struct {
                 else 
                     &this.exports.aliased_exports;
     
-                const spec = try getSlice(this.nodes.at(d.right), u8);
+                const spec = getSlice(this.nodes.at(d.right), u8);
 
                 if (d.left != 0) {
                     const clause = this.nodes.at(d.left);
                     if (clause.kind == .namespace_export) {
                         // export * as foo from 'foo'
-                        const binding = try unwrapRef(clause);
+                        const binding = unwrapRef(clause);
                         const sym = try this.symbols.push(.{
                             .binding = binding,
                             .ordinal = @as(u32, @intFromEnum(SymbolFlags.exported) | @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.namespace)) << 16
                         });
 
-                        try aliased_exports.append(this.scopes.allocator, .{
+                        try aliased_exports.append(this.allocator, .{
                             .spec = spec,
                             .binding = binding,
                             .sym = sym,
@@ -7896,7 +7904,7 @@ pub const Binder = struct {
                                 .ordinal = (@as(u32, @intFromEnum(SymbolFlags.exported)) << 16) | (@as(u32, @intFromEnum(SymbolFlags.imported)) << 16),
                             });
 
-                            try aliased_exports.append(this.scopes.allocator, .{
+                            try aliased_exports.append(this.allocator, .{
                                 .spec = spec,
                                 .target = export_data.left,
                                 .binding = export_data.right, // this is zero if not renamed
@@ -7913,7 +7921,7 @@ pub const Binder = struct {
                         .ordinal = (@as(u32, @intFromEnum(SymbolFlags.aliased_module)) << 16),
                     });
 
-                    try aliased_exports.append(this.scopes.allocator, .{
+                    try aliased_exports.append(this.allocator, .{
                         .spec = spec,
                         .sym = sym,
                     });
@@ -7935,7 +7943,7 @@ pub const Binder = struct {
                 const clause = this.nodes.at(d.left);
                 const clause_data = getPackedData(clause);
 
-                const module = try this.getOrAddImportedModule(try getSlice(this.nodes.at(d.right), u8));
+                const module = try this.getOrAddImportedModule(getSlice(this.nodes.at(d.right), u8));
 
                 // default import
                 if (clause_data.left != 0) {
@@ -7947,7 +7955,7 @@ pub const Binder = struct {
                 if (clause_data.right != 0) {
                     const imports = this.nodes.at(clause_data.right);
                     if (imports.kind == .namespace_import) {
-                        const binding_ref = try unwrapRef(imports);
+                        const binding_ref = unwrapRef(imports);
                         this.nodes.at(binding_ref).next = ref; // XXX
 
                         return this.bindImport(
@@ -7969,7 +7977,7 @@ pub const Binder = struct {
 
                         const d3 = getPackedData(s);
                         const binding_ref = if (d3.right != 0) d3.right else d3.left;
-                        const prop = try getSlice(this.nodes.at(d3.left), u8);
+                        const prop = getSlice(this.nodes.at(d3.left), u8);
                         this.nodes.at(binding_ref).next = ref; // XXX
 
                         try this.bindImport(
@@ -8002,8 +8010,8 @@ pub const Binder = struct {
                         this.ns = sym.binding + 1;
                         defer this.ns = prior_ns;
 
-                        try this.scopes.append(ns.symbols);
-                        try this.type_scopes.append(ns.type_symbols);
+                        try this.scopes.append(this.allocator, ns.symbols);
+                        try this.type_scopes.append(this.allocator, ns.type_symbols);
 
                         try forEachChild(this.nodes, this.nodes.at(d.right), this);
 
@@ -8018,14 +8026,14 @@ pub const Binder = struct {
 
                 const ns_id: u32 = @intCast(this.namespaces.items.len);
 
-                try this.namespaces.append(.{ .is_global = d.left == 0 });
+                try this.namespaces.append(this.allocator, .{ .is_global = d.left == 0 });
 
                 var ns = &this.namespaces.items[ns_id];
 
                 if (is_module) {
-                    ns.exports = try this.scopes.allocator.create(Exports);
+                    ns.exports = try this.allocator.create(Exports);
                     ns.exports.?.* = Exports{};
-                    ns.module_specifier = try getSlice(this.nodes.at(d.left), u8);
+                    ns.module_specifier = getSlice(this.nodes.at(d.left), u8);
                 }
 
                 {
@@ -8054,7 +8062,7 @@ pub const Binder = struct {
                 });
 
                 if (is_module) {
-                    try this.ambient_modules.put(std.hash.Wyhash.hash(0, ns.module_specifier orelse unreachable), s);
+                    try this.ambient_modules.put(this.allocator, std.hash.Wyhash.hash(0, ns.module_specifier orelse unreachable), s);
                 }
 
                 if (has_non_ns_symbol) {
@@ -8062,7 +8070,7 @@ pub const Binder = struct {
                     this.symbols.at(s).next = this.symbols.at(sym_ref).next;
                     this.symbols.at(sym_ref).next = s;
                 } else {
-                    try this.scopes.items[this.scopes.items.len - 1].put(this.scopes.allocator, hash, s);
+                    try this.scopes.items[this.scopes.items.len - 1].put(this.allocator, hash, s);
                     if (!is_module and this.shouldExport(node)) {
                         try this.pushExport(hash, s);
                        // try this.exports.put(hash, s);
@@ -8094,7 +8102,7 @@ pub const Binder = struct {
                 }
 
                 const r = this.nodes.at(d.right);
-                const module = try this.getOrAddImportedModule(try getSlice(this.nodes.at(try unwrapRef(r)), u8));
+                const module = try this.getOrAddImportedModule(getSlice(this.nodes.at(unwrapRef(r)), u8));
 
                 // default import
                 this.nodes.at(d.left).next = ref; // XXX
@@ -8153,7 +8161,7 @@ pub const Binder = struct {
                 try this.visitType(d.right);
             },
             .array_type, .parenthesized_type => {
-                try this.visitType(try unwrapRef(node));
+                try this.visitType(unwrapRef(node));
             },
             .mapped_type => {
                 try this.pushTypeScope();
@@ -8194,14 +8202,14 @@ pub const Binder = struct {
             .property_signature => {
                 const d = getPackedData(node);
                 if (this.nodes.at(d.left).kind == .computed_property_name) {
-                    try this.visitRef(try unwrapRef(this.nodes.at(d.left)));
+                    try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                 }
                 try this.visitType(d.right);
             },
             .method_signature => {
                 const d = getPackedData(node);
                 if (this.nodes.at(d.left).kind == .computed_property_name) {
-                    try this.visitRef(try unwrapRef(this.nodes.at(d.left)));
+                    try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                 }
 
                 try this.pushTypeScope();
@@ -8264,7 +8272,7 @@ pub const Binder = struct {
                 var iter = NodeIterator.init(this.nodes, maybeUnwrapRef(node) orelse 0);
                 while (iter.nextPair()) |pair| {
                     switch (pair[0].kind) {
-                        .rest_type, .optional_type => try this.visitType(try unwrapRef(pair[0])),
+                        .rest_type, .optional_type => try this.visitType(unwrapRef(pair[0])),
                         .named_tuple_member => {
                             const d = getPackedData(pair[0]);
                             try this.visitType(d.right);
@@ -8297,7 +8305,7 @@ pub const Binder = struct {
                 try this.visitType(node.extra_data);
             },
             .infer_type => {
-                const param_ref = try unwrapRef(node);
+                const param_ref = unwrapRef(node);
                 const param = this.nodes.at(param_ref);
 
                 // multiple type params w/ the same binding _are_ allowed in the same scope,
@@ -8333,7 +8341,7 @@ pub const Binder = struct {
                         .ordinal = flags_and_ordinal,
                     });
 
-                    try scope.put(this.type_scopes.allocator, getHashFromNode(ident), s);
+                    try scope.put(this.allocator, getHashFromNode(ident), s);
                     ident.extra_data = s;
                     this.type_ordinals += 1;
                 }
@@ -8361,7 +8369,7 @@ pub const Binder = struct {
                 while (iter.nextRef()) |r| try this.visitType(r);
             },
             .type_query => {
-                const exp = try unwrapRef(node);
+                const exp = unwrapRef(node);
                 try this.visitRef(exp);
                 var iter = NodeIterator.init(this.nodes, node.len);
                 while (iter.nextRef()) |r| try this.visitType(r);
@@ -8392,7 +8400,7 @@ pub const Binder = struct {
                 try this.visitType(d.right);
             },
             .template_literal_type => {
-                const head_ref = try unwrapRef(node);
+                const head_ref = unwrapRef(node);
                 var next: NodeRef = this.nodes.at(head_ref).next;
                 while (next != 0) {
                     const span = this.nodes.at(next);
@@ -8406,25 +8414,25 @@ pub const Binder = struct {
     }
 
     inline fn pushScope(this: *@This()) !void {
-        try this.scopes.append(std.AutoArrayHashMapUnmanaged(u32, SymbolRef){});
+        try this.scopes.append(this.allocator, SymbolTable{});
     }
 
     inline fn popScope(this: *@This()) void {
         var s = this.scopes.pop();
-        s.deinit(this.scopes.allocator);
+        s.deinit(this.allocator);
     }
 
     inline fn pushTypeScope(this: *@This()) !void {
-        try this.type_scopes.append(std.AutoArrayHashMapUnmanaged(u32, SymbolRef){});
+        try this.type_scopes.append(this.allocator, SymbolTable{});
     }
 
     inline fn popTypeScope(this: *@This()) void {
         var s = this.type_scopes.pop();
-        s.deinit(this.type_scopes.allocator);
+        s.deinit(this.allocator);
     }
 
     inline fn pushThisScope(this: *@This(), decl: NodeRef) !void {
-        try this.this_scope.append(decl | (1 << 31));
+        try this.this_scope.append(this.allocator, decl | (1 << 31));
     }
 
     inline fn popThisScope(this: *@This()) void {
@@ -8460,7 +8468,7 @@ pub const Binder = struct {
                 return this.visitType(ref);
             },
             .export_assignment => {
-                const inner = try unwrapRef(node);
+                const inner = unwrapRef(node);
                 this.default_export = inner;
                 try this.visitRef(inner);
             },
@@ -8487,7 +8495,7 @@ pub const Binder = struct {
 
                 if (has_type_params) try this.visitTypeParams(node.len);
 
-                return this.visitType(try unwrapRef(node));
+                return this.visitType(unwrapRef(node));
             },
             .enum_declaration => {
                 const d = getPackedData(node);
@@ -8554,7 +8562,7 @@ pub const Binder = struct {
                     return forEachChild(this.nodes, node, this);
                 }
 
-                const decl = try unwrapRef(exp);
+                const decl = unwrapRef(exp);
                 const decl_node = this.nodes.at(decl);
                 const q = getPackedData(decl_node);
 
@@ -8586,19 +8594,19 @@ pub const Binder = struct {
                 while (iter.next()) |el| {
                     switch (el.kind) {
                         .spread_assignment, .shorthand_property_assignment => {
-                            try this.visitRef(try unwrapRef(el));
+                            try this.visitRef(unwrapRef(el));
                         },
                         .property_assignment => {
                             const d = getPackedData(el);
                             if (this.nodes.at(d.left).kind == .computed_property_name) {
-                                try this.visitRef(try unwrapRef(this.nodes.at(d.left)));
+                                try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                             }
                             try this.visitRef(d.right);
                         },
                         .method_declaration, .set_accessor, .get_accessor => {
                             const d = getPackedData(el);
                             if (this.nodes.at(d.left).kind == .computed_property_name) {
-                                try this.visitRef(try unwrapRef(this.nodes.at(d.left)));
+                                try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                             }
                             return try this.visitLexicalScope(el);
                         },
@@ -8745,17 +8753,17 @@ pub const Binder = struct {
                 }
 
                 if (!sym.hasFlag(.namespace)) {
-                    if (d.left == 0) std.debug.print("global\n", .{}) else std.debug.print("{s}\n", .{try getSlice(this.nodes.at(d.left), u8)});
+                    if (d.left == 0) std.debug.print("global\n", .{}) else std.debug.print("{s}\n", .{getSlice(this.nodes.at(d.left), u8)});
                 }
 
                 std.debug.assert(sym.hasFlag(.namespace));
 
                 const ns = this.namespaces.items[sym.binding];
 
-                try this.scopes.append(ns.symbols);
+                try this.scopes.append(this.allocator, ns.symbols);
                 defer _ = this.scopes.pop();
 
-                try this.type_scopes.append(ns.type_symbols);
+                try this.type_scopes.append(this.allocator, ns.type_symbols);
                 defer _ = this.type_scopes.pop();
 
                 var iter = NodeIterator.init(this.nodes, maybeUnwrapRef(this.nodes.at(d.right)) orelse 0);
@@ -8767,17 +8775,17 @@ pub const Binder = struct {
 
                 try this.pushScope();
                 defer {
-                    if (!this.is_lib) 
+                    if (!this.is_lib)
                         this.popScope()
                     else
                         this.exports.symbols = this.scopes.pop();
                 }
 
                 if (comptime bind_types) try this.pushTypeScope();
-                defer if (comptime bind_types) { 
-                    if (!this.is_lib) 
+                defer if (comptime bind_types) {
+                    if (!this.is_lib)
                         this.popTypeScope()
-                    else 
+                    else
                         this.exports.type_symbols = this.type_scopes.pop();
                 };
 
@@ -8850,7 +8858,7 @@ pub const Binder = struct {
         const n = this.nodes.at(ref);
         return switch (n.kind) {
             .identifier => n.extra_data,
-            .parenthesized_type => this.getTypeSymbol(unwrapRef(n) catch unreachable),
+            .parenthesized_type => this.getTypeSymbol(unwrapRef(n)),
             .class_declaration, .type_alias_declaration, .interface_declaration, .enum_declaration, .type_parameter => this.getTypeSymbol(getPackedData(n).left),
             else => null,
         };
@@ -9169,7 +9177,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
         inline fn visitRefUnwrapStatement(this: *@This(), ref: NodeRef) !void {
             const n = this.getNode(ref);
             if (n.kind == .expression_statement) {
-                return this.visitRef(try unwrapRef(n));
+                return this.visitRef(unwrapRef(n));
             }
 
             return this.visit(n);
@@ -9307,7 +9315,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
         inline fn printUnaryPrefixExp(this: *@This(), comptime operator: []const u8, n: *const AstNode) !void {
             this.print(operator);
-            try this.visitRef(try unwrapRef(n));
+            try this.visitRef(unwrapRef(n));
         }
 
         inline fn printTypeParameter(this: *@This(), n: *const AstNode, comptime constraint_prefix: []const u8) !void {
@@ -9382,12 +9390,12 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
             if (hasStringFlag(n, .synthetic)) {
                 if (hasStringFlag(n, .double_quote)) {
-                    this.printEscapedString(try getSlice(n, u8), '"');
+                    this.printEscapedString(getSlice(n, u8), '"');
                 } else {
-                    this.printEscapedString(try getSlice(n, u8), '\'');
+                    this.printEscapedString(getSlice(n, u8), '\'');
                 }
             } else {
-                this.print(try getSlice(n, u8));
+                this.print(getSlice(n, u8));
             }
 
             this.print(quote_char);
@@ -9481,7 +9489,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         }
                     },
                     .defer_statement => {
-                        const x = this.getTransformer().maybeTransformAsyncDefer(unwrapRef(n) catch return false) catch continue; // XXX: not optimal
+                        const x = this.getTransformer().maybeTransformAsyncDefer(unwrapRef(n)) catch continue; // XXX: not optimal
 
                         if (x[0]) return true;
                     },
@@ -9520,7 +9528,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         }
                     }
 
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                     //this.print(getSourceSlice(this.data.source, n));
                 },
                 .object_keyword, .const_keyword, .undefined_keyword, .symbol_keyword, .void_keyword, .never_keyword, .unknown_keyword, .any_keyword, .for_keyword, .new_keyword, .null_keyword, .import_keyword, .default_keyword, .number_keyword, .string_keyword, .boolean_keyword, .false_keyword, .true_keyword, .super_keyword, .this_keyword, .debugger_keyword => {
@@ -9534,10 +9542,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print("]");
                 },
                 .regular_expression_literal => {
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                 },
                 .no_substitution_template_literal => {
-                    const s = try getSlice(n, u8);
+                    const s = getSlice(n, u8);
                     this.print("`");
                     this.print(s);
                     this.print("`");
@@ -9547,17 +9555,17 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .template_head => {
                     this.print("`");
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                     this.print("${");
                 },
                 .template_middle => {
                     this.print("}");
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                     this.print("${");
                 },
                 .template_tail => {
                     this.print("}");
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                     this.print("`");
                 },
                 // Why does typescript distinguish these two? No clue.
@@ -9567,7 +9575,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.right);
                 },
                 .template_expression, .template_literal_type => {
-                    var ref = try unwrapRef(n);
+                    var ref = unwrapRef(n);
                     while (ref != 0) {
                         const span = this.getNode(ref);
                         try this.visit(span);
@@ -9581,12 +9589,12 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .jsx_expression => {
                     this.print("{");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print("}");
                 },
                 .jsx_spread_attribute => {
                     this.print("{...");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print("}");
                 },
                 .jsx_attribute => {
@@ -9595,10 +9603,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.maybePrintInitNoSpace(d.right);
                 },
                 .jsx_attributes => {
-                    try this._visitLinkedList(try unwrapRef(n), "", "", " ", false);
+                    try this._visitLinkedList(unwrapRef(n), "", "", " ", false);
                 },
                 .jsx_text => {
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                 },
                 .jsx_element => {
                     // first/last refs are opening/closing elements, middle are children
@@ -9622,7 +9630,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .jsx_closing_element => {
                     this.print("</");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(">");
                 },
                 .jsx_fragment => {
@@ -9706,7 +9714,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .case_clause => {
                     this.print("case ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(": ");
                     try this._visitLinkedList(n.len, "", "", "", true);
                 },
@@ -9816,36 +9824,36 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.right);
                 },
                 .expression_statement => {
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(";"); // TODO: only emit semicolon when it's needed (ASI)
                 },
                 .type_query, .type_of_expression => {
                     this.print("typeof ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
 
                     // Only relevant for `type_query`
                     if (n.len != 0) try this.printTypeArgs(n.len);
                 },
                 .reify_expression => {
                     // this.print("reify ");
-                    const call_exp = try this.getTransformer().transformReifyExpression(try unwrapRef(n), n.len);
+                    const call_exp = try this.getTransformer().transformReifyExpression(unwrapRef(n), n.len);
                     try this.visit(&call_exp);
                 },
                 .void_expression => {
                     this.print("void ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .delete_expression => {
                     this.print("delete ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .await_expression => {
                     this.print("await ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .return_statement => {
                     this.print("return ");
-                    if (n.data != null) try this.visitRef(try unwrapRef(n));
+                    if (n.data != null) try this.visitRef(unwrapRef(n));
                 },
                 .yield_expression => {
                     if (hasFlag(n, .generator)) {
@@ -9853,19 +9861,19 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     } else {
                         this.print("yield ");
                     }
-                    if (n.data != null) try this.visitRef(try unwrapRef(n));
+                    if (n.data != null) try this.visitRef(unwrapRef(n));
                 },
                 .parenthesized_expression => {
                     if (this.needs_newline) {
                         this.print(";");
                     }
                     this.print("(");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(")");
                 },
                 .parenthesized_type => {
                     this.print("(");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(")");
                 },
                 .not_emitted_statement => {},
@@ -9921,7 +9929,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
                 },
                 .array_type => {
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print("[]");
                 },
                 .named_tuple_member => {
@@ -9937,7 +9945,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.right);
                 },
                 .literal_type => {
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .tuple_type => {
                     const first: NodeRef = maybeUnwrapRef(n) orelse 0;
@@ -9945,16 +9953,16 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .rest_type => {
                     this.print("...");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .optional_type => {
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print("?");
                 },
                 .union_type => {
                     // Synthethic list
                     if (n.flags == 1) {
-                        return this._visitLinkedList(try unwrapRef(n), "", "", " | ", false);
+                        return this._visitLinkedList(unwrapRef(n), "", "", " | ", false);
                     }
                     const d = getPackedData(n);
                     try this.visitRef(d.left);
@@ -9964,7 +9972,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 .intersection_type => {
                     // Synthethic list
                     if (n.flags == 1) {
-                        return this._visitLinkedList(try unwrapRef(n), "", "", " & ", false);
+                        return this._visitLinkedList(unwrapRef(n), "", "", " & ", false);
                     }
                     const d = getPackedData(n);
                     try this.visitRef(d.left);
@@ -10011,7 +10019,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .external_module_reference => {
                     this.print("require(");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print(")");
                 },
                 .constructor => {
@@ -10136,7 +10144,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .decorator => {
                     this.print("@");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .semicolon_class_element => {
                     this.print(";");
@@ -10228,7 +10236,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .namespace_import => {
                     this.print("* as ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .import_clause => {
                     const d = getPackedData(n);
@@ -10271,16 +10279,16 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .namespace_export => {
                     this.print("* as ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .export_assignment => {
                     if (n.len == 1) {
                         this.print("export = ");
-                        return this.visitRef(try unwrapRef(n));
+                        return this.visitRef(unwrapRef(n));
                     }
 
                     this.print("export default ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .export_declaration => { // Structure is slightly different from `import_declaration`
                     if (this.skip_types and hasFlag(n, .declare)) return;
@@ -10353,21 +10361,21 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .shorthand_property_assignment => {
                     if (comptime use_symbol_replacements) {
-                        const n2 = try this.getNode(try unwrapRef(n));
+                        const n2 = try this.getNode(unwrapRef(n));
                         const symbol_id = n2.extra_data;
                         if (symbol_id != 0) {
                             if (this.symbol_replacements.get(symbol_id)) |t| {
-                                this.print(try getSlice(n2, u8));
+                                this.print(getSlice(n2, u8));
                                 this.print(": ");
                                 return try this.visitRef(t);
                             }
                         }
                     }
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .spread_assignment, .spread_element => {
                     this.print("...");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .meta_property => {
                     const d = getPackedData(n);
@@ -10377,7 +10385,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .throw_statement => {
                     this.print("throw ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .new_expression => {
                     try this.printMappingSegment(n);
@@ -10408,7 +10416,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 .infer_type => {
                     this.print(syntaxKindToString(.infer_keyword));
                     this.print(" ");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                 },
                 .type_operator => {
                     const d = getPackedData(n);
@@ -10431,7 +10439,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 .defer_statement => {
                     this.addHelper(.@"defer");
 
-                    const inner = try unwrapRef(n);
+                    const inner = unwrapRef(n);
                     const x = try this.getTransformer().maybeTransformAsyncDefer(inner);
 
                     if (x[0]) {
@@ -10467,11 +10475,11 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         const needs_using_scope = u.kind == .defer_statement or (u.kind == .variable_statement and hasFlag(u, .using));
                         if (needs_using_scope) {
                             if (comptime enable_conditional_bindings) {
-                                const has_binding = u.kind == .defer_statement and isBoundControlFlow(&this.data.nodes, this.getNode(try unwrapRef(u)));
+                                const has_binding = u.kind == .defer_statement and isBoundControlFlow(&this.data.nodes, this.getNode(unwrapRef(u)));
                                 if (has_binding) {
                                     const n3 = try this.data.nodes.push(.{
                                         .kind = .defer_statement,
-                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(try unwrapRef(u)))),
+                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(u)))),
                                         .next = u.next,
                                     });
                                     return this.visitUsingOrDeferScope(n3);
@@ -10621,7 +10629,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
                         try this.visit(ident);
 
-                        const ident_slice = try getSlice(ident, u8);
+                        const ident_slice = getSlice(ident, u8);
 
                         this.print(" = {}");
                         this.needs_newline = true;
@@ -10743,7 +10751,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                             this.print("const ");
                             this.addHelper(.using);
 
-                            var ref = try unwrapRef(n);
+                            var ref = unwrapRef(n);
                             while (ref != 0) {
                                 const u = this.getNode(ref);
                                 const d = getPackedData(u);
@@ -10763,7 +10771,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         this.print("var ");
                     }
 
-                    try this._visitLinkedList(try unwrapRef(n), "", "", ", ", false);
+                    try this._visitLinkedList(unwrapRef(n), "", "", ", ", false);
                 },
                 .variable_declaration => {
                     const d = getPackedData(n);
@@ -10773,7 +10781,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .computed_property_name => {
                     this.print("[");
-                    try this.visitRef(try unwrapRef(n));
+                    try this.visitRef(unwrapRef(n));
                     this.print("]");
                 },
                 .binding_element => {
@@ -10837,11 +10845,11 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         if (needs_using_scope) {
                             defer this.printHelpers();
                             if (comptime enable_conditional_bindings) {
-                                const has_binding = n2.kind == .defer_statement and isBoundControlFlow(&this.data.nodes, this.getNode(try unwrapRef(n2)));
+                                const has_binding = n2.kind == .defer_statement and isBoundControlFlow(&this.data.nodes, this.getNode(unwrapRef(n2)));
                                 if (has_binding) {
                                     const n3 = try this.data.nodes.push(.{
                                         .kind = .defer_statement,
-                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(try unwrapRef(n2)))),
+                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(n2)))),
                                         .next = n2.next,
                                     });
                                     return this.visitUsingOrDeferScope(n3);
@@ -10904,7 +10912,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(start);
                 },
                 .verbatim_node => {
-                    this.print(try getSlice(n, u8));
+                    this.print(getSlice(n, u8));
                     if (n.extra_data == 0) return;
 
                     var lines = n.extra_data;
@@ -11193,7 +11201,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                 if (bindings.kind == .namespace_import) {
                     const decl = try data.nodes.push(.{
                         .kind = .variable_declaration,
-                        .data = toBinaryDataPtrRefs(try unwrapRef(bindings), r),
+                        .data = toBinaryDataPtrRefs(unwrapRef(bindings), r),
                     });
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
@@ -11280,7 +11288,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     data.nodes.at(without_export).next = exp_statement;
                 } else if (pair[0].kind == .variable_statement) {
                     var tail = without_export;
-                    var decls_iter = NodeIterator.init(&data.nodes, try unwrapRef(pair[0]));
+                    var decls_iter = NodeIterator.init(&data.nodes, unwrapRef(pair[0]));
                     while (decls_iter.next()) |decl| {
                         const binding_ref = getPackedData(decl).left;
                         const binding = data.nodes.at(binding_ref);
