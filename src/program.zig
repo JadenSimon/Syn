@@ -851,6 +851,22 @@ pub const Program = struct {
         try this.bindImports(f);
     }
 
+    fn doTopLevelCfa(this: *@This(), f: *ParsedFileData, start: NodeRef) !void {
+        if (!f.did_top_level_cfa) {
+            f.did_top_level_cfa = true;
+
+            const analyzer = try this.getTypeChecker();
+            const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
+
+            if (first_statement != 0) {
+                var flow = try analyzer.allocator().create(Analyzer.FlowTyper);
+                flow.* = Analyzer.FlowTyper.init(analyzer, f);
+                analyzer.current_flow = flow;
+                try flow.visitModule(first_statement);
+            }
+        }
+    }
+
     fn processAliasedExports(this: *@This(), f: *ParsedFileData) anyerror!void {
         if (f.did_bind_aliased_exports) return;
 
@@ -999,9 +1015,11 @@ pub const Program = struct {
         std.debug.assert(f.ast.nodes.at(start).kind == .source_file);
 
         try this.bindModule(f);
+        try this.doTopLevelCfa(f, start);
 
         const Visitor = struct {
             const Kind = Analyzer.Kind;
+            const TypeRef = Analyzer.TypeRef;
 
             file: *ParsedFileData,
             nodes: *BumpAllocator(AstNode),
@@ -1010,7 +1028,9 @@ pub const Program = struct {
             is_async_ctx: bool = true, // we start in a module
             as_type_node: ?*const AstNode = null,
 
-            fn makeIdent(self: *@This(), comptime s: []const u8) !u32 {
+            type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
+
+            fn makeIdent(self: *@This(), s: []const u8) !NodeRef {
                 const z = try getAllocator().alloc(u8, s.len);
                 @memcpy(z, s);
                 return try self.nodes.push(.{
@@ -1020,15 +1040,25 @@ pub const Program = struct {
                 });
             }
 
-            fn typeofExp(self: *@This(), subject: u32, comptime s: []const u8) !u32 {
+            fn makeString(self: *@This(), s: []const u8) !NodeRef {
                 const z = try getAllocator().alloc(u8, s.len);
                 @memcpy(z, s);
-                const rhs = try self.nodes.push(.{
+                return try self.nodes.push(.{
                     .kind = .string_literal,
                     .data = z.ptr,
                     .len = @intCast(z.len),
                 });
+            }
 
+            fn makeNumber(self: *@This(), v: u64) !NodeRef {
+                return try self.nodes.push(.{
+                    .kind = .numeric_literal,
+                    .data = if (v == 0) null else @ptrFromInt(v),
+                });
+            }
+
+            fn typeofExp(self: *@This(), subject: NodeRef, comptime s: []const u8) !NodeRef {
+                const rhs = try self.makeString(s);
                 const lhs = try self.nodes.push(.{
                     .kind = .type_of_expression,
                     .data = @ptrFromInt(subject),
@@ -1037,24 +1067,128 @@ pub const Program = struct {
                 return try self.equalsExp(lhs, rhs);
             }
 
-            fn equalsExp(self: *@This(), subject: u32, rhs: u32) !u32 {
+            fn equalsExp(self: *@This(), subject: NodeRef, rhs: NodeRef) !NodeRef {
+                return self.binaryExp(subject, rhs, .equals_equals_equals_token);
+            }
+
+            fn notEqualsExp(self: *@This(), subject: NodeRef, rhs: NodeRef) !NodeRef {
+                return self.binaryExp(subject, rhs, .exclamation_equals_equals_token);
+            }
+
+            fn binaryExp(self: *@This(), lhs: NodeRef, rhs: NodeRef, op: SyntaxKind) !NodeRef {
                 return try self.nodes.push(.{
                     .kind = .binary_expression,
-                    .data = toBinaryDataPtrRefs(subject, rhs),
-                    .len = @intFromEnum(SyntaxKind.equals_equals_equals_token),
+                    .data = toBinaryDataPtrRefs(lhs, rhs),
+                    .len = @intFromEnum(op),
                 });
             }
 
-            fn notEqualsExp(self: *@This(), subject: u32, rhs: u32) !u32 {
-                return try self.nodes.push(.{
-                    .kind = .binary_expression,
-                    .data = toBinaryDataPtrRefs(subject, rhs),
-                    .len = @intFromEnum(SyntaxKind.exclamation_equals_equals_token),
+            /// Appends a string to the pattern, escaping regex special characters
+            fn appendEscapedRegex(_: *@This(), pattern: *std.ArrayList(u8), text: []const u8) !void {
+                for (text) |c| {
+                    switch (c) {
+                        '.', '*', '+', '?', '^', '$', '{', '}', '[', ']', '|', '(', ')', '\\' => {
+                            try pattern.append('\\');
+                            try pattern.append(c);
+                        },
+                        else => try pattern.append(c),
+                    }
+                }
+            }
+
+            fn makeParam(self: *@This(), binding: NodeRef) !NodeRef {
+                return self.nodes.push(.{
+                    .kind = .parameter,
+                    .data = toBinaryDataPtrRefs(binding, 0),
                 });
+            }
+
+            fn singleParamArrowFn(self: *@This(), param_binding: NodeRef, body: NodeRef) !NodeRef {
+                return try self.nodes.push(.{
+                    .kind = .arrow_function,
+                    .data = toBinaryDataPtrRefs(
+                        try self.makeParam(param_binding),
+                        body
+                    ),
+                });
+            }
+
+            fn createHelper(self: *@This(), ty: TypeRef, decl_ref: NodeRef, followed: TypeRef) ![]const u8 {
+                const name = try std.fmt.allocPrint(getAllocator(), "__is{d}", .{self.type_helpers.count()});
+
+                try self.type_helpers.put(getAllocator(), ty, name);
+
+                const param_ident = try self.makeIdent("x");
+
+                const check = try self.generateIsExpression(param_ident, followed);
+
+                const return_stmt = try self.nodes.push(.{
+                    .kind = .return_statement,
+                    .data = @ptrFromInt(check),
+                });
+
+                const block = try self.nodes.push(.{
+                    .kind = .block,
+                    .data = @ptrFromInt(return_stmt),
+                });
+
+                const fn_name = try self.makeIdent(name);
+                const helper_ref = try self.nodes.push(.{
+                    .kind = .function_declaration,
+                    .data = toBinaryDataPtrRefs(fn_name, try self.makeParam(param_ident)),
+                    .len = block,
+                });
+
+                const decl = self.file.ast.nodes.at(decl_ref);
+                const clone_ref = try self.file.ast.nodes.push(decl.*);
+
+                self.file.ast.nodes.at(helper_ref).next = decl.next;
+                self.file.ast.nodes.at(clone_ref).next = helper_ref;
+
+                try self.replacements.put(decl_ref, clone_ref);
+
+                return name;
+            }
+
+            fn callHelper(self: *@This(), helper_name: []const u8, subject: u32) !u32 {
+                const fn_ident = try self.makeIdent(helper_name);
+                return try self.nodes.push(.{
+                    .kind = .call_expression,
+                    .data = toBinaryDataPtrRefs(fn_ident, subject),
+                });
+            }
+
+            fn getDeclarationForAlias(self: *@This(), ty: TypeRef) ?NodeRef {
+                if (ty >= @intFromEnum(Kind.false)) return null;
+
+                const t = self.analyzer.types.at(ty);
+                if (t.getKind() != .alias) return null;
+
+                const alias_file_id = t.slot3;
+                const sym_ref = t.slot4;
+
+                if (alias_file_id != self.file.id) return null;
+
+                const sym = self.file.binder.symbols.at(sym_ref);
+                return sym.declaration;
+            }
+
+            fn getOrCreateHelperForType(self: *@This(), ty: TypeRef) !?[]const u8 {
+                if (self.type_helpers.get(ty)) |name| {
+                    return name;
+                }
+
+                const decl_ref = self.getDeclarationForAlias(ty) orelse return null;
+
+                const followed = try self.analyzer.evaluateType(ty, (1 << 0) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases));
+                if (self.analyzer.getKindOfRef(followed) != .object_literal) {
+                    return null;
+                }
+
+                return try self.createHelper(ty, decl_ref, followed);
             }
 
             fn generateIsExpression(self: *@This(), subject: u32, ty: u32) anyerror!u32 {
-                //const TypeRef = Analyzer.TypeRef;
                 const getSlice2 = Analyzer.getSlice2;
 
                 if (self.analyzer.isParameterizedRef(ty)) {
@@ -1099,15 +1233,21 @@ pub const Program = struct {
                     //     return try this.getIntrinsic("Void");
                     // }
 
-                    // if (ty == @intFromEnum(Kind.any)) {
-                    //     return try this.getIntrinsic("any");
-                    // }
-                    // if (ty == @intFromEnum(Kind.never)) {
-                    //     return try this.getIntrinsic("never");
-                    // }
-                    // if (ty == @intFromEnum(Kind.unknown)) {
-                    //     return try this.getIntrinsic("unknown");
-                    // }
+                    if (ty == @intFromEnum(Kind.any)) {
+                        return try self.nodes.push(.{
+                            .kind = .true_keyword,
+                        });
+                    }
+                    if (ty == @intFromEnum(Kind.unknown)) {
+                        return try self.nodes.push(.{
+                            .kind = .true_keyword,
+                        });
+                    }
+                    if (ty == @intFromEnum(Kind.never)) {
+                        return try self.nodes.push(.{
+                            .kind = .false_keyword,
+                        });
+                    }
 
                     if (ty == @intFromEnum(Kind.string)) {
                         return try self.typeofExp(subject, "string");
@@ -1125,28 +1265,21 @@ pub const Program = struct {
                         return try self.typeofExp(subject, "symbol");
                     }
 
-                    // if (ty == @intFromEnum(Kind.empty_string)) {
-                    //     return try js.String.fromUtf8(this.env, "");
-                    // } else if (ty == @intFromEnum(Kind.empty_object)) {
-                    //     return try this.createShape("__Object");
-                    // } else if (ty == @intFromEnum(Kind.empty_tuple)) {
-                    //     return try this.createShape("__Tuple");
-                    // }
+                    if (ty == @intFromEnum(Kind.empty_string)) {
+                        return try self.equalsExp(subject, try self.makeString(""));
+                    } else if (ty == @intFromEnum(Kind.empty_object)) {
+                    //    return try this.createShape("__Object");
+                    } else if (ty == @intFromEnum(Kind.empty_tuple)) {
+                    //    return try this.createShape("__Tuple");
+                    }
 
                     // empty_element -> undefined ?
 
-                    // TODO
-                    // if (ty >= @intFromEnum(Kind.zero)) {
-                    //     const rhs = try self.nodes.push(.{
-
-                    //     });
-
-                    //     return try self.nodes.push(.{
-                    //         .kind = .binary_expression,
-                    //         .data = toBinaryDataPtrRefs(subject, rhs),
-                    //         .len = @intFromEnum(SyntaxKind.equals_equals_equals_token),
-                    //     });
-                    // }
+                    if (ty >= @intFromEnum(Kind.zero)) {
+                        const v = self.analyzer.getDoubleFromType(ty);
+                        const v2: u64 = @bitCast(v);
+                        return try self.equalsExp(subject, try self.makeNumber(v2));
+                    }
 
                     self.analyzer.printTypeInfo(ty);
                     return error.TODO_unhandled_primitve_type;
@@ -1155,18 +1288,36 @@ pub const Program = struct {
                 const t = self.analyzer.types.at(ty);
                 switch (t.getKind()) {
                     .alias => {
-                        // if (try this.hasCached(ty)) {
-                        //     return try this.getCached(ty);
-                        // }
+                        if (t.hasFlag(.instance_alias)) {
+                            const alias_file_id = t.slot3;
+                            const sym_ref = t.slot4;
 
-                        const followed = try self.analyzer.evaluateType(ty, 1 << 0);
+                            // only handle symbols in the same file (TODO: handle more)
+                            if (alias_file_id != self.file.id) {
+                                return error.InstanceOfCrossFileNotSupported;
+                            }
+
+                            const sym = self.file.binder.symbols.at(sym_ref);
+                            const decl = self.file.ast.nodes.at(sym.declaration);
+                            const ident_ref = getPackedData(decl).left;
+                            const ident = self.file.ast.nodes.at(ident_ref);
+                            const name = getSlice(ident, u8);
+
+                            const class_ident = try self.makeIdent(name);
+                            return try self.binaryExp(subject, class_ident, .instance_of_keyword);
+                        }
+
+                        if (try self.getOrCreateHelperForType(ty)) |helper_name| {
+                            return try self.callHelper(helper_name, subject);
+                        }
+
+                        const followed = try self.analyzer.evaluateType(ty, (1 << 0) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases));
                         if (ty == followed) {
                             self.analyzer.printTypeInfo(ty);
                             return error.RecursiveAlias;
                         }
 
                         const result = try self.generateIsExpression(subject, followed);
-                       // try this.setCached(ty, @ptrCast(result));
 
                         return result;
                     },
@@ -1179,79 +1330,174 @@ pub const Program = struct {
 
                         return try self.generateIsExpression(subject, followed);
                     },
-                    // .array => {
-                    //     const o = try this.createSavedShape(ty, "__ArrayType");
-                    //     try this.setField(o, "element", @alignCast(@ptrCast(try this.reifyType(t.slot0))));
-                    //     return o;
-                    // },
-                    // .tuple => {
-                    //     const o = try this.createSavedShape(ty, "__Tuple");
-                    //     const types = getSlice2(t, TypeRef);
-                    //     for (types) |u| {
-                    //         if (u < @intFromEnum(Kind.false)) {
-                    //             const t2 = self.analyzer.types.at(u);
-                    //             const el_type = t2.slot1;
-                    //             try this.callMethod(o, "add", .{
-                    //                 @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
-                    //             });
-                    //             continue;
-                    //         }
-
-                    //         try this.callMethod(o, "add", .{
-                    //             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    //         });
-                    //     }
-                    //     return o;
-                    // },
-                    // .named_tuple_element => {
-                    //     const o = try this.createSavedShape(ty, "__TupleElement");
-                    //     const types = getSlice2(t, TypeRef);
-                    //     for (types) |u| {
-                    //         try this.callMethod(o, "add", .{
-                    //             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    //         });
-                    //     }
-                    //     return o;
-                    // },
-                    // .@"union" => {
-                    //     const o = try this.createSavedShape(ty, "__Union");
-                    //     const types = getSlice2(t, TypeRef);
-                    //     for (types) |u| {
-                    //         try this.callMethod(o, "add", .{
-                    //             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    //         });
-                    //     }
-                    //     return o;
-                    // },
-                    .string_literal => {
-                        const name = self.analyzer.getSliceFromLiteral(ty);
-                        const z = try getAllocator().alloc(u8, name.len);
-                        @memcpy(z, name);
-                        const lit = try self.nodes.push(.{
-                            .kind = .string_literal,
-                            .data = z.ptr,
-                            .len = @intCast(z.len),
+                    .array => {
+                        const p = try self.nodes.push(.{
+                            .kind = .property_access_expression,
+                            .data = toBinaryDataPtrRefs(
+                                try self.makeIdent("Array"),
+                                try self.makeIdent("isArray"),
+                            ),
+                        });
+                        const lhs: u32 = try self.nodes.push(.{
+                            .kind = .call_expression,
+                            .data = toBinaryDataPtrRefs(p, subject),
                         });
 
-                        return try self.equalsExp(subject, lit);
+                        const fn_subject = try self.makeIdent("el");
+                        const inner = try self.generateIsExpression(fn_subject, t.slot0);
+                        if (self.nodes.at(inner).kind == .false_keyword or self.nodes.at(inner).kind == .true_keyword) {
+                            return lhs;
+                        }
+
+                        const predicate = try self.singleParamArrowFn(fn_subject, inner);
+
+                        const p2 = try self.nodes.push(.{
+                            .kind = .property_access_expression,
+                            .data = toBinaryDataPtrRefs(
+                                subject,
+                                try self.makeIdent("every"),
+                            ),
+                        });
+
+                        const every = try self.nodes.push(.{
+                            .kind = .call_expression,
+                            .data = toBinaryDataPtrRefs(p2, predicate),
+                        });
+                        return try self.binaryExp(lhs, every, .ampersand_ampersand_token);
                     },
-                    // .number_literal => {
-                    //     return try js.Number.createDouble(this.env, self.analyzer.getDoubleFromType(ty));
-                    // },
-                    .object_literal => {
-                        // if (try this.hasCached(ty)) {
-                        //     return try this.getCached(ty);
-                        // }
-
-                        // const o = try this.createSavedShape(ty, "__Object");
-                        // try this.setCached(ty, @ptrCast(o));
-
-                        var lhs: u32 = try self.typeofExp(subject, "object");
-                        lhs = try self.nodes.push(.{
-                            .kind = .binary_expression,
-                            .data = toBinaryDataPtrRefs(lhs, try self.notEqualsExp(subject, try self.nodes.push(.{ .kind = .null_keyword }))),
-                            .len = @intFromEnum(SyntaxKind.ampersand_ampersand_token)
+                    .tuple => {
+                        const p = try self.nodes.push(.{
+                            .kind = .property_access_expression,
+                            .data = toBinaryDataPtrRefs(
+                                try self.makeIdent("Array"),
+                                try self.makeIdent("isArray"),
+                            ),
                         });
+                        var lhs: u32 = try self.nodes.push(.{
+                            .kind = .call_expression,
+                            .data = toBinaryDataPtrRefs(p, subject),
+                        });
+
+                        const elements = getSlice2(t, TypeRef);
+                        const has_spread = elements.len > 0 and
+                            elements[elements.len - 1] < @intFromEnum(Kind.false) and
+                            self.analyzer.types.at(elements[elements.len - 1]).hasFlag(.spread);
+
+                        if (elements.len > 0) {
+                            const p2 = try self.nodes.push(.{
+                                .kind = .property_access_expression,
+                                .data = toBinaryDataPtrRefs(
+                                    subject,
+                                    try self.makeIdent("length"),
+                                ),
+                            });
+                            const min_len = if (has_spread) elements.len - 1 else elements.len;
+                            const len = try self.makeNumber(@bitCast(@as(f64, @floatFromInt(min_len))));
+                            const cmp = if (has_spread)
+                                try self.binaryExp(p2, len, .greater_than_equals_token)
+                            else
+                                try self.equalsExp(p2, len);
+                            lhs = try self.binaryExp(lhs, cmp, .ampersand_ampersand_token);
+                        }
+
+                        for (elements, 0..) |el, i| {
+                            if (el < @intFromEnum(Kind.false) and self.analyzer.types.at(el).hasFlag(.spread)) {
+                                if (i != elements.len - 1) {
+                                    return error.TODO_non_terminal_rest_tuple;
+                                }
+
+                                const spread_type = self.analyzer.types.at(el);
+                                const array_type = self.analyzer.types.at(spread_type.slot1);
+                                const element_type: TypeRef = array_type.slot0;
+
+                                const slice_access = try self.nodes.push(.{
+                                    .kind = .property_access_expression,
+                                    .data = toBinaryDataPtrRefs(
+                                        subject,
+                                        try self.makeIdent("slice"),
+                                    ),
+                                });
+                                const sliced = try self.nodes.push(.{
+                                    .kind = .call_expression,
+                                    .data = toBinaryDataPtrRefs(slice_access, try self.makeNumber(@bitCast(@as(f64, @floatFromInt(i))))),
+                                });
+
+                                const fn_subject = try self.makeIdent("el");
+                                const inner = try self.generateIsExpression(fn_subject, element_type);
+
+                                if (self.nodes.at(inner).kind != .false_keyword and self.nodes.at(inner).kind != .true_keyword) {
+                                    const predicate = try self.singleParamArrowFn(fn_subject, inner);
+
+                                    const every_access = try self.nodes.push(.{
+                                        .kind = .property_access_expression,
+                                        .data = toBinaryDataPtrRefs(
+                                            sliced,
+                                            try self.makeIdent("every"),
+                                        ),
+                                    });
+                                    const every = try self.nodes.push(.{
+                                        .kind = .call_expression,
+                                        .data = toBinaryDataPtrRefs(every_access, predicate),
+                                    });
+
+                                    lhs = try self.binaryExp(lhs, every, .ampersand_ampersand_token);
+                                }
+
+                                break;
+                            }
+
+                            const ind: u64 = @bitCast(@as(f64, @floatFromInt(i)));
+                            const arg = try self.makeNumber(ind);
+
+                            const p2 = try self.nodes.push(.{
+                                .kind = .element_access_expression,
+                                .data = toBinaryDataPtrRefs(subject,arg),
+                            });
+
+                            const pred = try self.generateIsExpression(p2, el);
+
+                            lhs = try self.binaryExp(lhs, pred, .ampersand_ampersand_token);
+                        }
+
+                        return lhs;
+                    },
+                    .named_tuple_element => {
+                        return try self.generateIsExpression(subject, t.slot1);
+                    },
+                    .@"union" => {
+                        const elements = getSlice2(t, TypeRef);
+                        var lhs: u32 = try self.nodes.push(.{
+                            .kind = .parenthesized_expression,
+                            .data = @ptrFromInt(try self.generateIsExpression(subject, elements[0]))
+                        });
+
+                        for (1..elements.len) |i| {
+                            const n = try self.nodes.push(.{
+                                .kind = .parenthesized_expression,
+                                .data = @ptrFromInt(try self.generateIsExpression(subject, elements[i]))
+                            });
+                            lhs = try self.binaryExp(lhs, n, .bar_bar_token);
+                        }
+
+                        return lhs;
+                    },
+                    .string_literal => {
+                        const s = self.analyzer.getSliceFromLiteral(ty);
+                        return try self.equalsExp(subject, try self.makeString(s));
+                    },
+                    .number_literal => {
+                        const v = self.analyzer.getDoubleFromType(ty);
+                        const v2: u64 = @bitCast(v);
+                        return try self.equalsExp(subject, try self.makeNumber(v2));
+                    },
+                    .object_literal => {
+                        // check proto first
+                        var lhs: u32 = if (t.slot3 != 0)
+                            try self.generateIsExpression(subject, t.slot3)
+                        else blk: {
+                            const typeof_check = try self.typeofExp(subject, "object");
+                            break :blk try self.binaryExp(typeof_check, try self.notEqualsExp(subject, try self.nodes.push(.{ .kind = .null_keyword })), .ampersand_ampersand_token);
+                        };
 
                         const members = getSlice2(t, Analyzer.ObjectLiteralMember);
                         for (members) |*u| {
@@ -1276,11 +1522,7 @@ pub const Program = struct {
 
                             const q = try self.generateIsExpression(sub, try u.getType(self.analyzer));
 
-                            lhs = try self.nodes.push(.{
-                                .kind = .binary_expression,
-                                .data = toBinaryDataPtrRefs(lhs, q),
-                                .len = @intFromEnum(SyntaxKind.ampersand_ampersand_token)
-                            });
+                            lhs = try self.binaryExp(lhs, q, .ampersand_ampersand_token);
                         }
 
                         return lhs;
@@ -1291,15 +1533,108 @@ pub const Program = struct {
                     .function_literal => {
                         return try self.typeofExp(subject, "function");
                     },
+                    .class => {
+                        // slot6 contains the instance_alias for the class
+                        if (t.slot6 != 0) {
+                            return try self.generateIsExpression(subject, t.slot6);
+                        }
+                        return error.ClassWithoutInstanceAlias;
+                    },
+                    .template_literal => {
+                        const slice = getSlice2(t, TypeRef);
+
+                        var pattern = std.ArrayList(u8).init(getAllocator());
+                        try pattern.append('/');
+                        try pattern.append('^');
+
+                        if (slice.len > 0) {
+                            const head_text = self.analyzer.getSliceFromLiteral(slice[0]);
+                            try self.appendEscapedRegex(&pattern, head_text);
+                        }
+
+                        var i: u32 = 1;
+                        while (i < slice.len) : (i += 2) {
+                            const exp_type = slice[i];
+
+                            try self.appendRegExpPattern(&pattern, exp_type);
+
+                            if (i + 1 < slice.len) {
+                                const text = self.analyzer.getSliceFromLiteral(slice[i + 1]);
+                                try self.appendEscapedRegex(&pattern, text);
+                            }
+                        }
+
+                        try pattern.append('$');
+                        try pattern.append('/');
+
+                        const typeof_check = try self.typeofExp(subject, "string");
+
+                        const regex_node = try self.nodes.push(.{
+                            .kind = .regular_expression_literal,
+                            .data = pattern.items.ptr,
+                            .len = @intCast(pattern.items.len),
+                        });
+
+                        const test_access = try self.nodes.push(.{
+                            .kind = .property_access_expression,
+                            .data = toBinaryDataPtrRefs(regex_node, try self.makeIdent("test")),
+                        });
+                        const test_call = try self.nodes.push(.{
+                            .kind = .call_expression,
+                            .data = toBinaryDataPtrRefs(test_access, subject),
+                        });
+
+                        return try self.binaryExp(typeof_check, test_call, .ampersand_ampersand_token);
+                    },
                     else => {},
-                    // class
-                    // template_literal
                     // module_namespace
                     // symbol_literal (only well-known symbols)
                 }
 
                 self.analyzer.printTypeInfo(ty);
                 return error.TODO_unhandled_allocated_type;
+            }
+
+            fn appendRegExpPattern(self: *@This(), pattern: *std.ArrayList(u8), exp_type: TypeRef) anyerror!void {
+                if (exp_type >= @intFromEnum(Kind.zero)) {
+                    const val = self.analyzer.getDoubleFromType(exp_type);
+                    var buf: [64]u8 = undefined;
+                    return pattern.appendSlice(try std.fmt.bufPrint(&buf, "{d}", .{val}));
+                }
+                
+                try switch (self.analyzer.getKindOfRef(exp_type)) {
+                    .string => pattern.appendSlice(".*"),
+                    .number => pattern.appendSlice("-?[0-9]+\\.?[0-9]*"),
+                    .true => pattern.appendSlice("true"),
+                    .false => pattern.appendSlice("false"),
+                    .string_literal => {
+                        const s = self.analyzer.getSliceFromLiteral(exp_type);
+                        return self.appendEscapedRegex(pattern, s);
+                    },
+                    .number_literal => {
+                        const val = self.analyzer.getDoubleFromType(exp_type);
+                        var buf: [64]u8 = undefined;
+                        return self.appendEscapedRegex(pattern, try std.fmt.bufPrint(&buf, "{d}", .{val}));
+                    },
+                    .@"union" => {
+                        try pattern.appendSlice("(?:");
+                        const slice = Analyzer.getSlice2(self.analyzer.types.at(exp_type), TypeRef);
+                        for (slice, 0..) |el, i| {
+                            try self.appendRegExpPattern(pattern, el);
+                            if (i != slice.len-1) try pattern.append('|');
+                        }
+                        try pattern.append(')');
+                    },
+                    .alias => {
+                        const followed = try self.analyzer.evaluateType(exp_type, 1 << 0);
+                        if (followed == exp_type) {
+                            return pattern.appendSlice(".*");
+                        }
+                        return self.appendRegExpPattern(pattern, followed);
+                    },
+                    // nested template literal?
+                    else => pattern.appendSlice(".*"),
+                };
             }
 
             fn unwrapSubject(self: *@This(), ref: NodeRef) NodeRef {
@@ -1401,7 +1736,7 @@ pub const Program = struct {
                     },
                     .is_expression => {
                         const d = getPackedData(n);
-                        const l = try self.analyzer.getType(self.file, d.left);
+                        var l = try self.analyzer.getType(self.file, d.left);
                         if (l == @intFromEnum(Kind.any) or l == @intFromEnum(Kind.unknown)) {
                             const r = try self.analyzer.getType(self.file, d.right);
                             const sub = self.unwrapSubject(d.left);
@@ -1414,7 +1749,7 @@ pub const Program = struct {
                             return;
                         }
 
-                        const r = try self.analyzer.getType(self.file, d.right);
+                        var r = try self.analyzer.getType(self.file, d.right);
                         if (l == r) {
                             try self.replacements.put(ref, try self.nodes.push(.{
                                 .kind = .true_keyword,
@@ -1428,6 +1763,9 @@ pub const Program = struct {
                             }));
                             return;
                         }
+
+                        l = try self.analyzer.evaluateType(l, @intFromEnum(Analyzer.EvaluationFlags.no_objects));
+                        r = try self.analyzer.evaluateType(r, @intFromEnum(Analyzer.EvaluationFlags.no_objects));
 
                         var isSimpleType = false;
                         if (r == @intFromEnum(Kind.number) or r == @intFromEnum(Kind.string) or r == @intFromEnum(Kind.boolean) or r == @intFromEnum(Kind.null) or r == @intFromEnum(Kind.undefined) or r == @intFromEnum(Kind.symbol)) {
@@ -1443,6 +1781,23 @@ pub const Program = struct {
                                 try self.replacements.put(ref, try self.nodes.push(.{
                                     .kind = .false_keyword,
                                 }));
+                                return;
+                            }
+
+                            if (try self.analyzer.findDiscriminant(self.analyzer.types.at(l))) |key| {
+                                const sub = self.unwrapSubject(d.left);
+                                const at = try self.analyzer.accessType(r, key);
+                                const s = self.analyzer.getSliceFromLiteral(key);
+                                const prop_node = try self.nodes.push(.{
+                                    .kind = .property_access_expression,
+                                    .data = toBinaryDataPtrRefs(sub, try self.makeIdent(s)),
+                                });
+                                const n2 = try self.generateIsExpression(prop_node, at);
+                                const n3 = try self.nodes.push(.{
+                                    .kind = .parenthesized_expression,
+                                    .data = @ptrFromInt(n2),
+                                });
+                                try self.replacements.put(ref, n3);
                                 return;
                             }
                             
@@ -1549,8 +1904,11 @@ pub const Program = struct {
 
         const analyzer = try this.getTypeChecker();
         const printer = try analyzer.getPrinter();
+        const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
 
-        printer.imported_symbols = std.AutoArrayHashMap(u64, []const u8).init(this.allocator);
+        try this.doTopLevelCfa(f, start);
+
+        printer.imported_symbols = .{};
 
         const Converter = struct {
             file: *ParsedFileData,
@@ -1583,7 +1941,7 @@ pub const Program = struct {
                     const spec = try std.fs.path.relativePosix(self.analyzer.allocator(), std.fs.path.dirname(origin) orelse "", imported_path);
                     const spec2 = try std.mem.concat(self.analyzer.allocator(), u8, &.{"./",std.mem.trimRight(u8, spec, ".ts")});
 
-                    try self.printer.imported_symbols.?.put(abs_ref, spec2); // FIXME: use module spec :/
+                    try self.printer.imported_symbols.?.put(self.printer.allocator, abs_ref, spec2); // FIXME: use module spec :/
                     return true;
                 }
 
@@ -1606,7 +1964,7 @@ pub const Program = struct {
                     const spec = try std.fs.path.relativePosix(self.analyzer.allocator(), std.fs.path.dirname(origin) orelse "", imported_path);
                     const spec2 = try std.mem.concat(self.analyzer.allocator(), u8, &.{"./",std.mem.trimRight(u8, spec, ".ts")});
 
-                    try self.printer.imported_symbols.?.put(abs_ref, spec2); // FIXME: use module spec :/
+                    try self.printer.imported_symbols.?.put(self.printer.allocator, abs_ref, spec2); // FIXME: use module spec :/
                     return true;
                 }
 
@@ -1641,10 +1999,10 @@ pub const Program = struct {
                                 }
 
                                 if (!did_find) {
-                                    try self.printer.triple_slash_directives.append(d.*);
+                                    try self.printer.triple_slash_directives.append(self.printer.allocator, d.*);
                                 }
                             }
-                            try self.printer.imported_symbols.?.put(abs_ref, ns.module_specifier.?);
+                            try self.printer.imported_symbols.?.put(self.printer.allocator, abs_ref, ns.module_specifier.?);
                             return true;
                         }
                     }
@@ -1820,8 +2178,6 @@ pub const Program = struct {
             // }
         }
 
-        const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
-
         var iter = NodeIterator.init(&f.ast.nodes, first_statement);
         while (iter.nextPair()) |p| {
             const n: *const AstNode = p[0];
@@ -1870,7 +2226,7 @@ pub const Program = struct {
 
                         try to_keep.put((@as(u64, file_id) << 32) | binding.extra_data, true);
 
-                        var t = try analyzer.getType(f, pair[1]);
+                        var t = try analyzer.getType(f, d.left);
                         if (pair[0].len == 0) {
                             // inferred, try to simplify
                             t = try analyzer.maybeSimplifyType(t);
@@ -3048,6 +3404,7 @@ pub const Analyzer = struct {
         type_args = 1 << 1,
         no_globals = 1 << 2,
         no_objects = 1 << 3,
+        no_instance_aliases = 1 << 4,
         inner_scoped_aliases = 1 << 20,
         for_reify = 1 << 30,
     };
@@ -3065,6 +3422,7 @@ pub const Analyzer = struct {
             .indexed => this.accessType(t.slot0, t.slot1),
             .alias => {
                 if (t.hasFlag(.parameterized)) return ref;
+                if (hasEvalFlag(flags, .no_instance_aliases) and t.hasFlag(.instance_alias)) return ref;
                 return try this.followImmediateAlias(t, @intFromEnum(EvaluationFlags.type_args) | flags) orelse ref;
             },
             .function_literal => {
@@ -3655,15 +4013,15 @@ pub const Analyzer = struct {
             .object_literal => {
                 var did_change = false;
                 var should_deinit = true;
-                var resolved = std.ArrayList(ObjectLiteralMember).init(this.allocator());
-                defer if (should_deinit) resolved.deinit();
+                var resolved = std.ArrayListUnmanaged(ObjectLiteralMember){};
+                defer if (should_deinit) resolved.deinit(this.allocator());
 
                 var flags: u24 = 0;
                 for (getSlice2(n, ObjectLiteralMember)) |*el| {
                     const t = try el.getType(this);
                     const v = try this.resolveParameterizedType(t) orelse t;
                     if (v != t) did_change = true;
-                    try resolved.append(.{
+                    try resolved.append(this.allocator(), .{
                         .kind = el.kind,
                         .name = el.name,
                         .type = v,
@@ -3820,6 +4178,40 @@ pub const Analyzer = struct {
         }
 
         return error.NotImplemented;
+    }
+
+    // attempts to find the a field to use between elements in a union
+    pub fn findDiscriminant(this: *@This(), u: *const Type) !?TypeRef {
+        const elements = getSlice2(u, TypeRef);
+        const first = try this.evaluateType(elements[0], @intFromEnum(EvaluationFlags.no_objects));
+        if (this.getKindOfRef(first) != .object_literal) {
+            return null;
+        }
+        const o = this.types.at(first);
+        var keys = std.ArrayListUnmanaged(TypeRef){};
+        defer keys.deinit(this.allocator());
+        for (getSlice2(o, ObjectLiteralMember)) |m| {
+            if (m.kind != .property) continue;
+            try keys.append(this.allocator(), m.name);
+        }
+
+        var j = keys.items.len;
+        while (j > 0) {
+            const k = keys.items[j-1];
+
+            for (1..elements.len) |i| {
+                const v = try this.accessType(elements[i], k);
+                if (v == @intFromEnum(Kind.undefined)) break;
+
+                if (v != try this.accessType(first, k)) {
+                    return k;
+                }
+            }
+
+            j -= 1;
+        }
+
+        return null;
     }
 
     pub fn getSliceFromLiteral(this: *const @This(), ref: TypeRef) []const u8 {
@@ -4838,7 +5230,7 @@ pub const Analyzer = struct {
             .@"union" => {
                 var did_change = false;
                 var tmp = TempUnion.init(this.allocator());
-                defer if (!did_change) tmp.elements.deinit();
+                defer if (!did_change) tmp.deinit();
 
                 for (getSlice2(n, TypeRef)) |t| {
                     const u = try this.truthyType(t);
@@ -4947,8 +5339,8 @@ pub const Analyzer = struct {
                     return this.buf[0..this.count];
                 }
 
-                const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
-                return @as([*]u32, @ptrFromInt(ptr.*))[0..this.buf[2]];
+                const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
+                return ptr[0..this.buf[2]];
             }
 
             inline fn _getValueSlice(this: *@This()) []u32 {
@@ -4957,7 +5349,7 @@ pub const Analyzer = struct {
                 }
 
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
-                return ptr[0..this.buf[5]];
+                return ptr[0..this.buf[2]];
             }
 
             inline fn getKeySlice(this: *const @This()) []const u32 {
@@ -4965,8 +5357,8 @@ pub const Analyzer = struct {
                     return this.buf[0..this.count];
                 }
 
-                const ptr: *const u64 = @alignCast(@ptrCast(&this.buf));
-                return @as([*]const u32, @ptrFromInt(ptr.*))[0..this.buf[2]];
+                const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
+                return ptr[0..this.buf[2]];
             }
 
             inline fn getValueSlice(this: *const @This()) []const u32 {
@@ -4975,7 +5367,7 @@ pub const Analyzer = struct {
                 }
 
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
-                return ptr[0..this.buf[5]];
+                return ptr[0..this.buf[2]];
             }
 
             fn findEmptyIndex(this: *const @This(), key: u32, keys: []const u32) u32 {
@@ -5059,15 +5451,15 @@ pub const Analyzer = struct {
                 }
 
                 {
-                    const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
-                    ptr.* = @intFromPtr(k.ptr);
+                    this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
+                    this.buf[1] = @truncate(@intFromPtr(k.ptr));
                     this.buf[2] = @intCast(k.len);
                 }
 
                 {
                     this.buf[3] = @truncate(@intFromPtr(v.ptr) >> 32);
                     this.buf[4] = @truncate(@intFromPtr(v.ptr));
-                    this.buf[5] = @intCast(v.len);
+                    //this.buf[5] = @intCast(v.len);
                 }
 
                 this.available = @truncate((amount * 80) / 100);
@@ -5076,17 +5468,23 @@ pub const Analyzer = struct {
             fn _swapRemove(this: *@This(), i: u32, j: u32, keys: []u32) void {
                 if (i == j) {
                     keys[j] = 0;
+                    this.count -= 1;
                     return;
                 }
                 const values = this._getValueSlice();
                 values[j] = values[i];
                 keys[j] = keys[i];
                 keys[i] = 0;
+                this.count -= 1;
             }
 
             pub fn swapRemove(this: *@This(), key: u32) bool {
                 const keys = this._getKeySlice();
                 const ind = this.findIndex(key, keys) orelse return false;
+                if (keys.len <= 3) {
+                    this._swapRemove(ind, @intCast(keys.len-1), keys);
+                    return true;
+                }
 
                 var i = ind + 1;
 
@@ -5259,62 +5657,83 @@ pub const Analyzer = struct {
             }
         };
 
-        fn Pool(comptime T: type) type {
-            return struct {
-                items: std.ArrayListUnmanaged(T) = .{},
-                free_list: std.ArrayListUnmanaged(u32) = .{},
+        const SimpleArrayList = struct {
+            buf: [3]u32 = undefined,
+            count: u32 = 0,
 
-                // The returned pointer is _not_ stable! Further allocations can invalidate it.
-                pub inline fn at(this: *@This(), id: u32) *T {
-                    return &this.items.items[id];
+            pub inline fn getSlice(this: *@This()) []u32 {
+                if (this.count <= 3) {
+                    return this.buf[0..this.count];
                 }
 
-                pub fn create(this: *@This(), a: std.mem.Allocator, v: T) !u32 {
-                    if (this.free_list.items.len > 0) {
-                        const id = this.free_list.pop();
-                        this.items.items[id].* = v;
-                        this.items.items[id].id = id;
-                        return id;
-                    }
+                return this.getAllocatedSlice();
+            }
 
-                    const id: u32 = @intCast(this.items.items.len);
-                    try this.items.append(a, v);
-                    this.items.items[id].id = id;
+            inline fn getAllocatedSlice(this: *@This()) []u32 {
+                const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
+                return @as([*]u32, @ptrFromInt(ptr.*))[0..this.buf[2]];
+            }
 
-                    return id;
-                }
+            pub fn last(this: *@This()) u32 {
+                return this.getSlice()[this.count - 1];
+            }
 
-                pub fn destroy(this: *@This(), a: std.mem.Allocator, id: u32) !void {
-                    std.debug.assert(this.items.items.len > 0);
+            pub fn pop(this: *@This()) u32 {
+                const v = this.getSlice()[this.count-1];
+                this.count -= 1;
+                return v;
+            }
 
-                    if (this.items.items.len-1 == id) {
-                        _ = this.items.pop();
+            pub fn append(this: *@This(), a: std.mem.Allocator, val: u32) !void {
+                if (this.count <= 3) {
+                    if (this.count == 3) {
+                        const k = try a.alloc(u32, 8);
+                        @memcpy(k[0..this.count], &this.buf);
+
+                        k[this.count] = val;
+                        this.count += 1;
+
+                        const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
+                        ptr.* = @intFromPtr(k.ptr);
+                        this.buf[2] = 8;
+
                         return;
                     }
 
-                    // opportunistic defragment
-                    while (
-                        this.items.items.len > 0 and 
-                        this.free_list.items.len > 0 and 
-                        this.items.items.len-1 == this.free_list.getLast()
-                    ) {
-                        _ = this.items.pop();
-                        _ = this.free_list.pop();
-                        if (id >= this.items.items.len) {
-                            return;
-                        }
-                    }
-                    
-                    try this.free_list.append(a, id);
+                    this.buf[this.count] = val;
+                    this.count += 1;
+
                     return;
                 }
 
-                pub fn deinit(this: @This(), a: std.mem.Allocator) void {
-                    this.items.deinit(a);
-                    this.free_list.deinit(a);
+                if (this.count == this.buf[2]) {
+                    const new_amount = std.math.ceilPowerOfTwo(u32, this.count + 1) catch unreachable;
+                    if (!a.resize(this.getSlice(), new_amount)) {
+                        const k = try a.alloc(u32, new_amount);
+                        @memcpy(k[0..this.count], this.getAllocatedSlice());
+                        const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
+                        ptr.* = @intFromPtr(k.ptr);
+                    }
+                    this.buf[2] = new_amount;
                 }
-            };
-        }
+
+                this.getAllocatedSlice()[this.count] = val;
+                this.count += 1;
+            }
+
+            pub fn clearAndFree(this: *@This(), a: std.mem.Allocator) void {
+                if (this.count > 3) {
+                    a.free(this.getAllocatedSlice());
+                }
+                this.count = 0;
+            }
+
+            pub fn deinit(this: *@This(), a: std.mem.Allocator) void {
+                if (this.count <= 3) return;
+
+                a.free(this.getAllocatedSlice());
+            }
+        };
 
         const Edge = packed struct {
             const Mode = enum(u3) {
@@ -5415,6 +5834,7 @@ pub const Analyzer = struct {
                     }
                 }
                 self.destroy(typer.analyzer.allocator());
+                // typer.analyzer.allocator().destroy(self);
                 typer.analyzer.label_pool.destroy(self);
             }
 
@@ -5465,7 +5885,6 @@ pub const Analyzer = struct {
             }
         };
 
-        const Errors = std.ArrayListUnmanaged(FileDiagnostic);
         const LabelStack = std.ArrayListUnmanaged(*Label);
 
         analyzer: *Analyzer,
@@ -5497,14 +5916,14 @@ pub const Analyzer = struct {
             };
         }
 
-        pub fn visitArrowFnBody(self: *@This(), start: parser.NodeRef) !TypeRef {
+        pub fn visitArrowFnBody(self: *@This(), start: NodeRef) !TypeRef {
             self.current_flow = try self.createLabel();
             try self.stack.append(self.analyzer.allocator(), self.current_flow);
             self.current_flow.on_stack = true;
             return self.visitExpression(start);
         }
 
-        pub fn visitFunctionLike(self: *@This(), first_statement: parser.NodeRef) !TypeRef {
+        pub fn visitFunctionLike(self: *@This(), first_statement: NodeRef) !TypeRef {
             if (first_statement == 0) {
                 return @intFromEnum(Kind.void);
             }
@@ -5534,9 +5953,13 @@ pub const Analyzer = struct {
             return result;
         }
 
+        pub fn visitModule(self: *@This(), target: NodeRef) !void {
+            try self.visitEntrypoint(target, false);
+        }
+
         // This should only be called with the first statement of a module or function.
         // Do not use the same struct for a different entrypoint. No re-entrancy.
-        fn visitEntrypoint(self: *@This(), target: parser.NodeRef, comptime can_return: bool) !void {
+        fn visitEntrypoint(self: *@This(), target: NodeRef, comptime can_return: bool) !void {
             std.debug.assert(target != 0);
             std.debug.assert(self.stack.items.len == 0);
 
@@ -5553,7 +5976,7 @@ pub const Analyzer = struct {
             try self.visitStatements(target);
         }
 
-        fn visitStatements(self: *@This(), start: parser.NodeRef) anyerror!void {
+        fn visitStatements(self: *@This(), start: NodeRef) anyerror!void {
             // all statements iterated belong to the same flow
             var iter = NodeIterator.init(&self.file.ast.nodes, start);
             while (iter.next()) |s| {
@@ -6077,6 +6500,50 @@ pub const Analyzer = struct {
                     }
                 },
 
+                .conditional_expression => {
+                    const d = getPackedData(node);
+                    const true_label = try self.createLabel();
+                    const false_label = try self.createLabel();
+
+                    true_label.ref();
+                    false_label.ref();
+
+                    const prev_true = self.true_target;
+                    const prev_false = self.false_target;
+
+                    self.true_target = true_label;
+                    self.false_target = false_label;
+
+                    _ = try self.visitCondition(d.left);
+
+                    self.true_target = prev_true;
+                    self.false_target = prev_false;
+
+                    try self.unifyAntecedents(true_label);
+                    try self.unifyAntecedents(false_label);
+
+                    const when_true = blk: {
+                        const prev_flow = self.current_flow;
+                        self.current_flow = true_label;
+                        defer self.current_flow = prev_flow;
+
+                        break :blk try self.visitExpression(d.right);
+                    };
+
+                    const when_false = blk: {
+                        const prev_flow = self.current_flow;
+                        self.current_flow = false_label;
+                        defer self.current_flow = prev_flow;
+
+                        break :blk try self.visitExpression(node.len);
+                    };
+
+                    true_label.unref(self);
+                    false_label.unref(self);
+
+                    return try self.analyzer.toUnion(&.{ when_true, when_false });
+                },
+
                 // TODO: somewhat wasteful, exact types should only be used in specific cases
                 .string_literal,
                 .numeric_literal => {
@@ -6114,7 +6581,7 @@ pub const Analyzer = struct {
 
                             // Create a label to capture narrowings from both branches
                             const effect_label = try self.createLabel();
-                            effect_label.ref_count += 1;
+                            effect_label.ref();
 
                             const prev_true = self.true_target;
                             const prev_false = self.false_target;
@@ -6132,8 +6599,7 @@ pub const Analyzer = struct {
                                 try self.writeOver(self.current_flow, effect_label);
                             }
 
-                            effect_label.ref_count -= 1;
-                            effect_label.destroyAll(self);
+                            effect_label.unref(self);
 
                             return result_type;
                         },
@@ -6207,9 +6673,28 @@ pub const Analyzer = struct {
                     return current_type;
                 },
 
-                // .property_access_expression => {
+                .property_access_expression => {
+                    const d = getPackedData(node);
+                    const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
 
-                // },
+                    const current_type = try self.getFlowType(d.left, sym);
+                    if (current_type == @intFromEnum(Kind.any)) return current_type;
+
+                    const r = try self.analyzer.propertyNameToType(self.file, d.right);
+
+                    const member_type = try self.analyzer.accessType(current_type, r);
+
+                    const true_type = if (self.in_nullish_context)
+                        try self.analyzer.nonNullable(member_type)
+                    else
+                        try self.analyzer.truthyType(member_type);
+                    
+                    const false_type = try self.analyzer.excludeType(member_type, true_type);
+
+                    try self.bindPropertyCondition(sym, current_type, r, true_type, false_type);
+
+                    return member_type;
+                },
 
                 .binary_expression => {
                     const d = getPackedData(node);
@@ -6217,6 +6702,21 @@ pub const Analyzer = struct {
 
                     switch (op) {
                         .equals_token => {
+                            const lhs = self.file.ast.nodes.at(d.left);
+                            if (lhs.kind == .property_access_expression) {
+                                const d2 = getPackedData(lhs);
+                                const sym = self.file.binder.getSymbol(d2.left) orelse return error.MissingSymbol;
+                                const cur = try self.getFlowType(d2.left, sym);
+                                const r = try self.analyzer.propertyNameToType(self.file, d2.right);
+                                const member_type = try self.analyzer.accessType(cur, r);
+
+                                const t = try self.visitExpression(d.right);
+
+                                const falsy_type = try self.analyzer.falsyType(member_type);
+                                try self.bindPropertyCondition(sym, cur, r, member_type, falsy_type);
+
+                                return t;
+                            }
                             const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
                             const t = try self.visitExpression(d.right);
                             if (t == @intFromEnum(Kind.zero)) {
@@ -6574,11 +7074,13 @@ pub const Analyzer = struct {
         }
 
         fn unifyAntecedents(self: *@This(), target: *Label) anyerror!void {
-            if (target.antecedents.items.len == 0) {
+            const antecedents_slice = target.antecedents.items;
+            const count = antecedents_slice.len;
+            if (count == 0) {
                 return;
             }
 
-            if (target.antecedents.items.len == 1) {
+            if (count == 1) {
                 const l = target.antecedents.pop();
                 try self.unifyAntecedents(l);
                 var iter = l.types.iterator();
@@ -6594,13 +7096,13 @@ pub const Analyzer = struct {
                 return;
             }
 
-            for (target.antecedents.items) |l| {
+            for (antecedents_slice) |l| {
                 try self.unifyAntecedents(l);
             }
 
-            try self._unifyAntecedents(target,target.antecedents.items);
+            try self._unifyAntecedents(target,antecedents_slice);
 
-            for (target.antecedents.items) |l| {
+            for (antecedents_slice) |l| {
                 l.unref(self);
             }
 
@@ -6660,10 +7162,11 @@ pub const Analyzer = struct {
         pub fn maybeGetFlowType(self: *@This(), sym: parser.SymbolRef) ?TypeRef {
             if (self.current_flow.maybeGetLinearType(sym)) |t| return t;
 
-            var i: usize = self.stack.items.len-1;
+            const items = self.stack.items;
+            var i: usize = items.len-1;
 
             // skip the current flow if needed
-            if (self.current_flow == self.stack.items[i]) {
+            if (self.current_flow == items[i]) {
                 if (i == 0) return null;
                 i -= 1;
             }
@@ -6671,7 +7174,7 @@ pub const Analyzer = struct {
             // see if we have a narrowed type in the stack 
             // could be optimized later, not all symbols need to check all frames
             while (true) {
-                if (self.stack.items[i].types.get(sym)) |t| return t;
+                if (items[i].types.get(sym)) |t| return t;
 
                 if (i == 0) break;
                 i -= 1;
@@ -6681,7 +7184,7 @@ pub const Analyzer = struct {
         }
 
         inline fn createLabel(self: *@This()) !*Label {
-            //return try Label.create(self.analyzer.allocator());
+            // return try Label.create(self.analyzer.allocator());
             return try Label.create2(&self.analyzer.label_pool);
         }
 
@@ -7483,8 +7986,18 @@ pub const Analyzer = struct {
                 } else if (el >= @intFromEnum(Kind.zero)) {
                     tmp.addFlag(.has_number_literal);
                 }
+            } else {
+                const t = this.types.at(el);
+                if (t.getKind() == .object_literal) {
+                    tmp.addFlag(.has_object_literal);
+                } else if (t.getKind() == .string_literal) {
+                    tmp.addFlag(.has_string_literal);
+                } else if (t.getKind() == .symbol_literal) {
+                    tmp.addFlag(.has_symbol_literal);
+                } else if (t.getKind() == .number_literal) {
+                    tmp.addFlag(.has_number_literal);
+                }
             }
-            // FIXME: need to handle object/number/string literals for flags too
 
             try tmp.appendChecked(el);
         }
@@ -7538,13 +8051,15 @@ pub const Analyzer = struct {
 
             // Potential fast path for aliases
             if (n.getKind() == .alias) {
-                if (dst < @intFromEnum(Kind.false) and this.types.at(dst).getKind() == .alias) {
+                if (dst < @intFromEnum(Kind.false)) {
                     const dst_type = this.types.at(dst);
-                    if (dst_type.slot3 == n.slot3 and dst_type.slot4 == n.slot4) {
-                        const src_args = getSlice2(n, TypeRef);
-                        const dst_args = getSlice2(dst_type, TypeRef);
-                        if (src_args.len == 0 and dst_args.len == 0) return true;
-                        // TODO: compute variance of type params during construction of paramterized type
+                    if (dst_type.getKind() == .alias) {
+                        if (dst_type.slot3 == n.slot3 and dst_type.slot4 == n.slot4) {
+                            const src_args = getSlice2(n, TypeRef);
+                            const dst_args = getSlice2(dst_type, TypeRef);
+                            if (src_args.len == 0 and dst_args.len == 0) return true;
+                            // TODO: compute variance of type params during construction of paramterized type
+                        }
                     }
                 }
 
@@ -7593,7 +8108,7 @@ pub const Analyzer = struct {
                 .@"union" => {
                     // TODO: check if src is a union
                     for (getSlice2(dst_type, u32)) |el| {
-                        if (el == src) return true;
+                        if (try this.isAssignableTo(src, el)) return true;
                     }
 
                     return false;
@@ -8081,6 +8596,99 @@ pub const Analyzer = struct {
         };
     }
 
+    fn areTypesEquivalent(this: *@This(), a: TypeRef, b: TypeRef) anyerror!bool {
+        // Same ref is trivially equivalent
+        if (a == b) return true;
+
+        if (a >= @intFromEnum(Kind.false) or b >= @intFromEnum(Kind.false)) {
+            return false;
+        }
+        
+        const a_type = this.types.at(a);
+        const b_type = this.types.at(b);
+        
+        // Different kinds
+        // TODO: resolve aliases first
+        if (a_type.getKind() != b_type.getKind()) return false;
+        
+        switch (a_type.getKind()) {
+            .object_literal => return this.areObjectLiteralsEquivalent(a_type, b_type),
+            .@"union" => {
+                const a_elements = getSlice2(a_type, TypeRef);
+                const b_elements = getSlice2(b_type, TypeRef);
+                if (a_elements.len != b_elements.len) return false;
+                
+                for (a_elements) |a_el| {
+                    var found = false;
+                    for (b_elements) |b_el| {
+                        if (try this.areTypesEquivalent(a_el, b_el)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return false;
+                }
+                return true;
+            },
+            .tuple => {
+                const a_elements = getSlice2(a_type, TypeRef);
+                const b_elements = getSlice2(b_type, TypeRef);
+                if (a_elements.len != b_elements.len) return false;
+                for (a_elements, b_elements) |a_el, b_el| {
+                    if (!try this.areTypesEquivalent(a_el, b_el)) return false;
+                }
+                return true;
+            },
+            .array => {
+                return this.areTypesEquivalent(a_type.slot0, b_type.slot0);
+            },
+            .function_literal => {
+                const a_params = getSlice2(a_type, TypeRef);
+                const b_params = getSlice2(b_type, TypeRef);
+                if (a_params.len != b_params.len) return false;
+                for (a_params, b_params) |a_p, b_p| {
+                    if (!try this.areTypesEquivalent(a_p, b_p)) return false;
+                }
+                return this.areTypesEquivalent(a_type.slot3, b_type.slot3);
+            },
+            else => return false,
+        }
+    }
+
+    fn areObjectLiteralsEquivalent(this: *@This(), a: *const Type, b: *const Type) anyerror!bool {
+        if (a.slot3 != b.slot3) {
+            if (a.slot3 == 0 or b.slot3 == 0) return false;
+            if (!try this.areTypesEquivalent(a.slot3, b.slot3)) return false;
+            // TODO: we need to access each prop directly to check for equivalence
+        }
+        
+
+        const a_members = getSlice2(a, ObjectLiteralMember);
+        const b_members = getSlice2(b, ObjectLiteralMember);
+        
+        if (a_members.len != b_members.len) return false;
+        
+        // Each member in a must have equivalent in b
+        for (a_members) |*a_m| {
+            var found = false;
+            for (b_members) |*b_m| {
+                if (a_m.name != b_m.name) continue;
+                if (a_m.kind != b_m.kind) continue;
+                
+                const a_type = try a_m.getType(this);
+                const b_type = try b_m.getType(this);
+                if (try this.areTypesEquivalent(a_type, b_type)) {
+                    found = true;
+                }
+                break; 
+            }
+            if (!found) return false;
+        }
+
+        return true;
+    }
+
+
     const TypeSet = std.AutoArrayHashMap(TypeRef, bool);
 
     // Used to construct a union
@@ -8340,6 +8948,21 @@ pub const Analyzer = struct {
                         try tmp.appendChecked(t);
                         return null;
                     }
+
+                    if (tmp.contains(t)) return null;
+
+                    for (tmp.elements.items) |k2| {
+                        if (k2 >= @intFromEnum(Kind.false)) continue;
+                        const t2 = this.types.at(k2);
+                        if (t2.getKind() != .object_literal) continue;
+                        if (try this.areObjectLiteralsEquivalent(t2, k)) {
+                            return null;
+                        }
+                    }
+
+                    try tmp.appendChecked(t);
+
+                    return null;
                 } else if (k.getKind() == .string_literal) {
                     if (tmp.hasFlag(.has_string)) return null;
                     if (!tmp.hasFlag(.has_string_literal)) {
@@ -8969,6 +9592,12 @@ pub const Analyzer = struct {
 
     fn createRefinement(this: *@This(), source_ref: TypeRef, member: ObjectLiteralMember) anyerror!TypeRef {
         const resolved = try this.maybeResolveAlias(source_ref);
+        if (comptime is_debug) {
+            if (resolved >= @intFromEnum(Kind.false)) {
+                this.printTypeInfo(source_ref);
+                this.printTypeInfo(resolved);
+            }
+        }
         const source = this.types.at(resolved);
 
         if (source.getKind() == .@"union") {
@@ -10774,6 +11403,7 @@ pub const Analyzer = struct {
 
                 if (rhs == lhs) return lhs;
 
+                // TODO: this is legacy TS behavior
                 if (rhs == @intFromEnum(Kind.empty_object)) return this.nonNullable(lhs);
                 if (lhs == @intFromEnum(Kind.empty_object)) return this.nonNullable(rhs);
 
@@ -11040,7 +11670,7 @@ pub const Analyzer = struct {
         }
         if (NumberType == f64) {
             const val2: i64 = @intFromFloat(val);
-            if (@as(i64, @intFromFloat(@trunc(val))) != val2) {
+            if (@as(f64, @floatFromInt(val2)) != val) {
                 return this.createNumericLiteral(@bitCast(val));
             }
             if (val2 >= -max_inline_number and val2 < max_inline_number) {
@@ -11062,30 +11692,6 @@ pub const Analyzer = struct {
         const v = getNumber(node);
 
         return this.numberToType(f64, if (comptime is_negative) -v else v);
-
-        // const val = getNumber(node);
-        // const val2: i64 = @intFromFloat(val);
-        // if (@as(i64, @intFromFloat(@trunc(val))) != val2) return error.TODO;
-
-        // if (@abs(val2) < std.math.pow(u64, 2, 29)) {
-        //     const v: i30 = @intCast(if (is_negative) -val2 else val2);
-        //     return @intFromEnum(Kind.zero) | @as(u30, @bitCast(v));
-        // }
-
-        // // The least-significant set bit in the mantissa determines how large the exponent must be to be a valid integer
-        // const bits: u64 = @bitCast(val);
-        // const exp = (bits & (0b11111111111 << 52)) >> 52;
-        // if (exp < 0) {
-        //     return 0; // less than 0
-        // }
-        // if ((bits & (0b11111111111 << 52)) >> 52 == 1023) {
-        //     // TODO: sign bit
-        //     const z: u64 = @bitCast(bits & 0xFFFF FFFF FFFF F);
-        //     if (z < std.math.pow(u64, 2, 26)) {
-        //         std.debug.print("{}\n", .{z});
-        //         return @intCast(@intFromEnum(Kind.zero) + z);
-        //     }
-        // }
     }
 
     fn getNumberFromInlineType(ref: TypeRef) i30 {
@@ -11648,6 +12254,9 @@ pub const Analyzer = struct {
 
                 return try this.maybeUnwrapPromise(inner_ty) orelse inner_ty;
             },
+            .void_expression => {
+                return @intFromEnum(Kind.undefined);
+            },
             .prefix_unary_expression => {
                 const d = getPackedData(exp);
                 return switch (@as(SyntaxKind, @enumFromInt(d.left))) {
@@ -11718,7 +12327,7 @@ pub const Analyzer = struct {
                 const d = getPackedData(exp);
                 const t = try this.getType(file, d.left);
                 if (t >= @intFromEnum(Kind.false)) {
-                    if (t == @intFromEnum(Kind.never)) {
+                    if (t == @intFromEnum(Kind.never) or t == @intFromEnum(Kind.any)) {
                         return t;
                     }
                     this.printTypeInfo(t);
@@ -11743,7 +12352,8 @@ pub const Analyzer = struct {
                     }
 
                     const resolved = try this.inferTypeCallExpParameterized(file, n, d.right) orelse return error.FailedToInferCallExp;
-                    return try this.getReturnType(resolved);
+                    const rt = try this.getReturnType(resolved);
+                    return rt;
                 }
 
                 if (n.getKind() != .function_literal) {
@@ -11830,7 +12440,6 @@ pub const Analyzer = struct {
                 if (!this.is_const_context and !this.is_const_variable_context) return @intFromEnum(Kind.string);
 
                 return @intFromEnum(Kind.string);
-                // return error.TODO;
             },
             .regular_expression_literal => return this.getRegExpType(file, ref),
             .array_literal_expression => {
@@ -11907,7 +12516,10 @@ pub const Analyzer = struct {
             .object_literal_expression => {
                 const node_start = maybeUnwrapRef(exp) orelse return @intFromEnum(Kind.empty_object);
 
-                var elements = std.ArrayList(ObjectLiteralMember).init(this.type_args.allocator);
+                var flags: u24 = 0;
+                var elements = std.ArrayListUnmanaged(ObjectLiteralMember){};
+                try elements.ensureTotalCapacity(this.allocator(), 4);
+
                 var iter = NodeIterator.init(&file.ast.nodes, node_start);
 
                 var accessors = std.AutoArrayHashMapUnmanaged(u32, struct {
@@ -11928,7 +12540,8 @@ pub const Analyzer = struct {
                         .shorthand_property_assignment => {
                             const ident = unwrapRef(n);
                             const t = try this.getType(file, ident);
-                            try elements.append(.{
+                            if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                            try elements.append(this.allocator(), .{
                                 .kind = .property,
                                 .name = try this.propertyNameToType(file, ident),
                                 .type = t,
@@ -11939,7 +12552,8 @@ pub const Analyzer = struct {
                             const name = file.ast.nodes.at(d.left);
                             if (name.kind == .identifier or name.kind == .string_literal) {
                                 const t = try this.getType(file, d.right);
-                                try elements.append(.{
+                                if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                                try elements.append(this.allocator(), .{
                                     .kind = .property,
                                     .name = try this.propertyNameToType(file, d.left),
                                     .type = t,
@@ -11960,7 +12574,7 @@ pub const Analyzer = struct {
 
                                     switch (@as(Kind, @enumFromInt(t))) {
                                         .string, .number, .symbol => {
-                                            try elements.append(.{
+                                            try elements.append(this.allocator(), .{
                                                 .kind = .index,
                                                 .name = t,
                                                 .type = try this.getType(file, d.right),
@@ -11980,7 +12594,7 @@ pub const Analyzer = struct {
                         .spread_assignment => {
                             const t = try this.getType(file, unwrapRef(n));
                             if (t == @intFromEnum(Kind.any)) {
-                                elements.deinit();
+                                elements.deinit(this.allocator());
                                 return t;
                             }
 
@@ -12010,7 +12624,7 @@ pub const Analyzer = struct {
                             for (getSlice2(type_node, ObjectLiteralMember)) |el| {
                                 if (el.kind == .call_signature or el.kind == .method or el.kind == .setter) continue;
                                 if (el.kind == .getter) {
-                                    try elements.append(.{
+                                    try elements.append(this.allocator(), .{
                                         .kind = .property,
                                         .flags = el.flags,
                                         .name = el.name,
@@ -12018,7 +12632,7 @@ pub const Analyzer = struct {
                                     });
                                     continue;
                                 }
-                                try elements.append(el);
+                                try elements.append(this.allocator(), el);
                             }
 
                             if (type_node.slot3 != 0 and type_node.slot3 < @intFromEnum(Kind.false)) {
@@ -12040,7 +12654,7 @@ pub const Analyzer = struct {
                                             if (set.get(el.name)) |_| continue;
                                         }
                                         if (el.kind == .getter) {
-                                            try elements.append(.{
+                                            try elements.append(this.allocator(), .{
                                                 .kind = .property,
                                                 .flags = el.flags,
                                                 .name = el.name,
@@ -12048,7 +12662,7 @@ pub const Analyzer = struct {
                                             });
                                             continue;
                                         }
-                                        try elements.append(el);
+                                        try elements.append(this.allocator(), el);
                                     }
                                 } else {
                                     return error.TODO;
@@ -12057,7 +12671,7 @@ pub const Analyzer = struct {
                         },
                         .method_declaration => {
                             const t = try this.getSignature(file, pair[1]);
-                            try elements.append(.{
+                            try elements.append(this.allocator(), .{
                                 .kind = .method,
                                 .name = try this.propertyNameToType(file, (getPackedData(n)).left),
                                 .type = t,
@@ -12133,22 +12747,25 @@ pub const Analyzer = struct {
                         }
                     };
 
-                    try elements.append(.{
+                    try elements.append(this.allocator(), .{
                         .kind = .property,
                         .name = s.name,
                         .type = t,
                     });
                 }
 
-                const obj_hash = try this.hashObjectLiteral(0, elements.items, 0);
+                const obj_hash = try this.hashObjectLiteral(flags, elements.items, 0);
                 if (this.canonical_types.get(obj_hash)) |t| {
-                    elements.deinit();
+                    elements.deinit(this.allocator());
                     return t;
                 }
+
+                elements.shrinkAndFree(this.allocator(), elements.items.len);
 
                 const x: u64 = @intFromPtr(elements.items.ptr);
                 const t = try this.types.push(.{
                     .kind = @intFromEnum(Kind.object_literal),
+                    .flags = flags,
                     .slot0 = @truncate(x),
                     .slot1 = @intCast(x >> 32),
                     .slot2 = @intCast(elements.items.len),
@@ -12274,7 +12891,7 @@ pub const Analyzer = struct {
     const SymbolCollector = struct {
         analyzer: *Analyzer,
         set: *std.AutoHashMap(u64, bool),
-        alias_set: std.AutoArrayHashMapUnmanaged(TypeRef, void) = std.AutoArrayHashMapUnmanaged(TypeRef, void){},
+        alias_set: std.AutoArrayHashMapUnmanaged(TypeRef, void) = .{},
 
         file_ref: ?FileRef = null,
         external_set: ?*std.AutoHashMap(u64, bool) = null,
@@ -12552,6 +13169,11 @@ pub const Analyzer = struct {
             std.debug.print("  rt: ", .{});
             this.printTypeInfo(t.slot3);
         }
+        if (t.getKind() == .object_literal) {
+            std.debug.print("    ",.{});
+            @constCast(this).debugPrint(ty) catch unreachable;
+            std.debug.print("\n",.{});
+        }
         if (t.getKind() == .@"union") {
             const elements = getSlice2(t, TypeRef);
             if (elements.len > 10) {
@@ -12590,14 +13212,15 @@ pub const Analyzer = struct {
 
     const TypePrinter = struct {
         analyzer: *Analyzer,
+        allocator: std.mem.Allocator,
         synthetic_nodes: parser.BumpAllocator(AstNode),
-        cached_type_to_node: std.AutoArrayHashMap(TypeRef, NodeRef),
-        cached_string_types: std.AutoArrayHashMap(TypeRef, NodeRef),
+        cached_type_to_node: std.AutoArrayHashMapUnmanaged(TypeRef, NodeRef),
+        cached_string_types: std.AutoArrayHashMapUnmanaged(TypeRef, NodeRef),
 
         can_print_identifier: bool = false,
 
-        imported_symbols: ?std.AutoArrayHashMap(u64, []const u8) = null,
-        triple_slash_directives: std.ArrayList(parser.TripleSlashDirective), // XXX: used by `printDeclarationText`
+        imported_symbols: ?std.AutoArrayHashMapUnmanaged(u64, []const u8) = null,
+        triple_slash_directives: std.ArrayListUnmanaged(parser.TripleSlashDirective), // XXX: used by `printDeclarationText`
 
         pub fn init(analyzer: *Analyzer) !*@This() {
             var synthetic_nodes = parser.BumpAllocator(AstNode).init(analyzer.allocator(), std.heap.page_allocator);
@@ -12607,10 +13230,11 @@ pub const Analyzer = struct {
             const p = try analyzer.allocator().create(@This());
             p.* = .{
                 .analyzer = analyzer,
+                .allocator = analyzer.allocator(),
                 .synthetic_nodes = synthetic_nodes,
-                .cached_type_to_node = std.AutoArrayHashMap(TypeRef, NodeRef).init(analyzer.allocator()),
-                .cached_string_types = std.AutoArrayHashMap(TypeRef, NodeRef).init(analyzer.allocator()),
-                .triple_slash_directives = std.ArrayList(parser.TripleSlashDirective).init(analyzer.allocator()),
+                .cached_type_to_node = .{},
+                .cached_string_types = .{},
+                .triple_slash_directives = .{},
             };
 
             return p;
@@ -12630,7 +13254,7 @@ pub const Analyzer = struct {
             }
 
             const n = try this._toTypeNode(ty);
-            try this.cached_type_to_node.put(ty, n);
+            try this.cached_type_to_node.put(this.allocator, ty, n);
 
             return n;
         }
@@ -12923,7 +13547,7 @@ pub const Analyzer = struct {
                                 .flags = @intFromEnum(StringFlags.single_quote),
                             });
 
-                            try this.cached_string_types.put(key, ref);
+                            try this.cached_string_types.put(this.allocator, key, ref);
                             return ref;
                         }
 
@@ -12938,7 +13562,7 @@ pub const Analyzer = struct {
                                 .flags = @intFromEnum(StringFlags.single_quote),
                             });
                             const new_key = (@as(u32, @intFromEnum(StringFlags.single_quote)) << 29) | ty;
-                            try this.cached_string_types.put(new_key, ref);
+                            try this.cached_string_types.put(this.allocator, new_key, ref);
                             return ref;
                         }
 
@@ -12949,7 +13573,7 @@ pub const Analyzer = struct {
                             this.synthetic_nodes.at(ref).flags = @intFromEnum(StringFlags.single_quote);
                         }
 
-                        try this.cached_string_types.put(key, ref);
+                        try this.cached_string_types.put(this.allocator, key, ref);
                         return ref;
                     },
                     // `typeof Symbol()`

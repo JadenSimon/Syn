@@ -3249,7 +3249,7 @@ fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
 
         pub fn init(allocator: std.mem.Allocator) @This() {
             return .{
-                .pages = std.ArrayListUnmanaged([]U){},
+                .pages = .{},
                 .allocator = allocator,
             };
         }
@@ -3304,11 +3304,9 @@ fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
 }
 
 pub const PositionsWriter = struct {
-    //const BumpAllocator = SizedBumpAllocator(4096 * 4, u8);
     const BumpAllocator = SizedBumpAllocator(4096, Position);
 
     positions: BumpAllocator,
-    // count: u32 = 0,
 
     pub fn init() @This() {
         const positions = BumpAllocator.init(getAllocator());
@@ -3325,10 +3323,6 @@ pub const PositionsWriter = struct {
     }
 
     pub inline fn append(this: *@This(), full_start: u32, width: u32) !void {
-        // this.count += 1;
-        // try this._appendSlice(encodeVlq(full_start));
-        // try this._appendSlice(encodeVlq(width));
-
         try this.positions.append(.{
             .full_start = full_start,
             .width = width,
@@ -3373,14 +3367,8 @@ pub const PositionsWriter = struct {
                 return null;
             }
 
-            //const start = this.prev + this.readVlq();
-            // this.prev = start;
-            // const start = this.readVlq();
-            // const width = this.readVlq();
             const p = this.positions.at(this.positions.count - this.count).*;
             this.count -= 1;
-
-            // return .{ .full_start = start, .width = width };
 
             return p;
         }

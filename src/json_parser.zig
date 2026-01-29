@@ -4,10 +4,11 @@ const parser = @import("./parser.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const strings = @import("./string_immutable.zig");
 
-const JsoncLexer = lexer.NewLexer(true, .{
+const Json5Lexer = lexer.NewLexer(true, .{
     .is_json = true,
     .allow_comments = true,
     .allow_trailing_commas = true,
+    .always_decode_escape_sequences = true,
 });
 
 const NodeRef = u32;
@@ -55,17 +56,17 @@ pub const ParseEvent = union(enum) {
     PropertyName: ParseEventBase([]const u8),
 };
 
-fn Parser_(comptime Listener: type, comptime is_jsonc: bool) type {
-    _ = is_jsonc;
+fn Parser_(comptime Listener: type, comptime is_json5: bool) type {
+    _ = is_json5;
 
     return struct {
-        lexer: JsoncLexer,
+        lexer: Json5Lexer,
         listener: Listener,
 
         pub fn init(listener: Listener, source: lexer.Source, allocator: std.mem.Allocator) !@This() {
             return .{
                 .listener = listener,
-                .lexer = JsoncLexer.initWithoutReading(source, allocator),
+                .lexer = Json5Lexer.initWithoutReading(source, allocator),
             };
         }
 
@@ -123,6 +124,17 @@ fn Parser_(comptime Listener: type, comptime is_jsonc: bool) type {
                 },
                 else => {},
             }
+        }
+
+        inline fn emitPropertyEvent(this: *@This()) !void {
+            const ev = ParseEventBase([]const u8){
+                .data = this.lexer.identifier,
+                .location = this.getLocation(),
+            };
+
+            try this._emitEvent(.{ .PropertyName = ev });
+
+            try this.lexer.next();
         }
 
         inline fn emitStringOrPropertyEvent(this: *@This(), kind: ParseEventKind) !void {
@@ -206,6 +218,16 @@ fn Parser_(comptime Listener: type, comptime is_jsonc: bool) type {
             try this.emitEvent(.object_start);
 
             while (this.lexer.token != .t_close_brace) {
+                if (this.lexer.token == .t_identifier) {
+                    try this.emitPropertyEvent();
+                    try this.lexer.expect(.t_colon);
+                    try this.parseValue();
+                    if (this.lexer.token == .t_comma) {
+                        try this.lexer.next();
+                    }
+                    continue;
+                }
+
                 if (this.lexer.token != .t_string_literal) {
                     try this.emitErrorEvent("Expected property name");
                     try this.lexer.next();
@@ -347,7 +369,7 @@ const JsValueEmitter = struct {
     }
 };
 
-pub fn parseJsoncToJs(source: []const u8, allocator: std.mem.Allocator) !*@import("js").Value {
+pub fn parseJson5ToJs(source: []const u8, allocator: std.mem.Allocator) !*@import("js").Value {
     var emitter = JsValueEmitter.initCurrentEnv(allocator);
     const Parser = Parser_(*JsValueEmitter, true);
     var p = try Parser.init(&emitter, .{ .contents = source }, allocator);
@@ -356,4 +378,4 @@ pub fn parseJsoncToJs(source: []const u8, allocator: std.mem.Allocator) !*@impor
     return emitter.getResult();
 }
 
-pub const JsoncParser = Parser_(void, true);
+pub const Json5Parser = Parser_(void, true);

@@ -5750,7 +5750,7 @@ export enum JsxEmit {
 
 export function parseConfigFileTextToJson(fileName: string, text: string): { config?: any; error?: ts.Diagnostic } {
     try {
-        return { config: api.parseJsonc(text) }
+        return { config: api.parseJson5(text) }
     } catch (e) {
         return { error: createErrorDiagnostic((e as any).message, fileName) }
     }

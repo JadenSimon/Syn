@@ -807,6 +807,7 @@ pub fn BumpAllocator(comptime T: type) type {
                 return;
             }
 
+            try this.pages.ensureTotalCapacity(4);
             try this.addPage();
         }
 

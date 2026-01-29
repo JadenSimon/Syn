@@ -199,7 +199,7 @@ pub fn printSynFile(program: *js.Object, sf: *js.Object, options: ?parser.Printe
     var replacements = try p.transformSyn(id, source.ast.start);
     defer replacements.deinit();
 
-    const result = try parser.printWithOptions(source.ast, .{ .replacements = &replacements, .transform_to_cjs = true });
+    const result = try parser.printWithOptions(p.getFileData(id).ast, .{ .replacements = &replacements, .transform_to_cjs = true });
 
     return .{
         .contents = try js.ArrayBuffer.from(@constCast(result.contents)),
@@ -367,8 +367,8 @@ pub fn waitForPromise(val: *js.Value) !*js.Value {
     return js.waitForPromise(val);
 }
 
-pub fn parseJsonc(text: js.UTF8String) !*js.Value {
-    return @import("./json_parser.zig").parseJsoncToJs(text.data, getAllocator());
+pub fn parseJson5(text: js.UTF8String) !*js.Value {
+    return @import("./json_parser.zig").parseJson5ToJs(text.data, getAllocator());
 }
 
 pub fn getLineMap(sf: WrappedFile) !?js.ArrayBuffer {

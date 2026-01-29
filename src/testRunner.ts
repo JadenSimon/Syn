@@ -158,7 +158,10 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
     for (const item of parsed.files) {
         const resolved = path.resolve(testsDir, item.name)
         if (item.name.endsWith('.json')) {
-            vfs.files.set(resolved, item.text.slice(1, -1)) // remove ()
+            const txt = item.text.at(0) === '(' && item.text.at(-1) === ')'
+                ? item.text.slice(1, -1) // removes ()
+                : item.text
+            vfs.files.set(resolved, txt) 
             continue
         }
 
