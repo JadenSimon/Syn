@@ -1031,8 +1031,7 @@ pub const Program = struct {
             type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
 
             fn makeIdent(self: *@This(), s: []const u8) !NodeRef {
-                const z = try getAllocator().alloc(u8, s.len);
-                @memcpy(z, s);
+                const z = try getAllocator().dupe(u8, s);
                 return try self.nodes.push(.{
                     .kind = .identifier,
                     .data = z.ptr,
@@ -1041,8 +1040,7 @@ pub const Program = struct {
             }
 
             fn makeString(self: *@This(), s: []const u8) !NodeRef {
-                const z = try getAllocator().alloc(u8, s.len);
-                @memcpy(z, s);
+                const z = try getAllocator().dupe(u8, s);
                 return try self.nodes.push(.{
                     .kind = .string_literal,
                     .data = z.ptr,
@@ -1188,6 +1186,23 @@ pub const Program = struct {
                 return try self.createHelper(ty, decl_ref, followed);
             }
 
+            fn generateUnionCheck(self: *@This(), subject: NodeRef, elements: []const TypeRef) !TypeRef {
+                var lhs: u32 = try self.nodes.push(.{
+                    .kind = .parenthesized_expression,
+                    .data = @ptrFromInt(try self.generateIsExpression(subject, elements[0]))
+                });
+
+                for (1..elements.len) |i| {
+                    const n = try self.nodes.push(.{
+                        .kind = .parenthesized_expression,
+                        .data = @ptrFromInt(try self.generateIsExpression(subject, elements[i]))
+                    });
+                    lhs = try self.binaryExp(lhs, n, .bar_bar_token);
+                }
+
+                return lhs;
+            }
+
             fn generateIsExpression(self: *@This(), subject: u32, ty: u32) anyerror!u32 {
                 const getSlice2 = Analyzer.getSlice2;
 
@@ -1306,12 +1321,25 @@ pub const Program = struct {
                             const class_ident = try self.makeIdent(name);
                             return try self.binaryExp(subject, class_ident, .instance_of_keyword);
                         }
+                        if (t.hasFlag(.enum_alias)) {
+                            const o_ref =  try self.analyzer.maybeResolveAlias(ty);
+                            const o = self.analyzer.types.at(o_ref);
+                            const members = getSlice2(o, Analyzer.ObjectLiteralMember);
+                            var vals = std.ArrayListUnmanaged(TypeRef){};
+                            defer vals.deinit(self.analyzer.allocator());
+                            try vals.ensureTotalCapacity(self.analyzer.allocator(), members.len);
+                            for (members) |*m| {
+                                const v = try m.getType(self.analyzer);
+                                vals.appendAssumeCapacity(v);
+                            }
+                            return try self.generateUnionCheck(subject, vals.items);
+                        }
 
                         if (try self.getOrCreateHelperForType(ty)) |helper_name| {
                             return try self.callHelper(helper_name, subject);
                         }
 
-                        const followed = try self.analyzer.evaluateType(ty, (1 << 0) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases));
+                        const followed = try self.analyzer.evaluateType(ty, (1 << 0) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases) | @intFromEnum(Analyzer.EvaluationFlags.no_enum_aliases));
                         if (ty == followed) {
                             self.analyzer.printTypeInfo(ty);
                             return error.RecursiveAlias;
@@ -1466,20 +1494,7 @@ pub const Program = struct {
                     },
                     .@"union" => {
                         const elements = getSlice2(t, TypeRef);
-                        var lhs: u32 = try self.nodes.push(.{
-                            .kind = .parenthesized_expression,
-                            .data = @ptrFromInt(try self.generateIsExpression(subject, elements[0]))
-                        });
-
-                        for (1..elements.len) |i| {
-                            const n = try self.nodes.push(.{
-                                .kind = .parenthesized_expression,
-                                .data = @ptrFromInt(try self.generateIsExpression(subject, elements[i]))
-                            });
-                            lhs = try self.binaryExp(lhs, n, .bar_bar_token);
-                        }
-
-                        return lhs;
+                        return try self.generateUnionCheck(subject, elements);
                     },
                     .string_literal => {
                         const s = self.analyzer.getSliceFromLiteral(ty);
@@ -2840,6 +2855,7 @@ pub const Analyzer = struct {
 
         class_alias = 1 << 4,
         instance_alias = 1 << 5,
+        enum_alias = 1 << 14,
 
         abstract = 1 << 6,
         constructor = 1 << 7, // used for signatures and function literals
@@ -3405,6 +3421,7 @@ pub const Analyzer = struct {
         no_globals = 1 << 2,
         no_objects = 1 << 3,
         no_instance_aliases = 1 << 4,
+        no_enum_aliases = 1 << 5,
         inner_scoped_aliases = 1 << 20,
         for_reify = 1 << 30,
     };
@@ -3423,6 +3440,7 @@ pub const Analyzer = struct {
             .alias => {
                 if (t.hasFlag(.parameterized)) return ref;
                 if (hasEvalFlag(flags, .no_instance_aliases) and t.hasFlag(.instance_alias)) return ref;
+                if (hasEvalFlag(flags, .no_enum_aliases) and t.hasFlag(.enum_alias)) return ref;
                 return try this.followImmediateAlias(t, @intFromEnum(EvaluationFlags.type_args) | flags) orelse ref;
             },
             .function_literal => {
@@ -11536,9 +11554,10 @@ pub const Analyzer = struct {
         if (subject.kind != .identifier) return notSupported(subject.kind);
         if (subject.extra_data == 0) return error.MissingSymbol;
 
+        const member = file.ast.nodes.at(d.right);
         const ns_sym = file.binder.symbols.at(subject.extra_data);
         if (hasSymbolFlag(ns_sym, .late_bound)) {
-            const hash = getHashFromNode(file.ast.nodes.at(d.right));
+            const hash = getHashFromNode(member);
             const g = this.program.ambient.globals_allocator.at(ns_sym.declaration);
             if (g.symbols.items.len > 1) {
                 for (g.symbols.items) |item| {
@@ -11557,14 +11576,14 @@ pub const Analyzer = struct {
             const f = this.program.getFileData(getOrdinal(ns_sym));
             if (hasSymbolFlag(ns_sym, .namespace)) {
                 // star export
-                const sym_ref = f.binder.exports.type_symbols.get(getHashFromNode(file.ast.nodes.at(d.right))) orelse return error.SymbolNotInNamespace;
+                const sym_ref = f.binder.exports.type_symbols.get(getHashFromNode(member)) orelse return error.SymbolNotInNamespace;
 
                 return this.getTypeOfSymbol(f, sym_ref);
             }
 
             const ns_sym2 = f.binder.symbols.at(ns_sym.declaration);
             const ns2 = f.binder.namespaces.items[ns_sym2.binding];
-            const sym_ref = ns2.type_symbols.get(getHashFromNode(file.ast.nodes.at(d.right))) orelse return error.SymbolNotInNamespace;
+            const sym_ref = ns2.type_symbols.get(getHashFromNode(member)) orelse return error.SymbolNotInNamespace;
 
             return this.getTypeOfSymbol(f, sym_ref);
         }
@@ -11572,8 +11591,14 @@ pub const Analyzer = struct {
         // TODO: namespaces can be merged w/ other declarations so we need to search the chain during binding
         if (!hasSymbolFlag(ns_sym, .namespace)) return error.NotANamespace;
 
+        if (ns_sym.hasFlag(.@"enum")) {
+            const o = try this.getTypeOfSymbol(file, subject.extra_data);
+            const name_type = try this.propertyNameToType(file, d.right);
+            return this.accessType(o, name_type);
+        }
+
         const ns = file.binder.namespaces.items[ns_sym.binding];
-        const sym_ref = ns.type_symbols.get(getHashFromNode(file.ast.nodes.at(d.right))) orelse return error.SymbolNotInNamespace;
+        const sym_ref = ns.type_symbols.get(getHashFromNode(member)) orelse return error.SymbolNotInNamespace;
 
         return this.getTypeOfSymbol(file, sym_ref);
     }
@@ -11624,6 +11649,8 @@ pub const Analyzer = struct {
             const decl = file.ast.nodes.at(sym.declaration);
             if (decl.kind == .class_declaration or decl.kind == .class_expression) {
                 flags |= @intFromEnum(Flags.instance_alias);
+            } else if (decl.kind == .enum_declaration) {
+                flags |= @intFromEnum(Flags.enum_alias);
             }
         }
 

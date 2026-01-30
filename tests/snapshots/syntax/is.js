@@ -59,8 +59,6 @@ const x = null
   const X = {}
   X[X["a"] = 0] = "a"
   X[X["b"] = 1] = "b"
-  function __is3(x) {
-    return typeof x === 'object' && x !== null && x.a === 0 && x.b === 1
-  }
-  ;(__is3(x));
+  ;((x === 0) || (x === 1));
+  ;(x === 0);
 }

@@ -510,6 +510,8 @@ pub const StringFlags = enum(u20) {
     // If set, this literal can be converted to a number
     numeric = 1 << 3,
 
+    external = 1 << 4, // `data` is a pointer
+
     synthetic = 1 << 6, // Implies escaping is needed
 };
 
@@ -519,7 +521,6 @@ const TypeParamFlags = enum(u20) {
     variance_out = 1 << 2,
 };
 
-// This is currently aliased because the plan is to pack the kind into it
 pub const NodeRef = u32;
 
 pub const AstNode = packed struct {
@@ -7077,7 +7078,6 @@ pub const SymbolFlags = enum(u16) {
     skip_narrowing = 1 << 5, // added during type analysis
 
     parameter = 1 << 8,
-    @"enum" = 1 << 9,
     late_bound = 1 << 10,
     imported = 1 << 11,
     exported = 1 << 12,
@@ -7085,6 +7085,7 @@ pub const SymbolFlags = enum(u16) {
     namespace = 1 << 14,
     type = 1 << 15,
 
+    @"enum" = (1 << 8) | (1 << 14), // parameter | namespace
     type_parameter = (1 << 8) | (1 << 15), // parameter | type
     aliased_module = (1 << 10) | (1 << 12) | (1 << 14), // late_bound | exported | namespace 
 };
