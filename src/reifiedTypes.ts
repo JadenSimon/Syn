@@ -161,7 +161,7 @@ export function createTypeNamespace() {
 
     // helpers
 
-    function tag(t: any) {
+    function kind(t: any) {
         if (typeof t !== 'object' || t === null) {
             if (typeof t === 'symbol') {
                 switch (t) {
@@ -192,7 +192,7 @@ export function createTypeNamespace() {
         let min = -1
         const keys: PropertyKey[][] = []
         for (const u of t) {
-            if (tag(u) !== 'object') return
+            if (kind(u) !== 'object') return
 
             const s = Object.keys(u)
             keys.push(s)
@@ -234,7 +234,7 @@ export function createTypeNamespace() {
     }
 
     function typeToTypeId(t: _type): number {
-        switch (tag(t)) {
+        switch (kind(t)) {
             case 'array':
             case 'object':
             case 'tuple':
@@ -246,7 +246,7 @@ export function createTypeNamespace() {
                 return id
             }
         }
-        throw new Error(`todo: ${tag(t)}`)
+        throw new Error(`todo: ${kind(t)}`)
     }
 
     function __TypeFunction(target: number, arity: number = 0) {
@@ -262,7 +262,7 @@ export function createTypeNamespace() {
     }
 
     return {
-        tag,
+        kind,
         findDiscriminant,
 
         any,

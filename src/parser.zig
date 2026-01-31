@@ -968,7 +968,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
     return struct {
         const ParserType = @This();
-        const NodeList2 = struct {
+        const NodeList_ = struct {
             head: NodeRef = 0,
             prev: NodeRef = 0,
 
@@ -1313,7 +1313,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             try this.expect(.t_open_brace);
 
-            var members = NodeList2.init(this);
+            var members = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 var flags: u20 = 0;
@@ -1498,7 +1498,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseTupleType(this: *@This()) !AstNode_ {
             try this.lexer.expect(.t_open_bracket);
 
-            var list = NodeList2.init(this);
+            var list = NodeList_.init(this);
             while (this.lexer.token != .t_close_bracket) {
                 var is_rest_type = false;
                 if (this.lexer.token == .t_dot_dot_dot) {
@@ -1507,7 +1507,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
 
                 const addNode = struct {
-                    pub fn f(parser: *Parser, l: *NodeList2, n: AstNode_, is_rest: bool, is_optional: bool) !void {
+                    pub fn f(parser: *Parser, l: *NodeList_, n: AstNode_, is_rest: bool, is_optional: bool) !void {
                         if (!is_rest and !is_optional) return l.append(n);
 
                         const ref = try parser.pushNode(n);
@@ -2182,7 +2182,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn parseTypeArgs(this: *Parser) anyerror!NodeRef {
             try this.expectTypeStart();
-            var args = NodeList2.init(this);
+            var args = NodeList_.init(this);
 
             if (this.lexer.token == .t_greater_than) {
                 // parse error
@@ -2201,7 +2201,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn parseTypeArgsInJSXElement(this: *Parser) !struct { bool, NodeRef } {
             try this.expectTypeStart();
-            var args = NodeList2.init(this);
+            var args = NodeList_.init(this);
             var is_terminated = false;
 
             while (true) {
@@ -2278,7 +2278,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 return 0;
             }
 
-            var params = NodeList2.init(this);
+            var params = NodeList_.init(this);
 
             while (true) {
                 if (try this.maybeParseTypeEnd()) break;
@@ -2296,7 +2296,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             this.context_state = .none;
 
             try this.lexer.expect(.t_open_paren);
-            var args = NodeList2.init(this);
+            var args = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_paren) {
                 if (this.lexer.token == .t_dot_dot_dot) {
@@ -3119,7 +3119,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         // Always the head followed by 1 or more spans
         fn parseTemplateParts(this: *@This(), comptime is_type: bool) !NodeRef {
-            var parts = NodeList2.init(this);
+            var parts = NodeList_.init(this);
             try parts.append(try this.parseStringLiteralLikeKind(.template_head));
 
             while (true) {
@@ -3150,8 +3150,8 @@ fn Parser_(comptime skip_trivia: bool) type {
             return parts.head;
         }
 
-        fn parseJSXChildren(this: *@This()) !NodeList2 {
-            var children = NodeList2.init(this);
+        fn parseJSXChildren(this: *@This()) !NodeList_ {
+            var children = NodeList_.init(this);
             while (true) {
                 if (this.lexer.token == .t_less_than) {
                     try this.lexer.nextInsideJSXElement();
@@ -3217,7 +3217,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             }
 
             var self_closing = false;
-            var attributes = NodeList2.init(this);
+            var attributes = NodeList_.init(this);
 
             while (scan_attributes) {
                 if (this.lexer.token == .t_slash) {
@@ -3501,6 +3501,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .t_delete => return this.parsePrefixExpression(.delete_expression),
                 .t_void => return this.parsePrefixExpression(.void_expression),
                 .t_typeof => return this.parsePrefixExpression(.type_of_expression),
+
                 .t_plus, .t_minus, .t_plus_plus, .t_minus_minus, .t_tilde, .t_exclamation => return this.parsePrefixUnaryExpression(),
 
                 .t_function => return this.parseFnExpression(this.lexer.full_start, 0),
@@ -3708,7 +3709,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // try this.lexer.expect(.t_open_brace);
             try this.lexer.nextNoKeywords();
 
-            var elements = NodeList2.init(this);
+            var elements = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 if (this.lexer.token == .t_comma) {
@@ -3729,7 +3730,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseArrayBindingPattern(this: *@This()) !NodeRef {
             try this.lexer.expect(.t_open_bracket);
 
-            var elements = NodeList2.init(this);
+            var elements = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_bracket) {
                 if (this.lexer.token == .t_comma) {
@@ -3769,7 +3770,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // try this.lexer.expect(.t_open_bracket);
             try this.lexer.next();
 
-            var elements = NodeList2.init(this);
+            var elements = NodeList_.init(this);
             var emit_omitted_expression = true;
 
             while (this.lexer.token != .t_close_bracket) {
@@ -3899,7 +3900,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // try this.expect(.t_open_brace);
             try this.lexer.nextNoKeywords();
 
-            var elements = NodeList2.init(this);
+            var elements = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 try elements.append(try this.parseObjectLiteralMember());
@@ -3964,7 +3965,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn parseVariableStatement(this: *@This(), flags: u20) !AstNode_ {
             const first = try this.parseVariableDeclaration();
-            var decls = NodeList2.init(this);
+            var decls = NodeList_.init(this);
             try decls.append(first);
 
             while (this.lexer.token == .t_comma) {
@@ -3990,7 +3991,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             const old_state = this.context_state;
             this.context_state = .none;
 
-            var list = NodeList2.init(this);
+            var list = NodeList_.init(this);
             while (this.lexer.token != .t_end_of_file) {
                 const n = try this.parseStatement();
                 try list.append(n);
@@ -4064,7 +4065,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseParameters(this: *@This()) !NodeRef {
             try this.expect(.t_open_paren);
 
-            var params = NodeList2.init(this);
+            var params = NodeList_.init(this);
             while (this.lexer.token != .t_close_paren) {
                 const p = try this.parseParam(0);
                 try params.append(p);
@@ -4081,7 +4082,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseConstructorParameters(this: *@This()) !NodeRef {
             try this.lexer.expectInConstructorParameterList(.t_open_paren);
 
-            var params = NodeList2.init(this);
+            var params = NodeList_.init(this);
             while (this.lexer.token != .t_close_paren) {
                 var flags: u20 = 0;
                 if (this.lexer.token == .t_public) {
@@ -4300,7 +4301,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             defer this.context_state = prev_state;
 
             try this.lexer.expectInInterfaceScope(.t_open_brace);
-            var members = NodeList2.init(this);
+            var members = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 try members.append(try this.parseTypeMember());
@@ -4561,7 +4562,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseModifierOrMember(this: *@This(), flags: *u20, members: *NodeList2, comptime flag: NodeFlags) !void {
+        fn parseModifierOrMember(this: *@This(), flags: *u20, members: *NodeList_, comptime flag: NodeFlags) !void {
             const ident = toIdentNodeWithLocation(this.lexer.identifier, this.getLocation(), this.lexer.full_start, this.getFullWidth());
             try this.lexer.nextInClassScopeFlag(); // XXX: TODO: remove the "newline" hack
 
@@ -4607,10 +4608,10 @@ fn Parser_(comptime skip_trivia: bool) type {
             defer this.context_state = prior_state;
 
             try this.lexer.expectInClassScope(.t_open_brace);
-            var members = NodeList2.init(this);
+            var members = NodeList_.init(this);
             var flags: u20 = 0;
 
-            var decorators = NodeList2.init(this);
+            var decorators = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 switch (this.lexer.token) {
@@ -4771,7 +4772,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 extendsClause = try this.pushNode(try this.parseExprWithTypeArgs());
             }
 
-            var implementsClauses = NodeList2.init(this);
+            var implementsClauses = NodeList_.init(this);
             if (this.lexer.token == .t_implements) {
                 try this.lexer.next();
 
@@ -4835,7 +4836,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             var extendsClauses: NodeRef = 0;
             if (this.lexer.token == .t_extends) {
                 try this.lexer.next();
-                var clauses = NodeList2.init(this);
+                var clauses = NodeList_.init(this);
                 while (this.lexer.token != .t_open_brace) {
                     const exp = try this.parseExprWithTypeArgs();
                     try clauses.append(exp);
@@ -4861,7 +4862,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             try this.lexer.expect(.t_open_brace);
 
-            var members = NodeList2.init(this);
+            var members = NodeList_.init(this);
             while (this.lexer.token != .t_close_brace) {
                 var name: NodeRef = 0;
                 // Only ident/string literals allowed
@@ -5054,7 +5055,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parseSwitchCase(this: *@This()) !AstNode_ {
-            var statements = NodeList2.init(this);
+            var statements = NodeList_.init(this);
 
             var n: AstNode_ = .{ .kind = .case_clause };
             if (this.lexer.token == .t_default) {
@@ -5091,12 +5092,12 @@ fn Parser_(comptime skip_trivia: bool) type {
             try this.lexer.expect(.t_switch);
 
             try this.lexer.expect(.t_open_paren);
-            const expression = try this.parseExpression();
+            const expression = try this.parseExpOrBinding();
             try this.lexer.expect(.t_close_paren);
 
             try this.lexer.expect(.t_open_brace);
 
-            var clauses = NodeList2.init(this);
+            var clauses = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 try clauses.append(try this.parseSwitchCase());
@@ -5134,7 +5135,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseNamedModuleBindings(this: *@This(), comptime is_export: bool) !NodeRef {
             try this.lexer.expect(.t_open_brace);
 
-            var elements = NodeList2.init(this);
+            var elements = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
                 var type_only = false;
@@ -6053,7 +6054,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             this.lexer.pause_on_comments = false;
 
-            var statements = NodeList2.init(this);
+            var statements = NodeList_.init(this);
 
             if (this.import_listener) |listener| {
                 var imports = std.ArrayListUnmanaged([]const u8){};
@@ -6121,6 +6122,455 @@ fn Parser_(comptime skip_trivia: bool) type {
 }
 
 pub const Parser = Parser_(false);
+
+pub const Factory = struct {
+    nodes: *BumpAllocator(AstNode),
+
+    pub inline fn cloneNode(this: *@This(), n: *const AstNode) !NodeRef {
+        return this.nodes.push(n.*);
+    }
+
+    pub inline fn cloneNodeRef(this: *@This(), ref: NodeRef) !NodeRef {
+        return this.cloneNode(this.nodes.at(ref));
+    }
+
+    pub fn createIdentifier(this: *@This(), text: []const u8) !NodeRef {
+        const t = try getAllocator().dupe(u8, text);
+        return this.createIdentifierAllocated(t);
+    }
+
+    pub fn createIdentifierAllocated(this: *@This(), text: []const u8) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .identifier,
+            .data = text.ptr,
+            .len = @intCast(text.len),
+        });
+    }
+
+    pub fn createStringLiteral(this: *@This(), text: []const u8) !NodeRef {
+        const t = try getAllocator().dupe(u8, text);
+        return this.createStringLiteralAllocated(t);
+    }
+
+    pub fn createStringLiteralAllocated(this: *@This(), text: []const u8) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .string_literal,
+            .data = text.ptr,
+            .len = @intCast(text.len),
+        });
+    }
+
+    pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef {
+        const d: u64 = switch (@TypeOf(val)) {
+            f64 => @bitCast(val),
+            i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
+            else => @compileError("Unhandled type"),
+        };
+
+        return this.nodes.push(.{
+            .kind = .numeric_literal,
+            .data = if (d == 0) null else @ptrFromInt(d),
+        });
+    }
+
+    pub fn createTrue(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .true_keyword });
+    }
+
+    pub fn createFalse(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .false_keyword });
+    }
+
+    pub fn createNull(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .null_keyword });
+    }
+
+    pub fn createUndefined(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .undefined_keyword });
+    }
+
+    pub fn createPropertyAccessExpression(this: *@This(), subject: NodeRef, member: anytype) !NodeRef {
+        const right = switch (@TypeOf(member)) {
+            NodeRef => member,
+            []const u8 => try this.createIdentifier(member),
+            else => blk: {
+                if (comptime isComptimeString(@TypeOf(member))) {
+                    break :blk try this.createIdentifier(member);
+                }
+                @compileLog(@TypeOf(member));
+                @compileError("Unhandled type");
+            },
+        };
+
+        return this.nodes.push(.{
+            .kind = .property_access_expression,
+            .data = toBinaryDataPtrRefs(subject, right),
+        });
+    }
+
+    pub fn createElementAccessExpression(this: *@This(), subject: NodeRef, arg: anytype) !NodeRef {
+        const right = switch (@TypeOf(arg)) {
+            NodeRef => arg,
+            []const u8 => try this.createStringLiteral(arg),
+            f64, usize, comptime_int => try this.createNumericLiteral(arg),
+            else => blk: {
+                if (comptime isComptimeString(@TypeOf(arg))) {
+                    break :blk try this.createStringLiteral(arg);
+                }
+                @compileLog(@TypeOf(arg));
+                @compileError("Unhandled type");
+            },
+        };
+
+        return this.nodes.push(.{
+            .kind = .element_access_expression,
+            .data = toBinaryDataPtrRefs(subject, right),
+        });
+    }
+
+    fn createList(this: *@This(), arg: []const NodeRef) !NodeRef {
+        var list = NodeList.init(this.nodes);
+        for (arg) |el| list.appendRef(el);
+
+        return list.head;
+    }
+
+    fn isComptimeString(comptime T: type) bool {
+        switch (@typeInfo(T)) {
+            .Pointer => |p| {
+                if (!p.is_const or p.size != .One) return false;
+
+                switch (@typeInfo(p.child)) {
+                    .Array => |s| {
+                        if (s.child != u8) return false;
+
+                        return true;
+                    },
+                    else => return false,
+                }
+            },
+            else => return false,
+        }
+    }
+
+    fn isAnonymousNodeList(comptime T: type) bool {
+        switch (@typeInfo(T)) {
+            .Pointer => |p| {
+                if (!p.is_const or p.size != .One) return false;
+
+                switch (@typeInfo(p.child)) {
+                    .Struct => |s| {
+                        if (!s.is_tuple) return false;
+
+                        inline for (s.fields) |f| {
+                            if (f.type != u32) return false;
+                        }
+
+                        return true;
+                    },
+                    else => return false,
+                }
+            },
+            else => return false,
+        }
+    }
+
+    fn maybeCreateList(this: *@This(), arg: anytype) !NodeRef {
+        return switch (@TypeOf(arg)) {
+            comptime_int, NodeRef => arg,
+            []const NodeRef => this.createList(arg),
+            else => {
+                if (comptime isAnonymousNodeList(@TypeOf(arg))) {
+                    return this.createList(arg);
+                }
+                
+                @compileLog(@TypeOf(arg));
+                @compileError("Unhandled type");
+            },
+        };
+    }
+
+    fn maybeCreateBlock(this: *@This(), arg: anytype) !NodeRef {
+        return switch (@TypeOf(arg)) {
+            comptime_int => arg, // TODO: assert 0?
+            NodeRef => this.assertKind(arg, .block),
+            []const NodeRef => this.createBlock(arg),
+            else => {
+                if (comptime isAnonymousNodeList(@TypeOf(arg))) {
+                    return this.createBlock(arg);
+                }
+                
+                @compileLog(@TypeOf(arg));
+                @compileError("Unhandled type");
+            },
+        };
+    }
+
+    pub fn createCallExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .call_expression,
+            .data = toBinaryDataPtrRefs(expression, try this.maybeCreateList(args)),
+        });
+    }
+
+    pub fn createNewExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .new_expression,
+            .data = toBinaryDataPtrRefs(expression, try this.maybeCreateList(args)),
+        });
+    }
+
+    pub fn createBinaryExpression(this: *@This(), left: NodeRef, operator: SyntaxKind, right: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .binary_expression,
+            .data = toBinaryDataPtrRefs(left, right),
+            .len = @intFromEnum(operator),
+        });
+    }
+
+    pub fn createPrefixUnaryExpression(this: *@This(), operator: SyntaxKind, operand: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .prefix_unary_expression,
+            .data = toBinaryDataPtrRefs(@intFromEnum(operator), operand),
+        });
+    }
+
+    pub fn createPostfixUnaryExpression(this: *@This(), operand: NodeRef, operator: SyntaxKind) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .postfix_unary_expression,
+            .data = toBinaryDataPtrRefs(operand, @intFromEnum(operator)),
+        });
+    }
+
+    pub fn createConditionalExpression(this: *@This(), condition: NodeRef, when_true: NodeRef, when_false: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .conditional_expression,
+            .data = toBinaryDataPtrRefs(condition, when_true),
+            .len = when_false
+        });
+    }
+
+    pub fn createParenthesizedExpression(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .parenthesized_expression,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createAwaitExpression(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .await_expression,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createTypeOfExpression(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .type_of_expression,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createSpreadElement(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .spread_element,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createArrayLiteralExpression(this: *@This(), elements: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .array_literal_expression,
+            .data = @ptrFromInt(elements),
+        });
+    }
+
+    pub fn createObjectLiteralExpression(this: *@This(), properties: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .object_literal_expression,
+            .data = @ptrFromInt(properties),
+        });
+    }
+
+    pub fn createArrowFunction(this: *@This(), params: NodeRef, body: NodeRef, flags: u20) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .arrow_function,
+            .data = toBinaryDataPtrRefs(params, body),
+            .flags = flags,
+        });
+    }
+
+    pub fn createAsExpression(this: *@This(), expression: NodeRef, type_node: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .as_expression,
+            .data = toBinaryDataPtrRefs(expression, type_node),
+        });
+    }
+
+    pub fn createBlock(this: *@This(), statements: anytype) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .block,
+            .data = @ptrFromInt(try this.maybeCreateList(statements)),
+        });
+    }
+
+    pub fn createExpressionStatement(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .expression_statement,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createReturnStatement(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .return_statement,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createThrowStatement(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .throw_statement,
+            .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createIfStatement(this: *@This(), condition: NodeRef, then_stmt: NodeRef, else_stmt: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .if_statement,
+            .data = toBinaryDataPtrRefs(condition, then_stmt),
+            .len = else_stmt,
+        });
+    }
+
+    pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u20) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .variable_statement,
+            .data = @ptrFromInt(declarations),
+            .flags = flags,
+        });
+    }
+
+    pub fn createVariableDeclaration(this: *@This(), name: NodeRef, type_node: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .variable_declaration,
+            .data = toBinaryDataPtrRefs(name, initializer),
+            .len = type_node,
+        });
+    }
+
+    pub fn createVariableDeclarationSimple(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.createVariableDeclaration(name, 0, initializer);
+    }
+
+    pub fn createCatchClause(this: *@This(), binding: anytype, statements: anytype) !NodeRef {
+        const left = switch (@TypeOf(binding)) {
+            NodeRef => this.assertKind(binding, .variable_declaration),
+            else => @compileError("Unhandled type"),
+        };
+
+        const right = try this.maybeCreateBlock(statements);
+
+        return this.nodes.push(.{
+            .kind = .catch_clause,
+            .data = toBinaryDataPtrRefs(left, right),
+        });
+    }
+
+    pub fn createTryStatement(this: *@This(), statements: anytype, catch_clause: NodeRef, finally_block: anytype) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .try_statement,
+            .data = toBinaryDataPtrRefs(
+                try this.maybeCreateBlock(statements),
+                catch_clause
+            ),
+            .len = try this.maybeCreateBlock(finally_block),
+        });
+    }
+
+    pub fn createParameter(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .parameter,
+            .data = toBinaryDataPtrRefs(name, initializer),
+            // .len = type_node,
+        });
+    }
+
+    pub fn createFunctionDeclaration(this: *@This(), name: NodeRef, params: anytype, body: anytype) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .function_declaration,
+            .data = toBinaryDataPtrRefs(name, try this.maybeCreateList(params)),
+            .len = try this.maybeCreateBlock(body),
+        });
+    }
+
+    pub fn createPropertyAssignment(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .property_assignment,
+            .data = toBinaryDataPtrRefs(name, initializer),
+        });
+    }
+
+    pub fn createShorthandPropertyAssignment(this: *@This(), name: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .shorthand_property_assignment,
+            .data = @ptrFromInt(name),
+        });
+    }
+
+    pub fn createTypeReference(this: *@This(), name: NodeRef, type_args: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .type_reference,
+            .data = toBinaryDataPtrRefs(name, type_args),
+        });
+    }
+
+    pub fn createArrayType(this: *@This(), element_type: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .array_type,
+            .data = @ptrFromInt(element_type),
+        });
+    }
+
+    pub fn createKeywordType(this: *@This(), keyword: SyntaxKind) !NodeRef {
+        return this.nodes.push(.{ .kind = keyword });
+    }
+
+    pub fn createBreakStatement(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .break_statement });
+    }
+
+    pub fn createContinueStatement(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .continue_statement });
+    }
+
+    pub fn createCaseClause(this: *@This(), expression: NodeRef, statements: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .case_clause,
+            .data = @ptrFromInt(expression),
+            .len = statements,
+        });
+    }
+
+    pub fn createDefaultClause(this: *@This(), statements: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .default_clause,
+            .len = statements,
+        });
+    }
+
+    pub fn createSwitchStatement(this: *@This(), expression: NodeRef, clauses: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .switch_statement,
+            .data = toBinaryDataPtrRefs(expression, clauses),
+        });
+    }
+
+    inline fn assertKind(this: *@This(), ref: NodeRef, kind: SyntaxKind) NodeRef {
+        std.debug.assert(this.nodes.at(ref).kind == kind);
+        return ref;
+    }
+};
 
 const HelperTags = enum {
     known_symbol,
@@ -6673,9 +7123,10 @@ pub fn maybeUnwrapRef(node: *const AstNode) ?NodeRef {
 
 pub inline fn getPackedData(node: *const AstNode) BinaryExpData {
     if (node.data) |p| {
+        const v = @as(u64, @intFromPtr(p));
         return .{
-            .left = @intCast(@as(u64, @intFromPtr(p)) & 0xFFFFFFFF),
-            .right = @intCast(@as(u64, @intFromPtr(p)) >> 32),
+            .left = @truncate(v),
+            .right = @intCast(v >> 32),
         };
     }
     return .{ .left = 0, .right = 0 };
@@ -6877,6 +7328,17 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(ref), ref);
             }
         },
+        .function_declaration, .function_expression => {
+            const d = getPackedData(node);
+            // d.left - name
+            // extra_data - type params
+            // extra_data2 - return type
+            try visitList(nodes, d.right, visitor);
+
+            if (node.len != 0) {
+                try visitor.visit(nodes.at(node.len), node.len);
+            }
+        },
         .call_expression, .new_expression => {
             const d = getPackedData(node);
             try visitor.visit(nodes.at(d.left), d.left);
@@ -6918,6 +7380,25 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left);
             try visitor.visit(nodes.at(d.right), d.right);
             try visitor.visit(nodes.at(node.len), node.len);
+        },
+        .try_statement => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left); // try block
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right); // catch clause
+            if (node.len != 0) try visitor.visit(nodes.at(node.len), node.len); // finally block
+        },
+        .catch_clause => {
+            const d = getPackedData(node);
+            if (d.left != 0) try visitor.visit(nodes.at(d.left), d.left);
+            try visitor.visit(nodes.at(d.right), d.right);
+        },
+        .case_clause, .default_clause => {
+            try visitList(nodes, node.len, visitor);
+        },
+        .switch_statement => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left); // expression
+            try visitList(nodes, d.right, visitor); // clauses
         },
         // constructor
 
@@ -8620,20 +9101,27 @@ pub const Binder = struct {
                 const d = getPackedData(node);
                 try this.visitRef(d.left);
 
+                // catch
                 if (d.right != 0) {
                     const clause = getPackedData(this.nodes.at(d.right));
                     if (clause.left != 0) {
                         try this.pushScope();
                         defer this.popScope();
 
-                        const q = getPackedData(this.nodes.at(clause.left));
+                        const decl = this.nodes.at(clause.left);
+                        const q = getPackedData(decl);
                         try this.visitBinding(q.left, clause.left);
+                        if (decl.len != 0) {
+                            try this.visitType(decl.len);
+                        }
 
                         try this.visitRef(clause.right);
                     } else {
                         try this.visitRef(clause.right);
                     }
                 }
+
+                // finally
                 if (node.len != 0) {
                     try this.visitRef(node.len);
                 }
@@ -8702,6 +9190,25 @@ pub const Binder = struct {
             },
             .switch_statement => {
                 const d = getPackedData(node);
+
+                if (this.nodes.at(d.left).kind == .variable_statement) {
+                    const decl = unwrapRef(this.nodes.at(d.left));
+                    const decl_node = this.nodes.at(decl);
+                    const q = getPackedData(decl_node);
+
+                    // visit type/initializer first
+                    try this.visitType(decl_node.len);
+                    if (q.right != 0) {
+                        try this.visitRef(q.right);
+                    }
+
+                    try this.pushScope();
+                    defer this.popScope();
+
+                    try this.visitBinding(q.left, decl);
+
+                    return this.visitRef(d.right);
+                }
 
                 try this.visitRef(d.left);
 
@@ -9718,7 +10225,11 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print("case ");
                     try this.visitRef(unwrapRef(n));
                     this.print(": ");
-                    try this._visitLinkedList(n.len, "", "", "", true);
+                    if (n.len != 0 and this.data.nodes.at(n.len).kind == .block) {
+                        try this.visitRef(n.len); // print block on the same line
+                    } else {
+                        try this._visitLinkedList(n.len, "", "", "", true);
+                    }
                 },
                 .default_clause => {
                     this.print("default: ");

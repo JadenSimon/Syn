@@ -13,3 +13,9 @@ You'll need [Synapse](https://github.com/Cohesible/synapse?tab=readme-ov-file#in
 3. Move `out/package.tgz` into the Synapse repo and change the `typescript` dependency version to `file:package.tgz`. 
 4. Run `synapse install && synapse compile --no-synth && synapse build` to create `dist/bin/synapse`, which can parse and execute `.syn` files.
 
+
+## Differences from TypeScript
+* Intersection types with objects behave more like the spread operator (flat merge)
+* Reworked enums
+    - 
+    - enum(string) Foo { success, failure }

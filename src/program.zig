@@ -1023,65 +1023,21 @@ pub const Program = struct {
 
             file: *ParsedFileData,
             nodes: *BumpAllocator(AstNode),
+            factory: *parser.Factory,
             analyzer: *Analyzer,
             replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
             is_async_ctx: bool = true, // we start in a module
+            should_use_parens: bool = false,
             as_type_node: ?*const AstNode = null,
 
             type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
 
-            fn makeIdent(self: *@This(), s: []const u8) !NodeRef {
-                const z = try getAllocator().dupe(u8, s);
-                return try self.nodes.push(.{
-                    .kind = .identifier,
-                    .data = z.ptr,
-                    .len = @intCast(z.len),
-                });
-            }
-
-            fn makeString(self: *@This(), s: []const u8) !NodeRef {
-                const z = try getAllocator().dupe(u8, s);
-                return try self.nodes.push(.{
-                    .kind = .string_literal,
-                    .data = z.ptr,
-                    .len = @intCast(z.len),
-                });
-            }
-
-            fn makeNumber(self: *@This(), v: u64) !NodeRef {
-                return try self.nodes.push(.{
-                    .kind = .numeric_literal,
-                    .data = if (v == 0) null else @ptrFromInt(v),
-                });
-            }
-
             fn typeofExp(self: *@This(), subject: NodeRef, comptime s: []const u8) !NodeRef {
-                const rhs = try self.makeString(s);
-                const lhs = try self.nodes.push(.{
-                    .kind = .type_of_expression,
-                    .data = @ptrFromInt(subject),
-                });
-
-                return try self.equalsExp(lhs, rhs);
+                const lhs = try self.factory.createTypeOfExpression(subject);
+                const rhs = try self.factory.createStringLiteral(s);
+                return self.factory.createBinaryExpression(lhs, .equals_equals_equals_token, rhs);
             }
 
-            fn equalsExp(self: *@This(), subject: NodeRef, rhs: NodeRef) !NodeRef {
-                return self.binaryExp(subject, rhs, .equals_equals_equals_token);
-            }
-
-            fn notEqualsExp(self: *@This(), subject: NodeRef, rhs: NodeRef) !NodeRef {
-                return self.binaryExp(subject, rhs, .exclamation_equals_equals_token);
-            }
-
-            fn binaryExp(self: *@This(), lhs: NodeRef, rhs: NodeRef, op: SyntaxKind) !NodeRef {
-                return try self.nodes.push(.{
-                    .kind = .binary_expression,
-                    .data = toBinaryDataPtrRefs(lhs, rhs),
-                    .len = @intFromEnum(op),
-                });
-            }
-
-            /// Appends a string to the pattern, escaping regex special characters
             fn appendEscapedRegex(_: *@This(), pattern: *std.ArrayList(u8), text: []const u8) !void {
                 for (text) |c| {
                     switch (c) {
@@ -1094,51 +1050,21 @@ pub const Program = struct {
                 }
             }
 
-            fn makeParam(self: *@This(), binding: NodeRef) !NodeRef {
-                return self.nodes.push(.{
-                    .kind = .parameter,
-                    .data = toBinaryDataPtrRefs(binding, 0),
-                });
-            }
-
-            fn singleParamArrowFn(self: *@This(), param_binding: NodeRef, body: NodeRef) !NodeRef {
-                return try self.nodes.push(.{
-                    .kind = .arrow_function,
-                    .data = toBinaryDataPtrRefs(
-                        try self.makeParam(param_binding),
-                        body
-                    ),
-                });
-            }
-
             fn createHelper(self: *@This(), ty: TypeRef, decl_ref: NodeRef, followed: TypeRef) ![]const u8 {
                 const name = try std.fmt.allocPrint(getAllocator(), "__is{d}", .{self.type_helpers.count()});
 
                 try self.type_helpers.put(getAllocator(), ty, name);
 
-                const param_ident = try self.makeIdent("x");
-
+                const param_ident = try self.factory.createIdentifier("x");
                 const check = try self.generateIsExpression(param_ident, followed);
-
-                const return_stmt = try self.nodes.push(.{
-                    .kind = .return_statement,
-                    .data = @ptrFromInt(check),
-                });
-
-                const block = try self.nodes.push(.{
-                    .kind = .block,
-                    .data = @ptrFromInt(return_stmt),
-                });
-
-                const fn_name = try self.makeIdent(name);
-                const helper_ref = try self.nodes.push(.{
-                    .kind = .function_declaration,
-                    .data = toBinaryDataPtrRefs(fn_name, try self.makeParam(param_ident)),
-                    .len = block,
+                const fn_name = try self.factory.createIdentifierAllocated(name);
+                const param = try self.factory.createParameter(param_ident, 0);
+                const helper_ref = try self.factory.createFunctionDeclaration(fn_name, param, &.{
+                    try self.factory.createReturnStatement(check)
                 });
 
                 const decl = self.file.ast.nodes.at(decl_ref);
-                const clone_ref = try self.file.ast.nodes.push(decl.*);
+                const clone_ref = try self.factory.cloneNode(decl);
 
                 self.file.ast.nodes.at(helper_ref).next = decl.next;
                 self.file.ast.nodes.at(clone_ref).next = helper_ref;
@@ -1149,11 +1075,20 @@ pub const Program = struct {
             }
 
             fn callHelper(self: *@This(), helper_name: []const u8, subject: u32) !u32 {
-                const fn_ident = try self.makeIdent(helper_name);
-                return try self.nodes.push(.{
-                    .kind = .call_expression,
-                    .data = toBinaryDataPtrRefs(fn_ident, subject),
-                });
+                const fn_ident = try self.factory.createIdentifier(helper_name);
+                return self.factory.createCallExpression(fn_ident, subject);
+            }
+
+            fn addReplacement(self: *@This(), ref: NodeRef, new_ref: NodeRef) !void {
+                if (self.replacements.get(ref)) |existing_ref| {
+                    const orig = self.nodes.at(ref);
+                    if (orig.next != 0) {
+                        return error.ReplacementConflict;
+                    }
+                    const existing = self.nodes.at(existing_ref);
+                    self.nodes.at(new_ref).next = existing.next;
+                }
+                try self.replacements.put(ref, new_ref);
             }
 
             fn getDeclarationForAlias(self: *@This(), ty: TypeRef) ?NodeRef {
@@ -1187,17 +1122,15 @@ pub const Program = struct {
             }
 
             fn generateUnionCheck(self: *@This(), subject: NodeRef, elements: []const TypeRef) !TypeRef {
-                var lhs: u32 = try self.nodes.push(.{
-                    .kind = .parenthesized_expression,
-                    .data = @ptrFromInt(try self.generateIsExpression(subject, elements[0]))
-                });
+                var lhs: u32 = try self.factory.createParenthesizedExpression(
+                    try self.generateIsExpression(subject, elements[0])
+                );
 
                 for (1..elements.len) |i| {
-                    const n = try self.nodes.push(.{
-                        .kind = .parenthesized_expression,
-                        .data = @ptrFromInt(try self.generateIsExpression(subject, elements[i]))
-                    });
-                    lhs = try self.binaryExp(lhs, n, .bar_bar_token);
+                    const n = try self.factory.createParenthesizedExpression(
+                        try self.generateIsExpression(subject, elements[i])
+                    );
+                    lhs = try self.factory.createBinaryExpression(lhs, .bar_bar_token, n);
                 }
 
                 return lhs;
@@ -1220,28 +1153,20 @@ pub const Program = struct {
 
                 if (ty >= @intFromEnum(Kind.false)) {
                     if (ty == @intFromEnum(Kind.false)) {
-                        const rhs = try self.nodes.push(.{
-                            .kind = .false_keyword,
-                        });
-                        return try self.equalsExp(subject, rhs);
+                        const rhs = try self.factory.createFalse();
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     }
                     if (ty == @intFromEnum(Kind.true)) {
-                        const rhs = try self.nodes.push(.{
-                            .kind = .true_keyword,
-                        });
-                        return try self.equalsExp(subject, rhs);
+                        const rhs = try self.factory.createTrue();
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     }
                     if (ty == @intFromEnum(Kind.undefined)) {
-                        const rhs = try self.nodes.push(.{
-                            .kind = .undefined_keyword,
-                        });
-                        return try self.equalsExp(subject, rhs);
+                        const rhs = try self.factory.createUndefined();
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     }
                     if (ty == @intFromEnum(Kind.null)) {
-                        const rhs = try self.nodes.push(.{
-                            .kind = .null_keyword,
-                        });
-                        return try self.equalsExp(subject, rhs);
+                        const rhs = try self.factory.createNull();
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     }
 
                     // if (ty == @intFromEnum(Kind.void)) {
@@ -1249,39 +1174,34 @@ pub const Program = struct {
                     // }
 
                     if (ty == @intFromEnum(Kind.any)) {
-                        return try self.nodes.push(.{
-                            .kind = .true_keyword,
-                        });
+                        return self.factory.createTrue();
                     }
                     if (ty == @intFromEnum(Kind.unknown)) {
-                        return try self.nodes.push(.{
-                            .kind = .true_keyword,
-                        });
+                        return self.factory.createTrue();
                     }
                     if (ty == @intFromEnum(Kind.never)) {
-                        return try self.nodes.push(.{
-                            .kind = .false_keyword,
-                        });
+                        return self.factory.createFalse();
                     }
 
                     if (ty == @intFromEnum(Kind.string)) {
-                        return try self.typeofExp(subject, "string");
+                        return self.typeofExp(subject, "string");
                     }
                     if (ty == @intFromEnum(Kind.number)) {
-                        return try self.typeofExp(subject, "number");
+                        return self.typeofExp(subject, "number");
                     }
                     if (ty == @intFromEnum(Kind.boolean)) {
-                        return try self.typeofExp(subject, "boolean");
+                        return self.typeofExp(subject, "boolean");
                     }
                     if (ty == @intFromEnum(Kind.object)) {
-                        return try self.typeofExp(subject, "object");
+                        return self.typeofExp(subject, "object");
                     }
                     if (ty == @intFromEnum(Kind.symbol)) {
-                        return try self.typeofExp(subject, "symbol");
+                        return self.typeofExp(subject, "symbol");
                     }
 
                     if (ty == @intFromEnum(Kind.empty_string)) {
-                        return try self.equalsExp(subject, try self.makeString(""));
+                        const rhs = try self.factory.createStringLiteral("");
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     } else if (ty == @intFromEnum(Kind.empty_object)) {
                     //    return try this.createShape("__Object");
                     } else if (ty == @intFromEnum(Kind.empty_tuple)) {
@@ -1292,8 +1212,8 @@ pub const Program = struct {
 
                     if (ty >= @intFromEnum(Kind.zero)) {
                         const v = self.analyzer.getDoubleFromType(ty);
-                        const v2: u64 = @bitCast(v);
-                        return try self.equalsExp(subject, try self.makeNumber(v2));
+                        const rhs = try self.factory.createNumericLiteral(v);
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     }
 
                     self.analyzer.printTypeInfo(ty);
@@ -1318,8 +1238,8 @@ pub const Program = struct {
                             const ident = self.file.ast.nodes.at(ident_ref);
                             const name = getSlice(ident, u8);
 
-                            const class_ident = try self.makeIdent(name);
-                            return try self.binaryExp(subject, class_ident, .instance_of_keyword);
+                            const class_ident = try self.factory.createIdentifier(name);
+                            return self.factory.createBinaryExpression(subject, .instance_of_keyword, class_ident);
                         }
                         if (t.hasFlag(.enum_alias)) {
                             const o_ref =  try self.analyzer.maybeResolveAlias(ty);
@@ -1333,6 +1253,15 @@ pub const Program = struct {
                                 vals.appendAssumeCapacity(v);
                             }
                             return try self.generateUnionCheck(subject, vals.items);
+                        }
+
+                        if (t.hasFlag(.global)) {
+                            if (try self.analyzer.getGlobalType("Error", .{})) |error_type| {
+                                if (ty == error_type) {
+                                    const error_ident = try self.factory.createIdentifier("Error");
+                                    return self.factory.createBinaryExpression(subject, .instance_of_keyword, error_ident);
+                                }
+                            }
                         }
 
                         if (try self.getOrCreateHelperForType(ty)) |helper_name| {
@@ -1359,52 +1288,31 @@ pub const Program = struct {
                         return try self.generateIsExpression(subject, followed);
                     },
                     .array => {
-                        const p = try self.nodes.push(.{
-                            .kind = .property_access_expression,
-                            .data = toBinaryDataPtrRefs(
-                                try self.makeIdent("Array"),
-                                try self.makeIdent("isArray"),
-                            ),
-                        });
-                        const lhs: u32 = try self.nodes.push(.{
-                            .kind = .call_expression,
-                            .data = toBinaryDataPtrRefs(p, subject),
-                        });
+                        const is_array = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createIdentifier("Array"),
+                            "isArray"
+                        );
+                        const lhs: u32 = try self.factory.createCallExpression(is_array, subject);
 
-                        const fn_subject = try self.makeIdent("el");
+                        const fn_subject = try self.factory.createIdentifier("el");
                         const inner = try self.generateIsExpression(fn_subject, t.slot0);
                         if (self.nodes.at(inner).kind == .false_keyword or self.nodes.at(inner).kind == .true_keyword) {
                             return lhs;
                         }
 
-                        const predicate = try self.singleParamArrowFn(fn_subject, inner);
+                        const param = try self.factory.createParameter(fn_subject, 0);
+                        const predicate = try self.factory.createArrowFunction(param, inner, 0);
 
-                        const p2 = try self.nodes.push(.{
-                            .kind = .property_access_expression,
-                            .data = toBinaryDataPtrRefs(
-                                subject,
-                                try self.makeIdent("every"),
-                            ),
-                        });
-
-                        const every = try self.nodes.push(.{
-                            .kind = .call_expression,
-                            .data = toBinaryDataPtrRefs(p2, predicate),
-                        });
-                        return try self.binaryExp(lhs, every, .ampersand_ampersand_token);
+                        const every_access = try self.factory.createPropertyAccessExpression(subject, "every");
+                        const every = try self.factory.createCallExpression(every_access, predicate);
+                        return self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, every);
                     },
                     .tuple => {
-                        const p = try self.nodes.push(.{
-                            .kind = .property_access_expression,
-                            .data = toBinaryDataPtrRefs(
-                                try self.makeIdent("Array"),
-                                try self.makeIdent("isArray"),
-                            ),
-                        });
-                        var lhs: u32 = try self.nodes.push(.{
-                            .kind = .call_expression,
-                            .data = toBinaryDataPtrRefs(p, subject),
-                        });
+                        const is_array = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createIdentifier("Array"),
+                            "isArray"
+                        );
+                        var lhs: u32 = try self.factory.createCallExpression(is_array, subject);
 
                         const elements = getSlice2(t, TypeRef);
                         const has_spread = elements.len > 0 and
@@ -1412,20 +1320,14 @@ pub const Program = struct {
                             self.analyzer.types.at(elements[elements.len - 1]).hasFlag(.spread);
 
                         if (elements.len > 0) {
-                            const p2 = try self.nodes.push(.{
-                                .kind = .property_access_expression,
-                                .data = toBinaryDataPtrRefs(
-                                    subject,
-                                    try self.makeIdent("length"),
-                                ),
-                            });
+                            const len_access = try self.factory.createPropertyAccessExpression(subject, "length");
                             const min_len = if (has_spread) elements.len - 1 else elements.len;
-                            const len = try self.makeNumber(@bitCast(@as(f64, @floatFromInt(min_len))));
+                            const len = try self.factory.createNumericLiteral(min_len);
                             const cmp = if (has_spread)
-                                try self.binaryExp(p2, len, .greater_than_equals_token)
+                                try self.factory.createBinaryExpression(len_access, .greater_than_equals_token, len)
                             else
-                                try self.equalsExp(p2, len);
-                            lhs = try self.binaryExp(lhs, cmp, .ampersand_ampersand_token);
+                                try self.factory.createBinaryExpression(len_access, .equals_equals_equals_token, len);
+                            lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, cmp);
                         }
 
                         for (elements, 0..) |el, i| {
@@ -1438,53 +1340,29 @@ pub const Program = struct {
                                 const array_type = self.analyzer.types.at(spread_type.slot1);
                                 const element_type: TypeRef = array_type.slot0;
 
-                                const slice_access = try self.nodes.push(.{
-                                    .kind = .property_access_expression,
-                                    .data = toBinaryDataPtrRefs(
-                                        subject,
-                                        try self.makeIdent("slice"),
-                                    ),
-                                });
-                                const sliced = try self.nodes.push(.{
-                                    .kind = .call_expression,
-                                    .data = toBinaryDataPtrRefs(slice_access, try self.makeNumber(@bitCast(@as(f64, @floatFromInt(i))))),
-                                });
+                                const slice_access = try self.factory.createPropertyAccessExpression(subject, "slice");
+                                const sliced = try self.factory.createCallExpression(slice_access, try self.factory.createNumericLiteral(i));
 
-                                const fn_subject = try self.makeIdent("el");
+                                const fn_subject = try self.factory.createIdentifier("el");
                                 const inner = try self.generateIsExpression(fn_subject, element_type);
 
                                 if (self.nodes.at(inner).kind != .false_keyword and self.nodes.at(inner).kind != .true_keyword) {
-                                    const predicate = try self.singleParamArrowFn(fn_subject, inner);
+                                    const param = try self.factory.createParameter(fn_subject, 0);
+                                    const predicate = try self.factory.createArrowFunction(param, inner, 0);
 
-                                    const every_access = try self.nodes.push(.{
-                                        .kind = .property_access_expression,
-                                        .data = toBinaryDataPtrRefs(
-                                            sliced,
-                                            try self.makeIdent("every"),
-                                        ),
-                                    });
-                                    const every = try self.nodes.push(.{
-                                        .kind = .call_expression,
-                                        .data = toBinaryDataPtrRefs(every_access, predicate),
-                                    });
+                                    const every_access = try self.factory.createPropertyAccessExpression(sliced, "every");
+                                    const every = try self.factory.createCallExpression(every_access, predicate);
 
-                                    lhs = try self.binaryExp(lhs, every, .ampersand_ampersand_token);
+                                    lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, every);
                                 }
 
                                 break;
                             }
 
-                            const ind: u64 = @bitCast(@as(f64, @floatFromInt(i)));
-                            const arg = try self.makeNumber(ind);
+                            const elem_access = try self.factory.createElementAccessExpression(subject, i);
+                            const pred = try self.generateIsExpression(elem_access, el);
 
-                            const p2 = try self.nodes.push(.{
-                                .kind = .element_access_expression,
-                                .data = toBinaryDataPtrRefs(subject,arg),
-                            });
-
-                            const pred = try self.generateIsExpression(p2, el);
-
-                            lhs = try self.binaryExp(lhs, pred, .ampersand_ampersand_token);
+                            lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, pred);
                         }
 
                         return lhs;
@@ -1498,12 +1376,13 @@ pub const Program = struct {
                     },
                     .string_literal => {
                         const s = self.analyzer.getSliceFromLiteral(ty);
-                        return try self.equalsExp(subject, try self.makeString(s));
+                        const rhs = try self.factory.createStringLiteral(s);
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     },
                     .number_literal => {
                         const v = self.analyzer.getDoubleFromType(ty);
-                        const v2: u64 = @bitCast(v);
-                        return try self.equalsExp(subject, try self.makeNumber(v2));
+                        const rhs = try self.factory.createNumericLiteral(v);
+                        return self.factory.createBinaryExpression(subject, .equals_equals_equals_token, rhs);
                     },
                     .object_literal => {
                         // check proto first
@@ -1511,7 +1390,8 @@ pub const Program = struct {
                             try self.generateIsExpression(subject, t.slot3)
                         else blk: {
                             const typeof_check = try self.typeofExp(subject, "object");
-                            break :blk try self.binaryExp(typeof_check, try self.notEqualsExp(subject, try self.nodes.push(.{ .kind = .null_keyword })), .ampersand_ampersand_token);
+                            const null_check = try self.factory.createBinaryExpression(subject, .exclamation_equals_equals_token, try self.factory.createNull());
+                            break :blk try self.factory.createBinaryExpression(typeof_check, .ampersand_ampersand_token, null_check);
                         };
 
                         const members = getSlice2(t, Analyzer.ObjectLiteralMember);
@@ -1521,23 +1401,11 @@ pub const Program = struct {
                             if (self.analyzer.getKindOfRef(u.name) == .symbol_literal) continue; // TODO
 
                             const name = self.analyzer.getSliceFromLiteral(u.name);
-                            const z = try getAllocator().alloc(u8, name.len);
-                            @memcpy(z, name);
-                            const member = try self.nodes.push(.{
-                                .kind = .identifier,
-                                .data = z.ptr,
-                                .len = @intCast(z.len),
-                            });
-
-
-                            const sub = try self.nodes.push(.{
-                                .kind = .property_access_expression,
-                                .data = toBinaryDataPtrRefs(subject, member),
-                            });
+                            const sub = try self.factory.createPropertyAccessExpression(subject, name);
 
                             const q = try self.generateIsExpression(sub, try u.getType(self.analyzer));
 
-                            lhs = try self.binaryExp(lhs, q, .ampersand_ampersand_token);
+                            lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, q);
                         }
 
                         return lhs;
@@ -1590,16 +1458,10 @@ pub const Program = struct {
                             .len = @intCast(pattern.items.len),
                         });
 
-                        const test_access = try self.nodes.push(.{
-                            .kind = .property_access_expression,
-                            .data = toBinaryDataPtrRefs(regex_node, try self.makeIdent("test")),
-                        });
-                        const test_call = try self.nodes.push(.{
-                            .kind = .call_expression,
-                            .data = toBinaryDataPtrRefs(test_access, subject),
-                        });
+                        const test_access = try self.factory.createPropertyAccessExpression(regex_node, "test");
+                        const test_call = try self.factory.createCallExpression(test_access, subject);
 
-                        return try self.binaryExp(typeof_check, test_call, .ampersand_ampersand_token);
+                        return self.factory.createBinaryExpression(typeof_check, .ampersand_ampersand_token, test_call);
                     },
                     else => {},
                     // module_namespace
@@ -1652,6 +1514,64 @@ pub const Program = struct {
                 };
             }
 
+            fn transformCaseBody(self: *@This(), stmts_head: NodeRef) !NodeRef {
+                if (stmts_head == 0) {
+                    return self.factory.createBreakStatement();
+                }
+
+                const first_stmt = self.nodes.at(stmts_head);
+                const is_single_block = first_stmt.kind == .block and first_stmt.next == 0;
+
+                if (is_single_block) {
+                    const block_stmts_head = maybeUnwrapRef(first_stmt) orelse 0;
+
+                    var last_stmt_ref: NodeRef = block_stmts_head;
+                    if (block_stmts_head != 0) {
+                        var stmt_iter = NodeIterator.init(self.nodes, block_stmts_head);
+                        while (stmt_iter.nextRef()) |stmt_ref| {
+                            last_stmt_ref = stmt_ref;
+                        }
+                    }
+
+                    const needs_break = if (block_stmts_head == 0) true else switch (self.nodes.at(last_stmt_ref).kind) {
+                        .break_statement, .return_statement, .throw_statement, .continue_statement => false,
+                        else => true,
+                    };
+
+                    if (needs_break) {
+                        const break_stmt = try self.factory.createBreakStatement();
+                        const last_copy = try self.factory.cloneNode(self.nodes.at(last_stmt_ref));
+                        self.nodes.at(last_copy).next = break_stmt;
+                        try self.addReplacement(last_stmt_ref, last_copy);
+                    }
+                    return stmts_head;
+                }
+
+                var last_stmt_ref: NodeRef = stmts_head;
+                var stmt_iter = NodeIterator.init(self.nodes, stmts_head);
+                while (stmt_iter.nextRef()) |stmt_ref| {
+                    last_stmt_ref = stmt_ref;
+                }
+
+                const last_stmt = self.nodes.at(last_stmt_ref);
+                const needs_break = switch (last_stmt.kind) {
+                    .break_statement, .return_statement, .throw_statement, .continue_statement => false,
+                    else => true,
+                };
+
+                if (!needs_break and last_stmt_ref == stmts_head) {
+                    return stmts_head;
+                }
+
+                if (needs_break) {
+                    const break_stmt = try self.factory.createBreakStatement();
+                    const last_copy = try self.factory.cloneNode(last_stmt);
+                    self.nodes.at(last_copy).next = break_stmt;
+                    try self.addReplacement(last_stmt_ref, last_copy);
+                }
+                return self.factory.createBlock(stmts_head);
+            }
+
             fn unwrapSubject(self: *@This(), ref: NodeRef) NodeRef {
                 const n = self.nodes.at(ref);
                 return switch (n.kind) {
@@ -1699,17 +1619,12 @@ pub const Program = struct {
                         }
 
                         if (emit_entries) {
-                            const clone = try self.nodes.push(n.*);
-                            const e = try self.nodes.push(.{
-                                .kind = .call_expression,
-                                .data = toBinaryDataPtrRefs(
-                                    try self.nodes.push(.{
-                                        .kind = .property_access_expression,
-                                        .data = toBinaryDataPtrRefs(try self.makeIdent("Object"), try self.makeIdent("entries")),
-                                    }),
-                                    r,
-                                ),
-                            });
+                            const clone = try self.factory.cloneNode(n);
+                            const entries_access = try self.factory.createPropertyAccessExpression(
+                                try self.factory.createIdentifier("Object"),
+                                "entries"
+                            );
+                            const e = try self.factory.createCallExpression(entries_access, r);
                             self.nodes.at(clone).data = toBinaryDataPtrRefs(getPackedData(n).left, e);
                             try self.replacements.put(ref, clone);
                         }
@@ -1728,26 +1643,100 @@ pub const Program = struct {
                         const inner_ref = unwrapRef(n);
                         const inner = self.nodes.at(inner_ref);
                         if (inner.kind != .string_literal and inner.kind != .template_expression and inner.kind != .no_substitution_template_literal) {
-                            return try parser.forEachChild(self.nodes, n, self);  
+                            return try parser.forEachChild(self.nodes, n, self);
                         }
 
-                        const z = try getAllocator().alloc(u8, "Error".len);
-                        @memcpy(z, "Error");
-                        const ident = try self.nodes.push(.{
-                            .kind = .identifier,
-                            .data = z.ptr,
-                            .len = @intCast(z.len),
-                        });
-
-                        const n2 = try self.nodes.push(.{
-                            .kind = .new_expression,
-                            .data = toBinaryDataPtrRefs(ident, inner_ref),
-                        });
+                        const ident = try self.factory.createIdentifier("Error");
+                        const n2 = try self.factory.createNewExpression(ident, inner_ref);
 
                         const n3 = try self.nodes.push(n.*);
                         self.nodes.at(n3).data = @ptrFromInt(n2);
 
                         try self.replacements.put(ref, n3);
+                    },
+                    .catch_clause => {
+                        const d = getPackedData(n);
+                        const var_decl_ref = d.left;
+                        const block_ref = d.right;
+
+                        if (var_decl_ref == 0) {
+                            return try parser.forEachChild(self.nodes, n, self);
+                        }
+
+                        const var_decl = self.nodes.at(var_decl_ref);
+                        const var_name_ref = getPackedData(var_decl).left;
+                        const type_annotation_ref = var_decl.len;
+
+                        const Mode = enum { coerce, passthrough, guard };
+                        var mode: Mode = .coerce; //no annotation = coerce
+
+                        if (type_annotation_ref != 0) {
+                            const ty = try self.analyzer.getType(self.file, type_annotation_ref);
+                            if (ty == @intFromEnum(Kind.unknown) or ty == @intFromEnum(Kind.any)) {
+                                mode = .passthrough;
+                            } else {
+                                mode = .guard;
+                            }
+                        }
+
+                        if (mode == .passthrough) {
+                            return try parser.forEachChild(self.nodes, n, self);
+                        }
+
+                        const orig_block = self.nodes.at(block_ref);
+                        const orig_stmts_head = maybeUnwrapRef(orig_block) orelse 0;
+
+                        const var_name = getSlice(self.nodes.at(var_name_ref), u8);
+
+                        const guard_stmt = if (mode == .coerce) blk: {
+                            const var_ident = try self.factory.createIdentifier(var_name);
+                            const error_ident = try self.factory.createIdentifier("Error");
+
+                            const instanceof_check = try self.factory.createBinaryExpression(var_ident, .instance_of_keyword, error_ident);
+
+                            // !(e instanceof Error)
+                            const not_instanceof = try self.factory.createPrefixUnaryExpression(.exclamation_token, try self.factory.createParenthesizedExpression(instanceof_check));
+
+                            // String(e)
+                            const string_ident = try self.factory.createIdentifier("String");
+                            const var_ident2 = try self.factory.createIdentifier(var_name);
+                            const string_call = try self.factory.createCallExpression(string_ident, var_ident2);
+
+                            // e = new Error(String(e))
+                            const error_ident2 = try self.factory.createIdentifier("Error");
+                            const new_error = try self.factory.createNewExpression(error_ident2, string_call);
+
+                            const var_ident3 = try self.factory.createIdentifier(var_name);
+                            const assignment = try self.factory.createBinaryExpression(var_ident3, .equals_token, new_error);
+                            const assign_stmt = try self.factory.createExpressionStatement(assignment);
+
+                            // if (!(e instanceof Error)) e = new Error(String(e))
+                            break :blk try self.factory.createIfStatement(not_instanceof, assign_stmt, 0);
+                        } else blk: {
+                            const ty = try self.analyzer.getType(self.file, type_annotation_ref);
+                            const var_ident = try self.factory.createIdentifier(var_name);
+
+                            const is_check = try self.generateIsExpression(var_ident, ty);
+
+                            const not_is = try self.factory.createPrefixUnaryExpression(.exclamation_token, try self.factory.createParenthesizedExpression(is_check));
+
+                            const var_ident2 = try self.factory.createIdentifier(var_name);
+                            const throw_stmt = try self.factory.createThrowStatement(var_ident2);
+
+                            // if (!(e is T)) throw e
+                            break :blk try self.factory.createIfStatement(not_is, throw_stmt, 0);
+                        };
+
+                        self.nodes.at(guard_stmt).next = orig_stmts_head;
+
+                        const new_block = try self.factory.createBlock(guard_stmt);
+
+                        const new_var_decl = try self.factory.createVariableDeclarationSimple(var_name_ref, 0);
+
+                        const new_catch = try self.factory.createCatchClause(new_var_decl, new_block);
+                        try self.addReplacement(ref, new_catch);
+
+                        try parser.forEachChild(self.nodes, n, self);
                     },
                     .is_expression => {
                         const d = getPackedData(n);
@@ -1757,25 +1746,18 @@ pub const Program = struct {
                             const sub = self.unwrapSubject(d.left);
 
                             const n2 = try self.generateIsExpression(sub, r);
-                            try self.replacements.put(ref, try self.nodes.push(.{
-                                .kind = .parenthesized_expression,
-                                .data = @ptrFromInt(n2),
-                            }));
+                            try self.replacements.put(ref, try self.factory.createParenthesizedExpression(n2));
                             return;
                         }
 
                         var r = try self.analyzer.getType(self.file, d.right);
                         if (l == r) {
-                            try self.replacements.put(ref, try self.nodes.push(.{
-                                .kind = .true_keyword,
-                            }));
+                            try self.replacements.put(ref, try self.factory.createTrue());
                             return;
                         }
 
                         if (!try self.analyzer.isAssignableTo(r, l)) {
-                            try self.replacements.put(ref, try self.nodes.push(.{
-                                .kind = .false_keyword,
-                            }));
+                            try self.replacements.put(ref, try self.factory.createFalse());
                             return;
                         }
 
@@ -1793,9 +1775,7 @@ pub const Program = struct {
                             const nt = try self.analyzer.excludeType(l, r);
 
                             if (nt == l) {
-                                try self.replacements.put(ref, try self.nodes.push(.{
-                                    .kind = .false_keyword,
-                                }));
+                                try self.replacements.put(ref, try self.factory.createFalse());
                                 return;
                             }
 
@@ -1803,32 +1783,19 @@ pub const Program = struct {
                                 const sub = self.unwrapSubject(d.left);
                                 const at = try self.analyzer.accessType(r, key);
                                 const s = self.analyzer.getSliceFromLiteral(key);
-                                const prop_node = try self.nodes.push(.{
-                                    .kind = .property_access_expression,
-                                    .data = toBinaryDataPtrRefs(sub, try self.makeIdent(s)),
-                                });
+                                const prop_node = try self.factory.createPropertyAccessExpression(sub, s);
                                 const n2 = try self.generateIsExpression(prop_node, at);
-                                const n3 = try self.nodes.push(.{
-                                    .kind = .parenthesized_expression,
-                                    .data = @ptrFromInt(n2),
-                                });
-                                try self.replacements.put(ref, n3);
+                                try self.replacements.put(ref, try self.factory.createParenthesizedExpression(n2));
                                 return;
                             }
-                            
+
                             // TODO: add complexity heuristic
                             if (self.analyzer.getKindOfRef(nt) != .@"union") {
                                 const sub = self.unwrapSubject(d.left);
 
                                 const n2 = try self.generateIsExpression(sub, nt);
-                                const n3 = try self.nodes.push(.{
-                                    .kind = .parenthesized_expression,
-                                    .data = @ptrFromInt(n2),
-                                });
-                                try self.replacements.put(ref, try self.nodes.push(.{
-                                    .kind = .prefix_unary_expression,
-                                    .data = toBinaryDataPtrRefs(@intFromEnum(SyntaxKind.exclamation_token), n3),
-                                }));
+                                const n3 = try self.factory.createParenthesizedExpression(n2);
+                                try self.replacements.put(ref, try self.factory.createPrefixUnaryExpression(.exclamation_token, n3));
                                 return;
                             }
                         }
@@ -1836,10 +1803,7 @@ pub const Program = struct {
                         const sub = self.unwrapSubject(d.left);
 
                         const n2 = try self.generateIsExpression(sub, r);
-                        try self.replacements.put(ref, try self.nodes.push(.{
-                            .kind = .parenthesized_expression,
-                            .data = @ptrFromInt(n2),
-                        }));
+                        try self.replacements.put(ref, try self.factory.createParenthesizedExpression(n2));
                     },
                     .binary_expression => {
                         const operator = n.len;
@@ -1877,15 +1841,167 @@ pub const Program = struct {
                         const t = try self.analyzer.getType(self.file, ref);
                         const u = try self.analyzer.maybeUnwrapPromise(t);
                         if (t != u) {
-                            const copy = try self.nodes.push(n.*);
-                            const n2 = try self.nodes.push(.{
-                                .kind = .await_expression,
-                                .data = @ptrFromInt(copy),
-                            });
+                            const copy = try self.factory.cloneNode(n);
+                            const n2 = try self.factory.createAwaitExpression(copy);
                             try self.replacements.put(ref, n2);
                         }
 
                         return try parser.forEachChild(self.nodes, n, self);
+                    },
+                    .switch_statement => {
+                        const d = getPackedData(n);
+                        const expr_ref = d.left;
+                        const clauses_head = d.right;
+
+                        var lifted_stmt: ?NodeRef = null;
+                        var switch_subject_ref = expr_ref;
+
+                        const expr_node = self.nodes.at(expr_ref);
+                        if (expr_node.kind == .variable_statement) {
+                            // TODO: handle name collisions
+                            lifted_stmt = expr_ref;
+
+                            const decl_head = unwrapRef(expr_node);
+                            const decl = self.nodes.at(decl_head);
+                            const decl_name = getPackedData(decl).left;
+                            switch_subject_ref = decl_name;
+                        }
+
+                        var has_case_is = false;
+                        {
+                            var check_iter = NodeIterator.init(self.nodes, clauses_head);
+                            while (check_iter.next()) |clause| {
+                                if (clause.kind == .case_clause and clause.hasFlag(.declare)) {
+                                    has_case_is = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        var switch_init_stmt: ?NodeRef = null;
+                        var new_expr_ref = switch_subject_ref;
+
+                        if (has_case_is) {
+                            var case_index: u32 = 0;
+                            var default_index: ?u32 = null;
+
+                            {
+                                var count_iter = NodeIterator.init(self.nodes, clauses_head);
+                                while (count_iter.next()) |clause| {
+                                    if (clause.kind == .default_clause) {
+                                        default_index = case_index;
+                                    }
+                                    case_index += 1;
+                                }
+                            }
+
+                            var cond_expr = if (default_index) |idx|
+                                try self.factory.createNumericLiteral(idx)
+                            else
+                                try self.factory.createNumericLiteral(@as(i64, -1));
+
+                            var case_idx: i32 = @intCast(case_index);
+                            case_idx -= 1;
+
+                            var clause_refs: [64]NodeRef = undefined; // TODO: dynamic allocation
+                            var clause_count: usize = 0;
+                            {
+                                var collect_iter = NodeIterator.init(self.nodes, clauses_head);
+                                while (collect_iter.nextRef()) |cref| {
+                                    clause_refs[clause_count] = cref;
+                                    clause_count += 1;
+                                }
+                            }
+
+                            while (case_idx >= 0) : (case_idx -= 1) {
+                                const idx: usize = @intCast(case_idx);
+                                const clause = self.nodes.at(clause_refs[idx]);
+
+                                if (clause.kind == .default_clause) continue;
+
+                                const case_num = try self.factory.createNumericLiteral(idx);
+
+                                const condition = if (clause.hasFlag(.declare)) blk: {
+                                    const type_ref = unwrapRef(clause);
+                                    const ty = try self.analyzer.getType(self.file, type_ref);
+                                    break :blk try self.generateIsExpression(switch_subject_ref, ty);
+                                } else blk: {
+                                    const case_expr = unwrapRef(clause);
+                                    break :blk try self.factory.createBinaryExpression(switch_subject_ref, .equals_equals_equals_token, case_expr);
+                                };
+
+                                cond_expr = try self.factory.createConditionalExpression(condition, case_num, cond_expr);
+                            }
+
+                            const switch_ident = try self.factory.createIdentifier("__switch");
+                            const switch_decl = try self.factory.createVariableDeclarationSimple(switch_ident, cond_expr);
+                            switch_init_stmt = try self.factory.createVariableStatement(switch_decl, @intFromEnum(NodeFlags.@"const"));
+
+                            new_expr_ref = try self.factory.createIdentifier("__switch");
+                        }
+
+                        var new_clauses_head: NodeRef = 0;
+                        var new_clauses_tail: NodeRef = 0;
+                        var case_index: u32 = 0;
+
+                        var clause_iter = NodeIterator.init(self.nodes, clauses_head);
+                        while (clause_iter.nextRef()) |clause_ref| {
+                            const clause = self.nodes.at(clause_ref);
+                            const stmts_head = clause.len;
+
+                            const is_empty = stmts_head == 0;
+                            const has_next_clause = clause.next != 0;
+
+                            var new_clause_ref: NodeRef = undefined;
+
+                            if (is_empty and has_next_clause) {
+                                if (has_case_is and clause.kind == .case_clause) {
+                                    new_clause_ref = try self.factory.createCaseClause(try self.factory.createNumericLiteral(case_index), 0);
+                                } else {
+                                    new_clause_ref = try self.factory.cloneNode(clause);
+                                }
+                            } else {
+                                const block_ref = try self.transformCaseBody(stmts_head);
+
+                                if (clause.kind == .default_clause) {
+                                    new_clause_ref = try self.factory.createDefaultClause(block_ref);
+                                } else if (has_case_is) {
+                                    new_clause_ref = try self.factory.createCaseClause(try self.factory.createNumericLiteral(case_index), block_ref);
+                                } else {
+                                    const case_expr = unwrapRef(clause);
+                                    new_clause_ref = try self.factory.createCaseClause(case_expr, block_ref);
+                                }
+                            }
+
+                            case_index += 1;
+
+                            if (new_clauses_head == 0) {
+                                new_clauses_head = new_clause_ref;
+                            } else {
+                                self.nodes.at(new_clauses_tail).next = new_clause_ref;
+                            }
+                            new_clauses_tail = new_clause_ref;
+                        }
+
+                        const new_switch = try self.factory.createSwitchStatement(new_expr_ref, new_clauses_head);
+                        self.nodes.at(new_switch).next = n.next;
+
+                        var result_head = new_switch;
+
+                        if (switch_init_stmt) |init_stmt| {
+                            self.nodes.at(init_stmt).next = new_switch;
+                            result_head = init_stmt;
+                        }
+
+                        if (lifted_stmt) |stmt_ref| {
+                            const cloned_stmt = try self.factory.cloneNode(self.nodes.at(stmt_ref));
+                            self.nodes.at(cloned_stmt).next = result_head;
+                            result_head = cloned_stmt;
+                        }
+
+                        try self.replacements.put(ref, result_head);
+
+                        try parser.forEachChild(self.nodes, n, self);
                     },
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
@@ -1895,8 +2011,15 @@ pub const Program = struct {
         };
 
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
+        var factory = parser.Factory{ .nodes = &f.ast.nodes };
         const a = try this.getTypeChecker();
-        var v = Visitor{ .analyzer = a, .file = f, .nodes = &f.ast.nodes, .replacements = &r };
+        var v = Visitor{ 
+            .analyzer = a, 
+            .file = f, 
+            .nodes = &f.ast.nodes,
+            .factory = &factory,
+            .replacements = &r,
+        };
         try v.visit(f.ast.nodes.at(start), start);
 
         return r;
@@ -6140,8 +6263,15 @@ pub const Analyzer = struct {
                         const d = getPackedData(s);
                         const switch_expr = self.file.ast.nodes.at(d.left);
 
-                        // For now, only handle switching over an identifier
-                        if (switch_expr.kind != .identifier) {
+                        var subject: SymbolRef = 0;
+                        var switch_type: TypeRef = 0;
+
+                        if (switch_expr.kind == .variable_statement) {
+                            try self.visitVariableStatement(switch_expr);
+                            const decl = self.file.ast.nodes.at(unwrapRef(switch_expr));
+                            subject = self.file.binder.getSymbol(getPackedData(decl).left) orelse continue;
+                            switch_type = self.current_flow.types.get(subject) orelse try self.visitExpression(getPackedData(decl).right);
+                        } else if (switch_expr.kind != .identifier) {
                             var clause_iter = NodeIterator.init(&self.file.ast.nodes, d.right);
                             while (clause_iter.next()) |clause| {
                                 if (clause.len != 0) {
@@ -6149,10 +6279,10 @@ pub const Analyzer = struct {
                                 }
                             }
                             continue;
+                        } else {
+                            subject = self.file.binder.getSymbol(d.left) orelse continue;
+                            switch_type = try self.getFlowType(d.left, subject);
                         }
-
-                        const sym = self.file.binder.getSymbol(d.left) orelse continue;
-                        const switch_type = try self.getFlowType(d.left, sym);
 
                         const join_label = try self.createLabel();
                         join_label.ref();
@@ -6179,10 +6309,10 @@ pub const Analyzer = struct {
                                     remaining_type = try self.analyzer.excludeType(remaining_type, group_type);
                                     const l2 = try self.createLabel();
                                     try current_label.addAntecedent(self.analyzer.allocator(), l2);
-                                    try l2.types.put(self.analyzer.allocator(), sym, group_type);
+                                    try l2.types.put(self.analyzer.allocator(), subject, group_type);
                                     case_types = TempUnion.init(self.analyzer.allocator());
                                 }
-                                try current_label.types.put(self.analyzer.allocator(), sym, remaining_type);
+                                try current_label.types.put(self.analyzer.allocator(), subject, remaining_type);
                             } else {
                                 const case_expr_ref = unwrapRef(clause);
                                 const case_type = try self.analyzer.getTypeAsConst(self.file, case_expr_ref);
@@ -6196,7 +6326,7 @@ pub const Analyzer = struct {
                                 remaining_type = try self.analyzer.excludeType(remaining_type, group_type);
                                 const l2 = try self.createLabel();
                                 try current_label.addAntecedent(self.analyzer.allocator(), l2);
-                                try l2.types.put(self.analyzer.allocator(), sym, group_type);     
+                                try l2.types.put(self.analyzer.allocator(), subject, group_type);     
                                 case_types = TempUnion.init(self.analyzer.allocator());
                             }
 
@@ -6229,18 +6359,22 @@ pub const Analyzer = struct {
                             try join_label.antecedents.append(self.analyzer.allocator(), current_label);
                         }
 
+                        if (switch_expr.kind == .variable_statement) {
+                            _ = self.current_flow.types.swapRemove(subject);
+                        }
+
                         self.break_target = prev_break_target;
                         const is_exhaustive = remaining_type == @intFromEnum(Kind.never);
                         if (is_exhaustive and all_terminal and join_label.antecedents.items.len == 0) {
                             self.current_flow.terminal = true;
-                            try self.current_flow.types.put(self.analyzer.allocator(), sym, remaining_type);
+                            try self.current_flow.types.put(self.analyzer.allocator(), subject, remaining_type);
                             continue;
                         }
 
                         if (!has_default and !is_exhaustive) {
                             const l2 = try self.createLabel();
                             try join_label.addAntecedent(self.analyzer.allocator(), l2);
-                            try l2.types.put(self.analyzer.allocator(), sym, remaining_type);
+                            try l2.types.put(self.analyzer.allocator(), subject, remaining_type);
                             all_terminal = false;
                         }
 
@@ -6274,24 +6408,7 @@ pub const Analyzer = struct {
                     .class_declaration => {},
 
                     .variable_statement => {
-                        const is_const = s.hasFlag(.@"const");
-                        var decls = NodeIterator.init(&self.file.ast.nodes, maybeUnwrapRef(s) orelse continue);
-                        while (decls.next()) |decl| {
-                            const d = getPackedData(decl);
-
-                            const sym = self.file.binder.getSymbol(d.left) orelse continue;
-                            if (self.current_symbols) |m| {
-                                try m.put(self.analyzer.allocator(), sym, {});
-                            }
-
-                            // Respect the annotated type, do not try to narrow
-                            if (is_const and decl.len != 0) continue;
-
-                            if (d.right == 0) continue;
-
-                            const init_type = try self.visitExpression(d.right);
-                            try self.current_flow.types.put(self.analyzer.allocator(), sym, init_type);
-                        }
+                        try self.visitVariableStatement(s);
                     },
 
                     .expression_statement => {
@@ -6301,6 +6418,27 @@ pub const Analyzer = struct {
                     },
                     else => {},
                 }
+            }
+        }
+
+        fn visitVariableStatement(self: *@This(), s: *const AstNode) !void {
+            const is_const = s.hasFlag(.@"const");
+            var decls = NodeIterator.init(&self.file.ast.nodes, unwrapRef(s));
+            while (decls.next()) |decl| {
+                const d = getPackedData(decl);
+
+                const sym = self.file.binder.getSymbol(d.left) orelse continue;
+                if (self.current_symbols) |m| {
+                    try m.put(self.analyzer.allocator(), sym, {});
+                }
+
+                // Respect the annotated type, do not try to narrow
+                if (is_const and decl.len != 0) continue;
+
+                if (d.right == 0) continue;
+
+                const init_type = try self.visitExpression(d.right);
+                try self.current_flow.types.put(self.analyzer.allocator(), sym, init_type);
             }
         }
 
@@ -12057,6 +12195,13 @@ pub const Analyzer = struct {
         return try this.accessType(gt, et);
     }
 
+    fn getGlobalType(this: *@This(), comptime name: []const u8, args: TypeList) !?TypeRef {
+        const g_ref = this.program.ambient.getGlobalTypeSymbolRef(name) orelse return null;
+
+        return try this.createCanonicalAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
+    }
+
+    // Prefer `getGlobalType` for types aligned with what user code sees
     fn getGlobalTypeSymbolAlias(this: *@This(), comptime name: []const u8, args: TypeList) !?TypeRef {
         const g = this.program.ambient.getGlobalTypeSymbol(name) orelse return null;
         if (g.symbols.items.len == 1) {

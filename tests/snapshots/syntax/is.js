@@ -1,5 +1,6 @@
 // @filename: main.syn
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.f = f;
 const x = null
 {
   const v = {
@@ -32,7 +33,7 @@ const x = null
 {
   const x = ''
   function __is0(x) {
-    return typeof x === 'object' && x !== null && typeof x.x === 'string' && typeof x.y === 'string' && typeof x.z === 'string'
+    return typeof x === 'object' && x !== null && typeof x.y === 'string' && typeof x.x === 'string' && typeof x.z === 'string'
   }
   if ((__is0(x))) {}
 }
@@ -47,7 +48,7 @@ const x = null
 }
 {
   function __is2(x) {
-    return typeof x === 'object' && x !== null && typeof x.z === 'number' && typeof x.x === 'number' && typeof x.y === 'number'
+    return typeof x === 'object' && x !== null && typeof x.y === 'number' && typeof x.z === 'number' && typeof x.x === 'number'
   }
   ;((Array.isArray(x) && x.every((el) => __is2(el))) || (__is2(x)));
 }
@@ -61,4 +62,43 @@ const x = null
   X[X["b"] = 1] = "b"
   ;((x === 0) || (x === 1));
   ;(x === 0);
+}
+{
+  const x2 = x
+  const __switch = typeof x2 === 'object' && x2 !== null && typeof x2.y === 'number' ? 0 : x2 === 0 ? 1 : x2 === 1 ? 2 : x2 === 2 ? 3 : x2 === 3 ? 4 : x2 === 4 ? 5 : -1
+  switch (__switch) {
+    case 0: 
+      throw x2.y
+    case 1: 
+    case 2: {
+      x2;
+      break
+    }
+    case 3: 
+      throw x2
+    case 4: 
+      break
+    case 5: {
+      break
+    }
+  }
+}
+function f(cb) {
+  const x = cb()
+  const __switch = typeof x === 'object' && x !== null && typeof x.y === 'number' ? 0 : typeof x === 'object' && x !== null && typeof x.z === 'string' ? 1 : -1
+  switch (__switch) {
+    case 0: 
+      return x.y
+    case 1: 
+      return x.z
+  }
+}
+{
+  function __is3(x) {
+    return typeof x === 'object' && x !== null && (x.parent === null) || (__is3(x.parent)) && typeof x.id === 'number' && typeof x.code === 'string' && typeof x.name === 'string' && typeof x.sequence === 'number' && __is4(x.created_at)
+  }
+  function __is4(x) {
+    return typeof x === 'object' && x !== null && typeof x.time === 'number' && typeof x.zone === 'number'
+  }
+  ;(__is3(x));
 }
