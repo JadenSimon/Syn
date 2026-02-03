@@ -7,7 +7,7 @@ const x = null
     kind: 'b',
     data: 'hi'
   }
-  if ((typeof v.data === 'string')) {}
+  if (v.kind === 'b') {}
 }
 {
   const x = ['']
@@ -48,7 +48,7 @@ const x = null
 }
 {
   function __is2(x) {
-    return typeof x === 'object' && x !== null && typeof x.y === 'number' && typeof x.z === 'number' && typeof x.x === 'number'
+    return typeof x === 'object' && x !== null && typeof x.z === 'number' && typeof x.y === 'number' && typeof x.x === 'number'
   }
   ;((Array.isArray(x) && x.every((el) => __is2(el))) || (__is2(x)));
 }
@@ -101,4 +101,18 @@ function f(cb) {
     return typeof x === 'object' && x !== null && typeof x.time === 'number' && typeof x.zone === 'number'
   }
   ;(__is3(x));
+}
+{
+  function __is7(x) {
+    return typeof x === 'object' && x !== null && x.kind === 'a' && typeof x.data === 'number'
+  }
+  function __is6(x) {
+    return typeof x === 'object' && x !== null && x.kind === 'b' && typeof x.data === 'string'
+  }
+  function __is5(x) {
+    return typeof x === 'object' && x !== null && x.kind === 'c'
+  }
+  if (((__is5(x)) || (__is6(x)) || (__is7(x)))) {
+    if (x.kind === 'c') {}
+  }
 }
