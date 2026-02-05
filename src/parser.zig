@@ -1028,6 +1028,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             if (lexer.source.name) |x| {
                 if (strings.endsWithComptime(x, ".syn")) {
                     this.options.is_syn = true;
+                    this.options.allow_jsx = true;
                 }
             }
 
@@ -1866,8 +1867,18 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.lexer.next();
             }
             if (this.lexer.token == .t_identifier) {
+                const ident = this.lexer.identifier;
+
+                // Syn does not allow JSX components with individual capital letters
+                if (ident.len == 1 and this.options.is_syn) {
+                    switch (ident[0]) {
+                        'A'...'Z' => return true,
+                        else => {},
+                    }
+                }
+
                 try this.lexer.next();
-                if (this.lexer.token == .t_comma) {
+                if (this.lexer.token == .t_comma or this.lexer.token == .t_equals) {
                     return true;
                 } else if (this.lexer.token == .t_extends) {
                     try this.lexer.next();
@@ -3335,10 +3346,9 @@ fn Parser_(comptime skip_trivia: bool) type {
             return this.parseJSXElement();
         }
 
-        // Could also be a type assertion
         fn parseArrowFnOrJSX(this: *@This()) !AstNode_ {
-            if (!this.options.allow_jsx or try this.isTSArrowFnJSX()) {
-                // TODO: this doesn't support type assertions like <T>foo
+            if (!this.options.allow_jsx or (this.isTSArrowFnJSX() catch false)) {
+                // we don't support legacy type assertions e.g. <T>foo
                 return this.parseArrowFn(this.lexer.full_start, 0);
             }
 

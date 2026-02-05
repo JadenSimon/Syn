@@ -854,15 +854,16 @@ pub const Program = struct {
     fn doTopLevelCfa(this: *@This(), f: *ParsedFileData, start: NodeRef) !void {
         if (!f.did_top_level_cfa) {
             f.did_top_level_cfa = true;
+            if (f.is_declaration) return;
 
             const analyzer = try this.getTypeChecker();
             const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
 
             if (first_statement != 0) {
-                var flow = try analyzer.allocator().create(Analyzer.FlowTyper);
-                flow.* = Analyzer.FlowTyper.init(analyzer, f);
-                analyzer.current_flow = flow;
-                try flow.visitModule(first_statement);
+                std.debug.assert(f.flow == null);
+                f.flow = try analyzer.allocator().create(Analyzer.FlowTyper);
+                f.flow.?.* = Analyzer.FlowTyper.init(analyzer, f);
+                try f.flow.?.visitModule(first_statement);
             }
         }
     }
@@ -1038,6 +1039,31 @@ pub const Program = struct {
                 return self.factory.createBinaryExpression(lhs, .equals_equals_equals_token, rhs);
             }
 
+            fn maybeAddLogicalParens(self: *@This(), ref: NodeRef, comptime operator: SyntaxKind) !NodeRef { 
+                const n = self.nodes.at(ref);
+                if (n.kind != .binary_expression) return ref;
+                
+                switch (@as(SyntaxKind, @enumFromInt(n.len))) {
+                    .bar_bar_token,
+                    .question_question_token,
+                    .ampersand_ampersand_token => |other| {
+                        if (other == operator) {
+                            return ref;
+                        }
+                        return self.factory.createParenthesizedExpression(ref);
+                    },
+                    else => return ref,
+                }
+            }
+
+            fn binaryExpWithParens(self: *@This(), left: NodeRef, comptime operator: SyntaxKind, right: NodeRef) !NodeRef {
+                return self.factory.createBinaryExpression(
+                    try self.maybeAddLogicalParens(left, operator),
+                    operator,
+                    try self.maybeAddLogicalParens(right, operator),
+                );
+            }
+
             fn appendEscapedRegex(_: *@This(), pattern: *std.ArrayList(u8), text: []const u8) !void {
                 for (text) |c| {
                     switch (c) {
@@ -1122,15 +1148,15 @@ pub const Program = struct {
             }
 
             fn generateUnionCheck(self: *@This(), subject: NodeRef, elements: []const TypeRef) !NodeRef {
-                var lhs: u32 = try self.factory.createParenthesizedExpression(
-                    try self.generateIsExpression(subject, elements[0])
-                );
+                // TODO: unions need to be sorted
+                // we should check tuples -> array -> objects
+
+
+                var lhs: u32 = try self.generateIsExpression(subject, elements[0]);
 
                 for (1..elements.len) |i| {
-                    const n = try self.factory.createParenthesizedExpression(
-                        try self.generateIsExpression(subject, elements[i])
-                    );
-                    lhs = try self.factory.createBinaryExpression(lhs, .bar_bar_token, n);
+                    const n = try self.generateIsExpression(subject, elements[i]);
+                    lhs = try self.binaryExpWithParens(lhs, .bar_bar_token, n);
                 }
 
                 return lhs;
@@ -1152,7 +1178,7 @@ pub const Program = struct {
                     if (lhs == 0) {
                         lhs = q;
                     } else {
-                        lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, q);
+                        lhs = try self.binaryExpWithParens(lhs, .ampersand_ampersand_token, q);
                     }
                 }
 
@@ -1422,7 +1448,7 @@ pub const Program = struct {
                         const members = getSlice2(t, Analyzer.ObjectLiteralMember);
                         const rhs = try self.generateObjectCheck(subject, members);
                         if (rhs != 0) {
-                            lhs = try self.factory.createBinaryExpression(lhs, .ampersand_ampersand_token, rhs);
+                            lhs = try self.binaryExpWithParens(lhs, .ampersand_ampersand_token, rhs);
                         }
 
                         return lhs;
@@ -2762,7 +2788,7 @@ const ModuleLinkage = struct {
 pub const ParsedFileData = struct {
     const CachedSymbolTypes = std.AutoArrayHashMapUnmanaged(parser.SymbolRef, Analyzer.TypeRef);
     const CachedFlowTypes = std.AutoArrayHashMapUnmanaged(parser.SymbolRef, Analyzer.TypeRef);
-    const Errors = std.ArrayListUnmanaged(FileDiagnostic);
+    const Diagnostics = std.ArrayListUnmanaged(FileDiagnostic);
 
     id: FileRef = 0,
     file_name: ?[]const u8 = null,
@@ -2788,11 +2814,10 @@ pub const ParsedFileData = struct {
     unresolved_imports: std.ArrayList(u64),
     linkage: *ModuleLinkage,
 
-    cfa_state: std.ArrayList(*CFAState),
+    flow: ?*Analyzer.FlowTyper = null,
 
-    // Used for semantic errors, e.g. `break` without being in a breakable context
-    // Exits without a flow label discard the environment i.e. assume it worked
-    errors: Errors = .{},
+    // Used for semantic issues, e.g. `break` without being in a breakable context
+    diagnostics: Diagnostics = .{},
 
     pub fn init(_allocator: std.mem.Allocator, ast: parser.AstData, binder: *const parser.Binder, linkage: *ModuleLinkage) @This() {
         return .{
@@ -2800,7 +2825,6 @@ pub const ParsedFileData = struct {
             .binder = binder,
             .import_map = std.AutoArrayHashMap(u64, FileRef).init(_allocator),
             .unresolved_imports = std.ArrayList(u64).init(_allocator),
-            .cfa_state = std.ArrayList(*CFAState).init(_allocator),
             .linkage = linkage,
         };
     }
@@ -2814,8 +2838,17 @@ pub const ParsedFileData = struct {
         var this = @This().init(getAllocator(), file.ast, &file.binder, linkage);
         this.file_name = file.source_name;
         this.is_lib = file.is_lib;
+        this.did_top_level_cfa = file.is_lib;
 
         return this;
+    }
+
+    pub fn emitError(this: *@This(), node_ref: NodeRef, message: []const u8) !void {
+        const s = try this.import_map.allocator.dupe(u8, message);
+        try this.diagnostics.append(this.import_map.allocator, .{
+            .node_ref = node_ref,
+            .message = s,
+        });
     }
 };
 
@@ -2873,93 +2906,7 @@ const Ambient = struct {
     }
 };
 
-// CFA operates over subroutines (Module, Function, etc.)
-// Narrowing from CFA _can_ transfer to arrow functions and class/function expressions
-// But it won't transfer for function/class declarations due to hoisting
-//
-// Certain things will cause CFA to be "lost" for a given non-constant symbol:
-// * yield
-// * await (this is practically a yield afterall)
-// * new/call expressions
-//
-// This is only true if the symbol is truly mutable w.r.t the yield point. A locally
-// mutable symbol is effectively constant when yielding.
-
-// TypeScript doesn't track implications e.g.
-//
-// function f(x: unknown, y: unknown) {
-//     if (typeof x === 'number' || typeof y === 'string') {
-//         if (typeof y === 'string') return;
-//         x // TSC shows `unknown`
-//     }
-// }
-//
-// Another example:
-//
-// declare function t(): never
-// function f(x: string | number) {
-//     typeof x === 'number' ? x : t()
-//     x // `string | number`
-// }
-
-// Assignments under a type narrowing exclude the narrowed type for subsequent analysis:
-//
-// function f(x: 'purple' | number) {
-//     if (x === 'purple') x = 1;
-//     x // `number`
-// }
-//
-// Assignments seem to reset the type back to the declaration if the type was narrowed under assertion.
-// We don't need to replicate this behavior.
-
 const is_debug = @import("builtin").mode == .Debug;
-
-const CFAState = struct {
-    const TypeRef = Analyzer.TypeRef;
-
-    iter: NodeIterator,
-    types: std.AutoArrayHashMap(SymbolRef, TypeRef),
-    termination_types: std.AutoArrayHashMap(SymbolRef, TypeRef), // Types that should be used if we do terminate execution
-    continuation_types: std.AutoArrayHashMap(SymbolRef, TypeRef), // Types that should be used if we do not terminate execution
-    is_unconditional: bool = true, // Type narrowing during unconditional execution is applied to the prior state
-    is_branch: bool = false,
-    is_expression: bool = false,
-
-    branch: ?NodeRef = null,
-    branch_continuation_types: ?std.AutoArrayHashMap(SymbolRef, std.ArrayList(TypeRef)) = null,
-    tmp_types: ?std.AutoArrayHashMap(SymbolRef, TypeRef) = null,
-    tmp_start: ?NodeRef = null,
-    switch_subject: ?NodeRef = null,
-
-    pub fn init(alloc: std.mem.Allocator, iter: NodeIterator) !*@This() {
-        var p = try alloc.create(@This());
-        p.iter = iter;
-        p.types = std.AutoArrayHashMap(SymbolRef, TypeRef).init(alloc);
-        p.termination_types = std.AutoArrayHashMap(SymbolRef, TypeRef).init(alloc);
-        p.continuation_types = std.AutoArrayHashMap(SymbolRef, TypeRef).init(alloc);
-        p.is_unconditional = true;
-        p.is_branch = false;
-        p.is_expression = false;
-        p.branch = null;
-        p.branch_continuation_types = null;
-        p.tmp_types = null;
-        p.tmp_start = null;
-        p.switch_subject = null;        
-
-        return p;
-    }
-
-    pub fn deinit(this: *@This()) void {
-        const a = this.types.allocator;
-        this.types.deinit();
-        this.termination_types.deinit();
-        this.continuation_types.deinit();
-        // if (this.branch_continuation_types) |b| {
-        //     b.deinit();
-        // }
-        a.destroy(this);
-    }
-};
 
 pub const Analyzer = struct {
     pub const Kind = enum(u32) {
@@ -3219,7 +3166,6 @@ pub const Analyzer = struct {
 
     current_node: if (is_debug) ?struct { *ParsedFileData, NodeRef } else void = if (is_debug) null else {},
    
-    current_flow: ?*FlowTyper = null,
     label_pool: std.heap.MemoryPool(FlowTyper.Label),
 
 
@@ -5539,26 +5485,6 @@ pub const Analyzer = struct {
         return ref;
     }
 
-    const AnalysisResult = struct {
-        path_type: TypeRef,
-        prior_type: TypeRef,
-        termination_type: TypeRef = undefined,
-        continuation_type: TypeRef = undefined,
-    };
-
-    fn pushExpressionFrame(file: *ParsedFileData) !void {
-        var state = try CFAState.init(
-            file.cfa_state.allocator,
-            NodeIterator.init(undefined, 0),
-        );
-        state.is_expression = true;
-        return file.cfa_state.append(state);
-    }
-
-    inline fn currentCFAFrame(file: *const ParsedFileData) *CFAState {
-        return file.cfa_state.items[file.cfa_state.items.len - 1];
-    }
-
     // TODO: cache this for unions
     fn truthyType(this: *@This(), ty: TypeRef) anyerror!TypeRef {
         if (ty > @intFromEnum(Kind.zero)) return ty;
@@ -6237,7 +6163,9 @@ pub const Analyzer = struct {
 
         analyzer: *Analyzer,
         file: *ParsedFileData,
-        stack: LabelStack = LabelStack{},
+
+        stack: LabelStack = .{},
+        declaration_flows: std.AutoArrayHashMapUnmanaged(NodeRef, *Label) = .{},
 
         // must be initialized upon starting flow analysis
         // if the current flow is a lexical scope, this will be at the top of the stack
@@ -7634,548 +7562,13 @@ pub const Analyzer = struct {
         }
     };
 
-    fn analyzeExpression(this: *@This(), file: *ParsedFileData, ref: NodeRef) anyerror!?std.AutoArrayHashMap(SymbolRef, AnalysisResult) {
-        const exp = file.ast.nodes.at(ref);
-        
-        const _n = this.current_node;
-        if (comptime is_debug) {
-            this.current_node = .{file, ref};
+    fn analyzeBody(this: *@This(), file: *ParsedFileData, start: NodeRef, comptime is_block: bool) !TypeRef {
+        _ = this;
+        const f = file.flow.?;
+        if (!is_block) {
+            return f.visitArrowFnBody(start);
         }
-        defer this.current_node = _n;
-        
-        if (exp.kind == .parenthesized_expression) {
-            return this.analyzeExpression(file, unwrapRef(exp));
-        }
-
-        if (exp.kind == .prefix_unary_expression) {
-            const d = getPackedData(exp);
-            switch (@as(SyntaxKind, @enumFromInt(d.left))) {
-                .exclamation_token => {
-                    const inner = file.ast.nodes.at(d.right);
-                    // Unwrap `!!` expressions (TODO: should we just parse this as special syntax? it's somewhat common)
-                    if (inner.kind == .prefix_unary_expression) {
-                        const inner_data = getPackedData(inner);
-                        if (inner_data.left == @intFromEnum(SyntaxKind.exclamation_token)) {
-                            return this.analyzeExpression(file, inner_data.right);
-                        }
-                    }
-
-                    var r = try this.analyzeExpression(file, d.right) orelse return null;
-                    var iter = r.iterator();
-                    while (iter.next()) |entry| {
-                        r.putAssumeCapacity(entry.key_ptr.*, .{
-                            .path_type = entry.value_ptr.termination_type,
-                            .prior_type = entry.value_ptr.prior_type,
-                            .termination_type = entry.value_ptr.path_type,
-                            .continuation_type = entry.value_ptr.termination_type,
-                        });
-                    }
-
-                    return r;
-                },
-                else => return null, // TODO?
-            }
-        }
-
-        var result = std.AutoArrayHashMap(SymbolRef, AnalysisResult).init(this.type_args.allocator);
-        errdefer result.deinit();
-
-        switch (exp.kind) {
-            .identifier => {
-                const target = file.binder.getSymbol(ref) orelse return null;
-                const cur = try this.getType(file, ref);
-                if (cur == @intFromEnum(Kind.any)) return null;
-
-                const t = try this.truthyType(cur);
-
-                try result.put(target, .{
-                    .path_type = t,
-                    .prior_type = cur,
-                    .continuation_type = t,
-                    .termination_type = try this.excludeType(cur, t),
-                });
-            },
-            .call_expression => {
-                const t = try this.getType(file, ref);
-
-                comptime {
-                    if (@intFromEnum(Kind.false) != @intFromEnum(Kind.true) - 1) {
-                        @compileError("False should be one less than true");
-                    }
-                }
-
-                // TODO: we should be able to return the type of the exp so we can
-                // know if a branch will ever be executed (or will always be executed)
-                if (t == @intFromEnum(Kind.false)) {
-                    return null;
-                } else if (t == @intFromEnum(Kind.true)) {
-                    return null;
-                }
-
-                if (t > @intFromEnum(Kind.true)) return null;
-
-                const n = this.types.at(t);
-                if (n.getKind() != .predicate) return null;
-
-                if (n.slot4 == 1) return error.TODO; // TODO: asserts x is T
-
-                var i: u32 = 0;
-                const pos = n.slot2;
-                var param_iter = NodeIterator.init(&file.ast.nodes, (getPackedData(exp)).right);
-                while (param_iter.nextPair()) |pair| {
-                    if (i < pos) {
-                        i += 1;
-                        continue;
-                    }
-
-                    const sym = file.binder.getSymbol(pair[1]) orelse return null;
-                    const cur = try this.getType(file, pair[1]);
-
-                    try result.put(sym, .{
-                        .path_type = n.slot1,
-                        .prior_type = cur,
-                        .continuation_type = n.slot1,
-                        .termination_type = try this.excludeType(cur, n.slot1),
-                    });
-
-                    break;
-                }
-            },
-            .binary_expression => {
-                const op = @as(SyntaxKind, @enumFromInt(exp.len));
-                const d = getPackedData(exp);
-
-                switch (op) {
-                    .ampersand_ampersand_token => {
-                        var lhs = try this.analyzeExpression(file, d.left) orelse return this.analyzeExpression(file, d.right);
-
-                        try pushExpressionFrame(file);
-                        defer file.cfa_state.pop().deinit();
-
-                        var iter = lhs.iterator();
-                        while (iter.next()) |entry| {
-                            try currentCFAFrame(file).types.put(entry.key_ptr.*, entry.value_ptr.path_type);
-                        }
-
-                        var rhs = try this.analyzeExpression(file, d.right) orelse return lhs;
-                        defer {
-                            lhs.deinit();
-                            rhs.deinit();
-                        }
-
-                        var rhs_iter = rhs.iterator();
-                        while (rhs_iter.next()) |entry| {
-                            try result.put(entry.key_ptr.*, entry.value_ptr.*);
-                            _ = lhs.swapRemove(entry.key_ptr.*);
-                        }
-
-                        var lhs_iter = lhs.iterator();
-                        while (lhs_iter.next()) |entry| {
-                            try result.put(entry.key_ptr.*, entry.value_ptr.*);
-                        }
-
-                        return result;
-                    },
-                    .bar_bar_token => {
-                        // TODO: the early returns are incorrect (when lhs or rhs don't contribute, we can't just return the remainder)
-                        // The exceptions are when either expression are always true. In that case, returning the remainder is correct
-                        var lhs = try this.analyzeExpression(file, d.left) orelse return this.analyzeExpression(file, d.right);
-
-                        try pushExpressionFrame(file);
-                        defer file.cfa_state.pop().deinit();
-
-                        var iter = lhs.iterator();
-                        while (iter.next()) |entry| {
-                            try currentCFAFrame(file).types.put(entry.key_ptr.*, entry.value_ptr.termination_type);
-                        }
-
-                        var rhs = try this.analyzeExpression(file, d.right) orelse return lhs;
-                        defer {
-                            lhs.deinit();
-                            rhs.deinit();
-                        }
-
-                        var rhs_iter = rhs.iterator();
-                        while (rhs_iter.next()) |entry| {
-                            if (lhs.get(entry.key_ptr.*)) |v| {
-                                const r = try this.toUnion(&.{ v.path_type, entry.value_ptr.path_type });
-                                try result.put(entry.key_ptr.*, .{
-                                    .path_type = r,
-                                    .prior_type = v.prior_type,
-                                    .continuation_type = r,
-                                    .termination_type = try this.excludeType(v.prior_type, r),
-                                });
-                                _ = lhs.swapRemove(entry.key_ptr.*);
-                            }
-                        }
-
-                        var lhs_iter = lhs.iterator();
-                        while (lhs_iter.next()) |entry| {
-                            if (rhs.get(entry.key_ptr.*)) |v| {
-                                const r = try this.toUnion(&.{ entry.value_ptr.path_type, v.path_type });
-                                try result.put(entry.key_ptr.*, .{
-                                    .path_type = r,
-                                    .prior_type = entry.value_ptr.path_type,
-                                    .continuation_type = r,
-                                    .termination_type = try this.excludeType(entry.value_ptr.path_type, r),
-                                });
-                            }
-                        }
-
-                        if (result.count() == 0) return null;
-
-                        return result;
-                    },
-                    else => {},
-                }
-
-                const is_negated: bool = switch (op) {
-                    .exclamation_equals_equals_token, .exclamation_equals_token => true,
-                    .equals_equals_token, .equals_equals_equals_token => false,
-                    else => return null,
-                };
-
-                const lhs = file.ast.nodes.at(d.left);
-
-                switch (lhs.kind) {
-                    .identifier => {
-                        const target = file.binder.getSymbol(d.left) orelse return null;
-                        const t_ref = blk: {
-                            const old_ctx = this.is_const_context;
-                            this.is_const_context = true;
-                            defer this.is_const_context = old_ctx;
-                            break :blk try this.getType(file, d.right);
-                        };
-                        if (t_ref == 0) return error.TODO;
-                        const cur = try this.getType(file, d.left);
-                        const t = if (is_negated) try this.excludeType(cur, t_ref) else t_ref;
-
-                        if (t != cur) {
-                            try result.put(target, .{
-                                .path_type = t,
-                                .prior_type = cur,
-                                .continuation_type = t,
-                                .termination_type = try this.excludeType(cur, t),
-                            });
-                        }
-                    },
-                    .type_of_expression => {
-                        const inner = unwrapRef(lhs);
-                        const target = file.binder.getSymbol(inner) orelse return null;
-
-                        // This exp is only relevant if the desired type provides narrowing
-                        const t_ref = blk: {
-                            const old_ctx = this.is_const_context;
-                            defer this.is_const_context = old_ctx;
-                            this.is_const_context = true;
-                            break :blk try this.getType(file, d.right);
-                        };
-
-                        if (try this.getTypeFromTypeOf(t_ref)) |x| {
-                            const cur = try this.getType(file, inner);
-                            if (cur == @intFromEnum(Kind.any) and !is_negated) {
-                                // We want to explicitly narrow the type in this case
-                                try result.put(target, .{
-                                    .path_type = x,
-                                    .prior_type = cur,
-                                    .continuation_type = x,
-                                    // Ideally this should should literally be "everything but x" but
-                                    // typescript cannot represent this
-                                    .termination_type = cur,
-                                });
-
-                                return result;
-                            }
-
-                            const y = try if (is_negated) this.excludeType(cur, x) else this.intersectType(cur, x);
-                            if (y != cur) {
-                                try result.put(target, .{
-                                    .path_type = y,
-                                    .prior_type = cur,
-                                    .continuation_type = y,
-                                    .termination_type = try this.excludeType(cur, y),
-                                });
-                            } else {
-                                try result.put(target, .{
-                                    .path_type = y,
-                                    .prior_type = cur,
-                                    .continuation_type = y,
-                                    .termination_type = @intFromEnum(Kind.never),
-                                });
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            },
-            else => {},
-        }
-
-        if (result.count() == 0) return null;
-
-        return result;
-    }
-
-    const use_one_pass_flow = true;
-
-    fn analyzeBody(this: *@This(), file: *ParsedFileData, start: NodeRef) !TypeRef {
-        if (use_one_pass_flow) {
-            var f = FlowTyper.init(this, file);
-            const old_flow = this.current_flow;
-            defer this.current_flow = old_flow;
-            this.current_flow = &f;
-            return f.visitFunctionLike(start);
-        }
-
-        const prev = file.cfa_state.items.len;
-        defer {
-            if (prev != file.cfa_state.items.len) {
-                for (prev + 1..file.cfa_state.items.len) |_| {
-                    const frame = file.cfa_state.pop();
-                    frame.deinit();
-                }
-            }
-        }
-
-        var return_types = std.ArrayList(TypeRef).init(file.ast.nodes.pages.allocator);
-        defer return_types.deinit();
-
-        var has_empty_return = false;
-
-        try file.cfa_state.append(
-            try CFAState.init(file.cfa_state.allocator, 
-            NodeIterator.init(&file.ast.nodes, start))
-        );
-
-        outer: while (file.cfa_state.items.len > prev) {
-            var c = file.cfa_state.items[file.cfa_state.items.len - 1];
-
-            if (!c.is_branch) {
-                if (c.branch_continuation_types) |t| {
-                    c.iter.ref = c.tmp_start orelse c.iter.ref;
-                    c.types = c.tmp_types orelse c.types;
-
-                    defer {
-                        // TODO: the deinit leaks
-                        // c.branch_continuation_types.?.deinit();
-                        c.is_unconditional = true;
-                        c.branch_continuation_types = null;
-                        c.tmp_start = null;
-                        c.tmp_types = null;
-                    }
-
-                    var iter = t.iterator();
-                    while (iter.next()) |entry| {
-                        if (entry.value_ptr.items.len == 0) {
-                            try c.types.put(entry.key_ptr.*, @intFromEnum(Kind.never));
-                        } else {
-                            const u = try this.toUnion(entry.value_ptr.items);
-                            try c.types.put(entry.key_ptr.*, u);
-                        }
-                    }
-                }
-            }
-
-            var did_terminate = false;
-
-            inner: while (c.iter.next()) |s| {
-                switch (s.kind) {
-                    .return_statement => {
-                        if (maybeUnwrapRef(s)) |exp| {
-                            const return_type = try this.getType(file, exp);
-                            // TODO: we should not do this if any symbols depend on CFA for accurate type info
-                            if (return_type == @intFromEnum(Kind.any)) {
-                                return return_type;
-                            }
-
-                            try return_types.append(return_type);
-                        } else {
-                            has_empty_return = true;
-                        }
-
-                        did_terminate = true;
-                        break :inner;
-                    },
-
-                    .throw_statement => {
-                        did_terminate = true;
-                        break :inner;
-                    },
-
-                    .block => {
-                        const start_node = maybeUnwrapRef(s) orelse continue;
-                        try file.cfa_state.append(try CFAState.init(file.cfa_state.allocator, NodeIterator.init(&file.ast.nodes, start_node)));
-                        continue :outer;
-                    },
-
-                    .if_statement => {
-                        const d = getPackedData(s);
-                        const start_node = unwrapConditionalStatement(file, d.right);
-                        try file.cfa_state.ensureUnusedCapacity(1);
-
-                        var state = try CFAState.init(
-                            file.cfa_state.allocator,
-                            NodeIterator.init(&file.ast.nodes, start_node),
-                        );
-                        state.is_unconditional = false;
-                        state.branch = if (s.len != 0) unwrapConditionalStatement(file, s.len) else null;
-                        if (state.branch != null) {
-                            c.is_branch = true;
-                        }
-
-                        defer file.cfa_state.appendAssumeCapacity(state);
-                        const r = try this.analyzeExpression(file, d.left) orelse continue :outer;
-
-                        var iter = r.iterator();
-                        while (iter.next()) |entry| {
-                            try state.types.put(entry.key_ptr.*, entry.value_ptr.path_type);
-                            try state.termination_types.put(entry.key_ptr.*, entry.value_ptr.termination_type);
-                            try state.continuation_types.put(
-                                entry.key_ptr.*,
-                                if (c.is_branch) entry.value_ptr.continuation_type else entry.value_ptr.prior_type,
-                            );
-                        }
-
-                        continue :outer; // Analyze the branch before moving forward
-                    },
-                    else => {},
-                }
-            }
-
-            const frame = file.cfa_state.pop();
-            defer frame.deinit();
-
-            const addBranch = struct {
-                pub fn f(a: *ParsedFileData, t: *const std.AutoArrayHashMap(SymbolRef, TypeRef)) !void {
-                    var prev_frame2 = a.cfa_state.items[a.cfa_state.items.len - 1];
-
-                    if (prev_frame2.branch_continuation_types == null) {
-                        prev_frame2.branch_continuation_types = std.AutoArrayHashMap(SymbolRef, std.ArrayList(TypeRef)).init(a.cfa_state.allocator);
-                    }
-
-                    var arr = &(prev_frame2.branch_continuation_types orelse unreachable);
-                    var iter = t.iterator();
-                    while (iter.next()) |entry| {
-                        const r = try arr.getOrPut(entry.key_ptr.*);
-                        if (!r.found_existing) {
-                            r.value_ptr.* = std.ArrayList(TypeRef).init(a.cfa_state.allocator);
-                        }
-                        try r.value_ptr.append(entry.value_ptr.*);
-                    }
-                }
-            }.f;
-
-            if (did_terminate and frame.is_unconditional) {
-                if (file.cfa_state.items.len > 0) {
-                    var prev_frame = file.cfa_state.items[file.cfa_state.items.len - 1];
-                    // Remaining frame should not continue
-                    prev_frame.iter.ref = 0;
-                }
-
-                continue;
-            }
-
-            if (!did_terminate and file.cfa_state.items.len == 0 and return_types.items.len > 0) {
-                has_empty_return = true; // close enough
-            }
-
-            if (!did_terminate and frame.is_unconditional) {
-                if (frame.types.count() > 0 and file.cfa_state.items.len > 0) {
-                    var prev_frame = file.cfa_state.items[file.cfa_state.items.len - 1];
-                    if (prev_frame.is_branch) {
-                        try addBranch(file, &frame.types);
-                    } else {
-                        var iter = frame.types.iterator();
-                        while (iter.next()) |entry| {
-                            try prev_frame.types.put(entry.key_ptr.*, entry.value_ptr.*);
-                        }
-                    }
-                }
-            }
-
-            if (did_terminate and !frame.is_unconditional) {
-                if (frame.termination_types.count() > 0) {
-                    var prev_frame = file.cfa_state.items[file.cfa_state.items.len - 1];
-                    if (prev_frame.is_branch) {
-                        if (frame.branch == null) {
-                            try addBranch(file, &frame.termination_types);
-                        }
-                    } else {
-                        var iter = frame.termination_types.iterator();
-                        while (iter.next()) |entry| {
-                            // Nested terminations within a conditional execution that narrow the same symbol
-                            // should be excluded after leaving the original branch
-                            //
-                            // function f(x: string | 1 | 2 | 3) {
-                            //     if (typeof x === 'number') if (x === 1) return;
-                            //     x // string | 2 | 3
-                            // }
-                            //
-                            // This is equivalent to the union of termination types
-
-                            // TODO: this could be deferred until we know if the previous frame terminates or not
-                            if (!prev_frame.is_unconditional) {
-                                if (prev_frame.termination_types.get(entry.key_ptr.*)) |t| {
-                                    const merged = try this.toUnion(&.{ t, entry.value_ptr.* });
-                                    if (merged != 0 and merged != t) {
-                                        try prev_frame.continuation_types.put(entry.key_ptr.*, merged);
-                                    }
-                                }
-                            }
-
-                            try prev_frame.types.put(entry.key_ptr.*, entry.value_ptr.*);
-                        }
-                    }
-                }
-            }
-
-            if (!did_terminate and !frame.is_unconditional) {
-                if (frame.continuation_types.count() > 0) {
-                    var prev_frame = file.cfa_state.items[file.cfa_state.items.len - 1];
-                    if (prev_frame.is_branch) {
-                        try addBranch(file, &frame.continuation_types);
-                    } else {
-                        var iter = frame.continuation_types.iterator();
-                        while (iter.next()) |entry| {
-                            try prev_frame.types.put(entry.key_ptr.*, entry.value_ptr.*);
-                        }
-                    }
-                }
-            }
-
-            if (frame.branch) |n| {
-                var c2 = file.cfa_state.items[file.cfa_state.items.len - 1];
-                if (c2.tmp_start == null) {
-                    c2.tmp_start = c2.iter.ref;
-                    c2.tmp_types = try c2.types.clone();
-                }
-
-                c2.is_unconditional = false;
-                c2.is_branch = true;
-                c2.iter.ref = n;
-                c2.types = try frame.termination_types.clone();
-            } else if (file.cfa_state.items.len > 0) {
-                var c2 = file.cfa_state.items[file.cfa_state.items.len - 1];
-                c2.is_branch = false;
-            }
-        }
-
-        if (return_types.items.len == 0) {
-            return @intFromEnum(Kind.void);
-        }
-
-        if (return_types.items.len == 1) {
-            if (has_empty_return) {
-                return this.toUnion(&.{ return_types.items[0], @intFromEnum(Kind.undefined) });
-            }
-            return return_types.items[0];
-        }
-
-        if (has_empty_return) {
-            try return_types.append(@intFromEnum(Kind.undefined));
-        }
-
-        return this.toUnion(return_types.items);
+        return f.visitFunctionLike(start);
     }
 
     // todo: simplify things more?
@@ -8446,6 +7839,7 @@ pub const Analyzer = struct {
         return tmp.complete(this);
     }
 
+    // TODO: comparable and subtype
     fn isAssignableTo(this: *@This(), src: TypeRef, dst: TypeRef) anyerror!bool {
         if (src == dst) return true;
 
@@ -8906,24 +8300,12 @@ pub const Analyzer = struct {
                 } else {
                     const block_or_exp = file.ast.nodes.at(d.right);
                     if (block_or_exp.kind == .block) {
-                        return_type = try this.analyzeBody(file, maybeUnwrapRef(block_or_exp) orelse 0);
-                        if (n.hasFlag(.@"async")) {
-                            return_type = try this.normalizeAsyncReturnType(return_type);
-                        }
-                        // TODO: generator, async generator -> Iterable, AsyncIterable
-                        if (n.hasFlag(.generator)) {
-                            return error.TODO_generator;
-                        }
+                        return_type = try this.analyzeBody(file, maybeUnwrapRef(block_or_exp) orelse 0, true);
                     } else {
-                        if (use_one_pass_flow) {
-                            var f = FlowTyper.init(this, file);
-                            const old_flow = this.current_flow;
-                            defer this.current_flow = old_flow;
-                            this.current_flow = &f;
-                            return_type = try f.visitArrowFnBody(d.right);
-                        } else {
-                            return_type = try this.getType(file, d.right);
-                        }
+                        return_type = try this.analyzeBody(file, d.right, false);
+                    }
+                    if (n.hasFlag(.@"async")) {
+                        return_type = try this.normalizeAsyncReturnType(return_type);
                     }
                 }
 
@@ -8949,8 +8331,8 @@ pub const Analyzer = struct {
                 } else if (n.len != 0) {
                     // TODO: assert block
                     const block = file.ast.nodes.at(n.len);
-                    return_type = try this.analyzeBody(file, maybeUnwrapRef(block) orelse 0);
-                    if (n.hasFlag(.@"async")) {
+                    return_type = try this.analyzeBody(file, maybeUnwrapRef(block) orelse 0, true);
+                    if (n.hasFlag(.@"async") and !n.hasFlag(.generator)) {
                         return_type = try this.normalizeAsyncReturnType(return_type);
                     }
                 } else {
@@ -11228,21 +10610,11 @@ pub const Analyzer = struct {
         return try this.createParameterizedType(params.items, inner);
     }
 
-    inline fn maybeGetCfaType(file: *ParsedFileData, sym_ref: SymbolRef) ?TypeRef {
-        for (0..file.cfa_state.items.len) |i| {
-            if (file.cfa_state.items[file.cfa_state.items.len - (i + 1)].types.get(sym_ref)) |t| {
-                return t;
-            }
-        }
-        return null;
-    }
-
     fn getThisType(this: *@This(), file: *ParsedFileData, node: *const AstNode) !TypeRef {
         if (node.extra_data == 0) {
             return @intFromEnum(Kind.this);
         }
 
-        if (maybeGetCfaType(file, node.extra_data)) |t| return t;
         if (file.cached_symbol_types.get(node.extra_data)) |t| return t;
 
         const type_ref = try this.getTypeOfSymbol(file, node.extra_data);
@@ -11337,21 +10709,28 @@ pub const Analyzer = struct {
                 return this.getType(file, unwrapRef(node));
             },
             .type_query => {
-                var args = try this.getTypeArgs(file, node.len);
-
                 // We automatically reduce relevant type queries during CFA
                 const inner_ref = unwrapRef(node);
-                if (file.binder.getSymbol(inner_ref)) |sym_ref| {
-                    if (maybeGetCfaType(file, sym_ref)) |t| {
-                        if (t >= @intFromEnum(Kind.false)) return t;
-
-                        if (this.types.at(t).getKind() == .parameterized) {
-                            defer args.deinit(this.allocator());
-                            return this.resolveWithTypeArgsSlice(this.types.at(t), args.getSlice());
-                        }
-
-                        return t;
+                const flow_type: ?u32 = blk: {
+                    if (file.cached_flow_types.get(inner_ref)) |t| break :blk t;
+                    const sym = file.binder.getSymbol(inner_ref) orelse break :blk null;
+                    if (file.flow) |f| {
+                        if (f.maybeGetFlowType(sym)) |t| break :blk t;
                     }
+                    break :blk null;
+                };
+
+                var args = try this.getTypeArgs(file, node.len);
+
+                if (flow_type) |t| {
+                    if (t >= @intFromEnum(Kind.false)) return t;
+
+                    if (this.types.at(t).getKind() == .parameterized) {
+                        defer args.deinit(this.allocator());
+                        return this.resolveWithTypeArgsSlice(this.types.at(t), args.getSlice());
+                    }
+
+                    return t;
                 }
 
                 if (node.len == 0) {
@@ -11518,13 +10897,8 @@ pub const Analyzer = struct {
 
                 if (file.binder.getSymbol(ref)) |sym_ref| {
                     const r = blk: {
-                        if (maybeGetCfaType(file, sym_ref)) |t| break :blk t;
-
-                        // XXX: each file should have a flow
-                        if (this.current_flow) |f| {
-                            if (f.file.id == file.id) {
-                                if (f.maybeGetFlowType(sym_ref)) |t| break :blk t;
-                            }
+                        if (file.flow) |f| {
+                            if (f.maybeGetFlowType(sym_ref)) |t| break :blk t;
                         }
 
                         break :blk try this.getTypeOfSymbol(file, sym_ref);
@@ -11543,6 +10917,8 @@ pub const Analyzer = struct {
 
                     return r;
                 }
+
+                return @intFromEnum(Kind.any);
             },
             .parameter => {
                 if (node.len != 0) {
@@ -12898,33 +12274,6 @@ pub const Analyzer = struct {
             .conditional_expression => {
                 // TODO: handle always true and always false cases
                 const d = getPackedData(exp);
-                if (try this.analyzeExpression(file, d.left)) |res| {
-                    const when_true = blk: {
-                        try pushExpressionFrame(file);
-                        defer file.cfa_state.pop().deinit();
-
-                        var iter = res.iterator();
-                        while (iter.next()) |entry| {
-                            try currentCFAFrame(file).types.put(entry.key_ptr.*, entry.value_ptr.path_type);
-                        }
-
-                        break :blk try this.getType(file, d.right);
-                    };
-
-                    const when_false = blk: {
-                        try pushExpressionFrame(file);
-                        defer file.cfa_state.pop().deinit();
-
-                        var iter = res.iterator();
-                        while (iter.next()) |entry| {
-                            try currentCFAFrame(file).types.put(entry.key_ptr.*, entry.value_ptr.termination_type);
-                        }
-
-                        break :blk try this.getType(file, exp.len);
-                    };
-
-                    return this.toUnion(&.{ when_true, when_false });
-                }
 
                 const when_true = try this.getType(file, d.right);
                 const when_false = try this.getType(file, exp.len);
@@ -13213,7 +12562,7 @@ pub const Analyzer = struct {
                             const hash = try this.getMemberNameHash(name);
                             const t: TypeRef = blk: {
                                 if (n.extra_data != 0) break :blk try this.getType(file, n.extra_data);
-                                if (n.len != 0) break :blk try this.analyzeBody(file, unwrapRef(file.ast.nodes.at(n.len)));
+                                if (n.len != 0) break :blk try this.analyzeBody(file, unwrapRef(file.ast.nodes.at(n.len)), true);
 
                                 break :blk @intFromEnum(Kind.empty_element);
                             };

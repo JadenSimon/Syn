@@ -15,11 +15,11 @@ const x = null
 }
 {
   const x = ''
-  if (((typeof x === 'string') || (typeof x === 'number'))) {}
+  if ((typeof x === 'string' || typeof x === 'number')) {}
 }
 {
   const x = ''
-  if (((x === 2) || (x === 1))) {}
+  if ((x === 2 || x === 1)) {}
   ;(x === 'a');
 }
 {
@@ -50,7 +50,7 @@ const x = null
   function __is2(x) {
     return typeof x === 'object' && x !== null && typeof x.z === 'number' && typeof x.y === 'number' && typeof x.x === 'number'
   }
-  ;((Array.isArray(x) && x.every((el) => __is2(el))) || (__is2(x)));
+  ;((Array.isArray(x) && x.every((el) => __is2(el))) || __is2(x));
 }
 {
   ;(typeof x === 'string' && /^foo.*bar$/.test(x));
@@ -60,7 +60,7 @@ const x = null
   const X = {}
   X[X["a"] = 0] = "a"
   X[X["b"] = 1] = "b"
-  ;((x === 0) || (x === 1));
+  ;(x === 0 || x === 1);
   ;(x === 0);
 }
 {
@@ -95,7 +95,7 @@ function f(cb) {
 }
 {
   function __is3(x) {
-    return typeof x === 'object' && x !== null && (x.parent === null) || (__is3(x.parent)) && typeof x.id === 'number' && typeof x.code === 'string' && typeof x.name === 'string' && typeof x.sequence === 'number' && __is4(x.created_at)
+    return typeof x === 'object' && x !== null && (x.parent === null || __is3(x.parent)) && typeof x.id === 'number' && typeof x.code === 'string' && typeof x.name === 'string' && typeof x.sequence === 'number' && __is4(x.created_at)
   }
   function __is4(x) {
     return typeof x === 'object' && x !== null && typeof x.time === 'number' && typeof x.zone === 'number'
@@ -112,7 +112,7 @@ function f(cb) {
   function __is5(x) {
     return typeof x === 'object' && x !== null && x.kind === 'c'
   }
-  if (((__is5(x)) || (__is6(x)) || (__is7(x)))) {
+  if ((__is5(x) || __is6(x) || __is7(x))) {
     if (x.kind === 'c') {}
   }
 }
