@@ -499,6 +499,16 @@ const TriviaScanner = struct {
     }
 };
 
+pub fn getFormattedDiagnostics(program: *js.Object, sf: WrappedFile) !js.UTF8String {
+    const p = try unwrap(Program, program);
+    const source_name = sf.value.source_name  orelse return error.MissingSourceFileName;
+    const ref = try p.getFileIdByPath(source_name);
+
+    const n = try p.files.items[ref].diagnosticsToBuf(getAllocator());
+
+    return .{ .data = @ptrCast(@constCast(n)) };
+}
+
 const Reifier = @import("./reifier.zig").Reifier;
 
 pub fn createReifier(program: *js.Object, type_ns: *js.Object) !js.Wrapped {

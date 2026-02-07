@@ -1,15 +1,15 @@
 import * as vm from 'node:vm'
 
-const any = Symbol.for('type.any')
-const never = Symbol.for('type.never')
-const unknown = Symbol.for('type.unknown')
-const Void = Symbol.for('type.void')
+const any = Symbol.for('Type.any')
+const never = Symbol.for('Type.never')
+const unknown = Symbol.for('Type.unknown')
+const Void = Symbol.for('Type.void')
 
-const number = Symbol.for('type.number')
-const string = Symbol.for('type.string')
-const object = Symbol.for('type.object')
-const boolean = Symbol.for('type.boolean')
-const symbol = Symbol.for('type.symbol')
+const number = Symbol.for('Type.number')
+const string = Symbol.for('Type.string')
+const object = Symbol.for('Type.object')
+const boolean = Symbol.for('Type.boolean')
+const symbol = Symbol.for('Type.symbol')
 
 type _type = any // placeholder
 
@@ -188,6 +188,22 @@ export function createTypeNamespace() {
         return 'object'
     }
 
+    function isType(t: any) {
+        if (typeof t !== 'object' || t === null) {
+            if (typeof t === 'symbol') {
+                return kind(t) === 'intrinsic'
+            }
+            return true
+        }
+
+        if (t instanceof ObjectType) return true
+        if (t instanceof Union) return true
+        if (t instanceof ArrayType) return true
+        if (t instanceof Tuple) return true
+
+        return false
+    }
+
     function findDiscriminant(t: Union): PropertyKey | undefined {
         let min = -1
         const keys: PropertyKey[][] = []
@@ -292,8 +308,8 @@ export function createTypeNamespace() {
     }
 }
 
-const typeIdSym = Symbol.for('_type.id')
-const originalProtoSym = Symbol.for('_type.proto')
+const typeIdSym = Symbol.for('_Type.id')
+const originalProtoSym = Symbol.for('_Type.proto')
 
 const arrayPrototypeKeys = new Set([
     ...Object.getOwnPropertyNames(Array.prototype),
@@ -307,7 +323,7 @@ interface TupleElementDescriptor {
     rest?: boolean 
 }
 
-const tupleElementDescriptors = Symbol.for('_type.tuple.elements')
+const tupleElementDescriptors = Symbol.for('_Type.tuple.elements')
 function getElementDescriptors(o: any) {
     if (typeof o !== 'object' || o === null) return
 
@@ -404,11 +420,6 @@ class _Tuple extends Array {
     }
 }
 
-const objectPrototypeKeys = new Set([
-    ...Object.getOwnPropertyNames(Object.prototype),
-    ...Object.getOwnPropertySymbols(Object.prototype),
-])
-
 function tag(t: _type) {
     if (typeof t !== 'object' || t === null) {
         if (typeof t === 'symbol') {
@@ -489,7 +500,7 @@ function proxyObjectTypePrototype(proto: any) {
                 return unknown
             }
 
-            if (objectPrototypeKeys.has(p) || Reflect.has(t, p)) {
+            if (Reflect.has(t, p)) {
                 return Reflect.get(t, p, r)
             }
 
@@ -524,14 +535,18 @@ interface ObjectTypeDescriptor {
     readonly callSignatures: any[] // (Function | TypeFunction)[]
 }
 
-const objectTypeDescriptor = Symbol.for('_type.object.typeDescriptor')
+const objectTypeDescriptor = Symbol.for('_Type.object.typeDescriptor')
 function getObjectTypeDescriptor(o: any) {
     if (typeof o !== 'object' || o === null) return
 
     return (o as _Object)[objectTypeDescriptor]
 }
 
-class _Object extends Object {
+declare class NullClass {}
+function NullClass() {}
+;(NullClass as Function).prototype = null
+
+class _Object extends NullClass {
     private readonly [objectTypeDescriptor]!: ObjectTypeDescriptor
 
     constructor(descriptor: ObjectTypeDescriptor) {
@@ -557,10 +572,10 @@ class _Object extends Object {
 }
 
 export function runSynModule(text: string, fileName: string, reifier: { types: any, __reify: any }) {
-    ;(globalThis as any).type = reifier.types
+    ;(globalThis as any).Type = reifier.types
     const ctx = vm.createContext({
         __filename: fileName,
-        type: reifier.types,
+        Type: reifier.types,
         __reify: reifier.__reify,
         console: console,
         performance,

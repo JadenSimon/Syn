@@ -5474,6 +5474,16 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
         return getSourceFile(fileName)
     }
 
+    // FIXME: should be an array w/ separate API call to format
+    function getSemanticDiagnostics(sourceFile?: ts.SourceFile, cancellationToken?: ts.CancellationToken) {
+        if (!sourceFile) return '' // TODO
+
+        const internal = getSourceFileInternal(sourceFile)
+        if (!internal) return ''
+
+        return api.getFormattedDiagnostics(programHandle, internal.handle)
+    }
+
     return {
         _handle: programHandle,
         emit,
@@ -5485,6 +5495,7 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
         getRootFileNames: () => rootNames,
         getSourceFileByPath,
         getReifier,
+        getSemanticDiagnostics,
     } as any
 }
 

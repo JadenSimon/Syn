@@ -639,15 +639,17 @@ pub const Program = struct {
                 }
             }
 
-            if (comptime is_debug) {
-                if (!f.is_lib) {
-                    try printNameWithLocation(f, sym.binding);
-                    const name = getSlice(f.ast.nodes.at(sym.binding), u8);
-                    if (comptime is_type) {
-                        std.debug.print("  missing type {s}\n", .{name});
-                    } else {
-                        std.debug.print("  missing {s}\n", .{name});
-                    }
+            if (!f.is_lib) {
+                // try printNameWithLocation(f, sym.binding);
+                const name = getSlice(f.ast.nodes.at(sym.binding), u8);
+                // XXX: long name will error here
+                var buf: [128]u8 = undefined;
+                if (comptime is_type) {
+                    const message = try std.fmt.bufPrint(&buf, "Cannot find type '{s}'", .{name});
+                    try f.emitError(sym.binding, message);
+                } else {
+                    const message = try std.fmt.bufPrint(&buf, "Cannot find name '{s}'", .{name});
+                    try f.emitError(sym.binding, message);
                 }
             }
 
@@ -1034,7 +1036,7 @@ pub const Program = struct {
             type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
 
             fn typeofExp(self: *@This(), subject: NodeRef, comptime s: []const u8) !NodeRef {
-                const lhs = try self.factory.createTypeOfExpression(subject);
+                const lhs = try self.factory.createTypeofExpression(subject);
                 const rhs = try self.factory.createStringLiteral(s);
                 return self.factory.createBinaryExpression(lhs, .equals_equals_equals_token, rhs);
             }
@@ -1172,8 +1174,12 @@ pub const Program = struct {
 
                     const name = self.analyzer.getSliceFromLiteral(u.name);
                     const sub = try self.factory.createPropertyAccessExpression(subject, name);
+                    var ty = try u.getType(self.analyzer);
+                    if (u.hasFlag(NodeFlags.optional)) {
+                        ty = try self.analyzer.toUnion(&.{ty, @intFromEnum(Kind.undefined)});
+                    }
 
-                    const q = try self.generateIsExpression(sub, try u.getType(self.analyzer));
+                    const q = try self.generateIsExpression(sub, ty);
 
                     if (lhs == 0) {
                         lhs = q;
@@ -1288,7 +1294,7 @@ pub const Program = struct {
                             const name = getSlice(ident, u8);
 
                             const class_ident = try self.factory.createIdentifier(name);
-                            return self.factory.createBinaryExpression(subject, .instance_of_keyword, class_ident);
+                            return self.factory.createBinaryExpression(subject, .instanceof_keyword, class_ident);
                         }
                         if (t.hasFlag(.enum_alias)) {
                             const o_ref =  try self.analyzer.maybeResolveAlias(ty);
@@ -1309,7 +1315,7 @@ pub const Program = struct {
                                 if (ty == error_type) {
                                     // TODO: use Error.isError, or add `DOMException`
                                     const error_ident = try self.factory.createIdentifier("Error");
-                                    return self.factory.createBinaryExpression(subject, .instance_of_keyword, error_ident);
+                                    return self.factory.createBinaryExpression(subject, .instanceof_keyword, error_ident);
                                 }
                             }
                         }
@@ -1840,7 +1846,7 @@ pub const Program = struct {
                             const var_ident = try self.factory.createIdentifier(var_name);
                             const error_ident = try self.factory.createIdentifier("Error");
 
-                            const instanceof_check = try self.factory.createBinaryExpression(var_ident, .instance_of_keyword, error_ident);
+                            const instanceof_check = try self.factory.createBinaryExpression(var_ident, .instanceof_keyword, error_ident);
 
                             // !(e instanceof Error)
                             const not_instanceof = try self.factory.createPrefixUnaryExpression(.exclamation_token, try self.factory.createParenthesizedExpression(instanceof_check));
@@ -2849,6 +2855,37 @@ pub const ParsedFileData = struct {
             .node_ref = node_ref,
             .message = s,
         });
+    }
+
+    pub fn printDiagnostics(this: *@This()) !void {
+        const file_name = this.file_name orelse return error.MissingFileName;
+        for (this.diagnostics.items) |d| {
+            const loc = parser.getLoc(&this.ast.nodes, this.ast.nodes.at(d.node_ref)) orelse return error.MissingNodeLocation;
+            std.debug.print("{s} at {s}:{}:{}\n", .{ d.message, file_name, loc.line + 1, loc.col + 1 });
+        }
+    }
+
+    pub fn diagnosticsToBuf(this: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        const file_name = this.file_name orelse return error.MissingFileName;
+
+        var list = std.ArrayList(u8).init(allocator);
+        errdefer list.deinit();
+
+        const writer = list.writer();
+
+        for (this.diagnostics.items) |d| {
+            const loc = parser.getLoc(
+                &this.ast.nodes,
+                this.ast.nodes.at(d.node_ref),
+            ) orelse return error.MissingNodeLocation;
+
+            try writer.print(
+                "{s} at {s}:{}:{}\n",
+                .{ d.message, file_name, loc.line + 1, loc.col + 1 },
+            );
+        }
+
+        return list.toOwnedSlice();
     }
 };
 
@@ -6234,10 +6271,8 @@ pub const Analyzer = struct {
         }
 
         // This should only be called with the first statement of a module or function.
-        // Do not use the same struct for a different entrypoint. No re-entrancy.
         fn visitEntrypoint(self: *@This(), target: NodeRef, comptime can_return: bool) !void {
             std.debug.assert(target != 0);
-            std.debug.assert(self.stack.items.len == 0);
 
             self.current_flow = try self.createLabel();
 
@@ -7256,7 +7291,7 @@ pub const Analyzer = struct {
 
                                     return @intFromEnum(Kind.boolean);
                                 },
-                                .type_of_expression => {
+                                .typeof_expression => {
                                     const inner = unwrapRef(lhs);
                                     const lhs_node = self.file.binder.nodes.at(inner);
                                     if (lhs_node.kind == .property_access_expression) {
@@ -11987,6 +12022,9 @@ pub const Analyzer = struct {
         const op: SyntaxKind = @enumFromInt(exp.len);
         const d = getPackedData(exp);
         switch (op) {
+            .less_than_token, .less_than_equals_token, .greater_than_token, .greater_than_equals_token => {
+                return @intFromEnum(Kind.number);
+            },
             .plus_token => {
                 const lhs = try this.getType(file, d.left);
                 if (lhs == @intFromEnum(Kind.string)) {
@@ -12264,9 +12302,12 @@ pub const Analyzer = struct {
                         }
                     }
 
+                    // TODO: error if missing compatible signature
+                    // return never if not a function
+
                     std.debug.print("{any}\n", .{n.getKind()});
                     try this.debugPrint(t);
-                    return error.NotAFunction;
+                    return error.NotAFunctionOrMissingCompatibleSignature;
                 }
 
                 return n.slot3;

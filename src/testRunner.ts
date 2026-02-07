@@ -1,7 +1,6 @@
 import * as api from './api'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import * as crypto from 'node:crypto'
 import { runSynModule } from './reifiedTypes'
 
 const filenameMarker = '// @filename:'
@@ -15,6 +14,8 @@ function parseTestFile(text: string, extname = '.ts') {
     const compilerOptions: any = {
         declaration: true,
     }
+
+    let line = 0
 
     let i = 0
     while (i < text.length) {
@@ -32,10 +33,11 @@ function parseTestFile(text: string, extname = '.ts') {
 
         compilerOptions[m[1]] = converted
         i = nextMarker+1
+        line += 1
     }
 
-    let currentFile: any = {}
-    const files: VirtualFile[] = []
+    let currentFile: any = { line }
+    const files: (VirtualFile & { line: number })[] = []
 
     while (i < text.length) {
         const nextMarker = text.indexOf(filenameMarker, i)
@@ -51,6 +53,7 @@ function parseTestFile(text: string, extname = '.ts') {
         if (currentFile.name) {
             const t = text.slice(i, nextMarker)
             if (t.trim()) {
+                line += t.split('\n').length
                 files.push({
                     ...currentFile,
                     text: t,
@@ -61,6 +64,7 @@ function parseTestFile(text: string, extname = '.ts') {
 
         const eol = text.indexOf('\n', nextMarker)
         currentFile.name = text.slice(nextMarker + filenameMarker.length, eol).trim()
+        currentFile.line = line + 1
         i = eol + 1
     }
 
@@ -142,7 +146,6 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
     const testsDir = path.resolve('tests')
     const casesDir = path.resolve(testsDir, 'cases')
     const snapshotDir = path.resolve(testsDir, 'snapshots')
-    const proposedDir = path.resolve(testsDir, 'proposed')
 
     const absPath = path.resolve(casesDir, name)
     const relPath = path.relative(casesDir, absPath)
@@ -152,11 +155,13 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
     const vfs = getVfs()
     vfs.files.clear()
 
-    const testHash = crypto.hash('sha256', text, 'hex')
+    const resolvedMap = new Map<string, VirtualFile & { line: number }>()
 
     const roots: string[] = []
     for (const item of parsed.files) {
         const resolved = path.resolve(testsDir, item.name)
+        resolvedMap.set(resolved, item)
+
         if (item.name.endsWith('.json')) {
             const txt = item.text.at(0) === '(' && item.text.at(-1) === ')'
                 ? item.text.slice(1, -1) // removes ()
@@ -203,6 +208,17 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
     }
 
     await Promise.all(promises)
+
+    for (const sf of sourceFiles) {
+        const r = path.relative(process.cwd(), absPath)
+        const item = resolvedMap.get(sf.fileName)!
+        console.log('----- diagnostics -----')
+        const formatted = (prog.getSemanticDiagnostics(sf) as any as string)
+        const replaced = formatted.replaceAll(/([^\s:]+):(\d+):(\d+)/g, (_, n, l, c) => {
+            return `${r}:${Number(l)+item.line}:${c}`
+        })
+        console.log(replaced)
+    }
 
     const groups = new Map<string, (VirtualFile & { order: number; absPath: string })[]>()
     for (const f of results) {

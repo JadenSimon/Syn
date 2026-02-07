@@ -116,3 +116,9 @@ function f(cb) {
     if (x.kind === 'c') {}
   }
 }
+{
+  function __is8(x) {
+    return typeof x === 'object' && x !== null && (typeof x.a === 'number' || x.a === undefined)
+  }
+  ;(__is8(x));
+}

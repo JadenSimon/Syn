@@ -21,12 +21,12 @@ fn getSource(args: *std.process.ArgIterator) !js_lexer.Source {
     return js_lexer.Source{ .contents = text };
 }
 
-fn printCounts(r: *const js_parser.ParseResult) !void {
+fn printCounts(r: *const js_parser.BumpAllocator(js_parser.AstNode)) !void {
     var m = std.AutoArrayHashMap(js_parser.SyntaxKind, u32).init(std.heap.c_allocator);
     defer m.deinit();
 
-    for (0..r.data.nodes.count) |i| {
-        const n = r.data.nodes.at(i);
+    for (0..r.count) |i| {
+        const n = r.at(i);
         const entry = try m.getOrPut(n.kind);
         if (!entry.found_existing) {
             entry.value_ptr.* = 1;
@@ -34,6 +34,15 @@ fn printCounts(r: *const js_parser.ParseResult) !void {
             entry.value_ptr.* += 1;
         }
     }
+
+    const C = struct {
+        values: []u32,
+        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+            return ctx.values[a_index] > ctx.values[b_index];
+        }
+    };
+
+    m.sort(C{ .values  = m.values() });
 
     var iter = m.iterator();
     while (iter.next()) |entry| {
@@ -232,11 +241,22 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
             try printExportedTypes(f, &p2);
         }
 
+        // try printCounts(&f.ast.nodes);
+
         if (!comptime skip_print) {
             std.debug.print("---- d.ts ----\n{s}\n", .{text});
         }
         std.debug.print("emit time {d:.3}\n", .{std.time.microTimestamp() - emit_start});
         std.debug.print("# of parse nodes {}\n", .{f.ast.nodes.count});
+
+        if (f.diagnostics.items.len == 0) continue;
+
+        std.debug.print("\n--- diagnostics ---\n",.{});
+        const old_name = f.file_name;
+        defer f.file_name = old_name;
+        f.file_name = try std.fs.path.relative(std.heap.c_allocator, ".", file_name);
+        try f.printDiagnostics();
+        std.debug.print("\n-------------------\n",.{});
     }
 
     std.debug.print("\ntotal types: {}\n", .{a.types.count});

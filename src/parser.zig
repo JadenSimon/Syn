@@ -19,7 +19,7 @@ pub const SyntaxKind = enum(u12) {
     conflict_marker_trivia = 7,
     non_text_file_marker_trivia = 8,
     numeric_literal = 9,
-    big_int_literal = 10,
+    bigint_literal = 10,
     string_literal = 11,
     jsx_text = 12,
     jsx_text_all_white_spaces = 13,
@@ -112,7 +112,7 @@ pub const SyntaxKind = enum(u12) {
     if_keyword = 101,
     import_keyword = 102,
     in_keyword = 103,
-    instance_of_keyword = 104,
+    instanceof_keyword = 104,
     new_keyword = 105,
     null_keyword = 106,
     return_keyword = 107,
@@ -122,7 +122,7 @@ pub const SyntaxKind = enum(u12) {
     throw_keyword = 111,
     true_keyword = 112,
     try_keyword = 113,
-    type_of_keyword = 114,
+    typeof_keyword = 114,
     var_keyword = 115,
     void_keyword = 116,
     while_keyword = 117,
@@ -171,7 +171,7 @@ pub const SyntaxKind = enum(u12) {
     using_keyword = 160,
     from_keyword = 161,
     global_keyword = 162,
-    big_int_keyword = 163,
+    bigint_keyword = 163,
     override_keyword = 164,
     of_keyword = 165,
     qualified_name = 166,
@@ -229,7 +229,7 @@ pub const SyntaxKind = enum(u12) {
     function_expression = 218,
     arrow_function = 219,
     delete_expression = 220,
-    type_of_expression = 221,
+    typeof_expression = 221,
     void_expression = 222,
     await_expression = 223,
     prefix_unary_expression = 224,
@@ -431,7 +431,7 @@ pub const TypeKeywords = ComptimeStringMap(SyntaxKind, .{
     .{ "string", .string_keyword },
     .{ "number", .number_keyword },
     .{ "boolean", .boolean_keyword },
-    .{ "bigint", .big_int_keyword },
+    .{ "bigint", .bigint_keyword },
     .{ "object", .object_keyword },
     .{ "any", .any_keyword },
     .{ "never", .never_keyword },
@@ -2360,7 +2360,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         inline fn tokenToSyntaxKind(this: *@This()) !SyntaxKind {
             return switch (this.lexer.token) {
                 .t_in => .in_keyword,
-                .t_instanceof => .instance_of_keyword,
+                .t_instanceof => .instanceof_keyword,
                 .t_comma => .comma_token,
                 .t_question_question => .question_question_token,
                 .t_plus => .plus_token,
@@ -3441,7 +3441,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     const value = this.lexer.identifier;
                     try this.next();
                     return .{
-                        .kind = .big_int_literal,
+                        .kind = .bigint_literal,
                         .data = value.ptr,
                         .len = @intCast(value.len),
                     };
@@ -3510,7 +3510,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 },
                 .t_delete => return this.parsePrefixExpression(.delete_expression),
                 .t_void => return this.parsePrefixExpression(.void_expression),
-                .t_typeof => return this.parsePrefixExpression(.type_of_expression),
+                .t_typeof => return this.parsePrefixExpression(.typeof_expression),
 
                 .t_plus, .t_minus, .t_plus_plus, .t_minus_minus, .t_tilde, .t_exclamation => return this.parsePrefixUnaryExpression(),
 
@@ -6374,9 +6374,9 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createTypeOfExpression(this: *@This(), expression: NodeRef) !NodeRef {
+    pub fn createTypeofExpression(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
-            .kind = .type_of_expression,
+            .kind = .typeof_expression,
             .data = @ptrFromInt(expression),
         });
     }
@@ -7200,8 +7200,8 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .public_keyword => "public",
         .readonly_keyword => "readonly",
         .key_of_keyword => "keyof",
-        .type_of_keyword => "typeof",
-        .instance_of_keyword => "instanceof",
+        .typeof_keyword => "typeof",
+        .instanceof_keyword => "instanceof",
         .new_keyword => "new",
         .import_keyword => "import",
         .in_keyword => "in",
@@ -7329,7 +7329,7 @@ pub fn forEachChild(
         .source_file, .block, .variable_statement, .object_literal_expression, .array_literal_expression, .template_expression, .class_static_block_declaration => {
             try visitList(nodes, maybeUnwrapRef(node) orelse 0, visitor);
         },
-        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .type_of_expression, .spread_element => {
+        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .typeof_expression, .spread_element => {
             const ref = unwrapRef(node);
             try visitor.visit(nodes.at(ref), ref);
         },
@@ -10350,7 +10350,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(unwrapRef(n));
                     this.print(";"); // TODO: only emit semicolon when it's needed (ASI)
                 },
-                .type_query, .type_of_expression => {
+                .type_query, .typeof_expression => {
                     this.print("typeof ");
                     try this.visitRef(unwrapRef(n));
 
