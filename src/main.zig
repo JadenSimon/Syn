@@ -228,7 +228,7 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
 
   //  try bundler2.bundle(parsed.items[parsed.items.len-1].name);
 
-    const a = try p2.getTypeChecker();
+    const a = try p2.getAnalyzer();
 
     for (parsed.items) |q| {
         const parse_start = std.time.microTimestamp();
@@ -270,7 +270,7 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
 
     return;
 
-    // const a = try p2.getTypeChecker();
+    // const a = try p2.getAnalyzer();
     // const id = try p2.getFileIdByPath(file_name);
     // const f = try p2.getBoundFile(id);
 
@@ -332,7 +332,7 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
 fn printExportedTypes(f: *program.ParsedFileData, p2: *program.Program) !void {
     const r = &f.ast.nodes;
     const id = f.id;
-    const a = try p2.getTypeChecker();
+    const a = try p2.getAnalyzer();
     var iter2 = js_parser.NodeIterator.init(r, js_parser.maybeUnwrapRef(f.ast.nodes.at(f.ast.start)) orelse 0);
     while (iter2.nextPair()) |p| {
         var n = p[0];
@@ -371,7 +371,7 @@ fn printExportedTypes(f: *program.ParsedFileData, p2: *program.Program) !void {
 
                 std.debug.print("\n", .{});
                 std.debug.print("  RESOLVED -> ", .{});
-                try a.debugPrint(resolved);
+                try a._debug(resolved);
                 std.debug.print("\n", .{});
             } else {
                 std.debug.print("   PARAMETERIZED {any}\n", .{a.types.at(t).getKind()});

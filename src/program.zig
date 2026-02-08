@@ -1,6 +1,7 @@
 const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
+const checker = @import("./checker.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 
@@ -348,7 +349,7 @@ pub const Program = struct {
 
     ambient: Ambient,
 
-    type_checker: ?*Analyzer = null,
+    analyzer: ?*Analyzer = null,
 
     did_load_default_libs: bool = false,
     did_load_async: bool = false,
@@ -381,12 +382,12 @@ pub const Program = struct {
         try this.virtual_files.put(this.allocator, getHash(file_name), data);
     }
 
-    pub fn getTypeChecker(this: *@This()) !*Analyzer {
-        if (this.type_checker) |p| return p;
+    pub fn getAnalyzer(this: *@This()) !*Analyzer {
+        if (this.analyzer) |p| return p;
 
         const p = try this.allocator.create(Analyzer);
         p.* = try Analyzer.init(this);
-        this.type_checker = p;
+        this.analyzer = p;
 
         return p;
     }
@@ -858,7 +859,7 @@ pub const Program = struct {
             f.did_top_level_cfa = true;
             if (f.is_declaration) return;
 
-            const analyzer = try this.getTypeChecker();
+            const analyzer = try this.getAnalyzer();
             const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
 
             if (first_statement != 0) {
@@ -1424,7 +1425,7 @@ pub const Program = struct {
 
                         return lhs;
                     },
-                    .named_tuple_element => {
+                    .tuple_element => {
                         return try self.generateIsExpression(subject, t.slot1);
                     },
                     .@"union" => {
@@ -2118,7 +2119,7 @@ pub const Program = struct {
 
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
         var factory = parser.Factory{ .nodes = &f.ast.nodes };
-        const a = try this.getTypeChecker();
+        const a = try this.getAnalyzer();
         var v = Visitor{ 
             .analyzer = a, 
             .file = f, 
@@ -2146,7 +2147,7 @@ pub const Program = struct {
 
         try this.bindModule(f);
 
-        const analyzer = try this.getTypeChecker();
+        const analyzer = try this.getAnalyzer();
         const printer = try analyzer.getPrinter();
         const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
 
@@ -2821,6 +2822,7 @@ pub const ParsedFileData = struct {
     linkage: *ModuleLinkage,
 
     flow: ?*Analyzer.FlowTyper = null,
+    declaration_flows: std.AutoArrayHashMapUnmanaged(NodeRef, *Analyzer.FlowTyper) = .{},
 
     // Used for semantic issues, e.g. `break` without being in a breakable context
     diagnostics: Diagnostics = .{},
@@ -2855,6 +2857,11 @@ pub const ParsedFileData = struct {
             .node_ref = node_ref,
             .message = s,
         });
+    }
+
+    pub fn emitErrorFmt(this: *@This(), node_ref: NodeRef, comptime fmt: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(this.import_map.allocator, fmt, args);
+        try this.emitError(node_ref, message);
     }
 
     pub fn printDiagnostics(this: *@This()) !void {
@@ -2962,7 +2969,7 @@ pub const Analyzer = struct {
 
         type_parameter,
 
-        named_tuple_element,
+        tuple_element,
 
         @"union",
         intersection,
@@ -3011,6 +3018,7 @@ pub const Analyzer = struct {
         this,
 
         any,
+        error_any,
         never,
         unknown,
         infer_unknown,
@@ -3030,7 +3038,7 @@ pub const Analyzer = struct {
         zero = 0b11 << 30,
     };
 
-    const Flags = enum(u24) {
+    pub const Flags = enum(u24) {
         has_promise = 1 << 0,
         has_infer = 1 << 1,
         parameter_decl = 1 << 2, // XXX: helper for getting types from constructor
@@ -3090,7 +3098,7 @@ pub const Analyzer = struct {
         }
     };
 
-    const Type = packed struct {
+    pub const Type = packed struct {
         slot0: u32 = 0,
         slot1: u32 = 0,
         slot2: u32 = 0,
@@ -3656,6 +3664,7 @@ pub const Analyzer = struct {
                 for (getSlice2(t, TypeRef)) |el| {
                     const v = try this.evaluateType(el, flags);
                     if (v != el) did_change = true;
+                    // TODO: perf: don't add to the union right away
                     if (try this.addToUnion(&tmp, v)) |x| return x;
                 }
 
@@ -3722,7 +3731,7 @@ pub const Analyzer = struct {
                 var tmp = try std.ArrayList(TypeRef).initCapacity(this.allocator(), members.len);
                 defer if (!did_change) tmp.deinit();
                 for (members) |el_type| {
-                    if (el_type < @intFromEnum(Kind.false) and this.getKindOfRef(el_type) == .named_tuple_element) {
+                    if (el_type < @intFromEnum(Kind.false) and this.getKindOfRef(el_type) == .tuple_element) {
                         const m = this.types.at(el_type);
                         const inner = m.slot1;
                         const v = try this.evaluateType(inner, flags);
@@ -3754,12 +3763,7 @@ pub const Analyzer = struct {
                         }
 
                         did_change = true;
-                        try tmp.append(try this.types.push(.{
-                            .kind = @intFromEnum(Kind.named_tuple_element),
-                            .slot0 = 0,
-                            .slot1 = v,
-                            .flags = @intFromEnum(Flags.spread),
-                        }));
+                        try tmp.append(try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread)));
 
                         continue;
                     }
@@ -3822,7 +3826,7 @@ pub const Analyzer = struct {
             .alias => true, // FIXME: check for simple args too
             .type_parameter => true,
             .string_literal, .number_literal => true,
-            .named_tuple_element => this.isSimpleType(t.slot1),
+            .tuple_element => this.isSimpleType(t.slot1),
             .tuple, .@"union", .intersection => {
                 const elements = getSlice2(t, TypeRef);
                 if (elements.len > 3) return false;
@@ -4264,7 +4268,7 @@ pub const Analyzer = struct {
 
                 return try this.createArrayType(v);
             },
-            .named_tuple_element => {
+            .tuple_element => {
                 const v = try this.resolveParameterizedType(n.slot1) orelse return null;
                 if (v == n.slot1) return ref;
 
@@ -4300,7 +4304,7 @@ pub const Analyzer = struct {
                         continue;
                     }
 
-                    if (this.types.at(v).getKind() != .named_tuple_element) {
+                    if (this.types.at(v).getKind() != .tuple_element) {
                         // TODO
                         try resolved.append(v);
                         continue;
@@ -4596,7 +4600,7 @@ pub const Analyzer = struct {
             const el = elements[index];
             if (el >= @intFromEnum(Kind.false)) return el;
             if (hasTypeFlag(this.types.at(el), .spread)) return this.getElementFromArrayLike(this.types.at(el).slot1, 0);
-            if (this.types.at(el).getKind() != .named_tuple_element) return @intFromEnum(Kind.never);
+            if (this.types.at(el).getKind() != .tuple_element) return @intFromEnum(Kind.never);
             return this.types.at(el).slot1;
         }
 
@@ -4950,7 +4954,7 @@ pub const Analyzer = struct {
                     if (subject == @intFromEnum(Kind.never)) return false;
                     if (subject >= @intFromEnum(Kind.zero)) return false;
 
-                    try this.debugPrint(subject);
+                    try this._debug(subject);
 
                     return error.TODO;
                 }
@@ -4962,7 +4966,7 @@ pub const Analyzer = struct {
 
                 return try this.inferTupleLikeTypes(getSlice2(s, TypeRef), getSlice2(n, TypeRef), inferred, variance);
             },
-            .named_tuple_element => {
+            .tuple_element => {
                 if (subject >= @intFromEnum(Kind.false)) {
                     if (hasTypeFlag(n, .spread)) {
                         if (n.slot1 >= @intFromEnum(Kind.false)) {
@@ -4974,7 +4978,7 @@ pub const Analyzer = struct {
                 }
 
                 const s = this.types.at(subject);
-                if (s.getKind() != .named_tuple_element) {
+                if (s.getKind() != .tuple_element) {
                     if (hasTypeFlag(n, .spread)) {
                         return this.inferConditionalTypeWithVariance(subject, this.types.at(n.slot1).slot0, inferred, variance);
                     }
@@ -6186,8 +6190,7 @@ pub const Analyzer = struct {
                     _indent(indent);
                     std.debug.print("  --> ", .{});
                     //typer.analyzer.printTypeInfo(entry.value_ptr.*);
-                    typer.analyzer.debugPrint(entry.value_ptr.*) catch unreachable;
-                    std.debug.print("\n", .{});
+                    typer.analyzer._debug(entry.value_ptr.*) catch unreachable;
                 }
 
                 for (self.antecedents.items) |l| {
@@ -6198,11 +6201,14 @@ pub const Analyzer = struct {
 
         const LabelStack = std.ArrayListUnmanaged(*Label);
 
+        prior: ?*@This() = null,
+        ref_count: u32 = 0,
+
         analyzer: *Analyzer,
         file: *ParsedFileData,
+        type_checker: checker.Checker,
 
         stack: LabelStack = .{},
-        declaration_flows: std.AutoArrayHashMapUnmanaged(NodeRef, *Label) = .{},
 
         // must be initialized upon starting flow analysis
         // if the current flow is a lexical scope, this will be at the top of the stack
@@ -6226,6 +6232,7 @@ pub const Analyzer = struct {
             return .{
                 .analyzer = analyzer,
                 .file = file,
+                .type_checker = checker.Checker.init(file, analyzer.allocator(), analyzer),
             };
         }
 
@@ -6233,7 +6240,13 @@ pub const Analyzer = struct {
             self.current_flow = try self.createLabel();
             try self.stack.append(self.analyzer.allocator(), self.current_flow);
             self.current_flow.on_stack = true;
-            return self.visitExpression(start);
+            const r = try self.visitExpression(start);
+
+            const last = self.stack.pop();
+            last.on_stack = false;
+            last.destroyAll(self);
+
+            return r;
         }
 
         pub fn visitFunctionLike(self: *@This(), first_statement: NodeRef) !TypeRef {
@@ -6290,7 +6303,9 @@ pub const Analyzer = struct {
         fn visitStatements(self: *@This(), start: NodeRef) anyerror!void {
             // all statements iterated belong to the same flow
             var iter = NodeIterator.init(&self.file.ast.nodes, start);
-            while (iter.next()) |s| {
+            while (iter.nextPair()) |p|{
+                const s = p[0];
+                const stmt_ref = p[1];
                 switch (s.kind) {
                     // --- control flow ---
 
@@ -6571,10 +6586,9 @@ pub const Analyzer = struct {
                     
                     // --- effects ---
 
-                    // ignore fn/class declarations for now, but we will eventually want to associate them 
-                    // with the current flow with pessimistic invalidations on scope exit so that they 
-                    // retain useful narrowings
-                    .function_declaration => {},
+                    .function_declaration => {
+                        try self.visitFunctionDeclaration(stmt_ref, s);
+                    },
                     .class_declaration => {},
 
                     .variable_statement => {
@@ -6584,7 +6598,8 @@ pub const Analyzer = struct {
                     .expression_statement => {
                         self.is_expression_statement = true;
                         const exp = unwrapRef(s);
-                        _ = try self.visitExpression(exp); 
+                        try self.type_checker.checkReadonlyAssignment(exp);
+                        _ = try self.visitExpression(exp);
                     },
                     else => {},
                 }
@@ -6594,7 +6609,9 @@ pub const Analyzer = struct {
         fn visitVariableStatement(self: *@This(), s: *const AstNode) !void {
             const is_const = s.hasFlag(.@"const");
             var decls = NodeIterator.init(&self.file.ast.nodes, unwrapRef(s));
-            while (decls.next()) |decl| {
+            while (true) {
+                const decl_ref = decls.ref;
+                const decl = decls.next() orelse break;
                 const d = getPackedData(decl);
 
                 const sym = self.file.binder.getSymbol(d.left) orelse continue;
@@ -6602,12 +6619,21 @@ pub const Analyzer = struct {
                     try m.put(self.analyzer.allocator(), sym, {});
                 }
 
-                // Respect the annotated type, do not try to narrow
-                if (is_const and decl.len != 0) continue;
+                // Check for duplicate declarations
+                try self.type_checker.checkDuplicateDeclaration(decl_ref);
 
                 if (d.right == 0) continue;
 
                 var init_type = try self.visitExpression(d.right);
+
+                // Check type assignability if there's a type annotation
+                if (decl.len != 0) {
+                    try self.type_checker.checkVariableDeclaration(decl_ref, init_type);
+                }
+
+                // Respect the annotated type, do not try to narrow
+                if (is_const and decl.len != 0) continue;
+
                 if (!is_const and decl.len == 0) {
                     // widen mutable bindings
                     if (try self.analyzer.maybeWidenType(init_type)) |t| {
@@ -6616,6 +6642,53 @@ pub const Analyzer = struct {
                 }
                 try self.current_flow.types.put(self.analyzer.allocator(), sym, init_type);
             }
+        }
+
+        fn visitFunctionDeclaration(self: *@This(), func_ref: NodeRef, s: *const AstNode) !void {
+            // we will visit it during .d.ts emit
+            if (s.hasFlag(.@"export")) return;
+
+            const body_ref = s.len;
+            if (body_ref == 0) return; 
+
+            const body = self.file.ast.nodes.at(body_ref);
+            if (body.kind != .block) return;
+
+            const block_start = maybeUnwrapRef(body) orelse return;
+
+            const saved_flow = self.current_flow;
+            const saved_stack = self.stack;
+            const saved_break = self.break_target;
+            const saved_continue = self.continue_target;
+            const saved_return = self.return_target;
+            const saved_exception = self.exception_target;
+            const saved_true = self.true_target;
+            const saved_false = self.false_target;
+            const saved_symbols = self.current_symbols;
+
+            self.stack = .{};
+            self.break_target = null;
+            self.continue_target = null;
+            self.exception_target = null;
+            self.true_target = null;
+            self.false_target = null;
+            self.current_symbols = null;
+
+            try self.visitEntrypoint(block_start, true);
+
+            if (!self.current_flow.terminal) {
+                try self.type_checker.checkFunctionReturnType(func_ref, s);
+            }
+
+            self.stack = saved_stack;
+            self.current_flow = saved_flow;
+            self.break_target = saved_break;
+            self.continue_target = saved_continue;
+            self.return_target = saved_return;
+            self.exception_target = saved_exception;
+            self.true_target = saved_true;
+            self.false_target = saved_false;
+            self.current_symbols = saved_symbols;
         }
 
         fn visitBlock(self: *@This(), s: *const AstNode) !void {
@@ -6976,6 +7049,11 @@ pub const Analyzer = struct {
                     return self.visitIsExpression(node, false);
                 },
 
+                .call_expression => {
+                    try self.type_checker.checkCallExpression(ref);
+                    return try self.analyzer.getType(self.file, ref);
+                },
+
                 else => {
                     return self.analyzer.getType(self.file, ref);
                 },
@@ -7041,6 +7119,9 @@ pub const Analyzer = struct {
                     const r = try self.analyzer.propertyNameToType(self.file, d.right);
 
                     const member_type = try self.analyzer.accessType(current_type, r);
+                    if (member_type == @intFromEnum(Kind.error_any)) {
+                        return member_type;
+                    }
 
                     const true_type = if (self.in_nullish_context)
                         try self.analyzer.nonNullable(member_type)
@@ -7261,6 +7342,9 @@ pub const Analyzer = struct {
 
                                     const cur = try self.getFlowType(d.left, target);
                                     const false_type = try self.analyzer.excludeType(cur, true_type);
+
+                                    // Check for comparison overlap (emit on left identifier for location)
+                                    try self.type_checker.checkComparisonOverlap(d.left, cur, true_type);
 
                                     if (negated) {
                                         try self.bindConditions(target, false_type, true_type);
@@ -7875,7 +7959,7 @@ pub const Analyzer = struct {
     }
 
     // TODO: comparable and subtype
-    fn isAssignableTo(this: *@This(), src: TypeRef, dst: TypeRef) anyerror!bool {
+    pub fn isAssignableTo(this: *@This(), src: TypeRef, dst: TypeRef) anyerror!bool {
         if (src == dst) return true;
 
         if (src < @intFromEnum(Kind.false)) {
@@ -7915,7 +7999,7 @@ pub const Analyzer = struct {
                 }
             }
 
-            if (n.getKind() == .named_tuple_element) {
+            if (n.getKind() == .tuple_element) {
                 return this.isAssignableTo(n.slot1, dst);
             }
 
@@ -7947,7 +8031,7 @@ pub const Analyzer = struct {
             
             const dst_type = this.types.at(dst);
             switch (dst_type.getKind()) {
-                .named_tuple_element => return this.isAssignableTo(src, dst_type.slot1),
+                .tuple_element => return this.isAssignableTo(src, dst_type.slot1),
                 .tuple => {
 
                 },
@@ -7966,6 +8050,8 @@ pub const Analyzer = struct {
                     const src_kind = this.getKindOfRef(src);
                     if (src_kind != .object_literal and src_kind != .empty_object) return false;
 
+                    // TODO: track if dst has an index type, then if we can't find a prop, we need 
+                    // to check against the index types. An object type flag could be useful here.
                     for (getSlice2(dst_type, ObjectLiteralMember)) |*m| {
                         if (m.kind != .index) continue;
 
@@ -7973,6 +8059,52 @@ pub const Analyzer = struct {
                             return true;
                         }
                     }
+
+                    const dst_members = getSlice2(dst_type, ObjectLiteralMember);
+                    if (src_kind == .empty_object) {
+                        for (dst_members) |dm| {
+                            if (dm.kind == .call_signature or dm.kind == .index) continue;
+                            if (!dm.isOptional()) return false;
+                        }
+                        return true;
+                    }
+
+                    const src_members = getSlice2(this.types.at(src), ObjectLiteralMember);
+
+                    for (dst_members) |*dm| {
+                        if (dm.kind == .call_signature or dm.kind == .index) continue;
+
+                        var found = false;
+                        for (src_members) |*sm| {
+                            if (sm.kind == .call_signature or sm.kind == .index) continue;
+                            if (sm.name != dm.name) continue;
+
+                            found = true;
+
+                            // ignore readonly, it only affects writing
+                            const sm_type = try sm.getType(this);
+                            const dm_type = try dm.getType(this);
+                            if (!try this.isAssignableTo(sm_type, dm_type)) {
+                                // getType doesn't include `undefined`, we'll attempt checking with it now
+                                if (dm.isOptional() and !sm.isOptional()) {
+                                    const dm_type_opt = try this.toUnion(&.{ dm_type, @intFromEnum(Kind.undefined )});
+                                    if (try this.isAssignableTo(sm_type, dm_type_opt)) break;
+                                } else if (!dm.isOptional() and sm.isOptional()) {
+                                    const sm_type_opt = try this.toUnion(&.{ sm_type, @intFromEnum(Kind.undefined )});
+                                    if (try this.isAssignableTo(sm_type_opt, dm_type)) break;
+                                }
+
+                                return false;
+                            }
+                            break;
+                        }
+
+                        if (!found and !dm.isOptional()) {
+                            return false;
+                        }
+                    }
+
+                    return true;
                 },
                 .function_literal => {},
                 .@"union" => {
@@ -8143,7 +8275,7 @@ pub const Analyzer = struct {
 
     fn reduceTupleElement(this: *@This(), t: *const Type, arr: *std.ArrayList(TypeRef)) anyerror!void {
         for (getSlice2(t, TypeRef)) |el| {
-            if (el < @intFromEnum(Kind.false) and this.types.at(el).getKind() == .named_tuple_element) {
+            if (el < @intFromEnum(Kind.false) and this.types.at(el).getKind() == .tuple_element) {
                 const u = this.types.at(el);
                 if (hasTypeFlag(u, .spread)) {
                     if (u.slot1 == @intFromEnum(Kind.empty_tuple)) continue;
@@ -8153,16 +8285,9 @@ pub const Analyzer = struct {
                         continue;
                     }
                 }
-                try arr.append(el);
-                continue;
             }
 
-            try arr.append(try this.types.push(.{
-                .kind = @intFromEnum(Kind.named_tuple_element),
-                .slot0 = 0,
-                .slot1 = el,
-                .flags = if (this.isParameterizedRef(el)) @intFromEnum(Flags.parameterized) else 0,
-            }));
+            try arr.append(el);
         }
     }
 
@@ -8316,7 +8441,7 @@ pub const Analyzer = struct {
         if (pos >= params.len) return null;
 
         const param = params[pos];
-        if (this.getKindOfRef(param) != .named_tuple_element) return null; // TODO?
+        if (this.getKindOfRef(param) != .tuple_element) return null; // TODO?
 
         return this.types.at(param).slot1;
     }
@@ -9004,17 +9129,6 @@ pub const Analyzer = struct {
         return null;
     }
 
-    // TODO: we should compute an ordered hash of the union after adding types
-    // fn toCanonicalUnion(this: *@This(), types: []const TypeRef) !u32 {
-    //     var tmp = TempUnion{ .elements = std.ArrayList(u32).init(this.allocator()) };
-
-    //     for (types) |t| {
-    //         if (try this.addToUnion(&tmp, t)) |x| return x;
-    //     }
-
-    //     return tmp.complete(this);
-    // }
-
     fn toUnion(this: *@This(), types: []const TypeRef) !u32 {
         std.debug.assert(types.len > 1);
 
@@ -9126,7 +9240,15 @@ pub const Analyzer = struct {
             return this.flags & protected_or_private == 0;
         }
 
-        pub inline fn hasFlag(this: *@This(), flag: NodeFlags) bool {
+        pub inline fn isOptional(this: *const @This()) bool {
+            return this.hasFlag(.optional);
+        }
+
+        pub inline fn isReadonly(this: *const @This()) bool {
+            return this.hasFlag(.readonly);
+        }
+
+        pub inline fn hasFlag(this: *const @This(), flag: NodeFlags) bool {
             return this.flags & @intFromEnum(flag) == @intFromEnum(flag);
         }
 
@@ -9147,7 +9269,7 @@ pub const Analyzer = struct {
         }
     };
 
-    fn propertyNameToType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !TypeRef {
+    pub fn propertyNameToType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !TypeRef {
         const n = file.ast.nodes.at(ref);
         switch (n.kind) {
             .identifier, .private_identifier => {
@@ -9316,7 +9438,9 @@ pub const Analyzer = struct {
         const params = getSlice2(base, TypeRef);
 
         for (params, 0..) |p, i| {
-            const val = if (i < args.len) args[i] else this.getTypeParamDefault(p) orelse @intFromEnum(Kind.infer_unknown);
+            const val = if (i < args.len) args[i] else this.getTypeParamDefault(p) 
+                orelse this.getTypeParamConstraint(p)
+                orelse @intFromEnum(Kind.infer_unknown);
             this.type_registers[this.types.at(p).slot3] = val;
         }
 
@@ -9346,7 +9470,9 @@ pub const Analyzer = struct {
 
         for (params) |p| {
             const prev = this.type_args.get(p) orelse 0;
-            const val = inferred.get(p) orelse (this.getTypeParamDefault(p) orelse @intFromEnum(Kind.infer_unknown));
+            const val = inferred.get(p) orelse (this.getTypeParamDefault(p) 
+                orelse this.getTypeParamConstraint(p)
+                orelse @intFromEnum(Kind.infer_unknown));
             try tmp_args.put(p, prev);
             try this.type_args.put(p, val);
 
@@ -9585,6 +9711,19 @@ pub const Analyzer = struct {
         return t;
     }
 
+    fn createCanonicalFunctionLiteral2(this: *@This(), params: []TypeRef, return_type: TypeRef, this_type: TypeRef, flags: u24) !TypeRef {
+        const key = hashFunctionLiteral(params, return_type, this_type, flags);
+        if (this.canonical_types.get(key)) |t| {
+            this.allocator().free(params);
+            return t;
+        }
+
+        const t = try this.createFunctionLiteralFull(params, return_type, this_type, flags);
+        try this.canonical_types.put(key, t);
+
+        return t;
+    }
+
     fn createFunctionLiteralFull(this: *@This(), params: []const TypeRef, return_type: TypeRef, this_type: TypeRef, flags: u24) !TypeRef {
         const _flags = flags | (if (this.hasThisType(return_type)) @intFromEnum(Flags.has_this_type) else 0); // XXX
         const x: u64 = @intFromPtr(params.ptr);
@@ -9639,19 +9778,38 @@ pub const Analyzer = struct {
         });
     }
 
-    fn createNamedTupleTypeFromIdent(this: *@This(), file_id: u32, ident: NodeRef, ty: TypeRef, flags: u24) !TypeRef {
-        const ident_hash = this.program.files.items[file_id].binder.nodes.at(ident).extra_data2;
+    fn getTupleElementHash(this: *const @This(), ident_hash: u32, ty: TypeRef, flags: u24) u64 {
+        _ = this;
         var h = std.hash.Wyhash.init(0);
-        h.update(&.{@as(u8, @intFromEnum(Kind.named_tuple_element))});
+        h.update(&.{@as(u8, @intFromEnum(Kind.tuple_element))});
         h.update(&@as([3]u8, @bitCast(flags)));
         h.update(&@as([4]u8, @bitCast(ident_hash)));
         h.update(&@as([4]u8, @bitCast(ty)));
+        return h.final();
+    }
 
-        const key = h.final();
+    fn createUnnamedTupleElement(this: *@This(), ty: TypeRef, flags: u24) !TypeRef {
+        const ident_hash = getHashComptime("");
+        const key = this.getTupleElementHash(ident_hash, ty, flags);
         if (this.canonical_types.get(key)) |t| return t;
         
         const t = try this.types.push(.{
-            .kind = @intFromEnum(Kind.named_tuple_element),
+            .kind = @intFromEnum(Kind.tuple_element),
+            .slot1 = ty,
+            .flags = flags,
+        });
+
+        try this.canonical_types.put(key, t);
+        return t;
+    }
+
+    fn createNamedTupleTypeFromIdent(this: *@This(), file_id: u32, ident: NodeRef, ty: TypeRef, flags: u24) !TypeRef {
+        const ident_hash = this.program.files.items[file_id].binder.nodes.at(ident).extra_data2;
+        const key = this.getTupleElementHash(ident_hash, ty, flags);
+        if (this.canonical_types.get(key)) |t| return t;
+        
+        const t = try this.types.push(.{
+            .kind = @intFromEnum(Kind.tuple_element),
             .slot0 = ident,
             .slot1 = ty,
             .slot4 = file_id,
@@ -9875,7 +10033,7 @@ pub const Analyzer = struct {
                     }
 
                     const n2 = this.types.at(m.name);
-                    if (n2.getKind() == .named_tuple_element) break :blk n2.slot1;
+                    if (n2.getKind() == .tuple_element) break :blk n2.slot1;
                     break :blk m.name;
                 },
             };
@@ -10644,6 +10802,31 @@ pub const Analyzer = struct {
 
         return try this.createParameterizedType(params.items, inner);
     }
+    
+    // unwraps `tuple_element`
+    pub fn getTupleElementType(this: *const @This(), t: TypeRef) TypeRef {
+        if (t >= @intFromEnum(Kind.false)) return t;
+
+        const n = this.types.at(t);
+        if (n.getKind() != .tuple_element) return t;
+
+        return n.slot1;
+    }
+
+    pub fn isNamedTupleElement(this: *const @This(), t: TypeRef) bool {
+        if (t >= @intFromEnum(Kind.false)) return false;
+
+        const n = this.types.at(t);
+        if (n.getKind() != .tuple_element) return false;
+
+        return n.slot0 != 0;
+    }
+
+    pub inline fn isSpreadElement(this: *const @This(), t: TypeRef) bool {
+        if (t >= @intFromEnum(Kind.false)) return false;
+
+        return this.types.at(t).hasFlag(.spread);
+    }
 
     fn getThisType(this: *@This(), file: *ParsedFileData, node: *const AstNode) !TypeRef {
         if (node.extra_data == 0) {
@@ -10894,7 +11077,7 @@ pub const Analyzer = struct {
                             }
 
                             try elements.append(
-                                try this.createNamedTupleTypeFromIdent(file.id, 0, inner, element_flags),
+                                try this.createUnnamedTupleElement(inner, element_flags),
                             );
                         },
                         else => {
@@ -11670,8 +11853,8 @@ pub const Analyzer = struct {
         return try this.getTypeOfSymbol(f, sym_ref);
     }
 
-    fn accessType(this: *@This(), subject: TypeRef, element: TypeRef) anyerror!TypeRef {
-        if (subject == @intFromEnum(Kind.any)) return subject;
+    pub fn accessType(this: *@This(), subject: TypeRef, element: TypeRef) anyerror!TypeRef {
+        if (subject == @intFromEnum(Kind.any) or subject == @intFromEnum(Kind.error_any)) return subject;
         if (element == @intFromEnum(Kind.any)) return element;
         if (element == @intFromEnum(Kind.never)) return element;
 
@@ -11718,9 +11901,18 @@ pub const Analyzer = struct {
             }
 
             // we are accessing the primitive protos
-            if (subject == @intFromEnum(Kind.string)) {
+            if (subject == @intFromEnum(Kind.string) or subject == @intFromEnum(Kind.empty_string)) {
                 const s = try this.getGlobalTypeSymbolAlias("String", .{}) orelse return error.MissingString;
                 return this.accessTypeWithHash(s, element, hash, set_this_type);
+            }
+
+            if (subject == @intFromEnum(Kind.number) or subject >= @intFromEnum(Kind.zero)) {
+                const s = try this.getGlobalTypeSymbolAlias("Number", .{}) orelse return error.MissingNumber;
+                return this.accessTypeWithHash(s, element, hash, set_this_type);
+            }
+
+            if (subject == @intFromEnum(Kind.undefined) or subject == @intFromEnum(Kind.null)) {
+                return @intFromEnum(Kind.error_any);
             }
 
             this.printTypeInfo(subject);
@@ -11755,7 +11947,7 @@ pub const Analyzer = struct {
 
                 const el = slice[@intCast(ind)];
                 if (el >= @intFromEnum(Kind.false)) return el;
-                if (this.getKindOfRef(el) == .named_tuple_element) {
+                if (this.getKindOfRef(el) == .tuple_element) {
                     return this.types.at(el).slot1;
                 }
                 return el;
@@ -11968,6 +12160,24 @@ pub const Analyzer = struct {
         return try this.getGlobalTypeSymbolAlias("RegExp", .{}) orelse @intFromEnum(Kind.empty_object);
     }
 
+    fn handleFailedInferCall(this: *@This(), file: *ParsedFileData, ref: NodeRef, n: *const Type, args_start: NodeRef) !TypeRef {
+        const apparent = try this.resolveWithTypeArgsSlice(n, &.{});
+
+        var checker2 = checker.Checker.init(file, this.allocator(), this);
+
+        var i: u32 = 0;
+        var args: [32]u32 = undefined;
+        var iter = NodeIterator.init(&file.ast.nodes, args_start);
+        while (iter.nextRef()) |x| {
+            args[i] = x;
+            i += 1;
+        }
+
+        try checker2.checkArgsAgainstSignature(apparent, args[0..i], ref);
+
+        return this.types.at(apparent).slot3;
+    }
+
     fn maybeGetInt32FromType(this: *@This(), ref: TypeRef) ?i32 {
         if (ref >= @intFromEnum(Kind.false)) {
             if (ref >= @intFromEnum(Kind.zero)) {
@@ -12121,7 +12331,7 @@ pub const Analyzer = struct {
             const old_ctx = this.inferrence_ctx;
             defer this.inferrence_ctx = old_ctx;
             const pt = fn_params[args.items.len];
-            std.debug.assert(this.getKindOfRef(pt) == .named_tuple_element);
+            std.debug.assert(this.getKindOfRef(pt) == .tuple_element);
             this.inferrence_ctx = this.types.at(pt).slot1;
 
             const ty = try this.getType(file, p[1]);
@@ -12246,7 +12456,7 @@ pub const Analyzer = struct {
                 const d = getPackedData(exp);
                 const t = try this.getType(file, d.left);
                 if (t >= @intFromEnum(Kind.false)) {
-                    if (t == @intFromEnum(Kind.never) or t == @intFromEnum(Kind.any)) {
+                    if (t == @intFromEnum(Kind.never) or t == @intFromEnum(Kind.any) or t == @intFromEnum(Kind.error_any)) {
                         return t;
                     }
                     this.printTypeInfo(t);
@@ -12270,7 +12480,9 @@ pub const Analyzer = struct {
                         return this.getReturnType(resolved);
                     }
 
-                    const resolved = try this.inferTypeCallExpParameterized(file, n, d.right) orelse return error.FailedToInferCallExp;
+                    const resolved = try this.inferTypeCallExpParameterized(file, n, d.right) 
+                        orelse return try this.handleFailedInferCall(file, ref, n, d.right);
+
                     const rt = try this.getReturnType(resolved);
                     return rt;
                 }
@@ -12306,7 +12518,7 @@ pub const Analyzer = struct {
                     // return never if not a function
 
                     std.debug.print("{any}\n", .{n.getKind()});
-                    try this.debugPrint(t);
+                    try this._debug(t);
                     return error.NotAFunctionOrMissingCompatibleSignature;
                 }
 
@@ -12385,7 +12597,7 @@ pub const Analyzer = struct {
                                         if (el < @intFromEnum(Kind.false)) {
                                             const nty = this.types.at(el);
                                             if (hasTypeFlag(nty, .spread)) break :blk nty.slot1; // TODO: reduce this?
-                                            if (nty.getKind() == .named_tuple_element) break :blk nty.slot1;
+                                            if (nty.getKind() == .tuple_element) break :blk nty.slot1;
                                         }
                                         break :blk el;
                                     };
@@ -12750,8 +12962,7 @@ pub const Analyzer = struct {
 
                 const old_ctx = this.inferrence_ctx;
                 defer this.inferrence_ctx = old_ctx;
-                std.debug.assert(this.getKindOfRef(st) == .named_tuple_element);
-                this.inferrence_ctx = this.types.at(st).slot1;
+                this.inferrence_ctx = this.getTupleElementType(st);
 
                 const pt = try this.getType(file, p);
                 if (!try this.isAssignableTo(pt, st)) continue :outer;
@@ -12923,7 +13134,7 @@ pub const Analyzer = struct {
                     try this.gatherReferencedSymbols(t.slot3);
                     try this.gatherReferencedSymbols(t.slot4);
                 },
-                .named_tuple_element => {
+                .tuple_element => {
                     try this.gatherReferencedSymbols(t.slot1);
                 },
                 .conditional => {
@@ -13066,8 +13277,7 @@ pub const Analyzer = struct {
         }
         if (t.getKind() == .object_literal) {
             std.debug.print("    ",.{});
-            @constCast(this).debugPrint(ty) catch unreachable;
-            std.debug.print("\n",.{});
+            @constCast(this)._debug(ty) catch unreachable;
         }
         if (t.getKind() == .string_literal) {
             std.debug.print("  value: {s}\n", .{this.getSliceFromLiteral(ty)});
@@ -13086,29 +13296,29 @@ pub const Analyzer = struct {
         }
     }
 
-    pub fn debugPrint(this: *@This(), ty: TypeRef) !void {
+    pub fn printType(this: *@This(), ty: TypeRef) ![]const u8 {
         const p = try this.getPrinter();
         const x = try p.toTypeNode(ty);
-        if (x == 0) return;
+        if (x == 0) {
+            if (comptime is_debug) this.printTypeInfo(ty);
+            return error.FailedToPrintType;
+        }
 
-        const f = this.program.getFileData(0);
         const s = try parser.printInMemoryWithTypes(.{
-            .source_name = f.file_name,
             .nodes = p.synthetic_nodes,
-            .decorators = f.ast.decorators,
-            .source = f.ast.source,
-            .positions = f.ast.positions,
+            .source = &.{},
         }, p.synthetic_nodes.at(x).*);
 
-        std.debug.print("{s}", .{s});
+        return s;
     }
 
-    fn _debug(this: *@This(), ty: u32) !void {
-        try this.debugPrint(ty);
-        std.debug.print("\n", .{});
+    pub fn _debug(this: *@This(), ty: u32) !void {
+        const s = try this.printType(ty);
+        std.debug.print("{s}\n", .{s});
     }
 
     const TypePrinter = struct {
+        factory: parser.Factory,
         analyzer: *Analyzer,
         allocator: std.mem.Allocator,
         synthetic_nodes: parser.BumpAllocator(AstNode),
@@ -13127,6 +13337,7 @@ pub const Analyzer = struct {
 
             const p = try analyzer.allocator().create(@This());
             p.* = .{
+                .factory = undefined,
                 .analyzer = analyzer,
                 .allocator = analyzer.allocator(),
                 .synthetic_nodes = synthetic_nodes,
@@ -13134,6 +13345,8 @@ pub const Analyzer = struct {
                 .cached_string_types = .{},
                 .triple_slash_directives = .{},
             };
+
+            p.factory = .{ .nodes = &p.synthetic_nodes };
 
             return p;
         }
@@ -13655,15 +13868,28 @@ pub const Analyzer = struct {
                         }
 
                         const params = getSlice2(k, TypeRef);
-                        for (params) |z| {
-                            const p = this.analyzer.types.at(z);
-                            const copy = try this.copyNodeFromRef(p.slot0, p.slot4);
-
+                        for (params, 0..) |z, i| {
                             var flags: u20 = 0;
-                            if (hasTypeFlag(p, .optional)) flags |= @intFromEnum(NodeFlags.optional);
-                            if (hasTypeFlag(p, .spread)) flags |= @intFromEnum(NodeFlags.generator);
+                            var copy: NodeRef = 0;
 
-                            const param_type_node = try this.toTypeNode(p.slot1);
+                            if (this.analyzer.isNamedTupleElement(z)) {
+                                const p = this.analyzer.types.at(z);
+                                copy = try this.copyNodeFromRef(p.slot0, p.slot4);
+                                if (p.hasFlag(.optional)) flags |= @intFromEnum(NodeFlags.optional);
+                                if (p.hasFlag(.spread)) flags |= @intFromEnum(NodeFlags.generator);
+                            } else {
+                                // TODO: detect conflicts
+                                const name = try std.fmt.allocPrint(this.allocator, "a_{d}", .{i});
+                                copy = try this.factory.createIdentifierAllocated(name);
+
+                                if (z < @intFromEnum(Kind.false) and this.analyzer.types.at(z).getKind() == .tuple_element) {
+                                    const p = this.analyzer.types.at(z);
+                                    if (p.hasFlag(.optional)) flags |= @intFromEnum(NodeFlags.optional);
+                                    if (p.hasFlag(.spread)) flags |= @intFromEnum(NodeFlags.generator);
+                                }
+                            }
+
+                            const param_type_node = try this.toTypeNode(this.analyzer.getTupleElementType(z));
 
                             try l.append(.{
                                 .kind = .parameter,
@@ -13686,7 +13912,7 @@ pub const Analyzer = struct {
                             .data = toBinaryDataPtrRefs(l.head, try this.toTypeNode(k.slot3)),
                         });
                     },
-                    .named_tuple_element => {
+                    .tuple_element => {
                         const inner = try this.toTypeNode(k.slot1);
 
                         if (k.slot0 == 0) {
@@ -13941,6 +14167,7 @@ pub const Analyzer = struct {
                     .unknown => .unknown_keyword,
                     .infer_unknown => .unknown_keyword,
                     .any => .any_keyword,
+                    .error_any => .any_keyword,
                     .null => .null_keyword,
                     else => {
                         std.debug.print("{}\n", .{ty});

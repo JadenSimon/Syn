@@ -10,7 +10,7 @@ const getSlice2 = program.Analyzer.getSlice2;
 
 pub const Reifier = struct {    
     env: *js.Env,
-    checker: *program.Analyzer,
+    analyzer: *program.Analyzer,
     type_map: std.AutoArrayHashMapUnmanaged(TypeRef, *js.Value) = std.AutoArrayHashMapUnmanaged(TypeRef, *js.Value){},
     allocator: std.mem.Allocator,
     type_module: *js.Ref,
@@ -97,8 +97,8 @@ pub const Reifier = struct {
     }
 
     fn reifyType(this: *@This(), ty: program.Analyzer.TypeRef) anyerror!*anyopaque {
-        if (this.checker.isParameterizedRef(ty)) {
-            this.checker.printTypeInfo(ty);
+        if (this.analyzer.isParameterizedRef(ty)) {
+            this.analyzer.printTypeInfo(ty);
             return error.TODO_parameterized;
         }
 
@@ -157,10 +157,10 @@ pub const Reifier = struct {
             // empty_element -> undefined ?
 
             if (ty >= @intFromEnum(Kind.zero)) {
-                return try js.Number.createDouble(this.env, this.checker.getDoubleFromType(ty));
+                return try js.Number.createDouble(this.env, this.analyzer.getDoubleFromType(ty));
             }
 
-            this.checker.printTypeInfo(ty);
+            this.analyzer.printTypeInfo(ty);
             return error.TODO_unhandled_primitve_type;
         }
 
@@ -168,16 +168,16 @@ pub const Reifier = struct {
             return p;
         }
 
-        const t = this.checker.types.at(ty);
+        const t = this.analyzer.types.at(ty);
         switch (t.getKind()) {
             .alias => {
                 if (try this.hasCached(ty)) {
                     return try this.getCached(ty);
                 }
 
-                const followed = try this.checker.evaluateType(ty, 1 << 0);
+                const followed = try this.analyzer.evaluateType(ty, 1 << 0);
                 if (ty == followed) {
-                    this.checker.printTypeInfo(ty);
+                    this.analyzer.printTypeInfo(ty);
                     return error.RecursiveAlias;
                 }
 
@@ -187,9 +187,9 @@ pub const Reifier = struct {
                 return result;
             },
             .conditional, .indexed, .keyof, .query, .mapped, .intersection => {
-                const followed = try this.checker.evaluateType(ty, 1 << 0 | 1 << 30);
+                const followed = try this.analyzer.evaluateType(ty, 1 << 0 | 1 << 30);
                 if (ty == followed) {
-                    this.checker.printTypeInfo(ty);
+                    this.analyzer.printTypeInfo(ty);
                     return error.Recursive;
                 }
 
@@ -205,7 +205,7 @@ pub const Reifier = struct {
                 const types = getSlice2(t, TypeRef);
                 for (types) |u| {
                     if (u < @intFromEnum(Kind.false)) {
-                        const t2 = this.checker.types.at(u);
+                        const t2 = this.analyzer.types.at(u);
                         const el_type = t2.slot1;
                         try this.callMethod(o, "add", .{
                             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
@@ -219,7 +219,7 @@ pub const Reifier = struct {
                 }
                 return o;
             },
-            // .named_tuple_element => {
+            // .tuple_element => {
             //     const o = try this.createSavedShape(ty, "__TupleElement");
             //     const types = getSlice2(t, TypeRef);
             //     for (types) |u| {
@@ -240,11 +240,11 @@ pub const Reifier = struct {
                 return o;
             },
             .string_literal => {
-                const s = this.checker.getSliceFromLiteral(ty);
+                const s = this.analyzer.getSliceFromLiteral(ty);
                 return try js.String.fromUtf8(this.env, s);
             },
             .number_literal => {
-                return try js.Number.createDouble(this.env, this.checker.getDoubleFromType(ty));
+                return try js.Number.createDouble(this.env, this.analyzer.getDoubleFromType(ty));
             },
             .object_literal => {
                 if (try this.hasCached(ty)) {
@@ -260,7 +260,7 @@ pub const Reifier = struct {
 
                     const name: *js.Value = @alignCast(@ptrCast(try this.reifyType(u.name)));
 
-                    const inner = try u.getType(this.checker);
+                    const inner = try u.getType(this.analyzer);
                     const v = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(inner))));
                     try o.setProperty(this.env, name, v);
                 }
@@ -275,7 +275,7 @@ pub const Reifier = struct {
             // symbol_literal (only well-known symbols)
         }
 
-        this.checker.printTypeInfo(ty);
+        this.analyzer.printTypeInfo(ty);
         return error.TODO_unhandled_allocated_type;
     }
 
@@ -285,10 +285,10 @@ pub const Reifier = struct {
         const scope = try EscapableHandleScope.open(this.env);
         defer scope.close(this.env) catch {};
 
-        const ty = try this.checker.getType(f, node_ref);
+        const ty = try this.analyzer.getType(f, node_ref);
 
         if (type_params != 0) {
-            const ty2 = try this.checker.createParameterizedTypeFromParams(f, type_params, ty);
+            const ty2 = try this.analyzer.createParameterizedTypeFromParams(f, type_params, ty);
 
             const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
             const prop = try type_module.getNamedProperty(this.env, "__TypeFunction");
@@ -308,7 +308,7 @@ pub const Reifier = struct {
         const scope = try EscapableHandleScope.open(this.env);
         defer scope.close(this.env) catch {};
 
-        const ty = try this.checker.resolveWithTypeArgsSlice(this.checker.types.at(inner), args);
+        const ty = try this.analyzer.resolveWithTypeArgsSlice(this.analyzer.types.at(inner), args);
 
         return try scope.escape(this.env, @alignCast(@ptrCast(try this.reifyType(ty))));
     }

@@ -514,7 +514,7 @@ const Reifier = @import("./reifier.zig").Reifier;
 pub fn createReifier(program: *js.Object, type_ns: *js.Object) !js.Wrapped {
     const p = try unwrap(Program, program);
     const reifier = try getAllocator().create(Reifier);
-    reifier.* = Reifier.initCurrentEnv(getAllocator(), try p.getTypeChecker(), type_ns);
+    reifier.* = Reifier.initCurrentEnv(getAllocator(), try p.getAnalyzer(), type_ns);
 
     return .{ .value = reifier };
 }

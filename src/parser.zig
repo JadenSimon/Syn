@@ -597,7 +597,7 @@ pub const AstData = struct {
     start: NodeRef = 0,
     source: []const u8,
     nodes: BumpAllocator(AstNode),
-    decorators: NodeMap,
+    decorators: NodeMap = .{},
     positions: ?js_lexer.PositionsWriter = null,
     lines: ?js_lexer.LineMap = null,
     triple_slash_directives: []const TripleSlashDirective = &.{},
@@ -2980,6 +2980,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             const full_start = this.lexer.full_start;
             const width = this.getFullWidth();
+            const location = this.getLocation();
             const slice = this.lexer.string_literal_slice;
             try this.next();
 
@@ -2987,6 +2988,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .kind = kind,
                 .data = slice.ptr,
                 .len = @intCast(slice.len),
+                .location = location,
                 .flags = flags,
                 .full_start = full_start,
                 .width = width,
@@ -9386,7 +9388,7 @@ pub const Binder = struct {
 
 pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct { line: u32, col: u32 } {
     switch (n.kind) {
-        .identifier => {
+        .identifier, .string_literal => {
             const x = decodeLocation(n.location);
 
             return .{

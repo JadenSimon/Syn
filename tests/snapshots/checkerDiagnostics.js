@@ -7,8 +7,26 @@ let n = "42"
 }
 function takesId(id) {}
 takesId("123");
+{
+  const u = {
+    name: ''
+  }
+}
+{
+  function tooFewArgs(id) {}
+  tooFewArgs();
+}
+{
+  function generic(id) {}
+  generic(1);
+  generic('a');
+}
 const u = {
   id: "a"
+}
+u.name.toUpperCase();
+function cfa(a) {
+  return a.b
 }
 const c = {
   retries: 3,
