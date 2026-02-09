@@ -8,7 +8,7 @@ const is_debug = @import("builtin").mode == .Debug;
 const enable_conditional_bindings = true;
 
 // First 512 kinds are reserved for the `typescript` API
-pub const SyntaxKind = enum(u12) {
+pub const SyntaxKind = enum(u10) {
     unknown = 0,
     end_of_file_token = 1,
     single_line_comment_trivia = 2,
@@ -378,8 +378,6 @@ pub const SyntaxKind = enum(u12) {
 
     start = 1022,
     parse_error = 1023,
-
-    reserved = 1024,
 };
 
 const Op = struct {
@@ -459,7 +457,7 @@ pub const TypeOperators = ComptimeStringMap(SyntaxKind, .{
 // perfect compatibility is not the goal. The `typescript` API primarily uses
 // node flags to help with binding or type checking whereas we use it to reduce
 // the number of nodes parsed.
-pub const NodeFlags = enum(u20) {
+pub const NodeFlags = enum(u22) {
     none = 0,
     let = 1 << 0,
     @"const" = 1 << 1,
@@ -499,6 +497,8 @@ pub const NodeFlags = enum(u20) {
     // Negation mapped type modifiers
     minus_readonly = (1 << 9) | (1 << 13),
     minus_optional = (1 << 10) | (1 << 17),
+
+    // upper two bits are reserved
 };
 
 pub const StringFlags = enum(u20) {
@@ -525,7 +525,7 @@ pub const NodeRef = u32;
 
 pub const AstNode = packed struct {
     kind: SyntaxKind,
-    flags: u20 = 0,
+    flags: u22 = 0,
     next: NodeRef = 0,
     data: ?*const anyopaque = null, // TODO: make this u64
     len: u32 = 0,
@@ -540,7 +540,7 @@ pub const AstNode = packed struct {
 
 const AstNodeWithTrivia = packed struct {
     kind: SyntaxKind,
-    flags: u20 = 0,
+    flags: u22 = 0,
     next: NodeRef = 0,
     data: ?*const anyopaque = null, // TODO: make this u64
     len: u32 = 0,
@@ -562,7 +562,7 @@ const AstNodeWithTrivia = packed struct {
 
 // pub const AstNode = packed struct {
 //     kind: SyntaxKind,
-//     flags: u20 = 0,
+//     flags: u22 = 0,
 //     slot0: u32 = 0,
 //     slot1: u32 = 0,
 //     slot2: u32 = 0,
@@ -654,6 +654,7 @@ comptime {
 const max_location: u32 = @intCast(std.math.pow(u64, 2, 32) - 1);
 
 pub inline fn encodeLocation(line: u32, col: u32) u32 {
+    // using `col` tends to have better branch prediction on source code
     if (col < 0xFF) {
         return (col << 22) | line;
     } else if (col < 0x3FFF) {
@@ -1249,7 +1250,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parsePropertySignature(this: *@This(), name: NodeRef, baseFlags: u20) !AstNode_ {
+        fn parsePropertySignature(this: *@This(), name: NodeRef, baseFlags: u22) !AstNode_ {
             var flags = baseFlags;
             if (this.lexer.token == .t_question) {
                 try this.lexer.next();
@@ -1269,7 +1270,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn finishMappedType(this: *@This(), exp: AstNode_, as_clause: NodeRef, flags_init: u20) !AstNode_ {
+        fn finishMappedType(this: *@This(), exp: AstNode_, as_clause: NodeRef, flags_init: u22) !AstNode_ {
             var flags = flags_init;
             const d: BinaryExpData = @bitCast(@intFromPtr(exp.data orelse return error.MissingData));
 
@@ -1317,7 +1318,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             var members = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
-                var flags: u20 = 0;
+                var flags: u22 = 0;
 
                 if (this.lexer.token == .t_new) {
                     try this.lexer.next();
@@ -1533,7 +1534,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 if (try this.isNamedTupleElement()) {
                     const node = try this.parseIdentifierNode();
-                    var flags: u20 = 0;
+                    var flags: u22 = 0;
                     if (this.lexer.token == .t_question) {
                         try this.lexer.next();
                         flags = @intFromEnum(NodeFlags.optional);
@@ -2238,7 +2239,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parseTypeParamNode(this: *Parser) !AstNode_ {
-            var flags: u20 = 0;
+            var flags: u22 = 0;
             if (this.lexer.token == .t_const) {
                 try this.lexer.next();
                 flags |= @intFromEnum(TypeParamFlags.@"const");
@@ -2405,11 +2406,11 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn toBinaryDataPtr(this: *@This(), left: AstNode_, right: AstNode_) !*anyopaque {
+        inline fn toBinaryDataPtr(this: *@This(), left: AstNode_, right: AstNode_) !*anyopaque {
             return toBinaryDataPtrRefs(try this.pushNode(left), try this.pushNode(right));
         }
 
-        fn parseRemainingBinaryExpression(this: *@This(), level: Op.Level, left: AstNode_, comptime is_logical_op: bool) !?AstNode_ {
+        inline fn parseRemainingBinaryExpression(this: *@This(), level: Op.Level, left: AstNode_, comptime is_logical_op: bool) !?AstNode_ {
             const expLevel = try this.getCurrentBinaryParseLevel();
             if (level.gte(expLevel)) {
                 return null;
@@ -2904,7 +2905,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             return this.pushNode(try this.parseExpressionWithLevel(.comma));
         }
 
-        fn parseArrowFn(this: *@This(), full_start: u32, flags: u20) !AstNode_ {
+        fn parseArrowFn(this: *@This(), full_start: u32, flags: u22) !AstNode_ {
             var typeParameters: NodeRef = 0;
             if (this.lexer.token == .t_less_than) {
                 typeParameters = try this.parseTypeParams();
@@ -2931,7 +2932,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseSingleParamArrowFn(this: *@This(), ident: AstNode_, full_start: u32, flags: u20) !AstNode_ {
+        fn parseSingleParamArrowFn(this: *@This(), ident: AstNode_, full_start: u32, flags: u22) !AstNode_ {
             const param_binding = try this.pushNode(ident);
             const param = try this.pushNode(.{
                 .kind = .parameter,
@@ -2972,7 +2973,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parseStringLiteralLikeKind(this: *Parser, kind: SyntaxKind) !AstNode_ {
-            var flags: u20 = if (this.lexer.raw()[0] == '"') @intFromEnum(StringFlags.double_quote) else @intFromEnum(StringFlags.single_quote);
+            var flags: u22 = if (this.lexer.raw()[0] == '"') @intFromEnum(StringFlags.double_quote) else @intFromEnum(StringFlags.single_quote);
 
             if (!this.lexer.string_literal_is_ascii) {
                 flags |= @intFromEnum(StringFlags.two_byte);
@@ -3063,11 +3064,11 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseFnDeclaration(this: *@This(), full_start: u32, flags: u20) !AstNode_ {
+        fn parseFnDeclaration(this: *@This(), full_start: u32, flags: u22) !AstNode_ {
             return this.parseFnDecl(full_start, flags, .function_declaration);
         }
 
-        fn parseFnExpression(this: *@This(), full_start: u32, flags: u20) !AstNode_ {
+        fn parseFnExpression(this: *@This(), full_start: u32, flags: u22) !AstNode_ {
             return this.parseFnDecl(full_start, flags, .function_expression);
         }
 
@@ -3076,7 +3077,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             const full_start = this.lexer.full_start;
             try this.lexer.next();
 
-            const flags: u20 = @intFromEnum(NodeFlags.@"async");
+            const flags: u22 = @intFromEnum(NodeFlags.@"async");
 
             // Greedily parse function expressions
             if (this.lexer.token == .t_function and !this.lexer.has_newline_before) {
@@ -3614,7 +3615,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseArrayBindingElement(this: *@This()) anyerror!AstNode_ {
             var name: NodeRef = 0;
             var initializer: NodeRef = 0;
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             switch (this.lexer.token) {
                 .t_identifier => {
@@ -3665,7 +3666,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             var name: NodeRef = 0;
             var property: NodeRef = 0;
             var initializer: NodeRef = 0;
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             switch (this.lexer.token) {
                 .t_identifier => {
@@ -3933,7 +3934,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             var binding: NodeRef = 0;
             var ty: NodeRef = 0;
             var initializer: NodeRef = 0;
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             switch (this.lexer.token) {
                 .t_identifier, .t_open_brace, .t_open_bracket => {
@@ -3975,7 +3976,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseVariableStatement(this: *@This(), flags: u20) !AstNode_ {
+        fn parseVariableStatement(this: *@This(), flags: u22) !AstNode_ {
             const first = try this.parseVariableDeclaration();
             var decls = NodeList_.init(this);
             try decls.append(first);
@@ -4031,8 +4032,8 @@ fn Parser_(comptime skip_trivia: bool) type {
             return this.pushNode(try this.parseBlockNode());
         }
 
-        fn parseParam(this: *@This(), flagsInit: u20) !AstNode_ {
-            var flags: u20 = flagsInit;
+        fn parseParam(this: *@This(), flagsInit: u22) !AstNode_ {
+            var flags: u22 = flagsInit;
             if (this.lexer.token == .t_dot_dot_dot) {
                 try this.lexer.next();
                 flags |= @intFromEnum(NodeFlags.generator);
@@ -4096,7 +4097,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             var params = NodeList_.init(this);
             while (this.lexer.token != .t_close_paren) {
-                var flags: u20 = 0;
+                var flags: u22 = 0;
                 if (this.lexer.token == .t_public) {
                     try this.lexer.nextInConstructorParameterList();
                     flags |= @intFromEnum(NodeFlags.public);
@@ -4125,7 +4126,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             return params.head;
         }
 
-        fn parseFnDecl(this: *@This(), full_start: u32, flags_init: u20, comptime kind: SyntaxKind) !AstNode_ {
+        fn parseFnDecl(this: *@This(), full_start: u32, flags_init: u22, comptime kind: SyntaxKind) !AstNode_ {
             try this.lexer.expect(.t_function);
 
             var flags = flags_init;
@@ -4226,7 +4227,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn finishIndexSignature(this: *@This(), name: NodeRef, flags: u20) !AstNode_ {
+        fn finishIndexSignature(this: *@This(), name: NodeRef, flags: u22) !AstNode_ {
             try this.lexer.expect(.t_colon);
             const exp = try this.parseType();
             try this.lexer.expect(.t_close_bracket);
@@ -4406,7 +4407,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parsePropertyDeclWithName(this: *@This(), name: NodeRef) !AstNode_ {
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             if (this.lexer.token == .t_exclamation) {
                 try this.lexer.next();
@@ -4453,7 +4454,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseMethodDeclWithName(this: *@This(), name: NodeRef, flags: u20) !AstNode_ {
+        fn parseMethodDeclWithName(this: *@This(), name: NodeRef, flags: u22) !AstNode_ {
             const typeParameters = if (this.lexer.token == .t_less_than) try this.parseTypeParams() else 0;
             const parameters = try this.parseParameters();
 
@@ -4498,7 +4499,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             return this.parsePropertyDeclWithName(name);
         }
 
-        fn parseMethodDecl(this: *@This(), flags: u20) !AstNode_ {
+        fn parseMethodDecl(this: *@This(), flags: u22) !AstNode_ {
             const name = try this.parseMemberName();
 
             return this.parseMethodDeclWithName(name, flags);
@@ -4574,7 +4575,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseModifierOrMember(this: *@This(), flags: *u20, members: *NodeList_, comptime flag: NodeFlags) !void {
+        fn parseModifierOrMember(this: *@This(), flags: *u22, members: *NodeList_, comptime flag: NodeFlags) !void {
             const ident = toIdentNodeWithLocation(this.lexer.identifier, this.getLocation(), this.lexer.full_start, this.getFullWidth());
             try this.lexer.nextInClassScopeFlag(); // XXX: TODO: remove the "newline" hack
 
@@ -4621,7 +4622,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             try this.lexer.expectInClassScope(.t_open_brace);
             var members = NodeList_.init(this);
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             var decorators = NodeList_.init(this);
 
@@ -4990,7 +4991,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // This is equivalent to an assignment statement
             //
             // The normal `For` statement is allowed to have anything in the initializer position
-            var flags: u20 = 0;
+            var flags: u22 = 0;
 
             if (this.lexer.token == .t_let) {
                 try this.lexer.next();
@@ -5210,7 +5211,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseImportEquals(this: *@This(), name: NodeRef, flags: u20) !AstNode_ {
+        fn parseImportEquals(this: *@This(), name: NodeRef, flags: u22) !AstNode_ {
             try this.lexer.next();
 
             var rhs: NodeRef = undefined;
@@ -5404,7 +5405,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         //     yield [no LineTerminator here] * AssignmentExpression
         //     yield [no LineTerminator here] AssignmentExpression
 
-        fn parseLocalDeclaration(this: *@This(), full_start: u32, flagsInit: u20) anyerror!AstNode_ {
+        fn parseLocalDeclaration(this: *@This(), full_start: u32, flagsInit: u22) anyerror!AstNode_ {
             var flags = flagsInit;
 
             switch (this.lexer.token) {
@@ -5507,7 +5508,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             namespace,
         };
 
-        fn parseNamespaceOrModule(this: *@This(), flags: u20, comptime subtype: ModuleDeclarationSubtype) !AstNode_ {
+        fn parseNamespaceOrModule(this: *@This(), flags: u22, comptime subtype: ModuleDeclarationSubtype) !AstNode_ {
             const is_declared = flags & @intFromEnum(NodeFlags.declare) == @intFromEnum(NodeFlags.declare);
             const name = switch (subtype) {
                 .none => try if (this.lexer.token == .t_identifier)
@@ -5631,7 +5632,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return switch (this.lexer.token) {
                 .t_let, .t_const => {
-                    const flags: u20 = @intFromEnum(if (this.lexer.token == .t_let) NodeFlags.let else NodeFlags.@"const");
+                    const flags: u22 = @intFromEnum(if (this.lexer.token == .t_let) NodeFlags.let else NodeFlags.@"const");
                     try this.lexer.next();
                     return this.pushNode(try this.parseVariableStatement(flags));
                 },
@@ -6404,7 +6405,7 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createArrowFunction(this: *@This(), params: NodeRef, body: NodeRef, flags: u20) !NodeRef {
+    pub fn createArrowFunction(this: *@This(), params: NodeRef, body: NodeRef, flags: u22) !NodeRef {
         return this.nodes.push(.{
             .kind = .arrow_function,
             .data = toBinaryDataPtrRefs(params, body),
@@ -6455,7 +6456,7 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u20) !NodeRef {
+    pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u22) !NodeRef {
         return this.nodes.push(.{
             .kind = .variable_statement,
             .data = @ptrFromInt(declarations),
@@ -9402,6 +9403,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
                 return getLoc(nodes, nodes.at(d.left));
             }
         },
+        .element_access_expression, .binary_expression,
         .property_access_expression, .call_expression, .qualified_name,
         .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
             const d = getPackedData(n);

@@ -136,10 +136,12 @@ const ModuleResolver = struct {
             return resolved;
         }
 
+        const origin_ext = if (strings.endsWithComptime(origin, ".syn")) ".syn" else ".ts";
+
         defer this.arena.allocator().free(resolved);
 
         var stack_buf: [4096]u8 = undefined;
-        const with_ext = try std.fmt.bufPrint(&stack_buf, "{s}.ts", .{resolved});
+        const with_ext = try std.fmt.bufPrint(&stack_buf, "{s}{s}", .{resolved,origin_ext});
 
         const buf = try this.arena.allocator().alloc(u8, with_ext.len);
         @memcpy(buf, with_ext);
@@ -2282,7 +2284,7 @@ pub const Program = struct {
                 const synthed = self.printer.synthetic_nodes.at(synthed_ref);
                 const copy = try self.printer.copyNodeFromRef(getPackedData(node).left, self.file.id);
 
-                var flags: u20 = @intFromEnum(NodeFlags.declare);
+                var flags: u22 = @intFromEnum(NodeFlags.declare);
                 if (node.hasFlag(.@"export")) flags |= @intFromEnum(NodeFlags.@"export");
 
                 var return_type = (getPackedData(synthed)).right;
@@ -6089,25 +6091,9 @@ pub const Analyzer = struct {
             on_stack: bool = false,
             ref_count: u8 = 0,
 
-            pub fn create(a: std.mem.Allocator) !*@This() {
-                const self = try a.create(@This());
-                self.types = .{};
-                //self.node_types = .{};
-                self.antecedents = .{};
-                self.terminal = false;
-                self.on_stack = false;
-                self.ref_count = 0;
-                return self;
-            }
-
-            pub fn create2(a: anytype) !*@This() {
+            pub fn create(a: anytype) !*@This() {
                 const self = try a.create();
-                self.types = .{};
-                //self.node_types = .{};
-                self.antecedents = .{};
-                self.terminal = false;
-                self.on_stack = false;
-                self.ref_count = 0;
+                self.* = .{};
                 return self;
             }
 
@@ -6149,7 +6135,6 @@ pub const Analyzer = struct {
                     }
                 }
                 self.destroy(typer.analyzer.allocator());
-                // typer.analyzer.allocator().destroy(self);
                 typer.analyzer.label_pool.destroy(self);
             }
 
@@ -6199,10 +6184,8 @@ pub const Analyzer = struct {
             }
         };
 
+        const return_type_key: u32 = 100_000_000;
         const LabelStack = std.ArrayListUnmanaged(*Label);
-
-        prior: ?*@This() = null,
-        ref_count: u32 = 0,
 
         analyzer: *Analyzer,
         file: *ParsedFileData,
@@ -6224,7 +6207,7 @@ pub const Analyzer = struct {
         false_target: ?*Label = null,
 
         in_nullish_context: bool = false,
-        is_expression_statement: bool = false,
+        in_expression_statement: bool = false,
 
         current_symbols: ?*SymbolSet = null,
 
@@ -6236,15 +6219,18 @@ pub const Analyzer = struct {
             };
         }
 
-        pub fn visitArrowFnBody(self: *@This(), start: NodeRef) !TypeRef {
+        pub fn visitArrowFnExpressionBody(self: *@This(), start: NodeRef) !TypeRef {
+            const old_flow = self.current_flow;
             self.current_flow = try self.createLabel();
-            try self.stack.append(self.analyzer.allocator(), self.current_flow);
-            self.current_flow.on_stack = true;
+            // try self.stack.append(self.analyzer.allocator(), self.current_flow);
+            self.current_flow.ref();
+            // self.current_flow.on_stack = true;
             const r = try self.visitExpression(start);
 
-            const last = self.stack.pop();
-            last.on_stack = false;
-            last.destroyAll(self);
+            const last = self.current_flow; // self.stack.pop();
+            // last.on_stack = false;
+            last.unref(self);
+            self.current_flow = old_flow;
 
             return r;
         }
@@ -6254,14 +6240,14 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.void);
             }
 
+            const old_flow = self.current_flow;
+            const old_return = self.return_target;
+
             try self.visitEntrypoint(first_statement, true);
             const last = self.stack.pop();
             const rt = self.return_target orelse unreachable;
             if (!last.terminal) {
-                if (rt.types.count == 0) {
-                    return @intFromEnum(Kind.void);
-                }
-                const dst = try rt.types.getOrPut(self.analyzer.allocator(), 100_000_000);
+                const dst = try rt.types.getOrPut(self.analyzer.allocator(), return_type_key);
                 if (dst.found_existing) {
                     const v = dst.value_ptr.*;
                     if (dst.value_ptr.* != @intFromEnum(Kind.void)) {
@@ -6271,11 +6257,15 @@ pub const Analyzer = struct {
                     }
                 }
             }
-            const result = rt.types.get(100_000_000) orelse @intFromEnum(Kind.void);
-            self.return_target = null;
+
+            const result = rt.types.get(return_type_key) orelse @intFromEnum(Kind.void);
             rt.destroyAll(self);
             last.on_stack = false;
-            last.destroyAll(self);
+            last.unref(self);
+
+            self.current_flow = old_flow;
+            self.return_target = old_return;
+
             return result;
         }
 
@@ -6288,6 +6278,7 @@ pub const Analyzer = struct {
             std.debug.assert(target != 0);
 
             self.current_flow = try self.createLabel();
+            self.current_flow.ref();
 
             try self.stack.append(self.analyzer.allocator(), self.current_flow);
             self.current_flow.on_stack = true;
@@ -6596,7 +6587,7 @@ pub const Analyzer = struct {
                     },
 
                     .expression_statement => {
-                        self.is_expression_statement = true;
+                        self.in_expression_statement = true;
                         const exp = unwrapRef(s);
                         try self.type_checker.checkReadonlyAssignment(exp);
                         _ = try self.visitExpression(exp);
@@ -6619,14 +6610,12 @@ pub const Analyzer = struct {
                     try m.put(self.analyzer.allocator(), sym, {});
                 }
 
-                // Check for duplicate declarations
                 try self.type_checker.checkDuplicateDeclaration(decl_ref);
 
                 if (d.right == 0) continue;
 
                 var init_type = try self.visitExpression(d.right);
 
-                // Check type assignability if there's a type annotation
                 if (decl.len != 0) {
                     try self.type_checker.checkVariableDeclaration(decl_ref, init_type);
                 }
@@ -6647,6 +6636,7 @@ pub const Analyzer = struct {
         fn visitFunctionDeclaration(self: *@This(), func_ref: NodeRef, s: *const AstNode) !void {
             // we will visit it during .d.ts emit
             if (s.hasFlag(.@"export")) return;
+            if (s.hasFlag(.declare)) return;
 
             const body_ref = s.len;
             if (body_ref == 0) return; 
@@ -6655,6 +6645,7 @@ pub const Analyzer = struct {
             if (body.kind != .block) return;
 
             const block_start = maybeUnwrapRef(body) orelse return;
+            _ = block_start;
 
             const saved_flow = self.current_flow;
             const saved_stack = self.stack;
@@ -6674,7 +6665,7 @@ pub const Analyzer = struct {
             self.false_target = null;
             self.current_symbols = null;
 
-            try self.visitEntrypoint(block_start, true);
+            _ = try self.analyzer.getType(self.file, func_ref);
 
             if (!self.current_flow.terminal) {
                 try self.type_checker.checkFunctionReturnType(func_ref, s);
@@ -6756,7 +6747,7 @@ pub const Analyzer = struct {
                 @intFromEnum(Kind.void);
 
             if (self.return_target) |target| {
-                const dst = try target.types.getOrPut(self.analyzer.allocator(), 100_000_000);
+                const dst = try target.types.getOrPut(self.analyzer.allocator(), return_type_key);
                 if (!dst.found_existing) {
                     dst.value_ptr.* = return_type;
                     return;
@@ -7004,8 +6995,8 @@ pub const Analyzer = struct {
                         .bar_bar_token,
                         .question_question_token,
                         .ampersand_ampersand_token => {
-                            const is_statement = self.is_expression_statement;
-                            self.is_expression_statement = false;
+                            const is_statement = self.in_expression_statement;
+                            self.in_expression_statement = false;
 
                             // Create a label to capture narrowings from both branches
                             const effect_label = try self.createLabel();
@@ -7343,8 +7334,7 @@ pub const Analyzer = struct {
                                     const cur = try self.getFlowType(d.left, target);
                                     const false_type = try self.analyzer.excludeType(cur, true_type);
 
-                                    // Check for comparison overlap (emit on left identifier for location)
-                                    try self.type_checker.checkComparisonOverlap(d.left, cur, true_type);
+                                    try self.type_checker.checkComparisonOverlap(ref, cur, true_type);
 
                                     if (negated) {
                                         try self.bindConditions(target, false_type, true_type);
@@ -7672,8 +7662,7 @@ pub const Analyzer = struct {
         }
 
         inline fn createLabel(self: *@This()) !*Label {
-            // return try Label.create(self.analyzer.allocator());
-            return try Label.create2(&self.analyzer.label_pool);
+            return try Label.create(&self.analyzer.label_pool);
         }
 
         inline fn addAntecedent(self: *@This(), target: *Label, label: *Label) !void {
@@ -7685,7 +7674,7 @@ pub const Analyzer = struct {
         _ = this;
         const f = file.flow.?;
         if (!is_block) {
-            return f.visitArrowFnBody(start);
+            return f.visitArrowFnExpressionBody(start);
         }
         return f.visitFunctionLike(start);
     }
@@ -7912,13 +7901,16 @@ pub const Analyzer = struct {
             else => return from, // TODO
         }
 
-        var tmp = try TempUnion.initCapacity(this.allocator(), from_type.slot2 - 1);
+        const elements = getSlice2(from_type, TypeRef);
+        const limit = @as(u32, @intCast(elements.len)) - 1;
+
+        var tmp = try TempUnion.initCapacity(this.allocator(), limit);
         errdefer tmp.deinit();
 
-        for (getSlice2(from_type, TypeRef)) |el| {
+        for (elements) |el| {
             if (try this.isAssignableTo(el, excluded)) continue;
 
-            if (tmp.elements.items.len == from_type.slot2 - 1) {
+            if (tmp.elements.items.len == limit) {
                 tmp.deinit();
                 return from;
             }
@@ -8346,7 +8338,11 @@ pub const Analyzer = struct {
             if (p.hasFlag(.optional)) flags |= @intFromEnum(Flags.optional);
             if (isParameterDecl(p)) flags |= @intFromEnum(Flags.parameter_decl); // TODO: this only matters for constructors...
 
+            std.debug.assert(p.kind == .parameter);
+
             const d = getPackedData(p);
+            // FIXME: we are not handling destructuring
+
             if (p.len != 0) {
                 const z = try this.getType(file, p.len);
                 const is_rest_arg = p.hasFlag(.generator); // TODO: this is only valid for the last param
@@ -8740,7 +8736,7 @@ pub const Analyzer = struct {
         }
 
         inline fn removeFlag(this: *@This(), comptime flag: UnionFlags) void {
-            this.flags &= @intFromEnum(flag);
+            this.flags &= ~@intFromEnum(flag);
         }
 
         pub fn fromUnion(analyzer: *Analyzer, t: *const Type) !@This() {
@@ -9190,6 +9186,13 @@ pub const Analyzer = struct {
                 if (n.data == null) return @intFromEnum(Kind.empty_object);
                 return null;
             },
+            // .literal_type => {
+            //     const old_state = this.is_const_context;
+            //     defer this.is_const_context = old_state;
+            //     this.is_const_context = true;
+
+            //     return try this.getType(f, unwrapRef(n));
+            // },
             .union_type => {
                 const d = getPackedData(n);
                 if (d.left == 0) return try this.maybeGetSimpleType(f, d.right);
@@ -9216,7 +9219,7 @@ pub const Analyzer = struct {
         };
 
         kind: Subkind = .property,
-        flags: u24 = 0, // Uses NodeFlags, upper 4 bits used for lazy eval
+        flags: u24 = 0, // Uses NodeFlags, upper 2 bits used for lazy eval
         name: TypeRef,
         type: TypeRef,
         slot0: u32 = undefined, // Scratch space
@@ -9263,7 +9266,7 @@ pub const Analyzer = struct {
 
             const t = try analyzer.getMemberType(try analyzer.getAnalyzedFile(this.slot0), this.type);
             this.type = t;
-            this.flags &= ~@as(u23, 0);
+            this.flags &= ~lazy_flag;
 
             return t;
         }
@@ -9604,6 +9607,10 @@ pub const Analyzer = struct {
     }
 
     fn createRefinement(this: *@This(), source_ref: TypeRef, member: ObjectLiteralMember) anyerror!TypeRef {
+        if (source_ref == @intFromEnum(Kind.never)) return source_ref;
+
+        std.debug.assert(!member.isLazy());
+
         const resolved = try this.maybeResolveAlias(source_ref);
         if (comptime is_debug) {
             if (resolved >= @intFromEnum(Kind.false)) {
@@ -9616,6 +9623,7 @@ pub const Analyzer = struct {
         if (source.getKind() == .@"union") {
             const elements = getSlice2(source, TypeRef);
             const hash = try this.getMemberNameHash(member.name);
+            const member_is_union = member.type < @intFromEnum(Kind.false) and this.types.at(member.type).getKind() == .@"union";
 
             var tmp = TempUnion.init(this.allocator());
 
@@ -9630,7 +9638,28 @@ pub const Analyzer = struct {
                     continue;
                 } 
 
-                if (!try this.isAssignableTo(member.type, prop_type)) continue;
+                if (!try this.isAssignableTo(member.type, prop_type)) {
+                    if (member_is_union) {
+                        const elements2 = getSlice2(this.types.at(member.type), TypeRef);
+                        for (elements2) |y| {
+                            if (y == prop_type) {
+                                if (try this.addToUnion(&tmp, el)) |x| return x;
+                                break;
+                            } 
+                            if (try this.isAssignableTo(y, prop_type)) {
+                                const refined = try this.createRefinement(el, .{
+                                    .kind = member.kind,
+                                    .name = member.name,
+                                    .type = y,
+                                    .flags = member.flags,
+                                });
+                                if (try this.addToUnion(&tmp, refined)) |x| return x;
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 const refined = try this.createRefinement(el, member);
                 if (try this.addToUnion(&tmp, refined)) |x| return x;
@@ -11803,9 +11832,10 @@ pub const Analyzer = struct {
         return @intCast(std.hash.Wyhash.hash(0, data));
     }
 
-    const name_hash = getHashComptime("name");
-    const length_hash = getHashComptime("length");
-
+    // TODO: we can widen unions if each element is directly 
+    // a literal that does not share a base type with any other element
+    //
+    // ^ this is NOT how typescript behaves, but it's generally close enough
     fn maybeWidenType(this: *@This(), ty: TypeRef) !?TypeRef {
         if (ty >= @intFromEnum(Kind.false)) {
             if (ty >= @intFromEnum(Kind.zero)) {
@@ -13272,7 +13302,7 @@ pub const Analyzer = struct {
         }
         std.debug.print("[ref] {any}\n", .{t.getKind()});
         if (t.getKind() == .function_literal) {
-            std.debug.print("  rt: ", .{});
+            std.debug.print("  -> ", .{});
             this.printTypeInfo(t.slot3);
         }
         if (t.getKind() == .object_literal) {
@@ -13280,7 +13310,7 @@ pub const Analyzer = struct {
             @constCast(this)._debug(ty) catch unreachable;
         }
         if (t.getKind() == .string_literal) {
-            std.debug.print("  value: {s}\n", .{this.getSliceFromLiteral(ty)});
+            std.debug.print("  '{s}'\n", .{this.getSliceFromLiteral(ty)});
         }
         if (t.getKind() == .@"union") {
             const elements = getSlice2(t, TypeRef);
@@ -13800,8 +13830,8 @@ pub const Analyzer = struct {
                                     const t = try printer.toTypeNode(try el.getType(printer.analyzer));
                                     const copy = try printer.toIdentLike(el.name);
 
-                                    var flags: u20 = @truncate(el.flags);
-                                    flags &= ~@as(u20, @intFromEnum(NodeFlags.public));
+                                    var flags: u22 = @truncate(el.flags);
+                                    flags &= ~@as(u22, @intFromEnum(NodeFlags.public));
                                     if (is_static) flags |= @intFromEnum(NodeFlags.static);
 
                                     if (el.kind == .method) {
@@ -13869,7 +13899,7 @@ pub const Analyzer = struct {
 
                         const params = getSlice2(k, TypeRef);
                         for (params, 0..) |z, i| {
-                            var flags: u20 = 0;
+                            var flags: u22 = 0;
                             var copy: NodeRef = 0;
 
                             if (this.analyzer.isNamedTupleElement(z)) {
@@ -13933,7 +13963,7 @@ pub const Analyzer = struct {
                             return inner;
                         }
 
-                        var flags: u20 = 0;
+                        var flags: u22 = 0;
                         if (hasTypeFlag(k, .spread)) flags |= @intFromEnum(NodeFlags.generator);
                         if (hasTypeFlag(k, .optional)) flags |= @intFromEnum(NodeFlags.optional);
 
@@ -13974,7 +14004,7 @@ pub const Analyzer = struct {
                                 continue;
                             }
 
-                            const flags: u20 = @intCast(el.flags);
+                            const flags: u22 = @intCast(el.flags);
 
                             if (el.kind == .index) {
                                 const index_type = try this.toTypeNode(el.name);

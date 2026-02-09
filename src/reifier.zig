@@ -16,18 +16,18 @@ pub const Reifier = struct {
     type_module: *js.Ref,
 
 
-    pub fn init(env: *js.Env, allocator: std.mem.Allocator, checker: *program.Analyzer, type_module: *js.Object) @This() {
+    pub fn init(env: *js.Env, allocator: std.mem.Allocator, analyzer: *program.Analyzer, type_module: *js.Object) @This() {
         const ref = js.Ref.init(env, @ptrCast(type_module), 1) catch unreachable;
         return .{
             .env = env,
             .allocator = allocator,
-            .checker = checker,
+            .analyzer = analyzer,
             .type_module = ref,
         };
     }
 
-    pub fn initCurrentEnv(allocator: std.mem.Allocator, checker: *program.Analyzer, type_module: *js.Object) @This() {
-        return @This().init(js.getCurrentEnv(), allocator, checker, type_module);
+    pub fn initCurrentEnv(allocator: std.mem.Allocator, analyzer: *program.Analyzer, type_module: *js.Object) @This() {
+        return @This().init(js.getCurrentEnv(), allocator, analyzer, type_module);
     }
 
     fn createShape(this: *@This(), comptime name: [:0]const u8) !*js.Object {

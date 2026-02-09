@@ -367,7 +367,6 @@ export const enum SyntaxKind {
     DeferStatement = 700,
     Start = 1022,
     ParseError = 1023,
-    Reserved = 1024,
 }
 
 function isTypeNodeKind(kind: SyntaxKind) {
@@ -448,7 +447,7 @@ class AstNode {
         public readonly source: Uint8Array,
         public readonly parent: AstNode | undefined = undefined
     ) {
-        this.kind = (this.buf[this.ref * 8]) & 0xFFF
+        this.kind = (this.buf[this.ref * 8]) & 0x3FF
     }
 
     public get flags() {
@@ -4855,6 +4854,10 @@ export function createCompilerHost(options: ts.CompilerOptions, setParentNodes?:
                     }
                     if (fileExists(`${base}/index.ts`)) {
                         return `${base}/index.ts`
+                    }
+                } else if (extname === '.syn') {
+                    if (fileExists(`${base}.syn`)) {
+                        return `${base}.syn`
                     }
                 }
 

@@ -13,3 +13,13 @@ const f2 = () => ({
   z: 1
 })
 export const q = false ? x ??= f1(f2()) : f2()
+export function f3() {
+  const x = 1
+  const y = false
+  const z = x && y
+  return z
+}
+export function f4() {
+  const x = undefined
+  return x && x.a
+}

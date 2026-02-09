@@ -522,9 +522,9 @@ pub fn createReifier(program: *js.Object, type_ns: *js.Object) !js.Wrapped {
 pub fn getReifiedType(reifier: *js.Object, sf: WrappedFile, node_ref: u32, type_params: u32) !*js.Value {
     const r = try unwrap(Reifier, reifier);
     const source_name = sf.value.source_name;
-    const ref = try r.checker.program.getFileIdByPath(source_name orelse return error.MissingSourceFileName);
-    const data = r.checker.program.getFileData(ref);
-    try r.checker.program.bindModule(data);
+    const ref = try r.analyzer.program.getFileIdByPath(source_name orelse return error.MissingSourceFileName);
+    const data = r.analyzer.program.getFileData(ref);
+    try r.analyzer.program.bindModule(data);
     const result = try r.processReifyExpression(data, node_ref, type_params);
 
     return @ptrCast(result);

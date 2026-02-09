@@ -15,7 +15,7 @@ const NodeRef = u32;
 
 const AstNode = packed struct {
     kind: parser.SyntaxKind,
-    flags: u20 = 0,
+    flags: u22 = 0,
     next: NodeRef = 0,
 };
 
