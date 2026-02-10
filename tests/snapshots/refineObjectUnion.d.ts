@@ -16,23 +16,5 @@ interface D {
   extra: number
 }
 type U = A | B | C | D;
-export declare function refine(input: U): {
-  kind: 1, 
-  data: string
-} | {
-  kind: 2, 
-  data: boolean
-} | {
-  kind: 3, 
-  data: number
-} | undefined;
-export declare function refine2(input: U): {
-  kind: 1, 
-  data: string
-} | {
-  kind: 2, 
-  data: boolean
-} | {
-  kind: 3, 
-  data: number
-} | 0 | undefined;
+export declare function refine(input: U): A | B | C | undefined;
+export declare function refine2(input: U): A | B | C | 0 | undefined;

@@ -111,11 +111,25 @@ pub const Checker = struct {
     const ObjectLiteralMember = program.Analyzer.ObjectLiteralMember;
 
     pub fn checkCallExpression(this: *@This(), call_ref: NodeRef) !void {
+        const d = getPackedData(this.file.ast.nodes.at(call_ref));
+        const callee_type = try this.analyzer.getType(this.file, d.left);
+
+        return this.checkCallExpressionWithCallee(call_ref, callee_type);
+    }
+
+    fn emitNotCallableError(this: *@This(), call_ref: NodeRef, callee_type: TypeRef) !void {
+        try this.file.emitErrorFmt(call_ref,  "Type '{s}' is not callable", .{
+            try this.analyzer.printType(callee_type),
+        });
+    }
+
+    pub fn checkCallExpressionWithCallee(this: *@This(), call_ref: NodeRef, callee_type: TypeRef) !void {
+        if (callee_type >= @intFromEnum(Kind.false)) {
+            return this.emitNotCallableError(call_ref, callee_type);
+        }
+
         const call = this.file.ast.nodes.at(call_ref);
         const d = getPackedData(call);
-
-        const callee_type = try this.analyzer.getType(this.file, d.left);
-        if (callee_type >= @intFromEnum(Kind.false)) return; // TODO: show "not callable"
 
         const callee = this.analyzer.types.at(callee_type);
 
@@ -151,7 +165,7 @@ pub const Checker = struct {
                     if (fn_node.getKind() == .parameterized) continue;
                     if (fn_node.getKind() != .function_literal) continue;
 
-                    if (this.signatureMatches(fn_ty, args) catch false) return;
+                    if (try this.signatureMatches(fn_ty, args)) return;
 
                     last_sig = fn_ty;
                 }
@@ -160,14 +174,15 @@ pub const Checker = struct {
                 if (last_sig) |sig| {
                     try this.checkArgsAgainstSignature(sig, args, call_ref);
                 } else {
-                    return; // TODO: show "not callable"
+                    return this.emitNotCallableError(call_ref, callee_type);
                 }
             },
-            else => {},
+            else => {
+                return this.emitNotCallableError(call_ref, callee_type);
+            },
         }
     }
 
-    /// Check if a set of arguments matches a function signature without emitting errors.
     fn signatureMatches(this: *@This(), fn_type: TypeRef, args: []const NodeRef) !bool {
         const fn_node = this.analyzer.types.at(fn_type);
         const params = getSlice2(fn_node, TypeRef);
@@ -234,6 +249,31 @@ pub const Checker = struct {
             count -= 1;
         }
         return count;
+    }
+
+    pub fn checkPointlessTypeofComparison(this: *@This(), node_ref: NodeRef, rhs_type: TypeRef) !void {
+        if (this.couldBeString(rhs_type)) return;
+
+        const rhs_str = try this.analyzer.printType(rhs_type);
+        try this.file.emitErrorFmt(node_ref, "This comparison appears to be unintentional because the types 'string' and '{s}' have no overlap", .{rhs_str});
+    }
+
+    fn couldBeString(this: *@This(), ty: TypeRef) bool {
+        if (ty == @intFromEnum(Kind.string) or ty == @intFromEnum(Kind.empty_string)) return true;
+        if (ty == @intFromEnum(Kind.any)) return true;
+        if (ty >= @intFromEnum(Kind.false)) return false;
+
+        const t = this.analyzer.types.at(ty);
+        return switch (t.getKind()) {
+            .string_literal, .template_literal => true,
+            .@"union" => {
+                for (getSlice2(t, TypeRef)) |el| {
+                    if (this.couldBeString(el)) return true;
+                }
+                return false;
+            },
+            else => false,
+        };
     }
 
     pub fn checkComparisonOverlap(this: *@This(), node_ref: NodeRef, left_type: TypeRef, right_type: TypeRef) !void {

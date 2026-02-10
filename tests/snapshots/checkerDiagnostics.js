@@ -35,6 +35,11 @@ const c = {
 {
   let x
   if (Math.random() > 0.5) x = 1;
+  x.toFixed(0);
+}
+{
+  let x
+  x.toFixed(0);
 }
 const maybeFn = "nope"
 const o = {}

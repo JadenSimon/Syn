@@ -371,7 +371,7 @@ fn printExportedTypes(f: *program.ParsedFileData, p2: *program.Program) !void {
 
                 std.debug.print("\n", .{});
                 std.debug.print("  RESOLVED -> ", .{});
-                try a._debug(resolved);
+                a._debug(resolved);
                 std.debug.print("\n", .{});
             } else {
                 std.debug.print("   PARAMETERIZED {any}\n", .{a.types.at(t).getKind()});

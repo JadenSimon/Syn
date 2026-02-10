@@ -1,5 +1,7 @@
 // @filename: http.ts
-/// <reference lib="es2015" />
+/// <reference lib="es2020" />
+/// <reference lib="dom" />
+
 type HttpMethod = "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | string;
 type TrimRoute<T extends string> = T extends `${infer U}${"+" | "*"}` ? U : T;
 type ExtractPattern<T extends string> = T extends `${infer P}{${infer U}}${infer S}` ? TrimRoute<U> | ExtractPattern<P | S> : never;
@@ -17,8 +19,7 @@ export type PathArgs<T extends string> = T extends `${infer P}{${infer U}}${infe
     ...PathArgs<P>,
     string,
     ...PathArgs<S>
-] : [
-];
+] : [];
 export type PathArgsWithBody<T extends string, U> = [
     ...PathArgs<T>,
     ...(U extends undefined ? [
@@ -120,6 +121,6 @@ import { HttpService } from './compute'
 
 const s = new HttpService()
 
-export const hello = s.route('GET', '/hello', () => {
+export const hello = s.route('GET', '/{foo}/{bar}/{fizz}', () => {
     return 'hello, world!'
 })

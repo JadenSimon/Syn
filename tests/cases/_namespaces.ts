@@ -7,3 +7,7 @@ export class Mixer {
 export namespace Mixer {
   export const ext = true
 }
+
+// (function (Mixer) {
+//     Mixer.ext = true;
+// })(Mixer || (Mixer = {}));

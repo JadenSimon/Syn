@@ -2373,6 +2373,11 @@ pub const Program = struct {
             const type_ref = try analyzer.getTypeOfSymbol(f, entry.value_ptr.*);
             try analyzer.gatherReferencedSymbols2(&to_keep, type_ref, f.id, &external_set);
 
+            // var iter2 = to_keep.iterator();
+            // while (iter2.next()) |entry2| {
+            //     printSymbol(f, @truncate(entry2.key_ptr.* & 0xFFFFFFFF));
+            // }
+
             defer external_set.clearAndFree();
 
             var external_set_iter = external_set.iterator();
@@ -3562,7 +3567,11 @@ pub const Analyzer = struct {
             if (hasEvalFlag(flags, .no_globals)) {
                 return null;
             }
-            return try this.getTypeOfGlobalSymbol(alias.slot4);
+
+            if (alias.slot5 != 0) return alias.slot5;
+            const r = try this.getTypeOfGlobalSymbol(alias.slot4);
+            alias.slot5 = r;
+            return r;
         }
 
         const f = try this.getAnalyzedFile(alias.slot3);
@@ -3570,20 +3579,23 @@ pub const Analyzer = struct {
             return null;
         }
 
-        return try this.getTypeOfSymbol(f, alias.slot4);
+        if (alias.slot5 != 0) return alias.slot5;
+        const r= try this.getTypeOfSymbol(f, alias.slot4);
+        alias.slot5 = r;
+        return r;
     }
 
     fn followImmediateAlias(this: *@This(), alias: *Type, flags: u32) anyerror!?TypeRef {
-        if (alias.slot5 != 0) {
-            return alias.slot5;
-        }
-
         const inner = try this.followImmediateAliasInner(alias, flags) orelse return null;
         if (inner >= @intFromEnum(Kind.false) or this.types.at(inner).getKind() != .parameterized) {
-            alias.slot5 = inner;
+            alias.slot6 = inner;
             return inner;
         }
 
+        if (flags == @intFromEnum(EvaluationFlags.type_args)) {
+            if (alias.slot6 != 0) return alias.slot6;
+        }
+ 
         const inner_type = this.types.at(inner);
         const params = getSlice2(inner_type, TypeRef);
         const args = getSlice2(alias, TypeRef);
@@ -3594,7 +3606,10 @@ pub const Analyzer = struct {
         try resolved.ensureTotalCapacity(params.len);
 
         for (params, 0..) |p, i| {
-            const el = if (i < args.len) args[i] else this.getTypeParamDefault(p) orelse @intFromEnum(Kind.infer_unknown);
+            const el = if (i < args.len) args[i] else this.getTypeParamDefault(p) 
+                orelse this.getTypeParamConstraint(p)
+                orelse @intFromEnum(Kind.infer_unknown);
+
             if ((flags & @intFromEnum(EvaluationFlags.type_args)) != @intFromEnum(EvaluationFlags.type_args)) {
                 try resolved.put(p, el);
             } else {
@@ -3603,17 +3618,20 @@ pub const Analyzer = struct {
             }
         }
 
-        alias.slot5 = try this.resolveWithTypeArgsInferred(inner_type, &resolved);
-        return alias.slot5;
+        const result = try this.resolveWithTypeArgsInferred(inner_type, &resolved);
+        if (flags == @intFromEnum(EvaluationFlags.type_args)) {
+            alias.slot6 = result;
+        }
+        return result;
     }
 
     const EvaluationFlags = enum(u32) {
-        all = 1 << 0,
         type_args = 1 << 1,
         no_globals = 1 << 2,
         no_objects = 1 << 3,
         no_instance_aliases = 1 << 4,
         no_enum_aliases = 1 << 5,
+        no_unions = 1 << 6,
         inner_scoped_aliases = 1 << 20,
         for_reify = 1 << 30,
     };
@@ -3636,6 +3654,7 @@ pub const Analyzer = struct {
                 return try this.followImmediateAlias(t, @intFromEnum(EvaluationFlags.type_args) | flags) orelse ref;
             },
             .function_literal => {
+                var flags2: u24 = 0;
                 var did_change = false;
                 var resolved = std.ArrayList(TypeRef).init(this.allocator());
                 defer if (!did_change) resolved.deinit();
@@ -3654,12 +3673,13 @@ pub const Analyzer = struct {
 
                 if (!did_change) return ref;
 
-                var flags2: u24 = 0;
                 if (t.hasFlag(.constructor)) flags2 |= @intFromEnum(Flags.constructor);
 
                 return try this.createFunctionLiteralFull(resolved.items, return_type, this_type, flags2);
             },
             .@"union" => {
+                if (hasEvalFlag(flags, .no_unions)) return ref;
+
                 var did_change = false;
                 var tmp = TempUnion.init(this.allocator());
                 defer if (!did_change) tmp.deinit();
@@ -3729,6 +3749,7 @@ pub const Analyzer = struct {
             },
             .tuple => {
                 const members = getSlice2(t, TypeRef);
+                var flags2: u24 = 0;
                 var did_change = false;
                 var tmp = try std.ArrayList(TypeRef).initCapacity(this.allocator(), members.len);
                 defer if (!did_change) tmp.deinit();
@@ -3737,12 +3758,13 @@ pub const Analyzer = struct {
                         const m = this.types.at(el_type);
                         const inner = m.slot1;
                         const v = try this.evaluateType(inner, flags);
+                        std.debug.assert(v != ref);
+                        if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
                         if (!m.hasFlag(.spread)) {
                             if (v == inner) {
                                 try tmp.append(el_type);
                                 continue;
                             }
-                            // if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
                             did_change = true;
                             try tmp.append(v);
                             continue;
@@ -3765,20 +3787,23 @@ pub const Analyzer = struct {
                         }
 
                         did_change = true;
-                        try tmp.append(try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread)));
+                        try tmp.append(
+                            try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread) | if (this.isParameterizedRef(v)) @intFromEnum(Flags.parameterized) else 0)
+                        );
 
                         continue;
                     }
 
                     const v = try this.evaluateType(el_type, flags);
                     if (v != el_type) did_change = true;
+                    if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
 
                     try tmp.append(v);
                 }
 
                 if (!did_change) return ref;
 
-                return this.createTupleType(tmp.items, 0);
+                return this.createCanonicalTupleType(try tmp.toOwnedSlice(), flags2);
             },
             .object_literal => {
                 if (hasEvalFlag(flags, .no_objects)) return ref;
@@ -3788,6 +3813,7 @@ pub const Analyzer = struct {
                 this.contextual_this_type = ref;
 
                 const members = getSlice2(t, ObjectLiteralMember);
+                var flags2: u24 = 0;
                 var did_change = false;
                 var tmp = try std.ArrayList(ObjectLiteralMember).initCapacity(this.allocator(), members.len);
                 defer if (!did_change) tmp.deinit();
@@ -3795,7 +3821,7 @@ pub const Analyzer = struct {
                     const el_type = try el.getType(this);
                     const v = try this.evaluateType(el_type, flags);
                     if (v != el_type) did_change = true;
-                    // if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
+                    if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
 
                     tmp.appendAssumeCapacity(.{
                         .flags = el.flags,
@@ -3808,10 +3834,11 @@ pub const Analyzer = struct {
 
                 const proto = if (t.slot3 != 0) try this.evaluateType(t.slot3, flags) else 0;
                 if (proto != t.slot3) did_change = true;
+                if (this.isParameterizedRef(proto)) flags2 |= @intFromEnum(Flags.parameterized);
 
                 if (!did_change) return ref;
 
-                return this.createObjectLiteral(tmp.items, 0, proto);
+                return this.createObjectLiteral(tmp.items, flags2, proto);
             },
             else => ref,
         };
@@ -3831,7 +3858,7 @@ pub const Analyzer = struct {
             .tuple_element => this.isSimpleType(t.slot1),
             .tuple, .@"union", .intersection => {
                 const elements = getSlice2(t, TypeRef);
-                if (elements.len > 3) return false;
+                if (elements.len > 16) return false;
 
                 for (elements) |u| {
                     if (!this.isSimpleType(u)) return false;
@@ -3850,7 +3877,12 @@ pub const Analyzer = struct {
         const t = try this.evaluateType(ref, @intFromEnum(EvaluationFlags.no_globals) | @intFromEnum(EvaluationFlags.no_objects));
         if (t == ref) return ref;
 
-        if (this.isSimpleType(t)) return t;
+        if (this.isSimpleType(t)) {
+            if (this.getKindOfRef(t) == .tuple) {
+                return this.maybeSimplifyType(t);
+            }
+            return t;
+        }
 
         const u = this.types.at(ref);
         if (u.getKind() != .alias) return ref;
@@ -4012,6 +4044,9 @@ pub const Analyzer = struct {
             } else if (isTypeParamRef(ref)) {
                 const r = this.resolveTypeParam(ref) orelse return null;
                 if (this.isParameterizedRef(r) and r != ref) {
+                    if (this.inferred_type_params != null) {
+                        return r; // do not recursively substitute during inference. 
+                    }
                     return this.resolveParameterizedType(r);
                 }
                 return r;
@@ -4117,11 +4152,14 @@ pub const Analyzer = struct {
                     if (v < @intFromEnum(Kind.false) and this.types.at(v).getKind() == .@"union") return error.TODO;
 
                     if (can_join) {
-                        if ((v >= @intFromEnum(Kind.false) and v != @intFromEnum(Kind.empty_string)) or this.types.at(v).getKind() != .string_literal) {
-                            can_join = false;
-                        } else {
+                        if (
+                            (v >= @intFromEnum(Kind.false) and v == @intFromEnum(Kind.empty_string)) or 
+                            (v < @intFromEnum(Kind.false) and this.types.at(v).getKind() == .string_literal)
+                        ) {
                             size += this.getSliceFromLiteral(v).len;
                             size += this.getSliceFromLiteral(slice[i + 1]).len;
+                        } else {
+                            can_join = false;
                         }
                     }
                 }
@@ -4149,14 +4187,7 @@ pub const Analyzer = struct {
                     resolved2.appendAssumeCapacity(slice[(j + 1) * 2]);
                 }
 
-                const ptr: u64 = @intFromPtr(resolved2.items.ptr);
-                return try this.types.push(.{
-                    .kind = @intFromEnum(Kind.template_literal),
-                    .flags = flags,
-                    .slot0 = @truncate(ptr),
-                    .slot1 = @intCast(ptr >> 32),
-                    .slot2 = @intCast(resolved2.items.len),
-                });
+                return try this.createTemplateLiteral(resolved2.items, flags);
             },
             .conditional => {
                 const subject = try this.resolveParameterizedType(n.slot0) orelse return ref;
@@ -4247,6 +4278,7 @@ pub const Analyzer = struct {
                 return try this.createObjectLiteral(resolved.items, flags, n.slot3);
             },
             .tuple => {
+                var flags: u24 = 0;
                 var did_change = false;
                 var should_deinit = true;
                 var resolved = std.ArrayList(TypeRef).init(this.allocator());
@@ -4255,6 +4287,7 @@ pub const Analyzer = struct {
                 for (getSlice2(n, TypeRef)) |el| {
                     const v = try this.resolveParameterizedType(el) orelse el;
                     if (v != el) did_change = true;
+                    if (this.isParameterizedRef(v)) flags |= @intFromEnum(Flags.parameterized);
                     try resolved.append(v);
                 }
 
@@ -4262,7 +4295,7 @@ pub const Analyzer = struct {
 
                 should_deinit = false;
 
-                return try this.createTupleType(resolved.items, 0);
+                return try this.createCanonicalTupleType(try resolved.toOwnedSlice(), flags);
             },
             .array => {
                 const v = try this.resolveParameterizedType(n.slot0) orelse return null;
@@ -4907,7 +4940,7 @@ pub const Analyzer = struct {
                     const s = this.types.at(subject);
                     if (s.getKind() == .alias) {
                         // Fast path for followed aliases
-                        if (s.slot5 != 0 and n.slot5 != 0 and s.slot5 == n.slot5) {
+                        if (s.slot6 != 0 and n.slot6 != 0 and s.slot6 == n.slot6) {
                             // FIXME: this needs to update `inferred` ??
                             return true;
                         }
@@ -4956,7 +4989,7 @@ pub const Analyzer = struct {
                     if (subject == @intFromEnum(Kind.never)) return false;
                     if (subject >= @intFromEnum(Kind.zero)) return false;
 
-                    try this._debug(subject);
+                    this._debug(subject);
 
                     return error.TODO;
                 }
@@ -5152,7 +5185,7 @@ pub const Analyzer = struct {
                 var iter = tmp_inferred.iterator();
                 while (iter.next()) |entry| {
                     const p = entry.value_ptr.*;
-                    const literal = try this.createSyntheticStringLiteral(subject_text[p[0]..p[1]], true);
+                    const literal = try this.createSyntheticStringLiteral(subject_text[p[0]..p[1]], false);
                     try inferred.put(entry.key_ptr.*, literal);
                 }
 
@@ -5273,6 +5306,7 @@ pub const Analyzer = struct {
                 }
 
                 if (s.getKind() != .object_literal) {
+                    if (s.getKind() == .string_literal or s.getKind() == .number_literal) return false;
                     this.printTypeInfo(subject);
                     return error.TODO;
                 }
@@ -6175,7 +6209,7 @@ pub const Analyzer = struct {
                     _indent(indent);
                     std.debug.print("  --> ", .{});
                     //typer.analyzer.printTypeInfo(entry.value_ptr.*);
-                    typer.analyzer._debug(entry.value_ptr.*) catch unreachable;
+                    typer.analyzer._debug(entry.value_ptr.*);
                 }
 
                 for (self.antecedents.items) |l| {
@@ -6255,6 +6289,8 @@ pub const Analyzer = struct {
                     } else {
                         dst.value_ptr.* = try self.analyzer.toUnion(&.{ v, @intFromEnum(Kind.void) });
                     }
+                } else {
+                    dst.value_ptr.* = @intFromEnum(Kind.void);
                 }
             }
 
@@ -6667,9 +6703,9 @@ pub const Analyzer = struct {
 
             _ = try self.analyzer.getType(self.file, func_ref);
 
-            if (!self.current_flow.terminal) {
-                try self.type_checker.checkFunctionReturnType(func_ref, s);
-            }
+            // if (!self.current_flow.terminal) {
+            //     try self.type_checker.checkFunctionReturnType(func_ref, s);
+            // }
 
             self.stack = saved_stack;
             self.current_flow = saved_flow;
@@ -6859,25 +6895,22 @@ pub const Analyzer = struct {
 
         fn visitIsExpression(self: *@This(), node: *const AstNode, comptime is_condition: bool) !TypeRef {
             const d = getPackedData(node);
-            const l = self.file.ast.nodes.at(d.left);
-            if (l.kind == .identifier) {
-                const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
+            const paths = try self.visitReference(d.left)
+                orelse return @intFromEnum(Kind.boolean);
+            const t = paths.types[paths.depth];
 
-                // only cache types if they diverge from the declared type
-                const flow_type = self.maybeGetFlowType(sym);
-                if (flow_type) |t| {
-                    try self.file.cached_flow_types.put(self.analyzer.allocator(), d.left, t);
-                }
-
-                if (comptime is_condition) {
-                    const current_type = flow_type orelse try self.getFlowType(d.left, sym);
-                    const goal_type = try self.analyzer.getType(self.file, d.right);
-                    const false_type = try self.analyzer.excludeType(current_type, goal_type);
-                    try self.bindConditions(sym, goal_type, false_type);
-                }
-
-                return @intFromEnum(Kind.boolean);
+            // only cache types if they diverge from the declared type
+            const flow_type = self.maybeGetFlowType(paths.root);
+            if (flow_type != null) {
+                try self.file.cached_flow_types.put(self.analyzer.allocator(), d.left, t);
             }
+
+            if (comptime is_condition) {
+                const goal_type = try self.analyzer.getType(self.file, d.right);
+                const false_type = try self.analyzer.excludeType(t, goal_type);
+                try self.bindReferencePaths(paths, goal_type, false_type);
+            }
+
             return @intFromEnum(Kind.boolean);
         }
 
@@ -6974,23 +7007,27 @@ pub const Analyzer = struct {
                     switch (op) {
                         .equals_token => {
                             const d = getPackedData(node);
-                            const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
-                            const t = try self.visitExpression(d.right);
-                            try self.current_flow.types.put(self.analyzer.allocator(), sym, t);
+                            const paths = try self.visitReference(d.left)
+                                orelse return self.visitExpression(d.right);
 
-                            return t;
+                            const rhs = try self.visitExpression(d.right);
+                            try self.bindReferenceAssignment(paths, rhs);
+
+                            return rhs;
                         },
                         .question_question_equals_token => {
                             const d = getPackedData(node);
-                            const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
-                            const a_type = try self.getFlowType(d.left, sym);
-                            const a_nonnullable = try self.analyzer.nonNullable(a_type);
+                            const paths = try self.visitReference(d.left)
+                                orelse return self.visitExpression(d.right);
+                            const cur = paths.types[paths.depth];
+
+                            const a_nonnullable = try self.analyzer.nonNullable(cur);
 
                             const b_type = try self.visitExpression(d.right);
-                            const t = try self.analyzer.toUnion(&.{ a_nonnullable, b_type });
-                            try self.current_flow.types.put(self.analyzer.allocator(), sym, t);
+                            const u = try self.analyzer.toUnion(&.{ a_nonnullable, b_type });
+                            try self.bindReferenceAssignment(paths, u);
 
-                            return t;
+                            return u;
                         },
                         .bar_bar_token,
                         .question_question_token,
@@ -7041,7 +7078,7 @@ pub const Analyzer = struct {
                 },
 
                 .call_expression => {
-                    try self.type_checker.checkCallExpression(ref);
+                    // try self.type_checker.checkCallExpression(ref);
                     return try self.analyzer.getType(self.file, ref);
                 },
 
@@ -7051,25 +7088,88 @@ pub const Analyzer = struct {
             };
         }
 
-        fn bindPropertyCondition(self: *@This(), sym: SymbolRef, subject: TypeRef, prop_name: TypeRef, true_type: TypeRef, false_type: TypeRef) !void {
-            const refined1 = try self.analyzer.createRefinement(subject, .{
-                .name = prop_name,
-                .type = true_type,
-            });
+        const ReferencePaths = struct {
+            root: SymbolRef,
+            depth: u32,
+            types: [9]TypeRef = undefined,
+            props: [8]TypeRef = undefined,
+        };
 
-            const refined2 = try self.analyzer.createRefinement(subject, .{
-                .name = prop_name,
-                .type = false_type,
-            });
+        // TODO: element access expressions
+        // TODO: fast paths / bail outs
+        fn visitReference(self: *@This(), ref: NodeRef) !?ReferencePaths {
+            var prop_node_refs: [8]NodeRef = undefined;
+            var depth: u32 = 0;
+            var walk_ref = ref;
 
-            try self.bindConditions(sym, refined1, refined2);
+            while (true) {
+                const wn = self.file.ast.nodes.at(walk_ref);
+                if (wn.kind != .property_access_expression) {
+                    if (wn.kind != .identifier) return null;
+                    break;
+                }
+                if (depth >= prop_node_refs.len) return null;
+                const wd = getPackedData(wn);
+                prop_node_refs[depth] = wd.right;
+                depth += 1;
+                walk_ref = wd.left;
+            }
 
-            return;
+            const target = self.file.binder.getSymbol(walk_ref) orelse {
+                std.debug.print("{?}\n",.{self.file.ast.nodes.at(walk_ref).kind});
+                return error.MissingSymbol;
+            };
+
+            // Compute types from root to leaf
+            var types: [9]TypeRef = undefined;
+            var props: [8]TypeRef = undefined;
+            types[0] = try self.getFlowType(walk_ref, target);
+
+            for (0..depth) |i| {
+                props[i] = try self.analyzer.propertyNameToType(self.file, prop_node_refs[depth - 1 - i]);
+                types[i + 1] = try self.analyzer.accessType(types[i], props[i]);
+            }
+
+            return .{
+                .root = target,
+                .depth = depth,
+                .types = types,
+                .props = props,
+            };
         }
 
-        // fn visitReference(self: *@This(), ref: NodeRef) anyerror!TypeRef {
+        fn bindReferenceAssignment(self: *@This(), paths: ReferencePaths, rhs: TypeRef) !void {
+            var val = rhs;
+            var j = paths.depth;
+            while (j > 0) {
+                j -= 1;
+                val = try self.analyzer.createRefinement(paths.types[j], .{
+                    .name = paths.props[j],
+                    .type = val,
+                });
+            }
+            try self.current_flow.types.put(self.analyzer.allocator(), paths.root, val);
+        }
 
-        // }
+        fn bindReferencePaths(self: *@This(), paths: ReferencePaths, true_type: TypeRef, false_type: TypeRef) !void {
+            var true_val = true_type;
+            var false_val = false_type;
+
+            var j = paths.depth;
+            while (j > 0) {
+                j -= 1;
+                true_val = try self.analyzer.createRefinement(paths.types[j], .{
+                    .name = paths.props[j],
+                    .type = true_val,
+                });
+                false_val = try self.analyzer.createRefinement(paths.types[j], .{
+                    .name = paths.props[j],
+                    .type = false_val,
+                });
+            }
+
+            try self.bindConditions(paths.root, true_val, false_val);
+        }
 
         fn visitCondition(self: *@This(), ref: NodeRef) anyerror!TypeRef {
             const node = self.file.ast.nodes.at(ref);
@@ -7080,92 +7180,56 @@ pub const Analyzer = struct {
                     return self.visitCondition(inner);
                 },
 
-                .identifier => {
-                    const sym = self.file.binder.getSymbol(ref) orelse return error.MissingSymbol;
-
-                    const current_type = try self.getFlowType(ref, sym);
-                    if (current_type == @intFromEnum(Kind.any)) return current_type;
-                    // TODO: or string/number ?
-
-                    // In nullish context (??) we narrow by null/undefined, otherwise by truthiness
-                    const true_type = if (self.in_nullish_context)
-                        try self.analyzer.nonNullable(current_type)
-                    else
-                        try self.analyzer.truthyType(current_type);
-
-                    const false_type = try self.analyzer.excludeType(current_type, true_type);
-
-                    try self.bindConditions(sym, true_type, false_type);
-
-                    return current_type;
-                },
-
-                .property_access_expression => {
-                    const d = getPackedData(node);
-                    const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
-
-                    const current_type = try self.getFlowType(d.left, sym);
-                    if (current_type == @intFromEnum(Kind.any)) return current_type;
-
-                    const r = try self.analyzer.propertyNameToType(self.file, d.right);
-
-                    const member_type = try self.analyzer.accessType(current_type, r);
-                    if (member_type == @intFromEnum(Kind.error_any)) {
-                        return member_type;
-                    }
+                .identifier, .property_access_expression => {
+                    const paths = try self.visitReference(ref)
+                        orelse return self.visitExpression(ref);
+                    const t = paths.types[paths.depth];
 
                     const true_type = if (self.in_nullish_context)
-                        try self.analyzer.nonNullable(member_type)
+                        try self.analyzer.nonNullable(t)
                     else
-                        try self.analyzer.truthyType(member_type);
+                        try self.analyzer.truthyType(t);
                     
-                    const false_type = try self.analyzer.excludeType(member_type, true_type);
+                    const false_type = try self.analyzer.excludeType(t, true_type);
 
-                    try self.bindPropertyCondition(sym, current_type, r, true_type, false_type);
-
-                    return member_type;
+                    try self.bindReferencePaths(paths, true_type, false_type);
+                    return t;
                 },
 
                 .call_expression => {
                     const d = getPackedData(node);
                     const t = try self.analyzer.getType(self.file, ref);
 
-                    if (t >= @intFromEnum(Kind.false)) return t;
+                    if (t >= @intFromEnum(Kind.false)) return @intFromEnum(Kind.boolean);
 
                     const n = self.analyzer.types.at(t);
-                    if (n.getKind() != .predicate) return t;
+                    if (n.getKind() != .predicate) return @intFromEnum(Kind.boolean);
 
-                    if (n.slot4 == 1) return t; // TODO: asserts x is T
+                    if (n.slot4 == 1) return @intFromEnum(Kind.boolean); // TODO: asserts x is T
 
                     const predicate_type = n.slot1;
                     const param_pos = n.slot2;
 
                     var i: u32 = 0;
                     var param_iter = NodeIterator.init(&self.file.ast.nodes, d.right);
-                    while (param_iter.nextPair()) |pair| {
+                    while (param_iter.nextRef()) |arg_ref| {
                         if (i < param_pos) {
                             i += 1;
                             continue;
                         }
 
-                        const arg_ref = pair[1];
-                        const arg_node = self.file.ast.nodes.at(arg_ref);
+                        const paths = try self.visitReference(arg_ref)
+                            orelse return @intFromEnum(Kind.boolean);
 
-                        if (arg_node.kind == .identifier) {
-                            const sym = self.file.binder.getSymbol(arg_ref) orelse return t;
-                            const current_type = try self.getFlowType(arg_ref, sym);
+                        const true_type = predicate_type;
+                        const false_type = try self.analyzer.excludeType(paths.types[paths.depth], predicate_type);
 
-                            const true_type = predicate_type;
-                            const false_type = try self.analyzer.excludeType(current_type, predicate_type);
-
-                            try self.bindConditions(sym, true_type, false_type);
-                        }
-                        // TODO: handle property/element access
+                        try self.bindReferencePaths(paths, true_type, false_type);
 
                         break;
                     }
 
-                    return t;
+                    return @intFromEnum(Kind.boolean);
                 },
 
                 .binary_expression => {
@@ -7174,32 +7238,21 @@ pub const Analyzer = struct {
 
                     switch (op) {
                         .equals_token => {
-                            const lhs = self.file.ast.nodes.at(d.left);
-                            if (lhs.kind == .property_access_expression) {
-                                const d2 = getPackedData(lhs);
-                                const sym = self.file.binder.getSymbol(d2.left) orelse return error.MissingSymbol;
-                                const cur = try self.getFlowType(d2.left, sym);
-                                const r = try self.analyzer.propertyNameToType(self.file, d2.right);
-                                const member_type = try self.analyzer.accessType(cur, r);
+                            const true_type = try self.visitExpression(d.right);
 
-                                const t = try self.visitExpression(d.right);
+                            const paths = try self.visitReference(d.left)
+                                orelse return true_type;
+                            const t = paths.types[paths.depth];
 
-                                const falsy_type = try self.analyzer.falsyType(member_type);
-                                try self.bindPropertyCondition(sym, cur, r, member_type, falsy_type);
-
-                                return t;
-                            }
-                            const sym = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
-                            const t = try self.visitExpression(d.right);
-                            if (t == @intFromEnum(Kind.zero)) {
-                                try self.bindConditions(sym, @intFromEnum(Kind.never), t);
-                                return t;
+                            if (true_type == @intFromEnum(Kind.zero)) {
+                                try self.bindReferencePaths(paths, @intFromEnum(Kind.never), t);
+                                return true_type;
                             }
 
-                            const falsy_type = try self.analyzer.falsyType(t);
-                            try self.bindConditions(sym, t, falsy_type);
+                            const false_type = try self.analyzer.falsyType(true_type);
+                            try self.bindReferencePaths(paths, true_type, false_type);
 
-                            return t;
+                            return true_type;
                         },
                         .ampersand_ampersand_token => {
                             // For `a && b`:
@@ -7326,95 +7379,45 @@ pub const Analyzer = struct {
                             const lhs = self.file.ast.nodes.at(d.left);
 
                             switch (lhs.kind) {
-                                .identifier => {
-                                    const target = self.file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
+                                .identifier, .property_access_expression => {
                                     const true_type = try self.analyzer.getTypeAsConst(self.file, d.right);
                                     if (true_type == 0) return error.TODO;
 
-                                    const cur = try self.getFlowType(d.left, target);
-                                    const false_type = try self.analyzer.excludeType(cur, true_type);
+                                    const paths = try self.visitReference(d.left)
+                                        orelse return @intFromEnum(Kind.boolean);
 
-                                    try self.type_checker.checkComparisonOverlap(ref, cur, true_type);
+                                    const t = paths.types[paths.depth];
+                                    try self.type_checker.checkComparisonOverlap(ref, t, true_type);
 
-                                    if (negated) {
-                                        try self.bindConditions(target, false_type, true_type);
-                                    } else {
-                                        try self.bindConditions(target, true_type, false_type);
-                                    }
-                                    return @intFromEnum(Kind.boolean);
-                                },
-                                .property_access_expression => {
-                                    const d2 = getPackedData(lhs);
-                                    const target = self.file.binder.getSymbol(d2.left) orelse return error.MissingSymbol;
-
-                                    const true_type = try self.analyzer.getTypeAsConst(self.file, d.right);
-                                    if (true_type == 0) return error.TODO;
-
-                                    const cur = try self.getFlowType(d2.left, target);
-
-                                    const r = try self.analyzer.propertyNameToType(self.file, d2.right);
-
-                                    const member_type = try self.analyzer.accessType(cur, r);
-                                    const false_type = try self.analyzer.excludeType(member_type, true_type);
+                                    const false_type = try self.analyzer.excludeType(t, true_type);
 
                                     if (negated) {
-                                        try self.bindPropertyCondition(target, cur, r, false_type, true_type);
+                                        try self.bindReferencePaths(paths, false_type, true_type);
                                     } else {
-                                        try self.bindPropertyCondition(target, cur, r, true_type, false_type);
+                                        try self.bindReferencePaths(paths, true_type, false_type);
                                     }
 
                                     return @intFromEnum(Kind.boolean);
                                 },
                                 .typeof_expression => {
-                                    const inner = unwrapRef(lhs);
-                                    const lhs_node = self.file.binder.nodes.at(inner);
-                                    if (lhs_node.kind == .property_access_expression) {
-                                        //const t_ref = try self.analyzer.getTypeAsConst(self.file, d.right);
-                                        const typeof_type = try self.analyzer.maybeGetTypeFromTypeOfNode(self.file, d.right) 
-                                            orelse return @intFromEnum(Kind.boolean);
-
-                                        const d2 = getPackedData(lhs_node);
-                                        const target = self.file.binder.getSymbol(d2.left) orelse return error.MissingSymbol;
-
-                                        const cur = try self.getFlowType(d2.left, target);
-                                        if (cur == @intFromEnum(Kind.any) and !negated) {
-                                            return @intFromEnum(Kind.boolean);
-                                        }
-
-                                        const r = try self.analyzer.propertyNameToType(self.file, d2.right);
-
-                                        const member_type = try self.analyzer.accessType(cur, r);
-
-                                        const y = try self.analyzer.intersectType(member_type, typeof_type);
-                                        const y2 = try self.analyzer.excludeType(member_type, y);
-
-                                        if (negated) {
-                                            try self.bindPropertyCondition(target, cur, r, y2, y);
-                                        } else {
-                                            try self.bindPropertyCondition(target, cur, r, y, y2);
-                                        }
-
+                                    const typeof_type = try self.analyzer.maybeGetTypeFromTypeOfNode(self.file, d.right) orelse {
+                                        const rhs_type = try self.analyzer.getType(self.file, d.right);
+                                        try self.type_checker.checkPointlessTypeofComparison(d.left, rhs_type);
                                         return @intFromEnum(Kind.boolean);
-                                    }
+                                    };
 
-                                    const target = self.file.binder.getSymbol(inner) orelse return error.MissingSymbol;
-
-                                    // const t_ref = try self.analyzer.getTypeAsConst(self.file, d.right);
-                                    const typeof_type = try self.analyzer.maybeGetTypeFromTypeOfNode(self.file, d.right) 
+                                   const paths = try self.visitReference(unwrapRef(self.file.ast.nodes.at(d.left)))
                                         orelse return @intFromEnum(Kind.boolean);
 
-                                    const cur = try self.getFlowType(inner, target);
-                                    if (cur == @intFromEnum(Kind.any) and !negated) {
-                                        // TODO: set the type
-                                        return @intFromEnum(Kind.boolean);
-                                    }
+                                    const t = paths.types[paths.depth];
 
-                                    const y = try self.analyzer.intersectType(cur, typeof_type);
-                                    const y2 = try self.analyzer.excludeType(cur, y);
+                                    const true_type = try self.analyzer.intersectType(t, typeof_type);
+                                    const false_type = try self.analyzer.excludeType(t, true_type);
+
                                     if (negated) {
-                                        try self.bindConditions(target, y2, y);
+                                        try self.bindReferencePaths(paths, false_type, true_type);
                                     } else {
-                                        try self.bindConditions(target, y, y2);
+                                        try self.bindReferencePaths(paths, true_type, false_type);
                                     }
 
                                     return @intFromEnum(Kind.boolean);
@@ -7426,7 +7429,6 @@ pub const Analyzer = struct {
                         },
 
                         else => {
-                            // TODO: Handle equality comparisons for type narrowing
                             return try self.visitExpression(ref);
                         },
                     }
@@ -7508,10 +7510,10 @@ pub const Analyzer = struct {
         }
 
         fn joinLabelsInto(self: *@This(), target: *Label, left: *Label, right: *Label) !void {
-            try self._unifyAntecedents(target, &.{left, right});
+            try self._unifyAntecedents(target, &.{left, right}, true);
         }
 
-        fn _unifyAntecedents(self: *@This(), target: *Label, antecedents: []const *Label) anyerror!void {
+        fn _unifyAntecedents(self: *@This(), target: *Label, antecedents: []const *Label, comptime check_prior: bool) anyerror!void {
             var symbols = SymbolSet{};
             defer symbols.deinit(self.analyzer.allocator());
             
@@ -7538,6 +7540,20 @@ pub const Analyzer = struct {
                         if (ot == t) continue :lp;
                     }
                     try arr.append(self.analyzer.allocator(), t);
+                }
+
+                if (comptime check_prior) {
+                    if (arr.items.len > 1) {
+                        const prior = try self.analyzer.getTypeOfSymbol(self.file, sym);
+                        const r = try self.analyzer.evaluateType(prior, @intFromEnum(EvaluationFlags.no_unions) | @intFromEnum(EvaluationFlags.no_objects));
+                        if (self.analyzer.getKindOfRef(r) == .@"union") {
+                            const u = try self.analyzer.toUnion(arr.items);
+                            if (!try self.analyzer.isAssignableTo(prior, u)) {
+                                try target.types.put(self.analyzer.allocator(), sym, u);
+                            }
+                            continue;
+                        }
+                    }
                 }
 
                 const dst = try target.types.getOrPut(self.analyzer.allocator(), sym);
@@ -7578,7 +7594,7 @@ pub const Analyzer = struct {
                 try self.unifyAntecedents(l);
             }
 
-            try self._unifyAntecedents(target,antecedents_slice);
+            try self._unifyAntecedents(target,antecedents_slice, false);
 
             for (antecedents_slice) |l| {
                 l.unref(self);
@@ -7891,7 +7907,7 @@ pub const Analyzer = struct {
         switch (from_type.getKind()) {
             .@"union" => {},
             .alias, .query, .keyof => {
-                const evaluated = try this.evaluateType(from, @intFromEnum(EvaluationFlags.all));
+                const evaluated = try this.evaluateType(from, 0);
                 if (evaluated == from) return error.TODO;
 
                 const result = try this.excludeType(evaluated, excluded);
@@ -8040,7 +8056,23 @@ pub const Analyzer = struct {
                 },
                 .object_literal => {
                     const src_kind = this.getKindOfRef(src);
-                    if (src_kind != .object_literal and src_kind != .empty_object) return false;
+                    if (src_kind != .object_literal and src_kind != .empty_object) {
+                        if (src_kind == .@"union") {
+                            for (getSlice2(this.types.at(src), TypeRef)) |el| {
+                                if (!try this.isAssignableTo(el, dst)) return false;
+                            }
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    // we should be able to assign to a supertype
+                    const s = this.types.at(src);
+                    if (s.slot3 != 0) {
+                        if (try this.isAssignableTo(s.slot3, dst)) {
+                            return true;
+                        }
+                    }
 
                     // TODO: track if dst has an index type, then if we can't find a prop, we need 
                     // to check against the index types. An object type flag could be useful here.
@@ -8061,7 +8093,7 @@ pub const Analyzer = struct {
                         return true;
                     }
 
-                    const src_members = getSlice2(this.types.at(src), ObjectLiteralMember);
+                    const src_members = getSlice2(s, ObjectLiteralMember);
 
                     for (dst_members) |*dm| {
                         if (dm.kind == .call_signature or dm.kind == .index) continue;
@@ -8959,11 +8991,12 @@ pub const Analyzer = struct {
 
                     if (tmp.contains(t)) return null;
 
-                    for (tmp.elements.items) |k2| {
-                        if (k2 >= @intFromEnum(Kind.false)) continue;
-                        const t2 = this.types.at(k2);
-                        if (t2.getKind() != .object_literal) continue;
-                        if (try this.areObjectLiteralsEquivalent(t2, k)) {
+                    for (tmp.elements.items) |ref2| {
+                        if (ref2 >= @intFromEnum(Kind.false)) continue;
+                        const k2 = this.types.at(ref2);
+                        if (k2.getKind() != .object_literal) continue;
+
+                        if (try this.areObjectLiteralsEquivalent(k2, k)) {
                             return null;
                         }
                     }
@@ -9564,6 +9597,20 @@ pub const Analyzer = struct {
         return t;
     }
 
+    fn hashTupleType(this: *const @This(), elements: []const TypeRef, flags: u24) u64 {
+        _ = this;
+        var h = std.hash.Wyhash.init(0);
+        h.update(&.{@as(u8, @intFromEnum(Kind.tuple))});
+        h.update(&@as([3]u8, @bitCast(flags)));
+        h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(elements.len)))));
+
+        for (elements) |el| {
+            h.update(&@as([4]u8, @bitCast(el)));
+        }
+
+        return h.final();
+    }
+
     fn createTupleType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
         if (elements.len == 0) return @intFromEnum(Kind.empty_tuple);
 
@@ -9575,6 +9622,20 @@ pub const Analyzer = struct {
             .slot1 = @intCast(x >> 32),
             .slot2 = @intCast(elements.len),
         });
+    }
+
+    fn createCanonicalTupleType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
+        if (elements.len == 0) return @intFromEnum(Kind.empty_tuple);
+        
+        const key = this.hashTupleType(elements, flags);
+        if (this.canonical_types.get(key)) |t| {
+            this.allocator().free(elements);
+            return t;
+        }
+
+        const t = try this.createTupleType(elements, flags);
+        try this.canonical_types.put(key, t);
+        return t;
     }
 
     fn _createObjectLiteral(this: *@This(), elements: []const ObjectLiteralMember, flags: u24, proto: TypeRef) !TypeRef {
@@ -9611,7 +9672,7 @@ pub const Analyzer = struct {
 
         std.debug.assert(!member.isLazy());
 
-        const resolved = try this.maybeResolveAlias(source_ref);
+        const resolved = try this.evaluateType(source_ref, @intFromEnum(EvaluationFlags.no_unions));
         if (comptime is_debug) {
             if (resolved >= @intFromEnum(Kind.false)) {
                 this.printTypeInfo(source_ref);
@@ -9695,16 +9756,16 @@ pub const Analyzer = struct {
 
                 const copy = try this.allocator().alloc(ObjectLiteralMember, members.len);
                 @memcpy(copy, members);
-                members[i] = member;
+                copy[i] = member;
 
-                return this.createObjectLiteral(members, source.flags, source.slot3);
+                return this.createObjectLiteral(copy, source.flags, source.slot3);
             }
 
             var copy = try this.allocator().alloc(ObjectLiteralMember, members.len+1);
             @memcpy(copy[0..members.len], members);
-            members[members.len] = member;
+            copy[members.len] = member;
 
-            return this.createObjectLiteral(members, source.flags, source.slot3);
+            return this.createObjectLiteral(copy, source.flags, source.slot3);
         }
 
         return notSupported(source.getKind());
@@ -9818,7 +9879,7 @@ pub const Analyzer = struct {
     }
 
     fn createUnnamedTupleElement(this: *@This(), ty: TypeRef, flags: u24) !TypeRef {
-        const ident_hash = getHashComptime("");
+        const ident_hash = comptime getHashComptime("");
         const key = this.getTupleElementHash(ident_hash, ty, flags);
         if (this.canonical_types.get(key)) |t| return t;
         
@@ -9855,13 +9916,13 @@ pub const Analyzer = struct {
 
     // `slot4` can be a global symbol ref, `slot3` will be maxInt(u32) in this case
     // `slot5` caches the immediate substitution
-    // `slot6` caches the full evaluation
+    // `slot6` caches the full evaluation (with )
     fn createCanonicalAlias(this: *@This(), args: *TypeList, file_id: u32, sym_ref: SymbolRef, flags: u24) !TypeRef {
         std.debug.assert(sym_ref != 0);
 
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.alias))});
-        h.update(&@as([3]u8, @bitCast(flags)));
+        h.update(&@as([3]u8, @bitCast(flags | args.flags)));
 
         for (args.getSlice()) |a| h.update(&@as([4]u8, @bitCast(a)));
         h.update(&@as([4]u8, @bitCast(file_id)));
@@ -10144,6 +10205,14 @@ pub const Analyzer = struct {
 
                 return this.evaluateKeyOfType(followed);
             },
+            .query => {
+                const followed = try this.evaluateQuery(n, 0);
+                if (followed == r) {
+                    this.printTypeInfo(r);
+                    return error.TODO_keyof_unfollowable_query;
+                }
+                return this.evaluateKeyOfType(followed);
+            },
             // .array => {
             //     const ty = try this.getGlobalTypeSymbolAlias("Array", .{}) orelse error.MissingArray;
 
@@ -10165,10 +10234,9 @@ pub const Analyzer = struct {
         const slot2: u32 = @truncate(std.hash.Wyhash.hash(0, text));
 
         var h = std.hash.Wyhash.init(0);
-        const bits: [4]u8 = @bitCast(@intFromEnum(Kind.string_literal));
-        h.update(&bits);
-        h.update(&@as([4]u8, @bitCast(slot2)));
+        h.update(&.{@as(u8, @intFromEnum(Kind.string_literal))});
         h.update(&@as([3]u8, @bitCast(string_flags)));
+        h.update(&@as([4]u8, @bitCast(slot2)));
 
         const key = h.final();
         if (this.canonical_types.get(key)) |t| {
@@ -10198,10 +10266,9 @@ pub const Analyzer = struct {
         const slot2: u32 = @truncate(std.hash.Wyhash.hash(0, text));
 
         var h = std.hash.Wyhash.init(0);
-        const bits: [4]u8 = @bitCast(@intFromEnum(Kind.string_literal));
-        h.update(&bits);
-        h.update(&@as([4]u8, @bitCast(slot2)));
+        h.update(&.{@as(u8, @intFromEnum(Kind.string_literal))});
         h.update(&@as([3]u8, @bitCast(string_flags)));
+        h.update(&@as([4]u8, @bitCast(slot2)));
 
         const key = h.final();
         if (this.canonical_types.get(key)) |t| {
@@ -10223,6 +10290,36 @@ pub const Analyzer = struct {
         });
 
         try this.canonical_types.put(key, t);
+        return t;
+    }
+
+    fn createTemplateLiteral(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
+        var h = std.hash.Wyhash.init(0);
+        h.update(&.{@as(u8, @intFromEnum(Kind.template_literal))});
+        h.update(&@as([3]u8, @bitCast(flags)));
+        h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(elements.len)))));
+
+        for (elements) |el| {
+            h.update(&@as([4]u8, @bitCast(el)));
+        }
+
+        const key = h.final();
+        if (this.canonical_types.get(key)) |t| {
+            this.allocator().free(elements);
+            return t;
+        }
+
+        const x: u64 = @intFromPtr(elements.ptr);
+        const t=  try this.types.push(.{
+            .kind = @intFromEnum(Kind.template_literal),
+            .flags = flags,
+            .slot0 = @truncate(x),
+            .slot1 = @intCast(x >> 32),
+            .slot2 = @intCast(elements.len),
+        });
+
+        try this.canonical_types.put(key, t);
+
         return t;
     }
 
@@ -10795,7 +10892,9 @@ pub const Analyzer = struct {
         return args;
     }
 
-    fn evaluateQuery(this: *@This(), t: *Type, _: u32) !TypeRef {
+    fn evaluateQuery(this: *@This(), t: *Type, flags: u32) !TypeRef {
+        _ = flags;
+
         if (t.slot5 != 0) return t.slot5;
 
         const f = this.program.getFileData(t.slot3);
@@ -11080,7 +11179,6 @@ pub const Analyzer = struct {
                 return this.createNamedTupleTypeFromIdent(file.id, d.left, inner, flags);
             },
             .tuple_type => {
-                // TODO: canonical type
                 var flags: u24 = 0;
                 var elements = std.ArrayList(TypeRef).init(this.type_args.allocator);
                 var iter = NodeIterator.init(&file.ast.nodes, maybeUnwrapRef(node) orelse 0);
@@ -11129,7 +11227,7 @@ pub const Analyzer = struct {
                     }
                 }
 
-                return this.createTupleType(elements.items, flags);
+                return this.createCanonicalTupleType(try elements.toOwnedSlice(), flags);
             },
             .identifier => {
                 // Equivalent to `type_reference` with no args
@@ -11829,7 +11927,7 @@ pub const Analyzer = struct {
     }
 
     fn getHashComptime(comptime data: []const u8) u32 {
-        return @intCast(std.hash.Wyhash.hash(0, data));
+        return @truncate(std.hash.Wyhash.hash(0, data));
     }
 
     // TODO: we can widen unions if each element is directly 
@@ -11907,7 +12005,7 @@ pub const Analyzer = struct {
                     return this.accessType(subject, r);
                 },
                 .keyof => {
-                    const r = try this.evaluateType(element, @intFromEnum(EvaluationFlags.all));
+                    const r = try this.evaluateType(element, 0);
                     if (r == element) return error.TODO_failed_eval_keyof;
                     return this.accessType(subject, r);
                 },
@@ -12193,8 +12291,6 @@ pub const Analyzer = struct {
     fn handleFailedInferCall(this: *@This(), file: *ParsedFileData, ref: NodeRef, n: *const Type, args_start: NodeRef) !TypeRef {
         const apparent = try this.resolveWithTypeArgsSlice(n, &.{});
 
-        var checker2 = checker.Checker.init(file, this.allocator(), this);
-
         var i: u32 = 0;
         var args: [32]u32 = undefined;
         var iter = NodeIterator.init(&file.ast.nodes, args_start);
@@ -12203,7 +12299,9 @@ pub const Analyzer = struct {
             i += 1;
         }
 
-        try checker2.checkArgsAgainstSignature(apparent, args[0..i], ref);
+        if (file.flow) |f| {
+            try f.type_checker.checkArgsAgainstSignature(apparent, args[0..i], ref);
+        }
 
         return this.types.at(apparent).slot3;
     }
@@ -12361,8 +12459,7 @@ pub const Analyzer = struct {
             const old_ctx = this.inferrence_ctx;
             defer this.inferrence_ctx = old_ctx;
             const pt = fn_params[args.items.len];
-            std.debug.assert(this.getKindOfRef(pt) == .tuple_element);
-            this.inferrence_ctx = this.types.at(pt).slot1;
+            this.inferrence_ctx = this.getTupleElementType(pt);
 
             const ty = try this.getType(file, p[1]);
             try args.append(this.allocator(), ty);
@@ -12373,7 +12470,6 @@ pub const Analyzer = struct {
 
         // Type args can be inferred both from the arguments and the expected return type
         const prev_inferred = this.inferred_type_params;
-        defer this.inferred_type_params = prev_inferred;
 
         var should_infer = std.AutoArrayHashMapUnmanaged(u32, TypeRef){};
         defer should_infer.deinit(this.allocator());
@@ -12387,6 +12483,8 @@ pub const Analyzer = struct {
         defer inferred.deinit();
 
         const did_infer = try this.inferTupleLikeTypes(args.items, fn_params, &inferred, .covariant) orelse return null;
+        this.inferred_type_params = prev_inferred;
+
         if (!did_infer) return null;
 
         // var iter2 = inferred.iterator();
@@ -12466,7 +12564,7 @@ pub const Analyzer = struct {
                     defer this.contextual_this_type = old_this_type;
                     this.contextual_this_type = l;
 
-                    t = try this.evaluateType(t, @intFromEnum(EvaluationFlags.all));
+                    t = try this.evaluateType(t, 0);
                 }
 
                 return t;
@@ -12489,9 +12587,11 @@ pub const Analyzer = struct {
                     if (t == @intFromEnum(Kind.never) or t == @intFromEnum(Kind.any) or t == @intFromEnum(Kind.error_any)) {
                         return t;
                     }
-                    this.printTypeInfo(t);
-                    this.printCurrentNode();
-                    return error.NotAFunctionType;
+                    if (file.flow) |ft| {
+                        try ft.type_checker.checkCallExpressionWithCallee(ref, t);
+                    }
+
+                    return @intFromEnum(Kind.never);
                 }
 
                 //const is_optional = hasFlag(exp, .optional);
@@ -12506,6 +12606,9 @@ pub const Analyzer = struct {
 
                     if (exp.len != 0) {
                         const resolved = try this.resolveWithTypeArgs(file, n, exp.len);
+                        if (file.flow) |ft| {
+                            try ft.type_checker.checkCallExpressionWithCallee(ref, resolved);
+                        }
 
                         return this.getReturnType(resolved);
                     }
@@ -12513,8 +12616,16 @@ pub const Analyzer = struct {
                     const resolved = try this.inferTypeCallExpParameterized(file, n, d.right) 
                         orelse return try this.handleFailedInferCall(file, ref, n, d.right);
 
+                    if (file.flow) |ft| {
+                        try ft.type_checker.checkCallExpressionWithCallee(ref, resolved);
+                    }
+
                     const rt = try this.getReturnType(resolved);
                     return rt;
+                }
+
+                if (file.flow) |ft| {
+                    try ft.type_checker.checkCallExpressionWithCallee(ref, t);
                 }
 
                 if (n.getKind() != .function_literal) {
@@ -12547,9 +12658,7 @@ pub const Analyzer = struct {
                     // TODO: error if missing compatible signature
                     // return never if not a function
 
-                    std.debug.print("{any}\n", .{n.getKind()});
-                    try this._debug(t);
-                    return error.NotAFunctionOrMissingCompatibleSignature;
+                    return @intFromEnum(Kind.never);
                 }
 
                 return n.slot3;
@@ -13044,12 +13153,18 @@ pub const Analyzer = struct {
                         return false;
                     }
 
-                    if (!self.file.binder.symbols.at(n.extra_data).hasFlag(.top_level)) {
+                    const sym = self.file.binder.symbols.at(n.extra_data);
+                    if (!sym.hasFlag(.top_level)) {
                         return false;
                     }
 
                     const key: u64 = (@as(u64, self.file.id) << 32) | n.extra_data;
                     const entry = try self.collector.set.getOrPut(key);
+
+                    // late bound symbols are ambient
+                    if (!entry.found_existing and sym.declaration != 0 and !sym.hasFlag(.late_bound)) {
+                        try self.visit(self.nodes.at(sym.declaration), sym.declaration);
+                    }
 
                     entry.value_ptr.* = true;
                     return true;
@@ -13307,10 +13422,17 @@ pub const Analyzer = struct {
         }
         if (t.getKind() == .object_literal) {
             std.debug.print("    ",.{});
-            @constCast(this)._debug(ty) catch unreachable;
+            @constCast(this)._debug(ty);
         }
         if (t.getKind() == .string_literal) {
             std.debug.print("  '{s}'\n", .{this.getSliceFromLiteral(ty)});
+        }
+        if (t.getKind() == .tuple) {
+            const elements = getSlice2(t, TypeRef);
+            for (elements) |el| {
+                std.debug.print("  ", .{});
+                this.printTypeInfo(el);
+            }
         }
         if (t.getKind() == .@"union") {
             const elements = getSlice2(t, TypeRef);
@@ -13342,8 +13464,8 @@ pub const Analyzer = struct {
         return s;
     }
 
-    pub fn _debug(this: *@This(), ty: u32) !void {
-        const s = try this.printType(ty);
+    pub fn _debug(this: *@This(), ty: u32) void {
+        const s = this.printType(ty) catch unreachable;
         std.debug.print("{s}\n", .{s});
     }
 
@@ -13398,6 +13520,16 @@ pub const Analyzer = struct {
             try this.cached_type_to_node.put(this.allocator, ty, n);
 
             return n;
+        }
+
+        // nodes in lists cannot be shared unless they are the last node in a list
+        fn toTypeNodeInList(this: *@This(), ty: u32) !NodeRef {
+            if (ty < @intFromEnum(Kind.false) and this.analyzer.types.at(ty).getKind() == .string_literal) {
+                const n = try this._toTypeNode(ty);
+                return this.synthetic_nodes.push(this.synthetic_nodes.at(n).*);
+            }
+
+            return this._toTypeNode(ty);
         }
 
         pub fn removeCacheEntry(this: *@This(), ty: u32) void {
@@ -13622,7 +13754,7 @@ pub const Analyzer = struct {
                         var l = BumpAllocatorList(AstNode).init(&this.synthetic_nodes);
 
                         for (getSlice2(k, TypeRef)) |el| {
-                            const n = try this.toTypeNode(el);
+                            const n = try this.toTypeNodeInList(el);
                             l.appendRef(n);
                         }
 
@@ -13758,7 +13890,7 @@ pub const Analyzer = struct {
                         var l = BumpAllocatorList(AstNode).init(&this.synthetic_nodes);
 
                         for (getSlice2(k, TypeRef)) |el| {
-                            const n = try this.toTypeNode(el);
+                            const n = try this.toTypeNodeInList(el);
                             l.appendRef(n);
                         }
 

@@ -878,6 +878,14 @@ pub fn BumpAllocatorList(comptime T: type) type {
         }
 
         pub inline fn appendRef(this: *@This(), ref: NodeRef) void {
+            if (comptime is_debug) {
+                var x = this.head;
+                while (x != 0) {
+                    if (x == ref) @panic("Recursive appendRef");
+                    x = this.allocator.at(x).next;
+                }
+            }
+
             if (this.prev != 0) {
                 this.allocator.at(this.prev).next = ref;
             } else {
@@ -7436,6 +7444,18 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(d.right), d.right);
             }
         },
+        .method_declaration => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left); // name
+            try visitList(nodes, node.extra_data, visitor); // type params
+            try visitList(nodes, d.right, visitor); // params
+            if (node.extra_data2 != 0) {
+                try visitor.visit(nodes.at(node.extra_data2), node.extra_data2); // return type
+            }
+            if (node.len != 0) {
+                try visitor.visit(nodes.at(node.len), node.len); // body
+            }
+        },
         .method_signature => {
             const d = getPackedData(node);
             try visitor.visit(nodes.at(d.left), d.left); // name
@@ -9402,6 +9422,10 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
             if (d.left != 0) {
                 return getLoc(nodes, nodes.at(d.left));
             }
+        },
+        .typeof_expression => {
+            // FIXME: add location to typeof
+            return getLoc(nodes, nodes.at(unwrapRef(n)));
         },
         .element_access_expression, .binary_expression,
         .property_access_expression, .call_expression, .qualified_name,
