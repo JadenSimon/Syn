@@ -443,7 +443,7 @@ pub const Program = struct {
         return this.getFileData(id);
     }
 
-    fn bindMapToGlobals(this: *@This(), file: *ParsedFileData, m: *std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef), comptime is_type: bool) !void {
+    fn bindMapToGlobals(this: *@This(), file: *ParsedFileData, m: *parser.Binder.SymbolTable, comptime is_type: bool) !void {
         var dst = switch (is_type) {
             true => &this.ambient.global_types,
             false => &this.ambient.globals,
@@ -2302,9 +2302,6 @@ pub const Program = struct {
                     std.debug.assert(inner.getKind() == .function_literal); // TODO: could be recursive
                     const followed = try self.analyzer.followInnerScopeAliases(inner.slot3);
                     if (followed != inner.slot3) {
-                        const prev_state = self.analyzer.saveState();
-                        defer self.analyzer.restoreState(prev_state);
-
                         const parameterized = try self.analyzer.createParameterizedType(Analyzer.getSlice2(t, Analyzer.TypeRef), followed);
                         return_type = try self.printer.toTypeNode(parameterized);
                     }
@@ -2333,10 +2330,10 @@ pub const Program = struct {
         // export type RegExp = 'ok';
         // export declare const y: globalThis.RegExp;
 
-        var to_keep = std.AutoHashMap(u64, bool).init(this.allocator);
+        var to_keep = std.AutoArrayHashMap(u64, bool).init(this.allocator);
         defer to_keep.deinit();
 
-        var external_set = std.AutoHashMap(u64, bool).init(this.allocator);
+        var external_set = std.AutoArrayHashMap(u64, bool).init(this.allocator);
         defer external_set.deinit();
 
         // file nodes -> synthetic nodes
@@ -2346,7 +2343,7 @@ pub const Program = struct {
         var named_imports = std.ArrayList(struct { NodeRef, NodeRef }).init(this.allocator);
         defer named_imports.deinit();
 
-        var nodes_to_keep = std.AutoHashMap(NodeRef, bool).init(this.allocator);
+        var nodes_to_keep = std.AutoArrayHashMap(NodeRef, bool).init(this.allocator);
         defer nodes_to_keep.deinit();
 
 
@@ -2588,12 +2585,12 @@ pub const Program = struct {
             var l = NodeList.init(&printer.synthetic_nodes);
             var did_change = false;
 
-            const count = printer.synthetic_nodes.count;
+            //const count = printer.synthetic_nodes.count;
             const local_count = printer.synthetic_nodes.local_count;
 
             defer {
                 if (!did_change) {
-                    printer.synthetic_nodes.count = count;
+                //    printer.synthetic_nodes.count = count;
                     printer.synthetic_nodes.local_count = local_count;
                 }
             }
@@ -2960,6 +2957,8 @@ const Ambient = struct {
 const is_debug = @import("builtin").mode == .Debug;
 
 pub const Analyzer = struct {
+    const num_type_registers = 8;
+
     pub const Kind = enum(u32) {
         nil = 0, // placeholder/invalid type
 
@@ -3038,10 +3037,12 @@ pub const Analyzer = struct {
         no_infer,
         this_type_marker, // TODO: typescript doesn't use `intrinsic` to mark this decl
 
-        // Lower bits reference the type parameter id
+        // Lower bits reference the type parameter id, biased by 16
+        // Under 16 uses ordinals = direct lookup into the register
         type_parameter_ref = 0b101 << 29,
 
         // 30 bit two's complement literals are treated as intrinsic
+        // TODO: we could have this be 31 bit if we made `false` 0b01 << 30
         zero = 0b11 << 30,
     };
 
@@ -3070,6 +3071,14 @@ pub const Analyzer = struct {
         readonly = 1 << 16,
         optional = 1 << 17,
         non_null = 1 << 18,
+    };
+
+    pub const QueryFlags = enum(u24) {
+        return_type = 1 << 2, // equivalent to `ReturnType<typeof foo>`
+
+        pub inline fn isReturnType(t: *const Type) bool {
+            return (t.flags & @intFromEnum(@This().return_type)) == @intFromEnum(@This().return_type);
+        }
     };
 
     // Goes into same slot as other type flags, be careful not to overlap
@@ -3196,7 +3205,7 @@ pub const Analyzer = struct {
     canonical_types: std.AutoArrayHashMap(u64, TypeRef),
 
     type_args: std.AutoArrayHashMap(TypeRef, TypeRef),
-    type_registers: [16]TypeRef = [_]TypeRef{0} ** 16,
+    type_registers: [num_type_registers]TypeRef = [_]TypeRef{0} ** num_type_registers,
     contextual_this_type: TypeRef = 0, // Used to evaluate `this` in types (not expressions)
 
     inferred_type_params: ?std.AutoArrayHashMapUnmanaged(TypeRef, TypeRef) = null,
@@ -3204,6 +3213,7 @@ pub const Analyzer = struct {
 
     is_const_context: bool = false, // Forced `const` context e.g. `as const` or `const T`
     is_const_variable_context: bool = false, // Implicit `const` context e.g. `const x = 1`
+    follow_parameterized_return_type: bool = false,
 
     // Used when analyzing parameterized types
     // We use this state to compute type parameter variance
@@ -3247,23 +3257,6 @@ pub const Analyzer = struct {
 
     fn getAnalyzedFile(this: *@This(), id: u32) !*ParsedFileData {
         return this.program.getBoundFile(id);
-    }
-
-    const State = struct {
-        count: u32,
-        local_count: u16,
-    };
-
-    inline fn saveState(this: *const @This()) State {
-        return .{
-            .count = this.types.count,
-            .local_count = this.types.local_count,
-        };
-    }
-
-    inline fn restoreState(this: *@This(), state: State) void {
-        this.types.count = state.count;
-        this.types.local_count = state.local_count;
     }
 
     const IntrinsicTypeAliases = ComptimeStringMap(Kind, .{
@@ -3357,7 +3350,7 @@ pub const Analyzer = struct {
 
             this.flags |= @intFromEnum(Flags.allocated_list);
             const buf = try _allocator.alloc(TypeRef, capacity);
-            @memcpy(buf, this.buf[0..this.count]);
+            @memcpy(buf[0..this.count], this.buf[0..this.count]);
 
             return buf;
         }
@@ -3474,18 +3467,22 @@ pub const Analyzer = struct {
                 return;
             }
 
-            const items_ptr: *u64 = @alignCast(@ptrCast(&t.slot1));
+            //const items_ptr: *u64 = @alignCast(@ptrCast(&t.slot1));
 
             if (this.count <= this.buf.len) {
                 const slice = try this.allocate(_allocator, this.count);
-                items_ptr.* = @intFromPtr(slice.ptr);
+                //items_ptr.* = @intFromPtr(slice.ptr);
+                t.slot1 = @truncate(@intFromPtr(slice.ptr));
+                t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
                 t.slot0 = @intCast(slice.len);
                 t.flags |= this.flags;
                 return;
             }
 
             const slice = this.shrinkToFit(_allocator, this.getAllocatedSlice());
-            items_ptr.* = @intFromPtr(slice.ptr);
+            // items_ptr.* = @intFromPtr(slice.ptr);
+            t.slot1 = @truncate(@intFromPtr(slice.ptr));
+            t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
             t.slot0 = @intCast(slice.len);
             t.flags |= this.flags;
         }
@@ -3905,15 +3902,40 @@ pub const Analyzer = struct {
         return try this.createCanonicalAlias(&tmp, u.slot3, u.slot4, u.flags);
     }
 
-    fn resolveTypeParam(this: *const @This(), ref: TypeRef) ?TypeRef {
-        const register: u32 = ref & (~@intFromEnum(Kind.type_parameter_ref));
-        if (register >= this.type_registers.len) {
-            // TODO
-            return null;
+    // clobbers
+    fn setTypeArg(this: *@This(), param: *const Type, param_ref: TypeRef, val: TypeRef) !void {
+        if (param.slot3 < num_type_registers) {
+            this.type_registers[param.slot3] = val;
+        } else {
+            try this.type_args.put(param_ref, val);
+        }
+    }
+
+    fn setTypeArgFromTypeParamRef(this: *@This(), type_param_ref: TypeRef, val: TypeRef) !void {
+        const register: u32 = type_param_ref & (~@intFromEnum(Kind.type_parameter_ref));
+        if (register < num_type_registers) {
+            this.type_registers[register] = val;
+            return;
         }
 
-        if (this.type_registers[register] == 0) return null;
-        return this.type_registers[register];
+        const param_ref = register - num_type_registers;
+        if (val == 0) {
+            _ = this.type_args.swapRemove(param_ref);
+        } else {
+            try this.type_args.put(param_ref, val);
+        }
+    }
+
+    fn resolveTypeParam(this: *const @This(), ref: TypeRef) ?TypeRef {
+        const register: u32 = ref & (~@intFromEnum(Kind.type_parameter_ref));
+        if (register >= num_type_registers) {
+            const param_ref = register - num_type_registers;
+            return this.type_args.get(param_ref);
+        }
+
+        const v = this.type_registers[register];
+        if (v == 0) return null;
+        return v;
     }
 
     fn resolveUnionOrIntersection(this: *@This(), ref: TypeRef, comptime kind: Kind) !TypeRef {
@@ -4042,14 +4064,7 @@ pub const Analyzer = struct {
             if (isCallableIntrinsic(ref)) {
                 return try this.callIntrinsicType(ref);
             } else if (isTypeParamRef(ref)) {
-                const r = this.resolveTypeParam(ref) orelse return null;
-                if (this.isParameterizedRef(r) and r != ref) {
-                    if (this.inferred_type_params != null) {
-                        return r; // do not recursively substitute during inference. 
-                    }
-                    return this.resolveParameterizedType(r);
-                }
-                return r;
+                return this.resolveTypeParam(ref) orelse return null;
             }
 
             return ref;
@@ -4192,20 +4207,25 @@ pub const Analyzer = struct {
             .conditional => {
                 const subject = try this.resolveParameterizedType(n.slot0) orelse return ref;
 
-                // Typescript appears to distribute unions over conditionals if the subject starts as a type parameter
-                // TODO: enable caller to control distribution by wrapping arg w/ `()` e.g. `F<(1 | 2 | 3)>`
-                // Really this just means differentiating between "naked" and grouped unions. But that's a whole can of worms.
-                if (subject < @intFromEnum(Kind.false) and this.types.at(subject).getKind() == .@"union" and n.slot4 == 0) {
-                    if (isTypeParamRef(n.slot0)) {
-                        const reg = n.slot0 - @intFromEnum(Kind.type_parameter_ref);
-                        const old_value = this.type_registers[reg];
-                        const elements = getSlice2(this.types.at(subject), TypeRef);
+                // We distribute over conditionals if the subject starts as a type parameter or alias
+                // TODO: should this include aliases too?
+                if (isTypeParamRef(n.slot0)) {
+                    var subject2 = try this.evaluateType(subject, 0);
+                    while (this.getKindOfRef(subject2) == .alias) {
+                        const nt = try this.evaluateType(subject2, 0);
+                        subject2 = nt;
+                        if (subject2 == nt) break;
+                    }
+                    if (this.getKindOfRef(subject2) == .@"union") {
+                        const old_value = this.resolveTypeParam(n.slot0) orelse 0;
+                        defer this.setTypeArgFromTypeParamRef(n.slot0, old_value) catch unreachable;
+
+                        const elements = getSlice2(this.types.at(subject2), TypeRef);
                         var arr = try std.ArrayList(TypeRef).initCapacity(this.allocator(), elements.len);
                         defer arr.deinit();
-                        defer this.type_registers[reg] = old_value;
 
                         for (elements) |el| {
-                            this.type_registers[reg] = el;
+                            try this.setTypeArgFromTypeParamRef(n.slot0, el);
                             const constraint = try this.resolveParameterizedType(n.slot1) orelse n.slot1;
 
                             if (try this.tryResolveConditionalType(el, constraint, n.slot2, n.slot3)) |t| {
@@ -4355,7 +4375,16 @@ pub const Analyzer = struct {
                     }
                 }
 
-                const return_type = try this.resolveParameterizedType(try this.followInnerScopeAliases(n.slot3)) orelse n.slot3;
+                const rt = blk: {
+                    if (this.follow_parameterized_return_type) {
+                        this.follow_parameterized_return_type = false;
+                        break :blk try this.followInnerScopeAliases(n.slot3);
+                    } else {
+                        break :blk n.slot3;
+                    }
+                };
+
+                const return_type = try this.resolveParameterizedType(rt) orelse n.slot3;
                 if (return_type != n.slot3) did_change = true;
 
                 const this_type = try this.resolveParameterizedType(n.slot4) orelse n.slot4;
@@ -4923,7 +4952,15 @@ pub const Analyzer = struct {
                 return null;
             }
 
-            if (this.isParameterizedRef(subject)) return null;
+            if (this.isParameterizedRef(subject)) {
+                if (this.getKindOfRef(subject) == .parameterized) {
+                    const t = try this.resolveWithTypeArgsSlice(this.types.at(subject), &.{});
+                    return try this.inferConditionalTypeWithVariance(t, condition, inferred, variance);
+                }
+                if (this.getKindOfRef(subject) != .object_literal) {
+                    return null;
+                }
+            }
 
             return switch (variance) {
                 .invariant => false,
@@ -5307,6 +5344,11 @@ pub const Analyzer = struct {
 
                 if (s.getKind() != .object_literal) {
                     if (s.getKind() == .string_literal or s.getKind() == .number_literal) return false;
+
+                    // TODO: these should _technically_ be supported if a number index exists
+                    if (s.getKind() == .array) return false;
+                    if (s.getKind() == .tuple) return false;
+
                     this.printTypeInfo(subject);
                     return error.TODO;
                 }
@@ -5329,8 +5371,13 @@ pub const Analyzer = struct {
                         if (h != h2) continue;
 
                         did_match = true;
+                        var st = try el2.getType(this);
+                        if (this.getKindOfRef(st) == .parameterized) {
+                            st = try this.resolveWithTypeArgsSlice(this.types.at(st), &.{});
+                        }
+                        const ct = try el.getType(this);
 
-                        if (try this.inferConditionalTypeWithVariance(try el2.getType(this), try el.getType(this), inferred, variance)) |x| {
+                        if (try this.inferConditionalTypeWithVariance(st, ct, inferred, variance)) |x| {
                             if (!x) return false;
                         } else return null;
                     }
@@ -5452,9 +5499,17 @@ pub const Analyzer = struct {
     }
 
     fn getMemberNameHash(this: *const @This(), name: TypeRef) anyerror!u32 {
-        if (name == @intFromEnum(Kind.empty_string)) return 0; // TODO
-
         if (name >= @intFromEnum(Kind.false)) {
+            if (name == @intFromEnum(Kind.empty_string)) return 0; // TODO
+
+            // BRITTLE
+            if (name == @intFromEnum(Kind.number)) {
+                return @truncate(std.hash.Wyhash.hash(0, "%%%number%%"));
+            }
+            if (name == @intFromEnum(Kind.string)) {
+                return @truncate(std.hash.Wyhash.hash(0, "%%%string%%"));
+            }
+
             if (name >= @intFromEnum(Kind.zero)) {
                 const d: u30 = @intCast(name - @intFromEnum(Kind.zero));
                 const v: i30 = @bitCast(d);
@@ -5485,7 +5540,7 @@ pub const Analyzer = struct {
         return .{ result, inferred };
     }
 
-    fn revertTypeArgs(this: *@This(), args: std.AutoArrayHashMap(TypeRef, TypeRef), registers: [16]TypeRef) void {
+    fn revertTypeArgs(this: *@This(), args: std.AutoArrayHashMap(TypeRef, TypeRef), registers: [num_type_registers]TypeRef) void {
         @memcpy(&this.type_registers, &registers);
         var iter = args.iterator();
         while (iter.next()) |entry| {
@@ -5497,8 +5552,34 @@ pub const Analyzer = struct {
         }
     }
 
+    fn distributeConditionalType(this: *@This(),  subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) !TypeRef {
+        std.debug.assert(this.getKindOfRef(subject) == .@"union");
+
+        const elements = getSlice2(this.types.at(subject), TypeRef);
+        var arr = try std.ArrayList(TypeRef).initCapacity(this.allocator(), elements.len);
+        defer arr.deinit();
+
+        for (elements) |el| {
+            if (try this.tryResolveConditionalType(el, condition, when_true, when_false)) |t| {
+                try arr.append(t);
+            } else {
+                try arr.append(try this.types.push(.{
+                    .kind = @intFromEnum(Kind.conditional),
+                    .slot0 = el,
+                    .slot1 = condition,
+                    .slot2 = when_true,
+                    .slot3 = when_false,
+                    .flags = @intFromEnum(Flags.parameterized),
+                }));
+            }
+        }
+
+        return try this.toUnion(arr.items);
+    }
+
+    // typescript treats any alias mentioned in the subject as being distributed...
     // `when_true` and `when_false` are lazily evaluated
-    fn tryResolveConditionalType(this: *@This(), subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) !?u32 {
+    fn tryResolveConditionalType(this: *@This(), subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) anyerror!?u32 {
         var r = try this.maybeEvaluateCondition(subject, condition) orelse return null;
         defer r[1].deinit();
 
@@ -5510,18 +5591,19 @@ pub const Analyzer = struct {
         defer tmp_args.deinit();
 
         const registers = this.type_registers;
+        defer this.revertTypeArgs(tmp_args, registers);
 
         var iter = r[1].iterator();
         while (iter.next()) |entry| {
-            const v = this.type_args.get(entry.key_ptr.*) orelse 0;
-            try tmp_args.put(entry.key_ptr.*, v);
-            try this.type_args.put(entry.key_ptr.*, entry.value_ptr.*);
+            const param_ref = entry.key_ptr.*;
+            const val = entry.value_ptr.*;
+            const n = this.types.at(param_ref);
 
-            const n = this.types.at(entry.key_ptr.*);
-            this.type_registers[n.slot3] = entry.value_ptr.*;
+            const saved_arg = this.type_args.get(param_ref) orelse 0;
+            try tmp_args.put(param_ref, saved_arg);
+
+            try this.setTypeArg(n, param_ref, val);
         }
-
-        defer this.revertTypeArgs(tmp_args, registers);
 
         return this.resolveParameterizedType(when_true);
     }
@@ -5530,7 +5612,7 @@ pub const Analyzer = struct {
         const n = file.ast.nodes.at(ref);
         const d = getPackedData(n);
 
-        const is_subject_parenthesized = file.ast.nodes.at(d.left).kind == .parenthesized_type;
+        // const is_subject_parenthesized = file.ast.nodes.at(d.left).kind == .parenthesized_type;
 
         const left = try this.getType(file, d.left);
         const right = try this.getType(file, d.right);
@@ -5549,7 +5631,7 @@ pub const Analyzer = struct {
             .slot1 = right,
             .slot2 = when_true,
             .slot3 = when_false,
-            .slot4 = if (is_subject_parenthesized) 1 else 0,
+            // .slot4 = if (is_subject_parenthesized) 1 else 0,
             .flags = @intFromEnum(Flags.parameterized),
         });
     }
@@ -5681,12 +5763,13 @@ pub const Analyzer = struct {
         const SymbolSet = std.AutoArrayHashMapUnmanaged(SymbolRef, void);
 
         const SimpleHashMap = struct {
+            const tombstone: u32 = std.math.maxInt(u32);
             buf: [6]u32 = undefined,
             count: u32 = 0,
-            available: u32 = undefined,
+            available: u32 = 0,
 
             inline fn _getKeySlice(this: *@This()) []u32 {
-                if (this.count <= 3) {
+                if (this.available == 0) {
                     return this.buf[0..this.count];
                 }
 
@@ -5695,8 +5778,8 @@ pub const Analyzer = struct {
             }
 
             inline fn _getValueSlice(this: *@This()) []u32 {
-                if (this.count <= 3) {
-                    return this.buf[this.count..(this.count*2)];
+                if (this.available == 0) {
+                    return this.buf[3..3+this.count];
                 }
 
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
@@ -5704,7 +5787,7 @@ pub const Analyzer = struct {
             }
 
             inline fn getKeySlice(this: *const @This()) []const u32 {
-                if (this.count <= 3) {
+                if (this.available == 0) {
                     return this.buf[0..this.count];
                 }
 
@@ -5713,8 +5796,8 @@ pub const Analyzer = struct {
             }
 
             inline fn getValueSlice(this: *const @This()) []const u32 {
-                if (this.count <= 3) {
-                    return this.buf[this.count..(this.count*2)];
+                if (this.available == 0) {
+                    return this.buf[3..3+this.count];
                 }
 
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
@@ -5723,27 +5806,55 @@ pub const Analyzer = struct {
 
             fn findEmptyIndex(this: *const @This(), key: u32, keys: []const u32) u32 {
                 _ = this;
+
+                std.debug.assert(keys.len > 8);
+                std.debug.assert(std.math.isPowerOfTwo(keys.len));
+
                 const start: u32 = mix(key) & (@as(u32, @intCast(keys.len))-1);
-  
+
                 var i = start;
                 while (i < keys.len) {
                     const k = keys[i];
-                    if (k == 0) return i;
+                    if (k == 0 or k == tombstone) return i;
                     i += 1;
                 }
 
                 i = 0;
                 while (i < start) {
                     const k = keys[i];
-                    if (k == 0) return i;
+                    if (k == 0 or k == tombstone) return i;
                     i += 1;
                 }
 
                 unreachable;
             }
 
+            fn findIndexSlow(this: *const @This(), key: u32, keys: []const u32) ?u32 {
+                std.debug.assert(this.available > 8);
+                std.debug.assert(std.math.isPowerOfTwo(keys.len));
+                const start: u32 = mix(key) & (@as(u32, @intCast(keys.len))-1);
+
+                var i = start;
+                while (i < keys.len) {
+                    const k = keys[i];
+                    if (k == 0) return null;
+                    if (k == key) return i;
+                    i += 1;
+                }
+
+                i = 0;
+                while (i < start) {
+                    const k = keys[i];
+                    if (k == 0) break;
+                    if (k == key) return i;
+                    i += 1;
+                }
+
+                return null;
+            }
+
             fn findIndex(this: *const @This(), key: u32, keys: []const u32) ?u32 {
-                if (this.count <= 8) {
+                if (this.available <= 8) {
                     for (0..this.count) |i| {
                         if (keys[i] == key) {
                             return @truncate(i);
@@ -5752,12 +5863,314 @@ pub const Analyzer = struct {
                     return null;
                 }
 
-                const start: u32 = mix(key) & (@as(u32, @intCast(keys.len))-1);
-  
+                return this.findIndexSlow(key, keys);
+            }
+
+            fn _ensureCapacity(this: *@This(), a: std.mem.Allocator, amount: u32) !void {                
+                const keys = this.getKeySlice();
+                std.debug.assert(keys.len < amount);
+                std.debug.assert(std.math.isPowerOfTwo(amount));
+
+                const k = try a.alloc(u32, amount);
+                if (amount <= 8) {
+                    @memcpy(k[0..this.count], keys);
+                }
+
+                const values = this.getValueSlice();
+                const v = try a.alloc(u32, amount);
+                if (amount <= 8) {
+                    @memcpy(v[0..this.count], values);
+                }
+
+                if (amount > 8) {
+                    @memset(k, 0);
+
+                    for (0..keys.len) |i| {
+                        const k2 = keys[i];
+                        if (k2 == 0 or k2 == tombstone) continue;
+
+                        const ind = this.findEmptyIndex(k2, k);
+                        k[ind] = k2;
+                        v[ind] = values[i];
+                    }
+                }
+
+                {
+                    this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
+                    this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                    this.buf[2] = @intCast(k.len);
+                }
+
+                {
+                    this.buf[3] = @truncate(@intFromPtr(v.ptr) >> 32);
+                    this.buf[4] = @truncate(@intFromPtr(v.ptr));
+                }
+
+                if (amount <= 8) {
+                    this.available = 8;
+                } else {
+                    this.available = @truncate((amount * 80) / 100);
+                }
+            }
+
+            inline fn _swapRemove(this: *@This(), i: u32, j: u32, keys: []u32) void {
+                if (i == j) {
+                    keys[j] = 0;
+                    this.count -= 1;
+                    return;
+                }
+                const values = this._getValueSlice();
+                values[j] = values[i];
+                keys[j] = keys[i];
+                keys[i] = 0;
+                this.count -= 1;
+            }
+
+            pub fn swapRemove(this: *@This(), key: u32) bool {
+                const keys = this._getKeySlice();
+                const ind = this.findIndex(key, keys) orelse return false;
+                if (this.available <= 8) {
+                    this._swapRemove(this.count-1, ind, keys);
+                    return true;
+                }
+
+                const v = if (keys[(ind + 1) & (@as(u32, @intCast(keys.len))-1)] == 0) 0 else tombstone;
+                keys[ind] = v;
+                this.count -= 1;
+                return true;
+            }
+
+            pub fn get(this: *const @This(), key: u32) ?u32 {
+                std.debug.assert(key != 0);
+
+                const init_keys = this.getKeySlice();
+                if (this.findIndex(key, init_keys)) |ind| {
+                    return this.getValueSlice()[ind];
+                }
+                return null;
+            }
+
+            pub fn put(this: *@This(), a2: std.mem.Allocator, key: u32, value: u32) !void {
+                const entry = try this.getOrPut(a2, key);
+                entry.value_ptr.* = value;
+            }
+
+            const GetOrPutEntry = struct {
+                key_ptr: *u32,
+                value_ptr: *u32,
+                found_existing: bool,
+            };
+
+            pub fn getOrPut(this: *@This(), a: std.mem.Allocator, key: u32) !GetOrPutEntry {
+                std.debug.assert(key != 0);
+
+                const init_keys = this._getKeySlice();
+                if (this.findIndex(key, init_keys)) |ind| {
+                    return .{
+                        .key_ptr = &init_keys[ind],
+                        .value_ptr = &this._getValueSlice()[ind],
+                        .found_existing = true,
+                    };
+                }
+
+                if (this.available == 0) {
+                    if (this.count == 3) {
+                        try this._ensureCapacity(a, 8);
+                        this.count += 1;
+                        const keys = this._getKeySlice();
+                        keys[3] = key;
+                        return .{
+                            .key_ptr = &keys[3],
+                            .value_ptr = &this._getValueSlice()[3],
+                            .found_existing = false,
+                        }; 
+                    }
+
+                    const ind = this.count;
+                    this.count += 1;
+                    const keys = this._getKeySlice();
+                    keys[ind] = key;
+                    return .{
+                        .key_ptr = &keys[ind],
+                        .value_ptr = &this._getValueSlice()[ind],
+                        .found_existing = false,
+                    };
+                }
+
+                if (this.count < 8 and this.available == 8) {
+                    const keys = this._getKeySlice();
+                    const ind = this.count;
+                    this.count += 1;
+                    keys[ind] = key;
+                    return .{
+                        .key_ptr = &keys[ind],
+                        .value_ptr = &this._getValueSlice()[ind],
+                        .found_existing = false,
+                    };
+                }
+
+                if (this.count >= this.available) {
+                    const new_amount = std.math.ceilPowerOfTwo(u32, (this.count * 2)-1) catch unreachable;
+                    try this._ensureCapacity(a, new_amount);
+                }
+
+                this.count += 1;
+                const keys = this._getKeySlice();
+                const ind = this.findEmptyIndex(key, keys);
+                keys[ind] = key;
+
+                return .{
+                    .key_ptr = &keys[ind],
+                    .value_ptr = &this._getValueSlice()[ind],
+                    .found_existing = false,
+                };
+            }
+
+            pub fn clearRetainingCapacity(this: *@This()) void {
+                this.count = 0;
+                if (this.available == 0) return;
+
+                @memset(this._getKeySlice(), 0);
+            }
+
+            pub fn deinit(this: *@This(), a: std.mem.Allocator) void {
+                if (this.available == 0) return;
+
+                a.free(this._getKeySlice());
+                a.free(this._getValueSlice());
+                this.count = 0;
+                this.available = 0;
+            }
+
+            const Entry = struct {
+                key_ptr: *u32,
+                value_ptr: *u32,
+            };
+
+            const Iterator = struct {
+                m: *SimpleHashMap,
+                c: u32 = 0,
+
+                fn nextSlow(this: *@This()) ?Entry {
+                    const keys = this.m._getKeySlice();
+                    if (this.c == keys.len) return null;
+                    while (keys[this.c] == 0 or keys[this.c] == tombstone) {
+                        this.c += 1;
+                        if (this.c == keys.len) return null;
+                    }
+                    const i = this.c;
+                    this.c += 1;
+                    return .{
+                        .key_ptr = &keys[i],
+                        .value_ptr = &this.m._getValueSlice()[i],
+                    }; 
+                }
+
+                pub inline fn next(this: *@This()) ?Entry {
+                    if (this.m.available > 8) {
+                        return this.nextSlow();
+                    }
+
+                    const i = this.c;
+                    if (i == this.m.count) return null;
+                    this.c += 1;
+                    return .{
+                        .key_ptr = &this.m._getKeySlice()[i],
+                        .value_ptr = &this.m._getValueSlice()[i],
+                    };
+                }
+            };
+
+            pub fn iterator(this: *const @This()) Iterator {
+                return .{ .m = @constCast(this) };
+            }
+
+            // performs well enough
+            inline fn mix(k: u64) u32 {
+                var key = k;
+                key *= 2654435761;
+                key ^= key >> 33;
+                return @truncate(key);
+            }
+        };
+
+        const SimpleSet = struct {
+            const tombstone: u32 = std.math.maxInt(u32);
+            buf: [7]u32 = undefined,
+            _count: u32 = 0,
+
+            inline fn isAllocated(this: *const @This()) bool {
+                return (this._count >> 31) == 1;
+            }
+
+            inline fn count(this: *const @This()) u32 {
+                return this._count & 0x7FFF_FFFF;
+            }
+
+            inline fn available(this: *const @This()) u32 {
+                return this.buf[3];
+            }
+
+            inline fn _getKeySlice(this: *@This()) []u32 {
+                if (!this.isAllocated()) {
+                    return this.buf[0..this._count];
+                }
+
+                const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
+                return ptr[0..this.buf[2]];
+            }
+
+            inline fn getKeySlice(this: *const @This()) []const u32 {
+                if (!this.isAllocated()) {
+                    return this.buf[0..this._count];
+                }
+
+                const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
+                return ptr[0..this.buf[2]];
+            }
+
+            fn findEmptyIndex(this: *const @This(), key: u32, keys: []const u32) u32 {
+                _ = this;
+
+                std.debug.assert(keys.len > 8);
+                std.debug.assert(std.math.isPowerOfTwo(keys.len));
+
+                const start: u32 = SimpleHashMap.mix(key) & (@as(u32, @intCast(keys.len))-1);
+
                 var i = start;
                 while (i < keys.len) {
                     const k = keys[i];
-                    if (k == 0) break;
+                    if (k == 0 or k == tombstone) return i;
+                    i += 1;
+                }
+
+                i = 0;
+                while (i < start) {
+                    const k = keys[i];
+                    if (k == 0 or k == tombstone) return i;
+                    i += 1;
+                }
+
+                unreachable;
+            }
+
+            fn findIndex(this: *const @This(), key: u32, keys: []const u32) ?u32 {
+                if (!this.isAllocated()) {
+                    for (0..this._count) |i| {
+                        if (keys[i] == key) {
+                            return @truncate(i);
+                        }
+                    }
+                    return null;
+                }
+
+                std.debug.assert(std.math.isPowerOfTwo(keys.len));
+                const start: u32 = SimpleHashMap.mix(key) & (@as(u32, @intCast(keys.len))-1);
+
+                var i = start;
+                while (i < keys.len) {
+                    const k = keys[i];
+                    if (k == 0) return null;
                     if (k == key) return i;
                     i += 1;
                 }
@@ -5776,235 +6189,182 @@ pub const Analyzer = struct {
             fn _ensureCapacity(this: *@This(), a: std.mem.Allocator, amount: u32) !void {                
                 const keys = this.getKeySlice();
                 std.debug.assert(keys.len < amount);
+                std.debug.assert(std.math.isPowerOfTwo(amount));
 
                 const k = try a.alloc(u32, amount);
-                if (amount <= 8) {
-                    @memcpy(k[0..this.count], keys);
+                @memset(k, 0);
+
+                for (0..keys.len) |i| {
+                    const k2 = keys[i];
+                    if (k2 == 0 or k2 == tombstone) continue;
+
+                    const ind = this.findEmptyIndex(k2, k);
+                    k[ind] = k2;
                 }
 
-                const values = this.getValueSlice();
-                const v = try a.alloc(u32, amount);
-                if (amount <= 8) {
-                    @memcpy(v[0..this.count], values);
-                }
-
-                if (amount > 8) {
-                    @memset(k, 0);
-
-                    for (0..keys.len) |i| {
-                        const k2 = keys[i];
-                        if (k2 == 0) continue;
-
-                        const ind = this.findEmptyIndex(k2, k);
-                        k[ind] = k2;
-                        v[ind] = values[i];
-                    }
-                }
-
-                {
-                    this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
-                    this.buf[1] = @truncate(@intFromPtr(k.ptr));
-                    this.buf[2] = @intCast(k.len);
-                }
-
-                {
-                    this.buf[3] = @truncate(@intFromPtr(v.ptr) >> 32);
-                    this.buf[4] = @truncate(@intFromPtr(v.ptr));
-                    //this.buf[5] = @intCast(v.len);
-                }
-
-                this.available = @truncate((amount * 80) / 100);
+                this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
+                this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                this.buf[2] = @intCast(k.len);
+                this.buf[3] = @truncate((amount * 80) / 100);
+                this._count |= 1 << 31;
             }
 
-            fn _swapRemove(this: *@This(), i: u32, j: u32, keys: []u32) void {
+            inline fn _swapRemove(this: *@This(), i: u32, j: u32, keys: []u32) void {
                 if (i == j) {
-                    keys[j] = 0;
-                    this.count -= 1;
+                    keys[i] = 0;
+                    this._count -= 1;
                     return;
                 }
-                const values = this._getValueSlice();
-                values[j] = values[i];
                 keys[j] = keys[i];
                 keys[i] = 0;
-                this.count -= 1;
+                this._count -= 1;
             }
 
             pub fn swapRemove(this: *@This(), key: u32) bool {
                 const keys = this._getKeySlice();
                 const ind = this.findIndex(key, keys) orelse return false;
-                if (keys.len <= 3) {
-                    this._swapRemove(ind, @intCast(keys.len-1), keys);
+                if (!this.isAllocated()) {
+                    this._swapRemove(this._count-1, ind, keys);
                     return true;
                 }
 
-                var i = ind + 1;
-
-                while (i < keys.len) {
-                    const k = keys[i];
-                    if (k == 0) {
-                        this._swapRemove(i-1, ind, keys);
-                        return true;
-                    }
-                    i += 1;
-                }
-
-                i = 0;
-                while (i < ind) {
-                    const k = keys[i];
-                    if (k == 0) {
-                        if (i == 0) {
-                            this._swapRemove(@as(u32, @truncate(keys.len))-1, ind, keys);
-                        } else {
-                            this._swapRemove(i-1, ind, keys);
-                        }
-                        return true;
-                    }
-                    i += 1;
-                }
-
-                unreachable;
+                const v = if (keys[(ind + 1) & (@as(u32, @intCast(keys.len))-1)] == 0) 0 else tombstone;
+                keys[ind] = v;
+                this._count -= 1;
+                return true;
             }
 
-            pub fn get(this: *const @This(), key: u32) ?u32 {
+            pub fn get(this: *const @This(), key: u32) ?void {
+                std.debug.assert(key != 0);
+
                 const init_keys = this.getKeySlice();
-                if (this.findIndex(key, init_keys)) |ind| {
-                    return this.getValueSlice()[ind];
+                if (this.findIndex(key, init_keys)) |_| {
+                    return {};
                 }
                 return null;
             }
 
-            pub fn put(this: *@This(), a: std.mem.Allocator, key: u32, value: u32) !void {
-                const entry = try this.getOrPut(a, key);
+            pub fn put(this: *@This(), a2: std.mem.Allocator, key: u32, value: void) !void {
+                const entry = try this.getOrPut(a2, key);
                 entry.value_ptr.* = value;
             }
 
             const GetOrPutEntry = struct {
                 key_ptr: *u32,
-                value_ptr: *u32,
+                value_ptr: *void,
                 found_existing: bool,
             };
 
             pub fn getOrPut(this: *@This(), a: std.mem.Allocator, key: u32) !GetOrPutEntry {
+                std.debug.assert(key != 0);
+
                 const init_keys = this._getKeySlice();
                 if (this.findIndex(key, init_keys)) |ind| {
                     return .{
                         .key_ptr = &init_keys[ind],
-                        .value_ptr = &this._getValueSlice()[ind],
+                        .value_ptr = undefined,
                         .found_existing = true,
                     };
                 }
 
-                if (this.count < 3) {
-                    this.count += 1;
-                    if (this.count == 1) {
-                        this.buf[0] = key;
+                if (!this.isAllocated()) {
+                    if (this._count == 7) {
+                        try this._ensureCapacity(a, 16);
+                        this._count += 1;
+                        const keys = this._getKeySlice();
+                        const ind = this.findEmptyIndex(key, keys);
+                        keys[ind] = key;
                         return .{
-                            .key_ptr = &this.buf[0],
-                            .value_ptr = &this.buf[1],
+                            .key_ptr = &keys[ind],
+                            .value_ptr = undefined,
                             .found_existing = false,
-                        };
-                    } else if (this.count == 2) {
-                        const v0 = this.buf[1];
-                        this.buf[1] = key;
-                        this.buf[2] = v0;
-
-                        return .{
-                            .key_ptr = &this.buf[1],
-                            .value_ptr = &this.buf[3],
-                            .found_existing = false,
-                        };
-                    } else {
-                        const v0 = this.buf[2];
-                        const v1 = this.buf[3];
-                        this.buf[2] = key;
-                        this.buf[3] = v0;
-                        this.buf[4] = v1;
-
-                        return .{
-                            .key_ptr = &this.buf[2],
-                            .value_ptr = &this.buf[5],
-                            .found_existing = false,
-                        };
+                        }; 
                     }
-                }
 
-                if (this.count == 3) {
-                    try this._ensureCapacity(a, 8);
-                    this.count += 1;
+                    const ind = this._count;
+                    this._count += 1;
                     const keys = this._getKeySlice();
-                    keys[3] = key;
+                    keys[ind] = key;
                     return .{
-                        .key_ptr = &keys[3],
-                        .value_ptr = &this._getValueSlice()[3],
+                        .key_ptr = &keys[ind],
+                        .value_ptr = undefined,
                         .found_existing = false,
                     };
                 }
 
-                if (this.count < 8) {
-                    const keys = this._getKeySlice();
-                    keys[this.count] = key;
-                    this.count += 1;
-                    return .{
-                        .key_ptr = &keys[this.count-1],
-                        .value_ptr = &this._getValueSlice()[this.count-1],
-                        .found_existing = false,
-                    };
-                }
-
-                if (this.count > this.available) {
-                    const new_amount = std.math.ceilPowerOfTwo(u32, this.count + 1) catch unreachable;
+                if (this.count() >= this.available()) {
+                    const new_amount = std.math.ceilPowerOfTwo(u32, (this.count() * 2)-1) catch unreachable;
                     try this._ensureCapacity(a, new_amount);
                 }
 
-                this.count += 1;
+                this._count += 1;
                 const keys = this._getKeySlice();
                 const ind = this.findEmptyIndex(key, keys);
                 keys[ind] = key;
 
                 return .{
                     .key_ptr = &keys[ind],
-                    .value_ptr = &this._getValueSlice()[ind],
+                    .value_ptr = undefined,
                     .found_existing = false,
                 };
             }
 
-            pub fn deinit(this: *@This(), a: std.mem.Allocator) void {
-                if (this.count <= 3) return;
+            pub fn clearRetainingCapacity(this: *@This()) void {
+                if (!this.isAllocated()) return;
 
-                a.free(this._getKeySlice());
-                a.free(this._getValueSlice());
+                @memset(this._getKeySlice(), 0);
+                this._count = 1 << 31;
             }
 
+            pub fn deinit(this: *@This(), a: std.mem.Allocator) void {
+                if (!this.isAllocated()) return;
+
+                a.free(this._getKeySlice());
+                this._count = 0;
+                this.buf[3] = 0;
+            }
 
             const Entry = struct {
                 key_ptr: *u32,
-                value_ptr: *u32,
+                value_ptr: *void,
             };
 
             const Iterator = struct {
-                m: *SimpleHashMap,
+                m: *SimpleSet,
                 c: u32 = 0,
-                pub inline fn next(this: *@This()) ?Entry {
+
+                fn nextSlow(this: *@This()) ?Entry {
+                    const keys = this.m._getKeySlice();
+                    if (this.c == keys.len) return null;
+                    while (keys[this.c] == 0 or keys[this.c] == tombstone) {
+                        this.c += 1;
+                        if (this.c == keys.len) return null;
+                    }
                     const i = this.c;
-                    if (i == this.m.count) return null;
+                    this.c += 1;
+                    return .{
+                        .key_ptr = &keys[i],
+                        .value_ptr = undefined,
+                    }; 
+                }
+
+                pub inline fn next(this: *@This()) ?Entry {
+                    if (this.m.isAllocated()) {
+                        return this.nextSlow();
+                    }
+
+                    const i = this.c;
+                    if (i == this.m._count) return null;
                     this.c += 1;
                     return .{
                         .key_ptr = &this.m._getKeySlice()[i],
-                        .value_ptr = &this.m._getValueSlice()[i],
+                        .value_ptr = undefined,
                     };
                 }
             };
 
-            pub fn iterator(this: *@This()) Iterator {
-                return .{ .m = this };
-            }
-
-            // performs well enough
-            fn mix(k: u64) u32 {
-                var key = k;
-                key *= 2654435761;
-                key ^= key >> 33;
-                return @truncate(key);
+            pub fn iterator(this: *const @This()) Iterator {
+                return .{ .m = @constCast(this) };
             }
         };
 
@@ -6112,7 +6472,7 @@ pub const Analyzer = struct {
         // Stores flow state at some point in the code
         // Antecedents link back to preconditions
         const Label = struct {
-            const Types = SimpleHashMap; // std.AutoArrayHashMapUnmanaged(SymbolRef, TypeRef);
+            const Types =  SimpleHashMap;
             const Antecedents = std.ArrayListUnmanaged(*Label);
 
             types: Types = .{},
@@ -6133,9 +6493,7 @@ pub const Analyzer = struct {
 
             pub fn destroy(self: *@This(), a: std.mem.Allocator) void {
                 self.types.deinit(a);
-                //self.node_types.deinit(a);
                 self.antecedents.deinit(a);
-                // a.destroy(self);
             }
 
             pub fn addAntecedent(self: *@This(), a: std.mem.Allocator, label: *Label) !void {
@@ -6242,8 +6600,12 @@ pub const Analyzer = struct {
 
         in_nullish_context: bool = false,
         in_expression_statement: bool = false,
+        is_async_ctx: bool = true, // module level is async
 
         current_symbols: ?*SymbolSet = null,
+
+        // used to detect recursion,
+        active_nodes: std.AutoArrayHashMapUnmanaged(NodeRef, ?TypeRef) = .{},
 
         pub fn init(analyzer: *Analyzer, file: *ParsedFileData) FlowTyper {
             return .{
@@ -6256,13 +6618,10 @@ pub const Analyzer = struct {
         pub fn visitArrowFnExpressionBody(self: *@This(), start: NodeRef) !TypeRef {
             const old_flow = self.current_flow;
             self.current_flow = try self.createLabel();
-            // try self.stack.append(self.analyzer.allocator(), self.current_flow);
             self.current_flow.ref();
-            // self.current_flow.on_stack = true;
             const r = try self.visitExpression(start);
 
-            const last = self.current_flow; // self.stack.pop();
-            // last.on_stack = false;
+            const last = self.current_flow;
             last.unref(self);
             self.current_flow = old_flow;
 
@@ -6684,7 +7043,7 @@ pub const Analyzer = struct {
             _ = block_start;
 
             const saved_flow = self.current_flow;
-            const saved_stack = self.stack;
+            // const saved_stack = self.stack;
             const saved_break = self.break_target;
             const saved_continue = self.continue_target;
             const saved_return = self.return_target;
@@ -6692,14 +7051,16 @@ pub const Analyzer = struct {
             const saved_true = self.true_target;
             const saved_false = self.false_target;
             const saved_symbols = self.current_symbols;
+            const saved_async = self.is_async_ctx;
 
-            self.stack = .{};
+            // self.stack = .{};
             self.break_target = null;
             self.continue_target = null;
             self.exception_target = null;
             self.true_target = null;
             self.false_target = null;
             self.current_symbols = null;
+            self.is_async_ctx = s.hasFlag(.@"async");
 
             _ = try self.analyzer.getType(self.file, func_ref);
 
@@ -6707,7 +7068,7 @@ pub const Analyzer = struct {
             //     try self.type_checker.checkFunctionReturnType(func_ref, s);
             // }
 
-            self.stack = saved_stack;
+            // self.stack = saved_stack;
             self.current_flow = saved_flow;
             self.break_target = saved_break;
             self.continue_target = saved_continue;
@@ -6716,6 +7077,7 @@ pub const Analyzer = struct {
             self.true_target = saved_true;
             self.false_target = saved_false;
             self.current_symbols = saved_symbols;
+            self.is_async_ctx = saved_async;
         }
 
         fn visitBlock(self: *@This(), s: *const AstNode) !void {
@@ -6747,7 +7109,7 @@ pub const Analyzer = struct {
                 }
             }
 
-            symbols.clearAndFree(self.analyzer.allocator());
+            symbols.deinit(self.analyzer.allocator());
 
             if (is_unconditional) {
                 self.current_flow = self.stack.getLast();
@@ -7078,8 +7440,36 @@ pub const Analyzer = struct {
                 },
 
                 .call_expression => {
-                    // try self.type_checker.checkCallExpression(ref);
+                    const ty = try self.analyzer.getType(self.file, ref);
+                    if (self.is_async_ctx) {
+                        return try self.analyzer.maybeUnwrapPromise(ty) orelse ty;
+                    }
+                    // sync context: check if calling an async function without `as async`
+                    try self.type_checker.checkAsyncCallInSyncContext(ref, ty);
+                    return ty;
+                },
+
+                .as_expression => {
+                    const as_d = getPackedData(node);
+                    const rhs_node = self.file.ast.nodes.at(as_d.right);
+                    if (rhs_node.kind == .async_keyword) {
+                        // `expr as async` — keep the Promise type, don't auto-unwrap
+                        const ty = try self.analyzer.getType(self.file, ref);
+                        try self.type_checker.checkAsAsyncOnNonAsyncCall(ref, ty);
+                        return ty;
+                    }
                     return try self.analyzer.getType(self.file, ref);
+                },
+
+                .await_expression => {
+                    const inner_ref = unwrapRef(node);
+                    const inner_ty = try self.visitExpression(inner_ref);
+                    if (!self.is_async_ctx) {
+                        try self.type_checker.checkAwaitInSyncContext(ref);
+                    } else {
+                        try self.type_checker.checkAwaitOnNonPromise(ref, inner_ty);
+                    }
+                    return try self.analyzer.maybeUnwrapPromise(inner_ty) orelse inner_ty;
                 },
 
                 else => {
@@ -7509,7 +7899,7 @@ pub const Analyzer = struct {
             }
         }
 
-        fn joinLabelsInto(self: *@This(), target: *Label, left: *Label, right: *Label) !void {
+        inline fn joinLabelsInto(self: *@This(), target: *Label, left: *Label, right: *Label) !void {
             try self._unifyAntecedents(target, &.{left, right}, true);
         }
 
@@ -7686,13 +8076,36 @@ pub const Analyzer = struct {
         }
     };
 
-    fn analyzeBody(this: *@This(), file: *ParsedFileData, start: NodeRef, comptime is_block: bool) !TypeRef {
-        _ = this;
+    fn analyzeBody(this: *@This(), file: *ParsedFileData, decl: NodeRef, start: NodeRef, comptime is_block: bool) !TypeRef {
         const f = file.flow.?;
-        if (!is_block) {
-            return f.visitArrowFnExpressionBody(start);
+        const entry = try f.active_nodes.getOrPut(this.allocator(), decl);
+        if (entry.found_existing) {
+            if (entry.value_ptr.*) |t| return t;
+
+            entry.value_ptr.* = try this.types.push(.{
+                .kind = @intFromEnum(Kind.query),
+                .flags = @intFromEnum(QueryFlags.return_type),
+                .slot3 = @intCast(file.id),
+                .slot4 = decl,
+            });
+
+            return entry.value_ptr.*.?;
+        } else {
+            entry.value_ptr.* = null;
         }
-        return f.visitFunctionLike(start);
+
+        const t = blk: {
+            if (!is_block) {
+                break :blk try f.visitArrowFnExpressionBody(start);
+            } else {
+                break :blk try f.visitFunctionLike(start);
+            }
+        };
+
+        // the old entry might be stale after evaluating to get `t`
+        f.active_nodes.putAssumeCapacity(decl, t);
+
+        return t;
     }
 
     // todo: simplify things more?
@@ -7754,6 +8167,14 @@ pub const Analyzer = struct {
                             return try this.intersectType(lhs, followed);
                         }
                     }
+                    // perf: could be better!
+                    if (rhs_type.getKind() == .intersection) {
+                        const slice = getSlice2(rhs_type, TypeRef);
+                        var elements = try this.allocator().alloc(TypeRef, slice.len + 1);
+                        @memcpy(elements[0..slice.len], slice);
+                        elements[slice.len] = lhs;
+                        return try this.createIntersectionType(elements, rhs_type.flags);
+                    }
                     this.printTypeInfo(rhs);
                     return error.TODO;
                 }
@@ -7795,8 +8216,6 @@ pub const Analyzer = struct {
         const x: u64 = @intFromPtr(arr.items.ptr);
         return this.types.push(.{
             .kind = @intFromEnum(Kind.@"union"),
-            // was this supposed to be intersection ??
-            // .kind = @intFromEnum(Kind.intersection),
             .slot0 = @truncate(x),
             .slot1 = @intCast(x >> 32),
             .slot2 = @intCast(arr.items.len),
@@ -8041,8 +8460,20 @@ pub const Analyzer = struct {
             switch (dst_type.getKind()) {
                 .tuple_element => return this.isAssignableTo(src, dst_type.slot1),
                 .tuple => {
+                    // TODO: readonly
+                    if (this.getKindOfRef(src) == .tuple) {
+                        const src_type = this.types.at(src);
+                        const src_elements = getSlice2(src_type, TypeRef);
+                        const dst_elements = getSlice2(dst_type, TypeRef);
+                        if (src_elements.len != dst_elements.len) return false; // TODO: optional and rest
 
-                },
+                        for (src_elements, 0..) |el, i| {
+                            if (!try this.isAssignableTo(el, dst_elements[i])) return false;
+                        }
+
+                        return true;
+                    }
+                 },
                 .array => {
                     if (dst_type.slot0 == @intFromEnum(Kind.any)) {
                         if (src == @intFromEnum(Kind.empty_tuple)) return true;
@@ -8052,11 +8483,23 @@ pub const Analyzer = struct {
                                 else => {},
                             }
                         }
+                    } else {
+                        if (src < @intFromEnum(Kind.false)) {
+                            switch (this.getKindOfRef(src)) {
+                                .array => {
+                                    return try this.isAssignableTo(this.types.at(src).slot0, dst_type.slot0);
+                                },
+                                else => {},
+                            }
+                        }
                     }
                 },
                 .object_literal => {
                     const src_kind = this.getKindOfRef(src);
                     if (src_kind != .object_literal and src_kind != .empty_object) {
+                        if (src_kind == .intersection) {
+                            
+                        }
                         if (src_kind == .@"union") {
                             for (getSlice2(this.types.at(src), TypeRef)) |el| {
                                 if (!try this.isAssignableTo(el, dst)) return false;
@@ -8130,7 +8573,41 @@ pub const Analyzer = struct {
 
                     return true;
                 },
-                .function_literal => {},
+                .function_literal => {
+                    if (src >= @intFromEnum(Kind.false)) return false;
+                    const src_type = this.types.at(src);
+                    if (src_type.getKind() != .function_literal) {
+                        if (src_type.getKind() == .@"union") {
+                            for (getSlice2(src_type, TypeRef)) |el| {
+                                if (!try this.isAssignableTo(el, dst)) return false;
+                            }
+                            return true;
+                        }
+                        return false;
+                    }
+
+                    const src_params = getSlice2(src_type, TypeRef);
+                    const dst_params = getSlice2(dst_type, TypeRef);
+
+                    const check_count = @min(src_params.len, dst_params.len);
+                    for (0..check_count) |i| {
+                        if (!try this.isAssignableTo(src_params[i], dst_params[i]) and
+                            !try this.isAssignableTo(dst_params[i], src_params[i]))
+                        {
+                            return false;
+                        }
+                    }
+
+                    const src_return = src_type.slot3;
+                    const dst_return = dst_type.slot3;
+                    if (dst_return != @intFromEnum(Kind.void) and dst_return != @intFromEnum(Kind.any)) {
+                        if (!try this.isAssignableTo(src_return, dst_return)) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                },
                 .@"union" => {
                     if (src < @intFromEnum(Kind.false)) {
                         const src_kind = this.getKindOfRef(src);
@@ -8488,9 +8965,9 @@ pub const Analyzer = struct {
                 } else {
                     const block_or_exp = file.ast.nodes.at(d.right);
                     if (block_or_exp.kind == .block) {
-                        return_type = try this.analyzeBody(file, maybeUnwrapRef(block_or_exp) orelse 0, true);
+                        return_type = try this.analyzeBody(file, ref, maybeUnwrapRef(block_or_exp) orelse 0, true);
                     } else {
-                        return_type = try this.analyzeBody(file, d.right, false);
+                        return_type = try this.analyzeBody(file, ref, d.right, false);
                     }
                     if (n.hasFlag(.@"async")) {
                         return_type = try this.normalizeAsyncReturnType(return_type);
@@ -8519,7 +8996,7 @@ pub const Analyzer = struct {
                 } else if (n.len != 0) {
                     // TODO: assert block
                     const block = file.ast.nodes.at(n.len);
-                    return_type = try this.analyzeBody(file, maybeUnwrapRef(block) orelse 0, true);
+                    return_type = try this.analyzeBody(file, ref, maybeUnwrapRef(block) orelse 0, true);
                     if (n.hasFlag(.@"async") and !n.hasFlag(.generator)) {
                         return_type = try this.normalizeAsyncReturnType(return_type);
                     }
@@ -8550,7 +9027,7 @@ pub const Analyzer = struct {
         return try this.getGlobalTypeSymbolAlias("Promise", args) orelse error.MissingPromise;
     }
 
-    fn maybeUnwrapPromise(this: *@This(), ref: TypeRef) anyerror!?TypeRef {
+    pub fn maybeUnwrapPromise(this: *@This(), ref: TypeRef) anyerror!?TypeRef {
         if (ref >= @intFromEnum(Kind.false)) return null;
         if (this.getKindOfRef(ref) != .alias) return null;
 
@@ -9477,7 +9954,7 @@ pub const Analyzer = struct {
             const val = if (i < args.len) args[i] else this.getTypeParamDefault(p) 
                 orelse this.getTypeParamConstraint(p)
                 orelse @intFromEnum(Kind.infer_unknown);
-            this.type_registers[this.types.at(p).slot3] = val;
+            try this.setTypeArg(this.types.at(p), p, val);
         }
 
         return try this.resolveParameterizedType(base.slot3) orelse return error.FailedToResolve;
@@ -9485,24 +9962,12 @@ pub const Analyzer = struct {
 
     fn resolveWithTypeArgsInferred(this: *@This(), base: *const Type, inferred: *const std.AutoArrayHashMap(TypeRef, TypeRef)) !TypeRef {
         var tmp_args = std.AutoArrayHashMap(TypeRef, TypeRef).init(this.type_args.allocator);
-        const registers = this.type_registers;
-
         defer tmp_args.deinit();
+
+        const registers = this.type_registers;
         defer this.revertTypeArgs(tmp_args, registers);
 
         const params = getSlice2(base, TypeRef);
-
-        // var iter = inferred.iterator();
-        // while (iter.next()) |entry| {
-        //     const prev = this.type_args.get(entry.key_ptr.*) orelse 0;
-        //     const val = entry.value_ptr.*;
-
-        //     try tmp_args.put(entry.key_ptr.*, prev);
-        //     try this.type_args.put(entry.key_ptr.*, val);
-
-        //     const reg = this.types.at(entry.key_ptr.*).slot3;
-        //     this.type_registers[reg] = val;
-        // }
 
         for (params) |p| {
             const prev = this.type_args.get(p) orelse 0;
@@ -9510,10 +9975,8 @@ pub const Analyzer = struct {
                 orelse this.getTypeParamConstraint(p)
                 orelse @intFromEnum(Kind.infer_unknown));
             try tmp_args.put(p, prev);
-            try this.type_args.put(p, val);
 
-            const reg = this.types.at(p).slot3;
-            this.type_registers[reg] = val;
+            try this.setTypeArg(this.types.at(p), p, val);
         }
 
         return try this.resolveParameterizedType(base.slot3) orelse return error.FailedToResolve;
@@ -9531,14 +9994,13 @@ pub const Analyzer = struct {
         defer this.revertTypeArgs(tmp_args, registers);
 
         while (iter.nextRef()) |r| {
-            const prev = this.type_args.get(params[i]) orelse 0;
+            const p = params[i];
+            const prev = this.type_args.get(p) orelse 0;
             const val = try this.getType(file, r);
 
-            try tmp_args.put(params[i], prev);
-            try this.type_args.put(params[i], val);
+            try tmp_args.put(p, prev);
 
-            const reg = this.types.at(params[i]).slot3;
-            this.type_registers[reg] = val;
+            try this.setTypeArg(this.types.at(p), p, val);
 
             i += 1;
         }
@@ -9673,12 +10135,17 @@ pub const Analyzer = struct {
         std.debug.assert(!member.isLazy());
 
         const resolved = try this.evaluateType(source_ref, @intFromEnum(EvaluationFlags.no_unions));
-        if (comptime is_debug) {
-            if (resolved >= @intFromEnum(Kind.false)) {
+        if (resolved >= @intFromEnum(Kind.false)) {
+            if (resolved == @intFromEnum(Kind.any)) return resolved;
+            if (resolved == @intFromEnum(Kind.string)) return resolved; // could refine `length`?
+            if (resolved == @intFromEnum(Kind.void)) return resolved; // TODO error
+
+            if (comptime is_debug) {
                 this.printTypeInfo(source_ref);
                 this.printTypeInfo(resolved);
             }
         }
+
         const source = this.types.at(resolved);
 
         if (source.getKind() == .@"union") {
@@ -9965,7 +10432,7 @@ pub const Analyzer = struct {
         return result;
     }
 
-    fn mappedTypeWorker(this: *@This(), reg: u32, values: []const TypeRef, value_flags: ?[]const u24, exp: TypeRef, rename: TypeRef, node_flags: u32) !?TypeRef {
+    fn mappedTypeWorker(this: *@This(), param: *const Type, param_ref: TypeRef, values: []const TypeRef, value_flags: ?[]const u24, exp: TypeRef, rename: TypeRef, node_flags: u32) !?TypeRef {
         // Mapping to the same name results in a union of types at that field
         // It always maps to a property regardless of the source (method, accessor, etc.)
         const TempMember = struct {
@@ -10015,13 +10482,17 @@ pub const Analyzer = struct {
         };
 
         var members = try std.ArrayList(TempMember).initCapacity(this.type_args.allocator, values.len);
-        defer members.deinit(); // TODO (LEAK): doesn't clean up elements on error or early return
+        defer members.deinit();
 
-        const old_value = this.type_registers[reg];
-        defer this.type_registers[reg] = old_value;
+        const old_value = if (param.slot3 < num_type_registers) 
+            this.type_registers[param.slot3] 
+        else 
+            this.type_args.get(param_ref) orelse 0;
+
+        defer this.setTypeArg(param, param_ref, old_value) catch unreachable;
 
         outer: for (values, 0..) |v, i| {
-            this.type_registers[reg] = v;
+            try this.setTypeArg(param, param_ref, v);
 
             const f = try this.resolveParameterizedType(exp) orelse exp;
             if (this.isParameterizedRef(f)) return null;
@@ -10077,7 +10548,7 @@ pub const Analyzer = struct {
             const slice = this.maybeGetUnion(c) orelse &.{c};
             // TODO: preserve modifiers when we know the constraint is a subtype of `keyof T`
 
-            break :blk try this.mappedTypeWorker(p.slot3, slice, null, exp, rename, node_flags);
+            break :blk try this.mappedTypeWorker(p, param, slice, null, exp, rename, node_flags);
         };
 
         return t orelse {
@@ -10137,8 +10608,9 @@ pub const Analyzer = struct {
     }
 
     fn evaluateKeyOfType(this: *@This(), r: TypeRef) anyerror!TypeRef {
-        // TODO: `keyof` works on non-object types if the type has an associated proto e.g. `number` and `string`
-        // `keyof` gathers keys from the prototype chain
+        // LEGACY: `keyof` works on non-object types if the type has an associated proto 
+        // e.g. `number` and `string`, `keyof` gathers keys from the prototype chain 
+        // ^ we should avoid supporting this, it's confusing vs. explicit `keyof String.prototype`
         if (r >= @intFromEnum(Kind.false)) {
             if (r == @intFromEnum(Kind.any)) {
                 return this.toUnion(&.{
@@ -10149,6 +10621,9 @@ pub const Analyzer = struct {
             }
             if (r == @intFromEnum(Kind.empty_object)) {
                 return @intFromEnum(Kind.never);
+            }
+            if (r == @intFromEnum(Kind.empty_tuple)) {
+                return @intFromEnum(Kind.number);
             }
             if (r == @intFromEnum(Kind.this)) {
                 if (this.contextual_this_type == 0) {
@@ -10162,6 +10637,12 @@ pub const Analyzer = struct {
                 }
                 return this.evaluateKeyOfType(this.contextual_this_type);
             }
+            // this is supposed to be PropertyKey ???
+            if (r == @intFromEnum(Kind.never))return this.toUnion(&.{
+                @intFromEnum(Kind.number),
+                @intFromEnum(Kind.string),
+                @intFromEnum(Kind.symbol),
+            });
             this.printTypeInfo(r);
             return error.TODO;
         }
@@ -10205,6 +10686,15 @@ pub const Analyzer = struct {
 
                 return this.evaluateKeyOfType(followed);
             },
+            .tuple => {
+                const elements = getSlice2(n, TypeRef);
+                var tmp = try TempUnion.initCapacity(this.type_args.allocator, @intCast(elements.len));
+                for (elements, 0..) |_, i| {
+                    const k = try this.numberToType(u32, @intCast(i));
+                    if (try this.addToUnion(&tmp, k)) |x| return x;
+                }
+                return tmp.complete(this);
+            },  
             .query => {
                 const followed = try this.evaluateQuery(n, 0);
                 if (followed == r) {
@@ -10213,14 +10703,36 @@ pub const Analyzer = struct {
                 }
                 return this.evaluateKeyOfType(followed);
             },
-            // .array => {
-            //     const ty = try this.getGlobalTypeSymbolAlias("Array", .{}) orelse error.MissingArray;
+            .array => {
+                return @intFromEnum(Kind.number);    
+            },
+            .@"union" => {
+                var set = std.AutoArrayHashMapUnmanaged(u32, void){};
+                defer set.deinit(this.allocator());
+                for (getSlice2(n, TypeRef)) |el| {
+                    const keys = try this.evaluateKeyOfType(el);
+                    if (this.getKindOfRef(keys) == .@"union") {
+                        const elements = getSlice2(this.types.at(keys), TypeRef);
+                        try set.ensureUnusedCapacity(this.allocator(), @intCast(elements.len));
+                        for (elements) |el2| {
+                            set.putAssumeCapacity(el2, {});
+                        }
+                    } else {
+                        try set.put(this.allocator(), keys, {});
+                    }
+                }
+                if (set.count() == 0) {
+                    return @intFromEnum(Kind.never);
+                }
 
-            // },
-            // TODO: union should be all common keys
-            // .@"union" => {
+                var tmp = try TempUnion.initCapacity(this.type_args.allocator, @intCast(set.count()));
+                var iter = set.iterator();
+                while (iter.next()) |entry| {
+                    if (try this.addToUnion(&tmp, entry.key_ptr.*)) |x| return x;
+                }
 
-            // },
+                return tmp.complete(this);
+            },
             else => return notSupported(n.getKind()),
         }
     }
@@ -10897,6 +11409,16 @@ pub const Analyzer = struct {
 
         if (t.slot5 != 0) return t.slot5;
 
+        if (QueryFlags.isReturnType(t)) {
+            const f = this.program.getFileData(t.slot3);
+            const base = try this.getType(f, t.slot4);
+            if (this.getKindOfRef(base) != .function_literal) {
+                return base;
+            }
+            t.slot5 = this.types.at(base).slot3;
+            return t.slot5;
+        }
+
         const f = this.program.getFileData(t.slot3);
         const base = try this.getType(f, t.slot4);
         if (base >= @intFromEnum(Kind.false) or this.types.at(base).getKind() != .parameterized) {
@@ -11139,11 +11661,11 @@ pub const Analyzer = struct {
                         const prefix = "@@unique symbol#";
                         var h = std.hash.Wyhash.init(0);
                         h.update(prefix);
-                        h.update(&@as([4]u8, @bitCast(this.types.count)));
+                        h.update(&@as([4]u8, @bitCast(this.types.count())));
 
                         return this.types.push(.{
                             .kind = @intFromEnum(Kind.symbol_literal),
-                            .slot0 = this.types.count,
+                            .slot0 = this.types.count(),
                             .slot1 = file.id,
                             .slot2 = ref,
                             .slot4 = @truncate(h.final()),
@@ -11314,20 +11836,30 @@ pub const Analyzer = struct {
             .type_parameter => {
                 const d = getPackedData(node);
                 const sym = file.binder.getTypeSymbol(ref) orelse return error.MissingTypeParam;
+                var s = file.binder.symbols.at(sym);
+                if (s.binding != 0) return s.binding; // cached
+                //if (file.cached_symbol_types.get(sym)) |t| return t;
 
                 const right = try this.getType(file, d.right);
                 const default: u32 = if (node.len != 0) try this.getType(file, node.len) else 0;
-
+                const ord = @as(u16, @truncate(s.ordinal));
+ 
                 const t = try this.types.push(.{
                     .kind = @intFromEnum(Kind.type_parameter),
                     .slot0 = sym,
                     .slot1 = right,
                     .slot2 = default,
-                    .slot3 = @as(u16, @truncate(file.binder.symbols.at(sym).ordinal)),
+                    .slot3 = ord,
                     .slot4 = @intCast(file.id),
                     .slot6 = node.flags,
                     .flags = if (this.isParameterizedRef(right) or this.isParameterizedRef(default)) @intFromEnum(Flags.parameterized) else 0,
                 });
+
+                // try file.cached_symbol_types.put(this.allocator(), sym, t);
+                s.binding = t;
+                if (ord >= num_type_registers) {
+                    this.types.at(t).slot3 = t + num_type_registers;
+                }
 
                 return t;
             },
@@ -11420,11 +11952,15 @@ pub const Analyzer = struct {
             },
             .as_expression => {
                 const d = getPackedData(node);
-                if (file.ast.nodes.at(d.right).kind == .const_keyword) {
+                const rhs_kind = file.ast.nodes.at(d.right).kind;
+                if (rhs_kind == .const_keyword) {
                     const old_context = this.is_const_context;
                     defer this.is_const_context = old_context;
                     this.is_const_context = true;
 
+                    return this.getType(file, d.left);
+                }
+                if (rhs_kind == .async_keyword) {
                     return this.getType(file, d.left);
                 }
 
@@ -11780,7 +12316,12 @@ pub const Analyzer = struct {
         const sym = file.binder.symbols.at(s);
 
         if (sym.hasFlag(.type_parameter)) {
-            return .{ .ty = @intFromEnum(Kind.type_parameter_ref) | getOrdinal(sym) };
+            const o = getOrdinal(sym);
+            if (o >= num_type_registers) {
+                const t = try this.getType(file, sym.declaration);
+                return .{ .ty = @intFromEnum(Kind.type_parameter_ref) | (t + num_type_registers) };
+            }
+            return .{ .ty = @intFromEnum(Kind.type_parameter_ref) | o };
         }
 
         if (sym.hasFlag(.late_bound) and !sym.hasFlag(.imported)) {
@@ -12030,7 +12571,10 @@ pub const Analyzer = struct {
 
             // we are accessing the primitive protos
             if (subject == @intFromEnum(Kind.string) or subject == @intFromEnum(Kind.empty_string)) {
-                const s = try this.getGlobalTypeSymbolAlias("String", .{}) orelse return error.MissingString;
+                const s = try this.getGlobalTypeSymbolAlias("String", .{}) orelse {
+                    return @intFromEnum(Kind.any);
+                    // return error.MissingString;
+                };
                 return this.accessTypeWithHash(s, element, hash, set_this_type);
             }
 
@@ -12043,6 +12587,15 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.error_any);
             }
 
+            if (subject == @intFromEnum(Kind.empty_tuple)) {
+                if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
+                    return @intFromEnum(Kind.zero);
+                }
+                return @intFromEnum(Kind.never);
+            }
+            if (subject == @intFromEnum(Kind.any)) return subject;
+            if (subject == @intFromEnum(Kind.void) or subject == @intFromEnum(Kind.unknown)) return @intFromEnum(Kind.never); // TODO emit error
+
             this.printTypeInfo(subject);
             this.printTypeInfo(element);
             this.printCurrentNode();
@@ -12054,6 +12607,7 @@ pub const Analyzer = struct {
             const r = try this.maybeResolveAlias(subject);
             if (r == subject) {
                 this.printTypeInfo(r);
+                this.printCurrentNode();
                 return error.FailedToResolveAlias;
             }
 
@@ -12063,6 +12617,10 @@ pub const Analyzer = struct {
             return this.accessTypeWithHash(try this.evaluateQuery(s, 0), element, hash, set_this_type);
         }
         if (s.getKind() == .array) {
+            if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
+                return @intFromEnum(Kind.number);
+            }
+
             // FIXME: we need to check the element type and see that it's a number
             return s.slot0;
         }
@@ -12074,11 +12632,18 @@ pub const Analyzer = struct {
                 if (ind >= slice.len) return @intFromEnum(Kind.never);
 
                 const el = slice[@intCast(ind)];
-                if (el >= @intFromEnum(Kind.false)) return el;
-                if (this.getKindOfRef(el) == .tuple_element) {
-                    return this.types.at(el).slot1;
+                return this.getTupleElementType(el);
+            }
+            if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
+                // FIXME: this is wrong, we may have to reduce the spread
+                if (this.isSpreadElement(slice[slice.len-1])) {
+                    return @intFromEnum(Kind.number);
                 }
-                return el;
+
+                return try this.numberToType(u32, @intCast(slice.len));
+            }
+            if (element == @intFromEnum(Kind.number)) {
+                return try this.toUnion(slice);
             }
             return error.TODO_index_into_tuple;
         }
@@ -12139,7 +12704,10 @@ pub const Analyzer = struct {
             return try tmp.complete(this);
         }
 
-        if (s.getKind() != .object_literal) return try notSupported(s.getKind());
+        if (s.getKind() != .object_literal) {
+            this.printCurrentNode();
+            return try notSupported(s.getKind());
+        }
 
         const old_this_type = this.contextual_this_type;
         defer this.contextual_this_type = old_this_type;
@@ -12201,7 +12769,10 @@ pub const Analyzer = struct {
     }
 
     fn getInstanceType(this: *@This(), type_ref: TypeRef, comptime follow_instance_alias: bool) anyerror!TypeRef {
-        if (type_ref >= @intFromEnum(Kind.false)) return error.CannotInstantiate;
+        if (type_ref >= @intFromEnum(Kind.false)) {
+            return @intFromEnum(Kind.never); // FIXME
+            // return error.CannotInstantiate;
+        }
 
         const t = this.types.at(type_ref);
 
@@ -12361,7 +12932,7 @@ pub const Analyzer = struct {
         const d = getPackedData(exp);
         switch (op) {
             .less_than_token, .less_than_equals_token, .greater_than_token, .greater_than_equals_token => {
-                return @intFromEnum(Kind.number);
+                return @intFromEnum(Kind.boolean);
             },
             .plus_token => {
                 const lhs = try this.getType(file, d.left);
@@ -12406,12 +12977,21 @@ pub const Analyzer = struct {
 
                 return this.toUnion(&.{ lhs, rhs });
             },
-            // .ampersand_ampersand_token => {
-
-            // },
+            .ampersand_ampersand_token => {
+                // todo: only do this if inside a cond
+                return @intFromEnum(Kind.boolean);
+            },
             // assignments
             .equals_token => {
                 return this.getType(file, d.right);
+            },
+            .bar_bar_equals_token => {
+                const lhs = try this.getType(file, d.left);
+                const rhs = try this.getType(file, d.right);
+                return this.toUnion(&.{
+                    try this.truthyType(lhs),
+                    rhs,
+                });
             },
             .question_question_equals_token => {
                 // FIXME: we can only apply `nonNullable` if rhs is also non-nullable
@@ -12423,6 +13003,18 @@ pub const Analyzer = struct {
                 const lhs = try this.getType(file, d.left);
                 const x = try this.nonNullable(lhs);
                 return try this.toUnion(&.{ x, try this.getType(file, d.right) });
+            },
+            .exclamation_equals_equals_token,
+            .equals_equals_equals_token => {
+                return @intFromEnum(Kind.boolean);
+            },
+            .instanceof_keyword,
+            .in_keyword => {
+                return @intFromEnum(Kind.boolean);
+            },
+            .minus_equals_token,
+            .plus_equals_token => {
+                return @intFromEnum(Kind.number);
             },
             else => {
                 std.debug.print("missing op implementation: {any}\n", .{op});
@@ -12465,6 +13057,8 @@ pub const Analyzer = struct {
             try args.append(this.allocator(), ty);
         }
 
+        this.is_const_context = false;
+
         // No type args, infer them
         const type_params = getSlice2(n, TypeRef);
 
@@ -12491,6 +13085,10 @@ pub const Analyzer = struct {
         // while (iter2.next()) |x| {
         //     this.printTypeInfo(x.value_ptr.*);
         // }
+
+        const save_follow_return_type = this.follow_parameterized_return_type;
+        this.follow_parameterized_return_type = true;
+        defer this.follow_parameterized_return_type = save_follow_return_type;
 
         const resolved = try this.resolveWithTypeArgsInferred(n, &inferred);
 
@@ -12954,7 +13552,8 @@ pub const Analyzer = struct {
                             const hash = try this.getMemberNameHash(name);
                             const t: TypeRef = blk: {
                                 if (n.extra_data != 0) break :blk try this.getType(file, n.extra_data);
-                                if (n.len != 0) break :blk try this.analyzeBody(file, unwrapRef(file.ast.nodes.at(n.len)), true);
+                                // TODO: how to best handle recursion here?
+                                if (n.len != 0) break :blk try this.analyzeBody(file, pair[1], unwrapRef(file.ast.nodes.at(n.len)), true);
 
                                 break :blk @intFromEnum(Kind.empty_element);
                             };
@@ -13135,11 +13734,11 @@ pub const Analyzer = struct {
 
     const SymbolCollector = struct {
         analyzer: *Analyzer,
-        set: *std.AutoHashMap(u64, bool),
+        set: *std.AutoArrayHashMap(u64, bool),
         alias_set: std.AutoArrayHashMapUnmanaged(TypeRef, void) = .{},
 
         file_ref: ?FileRef = null,
-        external_set: ?*std.AutoHashMap(u64, bool) = null,
+        external_set: ?*std.AutoArrayHashMap(u64, bool) = null,
 
         pub fn gatherReferencedSymbolsFromAst(this: *@This(), f: *ParsedFileData, node_ref: NodeRef) anyerror!void {
             const Visitor = struct {
@@ -13328,12 +13927,12 @@ pub const Analyzer = struct {
         }
     };
 
-    pub fn gatherReferencedSymbols(this: *@This(), set: *std.AutoHashMap(u64, bool), type_ref: TypeRef, file_ref: ?FileRef) anyerror!void {
+    pub fn gatherReferencedSymbols(this: *@This(), set: *std.AutoArrayHashMap(u64, bool), type_ref: TypeRef, file_ref: ?FileRef) anyerror!void {
         var c = SymbolCollector{ .analyzer = this, .set = set, .file_ref = file_ref };
         try c.gatherReferencedSymbols(type_ref);
     }
 
-    pub fn gatherReferencedSymbols2(this: *@This(), set: *std.AutoHashMap(u64, bool), type_ref: TypeRef, file_ref: ?FileRef, external_set: *std.AutoHashMap(u64, bool)) anyerror!void {
+    pub fn gatherReferencedSymbols2(this: *@This(), set: *std.AutoArrayHashMap(u64, bool), type_ref: TypeRef, file_ref: ?FileRef, external_set: *std.AutoArrayHashMap(u64, bool)) anyerror!void {
         var c = SymbolCollector{
             .analyzer = this,
             .set = set,
@@ -13343,7 +13942,7 @@ pub const Analyzer = struct {
         try c.gatherReferencedSymbols(type_ref);
     }
 
-    pub fn gatherReferencedSymbolsFromAst(this: *@This(), set: *std.AutoHashMap(u64, bool), f: *ParsedFileData, node_ref: TypeRef) anyerror!void {
+    pub fn gatherReferencedSymbolsFromAst(this: *@This(), set: *std.AutoArrayHashMap(u64, bool), f: *ParsedFileData, node_ref: TypeRef) anyerror!void {
         var c = SymbolCollector{ .analyzer = this, .set = set, .file_ref = f.id };
         try c.gatherReferencedSymbolsFromAst(f, node_ref);
     }
@@ -13612,7 +14211,7 @@ pub const Analyzer = struct {
         fn copyIdentFromSymbol(this: *@This(), file_id: u32, ref: SymbolRef) !NodeRef {
             const f = this.analyzer.program.getFileData(file_id);
             const sym = f.binder.symbols.at(ref);
-            if (sym.binding != 0 and !sym.hasFlag(.global)) {
+            if (sym.binding != 0 and !sym.hasFlag(.global) and !sym.hasFlag(.type_parameter)) {
                 const ident = f.ast.nodes.at(sym.binding);
 
                 return this.copyNodeNoNext(ident);
@@ -13723,7 +14322,7 @@ pub const Analyzer = struct {
                     }
 
                     std.debug.print("  {}\n", .{ty - @intFromEnum(Kind.type_parameter_ref)});
-                    for (0..this.analyzer.type_registers.len) |i| {
+                    for (0..num_type_registers) |i| {
                         const ref = this.analyzer.type_registers[i];
                         if (ref == 0) continue;
                         std.debug.print("  {}: {}\n", .{ i, ref });
@@ -14209,9 +14808,9 @@ pub const Analyzer = struct {
                         var l = BumpAllocatorList(AstNode).init(&this.synthetic_nodes);
                         for (getSlice2(k, TypeRef)) |p| {
                             const param = this.analyzer.types.at(p);
-                            this.analyzer.type_registers[param.slot3] = p;
+                            try this.analyzer.setTypeArg(param, p, p);
 
-                            const n = try this.toTypeNode(p);
+                            const n = try this.toTypeNodeInList(p);
                             l.appendRef(n);
                         }
 
@@ -14227,12 +14826,17 @@ pub const Analyzer = struct {
                     },
                     .mapped => {
                         const param = try this.toTypeNode(k.slot0);
+                        const param_type = this.analyzer.types.at(k.slot0);
 
-                        const reg = this.analyzer.types.at(k.slot0).slot3;
-                        const old_value = this.analyzer.type_registers[reg];
-                        defer this.analyzer.type_registers[reg] = old_value;
+                        const reg = param_type.slot3;
+                        const old_value = if (reg < num_type_registers) 
+                            this.analyzer.type_registers[reg]
+                        else
+                            this.analyzer.type_args.get(k.slot0) orelse 0;
 
-                        this.analyzer.type_registers[reg] = k.slot0;
+                        defer this.analyzer.setTypeArg(param_type, k.slot0, old_value) catch unreachable;
+
+                        try this.analyzer.setTypeArg(param_type, k.slot0, k.slot0);
 
                         const exp = try this.toTypeNode(k.slot1);
                         const rename = try this.toTypeNode(k.slot2);
@@ -14278,7 +14882,7 @@ pub const Analyzer = struct {
                             return inner;
                         }
 
-                        this.analyzer.type_registers[k.slot3] = ty;
+                        try this.analyzer.setTypeArg(k, ty, ty);
 
                         return this.synthetic_nodes.push(.{
                             .kind = .infer_type,

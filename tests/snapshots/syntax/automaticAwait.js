@@ -8,14 +8,39 @@ if (v !== 2) {
   throw new Error(`not 2: ${v}`)
 }
 const p = foo()
-if (!(typeof p === 'object' && p !== null && typeof p.then === 'function' && typeof p.catch === 'function')) {
-  throw new Error(`not a promise?`)
+if (!((typeof p === 'object' && p !== null && typeof p.then === 'function' && typeof p.catch === 'function'))) {
+  throw new Error(`not a promise!`)
 }
-let x
-if (!(x === undefined)) {}
-const o = {}
-for (const [k, v] of Object.entries(o)) {}
-const o2 = {
-  *[Symbol.iterator]() {}
+const n = await p
+function sync() {
+  const p = foo()
+  const p2 = foo()
+  foo();
+  foo();
+  await p
 }
-for (const x of o2) {}
+async function _async() {
+  const v = await foo()
+  const p = foo()
+  foo();
+  await foo();
+  sync();
+  await p
+  await v
+  const v2 = await await foo()
+}
+function wrap(cb) {
+  return cb()
+}
+function sync2() {
+  return wrap(async () => {})
+}
+async function _async2() {
+  sync2();
+  const p = await wrap(async () => {})
+}
+async function _async3() {
+  const v = await wrap2(async () => {})
+  const v2 = await (foo()).then(x => x + 1)
+}
+async function promises() {}

@@ -247,7 +247,7 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
             std.debug.print("---- d.ts ----\n{s}\n", .{text});
         }
         std.debug.print("emit time {d:.3}\n", .{std.time.microTimestamp() - emit_start});
-        std.debug.print("# of parse nodes {}\n", .{f.ast.nodes.count});
+        std.debug.print("# of parse nodes {}\n", .{f.ast.nodes.count()});
 
         if (f.diagnostics.items.len == 0) continue;
 
@@ -259,12 +259,12 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
         std.debug.print("\n-------------------\n",.{});
     }
 
-    std.debug.print("\ntotal types: {}\n", .{a.types.count});
-    if (a.types.count > 1000) {
-        for (0..100) |i| {
-            a.printTypeInfo(@intCast(i));
-        }
-    }
+    std.debug.print("\ntotal types: {}\n", .{a.types.count()});
+    // if (a.types.count > 1000) {
+    //     for (0..100) |i| {
+    //         a.printTypeInfo(@intCast(i));
+    //     }
+    // }
 
     std.debug.print("total time: {d:.3}\n", .{std.time.microTimestamp() - start});
 
@@ -361,13 +361,13 @@ fn printExportedTypes(f: *program.ParsedFileData, p2: *program.Program) !void {
             if (!a.isParameterizedRef(t)) {
                 var resolved = t;
                 var c: u32 = 0;
-                while (c < 10) {
+                while (c < 1000) {
                     const next = try a.evaluateType(resolved, 1 << 0);
                     if (next == resolved) break;
                     resolved = next;
                     c += 1;
                 }
-                std.debug.print("   time (us) {d:.3} # of types {}\n", .{ std.time.microTimestamp() - analysis_start2, a.types.count });
+                std.debug.print("   time (us) {d:.3} # of types {}\n", .{ std.time.microTimestamp() - analysis_start2, a.types.count() });
 
                 std.debug.print("\n", .{});
                 std.debug.print("  RESOLVED -> ", .{});

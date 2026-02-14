@@ -79,7 +79,7 @@ fn Parser_(comptime Listener: type, comptime is_json5: bool) type {
 
         inline fn getLocation(this: *const @This()) u32 {
             return parser.encodeLocation(
-                this.lexer.line_count,
+                this.lexer.line_map.count,
                 @as(u32, @intCast(this.lexer.start - this.lexer.last_line)),
             );
         }

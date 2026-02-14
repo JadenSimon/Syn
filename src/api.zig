@@ -98,7 +98,7 @@ pub fn ptrOffset(this: *js.Receiver, left: u32, right: u32, source: []u8) !u32 {
 pub fn serialize(sf: *js.Object) !js.ArrayBuffer {
     const p = try getSourceFile(sf);
     const nodes = p.ast.nodes;
-    var b = try std.ArrayList(u8).initCapacity(getAllocator(), nodes.count * 32);
+    var b = try std.ArrayList(u8).initCapacity(getAllocator(), nodes.count() * 32);
 
     std.debug.assert(nodes.pages.items.len > 0);
 
@@ -127,7 +127,7 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
         const nodes_pointer: [*]parser.AstNode = @alignCast(@ptrCast(nodes.ptr));
         const nodes_slice: []parser.AstNode = nodes_pointer[0..(nodes.len / 32)];
 
-        if (ref >= (sf.ast.nodes.count + nodes_slice.len)) {
+        if (ref >= (sf.ast.nodes.count() + nodes_slice.len)) {
             return error.InvalidNodeReference;
         }
 
@@ -150,7 +150,7 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
 
         ast_data.nodes = try ast_data.nodes.cloneWithItems(nodes_slice);
     } else {
-        if (ref >= sf.ast.nodes.count) {
+        if (ref >= sf.ast.nodes.count()) {
             return error.InvalidNodeReference;
         }
     }

@@ -287,6 +287,28 @@ pub const Checker = struct {
         }
     }
 
+    pub fn checkAsyncCallInSyncContext(this: *@This(), call_ref: NodeRef, return_type: TypeRef) !void {
+        if (try this.analyzer.maybeUnwrapPromise(return_type) != null) {
+            try this.file.emitErrorFmt(call_ref, "Async call in sync context requires 'as async'", .{});
+        }
+    }
+
+    pub fn checkAsAsyncOnNonAsyncCall(this: *@This(), node_ref: NodeRef, call_type: TypeRef) !void {
+        if (try this.analyzer.maybeUnwrapPromise(call_type) == null) {
+            try this.file.emitErrorFmt(node_ref, "Cannot use 'as async' on a non-async call signature", .{});
+        }
+    }
+
+    pub fn checkAwaitInSyncContext(this: *@This(), node_ref: NodeRef) !void {
+        try this.file.emitErrorFmt(node_ref, "'await' expressions are only allowed within async functions", .{});
+    }
+
+    pub fn checkAwaitOnNonPromise(this: *@This(), node_ref: NodeRef, inner_type: TypeRef) !void {
+        if (try this.analyzer.maybeUnwrapPromise(inner_type) == null) {
+            try this.file.emitErrorFmt(node_ref, "'await' has no effect on the type of this expression", .{});
+        }
+    }
+
     pub fn checkFunctionReturnType(this: *@This(), _: NodeRef, func: *const parser.AstNode) !void {
         const return_type_ref = func.extra_data2;
         if (return_type_ref == 0) return;

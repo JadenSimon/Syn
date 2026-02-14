@@ -27,7 +27,6 @@ pub const Source = struct {
 };
 
 const record_lines = true;
-const generate_line_map = record_lines;
 
 pub var emptyJavaScriptString = ([_]u16{0});
 
@@ -92,7 +91,7 @@ fn NewLexer_(
         const json = json_options;
         const JSONBool = if (is_json) bool else void;
         const JSONBoolDefault: JSONBool = if (is_json) true else {};
-        const LineMapType = if (generate_line_map) LineMap else void;
+        const LineMapType = if (record_lines) LineMap else void;
 
         pub const Error = error{
             UTF8Fail,
@@ -133,12 +132,11 @@ fn NewLexer_(
         is_ascii_only: JSONBool = JSONBoolDefault,
 
         last_line: usize = 0,
-        line_count: u32 = 0,
         full_start: u32 = 0,
 
         pause_on_comments: bool = true,
 
-        line_map: LineMapType = if (generate_line_map) LineMap.init() else {},
+        line_map: LineMapType = if (record_lines) undefined else {},
 
         pub fn clone(self: *const LexerType) LexerType {
             return LexerType{
@@ -216,13 +214,13 @@ fn NewLexer_(
         }
 
         pub fn deinit(this: *LexerType) void {
-            if (comptime generate_line_map) {
+            if (comptime record_lines) {
                 this.line_map.deinit();
             }
         }
 
         pub fn preAllocate(this: *LexerType) !void {
-            if (comptime generate_line_map) {
+            if (comptime record_lines) {
                 try this.line_map.approximateCapacityForSize(this.source.contents.len);
             }
         }
@@ -560,10 +558,10 @@ fn NewLexer_(
         pub const InnerStringLiteral = packed struct { suffix_len: u3, needs_slow_path: bool };
 
         fn parseStringLiteralInner(lexer: *LexerType, comptime quote: CodePoint) !InnerStringLiteral {
-            const check_for_backslash = comptime is_json and json_options.always_decode_escape_sequences;
+            const check_for_backslash = comptime (is_json and json_options.always_decode_escape_sequences);
             var needs_slow_path = false;
             var suffix_len: u3 = if (comptime quote == 0) 0 else 1;
-            var has_backslash: if (check_for_backslash) bool else void = if (check_for_backslash) false else {};
+            var has_backslash: if (check_for_backslash) bool else void = if (comptime check_for_backslash) false else {};
             stringLiteral: while (true) {
                 switch (lexer.code_point) {
                     '\\' => {
@@ -582,7 +580,7 @@ fn NewLexer_(
                             continue :stringLiteral;
                         }
 
-                        if (comptime is_json and json_options.ignore_trailing_escape_sequences) {
+                        if (comptime (is_json and json_options.ignore_trailing_escape_sequences)) {
                             if (lexer.code_point == quote and lexer.current >= lexer.source.contents.len) {
                                 lexer.step();
 
@@ -627,13 +625,7 @@ fn NewLexer_(
                                 break :stringLiteral;
                             },
                             '`' => {
-                                if (comptime record_lines) {
-                                    lexer.line_count += 1;
-                                    lexer.last_line = lexer.start + 1;
-                                }
-                                if (comptime generate_line_map) {
-                                    try lexer.line_map.append(lexer.current);
-                                }
+                                try lexer.recordNewLine();
                             },
                             else => {
                                 try lexer.addDefaultError("Unterminated string literal");
@@ -669,7 +661,7 @@ fn NewLexer_(
                         // Non-ASCII strings need the slow path
                         if (lexer.code_point >= 0x80) {
                             needs_slow_path = true;
-                        } else if (is_json and lexer.code_point < 0x20) {
+                        } else if ((comptime is_json) and lexer.code_point < 0x20) {
                             try lexer.syntaxError();
                         } else if (comptime (quote == '"' or quote == '\'')) {
                             const remainder = lexer.source.contents[lexer.current..];
@@ -742,19 +734,22 @@ fn NewLexer_(
         }
 
         inline fn nextCodepoint(it: *LexerType) CodePoint {
-            const cp_len = strings.wtf8ByteSequenceLengthWithInvalid(it.source.contents.ptr[it.current]);
-            const slice = if (!(cp_len + it.current > it.source.contents.len))
-                it.source.contents[it.current .. cp_len + it.current]
-            else
-                "";
-
-            const code_point = switch (slice.len) {
-                0 => -1,
-                1 => @as(CodePoint, slice[0]),
-                else => strings.decodeWTF8RuneTMultibyte(slice.ptr[0..4], @as(u3, @intCast(slice.len)), CodePoint, strings.unicode_replacement),
-            };
-
             it.end = it.current;
+
+            const cp_len = strings.wtf8ByteSequenceLengthWithInvalid(it.source.contents.ptr[it.current]);
+            if (cp_len + it.current > it.source.contents.len) {
+                it.current += 1;
+                return -1;
+            }
+
+            const slice = it.source.contents[it.current .. cp_len + it.current];
+            if (cp_len == 1) {
+                const code_point = @as(CodePoint, slice[0]);
+                it.current += 1;
+                return code_point;
+            }
+
+            const code_point = strings.decodeWTF8RuneTMultibyte(slice.ptr[0..4], @as(u3, @intCast(slice.len)), CodePoint, strings.unicode_replacement);
 
             it.current += if (code_point != strings.unicode_replacement)
                 cp_len
@@ -1056,13 +1051,20 @@ fn NewLexer_(
             }
         }
 
+        inline fn recordNewLine(lexer: *@This()) !void {
+            if (comptime record_lines) {
+                try lexer.line_map.append(lexer.current, lexer.last_line);
+                lexer.last_line = lexer.current;
+            }
+        }
+
         fn _next(lexer: *LexerType, comptime keywords: anytype, comptime use_default_keywords_if_same_line: bool) !void {
             lexer.has_newline_before = lexer.end == 0;
             lexer.full_start = @intCast(lexer.end);
 
             while (true) {
                 lexer.start = lexer.end;
-                lexer.token = T.t_end_of_file;
+                // lexer.token = T.t_end_of_file;
 
                 switch (lexer.code_point) {
                     -1 => {
@@ -1113,19 +1115,22 @@ fn NewLexer_(
                             break;
                         }
                     },
-                    '\r', '\n', 0x2028, 0x2029 => {
+                    0x2028, 0x2029 => {
+                        try lexer.recordNewLine();
                         lexer.has_newline_before = true;
-
-                        if (comptime record_lines) {
-                            lexer.line_count += 1;
-                            lexer.last_line = lexer.start + 1;
-                        }
-
-                        if (comptime generate_line_map) {
-                            try lexer.line_map.append(lexer.current);
-                        }
-
                         lexer.step();
+                        continue;
+                    },
+                    '\r', '\n' => {
+                        try lexer.recordNewLine();
+                        lexer.has_newline_before = true;
+                        lexer.step();
+
+                        if (lexer.code_point != -1) {
+                            lexer.current += skipToInterestingCharacterNextLine(lexer.source.contents[lexer.current..]);
+                            lexer.end = lexer.current - 1;
+                        }
+
                         continue;
                     },
                     '\t', ' ' => {
@@ -1451,15 +1456,9 @@ fn NewLexer_(
                                             }
                                         },
                                         '\r', '\n', 0x2028, 0x2029 => {
-                                            if (comptime record_lines) {
-                                                lexer.line_count += 1;
-                                                lexer.last_line = lexer.start + 1;
-                                            }
-                                            if (comptime generate_line_map) {
-                                                try lexer.line_map.append(lexer.current);
-                                            }
-                                            lexer.step();
+                                            try lexer.recordNewLine();
                                             lexer.has_newline_before = true;
+                                            lexer.step();
                                         },
                                         -1 => {
                                             lexer.start = lexer.end;
@@ -1654,8 +1653,7 @@ fn NewLexer_(
                     '_', '$', 'a'...'z', 'A'...'Z' => {
                         const advance = latin1IdentifierContinueLength(lexer.source.contents[lexer.current..], enable_simd);
 
-                        lexer.end = lexer.current + advance;
-                        lexer.current = lexer.end;
+                        lexer.current += advance;
 
                         lexer.step();
 
@@ -1773,7 +1771,7 @@ fn NewLexer_(
         pub fn expected(self: *LexerType, token: T) !void {
             if (comptime is_debug) {
                 if (self.print_expect)
-                    std.debug.print("{any} != {any} source [line: {}, pos {d}]:\n   {s}\n", .{ self.token, token, self.line_count+1, self.start, self.getContext(25) });
+                    std.debug.print("{any} != {any} source [line: {}, pos {d}]:\n   {s}\n", .{ self.token, token, self.line_map.count+1, self.start, self.getContext(25) });
             }
             // std.debug.print("{s} {}\n", .{self.source.name orelse "", self.line_count});
 
@@ -1948,6 +1946,7 @@ fn NewLexer_(
                 .string_literal = empty_string_literal,
                 .string_literal_buffer = std.ArrayList(u16).init(allocator),
                 .allocator = allocator,
+                .line_map = if (comptime record_lines) LineMap.init() else {},
             };
         }
 
@@ -2032,7 +2031,7 @@ fn NewLexer_(
             }
         }
 
-        pub fn utf16ToString(lexer: *LexerType, js: JavascriptString) string {
+        pub fn utf16ToString(lexer: *LexerType, js: []const u16) string {
             var temp: [4]u8 = undefined;
             var list = std.ArrayList(u8).initCapacity(lexer.allocator, js.len) catch unreachable;
             var i: usize = 0;
@@ -2065,15 +2064,9 @@ fn NewLexer_(
                         lexer.token = .t_end_of_file;
                     },
                     '\r', '\n', 0x2028, 0x2029 => {
-                        if (comptime record_lines) {
-                            lexer.line_count += 1;
-                            lexer.last_line = lexer.start + 1;
-                        }
-                        if (comptime generate_line_map) {
-                            try lexer.line_map.append(lexer.current);
-                        }
-                        lexer.step();
+                        try lexer.recordNewLine();
                         lexer.has_newline_before = true;
+                        lexer.step();
                         continue;
                     },
                     '\t', ' ' => {
@@ -2139,15 +2132,9 @@ fn NewLexer_(
                                                 }
                                             },
                                             '\r', '\n', 0x2028, 0x2029 => {
-                                                if (comptime record_lines) {
-                                                    lexer.line_count += 1;
-                                                    lexer.last_line = lexer.start + 1;
-                                                }
-                                                if (comptime generate_line_map) {
-                                                    try lexer.line_map.append(lexer.current);
-                                                }
-                                                lexer.step();
+                                                try lexer.recordNewLine();
                                                 lexer.has_newline_before = true;
+                                                lexer.step();
                                             },
                                             -1 => {
                                                 lexer.start = lexer.end;
@@ -2322,13 +2309,7 @@ fn NewLexer_(
                                     try lexer.syntaxError();
                                 },
                                 '\r', '\n', 0x2028, 0x2029 => {
-                                    if (comptime record_lines) {
-                                        lexer.line_count += 1;
-                                        lexer.last_line = lexer.start + 1;
-                                    }
-                                    if (comptime generate_line_map) {
-                                        try lexer.line_map.append(lexer.current);
-                                    }
+                                    try lexer.recordNewLine();
                                     needs_fixing = true;
                                     lexer.step();
                                 },
@@ -2590,7 +2571,7 @@ fn NewLexer_(
             lexer.token = T.t_numeric_literal;
 
             // Check for binary, octal, or hexadecimal literal;
-            if (first == '0') {
+            if (comptime first == '0') {
                 switch (lexer.code_point) {
                     'b', 'B' => {
                         base = 2;
@@ -2829,7 +2810,7 @@ fn NewLexer_(
                     }
                 }
 
-                if (lexer.code_point == 'n' and !hasDotOrExponent) {
+                if (!hasDotOrExponent and lexer.code_point == 'n') {
                     // The only bigint literal that can start with 0 is "0n"
                     if (text.len > 1 and first == '0') {
                         try lexer.syntaxError();
@@ -2861,7 +2842,7 @@ fn NewLexer_(
             }
 
             // Handle bigint literals after the underscore-at-end check above;
-            if (lexer.code_point == 'n' and !hasDotOrExponent) {
+            if (!hasDotOrExponent and lexer.code_point == 'n') {
                 lexer.token = T.t_big_integer_literal;
                 lexer.step();
             }
@@ -2929,39 +2910,6 @@ pub fn isIdentifier(text: string) bool {
     while (iter.next(&cursor)) {
         if (!isIdentifierContinue(cursor.c)) {
             return false;
-        }
-    }
-
-    return true;
-}
-
-pub fn isIdentifierUTF16(text: []const u16) bool {
-    const n = text.len;
-    if (n == 0) {
-        return false;
-    }
-
-    var i: usize = 0;
-    while (i < n) {
-        const is_start = i == 0;
-        var codepoint = @as(CodePoint, text[i]);
-        i += 1;
-
-        if (codepoint >= 0xD800 and codepoint <= 0xDBFF and i < n) {
-            const surrogate = @as(CodePoint, text[i]);
-            if (surrogate >= 0xDC00 and surrogate <= 0xDFFF) {
-                codepoint = (codepoint << 10) + surrogate + (0x10000 - (0xD800 << 10) - 0xDC00);
-                i += 1;
-            }
-        }
-        if (is_start) {
-            if (!isIdentifierStart(@as(CodePoint, codepoint))) {
-                return false;
-            }
-        } else {
-            if (!isIdentifierContinue(@as(CodePoint, codepoint))) {
-                return false;
-            }
         }
     }
 
@@ -3051,6 +2999,34 @@ inline fn latin1IdentifierContinueLength(name: []const u8, comptime enable_simd:
     return name.len;
 }
 
+inline fn skipToInterestingCharacterNextLine(text_: []const u8) u32 {
+    var text = text_;
+    const space: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, ' '));
+    const tab: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '\t'));
+    const V1x16 = strings.AsciiVectorU1;
+
+    const text_end_len = text.len & ~(@as(usize, strings.ascii_vector_size) - 1);
+
+    const text_end_ptr = text.ptr + text_end_len;
+
+    while (text_end_ptr != text.ptr) {
+        const vec: strings.AsciiVector = text.ptr[0..strings.ascii_vector_size].*;
+
+        const any_significant =
+            @as(V1x16, @bitCast(space != vec)) &
+            @as(V1x16, @bitCast(tab != vec));
+
+        if (@reduce(.Max, any_significant) > 0) {
+            const bitmask = @as(u16, @bitCast(any_significant));
+            const first = @ctz(bitmask);
+            return @as(u32, @truncate(first + (@intFromPtr(text.ptr) - @intFromPtr(text_.ptr))));
+        }
+        text.ptr += strings.ascii_vector_size;
+    }
+
+    return @as(u32, @truncate(@intFromPtr(text.ptr) - @intFromPtr(text_.ptr)));
+}
+
 fn skipToInterestingCharacterInMultilineComment(text_: []const u8) ?u32 {
     var text = text_;
     const star: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '*'));
@@ -3082,7 +3058,7 @@ fn skipToInterestingCharacterInMultilineComment(text_: []const u8) ?u32 {
     return @as(u32, @truncate(@intFromPtr(text.ptr) - @intFromPtr(text_.ptr)));
 }
 
-fn indexOfInterestingCharacterInStringLiteral(text_: []const u8, quote: u8) ?usize {
+inline fn indexOfInterestingCharacterInStringLiteral(text_: []const u8, comptime quote: u8) ?usize {
     var text = text_;
     const quote_: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, quote));
     const backslash: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '\\'));
@@ -3140,11 +3116,11 @@ pub const LineMap = struct {
 
     positions: BumpAllocator,
 
-    prev: u32 = 0,
     count: u32 = 0,
 
     pub fn init() @This() {
-        const positions = BumpAllocator.init(getAllocator());
+        var positions = BumpAllocator.init(getAllocator());
+        positions.warmup() catch unreachable;
 
         return .{ .positions = positions };
     }
@@ -3165,10 +3141,9 @@ pub const LineMap = struct {
         for (slice) |v| try this.positions.append(v);
     }
 
-    pub fn append(this: *@This(), start_: usize) !void {
+    pub fn append(this: *@This(), start_: usize, prev_: usize) !void {
         const start: u32 = @intCast(start_);
-        const delta = start - this.prev;
-        this.prev = start;
+        const delta = start - @as(u32, @intCast(prev_));
         this.count += 1;
 
         try this._appendSlice(encodeVlq(delta));
@@ -3242,8 +3217,7 @@ pub const LineMap = struct {
 
 fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
     return struct {
-        count: u32 = 0,
-        local_count: u16 = items_per_page,
+        local_count: u16 = 0,
         pages: std.ArrayListUnmanaged([]U),
         allocator: std.mem.Allocator,
 
@@ -3262,27 +3236,19 @@ fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
         }
 
         inline fn addPage(this: *@This()) !void {
-            std.debug.assert((this.count / items_per_page) >= this.pages.items.len);
+            std.debug.assert((this.count() / items_per_page) >= this.pages.items.len);
             const page = try this.allocator.alloc(U, items_per_page);
             try this.pages.append(this.allocator, page);
         }
 
-        pub inline fn alloc(this: *@This()) !*U {
-            if (this.local_count == items_per_page) {
-                try this.addPage();
-                this.local_count = 0;
-            }
-
-            var p = this.pages.items[this.pages.items.len - 1];
-            const ptr = &p[this.local_count];
-            this.local_count += 1;
-            this.count += 1;
-
-            return ptr;
+        inline fn warmup(this: *@This()) !void {
+            std.debug.assert(this.pages.items.len == 0);
+            const page = try this.allocator.alloc(U, items_per_page);
+            try this.pages.append(this.allocator, page);
         }
 
         pub inline fn at(this: *const @This(), index: usize) *U {
-            std.debug.assert(index < this.count);
+            std.debug.assert(index < this.count());
 
             const page = index / items_per_page;
             const offset = @rem(index, items_per_page);
@@ -3291,35 +3257,32 @@ fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
         }
 
         pub inline fn append(this: *@This(), val: U) !void {
+            this.pages.items[this.pages.items.len - 1][this.local_count] = val;
+            this.local_count += 1;
+
             if (this.local_count == items_per_page) {
                 try this.addPage();
                 this.local_count = 0;
             }
+        }
 
-            this.pages.items[this.pages.items.len - 1][this.local_count] = val;
-            this.local_count += 1;
-            this.count += 1;
+        pub inline fn count(this: *const @This()) u32 {
+            if (this.pages.items.len == 0) return 0;
+            return (@as(u32, @truncate(this.pages.items.len - 1)) * items_per_page) + this.local_count;
         }
     };
 }
 
 pub const PositionsWriter = struct {
-    const BumpAllocator = SizedBumpAllocator(4096, Position);
+    const BumpAllocator = SizedBumpAllocator(2048, Position);
 
     positions: BumpAllocator,
 
     pub fn init() @This() {
-        const positions = BumpAllocator.init(getAllocator());
+        var positions = BumpAllocator.init(getAllocator());
+        positions.warmup() catch unreachable;
 
         return .{ .positions = positions };
-    }
-
-    inline fn _appendByte(this: *@This(), byte: u8) !void {
-        try this.positions.append(byte);
-    }
-
-    inline fn _appendSlice(this: *@This(), slice: []const u8) !void {
-        for (slice) |v| try this._appendByte(v);
     }
 
     pub inline fn append(this: *@This(), full_start: u32, width: u32) !void {
@@ -3332,11 +3295,12 @@ pub const PositionsWriter = struct {
     const Position = struct { full_start: u32, width: u32 };
 
     pub fn decode(this: *const @This()) ![]const Position {
-        return Decoder.decode(this.positions, this.positions.count);
+        return Decoder.decode(this.positions, this.positions.count());
     }
 
     pub const Decoder = struct {
         positions: BumpAllocator,
+        total: u32,
         count: u32,
         cursor: u32 = 0,
         prev: u32 = 0,
@@ -3367,7 +3331,7 @@ pub const PositionsWriter = struct {
                 return null;
             }
 
-            const p = this.positions.at(this.positions.count - this.count).*;
+            const p = this.positions.at(this.total - this.count).*;
             this.count -= 1;
 
             return p;
@@ -3377,6 +3341,7 @@ pub const PositionsWriter = struct {
             return .{
                 .positions = positions,
                 .count = count,
+                .total = count,
             };
         }
 
