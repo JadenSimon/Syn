@@ -970,9 +970,6 @@ const ParserOptions = packed struct {
 };
 
 fn Parser_(comptime skip_trivia: bool) type {
-    const is_declaration_file = true;
-    // const is_synx_file = true;
-
     const AstNode_ = AstNodeWithTrivia;
 
     return struct {
@@ -5871,10 +5868,8 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     const ident = try this.parseIdentifierNode();
                     if (this.lexer.token != .t_colon) {
-                        if (comptime is_declaration_file) {
-                            if (this.lexer.token == .t_open_brace and strings.eqlComptime(getSlice(&ident.toAstNode(), u8), "global")) {
-                                return this.parseNamespaceOrModule(0, .global);
-                            }
+                        if (this.lexer.token == .t_open_brace and strings.eqlComptime(getSlice(&ident.toAstNode(), u8), "global")) {
+                            return this.parseNamespaceOrModule(0, .global);
                         }
 
                         return this.parseExpressionStatementFromIdent(ident);
@@ -7598,6 +7593,8 @@ pub const Symbol = struct {
     }
 };
 
+// important: some flags are added after binding
+// any incremental work may need to clear these flags if re-using binding data
 pub const SymbolFlags = enum(u16) {
     local = 1 << 1,
     global = 1 << 2, // only valid for `lib` files
@@ -7606,7 +7603,9 @@ pub const SymbolFlags = enum(u16) {
 
     top_level = 1 << 4,
     skip_narrowing = 1 << 5, // added during type analysis
+    skip_init_check = 1 << 6, // added during type analysis
 
+    let_binding = 1 << 7, // FIXME: get rid of this by marking var decl nodes during parsing instead
     parameter = 1 << 8,
     late_bound = 1 << 10,
     imported = 1 << 11,
@@ -7719,6 +7718,7 @@ pub const Binder = struct {
     should_hoist: bool = false,
     should_export: bool = false,
     should_mark_const: bool = false,
+    should_mark_let: bool = false,
 
     infer_scope: ?u32 = null,
 
@@ -7765,6 +7765,8 @@ pub const Binder = struct {
     inline fn bindDeclWithBinding(this: *@This(), ident: *AstNode, decl: NodeRef, binding: NodeRef) !void {
         const flags_or_ordinal = if (this.should_mark_const)
             @as(u32, @intFromEnum(SymbolFlags.@"const")) << 16
+        else if (this.should_mark_let)
+            @as(u32, @intFromEnum(SymbolFlags.let_binding)) << 16
         else if (comptime bind_types) this.param_ordinals else 0;
 
         return this.bindDeclWithFlagsOrOrdinal(ident, decl, binding, flags_or_ordinal, false);
@@ -8381,6 +8383,9 @@ pub const Binder = struct {
             .variable_statement => {
                 this.should_mark_const = hasFlag(node, .@"const");
                 defer this.should_mark_const = false;
+
+                this.should_mark_let = hasFlag(node, .let);
+                defer this.should_mark_let = false;
 
                 this.should_export = this.shouldExport(node);
                 defer this.should_export = false;

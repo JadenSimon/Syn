@@ -153,12 +153,12 @@ const VirtualFile = struct {
     text: []const u8,
 };
 
-pub fn parseTestFile(allocator: std.mem.Allocator, text: []const u8) !std.ArrayList(VirtualFile) {
+pub fn parseTestFile(allocator: std.mem.Allocator, text: []const u8, is_syn: bool) !std.ArrayList(VirtualFile) {
     const marker = "// @filename:";
     var files = std.ArrayList(VirtualFile).init(allocator);
 
     var i: usize = 0;
-    var current_name: []const u8 = "main.ts";
+    var current_name: []const u8 = if (is_syn) "main.syn" else "main.ts";
 
     while (i < text.len) {
         const next_marker = std.mem.indexOfPos(u8, text, i, marker);
@@ -202,7 +202,7 @@ pub fn parseTestFile(allocator: std.mem.Allocator, text: []const u8) !std.ArrayL
 
 fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime skip_print: bool, ) !void {
     const source = try std.fs.cwd().readFileAlloc(std.heap.c_allocator, file_name, std.math.maxInt(usize));
-    const parsed = try parseTestFile(std.heap.c_allocator, source);
+    const parsed = try parseTestFile(std.heap.c_allocator, source, std.mem.endsWith(u8, file_name, ".syn"));
 
 
     const start = std.time.microTimestamp();

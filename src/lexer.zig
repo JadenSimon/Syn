@@ -1124,12 +1124,13 @@ fn NewLexer_(
                     '\r', '\n' => {
                         try lexer.recordNewLine();
                         lexer.has_newline_before = true;
-                        lexer.step();
 
-                        if (lexer.code_point != -1) {
-                            lexer.current += skipToInterestingCharacterNextLine(lexer.source.contents[lexer.current..]);
-                            lexer.end = lexer.current - 1;
+                        const rem = lexer.source.contents[lexer.current..];
+                        if (rem.len >= 256) {
+                            lexer.current += skipToInterestingCharacterNextLine(rem);
                         }
+
+                        lexer.step();
 
                         continue;
                     },

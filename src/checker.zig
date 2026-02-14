@@ -323,4 +323,259 @@ pub const Checker = struct {
         const d = getPackedData(func);
         try this.file.emitErrorFmt(d.left, "Function lacks ending return statement and return type does not include 'undefined'", .{});
     }
+
+    pub fn checkUseBeforeInit(this: *@This(), node_ref: NodeRef, flow_type: TypeRef) !void {
+        if (!try this.analyzer.isAssignableTo(@intFromEnum(Kind.undefined), flow_type)) return;
+
+        const name_node = this.file.ast.nodes.at(node_ref);
+        const name = getSlice(name_node, u8);
+        try this.file.emitErrorFmt(node_ref, "Variable '{s}' is used before being assigned", .{name});
+    }
+
+    pub fn checkArithmeticAssignment(this: *@This(), expr_ref: NodeRef, _dest_type: TypeRef) !void {
+        const dest_type = try this.analyzer.followAllAliases(_dest_type);
+
+        if (this.analyzer.getKindOfRef(dest_type) != .@"union") return;
+
+        var gen = try ArithmeticEnumerator.init(this, expr_ref) orelse return;
+
+        while (try gen.current()) |result_type| {
+            if (try this.analyzer.isAssignableTo(result_type, dest_type)) {
+                gen.advance();
+                continue;
+            }
+
+            if (result_type == @intFromEnum(Kind.never)) {
+                var sub_buf: [256]u8 = undefined;
+                const sub_str = gen.printSubstituted(&sub_buf);
+                try this.file.emitErrorFmt(expr_ref, "Expression '{s}' produces NaN or Infinity", .{ sub_str });
+                break;
+            }
+
+            const result_str = try this.analyzer.printType(result_type);
+            const dest_str = try this.analyzer.printType(dest_type);
+            var sub_buf: [256]u8 = undefined;
+            const sub_str = gen.printSubstituted(&sub_buf);
+            try this.file.emitErrorFmt(expr_ref, "Type '{s}' ({s}) is not assignable to type '{s}'", .{ result_str, sub_str, dest_str });
+            break;
+        }
+    }
+
+    const ArithmeticEnumerator = struct {
+        const max_slots = 8;
+        const max_values = 64;
+
+        checker: *Checker,
+        expr_ref: NodeRef,
+        values: [max_values]f64 = undefined,
+        slot_offsets: [max_slots + 1]u8 = .{0} ** (max_slots + 1),
+        indices: [max_slots]u8 = .{0} ** max_slots,
+        num_slots: u8 = 0,
+        total_values: u8 = 0,
+        exhausted: bool = false,
+        is_number: bool = false,
+
+        fn init(checker: *Checker, expr_ref: NodeRef) !?@This() {
+            var self = @This(){
+                .checker = checker,
+                .expr_ref = expr_ref,
+            };
+
+            if (!try self.collectSlots(expr_ref)) return null;
+
+            return self;
+        }
+
+        fn current(this: *@This()) !?TypeRef {
+            if (this.exhausted) return null;
+
+            if (this.is_number) {
+                this.exhausted = true;
+                return @intFromEnum(Kind.number);
+            }
+
+            var eval_idx: u8 = 0;
+            const result = this.evaluate(this.expr_ref, &eval_idx);
+            if (std.math.isNan(result)) {
+                this.exhausted = true;
+                return @intFromEnum(Kind.never);
+            }
+
+            return try this.checker.analyzer.numberToType(f64, result);
+        }
+
+        fn printSubstituted(this: *@This(), buf: []u8) []const u8 {
+            var eval_idx: u8 = 0;
+            var pos: usize = 0;
+            this.printExpr(this.expr_ref, buf, &pos, &eval_idx);
+            return buf[0..pos];
+        }
+
+        fn printExpr(this: *@This(), ref: NodeRef, buf: []u8, pos: *usize, eval_idx: *u8) void {
+            const node = this.checker.file.ast.nodes.at(ref);
+
+            if (node.kind == .binary_expression) {
+                const op = @as(parser.SyntaxKind, @enumFromInt(node.len));
+                switch (op) {
+                    .plus_token, .minus_token, .asterisk_token, .slash_token => {
+                        const d = getPackedData(node);
+                        this.printExpr(d.left, buf, pos, eval_idx);
+                        const op_str = switch (op) {
+                            .plus_token => " + ",
+                            .minus_token => " - ",
+                            .asterisk_token => " * ",
+                            .slash_token => " / ",
+                            else => unreachable,
+                        };
+                        if (pos.* + op_str.len <= buf.len) {
+                            @memcpy(buf[pos.*..][0..op_str.len], op_str);
+                            pos.* += op_str.len;
+                        }
+                        this.printExpr(d.right, buf, pos, eval_idx);
+                        return;
+                    },
+                    else => {},
+                }
+            } else if (node.kind == .parenthesized_expression) {                
+                if (pos.* + 1 <= buf.len) {
+                    @memcpy(buf[pos.*..][0..1], "(");
+                    pos.* += 1;
+                }
+                this.printExpr(parser.unwrapRef(node), buf, pos, eval_idx);
+                if (pos.* + 1 <= buf.len) {
+                    @memcpy(buf[pos.*..][0..1], ")");
+                    pos.* += 1;
+                }
+                return;
+            }
+
+            // Leaf: print the current slot value
+            const slot = eval_idx.*;
+            eval_idx.* += 1;
+            const start = this.slot_offsets[slot];
+            const val = this.values[start + this.indices[slot]];
+
+            const int_val: i64 = @intFromFloat(val);
+            if (@as(f64, @floatFromInt(int_val)) == val) {
+                const s = std.fmt.bufPrint(buf[pos.*..], "{}", .{int_val}) catch return;
+                pos.* += s.len;
+            } else {
+                const s = std.fmt.bufPrint(buf[pos.*..], "{d}", .{val}) catch return;
+                pos.* += s.len;
+            }
+        }
+
+        fn collectSlots(this: *@This(), ref: NodeRef) !bool {
+            const node = this.checker.file.ast.nodes.at(ref);
+
+            if (node.kind == .binary_expression) {
+                const op = @as(parser.SyntaxKind, @enumFromInt(node.len));
+                switch (op) {
+                    .plus_token, .minus_token, .asterisk_token, .slash_token => {
+                        const d = getPackedData(node);
+                        return try this.collectSlots(d.left) and try this.collectSlots(d.right);
+                    },
+                    else => {},
+                }
+            } else if (node.kind == .parenthesized_expression) {
+                return this.collectSlots(parser.unwrapRef(node));
+            }
+
+            const ty = try this.checker.analyzer.getTypeAsConst(this.checker.file, ref);
+            return this.addSlotForType(ty);
+        }
+
+        fn addSlotForType(this: *@This(), ty: TypeRef) anyerror!bool {
+            if (ty == @intFromEnum(Kind.number)) {
+                this.is_number = true;
+                return true;
+            }
+
+            if (this.num_slots >= max_slots) return false;
+            this.slot_offsets[this.num_slots] = this.total_values;
+
+            if (ty >= @intFromEnum(Kind.zero)) {
+                if (this.total_values >= max_values) return false;
+                this.values[this.total_values] = this.checker.analyzer.getDoubleFromType(ty);
+                this.total_values += 1;
+            } else if (ty >= @intFromEnum(Kind.false)) {
+                return false;
+            } else {
+                const t = this.checker.analyzer.types.at(ty);
+                switch (t.getKind()) {
+                    .number_literal => {
+                        if (this.total_values >= max_values) return false;
+                        this.values[this.total_values] = this.checker.analyzer.getDoubleFromType(ty);
+                        this.total_values += 1;
+                    },
+                    .@"union" => {
+                        const members = getSlice2(t, TypeRef);
+                        for (members) |m| {
+                            if (m == @intFromEnum(Kind.number)) {
+                                this.is_number = true;
+                                return true;
+                            }
+                            if (!this.checker.analyzer.isNumericLiteral(m)) return false;
+                            if (this.total_values >= max_values) return false;
+                            this.values[this.total_values] = this.checker.analyzer.getDoubleFromType(m);
+                            this.total_values += 1;
+                        }
+                    },
+                    .alias => {
+                        const followed = try this.checker.analyzer.followAllAliases(ty);
+                        if (followed == ty) return false;
+                        
+                        return this.addSlotForType(followed);
+                    },
+                    else => return false,
+                }
+            }
+
+            this.num_slots += 1;
+            this.slot_offsets[this.num_slots] = this.total_values;
+            return true;
+        }
+
+        fn evaluate(this: *@This(), ref: NodeRef, eval_idx: *u8) f64 {
+            const node = this.checker.file.ast.nodes.at(ref);
+
+            if (node.kind == .binary_expression) {
+                const op = @as(parser.SyntaxKind, @enumFromInt(node.len));
+                switch (op) {
+                    .plus_token, .minus_token, .asterisk_token, .slash_token => {
+                        const d = getPackedData(node);
+                        const left = this.evaluate(d.left, eval_idx);
+                        const right = this.evaluate(d.right, eval_idx);
+                        return switch (op) {
+                            .plus_token => left + right,
+                            .minus_token => left - right,
+                            .asterisk_token => left * right,
+                            .slash_token => if (right != 0) left / right else std.math.nan(f64),
+                            else => unreachable,
+                        };
+                    },
+                    else => {},
+                }
+            } else if (node.kind == .parenthesized_expression) {
+                return this.evaluate(parser.unwrapRef(node), eval_idx);
+            }
+
+            const slot = eval_idx.*;
+            eval_idx.* += 1;
+            const start = this.slot_offsets[slot];
+            return this.values[start + this.indices[slot]];
+        }
+
+        fn advance(this: *@This()) void {
+            var i: u8 = this.num_slots;
+            while (i > 0) {
+                i -= 1;
+                this.indices[i] += 1;
+                const slot_len = this.slot_offsets[i + 1] - this.slot_offsets[i];
+                if (this.indices[i] < slot_len) return;
+                this.indices[i] = 0;
+            }
+            this.exhausted = true;
+        }
+    };
 };

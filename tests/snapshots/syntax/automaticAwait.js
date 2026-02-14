@@ -36,11 +36,15 @@ function sync2() {
   return wrap(async () => {})
 }
 async function _async2() {
-  sync2();
+  await sync2();
   const p = await wrap(async () => {})
 }
 async function _async3() {
   const v = await wrap2(async () => {})
   const v2 = await (foo()).then(x => x + 1)
+}
+const m = new Map()
+async function mapGet() {
+  const p = m.get(1)
 }
 async function promises() {}
