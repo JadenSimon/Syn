@@ -7431,6 +7431,12 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left); // expression
             try visitList(nodes, d.right, visitor); // clauses
         },
+        .parameter => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left);
+            if (node.len != 0) try visitor.visit(nodes.at(node.len), node.len);
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
         // constructor
 
         // Types
@@ -7475,6 +7481,7 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(node.len), node.len); // return type
             }
         },
+        .array_type,
         .infer_type, .parenthesized_type, .rest_type, .computed_property_name => {
             const r = unwrapRef(node);
             try visitor.visit(nodes.at(r), r);

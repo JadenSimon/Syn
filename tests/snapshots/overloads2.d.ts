@@ -1,4 +1,6 @@
 // @filename: http.ts
+type HttpMethod = "GET" | "POST" | "PUT" | "HEAD" | "DELETE" | "PATCH" | string;
+type TrimRoute<T extends string> = T extends `${infer U}${"+" | "*"}` ? U : T;
 type ExtractPattern<T extends string> = T extends `${infer P}{${infer U}}${infer S}` ? TrimRoute<U> | ExtractPattern<P | S> : never;
 export type CapturedPattern<T extends string> = string extends T ? Record<string, string> : { [P in ExtractPattern<T>]: string };
 type SplitRoute<T extends string> = T extends `${infer M extends HttpMethod} ${infer P}` ? [M, P] : [string, T];
@@ -22,8 +24,26 @@ export interface TypedRequest<T extends string = string> extends Request {
 export type RequestHandler<T extends string = string, R = unknown> = (request: TypedRequest<T>) => Promise<HandlerResponse<R>> | HandlerResponse<R>;
 export type RequestHandlerWithBody<T extends string = string, U = any, R = unknown> = (request: TypedRequest<T>, body: U) => Promise<HandlerResponse<R>> | HandlerResponse<R>;
 type HandlerResponse<R> = Response | R | void;
+type HandlerArgs<T extends string, U> = U extends undefined ? [request: HttpRequest<T>] : [request: HttpRequest<T>, body: U];
 export type HttpHandler<T extends string = string, U = any, R = unknown, C = void> = (this: C, ...args: HandlerArgs<T, U>) => Promise<HandlerResponse<R>> | HandlerResponse<R>;
 export type HttpFetcher<T extends string = string, U = any, R = unknown> = (...args: [...PathArgs<T>, ...(U extends undefined ? [] : [body: U])]) => Promise<R>;
+interface BindingBase {
+  from: string
+  to: string
+}
+interface PathBinding extends BindingBase {
+  type: "path"
+}
+interface QueryBinding extends BindingBase {
+  type: "query"
+}
+interface HeaderBinding extends BindingBase {
+  type: "header"
+}
+interface BodyBinding extends BindingBase {
+  type: "body"
+}
+type HttpBinding = PathBinding | QueryBinding | HeaderBinding | BodyBinding;
 export interface HttpRoute<T extends any[] = any[], R = any> {
   readonly host: string
   readonly port?: number
@@ -47,6 +67,7 @@ export type SubstituteRoute<T extends string, Root = true> = T extends `${infer 
 export type RequestArgs<T> = T extends HttpHandler<infer _, infer U> ? U extends undefined ? [] : any extends U ? [body?: any] : [body: U] : never;
 
 // @filename: compute.ts
+type HttpBodyMethod = "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH";
 export declare class HttpService {
   route<P extends string = string, R = unknown>(method: "GET", path: P, handler: RequestHandler<`GET ${P}`, R>): HttpRoute<PathArgs<P>, R>
   route<P extends string = string, U = unknown, R = unknown>(method: "ANY", path: P, handler: RequestHandlerWithBody<`${string} ${P}`, U, R>): HttpRoute<PathArgsWithBody<P, U>, R>
@@ -55,4 +76,4 @@ export declare class HttpService {
 }
 
 // @filename: main.ts
-export declare const hello: import("./http").HttpRoute<[], string>
+export declare const hello: import("./http").HttpRoute<[string, string, string], 'hello, world!'>

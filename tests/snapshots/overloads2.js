@@ -7,6 +7,6 @@ import { HttpRoute, PathArgs, RequestHandler, RequestHandlerWithBody, PathArgsWi
 // @filename: main.ts
 import { HttpService } from './compute'
 const s = new HttpService()
-export const hello = s.route('GET', '/hello', () => {
+export const hello = s.route('GET', '/{foo}/{bar}/{fizz}', () => {
   return 'hello, world!'
 })

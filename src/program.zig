@@ -3277,7 +3277,12 @@ pub const Analyzer = struct {
         flags: u24 = 0,
 
         pub fn fromSlice(analyzer: *Analyzer, slice: []const TypeRef) !@This() {
-            if (slice.len > 4) return error.TODO;
+            if (slice.len > 4) {
+                var this = @This(){ .count = 0 };
+                try this.allocateReplace(analyzer.allocator(), @intCast(slice.len));
+                this.recomputeStructuralFlags(analyzer);
+                return this;
+            }
 
             var this = @This(){ .count = @intCast(slice.len) };
             for (slice, 0..) |t, i| {
@@ -3285,6 +3290,15 @@ pub const Analyzer = struct {
                 this.buf[i] = t;
             }
 
+            return this;
+        }
+
+        pub fn fromAllocatedSlice(slice: []const TypeRef) @This() {
+            var this = @This(){ 
+                .count = @intCast(slice.len),
+                .flags = @intFromEnum(Flags.allocated_list),
+            };
+            this.setAllocatedSlice(slice);
             return this;
         }
 
@@ -3357,6 +3371,17 @@ pub const Analyzer = struct {
             return buf;
         }
 
+        inline fn allocateReplace(this: *@This(), _allocator: std.mem.Allocator, new_capacity: u32) !void {
+            const buf = try this.allocate(_allocator, new_capacity);
+            this.setAllocatedSlice(buf);
+        }
+
+        inline fn setAllocatedSlice(this: *@This(), slice: []const TypeRef) void {
+            const items_ptr: *u64 = @alignCast(@ptrCast(&this.buf));
+            items_ptr.* = @intFromPtr(slice.ptr);
+            this.buf[2] = @intCast(slice.len);
+        }
+
         pub fn append(this: *@This(), analyzer: *Analyzer, type_ref: TypeRef) !void {
             this.flags |= analyzer.getStructuralFlags(type_ref);
 
@@ -3367,11 +3392,7 @@ pub const Analyzer = struct {
             }
 
             if (this.count == 4) {
-                const new_capacity = 8;
-                const buf = try this.allocate(analyzer.allocator(), new_capacity);
-                const items_ptr: *u64 = @alignCast(@ptrCast(&this.buf));
-                items_ptr.* = @intFromPtr(buf.ptr);
-                this.buf[2] = new_capacity;
+                try this.allocateReplace(analyzer.allocator(), 8);
             }
 
             return this.appendAllocated(analyzer, type_ref);
@@ -3405,7 +3426,7 @@ pub const Analyzer = struct {
             }
 
             const el = slice[index];
-            count -= 1;
+            this.count -= 1;
             slice[index] = slice[count];
             return el;
         }
@@ -3446,7 +3467,7 @@ pub const Analyzer = struct {
         }
 
         pub fn recomputeStructuralFlags(this: *@This(), analyzer: *Analyzer) void {
-            this.flags &= @intFromEnum(Flags.allocated_list);
+            this.flags &= ~structural_flag_mask;
             const slice = if (this.isAllocated()) this.getAllocatedSlice() else this.buf[0..this.getCount()];
             for (slice) |t| {
                 this.flags |= analyzer.getStructuralFlags(t);
@@ -3663,15 +3684,13 @@ pub const Analyzer = struct {
                 return try this.followImmediateAlias(t, @intFromEnum(EvaluationFlags.type_args) | flags) orelse ref;
             },
             .function_literal => {
-                var flags2: u24 = 0;
                 var did_change = false;
-                var resolved = std.ArrayList(TypeRef).init(this.allocator());
-                defer if (!did_change) resolved.deinit();
+                var list = TypeList{};
 
                 for (getSlice2(t, TypeRef)) |el| {
                     const v = try this.evaluateType(el, flags);
                     if (v != el) did_change = true;
-                    try resolved.append(v);
+                    try list.append(this, v);
                 }
 
                 const return_type = try this.evaluateType(t.slot3, flags);
@@ -3680,11 +3699,15 @@ pub const Analyzer = struct {
                 const this_type = try this.evaluateType(t.slot4, flags);
                 if (this_type != t.slot4) did_change = true;
 
-                if (!did_change) return ref;
+                if (!did_change) {
+                    list.deinit(this.allocator());
+                    return ref;
+                }
 
-                if (t.hasFlag(.constructor)) flags2 |= @intFromEnum(Flags.constructor);
+                if (t.hasFlag(.constructor)) list.flags |= @intFromEnum(Flags.constructor);
+                var params = Params{ .params = list, .this_type = this_type };
 
-                return try this.createFunctionLiteralFull(resolved.items, return_type, this_type, flags2);
+                return try this.createFunctionLiteral(&params, return_type);
             },
             .@"union" => {
                 if (hasEvalFlag(flags, .no_unions)) return ref;
@@ -3758,24 +3781,21 @@ pub const Analyzer = struct {
             },
             .tuple => {
                 const members = getSlice2(t, TypeRef);
-                var flags2: u24 = 0;
                 var did_change = false;
-                var tmp = try std.ArrayList(TypeRef).initCapacity(this.allocator(), members.len);
-                defer if (!did_change) tmp.deinit();
+                var tmp = TypeList{};
                 for (members) |el_type| {
                     if (el_type < @intFromEnum(Kind.false) and this.getKindOfRef(el_type) == .tuple_element) {
                         const m = this.types.at(el_type);
                         const inner = m.slot1;
                         const v = try this.evaluateType(inner, flags);
                         std.debug.assert(v != ref);
-                        if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
                         if (!m.hasFlag(.spread)) {
                             if (v == inner) {
-                                try tmp.append(el_type);
+                                try tmp.append(this, el_type);
                                 continue;
                             }
                             did_change = true;
-                            try tmp.append(v);
+                            try tmp.append(this, v);
                             continue;
                         }
 
@@ -3791,13 +3811,14 @@ pub const Analyzer = struct {
                         }
 
                         if (v == inner) {
-                            try tmp.append(el_type);
+                            try tmp.append(this, el_type);
                             continue;
                         }
 
                         did_change = true;
                         try tmp.append(
-                            try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread) | if (this.isParameterizedRef(v)) @intFromEnum(Flags.parameterized) else 0)
+                            this,
+                            try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread) | if (this.isParameterizedRef(v)) @intFromEnum(Flags.parameterized) else 0),
                         );
 
                         continue;
@@ -3805,14 +3826,16 @@ pub const Analyzer = struct {
 
                     const v = try this.evaluateType(el_type, flags);
                     if (v != el_type) did_change = true;
-                    if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
 
-                    try tmp.append(v);
+                    try tmp.append(this, v);
                 }
 
-                if (!did_change) return ref;
+                if (!did_change) {
+                    tmp.deinit(this.allocator());
+                    return ref;
+                }
 
-                return this.createTupleType(try tmp.toOwnedSlice(), flags2);
+                return this.createTupleType(&tmp);
             },
             .object_literal => {
                 if (hasEvalFlag(flags, .no_objects)) return ref;
@@ -4311,24 +4334,21 @@ pub const Analyzer = struct {
                 return try this.createObjectLiteral(resolved.items, flags, n.slot3);
             },
             .tuple => {
-                var flags: u24 = 0;
                 var did_change = false;
-                var should_deinit = true;
-                var resolved = std.ArrayList(TypeRef).init(this.allocator());
-                defer if (should_deinit) resolved.deinit();
+                var resolved = TypeList{};
 
                 for (getSlice2(n, TypeRef)) |el| {
                     const v = try this.resolveParameterizedType(el) orelse el;
                     if (v != el) did_change = true;
-                    if (this.isParameterizedRef(v)) flags |= @intFromEnum(Flags.parameterized);
-                    try resolved.append(v);
+                    try resolved.append(this, v);
                 }
 
-                if (!did_change) return ref;
+                if (!did_change) {
+                    resolved.deinit(this.allocator());
+                    return ref;
+                }
 
-                should_deinit = false;
-
-                return try this.createTupleType(try resolved.toOwnedSlice(), flags);
+                return try this.createTupleType(&resolved);
             },
             .array => {
                 const v = try this.resolveParameterizedType(n.slot0) orelse return null;
@@ -4340,11 +4360,8 @@ pub const Analyzer = struct {
                 const v = try this.resolveParameterizedType(n.slot1) orelse return null;
                 if (v == n.slot1) return ref;
 
-                var flags = n.flags;
-
-                if (!this.isParameterizedRef(v)) {
-                    flags &= ~@as(u24, @intFromEnum(Flags.parameterized));
-                }
+                var flags = n.flags & ~structural_flag_mask;
+                flags |= this.getStructuralFlags(v);
 
                 if (n.slot0 == 0) {
                     return try this.createUnnamedTupleElement(v, flags);
@@ -4353,26 +4370,22 @@ pub const Analyzer = struct {
                 return try this.createNamedTupleTypeFromIdent(n.slot4, n.slot0, v, flags);
             },
             .function_literal => {
-                var flags: u24 = 0;
                 var did_change = false;
-                var should_deinit = true;
-                var resolved = std.ArrayList(TypeRef).init(this.allocator());
-                defer if (should_deinit) resolved.deinit();
+                var list = TypeList{};
 
                 const params = getSlice2(n, TypeRef);
                 for (params, 0..) |el, i| {
                     const v = try this.resolveParameterizedType(el) orelse el;
                     if (v != el) did_change = true;
-                    if (this.isParameterizedRef(v)) flags |= @intFromEnum(Flags.parameterized);
 
                     if (i < params.len - 1 or v >= @intFromEnum(Kind.false) or !this.types.at(v).hasFlag(.spread)) {
-                        try resolved.append(v);
+                        try list.append(this, v);
                         continue;
                     }
 
                     if (this.types.at(v).getKind() != .tuple_element) {
                         // TODO
-                        try resolved.append(v);
+                        try list.append(this, v);
                         continue;
                     }
 
@@ -4380,9 +4393,9 @@ pub const Analyzer = struct {
                     if (el_type == @intFromEnum(Kind.empty_tuple)) {
                         continue;
                     } else if (this.isTuple(el_type)) {
-                        try this.reduceTupleElement(this.types.at(el_type), &resolved);
+                        try this.reduceTupleElement(this.types.at(el_type), &list);
                     } else {
-                        try resolved.append(v);
+                        try list.append(this, v);
                     }
                 }
 
@@ -4401,18 +4414,19 @@ pub const Analyzer = struct {
                 const this_type = try this.resolveParameterizedType(n.slot4) orelse n.slot4;
                 if (this_type != n.slot4) did_change = true;
 
-                if (!did_change) return ref;
-
-                if (this.isParameterizedRef(return_type) or this.isParameterizedRef(this_type)) {
-                    flags |= @intFromEnum(Flags.parameterized);
-                }
-                if (n.hasFlag(.constructor)) {
-                    flags |= @intFromEnum(Flags.constructor);
+                if (!did_change) {
+                    list.deinit(this.allocator());
+                    return ref;
                 }
 
-                should_deinit = false;
+                if (n.hasFlag(.constructor)) list.flags |= @intFromEnum(Flags.constructor);
 
-                return try this.createCanonicalFunctionLiteral2(resolved.items, return_type, this_type, flags);
+                var params2: Params = .{
+                    .this_type = this_type,
+                    .params = list,
+                };
+
+                return try this.createFunctionLiteral(&params2, return_type);
             },
             .parameterized => {
                 var did_change = false;
@@ -5479,16 +5493,18 @@ pub const Analyzer = struct {
 
         const rt = if (c.slot6 != 0) c.slot6 else c.slot0; // prefer the alias if available
 
-        const params: []u32 = blk: {
-            if (c.slot3 == 0) break :blk &.{};
+        var list = blk: {
+            if (c.slot3 == 0) break :blk TypeList{};
 
             const t = try this.maybeGetClassFromTypeRef(c.slot3) orelse return error.TODO_base_class_not_a_class;
             const super_ref = try this.getClassCtorFromType(t);
             const super = this.types.at(super_ref);
-            break :blk getSlice2(super, TypeRef);
+            break :blk try TypeList.fromSlice(this, getSlice2(super, TypeRef));
         };
 
-        c.slot2 = try this.createFunctionLiteral(params, rt, @intFromEnum(Flags.constructor));
+        list.flags |= @intFromEnum(Flags.constructor);
+        var params: Params = .{ .params = list, .this_type = 0 };
+        c.slot2 = try this.createFunctionLiteral(&params, rt);
 
         return c.slot2;
     }
@@ -8839,7 +8855,7 @@ pub const Analyzer = struct {
         return ref < @intFromEnum(Kind.false) and this.types.at(ref).getKind() == .tuple;
     }
 
-    fn reduceTupleElement(this: *@This(), t: *const Type, arr: *std.ArrayList(TypeRef)) anyerror!void {
+    fn reduceTupleElement(this: *@This(), t: *const Type, arr: *TypeList) anyerror!void {
         for (getSlice2(t, TypeRef)) |el| {
             if (el < @intFromEnum(Kind.false) and this.types.at(el).getKind() == .tuple_element) {
                 const u = this.types.at(el);
@@ -8853,7 +8869,7 @@ pub const Analyzer = struct {
                 }
             }
 
-            try arr.append(el);
+            try arr.append(this, el);
         }
     }
 
@@ -8886,26 +8902,24 @@ pub const Analyzer = struct {
     }
 
     const Params = struct {
-        flags: u24 = 0,
         this_type: TypeRef,
-        params: []const TypeRef,
+        params: TypeList,
     };
 
     fn getParamsWithThisType(this: *@This(), file: *ParsedFileData, start: NodeRef) !Params {
         if (start == 0) {
-            return .{ .this_type = 0, .params = &.{} };
+            return .{ .this_type = 0, .params = .{} };
         }
 
         const old_variance = this.variance;
         defer this.variance = old_variance;
         this.variance = this.variance.invert();
 
-        var total_flags: u24 = 0;
         var is_first_param = true;
         var this_type: NodeRef = 0;
         var params_iter = NodeIterator.init(&file.ast.nodes, start);
 
-        var params = std.ArrayList(TypeRef).init(this.allocator());
+        var params = TypeList{};
 
         while (params_iter.next()) |p| {
             var flags: u24 = 0;
@@ -8934,10 +8948,7 @@ pub const Analyzer = struct {
                     if (d.right != 0) flags |= @intFromEnum(Flags.optional);
                 }
 
-                if (this.isParameterizedRef(z)) {
-                    flags |= @intFromEnum(Flags.parameterized);
-                    total_flags |= @intFromEnum(Flags.parameterized);
-                }
+                flags |= this.getStructuralFlags(z);
 
                 if (is_first_param) {
                     is_first_param = false;
@@ -8948,7 +8959,7 @@ pub const Analyzer = struct {
                     }
                 }
 
-                try params.append(try this.createNamedTupleTypeFromIdent(
+                try params.append(this, try this.createNamedTupleTypeFromIdent(
                     @intCast(file.id),
                     d.left,
                     z,
@@ -8960,7 +8971,7 @@ pub const Analyzer = struct {
                         break :blk try this.getInferredParamType(file, d.right);
                     }
 
-                    if (this.maybeGetParamFromInferrenceCtx(@intCast(params.items.len))) |inferred| {
+                    if (this.maybeGetParamFromInferrenceCtx(@intCast(params.getCount()))) |inferred| {
                         // we have to put inferred types here so they propagate
                         try file.cached_symbol_types.put(this.allocator(), file.ast.nodes.at(d.left).extra_data, inferred);
                         break :blk inferred;
@@ -8970,11 +8981,8 @@ pub const Analyzer = struct {
                 };
 
                 if (d.right != 0) flags |= @intFromEnum(Flags.optional);
-                if (this.isParameterizedRef(t)) {
-                    flags |= @intFromEnum(Flags.parameterized);
-                    total_flags |= @intFromEnum(Flags.parameterized);
-                }
-                try params.append(try this.createNamedTupleTypeFromIdent(
+                flags |= this.getStructuralFlags(t);
+                try params.append(this, try this.createNamedTupleTypeFromIdent(
                     @intCast(file.id),
                     d.left,
                     t,
@@ -8983,12 +8991,9 @@ pub const Analyzer = struct {
             }
         }
 
-        // CALLER MUST FREE .PARAMS
-
         return .{
-            .flags = total_flags,
             .this_type = this_type,
-            .params = try params.toOwnedSlice(),
+            .params = params,
         };
     }
 
@@ -9017,13 +9022,12 @@ pub const Analyzer = struct {
     }
 
     fn getSignature(this: *@This(), file: *ParsedFileData, ref: NodeRef) !u32 {
-        var flags: u24 = 0;
         const n = file.ast.nodes.at(ref);
         switch (n.kind) {
             .arrow_function => {
                 const d = getPackedData(n);
 
-                const params_with_this = try this.getParamsWithThisType(file, d.left);
+                var params_with_this = try this.getParamsWithThisType(file, d.left);
                 var return_type: u32 = 0;
                 if (n.len != 0) {
                     return_type = try this.getType(file, n.len);
@@ -9039,10 +9043,7 @@ pub const Analyzer = struct {
                     }
                 }
 
-                flags |= params_with_this.flags;
-                if (this.isParameterizedRef(return_type)) flags |= @intFromEnum(Flags.parameterized);
-
-                const inner = try this.createFunctionLiteral(params_with_this.params, return_type, flags);
+                const inner = try this.createFunctionLiteral(&params_with_this, return_type);
 
                 if (n.extra_data == 0) {
                     return inner;
@@ -9054,7 +9055,7 @@ pub const Analyzer = struct {
             .function_expression, .function_declaration, .method_declaration => {
                 const d = getPackedData(n);
 
-                const params_with_this = try this.getParamsWithThisType(file, d.right);
+                var params_with_this = try this.getParamsWithThisType(file, d.right);
                 var return_type: u32 = 0;
                 if (n.extra_data2 != 0) {
                     return_type = try this.getType(file, n.extra_data2);
@@ -9069,10 +9070,7 @@ pub const Analyzer = struct {
                     return_type = @intFromEnum(Kind.any);
                 }
 
-                flags |= params_with_this.flags;
-                if (this.isParameterizedRef(return_type)) flags |= @intFromEnum(Flags.parameterized);
-
-                const inner = try this.createCanonicalFunctionLiteral(params_with_this, return_type, flags);
+                const inner = try this.createFunctionLiteral(&params_with_this, return_type);
                 if (n.extra_data == 0) {
                     return inner;
                 }
@@ -9521,12 +9519,9 @@ pub const Analyzer = struct {
                 }
             } else {
                 if (k.getKind() == .object_literal) {
-                    if (!tmp.hasFlag(.parameterized) and hasTypeFlag(k, .parameterized)) {
-                        tmp.addFlag(.parameterized);
-                    }
-
                     if (!tmp.hasFlag(.has_object_literal)) {
                         tmp.addFlag(.has_object_literal);
+                        tmp.flags |= this.getStructuralFlags(t);
                         try tmp.appendChecked(t);
                         return null;
                     }
@@ -9543,8 +9538,8 @@ pub const Analyzer = struct {
                         }
                     }
 
+                    tmp.flags |= this.getStructuralFlags(t);
                     try tmp.appendChecked(t);
-
                     return null;
                 } else if (k.getKind() == .string_literal) {
                     if (tmp.hasFlag(.has_string)) return null;
@@ -9560,11 +9555,10 @@ pub const Analyzer = struct {
                         try tmp.appendChecked(t);
                         return null;
                     }
-                } else if (!tmp.hasFlag(.parameterized) and hasTypeFlag(k, .parameterized)) {
-                    tmp.addFlag(.parameterized);
                 }
 
                 if (tmp.contains(t)) return null;
+                tmp.flags |= this.getStructuralFlags(t);
                 try tmp.appendChecked(t);
             }
         } else if (t >= @intFromEnum(Kind.zero)) {
@@ -9691,7 +9685,7 @@ pub const Analyzer = struct {
                 if (tmp.contains(t)) return null;
                 try tmp.appendChecked(t);
 
-                if (!tmp.hasFlag(.parameterized) and isTypeParamRef(t)) {
+                if (isTypeParamRef(t)) {
                     tmp.addFlag(.parameterized);
                 }
             }
@@ -9880,20 +9874,18 @@ pub const Analyzer = struct {
                 .call_signature, .construct_signature => {
                     const d2 = getPackedData(p[0]);
                     const type_params = try this.getTypeParams(file, p[0].len);
-                    const params_with_this = try this.getParamsWithThisType(file, d2.left);
+                    var params_with_this = try this.getParamsWithThisType(file, d2.left);
                     const return_type = if (d2.right == 0) @intFromEnum(Kind.any) else try this.getType(file, d2.right);
-                    var fn_flags: u24 = params_with_this.flags;
-                    fn_flags |= if (type_params.len > 0) @intFromEnum(Flags.parameterized) else 0;
-                    fn_flags |= if (p[0].kind == .construct_signature) @intFromEnum(Flags.constructor) else 0;
-                    if (this.isParameterizedRef(return_type)) fn_flags |= @intFromEnum(Flags.parameterized);
 
-                    const inner = try this.createFunctionLiteralFull(params_with_this.params, return_type, params_with_this.this_type, fn_flags);
+                    if (p[0].kind == .construct_signature) params_with_this.params.flags |= @intFromEnum(Flags.constructor);
+
+                    const inner = try this.createFunctionLiteral(&params_with_this, return_type);
 
                     const t = if (type_params.len > 0) try this.createParameterizedType(type_params, inner) else inner;
 
                     const flags2: u20 = if (p[0].kind == .construct_signature) @intFromEnum(Flags.constructor) else 0;
 
-                    if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                    flags |= this.getStructuralFlags(t);
 
                     try members.append(.{
                         .kind = .call_signature,
@@ -9972,13 +9964,10 @@ pub const Analyzer = struct {
                     }
 
                     const ty = try this.getType(file, p[0].len);
-                    const params_with_this = try this.getParamsWithThisType(file, d2.right);
-                    if (this.isParameterizedRef(ty)) flags |= @intFromEnum(Flags.parameterized);
+                    var params_with_this = try this.getParamsWithThisType(file, d2.right);
+                    flags |= this.getStructuralFlags(ty);
 
-                    var flags2 = params_with_this.flags;
-                    if (this.isParameterizedRef(ty)) flags2 |= @intFromEnum(Flags.parameterized);
-
-                    const inner = try this.createFunctionLiteralFull(params_with_this.params, ty, params_with_this.this_type, flags2);
+                    const inner = try this.createFunctionLiteral(&params_with_this, ty);
 
                     try members.append(.{
                         .kind = .method,
@@ -10077,7 +10066,7 @@ pub const Analyzer = struct {
     }
 
     fn createParameterizedType(this: *@This(), params: []const TypeRef, inner: TypeRef) !TypeRef {
-        const flags = @intFromEnum(Flags.parameterized);
+        const flags = this.getStructuralFlags(inner);
 
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.parameterized))});
@@ -10123,7 +10112,7 @@ pub const Analyzer = struct {
     }
 
     fn createArrayType(this: *@This(), element: TypeRef) !TypeRef {
-        const flags = if (this.isParameterizedRef(element)) @intFromEnum(Flags.parameterized) else 0;
+        const flags = this.getStructuralFlags(element);
        
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.array))});
@@ -10144,11 +10133,12 @@ pub const Analyzer = struct {
         return t;
     }
 
-    fn hashTupleType(this: *const @This(), elements: []const TypeRef, flags: u24) u64 {
-        _ = this;
+    fn hashTupleType(_: *const @This(), list: *const TypeList) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.tuple))});
-        h.update(&@as([3]u8, @bitCast(flags)));
+        h.update(&@as([3]u8, @bitCast(list.flags)));
+
+        const elements = list.getSlice();
         h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(elements.len)))));
 
         for (elements) |el| {
@@ -10158,37 +10148,37 @@ pub const Analyzer = struct {
         return h.final();
     }
 
-    fn _createTupleType(this: *@This(), elements: []const TypeRef, flags: u24, comptime deinit: bool) !TypeRef {
-        if (elements.len == 0) return @intFromEnum(Kind.empty_tuple);
-        
-        const key = this.hashTupleType(elements, flags);
+    inline fn _createTupleType(this: *@This(), list: *TypeList, comptime can_deinit: bool) !TypeRef {
+        const key = this.hashTupleType(list);
         if (this.canonical_types.get(key)) |t| {
-            if (comptime deinit) this.allocator().free(elements);
+            if (comptime can_deinit) list.deinit(this.allocator());
             return t;
         }
 
-        const x: u64 = @intFromPtr(elements.ptr);
-        const t = try this.types.push(.{
-            .kind = @intFromEnum(Kind.tuple),
-            .flags = flags,
-            .slot0 = @truncate(x),
-            .slot1 = @intCast(x >> 32),
-            .slot2 = @intCast(elements.len),
-        });
-        try this.canonical_types.put(key, t);
-        return t;
+        var t = Type.init(.tuple);
+        try list.writeToType(this.allocator(), &t);
+
+        const ref = try this.types.push(t);
+        try this.canonical_types.put(key, ref);
+        return ref;
     }
 
-    fn createTupleType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
-        return this._createTupleType(elements, flags, true);
-    }
-
-    fn createSlicedTupleType(this: *@This(), elements: []const TypeRef, _flags: u24) !TypeRef {
-        var flags: u24 = _flags;
-        for (elements) |el| {
-            flags |= this.getStructuralFlags(el);
+    fn createTupleType(this: *@This(), list: *TypeList) !TypeRef {
+        if (list.getCount() == 0) {
+            list.deinit(this.allocator());
+            return @intFromEnum(Kind.empty_tuple);
         }
-        return this._createTupleType(elements, flags, false);
+        return this._createTupleType(list, true);
+    }
+
+    fn createSlicedTupleType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
+        if (elements.len == 0) return @intFromEnum(Kind.empty_tuple);
+        var list = TypeList.fromAllocatedSlice(elements);
+        for (elements) |t| {
+            list.flags |= this.getStructuralFlags(t);
+        }
+        list.flags |= flags;
+        return this._createTupleType(&list, false);
     }
 
     fn _createObjectLiteral(this: *@This(), elements: []const ObjectLiteralMember, flags: u24, proto: TypeRef) !TypeRef {
@@ -10330,13 +10320,13 @@ pub const Analyzer = struct {
     }
 
 
-    fn hashFunctionLiteral(params: []const TypeRef, return_type: TypeRef, this_type: TypeRef, flags: u24) u64 {
+    fn hashFunctionLiteral(params: *const TypeList, return_type: TypeRef, this_type: TypeRef) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.function_literal))});
-        h.update(&@as([3]u8, @bitCast(flags)));
-        h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(params.len)))));
+        h.update(&@as([3]u8, @bitCast(params.flags)));
+        h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(params.getCount())))));
 
-        for (params) |p| {
+        for (params.getSlice()) |p| {
             h.update(&@as([4]u8, @bitCast(p)));
         }
 
@@ -10346,48 +10336,27 @@ pub const Analyzer = struct {
         return h.final();
     }
 
-    fn createCanonicalFunctionLiteral(this: *@This(), params: Params, return_type: TypeRef, flags: u24) !TypeRef {
-        const key = hashFunctionLiteral(params.params, return_type, params.this_type, flags);
+    fn createFunctionLiteral(this: *@This(), params: *Params, return_type: TypeRef) !TypeRef {
+        params.params.flags |= this.getStructuralFlags(return_type);
+
+        const key = hashFunctionLiteral(&params.params, return_type, params.this_type);
         if (this.canonical_types.get(key)) |t| {
-            this.allocator().free(params.params);
+            params.params.deinit(this.allocator());
             return t;
         }
 
-        const t = try this.createFunctionLiteralFull(params.params, return_type, params.this_type, flags);
+        const t = try this._createFunctionLiteral(&params.params, return_type, params.this_type);
         try this.canonical_types.put(key, t);
 
         return t;
     }
 
-    fn createCanonicalFunctionLiteral2(this: *@This(), params: []TypeRef, return_type: TypeRef, this_type: TypeRef, flags: u24) !TypeRef {
-        const key = hashFunctionLiteral(params, return_type, this_type, flags);
-        if (this.canonical_types.get(key)) |t| {
-            this.allocator().free(params);
-            return t;
-        }
-
-        const t = try this.createFunctionLiteralFull(params, return_type, this_type, flags);
-        try this.canonical_types.put(key, t);
-
-        return t;
-    }
-
-    fn createFunctionLiteralFull(this: *@This(), params: []const TypeRef, return_type: TypeRef, this_type: TypeRef, flags: u24) !TypeRef {
-        const _flags = flags | (if (this.hasThisType(return_type)) @intFromEnum(Flags.has_this_type) else 0); // XXX
-        const x: u64 = @intFromPtr(params.ptr);
-        return this.types.push(.{
-            .kind = @intFromEnum(Kind.function_literal),
-            .flags = _flags,
-            .slot0 = @truncate(x),
-            .slot1 = @intCast(x >> 32),
-            .slot2 = @intCast(params.len),
-            .slot3 = return_type,
-            .slot4 = this_type,
-        });
-    }
-
-    fn createFunctionLiteral(this: *@This(), params: []const TypeRef, return_type: TypeRef, flags: u24) !TypeRef {
-        return this.createFunctionLiteralFull(params, return_type, 0, flags);
+    inline fn _createFunctionLiteral(this: *@This(), params: *TypeList, return_type: TypeRef, this_type: TypeRef) !TypeRef {
+        var t = Type.init(.function_literal);
+        try params.writeToType(this.allocator(), &t);
+        t.slot3 = return_type;
+        t.slot4 = this_type;
+        return this.types.push(t);
     }
 
     fn createClassType(this: *@This(), instance_type: TypeRef, static_type: TypeRef, constructor: TypeRef, base_class: TypeRef, flags: u24) !TypeRef {
@@ -10478,9 +10447,12 @@ pub const Analyzer = struct {
     fn createCanonicalAlias(this: *@This(), args: *TypeList, file_id: u32, sym_ref: SymbolRef, flags: u24) !TypeRef {
         std.debug.assert(sym_ref != 0);
 
+        // an alias always has an alias: itself!
+        const all_flags = args.flags | flags | @intFromEnum(Flags.has_alias);
+
         var h = std.hash.Wyhash.init(0);
         h.update(&.{@as(u8, @intFromEnum(Kind.alias))});
-        h.update(&@as([3]u8, @bitCast(flags | args.flags)));
+        h.update(&@as([3]u8, @bitCast(all_flags)));
 
         for (args.getSlice()) |a| h.update(&@as([4]u8, @bitCast(a)));
         h.update(&@as([4]u8, @bitCast(file_id)));
@@ -10493,7 +10465,7 @@ pub const Analyzer = struct {
         }
 
         var t = Type.init(.alias);
-        t.flags = flags;
+        t.flags = all_flags;
         t.slot3 = file_id;
         t.slot4 = sym_ref;
 
@@ -10945,12 +10917,10 @@ pub const Analyzer = struct {
                     @intFromEnum(Kind.any);
             },
             .method_signature => {
-                var flags: u24 = 0;
                 const d2 = getPackedData(n);
                 const ty = try this.getType(file, n.len);
-                const params_with_this = try this.getParamsWithThisType(file, d2.right);
-                if (this.isParameterizedRef(ty)) flags |= @intFromEnum(Flags.parameterized);
-                const inner = try this.createFunctionLiteralFull(params_with_this.params, ty, params_with_this.this_type, flags);
+                var params_with_this = try this.getParamsWithThisType(file, d2.right);
+                const inner = try this.createFunctionLiteral(&params_with_this, ty);
 
                 if (n.extra_data != 0) {
                     return this.createParameterizedType(try this.getTypeParams(file, n.extra_data), inner);
@@ -11094,8 +11064,8 @@ pub const Analyzer = struct {
                 .constructor => {
                     const data = getPackedData(pair[0]);
 
-                    const params_with_this = try this.getParamsWithThisType(file, data.left);
-                    for (params_with_this.params) |param| {
+                    var params_with_this = try this.getParamsWithThisType(file, data.left);
+                    for (params_with_this.params.getSlice()) |param| {
                         const x = this.types.at(param);
                         if (hasTypeFlag(x, .parameter_decl)) try instance_members.append(.{
                             .kind = .property,
@@ -11106,7 +11076,8 @@ pub const Analyzer = struct {
 
                     // FIXME: overloads
                     // FIXME: parameterized check
-                    constructor = try this.createFunctionLiteral(params_with_this.params, instance_alias, @intFromEnum(Flags.constructor));
+                    params_with_this.params.flags |= @intFromEnum(Flags.constructor);
+                    constructor = try this.createFunctionLiteral(&params_with_this, instance_alias);
                 },
                 .property_declaration => {
                     const data = getPackedData(pair[0]);
@@ -11717,7 +11688,7 @@ pub const Analyzer = struct {
 
                 return this.types.push(.{
                     .kind = @intFromEnum(Kind.predicate),
-                    .flags = if (this.isParameterizedRef(t)) @intFromEnum(Flags.parameterized) else 0,
+                    .flags = this.getStructuralFlags(t),
                     .slot0 = sym,
                     .slot1 = t,
                     .slot2 = @as(u16, @truncate(file.binder.symbols.at(sym).ordinal)),
@@ -11787,13 +11758,12 @@ pub const Analyzer = struct {
                 var flags: u24 = 0;
                 if (node.hasFlag(.generator)) flags |= @intFromEnum(Flags.spread);
                 if (node.hasFlag(.optional)) flags |= @intFromEnum(Flags.optional);
-                if (this.isParameterizedRef(inner)) flags |= @intFromEnum(Flags.parameterized);
+                flags |= this.getStructuralFlags(inner);
 
                 return this.createNamedTupleTypeFromIdent(file.id, d.left, inner, flags);
             },
             .tuple_type => {
-                var flags: u24 = 0;
-                var elements = std.ArrayList(TypeRef).init(this.type_args.allocator);
+                var elements = TypeList{};
                 var iter = NodeIterator.init(&file.ast.nodes, maybeUnwrapRef(node) orelse 0);
                 while (iter.nextPair()) |p| {
                     switch (p[0].kind) {
@@ -11802,8 +11772,6 @@ pub const Analyzer = struct {
                             if (p[0].kind == .rest_type and (this.isTuple(inner) or inner == @intFromEnum(Kind.empty_tuple))) {
                                 if (inner == @intFromEnum(Kind.empty_tuple)) continue;
 
-                                if (this.isParameterizedRef(inner)) flags |= @intFromEnum(Flags.parameterized);
-
                                 try this.reduceTupleElement(this.types.at(inner), &elements);
                                 continue;
                             }
@@ -11811,18 +11779,15 @@ pub const Analyzer = struct {
                             var element_flags: u24 = 0;
                             if (p[0].kind == .rest_type) element_flags |= @intFromEnum(Flags.spread);
                             if (p[0].kind == .optional_type) element_flags |= @intFromEnum(Flags.optional);
-                            if (this.isParameterizedRef(inner)) {
-                                flags |= @intFromEnum(Flags.parameterized);
-                                element_flags |= @intFromEnum(Flags.parameterized);
-                            }
+                            element_flags |= this.getStructuralFlags(inner);
 
                             try elements.append(
+                                this,
                                 try this.createUnnamedTupleElement(inner, element_flags),
                             );
                         },
                         else => {
                             const t = try this.getType(file, p[1]);
-                            if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
 
                             if (t < @intFromEnum(Kind.false) and hasTypeFlag(this.types.at(t), .spread)) {
                                 const u = this.types.at(t).slot1;
@@ -11831,16 +11796,16 @@ pub const Analyzer = struct {
                                 if (this.isTuple(u)) {
                                     try this.reduceTupleElement(this.types.at(u), &elements);
                                 } else {
-                                    try elements.append(t);
+                                    try elements.append(this, t);
                                 }
                             } else {
-                                try elements.append(t);
+                                try elements.append(this, t);
                             }
                         },
                     }
                 }
 
-                return this.createTupleType(try elements.toOwnedSlice(), flags);
+                return this.createTupleType(&elements);
             },
             .identifier => {
                 // Equivalent to `type_reference` with no args
@@ -12071,13 +12036,12 @@ pub const Analyzer = struct {
             },
             .constructor_type, .function_type => {
                 const d = getPackedData(node);
-                var params = std.ArrayList(TypeRef).init(this.type_args.allocator);
+                var list = TypeList{};
                 var iter = NodeIterator.init(&file.ast.nodes, d.left);
-                var flags: u24 = 0;
 
                 if (node.kind == .constructor_type) {
-                    flags |= @intFromEnum(Flags.constructor);
-                    if (node.hasFlag(.abstract)) flags |= @intFromEnum(Flags.abstract);
+                    list.flags |= @intFromEnum(Flags.constructor);
+                    if (node.hasFlag(.abstract)) list.flags |= @intFromEnum(Flags.abstract);
                 }
 
                 var this_type: TypeRef = 0;
@@ -12085,11 +12049,9 @@ pub const Analyzer = struct {
                 while (iter.nextPair()) |p| {
                     const d2 = getPackedData(p[0]);
                     const z = try this.getType(file, p[0].len);
-                    const is_parameterized = this.isParameterizedRef(z);
 
                     // Only possible for `function_type`
                     if (file.ast.nodes.at(d2.left).kind == .this_keyword) {
-                        if (is_parameterized) flags |= @intFromEnum(Flags.parameterized);
                         this_type = z;
                         continue;
                     }
@@ -12097,21 +12059,18 @@ pub const Analyzer = struct {
                     var param_flags: u24 = 0;
                     if (p[0].hasFlag(.generator)) param_flags |= @intFromEnum(Flags.spread);
                     if (p[0].hasFlag(.optional)) param_flags |= @intFromEnum(Flags.optional);
+                    param_flags |= this.getStructuralFlags(z);
 
-                    if (is_parameterized) {
-                        flags |= @intFromEnum(Flags.parameterized);
-                        param_flags |= @intFromEnum(Flags.parameterized);
-                    }
-
-                    try params.append(
+                    try list.append(
+                        this,
                         try this.createNamedTupleTypeFromIdent(file.id, d2.left, z, param_flags),
                     );
                 }
 
                 const return_type = try this.getType(file, d.right);
-                if (this.isParameterizedRef(return_type)) flags |= @intFromEnum(Flags.parameterized);
+                var params = Params{ .this_type = this_type, .params = list };
 
-                const inner = try this.createFunctionLiteralFull(params.items, return_type, this_type, flags);
+                const inner = try this.createFunctionLiteral(&params, return_type);
                 if (node.len == 0) {
                     return inner;
                 }
@@ -13381,8 +13340,7 @@ pub const Analyzer = struct {
                 var iter = NodeIterator.init(&file.ast.nodes, maybeUnwrapRef(exp) orelse 0);
 
                 if (this.is_const_context) {
-                    var flags: u24 = @intFromEnum(Flags.readonly);
-                    var elements = std.ArrayList(TypeRef).init(this.allocator());
+                    var list = TypeList{};
 
                     while (iter.nextPair()) |pair| {
                         if (pair[0].kind == .spread_element) {
@@ -13390,12 +13348,11 @@ pub const Analyzer = struct {
                         }
 
                         const t = try this.getType(file, pair[1]);
-                        try elements.append(t);
-
-                        if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                        try list.append(this, t);
                     }
 
-                    return this.createTupleType(elements.items, flags);
+                    list.flags |= @intFromEnum(Flags.readonly);
+                    return this.createTupleType(&list);
                 }
 
                 const old_variable_context = this.is_const_variable_context;
@@ -13811,7 +13768,7 @@ pub const Analyzer = struct {
     pub inline fn getSlice2(t: *const Type, comptime T: type) []T {
         if (T == TypeRef) {
             switch (t.getKind()) {
-                .alias, .query => return TypeList.getSliceFromType(t),
+                .alias, .query, .tuple, .function_literal => return TypeList.getSliceFromType(t),
                 else => {},
             }
         }
@@ -13865,6 +13822,11 @@ pub const Analyzer = struct {
                         .block => {},
                         .identifier => {
                             _ = try self.visitIdent(n);
+                        },
+                        .parameter => {
+                            if (n.len != 0) {
+                                return self.visit(self.nodes.at(n.len), n.len);
+                            }
                         },
                         .function_declaration, .class_declaration, .interface_declaration, .type_alias_declaration, .variable_declaration => {
                             std.debug.assert(getPackedData(n).left != 0);
@@ -13979,6 +13941,9 @@ pub const Analyzer = struct {
                     try this.gatherReferencedSymbols(t.slot3);
                 },
                 .object_literal => {
+                    if (ObjectLiteralFlags.isRefined(t)) {
+                        try this.gatherReferencedSymbols(t.slot3);
+                    }
                     for (getSlice2(t, ObjectLiteralMember)) |*m| {
                         try this.gatherReferencedSymbols(m.name);
                         if (!m.isLazy()) {
@@ -14009,10 +13974,13 @@ pub const Analyzer = struct {
                     try this.gatherReferencedSymbols(t.slot0);
                     try this.gatherReferencedSymbols(t.slot1);
                 },
+                .type_parameter => {
+                    try this.gatherReferencedSymbols(t.slot1);
+                    try this.gatherReferencedSymbols(t.slot2);
+                },
 
                 // TODO
                 .mapped => {},
-                .type_parameter => {},
                 else => {},
             }
         }
