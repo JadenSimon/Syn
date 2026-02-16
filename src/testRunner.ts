@@ -126,6 +126,16 @@ function setupVfs() {
 }
 
 function createSnapshot(results: VirtualFile[]) {
+    let isEmpty = true
+    for (const f of results) {
+        if (f.text.trim()) {
+            isEmpty = false
+            break
+        }
+    }
+
+    if (isEmpty) return ''
+
     const chunks: string[] = []
 
     for (const f of results) {
@@ -209,15 +219,40 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
 
     await Promise.all(promises)
 
+    const allErrors: string[] = []
     for (const sf of sourceFiles) {
         const r = path.relative(process.cwd(), absPath)
         const item = resolvedMap.get(sf.fileName)!
-        console.log('----- diagnostics -----')
-        const formatted = (prog.getSemanticDiagnostics(sf) as any as string)
+        const formatted = (prog.getSemanticDiagnostics(sf) as any as string).trim()
         const replaced = formatted.replaceAll(/([^\s:]+):(\d+):(\d+)/g, (_, n, l, c) => {
             return `${r}:${Number(l)+item.line}:${c}`
         })
-        console.log(replaced)
+        if (replaced) {
+            allErrors.push(replaced)
+        }
+    }
+
+    {
+        const snapshotPath = path.resolve(snapshotDir, relPath.replace(/\.(?:syn|tsx?)$/, '.errors'))
+        const existingSnapshot = await fs.promises.readFile(snapshotPath, 'utf-8').catch(err => {
+            if ((err as any).code !== 'ENOENT') {
+                throw err
+            }
+        })
+
+        if (allErrors.length) {
+            const d = allErrors.join('\n')
+            console.log('----- diagnostics -----')
+            console.log(d)
+            await writeFile(snapshotPath, d)
+        } else {
+            console.log('----- no diagnostics -----')
+            await fs.promises.rm(snapshotPath).catch(err => {
+                if ((err as any).code !== 'ENOENT') {
+                    throw err
+                }
+            })
+        }
     }
 
     const groups = new Map<string, (VirtualFile & { order: number; absPath: string })[]>()
@@ -253,26 +288,30 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
         }
 
         if (existingSnapshot === undefined) {
-            await writeFile(snapshotPath, newSnapshot)
+            if (newSnapshot) {
+                await writeFile(snapshotPath, newSnapshot)
+            }
             continue
         }
 
         const diff = lineDiff(existingSnapshot, newSnapshot)
         if (diff.length === 0) {
-            // all good
             continue
         }
 
-        console.log(diff)
-
         if (!opt?.testOnly) {
-            //const proposedPath = path.resolve(proposedDir, relPath.replace(/\.tsx?$/, k))
-            await writeFile(snapshotPath, newSnapshot)
+            if (!newSnapshot) {
+                await fs.promises.rm(snapshotPath).catch(err => {
+                    if ((err as any).code !== 'ENOENT') {
+                        throw err
+                    }
+                })
+            } else {
+                await writeFile(snapshotPath, newSnapshot)
+            } 
+        } else {
+            console.log(diff)
         }
-
-        // if (!opt?.noWrite) {
-        //     await fs.promises.writeFile(snapshotPath, newSnapshot)
-        // }
     }
 }
 

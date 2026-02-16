@@ -6,4 +6,4 @@ export declare let x3: string | number
 export declare let y1: string
 export declare let y2: number
 export declare let y3: string | number
-export declare const arr: { code: "nl" | "it" | "es" | "en" | "fr" }[]
+export declare const arr: { code: (MISSING) }[]

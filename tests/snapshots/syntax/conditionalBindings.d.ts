@@ -1,2 +1,2 @@
-// @filename: main.ts
+// @filename: main.syn
 

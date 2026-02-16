@@ -1,4 +1,5 @@
-// @filename: main.ts
+// @filename: main.syn
+Object.defineProperty(exports, "__esModule", { value: true });
 const _stack = []
 try {
   __defer(_stack, () => console.log('test'))
@@ -87,7 +88,7 @@ try {
     try {
       __defer(_stack, () => {
         const _tmp_0 = maybe(true)
-        if (_tmp_0) {
+        if (_tmp_0 != null) {
           const { v } = _tmp_0
           c -= v;
         }
@@ -99,23 +100,6 @@ try {
       __callDispose(_stack, _error, _hasError)
     }
   }
-  assert(c, 0);
-  async function f4() {
-    c += 1;
-    const p = new Promise(r => setTimeout(() => r(1)))
-    const _stack = []
-    try {
-      __defer(_stack, async () => {
-        c -= await p
-      }, true)
-    } catch(_) {
-      var _error = _, _hasError = true
-    } finally {
-      var _promise = __callDispose(_stack, _error, _hasError)
-      _promise && await _promise
-    }
-  }
-  await f4()
   assert(c, 0);
 } catch(_) {
   var _error = _, _hasError = true

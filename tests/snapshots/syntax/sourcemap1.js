@@ -1,4 +1,6 @@
-// @filename: main.ts
+// @filename: main.syn
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.foo = foo;
 {
   const _stack = []
   try {
@@ -9,7 +11,7 @@
     __callDispose(_stack, _error, _hasError)
   }
 }
-export default function foo() {}
+function foo() {}
 function __knownSymbol(name, symbol) {
   return (symbol = Symbol[name]) ? symbol : Symbol.for("Symbol." + name);
 }
@@ -38,4 +40,3 @@ function __defer(stack, value, async) {
       throw TypeError("Function expected");
   stack.push([async, value]);
 }
-//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbIi9Vc2Vycy9qYWRlbnNpbW9uL1Byb2plY3RzL3N5bmFwc2UtdHlwZXNjcmlwdC1wcml2YXRlL3Rlc3RzL21haW4udHMiXSwibWFwcGluZ3MiOiI7OzswQkFDVSxRQUFROzs7Ozs7O3dCQUVNOzs7In0=

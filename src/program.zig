@@ -2994,8 +2994,6 @@ pub const Analyzer = struct {
 
         module_namespace, // Special case of an object literal
 
-        err,
-
         // Intrinsics
         false = 1 << 31,
         true,
@@ -3004,11 +3002,12 @@ pub const Analyzer = struct {
         number,
         string,
         bigint,
-        object,
+        object, // TODO: possibly add `null_or_object` for `object | null`, useful for `typeof`
         boolean, // Not technically intrinsic, this is equivalent to `true | false`
         function,
         symbol,
 
+        // TODO: possibly remove empty_object/string/tuple
         empty_object,
         empty_string,
         empty_tuple,
@@ -3071,7 +3070,6 @@ pub const Analyzer = struct {
 
         readonly = 1 << 16,
         optional = 1 << 17,
-        non_null = 1 << 18,
     };
 
     pub const QueryFlags = enum(u24) {
@@ -3094,6 +3092,7 @@ pub const Analyzer = struct {
 
         // intrinsics
         has_undefined = 1 << 15,
+        has_null_or_void = 1 << 18,
         has_object = 1 << 19,
         has_boolean = 1 << 20,
         has_string = 1 << 21,
@@ -3102,16 +3101,24 @@ pub const Analyzer = struct {
     };
 
     const ObjectLiteralFlags = enum(u24) {
+        overloaded_function = 1 << 4,
+
         // shared with `Flags`
         parameterized = 1 << 10,
 
         lazy = 1 << 13,
 
+        has_call_signature = 1 << 21,
+        has_index_signature = 1 << 22,
         // synthetic type produced by FlowTyper
         refined = 1 << 23,
 
+        pub inline fn hasFlag(t: *const Type, comptime f: ObjectLiteralFlags) bool {
+            return (t.flags & @intFromEnum(f)) == @intFromEnum(f);
+        }
+
         pub inline fn isRefined(t: *const Type) bool {
-            return (t.flags & @intFromEnum(ObjectLiteralFlags.refined)) == @intFromEnum(ObjectLiteralFlags.refined);
+            return ObjectLiteralFlags.hasFlag(t, .refined);
         }
     };
 
@@ -3203,7 +3210,7 @@ pub const Analyzer = struct {
     synthetic_strings: std.ArrayList([]const u8),
 
     types: parser.BumpAllocator(Type),
-    canonical_types: std.AutoArrayHashMap(u64, TypeRef),
+    interned_types: std.AutoArrayHashMap(u64, TypeRef),
 
     // key is (src << 32) | dst, inflight checks are assumed true
     assignable_cache: std.AutoArrayHashMapUnmanaged(u64, bool) = .{},
@@ -3243,7 +3250,7 @@ pub const Analyzer = struct {
         return .{
             .program = program,
             .types = types,
-            .canonical_types = std.AutoArrayHashMap(u64, TypeRef).init(program.allocator),
+            .interned_types = std.AutoArrayHashMap(u64, TypeRef).init(program.allocator),
             .synthetic_strings = std.ArrayList([]const u8).init(program.allocator),
             .type_args = std.AutoArrayHashMap(TypeRef, TypeRef).init(program.allocator),
             .active_types = std.AutoArrayHashMapUnmanaged(u64, bool){},
@@ -3278,15 +3285,17 @@ pub const Analyzer = struct {
 
         pub fn fromSlice(analyzer: *Analyzer, slice: []const TypeRef) !@This() {
             if (slice.len > 4) {
-                var this = @This(){ .count = 0 };
-                try this.allocateReplace(analyzer.allocator(), @intCast(slice.len));
-                this.recomputeStructuralFlags(analyzer);
+                var this = @This(){ .count = 0, .flags = @intFromEnum(Flags.allocated_list) };
+                const buf = try this.allocate(analyzer.allocator(), @intCast(slice.len));
+                @memcpy(buf, slice);
+                this.setAllocatedSlice(buf);
+                //this.recomputeStructuralFlags(analyzer);
                 return this;
             }
 
             var this = @This(){ .count = @intCast(slice.len) };
             for (slice, 0..) |t, i| {
-                this.flags |= analyzer.getStructuralFlags(t);
+               //this.flags |= analyzer.getStructuralFlags(t);
                 this.buf[i] = t;
             }
 
@@ -3308,6 +3317,13 @@ pub const Analyzer = struct {
             return _allocator.free(this.getAllocatedSlice());
         }
 
+        pub fn setCapacity(this: *@This(), _allocator: std.mem.Allocator, capacity: u32) !void {
+            if (capacity <= 4) return;
+
+            const buf = try this.allocate(_allocator, capacity);
+            this.setAllocatedSlice(buf);
+        }
+
         fn appendAllocated(this: *@This(), analyzer: *Analyzer, value: TypeRef) !void {
             std.debug.assert(this.isAllocated());
 
@@ -3322,9 +3338,7 @@ pub const Analyzer = struct {
             }
 
             try list.append(analyzer.allocator(), value);
-            const items_ptr: *u64 = @alignCast(@ptrCast(&this.buf));
-            items_ptr.* = @intFromPtr(list.items.ptr);
-            this.buf[2] = @intCast(list.capacity);
+            this.setAllocatedSlice(list.items.ptr[0..list.capacity]);
             this.count += 1;
         }
 
@@ -3371,11 +3385,6 @@ pub const Analyzer = struct {
             return buf;
         }
 
-        inline fn allocateReplace(this: *@This(), _allocator: std.mem.Allocator, new_capacity: u32) !void {
-            const buf = try this.allocate(_allocator, new_capacity);
-            this.setAllocatedSlice(buf);
-        }
-
         inline fn setAllocatedSlice(this: *@This(), slice: []const TypeRef) void {
             const items_ptr: *u64 = @alignCast(@ptrCast(&this.buf));
             items_ptr.* = @intFromPtr(slice.ptr);
@@ -3392,7 +3401,8 @@ pub const Analyzer = struct {
             }
 
             if (this.count == 4) {
-                try this.allocateReplace(analyzer.allocator(), 8);
+                const buf = try this.allocate(analyzer.allocator(), 8);
+                this.setAllocatedSlice(buf);
             }
 
             return this.appendAllocated(analyzer, type_ref);
@@ -3415,19 +3425,15 @@ pub const Analyzer = struct {
         }
 
         pub fn swapRemove(this: *@This(), index: usize) TypeRef {
-            const count = this.getCount();
-            std.debug.assert(count != 0);
-            std.debug.assert(index < count);
+            std.debug.assert(this.count != 0);
+            std.debug.assert(index < this.count);
 
-            const slice = if (this.isAllocated()) this.getAllocatedSlice() else this.buf[0..count];
-            if (index == count-1) {
-                this.count = index;
-                return slice[index];
-            }
-
+            const slice = if (this.isAllocated()) this.getAllocatedSlice() else this.buf[0..this.count];
             const el = slice[index];
             this.count -= 1;
-            slice[index] = slice[count];
+            if (index != this.count) {
+                slice[index] = slice[this.count];
+            }
             return el;
         }
 
@@ -3815,11 +3821,10 @@ pub const Analyzer = struct {
                             continue;
                         }
 
+                        const el_flags: u24 = @intFromEnum(Flags.spread) | this.getStructuralFlags(v);
+
                         did_change = true;
-                        try tmp.append(
-                            this,
-                            try this.createUnnamedTupleElement(v, @intFromEnum(Flags.spread) | if (this.isParameterizedRef(v)) @intFromEnum(Flags.parameterized) else 0),
-                        );
+                        try tmp.append(this,try this.createUnnamedTupleElement(v, el_flags));
 
                         continue;
                     }
@@ -3853,7 +3858,12 @@ pub const Analyzer = struct {
                     const el_type = try el.getType(this);
                     const v = try this.evaluateType(el_type, flags);
                     if (v != el_type) did_change = true;
-                    if (this.isParameterizedRef(v)) flags2 |= @intFromEnum(Flags.parameterized);
+                    flags2 |= this.getStructuralFlags(v);
+                    flags2 |= switch (el.kind) {
+                        .index => @intFromEnum(ObjectLiteralFlags.has_index_signature),
+                        .call_signature => @intFromEnum(ObjectLiteralFlags.has_call_signature),
+                        else => 0,
+                    };
 
                     tmp.appendAssumeCapacity(.{
                         .flags = el.flags,
@@ -3866,9 +3876,10 @@ pub const Analyzer = struct {
 
                 const proto = if (t.slot3 != 0) try this.evaluateType(t.slot3, flags) else 0;
                 if (proto != t.slot3) did_change = true;
-                if (this.isParameterizedRef(proto)) flags2 |= @intFromEnum(Flags.parameterized);
 
                 if (!did_change) return ref;
+
+                flags2 |= this.getStructuralFlags(proto);
 
                 return this.createObjectLiteral(tmp.items, flags2, proto);
             },
@@ -3934,7 +3945,7 @@ pub const Analyzer = struct {
 
         if (!did_change) return ref;
 
-        return try this.createCanonicalAlias(&tmp, u.slot3, u.slot4, u.flags);
+        return try this.createAlias(&tmp, u.slot3, u.slot4, u.flags);
     }
 
     // clobbers
@@ -3990,7 +4001,7 @@ pub const Analyzer = struct {
         for (elements) |el| {
             const resolved = try this.resolveParameterizedType(el) orelse el;
             if (resolved != el) did_change = true;
-            if (this.isParameterizedRef(resolved)) flags |= @intFromEnum(Flags.parameterized);
+            flags |= this.getStructuralFlags(resolved);
             try arr.append(resolved);
         }
 
@@ -4157,7 +4168,7 @@ pub const Analyzer = struct {
                     return ref;
                 }
 
-                return try this.createCanonicalAlias(&resolved_args, n.slot3, n.slot4, flags);
+                return try this.createAlias(&resolved_args, n.slot3, n.slot4, flags);
             },
             .@"union" => return try this.resolveUnionOrIntersection(ref, .@"union"),
             .intersection => return try this.resolveUnionOrIntersection(ref, .intersection),
@@ -4197,7 +4208,7 @@ pub const Analyzer = struct {
 
                     try resolved.append(v);
 
-                    if (this.isParameterizedRef(v)) flags |= @intFromEnum(Flags.parameterized);
+                    flags |= this.getStructuralFlags(v);
 
                     if (v < @intFromEnum(Kind.false) and this.types.at(v).getKind() == .@"union") return error.TODO;
 
@@ -4256,28 +4267,23 @@ pub const Analyzer = struct {
                         defer this.setTypeArgFromTypeParamRef(n.slot0, old_value) catch unreachable;
 
                         const elements = getSlice2(this.types.at(subject2), TypeRef);
-                        var arr = try std.ArrayList(TypeRef).initCapacity(this.allocator(), elements.len);
-                        defer arr.deinit();
+                        var tmp = try TempUnion.initCapacity(this.allocator(), @intCast(elements.len));
 
                         for (elements) |el| {
                             try this.setTypeArgFromTypeParamRef(n.slot0, el);
                             const constraint = try this.resolveParameterizedType(n.slot1) orelse n.slot1;
 
                             if (try this.tryResolveConditionalType(el, constraint, n.slot2, n.slot3)) |t| {
-                                try arr.append(t);
+                                if (try this.addToUnion(&tmp, t)) |x| return x;
                             } else {
-                                try arr.append(try this.types.push(.{
-                                    .kind = @intFromEnum(Kind.conditional),
-                                    .slot0 = el,
-                                    .slot1 = constraint,
-                                    .slot2 = try this.resolveParameterizedType(n.slot2) orelse n.slot2,
-                                    .slot3 = try this.resolveParameterizedType(n.slot3) orelse n.slot3,
-                                    .flags = @intFromEnum(Flags.parameterized),
-                                }));
+                                const when_true = try this.resolveParameterizedType(n.slot2) orelse n.slot2;
+                                const when_false = try this.resolveParameterizedType(n.slot3) orelse n.slot3;
+                                const t = try this.createConditionalType(el, constraint, when_true, when_false);
+                                if (try this.addToUnion(&tmp, t)) |x| return x;
                             }
                         }
 
-                        return try this.toUnion(arr.items);
+                        return try tmp.complete(this);
                     }
                 }
 
@@ -4287,15 +4293,9 @@ pub const Analyzer = struct {
                     return t;
                 }
 
-                return try this.types.push(.{
-                    .kind = @intFromEnum(Kind.conditional),
-                    .slot0 = subject,
-                    .slot1 = constraint,
-                    .slot2 = try this.resolveParameterizedType(n.slot2) orelse n.slot2,
-                    .slot3 = try this.resolveParameterizedType(n.slot3) orelse n.slot3,
-                    .slot4 = n.slot4,
-                    .flags = @intFromEnum(Flags.parameterized),
-                });
+                const when_true = try this.resolveParameterizedType(n.slot2) orelse n.slot2;
+                const when_false = try this.resolveParameterizedType(n.slot3) orelse n.slot3;
+                return try this.createConditionalType(subject, constraint, when_true, when_false);
             },
             .keyof => {
                 const inner = try this.resolveParameterizedType(n.slot0) orelse n.slot0;
@@ -4323,11 +4323,11 @@ pub const Analyzer = struct {
                         .type = v,
                         .flags = el.flags,
                     });
-
-                    if (this.isParameterizedRef(v)) flags |= @intFromEnum(Flags.parameterized);
+                    flags |= this.getStructuralFlags(v);
                 }
 
                 if (!did_change) return ref;
+                flags |= n.flags & (@intFromEnum(ObjectLiteralFlags.has_index_signature) | @intFromEnum(ObjectLiteralFlags.has_call_signature));
                 flags &= ~@intFromEnum(ObjectLiteralFlags.lazy);
 
                 should_deinit = false;
@@ -4461,11 +4461,11 @@ pub const Analyzer = struct {
                 }
 
                 var flags: u24 = n.flags;
-                flags &= ~@as(u24, @intFromEnum(Flags.parameterized));
-                if (this.isParameterizedRef(instance_type)) flags |= @intFromEnum(Flags.parameterized);
-                if (this.isParameterizedRef(static_type)) flags |= @intFromEnum(Flags.parameterized);
-                if (this.isParameterizedRef(constructor)) flags |= @intFromEnum(Flags.parameterized);
-                if (this.isParameterizedRef(base_class)) flags |= @intFromEnum(Flags.parameterized);
+                flags &= ~structural_flag_mask;
+                flags |= this.getStructuralFlags(instance_type);
+                flags |= this.getStructuralFlags(static_type);
+                flags |= this.getStructuralFlags(constructor);
+                flags |= this.getStructuralFlags(base_class);
 
                 return try this.createClassType(instance_type, static_type, constructor, base_class, flags);
             },
@@ -4475,8 +4475,8 @@ pub const Analyzer = struct {
 
                 var copy = n.*;
                 copy.slot1 = resolved;
-                copy.flags &= ~@intFromEnum(Flags.parameterized);
-                if (this.isParameterizedRef(resolved)) copy.flags |= @intFromEnum(Flags.parameterized);
+                copy.flags &= ~structural_flag_mask;
+                copy.flags |= this.getStructuralFlags(resolved);
 
                 return try this.types.push(copy);
             },
@@ -4601,6 +4601,7 @@ pub const Analyzer = struct {
         return false;
     }
 
+    // does _not_ distribute over unions
     fn typeofRef(this: *const @This(), type_ref: TypeRef) ?Kind {
         if (type_ref >= @intFromEnum(Kind.false)) {
             if (type_ref >= @intFromEnum(Kind.zero) or type_ref == @intFromEnum(Kind.number)) {
@@ -5115,11 +5116,6 @@ pub const Analyzer = struct {
                     if (!did_match_this) return false;
                 }
 
-                // skip matching up return types when inferring parameters (FIXME: we should only skip once...)
-                // if (this.inferred_type_params == null or variance != .covariant) {
-
-                // }
-
                 // `void` is always assignable to as a return type
                 if (n.slot3 == @intFromEnum(Kind.void) and variance == .covariant) {} else {
                     const did_match_return = try this.inferConditionalTypeWithVariance(s.slot3, n.slot3, inferred, variance) orelse return null;
@@ -5320,7 +5316,6 @@ pub const Analyzer = struct {
                                 if (try this.addToUnion(entry2.value_ptr, ty)) |q| {
                                     // short-circuit
                                     try inferred.put(key, q);
-                                   // entry2.value_ptr.deinit();
                                     _ = inferred_unions.swapRemove(key);
                                 }
                             } else {
@@ -5328,7 +5323,6 @@ pub const Analyzer = struct {
                                 if (try this.addToUnion(&tmp, ty)) |q| {
                                     try inferred.put(key, q);
                                     _ = inferred_unions.swapRemove(key);
-                                //    tmp.deinit();
                                 } else {
                                     entry2.value_ptr.* = tmp;
                                 }
@@ -5499,7 +5493,9 @@ pub const Analyzer = struct {
             const t = try this.maybeGetClassFromTypeRef(c.slot3) orelse return error.TODO_base_class_not_a_class;
             const super_ref = try this.getClassCtorFromType(t);
             const super = this.types.at(super_ref);
-            break :blk try TypeList.fromSlice(this, getSlice2(super, TypeRef));
+            var l = try TypeList.fromSlice(this, getSlice2(super, TypeRef));
+            l.recomputeStructuralFlags(this);
+            break :blk l;
         };
 
         list.flags |= @intFromEnum(Flags.constructor);
@@ -5563,31 +5559,6 @@ pub const Analyzer = struct {
         }
     }
 
-    fn distributeConditionalType(this: *@This(),  subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) !TypeRef {
-        std.debug.assert(this.getKindOfRef(subject) == .@"union");
-
-        const elements = getSlice2(this.types.at(subject), TypeRef);
-        var arr = try std.ArrayList(TypeRef).initCapacity(this.allocator(), elements.len);
-        defer arr.deinit();
-
-        for (elements) |el| {
-            if (try this.tryResolveConditionalType(el, condition, when_true, when_false)) |t| {
-                try arr.append(t);
-            } else {
-                try arr.append(try this.types.push(.{
-                    .kind = @intFromEnum(Kind.conditional),
-                    .slot0 = el,
-                    .slot1 = condition,
-                    .slot2 = when_true,
-                    .slot3 = when_false,
-                    .flags = @intFromEnum(Flags.parameterized),
-                }));
-            }
-        }
-
-        return try this.toUnion(arr.items);
-    }
-
     // typescript treats any alias mentioned in the subject as being distributed...
     // `when_true` and `when_false` are lazily evaluated
     fn tryResolveConditionalType(this: *@This(), subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) anyerror!?u32 {
@@ -5619,32 +5590,50 @@ pub const Analyzer = struct {
         return this.resolveParameterizedType(when_true);
     }
 
-    fn createConditionalType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !u32 {
+    fn _createConditionalType(this: *@This(), subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef, flags: u24) !TypeRef {
+        return this.types.push(.{
+            .kind = @intFromEnum(Kind.conditional),
+            .slot0 = subject,
+            .slot1 = condition,
+            .slot2 = when_true,
+            .slot3 = when_false,
+            .flags = flags,
+        });
+    }
+
+    fn createConditionalType(this: *@This(), subject: TypeRef, condition: TypeRef, when_true: TypeRef, when_false: TypeRef) !TypeRef {
+        var flags: u24 = 0;
+        flags |= this.getStructuralFlags(subject);
+        flags |= this.getStructuralFlags(condition);
+        flags |= this.getStructuralFlags(when_true);
+        flags |= this.getStructuralFlags(when_false);
+        return this._createConditionalType(subject, condition, when_true, when_false, flags);
+    }
+
+    fn getConditionalType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !u32 {
         const n = file.ast.nodes.at(ref);
         const d = getPackedData(n);
-
-        // const is_subject_parenthesized = file.ast.nodes.at(d.left).kind == .parenthesized_type;
 
         const left = try this.getType(file, d.left);
         const right = try this.getType(file, d.right);
         const when_true = try this.getType(file, n.len);
         const when_false = try this.getType(file, n.extra_data);
 
-        if (!this.isParameterizedRef(left) and !this.isParameterizedRef(right)) {
+        var flags: u24 = 0;
+        flags |= this.getStructuralFlags(left);
+        flags |= this.getStructuralFlags(right);
+
+        // eagerly evaluate certain conditional types
+        if ((flags & structural_flag_mask) == 0) {
             if (try this.tryResolveConditionalType(left, right, when_true, when_false)) |t| {
                 return t;
             }
         }
 
-        return this.types.push(.{
-            .kind = @intFromEnum(Kind.conditional),
-            .slot0 = left,
-            .slot1 = right,
-            .slot2 = when_true,
-            .slot3 = when_false,
-            // .slot4 = if (is_subject_parenthesized) 1 else 0,
-            .flags = @intFromEnum(Flags.parameterized),
-        });
+        flags |= this.getStructuralFlags(when_true);
+        flags |= this.getStructuralFlags(when_false);
+
+        return this._createConditionalType(left, right, when_true, when_false, flags);
     }
 
     fn unwrapConditionalStatement(file: *const ParsedFileData, ref: NodeRef) NodeRef {
@@ -5657,9 +5646,8 @@ pub const Analyzer = struct {
 
     // TODO: cache this for unions
     fn truthyType(this: *@This(), ty: TypeRef) anyerror!TypeRef {
-        if (ty > @intFromEnum(Kind.zero)) return ty;
-
         if (ty >= @intFromEnum(Kind.false)) {
+            if (ty > @intFromEnum(Kind.zero)) return ty;
             if (isTypeParamRef(ty)) return ty; // not sure how this got here
 
             switch (@as(Kind, @enumFromInt(ty))) {
@@ -5724,18 +5712,6 @@ pub const Analyzer = struct {
             else => return false, // TODO: handle other types
         };
     }
-
-    // fn isSameObjectLiteralType(this: *@This(), a: TypeRef, b: TypeRef) !bool {
-    //     if (a == b) return true;
-
-    //     const l = this.types.at(a);
-    //     const r = this.types.at(b);
-    //     if (l.flags != r.flags) return false;
-
-    //     const lm = getSlice2(l, ObjectLiteralMember);
-    //     const rm = getSlice2(r, ObjectLiteralMember);
-    //     if (lm.len != rm.len) return false;
-    // }
 
     // this sorts `members` _in-place_
     fn hashObjectLiteral(this: *@This(), flags: u24, members: []ObjectLiteralMember, proto: u32) !u64 {
@@ -6886,7 +6862,7 @@ pub const Analyzer = struct {
                             if (clause.kind == .default_clause) {
                                 has_default = true;
                                 // Finalize any accumulated cases first
-                                if (case_types.elements.items.len > 0) {
+                                if (case_types.elements.getCount() > 0) {
                                     const group_type = try case_types.complete(self.analyzer);
                                     remaining_type = try self.analyzer.excludeType(remaining_type, group_type);
                                     const l2 = try self.createLabel();
@@ -6903,7 +6879,7 @@ pub const Analyzer = struct {
 
                             if (clause.len == 0 and clause_iter.ref > 0) continue;
 
-                            if (case_types.elements.items.len > 0) {
+                            if (case_types.elements.getCount() > 0) {
                                 const group_type = try case_types.complete(self.analyzer);
                                 remaining_type = try self.analyzer.excludeType(remaining_type, group_type);
                                 const l2 = try self.createLabel();
@@ -8243,7 +8219,7 @@ pub const Analyzer = struct {
 
         const elements = getSlice2(lhs_type, TypeRef);
         var arr = try std.ArrayList(TypeRef).initCapacity(this.allocator(), elements.len);
-        errdefer arr.deinit();
+        defer arr.deinit();
 
         for (elements) |el| {
             if (try this.isAssignableTo(el, rhs)) {
@@ -8254,57 +8230,60 @@ pub const Analyzer = struct {
         if (arr.items.len == 0) {
             return @intFromEnum(Kind.never);
         } else if (arr.items.len == 1) {
-            defer arr.deinit();
             return arr.items[0];
         }
 
-        const x: u64 = @intFromPtr(arr.items.ptr);
-        return this.types.push(.{
-            .kind = @intFromEnum(Kind.@"union"),
-            .slot0 = @truncate(x),
-            .slot1 = @intCast(x >> 32),
-            .slot2 = @intCast(arr.items.len),
-        });
+        return try this.toUnion(arr.items);
     }
 
     fn nonNullable(this: *@This(), ref: TypeRef) !TypeRef {
-        if (isNullLike(ref)) return @intFromEnum(Kind.never);
-        if (isTypeParamRef(ref)) {
-            const arr = try this.allocator().alloc(TypeRef, 2);
-            arr[0] = ref;
-            arr[1] = @intFromEnum(Kind.empty_object);
+        if (ref >= @intFromEnum(Kind.false)) {
+            if (isNullLike(ref)) return @intFromEnum(Kind.never);
+            if (isTypeParamRef(ref)) {
+                const arr = try this.allocator().alloc(TypeRef, 2);
+                arr[0] = ref;
+                arr[1] = @intFromEnum(Kind.empty_object);
 
-            return this.createIntersectionType(arr, @intFromEnum(Flags.parameterized));
+                return this.createIntersectionType(arr, @intFromEnum(Flags.parameterized));
+            }
+
+            return ref;
         }
 
-        if (ref >= @intFromEnum(Kind.false)) return ref;
-
         const t = this.types.at(ref);
-        if (t.getKind() != .@"union") return ref;
+        if (t.getKind() != .@"union") return ref; // TODO
 
-        var count: u32 = 0;
-        var first: TypeRef = 0;
+        const nullish_mask: u24 = comptime (
+            @intFromEnum(UnionFlags.has_undefined) |
+            @intFromEnum(UnionFlags.has_null_or_void)
+        );
+
+        const possibly_nullish_mask = comptime structural_flag_mask | nullish_mask;
+
+        if ((t.flags & possibly_nullish_mask) == 0) {
+            return ref;
+        }
+
         const slice = getSlice2(t, TypeRef);
-        for (slice) |el| {
-            if (!isNullLike(el)) {
-                if (count == 0) first = el;
-                count += 1;
+
+        // fast path for things like `string | undefined`
+        if ((t.flags & structural_flag_mask) == 0) {
+            if (slice.len == 2) {
+                if (isNullLike(slice[0])) {
+                    return slice[1];
+                }
+                return slice[0];
             }
         }
 
-        if (count == 0) {
-            return @intFromEnum(Kind.never);
-        } else if (count == 1) {
-            return first;
-        }
-
-        var tmp = try TempUnion.initCapacity(this.allocator(), count);
+        var tmp = try TempUnion.initCapacity(this.allocator(), @intCast(slice.len-1));
         errdefer tmp.deinit();
-        tmp.flags = t.flags;
+        tmp.elements.flags |= t.flags & ~@as(u24, @intFromEnum(Flags.allocated_list));
         tmp.removeFlag(.has_undefined);
+        tmp.removeFlag(.has_null_or_void);
 
         for (slice) |el| {
-            if (!isNullLike(el)) try tmp.appendChecked(el);
+            if (!isNullLike(el)) try tmp.appendChecked(this, el);
         }
 
         return tmp.complete(this);
@@ -8327,10 +8306,11 @@ pub const Analyzer = struct {
         const from_type = this.types.at(from);
         switch (from_type.getKind()) {
             .@"union" => {
-                var tmp = try TempUnion.initCapacity(this.allocator(), from_type.slot2);
+                const l = getSlice2(from_type, TypeRef);
+                var tmp = try TempUnion.initCapacity(this.allocator(), @intCast(l.len));
                 errdefer tmp.deinit();
 
-                for (getSlice2(from_type, TypeRef)) |el| {
+                for (l) |el| {
                     if (try this.addToUnion(&tmp, try this.falsyType(el))) |x| {
                         return x;
                     }
@@ -8357,8 +8337,7 @@ pub const Analyzer = struct {
                 } else if (excluded == @intFromEnum(Kind.false)) {
                     return @intFromEnum(Kind.true);
                 }
-            }
-            if (from == @intFromEnum(Kind.any)) {
+            } else if (from == @intFromEnum(Kind.any)) {
                 return from;
             }
             if (try this.isAssignableTo(from, excluded)) {
@@ -8390,7 +8369,7 @@ pub const Analyzer = struct {
         for (elements) |el| {
             if (try this.isAssignableTo(el, excluded)) continue;
 
-            if (tmp.elements.items.len == limit) {
+            if (tmp.elements.getCount() == limit) {
                 tmp.deinit();
                 return from;
             }
@@ -8400,6 +8379,8 @@ pub const Analyzer = struct {
                     tmp.addFlag(.has_boolean);
                 } else if (el == @intFromEnum(Kind.undefined)) {
                     tmp.addFlag(.has_undefined);
+                } else if (el == @intFromEnum(Kind.null) or el == @intFromEnum(Kind.void)) {
+                    tmp.addFlag(.has_null_or_void);
                 } else if (el == @intFromEnum(Kind.number)) {
                     tmp.addFlag(.has_number);
                 } else if (el == @intFromEnum(Kind.string)) {
@@ -8424,7 +8405,7 @@ pub const Analyzer = struct {
                 }
             }
 
-            try tmp.appendChecked(el);
+            try tmp.appendChecked(this, el);
         }
 
         return tmp.complete(this);
@@ -8459,23 +8440,21 @@ pub const Analyzer = struct {
                     return true;
                 }
 
-                // tuples are assignable to arrays are assignable Object
+                if (n.getKind() == .object_literal and dst == @intFromEnum(Kind.function) and ObjectLiteralFlags.hasFlag(n, .has_call_signature)) {
+                    return true;
+                }
 
-                // TODO: objects w/ call signatures are assignable to function
+                // tuples are assignable to arrays are assignable Object
             }
 
             if (n.getKind() == .object_literal and n.slot3 != 0) {
                 if (try this.isAssignableTo(n.slot3, dst)) {
                     return true;
                 }
-            }
-
-            if (n.getKind() == .tuple_element) {
+            } else if (n.getKind() == .tuple_element) {
                 return this.isAssignableTo(n.slot1, dst);
-            }
-
-            // Potential fast path for aliases
-            if (n.getKind() == .alias) {
+            } else if (n.getKind() == .alias) {
+                // Potential fast path for aliases
                 if (dst < @intFromEnum(Kind.false)) {
                     const dst_type = this.types.at(dst);
                     if (dst_type.getKind() == .alias) {
@@ -8510,15 +8489,55 @@ pub const Analyzer = struct {
         }
 
         if (dst < @intFromEnum(Kind.false)) {
-            if (src == @intFromEnum(Kind.any)) return true;
-            
             const dst_type = this.types.at(dst);
+            if (src >= @intFromEnum(Kind.false)) {
+                if (src == @intFromEnum(Kind.any)) return true;
+
+                switch (dst_type.getKind()) {
+                    .tuple_element => return this.isAssignableTo(src, dst_type.slot1),
+                    .alias => {
+                        const followed = try this.maybeResolveAlias(dst);
+                        if (followed != dst) {
+                            return try this.isAssignableTo(src, followed);
+                        }
+                        return false;
+                    },
+                    .@"union" => {
+                        for (getSlice2(dst_type, TypeRef)) |el| {
+                            if (try this.isAssignableTo(src, el)) return true;
+                        }
+
+                        return false;
+                    },
+                    else => {},
+                }
+
+                if (src == @intFromEnum(Kind.empty_object)) {
+                    if (dst_type.getKind() != .object_literal) return false;
+
+                    for (getSlice2(dst_type, ObjectLiteralMember)) |dm| {
+                        if (dm.kind == .call_signature or dm.kind == .index) continue;
+                        if (!dm.isOptional()) return false;
+                    }
+                    return true;
+                }
+
+                if (src == @intFromEnum(Kind.empty_tuple)) {
+                    if (dst_type.getKind() == .array and dst_type.slot0 == @intFromEnum(Kind.any)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            const src_type = this.types.at(src);
+
             switch (dst_type.getKind()) {
                 .tuple_element => return this.isAssignableTo(src, dst_type.slot1),
                 .tuple => {
                     // TODO: readonly
-                    if (this.getKindOfRef(src) == .tuple) {
-                        const src_type = this.types.at(src);
+                    if (src_type.getKind() == .tuple) {
                         const src_elements = getSlice2(src_type, TypeRef);
                         const dst_elements = getSlice2(dst_type, TypeRef);
                         if (src_elements.len != dst_elements.len) return false; // TODO: optional and rest
@@ -8551,45 +8570,46 @@ pub const Analyzer = struct {
                     }
                 },
                 .object_literal => {
-                    const src_kind = this.getKindOfRef(src);
-                    if (src_kind != .object_literal and src_kind != .empty_object) {
+                    const src_kind = src_type.getKind();
+                    if (src_kind != .object_literal) {
                         if (src_kind == .intersection) {
 
                         }
                         if (src_kind == .@"union") {
-                            for (getSlice2(this.types.at(src), TypeRef)) |el| {
+                            for (getSlice2(src_type, TypeRef)) |el| {
                                 if (!try this.isAssignableTo(el, dst)) return false;
                             }
                             return true;
                         }
+                        if (src_kind == .function_literal) {
+                            // find matching call signature 
+                            if (!ObjectLiteralFlags.hasFlag(dst_type, .has_call_signature)) {
+                                return false;
+                            }
+                            if (try this.findMatchingCallSignature(getSlice2(dst_type, ObjectLiteralMember), src)) |_| {
+                                return true;
+                            }
+                            return false;
+                        }
                         return false;
                     }
 
-                    // we should be able to assign to a supertype
-                    const s = this.types.at(src);
-                    if (s.slot3 != 0) {
-                        if (try this.isAssignableTo(s.slot3, dst)) {
-                            return true;
-                        }
-                    }
-
-                    // TODO: track if dst has an index type, then if we can't find a prop, we need 
-                    // to check against the index types. An object type flag could be useful here.
-                    for (getSlice2(dst_type, ObjectLiteralMember)) |*m| {
-                        if (m.kind != .index) continue;
-
-                        if (!m.isLazy() and m.type == @intFromEnum(Kind.any)) {
+                    if (src_type.slot3 != 0) {
+                        if (try this.isAssignableTo(src_type.slot3, dst)) {
                             return true;
                         }
                     }
 
                     const dst_members = getSlice2(dst_type, ObjectLiteralMember);
-                    if (src_kind == .empty_object) {
-                        for (dst_members) |dm| {
-                            if (dm.kind == .call_signature or dm.kind == .index) continue;
-                            if (!dm.isOptional()) return false;
+
+                    if (dst_type.flags & @intFromEnum(ObjectLiteralFlags.has_index_signature) == @intFromEnum(ObjectLiteralFlags.has_index_signature)) {
+                        for (dst_members) |*m| {
+                            if (m.kind != .index) continue;
+
+                            if (!m.isLazy() and m.type == @intFromEnum(Kind.any)) {
+                                return true;
+                            }
                         }
-                        return true;
                     }
 
                     const cache_key = (@as(u64, src) << 32) | dst;
@@ -8599,7 +8619,7 @@ pub const Analyzer = struct {
                     entry.value_ptr.* = true;
                     // do not re-use `entry` after this point, the ptr might be stale
 
-                    const src_members = getSlice2(s, ObjectLiteralMember);
+                    const src_members = getSlice2(src_type, ObjectLiteralMember);
 
                     for (dst_members) |*dm| {
                         if (dm.kind == .call_signature or dm.kind == .index) continue;
@@ -8639,8 +8659,6 @@ pub const Analyzer = struct {
                     return true;
                 },
                 .function_literal => {
-                    if (src >= @intFromEnum(Kind.false)) return false;
-                    const src_type = this.types.at(src);
                     if (src_type.getKind() != .function_literal) {
                         if (src_type.getKind() == .@"union") {
                             for (getSlice2(src_type, TypeRef)) |el| {
@@ -8654,11 +8672,11 @@ pub const Analyzer = struct {
                     const src_params = getSlice2(src_type, TypeRef);
                     const dst_params = getSlice2(dst_type, TypeRef);
 
+                    // FIXME: handle rest params, optional params, extraneous params, etc.
+                    
                     const check_count = @min(src_params.len, dst_params.len);
                     for (0..check_count) |i| {
-                        if (!try this.isAssignableTo(src_params[i], dst_params[i]) and
-                            !try this.isAssignableTo(dst_params[i], src_params[i]))
-                        {
+                        if (!try this.isAssignableTo(dst_params[i], src_params[i])) {
                             return false;
                         }
                     }
@@ -8674,14 +8692,11 @@ pub const Analyzer = struct {
                     return true;
                 },
                 .@"union" => {
-                    if (src < @intFromEnum(Kind.false)) {
-                        const src_kind = this.getKindOfRef(src);
-                        if (src_kind == .@"union") {
-                            for (getSlice2(this.types.at(src), TypeRef)) |el| {
-                                if (!try this.isAssignableTo(el, dst)) return false;
-                            }
-                            return true;
+                    if (src_type.getKind() == .@"union") {
+                        for (getSlice2(src_type, TypeRef)) |el| {
+                            if (!try this.isAssignableTo(el, dst)) return false;
                         }
+                        return true;
                     }
 
                     for (getSlice2(dst_type, TypeRef)) |el| {
@@ -8691,25 +8706,35 @@ pub const Analyzer = struct {
                     return false;
                 },
                 .intersection => {},
-                .empty_object => {
-                    const n = this.maybeGetTypeFromRef(src) orelse return !isNullLike(src);
-                    if (n.getKind() != .@"union") return true;
+                // .empty_object => {
+                //     const n = this.maybeGetTypeFromRef(src) orelse return !isNullLike(src);
+                //     if (n.getKind() != .@"union") return true;
 
-                    for (getSlice2(n, u32)) |el| {
-                        if (isNullLike(el)) return false;
-                    }
-                    return true;
-                },
+                //     for (getSlice2(n, u32)) |el| {
+                //         if (isNullLike(el)) return false;
+                //     }
+                //     return true;
+                // },
                 .alias => {
                     const followed = try this.maybeResolveAlias(dst);
                     if (followed != dst) {
                         return try this.isAssignableTo(src, followed);
                     }
                 },
+                .parameterized => {
+                    // TODO:
+                    // parameterized fn types are compared in a special way using their type params
+                    //  type X1 = <T>() => { x: T }
+                    //  type X2 = <T>() => T
+                    //  type R = X2 extends X1 ? true : false 
+                    //                                        --> true
+                },
                 else => {},
             }
             return false;
         }
+
+        // --- both src and dst are intrinsics ---
 
         if (dst == @intFromEnum(Kind.any)) return true;
         if (dst == @intFromEnum(Kind.unknown) or dst == @intFromEnum(Kind.infer_unknown)) return true;
@@ -8726,7 +8751,19 @@ pub const Analyzer = struct {
         if ((src == @intFromEnum(Kind.false) or src == @intFromEnum(Kind.true)) and dst == @intFromEnum(Kind.boolean)) return true;
         if (src == @intFromEnum(Kind.undefined) and dst == @intFromEnum(Kind.void)) return true;
 
-        return false; // TODO: objects, functions (incl. variance)
+        return false;
+    }
+
+    fn findMatchingCallSignature(this: *@This(), members: []ObjectLiteralMember, ty: TypeRef) !?usize {
+        for (members, 0..) |*m, i| {
+            if (m.kind != .call_signature) continue;
+
+            const ot = try m.getType(this);
+            if (try this.isAssignableTo(ty, ot)) {
+                return i;
+            }
+        }
+        return null;
     }
 
     fn isNullLike(t: TypeRef) bool {
@@ -8735,8 +8772,6 @@ pub const Analyzer = struct {
 
     // fast path for inline string literals
     fn maybeGetTypeFromTypeOfNode(this: *@This(), file: *ParsedFileData, ref: NodeRef) !?TypeRef {
-        _ = this;
-
         const n = file.ast.nodes.at(ref);
         if (n.kind != .string_literal) return null;
 
@@ -8751,6 +8786,9 @@ pub const Analyzer = struct {
         });
 
         if (Types.get(getSlice(n, u8))) |x| {
+            if (x == .object) {
+                return try this.toUnion(&.{@intFromEnum(Kind.object), @intFromEnum(Kind.null)});
+            }
             return @intFromEnum(x);
         }
 
@@ -8787,7 +8825,7 @@ pub const Analyzer = struct {
                     return @intFromEnum(Kind.function);
                 }
                 if (strings.eqlComptime(text, "object")) {
-                    return @intFromEnum(Kind.object); // nullish object
+                    return try this.toUnion(&.{@intFromEnum(Kind.object), @intFromEnum(Kind.null)});
                 }
             },
             .@"union" => {
@@ -8800,7 +8838,7 @@ pub const Analyzer = struct {
                     if (try this.addToUnion(&tmp, el_type)) |_| return null;
                 }
 
-                if (tmp.elements.items.len == 0) return null;
+                if (tmp.elements.getCount() == 0) return null;
                 should_deinit = false;
 
                 return try tmp.complete(this);
@@ -9086,7 +9124,8 @@ pub const Analyzer = struct {
     }
 
     inline fn getPromiseType(this: *@This(), inner: TypeRef) !TypeRef {
-        const args = try TypeList.fromSlice(this, &.{inner});
+        var args = try TypeList.fromSlice(this, &.{inner});
+        args.recomputeStructuralFlags(this);
         return try this.getGlobalTypeSymbolAlias("Promise", args) orelse error.MissingPromise;
     }
 
@@ -9273,24 +9312,21 @@ pub const Analyzer = struct {
 
     // Used to construct a union
     const TempUnion = struct {
-        has_unknown: bool = false,
+        has_infer_unknown: bool = false,
 
-        flags: u24 = 0,
-        elements: std.ArrayList(u32),
+        elements: TypeList = .{},
         xor_hash: u64 = 0,
 
         set: ?*TypeSet = null,
+        _allocator: std.mem.Allocator,
 
         pub fn init(alloc: std.mem.Allocator) @This() {
-            return .{
-                .elements = std.ArrayList(TypeRef).init(alloc),
-            };
+            return .{ ._allocator = alloc };
         }
 
         pub fn initCapacity(alloc: std.mem.Allocator, count: u32) !@This() {
-            var this = @This(){
-                .elements = try std.ArrayList(TypeRef).initCapacity(alloc, count),
-            };
+            var this = @This(){ ._allocator = alloc };
+            try this.elements.setCapacity(alloc, count);
 
             if (count >= allocated_set_threshold) {
                 this.set = try this.allocateSet(count);
@@ -9300,26 +9336,27 @@ pub const Analyzer = struct {
         }
 
         inline fn hasFlag(this: *const @This(), comptime flag: UnionFlags) bool {
-            return (this.flags & @intFromEnum(flag)) == @intFromEnum(flag);
+            return (this.elements.flags & @intFromEnum(flag)) == @intFromEnum(flag);
         }
 
         inline fn addFlag(this: *@This(), comptime flag: UnionFlags) void {
-            this.flags |= @intFromEnum(flag);
+            this.elements.flags |= @intFromEnum(flag);
         }
 
         inline fn removeFlag(this: *@This(), comptime flag: UnionFlags) void {
-            this.flags &= ~@intFromEnum(flag);
+            this.elements.flags &= ~@intFromEnum(flag);
         }
 
         pub fn fromUnion(analyzer: *Analyzer, t: *const Type) !@This() {
             const prev = getSlice2(t, TypeRef);
-            const slice = try analyzer.allocator().alloc(TypeRef, prev.len);
-            @memcpy(slice, prev);
+
+            var list = try TypeList.fromSlice(analyzer, prev);
+            list.flags |= t.flags & ~@as(u24, @intFromEnum(Flags.allocated_list));
 
             var this = @This(){
-                .elements = std.ArrayList(TypeRef).fromOwnedSlice(analyzer.allocator(), slice),
+                .elements = list,
                 .xor_hash = (@as(u64, t.slot3) << 32) | t.slot4,
-                .flags = t.flags,
+                ._allocator = analyzer.allocator(),
             };
 
             if (maybeGetUnionSet(t)) |set| {
@@ -9331,7 +9368,7 @@ pub const Analyzer = struct {
         }
 
         pub fn deinit(this: *@This()) void {
-            this.elements.deinit();
+            this.elements.deinit(this._allocator);
             if (this.set) |s| s.deinit();
         }
 
@@ -9347,9 +9384,10 @@ pub const Analyzer = struct {
 
         // In-place mutation
         pub fn filter(this: *@This(), analyzer: *Analyzer, comptime kind: Kind) !void {
-            var j: usize = this.elements.items.len - 1;
+            var j: usize = this.elements.getCount() - 1;
+            const elements = this.elements.getSlice();
             while (true) {
-                const el = this.elements.items[j];
+                const el = elements[j];
                 if (el < @intFromEnum(Kind.false)) {
                     const n = analyzer.types.at(el);
                     if (n.getKind() == kind) {
@@ -9383,7 +9421,7 @@ pub const Analyzer = struct {
                 return s.contains(t);
             }
 
-            for (this.elements.items) |el| {
+            for (this.elements.getSlice()) |el| {
                 if (el == t) return true;
             }
 
@@ -9393,8 +9431,8 @@ pub const Analyzer = struct {
         fn allocateSet(this: *@This(), capacity: usize) !*TypeSet {
             std.debug.assert(this.set == null);
 
-            const s = try this.elements.allocator.create(TypeSet);
-            s.* = TypeSet.init(this.elements.allocator);
+            const s = try this._allocator.create(TypeSet);
+            s.* = TypeSet.init(this._allocator);
             try s.ensureTotalCapacity(capacity);
 
             this.set = s;
@@ -9402,60 +9440,54 @@ pub const Analyzer = struct {
             return s;
         }
 
-        pub inline fn appendChecked(this: *@This(), t: TypeRef) !void {
-            try this.elements.append(t);
+        pub inline fn appendChecked(this: *@This(), analyzer: *Analyzer, t: TypeRef) !void {
+            try this.elements.append(analyzer, t);
             this.xor_hash ^= std.hash.Wyhash.hash(0, &@as([4]u8, @bitCast(t)));
 
-            if (this.elements.items.len >= allocated_set_threshold and this.set == null) {
-                const s = try this.allocateSet(this.elements.items.len * 2);
+            if (this.elements.getCount() >= allocated_set_threshold and this.set == null) {
+                const s = try this.allocateSet(this.elements.getCount() * 2);
 
-                for (this.elements.items) |el| s.putAssumeCapacity(el, true);
+                for (this.elements.getSlice()) |el| s.putAssumeCapacity(el, true);
             } else if (this.set) |s| {
                 try s.put(t, true);
             }
         }
 
         pub fn complete(this: *@This(), analyzer: *Analyzer) !TypeRef {
-            if (this.elements.items.len == 0) {
-                if (this.has_unknown) {
+            if (this.elements.getCount() == 0) {
+                if (this.has_infer_unknown) {
                     return @intFromEnum(Kind.unknown);
                 }
                 return @intFromEnum(Kind.never);
             }
 
-            if (this.elements.items.len == 1) {
-                defer this.elements.deinit();
-                return this.elements.items[0];
+            if (this.elements.getCount() == 1) {
+                defer this.elements.deinit(this._allocator);
+                return this.elements.getSlice()[0];
             }
 
             const key = this.xor_hash;
-            if (analyzer.canonical_types.get(key)) |t| {
+            if (analyzer.interned_types.get(key)) |t| {
                 if (this.set) |s| s.deinit();
-                defer this.elements.deinit();
+                this.elements.deinit(this._allocator);
                 return t;
             }
 
-            this.elements.shrinkAndFree(this.elements.items.len);
+            var t = Type.init(.@"union");
+            try this.elements.writeToType(this._allocator, &t);
+            t.slot3 = @intCast(this.xor_hash >> 32);
+            t.slot4 = @truncate(this.xor_hash);
 
-            const x: u64 = @intFromPtr(this.elements.items.ptr);
-            const t = try analyzer.types.push(.{
-                .kind = @intFromEnum(Kind.@"union"),
-                .slot0 = @truncate(x),
-                .slot1 = @intCast(x >> 32),
-                .slot2 = @intCast(this.elements.items.len),
-                .slot3 = @intCast(this.xor_hash >> 32),
-                .slot4 = @truncate(this.xor_hash),
-                .flags = this.flags,
-            });
+            const ref = try analyzer.types.push(t);
 
             if (this.set) |s| {
                 s.shrinkAndFree(s.count());
-                analyzer.types.at(t).slot5 = @truncate(@intFromPtr(s) >> 32);
-                analyzer.types.at(t).slot6 = @truncate(@intFromPtr(s));
+                analyzer.types.at(ref).slot5 = @truncate(@intFromPtr(s) >> 32);
+                analyzer.types.at(ref).slot6 = @truncate(@intFromPtr(s));
             }
 
-            try analyzer.canonical_types.put(key, t);
-            return t;
+            try analyzer.interned_types.put(key, ref);
+            return ref;
         }
 
         const allocated_set_threshold = 16;
@@ -9489,7 +9521,7 @@ pub const Analyzer = struct {
         if (t < @intFromEnum(Kind.false)) {
             const k = this.types.at(t);
             if (k.getKind() == .@"union") {
-                if (tmp.elements.items.len == 0) {
+                if (tmp.elements.getCount() == 0) {
                     tmp.deinit();
                     tmp.* = try TempUnion.fromUnion(this, k);
                     return null;
@@ -9499,9 +9531,9 @@ pub const Analyzer = struct {
 
                 // TODO: a potentially faster way is to check elements before adding to
                 // avoid checking elements that we know cannot possibly overlap
-                if (from.len >= (tmp.elements.items.len * 2)) {
+                if (from.len >= (tmp.elements.getCount() * 2)) {
                     var new_tmp = try TempUnion.fromUnion(this, k);
-                    for (tmp.elements.items) |el| {
+                    for (tmp.elements.getSlice()) |el| {
                         if (try this.addToUnion(&new_tmp, el)) |q| {
                             tmp.deinit();
                             return q;
@@ -9521,14 +9553,13 @@ pub const Analyzer = struct {
                 if (k.getKind() == .object_literal) {
                     if (!tmp.hasFlag(.has_object_literal)) {
                         tmp.addFlag(.has_object_literal);
-                        tmp.flags |= this.getStructuralFlags(t);
-                        try tmp.appendChecked(t);
+                        try tmp.appendChecked(this, t);
                         return null;
                     }
 
                     if (tmp.contains(t)) return null;
 
-                    for (tmp.elements.items) |ref2| {
+                    for (tmp.elements.getSlice()) |ref2| {
                         if (ref2 >= @intFromEnum(Kind.false)) continue;
                         const k2 = this.types.at(ref2);
                         if (k2.getKind() != .object_literal) continue;
@@ -9538,44 +9569,42 @@ pub const Analyzer = struct {
                         }
                     }
 
-                    tmp.flags |= this.getStructuralFlags(t);
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                     return null;
                 } else if (k.getKind() == .string_literal) {
                     if (tmp.hasFlag(.has_string)) return null;
                     if (!tmp.hasFlag(.has_string_literal)) {
                         tmp.addFlag(.has_string_literal);
-                        try tmp.appendChecked(t);
+                        try tmp.appendChecked(this, t);
                         return null;
                     }
                 } else if (k.getKind() == .symbol_literal) {
                     if (tmp.hasFlag(.has_symbol)) return null;
                     if (!tmp.hasFlag(.has_symbol_literal)) {
                         tmp.addFlag(.has_symbol_literal);
-                        try tmp.appendChecked(t);
+                        try tmp.appendChecked(this, t);
                         return null;
                     }
                 }
 
                 if (tmp.contains(t)) return null;
-                tmp.flags |= this.getStructuralFlags(t);
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
             }
         } else if (t >= @intFromEnum(Kind.zero)) {
             if (tmp.hasFlag(.has_number)) return null; // Do not add literal numbers if we have `number`
 
             if (!tmp.hasFlag(.has_number_literal)) {
                 tmp.addFlag(.has_number_literal);
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
 
                 return null;
             }
 
             if (tmp.contains(t)) return null;
-            try tmp.appendChecked(t);
+            try tmp.appendChecked(this, t);
         } else {
             if (t == @intFromEnum(Kind.infer_unknown)) {
-                tmp.has_unknown = true;
+                tmp.has_infer_unknown = true;
             } else if (t == @intFromEnum(Kind.never)) {
                 return null; // no-op
             } else if (t == @intFromEnum(Kind.any) or t == @intFromEnum(Kind.unknown)) {
@@ -9585,25 +9614,25 @@ pub const Analyzer = struct {
                 if (tmp.hasFlag(.has_string)) return null;
                 if (!tmp.hasFlag(.has_string_literal)) {
                     tmp.addFlag(.has_string_literal);
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                     return null;
                 }
 
                 if (tmp.contains(t)) return null;
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
             } else if (t == @intFromEnum(Kind.string)) {
                 if (tmp.hasFlag(.has_string)) return null;
                 tmp.addFlag(.has_string);
 
                 if (!tmp.hasFlag(.has_string_literal)) {
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                     return null;
                 }
 
                 try tmp.filter(this, .string_literal);
                 tmp.removeFlag(.has_string_literal);
 
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
 
                 return null;
             } else if (t == @intFromEnum(Kind.number)) {
@@ -9611,24 +9640,25 @@ pub const Analyzer = struct {
                 tmp.addFlag(.has_number);
 
                 if (!tmp.hasFlag(.has_number_literal)) {
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                     return null;
                 }
 
                 try tmp.filter(this, .number_literal);
                 tmp.removeFlag(.has_number_literal);
 
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
 
                 return null;
             } else if (t == @intFromEnum(Kind.boolean)) {
                 if (tmp.hasFlag(.has_boolean)) return null;
                 tmp.addFlag(.has_boolean);
 
-                if (tmp.elements.items.len > 0) {
-                    var j: usize = tmp.elements.items.len - 1;
+                if (tmp.elements.getCount() > 0) {
+                    const slice = tmp.elements.getSlice();
+                    var j: usize = tmp.elements.getCount() - 1;
                     while (true) {
-                        const el = tmp.elements.items[j];
+                        const el = slice[j];
                         if (el == @intFromEnum(Kind.false) or el == @intFromEnum(Kind.true)) {
                             tmp.removeAt(j);
                         }
@@ -9637,7 +9667,7 @@ pub const Analyzer = struct {
                     }
                 }
 
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
 
                 return null;
             } else if (t == @intFromEnum(Kind.symbol)) {
@@ -9645,14 +9675,14 @@ pub const Analyzer = struct {
                 tmp.addFlag(.has_symbol);
 
                 if (!tmp.hasFlag(.has_symbol_literal)) {
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                     return null;
                 }
 
                 try tmp.filter(this, .symbol_literal);
                 tmp.removeFlag(.has_symbol_literal);
 
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
 
                 return null;
             } else if (t == @intFromEnum(Kind.true) or t == @intFromEnum(Kind.false)) {
@@ -9662,9 +9692,10 @@ pub const Analyzer = struct {
                 const opposite = if (t == @intFromEnum(Kind.true)) @intFromEnum(Kind.false) else @intFromEnum(Kind.true);
 
                 if (tmp.contains(opposite)) {
-                    var j: usize = tmp.elements.items.len - 1;
+                    const slice = tmp.elements.getSlice();
+                    var j: usize = tmp.elements.getCount() - 1;
                     while (true) {
-                        const el = tmp.elements.items[j];
+                        const el = slice[j];
                         if (el == opposite) {
                             tmp.removeAt(j);
                             break;
@@ -9673,21 +9704,21 @@ pub const Analyzer = struct {
                         j -= 1;
                     }
                     tmp.addFlag(.has_boolean);
-                    try tmp.appendChecked(@intFromEnum(Kind.boolean));
+                    try tmp.appendChecked(this, @intFromEnum(Kind.boolean));
                 } else {
-                    try tmp.appendChecked(t);
+                    try tmp.appendChecked(this, t);
                 }            
             } else if (t == @intFromEnum(Kind.undefined)) {
                 if (tmp.hasFlag(.has_undefined)) return null;
                 tmp.addFlag(.has_undefined);
-                try tmp.appendChecked(t);
+                try tmp.appendChecked(this, t);
+            } else if (t == @intFromEnum(Kind.void) or t == @intFromEnum(Kind.null)) {
+                if (tmp.contains(t)) return null;
+                tmp.addFlag(.has_null_or_void);
+                try tmp.appendChecked(this, t);
             } else {
                 if (tmp.contains(t)) return null;
-                try tmp.appendChecked(t);
-
-                if (isTypeParamRef(t)) {
-                    tmp.addFlag(.parameterized);
-                }
+                try tmp.appendChecked(this, t);
             }
         }
 
@@ -9886,6 +9917,7 @@ pub const Analyzer = struct {
                     const flags2: u20 = if (p[0].kind == .construct_signature) @intFromEnum(Flags.constructor) else 0;
 
                     flags |= this.getStructuralFlags(t);
+                    flags |= @intFromEnum(ObjectLiteralFlags.has_call_signature);
 
                     try members.append(.{
                         .kind = .call_signature,
@@ -9900,6 +9932,7 @@ pub const Analyzer = struct {
                     const ty = try this.getType(file, p[0].len);
 
                     if (this.isParameterizedRef(name) or this.isParameterizedRef(ty)) flags |= @intFromEnum(Flags.parameterized);
+                    flags |= @intFromEnum(ObjectLiteralFlags.has_index_signature);
 
                     try members.append(.{
                         .kind = .index,
@@ -10078,7 +10111,7 @@ pub const Analyzer = struct {
         }
 
         const key = h.final();
-        if (this.canonical_types.get(key)) |t| return t;
+        if (this.interned_types.get(key)) |t| return t;
 
         const x: u64 = @intFromPtr(params.ptr);
         const t = try this.types.push(.{
@@ -10090,7 +10123,7 @@ pub const Analyzer = struct {
             .flags = flags,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
         return t;
     }
 
@@ -10120,7 +10153,7 @@ pub const Analyzer = struct {
         h.update(&@as([4]u8, @bitCast(element)));
 
         const key = h.final();
-        if (this.canonical_types.get(key)) |t| return t;
+        if (this.interned_types.get(key)) |t| return t;
         
         const t = try this.types.push(.{
             .kind = @intFromEnum(Kind.array),
@@ -10128,7 +10161,7 @@ pub const Analyzer = struct {
             .flags = flags,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
 
         return t;
     }
@@ -10150,7 +10183,7 @@ pub const Analyzer = struct {
 
     inline fn _createTupleType(this: *@This(), list: *TypeList, comptime can_deinit: bool) !TypeRef {
         const key = this.hashTupleType(list);
-        if (this.canonical_types.get(key)) |t| {
+        if (this.interned_types.get(key)) |t| {
             if (comptime can_deinit) list.deinit(this.allocator());
             return t;
         }
@@ -10159,7 +10192,7 @@ pub const Analyzer = struct {
         try list.writeToType(this.allocator(), &t);
 
         const ref = try this.types.push(t);
-        try this.canonical_types.put(key, ref);
+        try this.interned_types.put(key, ref);
         return ref;
     }
 
@@ -10200,13 +10233,13 @@ pub const Analyzer = struct {
         }
 
         const h = try this.hashObjectLiteral(flags, elements, proto);
-        if (this.canonical_types.get(h)) |c| {
+        if (this.interned_types.get(h)) |c| {
             //tmp.deinit();
             // FIXME: we don't clean-up any of the allocated types
             return c;
         }
         const c = try this._createObjectLiteral(elements, flags, proto);
-        try this.canonical_types.put(h, c);
+        try this.interned_types.put(h, c);
         return c;
     }
 
@@ -10340,13 +10373,13 @@ pub const Analyzer = struct {
         params.params.flags |= this.getStructuralFlags(return_type);
 
         const key = hashFunctionLiteral(&params.params, return_type, params.this_type);
-        if (this.canonical_types.get(key)) |t| {
+        if (this.interned_types.get(key)) |t| {
             params.params.deinit(this.allocator());
             return t;
         }
 
         const t = try this._createFunctionLiteral(&params.params, return_type, params.this_type);
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
 
         return t;
     }
@@ -10408,7 +10441,7 @@ pub const Analyzer = struct {
     fn createUnnamedTupleElement(this: *@This(), ty: TypeRef, flags: u24) !TypeRef {
         const ident_hash = comptime getHashComptime("");
         const key = this.getTupleElementHash(ident_hash, ty, flags);
-        if (this.canonical_types.get(key)) |t| return t;
+        if (this.interned_types.get(key)) |t| return t;
         
         const t = try this.types.push(.{
             .kind = @intFromEnum(Kind.tuple_element),
@@ -10416,14 +10449,14 @@ pub const Analyzer = struct {
             .flags = flags,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
         return t;
     }
 
     fn createNamedTupleTypeFromIdent(this: *@This(), file_id: u32, ident: NodeRef, ty: TypeRef, flags: u24) !TypeRef {
         const ident_hash = this.program.files.items[file_id].binder.nodes.at(ident).extra_data2;
         const key = this.getTupleElementHash(ident_hash, ty, flags);
-        if (this.canonical_types.get(key)) |t| return t;
+        if (this.interned_types.get(key)) |t| return t;
         
         const t = try this.types.push(.{
             .kind = @intFromEnum(Kind.tuple_element),
@@ -10433,18 +10466,18 @@ pub const Analyzer = struct {
             .flags = flags,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
         return t;
     }
 
     fn createAliasNoArgs(this: *@This(), file_id: u32, sym: SymbolRef, flags: u24) !TypeRef {
-        return this.createCanonicalAlias(@constCast(&.{}), file_id, sym, flags);
+        return this.createAlias(@constCast(&.{}), file_id, sym, flags);
     }
 
     // `slot4` can be a global symbol ref, `slot3` will be maxInt(u32) in this case
     // `slot5` caches the immediate substitution
     // `slot6` caches the full evaluation (with )
-    fn createCanonicalAlias(this: *@This(), args: *TypeList, file_id: u32, sym_ref: SymbolRef, flags: u24) !TypeRef {
+    fn createAlias(this: *@This(), args: *TypeList, file_id: u32, sym_ref: SymbolRef, flags: u24) !TypeRef {
         std.debug.assert(sym_ref != 0);
 
         // an alias always has an alias: itself!
@@ -10459,7 +10492,7 @@ pub const Analyzer = struct {
         h.update(&@as([4]u8, @bitCast(sym_ref)));
 
         const hash = h.final();
-        if (this.canonical_types.get(hash)) |t| {
+        if (this.interned_types.get(hash)) |t| {
             args.deinit(this.allocator());
             return t;
         }
@@ -10472,7 +10505,7 @@ pub const Analyzer = struct {
         try args.writeToType(this.allocator(), &t);
 
         const ref = try this.types.push(t);
-        try this.canonical_types.put(hash, ref);
+        try this.interned_types.put(hash, ref);
 
         return ref;
     }
@@ -10593,11 +10626,16 @@ pub const Analyzer = struct {
         var resolved = try std.ArrayList(ObjectLiteralMember).initCapacity(members.allocator, members.items.len);
         errdefer resolved.deinit();
 
+        var obj_flags: u24 = 0;
         for (members.items) |*m| {
-            resolved.appendAssumeCapacity(try m.complete(this));
+            const member = try m.complete(this);
+            if (member.kind == .index) {
+                obj_flags |= @intFromEnum(ObjectLiteralFlags.has_index_signature);
+            }
+            resolved.appendAssumeCapacity(member);
         }
 
-        return try createObjectLiteral(this, resolved.items, 0, 0);
+        return try createObjectLiteral(this, resolved.items, obj_flags, 0);
     }
 
     fn resolveMappedTypeInner(this: *@This(), param: TypeRef, exp: TypeRef, rename: TypeRef, node_flags: u32) !?TypeRef {
@@ -10814,7 +10852,7 @@ pub const Analyzer = struct {
         h.update(&@as([4]u8, @bitCast(slot2)));
 
         const key = h.final();
-        if (this.canonical_types.get(key)) |t| {
+        if (this.interned_types.get(key)) |t| {
             return t;
         }
 
@@ -10826,7 +10864,7 @@ pub const Analyzer = struct {
             .slot3 = string_flags,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
         return t;
     }
 
@@ -10846,7 +10884,7 @@ pub const Analyzer = struct {
         h.update(&@as([4]u8, @bitCast(slot2)));
 
         const key = h.final();
-        if (this.canonical_types.get(key)) |t| {
+        if (this.interned_types.get(key)) |t| {
             if (deinit) {
                 this.allocator().free(text);
             }
@@ -10864,7 +10902,7 @@ pub const Analyzer = struct {
             .slot5 = 1,
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
         return t;
     }
 
@@ -10879,7 +10917,7 @@ pub const Analyzer = struct {
         }
 
         const key = h.final();
-        if (this.canonical_types.get(key)) |t| {
+        if (this.interned_types.get(key)) |t| {
             this.allocator().free(elements);
             return t;
         }
@@ -10893,7 +10931,7 @@ pub const Analyzer = struct {
             .slot2 = @intCast(elements.len),
         });
 
-        try this.canonical_types.put(key, t);
+        try this.interned_types.put(key, t);
 
         return t;
     }
@@ -11152,6 +11190,7 @@ pub const Analyzer = struct {
             did_change: bool = false,
         };
 
+        flags: u24 = 0,
         analyzer: *Analyzer,
         class_type: TypeRef = 0,
         type_params: std.ArrayListUnmanaged(TempTypeParam) = std.ArrayListUnmanaged(TempTypeParam){},
@@ -11187,6 +11226,28 @@ pub const Analyzer = struct {
             }
         }
 
+        inline fn addMember(this: *@This(), m: ObjectLiteralMember) !void {
+            try this.elements.ensureUnusedCapacity(this.analyzer.allocator(), 1);
+            this.addMemberAssumeCapacity(m);
+        }
+
+        inline fn addMembers(this: *@This(), members: []const ObjectLiteralMember) !void {
+            // TODO: validate each addition
+            try this.elements.ensureUnusedCapacity(this.analyzer.allocator(), members.len);
+            for (members) |el| {
+                this.addMemberAssumeCapacity(el);
+            }
+        }
+
+        inline fn addMemberAssumeCapacity(this: *@This(), m: ObjectLiteralMember) void {
+            this.flags |= switch (m.kind) {
+                .index => @intFromEnum(ObjectLiteralFlags.has_index_signature),
+                .call_signature => @intFromEnum(ObjectLiteralFlags.has_call_signature),
+                else => 0,
+            };
+            this.elements.appendAssumeCapacity(m);
+        }
+
         pub fn addType(this: *@This(), type_ref: TypeRef) !void {
             if (type_ref >= @intFromEnum(Kind.false)) {
                 return error.TODO_merge_primitive_decl;
@@ -11195,16 +11256,10 @@ pub const Analyzer = struct {
             const k = this.analyzer.types.at(type_ref);
             switch (k.getKind()) {
                 .object_literal => {
-                    // TODO: validate each addition
-                    const members = getSlice2(k, ObjectLiteralMember);
-                    try this.elements.ensureUnusedCapacity(this.analyzer.allocator(), members.len);
-
-                    for (getSlice2(k, ObjectLiteralMember)) |el| {
-                        this.elements.appendAssumeCapacity(el);
-                    }
+                    try this.addMembers(getSlice2(k, ObjectLiteralMember));
                 },
                 .function_literal => {
-                    try this.elements.append(this.analyzer.allocator(), .{
+                    try this.addMember(.{
                         .kind = .call_signature,
                         .name = 0,
                         .type = type_ref,
@@ -11232,16 +11287,14 @@ pub const Analyzer = struct {
                     const inner = this.analyzer.types.at(inner_ref);
 
                     if (inner.getKind() == .function_literal) {
-                        try this.elements.append(this.analyzer.allocator(), .{
+                        try this.addMember(.{
                             .kind = .call_signature,
                             .name = 0,
                             .type = type_ref,
                         });
                     } else if (inner.getKind() == .object_literal) {
                         try this.addTypeParams(getSlice2(k, TypeRef));
-                        for (getSlice2(inner, ObjectLiteralMember)) |el| {
-                            try this.elements.append(this.analyzer.allocator(), el);
-                        }
+                        try this.addMembers(getSlice2(inner, ObjectLiteralMember));
                     } else if (inner.getKind() == .class) {
                         try this.addTypeParams(getSlice2(k, TypeRef));
                         this.class_type = inner_ref;
@@ -11266,7 +11319,7 @@ pub const Analyzer = struct {
                 defer this.type_params.deinit(this.analyzer.allocator());
 
                 // TODO (perf): micro-optimization: re-use first type param list if no params change
-                const inner = try this.analyzer.createObjectLiteral(this.elements.items, @intFromEnum(Flags.parameterized), 0);
+                const inner = try this.analyzer.createObjectLiteral(this.elements.items, @intFromEnum(Flags.parameterized) | this.flags, 0);
                 const params = try this.analyzer.allocator().alloc(TypeRef, this.type_params.items.len);
                 for (this.type_params.items, 0..) |p, i| {
                     if (!p.did_change) {
@@ -11279,7 +11332,7 @@ pub const Analyzer = struct {
                 return try this.analyzer.createParameterizedType(params, inner);
             }
 
-            return try this.analyzer.createObjectLiteral(this.elements.items, 0, 0);
+            return try this.analyzer.createObjectLiteral(this.elements.items, this.flags, 0);
         }
     };
 
@@ -11434,6 +11487,9 @@ pub const Analyzer = struct {
                     .type = t,
                 };
             }
+
+            list.flags |= @intFromEnum(ObjectLiteralFlags.overloaded_function);
+            list.flags |= @intFromEnum(ObjectLiteralFlags.has_call_signature);
 
             return this.createObjectLiteral(members, list.flags, 0);
         }
@@ -12094,7 +12150,7 @@ pub const Analyzer = struct {
 
                 var args = try this.getTypeArgs(file, d.right);
 
-                return this.createCanonicalAlias(&args, file.id, sym_ref, 0);
+                return this.createAlias(&args, file.id, sym_ref, 0);
             },
             .type_reference => {
                 const d = getPackedData(node);
@@ -12233,7 +12289,7 @@ pub const Analyzer = struct {
                     const span = file.ast.nodes.at(next);
                     const d = getPackedData(span);
                     const exp = try this.getType(file, d.left);
-                    if (this.isParameterizedRef(exp)) flags |= @intFromEnum(Flags.parameterized);
+                    flags |= this.getStructuralFlags(exp);
                     try elements.append(exp);
                     try elements.append(try this.createStringLiteral(file.id, d.right, getSlice(file.ast.nodes.at(d.right), u8), @intFromEnum(StringFlags.single_quote)));
 
@@ -12284,7 +12340,7 @@ pub const Analyzer = struct {
                 return this.createParameterizedType(type_params, inner);
             },
             .function_declaration, .function_expression, .arrow_function => return this.getSignature(file, ref),
-            .conditional_type => return this.createConditionalType(file, ref),
+            .conditional_type => return this.getConditionalType(file, ref),
             else => return this.inferType(file, ref),
         }
 
@@ -12320,6 +12376,9 @@ pub const Analyzer = struct {
                 this.printCurrentNode();
                 return error.SymbolNotInMergedNamespace;
             }
+
+            // FIXME: emit diag
+            if (g.symbols.items.len == 0) return @intFromEnum(Kind.never); 
 
             return try this.tryGetTypeFromNamespace(g.symbols.items[0], hash) orelse return error.SymbolNotInNamespace;
         }
@@ -12383,7 +12442,7 @@ pub const Analyzer = struct {
             var ty: TypeRef = undefined;
 
             if (args_start == 0) {
-                ty = try this.createCanonicalAlias(@constCast(&TypeList{}), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
+                ty = try this.createAlias(@constCast(&TypeList{}), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
             }  else {
                 var args = TypeList{};
                 var iter = NodeIterator.init(&file.ast.nodes, args_start);
@@ -12392,7 +12451,7 @@ pub const Analyzer = struct {
                     try args.append(this, t);
                 }
 
-                ty = try this.createCanonicalAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
+                ty = try this.createAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
             }
 
             return .{
@@ -12427,7 +12486,7 @@ pub const Analyzer = struct {
 
         return .{
             .is_alias = true,
-            .ty = try this.createCanonicalAlias(&args, file.id, s, flags),
+            .ty = try this.createAlias(&args, file.id, s, flags),
         };
     }
 
@@ -12848,16 +12907,25 @@ pub const Analyzer = struct {
                 return t.slot0;
             },
             .object_literal => {
+                if (!ObjectLiteralFlags.hasFlag(t, .has_call_signature)) {
+                    // report error
+                    return error.TODO_missing_construct_signature;
+                }
+
                 // TODO: multiple construct signatures
                 for (getSlice2(t, ObjectLiteralMember)) |*m| {
                     if (m.kind == .call_signature) {
-                        const f = this.types.at(try m.getType(this));
-                        if (hasTypeFlag(f, .constructor)) {
+                        const ref = try m.getType(this);
+                        const f = this.types.at(ref);
+                        if (f.hasFlag(.constructor)) {
                             return f.slot3;
+                        }
+                        // FIXME: probably not correct
+                        if (this.getKindOfRef(ref) == .parameterized and this.types.at(f.slot1).hasFlag(.constructor)) {
+                            return f.slot1;
                         }
                     }
                 }
-
                 return error.TODO_missing_construct_signature;
             },
             else => {},
@@ -12878,7 +12946,7 @@ pub const Analyzer = struct {
     fn getGlobalType(this: *@This(), comptime name: []const u8, args: TypeList) !?TypeRef {
         const g_ref = this.program.ambient.getGlobalTypeSymbolRef(name) orelse return null;
 
-        return try this.createCanonicalAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
+        return try this.createAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
     }
 
     // Prefer `getGlobalType` for types aligned with what user code sees
@@ -12890,13 +12958,13 @@ pub const Analyzer = struct {
                 return try this.createAliasNoArgs(abs_ref.file_id, abs_ref.ref, 0);
             }
 
-            return try this.createCanonicalAlias(@constCast(&args), abs_ref.file_id, abs_ref.ref, 0);
+            return try this.createAlias(@constCast(&args), abs_ref.file_id, abs_ref.ref, 0);
         }
 
         const g_ref = this.program.ambient.getGlobalTypeSymbolRef(name) orelse return null;
 
         if (args.count > 0) {
-            return try this.createCanonicalAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
+            return try this.createAlias(@constCast(&args), std.math.maxInt(u32), g_ref, @intFromEnum(Flags.global));
         } 
 
         return try this.getTypeOfGlobalSymbol(g_ref);
@@ -13432,7 +13500,7 @@ pub const Analyzer = struct {
                         .shorthand_property_assignment => {
                             const ident = unwrapRef(n);
                             const t = try this.getType(file, ident);
-                            if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                            flags |= this.getStructuralFlags(t);
                             try elements.append(this.allocator(), .{
                                 .kind = .property,
                                 .name = try this.propertyNameToType(file, ident),
@@ -13444,7 +13512,7 @@ pub const Analyzer = struct {
                             const name = file.ast.nodes.at(d.left);
                             if (name.kind == .identifier or name.kind == .string_literal) {
                                 const t = try this.getType(file, d.right);
-                                if (this.isParameterizedRef(t)) flags |= @intFromEnum(Flags.parameterized);
+                                flags |= this.getStructuralFlags(t);
                                 try elements.append(this.allocator(), .{
                                     .kind = .property,
                                     .name = try this.propertyNameToType(file, d.left),
@@ -13466,10 +13534,13 @@ pub const Analyzer = struct {
 
                                     switch (@as(Kind, @enumFromInt(t))) {
                                         .string, .number, .symbol => {
+                                            const v = try this.getType(file, d.right);
+                                            flags |= @intFromEnum(ObjectLiteralFlags.has_index_signature);
+                                            flags |= this.getStructuralFlags(t);
                                             try elements.append(this.allocator(), .{
                                                 .kind = .index,
                                                 .name = t,
-                                                .type = try this.getType(file, d.right),
+                                                .type = v,
                                                 .flags = n.flags,
                                             });
                                             continue;
@@ -13514,6 +13585,7 @@ pub const Analyzer = struct {
                             // TODO: these should override preceding members
                             // except in the case where an added field is optional
                             for (getSlice2(type_node, ObjectLiteralMember)) |el| {
+                                // FIXME: propagate flags
                                 if (el.kind == .call_signature or el.kind == .method or el.kind == .setter) continue;
                                 if (el.kind == .getter) {
                                     try elements.append(this.allocator(), .{
@@ -13563,6 +13635,7 @@ pub const Analyzer = struct {
                         },
                         .method_declaration => {
                             const t = try this.getSignature(file, pair[1]);
+                            flags |= this.getStructuralFlags(t);
                             try elements.append(this.allocator(), .{
                                 .kind = .method,
                                 .name = try this.propertyNameToType(file, (getPackedData(n)).left),
@@ -13640,6 +13713,8 @@ pub const Analyzer = struct {
                         }
                     };
 
+                    flags |= this.getStructuralFlags(t);
+
                     try elements.append(this.allocator(), .{
                         .kind = .property,
                         .name = s.name,
@@ -13648,7 +13723,7 @@ pub const Analyzer = struct {
                 }
 
                 const obj_hash = try this.hashObjectLiteral(flags, elements.items, 0);
-                if (this.canonical_types.get(obj_hash)) |t| {
+                if (this.interned_types.get(obj_hash)) |t| {
                     elements.deinit(this.allocator());
                     return t;
                 }
@@ -13664,7 +13739,7 @@ pub const Analyzer = struct {
                     .slot2 = @intCast(elements.items.len),
                 });
 
-                try this.canonical_types.put(obj_hash, t);
+                try this.interned_types.put(obj_hash, t);
 
                 return t;
             },
@@ -13696,6 +13771,7 @@ pub const Analyzer = struct {
 
                 return this.types.at(t).slot3;
             },
+            .reify_expression => return @intFromEnum(Kind.never), // FIXME: impl this
             else => {},
         }
 
@@ -13768,7 +13844,7 @@ pub const Analyzer = struct {
     pub inline fn getSlice2(t: *const Type, comptime T: type) []T {
         if (T == TypeRef) {
             switch (t.getKind()) {
-                .alias, .query, .tuple, .function_literal => return TypeList.getSliceFromType(t),
+                .alias, .query, .tuple, .function_literal, .@"union" => return TypeList.getSliceFromType(t),
                 else => {},
             }
         }

@@ -46,11 +46,12 @@ const o = {}
 const bag = {
   a: 1
 }
+bag["b"] = 2;
 {
   const a = b
   const b = 1
 }
-consoe;
+consoe.log("hi");
 let id = 1
 let id = 2
 function parse(x) {

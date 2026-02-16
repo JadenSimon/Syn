@@ -1,10 +1,10 @@
-// @filename: main.ts
-
+// @filename: main.syn
+Object.defineProperty(exports, "__esModule", { value: true });
 function stringy(t) {
   const r = {}
   for (const [k, v] of Object.entries(t)) {
     r[k] = (() => {
-      switch (type.tag(v)) {
+      switch (Type.kind(v)) {
         case 'literal': 
           return String(v)
         case 'object': 
