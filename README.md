@@ -14,8 +14,6 @@ You'll need [Synapse](https://github.com/Cohesible/synapse?tab=readme-ov-file#in
 4. Run `synapse install && synapse compile --no-synth && synapse build` to create `dist/bin/synapse`, which can parse and execute `.syn` files.
 
 ## Differences from TypeScript
-* Intersection types `T & U` with objects behave like the runtime spread syntax (flat merge)
-    - Use `Intersect<T, U>` for true type intersection 
 * Conditional types only distribute unions over `infer`:
     - `A extends any ? [A] : never` does _not_ distribute
     - `A extends infer U ? [U] : never` does distribute

@@ -370,6 +370,9 @@ pub const SyntaxKind = enum(u10) {
     reify_keyword = 698,
     reify_expression = 699,
     defer_statement = 700,
+    update_keyword = 701,
+    keyword_unary_expression = 702,
+
 
     // Used to stitch multiple ASTs together
     // Node contains a pointer to `AstData` and the start node
@@ -1856,21 +1859,26 @@ fn Parser_(comptime skip_trivia: bool) type {
             }
             if (this.lexer.token == .t_identifier) {
                 const ident = this.lexer.identifier;
+                try this.lexer.next();
 
-                // Syn does not allow JSX components with individual capital letters
-                if (ident.len == 1 and this.options.is_syn) {
+                if (this.options.is_syn and this.lexer.token == .t_greater_than and ident.len == 1) {
                     switch (ident[0]) {
-                        'A'...'Z' => return true,
+                        'A'...'Z' => {
+                            // Syn treats <[A-Z]>( as an arrow fn so long as the open paren is on the same line
+                            try this.lexer.next();
+                            return this.lexer.token == .t_open_paren and !this.lexer.has_newline_before;
+                        },
                         else => {},
                     }
+                    // TODO: use a bit more look ahead so `<Result>(x: Result) => {}` is also parsed as arrow fn
+                    return false;
                 }
 
-                try this.lexer.next();
                 if (this.lexer.token == .t_comma or this.lexer.token == .t_equals) {
                     return true;
                 } else if (this.lexer.token == .t_extends) {
                     try this.lexer.next();
-                    return this.lexer.token != .t_equals and this.lexer.token != .t_greater_than;
+                    return this.lexer.token != .t_equals and this.lexer.token != .t_greater_than and this.lexer.token != .t_slash;
                 }
             }
 
@@ -2765,6 +2773,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 if (comptime is_type) return false;
                 if (level == .lowest) return true;
 
+                // FIXME: this is wrong if we're inside `when_true` of a conditional:
+                //    (a ? (b) : d => e)
+
                 // TODO: it's possible to skip this check in many cases w/ additional parse state
                 // this check is only needed in "bare" when_true expressions
 
@@ -3048,6 +3059,17 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
+        fn parseKeywordUnaryExpression(this: *@This(), comptime kind: SyntaxKind) !AstNode_ {
+            try this.lexer.next();
+            const exp = try this.parseExpressionWithLevel(.prefix);
+
+            return .{
+                .kind = .keyword_unary_expression,
+                .data = @ptrFromInt(try this.pushNode(exp)),
+                .len = @intFromEnum(kind),
+            };
+        }
+
         fn parsePrefixUnaryExpression(this: *@This()) !AstNode_ {
             const operator: SyntaxKind = switch (this.lexer.token) {
                 .t_plus_plus => .plus_plus_token,
@@ -3169,6 +3191,10 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parseJSXChildren(this: *@This()) !NodeList_ {
+            const old_ctx = this.context_state;
+            defer this.context_state = old_ctx;
+            this.context_state = .jsx_children;
+
             var children = NodeList_.init(this);
             while (true) {
                 if (this.lexer.token == .t_less_than) {
@@ -3190,13 +3216,30 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
 
                 if (this.lexer.token == .t_open_brace) {
+                    this.context_state = .none;
+                    defer this.context_state = .jsx_children;
                     // FIXME: handle empty expression
-                    try this.lexer.nextInsideJSXElement();
+                    try this.lexer.next();
+                    var is_spread = false;
+                    if (this.lexer.token == .t_dot_dot_dot) {
+                        is_spread = true;
+                        try this.lexer.next();
+                    }
                     const exp = try this.parseExpression();
-                    try children.append(.{
-                        .kind = .jsx_expression,
-                        .data = @ptrFromInt(exp),
-                    });
+                    if (is_spread) {
+                        try children.append(.{
+                            .kind = .jsx_expression,
+                            .data = @ptrFromInt(try this.pushNode(.{
+                                .kind = .spread_element,
+                                .data = @ptrFromInt(exp),
+                            })),
+                        });
+                    } else {
+                        try children.append(.{
+                            .kind = .jsx_expression,
+                            .data = @ptrFromInt(exp),
+                        });
+                    }
                     try this.lexer.expectJSXElementChild(.t_close_brace);
                     continue;
                 }
@@ -3223,7 +3266,11 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         // Assumes `<` has already been parsed
         fn parseJSXElement(this: *@This()) anyerror!AstNode_ {
-            const openingTag = try this.parseExpressionWithLevel(.compare);
+            const old_ctx = this.context_state;
+            this.context_state = .none;
+            const openingTag = try this.parseExpressionWithLevel(.member);
+            this.context_state = old_ctx;
+
             const tag = try this.pushNode(openingTag);
 
             var scan_attributes = true;
@@ -3240,7 +3287,11 @@ fn Parser_(comptime skip_trivia: bool) type {
             while (scan_attributes) {
                 if (this.lexer.token == .t_slash) {
                     try this.lexer.nextInsideJSXElement();
-                    try this.lexer.expect(.t_greater_than);
+                    if (this.context_state == .jsx_children) {
+                        try this.lexer.expectJSXElementChild(.t_greater_than);
+                    } else {
+                        try this.expect(.t_greater_than);
+                    }
                     self_closing = true;
                     break;
                 }
@@ -3252,6 +3303,9 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 // spread attribute
                 if (this.lexer.token == .t_open_brace) {
+                    const ctx = this.context_state;
+                    defer this.context_state = ctx;
+                    this.context_state = .none;
                     try this.lexer.next();
                     try this.lexer.expect(.t_dot_dot_dot);
                     const exp = try this.parseExpression();
@@ -3271,6 +3325,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 if (this.lexer.token == .t_equals) {
                     try this.lexer.nextInsideJSXElement();
                     if (this.lexer.token == .t_open_brace) {
+                        const ctx = this.context_state;
+                        defer this.context_state = ctx;
+                        this.context_state = .none;
                         try this.lexer.next();
                         const exp = try this.parseExpression();
                         value = try this.pushNode(.{
@@ -3316,9 +3373,15 @@ fn Parser_(comptime skip_trivia: bool) type {
             });
 
             var children = try this.parseJSXChildren();
-            const exp = try this.parseExpressionWithLevel(.compare);
+            this.context_state = .none;
+            const exp = try this.parseExpressionWithLevel(.member);
+            this.context_state = old_ctx;
             const closing = try this.pushNode(exp);
-            try this.lexer.expect(.t_greater_than);
+            if (this.context_state == .jsx_children) {
+                try this.lexer.expectJSXElementChild(.t_greater_than);
+            } else {
+                try this.expect(.t_greater_than);
+            }
 
             try children.append(.{
                 .kind = .jsx_closing_element,
@@ -3578,10 +3641,6 @@ fn Parser_(comptime skip_trivia: bool) type {
                 },
                 .t_less_than => {
                     return this.parseArrowFnOrJSX();
-                },
-                .t_debugger => {
-                    try this.lexer.next();
-                    return .{ .kind = .debugger_keyword };
                 },
                 else => {
                     try this.lexer.next();
@@ -5835,34 +5894,41 @@ fn Parser_(comptime skip_trivia: bool) type {
                             .t_declare => {
                                 try this.lexer.next();
 
-                                // This is allowed but I'm not sure what it does
-                                if (this.lexer.isContextualKeyword("type")) {
+                                const DeclareKeywords = enum {
+                                    // This is allowed but I'm not sure what it does
+                                    t_type,
+                                    t_namespace,
+                                    t_module,
+                                    t_global,
+
+                                    const List = ComptimeStringMap(@This(), .{
+                                        .{ "type", .t_type },
+                                        .{ "namespace", .t_namespace },
+                                        .{ "module", .t_module },
+                                        .{ "global", .t_global },
+                                    });
+                                };
+
+                                if (DeclareKeywords.List.get(this.lexer.identifier)) |t| {
                                     try this.lexer.next();
-
-                                    return this.parseTypeAliasDecl();
-                                }
-
-                                if (this.lexer.isContextualKeyword("namespace")) {
-                                    try this.lexer.next();
-
-                                    return this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .namespace);
-                                }
-
-                                if (this.lexer.isContextualKeyword("module")) {
-                                    try this.lexer.next();
-
-                                    return this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .none);
-                                }
-
-                                if (this.lexer.isContextualKeyword("global")) {
-                                    try this.lexer.next();
-
-                                    return this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .global);
+                                    
+                                    return switch (t) {
+                                        .t_type => this.parseTypeAliasDecl(),
+                                        .t_namespace => this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .namespace),
+                                        .t_module => this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .none),
+                                        .t_global => this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .global),
+                                    };
                                 }
 
                                 return this.parseLocalDeclaration(full_start, @intFromEnum(NodeFlags.declare));
                             },
                             .t_defer => return this.parseDeferStatement(),
+                            .t_update => return .{
+                                .kind = .expression_statement,
+                                .data = @ptrFromInt(
+                                    try this.pushNode(try this.parseKeywordUnaryExpression(.update_keyword))
+                                ),
+                            }
                         }
                     }
 
@@ -5997,6 +6063,14 @@ fn Parser_(comptime skip_trivia: bool) type {
                     return .{
                         .kind = .with_statement,
                         .data = toBinaryDataPtrRefs(exp, statement),
+                    };
+                },
+                .t_debugger => {
+                    try this.lexer.next();
+                    try this.maybeEatSemi();
+                    return .{
+                        .kind = .expression_statement,
+                        .data = @ptrFromInt(try this.pushNode(.{ .kind = .debugger_keyword })),
                     };
                 },
                 else => return this.parseExpressionStatement(),
@@ -6179,8 +6253,12 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef {
+    pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef { // val: usize | 64 | i64 | i32 | u32
         const d: u64 = switch (@TypeOf(val)) {
+            comptime_int => {
+                // FIXME: why does bitcast not work here?
+                @compileError("Use @as(i64, <v>) for the argument");
+            },
             f64 => @bitCast(val),
             i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
             else => @compileError("Unhandled type"),
@@ -6227,9 +6305,12 @@ pub const Factory = struct {
         });
     }
 
+    // Converts []const u8 into string nodes
+    // NodeRef is used verbatim, otherwise tries to convert to numeric literal
+    // arg: (comptime_int | usize | f64) | Utf8String | NodeRef
     pub fn createElementAccessExpression(this: *@This(), subject: NodeRef, arg: anytype) !NodeRef {
         const right = switch (@TypeOf(arg)) {
-            NodeRef => arg,
+            NodeRef => this.assertNotNil(arg),
             []const u8 => try this.createStringLiteral(arg),
             f64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
@@ -6272,23 +6353,27 @@ pub const Factory = struct {
         }
     }
 
+    fn isAnonymousNodeListStruct(comptime T: type) bool {
+        switch (@typeInfo(T)) {
+            .Struct => |s| {
+                if (!s.is_tuple) return false;
+
+                inline for (s.fields) |f| {
+                    if (f.type != u32) return false;
+                }
+
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     fn isAnonymousNodeList(comptime T: type) bool {
         switch (@typeInfo(T)) {
             .Pointer => |p| {
-                if (!p.is_const or p.size != .One) return false;
+                if (p.size != .One) return false;
 
-                switch (@typeInfo(p.child)) {
-                    .Struct => |s| {
-                        if (!s.is_tuple) return false;
-
-                        inline for (s.fields) |f| {
-                            if (f.type != u32) return false;
-                        }
-
-                        return true;
-                    },
-                    else => return false,
-                }
+                return isAnonymousNodeListStruct(p.child);
             },
             else => return false,
         }
@@ -6297,8 +6382,12 @@ pub const Factory = struct {
     fn maybeCreateList(this: *@This(), arg: anytype) !NodeRef {
         return switch (@TypeOf(arg)) {
             comptime_int, NodeRef => arg,
-            []const NodeRef => this.createList(arg),
+            []const NodeRef, []NodeRef => this.createList(arg),
+            @TypeOf(.{}), @TypeOf(&.{}) => 0,
             else => {
+                if (comptime isAnonymousNodeListStruct(@TypeOf(arg))) {
+                    return this.createList(&arg);
+                }
                 if (comptime isAnonymousNodeList(@TypeOf(arg))) {
                     return this.createList(arg);
                 }
@@ -6313,7 +6402,7 @@ pub const Factory = struct {
         return switch (@TypeOf(arg)) {
             comptime_int => arg, // TODO: assert 0?
             NodeRef => this.assertKind(arg, .block),
-            []const NodeRef => this.createBlock(arg),
+            []const NodeRef, []NodeRef => this.createBlock(arg),
             else => {
                 if (comptime isAnonymousNodeList(@TypeOf(arg))) {
                     return this.createBlock(arg);
@@ -6325,14 +6414,14 @@ pub const Factory = struct {
         };
     }
 
-    pub fn createCallExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef {
+    pub fn createCallExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef { // args: NodeRef | []const NodeRef
         return this.nodes.push(.{
             .kind = .call_expression,
             .data = toBinaryDataPtrRefs(expression, try this.maybeCreateList(args)),
         });
     }
 
-    pub fn createNewExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef {
+    pub fn createNewExpression(this: *@This(), expression: NodeRef, args: anytype) !NodeRef { // args: NodeRef | []const NodeRef
         return this.nodes.push(.{
             .kind = .new_expression,
             .data = toBinaryDataPtrRefs(expression, try this.maybeCreateList(args)),
@@ -6397,17 +6486,19 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createArrayLiteralExpression(this: *@This(), elements: NodeRef) !NodeRef {
+    pub fn createArrayLiteralExpression(this: *@This(), elements: anytype) !NodeRef { // elements: NodeRef | []const NodeRef
+        const l = try this.maybeCreateList(elements);
         return this.nodes.push(.{
             .kind = .array_literal_expression,
-            .data = @ptrFromInt(elements),
+            .data = if (l == 0) null else @ptrFromInt(elements),
         });
     }
 
-    pub fn createObjectLiteralExpression(this: *@This(), properties: NodeRef) !NodeRef {
+    pub fn createObjectLiteralExpression(this: *@This(), properties: NodeRef) !NodeRef { // properties: NodeRef | []const NodeRef
+        const l = try this.maybeCreateList(properties);
         return this.nodes.push(.{
             .kind = .object_literal_expression,
-            .data = @ptrFromInt(properties),
+            .data = if (l == 0) null else @ptrFromInt(properties),
         });
     }
 
@@ -6426,7 +6517,7 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createBlock(this: *@This(), statements: anytype) !NodeRef {
+    pub fn createBlock(this: *@This(), statements: anytype) !NodeRef { // statements: NodeRef | []const NodeRef
         return this.nodes.push(.{
             .kind = .block,
             .data = @ptrFromInt(try this.maybeCreateList(statements)),
@@ -6482,7 +6573,7 @@ pub const Factory = struct {
         return this.createVariableDeclaration(name, 0, initializer);
     }
 
-    pub fn createCatchClause(this: *@This(), binding: anytype, statements: anytype) !NodeRef {
+    pub fn createCatchClause(this: *@This(), binding: anytype, statements: anytype) !NodeRef { // statements: NodeRef(.block) | []const NodeRef
         const left = switch (@TypeOf(binding)) {
             NodeRef => this.assertKind(binding, .variable_declaration),
             else => @compileError("Unhandled type"),
@@ -6496,6 +6587,8 @@ pub const Factory = struct {
         });
     }
 
+    // statements: NodeRef(.block) | []const NodeRef
+    // finally_block: NodeRef(.block) | []const NodeRef
     pub fn createTryStatement(this: *@This(), statements: anytype, catch_clause: NodeRef, finally_block: anytype) !NodeRef {
         return this.nodes.push(.{
             .kind = .try_statement,
@@ -6515,6 +6608,8 @@ pub const Factory = struct {
         });
     }
 
+    // params: NodeRef | []const NodeRef
+    // body: NodeRef(.block) | []const NodeRef
     pub fn createFunctionDeclaration(this: *@This(), name: NodeRef, params: anytype, body: anytype) !NodeRef {
         return this.nodes.push(.{
             .kind = .function_declaration,
@@ -6534,6 +6629,13 @@ pub const Factory = struct {
         return this.nodes.push(.{
             .kind = .shorthand_property_assignment,
             .data = @ptrFromInt(name),
+        });
+    }
+
+    pub fn createSpreadAssignment(this: *@This(), expression: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .spread_assignment,
+            .data = @ptrFromInt(expression),
         });
     }
 
@@ -6585,7 +6687,12 @@ pub const Factory = struct {
         });
     }
 
-    inline fn assertKind(this: *@This(), ref: NodeRef, kind: SyntaxKind) NodeRef {
+    inline fn assertNotNil(_: *const @This(), ref: NodeRef) NodeRef {
+        std.debug.assert(ref != 0);
+        return ref;
+    }
+
+    inline fn assertKind(this: *const @This(), ref: NodeRef, kind: SyntaxKind) NodeRef {
         std.debug.assert(this.nodes.at(ref).kind == kind);
         return ref;
     }
@@ -7228,7 +7335,7 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .minus_minus_token => "--",
         .asterisk_asterisk_token => "**",
         .asterisk_equals_token => "*=",
-        .minus_equals_token => "-=",
+        .slash_equals_token => "/=",
         .asterisk_asterisk_equals_token => "**=",
         .exclamation_equals_token => "!=",
         .equals_equals_equals_token => "===",
@@ -7241,8 +7348,14 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .ampersand_ampersand_equals_token => "&&=",
         .equals_equals_token => "==",
         .plus_equals_token => "+=",
+        .minus_equals_token => "-=",
+        .bar_equals_token => "|=",
+        .ampersand_equals_token => "&=",
+        .caret_equals_token => "^=",
+        .percent_equals_token => "%=",
         .slash_token => "/",
         .greater_than_greater_than_token => ">>",
+        .caret_token => "^",
         .ampersand_token => "&",
         .bar_token => "|",
         .greater_than_equals_token => ">=",
@@ -7358,6 +7471,19 @@ pub fn forEachChild(
             if (maybeUnwrapRef(node)) |ref| {
                 try visitor.visit(nodes.at(ref), ref);
             }
+        },
+        .for_statement => {
+            const d = getPackedData(node);
+            if (d.left != 0) {
+                try visitor.visit(nodes.at(d.left), d.left);
+            }
+            if (d.right != 0) {
+                try visitor.visit(nodes.at(d.right), d.right);
+            }
+            if (node.len != 0) {
+                try visitor.visit(nodes.at(node.len), node.len);
+            }
+            try visitor.visit(nodes.at(node.extra_data), node.extra_data);
         },
         .function_declaration, .function_expression => {
             const d = getPackedData(node);
@@ -7558,7 +7684,43 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(node.len), node.len);
             }
         },
-        else => {},
+        .jsx_element, .jsx_fragment => {
+            try visitList(nodes, maybeUnwrapRef(node) orelse 0, visitor);
+        },
+        .jsx_self_closing_element, .jsx_opening_element => {
+            const d = getPackedData(node);
+            // d.left = tag, d.right = attributes
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
+        .jsx_attributes => {
+            try visitList(nodes, unwrapRef(node), visitor);
+        },
+        .jsx_attribute => {
+            const d = getPackedData(node);
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
+        .jsx_expression, .jsx_spread_attribute => {
+            const r = unwrapRef(node);
+            try visitor.visit(nodes.at(r), r);
+        },
+        .jsx_closing_element, .jsx_text, .jsx_text_all_white_spaces => {},
+        .arrow_function => {
+            const d = getPackedData(node);
+            if (node.hasFlag(.let)) {
+                try visitor.visit(nodes.at(d.left), d.left); // single param
+                try visitor.visit(nodes.at(d.right), d.right); // body
+            } else {
+                try visitList(nodes, node.extra_data, visitor); // type params
+                try visitList(nodes, d.left, visitor); // params
+                if (node.len != 0) {
+                    try visitor.visit(nodes.at(node.len), node.len); // return type
+                }
+                try visitor.visit(nodes.at(d.right), d.right); // body
+            }
+        },
+        else => {
+            // std.debug.print("{}\n",.{node.kind});
+        },
     };
 }
 

@@ -581,6 +581,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         performance,
         Buffer,
         JSON,
+        exports: {},
     }, {
         origin: fileName,
     })

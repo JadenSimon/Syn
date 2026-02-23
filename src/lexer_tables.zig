@@ -102,7 +102,7 @@ pub const T = enum(u8) {
     t_class,
     t_const,
     t_continue,
-    t_debugger,
+    t_debugger, // TODO: let's not treat this as a keyword, only contextual keyword when parsing statements?
     t_default,
     t_delete,
     t_do,
@@ -245,6 +245,7 @@ pub const ExtraKeyword = enum {
     t_using,
     t_module,
     t_abstract, // abstract class
+    t_update,
 
     pub const List = ComptimeStringMap(ExtraKeyword, .{
         .{ "defer", .t_defer },
@@ -254,6 +255,7 @@ pub const ExtraKeyword = enum {
         .{ "using", .t_using }, // FIXME: remove this
         .{ "module", .t_module },
         .{ "abstract", .t_abstract },
+        .{ "update", .t_update },
     });
 };
 
