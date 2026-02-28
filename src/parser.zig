@@ -979,7 +979,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         const ParserType = @This();
         const NodeList_ = struct {
             head: NodeRef = 0,
-            prev: NodeRef = 0,
+            prev: NodeRef = undefined,
 
             parser: *ParserType,
 
@@ -998,7 +998,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             }
 
             pub inline fn appendRef(this: *@This(), ref: NodeRef) void {
-                if (this.prev != 0) {
+                if (this.head != 0) {
                     this.parser.node_allocator.at(this.prev).next = ref;
                 } else {
                     this.head = ref;
@@ -3245,7 +3245,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
 
                 if (this.lexer.token == .t_string_literal) {
-                    try children.append(try this.parseJSXText());
+                    var txt = try this.parseJSXText();
+                    if (children.head != 0) txt.flags |= @intFromEnum(NodeFlags.generator); // used during emit
+                    try children.append(txt);
                 } else {
                     std.debug.print("{any}", .{this.lexer.token});
                     return error.ParserError;
@@ -6289,7 +6291,7 @@ pub const Factory = struct {
     pub fn createPropertyAccessExpression(this: *@This(), subject: NodeRef, member: anytype) !NodeRef {
         const right = switch (@TypeOf(member)) {
             NodeRef => member,
-            []const u8 => try this.createIdentifier(member),
+            []const u8, [:0]const u8 => try this.createIdentifier(member),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(member))) {
                     break :blk try this.createIdentifier(member);
@@ -6311,7 +6313,7 @@ pub const Factory = struct {
     pub fn createElementAccessExpression(this: *@This(), subject: NodeRef, arg: anytype) !NodeRef {
         const right = switch (@TypeOf(arg)) {
             NodeRef => this.assertNotNil(arg),
-            []const u8 => try this.createStringLiteral(arg),
+            []const u8, [:0]const u8 => try this.createStringLiteral(arg),
             f64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(arg))) {
@@ -6490,7 +6492,7 @@ pub const Factory = struct {
         const l = try this.maybeCreateList(elements);
         return this.nodes.push(.{
             .kind = .array_literal_expression,
-            .data = if (l == 0) null else @ptrFromInt(elements),
+            .data = if (l == 0) null else @ptrFromInt(l),
         });
     }
 
@@ -6498,7 +6500,7 @@ pub const Factory = struct {
         const l = try this.maybeCreateList(properties);
         return this.nodes.push(.{
             .kind = .object_literal_expression,
-            .data = if (l == 0) null else @ptrFromInt(properties),
+            .data = if (l == 0) null else @ptrFromInt(l),
         });
     }
 
@@ -7484,6 +7486,12 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(node.len), node.len);
             }
             try visitor.visit(nodes.at(node.extra_data), node.extra_data);
+        },
+        .for_of_statement => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left);
+            try visitor.visit(nodes.at(d.right), d.right);
+            try visitor.visit(nodes.at(node.len), node.len);
         },
         .function_declaration, .function_expression => {
             const d = getPackedData(node);
