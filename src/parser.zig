@@ -372,7 +372,7 @@ pub const SyntaxKind = enum(u10) {
     defer_statement = 700,
     update_keyword = 701,
     keyword_unary_expression = 702,
-
+    jsx_if_directive = 703,
 
     // Used to stitch multiple ASTs together
     // Node contains a pointer to `AstData` and the start node
@@ -3204,14 +3204,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         break;
                     }
 
-                    // Must be tag or fragment
-                    if (this.lexer.token == .t_greater_than) {
-                        try this.lexer.nextInsideJSXElement();
-                        try children.append(try this.parseJSXElement());
-                        continue;
-                    }
-
-                    try children.append(try this.parseJSXElement());
+                    try children.append(try this.parseJSXContainer());
                     continue;
                 }
 
@@ -3246,7 +3239,8 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 if (this.lexer.token == .t_string_literal) {
                     var txt = try this.parseJSXText();
-                    if (children.head != 0) txt.flags |= @intFromEnum(NodeFlags.generator); // used during emit
+                    if (children.head != 0) 
+                        txt.flags |= @intFromEnum(NodeFlags.generator); // used during emit
                     try children.append(txt);
                 } else {
                     std.debug.print("{any}", .{this.lexer.token});
@@ -3283,6 +3277,11 @@ fn Parser_(comptime skip_trivia: bool) type {
                 typeArguments = r[1];
             }
 
+            // TODO:
+            // we want to track JSX text that shares the same line as the `>` token
+            // `<span> foo </span>` should preserve whitespace because it's all on one line
+            // var open_start_line: u32 = 0;
+
             var self_closing = false;
             var attributes = NodeList_.init(this);
 
@@ -3299,16 +3298,40 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
 
                 if (this.lexer.token == .t_greater_than) {
+                    // open_start_line = this.lexer.line_map.count;
                     try this.lexer.nextJSXElementChild();
                     break;
                 }
 
-                // spread attribute
+                // spread or shorthand attribute
                 if (this.lexer.token == .t_open_brace) {
                     const ctx = this.context_state;
                     defer this.context_state = ctx;
                     this.context_state = .none;
                     try this.lexer.next();
+                    if (this.options.is_syn and this.lexer.token == .t_identifier) {
+                        // TODO: report "did you forget '...'" or similar if we don't parse out an identifier
+                        const n = try this.parseIdentifierNode();
+                        const exp_node = try this.parseRemainingExpression(.lowest, n);
+                        if (exp_node.kind == .identifier) {
+                            const name = try this.pushNode(exp_node);
+                            const jsx_exp = try this.pushNode(.{
+                                .kind = .jsx_expression,
+                                .data = @ptrFromInt(try this.pushNode(exp_node)),
+                            });
+                            try attributes.append(.{
+                                .kind = .jsx_attribute,
+                                .data = toBinaryDataPtrRefs(name, jsx_exp),
+                            });
+                        }
+                        try this.lexer.expectInsideJSXElement(.t_close_brace);
+                        continue;
+                    }
+                    if (this.lexer.token == .t_close_brace) {
+                        // empty JSX expression, skip it
+                        try this.lexer.expectInsideJSXElement(.t_close_brace);
+                        continue;
+                    }
                     try this.lexer.expect(.t_dot_dot_dot);
                     const exp = try this.parseExpression();
                     try attributes.append(.{
@@ -3408,11 +3431,45 @@ fn Parser_(comptime skip_trivia: bool) type {
             };
         }
 
-        fn parseJSXElementOrFragment(this: *@This()) !AstNode_ {
+        fn parseJSXDirective(this: *@This()) anyerror!AstNode_ {
+            if (strings.eql(this.lexer.identifier, "#if")) {
+                try this.lexer.nextInsideJSXElement();
+                var cond: NodeRef = 0;
+                if (this.lexer.token == .t_open_brace) {
+                    const old_ctx = this.context_state;
+                    this.context_state = .none;
+                    try this.lexer.next();
+                    cond = try this.parseExpression();
+                    this.context_state = old_ctx;
+                    try this.lexer.expectInsideJSXElement(.t_close_brace);
+                }
+
+                try this.lexer.expectJSXElementChild(.t_greater_than);
+                const children = try this.parseJSXChildren();
+                if (this.context_state == .jsx_children) {
+                    try this.lexer.expectJSXElementChild(.t_greater_than);
+                } else {
+                    try this.expect(.t_greater_than);
+                }
+
+                return .{
+                    .kind = .jsx_if_directive,
+                    .data = toBinaryDataPtrRefs(cond, children.head),
+                };
+            }
+            return error.TODO;
+        }
+
+        fn parseJSXContainer(this: *@This()) !AstNode_ {
+            // assumes `<` has been parsed
             if (this.lexer.token == .t_greater_than) {
                 try this.lexer.nextJSXElementChild();
 
                 return this.parseJSXFragment();
+            }
+
+            if (this.options.is_syn and this.lexer.token == .t_private_identifier) {
+                return this.parseJSXDirective();
             }
 
             return this.parseJSXElement();
@@ -3426,13 +3483,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             try this.lexer.expect(.t_less_than);
 
-            if (this.lexer.token == .t_greater_than) {
-                try this.lexer.nextJSXElementChild();
-
-                return this.parseJSXFragment();
-            }
-
-            return this.parseJSXElement();
+            return this.parseJSXContainer();
         }
 
         fn parseRemainingImportExpression(this: *@This()) !AstNode_ {
@@ -5107,6 +5158,12 @@ fn Parser_(comptime skip_trivia: bool) type {
                 return this.finishForOfStatement(try this.pushNode(statement), is_async);
             }
 
+            if (this.options.is_syn) {
+                // we don't support `for` init expressions in Syn, so parse as a binding inside `for..of`
+                const statement = try this.parseVariableStatement(@intFromEnum(NodeFlags.@"const"));
+                return this.finishForOfStatement(try this.pushNode(statement), is_async);
+            }
+
             const exp = try this.parseExpressionWithLevel(.lowest);
             if (this.lexer.token == .t_semicolon) {
                 return this.finishForStatement(try this.pushNode(exp));
@@ -6255,6 +6312,14 @@ pub const Factory = struct {
         });
     }
 
+    pub fn createNoSubstitutionTemplateLiteralAllocated(this: *@This(), text: []const u8) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .no_substitution_template_literal,
+            .data = text.ptr,
+            .len = @intCast(text.len),
+        });
+    }
+
     pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef { // val: usize | 64 | i64 | i32 | u32
         const d: u64 = switch (@TypeOf(val)) {
             comptime_int => {
@@ -6496,7 +6561,7 @@ pub const Factory = struct {
         });
     }
 
-    pub fn createObjectLiteralExpression(this: *@This(), properties: NodeRef) !NodeRef { // properties: NodeRef | []const NodeRef
+    pub fn createObjectLiteralExpression(this: *@This(), properties: anytype) !NodeRef { // properties: NodeRef | []const NodeRef
         const l = try this.maybeCreateList(properties);
         return this.nodes.push(.{
             .kind = .object_literal_expression,
@@ -6555,10 +6620,17 @@ pub const Factory = struct {
         });
     }
 
+    pub fn createWhileStatement(this: *@This(), condition: NodeRef, body: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .while_statement,
+            .data = toBinaryDataPtrRefs(condition, body),
+        });
+    }
+
     pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u22) !NodeRef {
         return this.nodes.push(.{
             .kind = .variable_statement,
-            .data = @ptrFromInt(declarations),
+            .data = @ptrFromInt(this.assertNotNil(declarations)),
             .flags = flags,
         });
     }
@@ -7712,6 +7784,11 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(r), r);
         },
         .jsx_closing_element, .jsx_text, .jsx_text_all_white_spaces => {},
+        .jsx_if_directive => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left); // condition
+            try visitList(nodes, d.right, visitor); // children
+        },
         .arrow_function => {
             const d = getPackedData(node);
             if (node.hasFlag(.let)) {
@@ -8933,6 +9010,10 @@ pub const Binder = struct {
                     try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                 }
 
+                const has_params = d.right != 0;
+                if (has_params) try this.pushScope();
+                defer if (has_params) this.popScope();
+
                 try this.pushTypeScope();
                 defer this.popTypeScope();
 
@@ -8940,7 +9021,7 @@ pub const Binder = struct {
                 defer this.type_ordinals = prev_ordinals;
 
                 try this.visitTypeParams(node.extra_data);
-                try this.visitParams(d.right);
+                if (has_params) try this.visitParams(d.right);
 
                 try this.visitType(node.len); // return_type
             },

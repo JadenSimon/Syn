@@ -2162,6 +2162,18 @@ fn NewLexer_(
                         lexer.step();
                         try lexer.parseJSXStringLiteral('"');
                     },
+                    '#' => {
+                        // for directives
+                        lexer.step();
+                        if (!isIdentifierStart(lexer.code_point)) {
+                            try lexer.syntaxError();
+                        }
+                        lexer.step();
+                        while (isIdentifierContinue(lexer.code_point)) lexer.step();
+                        lexer.identifier = lexer.raw();
+                        lexer.token = T.t_private_identifier;
+                        break;
+                    },
                     else => {
                         if (isWhitespace(lexer.code_point)) {
                             lexer.step();
