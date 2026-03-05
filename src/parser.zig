@@ -6503,6 +6503,12 @@ pub const Factory = struct {
         });
     }
 
+    pub fn createAssignmentStatement(this: *@This(), left: NodeRef, right: NodeRef) !NodeRef {
+        return try this.createExpressionStatement(
+            try this.createBinaryExpression(left, .equals_token, right)
+        );
+    } 
+
     pub fn createPrefixUnaryExpression(this: *@This(), operator: SyntaxKind, operand: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .prefix_unary_expression,
@@ -6645,6 +6651,16 @@ pub const Factory = struct {
 
     pub fn createVariableDeclarationSimple(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
         return this.createVariableDeclaration(name, 0, initializer);
+    }
+
+    pub fn createConstVariable(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.createVariableStatement(
+            try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.@"const"));
+    }
+
+    pub fn createLetVariable(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
+        return this.createVariableStatement(
+            try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.let));
     }
 
     pub fn createCatchClause(this: *@This(), binding: anytype, statements: anytype) !NodeRef { // statements: NodeRef(.block) | []const NodeRef
@@ -9801,6 +9817,14 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
         .element_access_expression, .binary_expression,
         .property_access_expression, .call_expression, .qualified_name,
         .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
+            const d = getPackedData(n);
+            return getLoc(nodes, nodes.at(d.left));
+        },
+        .prefix_unary_expression => {
+            const d = getPackedData(n);
+            return getLoc(nodes, nodes.at(d.right));
+        },
+        .postfix_unary_expression => {
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.left));
         },

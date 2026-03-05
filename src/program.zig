@@ -1038,7 +1038,6 @@ pub const Program = struct {
             is_async_ctx: bool = true, // we start in a module
             should_use_parens: bool = false,
             as_type_node: ?*const AstNode = null,
-            use_syn_components: bool = true,
 
             type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
 
@@ -1896,6 +1895,7 @@ pub const Program = struct {
                     .arrow_function, .function_expression => {
                         return false;
                     },
+                    // template_expression
                     // class expressions are treated as effectively declarations, much like fn expressions
                     // so, static blocks + static field initializers run in source order. 
                     // We never thunk class expressions, even if they contain effectful static blocks.
@@ -2018,102 +2018,6 @@ pub const Program = struct {
                 return self.factory.createArrowFunction(0, inner, 0);
             }
 
-            const SplitProps = struct {
-                static_props: NodeRef = 0,
-                dynamic_props: NodeRef = 0,
-            };
-
-            fn createSynComponentCall(self: *@This(), tag_ref: NodeRef, split: SplitProps, collected: ?*CollectedChildren) !NodeRef {
-                const syn_fn = try self.factory.createIdentifier("__synComponent");
-                const s = if (split.static_props != 0) split.static_props else try self.factory.createNull();
-                const d = if (split.dynamic_props != 0) split.dynamic_props else try self.factory.createNull();
-                if (collected) |c| {
-                    const children_arr = try self.createChildrenArray(c.items.items);
-                    if (children_arr != 0) {
-                        const children_or_null = children_arr;
-                        if (c.spread_indices.items.len > 0) {
-                            const spread_arr = try self.createSpreadIndicesArray(c.spread_indices.items);
-                            return self.factory.createCallExpression(syn_fn, &.{ tag_ref, s, d, children_or_null, spread_arr });
-                        }
-                        return self.factory.createCallExpression(syn_fn, &.{ tag_ref, s, d, children_or_null });
-                    }
-                }
-                return self.factory.createCallExpression(syn_fn, &.{ tag_ref, s, d });
-            }
-
-            fn transformJsxAttributes(self: *@This(), attrs_ref: NodeRef) !SplitProps {
-                if (attrs_ref == 0) return .{};
-
-                const attrs = self.nodes.at(attrs_ref);
-                if (attrs.kind != .jsx_attributes) return .{};
-
-                var static_props = parser.NodeList.init(self.nodes);
-                var dynamic_props = parser.NodeList.init(self.nodes);
-
-                var iter = NodeIterator.init(self.nodes, unwrapRef(attrs));
-                while (iter.next()) |attr| {
-                    switch (attr.kind) {
-                        .jsx_attribute => {
-                            const ad = getPackedData(attr);
-                            const name_ref = ad.left;
-                            const value_ref = ad.right;
-
-                            if (value_ref == 0) {
-                                // <input disabled> → disabled: true
-                                const true_val = try self.factory.createTrue();
-                                const prop = try self.factory.createPropertyAssignment(name_ref, true_val);
-                                static_props.appendRef(prop);
-                            } else {
-                                const val = self.nodes.at(value_ref);
-                                const is_expr = val.kind == .jsx_expression;
-                                const inner = if (is_expr) unwrapRef(val) else value_ref;
-
-                                if (self.use_syn_components and is_expr) {
-                                    const thunked = try self.maybeCreateThunk(inner);
-                                    if (thunked != inner) {
-                                        const prop = try self.factory.createPropertyAssignment(name_ref, thunked);
-                                        dynamic_props.appendRef(prop);
-                                    } else {
-                                        const prop = try self.factory.createPropertyAssignment(name_ref, inner);
-                                        static_props.appendRef(prop);
-                                    }
-                                } else {
-                                    const prop = try self.factory.createPropertyAssignment(name_ref, inner);
-                                    static_props.appendRef(prop);
-                                }
-                            }
-                        },
-                        .jsx_spread_attribute => {
-                            const expr_ref = unwrapRef(attr);
-                            const spread = try self.factory.createSpreadAssignment(expr_ref);
-                            static_props.appendRef(spread);
-                        },
-                        else => {},
-                    }
-                }
-
-                return .{
-                    .static_props = if (static_props.head != 0) try self.factory.createObjectLiteralExpression(static_props.head) else 0,
-                    .dynamic_props = if (dynamic_props.head != 0) try self.factory.createObjectLiteralExpression(dynamic_props.head) else 0,
-                };
-            }
-
-            const CollectedChildren = struct {
-                items: std.ArrayList(NodeRef),
-                spread_indices: std.ArrayList(u32),
-
-                fn deinit(cc: *CollectedChildren) void {
-                    cc.items.deinit();
-                    cc.spread_indices.deinit();
-                }
-            };
-
-            const TemplateStructResult = struct {
-                ref: NodeRef,
-                has_dynamic: bool = false,
-                num_immediate_updaters: u32 = 0,
-            };
-
             fn trimJsxText(self: *const @This(), child: *const AstNode) []const u8 {
                 const values_to_strip = " \t\n\r";
                 const text = getSlice(child, u8);
@@ -2138,78 +2042,6 @@ pub const Program = struct {
                     return try self.factory.createStringLiteral(trimmed);
                 }
                 return null;
-            }
-
-            fn collectJsxChildren(self: *@This(), head: NodeRef) !CollectedChildren {
-                var children = std.ArrayList(NodeRef).init(getAllocator());
-                var spread_indices = std.ArrayList(u32).init(getAllocator());
-                var iter = NodeIterator.init(self.nodes, head);
-                while (iter.next()) |child| {
-                    switch (child.kind) {
-                        .jsx_opening_element, .jsx_closing_element => continue,
-                        .jsx_text => {
-                            if (try self.jsxTextToString(child)) |trimmed| {
-                                try children.append(trimmed);
-                            }
-                        },
-                        .jsx_text_all_white_spaces => continue,
-                        .jsx_expression => {
-                            const inner_ref = unwrapRef(child);
-                            const inner_node = self.nodes.at(inner_ref);
-                            if (inner_node.kind == .spread_element) {
-                                const spread_expr = unwrapRef(inner_node);
-                                try spread_indices.append(@intCast(children.items.len));
-                                if (self.use_syn_components) {
-                                    const thunk = try self.maybeCreateThunk(spread_expr);
-                                    try children.append(thunk);
-                                } else {
-                                    try children.append(spread_expr);
-                                }
-                            } else if (self.use_syn_components) {
-                                const thunk = try self.maybeCreateThunk(inner_ref);
-                                try children.append(thunk);
-                            } else {
-                                try children.append(inner_ref);
-                            }
-                        },
-                        .jsx_element, .jsx_self_closing_element, .jsx_fragment => {
-                            try children.append(try self.transformJsxNode(child));
-                        },
-                        else => {},
-                    }
-                }
-                return .{ .items = children, .spread_indices = spread_indices };
-            }
-
-            fn createChildrenArray(self: *@This(), children_items: []const NodeRef) !NodeRef {
-                if (children_items.len == 0) return 0;
-                var list = parser.NodeList.init(self.nodes);
-                for (children_items) |c| list.appendRef(c);
-                return self.factory.createArrayLiteralExpression(list.head);
-            }
-
-            fn createSpreadIndicesArray(self: *@This(), indices: []const u32) !NodeRef {
-                if (indices.len == 0) return 0;
-                var list = parser.NodeList.init(self.nodes);
-                for (indices) |idx| {
-                    const num = try self.factory.createNumericLiteral(@as(i32, @intCast(idx)));
-                    list.appendRef(num);
-                }
-                return self.factory.createArrayLiteralExpression(list.head);
-            }
-
-            fn createIntrinsicCall(self: *@This(), tag_str: NodeRef, split: SplitProps, collected: *CollectedChildren) !NodeRef {
-                const h_fn = try self.factory.createIdentifier("__h");
-                const s = if (split.static_props != 0) split.static_props else try self.factory.createNull();
-                const d = if (split.dynamic_props != 0) split.dynamic_props else try self.factory.createNull();
-                const children_arr = try self.createChildrenArray(collected.items.items);
-                const children_or_null = if (children_arr != 0) children_arr else try self.factory.createNull();
-
-                if (collected.spread_indices.items.len > 0) {
-                    const spread_arr = try self.createSpreadIndicesArray(collected.spread_indices.items);
-                    return self.factory.createCallExpression(h_fn, &.{ tag_str, s, d, children_or_null, spread_arr });
-                }
-                return self.factory.createCallExpression(h_fn, &.{ tag_str, s, d, children_or_null });
             }
 
             fn templateIsVoidElement(_: *@This(), tag: []const u8) bool {
@@ -2238,48 +2070,6 @@ pub const Program = struct {
                     },
                     else => 0,
                 };
-            }
-
-            fn templateCountElements(self: *@This(), node: *const AstNode) ?u32 {
-                return self._templateCount(node, true);
-            }
-
-            fn _templateCount(self: *@This(), node: *const AstNode, comptime is_root: bool) ?u32 {
-                switch (node.kind) {
-                    .jsx_self_closing_element => {
-                        const d = getPackedData(node);
-                        if (is_root and !self.isIntrinsicTag(d.left)) return null;
-                        if (self.templateHasSpreadAttr(d.right)) return null;
-                        return 1;
-                    },
-                    .jsx_element => {
-                        const opening_ref = maybeUnwrapRef(node) orelse return null;
-                        const opening = self.nodes.at(opening_ref);
-                        const od = getPackedData(opening);
-                        const is_intrinsic = self.isIntrinsicTag(od.left);
-                        if (is_root and !is_intrinsic) return null;
-                        if (self.templateHasSpreadAttr(od.right)) return null;
-                        if (!is_intrinsic) return 1;
-                        var total: u32 = 1;
-                        var iter = NodeIterator.init(self.nodes, opening_ref);
-                        while (iter.next()) |child| {
-                            switch (child.kind) {
-                                .jsx_opening_element, .jsx_closing_element, .jsx_text, .jsx_text_all_white_spaces => {},
-                                .jsx_expression => {
-                                    const inner = self.nodes.at(unwrapRef(child));
-                                    if (inner.kind == .spread_element) return null;
-                                },
-                                .jsx_element, .jsx_self_closing_element => {
-                                    total += self._templateCount(child, false) orelse return null;
-                                },
-                                .jsx_fragment => return null,
-                                else => {},
-                            }
-                        }
-                        return total;
-                    },
-                    else => return null,
-                }
             }
 
             fn templateWriteHtmlChildren(self: *@This(), opening_ref: NodeRef, out: *std.ArrayList(u8)) anyerror!void {
@@ -2417,280 +2207,6 @@ pub const Program = struct {
                 }
             }
 
-            const AttrTag = enum(u8) {
-                static = 0,
-                computed = 1,
-                thunk = 2,
-
-                spread_computed = (1 << 7) + 1, 
-                spread_thunk = (1 << 7) + 2,
-            };
-
-            fn templateBuildAttrsStruct(self: *@This(), attrs_ref: NodeRef, exps: *parser.NodeList) !TemplateStructResult {
-                const zero = try self.factory.createNumericLiteral(@as(i64, 0));
-                if (attrs_ref == 0) return .{ .ref = zero };
-                const attrs = self.nodes.at(attrs_ref);
-                if (attrs.kind != .jsx_attributes) return .{ .ref = zero };
-
-                var list = parser.NodeList.init(self.nodes);
-                var has_dynamic = false;
-                var iter = NodeIterator.init(self.nodes, unwrapRef(attrs));
-                while (iter.next()) |attr| {
-                    if (attr.kind != .jsx_attribute) continue;
-                    const ad = getPackedData(attr);
-                    if (ad.right == 0) continue; // boolean attr — static, already in HTML
-                    const val = self.nodes.at(ad.right);
-                    if (val.kind != .jsx_expression) continue; // string literal — static, in HTML
-                    const inner_ref = unwrapRef(val);
-                    const result = try self.maybeCreateThunk(inner_ref);
-                    const tag: AttrTag = if (result != inner_ref) .thunk else .computed;
-                    list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(tag))));
-                    const key_str = try self.factory.createStringLiteral(getSlice(self.nodes.at(ad.left), u8));
-                    list.appendRef(key_str);
-                    exps.appendRef(result); // value goes into exps, not inline
-                    has_dynamic = true;
-                }
-
-                if (!has_dynamic) return .{ .ref = zero };
-                const arr = try self.factory.createArrayLiteralExpression(list.head);
-                return .{ .ref = arr, .has_dynamic = true };
-            }
-
-            fn templateBuildComponentAttrs(self: *@This(), attrs_ref: NodeRef, exps: *parser.NodeList) !TemplateStructResult {
-                const zero = try self.factory.createNumericLiteral(@as(i64, 0));
-                if (attrs_ref == 0) return .{ .ref = zero };
-                const attrs = self.nodes.at(attrs_ref);
-                if (attrs.kind != .jsx_attributes) return .{ .ref = zero };
-
-                var list = parser.NodeList.init(self.nodes);
-                var has_any = false;
-                var has_dynamic = false;
-                var iter = NodeIterator.init(self.nodes, unwrapRef(attrs));
-                while (iter.next()) |attr| {
-                    if (attr.kind != .jsx_attribute) continue;
-                    const ad = getPackedData(attr);
-                    const key_str = try self.factory.createStringLiteral(getSlice(self.nodes.at(ad.left), u8));
-                    if (ad.right == 0) {
-                        // boolean attr e.g. `<Foo bar />`
-                        list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(AttrTag.static))));
-                        list.appendRef(key_str);
-                        list.appendRef(try self.factory.createTrue());
-                    } else {
-                        const val = self.nodes.at(ad.right);
-                        if (val.kind == .jsx_expression) {
-                            const inner_ref = unwrapRef(val);
-                            const result = try self.maybeCreateThunk(inner_ref);
-                            const tag: AttrTag = if (result != inner_ref) .thunk else .computed;
-                            list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(tag))));
-                            list.appendRef(key_str);
-                            exps.appendRef(result); // value in exps
-                            if (tag == .thunk) has_dynamic = true;
-                        } else {
-                            // static string literal (string_literal or jsx_text)
-                            std.debug.assert(val.kind == .string_literal or val.kind == .jsx_text or val.kind == .jsx_text_all_white_spaces);
-                            const lit = try self.factory.createStringLiteral(getSlice(val, u8));
-                            list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(AttrTag.static))));
-                            list.appendRef(key_str);
-                            list.appendRef(lit);
-                        }
-                    }
-                    has_any = true;
-                }
-
-                if (!has_any) return .{ .ref = zero };
-                const arr = try self.factory.createArrayLiteralExpression(list.head);
-                return .{ .ref = arr, .has_dynamic = has_dynamic };
-            }
-
-            fn templateBuildFreshDescriptor(self: *@This(), node: *const AstNode, exps: *parser.NodeList) anyerror!TemplateStructResult {
-                switch (node.kind) {
-                    .jsx_self_closing_element => {
-                        const d = getPackedData(node);
-                        const attrs = try self.templateBuildComponentAttrs(d.right, exps);
-                        var list = parser.NodeList.init(self.nodes);
-                        list.appendRef(attrs.ref);
-                        const arr = try self.factory.createArrayLiteralExpression(list.head);
-                        return .{ .ref = arr, .has_dynamic = attrs.has_dynamic };
-                    },
-                    .jsx_element => {
-                        const opening_ref = maybeUnwrapRef(node) orelse return error.InvalidJsx;
-                        const opening = self.nodes.at(opening_ref);
-                        const od = getPackedData(opening);
-                        const attrs = try self.templateBuildComponentAttrs(od.right, exps);
-                        var has_dynamic = attrs.has_dynamic;
-
-                        var list = parser.NodeList.init(self.nodes);
-                        list.appendRef(attrs.ref);
-
-                        var iter = NodeIterator.init(self.nodes, opening_ref);
-                        while (iter.next()) |child| {
-                            switch (child.kind) {
-                                .jsx_opening_element, .jsx_closing_element, .jsx_text_all_white_spaces => {},
-                                .jsx_text => {
-                                    // Static text: tag=0, value in static descriptor
-                                    if (try self.jsxTextToString(child)) |trimmed| {
-                                        list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(ChildTag.static))));
-                                        list.appendRef(trimmed);
-                                    }
-                                },
-                                .jsx_expression => {
-                                    const inner_ref = unwrapRef(child);
-                                    const inner_node = self.nodes.at(inner_ref);
-                                    if (inner_node.kind == .spread_element) {
-                                        const spread_inner_ref = unwrapRef(inner_node);
-                                        const result = try self.maybeCreateThunk(spread_inner_ref);
-                                        const base_tag: i64 = if (result != spread_inner_ref) @intFromEnum(ChildTag.thunk) else @intFromEnum(ChildTag.computed);
-                                        list.appendRef(try self.factory.createNumericLiteral(0x80 | base_tag));
-                                        exps.appendRef(result);
-                                        has_dynamic = true;
-                                    } else {
-                                        const result = try self.maybeCreateThunk(inner_ref);
-                                        const tag: ChildTag = if (result != inner_ref) .thunk else .computed;
-                                        list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(tag))));
-                                        exps.appendRef(result); // value in exps
-                                        if (tag == .thunk) has_dynamic = true;
-                                    }
-                                },
-                                .jsx_element, .jsx_self_closing_element => {
-                                    const child_tag_ref = self.getJsxTagRef(child);
-                                    if (self.isIntrinsicTag(child_tag_ref)) {
-                                        const tagname = try self.factory.createStringLiteral(getSlice(self.nodes.at(child_tag_ref), u8));
-                                        const sub = try self.templateBuildFreshDescriptor(child, exps);
-                                        list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(ChildTag.descriptor_with_tagname))));
-                                        list.appendRef(tagname);
-                                        list.appendRef(sub.ref);
-                                        if (sub.has_dynamic) has_dynamic = true;
-                                    } else {
-                                        exps.appendRef(child_tag_ref);
-                                        const sub = try self.templateBuildFreshDescriptor(child, exps);
-                                        list.appendRef(try self.factory.createNumericLiteral(@as(i64, @intFromEnum(ChildTag.descriptor_with_component))));
-                                        list.appendRef(sub.ref);
-                                        has_dynamic = true;
-                                    }
-                                },
-                                .jsx_fragment => {
-                                },
-                                else => {},
-                            }
-                        }
-
-                        const arr = try self.factory.createArrayLiteralExpression(list.head);
-                        return .{ .ref = arr, .has_dynamic = has_dynamic };
-                    },
-                    else => return error.InvalidJsx,
-                }
-            }
-
-            // tags 0/1/2 are guaranteed to not have updaters
-            // tag 4 always has an updater
-            const ChildTag = enum(u8) {
-                // for templated descriptors, this is a noop, otherwise check the static descriptor for the value
-                static = 0,
-                computed = 1,
-                thunk = 2,
-                descriptor = 3,
-                descriptor_with_component = 4, // component is emitted into `exps` array
-                descriptor_with_tagname = 5, // tag is emitted into static descriptor
-                descriptor_with_template = 6, // string is emitted into static descriptor
-
-                spread_computed = (1 << 7) + 1,
-                spread_thunk = (1 << 7) + 2,
-            };
-
-            const TaggedChild = struct { tag: ChildTag, ref: NodeRef };
-
-            fn templateBuildStructure(self: *@This(), node: *const AstNode, exps: *parser.NodeList) anyerror!TemplateStructResult {
-                switch (node.kind) {
-                    .jsx_self_closing_element => {
-                        const d = getPackedData(node);
-                        const attrs = try self.templateBuildAttrsStruct(d.right, exps);
-                        var list = parser.NodeList.init(self.nodes);
-                        list.appendRef(attrs.ref);
-                        const arr = try self.factory.createArrayLiteralExpression(list.head);
-                        return .{ .ref = arr, .has_dynamic = attrs.has_dynamic };
-                    },
-                    .jsx_element => {
-                        const opening_ref = maybeUnwrapRef(node) orelse return error.InvalidJsx;
-                        const opening = self.nodes.at(opening_ref);
-                        const od = getPackedData(opening);
-                        const attrs = try self.templateBuildAttrsStruct(od.right, exps);
-
-                        // Collect tagged children. Static text is skipped (it's in the HTML).
-                        // Dynamic values (computed/thunk) are pushed to exps immediately during
-                        // collection so exps order matches descriptor traversal order.
-                        var child_results = std.ArrayList(TaggedChild).init(getAllocator());
-                        defer child_results.deinit();
-
-                        var iter = NodeIterator.init(self.nodes, opening_ref);
-                        while (iter.next()) |child| {
-                            switch (child.kind) {
-                                .jsx_opening_element, .jsx_closing_element, .jsx_text, .jsx_text_all_white_spaces => {},
-                                .jsx_expression => {
-                                    const inner_ref = unwrapRef(child);
-                                    const result = try self.maybeCreateThunk(inner_ref);
-                                    const tag: ChildTag = if (result != inner_ref) .thunk else .computed;
-                                    exps.appendRef(result); // value goes into exps, not inline
-                                    try child_results.append(.{ .tag = tag, .ref = 0 });
-                                },
-                                .jsx_element, .jsx_self_closing_element => {
-                                    const child_tag_ref = self.getJsxTagRef(child);
-                                    if (self.isIntrinsicTag(child_tag_ref)) {
-                                        const sub = try self.templateBuildStructure(child, exps);
-                                        if (sub.has_dynamic) {
-                                            try child_results.append(.{ .tag = .descriptor, .ref = sub.ref });
-                                        } else {
-                                            try child_results.append(.{ .tag = .static, .ref = 0 });
-                                        }
-                                    } else {
-                                        // Component child: comp fn goes into exps first (runtime
-                                        // pulls it before entering the sub-descriptor).
-                                        exps.appendRef(child_tag_ref);
-                                        const desc = try self.templateBuildFreshDescriptor(child, exps);
-                                        try child_results.append(.{ .tag = .descriptor_with_component, .ref = desc.ref });
-                                    }
-                                },
-                                else => {},
-                            }
-                        }
-
-                        var last_dynamic: ?usize = null;
-                        for (child_results.items, 0..) |tc, i| {
-                            if (tc.tag != .static) last_dynamic = i;
-                        }
-
-                        // IMPORTANT: include at least 1 trailing 0 in the very specific case
-                        // where there's a single slot prefixing text. This is because we want
-                        // to guarantee that seeing exactly a single 1/2 tag means there is only
-                        // 1 child.
-                        //
-                        //    `<div>{x}foo</div>` - include a trailing 0
-                        //
-                        if (last_dynamic == 0 and child_results.items.len > 1) {
-                            last_dynamic = last_dynamic.? + 1;
-                        }
-
-                        const has_dynamic = attrs.has_dynamic or last_dynamic != null;
-                        var list = parser.NodeList.init(self.nodes);
-                        list.appendRef(attrs.ref);
-                        if (last_dynamic) |ld| {
-                            for (child_results.items[0 .. ld + 1]) |tc| {
-                                const tag_ref = try self.factory.createNumericLiteral(@as(i64, @intFromEnum(tc.tag)));
-                                list.appendRef(tag_ref);
-                                // Only descriptor tags carry an inline sub-descriptor in static.
-                                // Computed/thunk values are already in exps; static is a noop.
-                                switch (tc.tag) {
-                                    .descriptor, .descriptor_with_component => list.appendRef(tc.ref),
-                                    else => {},
-                                }
-                            }
-                        }
-                        const arr = try self.factory.createArrayLiteralExpression(list.head);
-                        return .{ .ref = arr, .has_dynamic = has_dynamic };
-                    },
-                    else => return error.InvalidJsx,
-                }
-            }
-
             const inline_emit = true;
 
             const InlineEmitState = struct {
@@ -2703,6 +2219,7 @@ pub const Program = struct {
                 counter: u32 = 0,
                 ctx: Ctx = .templated,
                 stmts: std.ArrayList(NodeRef),
+                hoist_stmts: ?*std.ArrayList(NodeRef) = null,
 
                 fn nextName(s: *@This()) ![]const u8 {
                     const name = try std.fmt.allocPrint(getAllocator(), "_v{d}", .{s.counter});
@@ -2714,27 +2231,13 @@ pub const Program = struct {
                 }
             };
 
-            fn createSynIntrinsicCall(self: *@This(), n: *const AstNode, tag_ref: NodeRef) !NodeRef {
-                const tagname_str = try self.factory.createStringLiteral(getSlice(self.nodes.at(tag_ref), u8));
-                const document_id = try self.factory.createIdentifier("document");
-                const create_el = try self.factory.createPropertyAccessExpression(document_id, "createElement");
-                const el_call = try self.factory.createCallExpression(create_el, tagname_str);
-
-                var exps_list = parser.NodeList.init(self.nodes);
-                const desc = try self.templateBuildFreshDescriptor(n, &exps_list);
-                const exps_arr = try self.factory.createArrayLiteralExpression(exps_list.head);
-                const s_fn = try self.factory.createIdentifier("__s");
-                return self.factory.createCallExpression(s_fn, &.{ el_call, desc.ref, exps_arr });
-            }
-
             fn inlineEmitSymbolUpdateFull(
                 self: *@This(),
                 state: *InlineEmitState,
                 el_name: []const u8,
                 own_ops: []const NodeRef,
-                child_fwds: []const []const u8,
             ) !bool {
-                if (own_ops.len == 0 and child_fwds.len == 0) return state.ctx == .component;
+                if (own_ops.len == 0) return state.ctx == .component;
                 const lhs = blk: {
                     if (state.ctx == .component) {
                         break :blk try self.factory.createPropertyAccessExpression(
@@ -2745,28 +2248,13 @@ pub const Program = struct {
                     break :blk try self.factory.createElementAccessExpression(
                         try self.factory.createIdentifier(el_name), sym);
                 };
-                if (own_ops.len == 0 and child_fwds.len == 1) {
-                    const child_sym = try self.factory.createPropertyAccessExpression(
-                        try self.factory.createIdentifier("Symbol"), "update");
-                    var rhs = try self.factory.createElementAccessExpression(
-                        try self.factory.createIdentifier(child_fwds[0]), child_sym);
-                    // TODO: `.bind` is only needed if the child is a component
-                    rhs = try self.factory.createCallExpression(
-                        try self.factory.createPropertyAccessExpression(rhs, "bind"), 
-                        &.{ try self.factory.createIdentifier(child_fwds[0]) }
-                    );
-                    const assign = try self.factory.createBinaryExpression(lhs, .equals_token, rhs);
-                    try state.addStmt(try self.factory.createExpressionStatement(assign));
-                } else {
-                    var body_stmts = std.ArrayList(NodeRef).init(getAllocator());
-                    defer body_stmts.deinit();
-                    for (own_ops) |s| try body_stmts.append(s);
-                    for (child_fwds) |name| try body_stmts.append(try self.inlineCallSymbolUpdate(name));
-                    const body_block = try self.factory.createBlock(body_stmts.items);
-                    const arrow = try self.factory.createArrowFunction(0, body_block, 0);
-                    const assign = try self.factory.createBinaryExpression(lhs, .equals_token, arrow);
-                    try state.addStmt(try self.factory.createExpressionStatement(assign));
-                }
+                var body_stmts = std.ArrayList(NodeRef).init(getAllocator());
+                defer body_stmts.deinit();
+                for (own_ops) |s| try body_stmts.append(s);
+                const body_block = try self.factory.createBlock(body_stmts.items);
+                const arrow = try self.factory.createArrowFunction(0, body_block, 0);
+                const assign = try self.factory.createBinaryExpression(lhs, .equals_token, arrow);
+                try state.addStmt(try self.factory.createExpressionStatement(assign));
                 return true;
             }
 
@@ -2853,9 +2341,8 @@ pub const Program = struct {
                         const tmp_id = try self.factory.createIdentifier(try state.nextName());
                         const decl = try self.factory.createVariableDeclarationSimple(tmp_id, 0);
                         try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.let)));
-                        var s = try self.factory.createCallExpression(set_fn, &.{ el_id, tmp_id, inner_ref, is_comp });
-                        s = try self.factory.createBinaryExpression(tmp_id, .equals_token, s);
-                        try upd_body.append(try self.factory.createExpressionStatement(s));
+                        const s = try self.factory.createCallExpression(set_fn, &.{ el_id, tmp_id, inner_ref, is_comp });
+                        try upd_body.append(try self.factory.createAssignmentStatement(tmp_id, s));
                         continue;
                     }
 
@@ -2978,13 +2465,56 @@ pub const Program = struct {
                 }
             }
 
+            // we consider nodes with exactly 1 computed child to be "empty"
+            fn jsxEmptyIntrinsicTag(self: *@This(), n: *const AstNode) ?[]const u8 {
+                switch (n.kind) {
+                    .jsx_self_closing_element => {
+                        const d = getPackedData(n);
+                        if (d.right != 0) return null;
+                        return getSlice(self.nodes.at(d.left), u8);
+                    },
+                    .jsx_element => {
+                        const opening_ref = maybeUnwrapRef(n) orelse return null;
+                        const opening = self.nodes.at(opening_ref);
+                        const od = getPackedData(opening);
+                        if (od.right != 0) return null;
+                        var iter = NodeIterator.init(self.nodes, opening_ref);
+                        var has_computed = false;
+                        while (iter.next()) |child| {
+                            switch (child.kind) {
+                                .jsx_opening_element, .jsx_closing_element, .jsx_text_all_white_spaces => {},
+                                .jsx_text => { if (self.trimJsxText(child).len > 0) return null; },
+                                .jsx_expression => {
+                                    if (has_computed) return null;
+                                    has_computed = true;
+                                },
+                                else => return null,
+                            }
+                        }
+                        return getSlice(self.nodes.at(od.left), u8);
+                    },
+                    else => return null,
+                }
+            }
+
             fn createHtmlTemplate(self: *@This(), n: *const AstNode) !NodeRef {
+                // empty intrinsic -> document.createElement('tag')
+                if (self.jsxEmptyIntrinsicTag(n)) |tag| {
+                    const document_id = try self.factory.createIdentifier("document");
+                    const create_el = try self.factory.createPropertyAccessExpression(document_id, "createElement");
+                    return self.factory.createCallExpression(create_el, try self.factory.createStringLiteral(tag));
+                }
+
                 var html = std.ArrayList(u8).init(getAllocator());
                 defer html.deinit();
                 try self.templateWriteHtml(n, &html);
-                
-                // handle empty template
-                if (html.items.len == 0) try html.appendSlice("<!>");
+
+                // empty -> document.createComment('')
+                if (html.items.len == 0) {
+                    const document_id = try self.factory.createIdentifier("document");
+                    const create_comment = try self.factory.createPropertyAccessExpression(document_id, "createComment");
+                    return self.factory.createCallExpression(create_comment, try self.factory.createStringLiteral(""));
+                }
 
                 const html_duped = try getAllocator().dupe(u8, html.items);
                 const html_ref = try self.factory.createNoSubstitutionTemplateLiteralAllocated(html_duped);
@@ -3061,6 +2591,21 @@ pub const Program = struct {
                 std.debug.assert(node.kind == .jsx_if_directive);
                 std.debug.assert(state.ctx == .templated);
 
+                const cond = getPackedData(node).left;
+                try self.visit(self.nodes.at(cond), cond);
+
+                const cond_can_change = self._dependsOnEffects(cond);
+                const children_start = getPackedData(node).right;
+
+                const children = try self.gatherChildInfo(children_start);
+                defer children.deinit();
+
+                if (children.items.len == 0) {
+                    // TODO: we can only do this if cond is pure
+                    // otherwise, we still need to evaluate `cond`
+                    return false;
+                }
+
                 // el_name points to a placeholder element
 
                 // #if directives use range semantics for clobbering
@@ -3087,23 +2632,6 @@ pub const Program = struct {
                 var unm_body = std.ArrayList(NodeRef).init(getAllocator());
                 defer unm_body.deinit();
 
-                var child_fwds = std.ArrayList([]const u8).init(getAllocator());
-                defer child_fwds.deinit();
-
-                const cond = getPackedData(node).left;
-                try self.visit(self.nodes.at(cond), cond);
-
-                const cond_can_change = self._dependsOnEffects(cond);
-                const children_start = getPackedData(node).right;
-
-                const children = try self.gatherChildInfo(children_start);
-                defer children.deinit();
-
-                if (children.items.len == 0) {
-                    // TODO: we can only do this if cond is pure
-                    return false;
-                }
-
                 if (children.items.len > 1) {
                     try init_body.append(try self.factory.createExpressionStatement(
                         try self.factory.createCallExpression(
@@ -3122,6 +2650,7 @@ pub const Program = struct {
                 const tmpl = try self.createHtmlTemplate(node);
 
                 if (children.items.len > 1) {
+                    // walks from marker1 to marker2, removing intermediate nodes
                     const n = try self.factory.createIdentifier("n");
                     const n2 = try self.factory.createIdentifier("n2");
                     try unm_body.append(try self.factory.createVariableStatement(
@@ -3142,7 +2671,7 @@ pub const Program = struct {
                     ));
                 } else {
                     const c = children.items[0];
-                    if (!c.is_spread and !c.is_thunk and !cond_can_change and child_fwds.items.len == 0) {
+                    if (!c.is_spread and !c.is_thunk and !cond_can_change and (c.kind == .text_static or c.kind == .intrinsic_static or c.kind == .expression)) {
                         // emit  `if (cond) ph.replaceWith(child)` directly
                         const m = try self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(
                             ph, "replaceWith"), if (c.kind == .expression) c.inner_ref else tmpl);
@@ -3300,7 +2829,7 @@ pub const Program = struct {
                             defer state.stmts = stmts;
                             state.stmts = init_body;
                             if (try self.inlineProcessElement(state, nav_name, child_info.node_ptr)) {
-                                try child_fwds.append(nav_name);
+                                try upd_body.append(try self.inlineCallSymbolUpdate(nav_name));
                             }
                             init_body = state.stmts;
                         },
@@ -3323,10 +2852,9 @@ pub const Program = struct {
                             const assign = try self.factory.createBinaryExpression(
                                 tmp_slot, .equals_token, try self.factory.createIdentifier(nav_name));
                             try state.addStmt(try self.factory.createExpressionStatement(assign));
-
-                            try child_fwds.append(c_name);
+                            try upd_body.append(try self.inlineCallSymbolUpdate(c_name));
                         },
-                        else => {
+                        .if_directive => {
                             // TODO: nested jsx_if_directive
                         },
                     }
@@ -3350,7 +2878,7 @@ pub const Program = struct {
                         0,
                     ));
 
-                    if (upd_body.items.len > 0 or child_fwds.items.len > 0) {
+                    if (upd_body.items.len > 0) {
                         try body_stmts.append(try self.factory.createIfStatement(
                             try self.factory.createPrefixUnaryExpression(
                                 .exclamation_token, try self.factory.createIdentifier(children.items[0].nav_name)),
@@ -3359,7 +2887,6 @@ pub const Program = struct {
                         ));
 
                         for (upd_body.items) |s| try body_stmts.append(s);
-                        for (child_fwds.items) |name| try body_stmts.append(try self.inlineCallSymbolUpdate(name));
                         const body_block = try self.factory.createBlock(body_stmts.items);
                         const arrow = try self.factory.createArrowFunction(0, body_block, 0);
                         const assign = try self.factory.createBinaryExpression(lhs, .equals_token, arrow);
@@ -3413,7 +2940,6 @@ pub const Program = struct {
                         0)
                 );
                 for (upd_body.items) |s| try body_stmts.append(s);
-                for (child_fwds.items) |name| try body_stmts.append(try self.inlineCallSymbolUpdate(name));
                 const body_block = try self.factory.createBlock(body_stmts.items);
                 const arrow = try self.factory.createArrowFunction(0, body_block, 0);
                 const assign = try self.factory.createBinaryExpression(lhs, .equals_token, arrow);
@@ -3422,13 +2948,24 @@ pub const Program = struct {
                 return true;
             }
 
+            fn inlineAddHoistedVar(self: *@This(), state: *InlineEmitState, ident: NodeRef, initializer: NodeRef, flags: u22) !void {
+                if (state.hoist_stmts) |hoist| {
+                    try hoist.append(try self.factory.createVariableStatement(
+                        try self.factory.createVariableDeclarationSimple(ident, 0), @intFromEnum(NodeFlags.let)));
+                    try state.addStmt(try self.factory.createExpressionStatement(
+                        try self.factory.createBinaryExpression(ident, .equals_token, initializer)));
+                } else {
+                    try state.addStmt(try self.factory.createVariableStatement(
+                        try self.factory.createVariableDeclarationSimple(ident, initializer), flags));
+                }
+            }
+
             fn inlineComponentChildren(
                 self: *@This(),
                 state: *InlineEmitState,
                 el_name: []const u8,
                 children: []const ChildInfo,
                 upd_body: *std.ArrayList(NodeRef),
-                child_fwds: *std.ArrayList([]const u8),
                 children_exp: NodeRef,
             ) anyerror!void {
                 for (children) |child_info| {
@@ -3447,17 +2984,14 @@ pub const Program = struct {
                             if (child_info.is_thunk) {
                                 const nav_name = try state.nextName();
                                 const ph_name = try state.nextName();
-                                const ph_decl = try self.factory.createVariableDeclarationSimple(
+                                    try self.inlineAddHoistedVar(state,
                                     try self.factory.createIdentifier(ph_name),
-                                    try self.factory.createObjectLiteralExpression(0));
-                                try state.addStmt(try self.factory.createVariableStatement(
-                                    ph_decl, @intFromEnum(NodeFlags.@"const")));
-
-                                const nav_decl = try self.factory.createVariableDeclarationSimple(
+                                    try self.factory.createObjectLiteralExpression(0),
+                                    @intFromEnum(NodeFlags.@"const"));
+                                try self.inlineAddHoistedVar(state,
                                     try self.factory.createIdentifier(nav_name),
-                                    try self.factory.createIdentifier(ph_name));
-                                try state.addStmt(try self.factory.createVariableStatement(
-                                    nav_decl, @intFromEnum(NodeFlags.let)));
+                                    try self.factory.createIdentifier(ph_name),
+                                    @intFromEnum(NodeFlags.let));
 
                                 const set_slot_fn = try self.factory.createIdentifier(if (child_info.is_spread) "__setSpreadSlot" else "__setSlot");
                                 const set_slot_call = try self.factory.createCallExpression(set_slot_fn,
@@ -3491,10 +3025,25 @@ pub const Program = struct {
                             const nav_name = try state.nextName();
                             const ident = try self.factory.createIdentifier(nav_name);
                             element_init = ident;
-                            try child_fwds.append(nav_name);
-                            const decl_init = try self.transformJsxNode(child_info.node_ptr);
-                            const decl = try self.factory.createVariableDeclarationSimple(ident, decl_init);
-                            try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));   
+                            var child_state = InlineEmitState{
+                                .counter = state.counter,
+                                .stmts = std.ArrayList(NodeRef).init(getAllocator()),
+                                .hoist_stmts = state.hoist_stmts,
+                            };
+                            defer child_state.stmts.deinit();
+                            
+                            if (!self.isIntrinsicTag(self.getJsxTagRef(child_info.node_ptr))) child_state.ctx = .component;
+                            const element_expr: NodeRef = if (child_state.ctx == .templated)
+                                try self.createHtmlTemplate(child_info.node_ptr)
+                            else
+                                try self.factory.createCallExpression(
+                                    try self.factory.createIdentifier("__comp"), &.{try self.factory.createTrue()});
+                            const had_update = try self.inlineProcessElement(&child_state, nav_name, child_info.node_ptr);
+                            if (had_update) try upd_body.append(try self.inlineCallSymbolUpdate(nav_name));
+
+                            state.counter = child_state.counter;
+                            try self.inlineAddHoistedVar(state, ident, element_expr, @intFromEnum(NodeFlags.@"const"));
+                            try state.stmts.appendSlice(child_state.stmts.items);
                         },
                         .if_directive => {
                             // essentially emitted like `{...(cond ? children : [])}
@@ -3505,35 +3054,51 @@ pub const Program = struct {
                             const cond_can_change = self._dependsOnEffects(if_cond);
                             const children_start = getPackedData(child_info.node_ptr).right;
 
-                            const el_name2 = try state.nextName();
-
-                            const ident = try self.factory.createIdentifier(el_name2);
-                            element_init = try self.factory.createIdentifier(el_name2);
-                            // try child_fwds.append(el_name2);
-                            const decl_init = try self.factory.createCallExpression(try self.factory.createIdentifier("__comp"), &.{});
-                            const decl = try self.factory.createVariableDeclarationSimple(ident, decl_init);
-                            try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));  
-
-
                             const if_children = try self.gatherChildInfo(children_start);
                             defer if_children.deinit();
 
                             var init_body = std.ArrayList(NodeRef).init(getAllocator());
                             defer init_body.deinit();
 
-                            var fwds = std.ArrayList([]const u8).init(getAllocator());
-                            defer fwds.deinit();
-
                             var updates = std.ArrayList(NodeRef).init(getAllocator());
                             defer updates.deinit();
 
-                            const old_stmts = state.stmts;
-                            defer state.stmts = old_stmts;
+                            var parent_init_stmts = state.stmts;
+                            defer state.stmts = parent_init_stmts;
                             state.stmts = init_body;
 
-                            const ch = try self.factory.createPropertyAccessExpression(try self.factory.createPropertyAccessExpression(ident, "_p"), "children");
+                            if (!cond_can_change) {
+                                const old_hoist = state.hoist_stmts;
+                                state.hoist_stmts = &parent_init_stmts;
+                                defer state.hoist_stmts = old_hoist;
+                                try self.inlineComponentChildren(state, el_name, if_children.items, &updates, children_exp);
+                                const gate_cond: NodeRef = if (updates.items.len > 0) blk: {
+                                    const cond_name = try state.nextName();
+                                    try parent_init_stmts.append(try self.factory.createConstVariable(
+                                        try self.factory.createIdentifier(cond_name), if_cond));
+                                    break :blk try self.factory.createIdentifier(cond_name);
+                                } else if_cond;
+                                try parent_init_stmts.append(
+                                    try self.factory.createIfStatement(gate_cond, try self.factory.createBlock(state.stmts.items), 0));
+                                if (updates.items.len > 0) {
+                                    try upd_body.append(
+                                        try self.factory.createIfStatement(gate_cond, try self.factory.createBlock(updates.items), 0));
+                                }
+                                continue;
+                            }
 
-                            try self.inlineComponentChildren(state, el_name2, if_children.items, &updates, &fwds, ch);
+                            const el_name2 = try state.nextName();
+
+                            const ident = try self.factory.createIdentifier(el_name2);
+                            element_init = try self.factory.createIdentifier(el_name2);
+                            const decl_init = try self.factory.createCallExpression(try self.factory.createIdentifier("__comp"), &.{});
+                            const decl = try self.factory.createVariableDeclarationSimple(ident, decl_init);
+                            try parent_init_stmts.append(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));
+
+                            const ch = try self.factory.createPropertyAccessExpression(try self.factory.createPropertyAccessExpression(ident, "_p"), "children");
+                            try parent_init_stmts.append(try self.factory.createAssignmentStatement(ch, try self.factory.createArrayLiteralExpression(0)));
+
+                            try self.inlineComponentChildren(state, el_name2, if_children.items, &updates, ch);
 
                             const lhs = blk: {
                                 const sym = try self.factory.createPropertyAccessExpression(
@@ -3541,59 +3106,57 @@ pub const Program = struct {
                                 break :blk try self.factory.createElementAccessExpression(ident, sym);
                             };
 
-                            const set_slot_fn = try self.factory.createIdentifier(if (child_info.is_spread) "__setSpreadSlot" else "__setSlot");
-                            const set_slot_call = try self.factory.createCallExpression(set_slot_fn,
-                                &.{
-                                    ident,
-                                    try self.factory.createNull(),
-                                    try self.factory.createConditionalExpression(if_cond, ch, try self.factory.createArrayLiteralExpression(0)),
-                                    try self.factory.createNumericLiteral(@as(i64, 1)),
-                                    try self.factory.createIdentifier(el_name),
-                                });
+                            const set_slot_fn = try self.factory.createIdentifier("__setSpreadSlot");
 
                             const s_exp = try self.factory.createPropertyAccessExpression(ident, "_s");
-                            
-                            const s_exp_set = try self.factory.createExpressionStatement(
-                                try self.factory.createBinaryExpression(s_exp, .equals_token, try self.factory.createNumericLiteral(@as(i64, 1))),
-                            );
                             try init_body.appendSlice(state.stmts.items);
-                            try init_body.append(s_exp_set);
+                            try init_body.append(try self.factory.createExpressionStatement(
+                                try self.factory.createBinaryExpression(s_exp, .equals_token, try self.factory.createNumericLiteral(@as(i64, 1)))));
 
-                            // try self.factory.createIfStatement(
-                            //     try self.factory.createPrefixUnaryExpression(
-                            //         .exclamation_token, 
-                            //         try self.factory.createParenthesizedExpression(if_cond)
-                            //     ),
-                            //     try self.factory.createReturnStatement(0),
-                            // )
-
-
-                            //state.stmts = old_stmts;
-
-                            _ = cond_can_change;
-
-                            if (fwds.items.len > 0 or updates.items.len > 0) {
+                            if (updates.items.len > 0) {
+                                // stub update fn in parent init, real fn added during lazy init
+                                try parent_init_stmts.append(
+                                    try self.factory.createAssignmentStatement(lhs, try self.factory.createArrowFunction(0, try self.factory.createBlock(0), 0))
+                                );
                                 var body_stmts = std.ArrayList(NodeRef).init(getAllocator());
                                 defer body_stmts.deinit();
-
                                 for (updates.items) |s| try body_stmts.append(s);
-                                for (fwds.items) |name| try body_stmts.append(try self.inlineCallSymbolUpdate(name));
-                                const body_block = try self.factory.createBlock(body_stmts.items);
-                                const arrow = try self.factory.createArrowFunction(0, body_block, 0);
-                                const assign = try self.factory.createBinaryExpression(lhs, .equals_token, arrow);
-                                
-                                try init_body.append(try self.factory.createExpressionStatement(assign));
-                                try child_fwds.append(el_name2); // FIXME: emit direct call instead
+                                try init_body.append(try self.factory.createExpressionStatement(
+                                    try self.factory.createBinaryExpression(lhs, .equals_token,
+                                        try self.factory.createArrowFunction(0, try self.factory.createBlock(body_stmts.items), 0))));
                             }
 
-                            // FIXME: this should be gated using if_cond
-                            try upd_body.append(try self.factory.createIfStatement(
-                                try self.factory.createPrefixUnaryExpression(.exclamation_token, s_exp), 
+                            const cond_var_name = try state.nextName();
+                            try upd_body.append(try self.factory.createConstVariable(
+                                try self.factory.createIdentifier(cond_var_name), if_cond));
+
+                            var if_true_body = std.ArrayList(NodeRef).init(getAllocator());
+                            defer if_true_body.deinit();
+                            try if_true_body.append(try self.factory.createIfStatement(
+                                try self.factory.createPrefixUnaryExpression(.exclamation_token, s_exp),
                                 try self.factory.createBlock(init_body.items),
                                 0,
                             ));
+                            if (updates.items.len > 0) {
+                                try if_true_body.append(try self.inlineCallSymbolUpdate(el_name2));
+                            }
+                            try upd_body.append(try self.factory.createIfStatement(
+                                try self.factory.createIdentifier(cond_var_name),
+                                try self.factory.createBlock(if_true_body.items),
+                                0,
+                            ));
 
-                            try upd_body.append(try self.factory.createExpressionStatement(set_slot_call));
+                            try upd_body.append(try self.factory.createExpressionStatement(
+                                try self.factory.createCallExpression(set_slot_fn, &.{
+                                    ident,
+                                    try self.factory.createNull(),
+                                    try self.factory.createConditionalExpression(
+                                        try self.factory.createIdentifier(cond_var_name),
+                                        ch,
+                                        try self.factory.createArrayLiteralExpression(0)),
+                                    try self.factory.createNumericLiteral(@as(i64, 1)),
+                                    try self.factory.createIdentifier(el_name),
+                                })));
                         },
                     }
 
@@ -3601,6 +3164,18 @@ pub const Program = struct {
 
                     if (child_info.is_spread and !child_info.is_thunk) {
                         element_init = try self.factory.createSpreadElement(element_init);
+                    }
+
+                    // init placeholders
+                    if ((child_info.is_thunk or child_info.kind == .if_directive) and cond == 0) {
+                        try state.addStmt(try self.factory.createAssignmentStatement(
+                            try self.factory.createPropertyAccessExpression(element_init, "s"),
+                            try self.factory.createPropertyAccessExpression(children_exp, "length")
+                        ));
+                        try state.addStmt(try self.factory.createAssignmentStatement(
+                            try self.factory.createPropertyAccessExpression(element_init, "l"),
+                            try self.factory.createNumericLiteral(@as(i64, 1)),
+                        ));
                     }
 
                     const lhs = try self.factory.createPropertyAccessExpression(children_exp, "push");
@@ -3623,8 +3198,6 @@ pub const Program = struct {
             ) anyerror!bool {
                 var upd_body = std.ArrayList(NodeRef).init(getAllocator());
                 defer upd_body.deinit();
-                var child_fwds = std.ArrayList([]const u8).init(getAllocator());
-                defer child_fwds.deinit();
 
                 if (state.ctx == .component) {
                     switch (node.kind) {
@@ -3649,7 +3222,7 @@ pub const Program = struct {
                     .jsx_self_closing_element => {
                         const d = getPackedData(node);
                         try self.inlineProcessAttrs(state, &upd_body, el_name, d.right);
-                        return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items, &.{});
+                        return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items);
                     },
                     .jsx_element => maybeUnwrapRef(node) orelse return error.InvalidJsx,
                     else => return error.InvalidJsx,
@@ -3677,135 +3250,8 @@ pub const Program = struct {
                         try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));
                     }
 
-                    if (comptime true) {
-                        try self.inlineComponentChildren(state, el_name, children.items, &upd_body, &child_fwds, try self.factory.createIdentifier("children"));
-                        return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items, child_fwds.items);
-                    }
-
-                    for (children.items, 0..) |child_info, idx| {
-                        _ = idx;
-                        var element_init: NodeRef = 0;
-                        var cond: NodeRef = 0;
-
-                        switch (child_info.kind) {
-                            .text_static => {
-                                element_init = (try self.jsxTextToString(child_info.node_ptr)).?;
-                            },
-                            .intrinsic_static => {
-                                element_init = try self.transformJsxNode(child_info.node_ptr);
-                            },
-                            .expression => {
-                                const inner_ref = child_info.inner_ref;
-                                if (child_info.is_thunk) {
-                                    const nav_name = try state.nextName();
-                                    const ph_name = try state.nextName();
-                                    const ph_decl = try self.factory.createVariableDeclarationSimple(
-                                        try self.factory.createIdentifier(ph_name),
-                                        try self.factory.createObjectLiteralExpression(0));
-                                    try state.addStmt(try self.factory.createVariableStatement(
-                                        ph_decl, @intFromEnum(NodeFlags.@"const")));
-
-                                    const nav_decl = try self.factory.createVariableDeclarationSimple(
-                                        try self.factory.createIdentifier(nav_name),
-                                        try self.factory.createIdentifier(ph_name));
-                                    try state.addStmt(try self.factory.createVariableStatement(
-                                        nav_decl, @intFromEnum(NodeFlags.let)));
-
-                                    const set_slot_fn = try self.factory.createIdentifier(if (child_info.is_spread) "__setSpreadSlot" else "__setSlot");
-                                    const set_slot_call = try self.factory.createCallExpression(set_slot_fn,
-                                        &.{
-                                            try self.factory.createIdentifier(ph_name),
-                                            try self.factory.createIdentifier(nav_name),
-                                            inner_ref,
-                                            try self.factory.createNumericLiteral(@as(i64, 1)),
-                                            try self.factory.createIdentifier(el_name),
-                                        });
-                                    const assign = try self.factory.createBinaryExpression(
-                                        try self.factory.createIdentifier(nav_name), .equals_token, set_slot_call);
-                                    try upd_body.append(try self.factory.createExpressionStatement(assign));
-
-                                    element_init = try self.factory.createIdentifier(ph_name);
-                                } else {
-                                    var cmp_subject = inner_ref;
-                                    if (self.nodes.at(inner_ref).kind != .identifier) {
-                                        const tmp_name = try self.factory.createIdentifier(try state.nextName());
-                                        const decl = try self.factory.createVariableDeclarationSimple(tmp_name, inner_ref);
-                                        try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));
-                                        cmp_subject = tmp_name;
-                                    }
-                                    const cmp = try self.factory.createBinaryExpression(
-                                        cmp_subject, .equals_equals_token, try self.factory.createNull());
-                                    cond = cmp;
-                                    element_init = cmp_subject;
-                                }
-                            },
-                            .intrinsic_dynamic, .component => {
-                                const nav_name = try state.nextName();
-                                const ident = try self.factory.createIdentifier(nav_name);
-                                element_init = ident;
-                                try child_fwds.append(nav_name);
-                                const decl_init = try self.transformJsxNode(child_info.node_ptr);
-                                const decl = try self.factory.createVariableDeclarationSimple(ident, decl_init);
-                                try state.addStmt(try self.factory.createVariableStatement(decl, @intFromEnum(NodeFlags.@"const")));   
-                            },
-                            .if_directive => {
-                                const if_cond = getPackedData(child_info.node_ptr).left;
-                                try self.visit(self.nodes.at(if_cond), if_cond);
-
-                                // const cond_can_change = self._dependsOnEffects(if_cond);
-                                const children_start = getPackedData(child_info.node_ptr).right;
-
-                                const if_children = try self.gatherChildInfo(children_start);
-                                defer if_children.deinit();
-
-                                var init_body = std.ArrayList(NodeRef).init(getAllocator());
-                                defer init_body.deinit();
- 
-                                var m_body = std.ArrayList(NodeRef).init(getAllocator());
-                                defer m_body.deinit();
-
-                                var unm_body = std.ArrayList(NodeRef).init(getAllocator());
-                                defer unm_body.deinit();
-
-                                var updates = std.ArrayList(NodeRef).init(getAllocator());
-                                defer updates.deinit();
-
-                                const old_init = state.init_statements;
-                                const old_mount = state.mount_statements;
-                                const old_unmount = state.unmount_statements;
-                                const old_update = state.update_statements;
-                                defer {
-                                    state.init_statements = old_init;
-                                    state.mount_statements = old_mount;
-                                    state.unmount_statements = old_unmount;
-                                    state.update_statements = old_update;
-                                }
-
-                                // if (try self.inlineProcessIfDirective(state, nav_name, child_info.node_ptr)) {
-                                //     try child_fwds.append(nav_name);
-                                // }
-                            },
-                        }
-
-                        std.debug.assert(element_init != 0);
-
-                        if (child_info.is_spread and !child_info.is_thunk) {
-                            element_init = try self.factory.createSpreadElement(element_init);
-                        }
-
-                        const lhs = try self.factory.createPropertyAccessExpression(
-                        try self.factory.createIdentifier("children"), "push");
-                        const assign = try self.factory.createExpressionStatement(
-                            try self.factory.createCallExpression(lhs, &.{element_init})
-                        );
-                        if (cond != 0) {
-                            try state.addStmt(try self.factory.createIfStatement(cond, assign, 0));
-                        } else {
-                            try state.addStmt(assign);
-                        }                    
-                    }
-
-                    return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items, child_fwds.items);
+                    try self.inlineComponentChildren(state, el_name, children.items, &upd_body, try self.factory.createIdentifier("children"));
+                    return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items);
                 }
 
                 var has_dynamic_after = false;
@@ -3885,7 +3331,7 @@ pub const Program = struct {
                         },
                         .intrinsic_dynamic => {
                             if (try self.inlineProcessElement(state, nav_name, child_info.node_ptr)) {
-                                try child_fwds.append(nav_name);
+                                try upd_body.append(try self.inlineCallSymbolUpdate(nav_name));
                             }
                         },
                         .component => {
@@ -3917,17 +3363,29 @@ pub const Program = struct {
                                 tmp_slot, .equals_token, try self.factory.createIdentifier(nav_name));
                             try state.addStmt(try self.factory.createExpressionStatement(assign));
 
-                            try child_fwds.append(c_name);
+                            try upd_body.append(try self.inlineCallSymbolUpdate(c_name));
                         },
                         .if_directive => {
                             if (try self.inlineProcessIfDirective(state, nav_name, child_info.node_ptr)) {
-                                try child_fwds.append(nav_name);
+                                try upd_body.append(try self.inlineCallSymbolUpdate(nav_name));
                             }
                         },
                     }
                 }
 
-                return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items, child_fwds.items);
+                return try self.inlineEmitSymbolUpdateFull(state, el_name, upd_body.items);
+            }
+
+            fn inlineSetupJsxRoot(self: *@This(), state: *InlineEmitState, n: *const AstNode, binding_name: []const u8) !NodeRef {
+                if (!self.isIntrinsicTag(self.getJsxTagRef(n))) state.ctx = .component;
+                const element_expr: NodeRef = if (state.ctx == .templated)
+                    try self.createHtmlTemplate(n)
+                else
+                    try self.factory.createCallExpression(
+                        try self.factory.createIdentifier("__comp"), &.{try self.factory.createTrue()});
+                const had_update = try self.inlineProcessElement(state, binding_name, n);
+                if (had_update) try state.addStmt(try self.inlineCallSymbolUpdate(binding_name));
+                return element_expr;
             }
 
             fn createInlineJsx(self: *@This(), n: *const AstNode) !NodeRef {
@@ -3937,37 +3395,25 @@ pub const Program = struct {
                 };
                 defer state.stmts.deinit();
 
-                if (!self.isIntrinsicTag(self.getJsxTagRef(n))) {
-                    state.ctx = .component;
-                }
-
                 const root_name = try state.nextName();
-                var element_expr: NodeRef = undefined;
-                if (state.ctx == .templated) {
-                    element_expr = try self.createHtmlTemplate(n);
-                } else {
-                    element_expr = try self.factory.createCallExpression(
-                        try self.factory.createIdentifier("__comp"), &.{try self.factory.createTrue()});
+                const element_expr = try self.inlineSetupJsxRoot(&state, n, root_name);
+
+                if (state.stmts.items.len == 0) {
+                    return element_expr;
                 }
 
-                const decl = try self.factory.createVariableDeclarationSimple(
-                    try self.factory.createIdentifier(root_name), element_expr);
-                try state.addStmt(try self.factory.createVariableStatement(
-                    decl, @intFromEnum(NodeFlags.@"const")));
-
-                const root_had_update = try self.inlineProcessElement(&state, root_name, n);
-
-                if (root_had_update) {
-                    try state.addStmt(try self.inlineCallSymbolUpdate(root_name));
-                }
-
-                try state.addStmt(try self.factory.createReturnStatement(
+                var body_stmts = std.ArrayList(NodeRef).init(getAllocator());
+                defer body_stmts.deinit();
+                try body_stmts.append(try self.factory.createConstVariable(
+                    try self.factory.createIdentifier(root_name), element_expr));
+                try body_stmts.appendSlice(state.stmts.items);
+                try body_stmts.append(try self.factory.createReturnStatement(
                     try self.factory.createIdentifier(root_name)));
 
-                const body = try self.factory.createBlock(state.stmts.items);
+                const body = try self.factory.createBlock(body_stmts.items);
                 const arrow = try self.factory.createArrowFunction(0, body, 0);
-                const paren_arrow = try self.factory.createParenthesizedExpression(arrow);
-                return self.factory.createCallExpression(paren_arrow, &.{});
+                return self.factory.createCallExpression(
+                    try self.factory.createParenthesizedExpression(arrow), &.{});
             }
 
             fn createInlineJsxBlock(
@@ -3981,153 +3427,30 @@ pub const Program = struct {
                 };
                 defer state.stmts.deinit();
 
-                if (!self.isIntrinsicTag(self.getJsxTagRef(n))) {
-                    state.ctx = .component;
-                }
-
-                var element_expr: NodeRef = undefined;
-
-                if (state.ctx == .templated) {
-                    element_expr = try self.createHtmlTemplate(n);
-                } else {
-                    element_expr = try self.factory.createCallExpression(
-                        try self.factory.createIdentifier("__comp"), &.{try self.factory.createTrue()});
-                }
-
-                const root_had_update = try self.inlineProcessElement(&state, binding_name, n);
-
-                if (root_had_update) try state.addStmt(try self.inlineCallSymbolUpdate(binding_name));
+                const element_expr = try self.inlineSetupJsxRoot(&state, n, binding_name);
 
                 const setup_block: NodeRef = if (state.stmts.items.len > 0)
                     try self.factory.createBlock(state.stmts.items)
                 else
                     0;
-
                 return .{ .element_expr = element_expr, .setup_block = setup_block };
             }
 
             // -----------------------------------------------------------------------
 
-            fn maybeCreateTemplatedJsx(self: *@This(), n: *const AstNode) !?NodeRef {
-                // TODO: avoid heuristics.
-                // Instead, have a special attribute to opt-in e.g. `__templated` + use the existence of loops as the heuristic
-                const elem_count = self.templateCountElements(n) orelse return null;
-                if (elem_count < 3) return null;
-
-                var html = std.ArrayList(u8).init(getAllocator());
-                defer html.deinit();
-                try self.templateWriteHtml(n, &html);
-
-                var exps_list = parser.NodeList.init(self.nodes);
-                const struct_result = try self.templateBuildStructure(n, &exps_list);
-
-                const s_fn = try self.factory.createIdentifier("__s");
-                const html_duped = try getAllocator().dupe(u8, html.items);
-                const html_ref = try self.factory.createNoSubstitutionTemplateLiteralAllocated(html_duped);
-                const exps_arr = try self.factory.createArrayLiteralExpression(exps_list.head);
-                return @as(?NodeRef, try self.factory.createCallExpression(s_fn, &.{ html_ref, struct_result.ref, exps_arr }));
-            }
 
             fn transformJsxNode(self: *@This(), n: *const AstNode) anyerror!NodeRef {
                 switch (n.kind) {
                     .jsx_self_closing_element => {
-                        const d = getPackedData(n);
-                        const tag_ref = d.left;
-                        const attrs_ref = d.right;
-
-                        if (self.isIntrinsicTag(tag_ref)) {
-                            if (self.use_syn_components) {
-                                if (inline_emit) return self.createInlineJsx(n);
-                                return self.createSynIntrinsicCall(n, tag_ref);
-                            }
-                            const tag_str = try self.factory.createStringLiteral(getSlice(self.nodes.at(tag_ref), u8));
-                            const split = try self.transformJsxAttributes(attrs_ref);
-                            var empty_children = CollectedChildren{
-                                .items = std.ArrayList(NodeRef).init(getAllocator()),
-                                .spread_indices = std.ArrayList(u32).init(getAllocator()),
-                            };
-                            defer empty_children.deinit();
-                            return self.createIntrinsicCall(tag_str, split, &empty_children);
-                        } else {
-                            if (inline_emit) return self.createInlineJsx(n);
-
-                            const split = try self.transformJsxAttributes(attrs_ref);
-                            if (self.use_syn_components) {
-                                return self.createSynComponentCall(tag_ref, split, null);
-                            }
-                            const props = split.static_props;
-                            if (props != 0) {
-                                return self.factory.createCallExpression(tag_ref, props);
-                            } else {
-                                const empty = try self.factory.createObjectLiteralExpression(0);
-                                return self.factory.createCallExpression(tag_ref, empty);
-                            }
-                        }
+                        return self.createInlineJsx(n);
                     },
                     .jsx_element => {
-                        const opening_ref = maybeUnwrapRef(n) orelse return error.InvalidJsx;
-                        const opening = self.nodes.at(opening_ref);
-                        const od = getPackedData(opening);
-                        const tag_ref = od.left;
-                        const attrs_ref = od.right;
-
-                        if (self.use_syn_components and self.isIntrinsicTag(tag_ref)) {
-                            if (inline_emit) return self.createInlineJsx(n);
-                            if (try self.maybeCreateTemplatedJsx(n)) |templated| return templated;
-                            return self.createSynIntrinsicCall(n, tag_ref);
-                        }
-
-                        if (inline_emit) return self.createInlineJsx(n);
-
-                        var collected = try self.collectJsxChildren(opening_ref);
-                        defer collected.deinit();
-
-                        if (self.isIntrinsicTag(tag_ref)) {
-                            const tag_str = try self.factory.createStringLiteral(getSlice(self.nodes.at(tag_ref), u8));
-                            const split = try self.transformJsxAttributes(attrs_ref);
-                            return self.createIntrinsicCall(tag_str, split, &collected);
-                        } else {
-                            // Component with children
-                            const split = try self.transformJsxAttributes(attrs_ref);
-
-                            // For non-syn mode, merge props + children into single object
-                            if (!self.use_syn_components) {
-                                var prop_list = parser.NodeList.init(self.nodes);
-                                if (split.static_props != 0) {
-                                    const obj = self.nodes.at(split.static_props);
-                                    var prop_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(obj) orelse 0);
-                                    while (prop_iter.nextRef()) |prop_ref| {
-                                        prop_list.appendRef(prop_ref);
-                                    }
-                                }
-                                if (collected.items.items.len > 0) {
-                                    var children_linked = parser.NodeList.init(self.nodes);
-                                    for (collected.items.items) |c| children_linked.appendRef(c);
-                                    const children_arr = try self.factory.createArrayLiteralExpression(children_linked.head);
-                                    const children_name = try self.factory.createIdentifier("children");
-                                    const children_prop = try self.factory.createPropertyAssignment(children_name, children_arr);
-                                    prop_list.appendRef(children_prop);
-                                }
-                                const final_props = try self.factory.createObjectLiteralExpression(prop_list.head);
-                                return self.factory.createCallExpression(tag_ref, final_props);
-                            }
-
-                            return self.createSynComponentCall(tag_ref, split, &collected);
-                        }
+                        return self.createInlineJsx(n);
                     },
                     .jsx_fragment => {
                         // Fragments become array literals
                         // TODO: these should have Symbol.update
-                        const children_head = maybeUnwrapRef(n) orelse 0;
-                        var collected = try self.collectJsxChildren(children_head);
-                        defer collected.deinit();
-
-                        if (collected.items.items.len == 0) {
-                            return self.factory.createArrayLiteralExpression(0);
-                        }
-                        var list = parser.NodeList.init(self.nodes);
-                        for (collected.items.items) |c| list.appendRef(c);
-                        return self.factory.createArrayLiteralExpression(list.head);
+                        return error.TODO;
                     },
                     else => return error.InvalidJsx,
                 }
@@ -4520,17 +3843,14 @@ pub const Program = struct {
                         try parser.forEachChild(self.nodes, n, self);
                     },
                     .variable_statement => {
-                        // Optimization: JSX directly assigned to a variable — emit as decl + block
-                        // instead of an IIFE. E.g.: const el = <div>...</div>
-                        // → const el = document.createElement('div') \n { ...setup... }
-                        if (inline_emit and self.use_syn_components) blk: {
+                        if (inline_emit) blk: {
                             const decl_start = maybeUnwrapRef(n) orelse break :blk;
                             const first_decl = self.nodes.at(decl_start);
                             if (first_decl.kind != .variable_declaration or first_decl.next != 0) break :blk;
                             const fd = getPackedData(first_decl);
                             const init_node = self.nodes.at(fd.right);
                             if (init_node.kind != .jsx_element and init_node.kind != .jsx_self_closing_element) break :blk;
-                            if (!self.isIntrinsicTag(self.getJsxTagRef(init_node))) break :blk;
+                            // if (!self.isIntrinsicTag(self.getJsxTagRef(init_node))) break :blk;
                             const binding_node = self.nodes.at(fd.left);
                             if (binding_node.kind != .identifier) break :blk;
 
@@ -4559,11 +3879,13 @@ pub const Program = struct {
                     },
                     .keyword_unary_expression => {
                         if (n.len == @intFromEnum(SyntaxKind.update_keyword)) {
-                            const jsx_update = try self.factory.createIdentifier("__jsx_update");
-                            const called = try self.factory.createCallExpression(jsx_update, .{
-                                unwrapRef(n)
-                            });
-                            try self.replacements.put(ref, called);
+                            const inner = unwrapRef(n);
+                            const sym = try self.factory.createPropertyAccessExpression(
+                                try self.factory.createIdentifier("Symbol"), "update");
+                            const call_lhs = try self.factory.createElementAccessExpression(inner, sym);
+                            const call_exp = try self.factory.createCallExpression(call_lhs, &.{});
+                            self.nodes.at(call_exp).flags |= @intFromEnum(NodeFlags.optional);
+                            try self.replacements.put(ref, call_exp);
                         } else {
                             try parser.forEachChild(self.nodes, n, self);
                         }
@@ -4575,6 +3897,10 @@ pub const Program = struct {
             }
         };
 
+        // our transform allocates nodes, we need to copy the node allocator 
+        // so we don't clobber the page ptr array in the binder
+        const nodes = try f.ast.nodes.clone();
+        f.ast.nodes = nodes;
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
         var factory = parser.Factory{ .nodes = &f.ast.nodes };
         const a = try this.getAnalyzer();

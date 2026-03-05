@@ -110,13 +110,6 @@ pub const Checker = struct {
 
     const ObjectLiteralMember = program.Analyzer.ObjectLiteralMember;
 
-    pub fn checkCallExpression(this: *@This(), call_ref: NodeRef) !void {
-        const d = getPackedData(this.file.ast.nodes.at(call_ref));
-        const callee_type = try this.analyzer.getType(this.file, d.left);
-
-        return this.checkCallExpressionWithCallee(call_ref, callee_type);
-    }
-
     fn emitNotCallableError(this: *@This(), call_ref: NodeRef, callee_type: TypeRef) !void {
         try this.file.emitErrorFmt(call_ref,  "Type '{s}' is not callable", .{
             try this.analyzer.printType(callee_type),
@@ -133,6 +126,7 @@ pub const Checker = struct {
 
         const callee = this.analyzer.types.at(callee_type);
 
+        // TODO: compute types ahead of time ?
         var arg_refs: [32]NodeRef = undefined;
         var arg_count: usize = 0;
         {
