@@ -66,6 +66,12 @@ pub fn NewLexer(
     );
 }
 
+pub const Diagnostic = struct {
+    start: u32,
+    end: u32,
+    message: []const u8,
+};
+
 fn NewLexer_(
     comptime enable_simd: bool,
     comptime json_options_is_json: bool,
@@ -110,8 +116,7 @@ fn NewLexer_(
         token: T = T.t_end_of_file,
         has_newline_before: bool = false,
         is_legacy_octal_literal: bool = false,
-        is_log_disabled: bool = true,
-        print_expect: bool = true,
+        suppress_errors: bool = false,
         code_point: CodePoint = -1,
         identifier: []const u8 = "",
         // jsx_pragma: JSXPragma = .{},
@@ -137,6 +142,7 @@ fn NewLexer_(
         pause_on_comments: bool = true,
 
         line_map: LineMapType = if (record_lines) undefined else {},
+        errors: std.ArrayListUnmanaged(Diagnostic) = .{},
 
         pub fn clone(self: *const LexerType) LexerType {
             return LexerType{
@@ -147,7 +153,7 @@ fn NewLexer_(
                 .token = self.token,
                 .has_newline_before = self.has_newline_before,
                 .is_legacy_octal_literal = self.is_legacy_octal_literal,
-                .is_log_disabled = self.is_log_disabled,
+                .suppress_errors = self.suppress_errors,
                 .code_point = self.code_point,
                 .identifier = self.identifier,
                 .regex_flags_start = self.regex_flags_start,
@@ -160,6 +166,7 @@ fn NewLexer_(
                 .string_literal_is_ascii = self.string_literal_is_ascii,
                 .is_ascii_only = self.is_ascii_only,
                 .line_map = self.line_map,
+                .errors = self.errors,
             };
         }
 
@@ -186,22 +193,15 @@ fn NewLexer_(
 
         pub fn addError(self: *LexerType, _loc: usize, comptime format: []const u8, args: anytype, _: bool) void {
             @setCold(true);
-
-            if (self.is_log_disabled) return;
-
-            _ = _loc;
-            _ = format;
-            _ = args;
-            //self.log.addErrorFmt(&self.source, __loc, self.allocator, format, args) catch unreachable;
+            const loc: u32 = @intCast(@min(_loc, std.math.maxInt(u32)));
+            self.addRangeError(loc, loc, format, args) catch {};
         }
 
         pub fn addRangeError(self: *LexerType, start: u32, end: u32, comptime format: []const u8, args: anytype) !void {
             @setCold(true);
-            _ = self;
-            _ = start;
-            _ = end;
-            _ = format;
-            _ = args;
+            if (self.suppress_errors) return;
+            const message = try std.fmt.allocPrint(self.allocator, format, args);
+            try self.errors.append(self.allocator, .{ .start = start, .end = end, .message = message });
         }
 
         pub fn addCurrentRangeError(self: *LexerType, comptime format: []const u8, args: anytype) !void {
@@ -217,6 +217,7 @@ fn NewLexer_(
             if (comptime record_lines) {
                 this.line_map.deinit();
             }
+            this.errors.deinit(this.allocator);
         }
 
         pub fn preAllocate(this: *LexerType) !void {
@@ -1770,12 +1771,12 @@ fn NewLexer_(
         }
 
         pub fn expected(self: *LexerType, token: T) !void {
-            if (comptime is_debug) {
-                if (self.print_expect)
-                    std.debug.print("{any} != {any} source [line: {}, pos {d}]:\n   {s}\n", .{ self.token, token, self.line_map.count+1, self.start, self.getContext(25) });
-            }
-            // std.debug.print("{s} {}\n", .{self.source.name orelse "", self.line_count});
-
+            try self.addRangeError(
+                @intCast(self.start),
+                @intCast(self.end),
+                "Expected '{s}' but got '{s}'",
+                .{ @tagName(token), @tagName(self.token) },
+            );
             return error.UnexpectedSyntax;
         }
 
@@ -2077,6 +2078,16 @@ fn NewLexer_(
                     '.' => {
                         lexer.step();
                         lexer.token = .t_dot;
+
+                        if ((lexer.code_point == '.' and
+                            lexer.current < lexer.source.contents.len) and
+                            lexer.source.contents[lexer.current] == '.')
+                        {
+                            lexer.end = lexer.current;
+                            lexer.current += 1;
+                            lexer.step();
+                            lexer.token = T.t_dot_dot_dot;
+                        }
                     },
                     '=' => {
                         lexer.step();
@@ -2162,6 +2173,37 @@ fn NewLexer_(
                         lexer.step();
                         try lexer.parseJSXStringLiteral('"');
                     },
+                    '-' => {
+                        lexer.step();
+                        lexer.token = .t_minus;
+                    },
+                    '0' => {
+                        try lexer.parseNumericLiteralOrDot('0');
+                    },
+                    '1'...'9' => {
+                        try lexer.parseNumericLiteralOrDot(0);
+                    },
+                    '@' => {
+                        lexer.step();
+                        lexer.token = .t_at;
+                    },
+                    ':' => {
+                        lexer.step();
+                        lexer.token = .t_colon;
+                    },
+                    '(' => {
+                        lexer.step();
+                        lexer.token = .t_open_paren;
+                    },
+                    ')' => {
+                        lexer.step();
+                        lexer.token = .t_close_paren;
+                    },
+                    ',' => {
+                        // for classlist
+                        lexer.step();
+                        lexer.token = .t_comma;
+                    },
                     '#' => {
                         // for directives
                         lexer.step();
@@ -2186,10 +2228,7 @@ fn NewLexer_(
                                 lexer.step();
                             }
 
-                            // Parse JSX namespaces. These are not supported by React or TypeScript
-                            // but someone using JSX syntax in more obscure ways may find a use for
-                            // them. A namespaced name is just always turned into a string so you
-                            // can't use this feature to reference JavaScript identifiers.
+                            // JSX namespace
                             if (lexer.code_point == ':') {
                                 lexer.step();
 
@@ -2346,6 +2385,77 @@ fn NewLexer_(
                         lexer.string_literal_is_ascii = !needs_fixing;
                         if (needs_fixing) {
                             // slow path
+                            lexer.string_literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
+
+                            if (lexer.string_literal.len == 0) {
+                                lexer.has_newline_before = true;
+                                continue;
+                            }
+                        } else {
+                            lexer.string_literal = &([_]u16{});
+                        }
+                    },
+                }
+
+                break;
+            }
+        }
+
+        pub fn nextJSXStyle(lexer: *LexerType) !void {
+            lexer.assertNotJSON();
+
+            lexer.has_newline_before = false;
+            const original_start = lexer.end;
+
+            while (true) {
+                lexer.start = lexer.end;
+                lexer.token = T.t_end_of_file;
+
+                switch (lexer.code_point) {
+                    -1 => {
+                        lexer.token = .t_end_of_file;
+                    },
+                    '<' => {
+                        lexer.step();
+                        lexer.token = .t_less_than;
+                    },
+                    else => {
+                        var needs_fixing = false;
+
+                        string_literal: while (true) {
+                            switch (lexer.code_point) {
+                                -1 => {
+                                    try lexer.syntaxError();
+                                },
+                                '\r', '\n', 0x2028, 0x2029 => {
+                                    try lexer.recordNewLine();
+                                    needs_fixing = true;
+                                    lexer.step();
+                                },
+                                '&' => {
+                                    // FIXME: don't include jsx entities for jsx style
+                                    needs_fixing = true;
+                                    lexer.step();
+                                },
+                                '<' => {
+                                    if (lexer.current < lexer.source.contents.len) {
+                                        if (lexer.source.contents[lexer.current] == '/') {
+                                            break :string_literal;
+                                        }
+                                    }
+                                    lexer.step();
+                                },
+                                else => {
+                                    needs_fixing = needs_fixing or lexer.code_point >= 0x80;
+                                    lexer.step();
+                                },
+                            }
+                        }
+
+                        lexer.token = .t_string_literal;
+                        lexer.string_literal_slice = lexer.source.contents[original_start..lexer.end];
+                        lexer.string_literal_is_ascii = !needs_fixing;
+                        if (needs_fixing) {
                             lexer.string_literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
 
                             if (lexer.string_literal.len == 0) {
