@@ -898,6 +898,9 @@ pub fn BumpAllocatorList(comptime T: type) type {
                     if (x == ref) @panic("Recursive appendRef");
                     x = this.allocator.at(x).next;
                 }
+                if (ref == 0 and this.head != 0) {
+                    @panic("Found nil ref appended to non-empty list");
+                }
             }
 
             if (this.prev != 0) {
@@ -6620,6 +6623,7 @@ pub const Factory = struct {
         });
     }
 
+    /// if using literal number, call with a casted value like `@as(i64, 1)`
     pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef { // val: usize | 64 | i64 | i32 | u32
         const d: u64 = switch (@TypeOf(val)) {
             comptime_int => {
@@ -11172,7 +11176,9 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print(") ");
                     try this.visitRef(d.right);
                     // for ASI
-                    this.needs_newline = true;
+                    if (n.len == 0 or this.data.nodes.at(d.right).kind != .block) {
+                        this.needs_newline = true;
+                    }
                     try this.maybePrint(" else ", n.len);
                 },
                 .switch_statement => {
