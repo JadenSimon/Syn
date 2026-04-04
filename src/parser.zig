@@ -6589,6 +6589,12 @@ pub const Factory = struct {
         n.next = new_ref;
     }
 
+    pub inline fn insertListAfter(this: *@This(), target: NodeRef, head_ref: NodeRef, tail_ref: NodeRef) void {
+        var n = this.nodes.at(target);
+        this.nodes.at(tail_ref).next = n.next;
+        n.next = head_ref;
+    }
+
     pub fn createIdentifier(this: *@This(), text: []const u8) !NodeRef {
         const t = try getAllocator().dupe(u8, text);
         return this.createIdentifierAllocated(t);
@@ -10200,14 +10206,14 @@ pub const Binder = struct {
                 const n = unwrapRef(node);
                 const head = this.nodes.at(n);
 
-                try this.visit(head, n);
-
-                if (head.next == 0) return;
-
                 if (this.jsx_tree_root == null) {
                     this.jsx_tree_root = ref;
                     try this.hoist(node, ref);
                 }
+
+                try this.visit(head, n);
+
+                if (head.next == 0) return;
 
                 const maybe_tail = this.nodes.at(head.next);
                 if (maybe_tail.kind != .jsx_closing_element) {
@@ -12517,15 +12523,6 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
         }
     }.f;
 
-    const x3 = try copyStr(__esm_exports_helper);
-
-    try statements.append(.{
-        .kind = .verbatim_node,
-        .data = x3.ptr,
-        .len = @intCast(x3.len),
-        .extra_data = 1, // 1 new line
-    });
-
     const x = try copyStr("require");
 
     const req = try data.nodes.push(.{
@@ -12568,6 +12565,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
         }
     }.f;
 
+    var has_exports = false;
     const first_statement = maybeUnwrapRef(data.nodes.at(data.start)) orelse 0;
     var iter = NodeIterator.init(&data.nodes, first_statement);
     while (iter.nextPair()) |pair| {
@@ -12692,6 +12690,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                 // TODO: default export
                 const without_export = try data.nodes.push(pair[0].*);
                 data.nodes.at(without_export).flags &= ~@as(u20, @intFromEnum(NodeFlags.@"export"));
+                has_exports = true;
 
                 try replacements.put(pair[1], without_export);
 
@@ -12764,6 +12763,18 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
             .kind = .expression_statement,
             .data = @ptrFromInt(right),
         });
+    }
+
+    if (has_exports) {
+        const s = try copyStr(__esm_exports_helper);
+        const helper = try statements.allocator.push(.{
+            .kind = .verbatim_node,
+            .data = s.ptr,
+            .len = @intCast(s.len),
+            .extra_data = 1,
+            .next = statements.head,
+        });
+        statements.head = helper;
     }
 
     if (statements.head != 0) {

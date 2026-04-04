@@ -300,6 +300,7 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
         }
 
         if (!opt?.testOnly) {
+            console.log(`snapshot changed: ${path.relative(process.cwd(), snapshotPath)}`)
             if (!newSnapshot) {
                 await fs.promises.rm(snapshotPath).catch(err => {
                     if ((err as any).code !== 'ENOENT') {
@@ -311,6 +312,7 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
             } 
         } else {
             console.log(diff)
+            throw new Error(`snapshot did not match: ${path.relative(process.cwd(), snapshotPath)}`)
         }
     }
 }
