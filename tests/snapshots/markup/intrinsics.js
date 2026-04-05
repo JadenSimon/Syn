@@ -10,6 +10,15 @@ var __spreadAttributes = (f => (x, v, c = {}, t, k) => {
   return v
 })((x, k, v, t, u = t?.[k] ?? k) => !u ? __setAttr(x,k,v) : x[u] = v)
 var __sym_upd = Symbol.update ||= Symbol.for('update')
+var __setSlot = (a,v,c) => {
+  const q = c?.nextSibling === a
+  if (typeof v !== 'object') {
+    if (q && c.nodeType === 3) { c.nodeValue = v; return c }
+    v = document.createTextNode(v)
+  }
+  q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
+  return v
+}
 function staticAttrs() {
   return __template(`<input type="text" placeholder="enter value">`)
 }
@@ -130,6 +139,26 @@ function spreadAttrs5(o, value) {
         ...o,
         value: value
       }, _v0);
+    })();
+  }
+  return __ret
+}
+function manyNodes(v) {
+  const __ret = __template(`<div>1
+<span><!></span> 2
+<span><!></span></div>`)
+  {
+    let _v0 = __ret.firstChild
+    _v0 = _v0.nextSibling;
+    let _v1 = _v0.nextSibling
+    _v1 = _v1.nextSibling;
+    let _v2 = _v0.firstChild
+    let _v3
+    let _v4 = _v1.firstChild
+    let _v5
+    ;(__ret[__sym_upd] = () => {
+      _v3 = __setSlot(_v2, v, _v3);
+      _v5 = __setSlot(_v4, v, _v5);
     })();
   }
   return __ret

@@ -3504,6 +3504,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             return .{
                 .kind = .jsx_element,
                 .data = @ptrFromInt(opening),
+                .flags = flags,
             };
         }
 
@@ -3653,7 +3654,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return .{
                     .kind = .jsx_run_directive,
-                    .data = toBinaryDataPtrRefs(0, list.head),
+                    .data = toBinaryDataPtrRefsMaybeNull(0, list.head),
                 };
             }
 
@@ -3663,7 +3664,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return .{
                     .kind = .jsx_else_directive,
-                    .data = toBinaryDataPtrRefs(0, children.head),
+                    .data = toBinaryDataPtrRefsMaybeNull(0, children.head),
                 };
             }
 
@@ -6689,7 +6690,7 @@ pub const Factory = struct {
         const right = switch (@TypeOf(arg)) {
             NodeRef => this.assertNotNil(arg),
             []const u8, [:0]const u8 => try this.createStringLiteral(arg),
-            f64, usize, comptime_int => try this.createNumericLiteral(arg),
+            i64, f64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(arg))) {
                     break :blk try this.createStringLiteral(arg);

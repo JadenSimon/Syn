@@ -38,13 +38,13 @@ function multiExpr(a, b) {
   const __ret = __template(`<div><!> and <!></div>`)
   {
     let _v0 = __ret.firstChild
-    const _v1 = _v0.nextSibling
-    let _v2 = _v1.nextSibling
+    let _v1 = _v0.nextSibling
+    _v1 = _v1.nextSibling;
+    let _v2
     let _v3
-    let _v4
     ;(__ret[__sym_upd] = () => {
-      _v3 = __setSlot(_v0, a, _v3);
-      _v4 = __setSlot(_v2, b, _v4);
+      _v2 = __setSlot(_v0, a, _v2);
+      _v3 = __setSlot(_v1, b, _v3);
     })();
   }
   return __ret
@@ -52,11 +52,11 @@ function multiExpr(a, b) {
 function mixedStaticDynamic(name) {
   const __ret = __template(`<div>hello <!>!</div>`)
   {
-    const _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
-    let _v2
+    let _v0 = __ret.firstChild
+    _v0 = _v0.nextSibling;
+    let _v1
     ;(__ret[__sym_upd] = () => {
-      _v2 = __setSlot(_v1, name, _v2);
+      _v1 = __setSlot(_v0, name, _v1);
     })();
   }
   return __ret
@@ -80,11 +80,11 @@ function singularSpread(items) {
 function mixedSpread(items) {
   const __ret = __template(`<div>before: <!> :after</div>`)
   {
-    const _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
-    let _v2
+    let _v0 = __ret.firstChild
+    _v0 = _v0.nextSibling;
+    let _v1
     ;(__ret[__sym_upd] = () => {
-      _v2 = __setSlotSpread(_v1, items, _v2);
+      _v1 = __setSlotSpread(_v0, items, _v1);
     })();
   }
   return __ret
