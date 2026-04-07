@@ -29,7 +29,7 @@ var __setSlot = (a,v,c) => {
   const q = c?.nextSibling === a
   if (typeof v !== 'object') {
     if (q && c.nodeType === 3) { c.nodeValue = v; return c }
-    v = document.createTextNode(v)
+    v = new Text(v)
   }
   q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
   return v
@@ -57,7 +57,7 @@ function basicIf(show) {
         }
       }
     };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind())();
+    ;(__ret[__sym_upd] = _v0[__sym_upd].bind(_v0))();
   }
   return __ret
 }
@@ -65,20 +65,46 @@ function ifElse(show) {
   const __ret = __template(`<div><!></div>`)
   {
     const _v0 = __ret.firstChild
-    let _v2
+    let _v4
     let _v5
     let _v6
-    let _v7
-    _v0[__sym_upd] = () => {
-      const _v1 = !!show
-      if (_v1) {
-        _v2 = _v5 ??= __template(`<span>yes</span>`);
+    ;(__ret[__sym_upd] = () => {
+      let _v1
+      if (show) {
+        _v1 = _v4 ??= __template(`<span>yes</span>`);
       } else {
-        _v2 = _v6 ??= __template(`<span>no</span>`);
+        _v1 = _v5 ??= __template(`<span>no</span>`);
       }
-      _v2 != null ? _v7 = __setSlot(_v0, _v2, _v7) : _v7.remove?.();
-    };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind())();
+      _v1 != null ? _v6 = __setSlot(_v0, _v1, _v6) : _v6?.remove();
+    })();
+  }
+  return __ret
+}
+function ifExpr(count, show) {
+  const __ret = __template(`<div><!></div>`)
+  {
+    const _v0 = __ret.firstChild
+    let _v1
+    ;(__ret[__sym_upd] = () => {
+      show ? _v1 = __setSlot(_v0, count, _v1) : _v1?.remove();
+    })();
+  }
+  return __ret
+}
+function ifElseExpr(val, show) {
+  const __ret = __template(`<div><!></div>`)
+  {
+    const _v0 = __ret.firstChild
+    let _v4
+    ;(__ret[__sym_upd] = () => {
+      let _v1
+      if (show) {
+        _v1 = val;
+      } else {
+        _v1 = "hidden";
+      }
+      _v4 = __setSlot(_v0, _v1, _v4);
+    })();
   }
   return __ret
 }
@@ -155,7 +181,7 @@ function ifWithBinding(show) {
         }
       }
     };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind())();
+    ;(__ret[__sym_upd] = _v0[__sym_upd].bind(_v0))();
   }
   return __ret
 }
@@ -166,7 +192,15 @@ function ifWithUnwind(show) {
     let _v3
     let _v4
     let _v7
-    _v0[__sym_upd] = () => {
+    let _v1 = []
+    ;(__ret[__sym_upd] = () => {
+      if (_v1.length) {
+        let f
+        while (f = _v1.pop()) f();
+      }
+      _v1.push(() => {
+        console.log('2');
+      });
       const _v2 = !!show
       if (_v2) {
         if (_v3) _v3[__sym_upd]();
@@ -190,17 +224,6 @@ function ifWithUnwind(show) {
         })();
       }
       _v7 = __setSlotSpread(_v0, _v2 ? _v3 : _v4, _v7);
-    };
-    let _v1 = []
-    ;(__ret[__sym_upd] = () => {
-      if (_v1.length) {
-        let f
-        while (f = _v1.pop()) f();
-      }
-      _v1.push(() => {
-        console.log('2');
-      });
-      _v0[__sym_upd]();
     })();
   }
   return __ret
@@ -209,18 +232,16 @@ function singleSlotNoEffects(show) {
   const __ret = __template(`<div><!></div>`)
   {
     const _v0 = __ret.firstChild
-    let _v2
-    let _v5
-    _v0[__sym_upd] = () => {
-      const _v1 = !!show
-      if (_v1) {
-        _v2 = '1';
+    let _v4
+    ;(__ret[__sym_upd] = () => {
+      let _v1
+      if (show) {
+        _v1 = '1';
       } else {
-        _v2 = '2';
+        _v1 = '2';
       }
-      _v5 = __setSlot(_v0, _v2, _v5);
-    };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind())();
+      _v4 = __setSlot(_v0, _v1, _v4);
+    })();
   }
   return __ret
 }
@@ -231,7 +252,7 @@ function branchWithBinding(show) {
     let _v2
     let _v3
     let _v6
-    _v0[__sym_upd] = () => {
+    ;(__ret[__sym_upd] = () => {
       const _v1 = !!show
       if (_v1) {
         if (_v2) _v2[__sym_upd]();
@@ -243,7 +264,7 @@ function branchWithBinding(show) {
             console.log(d);
           };
           _v4[0] = d;
-          ;(_v4[__sym_upd] = d[__sym_upd].bind())();
+          ;(_v4[__sym_upd] = d[__sym_upd].bind(d))();
           return _v4
         })();
       } else {
@@ -255,8 +276,7 @@ function branchWithBinding(show) {
         })();
       }
       _v6 = __setSlotSpread(_v0, _v1 ? _v2 : _v3, _v6);
-    };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind())();
+    })();
   }
   return __ret
 }
@@ -290,7 +310,7 @@ function conditionalComponentInstanceChildren(cond) {
       }
       _v3 += (_v4 = __pushAt(_v2, _v3, _v6 ? _v5 : []));
     };
-    ;(__ret[__sym_upd] = _v1[__sym_upd].bind())();
+    ;(__ret[__sym_upd] = _v1[__sym_upd].bind(_v1))();
   }
   return __ret
 }

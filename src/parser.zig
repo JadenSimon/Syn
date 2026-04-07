@@ -6638,7 +6638,7 @@ pub const Factory = struct {
                 @compileError("Use @as(i64, <v>) for the argument");
             },
             f64 => @bitCast(val),
-            i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
+            u16, i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
             else => @compileError("Unhandled type"),
         };
 
@@ -6690,7 +6690,7 @@ pub const Factory = struct {
         const right = switch (@TypeOf(arg)) {
             NodeRef => this.assertNotNil(arg),
             []const u8, [:0]const u8 => try this.createStringLiteral(arg),
-            i64, f64, usize, comptime_int => try this.createNumericLiteral(arg),
+            u16, i32, i64, f64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(arg))) {
                     break :blk try this.createStringLiteral(arg);
@@ -7037,6 +7037,22 @@ pub const Factory = struct {
         return this.nodes.push(.{
             .kind = .spread_assignment,
             .data = @ptrFromInt(expression),
+        });
+    }
+
+    pub fn createGetAccessor(this: *@This(), name: NodeRef, body: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .get_accessor,
+            .data = toBinaryDataPtrRefs(name, 0),
+            .len = body,
+        });
+    }
+
+    pub fn createSetAccessor(this: *@This(), name: NodeRef, param: NodeRef, body: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .set_accessor,
+            .data = toBinaryDataPtrRefs(name, param),
+            .len = body,
         });
     }
 

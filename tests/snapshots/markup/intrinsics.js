@@ -14,7 +14,7 @@ var __setSlot = (a,v,c) => {
   const q = c?.nextSibling === a
   if (typeof v !== 'object') {
     if (q && c.nodeType === 3) { c.nodeValue = v; return c }
-    v = document.createTextNode(v)
+    v = new Text(v)
   }
   q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
   return v
