@@ -17,7 +17,7 @@ var __comp = root => ({
     }
   }
 })
-var __pushAt = (c,i,v,l = c.length) => (c.splice(i,0,...v), c.length-l)
+var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
 var __setSlotSpread = (a,v,b) => {
   b || a.after(b = a.cloneNode())
   let p, n = a.nextSibling

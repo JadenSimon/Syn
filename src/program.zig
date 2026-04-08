@@ -1227,19 +1227,30 @@ pub const Program = struct {
                     \\  }
                     \\})
                 ;
+                // const spread_comp =
+                //     \\var __spreadComp = function(a=this._b, r=this.root, s=this._sd, e=a._e,n,v,i=0,j=0) {
+                //     \\  if (!e) {
+                //     \\    e=a._e=s?[]:0
+                //     \\    while (v = s&15) { 
+                //     \\      s >>= 4 
+                //     \\      a.before(n = v===1?r[i++]:new Comment)
+                //     \\      if (v>3) __spreadComp.call(this._ca[j++],n)
+                //     \\      else if (v>1) { let u,x=v<3,g=i,h=n,f=x?__setSlot:__setSlotSpread; e.push(() => u=f(h,x?r[g]:)) }
+                //     \\    }
+                //     \\    if(!e)a.after(...r),e=[]
+                //     \\    a.remove()
+                //     \\  }
+                //     \\  for (n of e) n()
+                //     \\  return e
+                //     \\}
+                // ;
+
                 const spread_comp =
                     \\var __spreadComp = function(a=this._b) {
-                    \\  let i=0,b=a._e,c=a.nextSibling,r=this.root,l=r.length,n,v
-                    \\  b||a.after(b=a.cloneNode())
-                    \\  while((n=c,c=n.nextSibling)&&n!==b) {
-                    \\    if (i>=l) n.remove()
-                    \\    else if (n!==(v=r[i++])) n.replaceWith(v)
-                    \\  }
-                    \\  while (i<l) b.before(r[i++])
-                    \\  return a._e=b
+                    \\  return this.root._sc(a), a
                     \\}
                 ;
-                const push_at = "var __pushAt = (c,i,v,l = c.length) => (c.splice(i,0,...v), c.length-l)";
+                const push_at = "var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)";
                 const set_slot =
                     \\var __setSlot = (a,v,c) => {
                     \\  const q = c?.nextSibling === a
@@ -1498,7 +1509,6 @@ pub const Program = struct {
                 self.helpers.insert(h);
                 // some helpers depend on other helpers
                 if (h == .comp) self.helpers.insert(.update_symbol);
-                if (h == .spread_comp) self.helpers.insert(.set_slot_spread);
                 if (h == .spread_attributes) self.helpers.insert(.set_attribute);
                 return switch (h) {
                     .style => "__style",
@@ -2527,6 +2537,158 @@ pub const Program = struct {
                 }
             }
 
+            //  FIXME: 3rd param of .map (or ...rest param) should count as aliasing
+            //  FIXME: we don't handle various parens cases (and comma) e.g. return (foo) 
+            fn childrenParamMutatesOrEscapes(self: *@This(), param_ident: NodeRef, body_ref: NodeRef) !bool {
+                const V = struct {
+                    sym: u32,
+                    nodes: *const BumpAllocator(AstNode),
+                    mutates: bool = false,
+                    in_lhs: bool = false,
+
+                    pub fn visit(s: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
+                        _ = n;
+                        s.mutates = try s._visit(ref);
+                    }
+
+                    fn _visit(s: *@This(), ref: NodeRef) !bool {
+                        if (s.mutates) return true;
+                        if (ref == 0) return false;
+                        const in_lhs = s.in_lhs;
+                        s.in_lhs = false;
+                        const n = s.nodes.at(ref);
+                        switch (n.kind) {
+                            .identifier => {
+                                if (!in_lhs) return false;
+                                return n.extra_data == s.sym;
+                            },
+                            .element_access_expression => {
+                                const d = getPackedData(n);
+                                if (in_lhs) {
+                                    s.in_lhs = true;
+                                    if (try s._visit(d.left)) return true;
+                                    return s._visit(d.right);
+                                }
+                            },
+                            .property_access_expression => {
+                                const d = getPackedData(n);
+                                if (in_lhs) {
+                                    s.in_lhs = true;
+                                    if (try s._visit(d.left)) return true;
+                                    return false;
+                                }
+                            },
+                            .property_assignment => {
+                                const d = getPackedData(n);
+                                if (in_lhs) {
+                                    s.in_lhs = true;
+                                    if (try s._visit(d.left)) return true;
+                                }
+                            },
+                            .binary_expression => {
+                                const d = getPackedData(n);
+                                const is_assign = switch (@as(SyntaxKind, @enumFromInt(n.len))) {
+                                    .equals_token,
+                                    .plus_equals_token, .minus_equals_token,
+                                    .asterisk_equals_token, .asterisk_asterisk_equals_token,
+                                    .slash_equals_token, .percent_equals_token,
+                                    .bar_equals_token, .ampersand_equals_token, .caret_equals_token,
+                                    .question_question_equals_token, .bar_bar_equals_token,
+                                    .ampersand_ampersand_equals_token => true,
+                                    else => false,
+                                };
+                                if (is_assign) {
+                                    s.in_lhs = true;
+                                    if (try s._visit(d.left)) return true;
+                                    return try s._visit(d.right);
+                                }
+                            },
+                            .prefix_unary_expression => {
+                                const d = getPackedData(n);
+                                const is_mutating = switch (@as(SyntaxKind, @enumFromInt(d.left))) {
+                                    .plus_plus_token, .minus_minus_token => true,
+                                    else => false,
+                                };
+                                s.in_lhs = is_mutating;
+                            },
+                            // TODO: jsx shorthand attr
+                            .postfix_unary_expression, .shorthand_property_assignment => {
+                                s.in_lhs = true;
+                            },
+                            .call_expression => {
+                                const d = getPackedData(n);
+                                const callee = s.nodes.at(d.left);
+                                if (callee.kind == .property_access_expression) {
+                                    const cd = getPackedData(callee);
+                                    const obj = s.nodes.at(cd.left);
+                                    if (obj.kind == .identifier and obj.extra_data == s.sym) {
+                                        const method = s.nodes.at(cd.right);
+                                        const method_name = getSlice(method, u8);
+                                        const copies = for ([_][]const u8{
+                                            "slice", "map", "filter", "find", "findIndex",
+                                            "indexOf", "lastIndexOf", "some", "every",
+                                            "reduce", "reduceRight", "forEach", "includes",
+                                            "join", "flat", "flatMap", "at", "entries",
+                                            "keys", "values", "concat",
+                                        }) |sm| {
+                                            if (std.mem.eql(u8, method_name, sm)) break true;
+                                        } else false;
+                                        if (!copies) return true;
+                                        var args = NodeIterator.init(s.nodes, d.right);
+                                        while (args.nextRef()) |arg_ref| {
+                                            if (try s._visit(arg_ref)) return true;
+                                        }
+                                        return false;
+                                    }
+                                } else if (callee.kind == .element_access_expression) {
+                                    const cd = getPackedData(callee);
+                                    const obj = s.nodes.at(cd.left);
+                                    if (obj.kind == .identifier and obj.extra_data == s.sym) {
+                                        return true; // treat it as escaped
+                                    }
+                                }
+                                var args = NodeIterator.init(s.nodes, d.right);
+                                while (args.nextRef()) |arg_ref| {
+                                    const arg = s.nodes.at(arg_ref);
+                                    if (arg.kind == .identifier and arg.extra_data == s.sym) return true;
+                                    if (try s._visit(arg_ref)) return true;
+                                }
+                                return false;
+                            },
+                            .variable_declaration => {
+                                const d = getPackedData(n);
+                                if (d.right != 0) {
+                                    const rhs = s.nodes.at(d.right);
+                                    if (rhs.kind == .identifier and rhs.extra_data == s.sym) return true;
+                                }
+                            },
+                            .parenthesized_expression => {
+                                s.in_lhs = in_lhs;
+                            },
+                            .return_statement => {
+                                if (maybeUnwrapRef(n)) |r| {
+                                    const ret = s.nodes.at(r);
+                                    if (ret.kind == .identifier and ret.extra_data == s.sym) return true;
+                                }
+                                return false;
+                            },
+                            else => {},
+                        }
+                        try parser.forEachChild(s.nodes, n, s);
+                        return s.mutates;
+                    }
+                };
+
+                var v = V{
+                    .nodes = self.nodes,
+                    .sym = self.nodes.at(param_ident).extra_data,
+                };
+
+                try v.visit(self.nodes.at(body_ref), body_ref);
+
+                return v.mutates;
+            }
+
             // Wraps an expression in a thunk `() => expr` if the immediate result of _expr_ can change.
             // This means that, if the expression itself can be proven to never change at runtime, we can
             // omit the thunk entirely. For example:
@@ -2593,7 +2755,7 @@ pub const Program = struct {
                 return try self.factory.createStringLiteral(trimmed);
             }
 
-            fn templateIsVoidElement(_: *@This(), tag: []const u8) bool {
+            fn templateIsVoidElement(tag: []const u8) bool {
                 const voids = [_][]const u8{ "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr" };
                 for (voids) |v| if (std.mem.eql(u8, tag, v)) return true;
                 return false;
@@ -2754,7 +2916,7 @@ pub const Program = struct {
                         try out.appendSlice(tag);
                         if (self.scoped_attr) |sa| { try out.append(' '); try out.appendSlice(sa); }
                         try self.templateWriteHtmlAttrs(d.right, out);
-                        if (self.templateIsVoidElement(tag)) {
+                        if (templateIsVoidElement(tag)) {
                             try out.appendSlice(">");
                         } else {
                             try out.appendSlice("></");
@@ -2895,31 +3057,129 @@ pub const Program = struct {
                 }
             }
 
-            // const TemplateEmitter = struct {
-            //     const Attr = struct {
-            //         name: []const u8,
-            //         value: ?[]const u8 = null,
-            //         value_needs_quotes: bool = true,
-            //     };
-            //     const Node = union {
-            //         text: TextNode,
-            //         element: ElementNode,
-            //         comment: CommentNode,
-            //     };
-            //     const TextNode = struct {
-            //         text: []const u8,
-            //     };
-            //     const ElementNode = struct {
-            //         tag: []const u8,
-            //         children: std.ArrayListUnmanaged(*Node) = .{},
-            //         attributes: std.ArrayListUnmanaged(Attr) = .{},
-            //     };
-            //     const CommentNode = struct {};
-            //     const Root = struct {
-            //         nodes: std.ArrayListUnmanaged(*Node) = .{},
-            //     };
-            // };
+            const HtmlPrinter = struct {
+                const Attr = struct {
+                    name: []const u8,
+                    value: ?[]const u8 = null,
+                    value_needs_quotes: bool = true,
+                };
+                const Node = union(enum) {
+                    text: TextNode,
+                    comment: CommentNode,
+                    element: ElementNode,
+                };
+                const TextNode = struct {
+                    text: []const u8,
+                };
+                const CommentNode = struct {
+                    text: []const u8 = &.{},
+                };
+                const ElementNode = struct {
+                    tag: []const u8,
+                    children: std.ArrayListUnmanaged(*Node) = .{},
+                    attributes: std.ArrayListUnmanaged(*Attr) = .{},
+                };
 
+                fn _printAttr(attr: *Attr, out: *std.ArrayList(u8)) !void {
+                    try out.appendSlice(attr.name);
+                    if (attr.value) |v| {
+                        try out.append("=");
+                        if (attr.value_needs_quotes) try out.append('"');
+                        for (v) |c| switch (c) {
+                            '"' => try out.appendSlice("&quot;"),
+                            '&' => try out.appendSlice("&amp;"),
+                            else => try out.append(c),
+                        };
+                        if (attr.value_needs_quotes) try out.append('"');
+                    }
+                }
+
+                fn _printChild(node: *Node, out: *std.ArrayList(u8)) !void {
+                    switch (node) {
+                        .comment => |n| {
+                            if (n.text.len == 0) {
+                                try out.appendSlice("<!>");
+                            } else {
+                                try out.appendSlice("<!--");
+                                try out.appendSlice(n.text);
+                                try out.appendSlice("-->");
+                            }
+                        },
+                        .text => |n| {
+                            for (n.text) |c| switch (c) {
+                                '<' => try out.appendSlice("&lt;"),
+                                '>' => try out.appendSlice("&gt;"),
+                                '&' => try out.appendSlice("&amp;"),
+                                else => try out.append(c),
+                            };
+                        },
+                        .element => |n| {
+                            try _printElement(n, out);
+                        },
+                    }
+                }
+
+                fn _printElement(node: *ElementNode, out: *std.ArrayList(u8)) !void {
+                    const is_fragment = node.tag.len == 0;
+                    const is_void = templateIsVoidElement(node.tag);
+                    if (is_fragment) {
+                        std.debug.assert(node.attributes.items.len == 0);
+                    } else {
+                        try out.append('<');
+                        try out.appendSlice(node.tag);
+                        for (node.attributes.items) |attr| {
+                            try out.append(' ');
+                            try _printAttr(attr, out);
+                        }
+                        try out.append('>');
+                    }
+                    if (is_void) {
+                        try out.append('>');
+                        std.debug.assert(node.children.items.len == 0);
+                        return;
+                    } 
+                    for (node.children.items) |c| {
+                        try _printChild(c, out);
+                    }
+                    if (!is_fragment) {
+                        try out.appendSlice("</");
+                        try out.appendSlice(node.tag);
+                        try out.append('>');
+                    }
+                }
+
+                pub fn print(node: *ElementNode) !std.ArrayList(u8) {
+                    var out = std.ArrayList(u8).init(getAllocator());
+                    try _printElement(node, &out);
+                    return out;
+                }
+
+                pub fn createElement(tag: []const u8) !*ElementNode {
+                    const el = try getAllocator().create(ElementNode);
+                    el.* = .{ .tag = tag };
+                    return el;
+                }
+
+                pub fn appendNewAttribute(el: *ElementNode, name: []const u8, value: ?[]const u8) !*Attr {
+                    const attr = try getAllocator().create(Attr);
+                    attr.* = .{ .name = name, .value = value };
+                    try el.attributes.append(getAllocator(), attr);
+                    return attr;
+                }
+
+                pub fn appendNewElement(el: *ElementNode, tag: []const u8) !*ElementNode {
+                    const n = try createElement(tag);
+                    try el.children.append(getAllocator(), n);
+                    return n;
+                }
+
+                pub fn appendNewAnchor(el: *ElementNode) !*CommentNode {
+                    const n = try getAllocator().create(CommentNode);
+                    n.* = .{};
+                    try el.children.append(getAllocator(), n);
+                    return n;
+                }
+            };
 
             const InlineEmitState = struct {
                 pub const Ctx = enum {
@@ -2935,6 +3195,9 @@ pub const Program = struct {
                 unwinders_var: ?[]const u8 = null,
                 is_branch: bool = false,
                 is_single_slot_branch: bool = false,
+                // used by inlineArrayChildren 
+                offset_counter_name: NodeRef = 0,
+                children_exp: NodeRef = 0,
                 // some vars can be re-used, those go here
                 // must _not_ be used if you need uninitialized state
                 released_vars: std.ArrayListUnmanaged([]const u8) = .{},
@@ -3461,6 +3724,7 @@ pub const Program = struct {
 
                 // empty -> document.createComment('')
                 if (html.items.len == 0) {
+                    // TODO: maybe use `new Comment` as it is smaller
                     const document_id = try self.factory.createIdentifier("document");
                     const create_comment = try self.factory.createPropertyAccessExpression(document_id, "createComment");
                     return self.factory.createCallExpression(create_comment, try self.factory.createStringLiteral(""));
@@ -4244,9 +4508,11 @@ pub const Program = struct {
                     }
                 }
 
+                state.children_exp = children_exp;
                 var offset_counter_name: NodeRef = 0;
                 if (needs_spread_unwind.items.len > 0) {
                     offset_counter_name = try self.factory.createIdentifier(try state.nextName());
+                    state.offset_counter_name = offset_counter_name;
                     try self.inlineAddHoistedVar(state,
                         offset_counter_name,
                         try self.factory.createNumericLiteral(@as(i64, 0)),
@@ -4837,6 +5103,249 @@ pub const Program = struct {
                 }
             }
 
+            fn inlineEmitSpreadCompFn(
+                self: *@This(),
+                state: *InlineEmitState,
+                el_name: []const u8,
+                children: []const ChildInfo,
+            ) !void {
+                const SlotInfo = struct { tag: u4, static_pos: u32, dyn_idx: u32, len_var: NodeRef, nav_name: []const u8 };
+                var slots = std.ArrayList(SlotInfo).init(getAllocator());
+                defer slots.deinit();
+                var has_dynamic = false;
+                var dyn_counter: u32 = 0;
+                for (children) |ci| {
+                    const tag: u4 = switch (ci.kind) {
+                        .run_directive, .style_directive, .labeled_fragment => continue,
+                        .text_static, .intrinsic_static, .intrinsic_dynamic => 1,
+                        .component_instance => if (ci.is_spread) 4 else 1,
+                        .expression => if (ci.is_spread) 3 else 2,
+                        .if_directive => 3,
+                    };
+                    const dyn_idx = if (tag != 1) blk: { const d = dyn_counter; dyn_counter += 1; break :blk d; } else 0;
+                    try slots.append(.{
+                        .tag = tag,
+                        .static_pos = ci.static_pos,
+                        .dyn_idx = dyn_idx,
+                        .len_var = ci.len_var,
+                        .nav_name = ci.nav_name,
+                    });
+                    if (tag != 1) has_dynamic = true;
+                }
+
+                const a_id = try self.factory.createIdentifier("a");
+                const rm_anchor = try self.factory.createExpressionStatement(
+                    try self.factory.createCallExpression(
+                        try self.factory.createPropertyAccessExpression(
+                            try self.cloneIfNeeded(a_id), "remove"), 0));
+
+                if (!has_dynamic) {
+                    const a_d = try self.factory.createPropertyAccessExpression(a_id, "_d");
+                    const not_d = try self.factory.createPrefixUnaryExpression(.exclamation_token, a_d);
+                    const init_blk = try self.factory.createIfStatement(not_d, try self.factory.createBlock(&.{
+                        try self.factory.createAssignmentStatement(a_id, try self.factory.createNumericLiteral(@as(i64,1))),
+                        try self.factory.createExpressionStatement(
+                            try self.factory.createCallExpression(
+                                try self.factory.createPropertyAccessExpression(
+                                    try self.cloneIfNeeded(a_id), "after"),
+                                &.{try self.factory.createSpreadElement(state.children_exp)})
+                        ),
+                        rm_anchor,
+                    }), 0);
+                    const fn_body = try self.factory.createBlock(&.{init_blk});
+                    const param = try self.cloneIfNeeded(a_id);
+                    const arrow = try self.factory.createArrowFunction(param, fn_body, 0);
+
+                    const sc_lhs = try self.factory.createPropertyAccessExpression(
+                        try self.factory.createIdentifier(el_name), "_sc");
+                    try state.addStmt(try self.factory.createExpressionStatement(
+                        try self.factory.createBinaryExpression(sc_lhs, .equals_token, arrow)));
+
+                    return;
+                }
+
+                const total_dyn = dyn_counter;
+                const d_id = try self.factory.createIdentifier("d");
+
+                var init_stmts = std.ArrayList(NodeRef).init(getAllocator());
+                defer init_stmts.deinit();
+
+                var d_props = NodeList.init(self.nodes);
+                for (0..total_dyn) |i| {
+                    const key = try std.fmt.allocPrint(getAllocator(), "c{d}", .{i});
+                    const key_id = try self.factory.createIdentifier(key);
+                    const new_cmt = try self.factory.createNewExpression(
+                        try self.factory.createIdentifier("Comment"), @as(NodeRef, 0));
+                    d_props.appendRef(try self.factory.createPropertyAssignment(key_id, new_cmt));
+                }
+                const a_d = try self.factory.createPropertyAccessExpression(
+                    try self.factory.cloneNodeRef(a_id), "_d");
+                const obj_lit = try self.factory.createObjectLiteralExpression(d_props.head);
+                try init_stmts.append(try self.factory.createExpressionStatement(
+                    try self.factory.createBinaryExpression(
+                        try self.factory.cloneNodeRef(d_id), .equals_token,
+                        try self.factory.createBinaryExpression(
+                            a_d, .equals_token, obj_lit))));
+
+                var after_args = NodeList.init(self.nodes);
+                for (slots.items) |s| {
+                    if (s.tag == 1) {
+                        after_args.appendRef(try self.factory.createElementAccessExpression(
+                            try self.cloneIfNeeded(state.children_exp), s.static_pos));
+                    } else {
+                        const key: []const u8 = try std.fmt.allocPrint(getAllocator(), "c{d}", .{s.dyn_idx});
+                        after_args.appendRef(try self.factory.createPropertyAccessExpression(
+                            try self.factory.cloneNodeRef(d_id), key));
+                    }
+                }
+                try init_stmts.append(try self.factory.createExpressionStatement(
+                    try self.factory.createCallExpression(
+                        try self.factory.createPropertyAccessExpression(
+                            try self.cloneIfNeeded(a_id), "after"),
+                        after_args.head)));
+
+                for (slots.items) |s| {
+                    if (s.tag == 4) {
+                        const sc_fn = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createIdentifier(s.nav_name), "_sc");
+                        const key: []const u8 = try std.fmt.allocPrint(getAllocator(), "c{d}", .{s.dyn_idx});
+                        const cn_init = try self.factory.createPropertyAccessExpression(
+                            try self.factory.cloneNodeRef(d_id), key);
+                        try init_stmts.append(try self.factory.createExpressionStatement(
+                            try self.factory.createCallExpression(sc_fn, &.{cn_init})));
+                    }
+                }
+
+                try init_stmts.append(rm_anchor);
+
+                var upd_stmts = std.ArrayList(NodeRef).init(getAllocator());
+                defer upd_stmts.deinit();
+
+                const has_spreads = state.offset_counter_name != 0;
+                const acc_id = if (has_spreads) blk: {
+                    const acc_name = try state.nextName();
+                    const id = try self.factory.createIdentifier(acc_name);
+                    try upd_stmts.append(try self.factory.createVariableStatement(
+                        try self.factory.createVariableDeclarationSimple(
+                            try self.cloneIfNeeded(id),
+                            try self.cloneIfNeeded(state.offset_counter_name)),
+                        @intFromEnum(NodeFlags.let)));
+                    break :blk id;
+                } else @as(NodeRef, 0);
+
+                var i: usize = slots.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const s = slots.items[i];
+                    if (s.tag == 1) continue;
+
+                    const key: []const u8 = try std.fmt.allocPrint(getAllocator(), "c{d}", .{s.dyn_idx});
+                    const cn = try self.factory.createPropertyAccessExpression(
+                        try self.factory.cloneNodeRef(d_id), key);
+
+                    if (s.tag == 2) {
+                        // __setSlot(d.cN, children[static_pos (+ acc)], d.cN.s)
+                        const idx_exp = if (!has_spreads)
+                            try self.factory.createNumericLiteral(s.static_pos)
+                        else if (s.static_pos == 0)
+                            try self.cloneIfNeeded(acc_id)
+                        else
+                            try self.factory.createBinaryExpression(
+                                try self.factory.createNumericLiteral(s.static_pos),
+                                .plus_token,
+                                try self.cloneIfNeeded(acc_id));
+                        const val = try self.factory.createElementAccessExpression(
+                            try self.cloneIfNeeded(state.children_exp), idx_exp);
+                        const cn_s = try self.factory.createPropertyAccessExpression(cn, "s");
+                        const cn_s2 = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createPropertyAccessExpression(
+                                try self.factory.cloneNodeRef(d_id), key), "s");
+                        const set_slot = try self.factory.createCallExpression(
+                            try self.factory.createIdentifier(self.requireHelper(.set_slot)),
+                            &.{cn, val, cn_s2});
+                        try upd_stmts.append(try self.factory.createExpressionStatement(
+                            try self.factory.createBinaryExpression(
+                                cn_s, .equals_token, set_slot)));
+                    } else if (s.tag == 3) {
+                        // slice(acc -= len, acc + len)
+                        const dec_exp = try self.factory.createBinaryExpression(
+                            try self.cloneIfNeeded(acc_id), .minus_equals_token,
+                            try self.cloneIfNeeded(s.len_var));
+                        const start_exp = if (s.static_pos == 0)
+                            dec_exp
+                        else
+                            try self.factory.createBinaryExpression(
+                                try self.factory.createNumericLiteral(s.static_pos),
+                                .plus_token,
+                                try self.factory.createParenthesizedExpression(dec_exp));
+                        const end_exp = if (s.static_pos == 0)
+                            try self.factory.createBinaryExpression(
+                                try self.cloneIfNeeded(acc_id), .plus_token,
+                                try self.cloneIfNeeded(s.len_var))
+                        else
+                            try self.factory.createBinaryExpression(
+                                try self.factory.createBinaryExpression(
+                                    try self.factory.createNumericLiteral(s.static_pos),
+                                    .plus_token,
+                                    try self.cloneIfNeeded(acc_id)),
+                                .plus_token,
+                                try self.cloneIfNeeded(s.len_var));
+                        const slice_call = try self.factory.createCallExpression(
+                            try self.factory.createPropertyAccessExpression(
+                                try self.cloneIfNeeded(state.children_exp), "slice"),
+                            &.{start_exp, end_exp});
+                        const cn_s = try self.factory.createPropertyAccessExpression(cn, "s");
+                        const cn_s2 = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createPropertyAccessExpression(
+                                try self.factory.cloneNodeRef(d_id), key), "s");
+                        const set_spread = try self.factory.createCallExpression(
+                            try self.factory.createIdentifier(self.requireHelper(.set_slot_spread)),
+                            &.{cn, slice_call, cn_s2});
+                        try upd_stmts.append(try self.factory.createExpressionStatement(
+                            try self.factory.createBinaryExpression(
+                                cn_s, .equals_token, set_spread)));
+                    } else if (s.tag == 4) {
+                        // comp.root._sc(d.cN)
+                        const sc_fn = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier(s.nav_name), "root"), "_sc");
+                        try upd_stmts.append(try self.factory.createExpressionStatement(
+                            try self.factory.createCallExpression(sc_fn, &.{cn})));
+                        // acc -= len
+                        try upd_stmts.append(try self.factory.createExpressionStatement(
+                            try self.factory.createBinaryExpression(
+                                try self.cloneIfNeeded(acc_id),
+                                .minus_equals_token,
+                                try self.cloneIfNeeded(s.len_var))));
+                    }
+                }
+
+                var fn_body_stmts = std.ArrayList(NodeRef).init(getAllocator());
+                defer fn_body_stmts.deinit();
+
+                try fn_body_stmts.append(try self.factory.createVariableStatement(
+                    try self.factory.createVariableDeclarationSimple(
+                        try self.factory.cloneNodeRef(d_id),
+                        try self.factory.createPropertyAccessExpression(
+                            try self.factory.cloneNodeRef(a_id), "_d")),
+                    @intFromEnum(NodeFlags.let)));
+
+                const not_d = try self.factory.createPrefixUnaryExpression(
+                    .exclamation_token,
+                    try self.factory.cloneNodeRef(d_id));
+                try fn_body_stmts.append(try self.factory.createIfStatement(
+                    not_d, try self.factory.createBlock(init_stmts.items), 0));
+                try fn_body_stmts.appendSlice(upd_stmts.items);
+
+                const fn_body = try self.factory.createBlock(fn_body_stmts.items);
+                const param = try self.factory.createIdentifier("a");
+                const arrow = try self.factory.createArrowFunction(param, fn_body, 0);
+
+                const sc_lhs = try self.factory.createPropertyAccessExpression(
+                    try self.factory.createIdentifier(el_name), "_sc");
+                try state.addStmt(try self.factory.createExpressionStatement(
+                    try self.factory.createBinaryExpression(sc_lhs, .equals_token, arrow)));
+            }
+
             fn inlineProcessElement(
                 self: *@This(),
                 state: *InlineEmitState,
@@ -5054,6 +5563,9 @@ pub const Program = struct {
                         try self.inlineFragmentObjectChildren(state, children.items, try self.cloneIfNeeded(children_binding));
                     } else {
                         try self.inlineArrayChildren(state, children.items, &upd_body, try self.cloneIfNeeded(children_binding));
+                        if (node.kind == .jsx_component) {
+                            try self.inlineEmitSpreadCompFn(state, el_name, children.items);
+                        }
                     }
 
                     try self.inlineEmitDrainIfNeeded(state, &upd_body);
@@ -5413,6 +5925,27 @@ pub const Program = struct {
                     }
                 }
 
+                // sets `_mc = 1`
+                const children_mutates_or_escapes: bool = mc: {
+                    var it = NodeIterator.init(self.nodes, params_head);
+                    while (it.nextRef()) |pr| {
+                        const param_name_ref = getPackedData(self.nodes.at(pr)).left;
+                        const name_text = getSlice(self.nodes.at(param_name_ref), u8);
+                        if (std.mem.eql(u8, name_text, "children")) {
+                            var mutates = try self.childrenParamMutatesOrEscapes(param_name_ref, original_body);
+                            if (!mutates) {
+                                var iter = NodeIterator.init(self.nodes, children_head);
+                                while (iter.nextRef()) |c| {
+                                    mutates = try self.childrenParamMutatesOrEscapes(param_name_ref, c);
+                                    if (mutates) break;
+                                }
+                            }
+                            break :mc mutates;
+                        }
+                    }
+                    break :mc false;
+                };
+
                 const orig_stmts_head = if (original_body != 0)
                     maybeUnwrapRef(self.nodes.at(original_body)) orelse 0
                 else 0;
@@ -5436,15 +5969,23 @@ pub const Program = struct {
                     const setup = try self.createInlineJsxBlock(target, "__ret");
                     const decl = try self.factory.createLetVariable(name, setup.element_expr);
                     const ret = try self.factory.createReturnStatement(name);
+                    const tail = if (children_mutates_or_escapes) t: {
+                        const lhs = try self.factory.createPropertyAccessExpression(
+                            try self.factory.createIdentifier("__ret"), "_mc");
+                        const mc_stmt = try self.factory.createExpressionStatement(
+                            try self.factory.createBinaryExpression(lhs, .equals_token, try self.factory.createNumericLiteral(@as(i64, 1))));
+                        self.nodes.at(mc_stmt).next = ret;
+                        break :t mc_stmt;
+                    } else ret;
                     if (setup.setup_block != 0) {
                         var block_tail: NodeRef = 0;
                         var iter = NodeIterator.init(self.nodes, maybeUnwrapRef(self.nodes.at(setup.setup_block)) orelse 0);
                         const block_head = iter.ref;
                         while (iter.nextRef()) |r| block_tail = r;
-                        self.nodes.at(block_tail).next = ret;
+                        self.nodes.at(block_tail).next = tail;
                         self.nodes.at(decl).next = block_head;
                     } else {
-                        self.nodes.at(decl).next = ret;
+                        self.nodes.at(decl).next = tail;
                     }
                     break :blk decl;
                 };

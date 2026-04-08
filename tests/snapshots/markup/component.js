@@ -19,16 +19,9 @@ var __comp = root => ({
   }
 })
 var __spreadComp = function(a=this._b) {
-  let i=0,b=a._e,c=a.nextSibling,r=this.root,l=r.length,n,v
-  b||a.after(b=a.cloneNode())
-  while((n=c,c=n.nextSibling)&&n!==b) {
-    if (i>=l) n.remove()
-    else if (n!==(v=r[i++])) n.replaceWith(v)
-  }
-  while (i<l) b.before(r[i++])
-  return a._e=b
+  return this.root._sc(a), a
 }
-var __pushAt = (c,i,v,l = c.length) => (c.splice(i,0,...v), c.length-l)
+var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
 var __setSlotSpread = (a,v,b) => {
   b || a.after(b = a.cloneNode())
   let p, n = a.nextSibling
@@ -102,6 +95,13 @@ function Row(props) {
   let _v4 = _v1.firstChild
   let _v5
   __ret[1] = _v1;
+  __ret._sc = (a) => {
+    if (!a._d) {
+      a = 1;
+      a.after(...__ret);
+      a.remove();
+    }
+  };
   ;(__ret[__sym_upd] = () => {
     _v3 = __setSlot(_v2, props.a, _v3);
     _v5 = __setSlot(_v4, props.b, _v5);
@@ -113,6 +113,18 @@ function Inner(props) {
   __ret = [];
   let _v0 = 0
   let _v1 = 0
+  __ret._sc = (a) => {
+    let d = a._d
+    if (!d) {
+      d = a._d = {
+        c0: new Comment()
+      };
+      a.after(d.c0);
+      a.remove();
+    }
+    let _v2 = _v0
+    d.c0.s = __setSlotSpread(d.c0, __ret.slice(_v2 -= _v1, _v2 + _v1), d.c0.s);
+  };
   ;(__ret[__sym_upd] = () => {
     if (_v0) {
       __ret.splice(_v0 -= _v1, _v1);

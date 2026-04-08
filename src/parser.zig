@@ -472,7 +472,7 @@ pub const TypeOperators = ComptimeStringMap(SyntaxKind, .{
 // the number of nodes parsed.
 pub const NodeFlags = enum(u22) {
     none = 0,
-    let = 1 << 0,
+    let = 1 << 0, // hex for numbers
     @"const" = 1 << 1,
     using = 1 << 2,
     @"async" = 1 << 3,
@@ -11090,7 +11090,11 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         const val: u64 = @intFromPtr(d);
                         const f: f64 = @bitCast(val);
                         var buf: [64]u8 = undefined;
-                        this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
+                        if (n.hasFlag(.let)) { // hex
+                            this.print(try std.fmt.bufPrint(&buf, "0x{X}", .{@as(u64, @intFromFloat(f))}));
+                        } else {
+                            this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
+                        }
                     } else {
                         this.print("0");
                     }

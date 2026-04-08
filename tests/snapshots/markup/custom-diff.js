@@ -17,18 +17,44 @@ var __comp = root => ({
     }
   }
 })
-var __pushAt = (c,i,v,l = c.length) => (c.splice(i,0,...v), c.length-l)
+var __spreadComp = function(a=this._b) {
+  return this.root._sc(a), a
+}
+var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
+var __setSlot = (a,v,c) => {
+  const q = c?.nextSibling === a
+  if (typeof v !== 'object') {
+    if (q && c.nodeType === 3) { c.nodeValue = v; return c }
+    v = new Text(v)
+  }
+  q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
+  return v
+}
 function Inner(props) {
   const a = document.createComment('')
   const b = document.createComment('')
   let len = 0
-  let __ret = __template(`<div><!><!></div>`)
+  let __ret = __template(`<a>`)
   const _v0 = __ret.firstChild
   const _v1 = _v0.nextSibling
-  _v0.replaceWith(a);
-  _v1.replaceWith(b);
+  __ret = [];
+  __ret[0] = a;
+  __ret[1] = b;
   let cur
   let i
+  __ret._sc = (a) => {
+    let d = a._d
+    if (!d) {
+      d = a._d = {
+        c0: new Comment(),
+        c1: new Comment()
+      };
+      a.after(d.c0, d.c1);
+      a.remove();
+    }
+    d.c1.s = __setSlot(d.c1, __ret[1], d.c1.s);
+    d.c0.s = __setSlot(d.c0, __ret[0], d.c0.s);
+  };
   ;(__ret[__sym_upd] = () => {
     cur = a.nextSibling;
     i = 0;
@@ -40,11 +66,7 @@ function Inner(props) {
         continue
       }
       const c = props.children[i++]
-      if (n === c) continue
-      if (n.nodeType === 3 && typeof c !== 'object') {
-        n.nodeValue = c;
-        continue
-      }
+      if (n === c || (n.nodeType === 3 && typeof c !== 'object' && n.nodeValue === String(c))) continue
       if (len > props.children.length) {
         i--;
         n.remove();
@@ -61,17 +83,21 @@ function Inner(props) {
   return __ret
 }
 function WithSpread(props) {
-  let __ret = __comp(Inner)
-  const _v0 = __ret._p.children = []
-  let _v1 = 0
-  let _v2 = 0
-  __ret._u = () => {
-    if (_v1) {
-      _v0.splice(_v1 -= _v2, _v2);
+  let __ret = __template(`<div><!></div>`)
+  let _v0 = __ret.firstChild
+  const _v1 = __comp(Inner)
+  _v1._b = _v0;
+  _v1._s = __spreadComp;
+  const _v2 = _v1._p.children = []
+  let _v3 = 0
+  let _v4 = 0
+  _v1._u = () => {
+    if (_v3) {
+      _v2.splice(_v3 -= _v4, _v4);
     }
-    _v1 += (_v2 = __pushAt(_v0, _v1, props.items));
+    _v3 += (_v4 = __pushAt(_v2, _v3, props.items));
   };
-  __ret[__sym_upd]();
+  ;(__ret[__sym_upd] = _v1[__sym_upd].bind(_v1))();
   return __ret
 }
 const items = []
