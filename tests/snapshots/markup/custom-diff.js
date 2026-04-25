@@ -20,7 +20,6 @@ var __comp = root => ({
 var __spreadComp = function(a=this._b) {
   return this.root._sc(a), a
 }
-var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
 var __setSlot = (a,v,c) => {
   const q = c?.nextSibling === a
   if (typeof v !== 'object') {
@@ -34,9 +33,7 @@ function Inner(props) {
   const a = document.createComment('')
   const b = document.createComment('')
   let len = 0
-  let __ret = __template(`<a>`)
-  const _v0 = __ret.firstChild
-  const _v1 = _v0.nextSibling
+  let __ret
   __ret = [];
   __ret[0] = a;
   __ret[1] = b;
@@ -88,14 +85,8 @@ function WithSpread(props) {
   const _v1 = __comp(Inner)
   _v1._b = _v0;
   _v1._s = __spreadComp;
-  const _v2 = _v1._p.children = []
-  let _v3 = 0
-  let _v4 = 0
   _v1._u = () => {
-    if (_v3) {
-      _v2.splice(_v3 -= _v4, _v4);
-    }
-    _v3 += (_v4 = __pushAt(_v2, _v3, props.items));
+    _v1._p.children = _v1.root._mc || !Array.isArray(props.items) ? [...props.items] : props.items;
   };
   ;(__ret[__sym_upd] = _v1[__sym_upd].bind(_v1))();
   return __ret

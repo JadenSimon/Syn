@@ -8141,7 +8141,7 @@ pub fn forEachChild(
         },
         .jsx_component => {
             const d = getPackedData(node);
-            try visitList(nodes, d.left, visitor); // fn exp
+            try visitor.visit(nodes.at(d.left), d.left); // fn exp
             try visitList(nodes, d.right, visitor); // children
         },
         .update_statement => {

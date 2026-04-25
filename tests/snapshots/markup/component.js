@@ -109,7 +109,7 @@ function Row(props) {
   return __ret
 }
 function Inner(props) {
-  let __ret = document.createComment('')
+  let __ret
   __ret = [];
   let _v0 = 0
   let _v1 = 0
@@ -146,14 +146,8 @@ function withSpread(items) {
     const _v3 = __comp(Inner)
     _v3._b = _v1;
     _v3._s = __spreadComp;
-    const _v4 = _v3._p.children = []
-    let _v5 = 0
-    let _v6 = 0
     _v3._u = () => {
-      if (_v5) {
-        _v4.splice(_v5 -= _v6, _v6);
-      }
-      _v5 += (_v6 = __pushAt(_v4, _v5, items));
+      _v3._p.children = _v3.root._mc || !Array.isArray(items) ? [...items] : items;
     };
     ;(__ret[__sym_upd] = () => {
       _v2[__sym_upd]();
