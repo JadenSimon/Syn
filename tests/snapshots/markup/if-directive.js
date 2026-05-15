@@ -1,41 +1,41 @@
 // @filename: main.syn
 var __template = ((p,c,u) => s => {
   u ||= setTimeout(() => (c = {}, u = 0))
-  return s in c ? (c[s].n ||= p(s)).cloneNode(true) : c[s] = p(s)
+  return s in c ? (c[s]._n ||= p(s)).cloneNode(true) : c[s] = p(s)
 })((s,t = document.createElement('template')) => (t.innerHTML = s, t.content.firstChild), {})
 var __sym_upd = Symbol.update ||= Symbol.for('update')
-var __comp = root => ({
-  root, _p: {}, [__sym_upd]() {
-    let t = this.root
-    this._u?.()
-    if (typeof t === 'function') {
-      t = this.root = t(this._p)
-      this._s?.() ?? this._b?.replaceWith(t)
-    } else {
-      t[__sym_upd]?.()
-      this._s?.()
-    }
+var __comp = root => ({ root, _p: {}, [__sym_upd]() {
+  let t = this.root
+  this._u?.()
+  if (typeof t === 'function') {
+    t = this.root = t(this._p)
+    this._a && t.setAttribute(this._a,'')
+    this._s?.() ?? this._b?.replaceWith(t)
+  } else {
+    t[__sym_upd]?.()
+    this._s?.()
   }
-})
+}})
 var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
-var __setSlotSpread = (a,v,b) => {
+var __slot_s = (a,v,b) => {
   b || a.after(b = a.cloneNode())
   let p, n = a.nextSibling
   while (p = n, n = p.nextSibling, p !== b) p.remove()
   a.after(...v)
   return b
 }
-var __setSlot = (a,v,c) => {
+var __slot = (a,v,c) => {
   const q = c?.nextSibling === a
   if (typeof v !== 'object') {
-    if (q && c.nodeType === 3) { c.nodeValue = v; return c }
+    if (q && c.nodeType === 3) { c.nodeValue != v && (c.nodeValue = v); return c }
     v = new Text(v)
   }
   q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
   return v
 }
+var __unw = (a,f) => { while (f = a.pop()) if (Array.isArray(f)) __unw(f); else f() }
 function basicIf(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
     let _v1
@@ -44,7 +44,7 @@ function basicIf(show) {
       if (_v2 != _v0._s) {
         if (_v2) {
           if (_v0._s !== 0) {
-            _v1 = __template(`<span>hello</span>`);
+            _v1 = __template(`<span>hello`);
           }
           _v0.replaceWith(_v1);
           _v0._s = 1;
@@ -62,37 +62,35 @@ function basicIf(show) {
   return __ret
 }
 function ifElse(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
-    let _v4
-    let _v5
-    let _v6
+    let _v4, _v5, _v6
     ;(__ret[__sym_upd] = () => {
       let _v1
       if (show) {
-        _v1 = _v4 ??= __template(`<span>yes</span>`);
+        _v1 = _v4 ??= __template(`<span>yes`);
       } else {
-        _v1 = _v5 ??= __template(`<span>no</span>`);
+        _v1 = _v5 ??= __template(`<span>no`);
       }
-      _v1 != null ? _v6 = __setSlot(_v0, _v1, _v6) : _v6?.remove();
+      _v1 != null ? _v6 = __slot(_v0, _v1, _v6) : _v6?.remove();
     })();
   }
   return __ret
 }
 function ifExpr(count, show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
     let _v1
     ;(__ret[__sym_upd] = () => {
-      show ? _v1 = __setSlot(_v0, count, _v1) : _v1?.remove();
+      show ? _v1 = __slot(_v0, count, _v1) : _v1?.remove();
     })();
   }
   return __ret
 }
 function ifElseExpr(val, show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
     let _v4
@@ -103,13 +101,13 @@ function ifElseExpr(val, show) {
       } else {
         _v1 = "hidden";
       }
-      _v4 = __setSlot(_v0, _v1, _v4);
+      _v4 = __slot(_v0, _v1, _v4);
     })();
   }
   return __ret
 }
 function siblingIfs(a, b) {
-  const __ret = __template(`<div><!><!></div>`)
+  const __ret = __template(`<div><!><!>`)
   {
     const _v0 = __ret.firstChild
     const _v1 = _v0.nextSibling
@@ -119,7 +117,7 @@ function siblingIfs(a, b) {
       if (_v3 != _v0._s) {
         if (_v3) {
           if (_v0._s !== 0) {
-            _v2 = __template(`<span>a</span>`);
+            _v2 = __template(`<span>a`);
           }
           _v0.replaceWith(_v2);
           _v0._s = 1;
@@ -138,7 +136,7 @@ function siblingIfs(a, b) {
       if (_v5 != _v1._s) {
         if (_v5) {
           if (_v1._s !== 0) {
-            _v4 = __template(`<span>b</span>`);
+            _v4 = __template(`<span>b`);
           }
           _v1.replaceWith(_v4);
           _v1._s = 1;
@@ -159,7 +157,7 @@ function siblingIfs(a, b) {
   return __ret
 }
 function ifWithBinding(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
     let el
@@ -168,7 +166,7 @@ function ifWithBinding(show) {
       if (_v1 != _v0._s) {
         if (_v1) {
           if (_v0._s !== 0) {
-            el = __template(`<span>hello</span>`);
+            el = __template(`<span>hello`);
           }
           _v0.replaceWith(el);
           _v0._s = 1;
@@ -186,18 +184,13 @@ function ifWithBinding(show) {
   return __ret
 }
 function ifWithUnwind(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
-    let _v3
-    let _v4
-    let _v7
+    let _v3, _v4, _v7
     let _v1 = []
     ;(__ret[__sym_upd] = () => {
-      if (_v1.length) {
-        let f
-        while (f = _v1.pop()) f();
-      }
+      __unw(_v1);
       _v1.push(() => {
         console.log('2');
       });
@@ -223,13 +216,13 @@ function ifWithUnwind(show) {
           return _v6
         })();
       }
-      _v7 = __setSlotSpread(_v0, _v2 ? _v3 : _v4, _v7);
+      _v7 = __slot_s(_v0, _v2 ? _v3 : _v4, _v7);
     })();
   }
   return __ret
 }
 function singleSlotNoEffects(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
     let _v4
@@ -240,24 +233,22 @@ function singleSlotNoEffects(show) {
       } else {
         _v1 = '2';
       }
-      _v4 = __setSlot(_v0, _v1, _v4);
+      _v4 = __slot(_v0, _v1, _v4);
     })();
   }
   return __ret
 }
 function branchWithBinding(show) {
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     const _v0 = __ret.firstChild
-    let _v2
-    let _v3
-    let _v6
+    let _v2, _v3, _v6
     ;(__ret[__sym_upd] = () => {
       const _v1 = !!show
       if (_v1) {
         if (_v2) _v2[__sym_upd]();
          else _v2 = (() => {
-          let _v4 = __template(`<div></div>`)
+          let _v4 = __template(`<div>`)
           const d = _v4
           _v4 = [];
           d[__sym_upd] = () => {
@@ -275,7 +266,7 @@ function branchWithBinding(show) {
           return _v5
         })();
       }
-      _v6 = __setSlotSpread(_v0, _v1 ? _v2 : _v3, _v6);
+      _v6 = __slot_s(_v0, _v1 ? _v2 : _v3, _v6);
     })();
   }
   return __ret
@@ -288,7 +279,7 @@ function conditionalComponentInstanceChildren(cond) {
     })();
     return __ret
   }
-  const __ret = __template(`<div><!></div>`)
+  const __ret = __template(`<div><!>`)
   {
     let _v0 = __ret.firstChild
     const _v1 = __comp(Inner)
@@ -298,9 +289,7 @@ function conditionalComponentInstanceChildren(cond) {
     let _v4 = 0
     const _v5 = []
     _v1._u = () => {
-      if (_v3) {
-        _v2.splice(_v3 -= _v4, _v4);
-      }
+      _v3 = 0;
       const _v6 = !!cond
       if (_v6) {
         if (!_v5._s) {
@@ -308,7 +297,7 @@ function conditionalComponentInstanceChildren(cond) {
           _v5._s = 1;
         }
       }
-      _v3 += (_v4 = __pushAt(_v2, _v3, _v6 ? _v5 : []));
+      _v3 += (_v4 = __pushAt(_v2, _v3, _v6 ? _v5 : [], _v4));
     };
     ;(__ret[__sym_upd] = _v1[__sym_upd].bind(_v1))();
   }

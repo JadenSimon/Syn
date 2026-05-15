@@ -6154,6 +6154,19 @@ fn Parser_(comptime skip_trivia: bool) type {
                     return n;
                 },
                 .t_identifier => {
+                    // TODO: slightly restructure the below to avoid creating nodes for various keywords
+                    // const ident = this.lexer.identifier;
+                    // const location = this.getLocation();
+                    // const width = this.getFullWidth();
+                    // try this.lexer.next();
+                    // if (this.lexer.token == .t_colon) {
+                    //     const ident_node = toIdentNodeWithLocation(ident, location, full_start, width);
+                    //     try this.lexer.next();
+                    //     return .{
+                    //         .kind = .labeled_statement,
+                    //         .data = try this.toBinaryDataPtr(ident_node, try this.parseStatement()),
+                    //     };
+                    // }
                     if (js_lexer.ExtraKeyword.List.get(this.lexer.identifier)) |k| {
                         switch (k) {
                             .t_type => {
@@ -6427,6 +6440,12 @@ fn Parser_(comptime skip_trivia: bool) type {
                         return this.parseJSXContainer();
                     }
                     return this.parseExpressionStatement();
+                },
+                .t_public => {
+                    if (this.options.is_syn) {
+                        try this.lexer.next();
+                        return this.parseFnDecl(full_start, @intFromEnum(NodeFlags.public), .function_declaration);
+                    }
                 },
                 else => return this.parseExpressionStatement(),
             }
@@ -10204,7 +10223,11 @@ pub const Binder = struct {
                     defer this.should_hoist = false;
                     var iter = NodeIterator.init(this.nodes, o.right);
                     while (iter.nextPair()) |p| {
-                        try this.visit(p[0], p[1]);
+                        if (p[0].kind == .jsx_run_directive) {
+                            try forEachChild(this.nodes, p[0], this);
+                        } else {
+                            try this.visit(p[0], p[1]);
+                        }
                     }
                 }
 
