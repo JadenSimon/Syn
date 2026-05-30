@@ -3610,9 +3610,18 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             if (strings.eql(this.lexer.identifier, "#style")) {
                 try this.lexer.nextInsideJSXElement();
+                var name: NodeRef = 0;
+                var deps: NodeRef = 0;
+                if (this.lexer.token == .t_identifier) {
+                    name = try this.parseIdentifier();
+                }
+                if (this.lexer.token == .t_open_paren) {
+                    deps = try this.parseCallArgs();
+                }
                 try this.lexer.nextJSXStyle(); // expect .t_greater_than
                 // possibly empty style directive
-                const txt = if (this.lexer.token == .t_less_than) 0 else try this.pushNode(try this.parseJSXText());
+                const txt = if (this.lexer.token == .t_less_than) 0 
+                    else try this.pushNode(try this.parseJSXText());
                 try this.lexer.expect(.t_less_than);
                 try this.lexer.expect(.t_slash);
                 if (this.context_state == .jsx_children) {
@@ -3622,7 +3631,8 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
                 return .{
                     .kind = .jsx_style_directive,
-                    .data = if (txt == 0) null else @ptrFromInt(txt),
+                    .data = toBinaryDataPtrRefsMaybeNull(name, txt),
+                    .len = deps,
                 };
             }
 
@@ -5940,6 +5950,16 @@ fn Parser_(comptime skip_trivia: bool) type {
                         .data = @ptrFromInt(try this.pushNode(statement)),
                     };
                 },
+                .t_finally => {
+                    try this.next();
+                    const statement = try this.parseBlock();
+
+                    return .{
+                        .kind = .defer_statement,
+                        .data = @ptrFromInt(statement),
+                        .extra_data = 1,
+                    };
+                },
                 .t_identifier, .t_this, .t_super, .t_void, .t_await, .t_delete, .t_typeof, .t_plus_plus, .t_minus_minus => {
                     const statement = try this.parseExpressionStatement();
 
@@ -6446,6 +6466,15 @@ fn Parser_(comptime skip_trivia: bool) type {
                         try this.lexer.next();
                         return this.parseFnDecl(full_start, @intFromEnum(NodeFlags.public), .function_declaration);
                     }
+                    return this.parseExpressionStatement();
+                },
+                .t_static => {
+                    if (this.options.is_syn) {
+                        // FIXME: this is wrong, needs to parse exp statement unless certain keywords follow
+                        try this.lexer.next();
+                        return this.parseLocalDeclaration(full_start, @intFromEnum(NodeFlags.static));
+                    }
+                    return this.parseExpressionStatement();
                 },
                 else => return this.parseExpressionStatement(),
             }
@@ -6658,7 +6687,10 @@ pub const Factory = struct {
             },
             f64 => @bitCast(val),
             u16, i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
-            else => @compileError("Unhandled type"),
+            else => {
+                @compileLog(@TypeOf(val));
+                @compileError("Unhandled type");
+            },
         };
 
         return this.nodes.push(.{
@@ -6910,6 +6942,15 @@ pub const Factory = struct {
             .kind = .arrow_function,
             .data = toBinaryDataPtrRefs(params, body),
             .flags = flags,
+        });
+    }
+
+    pub fn createSingleParamArrowFunction(this: *@This(), param: NodeRef, body: NodeRef, flags: u22) !NodeRef {
+        std.debug.assert(param != 0);
+        return this.nodes.push(.{
+            .kind = .arrow_function,
+            .data = toBinaryDataPtrRefs(param, body),
+            .flags = flags | @intFromEnum(NodeFlags.let),
         });
     }
 
@@ -9342,14 +9383,14 @@ pub const Binder = struct {
                 const name = head.extra_data;
                 if (name != 0) {
                     const ident = this.nodes.at(name);
-                    try this.bindDeclWithFlagsOrOrdinal(ident, ref, 0, 0, false);
+                    try this.bindDeclWithFlagsOrOrdinal(ident, ref, 0, @as(u32, @intFromEnum(SymbolFlags.@"const")) << 16, false);
                 }
             },
             .jsx_self_closing_element => {
                 const name = node.extra_data;
                 if (name != 0) {
                     const ident = this.nodes.at(name);
-                    try this.bindDeclWithFlagsOrOrdinal(ident, ref, 0, 0, false);
+                    try this.bindDeclWithFlagsOrOrdinal(ident, ref, 0, @as(u32, @intFromEnum(SymbolFlags.@"const")) << 16, false);
                 }
             },
             else => {},
