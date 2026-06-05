@@ -383,11 +383,13 @@ pub const SyntaxKind = enum(u10) {
     jsx_style_directive = 711,
     jsx_class_attribute = 712,
     jsx_class_list = 713,
+    public_declaration = 714,
 
     // Used to stitch multiple ASTs together
     // Node contains a pointer to `AstData` and the start node
     external_node = 1000,
     verbatim_node = 1001, // Writes text out directly
+    // statement_list = 1002,
 
     start = 1022,
     parse_error = 1023,
@@ -895,7 +897,14 @@ pub fn BumpAllocatorList(comptime T: type) type {
             if (comptime is_debug) {
                 var x = this.head;
                 while (x != 0) {
-                    if (x == ref) @panic("Recursive appendRef");
+                    if (x == ref) {
+                        // weird but technically harmless
+                        if (this.allocator.at(this.prev).next == ref) break;
+                        if (comptime T == AstNode) {
+                            std.debug.print("{?}\n",.{this.allocator.at(x).kind});
+                        }
+                        @panic("Recursive appendRef");
+                    }
                     x = this.allocator.at(x).next;
                 }
                 if (ref == 0 and this.head != 0) {
@@ -3261,14 +3270,21 @@ fn Parser_(comptime skip_trivia: bool) type {
                         continue;
                     }
                     var is_spread = false;
+                    var flags: u22 = 0;
                     if (this.lexer.token == .t_dot_dot_dot) {
                         is_spread = true;
+                        flags |= @intFromEnum(NodeFlags.generator);
+                        try this.lexer.next();
+                    }
+                    if (this.lexer.token == .t_static) {
+                        flags |= @intFromEnum(NodeFlags.static);
                         try this.lexer.next();
                     }
                     const exp = try this.parseExpression();
                     if (is_spread) {
                         try children.append(.{
                             .kind = .jsx_expression,
+                            .flags = flags,
                             .data = @ptrFromInt(try this.pushNode(.{
                                 .kind = .spread_element,
                                 .data = @ptrFromInt(exp),
@@ -3277,6 +3293,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     } else {
                         try children.append(.{
                             .kind = .jsx_expression,
+                            .flags = flags,
                             .data = @ptrFromInt(exp),
                         });
                     }
@@ -3312,9 +3329,15 @@ fn Parser_(comptime skip_trivia: bool) type {
             defer this.context_state = ctx;
             this.context_state = .none;
             try this.lexer.expect(.t_open_brace);
+            var flags: u22 = 0;
+            if (this.lexer.token == .t_static) {
+                flags |= @intFromEnum(NodeFlags.static);
+                try this.lexer.next();
+            }
             const exp = try this.parseExpression();
             const value = try this.pushNode(.{
                 .kind = .jsx_expression,
+                .flags = flags,
                 .data = @ptrFromInt(exp),
             });
             try this.lexer.expectInsideJSXElement(.t_close_brace);
@@ -3329,10 +3352,20 @@ fn Parser_(comptime skip_trivia: bool) type {
                 is_spread = true;
                 try this.lexer.nextInsideJSXElement();
             }
-            // todo: handle `Foo.Bar` tags
-            // const openingTag = try this.parseExpressionWithLevel(.member);
-            const openingTag = toIdentNode2(this.lexer.identifier);
+            const end = this.lexer.end;
+            var openingTag = toIdentNode2(this.lexer.identifier);
             try this.lexer.nextInsideJSXElement();
+            // FIXME: this should be a loop
+            if (this.lexer.token == .t_dot and this.lexer.start == end) {
+                const left = try this.pushNode(openingTag);
+                try this.lexer.nextInsideJSXElement();
+                const right = toIdentNode2(this.lexer.identifier);
+                try this.lexer.nextInsideJSXElement();
+                openingTag = .{
+                    .kind = .property_access_expression,
+                    .data = toBinaryDataPtrRefs(left, try this.pushNode(right)),
+                };
+            }
 
             const tag = try this.pushNode(openingTag);
 
@@ -3388,6 +3421,11 @@ fn Parser_(comptime skip_trivia: bool) type {
                     defer this.context_state = ctx;
                     this.context_state = .none;
                     try this.lexer.next();
+                    var exp_flags: u22 = 0;
+                    if (this.lexer.token == .t_static) {
+                        exp_flags |= @intFromEnum(NodeFlags.static);
+                        try this.lexer.next();
+                    }
                     if (this.options.is_syn and this.lexer.token == .t_identifier) {
                         // TODO: report "did you forget '...'" or similar if we don't parse out an identifier
                         const n = try this.parseIdentifierNode();
@@ -3396,6 +3434,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                             const name = try this.pushNode(exp_node);
                             const jsx_exp = try this.pushNode(.{
                                 .kind = .jsx_expression,
+                                .flags = exp_flags,
                                 .data = @ptrFromInt(try this.pushNode(exp_node)),
                             });
                             try attributes.append(.{
@@ -3415,6 +3454,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     const exp = try this.parseExpression();
                     try attributes.append(.{
                         .kind = .jsx_spread_attribute,
+                        .flags = exp_flags,
                         .data = @ptrFromInt(exp),
                     });
                     try this.lexer.expectInsideJSXElement(.t_close_brace);
@@ -4506,6 +4546,29 @@ fn Parser_(comptime skip_trivia: bool) type {
             return params.head;
         }
 
+        fn parseComponentParameters(this: *@This()) !NodeRef {
+            try this.expect(.t_open_paren);
+
+            var params = NodeList_.init(this);
+            while (this.lexer.token != .t_close_paren) {
+                var flags: u22 = 0;
+                if (this.lexer.token == .t_static) {
+                    try this.lexer.nextInConstructorParameterList();
+                    flags |= @intFromEnum(NodeFlags.static);
+                }
+
+                const p = try this.parseParam(flags);
+                try params.append(p);
+
+                if (this.lexer.token == .t_close_paren) break;
+                try this.expect(.t_comma);
+            }
+
+            try this.next();
+
+            return params.head;
+        }
+
         fn parseFnDecl(this: *@This(), full_start: u32, flags_init: u22, comptime kind: SyntaxKind) !AstNode_ {
             if (comptime kind != .jsx_component) {
                 try this.lexer.expect(.t_function);
@@ -4528,7 +4591,10 @@ fn Parser_(comptime skip_trivia: bool) type {
                 typeParameters = try this.parseTypeParams();
             }
 
-            const parameters = try this.parseParameters();
+            const parameters = if (comptime kind == .jsx_component) 
+                try this.parseComponentParameters() 
+            else 
+                try this.parseParameters();
 
             var return_type: NodeRef = 0;
             if (this.lexer.token == .t_colon) {
@@ -6464,6 +6530,18 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .t_public => {
                     if (this.options.is_syn) {
                         try this.lexer.next();
+                        if (this.lexer.token == .t_open_brace) {
+                            const bindings = try this.parseNamedModuleBindings(true);
+                            return .{
+                                .kind = .public_declaration,
+                                .data = if (bindings == 0) null else @ptrFromInt(bindings),
+                                .flags = @intFromEnum(NodeFlags.public),
+                            };
+                        }
+                        // TODO: public type and public interface
+                        if (this.lexer.token == .t_class) { // or this.lexer.token == .t_const
+                            return this.parseLocalDeclaration(full_start, @intFromEnum(NodeFlags.public));
+                        }
                         return this.parseFnDecl(full_start, @intFromEnum(NodeFlags.public), .function_declaration);
                     }
                     return this.parseExpressionStatement();
@@ -6739,7 +6817,7 @@ pub const Factory = struct {
     // arg: (comptime_int | usize | f64) | Utf8String | NodeRef
     pub fn createElementAccessExpression(this: *@This(), subject: NodeRef, arg: anytype) !NodeRef {
         const right = switch (@TypeOf(arg)) {
-            NodeRef => this.assertNotNil(arg),
+            NodeRef => this.assertValid(arg),
             []const u8, [:0]const u8 => try this.createStringLiteral(arg),
             u16, i32, i64, f64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
@@ -6867,7 +6945,7 @@ pub const Factory = struct {
 
     pub fn createAssignmentStatement(this: *@This(), left: NodeRef, right: NodeRef) !NodeRef {
         return try this.createExpressionStatement(
-            try this.createBinaryExpression(left, .equals_token, right)
+            try this.createBinaryExpression(this.assertValid(left), .equals_token, this.assertValid(right))
         );
     } 
 
@@ -7007,7 +7085,7 @@ pub const Factory = struct {
     pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u22) !NodeRef {
         return this.nodes.push(.{
             .kind = .variable_statement,
-            .data = @ptrFromInt(this.assertNotNil(declarations)),
+            .data = @ptrFromInt(this.assertValid(declarations)),
             .flags = flags,
         });
     }
@@ -7164,8 +7242,9 @@ pub const Factory = struct {
         });
     }
 
-    inline fn assertNotNil(_: *const @This(), ref: NodeRef) NodeRef {
+    inline fn assertValid(this: *const @This(), ref: NodeRef) NodeRef {
         std.debug.assert(ref != 0);
+        std.debug.assert(ref < this.nodes.count());
         return ref;
     }
 
@@ -12443,6 +12522,9 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
                     this.needs_newline = true;
                 },
+                // .statement_list => {
+                //     try this._visitLinkedList(n.extra_data, "", "", "", true);
+                // },
                 .with_statement => {
                     const d = getPackedData(n);
                     this.print("with (");
