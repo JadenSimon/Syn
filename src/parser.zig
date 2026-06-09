@@ -383,7 +383,8 @@ pub const SyntaxKind = enum(u10) {
     jsx_style_directive = 711,
     jsx_class_attribute = 712,
     jsx_class_list = 713,
-    public_declaration = 714,
+    jsx_method_attribute = 714,
+    public_declaration = 715,
 
     // Used to stitch multiple ASTs together
     // Node contains a pointer to `AstData` and the start node
@@ -3271,13 +3272,13 @@ fn Parser_(comptime skip_trivia: bool) type {
                     }
                     var is_spread = false;
                     var flags: u22 = 0;
+                    if (this.lexer.token == .t_static) {
+                        flags |= @intFromEnum(NodeFlags.static);
+                        try this.lexer.next();
+                    }
                     if (this.lexer.token == .t_dot_dot_dot) {
                         is_spread = true;
                         flags |= @intFromEnum(NodeFlags.generator);
-                        try this.lexer.next();
-                    }
-                    if (this.lexer.token == .t_static) {
-                        flags |= @intFromEnum(NodeFlags.static);
                         try this.lexer.next();
                     }
                     const exp = try this.parseExpression();
@@ -3468,7 +3469,33 @@ fn Parser_(comptime skip_trivia: bool) type {
                     continue;
                 }
 
+                if (strings.eqlComptime(this.lexer.identifier, "async")) {
+                    var save_lexer = std.mem.toBytes(this.lexer);
+                    var should_restore = true;
+                    defer {
+                        if (should_restore) 
+                            this.lexer = std.mem.bytesToValue(@TypeOf(this.lexer), &save_lexer);
+                    }
+                    try this.lexer.nextInsideJSXElement();
+                    if (!this.lexer.has_newline_before and this.lexer.token == .t_identifier) {
+                        const ident_end = this.lexer.end;
+                        const name = toIdentNode2(this.lexer.identifier);
+                        try this.lexer.nextInsideJSXElement();
+                        if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
+                            const ctx = this.context_state;
+                            defer this.context_state = ctx;
+                            this.context_state = .none;
+                            var decl = try this.parseMethodDeclWithName(try this.pushNode(name), @intFromEnum(NodeFlags.@"async"));
+                            decl.kind = .jsx_method_attribute;
+                            try attributes.append(decl);
+                            should_restore = false;
+                            continue; 
+                        }
+                    }
+                }
+
                 // ident
+                const ident_end = this.lexer.end;
                 const n = try this.pushNode(toIdentNode2(this.lexer.identifier));
                 try this.lexer.nextInsideJSXElement();
 
@@ -3484,11 +3511,27 @@ fn Parser_(comptime skip_trivia: bool) type {
                         value = try this.parseJSXExpression();
                     } else if (this.lexer.token == .t_string_literal) {
                         value = try this.pushNode(try this.parseJSXElementStringLiteral());
+                    } else if (this.lexer.token == .t_true or this.lexer.token == .t_false) {
+                        value = try this.pushNode(.{
+                            .kind = if (this.lexer.token == .t_true) .true_keyword else .false_keyword,
+                        });
+                        try this.lexer.nextInsideJSXElement();
                     } else {
                         // try this.lexer.expectInsideJSXElement(.t_less_than);
                         // value = try this.pushNode(try this.parseJSXElementOrFragment());
                         return error.ParserError;
                     }
+                }
+
+                if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
+                    // `<` or `(` must immediately follow the ident for us to treat it as valid
+                    const ctx = this.context_state;
+                    defer this.context_state = ctx;
+                    this.context_state = .none;
+                    var decl = try this.parseMethodDeclWithName(n, 0);
+                    decl.kind = .jsx_method_attribute;
+                    try attributes.append(decl);
+                    continue; 
                 }
 
                 try attributes.append(.{
@@ -5950,6 +5993,19 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     // TODO: global is valid here if already in an ambient context
                 },
+                .t_less_than => {
+                    const is_comp_decl = blk: {
+                        var save_lexer = std.mem.toBytes(this.lexer);
+                        defer this.lexer = std.mem.bytesToValue(@TypeOf(this.lexer), &save_lexer);
+                        try this.lexer.next();
+                        break :blk this.lexer.token == .t_private_identifier and strings.eqlComptime(this.lexer.identifier, "#component");
+                    };
+                    if (is_comp_decl) {
+                        var decl = try this.parseJSXDirective();
+                        decl.flags |= flags;
+                        return decl;
+                    }
+                },
                 else => {},
             }
 
@@ -8148,7 +8204,7 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(d.right), d.right);
             }
         },
-        .method_declaration => {
+        .method_declaration, .jsx_method_attribute => {
             const d = getPackedData(node);
             try visitor.visit(nodes.at(d.left), d.left); // name
             try visitList(nodes, node.extra_data, visitor); // type params
@@ -8485,6 +8541,7 @@ pub const Binder = struct {
 
     infer_scope: ?u32 = null,
     jsx_tree_root: ?u32 = null,
+    jsx_method_this: ?u32 = null,
 
     ns: u32 = 0, // this is always 1-indexed relative to `namespaces`
 
@@ -9006,7 +9063,7 @@ pub const Binder = struct {
                 if (comptime bind_types) try this.visitType(node.extra_data);
                 if (node.len != 0) return this.hoistAndVisit(this.nodes.at(node.len));
             },
-            .function_expression, .function_declaration, .method_declaration => {
+            .function_expression, .function_declaration, .method_declaration, .jsx_method_attribute => {
                 const d = getPackedData(node);
 
                 const prev_type_ordinals = this.type_ordinals;
@@ -10365,6 +10422,9 @@ pub const Binder = struct {
             .jsx_element => {
                 const n = unwrapRef(node);
                 const head = this.nodes.at(n);
+                const save_jsx_method_this = this.jsx_method_this;
+                defer this.jsx_method_this = save_jsx_method_this;
+                this.jsx_method_this = ref;
 
                 if (this.jsx_tree_root == null) {
                     this.jsx_tree_root = ref;
@@ -10391,6 +10451,21 @@ pub const Binder = struct {
             },
             .jsx_fragment, .jsx_else_directive => {
                 try this.visitJsxChildren(getPackedData(node).right);
+            },
+            .jsx_self_closing_element => {
+                const save_jsx_method_this = this.jsx_method_this;
+                defer this.jsx_method_this = save_jsx_method_this;
+                this.jsx_method_this = ref;
+                return forEachChild(this.nodes, node, this);
+            },
+            .jsx_method_attribute => {
+                if (this.jsx_method_this == null) {
+                    return this.visitLexicalScope(node);
+                }
+                const this_ref = this.jsx_method_this.?;
+                try this.pushThisScope(this_ref);
+                defer this.popThisScope();
+                return this.visitLexicalScope(node);
             },
             else => return forEachChild(this.nodes, node, this),
         }
