@@ -3305,7 +3305,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 if (this.lexer.token == .t_string_literal) {
                     var txt = try this.parseJSXText();
                     if (children.head != 0) 
-                        txt.flags |= @intFromEnum(NodeFlags.generator); // used during emit
+                        txt.flags |= @intFromEnum(NodeFlags.generator) // used during emit
+                    else
+                        txt.flags |= @intFromEnum(NodeFlags.abstract); // marks the text as immediately following the opening tag
                     try children.append(txt);
                 } else {
                     std.debug.print("{any}", .{this.lexer.token});
@@ -3343,6 +3345,45 @@ fn Parser_(comptime skip_trivia: bool) type {
             });
             try this.lexer.expectInsideJSXElement(.t_close_brace);
             return value;
+        }
+
+        fn parseJSXMethodAttribute(this: *@This(), name: NodeRef, flags: u22) !AstNode_ {
+            const old_state = this.context_state;
+            defer this.context_state = old_state;
+            this.context_state = .none;
+            
+            const type_params = if (this.lexer.token == .t_less_than) try this.parseTypeParams() else 0;
+            const parameters = try this.parseParameters();
+
+            var return_type: NodeRef = 0;
+            if (this.lexer.token == .t_colon) {
+                try this.lexer.next();
+                return_type = try this.parseType();
+            }
+
+            try this.lexer.expect(.t_open_brace);
+
+            var list = NodeList_.init(this);
+            while (this.lexer.token != .t_end_of_file) {
+               if (this.lexer.token == .t_close_brace) {
+                    try this.lexer.nextInsideJSXElement();
+                    break;
+                }
+                const n = try this.parseStatement();
+                try list.append(n);
+            }
+
+            return .{
+                .kind = .jsx_method_attribute,
+                .data = toBinaryDataPtrRefs(name, parameters),
+                .len = try this.pushNode(.{
+                    .kind = .block,
+                    .data = if (list.head != 0) @ptrFromInt(list.head) else null,
+                }),
+                .flags = flags,
+                .extra_data = type_params,
+                .extra_data2 = return_type,
+            };
         }
 
         // Assumes `<` has already been parsed
@@ -3482,12 +3523,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         const name = toIdentNode2(this.lexer.identifier);
                         try this.lexer.nextInsideJSXElement();
                         if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
-                            const ctx = this.context_state;
-                            defer this.context_state = ctx;
-                            this.context_state = .none;
-                            var decl = try this.parseMethodDeclWithName(try this.pushNode(name), @intFromEnum(NodeFlags.@"async"));
-                            decl.kind = .jsx_method_attribute;
-                            try attributes.append(decl);
+                            try attributes.append(try this.parseJSXMethodAttribute(try this.pushNode(name), @intFromEnum(NodeFlags.@"async")));
                             should_restore = false;
                             continue; 
                         }
@@ -3525,12 +3561,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
                     // `<` or `(` must immediately follow the ident for us to treat it as valid
-                    const ctx = this.context_state;
-                    defer this.context_state = ctx;
-                    this.context_state = .none;
-                    var decl = try this.parseMethodDeclWithName(n, 0);
-                    decl.kind = .jsx_method_attribute;
-                    try attributes.append(decl);
+                    try attributes.append(try this.parseJSXMethodAttribute(n, 0));
                     continue; 
                 }
 
@@ -6849,6 +6880,13 @@ pub const Factory = struct {
         return this.nodes.push(.{ .kind = .undefined_keyword });
     }
 
+    pub fn createVoidZero(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ 
+            .kind = .void_expression,
+            .data = @ptrFromInt(try this.createNumericLiteral(@as(i64, 0))),
+        });
+    }
+
     pub fn createPropertyAccessExpression(this: *@This(), subject: NodeRef, member: anytype) !NodeRef {
         const right = switch (@TypeOf(member)) {
             NodeRef => member,
@@ -7967,6 +8005,8 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .percent_equals_token => "%=",
         .slash_token => "/",
         .greater_than_greater_than_token => ">>",
+        .greater_than_greater_than_equals_token => ">>=",
+        .greater_than_greater_than_greater_than_equals_token => ">>>=",
         .caret_token => "^",
         .ampersand_token => "&",
         .bar_token => "|",
@@ -8311,7 +8351,7 @@ pub fn forEachChild(
             if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
             if (node.extra_data != 0) try visitor.visit(nodes.at(node.extra_data), node.extra_data); // binding name
         },
-        .jsx_attributes => {
+        .jsx_attributes, .jsx_class_list => {
             try visitList(nodes, unwrapRef(node), visitor);
         },
         .jsx_class_attribute,
