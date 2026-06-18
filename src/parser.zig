@@ -376,10 +376,10 @@ pub const SyntaxKind = enum(u10) {
     jsx_else_directive = 704,
     jsx_component = 705,
     jsx_labeled_fragment = 706,
-    unwind_keyword = 707,
+    // _ = 707,
     jsx_run_directive = 708,
     update_statement = 709,
-    unwind_statement = 710,
+    // _ = 710,
     jsx_style_directive = 711,
     jsx_class_attribute = 712,
     jsx_class_list = 713,
@@ -3249,6 +3249,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             defer this.context_state = old_ctx;
             this.context_state = .jsx_children;
 
+            var is_first_content_node = true;
             var children = NodeList_.init(this);
             while (true) {
                 if (this.lexer.token == .t_less_than) {
@@ -3258,11 +3259,19 @@ fn Parser_(comptime skip_trivia: bool) type {
                         break;
                     }
 
-                    try children.append(try this.parseJSXContainer());
+                    const child = try this.parseJSXContainer();
+                    if (is_first_content_node) {
+                        is_first_content_node = switch (child.kind) {
+                            .jsx_run_directive, .jsx_style_directive, .jsx_component => true,
+                            else => false,
+                        };
+                    }
+                    try children.append(child);
                     continue;
                 }
 
                 if (this.lexer.token == .t_open_brace) {
+                    is_first_content_node = false;
                     this.context_state = .none;
                     defer this.context_state = .jsx_children;
                     try this.lexer.next();
@@ -3304,10 +3313,16 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 if (this.lexer.token == .t_string_literal) {
                     var txt = try this.parseJSXText();
-                    if (children.head != 0) 
-                        txt.flags |= @intFromEnum(NodeFlags.generator) // used during emit
-                    else
-                        txt.flags |= @intFromEnum(NodeFlags.abstract); // marks the text as immediately following the opening tag
+                    if (is_first_content_node) {
+                        txt.flags |= @intFromEnum(NodeFlags.abstract);
+                        is_first_content_node = false;
+                    } else {
+                        if (children.head != 0) 
+                            txt.flags |= @intFromEnum(NodeFlags.generator) // used during emit
+                        else
+                            txt.flags |= @intFromEnum(NodeFlags.abstract); // marks the text as immediately following the opening tag
+                    }
+
                     try children.append(txt);
                 } else {
                     std.debug.print("{any}", .{this.lexer.token});
@@ -6448,13 +6463,6 @@ fn Parser_(comptime skip_trivia: bool) type {
                                     ),
                                 };
                             },
-                            .t_unwind => {
-                                try this.lexer.next();
-                                return .{
-                                    .kind = .unwind_statement,
-                                    .data = @ptrFromInt(try this.parseBlock()),
-                                };
-                            },
                         }
                     }
 
@@ -6637,6 +6645,11 @@ fn Parser_(comptime skip_trivia: bool) type {
                     if (this.options.is_syn) {
                         // FIXME: this is wrong, needs to parse exp statement unless certain keywords follow
                         try this.lexer.next();
+                        if (this.lexer.token == .t_open_brace) {
+                            var block = try this.parseBlockNode();
+                            block.flags |= @intFromEnum(NodeFlags.static);
+                            return block;
+                        }
                         return this.parseLocalDeclaration(full_start, @intFromEnum(NodeFlags.static));
                     }
                     return this.parseExpressionStatement();
@@ -7333,6 +7346,17 @@ pub const Factory = struct {
         return this.nodes.push(.{
             .kind = .switch_statement,
             .data = toBinaryDataPtrRefs(expression, clauses),
+        });
+    }
+
+    pub fn attachDebugComment(this: *@This(), target: NodeRef, text: []const u8) !void {
+        const n = this.nodes.at(target);
+        std.debug.assert(n.kind == .expression_statement or n.kind == .variable_statement);
+        // const comment = try std.fmt.allocPrint(getAllocator(), "// {s}", .{text}); // LEAKS
+        n.extra_data2 = try this.nodes.push(.{
+            .kind = .single_line_comment_trivia,
+            .data = text.ptr,
+            .len = @truncate(text.len),
         });
     }
 
@@ -8383,10 +8407,6 @@ pub fn forEachChild(
             const d = getPackedData(node);
             try visitList(nodes, d.left, visitor); // operands
             try visitor.visit(nodes.at(d.right), d.right); // block
-        },
-        .unwind_statement => {
-            const s = unwrapRef(node);
-            try visitor.visit(nodes.at(s), s); // statement
         },
         .jsx_labeled_fragment => {
             const d = getPackedData(node);
@@ -11542,6 +11562,9 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 .expression_statement => {
                     try this.visitRef(unwrapRef(n));
                     this.print(";"); // TODO: only emit semicolon when it's needed (ASI)
+                    if (n.extra_data2 != 0) { // debug comment node
+                        try this.visitRef(n.extra_data2);
+                    }
                 },
                 .type_query, .typeof_expression => {
                     this.print("typeof ");
@@ -12488,6 +12511,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
 
                     try this._visitLinkedList(unwrapRef(n), "", "", ", ", false);
+
+                    if (n.extra_data2 != 0) { // debug comment node
+                        try this.visitRef(n.extra_data2);
+                    }
                 },
                 .variable_declaration => {
                     const d = getPackedData(n);
@@ -12636,6 +12663,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         this.printLine();
                     }
                     this.needs_newline = true;
+                },
+                .single_line_comment_trivia => {
+                    this.print(" // ");
+                    this.print(getSlice(n, u8));
                 },
                 // .statement_list => {
                 //     try this._visitLinkedList(n.extra_data, "", "", "", true);

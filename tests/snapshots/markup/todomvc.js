@@ -1,8 +1,11 @@
 // @filename: main.syn
-var __template = ((c,p) => s => {
+var __template = ((c,p) => (s,b) => {
   c[0] ||= setTimeout(() => c={})
-  return s in c ? (c[s][1] ||= p(s)).cloneNode(1) : (c[s] = [p(s)])[0]
-})({}, (s,t=document.createElement('template')) => (t.innerHTML = s, t.content.firstChild))
+  return s in c ? (c[s][1] ||= p(s,b)).cloneNode(1) : (c[s] = [p(s,b)])[0]
+})({}, (s,b,t=document.createElement('template')) => {
+  t.innerHTML = s
+  return b ? t.content : t.content.firstChild
+})
 var __style = (c => s => c[s]||=(document.head.insertAdjacentHTML('beforeend', `<style>${s}</style>`),1))({})
 var __sym_upd = Symbol.update ||= Symbol.for('update')
 var __slot_s = (a,b,v) => {
@@ -60,7 +63,7 @@ function App() {
       root[Symbol.update]();
     }
   });
-  let _v5, _v23, _v25, _v28
+  let _v5, _v23, _v26, _v29
   root[__sym_upd] = () => {
     serializeTodos();
     const _v24 = !!todos.length
@@ -68,7 +71,7 @@ function App() {
       if (!_v5) {
         let _v17 = 0x1
         const _v6 = []
-        _v5 = __template(`<a><main _mvrhbcb5><ul _mvrhbcb5 class="list"><!><!></ul><div _mvrhbcb5 class="filters"><!><!></div><button _mvrhbcb5>toggle all <!></button></main><footer _mvrhbcb5><div _mvrhbcb5 class="count"><!> active TODOs`);
+        _v5 = __template(`<main _mvrhbcb5><ul _mvrhbcb5 class="list"><!><!></ul><div _mvrhbcb5 class="filters"><!><!></div><button _mvrhbcb5>toggle all <!></button></main><footer _mvrhbcb5><div _mvrhbcb5 class="count"><!> active TODOs`, 1);
         _v6.push(..._v5.childNodes);
         const _v7 = _v5.firstChild
         const _v8 = _v7.nextSibling
@@ -146,29 +149,29 @@ function App() {
         };
       }
     }
-    const _v6 = _v24 ? _v5 : []
-    if (_v24 !== _v23) __slot_s(_v1, _v2, _v6);
+    const _v25 = _v24 ? _v5 : []
+    if (_v24 !== _v23) __slot_s(_v1, _v2, _v25);
     _v23 = _v24;
-    _v6[Symbol.update]?.()
-    const _v29 = !!todos.some(d => d.completed)
-    if (_v29) {
-      if (!_v25) {
-        const _v26 = []
-        _v25 = __template(`<button _mvrhbcb5>clear completed todos`);
-        _v26.push(..._v25.childNodes);
-        let _v27 = _v25
-        _v27.addEventListener('click', () => {
+    _v25[Symbol.update]?.()
+    const _v30 = !!todos.some(d => d.completed)
+    if (_v30) {
+      if (!_v26) {
+        const _v27 = []
+        _v26 = __template(`<button _mvrhbcb5>clear completed todos`);
+        _v27.push(_v26);
+        let _v28 = _v26
+        _v28.addEventListener('click', () => {
           const active = todos.filter(d => !d.completed)
           todos.splice(0, todos.length, ...active);
           root[Symbol.update]();
         });
-        _v25 = _v26;
+        _v26 = _v27;
       }
     }
-    const _v26 = _v29 ? _v25 : []
-    if (_v29 !== _v28) __slot_s(_v3, _v4, _v26);
-    _v28 = _v29;
-    _v26[Symbol.update]?.()
+    const _v28 = _v30 ? _v26 : []
+    if (_v30 !== _v29) __slot_s(_v3, _v4, _v28);
+    _v29 = _v30;
+    _v28[Symbol.update]?.()
   };
   function Todo(attrs) {
     let tmpLabel = attrs.todo.label
@@ -184,20 +187,20 @@ function App() {
     const __ret = __template(`<li _mvrhbcb5><label _mvrhbcb5>completed
 <input _mvrhbcb5 type="checkbox"></label><!><!><label _mvrhbcb5>delete
 <button _mvrhbcb5 type="button">X`)
-    const _v30 = __ret.firstChild
-    const _v31 = _v30.nextSibling
-    let _v32 = _v31.nextSibling
-    const _v33 = _v32.nextSibling
-    let _v34 = _v30.firstChild
-    _v34 = _v34.nextSibling;
-    _v34.addEventListener('change', () => {
-      attrs.todo.completed = _v34.checked;
+    const _v31 = __ret.firstChild
+    const _v32 = _v31.nextSibling
+    let _v33 = _v32.nextSibling
+    const _v34 = _v33.nextSibling
+    let _v35 = _v31.firstChild
+    _v35 = _v35.nextSibling;
+    _v35.addEventListener('change', () => {
+      attrs.todo.completed = _v35.checked;
       root[Symbol.update]();
     });
-    let _v35, _v40, _v42
-    let _v44 = _v33.firstChild
-    _v44 = _v44.nextSibling;
-    _v44.addEventListener('click', () => {
+    let _v36, _v41, _v44
+    let _v47 = _v34.firstChild
+    _v47 = _v47.nextSibling;
+    _v47.addEventListener('click', () => {
       deleteTodo(attrs.todo);
     });
     return {
@@ -205,41 +208,41 @@ function App() {
       [__sym_upd]: () => {
         __ret.classList.toggle('completed', !!attrs.todo.completed);
         __ret.classList.toggle('editing', editingTodo === attrs.todo);
-        _v34.checked = attrs.todo.completed;
-        const _v43 = editingTodo !== attrs.todo
-        if (_v43) {
-          if (!_v35) {
-            const _v36 = []
-            _v35 = __template(`<label _mvrhbcb5><!>`);
-            _v36.push(..._v35.childNodes);
-            const _v37 = _v35
-            _v37.addEventListener('dblclick', () => {
+        _v35.checked = attrs.todo.completed;
+        const _v45 = editingTodo !== attrs.todo
+        if (_v45) {
+          if (!_v36) {
+            const _v37 = []
+            _v36 = __template(`<label _mvrhbcb5><!>`);
+            _v37.push(_v36);
+            const _v38 = _v36
+            _v38.addEventListener('dblclick', () => {
               if (editingTodo === attrs.todo) return 
+              const p = _v38.parentElement
               editingTodo = attrs.todo;
-              const p = _v37.parentElement
               root[Symbol.update]();
-              (p?.querySelector('input[type="text"]'))?.focus()
+              p?.querySelector('input[type="text"]')?.focus();
             });
-            let _v38 = _v37.firstChild
-            let _v39
-            _v35 = _v36;
-            _v35[__sym_upd] = () => {
-              _v39 = __slot(_v38, _v39, attrs.todo.label)
+            let _v39 = _v38.firstChild
+            let _v40
+            _v36 = _v37;
+            _v36[__sym_upd] = () => {
+              _v40 = __slot(_v39, _v40, attrs.todo.label)
             };
           }
         } else {
-          if (!_v40) {
-            const _v41 = []
-            _v40 = __template(`<input _mvrhbcb5 type="text">`);
-            _v41.push(..._v40.childNodes);
-            _v36 = _v40;
-            _v36.addEventListener('input', () => {
-              tmpLabel = _v36.value;
+          if (!_v41) {
+            const _v42 = []
+            _v41 = __template(`<input _mvrhbcb5 type="text">`);
+            _v42.push(_v41);
+            const _v43 = _v41
+            _v43.addEventListener('input', () => {
+              tmpLabel = _v43.value;
             });
-            _v36.addEventListener('blur', () => {
+            _v43.addEventListener('blur', () => {
               save(tmpLabel);
             });
-            _v36.addEventListener('keydown', (ev) => {
+            _v43.addEventListener('keydown', (ev) => {
               if (editingTodo !== attrs.todo) return 
               if (ev.key === 'Enter') {
                 save(tmpLabel);
@@ -249,16 +252,16 @@ function App() {
                 root[Symbol.update]();
               }
             });
-            _v40 = _v41;
-            _v40[__sym_upd] = () => {
-              _v36.value = tmpLabel;
+            _v41 = _v42;
+            _v41[__sym_upd] = () => {
+              _v43.value = tmpLabel;
             };
           }
         }
-        const _v41 = _v43 ? _v35 : _v40
-        if (_v43 !== _v42) __slot_s(_v31, _v32, _v41);
-        _v42 = _v43;
-        _v41[Symbol.update]?.()
+        const _v46 = _v45 ? _v36 : _v41
+        if (_v45 !== _v44) __slot_s(_v32, _v33, _v46);
+        _v44 = _v45;
+        _v46[Symbol.update]?.()
       }
     }
   }

@@ -1,305 +1,282 @@
 // @filename: main.syn
-var __template = ((p,c,u) => s => {
-  u ||= setTimeout(() => (c = {}, u = 0))
-  return s in c ? (c[s]._n ||= p(s)).cloneNode(true) : c[s] = p(s)
-})((s,t = document.createElement('template')) => (t.innerHTML = s, t.content.firstChild), {})
+var __template = ((c,p) => (s,b) => {
+  c[0] ||= setTimeout(() => c={})
+  return s in c ? (c[s][1] ||= p(s,b)).cloneNode(1) : (c[s] = [p(s,b)])[0]
+})({}, (s,b,t=document.createElement('template')) => {
+  t.innerHTML = s
+  return b ? t.content : t.content.firstChild
+})
 var __sym_upd = Symbol.update ||= Symbol.for('update')
-var __comp = root => ({ root, _p: {}, [__sym_upd]() {
-  let t = this.root
-  this._u?.()
-  if (typeof t === 'function') {
-    t = this.root = t(this._p)
-    this._a && t.setAttribute(this._a,'')
-    this._s?.() ?? this._b?.replaceWith(t)
-  } else {
-    t[__sym_upd]?.()
-    this._s?.()
-  }
-}})
-var __pushAt = (c,i,v,d=0,l = c.length) => (c.splice(i,d,...v), c.length-l+d)
-var __slot_s = (a,v,b) => {
-  b || a.after(b = a.cloneNode())
+var __splice_at = (c,i,v,d,l=c.length) => (c.splice(i,d,...v), c.length-l+d)
+var __slot_s = (a,b,v) => {
   let p, n = a.nextSibling
+  for (p of v) n === p ? n=n.nextSibling : n.before(p)
   while (p = n, n = p.nextSibling, p !== b) p.remove()
-  a.after(...v)
-  return b
 }
-var __slot = (a,v,c) => {
+var __slot = (a,c,v) => {
   const q = c?.nextSibling === a
   if (typeof v !== 'object') {
-    if (q && c.nodeType === 3) { c.nodeValue != v && (c.nodeValue = v); return c }
+    if (q && c.nodeType === 3) { c.data != v && (c.data = v); return c }
     v = new Text(v)
   }
   q ? c !== v && c.replaceWith(v) : a.parentNode?.insertBefore(v,a)
   return v
 }
-var __unw = (a,f) => { while (f = a.pop()) if (Array.isArray(f)) __unw(f); else f() }
 function basicIf(show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v1
-    _v0[__sym_upd] = () => {
-      const _v2 = !!show
-      if (_v2 != _v0._s) {
-        if (_v2) {
-          if (_v0._s !== 0) {
-            _v1 = __template(`<span>hello`);
-          }
-          _v0.replaceWith(_v1);
-          _v0._s = 1;
-        } else {
-          if (_v0._s === 1) {
-            _v1.replaceWith(_v0);
-            _v0._s = 0;
-          }
-          return 
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v4
+    ;(__ret[__sym_upd] = () => {
+      const _v5 = !!show
+      if (_v5) {
+        if (!_v2) {
+          _v2 = [__template(`<span>hello`)];
         }
       }
-    };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind(_v0))();
+      const _v6 = _v5 ? _v2 : []
+      if (_v5 !== _v4) __slot_s(_v0, _v1, _v6);
+      _v4 = _v5;
+      _v6[Symbol.update]?.()
+    })();
   }
   return __ret
 }
 function ifElse(show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v4, _v5, _v6
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v4, _v6
     ;(__ret[__sym_upd] = () => {
-      let _v1
-      if (show) {
-        _v1 = _v4 ??= __template(`<span>yes`);
+      const _v7 = !!show
+      if (_v7) {
+        if (!_v2) {
+          _v2 = [__template(`<span>yes`)];
+        }
       } else {
-        _v1 = _v5 ??= __template(`<span>no`);
+        if (!_v4) {
+          _v4 = [__template(`<span>no`)];
+        }
       }
-      _v1 != null ? _v6 = __slot(_v0, _v1, _v6) : _v6?.remove();
+      const _v8 = _v7 ? _v2 : _v4
+      if (_v7 !== _v6) __slot_s(_v0, _v1, _v8);
+      _v6 = _v7;
+      _v8[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function ifExpr(count, show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v1
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v5
     ;(__ret[__sym_upd] = () => {
-      show ? _v1 = __slot(_v0, count, _v1) : _v1?.remove();
+      const _v6 = !!show
+      if (_v6) {
+        if (!_v2) {
+          const _v3 = [_v2 = new Comment()]
+          let _v4
+          _v2 = _v3;
+          _v2[__sym_upd] = () => {
+            _v4 = __slot(_v2, _v4, count)
+          };
+        }
+      }
+      const _v7 = _v6 ? _v2 : []
+      if (_v6 !== _v5) __slot_s(_v0, _v1, _v7);
+      _v5 = _v6;
+      _v7[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function ifElseExpr(val, show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v4
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v5, _v8
     ;(__ret[__sym_upd] = () => {
-      let _v1
-      if (show) {
-        _v1 = val;
+      const _v9 = !!show
+      if (_v9) {
+        if (!_v2) {
+          const _v3 = [_v2 = new Comment()]
+          let _v4
+          _v2 = _v3;
+          _v2[__sym_upd] = () => {
+            _v4 = __slot(_v2, _v4, val)
+          };
+        }
       } else {
-        _v1 = "hidden";
+        if (!_v5) {
+          const _v6 = [_v5 = new Comment()]
+          let _v7
+          _v5 = _v6;
+          _v5[__sym_upd] = () => {
+            _v7 = __slot(_v5, _v7, "hidden")
+          };
+        }
       }
-      _v4 = __slot(_v0, _v1, _v4);
+      const _v10 = _v9 ? _v2 : _v5
+      if (_v9 !== _v8) __slot_s(_v0, _v1, _v10);
+      _v8 = _v9;
+      _v10[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function siblingIfs(a, b) {
-  const __ret = __template(`<div><!><!>`)
+  const __ret = __template(`<div><!><!><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    const _v1 = _v0.nextSibling
-    let _v2
-    _v0[__sym_upd] = () => {
-      const _v3 = !!a
-      if (_v3 != _v0._s) {
-        if (_v3) {
-          if (_v0._s !== 0) {
-            _v2 = __template(`<span>a`);
-          }
-          _v0.replaceWith(_v2);
-          _v0._s = 1;
-        } else {
-          if (_v0._s === 1) {
-            _v2.replaceWith(_v0);
-            _v0._s = 0;
-          }
-          return 
-        }
-      }
-    };
-    let _v4
-    _v1[__sym_upd] = () => {
-      const _v5 = !!b
-      if (_v5 != _v1._s) {
-        if (_v5) {
-          if (_v1._s !== 0) {
-            _v4 = __template(`<span>b`);
-          }
-          _v1.replaceWith(_v4);
-          _v1._s = 1;
-        } else {
-          if (_v1._s === 1) {
-            _v4.replaceWith(_v1);
-            _v1._s = 0;
-          }
-          return 
-        }
-      }
-    };
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    const _v2 = _v1.nextSibling // <!> - #if
+    let _v3 = _v2.nextSibling // #if - <!>
+    let _v4, _v6, _v9, _v11
     ;(__ret[__sym_upd] = () => {
-      _v0[__sym_upd]();
-      _v1[__sym_upd]();
+      const _v7 = !!a
+      if (_v7) {
+        if (!_v4) {
+          _v4 = [__template(`<span>a`)];
+        }
+      }
+      const _v8 = _v7 ? _v4 : []
+      if (_v7 !== _v6) __slot_s(_v0, _v1, _v8);
+      _v6 = _v7;
+      _v8[Symbol.update]?.()
+      const _v12 = !!b
+      if (_v12) {
+        if (!_v9) {
+          _v9 = [__template(`<span>b`)];
+        }
+      }
+      const _v13 = _v12 ? _v9 : []
+      if (_v12 !== _v11) __slot_s(_v2, _v3, _v13);
+      _v11 = _v12;
+      _v13[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function ifWithBinding(show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let el
-    _v0[__sym_upd] = () => {
-      const _v1 = !!show
-      if (_v1 != _v0._s) {
-        if (_v1) {
-          if (_v0._s !== 0) {
-            el = __template(`<span>hello`);
-          }
-          _v0.replaceWith(el);
-          _v0._s = 1;
-        } else {
-          if (_v0._s === 1) {
-            el.replaceWith(_v0);
-            _v0._s = 0;
-          }
-          return 
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v4
+    ;(__ret[__sym_upd] = () => {
+      const _v5 = !!show
+      if (_v5) {
+        if (!_v2) {
+          const _v3 = [_v2 = __template(`<span>hello`)]
+          const el = _v2
+          _v2 = _v3;
         }
       }
-    };
-    ;(__ret[__sym_upd] = _v0[__sym_upd].bind(_v0))();
-  }
-  return __ret
-}
-function ifWithUnwind(show) {
-  const __ret = __template(`<div><!>`)
-  {
-    const _v0 = __ret.firstChild
-    let _v3, _v4, _v7
-    let _v1 = []
-    ;(__ret[__sym_upd] = () => {
-      __unw(_v1);
-      _v1.push(() => {
-        console.log('2');
-      });
-      const _v2 = !!show
-      if (_v2) {
-        if (_v3) _v3[__sym_upd]();
-         else _v3 = (() => {
-          let _v5
-          _v5 = [];
-          _v5[0] = 'test ';
-          ;(_v5[__sym_upd] = () => {
-            _v1.push(() => {
-              console.log('1');
-            });
-          })();
-          return _v5
-        })();
-      } else {
-        _v4 ??= (() => {
-          let _v6
-          _v6 = [];
-          _v6[0] = 't';
-          return _v6
-        })();
-      }
-      _v7 = __slot_s(_v0, _v2 ? _v3 : _v4, _v7);
+      const _v6 = _v5 ? _v2 : []
+      if (_v5 !== _v4) __slot_s(_v0, _v1, _v6);
+      _v4 = _v5;
+      _v6[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function singleSlotNoEffects(show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v4
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v4, _v6
     ;(__ret[__sym_upd] = () => {
-      let _v1
-      if (show) {
-        _v1 = '1';
+      const _v7 = !!show
+      if (_v7) {
+        if (!_v2) {
+          _v2 = [new Text(`1`)];
+        }
       } else {
-        _v1 = '2';
+        if (!_v4) {
+          _v4 = [new Text(`2`)];
+        }
       }
-      _v4 = __slot(_v0, _v1, _v4);
+      const _v8 = _v7 ? _v2 : _v4
+      if (_v7 !== _v6) __slot_s(_v0, _v1, _v8);
+      _v6 = _v7;
+      _v8[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function branchWithBinding(show) {
-  const __ret = __template(`<div><!>`)
+  const __ret = __template(`<div><!><!>`)
   {
-    const _v0 = __ret.firstChild
-    let _v2, _v3, _v6
+    const _v0 = __ret.firstChild // <!> - #if
+    let _v1 = _v0.nextSibling // #if - <!>
+    let _v2, _v4, _v6
     ;(__ret[__sym_upd] = () => {
-      const _v1 = !!show
-      if (_v1) {
-        if (_v2) _v2[__sym_upd]();
-         else _v2 = (() => {
-          let _v4 = __template(`<div>`)
-          const d = _v4
-          _v4 = [];
+      const _v7 = !!show
+      if (_v7) {
+        if (!_v2) {
+          const _v3 = [_v2 = __template(`<div>`)]
+          const d = _v2
           d[__sym_upd] = () => {
             console.log(d);
           };
-          _v4[0] = d;
-          ;(_v4[__sym_upd] = d[__sym_upd].bind(d))();
-          return _v4
-        })();
+          _v2 = _v3;
+          _v2[__sym_upd] = () => {
+            d[__sym_upd]();
+          };
+        }
       } else {
-        _v3 ??= (() => {
-          let _v5
-          _v5 = [];
-          _v5[0] = '0';
-          return _v5
-        })();
+        if (!_v4) {
+          _v4 = [new Text(`0`)];
+        }
       }
-      _v6 = __slot_s(_v0, _v1 ? _v2 : _v3, _v6);
+      const _v8 = _v7 ? _v2 : _v4
+      if (_v7 !== _v6) __slot_s(_v0, _v1, _v8);
+      _v6 = _v7;
+      _v8[Symbol.update]?.()
     })();
   }
   return __ret
 }
 function conditionalComponentInstanceChildren(cond) {
-  function Inner(props) {
-    let __ret = document.createElement('div')
-    ;(__ret[__sym_upd] = () => {
-      __ret.replaceChildren(...props.children);
-    })();
-    return __ret
+  function Inner(_attrs, children = []) {
+    const __ret = __template(`<div><!><!>`)
+    let _v0 = __ret.firstChild // <!> - {...}
+    let _v1 = _v0.nextSibling // {...} - <!>
+    return {
+      root: __ret,
+      [__sym_upd]: () => {
+        __slot_s(_v0, _v1, children);
+      }
+    }
   }
   const __ret = __template(`<div><!>`)
   {
-    let _v0 = __ret.firstChild
-    const _v1 = __comp(Inner)
-    _v1._b = _v0;
-    const _v2 = _v1._p.children = []
+    let _v0 = __ret.firstChild // Inner
+    let _v1
+    const _v2 = []
     let _v3 = 0
-    let _v4 = 0
-    const _v5 = []
-    _v1._u = () => {
-      _v3 = 0;
-      const _v6 = !!cond
-      if (_v6) {
-        if (!_v5._s) {
-          _v5[0] = 'test';
-          _v5._s = 1;
+    let _v4, _v6
+    ;(__ret[__sym_upd] = () => {
+      _v1 ??= Inner(void 0, _v2);
+      const _v7 = !!cond
+      if (_v7) {
+        if (!_v4) {
+          _v4 = [`test`];
         }
       }
-      _v3 += (_v4 = __pushAt(_v2, _v3, _v6 ? _v5 : [], _v4));
-    };
-    ;(__ret[__sym_upd] = _v1[__sym_upd].bind(_v1))();
+      const _v8 = _v7 ? _v4 : []
+      _v8[Symbol.update]?.()
+      if (_v7 !== _v6) _v3 = __splice_at(_v2, 0, _v8, _v3);
+      _v6 = _v7;
+      _v1[Symbol.update]();
+      if (_v0) _v0 = void _v0.replaceWith(_v1.root);
+    })();
   }
   return __ret
 }

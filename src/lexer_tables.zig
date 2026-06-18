@@ -246,7 +246,6 @@ pub const ExtraKeyword = enum {
     t_module,
     t_abstract, // abstract class
     t_update,
-    t_unwind,
 
     pub const List = ComptimeStringMap(ExtraKeyword, .{
         .{ "defer", .t_defer },
@@ -257,7 +256,6 @@ pub const ExtraKeyword = enum {
         .{ "module", .t_module },
         .{ "abstract", .t_abstract },
         .{ "update", .t_update },
-        .{ "unwind", .t_unwind },
     });
 };
 
