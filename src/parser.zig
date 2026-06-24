@@ -6453,14 +6453,8 @@ fn Parser_(comptime skip_trivia: bool) type {
                                 }
 
                                 return .{
-                                    .kind = .expression_statement,
-                                    .data = @ptrFromInt(
-                                        try this.pushNode(.{
-                                            .kind = .keyword_unary_expression,
-                                            .data = @ptrFromInt(exp),
-                                            .len = @intFromEnum(SyntaxKind.update_keyword),
-                                        })
-                                    ),
+                                    .kind = .update_statement,
+                                    .data = toBinaryDataPtrRefs(exp, 0)
                                 };
                             },
                         }
@@ -6942,7 +6936,7 @@ pub const Factory = struct {
         });
     }
 
-    fn createList(this: *@This(), arg: []const NodeRef) !NodeRef {
+    pub fn createList(this: *@This(), arg: []const NodeRef) !NodeRef {
         var list = NodeList.init(this.nodes);
         for (arg) |el| list.appendRef(el);
 
@@ -7376,6 +7370,7 @@ const HelperTags = enum {
     known_symbol,
     using,
     call_dispose,
+    run_defers,
     @"defer",
 };
 
@@ -7384,6 +7379,7 @@ inline fn getHelper(tag: HelperTags) []const u8 {
         .known_symbol => __knownSymbol,
         .using => __using,
         .call_dispose => __callDispose,
+        .run_defers => __run_defers,
         .@"defer" => __defer,
     };
 }
@@ -7438,11 +7434,30 @@ const __callDispose =
     \\}
 ;
 
+const __run_defers =
+    \\function __run_defers(stack, error) {
+    \\  var fail = (e) => { if (error) throw error; error = e }
+    \\  var next = (it) => {
+    \\    while (it = stack.pop()) {
+    \\      if (error && !it[2]) continue;
+    \\      try { 
+    \\        var result = it[1]();
+    \\        if (it[0])
+    \\          return Promise.resolve(result).then(next, (e) => (fail(e), next()));
+    \\      } catch (e) { fail(e) }
+    \\    }
+    \\    if (error)
+    \\      throw error;
+    \\  };
+    \\  return next();
+    \\}
+;
+
 const __defer =
-    \\function __defer(stack, value, async) {
+    \\function __defer(stack, value, async, unconditional) {
     \\  if (typeof value !== "function")
     \\      throw TypeError("Function expected");
-    \\  stack.push([async, value]);
+    \\  stack.push([async, value, unconditional]);
     \\}
 ;
 
@@ -8406,7 +8421,7 @@ pub fn forEachChild(
         .update_statement => {
             const d = getPackedData(node);
             try visitList(nodes, d.left, visitor); // operands
-            try visitor.visit(nodes.at(d.right), d.right); // block
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right); // block
         },
         .jsx_labeled_fragment => {
             const d = getPackedData(node);
@@ -11154,7 +11169,8 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
             var t = this.getTransformer();
             const is_async = this.needsAsyncUsingScope(ref);
 
-            this.addHelper(.call_dispose);
+            // this.addHelper(.call_dispose);
+            this.addHelper(.run_defers);
             this.addHelper(.known_symbol);
 
             try this.visit(&(try t.stackStatement()));
@@ -12190,10 +12206,14 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(x[1]);
 
                     if (x[0]) {
-                        this.print(", true)");
-                    } else {
-                        this.print(")");
+                        this.print(", 1"); // async
                     }
+
+                    if (n.extra_data == 1) {
+                        this.print(", 1"); // unconditional
+                    }
+
+                    this.print(")");
                 },
                 .block => {
                     const p = n.data orelse return this.print("{}");

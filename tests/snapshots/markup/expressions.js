@@ -1,8 +1,11 @@
 // @filename: main.syn
-var __template = ((c,p) => s => {
+var __template = ((c,p) => (s,b) => {
   c[0] ||= setTimeout(() => c={})
-  return s in c ? (c[s][1] ||= p(s)).cloneNode(1) : (c[s] = [p(s)])[0]
-})({}, (s,t=document.createElement('template')) => (t.innerHTML = s, t.content.firstChild))
+  return s in c ? (c[s][1] ||= p(s,b)).cloneNode(1) : (c[s] = [p(s,b)])[0]
+})({}, (s,b,t=document.createElement('template')) => {
+  t.innerHTML = s
+  return b ? t.content : t.content.firstChild
+})
 var __sym_upd = Symbol.update ||= Symbol.for('update')
 var __slot_s = (a,b,v) => {
   let p, n = a.nextSibling
@@ -24,7 +27,7 @@ function staticText() {
 function singleExpr(v) {
   const __ret = __template(`<div><!>`)
   {
-    let _v0 = __ret.firstChild
+    let _v0 = __ret.firstChild // <!> - {}
     let _v1
     ;(__ret[__sym_upd] = () => {
       _v1 = __slot(_v0, _v1, v)
@@ -35,9 +38,9 @@ function singleExpr(v) {
 function multiExpr(a, b) {
   const __ret = __template(`<div><!> and <!>`)
   {
-    let _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
-    _v1 = _v1.nextSibling;
+    let _v0 = __ret.firstChild // <!> - {}
+    let _v1 = _v0.nextSibling // #text
+    _v1 = _v1.nextSibling; // <!> - {}
     let _v2, _v3
     ;(__ret[__sym_upd] = () => {
       _v2 = __slot(_v0, _v2, a)
@@ -49,9 +52,9 @@ function multiExpr(a, b) {
 function multiExprSpaced(a, b) {
   const __ret = __template(`<div><!> <!>`)
   {
-    let _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
-    _v1 = _v1.nextSibling;
+    let _v0 = __ret.firstChild // <!> - {}
+    let _v1 = _v0.nextSibling // #text
+    _v1 = _v1.nextSibling; // <!> - {}
     let _v2, _v3
     ;(__ret[__sym_upd] = () => {
       _v2 = __slot(_v0, _v2, a)
@@ -63,9 +66,9 @@ function multiExprSpaced(a, b) {
 function multiExprSpaced2(a, b) {
   const __ret = __template(`<div><!>   <!>`)
   {
-    let _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
-    _v1 = _v1.nextSibling;
+    let _v0 = __ret.firstChild // <!> - {}
+    let _v1 = _v0.nextSibling // #text
+    _v1 = _v1.nextSibling; // <!> - {}
     let _v2, _v3
     ;(__ret[__sym_upd] = () => {
       _v2 = __slot(_v0, _v2, a)
@@ -77,8 +80,8 @@ function multiExprSpaced2(a, b) {
 function multiExprMultiline(a, b) {
   const __ret = __template(`<div><!><!>`)
   {
-    let _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
+    let _v0 = __ret.firstChild // <!> - {}
+    let _v1 = _v0.nextSibling // <!> - {}
     let _v2, _v3
     ;(__ret[__sym_upd] = () => {
       _v2 = __slot(_v0, _v2, a)
@@ -90,8 +93,8 @@ function multiExprMultiline(a, b) {
 function mixedStaticDynamic(name) {
   const __ret = __template(`<div>hello <!>!`)
   {
-    let _v0 = __ret.firstChild
-    _v0 = _v0.nextSibling;
+    let _v0 = __ret.firstChild // #text
+    _v0 = _v0.nextSibling; // <!> - {}
     let _v1
     ;(__ret[__sym_upd] = () => {
       _v1 = __slot(_v0, _v1, name)
@@ -103,7 +106,7 @@ function pureExpr() {
   const x = 'hello'
   const __ret = __template(`<div><!>`)
   {
-    const _v0 = __ret.firstChild
+    const _v0 = __ret.firstChild // <!> - {}
     let _v1
     ;(__ret[__sym_upd] = () => {
       _v1 = __slot(_v0, _v1, x)
@@ -114,8 +117,8 @@ function pureExpr() {
 function singularSpread(items) {
   const __ret = document.createElement('div')
   {
-    let _v0 = __ret.firstChild
-    let _v1 = _v0.nextSibling
+    let _v0 = __ret.firstChild // <!> - {...}
+    let _v1 = _v0.nextSibling // {...} - <!>
     ;(__ret[__sym_upd] = () => {
       __slot_s(_v0, _v1, items);
     })();
@@ -125,9 +128,9 @@ function singularSpread(items) {
 function mixedSpread(items) {
   const __ret = __template(`<div>before: <!><!> :after`)
   {
-    let _v0 = __ret.firstChild
-    _v0 = _v0.nextSibling;
-    let _v1 = _v0.nextSibling
+    let _v0 = __ret.firstChild // #text
+    _v0 = _v0.nextSibling; // <!> - {...}
+    let _v1 = _v0.nextSibling // {...} - <!>
     ;(__ret[__sym_upd] = () => {
       __slot_s(_v0, _v1, items);
     })();
@@ -138,8 +141,8 @@ function mutations() {
   let x = __template(`<span id="a">`)
   const d = __template(`<div><span></span><!>`)
   {
-    let _v0 = d.firstChild
-    _v0 = _v0.nextSibling;
+    let _v0 = d.firstChild // span
+    _v0 = _v0.nextSibling; // <!> - {}
     let _v1
     ;(d[__sym_upd] = () => {
       _v1 = __slot(_v0, _v1, x)
@@ -158,9 +161,9 @@ function mutations() {
 function multilineElements(a) {
   const __ret = __template(`<div><span>1</span><span><!>`)
   {
-    let _v0 = __ret.firstChild
-    _v0 = _v0.nextSibling;
-    let _v1 = _v0.firstChild
+    let _v0 = __ret.firstChild // span
+    _v0 = _v0.nextSibling; // span
+    let _v1 = _v0.firstChild // <!> - {}
     let _v2
     ;(__ret[__sym_upd] = () => {
       _v2 = __slot(_v1, _v2, a)
@@ -188,8 +191,8 @@ function multilineText3() {
 <!>
 b   `)
   {
-    let _v0 = __ret.firstChild
-    _v0 = _v0.nextSibling;
+    let _v0 = __ret.firstChild // #text
+    _v0 = _v0.nextSibling; // <!> - {}
     let _v1
     ;(__ret[__sym_upd] = () => {
       _v1 = __slot(_v0, _v1, 'c')
