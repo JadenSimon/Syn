@@ -137,6 +137,7 @@ fn NewLexer_(
         is_ascii_only: JSONBool = JSONBoolDefault,
 
         last_line: usize = 0,
+        full_last_line: u32 = 0,
         full_start: u32 = 0,
 
         pause_on_comments: bool = true,
@@ -692,8 +693,10 @@ fn NewLexer_(
                 lexer.token = T.t_string_literal;
             } else if (lexer.rescan_close_brace_as_template_token) {
                 lexer.token = T.t_template_tail;
+                lexer.full_last_line = @truncate(lexer.last_line);
             } else {
                 lexer.token = T.t_no_substitution_template_literal;
+                lexer.full_last_line = @truncate(lexer.last_line);
             }
 
             lexer.step();
@@ -704,12 +707,12 @@ fn NewLexer_(
             const base = if (comptime quote == 0) lexer.start else lexer.start + 1;
             lexer.string_literal_slice = lexer.source.contents[base..@min(lexer.source.contents.len, lexer.end - @as(usize, string_literal_details.suffix_len))];
             lexer.string_literal_is_ascii = !string_literal_details.needs_slow_path;
-            if (string_literal_details.needs_slow_path) {
-                lexer.string_literal_buffer.shrinkRetainingCapacity(0);
-                lexer.string_literal_buffer.ensureUnusedCapacity(lexer.string_literal_slice.len) catch unreachable;
-                try lexer.decodeEscapeSequences(lexer.start, lexer.string_literal_slice, @TypeOf(lexer.string_literal_buffer), &lexer.string_literal_buffer);
-                lexer.string_literal = lexer.string_literal_buffer.items;
-            }
+            // if (string_literal_details.needs_slow_path) {
+            //     lexer.string_literal_buffer.shrinkRetainingCapacity(0);
+            //     lexer.string_literal_buffer.ensureUnusedCapacity(lexer.string_literal_slice.len) catch unreachable;
+            //     try lexer.decodeEscapeSequences(lexer.start, lexer.string_literal_slice, @TypeOf(lexer.string_literal_buffer), &lexer.string_literal_buffer);
+            //     lexer.string_literal = lexer.string_literal_buffer.items;
+            // }
             if (comptime is_json) lexer.is_ascii_only = lexer.is_ascii_only and lexer.string_literal_is_ascii;
 
             // if (comptime !FeatureFlags.allow_json_single_quotes) {
@@ -2312,12 +2315,12 @@ fn NewLexer_(
             lexer.token = .t_string_literal;
             lexer.string_literal_slice = lexer.source.contents[lexer.start + 1 .. lexer.end - 1];
             lexer.string_literal_is_ascii = !needs_decode;
-            lexer.string_literal_buffer.clearRetainingCapacity();
-            if (needs_decode) {
-                lexer.string_literal_buffer.ensureTotalCapacity(lexer.string_literal_slice.len) catch unreachable;
-                try lexer.decodeJSXEntities(lexer.string_literal_slice, &lexer.string_literal_buffer);
-                lexer.string_literal = lexer.string_literal_buffer.items;
-            }
+            // lexer.string_literal_buffer.clearRetainingCapacity();
+            // if (needs_decode) {
+            //     lexer.string_literal_buffer.ensureTotalCapacity(lexer.string_literal_slice.len) catch unreachable;
+            //     try lexer.decodeJSXEntities(lexer.string_literal_slice, &lexer.string_literal_buffer);
+            //     lexer.string_literal = lexer.string_literal_buffer.items;
+            // }
         }
 
         pub fn expectJSXElementChild(lexer: *LexerType, token: T) !void {

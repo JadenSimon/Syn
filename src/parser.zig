@@ -629,6 +629,7 @@ pub const AstData = struct {
     }
 
     // Does _not_ copy `source`
+    // Does _not_ do a deep copy of the AST nodes, only the page ptrs are copied
     pub fn clone(this: *const @This()) !@This() {
         const nodes = try this.nodes.cloneAndPad();
         var cloned: AstData = this.*;
@@ -775,6 +776,7 @@ pub fn BumpAllocator(comptime T: type) type {
             }
 
             // Move the count so we don't write into these "external" pages
+            this.local_count = items_per_page;
             try this.addPage();
             this.local_count = 0;
         }
@@ -791,10 +793,7 @@ pub fn BumpAllocator(comptime T: type) type {
         pub fn cloneAndPad(this: *const @This()) !@This() {
             var c = try this.clone();
             if (c.local_count > 0) {
-                while (c.local_count < items_per_page) {
-                    c.local_count += 1;
-                }
-
+                c.local_count = items_per_page;
                 try c.addPage();
                 c.local_count = 0;
             }
@@ -1061,6 +1060,8 @@ fn Parser_(comptime skip_trivia: bool) type {
             if (lexer.source.name) |x| {
                 if (strings.endsWithComptime(x, ".syn")) {
                     this.options.is_syn = true;
+                    this.options.allow_jsx = true;
+                } else if (strings.endsWithComptime(x, ".tsx")) {
                     this.options.allow_jsx = true;
                 }
             }
@@ -3050,7 +3051,10 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             const full_start = this.lexer.full_start;
             const width = this.getFullWidth();
-            const location = this.getLocation();
+            const location = if (this.lexer.token == .t_string_literal) 
+                this.getLocation()
+            else
+                encodeLocation(this.lexer.line_map.count, @as(u32, @intCast(this.lexer.start - this.lexer.full_last_line)));
             const slice = this.lexer.string_literal_slice;
             try this.next();
 
@@ -3729,11 +3733,14 @@ fn Parser_(comptime skip_trivia: bool) type {
                 var decl = try this.parseFnDecl(this.lexer.full_start, 0, .jsx_component);
                 this.context_state = old_state;
                 decl.kind = .function_expression;
+                const implements = decl.extra_data2; // temporarily placed in the return type
+                decl.extra_data2 = 0;
                 const decl_ref = try this.pushNode(decl);
                 const children = try this.parseJSXChildrenAndClosingTag();
                 return .{
                     .kind = .jsx_component,
                     .data = toBinaryDataPtrRefs(decl_ref, children.head),
+                    .len = implements,
                 };
             }
 
@@ -4686,9 +4693,22 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.parseParameters();
 
             var return_type: NodeRef = 0;
-            if (this.lexer.token == .t_colon) {
-                try this.lexer.next();
-                return_type = try this.parseType();
+            if (comptime kind == .jsx_component) {
+                if (this.lexer.token == .t_implements) {
+                    try this.lexer.next();
+                    var types = NodeList_.init(this);
+                    while (true) {
+                        types.appendRef(try this.parseType());
+                        if (this.lexer.token == .t_greater_than or this.lexer.token == .t_open_brace) break;
+                        try this.lexer.expect(.t_comma);
+                    }
+                    return_type = types.head;
+                }
+            } else {
+                if (this.lexer.token == .t_colon) {
+                    try this.lexer.next();
+                    return_type = try this.parseType();
+                }
             }
 
             var body: NodeRef = 0;
@@ -10669,6 +10689,7 @@ pub const ParsedFile = struct {
 
     // Used to store the associated JS object
     api_handle: ?*anyopaque = null,
+    source_program: ?*@import("./program.zig").Program = null,
 
     const allocator = getAllocator();
 
@@ -10796,6 +10817,8 @@ pub const PrinterOptions = struct {
     file_name: ?[]const u8 = null,
 
     replacements: ?*anyopaque = null,
+
+    is_syn: bool = false,
 };
 
 pub const ComptimePrinterOptions = struct {

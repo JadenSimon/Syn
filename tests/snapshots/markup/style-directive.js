@@ -1,28 +1,17 @@
 // @filename: main.syn
-var __template = ((p,c,u) => s => {
-  u ||= setTimeout(() => (c = {}, u = 0))
-  return s in c ? (c[s]._n ||= p(s)).cloneNode(true) : c[s] = p(s)
-})((s,t = document.createElement('template')) => (t.innerHTML = s, t.content.firstChild), {})
-var __style = (c => s => c[s] ||= (document.head.insertAdjacentHTML('beforeend', `<style>${s}</style>`),1))({})
+var __template = ((c,p) => (s,b) => {
+  c[0] ||= setTimeout(() => c={})
+  return s in c ? (c[s][1] ||= p(s,b)).cloneNode(1) : (c[s] = [p(s,b)])[0]
+})({}, (s,b,t=document.createElement('template')) => {
+  t.innerHTML = s
+  return b ? t.content : t.content.firstChild
+})
+var __style = (c => s => c[s]||=(document.head.insertAdjacentHTML('beforeend', `<style>${s}</style>`),1))({})
 var __sym_upd = Symbol.update ||= Symbol.for('update')
-var __comp = root => ({ root, _p: {}, [__sym_upd]() {
-  let t = this.root
-  this._u?.()
-  if (typeof t === 'function') {
-    t = this.root = t(this._p)
-    this._a && t.setAttribute(this._a,'')
-    this._s?.() ?? this._b?.replaceWith(t)
-  } else {
-    t[__sym_upd]?.()
-    this._s?.()
-  }
-}})
-var __slot_s = (a,v,b) => {
-  b || a.after(b = a.cloneNode())
+var __slot_s = (a,b,v) => {
   let p, n = a.nextSibling
+  for (p of v) n === p ? n=n.nextSibling : n.before(p)
   while (p = n, n = p.nextSibling, p !== b) p.remove()
-  a.after(...v)
-  return b
 }
 function compiledClass() {
   __style(`
@@ -68,6 +57,12 @@ function nestedFnScopes() {
   }
   return f
 }
+function selectorList() {
+  __style(`
+        div[_r0uxdr5t], button[_r0uxdr5t] { color: red; }
+    `);
+  return __template(`<div _r0uxdr5t><button _r0uxdr5t>`)
+}
 function unscoped() {
   __style(`
         div.foo[_r2wz7amj] { color: red; }
@@ -85,7 +80,7 @@ function unscopedAtRule() {
             .bar { animation-name: bar; }
         
     `);
-  return __template(`<div _sz2398f8 class="foo">`)
+  return __template(`<div class="foo">`)
 }
 function scopeAtRule() {
   __style(`
@@ -309,9 +304,12 @@ function customPropMixedBlocks() {
     `);
 }
 function componentTypeSelectors() {
-  function Foo(props) {
-    let __ret = __template(`<div _59jo03zx _s-1>children:
-<!>`)
+  function Foo(_attrs, children = []) {
+    const __ret = __template(`<div _59jo03zx _s-1>children:
+<!><!>`)
+    let _v0 = __ret.firstChild // #text
+    _v0 = _v0.nextSibling; // <!> - {...}
+    let _v1 = _v0.nextSibling // {...} - <!>
     __style(`
             div[_59jo03zx]:where([_s-1]) {
                 
@@ -326,13 +324,12 @@ function componentTypeSelectors() {
                 
             }
         `);
-    let _v0 = __ret.firstChild
-    _v0 = _v0.nextSibling;
-    let _v1
-    ;(__ret[__sym_upd] = () => {
-      _v1 = __slot_s(_v0, props.children, _v1);
-    })();
-    return __ret
+    return {
+      root: __ret,
+      [__sym_upd]: () => {
+        __slot_s(_v0, _v1, children);
+      }
+    }
   }
   __style(`
         [_comp_lfk0x6fk] div:where([_59jo03zx]) {
@@ -342,23 +339,40 @@ function componentTypeSelectors() {
             }
         }
     `);
-  const __ret = __comp(Foo)
+  let __ret = void 0
   {
-    __ret._a = '_comp_lfk0x6fk';
-    const _v0 = __template(`<a><div _59jo03zx>red</div><div _59jo03zx><!>`)
-    const _v1 = _v0.firstChild
-    const _v2 = _v1.nextSibling
-    const _v3 = __ret._p.children = [_v1]
-    let _v4 = _v2.firstChild
-    const _v5 = __comp(Foo)
-    _v5._a = '_comp_lfk0x6fk';
-    _v5._b = _v4;
-    const _v6 = __template(`<a><span _59jo03zx>hover over me`)
-    _v4 = _v6.firstChild;
-    const _v7 = _v5._p.children = [_v4]
-    _v3[1] = _v2;
-    __ret._u = _v5[__sym_upd].bind(_v5);
-    __ret[__sym_upd]();
+    const _v0 = []
+    const _v1 = __template(`<div _59jo03zx>red</div><div _59jo03zx><!>`)
+    let _v2 = _v1 // div
+    _v2 = _v2.nextSibling; // div
+    _v2 = _v2.firstChild; // Foo
+    let _v3
+    __ret = Foo(void 0, _v0);
+    _v3 ??= Foo(void 0, []);
+    _v3[Symbol.update]();
+    if (_v2) _v2 = void _v2.replaceWith(_v3.root);
+    __ret[Symbol.update]();
   }
   return __ret
+}
+function deadAttributeElimination() {
+  __style(`
+        div[_do850bjp] { color: red; }
+        
+            span { background: gray; }
+        
+    `);
+  return __template(`<span>red?`)
+}
+function deadAttributeElimination2() {
+  __style(`
+        div.foo[_zovaszno] { color: red; }
+    `);
+  return __template(`<div _zovaszno class="foo">red!`)
+}
+function deadAttributeElimination3() {
+  __style(`
+        div#foo[_d3dm9dua] { color: red; }
+    `);
+  return __template(`<div _d3dm9dua>red!`)
 }

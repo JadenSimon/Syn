@@ -483,6 +483,125 @@ fn collectComponentSelectors(css: []const u8, root_attr: []const u8, entries: *s
     }
 }
 
+fn cssTsAddUnique(out: *std.ArrayList([]const u8), word: []const u8) !void {
+    for (out.items) |e| if (std.mem.eql(u8, e, word)) return;
+    try out.append(try getAllocator().dupe(u8, word));
+}
+
+fn collectTypeSelectorsFromCompound(css: []const u8, pos: *usize, out: *std.ArrayList([]const u8)) anyerror!void {
+    const full_start = pos.*;
+    var at_start = true;
+    var has_type_selector = false;
+    var ignore = false;
+
+    var i = full_start;
+    while (cssNext(css, i)) |tok| {
+        if (tok.has_leading_whitespace and i != full_start) break;
+        if (tok.kind == .punct) {
+            switch (css[tok.start]) {
+                '>', '+', '~', ',', '{', '}', ';' => break,
+                '&' => {
+                    i = tok.end;
+                    ignore = true;
+                    at_start = false;
+                },
+                ':' => {
+                    at_start = false;
+                    i = tok.end;
+                    const name_tok = cssNext(css, i) orelse break;
+                    if (name_tok.has_leading_whitespace) break;
+                    i = name_tok.end;
+                    if (name_tok.kind == .punct) continue; // ::pseudo-element
+                    const name_text = css[name_tok.start..name_tok.end];
+                    const paren = std.mem.indexOfScalar(u8, name_text, '(') orelse continue;
+                    const fn_name = name_text[0..paren];
+                    if (!ignore and (std.mem.eql(u8, fn_name, "is") or std.mem.eql(u8, fn_name, "where"))) {
+                        const inner = name_text[paren + 1 .. name_text.len - 1];
+                        const prev_len = out.items.len;
+                        try collectTypeSelectorsFromSelectorList(inner, out);
+                        if (out.items.len > prev_len) has_type_selector = true;
+                    }
+                },
+                else => {
+                    at_start = false;
+                    i = tok.end;
+                },
+            }
+        } else {
+            const word = css[tok.start..tok.end];
+            if (!ignore and at_start) {
+                if (std.mem.eql(u8, word, "*")) {
+                    try cssTsAddUnique(out, "*");
+                    has_type_selector = true;
+                } else if (word[0] != '.' and word[0] != '#' and word[0] != '[') {
+                    var end: usize = 0;
+                    while (end < word.len) {
+                        switch (word[end]) {
+                            '.', '#' => break,
+                            else => {},
+                        }
+                        end += 1;
+                    }
+                    try cssTsAddUnique(out, word[0..end]);
+                    has_type_selector = true;
+                }
+            }
+            at_start = false;
+            i = tok.end;
+        }
+    }
+
+    pos.* = i;
+    if (!ignore and !has_type_selector) {
+        try cssTsAddUnique(out, "*");
+    }
+}
+
+fn collectTypeSelectorsFromSelectorList(css: []const u8, out: *std.ArrayList([]const u8)) anyerror!void {
+    var i: usize = 0;
+    while (cssNext(css, i)) |tok| {
+        if (tok.kind == .punct) {
+            switch (css[tok.start]) {
+                ',', '>', '+', '~' => { i = tok.end; },
+                '{', '}', ';' => break,
+                '&', ':' => try collectTypeSelectorsFromCompound(css, &i, out),
+                else => { i = tok.end; },
+            }
+        } else {
+            try collectTypeSelectorsFromCompound(css, &i, out);
+        }
+        for (out.items) |t| if (std.mem.eql(u8, t, "*")) return;
+    }
+}
+
+fn collectPossibleTypeSelectorsFromCss(css: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var pos: usize = 0;
+    while (cssScanDeclaration(css, pos)) |decl| {
+        pos = decl.end;
+        var should_recurse = false;
+        switch (decl.kind) {
+            .rule => {
+                try collectTypeSelectorsFromSelectorList(css[decl.start..decl.value_start], out);
+                for (out.items) |t| if (std.mem.eql(u8, t, "*")) return;
+                should_recurse = true;
+            },
+            .at_rule => {
+                const kw_token = cssNext(css, decl.start) orelse continue;
+                const kw = css[kw_token.start..kw_token.end];
+                const recurse_into = [_][]const u8{ "@media", "@supports", "@layer", "@container", "@scope", "@starting-style" };
+                for (recurse_into) |x| {
+                    if (std.mem.eql(u8, kw, x)) { should_recurse = true; break; }
+                }
+            },
+            else => {},
+        }
+        if (should_recurse) {
+            try collectPossibleTypeSelectorsFromCss(css[decl.value_start + 1 .. decl.end - 1], out);
+            for (out.items) |t| if (std.mem.eql(u8, t, "*")) return;
+        }
+    }
+}
+
 fn replaceKeyframeNamesInValue(value: []const u8, keyframes: []const KeyframeEntry, out: *std.ArrayList(u8)) !void {
     var i: usize = 0;
     var s = i;
@@ -642,6 +761,7 @@ const StyleVisitor = struct {
         merged_css: []const u8 = &.{},
         needs_attr_value: bool = false,
         comp_selectors: []const CompSelectorEntry = &.{},
+        possible_type_selectors: ?[]const []const u8 = null,
 
         did_transform: bool = false, // updates `merged_css`
 
@@ -685,6 +805,9 @@ const StyleVisitor = struct {
         std.debug.assert(s.root.attr.len != 0);
         std.debug.assert(s.merged_css.len != 0);
         s.did_transform = true;
+        var type_sel_list = std.ArrayList([]const u8).init(getAllocator());
+        try collectPossibleTypeSelectorsFromCss(s.merged_css, &type_sel_list);
+        s.possible_type_selectors = try type_sel_list.toOwnedSlice();
         var scoped = std.ArrayList(u8).init(getAllocator());
         var comp_list = std.ArrayList(CompSelectorEntry).init(getAllocator());
         try transformCssSelectors(s.merged_css, s.root.attr, s.subscopes.items, &comp_list, &scoped);
@@ -1178,6 +1301,7 @@ pub const Program = struct {
     }
 
     pub fn putFileData(this: *@This(), hash: u64, id: FileRef, parsed: *ParsedFile) !void {
+        if (parsed.source_program == null) parsed.source_program = this;
         const linkage = this.files.items[id].linkage;
         this.files.items[id].* = ParsedFileData.initFromParsedFile(parsed, linkage);
         this.files.items[id].id = id;
@@ -3798,8 +3922,15 @@ pub const Program = struct {
                 }
             }
 
-            fn templateWriteHtmlScopeAttrs(self: *@This(), node: *const AstNode, out: *std.ArrayList(u8)) !void {
+            fn templateWriteHtmlScopeAttrs(self: *@This(), node: *const AstNode, tag: []const u8, out: *std.ArrayList(u8)) !void {
                 const s = self.style_visitor.node_ptr_to_scope_map.get(node) orelse return;
+                if (s.possible_type_selectors) |pts| {
+                    var matched = false;
+                    for (pts) |t| {
+                        if (std.mem.eql(u8, t, "*") or std.mem.eql(u8, t, tag)) { matched = true; break; }
+                    }
+                    if (!matched) return;
+                }
                 try out.append(' ');
                 try out.appendSlice(s.root.attr);
                 // if (s.needs_attr_value) {
@@ -3842,7 +3973,7 @@ pub const Program = struct {
                         const tag = getSlice(self.nodes.at(d.left), u8);
                         try out.appendSlice("<");
                         try out.appendSlice(tag);
-                        try self.templateWriteHtmlScopeAttrs(node, out);
+                        try self.templateWriteHtmlScopeAttrs(node, tag, out);
                         try self.templateWriteHtmlAttrs(d.right, out);
                         try out.appendSlice(">");
                         try self.templateWriteEndTagIfNeeded(node, tag, out);
@@ -3861,7 +3992,7 @@ pub const Program = struct {
                         const tag = getSlice(self.nodes.at(od.left), u8);
                         try out.appendSlice("<");
                         try out.appendSlice(tag);
-                        try self.templateWriteHtmlScopeAttrs(node, out);
+                        try self.templateWriteHtmlScopeAttrs(node, tag, out);
                         try self.templateWriteHtmlAttrs(od.right, out);
                         try out.appendSlice(">");
 
@@ -9570,11 +9701,16 @@ pub const Program = struct {
                         try self.factory.createIdentifier("children"), default_init);     
                 }
                 try self.coalesceVariableStatements(self.nodes.at(body_block));
+                var flags: u22 = 0;
+                if (n.hasFlag(.@"export")) {
+                    flags |= @intFromEnum(NodeFlags.@"export");
+                }
                 return self.nodes.push(.{
                     .kind = .function_declaration,
                     .data = toBinaryDataPtrRefs(fn_name, props_param),
                     .len = body_block,
                     .next = n.next,
+                    .flags = flags,
                 });
             }
 
@@ -9739,7 +9875,9 @@ pub const Program = struct {
                     },
                     .return_statement => {
                         inner_exp = maybeUnwrapRef(statement) orelse return null;
-                        binding_name = try self.factory.createIdentifier("__ret"); // FIXME: allocate name instead
+                        const el_name = if (self.inlineMaybeGetElementBinding(self.nodes.at(inner_exp))) |x| 
+                            getSlice(self.nodes.at(x), u8) else "__ret";
+                        binding_name = try self.factory.createIdentifier(el_name);
                         binding_statement = try self.factory.createConstVariable(binding_name, inner_exp);
                         const clone = try self.factory.cloneNode(statement);
                         self.nodes.at(clone).data = @ptrFromInt(binding_name); // return __ret
@@ -10133,7 +10271,17 @@ pub const Program = struct {
 
                         if (as_node) |c| {
                             if (c.kind == .async_keyword) {
-                                return try parser.forEachChild(self.nodes, n, self);
+                                const d = getPackedData(n);
+                                {
+                                    self.as_type_node = c;
+                                    defer self.as_type_node = null;
+                                    try self.visit(self.nodes.at(d.left), d.left);
+                                }
+                                var arg_iter = NodeIterator.init(self.nodes, d.right);
+                                while (arg_iter.nextRef()) |arg_ref| {
+                                    try self.visit(self.nodes.at(arg_ref), arg_ref);
+                                }
+                                return;
                             }
 
                             // TODO: as Promise...
@@ -11253,7 +11401,6 @@ pub const ParsedFileData = struct {
     flow: ?*Analyzer.FlowTyper = null,
     declaration_flows: std.AutoArrayHashMapUnmanaged(NodeRef, *Analyzer.FlowTyper) = .{},
 
-    // Used for semantic issues, e.g. `break` without being in a breakable context
     diagnostics: Diagnostics = .{},
 
     pub fn init(_allocator: std.mem.Allocator, ast: parser.AstData, binder: *const parser.Binder, linkage: *ModuleLinkage) @This() {
@@ -19747,10 +19894,12 @@ pub const Analyzer = struct {
                         try this.addTypeParams(getSlice2(k, TypeRef));
                         this.class_type = inner_ref;
                     } else {
+                        this.analyzer._debug(inner_ref);
                         _ = try notSupported(inner.getKind());
                     }
                 },
                 else => {
+                    this.analyzer._debug(type_ref);
                     _ = try notSupported(k.getKind());
                 },
             }
@@ -19807,7 +19956,8 @@ pub const Analyzer = struct {
 
         var merged = Merged{ .analyzer = this };
         for (g.symbols.items) |abs_ref| {
-            try merged.addType(try this.getTypeOfAbsoluteSymbol(abs_ref));
+            const t = try this.getTypeOfAbsoluteSymbol(abs_ref);
+            try merged.addType(t);
         }
 
         g.type = try merged.complete();
@@ -19943,7 +20093,8 @@ pub const Analyzer = struct {
         }
 
         var merged = Merged{ .analyzer = this };
-        try merged.addType(try this.getType(file, sym.declaration));
+        const t = try this.getType(file, sym.declaration);
+        try merged.addType(t);
 
         var next: SymbolRef = sym.next;
         while (next != 0) {
@@ -21929,7 +22080,11 @@ pub const Analyzer = struct {
                                     }
                                 }
                             },
-                            else => return notSupported(n.getKind()), // TODO
+                            else => {
+                                std.debug.print("unhandled spread type\n", .{});
+                                this._debug(t);
+                                return notSupported(n.getKind()); // TODO
+                            },
                         }
                         continue;
                     }

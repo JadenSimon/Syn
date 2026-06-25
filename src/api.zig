@@ -136,7 +136,7 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
             for (0..nodes_slice.len) |i| {
                 var n = &nodes_slice[i];
                 switch (n.kind) {
-                    .identifier, .string_literal, .private_identifier, .template_head, .template_middle, .template_tail, .no_substitution_template_literal, .regular_expression_literal => {
+                    .identifier, .string_literal, .private_identifier, .template_head, .template_middle, .template_tail, .no_substitution_template_literal, .regular_expression_literal, .jsx_text => {
                         const data = if (n.data) |x| @intFromPtr(x) else 0;
                         if ((data >> 32) == 0xFF) {
                             n.data = @ptrFromInt(@intFromPtr(heap.ptr) + ((data & 0xFFFFFFFF) - ast_data.source.len));
@@ -153,6 +153,23 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
         if (ref >= sf.ast.nodes.count()) {
             return error.InvalidNodeReference;
         }
+    }
+
+    if (options != null and options.?.is_syn) {
+        const p = sf.source_program orelse return error.MissingProgram;
+        const id = try p.getFileIdByPath(sf.source_name orelse return error.MissingSourceFileName);
+        p.getFileData(id).ast = ast_data;
+        var replacements = try p.transformSyn(id, sf.ast.start);
+        defer replacements.deinit();
+
+        var opt = options.?;
+        opt.replacements = &replacements;
+        opt.transform_to_cjs = true; // XXX: used to force replacements printer
+        const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
+        return .{
+            .contents = try js.ArrayBuffer.from(@constCast(result.contents)),
+            .mappings = if (result.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
+        };
     }
 
     const result = try parser.printWithOptions(ast_data, options orelse .{});

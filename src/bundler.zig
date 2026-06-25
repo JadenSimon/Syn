@@ -149,12 +149,16 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
     while (iter.nextPair()) |pair| {
         switch (pair[0].kind) {
             .import_declaration => {
+                const ref = replacements.get(pair[1]) orelse pair[1];
+                const next = data.nodes.at(ref).next;
+
                 const d = getPackedData(pair[0]);
                 const spec = d.right;
                 if (d.left == 0 or pair[0].hasFlag(.declare)) {
                     // Side-effect import
                     const r = try data.nodes.push(.{
                         .kind = .empty_statement,
+                        .next = next,
                     });
                     try replacements.put(pair[1], r);
                     continue;
@@ -224,7 +228,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
                         .data = @ptrFromInt(decl),
-                        .next = pair[0].next,
+                        .next = next,
                     });
                     try replacements.put(pair[1], variable_statement);
                     default_import = data.nodes.at(variable_statement);
@@ -245,7 +249,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
                         .data = @ptrFromInt(decl),
-                        .next = pair[0].next,
+                        .next = next,
                     });
                     if (default_import) |n| {
                         n.next = variable_statement;
@@ -284,7 +288,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
                         .data = @ptrFromInt(decl),
-                        .next = pair[0].next,
+                        .next = next,
                     });
                     if (default_import) |n| {
                         n.next = variable_statement;
@@ -296,8 +300,9 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
             else => {
                 if (pair[0].hasFlag(.declare) or !pair[0].hasFlag(.@"export")) continue;
 
+                const ref = replacements.get(pair[1]) orelse pair[1];
                 // TODO: default export
-                const without_export = try data.nodes.push(pair[0].*);
+                const without_export = try data.nodes.push(data.nodes.at(ref).*);
                 data.nodes.at(without_export).flags &= ~@as(u20, @intFromEnum(NodeFlags.@"export"));
 
                 try replacements.put(pair[1], without_export);
@@ -348,6 +353,16 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         data.nodes.at(tail).next = exp_statement;
                         tail = exp_statement;
                     }
+                } else if (pair[0].kind == .jsx_component) {
+                    const fn_exp = data.nodes.at(getPackedData(pair[0]).right);
+                    const copy = try data.nodes.push(data.nodes.at(getPackedData(fn_exp).left).*);
+                    data.nodes.at(copy).location = 0;
+
+                    const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
+                    try statements.append(.{
+                        .kind = .expression_statement,
+                        .data = @ptrFromInt(exp),
+                    });
                 }
             },
         }
