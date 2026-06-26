@@ -520,15 +520,14 @@ pub const NodeFlags = enum(u22) {
 pub const StringFlags = enum(u20) {
     single_quote = 1 << 0,
     double_quote = 1 << 1,
-    two_byte = 1 << 2,
-
-    // TODO: compute this in the lexer (should be practically free)
-    // If set, this literal can be converted to a number
-    numeric = 1 << 3,
+    backtick = (1 << 0) | (1 << 1),
 
     external = 1 << 4, // `data` is a pointer
+    non_ascii = 1 << 5, // contains multibyte codepoints
 
-    synthetic = 1 << 6, // Implies escaping is needed
+    synthetic = 1 << 6, // Implies escaping may be needed
+    emits_verbatim = 1 << 12,
+    needs_decode = 1 << 14,
 };
 
 const TypeParamFlags = enum(u20) {
@@ -550,6 +549,10 @@ pub const AstNode = packed struct {
     location: u32 = 0,
 
     pub inline fn hasFlag(this: *const AstNode, flag: NodeFlags) bool {
+        return (this.flags & @intFromEnum(flag)) == @intFromEnum(flag);
+    }
+
+    pub inline fn hasStringFlag(this: *const AstNode, flag: StringFlags) bool {
         return (this.flags & @intFromEnum(flag)) == @intFromEnum(flag);
     }
 };
@@ -3038,20 +3041,31 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .kind = .string_literal,
                 .data = slice.ptr,
                 .len = @intCast(slice.len),
-                .flags = if (this.lexer.string_literal_is_ascii) 0 else @intFromEnum(StringFlags.two_byte),
+                .flags = if (this.lexer.string_literal_is_ascii) 0 else @intFromEnum(StringFlags.needs_decode),
             };
         }
 
-        fn parseStringLiteralLikeKind(this: *Parser, kind: SyntaxKind) !AstNode_ {
-            var flags: u22 = if (this.lexer.raw()[0] == '"') @intFromEnum(StringFlags.double_quote) else @intFromEnum(StringFlags.single_quote);
+        // FIXME: does comptime param here add code bloat?
+        fn parseStringLiteralLikeKind(this: *Parser, comptime kind: SyntaxKind) !AstNode_ {
+            var flags: u22 = 0;
 
             if (!this.lexer.string_literal_is_ascii) {
-                flags |= @intFromEnum(StringFlags.two_byte);
+                flags |= @intFromEnum(StringFlags.needs_decode);
+            }
+            switch (kind) {
+                .string_literal => {
+                    flags |= if (this.lexer.raw()[0] == '"') @intFromEnum(StringFlags.double_quote) else @intFromEnum(StringFlags.single_quote);
+                },
+                .no_substitution_template_literal,
+                .template_head, .template_middle, .template_tail => {
+                    flags |= @intFromEnum(StringFlags.backtick);
+                },
+                else => {},
             }
 
             const full_start = this.lexer.full_start;
             const width = this.getFullWidth();
-            const location = if (this.lexer.token == .t_string_literal) 
+            const location = if (kind == .string_literal) 
                 this.getLocation()
             else
                 encodeLocation(this.lexer.line_map.count, @as(u32, @intCast(this.lexer.start - this.lexer.full_last_line)));
@@ -3071,9 +3085,10 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         // Assumes either t_string_literal or t_no_substitution_template_literal
         inline fn parseStringLiteralLike(this: *@This()) !AstNode_ {
-            const kind: SyntaxKind = if (this.lexer.token == .t_string_literal) .string_literal else .no_substitution_template_literal;
-
-            return this.parseStringLiteralLikeKind(kind);
+            if (this.lexer.token == .t_string_literal) {
+                return this.parseStringLiteralLikeKind(.string_literal);
+            }
+            return this.parseStringLiteralLikeKind(.no_substitution_template_literal);
         }
 
         fn parseYieldExpression(this: *@This()) !AstNode_ {
@@ -6907,6 +6922,10 @@ pub const Factory = struct {
         return this.nodes.push(.{ .kind = .undefined_keyword });
     }
 
+    pub fn createThis(this: *@This()) !NodeRef {
+        return this.nodes.push(.{ .kind = .this_keyword });
+    }
+
     pub fn createVoidZero(this: *@This()) !NodeRef {
         return this.nodes.push(.{ 
             .kind = .void_expression,
@@ -8280,6 +8299,23 @@ pub fn forEachChild(
             if (node.len != 0) try visitor.visit(nodes.at(node.len), node.len);
             if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
         },
+        .object_binding_pattern, .array_binding_pattern => {
+            var it = NodeIterator.init(nodes, maybeUnwrapRef(node) orelse 0);
+            while (it.nextPair()) |p| try visitor.visit(p[0], p[1]);
+        },
+        .binding_element => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left);
+            if (node.len != 0) try visitor.visit(nodes.at(node.len), node.len);
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
+        .property_declaration => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left);
+            // len is type
+            if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
+
         // constructor
 
         // Types
@@ -8485,10 +8521,11 @@ pub const Symbol = struct {
     // For namespaces, this is an index into the `namespaces` array
     // **Type params use this to cache their own type**
     binding: u32 = 0,
-    next: u32 = 0, // Only used for locally merged declarations
+    next: u32 = 0, // Used for locally merged declarations. Parameters use this for their position
 
     // This is used for flags for non-params
-    ordinal: u32 = 0, // Used for type parameters, this is similar to register allocation
+    // Non-imported, non-global value symbols will store a scope depth here
+    ordinal: u32 = 0, // Also used for position of type parameters
 
     pub inline fn hasFlag(this: *const Symbol, flag: SymbolFlags) bool {
         return hasSymbolFlag(this, flag);
@@ -8505,12 +8542,22 @@ pub const Symbol = struct {
     pub inline fn removeFlag(this: *Symbol, flag: SymbolFlags) void {
         this.ordinal &= ~(@as(u32, @intFromEnum(flag)) << 16);
     }
+
+    pub inline fn getScopeDepth(this: *const Symbol) u16 {
+        std.debug.assert(!this.hasFlag(.type));
+        if (this.hasFlag(.global) or this.hasFlag(.imported) or this.hasFlag(.late_bound)) {
+            return 0;
+        }
+        return @intCast(this.ordinal & 0xFFFF);
+    }
 };
 
 // important: some flags are added after binding
 // any incremental work may need to clear these flags if re-using binding data
 pub const SymbolFlags = enum(u16) {
-    local = 1 << 1,
+    referenced = 1 << 0,
+
+    local = 1 << 1, // "locally global...."
     global = 1 << 2, // only valid for `lib` files
 
     not_type = 1 << 3, // Only relevant for imports
@@ -8580,6 +8627,8 @@ pub const Binder = struct {
     const Scopes = std.ArrayListUnmanaged(SymbolTable);
 
     const warm_stack_depth = 16;
+    // seems to not add much overhead
+    const track_referenced = true;
 
     pub const Namespace = struct {
         const global_hash: u32 = @truncate(std.hash.Wyhash.hash(0, "global"));
@@ -8625,7 +8674,7 @@ pub const Binder = struct {
     imports: std.AutoArrayHashMapUnmanaged(u64, ImportedModule) = .{},
 
     type_ordinals: u32 = 0,
-    param_ordinals: u32 = 0,
+    param_ordinals: u32 = 0, // biased by 1
 
     is_lib: bool = false,
 
@@ -8683,26 +8732,30 @@ pub const Binder = struct {
             @as(u32, @intFromEnum(SymbolFlags.@"const")) << 16
         else if (this.should_mark_let)
             @as(u32, @intFromEnum(SymbolFlags.let_binding)) << 16
-        else if (comptime bind_types) this.param_ordinals else 0;
+        else 0;
 
         return this.bindDeclWithFlagsOrOrdinal(ident, decl, binding, flags_or_ordinal, false);
     }
 
     fn bindDeclWithFlagsOrOrdinal(this: *@This(), ident: *AstNode, decl: NodeRef, binding: NodeRef, flags_or_ordinal: u32, comptime is_type_like: bool) !void {
+        const depth = this.scopes.items.len;
+
         var extra_flags: u32 = 0;
-        if (this.scopes.items.len == 1) {
+        if (depth == 1) {
             extra_flags |= @as(u32, @intFromEnum(SymbolFlags.top_level)) << 16;
         }
+        extra_flags |= @as(u16, @intCast(depth));
 
-        var current_scope = &this.scopes.items[this.scopes.items.len - 1];
+        const current_scope = &this.scopes.items[depth - 1];
         const hash = getHashFromNode(ident);
 
         // We might return early from here
         if (comptime bind_types) {
             // Potentially merge symbols, constructing a linked list in reverse order
             // FIXME: we don't need to check this for some declarations
-            if (current_scope.get(hash)) |sym_ref| {
+            if (getCleanedSymbol(current_scope.*, hash)) |sym_ref| {
                 var from = this.symbols.at(sym_ref);
+                std.debug.assert(!from.hasFlag(.parameter));
                 const s = try this.symbols.push(from.*);
 
                 from.declaration = decl;
@@ -8716,10 +8769,16 @@ pub const Binder = struct {
             }
         }
 
+        const is_param = this.param_ordinals > 0;
+        if (is_param) {
+            extra_flags |= @as(u32, @intFromEnum(SymbolFlags.parameter)) << 16;
+        }
+
         const s = try this.symbols.push(.{
             .declaration = decl,
             .binding = binding,
             .ordinal = flags_or_ordinal | extra_flags,
+            .next = if (is_param) this.param_ordinals - 1 else 0,
         });
 
         // if (getLoc(this.nodes, ident)) |loc| {
@@ -8736,14 +8795,13 @@ pub const Binder = struct {
             try this.pushExport(hash, s);
         }
 
-        try current_scope.put(this.allocator, hash, s);
+        try this.putSymbol(current_scope, hash, s);
         ident.extra_data = s;
 
         if (comptime is_type_like) {
-            try this.type_scopes.items[this.type_scopes.items.len - 1].put(this.allocator, hash, s);
+            try this.putImmediateSymbol(hash, s, true);
             if (this.should_export) {
                 try this.pushTypeExport(hash, s);
-                // try this.type_exports.put(hash, s);
             }
         }
     }
@@ -8756,12 +8814,12 @@ pub const Binder = struct {
             extra_flags |= @as(u32, @intFromEnum(SymbolFlags.top_level)) << 16;
         }
 
-        var current_scope = &this.type_scopes.items[depth - 1];
+        const current_scope = &this.type_scopes.items[depth - 1];
 
         var ident = this.nodes.at(ident_ref);
         const hash = getHashFromNode(ident);
 
-        if (current_scope.get(hash)) |prev| {
+        if (getCleanedSymbol(current_scope.*, hash)) |prev| {
             var sym = this.symbols.at(prev);
             const next = sym.next;
 
@@ -8779,7 +8837,7 @@ pub const Binder = struct {
                     .ordinal = flags_and_ordinal | extra_flags | (@as(u32, @intFromEnum(SymbolFlags.global)) << 16),
                 });
                 ident.extra_data = s;
-                try current_scope.put(this.allocator, hash, s);
+                try this.putSymbol(current_scope, hash, s);
                 return;
             }
 
@@ -8801,7 +8859,7 @@ pub const Binder = struct {
             //     });
             // }
 
-            try current_scope.put(this.allocator, hash, s);
+            try this.putSymbol(current_scope, hash, s);
 
             ident.extra_data = s;
 
@@ -8851,8 +8909,9 @@ pub const Binder = struct {
 
         ident.extra_data = s;
 
-        var current_type_scope = &this.type_scopes.items[this.type_scopes.items.len - 1];
-        try current_type_scope.put(this.allocator, getHashFromNode(ident), s);
+        // var current_type_scope = &this.type_scopes.items[this.type_scopes.items.len - 1];
+        // try current_type_scope.put(this.allocator, getHashFromNode(ident), s | (1 << 31));
+        try this.putImmediateSymbol(getHashFromNode(ident), s, true);
 
         if (property_name) |name| {
             const hash: u32 = @truncate(std.hash.Wyhash.hash(0, name));
@@ -8879,8 +8938,9 @@ pub const Binder = struct {
 
         if (is_type_only) return; // TODO: need flag? we can't differentiate when linking
 
-        var current_scope = &this.scopes.items[this.scopes.items.len - 1];
-        try current_scope.put(this.allocator, getHashFromNode(ident), s);
+        // var current_scope = &this.scopes.items[this.scopes.items.len - 1];
+        // try current_scope.put(this.allocator, getHashFromNode(ident), s | (1 << 31));
+        try this.putImmediateSymbol(getHashFromNode(ident), s, false);
     }
 
     inline fn pushExport(this: *@This(), hash: u32, s: SymbolRef) !void {
@@ -8984,14 +9044,27 @@ pub const Binder = struct {
 
         var i: usize = scopes.items.len - 1;
         while (true) {
-            if (scopes.items[i].get(h)) |ref| {
-                if (comptime bind_types and !is_type) {
-                    // TODO: reserve the upper bit of scoped refs to mark imported symbols.
-                    // Then when an imported symbol is only used as a value (not a type) we 
-                    // can confidently say that the symbol _isn't_ a type in this context. Mark 
-                    // the symbol as "not a type" and then remove the bit from the reference.
+            if (comptime track_referenced) {
+                if (scopes.items[i].getEntry(h)) |entry| {
+                    // if (comptime bind_types and !is_type) {
+                    //     // TODO: reserve the upper bit of scoped refs to mark imported symbols.
+                    //     // Then when an imported symbol is only used as a value (not a type) we 
+                    //     // can confidently say that the symbol _isn't_ a type in this context. Mark 
+                    //     // the symbol as "not a type" and then remove the bit from the reference.
+                    // }
+                    const ref = entry.value_ptr.*;
+                    if (ref >> 31 == 1) {
+                        const z = ref & ~@as(u31, 0);
+                        entry.value_ptr.* = z;
+                        this.symbols.at(z).addFlag(.referenced);
+                        return z;
+                    }
+                    return ref;
                 }
-                return ref;
+            } else {
+                if (scopes.items[i].get(h)) |ref| {
+                    return ref;
+                }
             }
             if (i == 0) break;
             i -= 1;
@@ -9008,28 +9081,37 @@ pub const Binder = struct {
         return this._findSymbol(ident, true);
     }
 
+    inline fn getImmediateSymbol(this: *const @This(), hash: u32, comptime is_type: bool) ?SymbolRef {
+        const scopes = if (comptime is_type) this.type_scopes else this.scopes;
+        return getCleanedSymbol(scopes.items[scopes.items.len - 1], hash);
+    }
+
+    inline fn getCleanedSymbol(scope: SymbolTable, hash: u32) ?SymbolRef {
+        if (scope.get(hash)) |sym_ref| {
+            return if (comptime track_referenced) sym_ref & ~@as(u31, 0) else sym_ref;
+        }
+        return null;
+    }
+
+    inline fn putSymbol(this: *@This(), scope: *SymbolTable, hash: u32, sym_ref: SymbolRef) !void {
+        try scope.put(this.allocator, hash, if (comptime track_referenced) sym_ref | (1 << 31) else sym_ref);
+    }
+
+    inline fn putImmediateSymbol(this: *@This(), hash: u32, sym_ref: SymbolRef, comptime is_type: bool) !void {
+        const scopes = if (comptime is_type) &this.type_scopes else &this.scopes;
+        try scopes.items[scopes.items.len-1].put(this.allocator, hash, if (comptime track_referenced) sym_ref | (1 << 31) else sym_ref);
+    }
+
     fn visitParams(this: *@This(), start: NodeRef) !void {
         const old_ordinals = this.param_ordinals;
         defer {
             if (comptime bind_types) this.param_ordinals = old_ordinals;
         }
-        if (comptime bind_types) this.param_ordinals = 0;
+        if (comptime bind_types) this.param_ordinals = 1;
 
         var iter = NodeIterator.init(this.nodes, start);
         while (iter.nextPair()) |pair| {
             const param = getPackedData(pair[0]);
-            if (bind_types and this.param_ordinals == 0) {
-                const binding = this.nodes.at(param.left);
-                if (binding.kind == .this_keyword) {
-                    // TODO: we should directly instantiate the symbol and link to the ambient one
-                    try this.lazyBindThis(binding);
-                    try this.visitType(pair[0].len);
-                    this.param_ordinals += 1;
-
-                    continue;
-                }
-            }
-
             try this.visitBinding(param.left, pair[1]);
 
             if (comptime bind_types) {
@@ -9050,12 +9132,27 @@ pub const Binder = struct {
         const binding = this.nodes.at(ref);
 
         switch (binding.kind) {
-            .this_keyword => {}, // TODO: emit error
+            .this_keyword => {
+                const source = this.nodes.at(decl);
+                if (source.kind == .parameter and getPackedData(source).left == ref) {
+                    if (comptime bind_types) {
+                        if (this.param_ordinals != 1) {
+                            // TODO: diagnostic / flag as error
+                        }
+                        try this.lazyBindThis(binding);
+                    } else {
+                        // not valid as a param
+                    }
+                }
+                // TODO: you can technically do this: `const { this: foo } = { this: 1 }` 
+            },
             .identifier => return this.bindDeclWithBinding(binding, decl, ref),
             .binding_element => {
                 binding.extra_data = decl;
                 const d = getPackedData(binding);
-                return this.visitBinding(d.left, ref);
+                try this.visitBinding(d.left, ref);
+                if (d.right != 0) try this.visit(this.nodes.at(d.right), d.right); // FIXME: this runs too soon, we have to wait until after hoist
+                return;
             },
             .object_binding_pattern => {
                 var iter = NodeIterator.init(this.nodes, maybeUnwrapRef(binding) orelse 0);
@@ -9085,7 +9182,6 @@ pub const Binder = struct {
         }
     }
 
-    // TODO: use this
     fn maybeVisitBindingInitializers(this: *@This(), ref: NodeRef) anyerror!void {
         const binding = this.nodes.at(ref);
 
@@ -9093,7 +9189,7 @@ pub const Binder = struct {
             .binding_element => {
                 const r = getPackedData(binding).right;
                 if (r != 0) {
-                    try this.maybeVisitBindingInitializers(r);
+                    try this.visit(this.nodes.at(r), r);
                 }
             },
             .object_binding_pattern => {
@@ -9263,6 +9359,10 @@ pub const Binder = struct {
             switch (el.kind) {
                 .property_declaration => {
                     const d2 = getPackedData(el);
+                    const name = this.nodes.at(d2.left);
+                    if (name.kind == .computed_property_name) {
+                        try this.visit(name, d2.left);
+                    }
                     if (d2.right != 0) {
                         try this.visit(this.nodes.at(d2.right), d2.right);
                     }
@@ -9271,7 +9371,15 @@ pub const Binder = struct {
                         try this.visitType(el.len);
                     }
                 },
-                .method_declaration, .constructor, .class_static_block_declaration => try this.visitLexicalScope(el),
+                .method_declaration => {
+                    const d2 = getPackedData(el);
+                    const name = this.nodes.at(d2.left);
+                    if (name.kind == .computed_property_name) {
+                        try this.visit(name, d2.left);
+                    }
+                    try this.visitLexicalScope(el);
+                },
+                .constructor, .class_static_block_declaration => try this.visitLexicalScope(el),
                 else => {},
             }
         }
@@ -9289,6 +9397,8 @@ pub const Binder = struct {
 
     // Hoisted declarations is something we can compute during parsing given that it's associated with lexical scopes
     // Blocks and top-level scope nodes have plenty of space
+    //
+    // The cheapest optimization here is recording the last hoisted decl, then we stop here
     fn hoist(this: *@This(), node: *const AstNode, ref: NodeRef) !void {
         switch (node.kind) {
             .class_declaration => {
@@ -9487,7 +9597,7 @@ pub const Binder = struct {
                 const hash = if (d.left == 0) Namespace.global_hash else try getHashFromModuleNode(this.nodes.at(d.left));
 
                 var has_non_ns_symbol = false;
-                if (this.scopes.items[this.scopes.items.len - 1].get(hash)) |sym_ref| {
+                if (this.getImmediateSymbol(hash, false)) |sym_ref| {
                     var sym = this.symbols.at(sym_ref);
                     while (!sym.hasFlag(.namespace)) {
                         if (sym.next == 0) break;
@@ -9557,11 +9667,11 @@ pub const Binder = struct {
                 }
 
                 if (has_non_ns_symbol) {
-                    const sym_ref = this.scopes.items[this.scopes.items.len - 1].get(hash) orelse unreachable;
+                    const sym_ref = this.getImmediateSymbol(hash, false) orelse unreachable;
                     this.symbols.at(s).next = this.symbols.at(sym_ref).next;
                     this.symbols.at(sym_ref).next = s;
                 } else {
-                    try this.scopes.items[this.scopes.items.len - 1].put(this.allocator, hash, s);
+                    try this.putImmediateSymbol(hash, s, false);
                     if (!is_module and this.shouldExport(node)) {
                         try this.pushExport(hash, s);
                        // try this.exports.put(hash, s);
@@ -9839,7 +9949,7 @@ pub const Binder = struct {
 
                 const scope = &this.type_scopes.items[infer_scope];
                 const ident = this.nodes.at(d.left);
-                if (scope.get(ident.extra_data2)) |prev| {
+                if (getCleanedSymbol(scope.*, ident.extra_data2)) |prev| {
                     var s = this.symbols.at(prev);
                     const n2 = this.nodes.at(s.declaration);
 
@@ -9861,7 +9971,7 @@ pub const Binder = struct {
                         .ordinal = flags_and_ordinal,
                     });
 
-                    try scope.put(this.allocator, getHashFromNode(ident), s);
+                    try this.putSymbol(scope, getHashFromNode(ident), s);
                     ident.extra_data = s;
                     this.type_ordinals += 1;
                 }
@@ -10027,6 +10137,28 @@ pub const Binder = struct {
             this.this_scope.items.len = len - 1;
         } else {
             _ = this.this_scope.pop();
+        }
+    }
+
+    inline fn cleanReferencedBits(symbols: *SymbolTable) void {
+        var vals = symbols.values();
+        var i: usize = 0;
+        while (i < vals.len) {
+            vals[i] &= ~@as(u31, 0);
+            i += 1;
+        }
+    }
+
+    fn finalizeNamespaces(this: *@This()) void {
+        if (!comptime track_referenced) return;
+
+        for (this.namespaces.items) |*ns| {
+            cleanReferencedBits(&ns.symbols);
+            cleanReferencedBits(&ns.type_symbols);
+        }
+        if (this.is_lib) {
+            cleanReferencedBits(&this.exports.symbols);
+            cleanReferencedBits(&this.exports.type_symbols);
         }
     }
 
@@ -10361,7 +10493,7 @@ pub const Binder = struct {
                 // Everything in the block has already been hoisted
                 const d = getPackedData(node);
                 const hash = if (d.left == 0) Namespace.global_hash else try getHashFromModuleNode(this.nodes.at(d.left));
-                const sym_ref = this.scopes.items[this.scopes.items.len - 1].get(hash) orelse return error.MissingNamespaceSymbol;
+                const sym_ref = this.getImmediateSymbol(hash, false) orelse return error.MissingNamespaceSymbol;
 
                 var sym = this.symbols.at(sym_ref);
                 while (!sym.hasFlag(.namespace)) {
@@ -10388,6 +10520,8 @@ pub const Binder = struct {
                 while (iter.nextRef()) |r| try this.visitRef(r);
             },
             .source_file => {
+                defer this.finalizeNamespaces();
+
                 try this.pushThisScope(ref);
                 defer this.popThisScope();
 
@@ -10677,6 +10811,11 @@ pub fn getIdentFromSymbol(binder: *const Binder, ref: SymbolRef) ?*const AstNode
     }
 
     return null;
+}
+
+pub fn getSliceFromSymbol(binder: *const Binder, ref: SymbolRef) ?[]const u8 {
+    const ident = getIdentFromSymbol(binder, ref) orelse return null;
+    return getSlice(ident, u8);
 }
 
 pub const ParsedFile = struct {

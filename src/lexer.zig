@@ -3486,3 +3486,260 @@ pub const PositionsWriter = struct {
 };
 
 const getAllocator = @import("./string_immutable.zig").getAllocator;
+
+pub const DecodeInfo = struct {
+    did_change: bool = false,
+    non_ascii: bool = false,
+    needs_escapes: bool = false,
+    has_newlines: bool = false,
+};
+pub fn decodeJSEscapeSequences(text: []const u8, buf: *std.ArrayList(u8), comptime quote: ?u8) !DecodeInfo {
+    const iterator = strings.CodepointIterator{ .bytes = text, .i = 0 };
+    var iter = strings.CodepointIterator.Cursor{};
+    var info: DecodeInfo = .{};
+    const newlines_needs_escapes = comptime (quote != null and quote.? != '`');
+    while (iterator.next(&iter)) {
+        switch (iter.c) {
+            '\r' => {
+                info.did_change = true;
+                info.has_newlines = true;
+                if (comptime newlines_needs_escapes) info.needs_escapes = true;
+                // From the specification:
+                //
+                // 11.8.6.1 Static Semantics: TV and TRV
+                //
+                // TV excludes the code units of LineContinuation while TRV includes
+                // them. <CR><LF> and <CR> LineTerminatorSequences are normalized to
+                // <LF> for both TV and TRV. An explicit EscapeSequence is needed to
+                // include a <CR> or <CR><LF> sequence.
+
+                // Convert '\r\n' into '\n'
+                const next_i: usize = iter.i + 1;
+                iter.i += @as(u32, @intFromBool(next_i < text.len and text[next_i] == '\n'));
+
+                // Convert '\r' into '\n'
+                buf.append('\n') catch unreachable;
+                continue;
+            },
+
+            '\\' => {
+                info.did_change = true;
+                _ = iterator.next(&iter) or return error.SyntaxError;
+
+                const c2 = iter.c;
+
+                switch (c2) {
+                    '0' => {
+                        buf.append(0x00) catch unreachable;
+                        continue;
+                    },
+                    'b' => {
+                        info.needs_escapes = true;
+                        buf.append(0x08) catch unreachable;
+                        continue;
+                    },
+                    'f' => {
+                        info.needs_escapes = true;
+                        buf.append(0x0C) catch unreachable;
+                        continue;
+                    },
+                    'v' => {
+                        info.needs_escapes = true;
+                        buf.append(0x0B) catch unreachable;
+                        continue;
+                    },
+                    't' => {
+                        info.needs_escapes = true;
+                        buf.append(0x09) catch unreachable;
+                        continue;
+                    },
+                    'r' => {
+                        info.has_newlines = true;
+                        if (comptime newlines_needs_escapes) info.needs_escapes = true;
+                        buf.append(0x0D) catch unreachable;
+                        continue;
+                    },
+                    'n' => {
+                        info.has_newlines = true;
+                        if (comptime newlines_needs_escapes) info.needs_escapes = true;
+                        buf.append(0x0A) catch unreachable;
+                        continue;
+                    },
+
+                    // 2-digit hexadecimal
+                    'x' => {
+                        var value: CodePoint = 0;
+                        var c3: CodePoint = 0;
+                        var width3: u3 = 0;
+
+                        _ = iterator.next(&iter) or return error.SyntaxError;
+                        c3 = iter.c;
+                        width3 = iter.width;
+                        switch (c3) {
+                            '0'...'9' => {
+                                value = value * 16 | (c3 - '0');
+                            },
+                            'a'...'f' => {
+                                value = value * 16 | (c3 + 10 - 'a');
+                            },
+                            'A'...'F' => {
+                                value = value * 16 | (c3 + 10 - 'A');
+                            },
+                            else => {
+                                return error.SyntaxError;
+                            },
+                        }
+
+                        _ = iterator.next(&iter) or return error.SyntaxError;
+                        c3 = iter.c;
+                        width3 = iter.width;
+                        switch (c3) {
+                            '0'...'9' => {
+                                value = value * 16 | (c3 - '0');
+                            },
+                            'a'...'f' => {
+                                value = value * 16 | (c3 + 10 - 'a');
+                            },
+                            'A'...'F' => {
+                                value = value * 16 | (c3 + 10 - 'A');
+                            },
+                            else => {
+                                return error.SyntaxError;
+                            },
+                        }
+
+                        iter.c = value;
+                    },
+                    'u' => {
+                        var value: i64 = 0;
+
+                        _ = iterator.next(&iter) or return error.SyntaxError;
+                        var c3 = iter.c;
+                        var width3 = iter.width;
+
+                        // variable-length
+                        if (c3 == '{') {
+                            // const hex_start = (iter.i + start) - width - width2 - width3;
+                            var is_first = true;
+                            var is_out_of_range = false;
+                            variableLength: while (true) {
+                                _ = iterator.next(&iter) or break :variableLength;
+                                c3 = iter.c;
+
+                                switch (c3) {
+                                    '0'...'9' => {
+                                        value = value * 16 | (c3 - '0');
+                                    },
+                                    'a'...'f' => {
+                                        value = value * 16 | (c3 + 10 - 'a');
+                                    },
+                                    'A'...'F' => {
+                                        value = value * 16 | (c3 + 10 - 'A');
+                                    },
+                                    '}' => {
+                                        if (is_first) {
+                                            return error.SyntaxError;
+                                        }
+                                        break :variableLength;
+                                    },
+                                    else => {
+                                        return error.SyntaxError;
+                                    },
+                                }
+
+                                // \U0010FFFF
+                                if (value > 1114111) {
+                                    is_out_of_range = true;
+                                }
+                                is_first = false;
+                            }
+
+                            if (is_out_of_range) {
+                                return error.SyntaxError;
+                            }
+
+                            // fixed-length
+                        } else {
+                            // Fixed-length
+                            // comptime var j: usize = 0;
+                            var j: usize = 0;
+                            while (j < 4) : (j += 1) {
+                                switch (c3) {
+                                    '0'...'9' => {
+                                        value = value * 16 | (c3 - '0');
+                                    },
+                                    'a'...'f' => {
+                                        value = value * 16 | (c3 + 10 - 'a');
+                                    },
+                                    'A'...'F' => {
+                                        value = value * 16 | (c3 + 10 - 'A');
+                                    },
+                                    else => {
+                                        return error.SyntaxError;
+                                    },
+                                }
+
+                                if (j < 3) {
+                                    _ = iterator.next(&iter) or return error.SyntaxError;
+                                    c3 = iter.c;
+
+                                    width3 = iter.width;
+                                }
+                            }
+                        }
+
+                        switch (value) {
+                            '\r', '\n', 0x2028, 0x2029 => {
+                                info.has_newlines = true;
+                                if (comptime newlines_needs_escapes) info.needs_escapes = true;
+                            },
+                            0x08, // \b
+                            0x0B, // \v
+                            0x0C, // \f
+                            '\t', '\\', (quote orelse -2) => {
+                                info.needs_escapes = true;
+                            },
+                            else => {},
+                        }
+
+                        iter.c = @as(CodePoint, @truncate(value));
+                    },
+                    '\r' => {
+                        const next_i: usize = iter.i + 1;
+                        iter.i += @as(u32, @intFromBool(next_i < text.len and text[next_i] == '\n'));
+                        continue;
+                    },
+                    '\n', 0x2028, 0x2029 => {
+                        continue; // Ignore line continuations. A line continuation is not an escaped newline.
+                    },
+                    '\\' => {
+                        info.needs_escapes = true;
+                        iter.c = c2;
+                    },
+                    (quote orelse -2) => {
+                        info.needs_escapes = true;
+                        iter.c = c2;
+                    },
+                    else => {
+                        iter.c = c2;
+                    },
+                }
+            },
+            else => {},
+        }
+
+        switch (iter.c) {
+            -1 => return error.UnexpectedEOF,
+            0...0x7F => {
+                buf.append(@intCast(iter.c)) catch unreachable;
+            },
+            else => {
+                info.non_ascii = true;
+                // try buf.ensureUnusedCapacity(4);
+                const len = try std.unicode.utf8Encode(@intCast(iter.c), buf.items[buf.items.len..]);
+                buf.items.len += len;
+            },
+        }
+    }
+    return info;
+}

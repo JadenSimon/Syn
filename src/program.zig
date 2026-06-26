@@ -2,6 +2,7 @@ const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
+// const synth_helper = @import("./synth_helper.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 
@@ -1928,6 +1929,11 @@ pub const Program = struct {
         std.debug.assert(f.ast.nodes.at(start).kind == .source_file);
 
         try this.bindModule(f);
+
+        // synth_helper.debugPrintCaptures(f.binder, &f.ast) catch |err| {
+        //     std.debug.print("synth_helper debug dump failed: {any}\n", .{err});
+        // };
+
         try this.doTopLevelCfa(f, start);
 
         const Visitor = struct {
@@ -12120,6 +12126,8 @@ pub const Analyzer = struct {
 
     pub inline fn getKindOfRef(this: *const @This(), ref: TypeRef) Kind {
         if (ref >= @intFromEnum(Kind.false)) {
+            if (isTypeParamRef(ref)) return .type_parameter_ref;
+            if (ref >= @intFromEnum(Kind.zero)) return .number_literal;
             return @enumFromInt(ref);
         }
 
@@ -12640,8 +12648,8 @@ pub const Analyzer = struct {
         const t = this.types.at(arg0);
         if (t.getKind() != .string_literal) return error.NotAString;
 
-        if ((t.slot3 & @intFromEnum(StringFlags.two_byte)) == @intFromEnum(StringFlags.two_byte)) {
-            return error.TODO_two_byte_string;
+        if ((t.slot3 & @intFromEnum(StringFlags.needs_decode)) == @intFromEnum(StringFlags.needs_decode)) {
+            return error.TODO_non_ascii;
         }
 
         return arg0;
@@ -18473,8 +18481,7 @@ pub const Analyzer = struct {
                 return this.createStringLiteral(file.id, ref, s, 0);
             },
             .string_literal => {
-                const s = getSlice(n, u8);
-                return this.createStringLiteral(file.id, ref, s, @intFromEnum(StringFlags.single_quote));
+                return this.createStringLiteralFromNode(file.id, ref, n);
             },
             .computed_property_name => {
                 return this.getType(file, unwrapRef(n));
@@ -19431,6 +19438,34 @@ pub const Analyzer = struct {
         }
     }
 
+    fn createStringLiteralFromNode(this: *@This(), file_id: u32, ref: NodeRef, n: *const AstNode) !TypeRef {
+        const s = getSlice(n, u8);
+        var flags: u20 = @intFromEnum(StringFlags.single_quote);
+        if (n.hasStringFlag(.needs_decode)) {
+            var decoded_buf = try std.ArrayList(u8).initCapacity(getAllocator(), s.len);
+            errdefer decoded_buf.deinit();
+            const info = blk: {
+                if (n.hasStringFlag(.backtick)) {
+                    flags = @intFromEnum(StringFlags.backtick);
+                    break :blk try @import("./lexer.zig").decodeJSEscapeSequences(s, &decoded_buf, '`');
+                }
+                if (n.hasStringFlag(.double_quote)) {
+                    flags = @intFromEnum(StringFlags.double_quote);
+                    break :blk try @import("./lexer.zig").decodeJSEscapeSequences(s, &decoded_buf, '"');       
+                }
+                break :blk try @import("./lexer.zig").decodeJSEscapeSequences(s, &decoded_buf, '\'');
+            };
+            if (!info.needs_escapes) flags |= @intFromEnum(StringFlags.emits_verbatim);
+            if (info.non_ascii) flags |= @intFromEnum(StringFlags.non_ascii);
+            if (info.did_change) {
+                return this._createSyntheticStringLiteral(decoded_buf.items, flags, true);
+            } else {
+                decoded_buf.deinit();
+            }
+        }
+        return this.createStringLiteral(file_id, ref, s, flags);
+    }
+
     fn createStringLiteral(this: *@This(), file_id: u32, ref: NodeRef, text: []const u8, string_flags: u24) !TypeRef {
         if (text.len == 0) {
             return @intFromEnum(Kind.empty_string);
@@ -19461,12 +19496,14 @@ pub const Analyzer = struct {
         return t;
     }
 
-    fn createSyntheticStringLiteral(this: *@This(), text: []const u8, comptime deinit: bool) !TypeRef {
+    inline fn createSyntheticStringLiteral(this: *@This(), text: []const u8, comptime deinit: bool) !TypeRef {
+        return this._createSyntheticStringLiteral(text, @intFromEnum(StringFlags.single_quote), deinit);
+    }
+
+    fn _createSyntheticStringLiteral(this: *@This(), text: []const u8, string_flags: u24, comptime deinit: bool) !TypeRef {
         if (text.len == 0) {
             return @intFromEnum(Kind.empty_string);
         }
-
-        const string_flags: u24 = @intFromEnum(StringFlags.single_quote);
 
         // FIXME: too many hashes
         const slot2: u32 = @truncate(std.hash.Wyhash.hash(0, text));
@@ -19527,6 +19564,15 @@ pub const Analyzer = struct {
         try this.interned_types.put(key, t);
 
         return t;
+    }
+
+    fn getStringLiteralTypeSlice(this: *const @This(), k: *const Type) []const u8 {
+        if (k.slot5 == 1) {
+            return this.synthetic_strings.items[k.slot0];
+        }
+        const f = this.program.getFileData(k.slot0);
+        const n = f.ast.nodes.at(k.slot1);
+        return getSlice(n, u8);
     }
 
     fn getMemberType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !TypeRef {
@@ -19745,9 +19791,17 @@ pub const Analyzer = struct {
         const base_class = if (n.len != 0) try this.getType(file, n.len) else 0;
 
         const instance_proto = if (base_class != 0) try this.getInstanceType(base_class, false) else 0;
+        var static_proto: TypeRef = 0;
+        if (base_class != 0) {
+            if (try this.maybeGetClassFromTypeRef(base_class)) |x| {
+                static_proto = x.slot1;
+            } else {
+                static_proto = base_class;
+            }
+        }
 
         const instance_type = try this.createObjectLiteral(instance_members.items, instance_flags, instance_proto);
-        const static_type = try this.createObjectLiteral(static_members.items, static_flags, 0);
+        const static_type = try this.createObjectLiteral(static_members.items, static_flags, static_proto); 
 
         var flags: u24 = 0;
         if (this.isParameterizedRef(instance_type) or this.isParameterizedRef(static_type)) flags |= @intFromEnum(Flags.parameterized);
@@ -19759,10 +19813,6 @@ pub const Analyzer = struct {
         }
 
         return type_ref;
-        // len is extends
-        // right is body
-        // extra_data is type params
-        // extra_data2 is implements
     }
 
     // Interfaces merge with classes by augmenting the instance type
@@ -20038,7 +20088,7 @@ pub const Analyzer = struct {
 
         if (sym.declaration == 0) return @intFromEnum(Kind.any);
 
-        const t = try if (sym.next != 0)
+        const t = try if (sym.next != 0 and !sym.hasFlag(.parameter))
             this.getTypeMultipleDeclarations(file, sym)
         else
             this.getType(file, sym.declaration);
@@ -20340,15 +20390,17 @@ pub const Analyzer = struct {
             },
             .type_predicate => {
                 const d = getPackedData(node);
-                const sym = file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
+                const sym_ref = file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
                 const t = try this.getType(file, d.right);
+                const sym = file.binder.symbols.at(sym_ref);
+                std.debug.assert(sym.hasFlag(.parameter));
 
                 return this.types.push(.{
                     .kind = @intFromEnum(Kind.predicate),
                     .flags = this.getStructuralFlags(t),
-                    .slot0 = sym,
+                    .slot0 = sym_ref,
                     .slot1 = t,
-                    .slot2 = @as(u16, @truncate(file.binder.symbols.at(sym).ordinal)),
+                    .slot2 = sym.next,
                     .slot3 = @intCast(file.id),
                     .slot4 = node.len,
                 });
@@ -20916,8 +20968,7 @@ pub const Analyzer = struct {
             .no_substitution_template_literal, .string_literal => {
                 if (!this.is_const_context and !this.is_const_variable_context) return @intFromEnum(Kind.string);
 
-                const s = getSlice(node, u8);
-                return this.createStringLiteral(file.id, ref, s, @intFromEnum(StringFlags.single_quote));
+                return this.createStringLiteralFromNode(file.id, ref, node);
             },
             .numeric_literal => return this.getNumericLiteralType(node, false),
             .variable_declaration => {
@@ -21239,6 +21290,18 @@ pub const Analyzer = struct {
         return try this.getTypeOfSymbol(f, sym_ref);
     }
 
+    fn accessPrimitivePrototype(this: *@This(), comptime name: []const u8, element: TypeRef, hash: NodeSymbolHash, set_this_type: bool) !?TypeRef {
+        const global_type = try this.getGlobalTypeSymbolAlias(name, .{});
+        if (global_type == null) return @intFromEnum(Kind.error_any);
+        return this.accessTypeWithHash(global_type.?, element, hash, set_this_type);
+    }
+
+    fn accessParameterizedPrimitivePrototype(this: *@This(), comptime name: []const u8, types: TypeList, element: TypeRef, hash: NodeSymbolHash, set_this_type: bool) !?TypeRef {
+        const global_type = try this.getGlobalTypeSymbolAlias(name, types);
+        if (global_type == null) return @intFromEnum(Kind.error_any);
+        return this.accessTypeWithHash(global_type.?, element, hash, set_this_type);
+    }
+
     pub fn accessType(this: *@This(), subject: TypeRef, element: TypeRef) anyerror!TypeRef {
         if (subject == @intFromEnum(Kind.any) or subject == @intFromEnum(Kind.error_any)) return subject;
         if (element == @intFromEnum(Kind.any)) return element;
@@ -21277,7 +21340,12 @@ pub const Analyzer = struct {
 
     fn accessTypeWithHash(this: *@This(), subject: TypeRef, element: TypeRef, hash: NodeSymbolHash, set_this_type: bool) anyerror!?TypeRef {
         if (subject >= @intFromEnum(Kind.false)) {
+            if (subject == @intFromEnum(Kind.undefined) or subject == @intFromEnum(Kind.null)) {
+                return @intFromEnum(Kind.error_any);
+            }
+            if (subject == @intFromEnum(Kind.any)) return subject;
             if (subject == @intFromEnum(Kind.never)) return subject;
+            if (subject == @intFromEnum(Kind.error_any)) return subject;
             if (subject == @intFromEnum(Kind.empty_object)) return null;
             if (subject == @intFromEnum(Kind.this)) {
                 if (this.contextual_this_type == 0 or this.contextual_this_type == @intFromEnum(Kind.this)) {
@@ -21288,31 +21356,33 @@ pub const Analyzer = struct {
 
             // we are accessing the primitive protos
             if (subject == @intFromEnum(Kind.string) or subject == @intFromEnum(Kind.empty_string)) {
-                const s = try this.getGlobalTypeSymbolAlias("String", .{}) orelse {
-                    return @intFromEnum(Kind.any);
-                    // return error.MissingString;
-                };
-                return this.accessTypeWithHash(s, element, hash, set_this_type);
+                return try this.accessPrimitivePrototype("String", element, hash, set_this_type);
             }
 
             if (subject == @intFromEnum(Kind.number) or subject >= @intFromEnum(Kind.zero)) {
-                const s = try this.getGlobalTypeSymbolAlias("Number", .{}) orelse return error.MissingNumber;
-                return this.accessTypeWithHash(s, element, hash, set_this_type);
+                return try this.accessPrimitivePrototype("Number", element, hash, set_this_type);
             }
 
-            if (subject == @intFromEnum(Kind.undefined) or subject == @intFromEnum(Kind.null)) {
-                return @intFromEnum(Kind.error_any);
+            if (subject == @intFromEnum(Kind.boolean) or subject == @intFromEnum(Kind.false) or subject == @intFromEnum(Kind.true)) {
+                return try this.accessPrimitivePrototype("Boolean", element, hash, set_this_type);
+            }
+
+            if (subject == @intFromEnum(Kind.function)) {
+                return try this.accessPrimitivePrototype("Function", element, hash, set_this_type);
+            }
+
+            if (subject == @intFromEnum(Kind.symbol)) {
+                return try this.accessPrimitivePrototype("Symbol", element, hash, set_this_type);
             }
 
             if (subject == @intFromEnum(Kind.empty_tuple)) {
                 if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
                     return @intFromEnum(Kind.zero);
                 }
-                return @intFromEnum(Kind.never);
+                return try this.accessPrimitivePrototype("Array", element, hash, set_this_type);
+                // return @intFromEnum(Kind.never);
             }
-            if (subject == @intFromEnum(Kind.any)) return subject;
             if (subject == @intFromEnum(Kind.void) or subject == @intFromEnum(Kind.unknown)) return @intFromEnum(Kind.never); // TODO emit error
-            if (subject == @intFromEnum(Kind.error_any)) return subject;
 
             this.printTypeInfo(subject);
             this.printTypeInfo(element);
@@ -21338,9 +21408,10 @@ pub const Analyzer = struct {
             if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
                 return @intFromEnum(Kind.number);
             }
-
-            // FIXME: we need to check the element type and see that it's a number
-            return s.slot0;
+            if (this.getKindOfRef(element) == .number_literal or this.getKindOfRef(element) == .number) {
+                return s.slot0;
+            }
+            return try this.accessParameterizedPrimitivePrototype("Array", try TypeList.fromSlice(this, &.{s.slot0}), element, hash, set_this_type);
         }
         if (s.getKind() == .tuple) {
             const slice = getSlice2(s, TypeRef);
@@ -21353,17 +21424,26 @@ pub const Analyzer = struct {
                 return this.getTupleElementType(el);
             }
             if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
-                // FIXME: this is wrong, we may have to reduce the spread
+                // FIXME: this is wrong, we may have to reduce all spreads
                 if (this.isSpreadElement(slice[slice.len-1])) {
                     return @intFromEnum(Kind.number);
                 }
 
                 return try this.numberToType(u32, @intCast(slice.len));
             }
+            if (this.getKindOfRef(element) == .string_literal) {
+                if (this.maybeGetInt64FromStringLiteral(this.types.at(element))) |ind| {
+                    if (ind < 0) return @intFromEnum(Kind.never);
+                    if (ind >= slice.len) return @intFromEnum(Kind.never);
+                    const el = slice[@intCast(ind)];
+                    return this.getTupleElementType(el);
+                }
+            }
             if (element == @intFromEnum(Kind.number)) {
                 return try this.toUnion(slice);
             }
-            return error.TODO_index_into_tuple;
+            const types = try TypeList.fromSlice(this, &.{try this.toUnion(slice)});
+            return try this.accessParameterizedPrimitivePrototype("Array", types, element, hash, set_this_type);
         }
         if (s.getKind() == .intersection) {
             var tmp = TypeList{};
@@ -21423,6 +21503,18 @@ pub const Analyzer = struct {
         }
 
         if (s.getKind() != .object_literal) {
+            // less common checks
+            if (s.getKind() == .function_literal) {
+                return try this.accessPrimitivePrototype("Function", element, hash, set_this_type);
+            }
+            if (s.getKind() == .symbol_literal) {
+                return try this.accessPrimitivePrototype("Symbol", element, hash, set_this_type);
+            }
+            if (s.getKind() == .class) {
+                // normally you wouldn't end up in this code path. 
+                // we'll treat this the same as `(typeof C)[T]`
+                return this.accessTypeWithHash(s.slot1, element, hash, set_this_type);
+            }
             this.printCurrentNode();
             return try notSupported(s.getKind());
         }
@@ -21620,6 +21712,31 @@ pub const Analyzer = struct {
             return this.getInt32FromType(ref);
         }
         return null;
+    }
+
+    fn maybeGetInt64FromStringLiteral(this: *const @This(), t: *const Type) ?i64 {
+        std.debug.assert(t.getKind() == .string_literal);
+        const s = this.getStringLiteralTypeSlice(t);
+        if (s.len == 0 or s.len > 31) return null;
+        var is_negative = false;
+        if (s.len >= 2) {
+            if (s[0] == '0') return null;
+            if (s[0] == '-') {
+                is_negative = true;
+                if (s[1] == '0') return null;
+            }
+        }
+        var val: i64 = 0;
+        for (s[@intFromBool(is_negative)..]) |c| {
+            switch (c) {
+                '0'...'9' => {
+                    val = (val * 10) + (c - '0');
+                },
+                else => return null,
+            }
+            if (val >= std.math.maxInt(u60)) return null;
+        }
+        return if (is_negative) -val else val;
     }
 
     fn castShiftAmount(v: i32) u5 {
