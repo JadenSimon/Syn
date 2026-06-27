@@ -977,7 +977,7 @@ pub inline fn getHashFromNode(node: *const AstNode) NodeSymbolHash {
     return node.extra_data2;
 }
 
-inline fn getHashFromModuleNode(node: *const AstNode) !NodeSymbolHash {
+pub inline fn getHashFromModuleNode(node: *const AstNode) !NodeSymbolHash {
     if (node.kind == .string_literal) {
         return @truncate(std.hash.Wyhash.hash(1, getSlice(node, u8)));
     }
@@ -1648,7 +1648,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         return this.parsePredicate(.{ .kind = .this_keyword }, false);
                     }
 
-                    return .{ .kind = .this_keyword };
+                    return .{ .kind = .this_keyword, .len = 1 };
                 },
                 .t_reify => {
                     try this.next();
@@ -5740,6 +5740,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                         try this.lexer.next();
                         break :blk try this.pushNode(.{ .kind = .default_keyword });
                     }
+                    if (!is_export and this.lexer.token == .t_string_literal) {
+                        break :blk try this.pushNode(try this.parseStringLiteralLike());
+                    }
 
                     break :blk try this.parseIdentifier();
                 };
@@ -5747,6 +5750,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 const alias: NodeRef = blk: {
                     if (this.lexer.isContextualKeyword("as")) {
                         try this.lexer.next();
+                        if (is_export and this.lexer.token == .t_string_literal) {
+                            break :blk try this.pushNode(try this.parseStringLiteralLike());
+                        }
                         break :blk try this.parseIdentifier();
                     } else {
                         break :blk 0;
@@ -7382,6 +7388,34 @@ pub const Factory = struct {
         });
     }
 
+    pub fn createNamespaceImport(this: *@This(), ident: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .namespace_import,
+            .data = @ptrFromInt(this.assertValid(ident)),
+        });
+    }
+
+    pub fn createImportClause(this: *@This(), name: NodeRef, bindings: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .import_clause,
+            .data = toBinaryDataPtrRefs(name, bindings),
+        });
+    }
+
+    pub fn createImportDeclaration(this: *@This(), clause: NodeRef, specifier: NodeRef, attributes: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .import_declaration,
+            .data = toBinaryDataPtrRefs(clause, this.assertValid(specifier)),
+            .len = attributes,
+        });
+    }
+
+    pub fn createNotEmittedStatement(this: *@This()) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .not_emitted_statement,
+        });
+    }
+
     pub fn attachDebugComment(this: *@This(), target: NodeRef, text: []const u8) !void {
         const n = this.nodes.at(target);
         std.debug.assert(n.kind == .expression_statement or n.kind == .variable_statement);
@@ -8557,7 +8591,7 @@ pub const Symbol = struct {
 pub const SymbolFlags = enum(u16) {
     referenced = 1 << 0,
 
-    local = 1 << 1, // "locally global...."
+    local = 1 << 1, // used by local imported symbols
     global = 1 << 2, // only valid for `lib` files
 
     not_type = 1 << 3, // Only relevant for imports
@@ -8594,7 +8628,7 @@ pub const Exports = struct {
     const default_hash: u32 = @truncate(std.hash.Wyhash.hash(0, "default"));
 
     // namespace re-exports don't include the default export
-    const AliasedExport = struct {
+    pub const AliasedExport = struct {
         is_type: bool = false,
         spec: []const u8,
         sym: SymbolRef,
@@ -8865,7 +8899,6 @@ pub const Binder = struct {
 
             if (this.should_export) {
                 try this.pushTypeExport(hash, s);
-                //try this.type_exports.put(hash, s);
             }
         }
     }
@@ -8914,6 +8947,7 @@ pub const Binder = struct {
         try this.putImmediateSymbol(getHashFromNode(ident), s, true);
 
         if (property_name) |name| {
+            // FIXME: we need to link multiple symbols with `.next` here?
             const hash: u32 = @truncate(std.hash.Wyhash.hash(0, name));
             try module.bindings.put(this.allocator, hash, s);
         } else if (is_namespace) {
@@ -8925,8 +8959,6 @@ pub const Binder = struct {
                 module.namespace_binding = s;
             }
         } else {
-            // const hash: u32 = comptime @truncate(std.hash.Wyhash.hash(0, "default"));
-            // try module.bindings.put(this.allocator, hash, s);
             if (module.default_binding) |b| {
                 var prev = this.symbols.at(b);
                 this.symbols.at(s).next = prev.next;
@@ -9455,7 +9487,7 @@ pub const Binder = struct {
             },
             .export_declaration => {
                 if (!comptime bind_types) {
-                    if (hasFlag(node, .declare)) return; // export types
+                    if (hasFlag(node, .declare)) return; // export type
                 }
 
                 const d = getPackedData(node);
@@ -9674,7 +9706,6 @@ pub const Binder = struct {
                     try this.putImmediateSymbol(hash, s, false);
                     if (!is_module and this.shouldExport(node)) {
                         try this.pushExport(hash, s);
-                       // try this.exports.put(hash, s);
                     }
                 }
             },
@@ -10753,6 +10784,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
             // FIXME: add location to typeof
             return getLoc(nodes, nodes.at(unwrapRef(n)));
         },
+        .type_predicate,
         .as_expression,
         .element_access_expression, .binary_expression,
         .property_access_expression, .call_expression, .qualified_name,
@@ -10828,7 +10860,6 @@ pub const ParsedFile = struct {
 
     // Used to store the associated JS object
     api_handle: ?*anyopaque = null,
-    source_program: ?*@import("./program.zig").Program = null,
 
     const allocator = getAllocator();
 
@@ -12879,9 +12910,38 @@ pub const PrintResult = struct {
     source_map: ?[]const u8,
 };
 
+pub fn _printWithOptions(writer: *Writer, _printer: anytype, data: AstData, options: PrinterOptions) !PrintResult {
+    var printer = _printer;
+    var source_map: ?[]const u8 = null;
+
+    printer.skip_types = options.skip_types;
+    defer if (options.emit_source_map) printer.source_map.deinit();
+
+    if (options.replacements) |x| {
+        const z: *std.AutoArrayHashMap(NodeRef, NodeRef) = @alignCast(@ptrCast(x));
+        printer.replacements = z;
+    }
+
+    try printer.visit(data.nodes.at(data.start));
+    if (options.emit_source_map) {
+        if (options.inline_source_map) {
+            if (printer.needs_newline) {
+                writer.write("\n");
+            }
+            writer.write(try printer.source_map.toInlineComment(getAllocator()));
+        } else {
+            source_map = try printer.source_map.toJson(getAllocator());
+        }
+    }
+
+    return .{
+        .contents = writer.buf.items,
+        .source_map = source_map,
+    };
+}
+
 pub fn printWithOptions(data: AstData, options: PrinterOptions) !PrintResult {
     var writer = try Writer.init(data.source.len);
-    var source_map: ?[]const u8 = null;
 
     if (options.transform_to_cjs) {
         var r = try printToCjs(data, options.replacements);
@@ -12891,36 +12951,53 @@ pub fn printWithOptions(data: AstData, options: PrinterOptions) !PrintResult {
             .source_map = try r.source_map.toJson(getAllocator()),
         };
     }
-
-    if (options.emit_source_map) {
-        var printer = Printer(Writer, .{ .print_source_map = true }).init(data, &writer);
-        printer.skip_types = options.skip_types;
-
-        defer printer.source_map.deinit();
-
-        try printer.visit(data.nodes.at(data.start));
-        if (options.inline_source_map) {
-            if (printer.needs_newline) {
-                writer.write("\n");
-            }
-            writer.write(try printer.source_map.toInlineComment(getAllocator()));
-        } else {
-            source_map = try printer.source_map.toJson(getAllocator());
+    
+    if (options.replacements != null) {
+        if (options.emit_source_map) {
+            return _printWithOptions(&writer, Printer(Writer, .{ .use_replacements = true, .print_source_map = true }).init(data, &writer), data, options);
         }
-    } else {
-        var printer = Printer(Writer, .{}).init(data, &writer);
-        printer.skip_types = options.skip_types;
-
-        try printer.visit(data.nodes.at(data.start));
+        return _printWithOptions(&writer, Printer(Writer, .{ .use_replacements = true }).init(data, &writer), data, options);
     }
 
-    // TODO: check perf impact
-    // writer.buf.shrinkAndFree(writer.buf.items.len);
+    return _printWithOptions(&writer, Printer(Writer, .{}).init(data, &writer), data, options);
 
-    return .{
-        .contents = writer.buf.items,
-        .source_map = source_map,
-    };
+    // var source_map: ?[]const u8 = null;
+
+    // if (options.emit_source_map) {
+    //     var printer = if (options.replacements != null)
+    //         Printer(Writer, .{ .use_replacements = true, .print_source_map = true }).init(data, &writer)
+    //     else
+    //         Printer(Writer, .{ .print_source_map = true }).init(data, &writer);        
+    //     printer.skip_types = options.skip_types;
+
+    //     defer printer.source_map.deinit();
+
+    //     try printer.visit(data.nodes.at(data.start));
+    //     if (options.inline_source_map) {
+    //         if (printer.needs_newline) {
+    //             writer.write("\n");
+    //         }
+    //         writer.write(try printer.source_map.toInlineComment(getAllocator()));
+    //     } else {
+    //         source_map = try printer.source_map.toJson(getAllocator());
+    //     }
+    // } else {
+    //     var printer = if (options.replacements != null)
+    //         Printer(Writer, .{ .use_replacements = true }).init(data, &writer)
+    //     else
+    //         Printer(Writer, .{}).init(data, &writer);
+    //     printer.skip_types = options.skip_types;
+
+    //     try printer.visit(data.nodes.at(data.start));
+    // }
+
+    // // TODO: check perf impact
+    // // writer.buf.shrinkAndFree(writer.buf.items.len);
+
+    // return .{
+    //     .contents = writer.buf.items,
+    //     .source_map = source_map,
+    // };
 }
 
 pub fn print(data: AstData, node: AstNode) !void {

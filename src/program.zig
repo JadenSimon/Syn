@@ -2,7 +2,7 @@ const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
-// const synth_helper = @import("./synth_helper.zig");
+const synth_helper = @import("./synth_helper.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 
@@ -1073,8 +1073,6 @@ pub const AsyncProgramLoader = struct {
     }
 
     pub fn loadFiles(this: *@This(), ctx: ?*anyopaque, on_done: *const fn (ctx: ?*anyopaque) anyerror!void) !void {
-        this.program.did_load_async = true;
-
         this.on_done_ctx = ctx;
         this.on_done = on_done;
 
@@ -1114,8 +1112,10 @@ pub const AsyncProgramLoader = struct {
         try this.evaluateDirectives(ref);
 
         if (!parsed.is_lib) {
-            try this.resolveImports(this.program.getFileData(ref));
-            try this.program.resolveAndBindModules(this.program.getFileData(ref));
+            const f = this.program.getFileData(ref);
+            f.parsed_async = true;
+            try this.resolveImports(f);
+            try this.program.resolveAndBindModules(f);
         } else {
             try this.program.bindLibForAsync(this.program.getFileData(ref));
         }
@@ -1219,6 +1219,15 @@ fn printSymbol(file: *ParsedFileData, sym_ref: SymbolRef) void {
     } else {
         std.debug.print("{s}\n", .{s});
     }
+    const sym = file.binder.symbols.at(sym_ref);
+    if (sym.hasFlag(.local)) std.debug.print("  [local]", .{});
+    if (sym.hasFlag(.global)) std.debug.print("  [global]", .{});
+    if (sym.hasFlag(.type)) std.debug.print("  [type]", .{});
+    if (sym.hasFlag(.namespace)) std.debug.print("  [namespace]", .{});
+    if (sym.hasFlag(.imported)) std.debug.print("  [imported]", .{});
+    if (sym.hasFlag(.exported)) std.debug.print("  [exported]", .{});
+    if (sym.hasFlag(.late_bound)) std.debug.print("  [late bound]", .{});
+    std.debug.print("\n", .{});
 }
 
 fn printNameWithLocation(f: *ParsedFileData, ref: NodeRef) !void {
@@ -1261,7 +1270,6 @@ pub const Program = struct {
     analyzer: ?*Analyzer = null,
 
     did_load_default_libs: bool = false,
-    did_load_async: bool = false,
 
     // for testing
     virtual_files: std.AutoArrayHashMapUnmanaged(u64, []const u8) = std.AutoArrayHashMapUnmanaged(u64, []const u8){},
@@ -1302,10 +1310,10 @@ pub const Program = struct {
     }
 
     pub fn putFileData(this: *@This(), hash: u64, id: FileRef, parsed: *ParsedFile) !void {
-        if (parsed.source_program == null) parsed.source_program = this;
-        const linkage = this.files.items[id].linkage;
-        this.files.items[id].* = ParsedFileData.initFromParsedFile(parsed, linkage);
-        this.files.items[id].id = id;
+        const items = this.files.items;
+        const linkage = items[id].linkage;
+        items[id].* = ParsedFileData.initFromParsedFile(parsed, linkage);
+        items[id].id = id;
         try this.parsed_files.put(hash, .{ parsed, id });
     }
 
@@ -1455,6 +1463,7 @@ pub const Program = struct {
         if (f.did_analyze) return;
 
         f.did_analyze = true;
+        f.parsed_async = true;
 
         try this.maybeBindGlobalNamespace(f);
 
@@ -1462,6 +1471,9 @@ pub const Program = struct {
     }
 
     fn resolveImports(this: *@This(), file: *ParsedFileData) anyerror!void {
+        // The async loader should have already resolved all imports
+        std.debug.assert(!file.parsed_async);
+
         const origin_id = file.id;
         const origin = file.file_name orelse return error.MissingFileName; 
 
@@ -1574,7 +1586,7 @@ pub const Program = struct {
         sym.declaration = global_ref;
     }
 
-    fn getNamespaceFromSymbol(this: *const @This(), absolute_symbol: AbsoluteSymbolRef) Binder.Namespace {
+    pub fn getNamespaceFromSymbol(this: *const @This(), absolute_symbol: AbsoluteSymbolRef) Binder.Namespace {
         const b = this.getFileData(absolute_symbol.file_id).binder;
         const ns_sym = b.symbols.at(absolute_symbol.ref);
         
@@ -1586,8 +1598,7 @@ pub const Program = struct {
             // non-ambient export
             const f = this.getFileData(imported_sym.getOrdinal());
 
-            // FIXME: type exports are ignored 
-            const maybe = f.binder.exports.symbols.get(target_hash) orelse {
+            const maybe = f.binder.exports.symbols.get(target_hash) orelse f.binder.exports.type_symbols.get(target_hash) orelse {
                 return error.AliasedExportError;
             };
 
@@ -1606,9 +1617,10 @@ pub const Program = struct {
         for (items) |g| {
             const b2 = this.getFileData(g.file_id).binder;
             const ns_sym2 = b2.symbols.at(g.ref);
+            std.debug.assert(ns_sym2.hasFlag(.namespace));
             const ns2 = b2.namespaces.items[ns_sym2.binding];
-            const maybe = ns2.exports.?.symbols.get(target_hash) orelse continue;
-
+            const maybe = ns2.exports.?.symbols.get(target_hash) orelse 
+                ns2.exports.?.type_symbols.get(target_hash) orelse continue;
             const maybe_sym = b2.symbols.at(maybe);
             if (maybe_sym.hasFlag(.aliased_module)) {
                 return this.followAliasedExports(maybe_sym, target_hash, sym);
@@ -1617,14 +1629,11 @@ pub const Program = struct {
             sym.addFlag(.local);
             sym.declaration = maybe;
             sym.ordinal |= @as(u16, @intCast(g.file_id));
+            return;
         }
 
         return error.MissingAliasedExportedSymbolModule;
     }
-
-    // fn searchAliasedExports(this: *@This(), exports: *parser.Exports, sym_hash: u32) !void {
-
-    // }
 
     fn bindImports(this: *@This(), f: *ParsedFileData) !void {
         var iter = f.binder.imports.iterator();
@@ -1649,17 +1658,20 @@ pub const Program = struct {
 
                     const exports = ns.exports orelse return error.MissingModuleExports;
 
+                    var sym = f.binder.symbols.at(sym_entry.value_ptr.*);
 
                     const imported_sym = exports.symbols.get(sym_entry.key_ptr.*) orelse exports.type_symbols.get(sym_entry.key_ptr.*) orelse {
                         printSymbol(f, sym_entry.value_ptr.*);
                         return error.MissingImportedSymbolModule;
                     };
 
-                    var sym = f.binder.symbols.at(sym_entry.value_ptr.*);
-
                     const imported_sym2 = b.symbols.at(imported_sym);
                     if (imported_sym2.hasFlag(.aliased_module)) {
-                        try this.followAliasedExports(imported_sym2, sym_entry.key_ptr.*, sym);
+                        this.followAliasedExports(imported_sym2, sym_entry.key_ptr.*, sym) catch |e| {
+                            this.debugPrintFileStates();
+                            printSymbol(f, sym_entry.value_ptr.*);
+                            return e;
+                        };
                         continue;
                     }
 
@@ -1696,7 +1708,11 @@ pub const Program = struct {
 
                 const imported_sym2 = b.symbols.at(imported_sym);
                 if (imported_sym2.hasFlag(.aliased_module)) {
-                    try this.followAliasedExports(imported_sym2, sym_entry.key_ptr.*, sym);
+                    this.followAliasedExports(imported_sym2, sym_entry.key_ptr.*, sym) catch |e| {
+                        this.debugPrintFileStates();
+                        printSymbol(f, sym_entry.value_ptr.*);
+                        return e;
+                    };
                     continue;
                 }
 
@@ -1740,12 +1756,12 @@ pub const Program = struct {
     }
 
     pub fn bindModule(this: *@This(), f: *ParsedFileData) !void {
-        try this.resolveAndBindModules(f);
-
         if (f.did_bind_imports) return;
         f.did_bind_imports = true;
 
-        if (!this.did_load_async) {
+        try this.resolveAndBindModules(f);
+
+        if (!f.parsed_async) {
             try this.loadDefaultLibs();
             try this.evaluateDirectives(f.id);
         }
@@ -1769,6 +1785,8 @@ pub const Program = struct {
             f.did_top_level_cfa = true;
             if (f.is_declaration) return;
 
+            try this.bindModule(f);
+
             const analyzer = try this.getAnalyzer();
             const first_statement = maybeUnwrapRef(f.ast.nodes.at(start)) orelse 0;
 
@@ -1781,54 +1799,120 @@ pub const Program = struct {
         }
     }
 
+    fn debugPrintFileStates(this: *@This()) void {
+        for (this.files.items) |f| {
+            f.printDebugInfo();
+        }
+    }
+
+    // we link aliased module symbols immediately, though this could be done lazily too
+    fn linkAliasedExports(
+        this: *@This(), 
+        f: *ParsedFileData, 
+        exports: *parser.Exports,
+        item: parser.Exports.AliasedExport,
+        file_id_or_global: u32,
+        comptime is_global_symbol: bool
+    ) !void {
+        const linked_globals: []AbsoluteSymbolRef = if (comptime is_global_symbol) 
+            this.ambient.globals_allocator.at(file_id_or_global).symbols.items
+        else &.{};
+        const x: ?parser.Binder.Namespace = if (comptime is_global_symbol) 
+            this.getNamespaceFromSymbol(linked_globals[0])
+        else null;
+        var sym2 = f.binder.symbols.at(item.sym);
+        sym2.ordinal |= @as(u16, @intCast(file_id_or_global));
+
+        if (comptime is_global_symbol) {
+            try this.processAliasedExports(this.getFileData(linked_globals[0].file_id));
+        }
+
+        if (item.target == 0) {
+            if (item.binding == 0) {
+                // export * from 'y'
+                var iter = if (comptime is_global_symbol) 
+                    x.?.exports.?.symbols.iterator()
+                else
+                    this.getFileData(file_id_or_global).binder.exports.symbols.iterator();
+
+                sym2.next = if (comptime is_global_symbol) file_id_or_global else std.math.maxInt(u32);
+
+                if (!item.is_type) {
+                    while (iter.next()) |item2| {
+                        try exports.symbols.put(f.binder.allocator, item2.key_ptr.*, item.sym);
+                    }         
+                }
+
+                iter = if (comptime is_global_symbol) 
+                    x.?.exports.?.type_symbols.iterator()
+                else
+                    this.getFileData(file_id_or_global).binder.exports.type_symbols.iterator();
+
+                while (iter.next()) |item2| {
+                    try exports.type_symbols.put(f.binder.allocator, item2.key_ptr.*, item.sym);
+                }
+            } else {
+                // export * as y from 'y'
+                std.debug.assert(sym2.hasFlag(.namespace));
+                const hash = getHashFromNode(f.ast.nodes.at(sym2.binding));
+                if (!item.is_type) {
+                    try exports.symbols.put(f.binder.allocator, hash, item.sym);
+                }
+                try exports.type_symbols.put(f.binder.allocator, hash, item.sym);
+            }
+        } else {
+            const sym_hash = getHashFromNode(f.ast.nodes.at(sym2.declaration));
+
+            if (!item.is_type) {
+                const maybe_sym_ref: ?SymbolRef = if (comptime is_global_symbol)
+                    x.?.exports.?.symbols.get(sym_hash)
+                else this.getFileData(file_id_or_global).binder.exports.symbols.get(sym_hash);
+                if (maybe_sym_ref) |aliased| {
+                    sym2.declaration = aliased;
+
+                    if (item.binding == 0) {
+                        // export { x } from 'y'
+                        try exports.symbols.put(f.binder.allocator, sym_hash, item.sym);
+                    } else {
+                        // export { x as y } from 'y'
+                        const aliased_hash = getHashFromNode(f.ast.nodes.at(sym2.binding));
+                        try exports.symbols.put(f.binder.allocator, aliased_hash, item.sym);
+                    }
+                }
+            }
+
+            const maybe_sym_ref: ?SymbolRef = if (comptime is_global_symbol)
+                x.?.exports.?.type_symbols.get(sym_hash)
+            else this.getFileData(file_id_or_global).binder.exports.type_symbols.get(sym_hash);
+            if (maybe_sym_ref) |aliased| {
+                sym2.declaration = aliased;
+
+                if (item.binding == 0) {
+                    try exports.type_symbols.put(f.binder.allocator, sym_hash, item.sym);
+                } else {
+                    const aliased_hash = getHashFromNode(f.ast.nodes.at(sym2.binding));
+                    try exports.type_symbols.put(f.binder.allocator, aliased_hash, item.sym);
+                }
+            }
+        }
+    }
+
     fn processAliasedExports(this: *@This(), f: *ParsedFileData) anyerror!void {
         if (f.did_bind_aliased_exports) return;
-
         f.did_bind_aliased_exports = true;
+
+        std.debug.assert(f.did_resolve_imports);
 
         const origin = f.file_name orelse return error.MissingFileName;
         const exports2 = &f.binder.exports;
         for (exports2.aliased_exports.items) |item| {
             const resolved = try this.resolver.resolveSpecifier(origin, item.spec);
             const file_id = try this.getResolvedModule(resolved);
-            if (!this.did_load_async) {
+            if (!this.getFileData(file_id).parsed_async) {
                 try this.bindModule(this.getFileData(file_id));
             }
             try this.processAliasedExports(this.getFileData(file_id));
-
-            var sym2 = f.binder.symbols.at(item.sym);
-            sym2.ordinal |= @as(u16, @intCast(file_id));
-
-            if (item.target == 0) {
-                if (item.binding == 0) {
-                    // export * from 'y'
-                    var iter = this.getFileData(file_id).binder.exports.symbols.iterator();
-
-                    sym2.next = std.math.maxInt(u32);
-
-                    while (iter.next()) |item2| {
-                        try @constCast(exports2).symbols.put(f.binder.allocator, item2.key_ptr.*, item.sym);
-                    }
-                } else {
-                    // export * as y from 'y'
-                    std.debug.assert(sym2.hasFlag(.namespace));
-                    try @constCast(exports2).symbols.put(f.binder.allocator, getHashFromNode(f.ast.nodes.at(sym2.binding)), item.sym);
-                }
-            } else {
-                const sym_hash = getHashFromNode(f.ast.nodes.at(sym2.declaration));
-
-                sym2.declaration = this.getFileData(file_id).binder.exports.symbols.get(sym_hash) 
-                    orelse return error.MissingAliasedExport;
-
-                if (item.binding == 0) {
-                    // export { x } from 'y'
-                    try @constCast(exports2).symbols.put(f.binder.allocator, sym_hash, item.sym);
-                } else {
-                    // export { x as y } from 'y'
-                    const aliased_hash = getHashFromNode(f.ast.nodes.at(sym2.binding));
-                    try @constCast(exports2).symbols.put(f.binder.allocator, aliased_hash, item.sym);
-                }
-            }
+            try this.linkAliasedExports(f, @constCast(exports2), item, file_id, false);
         }
 
         // ambient modules cannot use relative specifiers
@@ -1839,41 +1923,63 @@ pub const Program = struct {
             const ns = f.binder.namespaces.items[sym.binding];
             // std.debug.print("re-exports {s} -> {s}\n", .{f.file_name orelse "", ns.module_specifier orelse ""});
 
-            var exports3 = ns.exports orelse return error.MissingModuleExports;
+            const exports3 = ns.exports orelse return error.MissingModuleExports;
             for (exports3.aliased_exports.items) |item| {
                 const global_ref = this.ambient.modules.get(getHash(item.spec)) orelse {
                     std.debug.print("missing re-exported module '{s}'\n", .{item.spec});
                     continue;
                 };
 
-                if (item.target == 0) {
-                    if (item.binding == 0) {
-                        const symbols = this.ambient.globals_allocator.at(global_ref).symbols.items;
-                        const x = this.getNamespaceFromSymbol(symbols[0]);
-                        var iter = x.exports.?.symbols.iterator();
+                try this.linkAliasedExports(f, exports3, item, global_ref, true);
 
-                        var sym2 = f.binder.symbols.at(item.sym);
-                        sym2.ordinal |= @as(u16, @intCast(symbols[0].file_id));
-                        sym2.next = global_ref;
 
-                        while (iter.next()) |item2| {
-                            try exports3.symbols.put(f.binder.allocator, item2.key_ptr.*, item.sym);
-                        }
-                    } else {
-                        // exports2.symbols.put(f.binder.scopes.allocator, getHashFromNode(), );
-                    }
-                } else {
+                // var sym2 = f.binder.symbols.at(item.sym);
 
-                }
+                // const symbols = this.ambient.globals_allocator.at(global_ref).symbols.items;
+                // const x = this.getNamespaceFromSymbol(symbols[0]);
+
+                // sym2.ordinal |= @as(u16, @intCast(symbols[0].file_id));
+
+                // if (item.target == 0) {
+                //     if (item.binding == 0) {
+                //         // export * from 'y'
+                //         var iter = x.exports.?.symbols.iterator();
+
+
+                //         sym2.next = global_ref;
+
+                //         while (iter.next()) |item2| {
+                //             printSymbol(this.getFileData(symbols[0].file_id), item2.value_ptr.*);
+                //             try exports3.symbols.put(f.binder.allocator, item2.key_ptr.*, item.sym);
+                //         }
+                //     } else {
+                //         // exports2.symbols.put(f.binder.scopes.allocator, getHashFromNode(), );
+                //     }
+                // } else {
+                //     const sym_hash = getHashFromNode(f.ast.nodes.at(sym2.declaration));
+                //     sym2.declaration = x.exports.?.symbols.get(sym_hash) 
+                //         orelse return error.MissingAliasedExport;
+
+                //     if (item.binding == 0) {
+                //         // export { x } from 'y'
+                //         try exports3.symbols.put(f.binder.allocator, sym_hash, item.sym);
+                //     } else {
+                //         // export { x as y } from 'y'
+                //         const aliased_hash = getHashFromNode(f.ast.nodes.at(sym2.binding));
+                //         try exports3.symbols.put(f.binder.allocator, aliased_hash, item.sym);
+                //     }
+                // }
             }
         }
     }
 
+    // "resolve" means we know how a given module specifier maps to a loaded module
+    // ambient module declarations don't need resolution on their interior imports/exports 
     pub fn resolveAndBindModules(this: *@This(), f: *ParsedFileData) !void {
         if (f.did_resolve_imports) return;
         f.did_resolve_imports = true;
 
-        if (!this.did_load_async) {
+        if (!f.parsed_async) {
             try this.resolveImports(f);
         }
 
@@ -2258,6 +2364,7 @@ pub const Program = struct {
             jsx_emit_state: ?*InlineEmitState = null,
 
             style_visitor: StyleVisitor = .{},
+            import_visitor: @import("./synth_helper.zig").ImportTransformer = undefined,
 
             helpers: std.EnumSet(Helper) = std.EnumSet(Helper).initEmpty(),
 
@@ -10619,6 +10726,9 @@ pub const Program = struct {
                             }
                         }
                     },
+                    .import_declaration => {
+                    //    try self.import_visitor.visitImportDecl(ref);
+                    },
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
                     },
@@ -10637,6 +10747,12 @@ pub const Program = struct {
             .analyzer = a, 
             .file = f, 
             .nodes = &f.ast.nodes,
+            .factory = &factory,
+            .replacements = &r,
+        };
+
+        v.import_visitor = .{
+            .allocator = getAllocator(),
             .factory = &factory,
             .replacements = &r,
         };
@@ -11393,8 +11509,9 @@ pub const ParsedFileData = struct {
 
     is_lib: bool = false,
     is_declaration: bool = false,
+    parsed_async: bool = false,
     did_analyze: bool = false,
-    did_top_level_cfa: bool = false,
+    did_top_level_cfa: bool = false,    
     did_resolve_imports: bool = false,
     did_bind_imports: bool = false,
     did_bind_aliased_exports: bool = false,
@@ -11475,6 +11592,30 @@ pub const ParsedFileData = struct {
         }
 
         return list.toOwnedSlice();
+    }
+
+    pub fn printDebugInfo(this: *@This()) void {
+        std.debug.print("  {s}: resolved imports: {?} | bound imports: {?}\n", .{
+            this.file_name orelse "<unknown file>",
+            this.did_resolve_imports,
+            this.did_bind_imports,
+        });
+        std.debug.print("    # namespaces: {}\n", .{this.binder.namespaces.items.len});
+        for (this.binder.namespaces.items) |ns| {
+            const exports = ns.exports orelse continue;
+            std.debug.print("    --- exported types ---\n", .{});
+            var iter = exports.type_symbols.iterator();
+            while (iter.next()) |entry| {
+                std.debug.print("    {} - ",.{entry.key_ptr.*});
+                printSymbol(this, entry.value_ptr.*);
+            }
+            std.debug.print("    --- exported values ---\n", .{});
+            iter = exports.symbols.iterator();
+            while (iter.next()) |entry| {
+                std.debug.print("    {} - ",.{entry.key_ptr.*});
+                printSymbol(this, entry.value_ptr.*);
+            }
+        }
     }
 };
 
@@ -11819,6 +11960,7 @@ pub const Analyzer = struct {
    
     label_pool: std.heap.MemoryPool(FlowTyper.Label),
 
+    iterable_inference_type: ?TypeRef = null,
 
     pub fn init(program: *Program) !@This() {
         var types = BumpAllocator(Type).init(program.allocator, std.heap.page_allocator);
@@ -12118,6 +12260,17 @@ pub const Analyzer = struct {
                 .pos = this.getCount(),
             };
         }
+
+        pub fn seedHash(this: *const @This(), comptime kind: Kind) std.hash.Wyhash {
+            var h = std.hash.Wyhash.init(0);
+            h.update(&.{@as(u8, @intFromEnum(kind))});
+            h.update(&@as([3]u8, @bitCast(this.flags)));
+            h.update(&@as([4]u8, @bitCast(@as(u32, @intCast(this.getCount())))));
+            for (this.getSlice()) |p| {
+                h.update(&@as([4]u8, @bitCast(p)));
+            }
+            return h;
+        }
     };
 
     inline fn isTypeParamRef(ref: TypeRef) bool {
@@ -12143,11 +12296,17 @@ pub const Analyzer = struct {
     }
 
     pub fn followAllAliases(this: *@This(), type_ref: TypeRef) !TypeRef {
+        var step: u32 = 0;
         var res = type_ref;
         while (true) {
             const next = try this.maybeResolveAlias(res);
             if (next == res) return next;
             res = next;
+            if (step > 25_000) {
+                this.printTypeInfo(type_ref);
+                return error.TooManyAliases;
+            }
+            step += 1;
         }
     }
 
@@ -12180,9 +12339,9 @@ pub const Analyzer = struct {
     }
 
     fn followImmediateAliasInner(this: *@This(), alias: *Type, flags: u32) anyerror!?TypeRef {
-        const should_skip_inner = hasEvalFlag(flags, .inner_scoped_aliases);
+        const should_skip_top_level = hasEvalFlag(flags, .inner_scoped_aliases);
         if (alias.hasFlag(.global)) {
-            if (should_skip_inner) {
+            if (should_skip_top_level) {
                 return null;
             }
             if (hasEvalFlag(flags, .no_globals)) {
@@ -12196,7 +12355,7 @@ pub const Analyzer = struct {
         }
 
         const f = try this.getAnalyzedFile(alias.slot3);
-        if (should_skip_inner and f.binder.symbols.at(alias.slot4).hasFlag(.top_level)) {
+        if (should_skip_top_level and f.binder.symbols.at(alias.slot4).hasFlag(.top_level)) {
             return null;
         }
 
@@ -12254,11 +12413,15 @@ pub const Analyzer = struct {
         no_enum_aliases = 1 << 5,
         no_unions = 1 << 6,
         inner_scoped_aliases = 1 << 20,
+        for_this = 1 << 29,
         for_reify = 1 << 30,
     };
 
     pub fn evaluateType(this: *@This(), ref: TypeRef, flags: u32) anyerror!TypeRef {
         if (ref >= @intFromEnum(Kind.false)) {
+            if (ref == @intFromEnum(Kind.this) and this.contextual_this_type != 0) {
+                return this.contextual_this_type;
+            }
             return ref;
         }
 
@@ -12318,26 +12481,34 @@ pub const Analyzer = struct {
                 return tmp.complete(this);
             },
             .intersection => {
-                if (!hasEvalFlag(flags, .for_reify)) return ref;
+                if (!hasEvalFlag(flags, .for_reify) and !(this.hasThisType(ref) and this.contextual_this_type != 0)) {
+                    return ref;
+                }
 
+                var did_change = false;
+                var is_valid = true;
                 var tmp = std.ArrayList(ObjectLiteralMember).init(this.allocator());
-
+                var tmp2 = TypeList{};
                 for (getSlice2(t, TypeRef)) |el| {
                     const v = try this.evaluateType(el, flags);
+                    if (v != el) did_change = true;
+                    try tmp2.append(this, v);
                     if (v >= @intFromEnum(Kind.false)) {
                         if (v == @intFromEnum(Kind.empty_object)) continue;
                         if (v == @intFromEnum(Kind.any) or v == @intFromEnum(Kind.never)) {
                             tmp.deinit();
+                            tmp2.deinit(getAllocator());
                             return v;
                         }
-                        this.printTypeInfo(v);
-                        return error.TODO_primitive_intersection;
+                        is_valid = false;
+                        continue;
                     }
                     const t2 = this.types.at(v);
                     if (t2.getKind() != .object_literal) {
-                        this.printTypeInfo(v);
-                        return error.TODO_intersection_non_object;
+                        is_valid = false;
+                        continue;
                     }
+                    if (!is_valid) continue;
                     const members = getSlice2(t2, ObjectLiteralMember);
                     for (members) |*m| {
                         if (m.kind != .property) continue;
@@ -12366,6 +12537,15 @@ pub const Analyzer = struct {
                             });
                         }
                     }
+                }
+
+                if (!is_valid) {
+                    tmp.deinit();
+                    if (!did_change) {
+                        tmp2.deinit(getAllocator());
+                        return ref;
+                    }
+                    return try this.createIntersectionType2(&tmp2, 0);
                 }
 
                 return this.createObjectLiteral(tmp.items, 0, 0);
@@ -12468,10 +12648,36 @@ pub const Analyzer = struct {
 
                 return this.createObjectLiteral(tmp.items, flags2, proto);
             },
+            .type_parameter => {
+                if (!hasEvalFlag(flags, .for_this)) return ref;
+                if (!this.hasThisType(ref)) return ref;
+                const extends = if (t.slot1 != 0) try this.evaluateType(t.slot1, flags) else 0;
+                const default = if (t.slot2 != 0) try this.evaluateType(t.slot2, flags) else 0;
+                if (extends == t.slot1 and default == t.slot2) return ref;
+                return this.updateTypeParameter(t, extends, default);
+            },
+            .parameterized => {
+                if (!hasEvalFlag(flags, .for_this)) return ref;
+                var tmp = TypeList{};
+                var did_change = false;
+                for (getSlice2(t, TypeRef)) |r| {
+                    const v = try this.evaluateType(r, flags);
+                    if (v != r) did_change = true;
+                    try tmp.append(this, v);
+                }
+                const inner = try this.evaluateType(t.slot3, flags);
+                if (inner != t.slot3) did_change = true;
+                if (!did_change) {
+                    tmp.deinit(getAllocator());
+                    return ref;
+                }
+                return this.createParameterizedType(try tmp.toAllocated(getAllocator()), inner);
+            },
             else => ref,
         };
+        if (evaluated == ref) return evaluated;
 
-        return if (evaluated != ref) this.evaluateType(evaluated, flags) else evaluated;
+        return this.evaluateType(evaluated, flags);
     }
 
     fn isSimpleType(this: *const @This(), ref: TypeRef) bool {
@@ -12911,12 +13117,22 @@ pub const Analyzer = struct {
                     flags |= this.getStructuralFlags(v);
                 }
 
+                var proto = n.slot3;
+                if (proto != 0) {
+                    const s = try this.resolveParameterizedType(proto) orelse proto;
+                    if (proto != s) {
+                        did_change = true;
+                        proto = s;
+                    }
+                    flags |= this.getStructuralFlags(proto);
+                }
+
                 if (!did_change) return ref;
                 flags |= n.flags & (@intFromEnum(ObjectLiteralFlags.has_index_signature) | @intFromEnum(ObjectLiteralFlags.has_call_signature));
                 flags &= ~@intFromEnum(ObjectLiteralFlags.lazy);
 
                 should_deinit = false;
-                return try this.createObjectLiteral(resolved.items, flags, n.slot3);
+                return try this.createObjectLiteral(resolved.items, flags, proto);
             },
             .tuple => {
                 var did_change = false;
@@ -13325,7 +13541,7 @@ pub const Analyzer = struct {
                 if (subject_has_spread) {
                     const did_match = try this.inferConditionalTypeWithVariance(subject[subject.len - 1], el, inferred, variance) orelse return null;
                     if (!did_match) return false;
-                } else {
+                } else if (el < @intFromEnum(Kind.false) ){
                     const ref = this.types.at(el).slot1;
                     if (this.maybeGetTypeFromRef(ref)) |n| {
                         if (hasTypeFlag(n, .infer_node)) {
@@ -13370,6 +13586,9 @@ pub const Analyzer = struct {
         }
 
         if (condition_has_spread) {
+            if (subject_has_spread and cond_end == subject_end)
+                return try this.inferConditionalTypeWithVariance(subject[subject.len - 1], condition[condition.len - 1], inferred, variance);
+
             const rem = subject[cond_end..];
             const ref = this.types.at(condition[cond_end]).slot1;
 
@@ -13535,6 +13754,9 @@ pub const Analyzer = struct {
             if (t.getKind() == .type_parameter or t.getKind() == .parameterized) return null;
         } else if (isTypeParamRef(subject)) {
             return null;
+        } else if (subject == @intFromEnum(Kind.this)) {
+            if (this.contextual_this_type == 0 or this.contextual_this_type == subject) return null;
+            return try this.inferConditionalTypeWithVariance(this.contextual_this_type, condition, inferred, variance);
         }
 
         if (condition >= @intFromEnum(Kind.false)) {
@@ -13629,7 +13851,16 @@ pub const Analyzer = struct {
                 const s = this.types.at(subject);
                 if (s.getKind() == .array) return error.TODO;
 
-                if (s.getKind() != .tuple) return false;
+                if (s.getKind() != .tuple) {
+                    if (variance == .contravariant and s.getKind() == .@"union") {
+                        for (getSlice2(s, TypeRef)) |el| {
+                            const did_match = try this.inferConditionalTypeWithVariance(el, condition, inferred, variance) orelse return null;
+                            if (!did_match) return false;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
 
                 return try this.inferTupleLikeTypes(getSlice2(s, TypeRef), getSlice2(n, TypeRef), inferred, variance);
             },
@@ -13864,6 +14095,8 @@ pub const Analyzer = struct {
                 if (s.getKind() == .alias) {
                     const next = try this.maybeResolveAlias(subject);
                     if (next == subject) {
+                        this._debug(next);
+                        this.printTypeInfo(next);
                         return error.FailedToResolveAlias;
                     }
                     return try this.inferConditionalTypeWithVariance(next, condition, inferred, variance);
@@ -13972,6 +14205,12 @@ pub const Analyzer = struct {
 
                     if (!did_match) {
                         if (el.hasFlag(.optional)) continue;
+                        if (s.slot3 != 0) {
+                            const c2 = try this.getSyntheticSinglePropObjectLiteral(condition, el);
+                            if (try this.inferConditionalTypeWithVariance(s.slot3, c2, inferred, variance)) |x| {
+                                if (x) continue;
+                            }
+                        }
 
                         return false;
                     }
@@ -14046,7 +14285,29 @@ pub const Analyzer = struct {
         }
     }
 
+    fn getSyntheticSinglePropObjectLiteral(this: *@This(), _base: TypeRef, member: *ObjectLiteralMember) !TypeRef {
+        const base = this.types.at(_base);
+        if (base.slot3 == 0 and getSlice2(base, ObjectLiteralMember).len == 1) {
+            return _base;
+        }
+        // must call getType before deref
+        const flags = this.getStructuralFlags(try member.getType(this));
+        const m = member.*;
+        var tmp: [1]ObjectLiteralMember = undefined;
+        tmp[0] = m;
+        const h = try this.hashObjectLiteral(flags, &tmp, 0);
+        if (this.interned_types.get(h)) |c| {
+            return c;
+        }
+        const elements = try getAllocator().alloc(ObjectLiteralMember, 1);
+        elements[0] = m;
+        const c = try this._createObjectLiteral(elements, flags, 0);
+        try this.interned_types.put(h, c);
+        return c;
+    }
+
     fn maybeGetClassFromTypeRef(this: *@This(), type_ref: TypeRef) !?*Type {
+        if (type_ref >= @intFromEnum(Kind.false)) return null;
         const t = this.types.at(type_ref);
         switch (t.getKind()) {
             .class => return t,
@@ -16744,12 +17005,7 @@ pub const Analyzer = struct {
         if (this.isParameterizedRef(lhs) or this.isParameterizedRef(rhs)) {
             if (lhs == rhs) return lhs;
 
-            // TODO: don't alloc
-            var elements = try this.allocator().alloc(TypeRef, 2);
-            elements[0] = lhs;
-            elements[1] = rhs;
-
-            return this.createIntersectionType(elements, @intFromEnum(Flags.parameterized));
+            return this.createIntersectionType(&.{lhs, rhs}, @intFromEnum(Flags.parameterized));
         }
 
         // TODO: skip these checks if both are unions
@@ -16760,6 +17016,9 @@ pub const Analyzer = struct {
         }
 
         if (lhs >= @intFromEnum(Kind.false)) {
+            if (lhs == @intFromEnum(Kind.this)) {
+                return this.createIntersectionType(&.{lhs, rhs}, 0);
+            }
             return lhs; // TODO
         }
 
@@ -16771,6 +17030,9 @@ pub const Analyzer = struct {
                     if (rhs_type.getKind() == .alias) {
                         const followed = try this.maybeResolveAlias(rhs);
                         if (followed != rhs) {
+                            if (this.hasThisType(followed)) {
+                                return this.createIntersectionType(&.{lhs, rhs}, 0);
+                            }
                             return try this.intersectType(lhs, followed);
                         }
                     }
@@ -16785,15 +17047,14 @@ pub const Analyzer = struct {
                     this.printTypeInfo(rhs);
                     return error.TODO;
                 }
-                // TODO: don't alloc
-                var elements = try this.allocator().alloc(TypeRef, 2);
-                elements[0] = lhs;
-                elements[1] = rhs;
-                return this.createIntersectionType(elements, 0);
+                return this.createIntersectionType(&.{lhs, rhs}, 0);
             }
             if (lhs_type.getKind() == .alias) {
                 const followed = try this.maybeResolveAlias(lhs);
                 if (followed != lhs) {
+                    if (this.hasThisType(followed)) {
+                        return this.createIntersectionType(&.{lhs, rhs}, 0);
+                    }
                     return try this.intersectType(followed, rhs);
                 }
             }
@@ -17479,6 +17740,12 @@ pub const Analyzer = struct {
 
         const u = this.types.at(ref);
         return u.flags & structural_flag_mask;
+    }
+
+    // prefer this fn when ref is likely to be nil
+    pub inline fn maybeGetStructuralFlags(this: *const @This(), ref: TypeRef) u24 {
+        if (ref == 0) return 0;
+        return this.getStructuralFlags(ref);
     }
 
     inline fn maybeGetUnion(this: *const @This(), ref: TypeRef) ?[]const TypeRef {
@@ -18372,6 +18639,7 @@ pub const Analyzer = struct {
 
         const n = f.ast.nodes.at(node_ref);
         return switch (n.kind) {
+            // .this_keyword => @intFromEnum(Kind.this),
             .object_keyword => @intFromEnum(Kind.object),
             .boolean_keyword =>  @intFromEnum(Kind.boolean),
             .number_keyword => @intFromEnum(Kind.number),
@@ -18530,8 +18798,8 @@ pub const Analyzer = struct {
                     const d2 = getPackedData(p[0]);
                     const name = try this.getType(file, d2.right);
                     const ty = try this.getType(file, p[0].len);
-
-                    if (this.isParameterizedRef(name) or this.isParameterizedRef(ty)) flags |= @intFromEnum(Flags.parameterized);
+                    
+                    flags |= this.getStructuralFlags(name) | this.getStructuralFlags(ty);
                     flags |= @intFromEnum(ObjectLiteralFlags.has_index_signature);
 
                     try members.append(.{
@@ -18577,8 +18845,8 @@ pub const Analyzer = struct {
                     //         continue;
                     //     }
                     // }
-
-                    if (try this.peekIsParameterized(file, p[1])) flags |= @intFromEnum(Flags.parameterized);
+                    if ((flags & structural_flag_mask) != structural_flag_mask) 
+                        flags |= this.peekStructuralFlags(file, p[1]);
                     flags |= @intFromEnum(ObjectLiteralFlags.lazy);
 
                     try members.append(ObjectLiteralMember.initLazy(.property, name, file.id, p[1], p[0].flags));
@@ -18588,7 +18856,8 @@ pub const Analyzer = struct {
                     const name = try this.propertyNameToType(file, d2.left);
 
                     if (p[0].extra_data != 0) {
-                        if (try this.peekIsParameterized(file, p[1])) flags |= @intFromEnum(Flags.parameterized);
+                        if ((flags & structural_flag_mask) != structural_flag_mask) 
+                            flags |= this.peekStructuralFlags(file, p[1]);
                         flags |= @intFromEnum(ObjectLiteralFlags.lazy);
 
                         try members.append(ObjectLiteralMember.initLazy(.method, name, file.id, p[1], p[0].flags));
@@ -18598,9 +18867,9 @@ pub const Analyzer = struct {
 
                     const ty = try this.getType(file, p[0].len);
                     var params_with_this = try this.getParamsWithThisType(file, d2.right);
-                    flags |= this.getStructuralFlags(ty);
 
                     const inner = try this.createFunctionLiteral(&params_with_this, ty);
+                    flags |= this.getStructuralFlags(inner);
 
                     try members.append(.{
                         .kind = .method,
@@ -18806,7 +19075,7 @@ pub const Analyzer = struct {
 
     fn createSlicedTupleType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
         if (elements.len == 0) return @intFromEnum(Kind.empty_tuple);
-        var list = TypeList.fromAllocatedSlice(elements);
+        var list = try TypeList.fromSlice(this, elements); // TypeList.fromAllocatedSlice(elements);
         for (elements) |t| {
             list.flags |= this.getStructuralFlags(t);
         }
@@ -19003,29 +19272,41 @@ pub const Analyzer = struct {
         });
     }
 
-    fn createIntersectionType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
-        std.debug.assert(elements.len > 1);
-        const x: u64 = @intFromPtr(elements.ptr);
-        return this.types.push(.{
-            .kind = @intFromEnum(Kind.intersection),
-            .flags = flags,
-            .slot0 = @truncate(x),
-            .slot1 = @intCast(x >> 32),
-            .slot2 = @intCast(elements.len),
-        });
+    fn updateTypeParameter(this: *@This(), original: *const Type, extends: TypeRef, default: TypeRef) !TypeRef {
+        std.debug.assert(original.getKind() == .type_parameter);
+        var x = original.*;
+        x.slot1 = extends;
+        x.slot2 = default;
+        x.flags = this.maybeGetStructuralFlags(extends) | this.maybeGetStructuralFlags(default);
+        return try this.types.push(x);
     }
 
-    fn createIntersectionType2(this: *@This(), elements: *TypeList, flags: u24) !TypeRef {
-        const _elements = try elements.toAllocated(this.allocator());
-        std.debug.assert(_elements.len > 1);
-        const x: u64 = @intFromPtr(_elements.ptr);
-        return this.types.push(.{
-            .kind = @intFromEnum(Kind.intersection),
-            .flags = flags | elements.flags,
-            .slot0 = @truncate(x),
-            .slot1 = @intCast(x >> 32),
-            .slot2 = @intCast(_elements.len),
-        });
+    fn hashIntersectionType(types: *const TypeList) u64 {
+        var h = types.seedHash(.intersection);
+        return h.final();
+    }
+
+    fn createIntersectionType(this: *@This(), elements: []const TypeRef, flags: u24) !TypeRef {
+        var l = try TypeList.fromSlice(this, elements);
+        l.recomputeStructuralFlags(this);
+        return this.createIntersectionType2(&l, flags);
+    }
+
+    fn createIntersectionType2(this: *@This(), types: *TypeList, flags: u24) !TypeRef {
+        std.debug.assert(types.getCount() > 1 and types.getCount() != 0);
+
+        types.flags |= flags;
+        const key = hashIntersectionType(types);
+        if (this.interned_types.get(key)) |t| {
+            types.deinit(this.allocator());
+            return t;
+        }
+
+        var t = Type.init(.intersection);
+        try types.writeToType(this.allocator(), &t);
+        const ref = try this.types.push(t);
+        try this.interned_types.put(key, ref);
+        return ref;
     }
 
     fn getTupleElementHash(this: *const @This(), ident_hash: u32, ty: TypeRef, flags: u24) u64 {
@@ -19612,6 +19893,93 @@ pub const Analyzer = struct {
         }
     }
 
+    fn peekStructuralFlags(this: *@This(), file: *ParsedFileData, ref: NodeRef) u24 {
+        if (ref == 0) return 0;
+
+        const n = file.ast.nodes.at(ref);
+        switch (n.kind) {
+            .identifier => {
+                var f: u24 = 0;
+                if (file.binder.getTypeSymbol(ref)) |s| {
+                    if (file.binder.symbols.at(s).hasFlag(.type_parameter)) f |= @intFromEnum(Flags.parameterized)
+                    else f |= @intFromEnum(Flags.has_alias);
+                }
+                return f;
+            },
+            .this_keyword => return if (n.len == 1) @intFromEnum(Flags.has_this_type) else 0,
+            .parenthesized_type => return this.peekStructuralFlags(file, unwrapRef(n)),
+            .property_signature => {
+                return this.peekStructuralFlags(file, getPackedData(n).right);
+            },
+            .property_declaration => {
+                return this.peekStructuralFlags(file, n.len);
+                // TODO: check computed name
+                // TODO: check init (not needed for .d.ts files)
+            },
+            .function_type => {
+                var f: u24 = 0;
+                var iter = NodeIterator.init(&file.ast.nodes, getPackedData(n).left);
+                while (iter.nextRef()) |r| {
+                    f |= this.peekStructuralFlags(file, r);
+                    if (f == structural_flag_mask) return f;
+                }
+                f |= this.peekStructuralFlags(file, getPackedData(n).right);
+                return f;
+            },
+            .union_type, .intersection_type, .indexed_access_type => {
+                return this.peekStructuralFlags(file, getPackedData(n).left) | this.peekStructuralFlags(file, getPackedData(n).right);
+            },
+            .parameter => {
+                return this.peekStructuralFlags(file, n.len);
+            },
+            .method_signature => {
+                var f: u24 = 0;
+                var iter = NodeIterator.init(&file.ast.nodes, getPackedData(n).right);
+                while (iter.nextRef()) |r| {
+                    f |= this.peekStructuralFlags(file, r);
+                    if (f == structural_flag_mask) return f;
+                }
+                f |= this.peekStructuralFlags(file, n.len);
+                return f;
+            },
+            .method_declaration => {
+                var f: u24 = 0;
+                var iter = NodeIterator.init(&file.ast.nodes, getPackedData(n).right);
+                while (iter.nextRef()) |r| {
+                    f |= this.peekStructuralFlags(file, r);
+                    if (f == structural_flag_mask) return f;
+                }
+                f |= this.peekStructuralFlags(file, n.extra_data2);
+                return f;
+            },
+            .expression_with_type_arguments, .type_reference => {
+                var f: u24 = if (n.kind == .type_reference) @intFromEnum(Flags.has_alias) else 0;
+                var iter = NodeIterator.init(&file.ast.nodes, getPackedData(n).right);
+                while (iter.nextRef()) |r| {
+                    f |= this.peekStructuralFlags(file, r);
+                    if (f == structural_flag_mask) return f;
+                }
+                return f;
+            },
+            .type_literal => {
+                var f: u24 = 0;
+                const first_member = maybeUnwrapRef(n) orelse return f;
+                var iter = NodeIterator.init(&file.ast.nodes, first_member);
+                while (iter.nextRef()) |r| {
+                    f |= this.peekStructuralFlags(file, r);
+                    if (f == structural_flag_mask) return f;
+                }
+                return f;
+            },
+            .template_literal_type => {
+                // TODO: loop over
+            },
+            else => {},
+        }
+
+        return 0;
+    }
+
     // XXX: do this during binding? That impl. would be cleaner and faster, this one is brittle
     fn peekIsParameterized(this: *@This(), file: *ParsedFileData, ref: NodeRef) anyerror!bool {
         if (ref == 0) return false;
@@ -19838,6 +20206,7 @@ pub const Analyzer = struct {
         class_type: TypeRef = 0,
         type_params: std.ArrayListUnmanaged(TempTypeParam) = std.ArrayListUnmanaged(TempTypeParam){},
         elements: std.ArrayListUnmanaged(ObjectLiteralMember) = std.ArrayListUnmanaged(ObjectLiteralMember){},
+        analysis_err_type: TypeRef = 0,
 
         fn addTypeParams(this: *@This(), params: []const TypeRef) !void {
             if (this.type_params.items.len == 0) {
@@ -19891,8 +20260,12 @@ pub const Analyzer = struct {
             this.elements.appendAssumeCapacity(m);
         }
 
-        pub fn addType(this: *@This(), type_ref: TypeRef) !void {
+        pub fn addType(this: *@This(), type_ref: TypeRef) anyerror!void {
             if (type_ref >= @intFromEnum(Kind.false)) {
+                if (type_ref == @intFromEnum(Kind.any) or type_ref == @intFromEnum(Kind.error_any)) {
+                    this.analysis_err_type = type_ref;
+                    return;
+                }
                 this.analyzer.printTypeInfo(type_ref);
                 this.analyzer.printCurrentNode();
                 return error.TODO_merge_primitive_decl;
@@ -19948,6 +20321,14 @@ pub const Analyzer = struct {
                         _ = try notSupported(inner.getKind());
                     }
                 },
+                .alias => {
+                    const ref = try this.analyzer.maybeResolveAlias(type_ref);
+                    if (ref == type_ref) {
+                        this.analyzer._debug(ref);
+                        return this.analyzer.fail(ref, error.RecursiveAlias);
+                    }
+                    try this.addType(ref);
+                },
                 else => {
                     this.analyzer._debug(type_ref);
                     _ = try notSupported(k.getKind());
@@ -19956,6 +20337,7 @@ pub const Analyzer = struct {
         }
 
         pub fn complete(this: *@This()) !TypeRef {
+            if (this.analysis_err_type != 0) return this.analysis_err_type;
             if (this.class_type != 0) {
                 // TODO
                 std.debug.print("TODO: class_type", .{});
@@ -20016,7 +20398,6 @@ pub const Analyzer = struct {
     }
 
     fn getTypeOfLateBoundSymbol(this: *@This(), file: *ParsedFileData, sym: *const parser.Symbol, sym_ref: SymbolRef) !TypeRef {
-        // Check for `globalThis`
         if (sym.declaration == std.math.maxInt(u32)) {
             return @intFromEnum(Kind.global_this);
         }
@@ -20025,25 +20406,27 @@ pub const Analyzer = struct {
             return this.getTypeOfSymbol(this.program.getFileData(sym.getOrdinal()),sym.declaration);
         }
 
-        if (hasSymbolFlag(sym, .imported) and hasSymbolFlag(sym, .namespace)) {
-            const g = this.program.ambient.globals_allocator.at(sym.declaration);
-            const f = this.program.getFileData(g.symbols.items[0].file_id);
-            const r = g.symbols.items[0].ref;
+        if (sym.hasFlag(.namespace)) {
+            if (sym.hasFlag(.imported)) {
+                const g = this.program.ambient.globals_allocator.at(sym.declaration);
+                const f = this.program.getFileData(g.symbols.items[0].file_id);
+                const r = g.symbols.items[0].ref;
 
-            // Ambient module
-            const t = try this.types.push(.{
-                .kind = @intFromEnum(Kind.module_namespace),
-                .slot0 = 0,
-                .slot1 = sym_ref,
-                .slot2 = file.id,
-                .slot3 = f.binder.symbols.at(r).binding,
-                .slot4 = f.id,
-                .slot5 = 1,
-            });
+                // Ambient module
+                const t = try this.types.push(.{
+                    .kind = @intFromEnum(Kind.module_namespace),
+                    .slot0 = 0,
+                    .slot1 = sym_ref,
+                    .slot2 = file.id,
+                    .slot3 = f.binder.symbols.at(r).binding,
+                    .slot4 = f.id,
+                    .slot5 = 1,
+                });
 
-            try file.cached_symbol_types.put(this.allocator(), sym_ref, t);
+                try file.cached_symbol_types.put(this.allocator(), sym_ref, t);
 
-            return t;
+                return t;
+            }
         }
 
         return this.getTypeOfGlobalSymbol(sym.declaration);
@@ -20079,7 +20462,8 @@ pub const Analyzer = struct {
             }
 
             const imported = this.program.getFileData(getOrdinal(sym));
-            if (sym.declaration >> 30 == 1) {
+            try this.program.doTopLevelCfa(imported, imported.ast.start);
+            if (sym.declaration >> 30 == 1) { // default import
                 return this.getType(imported, sym.declaration & ~@as(u32, 0b11 << 30));
             }
 
@@ -20220,6 +20604,14 @@ pub const Analyzer = struct {
         return try this.createParameterizedType(params.items, inner);
     }
     
+    pub fn accessTupleElementType(this: *@This(), t: TypeRef) !TypeRef {
+        if (t >= @intFromEnum(Kind.false)) return t;
+        const n = this.types.at(t);
+        if (n.getKind() != .tuple_element) return t;
+        if (n.hasFlag(.optional)) return this.toUnion(&.{n.slot1, @intFromEnum(Kind.undefined)});
+        return n.slot1;
+    }
+
     // unwraps `tuple_element`
     pub fn getTupleElementType(this: *const @This(), t: TypeRef) TypeRef {
         if (t >= @intFromEnum(Kind.false)) return t;
@@ -20393,6 +20785,12 @@ pub const Analyzer = struct {
                 const sym_ref = file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
                 const t = try this.getType(file, d.right);
                 const sym = file.binder.symbols.at(sym_ref);
+                if (!sym.hasFlag(.parameter)) {
+                    if (file.ast.nodes.at(d.left).kind == .this_keyword) {
+                        return @intFromEnum(Kind.error_any); // FIXME
+                    }
+                    this.printCurrentNode();
+                }
                 std.debug.assert(sym.hasFlag(.parameter));
 
                 return this.types.push(.{
@@ -20589,12 +20987,17 @@ pub const Analyzer = struct {
                     return error.TODO;
                 }
 
-                if (this.isParameterizedRef(lhs) or this.isParameterizedRef(rhs)) {
+                const flags = this.getStructuralFlags(lhs) | this.getStructuralFlags(rhs);
+                const should_defer_eval = flags != 0 or switch (this.getKindOfRef(lhs)) {
+                    .query, .indexed, .conditional, .parameterized => true,
+                    else => false,
+                };
+                if (should_defer_eval) {
                     return this.types.push(.{
                         .kind = @intFromEnum(Kind.indexed),
                         .slot0 = lhs,
                         .slot1 = rhs,
-                        .flags = @intFromEnum(Flags.parameterized),
+                        .flags = flags,
                     });
                 }
 
@@ -20615,7 +21018,7 @@ pub const Analyzer = struct {
                 const right = if (d.right != 0) try this.getType(file, d.right) else 0;
                 const default: u32 = if (node.len != 0) try this.getType(file, node.len) else 0;
                 const ord = @as(u16, @truncate(s.ordinal));
- 
+                const flags: u24 = this.maybeGetStructuralFlags(right) | this.maybeGetStructuralFlags(default);
                 const t = try this.types.push(.{
                     .kind = @intFromEnum(Kind.type_parameter),
                     .slot0 = sym,
@@ -20624,7 +21027,7 @@ pub const Analyzer = struct {
                     .slot3 = ord,
                     .slot4 = @intCast(file.id),
                     .slot6 = node.flags,
-                    .flags = if (this.isParameterizedRef(right) or this.isParameterizedRef(default)) @intFromEnum(Flags.parameterized) else 0,
+                    .flags = flags,
                 });
 
                 // try file.cached_symbol_types.put(this.allocator(), sym, t);
@@ -20649,6 +21052,10 @@ pub const Analyzer = struct {
                 defer {
                     if (should_add and !this.active_types.swapRemove(key)) @panic("failed to remove key");
                 }
+
+                const save_contextual_this_type = this.contextual_this_type;
+                defer this.contextual_this_type = save_contextual_this_type;
+                this.contextual_this_type = 0;
 
                 // Each ref will contribute to this type's prototype which we will represent as an intersection
                 // This is a restricted intersection because we do not permit narrowing
@@ -20849,7 +21256,12 @@ pub const Analyzer = struct {
 
                 if (file.ast.nodes.at(node.len).kind == .intrinsic_keyword) {
                     const name = getSlice(file.ast.nodes.at(d.left), u8);
-                    const k = IntrinsicTypeAliases.get(name) orelse return error.MissingIntrinsic;
+                    const k = IntrinsicTypeAliases.get(name) orelse {
+                        if (strings.eqlComptime(name, "BuiltinIteratorReturn")) {
+                            return @intFromEnum(Kind.any);
+                        }
+                        return error.MissingIntrinsic;
+                    };
 
                     if (d.right == 0) return @intFromEnum(k);
 
@@ -21042,14 +21454,25 @@ pub const Analyzer = struct {
             return try this.tryGetTypeFromNamespace(g.symbols.items[0], hash) orelse return error.SymbolNotInNamespace;
         }
 
-        if (hasSymbolFlag(ns_sym, .imported)) {
+        if (ns_sym.hasFlag(.imported)) {
             const f = this.program.getFileData(getOrdinal(ns_sym));
-            if (hasSymbolFlag(ns_sym, .namespace)) {
+            if (ns_sym.hasFlag(.namespace)) {
                 // star export
                 const sym_ref = f.binder.exports.type_symbols.get(getHashFromNode(member)) orelse return error.SymbolNotInNamespace;
 
                 return this.getTypeOfSymbol(f, sym_ref);
             }
+
+            if (ns_sym.declaration >> 30 == 1) { // default import
+                return this.getType(f, ns_sym.declaration & ~@as(u32, 0b11 << 30)); // FIXME: wrong!
+            }
+
+            if (ns_sym.declaration == 0) {
+                this.printCurrentNode();
+                printSymbol(file, subject.extra_data);
+            }
+            std.debug.assert(file.did_resolve_imports);
+            std.debug.assert(ns_sym.declaration != 0);
 
             const ns_sym2 = f.binder.symbols.at(ns_sym.declaration);
             const ns2 = f.binder.namespaces.items[ns_sym2.binding];
@@ -21264,6 +21687,33 @@ pub const Analyzer = struct {
         };
     }
 
+    fn maybeAccessAliasedModule(this: *@This(), f: *ParsedFileData, sym_ref: SymbolRef, element: TypeRef, comptime is_type: bool) !?TypeRef {
+        const hash = try this.getMemberNameHash(element);
+        const imported_sym = f.binder.symbols.at(sym_ref);
+        if (imported_sym.next == std.math.maxInt(u32)) {
+            // non-ambient export
+            const f2 = this.program.getFileData(imported_sym.getOrdinal());
+            try this.program.doTopLevelCfa(f2, f2.ast.start);
+            const m = if (comptime is_type) f2.binder.exports.type_symbols else f2.binder.exports.symbols;
+            const sym_ref2 = m.get(hash) orelse return null;
+
+            return try this.getTypeOfSymbol(f2, sym_ref2);
+        }
+        const items = this.program.ambient.globals_allocator.at(imported_sym.next).symbols.items;
+        for (items) |g| {
+            const f2 = this.program.getFileData(g.file_id);
+            const b2 = f2.binder;
+            const ns_sym2 = b2.symbols.at(g.ref);
+            std.debug.assert(ns_sym2.hasFlag(.namespace));
+            const ns2 = b2.namespaces.items[ns_sym2.binding];
+            const m = if (comptime is_type) ns2.exports.?.type_symbols else ns2.exports.?.symbols;
+            const sym_ref2 = m.get(hash) orelse continue;
+
+            return try this.getTypeOfSymbol(f2, sym_ref2);
+        }
+        return error.MissingAliasExport;
+    }
+
     fn maybeAccessModule(this: *@This(), subject: TypeRef, element: TypeRef, comptime is_type: bool) !?TypeRef {
         if (subject == @intFromEnum(Kind.any)) return subject;
         if (element == @intFromEnum(Kind.any)) return element;
@@ -21277,16 +21727,23 @@ pub const Analyzer = struct {
         if (s.slot5 == 1) { // XXX: ambient module
             const f = this.program.getFileData(s.slot4);
             const ns = f.binder.namespaces.items[s.slot3];
-            const m = if (comptime is_type) ns.type_symbols else ns.symbols;
+            const m = if (comptime is_type) ns.exports.?.type_symbols else ns.exports.?.symbols;
             const sym_ref = m.get(hash) orelse return null;
-
+            const sym = f.binder.symbols.at(sym_ref);
+            if (sym.hasFlag(.aliased_module)) {
+                return try this.maybeAccessAliasedModule(f, sym_ref, element, is_type);
+            }
             return try this.getTypeOfSymbol(f, sym_ref);
         }
 
         const f = this.program.getFileData(s.slot0);
+        try this.program.doTopLevelCfa(f, f.ast.start);
         const m = if (comptime is_type) f.binder.exports.type_symbols else f.binder.exports.symbols;
         const sym_ref = m.get(hash) orelse return null;
-
+        const sym = f.binder.symbols.at(sym_ref);
+        if (sym.hasFlag(.aliased_module)) {
+            return try this.maybeAccessAliasedModule(f, sym_ref, element, is_type);
+        }
         return try this.getTypeOfSymbol(f, sym_ref);
     }
 
@@ -21322,7 +21779,12 @@ pub const Analyzer = struct {
                 },
                 .alias => {
                     const r = try this.maybeResolveAlias(element);
-                    if (r == element) return error.TODO_failed_resolve_alias;
+                    if (r == element) {
+                        std.debug.print("TODO_failed_resolve_alias\n", .{});
+                        this.printTypeInfo(r);
+                        // return error.TODO_failed_resolve_alias;
+                        return @intFromEnum(Kind.any);
+                    }
                     return this.accessType(subject, r);
                 },
                 .keyof => {
@@ -21421,7 +21883,7 @@ pub const Analyzer = struct {
                 if (ind >= slice.len) return @intFromEnum(Kind.never);
 
                 const el = slice[@intCast(ind)];
-                return this.getTupleElementType(el);
+                return try this.accessTupleElementType(el);
             }
             if (this.getKindOfRef(element) == .string_literal and hash == comptime getHashComptime("length")) {
                 // FIXME: this is wrong, we may have to reduce all spreads
@@ -21436,7 +21898,7 @@ pub const Analyzer = struct {
                     if (ind < 0) return @intFromEnum(Kind.never);
                     if (ind >= slice.len) return @intFromEnum(Kind.never);
                     const el = slice[@intCast(ind)];
-                    return this.getTupleElementType(el);
+                    return try this.accessTupleElementType(el);
                 }
             }
             if (element == @intFromEnum(Kind.number)) {
@@ -21503,6 +21965,9 @@ pub const Analyzer = struct {
         }
 
         if (s.getKind() != .object_literal) {
+            if (s.getKind() == .module_namespace) {
+                return try this.maybeAccessModule(subject, element, false);
+            }
             // less common checks
             if (s.getKind() == .function_literal) {
                 return try this.accessPrimitivePrototype("Function", element, hash, set_this_type);
@@ -21878,7 +22343,7 @@ pub const Analyzer = struct {
 
     fn inferTypeCallExpParameterized(this: *@This(), file: *ParsedFileData, n: *const Type, param_start: NodeRef) !?TypeRef {
         var args = std.ArrayListUnmanaged(TypeRef){};
-        defer args.deinit(this.allocator());
+        defer args.deinit(this.allocator()); // FIXME: tuples may get allocated that ref this!!!
 
         const fn_params = getSlice2(this.types.at(n.slot3), TypeRef);
 
@@ -21992,6 +22457,20 @@ pub const Analyzer = struct {
                     break :blk try this.getType(file, d.right);
                 };
 
+                if (exp.hasFlag(.optional)) {
+                    const l2 = try this.nonNullable(l);
+                    if (l2 != l) {
+                        if (try this.maybeAccessModule(l2, r, false)) |t| {
+                            return this.toUnion(&.{t, @intFromEnum(Kind.undefined)});
+                        }
+
+                        return this.toUnion(&.{
+                            try this.accessType(l2, r),
+                            @intFromEnum(Kind.undefined),
+                        });
+                    }
+                }
+
                 if (try this.maybeAccessModule(l, r, false)) |t| {
                     return t;
                 }
@@ -22008,16 +22487,13 @@ pub const Analyzer = struct {
                 }
 
                 // FIXME: we only need to evaluate `this` when `this` escapes
-                var t = try this.accessType(l, r);
-                while (this.hasThisType(t)) {
-                    const old_this_type = this.contextual_this_type;
-                    defer this.contextual_this_type = old_this_type;
-                    this.contextual_this_type = l;
+                const t = try this.accessType(l, r);
+                if (!this.hasThisType(t)) return t;
 
-                    t = try this.evaluateType(t, 0);
-                }
-
-                return t;
+                const old_this_type = this.contextual_this_type;
+                defer this.contextual_this_type = old_this_type;
+                this.contextual_this_type = l;
+                return try this.evaluateType(t, @intFromEnum(EvaluationFlags.for_this));
             },
             .binary_expression => {
                 return this.inferTypeBinaryExp(file, exp);
@@ -22030,10 +22506,18 @@ pub const Analyzer = struct {
                 return this.getInstanceType(type_ref, false);
             },
             .call_expression => {
+                const is_optional = exp.hasFlag(.optional);
+
                 const d = getPackedData(exp);
                 const t = try this.getType(file, d.left);
+                // TODO: optional chain should prune union type
+
                 if (t >= @intFromEnum(Kind.false)) {
                     if (t == @intFromEnum(Kind.never) or t == @intFromEnum(Kind.any) or t == @intFromEnum(Kind.error_any)) {
+                        return t;
+                    }
+                    if (is_optional and (t == @intFromEnum(Kind.undefined) or t == @intFromEnum(Kind.void) or t == @intFromEnum(Kind.null))) {
+                        if (t == @intFromEnum(Kind.void)) return @intFromEnum(Kind.undefined);
                         return t;
                     }
                     if (file.flow) |ft| {
@@ -22043,7 +22527,6 @@ pub const Analyzer = struct {
                     return @intFromEnum(Kind.never);
                 }
 
-                //const is_optional = hasFlag(exp, .optional);
                 //const is_non_nullable = hasFlag(exp, .non_null);
 
                 // Optional chain should only do something if the expression type is a union w/ `undefined`/`null`/`void`
@@ -22195,6 +22678,18 @@ pub const Analyzer = struct {
                                     if (try this.addToUnion(&tmp, inner)) |x| {
                                         return this.createArrayType(x);
                                     }
+                                }
+                            },
+                            .alias => {
+                                const s = try this.getIterableInferenceType();
+                                if (s == @intFromEnum(Kind.error_any)) return s;
+                                var r = try this.maybeEvaluateCondition(t, s) orelse return @intFromEnum(Kind.error_any);
+                                defer r[1].deinit();
+
+                                if (r[0] == false) return @intFromEnum(Kind.never);
+                                const inner = r[1].get(getSlice2(this.types.at(s), TypeRef)[0]) orelse unreachable;
+                                if (try this.addToUnion(&tmp, inner)) |x| {
+                                    return this.createArrayType(x);
                                 }
                             },
                             else => {
@@ -22523,12 +23018,33 @@ pub const Analyzer = struct {
                 }
                 return @intFromEnum(Kind.void);
             },
+            .module_declaration => {
+                return @intFromEnum(Kind.any); // FIXME
+            },
             else => {},
         }
 
         this.printCurrentNode();
         std.debug.print("MISSING INFER TYPE {?}\n",.{exp.kind});
         return error.FailedToInfer;
+    }
+
+    fn getIterableInferenceType(this: *@This()) !TypeRef {
+        if (this.iterable_inference_type) |t| return t;
+        const p = try this.types.push(.{
+            .kind = @intFromEnum(Kind.type_parameter),
+            .slot0 = 0,
+            .slot1 = 0,
+            .slot2 = 0,
+            .slot3 = 100_000_000,
+            .slot4 = 0,
+            .slot6 = 0,
+            .flags = @intFromEnum(Flags.infer_node),
+        });
+        const types = try TypeList.fromSlice(this, &.{p, @intFromEnum(Kind.any), @intFromEnum(Kind.any)});
+        const s = try this.getGlobalType("Iterable", types) orelse @intFromEnum(Kind.error_any);
+        this.iterable_inference_type = s;
+        return s;
     }
 
     fn findCallSignature(this: *@This(), subject: *const Type, file: *ParsedFileData, args: []const NodeRef, args_start: NodeRef, type_args: []const NodeRef) !?TypeRef {
@@ -22594,9 +23110,16 @@ pub const Analyzer = struct {
         return error.Unsupported;
     }
 
+    fn fail(this: *const @This(), n: anytype, err: anyerror) !void {
+        this.printCurrentNode();
+        std.debug.print("  not supported: {any}\n\n", .{n});
+        return err;
+    }
+
     pub inline fn getSlice2(t: *const Type, comptime T: type) []T {
         if (T == TypeRef) {
             switch (t.getKind()) {
+                .intersection,
                 .alias, .query, .tuple, .function_literal, .@"union" => return TypeList.getSliceFromType(t),
                 else => {},
             }
@@ -23087,12 +23610,37 @@ pub const Analyzer = struct {
             std.debug.assert(ref != 0);
             const n = this.analyzer.program.getFileData(file_id).ast.nodes.at(ref);
             return switch (n.kind) {
-                .identifier, .this_keyword, .string_literal => this.copyNodeNoNext(n),
+                .identifier, .this_keyword, .string_literal, .omitted_expression => this.copyNodeNoNext(n),
                 .property_access_expression => this.synthetic_nodes.push(.{
                     .kind = n.kind,
                     .flags = n.flags,
                     .data = try this.copyNodePair(n, file_id),
                 }),
+                .binding_element => this.synthetic_nodes.push(.{
+                    .kind = n.kind,
+                    .flags = n.flags,
+                    .data = @ptrFromInt(try this.copyNodeFromRef(unwrapRef(n), file_id)),
+                }),
+                .array_binding_pattern => {
+                    var head: NodeRef = 0;
+                    var tail: NodeRef = 0;
+                    var iter = NodeIterator.init(&this.analyzer.program.getFileData(file_id).ast.nodes, maybeUnwrapRef(n) orelse 0);
+                    while (iter.nextRef()) |x| {
+                        const c = try this.copyNodeFromRef(x, file_id);
+                        if (head == 0) {
+                            head = c;
+                        }
+                        if (tail != 0) {
+                            this.synthetic_nodes.at(c).next = c;
+                        }
+                        tail = c;
+                    }
+                    return this.synthetic_nodes.push(.{
+                        .kind = n.kind,
+                        .flags = n.flags,
+                        .data = if (head != 0) @ptrFromInt(head) else null,
+                    });
+                },
                 else => {
                     std.debug.print("TODO {any}\n", .{n.kind});
                     return error.TODO;

@@ -155,22 +155,21 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
         }
     }
 
-    if (options != null and options.?.is_syn) {
-        const p = sf.source_program orelse return error.MissingProgram;
-        const id = try p.getFileIdByPath(sf.source_name orelse return error.MissingSourceFileName);
-        p.getFileData(id).ast = ast_data;
-        var replacements = try p.transformSyn(id, sf.ast.start);
-        defer replacements.deinit();
+    // if (options != null and options.?.is_syn) {
+    //     const p = sf.source_program orelse return error.MissingProgram;
+    //     const id = try p.getFileIdByPath(sf.source_name orelse return error.MissingSourceFileName);
+    //     p.getFileData(id).ast = ast_data;
+    //     var replacements = try p.transformSyn(id, sf.ast.start);
+    //     defer replacements.deinit();
 
-        var opt = options.?;
-        opt.replacements = &replacements;
-        opt.transform_to_cjs = true; // XXX: used to force replacements printer
-        const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
-        return .{
-            .contents = try js.ArrayBuffer.from(@constCast(result.contents)),
-            .mappings = if (result.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
-        };
-    }
+    //     var opt = options.?;
+    //     opt.replacements = &replacements;
+    //     const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
+    //     return .{
+    //         .contents = try js.ArrayBuffer.from(@constCast(result.contents)),
+    //         .mappings = if (result.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
+    //     };
+    // }
 
     const result = try parser.printWithOptions(ast_data, options orelse .{});
 
@@ -208,7 +207,6 @@ pub fn printDeclarationFile(program: *js.Object, sf: *js.Object, options: ?parse
 }
 
 pub fn printSynFile(program: *js.Object, sf: *js.Object, options: ?parser.PrinterOptions) !PrintResult {
-    _ = options;
     const p = try getProgram(program);
     const source = try getSourceFile(sf);
 
@@ -216,7 +214,10 @@ pub fn printSynFile(program: *js.Object, sf: *js.Object, options: ?parser.Printe
     var replacements = try p.transformSyn(id, source.ast.start);
     defer replacements.deinit();
 
-    const result = try parser.printWithOptions(p.getFileData(id).ast, .{ .replacements = &replacements, .transform_to_cjs = true });
+    var opt = options orelse parser.PrinterOptions{};
+    opt.replacements = &replacements;
+
+    const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
 
     return .{
         .contents = try js.ArrayBuffer.from(@constCast(result.contents)),

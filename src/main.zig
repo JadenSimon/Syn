@@ -217,6 +217,10 @@ fn binderTest(file_name: []const u8, args: *std.process.ArgIterator, comptime sk
         if (std.mem.eql(u8, x, "--types")) {
             print_exported_types = true;
         }
+        if (std.mem.eql(u8, x, "--cwd")) {
+            std.debug.print("setting cwd\n", .{});
+            p2.resolver.working_dir = args.next() orelse unreachable;
+        }
     }
 
     // const bundler = @import("./bundler.zig");
