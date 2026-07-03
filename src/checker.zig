@@ -23,26 +23,6 @@ pub const Checker = struct {
         };
     }
 
-    pub fn checkVariableDeclaration(this: *@This(), decl_ref: NodeRef, init_type: TypeRef) !void {
-        const decl = this.file.ast.nodes.at(decl_ref);
-        std.debug.assert(decl.kind == .variable_declaration);
-
-        const annotation_ref = decl.len;
-        if (annotation_ref == 0) return;
-
-        // no init, TODO: emit error if binding is const, regardless of annotation (could do this in parser)
-        const d = getPackedData(decl);
-        if (d.right == 0) return;
-
-        const declared_type = try this.analyzer.getType(this.file, annotation_ref);
-
-        if (!try this.analyzer.isAssignableTo(init_type, declared_type)) {
-            const init_str = try this.analyzer.printType(init_type);
-            const decl_str = try this.analyzer.printType(declared_type);
-            try this.file.emitErrorFmt(d.left, "Type '{s}' is not assignable to type '{s}'", .{ init_str, decl_str });
-        }
-    }
-
     pub fn checkReadonlyAssignment(this: *@This(), node_ref: NodeRef) !void {
         const node = this.file.ast.nodes.at(node_ref);
 

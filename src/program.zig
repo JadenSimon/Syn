@@ -3166,6 +3166,18 @@ pub const Program = struct {
                 };
 
                 if (!needs_break and last_stmt_ref == stmts_head) {
+                    if (last_stmt.kind == .return_statement) {
+                        if (maybeUnwrapRef(last_stmt)) |exp_ref| {
+                            const exp = self.nodes.at(exp_ref);
+                            const needs_block = switch (exp.kind) {
+                                .jsx_element, .jsx_self_closing_element => true,
+                                else => false,
+                            };
+                            if (needs_block) {
+                                return self.factory.createBlock(stmts_head);
+                            }
+                        }
+                    }
                     return stmts_head;
                 }
 
@@ -3528,6 +3540,7 @@ pub const Program = struct {
                                 s.in_lhs = true;
                             },
                             .call_expression => {
+                                // FIXME: we need to check the declared type before we enter this path
                                 const d = getPackedData(n);
                                 const callee = s.nodes.at(d.left);
                                 if (callee.kind == .property_access_expression) {
@@ -3963,7 +3976,7 @@ pub const Program = struct {
                             if (for_component) continue;
 
                             try out.appendSlice("<!>");
-                            if (child.hasFlag(.generator) and !child.hasFlag(.static)) {
+                            if (child.hasFlag(.generator)) {
                                 try out.appendSlice("<!>");
                             }
                         },
@@ -4540,6 +4553,9 @@ pub const Program = struct {
 
                 current_node_ref: NodeRef = 0,
                 skip_attributes: bool = false, // XXX
+                is_fully_static: bool = false, // we are fully static if there is no update binding and we are not inside of a #component
+
+                static_branch_target: NodeRef = 0,
                 
                 current_component_decl: NodeRef = 0,
                 node_info: std.AutoHashMapUnmanaged(NodeRef, *TreeNodeInfo) = .{},
@@ -5985,18 +6001,12 @@ pub const Program = struct {
                         const od = getPackedData(opening);
                         if (self.attrsAnyStatic(od.right)) return null;
                         var iter = NodeIterator.init(self.nodes, opening_ref);
-                        var has_computed = false;
                         while (iter.next()) |child| {
                             switch (child.kind) {
                                 .jsx_run_directive, .jsx_component,
                                 .jsx_opening_element, .jsx_closing_element, .jsx_text_all_white_spaces => {},
                                 .jsx_text => { if (!self.isJsxTextAllWhitespace(child)) return null; },
-                                .jsx_expression => {
-                                    if (has_computed) return null;
-                                    const inner = maybeUnwrapRef(child) orelse continue;
-                                    if (self.nodes.at(inner).kind != .spread_element) return null;
-                                    has_computed = true;
-                                },
+                                .jsx_expression => return null,
                                 else => return null,
                             }
                         }
@@ -6508,6 +6518,14 @@ pub const Program = struct {
                 std.debug.assert(child_info.nav_name.len > 0);
                 std.debug.assert(child_info.kind == .expression);
 
+                if (state.is_fully_static or self.nodes.at(child_info.inner_ref).hasFlag(.static)) {
+                    const insert_call = try self.factory.createCallExpression(
+                        try self.factory.createPropertyAccessExpression(
+                            try self.factory.createIdentifier(child_info.nav_name), if (child_info.is_spread) "after" else "before"), 
+                            &.{unwrapRef(self.nodes.at(child_info.node_ref))});
+                    return self.factory.createExpressionStatement(insert_call);
+                }
+
                 if (child_info.is_spread) {
                     std.debug.assert(child_info.ph_name.len > 0);
                     const set_slot_call = try self.factory.createCallExpression(
@@ -6600,7 +6618,6 @@ pub const Program = struct {
                 // const decl_init = try self.factory.createArrayLiteralExpression(0);
                 try state.addStmt(try self.factory.createLetVariable(ident, 0));
 
-
                 const parent_init_stmts = state.stmts;
                 defer state.stmts = parent_init_stmts;
                 state.stmts = init_body;
@@ -6619,7 +6636,11 @@ pub const Program = struct {
                         else => state.emit_internal_fragment,
                     };
                 };
-                
+
+                const target = state.static_branch_target;
+                defer state.static_branch_target = target;
+                state.static_branch_target = 0;
+
                 const many_elements = self.willHaveManyNodes(children_start, state.containing_element_is_fragment_like);
                 const snapshot_name = try state.nextName();
                 // TODO: can only be released to the next element up
@@ -6627,20 +6648,42 @@ pub const Program = struct {
                 {
                     const save_children_exp = state.children_exp;
                     defer state.children_exp = save_children_exp;
-                    state.children_exp = 0;
+                    state.children_exp = if (target != 0) save_children_exp else 0;
 
                     const save_children_init_ref = state.children_init_ref;
                     defer state.children_init_ref = save_children_init_ref;
                     state.children_init_ref = 0;
 
                     const tmpl =  try self.createHtmlTemplate(node_ref);
-                    if (!many_elements and tmpl != 0) {
+                    if (target != 0) {
+                        if (tmpl != 0 and save_children_exp == 0) {
+                            const tmpl_assign = unwrapRef(self.nodes.at(try self.factory.createAssignmentStatement(ident, tmpl)));
+                            if (!many_elements) {
+                                const before_call = try self.factory.createCallExpression(
+                                    try self.factory.createPropertyAccessExpression(target, "before"), 
+                                    &.{tmpl_assign}
+                                );
+                                try state.addStmt(try self.factory.createExpressionStatement(before_call));
+                            } else {
+                                try state.addStmt(try self.factory.createExpressionStatement(tmpl_assign));
+                            }
+                        } else if (tmpl != 0) {
+                            const tmpl_assign = unwrapRef(self.nodes.at(try self.factory.createAssignmentStatement(ident, tmpl)));
+                            const arg = if (many_elements) try self.factory.createSpreadElement(try self.factory.createParenthesizedExpression(tmpl_assign)) else tmpl_assign;
+                            const push_call = try self.factory.createCallExpression(
+                                try self.factory.createPropertyAccessExpression(save_children_exp, "push"), 
+                                &.{arg}
+                            );
+                            try state.addStmt(try self.factory.createExpressionStatement(push_call));      
+                        }
+                    } else if (!many_elements and tmpl != 0) {
+                        const tmpl_assign = try self.factory.createAssignmentStatement(ident, tmpl);
                         state.children_exp = try self.factory.createIdentifier(snapshot_name);
                         try state.addStmt(
                             try self.factory.createConstVariable(
                                 try self.factory.createIdentifier(snapshot_name), 
                                 try self.factory.createArrayLiteralExpression(&.{
-                                    unwrapRef(self.nodes.at(try self.factory.createAssignmentStatement(ident, tmpl)))
+                                    unwrapRef(self.nodes.at(tmpl_assign))
                                 })
                             )
                         );
@@ -6661,16 +6704,33 @@ pub const Program = struct {
                         try state.addStmt(try self.factory.createAssignmentStatement(ident, state.children_init_ref));
                     }
                     _ = try self.inlineProcessElement2(state, el_name, node_ref, &updates);
-                    if (state.stmts.items.len == 1 and tmpl != 0) {
-                        _ = state.stmts.pop();
-                        try state.stmts.append(try self.factory.createAssignmentStatement(ident, try self.factory.createArrayLiteralExpression(&.{tmpl})));
-                    } else if (tmpl != 0) {
-                        try state.addStmt(try self.factory.createAssignmentStatement(ident, try self.factory.createIdentifier(snapshot_name)));
+                    if (target != 0) {
+                        if (many_elements and save_children_exp == 0) {
+                            // `target` should be a DocumentFragment
+                            const after_call = try self.factory.createCallExpression(
+                                try self.factory.createPropertyAccessExpression(target, "after"), 
+                                &.{target}
+                            );
+                            try updates.append(try self.factory.createExpressionStatement(after_call));
+                        }
+                    } else {
+                        if (state.stmts.items.len == 1 and tmpl != 0) {
+                            _ = state.stmts.pop();
+                            try state.stmts.append(try self.factory.createAssignmentStatement(ident, try self.factory.createArrayLiteralExpression(&.{tmpl})));
+                        } else if (tmpl != 0) {
+                            try state.addStmt(try self.factory.createAssignmentStatement(ident, try self.factory.createIdentifier(snapshot_name)));
+                        }
                     }
                     try self.emitStaticGateInit(state);
                 }
                 
                 init_body = state.stmts;
+
+                if (target != 0) {
+                    try body.appendSlice(init_body.items);
+                    try body.appendSlice(updates.items);
+                    return 0;
+                }
 
                 const lhs = try self.accessUpdateSymbol(ident);
 
@@ -6710,9 +6770,11 @@ pub const Program = struct {
 
                 var needs_spread_unwind = std.ArrayList(*TreeNodeInfo).init(upd_body.allocator);
                 defer needs_spread_unwind.deinit();
-                for (children) |*child_info| {
-                    if (child_info.is_spread or child_info.kind == .if_directive) {
-                        try needs_spread_unwind.append(child_info);
+                if (!state.is_fully_static) {
+                    for (children) |*child_info| {
+                        if (child_info.is_spread or child_info.kind == .if_directive) {
+                            try needs_spread_unwind.append(child_info);
+                        }
                     }
                 }
 
@@ -8679,6 +8741,9 @@ pub const Program = struct {
                         },
                         .intrinsic_dynamic => {
                             if (self.inlineMaybeGetElementBinding(child_info.node_ptr) != null) {
+                                const save_fully_static = state.is_fully_static;
+                                defer state.is_fully_static = save_fully_static;
+                                state.is_fully_static = false;
                                 const had_update = try self.inlineProcessElement2(state, nav_name, child_info.node_ref, null);
                                 if (had_update) {
                                     try upd_body.append(try self.inlineCallSymbolUpdate(nav_name));
@@ -8742,12 +8807,32 @@ pub const Program = struct {
                 var if_had_update = false;
                 var else_had_update = false;
 
+                const save_static_branch_target = state.static_branch_target;
+                defer state.static_branch_target = save_static_branch_target;
+                state.static_branch_target = if (state.is_fully_static) try self.factory.createIdentifier(child_info.nav_name) else 0;
+
                 const if_exp = try self.inlineInternalArrayChildren(state, child_info.node_ref, if_children_start, &if_body, &if_had_update);
 
                 const else_exp = if (else_children_start != 0)
                     try self.inlineInternalArrayChildren(state, child_info.node_ptr.next, else_children_start, &else_body, &else_had_update)
                 else
                     try self.factory.createArrayLiteralExpression(0);
+
+                if (state.is_fully_static) {
+                    // TODO: handle array dest case
+                    const then_block = try self.factory.createBlock(if_body.items);
+                    const else_block = if (else_body.items.len > 0) try self.factory.createBlock(else_body.items) else 0;
+
+                    try self.coalesceVariableStatements(self.nodes.at(then_block));
+                    if (else_block != 0) try self.coalesceVariableStatements(self.nodes.at(else_block));
+
+                    try upd_body.append(try self.factory.createIfStatement(
+                        if_cond,
+                        then_block,
+                        else_block,
+                    ));
+                    return;
+                }
 
                 const cond_var_name = try state.nextName();
                 try upd_body.append(try self.factory.createConstVariable(
@@ -9037,6 +9122,9 @@ pub const Program = struct {
                 const opening_ref = if (n.kind == .jsx_element) unwrapRef(n) else info.node_ref;
                 const opening = self.nodes.at(opening_ref);
                 const attrs = getPackedData(opening).right;
+                const save_fully_static = state.is_fully_static;
+                defer state.is_fully_static = save_fully_static;
+                state.is_fully_static = save_fully_static and self.inlineMaybeGetElementBinding(n) == null;
                 var static_props_members = std.ArrayList(NodeRef).init(getAllocator());
                 defer static_props_members.deinit();
                 var has_children_like = false;
@@ -9067,7 +9155,7 @@ pub const Program = struct {
                             .jsx_if_directive, .jsx_fragment => {
                                 // just assume in these cases (come back to this later for opt)
                                 dynamic = true;
-                                has_children_like = true;  
+                                has_children_like = true;
                             },
                             .jsx_run_directive => {
                                 has_update_code = true;
@@ -9082,7 +9170,7 @@ pub const Program = struct {
                     var iter = NodeIterator.init(self.nodes, maybeUnwrapRef(self.nodes.at(attrs)) orelse 0);
                     while (iter.nextRef()) |r| {
                         const a = self.nodes.at(r);
-                        if (a.kind != .jsx_attribute) break;
+                        if (a.kind != .jsx_attribute) break; // have to break to preserve order
                         const d = getPackedData(a);
                         const name_ref = d.left; // quotes?
                         var val: NodeRef = undefined;
@@ -9092,7 +9180,7 @@ pub const Program = struct {
                             const v = self.nodes.at(d.right);
                             if (v.kind == .jsx_expression) {
                                 const inner = unwrapRef(v);
-                                if (v.hasFlag(.static) or !self._dependsOnEffects(inner)) {
+                                if (state.is_fully_static or v.hasFlag(.static) or !self._dependsOnEffects(inner)) {
                                     val = inner;
                                 } else {
                                     break :blk false;
@@ -9186,10 +9274,9 @@ pub const Program = struct {
                 defer fn_upd_body.deinit();
                 var upd_dest: *std.ArrayList(NodeRef) = if (upd_body) |x| x else &fn_upd_body;
 
-                const should_decorate = !can_inline_attrs;
                 // emit a decorator instead of inline
                 // TODO: unlike intrinsics, a named comp instance can be proven to not need a decorator via escape analysis
-                if ((info.parent_ref == 0 and should_decorate and state.current_component_decl == 0) or self.inlineMaybeGetElementBinding(n) != null) {
+                if ((info.parent_ref == 0 and !can_inline_attrs and state.current_component_decl == 0) or self.inlineMaybeGetElementBinding(n) != null) {
                     snapshot_ident = try self.factory.createIdentifier(try state.nextName());
                     try state.addStmt(try self.factory.createLetVariable(snapshot_ident, 0));
                     fn_ident = try self.factory.createIdentifier(try state.nextName());
@@ -9216,7 +9303,7 @@ pub const Program = struct {
                 };
 
                 if (snapshot_ident == 0) {
-                    const op: SyntaxKind = if (upd_body == null and fn_ident == 0) .equals_token else .question_question_equals_token;
+                    const op: SyntaxKind = if ((upd_body == null and fn_ident == 0) or state.is_fully_static) .equals_token else .question_question_equals_token;
                     try upd_dest.append(try self.factory.createExpressionStatement(
                         try self.factory.createBinaryExpression(el_ident, op, comp_call)
                     ));
@@ -9255,13 +9342,21 @@ pub const Program = struct {
                 const is_dom_insertion = !inside_component_decl;
                 if (ph_name.len != 0 and is_dom_insertion) {
                     const p = try self.factory.createIdentifier(ph_name);
-                    insertion_statement = try self.factory.createIfStatement(
-                        p,
-                        try self.factory.createAssignmentStatement(p, try self.factory.nodes.push(.{
-                            .kind = .void_expression,
-                            .data = @ptrFromInt(try self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(p, "replaceWith"), &.{try self.factory.createPropertyAccessExpression(el_ident, "root")}))
-                        })),
-                        0);
+                    const replace_with_call = try self.factory.createCallExpression(
+                        try self.factory.createPropertyAccessExpression(p, "replaceWith"), 
+                        &.{try self.factory.createPropertyAccessExpression(el_ident, "root")}
+                    );
+                    if (state.is_fully_static) {
+                        insertion_statement = try self.factory.createExpressionStatement(replace_with_call);
+                    } else {
+                        insertion_statement = try self.factory.createIfStatement(
+                            p,
+                            try self.factory.createAssignmentStatement(p, try self.factory.nodes.push(.{
+                                .kind = .void_expression,
+                                .data = @ptrFromInt(replace_with_call)
+                            })),
+                            0);
+                    }
                 } else if (inside_component_decl and !self.nodes.at(info.parent_ref).hasFlag(.generator)) {
                     insertion_statement = try self.factory.createExpressionStatement(try self.factory.createBinaryExpression(
                         try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("__ret"), "root"),
@@ -9302,6 +9397,8 @@ pub const Program = struct {
                 
                 const n = self.nodes.at(ref);
                 const is_fragment_like = self.isFragmentLike(n);
+                state.is_fully_static = !is_fragment_like and self.inlineMaybeGetElementBinding(n) == null and n.kind != .jsx_component;
+
                 if (is_fragment_like) state.ctx = .templated
                 else if (!self.isIntrinsicTag(self.getJsxTagRef(n))) state.ctx = .component;
                 if (comptime callee_creates_comp_instance) {
@@ -9362,6 +9459,15 @@ pub const Program = struct {
                         try self.emitStaticGateInit(state);
                         return element_expr;
                     }
+                }
+                if (state.is_fully_static) {
+                    var upd_body = std.ArrayList(NodeRef).init(getAllocator());
+                    defer upd_body.deinit();
+
+                    _ = try self.inlineProcessElement(state, binding_name, n, &upd_body);
+                    try state.stmts.appendSlice(upd_body.items);
+
+                    return element_expr;
                 }
                 const had_update = try self.inlineProcessElement(state, binding_name, n, null);
                 if (had_update and state.stmts.items.len > 0) {
@@ -10373,6 +10479,14 @@ pub const Program = struct {
                         }
                         return try parser.forEachChild(self.nodes, n, self);
                     },
+                    .await_expression => {
+                        const inner_ref = unwrapRef(n);
+                        const inner = self.nodes.at(inner_ref);
+                        if (inner.kind == .call_expression) {
+                            inner.flags |= @intFromEnum(parser.CallExpFlags.awaited);
+                        }
+                        return self.visit(inner, inner_ref);
+                    },
                     .call_expression => {
                         if (!self.is_async_ctx) {
                             self.as_type_node = null;
@@ -10397,8 +10511,10 @@ pub const Program = struct {
                                 return;
                             }
 
-                            // TODO: as Promise...
+                            // TODO: as Promise?
                         }
+                        
+                        if (n.flags & @intFromEnum(parser.CallExpFlags.awaited) != 0) return;
 
                         const t = try self.analyzer.getType(self.file, ref);
                         const u = try self.analyzer.maybeUnwrapPromise(t);
@@ -10643,10 +10759,18 @@ pub const Program = struct {
                         }
                     },
                     .jsx_component => {
+                        const save_async_ctx = self.is_async_ctx;
+                        defer self.is_async_ctx = save_async_ctx;
+                        self.is_async_ctx = false;
                         const replacement = try self.transformJsxComponent(ref);
                         try self.replacements.put(ref, replacement);
                     },
                     .jsx_element, .jsx_self_closing_element, .jsx_fragment => {
+                        const save_async_ctx = self.is_async_ctx;
+                        defer self.is_async_ctx = save_async_ctx;
+                        if (self.inlineMaybeGetElementBinding(n) != null) {
+                            self.is_async_ctx = false;
+                        }
                         const replacement = try self.transformJsxNode(ref);
                         try self.replacements.put(ref, replacement);
                     },
@@ -11776,7 +11900,7 @@ pub const Analyzer = struct {
         enum_alias = 1 << 14,
 
         abstract = 1 << 6,
-        constructor = 1 << 7, // used for signatures and function literals
+        constructor = 1 << 7, // used for signatures and function literals (overlaps with NodeFlags.@"export")
         spread = 1 << 8,
         infer_node = 1 << 9,
 
@@ -11939,7 +12063,9 @@ pub const Analyzer = struct {
     contextual_this_type: TypeRef = 0, // Used to evaluate `this` in types (not expressions)
 
     inferred_type_params: ?std.AutoArrayHashMapUnmanaged(TypeRef, TypeRef) = null,
-    inferrence_ctx: ?TypeRef = null, // points to a type to guide inferrence
+    contextual_type: ?TypeRef = null,
+    // uses the index into the union
+    contextual_type_excluded_union_elements: ?*std.AutoArrayHashMapUnmanaged(u32, void) = null,
 
     is_const_context: bool = false, // Forced `const` context e.g. `as const` or `const T`
     is_const_variable_context: bool = false, // Implicit `const` context e.g. `const x = 1`
@@ -12005,8 +12131,8 @@ pub const Analyzer = struct {
 
         pub fn fromSlice(analyzer: *Analyzer, slice: []const TypeRef) !@This() {
             if (slice.len > 4) {
-                var this = @This(){ .count = 0, .flags = @intFromEnum(Flags.allocated_list) };
-                const buf = try this.allocate(analyzer.allocator(), @intCast(slice.len));
+                var this = @This(){ .count = @intCast(slice.len), .flags = @intFromEnum(Flags.allocated_list) };
+                const buf = try analyzer.allocator().alloc(TypeRef, @intCast(slice.len));
                 @memcpy(buf, slice);
                 this.setAllocatedSlice(buf);
                 //this.recomputeStructuralFlags(analyzer);
@@ -13623,6 +13749,29 @@ pub const Analyzer = struct {
         return this.inferConditionalTypeWithVariance(subject, condition, inferred, .covariant);
     }
 
+    // returns `null` if the pair is invalid
+    fn checkInferredTypeCombination(this: *@This(), current: TypeRef, proposed: TypeRef, variance: Variance) !?TypeRef {
+        if (current == proposed) return current;
+
+        if (variance == .covariant) {
+            if (try this.isAssignableTo(proposed, current)) return current;
+            if (try this.isAssignableTo(current, proposed)) {
+                return proposed;
+            }
+        } else if (variance == .contravariant) {
+            if (try this.isAssignableTo(current, proposed)) return current;
+            if (try this.isAssignableTo(proposed, current)) {
+                return proposed;
+            }
+        } else {
+            if (try this.isAssignableTo(current, proposed) and try this.isAssignableTo(proposed, current)) {
+                return current;
+            }
+        }
+
+        return null;
+    }
+
     fn inferTypeParam(
         this: *@This(),
         subject: TypeRef,
@@ -13640,25 +13789,9 @@ pub const Analyzer = struct {
 
         // TODO: we need to check the constraint too
         if (inferred.get(condition)) |t| {
-            if (subject == t) return true;
-
-            if (variance == .covariant) {
-                if (try this.isAssignableTo(subject, t)) return true;
-
-                if (try this.isAssignableTo(t, subject)) {
-                    inferred.putAssumeCapacity(condition, subject);
-                    return true;
-                }
-            } else if (variance == .contravariant) {
-                if (try this.isAssignableTo(t, subject)) return true;
-
-                if (try this.isAssignableTo(subject, t)) {
-                    inferred.putAssumeCapacity(condition, subject);
-                    return true;
-                }
-            }
-
-            return false;
+            const next = try this.checkInferredTypeCombination(t, subject, variance) orelse return false;
+            if (t != next) inferred.putAssumeCapacity(condition, next);
+            return true;
         }
 
         if (this.getTypeParamConstraint(condition)) |constraint| {
@@ -13787,6 +13920,53 @@ pub const Analyzer = struct {
         }
 
         const n = this.types.at(condition);
+        if (n.getKind() != .@"union" and n.getKind() != .alias and subject < @intFromEnum(Kind.false) and variance != .invariant) {
+            const s = this.types.at(subject);
+            if (s.getKind() == .@"union") {
+                var did_match_once: bool = false;
+                var result = std.AutoArrayHashMap(TypeRef, TypeRef).init(getAllocator());
+                defer result.deinit();
+                const elements = getSlice2(s, TypeRef);
+                for (elements) |el| {
+                    var tmp = std.AutoArrayHashMap(TypeRef, TypeRef).init(getAllocator());
+                    defer tmp.deinit();
+                    const did_match = try this.inferConditionalTypeWithVariance(el, condition, &tmp, variance) orelse return null;
+                    if (!did_match) {
+                        if (variance == .covariant) return false;
+                    } else did_match_once = true;
+                    var iter = tmp.iterator();
+                    while (iter.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        const value = entry.value_ptr.*;
+                        const entry2 = try result.getOrPut(key);
+                        if (entry2.found_existing) {
+                            const ov = entry2.value_ptr.*;
+                            if (variance == .covariant) {
+                                entry2.value_ptr.* = try this.toUnion(&.{ov, value});
+                            } else {
+                                entry2.value_ptr.* = try this.intersectType(ov, value);
+                            }
+                        } else {
+                            entry2.value_ptr.* = value;
+                        }
+                    }
+                }
+                if (!did_match_once) return false;
+                var iter = result.iterator();
+                while (iter.next()) |entry| {
+                    const value = entry.value_ptr.*;
+                    const entry2 = try inferred.getOrPut(entry.key_ptr.*);
+                    if (!entry2.found_existing) {
+                        entry2.value_ptr.* = value;
+                    } else {
+                        const cur = entry2.value_ptr.*;
+                        const z = try this.checkInferredTypeCombination(cur, value, variance) orelse return false;
+                        entry2.value_ptr.* = z;
+                    }
+                }
+                return true;
+            }
+        }
 
         switch (n.getKind()) {
             .alias => {
@@ -13852,13 +14032,6 @@ pub const Analyzer = struct {
                 if (s.getKind() == .array) return error.TODO;
 
                 if (s.getKind() != .tuple) {
-                    if (variance == .contravariant and s.getKind() == .@"union") {
-                        for (getSlice2(s, TypeRef)) |el| {
-                            const did_match = try this.inferConditionalTypeWithVariance(el, condition, inferred, variance) orelse return null;
-                            if (!did_match) return false;
-                        }
-                        return true;
-                    }
                     return false;
                 }
 
@@ -14284,6 +14457,48 @@ pub const Analyzer = struct {
             },
         }
     }
+
+    // fn factorStructuralUnionTypes(this: *@This(), ref: TypeRef) !TypeRef {
+    //     const t = this.types.at(ref);
+    //     std.debug.assert(t.getKind() == .@"union");
+    //     const s = getSlice2(t, u8);
+    //     if (s.len > 256) return t;
+    //     var buf: [256]bool = std.mem.zeroes([256]bool);
+    //     var should_deinit = true;
+    //     var tmp = TempUnion.init(this.allocator());
+    //     defer if (should_deinit) tmp.deinit();
+    //     var i: u32 = 0;
+    //     while (i < s.len-1) {
+    //         const el = s[i];
+    //         i += 1;
+    //         if (buf[i-1]) continue;
+    //         if (el >= @intFromEnum(Kind.false)) {
+    //             _ = try this.addToUnion(&tmp, el);
+    //             continue;
+    //         }
+    //         const u = this.types.at(el);
+    //         switch (u.getKind()) {
+    //             .object_literal, .tuple => {
+    //                 var j: u32 = i;
+    //                 while (j < s.len) {
+    //                     const el2 = s[j];
+    //                     j += 1;
+    //                     if (buf[j-1]) continue;
+    //                     if (u.getKind() != this.getKindOfRef(el2)) continue;
+    //                     if (u.getKind())
+    //                 }
+    //             },
+    //             else => {
+    //                 _ = try this.addToUnion(&tmp, el);
+    //                 continue;
+    //             }
+    //         }
+    //     }
+
+    //     if (should_deinit) return t;
+
+    //     return tmp.complete(this);
+    // }
 
     fn getSyntheticSinglePropObjectLiteral(this: *@This(), _base: TypeRef, member: *ObjectLiteralMember) !TypeRef {
         const base = this.types.at(_base);
@@ -15827,6 +16042,7 @@ pub const Analyzer = struct {
 
         fn visitVariableStatement(self: *@This(), s: *const AstNode) !void {
             const is_const = s.hasFlag(.@"const");
+            if (s.hasFlag(.declare)) return; // TODO
             var decls = NodeIterator.init(&self.file.ast.nodes, unwrapRef(s));
             while (true) {
                 const decl_ref = decls.ref;
@@ -15844,12 +16060,14 @@ pub const Analyzer = struct {
 
                 try self.type_checker.checkDuplicateDeclaration(decl_ref);
 
+                var declared_type: TypeRef = 0;
+
                 if (d.right == 0) {
                     // no init -> bind flow type to `undefined`
                     if (!self.file.binder.symbols.at(sym).hasFlag(.skip_init_check)) {
                         // check if declared type includes undefined
                         if (decl.len != 0) {
-                            const declared_type = try self.analyzer.getType(self.file, decl.len);
+                            declared_type = try self.analyzer.getType(self.file, decl.len);
                             if (try self.analyzer.isAssignableTo(@intFromEnum(Kind.undefined), declared_type)) {
                                 self.file.binder.symbols.at(sym).addFlag(.skip_init_check);
                             }
@@ -15859,13 +16077,22 @@ pub const Analyzer = struct {
                     continue;
                 }
 
+                if (decl.len != 0) declared_type = try self.analyzer.getType(self.file, decl.len);
+
+                const save_ctx_type = self.analyzer.contextual_type;
+                defer self.analyzer.contextual_type = save_ctx_type;
+                self.analyzer.contextual_type = if (declared_type == 0) null else declared_type;
+
                 var init_type = try self.visitExpression(d.right);
 
-                if (decl.len != 0) {
-                    try self.type_checker.checkVariableDeclaration(decl_ref, init_type);
+                if (decl.len != 0 and d.right != 0) {
+                    if (!try self.analyzer.isAssignableTo(init_type, declared_type)) {
+                        const init_str = try self.analyzer.printType(init_type);
+                        const decl_str = try self.analyzer.printType(declared_type);
+                        try self.file.emitErrorFmt(d.left, "Type '{s}' is not assignable to type '{s}'", .{ init_str, decl_str });
+                    }
                 }
 
-                // Respect the annotated type, do not try to narrow
                 if (is_const and decl.len != 0) continue;
 
                 if (!is_const and decl.len == 0) {
@@ -17877,7 +18104,7 @@ pub const Analyzer = struct {
                         break :blk try this.getInferredParamType(file, d.right);
                     }
 
-                    if (this.maybeGetParamFromInferrenceCtx(@intCast(params.getCount()))) |inferred| {
+                    if (this.maybeGetParamFromContextualType(@intCast(params.getCount()))) |inferred| {
                         // we have to put inferred types here so they propagate
                         try file.cached_symbol_types.put(this.allocator(), file.ast.nodes.at(d.left).extra_data, inferred);
                         break :blk inferred;
@@ -17913,8 +18140,148 @@ pub const Analyzer = struct {
         return type_params.items; // LEAKS
     }
 
-    fn maybeGetParamFromInferrenceCtx(this: *@This(), pos: u32) ?TypeRef {
-        const pt = this.inferrence_ctx orelse return null;
+    fn nodeMayUseContextualType(this: *@This(), file: *ParsedFileData, exp: NodeRef) bool {
+        const n = file.ast.nodes.at(exp);
+        return switch (n.kind) {
+            .array_literal_expression, .object_literal_expression => true,
+            .arrow_function, .function_expression, .class_expression => true,
+            .get_accessor, .set_accessor,
+            .method_declaration, .property_declaration => !n.hasFlag(.static),
+            // it's needed for overload resolution in the return position 
+            // TODO: we only need this for some symbols
+            .call_expression, .new_expression => true,
+            .conditional_expression => this.nodeMayUseContextualType(file, getPackedData(n).right) or this.nodeMayUseContextualType(file, n.len),
+            .spread_element,
+            .await_expression,
+            .parenthesized_expression => this.nodeMayUseContextualType(file, unwrapRef(n)),
+            .binary_expression => {
+                const op = @as(SyntaxKind, @enumFromInt(n.len));
+                switch (op) {
+                    .ampersand_ampersand_token, .bar_bar_token, .question_question_token => {},
+                    else => {
+                        if (!parser.isAssignmentOp(op)) return false;
+                    }
+                }
+                const d = getPackedData(n);
+                return this.nodeMayUseContextualType(file, d.left) or this.nodeMayUseContextualType(file, d.right);
+            },
+            .jsx_element, .jsx_self_closing_element, .jsx_component => true,
+            .jsx_expression => this.nodeMayUseContextualType(file, maybeUnwrapRef(n) orelse return false),
+            .jsx_attribute => this.nodeMayUseContextualType(file, getPackedData(n).right),
+            .jsx_spread_attribute => this.nodeMayUseContextualType(file, unwrapRef(n)),
+            .jsx_method_attribute => true,
+            else => false,
+        };
+    }
+
+    // caller must deinit
+    fn excludeUnionElementsFromContext(this: *@This(), key: TypeRef, value: TypeRef) !?struct { ctx_type: TypeRef, excluded: *std.AutoArrayHashMapUnmanaged(u32, void) } {
+        const pt = this.contextual_type orelse return null;
+        const r = switch (this.getKindOfRef(pt)) {
+            .@"union" => pt,
+            .alias, .query, .keyof, .indexed => try this.evaluateType(pt, @intFromEnum(EvaluationFlags.no_unions) | @intFromEnum(EvaluationFlags.no_objects)),
+            else => return null,
+        };
+        if (this.getKindOfRef(r) != .@"union") return null;
+
+        var m = try this.allocator().create(std.AutoArrayHashMapUnmanaged(u32, void));
+        m.* = .{};
+        for (getSlice2(this.types.at(r), TypeRef), 0..) |el, i| {
+            const ov = try this.accessType(el, key);
+            if (!try this.isAssignableTo(ov, value)) {
+                try m.put(this.allocator(), @intCast(i), {});
+            }
+        }
+
+        return .{ .ctx_type = r, .excluded = m };
+    }
+
+    fn maybeGetObjectElementContextualType(this: *@This(), key: TypeRef) anyerror!?TypeRef {
+        switch (this.getKindOfRef(key)) {
+            .any, .error_any, .unknown => return null,
+            else => {},
+        }
+        const pt = this.contextual_type orelse return null;
+        if (pt >= @intFromEnum(Kind.false)) return null;
+        const t = this.types.at(pt);
+        switch (t.getKind()) {
+            .alias => {
+                const r = try this.followAllAliases(pt);
+                if (r == pt) return null;
+                this.contextual_type = r;
+                defer this.contextual_type = pt;
+                const save_this_type = this.contextual_this_type;
+                defer this.contextual_this_type = save_this_type;
+                this.contextual_this_type = pt;
+                var u = try this.maybeGetObjectElementContextualType(key) orelse return null;
+                if (this.hasThisType(u)) u = try this.evaluateType(u, @intFromEnum(EvaluationFlags.for_this));
+                return u;
+            },
+            .@"union" => {
+                const m = this.contextual_type_excluded_union_elements;
+                defer this.contextual_type = pt;
+                var tmp = TempUnion.init(getAllocator());
+                for (getSlice2(t, TypeRef), 0..) |el, i| {
+                    if (m) |x| if (x.contains(@intCast(i))) continue;
+                    this.contextual_type = el;
+                    const u = try this.maybeGetObjectElementContextualType(key) orelse continue;
+                    if (try this.addToUnion(&tmp, u)) |x| {
+                        return x;
+                    }
+                }
+                this.contextual_type = try tmp.complete(this);
+                return try this.maybeGetObjectElementContextualType(key);
+            },
+            else => {
+                const u = try this.accessType(pt, key);
+                return u;
+            },
+        }
+        return null;
+    }
+
+    fn maybeGetArrayElementContextualType(this: *@This(), pos: u32) anyerror!?TypeRef {
+        const pt = this.contextual_type orelse return null;
+        if (pt >= @intFromEnum(Kind.false)) return null;
+        const t = this.types.at(pt);
+        switch (t.getKind()) {
+            .array => {
+                return t.slot0;
+            },
+            .tuple => {
+                const elements = getSlice2(t, TypeRef);
+                if (pos >= elements.len) return null; // TODO: spread
+                return try this.accessTupleElementType(elements[pos]);
+            },
+            .alias => {
+                const r = try this.followAllAliases(pt);
+                if (r == pt) return null;
+                this.contextual_type = r;
+                defer this.contextual_type = pt;
+                return try this.maybeGetArrayElementContextualType(pos);
+            },
+            .@"union" => {
+                const m = this.contextual_type_excluded_union_elements;
+                defer this.contextual_type = pt;
+                var tmp = TempUnion.init(getAllocator());
+                for (getSlice2(t, TypeRef), 0..) |el, i| {
+                    if (m) |x| if (x.contains(@intCast(i))) continue;
+                    this.contextual_type = el;
+                    const u = try this.maybeGetArrayElementContextualType(pos) orelse continue;
+                    if (try this.addToUnion(&tmp, u)) |x| {
+                        return x;
+                    }
+                }
+                this.contextual_type = try tmp.complete(this);
+                return try this.maybeGetArrayElementContextualType(pos);
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn maybeGetParamFromContextualType(this: *@This(), pos: u32) ?TypeRef {
+        const pt = this.contextual_type orelse return null;
         if (this.getKindOfRef(pt) != .function_literal) return null;
 
         const t = this.types.at(pt);
@@ -18724,6 +19091,14 @@ pub const Analyzer = struct {
             return this.flags & @intFromEnum(flag) == @intFromEnum(flag);
         }
 
+        pub inline fn hasTypeFlag(this: *const @This(), flag: Flags) bool {
+            return this.flags & @intFromEnum(flag) == @intFromEnum(flag);
+        }
+
+        pub inline fn hasSyntheticFlag(this: *const @This(), flag: parser.SyntheticMemberFlags) bool {
+            return this.flags & @intFromEnum(flag) == @intFromEnum(flag);
+        }
+
         pub inline fn isLazy(this: *const @This()) bool {
             return this.flags & lazy_flag == lazy_flag;
         }
@@ -18767,6 +19142,9 @@ pub const Analyzer = struct {
         var flags = flags_init;
         var iter = NodeIterator.init(&file.ast.nodes, first_member);
         var members = std.ArrayList(ObjectLiteralMember).init(this.allocator());
+        var has_accessors = false; // accessors need a second pass
+        var unmatched_setter_count: u15 = 0;
+        var unmatched_getter_count: u15 = 0;
 
         while (iter.nextPair()) |p| {
             switch (p[0].kind) {
@@ -18878,11 +19256,138 @@ pub const Analyzer = struct {
                         .type = inner,
                     });
                 },
+                .get_accessor, .set_accessor => outer: {
+                    const n = p[0];
+                    const d = getPackedData(n);
+
+                    const name = try this.propertyNameToType(file, d.left);
+                    var param_ref: NodeRef = 0;
+                    const t: TypeRef = blk: {
+                        if (n.kind == .get_accessor) {
+                            const declared_type = if (n.extra_data != 0) 
+                                try this.getType(file, n.extra_data)
+                            else 0;
+
+                            // linear scan walking backwards is generally pretty fast
+                            if (unmatched_setter_count > 0) {
+                                var i: usize = members.items.len;
+                                while (i > 0) {
+                                    i -= 1;
+                                    const m = members.items[i];
+                                    if (m.kind != .setter) continue;
+                                    if (m.name != name) continue;
+                                    std.debug.assert(!m.isLazy());
+                                    unmatched_setter_count -= 1;
+                                    if (declared_type == 0 or declared_type == m.type or m.type == @intFromEnum(Kind.infer_unknown)) {
+                                        if (m.type == @intFromEnum(Kind.infer_unknown)) members.items[i].type = declared_type;
+                                        members.items[i].kind = .property;
+                                        members.items[i].flags |= @intFromEnum(parser.SyntheticMemberFlags.setter) | @intFromEnum(parser.SyntheticMemberFlags.getter);
+                                        break :outer;
+                                    }
+                                    members.items[i].flags |= @intFromEnum(parser.SyntheticMemberFlags.getter);
+                                    break :blk declared_type;
+                                }
+                            }
+
+                            if (declared_type != 0) break :blk declared_type;
+
+                            break :blk @intFromEnum(Kind.infer_unknown);
+                        }
+                        if (d.right == 0) {
+                            // FIXME: report diag
+                            break :outer;
+                            //break :blk @intFromEnum(Kind.error_any);
+                        }
+
+                        const param = file.ast.nodes.at(d.right);
+                        // const d2 = getPackedData(param);
+                        // if (d2.right != 0) return error.CannotHaveInit;
+                        param_ref = d.right;
+                        const declared_type = if (param.len != 0) 
+                            try this.getType(file, param.len)
+                        else 0;
+
+                        if (unmatched_getter_count > 0) {
+                            var i: usize = members.items.len;
+                            while (i > 0) {
+                                i -= 1;
+                                const m = members.items[i];
+                                if (m.kind != .getter) continue;
+                                if (m.name != name) continue;
+                                std.debug.assert(!m.isLazy());
+                                unmatched_getter_count -= 1;
+                                if (declared_type == 0 or declared_type == m.type or m.type == @intFromEnum(Kind.infer_unknown)) {
+                                    if (m.type == @intFromEnum(Kind.infer_unknown)) members.items[i].type = declared_type;
+                                    members.items[i].kind = .property;
+                                    members.items[i].flags |= @intFromEnum(parser.SyntheticMemberFlags.setter) | @intFromEnum(parser.SyntheticMemberFlags.getter);
+                                    break :outer;
+                                }
+                                members.items[i].flags |= @intFromEnum(parser.SyntheticMemberFlags.setter);
+                                break :blk declared_type;
+                            }
+                        }
+
+                        if (declared_type != 0) break :blk declared_type;
+
+                        break :blk @intFromEnum(Kind.infer_unknown);
+                    };
+
+                    has_accessors = true;
+                    if (n.kind == .get_accessor) unmatched_getter_count += 1 else unmatched_setter_count += 1;
+
+                    try members.append(.{
+                        .kind = if (n.kind == .get_accessor) .getter else .setter,
+                        .name = name,
+                        .type = t,
+                        .slot0 = param_ref,
+                    });
+                },
                 else => {
                     if (comptime is_debug) {
                         std.debug.print("MISSING OBJ IMPL {any}\n", .{p[0].kind});
                     }
                 },
+            }
+        }
+
+        // converts all partially constructed accessors into fn literal types
+        if (has_accessors or unmatched_getter_count > 0 or unmatched_setter_count > 0) {
+            for (members.items) |*m| {                
+                if (m.kind == .getter) {
+                    if (m.type == @intFromEnum(Kind.infer_unknown)) m.type = @intFromEnum(Kind.error_any);
+
+                    // we convert unmatched getters into readonly properties
+                    if (!m.hasSyntheticFlag(.setter)) {
+                        m.kind = .property;
+                        m.flags |= @intFromEnum(parser.SyntheticMemberFlags.getter);
+                        m.flags |= @intFromEnum(NodeFlags.readonly);
+                        continue;
+                    }
+                    const pt = m.type;
+                    var params = Params{ .this_type = 0, .params = .{} };
+                    m.type = try this.createFunctionLiteral(&params, pt);
+                } else if (m.kind == .setter) {
+                    if (m.type == @intFromEnum(Kind.infer_unknown)) m.type = @intFromEnum(Kind.error_any);
+
+                    var param_tuple_type: TypeRef = 0;
+                    const pt = m.type;
+                    const param_decl = file.ast.nodes.at(m.slot0);
+                    const param_name = file.ast.nodes.at(getPackedData(param_decl).left);
+                    if (param_name.kind == .identifier) {
+                        param_tuple_type = try this.createNamedTupleTypeFromIdent(
+                            @intCast(file.id),
+                            getPackedData(param_decl).left,
+                            pt,
+                            this.getStructuralFlags(pt),
+                        );
+                    } else {
+                        // try this.createSyntheticStringLiteral("v", false);
+                        param_tuple_type = try this.createUnnamedTupleElement(pt, this.getStructuralFlags(pt));
+                    }
+                    var params = Params{ .this_type = 0, .params = .{} };
+                    try params.params.append(this, param_tuple_type);
+                    m.type = try this.createFunctionLiteral(&params, @intFromEnum(Kind.void));
+                }
             }
         }
 
@@ -19359,7 +19864,11 @@ pub const Analyzer = struct {
     // `slot5` caches the immediate substitution
     // `slot6` caches the full evaluation (with )
     fn createAlias(this: *@This(), args: *TypeList, file_id: u32, sym_ref: SymbolRef, flags: u24) !TypeRef {
-        std.debug.assert(sym_ref != 0);
+        if (comptime is_debug) {
+            if (flags & @intFromEnum(SymbolFlags.global) == 0) {
+                std.debug.assert(sym_ref != 0);
+            }
+        }
 
         // an alias always has an alias: itself!
         const all_flags = args.flags | flags | @intFromEnum(Flags.has_alias);
@@ -20119,10 +20628,18 @@ pub const Analyzer = struct {
                         });
                     }
 
+                    static_flags |= @intFromEnum(ObjectLiteralFlags.has_call_signature);
+
                     // FIXME: overloads
                     // FIXME: parameterized check
                     params_with_this.params.flags |= @intFromEnum(Flags.constructor);
                     constructor = try this.createFunctionLiteral(&params_with_this, instance_alias);
+                    try static_members.append(.{
+                        .kind = .call_signature,
+                        .name = 0,
+                        .type = constructor,
+                        .flags = params_with_this.params.flags,
+                    });
                 },
                 .property_declaration => {
                     const data = getPackedData(pair[0]);
@@ -21061,8 +21578,7 @@ pub const Analyzer = struct {
                 // This is a restricted intersection because we do not permit narrowing
 
                 var extends = std.ArrayList(TypeRef).init(this.allocator());
-                var should_deinit = true;
-                defer if (should_deinit) extends.deinit();
+                defer extends.deinit();
 
                 var extends_iter = NodeIterator.init(&file.ast.nodes, node.extra_data);
                 while (extends_iter.nextPair()) |pair| {
@@ -21072,7 +21588,6 @@ pub const Analyzer = struct {
                 const proto: TypeRef = blk: {
                     if (extends.items.len == 0) break :blk 0;
                     if (extends.items.len == 1) break :blk extends.items[0];
-                    should_deinit = false;
 
                     break :blk try this.createIntersectionType(extends.items, 0);
                 };
@@ -21856,7 +22371,14 @@ pub const Analyzer = struct {
         if (s.getKind() == .alias) {
             const r = try this.maybeResolveAlias(subject);
             if (r == subject) {
+                std.debug.print("subject: ", .{});
                 this.printTypeInfo(r);
+                std.debug.print("element: ", .{});
+                this.printTypeInfo(element);
+                if (this.contextual_type) |ct| {
+                    std.debug.print("contextual type: ", .{});
+                    this.printTypeInfo(ct);
+                }
                 this.printCurrentNode();
                 return error.FailedToResolveAlias;
             }
@@ -22041,6 +22563,49 @@ pub const Analyzer = struct {
             }
         }
         return try tmp.complete(this);
+    }
+
+    // may return error_any on errors
+    fn collectConstructSignatures(this: *@This(), type_ref: TypeRef, dest: *TempUnion) !?TypeRef {
+        if (type_ref >= @intFromEnum(Kind.false)) return null;
+
+        const t = this.types.at(type_ref);
+
+        switch (t.getKind()) {
+            .alias => {
+                const followed = try this.maybeResolveAlias(type_ref);
+                if (followed == type_ref) return null;
+
+                if (try this.collectConstructSignatures(followed, dest)) |x| return x;
+            },
+            .class => {
+                // TODO: base class!
+                if (t.slot1 == 0) return null;
+                if (try this.collectConstructSignatures(t.slot1, dest)) |x| return x;
+            },
+            .intersection => {
+                for (getSlice2(t, TypeRef)) |u| {
+                    if (try this.collectConstructSignatures(u, dest)) |x| return x;
+                }
+            },
+            .object_literal => {
+                if (!ObjectLiteralFlags.hasFlag(t, .has_call_signature)) return null;
+
+                for (getSlice2(t, ObjectLiteralMember)) |*m| {
+                    if (m.kind != .call_signature) continue;
+                    if (!m.hasTypeFlag(.constructor)) continue;
+                    const ref = try m.getType(this);
+                    if (ref >= @intFromEnum(Kind.false)) continue;
+                    if (try this.addToUnion(dest, ref)) |x| return x;
+                }
+            },
+            .@"union" => {
+                // we cannot proceed if we hit a union, this requires special handling
+                return 0;
+            },
+            else => {},
+        }
+        return null;
     }
 
     fn getInstanceType(this: *@This(), type_ref: TypeRef, comptime follow_instance_alias: bool) anyerror!TypeRef {
@@ -22365,10 +22930,10 @@ pub const Analyzer = struct {
                 },
             }
 
-            const old_ctx = this.inferrence_ctx;
-            defer this.inferrence_ctx = old_ctx;
+            const old_ctx = this.contextual_type;
+            defer this.contextual_type = old_ctx;
             const pt = fn_params[args.items.len];
-            this.inferrence_ctx = this.getTupleElementType(pt);
+            this.contextual_type = this.getTupleElementType(pt); // this.contextual_type = this.maybeGetArrayElementContextualType(args.items.len);
 
             const ty = try this.getType(file, p[1]);
             try args.append(this.allocator(), ty);
@@ -22501,8 +23066,60 @@ pub const Analyzer = struct {
             .new_expression => {
                 const d = getPackedData(exp);
                 const type_ref = try this.getType(file, d.left);
+                var tmp = TempUnion.init(this.allocator());
+                defer tmp.deinit();
 
-                // TODO: infer parameterized class type
+                var args = std.ArrayListUnmanaged(NodeRef){};
+                defer args.deinit(this.allocator());
+
+                {
+                    var iter = NodeIterator.init(&file.ast.nodes, d.right);
+                    while (iter.nextRef()) |p| {
+                        try args.append(this.allocator(), p);
+                    }
+                }
+
+                // TODO: add a fast path for when we know the target directly
+                if (try this.collectConstructSignatures(type_ref, &tmp)) |x| {
+                    if (x != 0) return x;
+                    // we should have hit a union, try to evaluate it
+                    var u: TypeRef = type_ref;
+                    while (true) {
+                        const nt = try this.evaluateType(u, @intFromEnum(EvaluationFlags.no_objects) | @intFromEnum(EvaluationFlags.no_unions));
+                        if (nt == u) break;
+                        u = nt;
+                    }
+                    if (u >= @intFromEnum(Kind.false)) return u;
+                    const uu = this.types.at(u);
+                    if (uu.getKind() != .@"union") return @intFromEnum(Kind.error_any);
+                    var res = TempUnion.init(this.allocator());
+                    outer: for (getSlice2(uu, TypeRef)) |el| {
+                        var tmp2 = TempUnion.init(this.allocator());
+                        defer tmp2.deinit();
+                        if (try this.collectConstructSignatures(el, &tmp2)) |x2| {
+                            res.deinit();
+                            return x2;
+                        }
+                        for (tmp2.elements.getSlice()) |sig| {
+                            if (try this.matchCallSignature(sig, file, args.items, d.right, exp.len)) |t| {
+                                if (try this.addToUnion(&res, try this.getReturnType(t))) |x2| return x2;
+                                continue :outer;
+                            }
+                        }
+                        // no match
+                        res.deinit();
+                        return @intFromEnum(Kind.error_any);
+                    }
+
+                    return res.complete(this);
+                }
+
+                for (tmp.elements.getSlice()) |sig| {
+                    if (try this.matchCallSignature(sig, file, args.items, d.right, exp.len)) |t| {
+                        return try this.getReturnType(t);
+                    }
+                }
+
                 return this.getInstanceType(type_ref, false);
             },
             .call_expression => {
@@ -22647,9 +23264,37 @@ pub const Analyzer = struct {
                 defer this.is_const_variable_context = old_variable_context;
                 this.is_const_variable_context = false;
 
+                if (this.contextual_type) |pt| {
+                    // or union of tuples
+                    if (this.getKindOfRef(pt) == .tuple) {
+                        var tmp = TypeList{};
+                        while (iter.nextPair()) |pair| {
+                            if (pair[0].kind == .spread_element) {
+                                this.printCurrentNode();
+                                return error.TODO;
+                            }
+                            const save_contextual_type = this.contextual_type;
+                            defer this.contextual_type = save_contextual_type;
+                            this.contextual_type = try this.maybeGetArrayElementContextualType(tmp.getCount());
+                            const t = try this.getType(file, pair[1]);
+                            try tmp.append(this, t);
+                        }
+                        return try this.createTupleType(&tmp);
+                    }
+                }
+
+                const save_contextual_type = this.contextual_type;
+                defer this.contextual_type = save_contextual_type;
+                this.contextual_type = try this.maybeGetArrayElementContextualType(0);
+
                 var tmp = TempUnion.init(this.allocator());
                 while (iter.nextPair()) |pair| {
                     if (pair[0].kind == .spread_element) {
+                        // reset the context to the outer array type for spread elements
+                        const save_contextual_type_inner = this.contextual_type;
+                        defer this.contextual_type = save_contextual_type_inner;
+                        this.contextual_type = if (save_contextual_type != null and this.getKindOfRef(save_contextual_type.?) == .array) save_contextual_type.? else null;
+        
                         const t = try this.getType(file, unwrapRef(pair[0]));
                         if (t == @intFromEnum(Kind.any)) {
                             defer tmp.deinit();
@@ -22707,16 +23352,24 @@ pub const Analyzer = struct {
                     }
                 }
 
+                if (save_contextual_type != null) {
+                    // TS does not appear to use the exact type here
+                    tmp.deinit();
+                    return save_contextual_type.?;
+                }
+
                 return this.createArrayType(try tmp.complete(this));
             },
             .object_literal_expression => {
                 const node_start = maybeUnwrapRef(exp) orelse return @intFromEnum(Kind.empty_object);
 
+                var iter = NodeIterator.init(&file.ast.nodes, node_start);
+
                 var flags: u24 = 0;
                 var elements = std.ArrayListUnmanaged(ObjectLiteralMember){};
-                try elements.ensureTotalCapacity(this.allocator(), 4);
+                try elements.ensureTotalCapacity(this.allocator(), iter.computeLength());
 
-                var iter = NodeIterator.init(&file.ast.nodes, node_start);
+                // excludeUnionElementsFromContext
 
                 var accessors = std.AutoArrayHashMapUnmanaged(u32, struct {
                     name: TypeRef,
@@ -22730,16 +23383,25 @@ pub const Analyzer = struct {
                 defer this.is_const_variable_context = old_variable_context;
                 this.is_const_variable_context = false;
 
+                const save_contextual_type_exclusion = this.contextual_type_excluded_union_elements;
+                this.contextual_type_excluded_union_elements = null;
+                var did_narrow_contextual_type = false;
+                defer if (did_narrow_contextual_type) {
+                    this.allocator().destroy(this.contextual_type_excluded_union_elements.?);
+                    this.contextual_type_excluded_union_elements = save_contextual_type_exclusion;
+                };
+
                 while (iter.nextPair()) |pair| {
                     const n = pair[0];
                     switch (n.kind) {
                         .shorthand_property_assignment => {
                             const ident = unwrapRef(n);
+                            const key = try this.propertyNameToType(file, ident);
                             const t = try this.getType(file, ident);
                             flags |= this.getStructuralFlags(t);
                             try elements.append(this.allocator(), .{
                                 .kind = .property,
-                                .name = try this.propertyNameToType(file, ident),
+                                .name = key,
                                 .type = t,
                             });
                         },
@@ -22747,11 +23409,24 @@ pub const Analyzer = struct {
                             const d = getPackedData(n);
                             const name = file.ast.nodes.at(d.left);
                             if (name.kind == .identifier or name.kind == .string_literal) {
+                                const key = try this.propertyNameToType(file, d.left);
+                                const save_contextual_type = this.contextual_type;
+                                defer this.contextual_type = save_contextual_type;
+                                if (save_contextual_type != null and this.nodeMayUseContextualType(file, d.right)) {
+                                    this.contextual_type = try this.maybeGetObjectElementContextualType(key);
+                                } else if (save_contextual_type != null) {
+                                    // these literals don't use the contextual type 
+                                    // but should be treated as consts when we do have a contextual type
+                                    switch (file.ast.nodes.at(d.right).kind) {
+                                        .numeric_literal, .string_literal => this.is_const_variable_context = true,
+                                        else => {},
+                                    }
+                                }
                                 const t = try this.getType(file, d.right);
                                 flags |= this.getStructuralFlags(t);
                                 try elements.append(this.allocator(), .{
                                     .kind = .property,
-                                    .name = try this.propertyNameToType(file, d.left),
+                                    .name = key,
                                     .type = t,
                                 });
                                 continue;
@@ -22870,11 +23545,17 @@ pub const Analyzer = struct {
                             }
                         },
                         .method_declaration => {
+                            const key = try this.propertyNameToType(file, (getPackedData(n)).left);
+                            const save_contextual_type = this.contextual_type;
+                            defer this.contextual_type = save_contextual_type;
+                            if (save_contextual_type != null and this.nodeMayUseContextualType(file, pair[1])) {
+                                this.contextual_type = try this.maybeGetObjectElementContextualType(key);
+                            }
                             const t = try this.getSignature(file, pair[1]);
                             flags |= this.getStructuralFlags(t);
                             try elements.append(this.allocator(), .{
                                 .kind = .method,
-                                .name = try this.propertyNameToType(file, (getPackedData(n)).left),
+                                .name = key,
                                 .type = t,
                             });
                         },
@@ -22925,6 +23606,17 @@ pub const Analyzer = struct {
                             }
                         },
                         else => return error.TODO,
+                    }
+                    // we only narrow on the first element
+                    if (elements.items.len == 1 and this.contextual_type != null and !did_narrow_contextual_type) {
+                        std.debug.assert(!elements.items[0].isLazy());
+                        const key = elements.items[0].name;
+                        const value = elements.items[0].type;
+                        if (try this.excludeUnionElementsFromContext(key, value)) |res| {
+                            did_narrow_contextual_type = true;
+                            this.contextual_type = res.ctx_type;
+                            this.contextual_type_excluded_union_elements = res.excluded;
+                        }
                     }
                 }
 
@@ -23047,6 +23739,76 @@ pub const Analyzer = struct {
         return s;
     }
 
+    fn matchCallSignature(this: *@This(), fn_ty: TypeRef, file: *ParsedFileData, args: []const NodeRef, args_start: NodeRef, type_args_start: NodeRef) !?TypeRef {
+        const fn_ty_kind = this.getKindOfRef(fn_ty);
+        if (fn_ty_kind == .parameterized) {
+            const s = this.types.at(fn_ty);
+            std.debug.assert(this.getKindOfRef(s.slot3) == .function_literal);
+
+            if (type_args_start == 0) {
+                return try this.inferTypeCallExpParameterized(file, s, args_start) orelse return null;
+            }
+
+            const type_params = getSlice2(s, TypeRef);
+
+            var c: u32 = 0;
+            var iter = NodeIterator.init(&file.ast.nodes, type_args_start);
+            while (iter.nextRef()) |r| {
+                if (c >= type_params.len) return null;
+                const p = type_params[c];
+                c += 1;
+                if (this.getTypeParamConstraint(p)) |pt| {
+                    if (pt == @intFromEnum(Kind.any)) continue;
+                    const u = try this.getType(file, r);
+                    if (!try this.isAssignableTo(u, pt)) return null;
+                }
+            }
+
+            return try this.resolveWithTypeArgs(file, s, type_args_start);
+        }
+
+        if (type_args_start != 0) return null;
+        if (fn_ty_kind != .function_literal) return null;
+
+        const s = this.types.at(fn_ty);
+
+        const s_params = getSlice2(s, TypeRef);
+        if (args.len > s_params.len) {
+            if (s_params.len == 0) return null;
+            const last = s_params[s_params.len-1];
+            const n = this.types.at(last);
+            if (!n.hasFlag(.spread)) return null;
+
+            // todo: check the spread type
+            return null;
+        }
+
+        if (args.len < s_params.len) {
+            const n = this.types.at(s_params[args.len-1]);
+            if (!n.hasFlag(.spread) and !n.hasFlag(.optional)) {
+                return null; // TODO
+            }
+        }
+
+        if (args.len > 0) {
+            const n = file.ast.nodes.at(args[args.len-1]);
+            if (n.kind == .spread_element) return null; // TODO
+        }
+
+        for (args, 0..) |p, i| {
+            const st = s_params[i];
+            const pt = blk: {
+                const old_ctx = this.contextual_type;
+                defer this.contextual_type = old_ctx;
+                this.contextual_type = this.getTupleElementType(st);
+                break :blk try this.getType(file, p);
+            };
+            if (!try this.isAssignableTo(pt, st)) return null;
+        }
+
+        return fn_ty;
+    }
+
     fn findCallSignature(this: *@This(), subject: *const Type, file: *ParsedFileData, args: []const NodeRef, args_start: NodeRef, type_args: []const NodeRef) !?TypeRef {
         const members = getSlice2(subject, ObjectLiteralMember);
         outer: for (members) |*m| {
@@ -23091,9 +23853,9 @@ pub const Analyzer = struct {
             for (args, 0..) |p, i| {
                 const st = s_params[i];
 
-                const old_ctx = this.inferrence_ctx;
-                defer this.inferrence_ctx = old_ctx;
-                this.inferrence_ctx = this.getTupleElementType(st);
+                const old_ctx = this.contextual_type;
+                defer this.contextual_type = old_ctx;
+                this.contextual_type = this.getTupleElementType(st);
 
                 const pt = try this.getType(file, p);
                 if (!try this.isAssignableTo(pt, st)) continue :outer;
@@ -23313,7 +24075,7 @@ pub const Analyzer = struct {
                         try this.gatherReferencedSymbols(el);
                     }
                 },
-                .keyof => {
+                .array, .keyof => {
                     try this.gatherReferencedSymbols(t.slot0);
                 },
                 .class => {
@@ -24203,6 +24965,17 @@ pub const Analyzer = struct {
                                 continue;
                             }
 
+                            if (el.kind == .getter or el.kind == .setter) {
+                                const d = getPackedData(this.synthetic_nodes.at(t));
+                                try l.append(.{
+                                    .kind = if (el.kind == .getter) .get_accessor else .set_accessor,
+                                    .data = toBinaryDataPtrRefs(copy, d.left),
+                                    .extra_data = d.right,
+                                    .flags = flags,
+                                });
+                                continue; 
+                            }
+
                             try l.append(.{
                                 .kind = .property_signature,
                                 .data = toBinaryDataPtrRefs(copy, t),
@@ -24257,7 +25030,7 @@ pub const Analyzer = struct {
                         const t = try this.toTypeNode(k.slot3);
                         const n = this.synthetic_nodes.at(t);
                         switch (n.kind) {
-                            .function_type => n.len = l.head,
+                            .function_type, .constructor_type => n.len = l.head,
                             .class_declaration => n.extra_data = l.head,
                             else => {},
                         }

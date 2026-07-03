@@ -536,6 +536,23 @@ const TypeParamFlags = enum(u20) {
     variance_out = 1 << 2,
 };
 
+pub const CallExpFlags = enum(u22) {
+    awaited = 1 << 15,
+};
+
+pub const JsxElementFlags = enum(u22) {
+    targeted = 1 << 15, // @
+};
+
+// used by type engine
+pub const SyntheticMemberFlags = enum(u22) {
+    // these two are used when a property was created by combining accessors
+    // the original param (as a node ref) for the setter is stored on `.slot0`
+    setter = 1 << 0,
+    getter = 1 << 2,
+};
+
+
 pub const NodeRef = u32;
 
 pub const AstNode = packed struct {
@@ -689,7 +706,8 @@ pub inline fn encodeLocation(line: u32, col: u32) u32 {
     return max_location;
 }
 
-pub inline fn decodeLocation(loc: u32) struct { line: u32, col: u32 } {
+const DecodedLocation = struct { line: u32, col: u32 };
+pub inline fn decodeLocation(loc: u32) DecodedLocation {
     // if (loc == max_location) {
     //     @panic("max loc");
     // }
@@ -3458,6 +3476,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // `<span> foo </span>` should preserve whitespace because it's all on one line
             // var open_start_line: u32 = 0;
 
+            var static_block: NodeRef = 0;
             var self_closing = false;
             var attributes = NodeList_.init(this);
             var binding_name: NodeRef = 0;
@@ -3564,6 +3583,41 @@ fn Parser_(comptime skip_trivia: bool) type {
                     }
                 }
 
+                if (strings.eqlComptime(this.lexer.identifier, "static")) {
+                    var save_lexer = std.mem.toBytes(this.lexer);
+                    var should_restore = true;
+                    defer {
+                        if (should_restore) 
+                            this.lexer = std.mem.bytesToValue(@TypeOf(this.lexer), &save_lexer);
+                    }
+                    try this.lexer.nextInsideJSXElement();
+                    if (!this.lexer.has_newline_before and this.lexer.token == .t_open_brace) {
+                        should_restore = false;
+                        const save_state = this.context_state;
+                        defer this.context_state = save_state;
+                        this.context_state = .none;
+
+                        try this.lexer.expect(.t_open_brace);
+
+                        var list = NodeList_.init(this);
+                        while (this.lexer.token != .t_end_of_file) {
+                            if (this.lexer.token == .t_close_brace) {
+                                try this.lexer.nextInsideJSXElement();
+                                break;
+                            }
+                            const n = try this.parseStatement();
+                            try list.append(n);
+                        }
+
+                        static_block = try this.pushNode(.{
+                            .kind = .block,
+                            .data = if (list.head == 0) null else @ptrFromInt(list.head),
+                        });
+
+                        continue;
+                    }         
+                }
+
                 // ident
                 const ident_end = this.lexer.end;
                 const n = try this.pushNode(toIdentNode2(this.lexer.identifier));
@@ -3610,6 +3664,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 attributes_ref = try this.pushNode(.{
                     .kind = .jsx_attributes,
                     .data = @ptrFromInt(attributes.head),
+                    .extra_data2 = static_block,
                 });
             }
 
@@ -4105,6 +4160,13 @@ fn Parser_(comptime skip_trivia: bool) type {
                 },
                 .t_less_than => {
                     return this.parseArrowFnOrJSX();
+                },
+                .t_at => {
+                    try this.lexer.next();
+                    try this.lexer.expect(.t_less_than);
+                    var n = try this.parseJSXContainer();
+                    n.flags |= @intFromEnum(JsxElementFlags.targeted);
+                    return n;
                 },
                 else => {
                     try this.lexer.next();
@@ -7540,6 +7602,29 @@ pub fn isParameterDecl(p: *const AstNode) bool {
     return (hasFlag(p, .private) or hasFlag(p, .public) or hasFlag(p, .protected) or hasFlag(p, .override) or hasFlag(p, .readonly));
 }
 
+pub fn isAssignmentOp(kind: SyntaxKind) bool {
+    return switch (kind) {
+        .equals_token,
+        .plus_equals_token,
+        .minus_equals_token,
+        .asterisk_equals_token,
+        .asterisk_asterisk_equals_token,
+        .slash_equals_token,
+        .percent_equals_token,
+        .ampersand_equals_token,
+        .bar_equals_token,
+        .caret_equals_token,
+        .less_than_less_than_equals_token,
+        .greater_than_greater_than_equals_token,
+        .greater_than_greater_than_greater_than_equals_token,
+        .bar_bar_equals_token,
+        .ampersand_ampersand_equals_token,
+        .question_question_equals_token,
+        => true,
+        else => false,
+    };
+}
+
 fn isBoundControlFlow(nodes: *const BumpAllocator(AstNode), n: *const AstNode) bool {
     if (n.kind != .if_statement and n.kind != .while_statement) return false;
 
@@ -8348,6 +8433,13 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left);
             // len is type
             if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
+        },
+        .get_accessor, .set_accessor => {
+            const d = getPackedData(node);
+            try visitor.visit(nodes.at(d.left), d.left);
+            try visitList(nodes, d.right, visitor); // params
+            if (node.extra_data != 0) try visitor.visit(nodes.at(node.extra_data), node.extra_data); // return type
+            if (node.len != 0) try visitor.visit(nodes.at(node.len), node.len); // body
         },
 
         // constructor
@@ -9403,7 +9495,7 @@ pub const Binder = struct {
                         try this.visitType(el.len);
                     }
                 },
-                .method_declaration => {
+                .get_accessor, .set_accessor, .method_declaration => {
                     const d2 = getPackedData(el);
                     const name = this.nodes.at(d2.left);
                     if (name.kind == .computed_property_name) {
@@ -9863,6 +9955,18 @@ pub const Binder = struct {
                 }
                 try this.visitType(d.right);
             },
+            .get_accessor, .set_accessor => {
+                const d = getPackedData(node);
+                if (this.nodes.at(d.left).kind == .computed_property_name) {
+                    try this.visitRef(unwrapRef(this.nodes.at(d.left)));
+                }
+                const has_params = d.right != 0;
+                if (has_params) try this.pushScope();
+                defer if (has_params) this.popScope();
+
+                if (has_params) try this.visitParams(d.right);
+                try this.visitType(node.extra_data); // return_type
+            },
             .method_signature => {
                 const d = getPackedData(node);
                 if (this.nodes.at(d.left).kind == .computed_property_name) {
@@ -10284,7 +10388,7 @@ pub const Binder = struct {
                     while (iter.nextRef()) |r| try this.visitType(r);
                 }
             },
-            .call_expression => {
+            .call_expression, .new_expression => {
                 const d = getPackedData(node);
                 try this.visitRef(d.left);
                 var iter = NodeIterator.init(this.nodes, d.right);
@@ -10752,15 +10856,11 @@ pub const Binder = struct {
     }
 };
 
-pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct { line: u32, col: u32 } {
+// kind of annoying zig 0.13 doesn't passthru anonymous struct type annotations
+pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedLocation {
     switch (n.kind) {
         .identifier, .numeric_literal, .string_literal, .arrow_function, .array_literal_expression => {
-            const x = decodeLocation(n.location);
-
-            return .{
-                .line = x.line,
-                .col = x.col,
-            };
+            return decodeLocation(n.location);
         },
         .class_declaration, .function_declaration => {
             const d = getPackedData(n);
@@ -10768,27 +10868,37 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
                 return getLoc(nodes, nodes.at(d.left));
             }
         },
+        .return_statement,
+        .throw_statement,
+        .jsx_expression => {
+            if (n.location != 0) return decodeLocation(n.location);
+            return getLoc(nodes, nodes.at(maybeUnwrapRef(n) orelse 0));
+        },
+        .shorthand_property_assignment,
+        .delete_expression,
+        .void_expression,
+        .parenthesized_expression,
+        .parenthesized_type,
+        .typeof_expression,
         .await_expression => {
-            // TODO: add location to `await`, this is dead code currently
-            if (n.location != 0) {
-                const x = decodeLocation(n.location);
-
-                return .{
-                    .line = x.line,
-                    .col = x.col,
-                };
-            }
+            if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(unwrapRef(n)));
         },
-        .typeof_expression => {
-            // FIXME: add location to typeof
-            return getLoc(nodes, nodes.at(unwrapRef(n)));
-        },
+        .jsx_attribute,
+        .jsx_class_attribute,
+        .jsx_method_attribute,
+        .jsx_element,
+        .jsx_self_closing_element,
+        .as_expression, .is_expression, .satisfies_expression,
+        .property_assignment,
+        .method_declaration,
+        .get_accessor,
+        .set_accessor,
         .type_predicate,
-        .as_expression,
         .element_access_expression, .binary_expression,
         .property_access_expression, .call_expression, .qualified_name,
         .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
+            if (n.location != 0) return decodeLocation(n.location);
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.left));
         },
@@ -10796,17 +10906,18 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?struct {
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.right));
         },
+        .jsx_if_directive,
+        .if_statement, .while_statement,
+        .conditional_expression, .conditional_type,
+        .update_statement,
         .postfix_unary_expression => {
+            if (n.location != 0) return decodeLocation(n.location);
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.left));
         },
         else => {
             if (n.location != 0) {
-                const x = decodeLocation(n.location);
-                return .{
-                    .line = x.line,
-                    .col = x.col,
-                };
+                return decodeLocation(n.location);
             }
             std.debug.print("missing location {}\n", .{n.kind});
         },
@@ -12065,7 +12176,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.left);
                     try this.printParams(d.right);
                     try this.maybePrintType(n.extra_data);
-                    try this.maybePrint(" ", n.len);
+                    try this.maybePrint(" ", n.len); // body
                 },
                 .set_accessor => {
                     this.printModifiers(n);
@@ -12075,7 +12186,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.left);
                     try this.printParams(d.right);
                     try this.maybePrintType(n.extra_data);
-                    try this.maybePrint(" ", n.len);
+                    try this.maybePrint(" ", n.len); // body
                 },
                 .parameter => {
                     const d = getPackedData(n);
