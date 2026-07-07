@@ -4,6 +4,7 @@ const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
+const debugPrint = parser.debugPrint;
 
 const SymbolRef = parser.SymbolRef;
 const NodeRef = parser.NodeRef;
@@ -795,7 +796,7 @@ const StyleVisitor = struct {
         var n_digits: usize = 0;
         var v = hash;
         while (v > 0 and n_digits < total_digits) {
-            digits[n_digits] = chars[v % 36];
+            digits[n_digits] = chars[@intCast(v % 36)];
             v /= 36;
             n_digits += 1;
         }
@@ -966,6 +967,11 @@ const ModuleResolver = struct {
             .working_dir = &.{},
         };
 
+        if (comptime @import("builtin").target.isWasm()) {
+            this.working_dir = "";
+            return this;
+        }
+
         this.working_dir = try std.process.getCwdAlloc(this.arena.allocator());
 
         return this;
@@ -981,6 +987,8 @@ const ModuleResolver = struct {
     }
 
     fn findNodeModules(this: *@This(), origin: []const u8) anyerror!?[]const u8 {
+        if (comptime @import("builtin").target.isWasm()) return null;
+
         const resolve_dir = try this.getResolveDir(origin);
         defer if (resolve_dir.should_free) this.arena.allocator().free(resolve_dir.dir);
 
@@ -1005,6 +1013,8 @@ const ModuleResolver = struct {
     }
 
     pub fn resolveTypesDirective(this: *@This(), origin: []const u8, name: []const u8) anyerror!?[]const u8 {
+        if (comptime @import("builtin").target.isWasm()) return null;
+
         const start = try this.findNodeModules(origin) orelse return null;
 
         var found = false;
@@ -1211,6 +1221,10 @@ fn printSymbol(file: *ParsedFileData, sym_ref: SymbolRef) void {
     const s = getSlice(ident, u8);
     if (parser.getLoc(&file.ast.nodes, ident)) |loc| {
         const file_name = file.file_name orelse "<unknown>";
+        if (comptime @import("builtin").target.isWasm()) {
+            debugPrint("{s} at {s}:{}:{}\n", .{ s, file_name, loc.line + 1, loc.col + 1 });
+            return;
+        }
         const cwd = std.fs.cwd().realpathAlloc(getAllocator(), ".") catch "";
         defer getAllocator().free(cwd);
         var did_alloc = true;
@@ -1219,30 +1233,30 @@ fn printSymbol(file: *ParsedFileData, sym_ref: SymbolRef) void {
             break :blk file_name;
         };
         defer if (did_alloc) getAllocator().free(rel);
-        std.debug.print("{s} at {s}:{}:{}\n", .{ s, rel, loc.line + 1, loc.col + 1 });
+        debugPrint("{s} at {s}:{}:{}\n", .{ s, rel, loc.line + 1, loc.col + 1 });
     } else {
-        std.debug.print("{s}\n", .{s});
+        debugPrint("{s}\n", .{s});
     }
     const sym = file.binder.symbols.at(sym_ref);
-    if (sym.hasFlag(.local)) std.debug.print("  [local]", .{});
-    if (sym.hasFlag(.global)) std.debug.print("  [global]", .{});
-    if (sym.hasFlag(.type)) std.debug.print("  [type]", .{});
-    if (sym.hasFlag(.namespace)) std.debug.print("  [namespace]", .{});
-    if (sym.hasFlag(.imported)) std.debug.print("  [imported]", .{});
-    if (sym.hasFlag(.exported)) std.debug.print("  [exported]", .{});
-    if (sym.hasFlag(.late_bound)) std.debug.print("  [late bound]", .{});
-    std.debug.print("\n", .{});
+    if (sym.hasFlag(.local)) debugPrint("  [local]", .{});
+    if (sym.hasFlag(.global)) debugPrint("  [global]", .{});
+    if (sym.hasFlag(.type)) debugPrint("  [type]", .{});
+    if (sym.hasFlag(.namespace)) debugPrint("  [namespace]", .{});
+    if (sym.hasFlag(.imported)) debugPrint("  [imported]", .{});
+    if (sym.hasFlag(.exported)) debugPrint("  [exported]", .{});
+    if (sym.hasFlag(.late_bound)) debugPrint("  [late bound]", .{});
+    debugPrint("\n", .{});
 }
 
 fn printNameWithLocation(f: *ParsedFileData, ref: NodeRef) !void {
     const n = f.ast.nodes.at(ref);
     const name = getSlice(n, u8);
     const loc = parser.getLoc(&f.ast.nodes, n) orelse {
-        std.debug.print("{?}\n",.{n.kind});
+        debugPrint("{?}\n",.{n.kind});
         return error.MissingLocation;
     };
     const file_name = f.file_name orelse return error.MissingFileName;
-    std.debug.print("{s} at {s}:{}:{}\n", .{ name, file_name, loc.line + 1, loc.col + 1 });
+    debugPrint("{s} at {s}:{}:{}\n", .{ name, file_name, loc.line + 1, loc.col + 1 });
 }
 
 fn isRelativeModuleSpecifier(spec: []const u8) bool {
@@ -1543,7 +1557,7 @@ pub const Program = struct {
                     const resolved = try this.resolver.resolveTypesDirective(origin, directive.value) orelse return error.MissingTypesDirective;
 
                     // TODO: this has to read from `package.json`
-                    std.debug.print("types dir {s} -> {s}", .{ directive.value, resolved });
+                    debugPrint("types dir {s} -> {s}", .{ directive.value, resolved });
 
                     // TODO: associate directive w/ file
                 },
@@ -1707,7 +1721,7 @@ pub const Program = struct {
 
             const b = imported_file.binder;
 
-            // std.debug.print("exported symbol count -> {} [id: {}]\n", .{ imported_file.binder.exports.keys().len, imported_id });
+            // debugPrint("exported symbol count -> {} [id: {}]\n", .{ imported_file.binder.exports.keys().len, imported_id });
 
             var sym_iter = entry.value_ptr.bindings.iterator();
             while (sym_iter.next()) |sym_entry| {
@@ -1782,7 +1796,7 @@ pub const Program = struct {
         for (f.unresolved_imports.items) |hash| {
             const global_ref = this.ambient.modules.get(hash) orelse {
                 const import = f.binder.imports.get(hash) orelse @panic("Missing import spec");
-                std.debug.print("missing {s}\n", .{import.spec});
+                debugPrint("missing {s}\n", .{import.spec});
                 return error.MissingModule;
             };
             try f.import_map.put(hash, (1 << 31) | global_ref);
@@ -1933,12 +1947,12 @@ pub const Program = struct {
             const sym = f.binder.symbols.at(module_entry.value_ptr.*);
             std.debug.assert(sym.hasFlag(.namespace));
             const ns = f.binder.namespaces.items[sym.binding];
-            // std.debug.print("re-exports {s} -> {s}\n", .{f.file_name orelse "", ns.module_specifier orelse ""});
+            // debugPrint("re-exports {s} -> {s}\n", .{f.file_name orelse "", ns.module_specifier orelse ""});
 
             const exports3 = ns.exports orelse return error.MissingModuleExports;
             for (exports3.aliased_exports.items) |item| {
                 const global_ref = this.ambient.modules.get(getHash(item.spec)) orelse {
-                    std.debug.print("missing re-exported module '{s}'\n", .{item.spec});
+                    debugPrint("missing re-exported module '{s}'\n", .{item.spec});
                     continue;
                 };
 
@@ -2962,7 +2976,7 @@ pub const Program = struct {
 
                         const regex_node = try self.nodes.push(.{
                             .kind = .regular_expression_literal,
-                            .data = pattern.items.ptr,
+                            .data = @intFromPtr(pattern.items.ptr),
                             .len = @intCast(pattern.items.len),
                         });
 
@@ -3417,12 +3431,12 @@ pub const Program = struct {
                         return self._dependsOnEffects(d.left) or self._dependsOnEffects(d.right) or self._dependsOnEffects(inner_node.len);
                     },
                     .case_clause, .default_clause => {
-                        if (inner_node.data) |d| {
+                        if (maybeUnwrapRef(inner_node)) |d| {
                             if (inner_node.hasFlag(.declare)) {
                                 // case is
                                 return false;
                             } else {
-                                if (self._dependsOnEffects(@intCast(@intFromPtr(d)))) return true;
+                                if (self._dependsOnEffects(d)) return true;
                             }
                         }
                         var iter = NodeIterator.init(self.nodes, inner_node.len);
@@ -4179,8 +4193,7 @@ pub const Program = struct {
                         continue;
                     }
                     if (attr.kind == .jsx_class_list) {
-                        if (attr.data == null) continue;
-                        const list_ref: NodeRef = @truncate(@intFromPtr(attr.data.?));
+                        const list_ref: NodeRef = maybeUnwrapRef(attr) orelse continue;
                         var li = NodeIterator.init(self.nodes, list_ref);
                         while (li.next()) |ca| {
                             if (ca.kind != .jsx_class_attribute) continue;
@@ -4215,10 +4228,9 @@ pub const Program = struct {
                         try out.appendSlice(" ");
                         try out.appendSlice(name);
                         try out.appendSlice("=");
-                        if (val.data) |d| {
+                        if (val.data != 0) {
                             // FIXME: dedupe
-                            const val2: u64 = @intFromPtr(d);
-                            const f2: f64 = @bitCast(val2);
+                            const f2: f64 = @bitCast(val.data);
                             var buf: [64]u8 = undefined;
                             try out.appendSlice(try std.fmt.bufPrint(&buf, "{d}", .{f2}));
                         } else {
@@ -4417,7 +4429,7 @@ pub const Program = struct {
                     )
                 );
                 const l = unwrapRef(self.nodes.at(block));
-                self.nodes.at(block).data = @ptrFromInt(assign);
+                self.nodes.at(block).data = assign;
                 self.nodes.at(assign).next = l;
                 const branch = try self.factory.createIfStatement(try self.factory.createIdentifier(gate.name), block, 0);
 
@@ -5517,7 +5529,7 @@ pub const Program = struct {
                 if (body.items.len > 0) {
                     const block_ref = n.len;
                     const block_start = maybeUnwrapRef(self.nodes.at(block_ref)) orelse 0;
-                    self.nodes.at(block_ref).data = @ptrFromInt(body.items[0]);
+                    self.nodes.at(block_ref).data = body.items[0];
                     var x: NodeRef = 0;
                     for (body.items) |u| {
                         if (x != 0) self.nodes.at(x).next = u;
@@ -5620,9 +5632,7 @@ pub const Program = struct {
                     if (attr.kind == .jsx_class_attribute or attr.kind == .jsx_class_list) {
                         if (state.ctx == .component) continue;
                         if (attr.kind == .jsx_class_list) {
-                            if (attr.data == null) continue;
-                            const list_ref: NodeRef = @truncate(@intFromPtr(attr.data.?));
-                            var li = NodeIterator.init(self.nodes, list_ref);
+                            var li = NodeIterator.init(self.nodes, maybeUnwrapRef(attr) orelse continue);
                             while (li.next()) |ca| {
                                 if (ca.kind != .jsx_class_attribute) continue;
                                 try self.inlineEmitClassToggle(state, upd_body, el_name, ca);
@@ -6859,7 +6869,7 @@ pub const Program = struct {
                         const val = if (is_static) try self.cloneIfNeeded(element_init) else try self.factory.createNull();
                         self.nodes.at(val).next = 0;
                         if (tail == 0) {
-                            arr_exp.data = @ptrFromInt(val);
+                            arr_exp.data = val;
                         } else {
                             self.nodes.at(tail).next = try self.factory.createNull();
                         }
@@ -7014,11 +7024,11 @@ pub const Program = struct {
                 }
 
                 fn debug_print(tc: *const @This(), nodes: *const BumpAllocator(AstNode), binder: *const Binder) void {
-                    std.debug.print("=== classifyTreeSymbols ===\n", .{});
+                    debugPrint("=== classifyTreeSymbols ===\n", .{});
                     var iter = tc.node_maps.iterator();
                     while (iter.next()) |node_entry| {
                         const node_ref = node_entry.key_ptr.*;
-                        std.debug.print("  node #{d} [{?}]:\n", .{node_ref, nodes.at(node_ref).kind});
+                        debugPrint("  node #{d} [{?}]:\n", .{node_ref, nodes.at(node_ref).kind});
                         var sym_iter = node_entry.value_ptr.iterator();
                         while (sym_iter.next()) |sym_entry| {
                             const sym_ref = sym_entry.key_ptr.*;
@@ -7028,19 +7038,19 @@ pub const Program = struct {
                                 getSlice(nodes.at(getPackedData(nodes.at(sym.declaration)).left), u8)
                             else
                                 "<unknown>";
-                            std.debug.print("    sym #{d} ({s}): read={} write={} capture={}", .{
+                            debugPrint("    sym #{d} ({s}): read={} write={} capture={}", .{
                                 sym_ref, name, info.is_read, info.is_written, info.is_captured,
                             });
                             if (info.producer) |p| {
-                                std.debug.print(" | producer: read={} write={} capture={} | any_consumer: read={} write={} capture={}", .{
+                                debugPrint(" | producer: read={} write={} capture={} | any_consumer: read={} write={} capture={}", .{
                                     p.is_read, p.is_written, p.is_captured,
                                     p.any_consumer_read, p.any_consumer_written, p.any_consumer_captured,
                                 });
                             }
-                            std.debug.print("\n", .{});
+                            debugPrint("\n", .{});
                         }
                     }
-                    std.debug.print("===========================\n", .{});
+                    debugPrint("===========================\n", .{});
                 }
             };
 
@@ -7718,7 +7728,7 @@ pub const Program = struct {
                         }
                         break :blk try self.nodes.push(.{
                             .kind = .array_literal_expression,
-                            .data = @ptrFromInt(children_head),
+                            .data = children_head,
                         });
                     };
 
@@ -8310,7 +8320,7 @@ pub const Program = struct {
                         break :blk d.right;
                     },
                     else => {
-                        if (comptime is_debug) std.debug.print("Invalid Jsx: {?}\n",.{node.kind});
+                        if (comptime is_debug) debugPrint("Invalid Jsx: {?}\n",.{node.kind});
                         return error.InvalidJsx;
                     },
                 };
@@ -9292,7 +9302,7 @@ pub const Program = struct {
                             p,
                             try self.factory.createAssignmentStatement(p, try self.factory.nodes.push(.{
                                 .kind = .void_expression,
-                                .data = @ptrFromInt(replace_with_call)
+                                .data = replace_with_call,
                             })),
                             0);
                     }
@@ -9499,7 +9509,7 @@ pub const Program = struct {
                 const sym_name = try self.factory.createIdentifier(self.requireHelper(.update_symbol));
                 const computed_key = try self.factory.nodes.push(.{
                     .kind = .computed_property_name,
-                    .data = @ptrFromInt(sym_name),
+                    .data = sym_name,
                 });
                 const upd_body = try self.factory.createBlock(upd_stmts);
                 try self.coalesceVariableStatements(self.nodes.at(upd_body));
@@ -9710,7 +9720,6 @@ pub const Program = struct {
                     if (children_head == 0) {
                         break :blk try self.factory.createReturnStatement(try self.nodes.push(.{
                             .kind = .array_literal_expression,
-                            .data = null,
                         }));
                     }
                     var root_ref: NodeRef = 0;
@@ -9828,7 +9837,7 @@ pub const Program = struct {
 
                 const body_block = try self.nodes.push(.{
                     .kind = .block,
-                    .data = if (body_head != 0) @ptrFromInt(body_head) else null,
+                    .data = body_head,
                 });
                 const props_param: NodeRef = if (params_head == 0) 0 else blk: {
                     if (param_count == 1 and children_param_ref != 0) {
@@ -9920,7 +9929,7 @@ pub const Program = struct {
                                 s.kind = .expression_statement;
                                 const copy = try self.factory.cloneNode(inner_exp);
                                 self.nodes.at(copy).len = @intFromEnum(SyntaxKind.question_question_equals_token);
-                                s.data = @ptrFromInt(copy);
+                                s.data = copy;
                             }
                         },
                         .variable_statement => {
@@ -10038,7 +10047,7 @@ pub const Program = struct {
                         binding_name = try self.factory.createIdentifier(el_name);
                         binding_statement = try self.factory.createConstVariable(binding_name, inner_exp);
                         const clone = try self.factory.cloneNode(statement);
-                        self.nodes.at(clone).data = @ptrFromInt(binding_name); // return __ret
+                        self.nodes.at(clone).data = binding_name; // return __ret
                         self.nodes.at(binding_statement.?).next = clone;
                     },
                     else => return null,
@@ -10102,7 +10111,7 @@ pub const Program = struct {
                                 setup_block = try self.factory.createBlock(state.stmts.items);
                                 element_exp = try self.factory.nodes.push(.{
                                     .kind = .void_expression,
-                                    .data = @ptrFromInt(try self.factory.createNumericLiteral(@as(i64,0)))
+                                    .data = try self.factory.createNumericLiteral(@as(i64,0)),
                                 });
                                 // XXX: const binding would be difficult here
                                 var s = if (binding_statement) |x| self.nodes.at(x) else @constCast(statement);
@@ -10238,7 +10247,7 @@ pub const Program = struct {
                         const n2 = try self.factory.createNewExpression(ident, inner_ref);
 
                         const n3 = try self.nodes.push(n.*);
-                        self.nodes.at(n3).data = @ptrFromInt(n2);
+                        self.nodes.at(n3).data = n2;
 
                         try self.replacements.put(ref, n3);
                     },
@@ -10858,7 +10867,7 @@ pub const Program = struct {
 
         if (v.helpers.count() > 0) {
             const source = f.ast.nodes.at(start);
-            const first_stmt_ref: NodeRef = @truncate(@intFromPtr(source.data orelse return r));
+            const first_stmt_ref = maybeUnwrapRef(source) orelse return r;
             var first_emit = r.get(first_stmt_ref) orelse first_stmt_ref;
             while (r.get(first_emit)) |next| first_emit = next;
 
@@ -10868,7 +10877,7 @@ pub const Program = struct {
                 fn run(bump: *BumpAllocator(AstNode), code: []const u8, head: *NodeRef, tail: *NodeRef) !void {
                     const vnode = try bump.push(.{
                         .kind = .verbatim_node,
-                        .data = @ptrCast(code.ptr),
+                        .data = @intFromPtr(code.ptr),
                         .len = @intCast(code.len),
                         .extra_data = 1,
                     });
@@ -10961,7 +10970,7 @@ pub const Program = struct {
 
                 if (external_sym.hasFlag(.late_bound)) {
                     if (comptime is_debug) {
-                        std.debug.print(" skipped converting late bound symbol: ", .{});
+                        debugPrint(" skipped converting late bound symbol: ", .{});
                         printSymbol(f2, sym_ref);
                     }
                     return true;
@@ -10971,6 +10980,7 @@ pub const Program = struct {
                 const hash = getHashFromNode(ident);
 
                 if (f2.binder.exports.type_symbols.get(hash) != null) {
+                    if (comptime @import("builtin").target.isWasm()) return false;
                     const imported_path = f2.file_name orelse "";
                     const origin = self.file.file_name orelse "";
                     // LEAK
@@ -10993,6 +11003,7 @@ pub const Program = struct {
                     if (try self.searchAmbientModules(f3, external_sym2, ident.extra_data2, external_sym.declaration, abs_ref)) |r| {
                         return r;
                     }
+                    if (comptime @import("builtin").target.isWasm()) return false;
 
                     const imported_path = f3.file_name orelse "";
                     const origin = self.file.file_name orelse "";
@@ -11295,7 +11306,7 @@ pub const Program = struct {
                     const n2 = try printer.synthetic_nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.declare) | n.flags,
-                        .data = @ptrFromInt(l.head),
+                        .data = l.head,
                     });
                     try replacements.put(ref, n2);
                 },
@@ -11348,7 +11359,7 @@ pub const Program = struct {
 
             if (hasSymbolFlag(sym, .imported)) {
                 const ident = getIdentFromSymbol(f.binder, sym_ref) orelse unreachable;
-                // std.debug.print("IMPORT {s} -> {}\n", .{ getSlice(ident, u8), ident.next });
+                // debugPrint("IMPORT {s} -> {}\n", .{ getSlice(ident, u8), ident.next });
                 try nodes_to_keep.put(ident.next, true);
             } else if (sym.declaration != 0) {
                 try nodes_to_keep.put(sym.declaration, true);
@@ -11393,7 +11404,7 @@ pub const Program = struct {
                 if (to_keep.get((@as(u64, f.id) << 32) | ident.extra_data) orelse false) {
                     try l.append(.{
                         .kind = .external_node,
-                        .data = &f.ast,
+                        .data = @intFromPtr(&f.ast),
                         .len = p[1],
                     });
                 } else {
@@ -11407,13 +11418,13 @@ pub const Program = struct {
             const d = getPackedData(decl);
             const right = try printer.synthetic_nodes.push(.{
                 .kind = .external_node,
-                .data = &f.ast,
+                .data = @intFromPtr(&f.ast),
                 .len = d.right,
             });
 
             const imports = try printer.synthetic_nodes.push(.{
                 .kind = .named_imports,
-                .data = @ptrFromInt(l.head),
+                .data = l.head,
             });
 
             const clause = try printer.synthetic_nodes.push(.{
@@ -11454,7 +11465,7 @@ pub const Program = struct {
 
                 try statements.append(.{
                     .kind = .external_node,
-                    .data = &f.ast,
+                    .data = @intFromPtr(&f.ast),
                     .len = p[1],
                 });
             }
@@ -11471,10 +11482,10 @@ pub const Program = struct {
             .triple_slash_directives = printer.triple_slash_directives.items,
         }, .{
             .kind = .source_file,
-            .data = @ptrFromInt(statements.head),
+            .data = statements.head,
         });
 
-        // std.debug.print("  print time: {d:.3}\n", .{std.time.microTimestamp() - start_print_time});
+        // debugPrint("  print time: {d:.3}\n", .{std.time.microTimestamp() - start_print_time});
 
         return s;
     }
@@ -11661,7 +11672,7 @@ pub const ParsedFileData = struct {
         const file_name = this.file_name orelse return error.MissingFileName;
         for (this.diagnostics.items) |d| {
             const loc = parser.getLoc(&this.ast.nodes, this.ast.nodes.at(d.node_ref)) orelse return error.MissingNodeLocation;
-            std.debug.print("{s} at {s}:{}:{}\n", .{ d.message, file_name, loc.line + 1, loc.col + 1 });
+            debugPrint("{s} at {s}:{}:{}\n", .{ d.message, file_name, loc.line + 1, loc.col + 1 });
         }
     }
 
@@ -11689,24 +11700,24 @@ pub const ParsedFileData = struct {
     }
 
     pub fn printDebugInfo(this: *@This()) void {
-        std.debug.print("  {s}: resolved imports: {?} | bound imports: {?}\n", .{
+        debugPrint("  {s}: resolved imports: {?} | bound imports: {?}\n", .{
             this.file_name orelse "<unknown file>",
             this.did_resolve_imports,
             this.did_bind_imports,
         });
-        std.debug.print("    # namespaces: {}\n", .{this.binder.namespaces.items.len});
+        debugPrint("    # namespaces: {}\n", .{this.binder.namespaces.items.len});
         for (this.binder.namespaces.items) |ns| {
             const exports = ns.exports orelse continue;
-            std.debug.print("    --- exported types ---\n", .{});
+            debugPrint("    --- exported types ---\n", .{});
             var iter = exports.type_symbols.iterator();
             while (iter.next()) |entry| {
-                std.debug.print("    {} - ",.{entry.key_ptr.*});
+                debugPrint("    {} - ",.{entry.key_ptr.*});
                 printSymbol(this, entry.value_ptr.*);
             }
-            std.debug.print("    --- exported values ---\n", .{});
+            debugPrint("    --- exported values ---\n", .{});
             iter = exports.symbols.iterator();
             while (iter.next()) |entry| {
-                std.debug.print("    {} - ",.{entry.key_ptr.*});
+                debugPrint("    {} - ",.{entry.key_ptr.*});
                 printSymbol(this, entry.value_ptr.*);
             }
         }
@@ -12175,6 +12186,10 @@ pub const Analyzer = struct {
         inline fn getAllocatedSlice(this: *const @This()) []TypeRef {
             // const ptr: *u64 = @constCast(@alignCast(@ptrCast(&this.buf)));
             // return @as([*]TypeRef, @ptrFromInt(ptr.*))[0..this.count];
+            if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                const ptr: [*]TypeRef = @ptrFromInt(this.buf[1]);
+                return ptr[0..this.count];
+            }
             const ptr: [*]TypeRef = @ptrFromInt((@as(u64, this.buf[0]) << 32) | this.buf[1]);
             return ptr[0..this.count];
         }
@@ -12271,6 +12286,10 @@ pub const Analyzer = struct {
         pub fn getSliceFromType(t: *const Type) []TypeRef {
             if (t.hasFlag(.allocated_list)) {
                 if (t.slot0 == 0) return &.{};
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]TypeRef = @ptrFromInt(t.slot1);
+                    return ptr[0..t.slot0];        
+                }
                 const ptr: [*]TypeRef = @ptrFromInt((@as(u64, t.slot2) << 32) | t.slot1);
 
                 return ptr[0..t.slot0];
@@ -12325,18 +12344,26 @@ pub const Analyzer = struct {
 
             if (this.count <= this.buf.len and !this.isAllocated()) {
                 const slice = try this.allocate(_allocator, this.count);
-                //items_ptr.* = @intFromPtr(slice.ptr);
-                t.slot1 = @truncate(@intFromPtr(slice.ptr));
-                t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    t.slot1 = @intFromPtr(slice.ptr);
+                    t.slot2 = 0;
+                } else {
+                    t.slot1 = @truncate(@intFromPtr(slice.ptr));
+                    t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
+                }
                 t.slot0 = @intCast(slice.len);
                 t.flags |= this.flags;
                 return;
             }
 
             const slice = this.shrinkToFit(_allocator, this.getAllocatedSlice());
-            // items_ptr.* = @intFromPtr(slice.ptr);
-            t.slot1 = @truncate(@intFromPtr(slice.ptr));
-            t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
+            if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                t.slot1 = @intFromPtr(slice.ptr);
+                t.slot2 = 0;
+            } else {
+                t.slot1 = @truncate(@intFromPtr(slice.ptr));
+                t.slot2 = @truncate(@intFromPtr(slice.ptr) >> 32);
+            }
             t.slot0 = @intCast(slice.len);
             t.flags |= this.flags;
         }
@@ -12910,7 +12937,7 @@ pub const Analyzer = struct {
             return this.intersectType(arr.items[0], arr.items[1]);
         }
 
-        std.debug.print("FIXME INTERSECTION TYPES LEN > 2\n", .{});
+        debugPrint("FIXME INTERSECTION TYPES LEN > 2\n", .{});
 
         return createIntersectionType(this, arr.items, flags);
     }
@@ -13381,7 +13408,7 @@ pub const Analyzer = struct {
                 return try this.types.push(copy);
             },
             else => {
-                std.debug.print("{any}\n", .{n.getKind()});
+                debugPrint("{any}\n", .{n.getKind()});
             },
         }
 
@@ -14405,7 +14432,7 @@ pub const Analyzer = struct {
                     }
                     return false;
                 }
-                std.debug.print("{any}\n", .{n.getKind()});
+                debugPrint("{any}\n", .{n.getKind()});
                 return error.TODO4;
             },
             .predicate => {
@@ -14440,7 +14467,7 @@ pub const Analyzer = struct {
             //     }
             // },
             else => {
-                std.debug.print("{any}\n", .{n.getKind()});
+                debugPrint("{any}\n", .{n.getKind()});
                 return error.TODO3;
             },
         }
@@ -14808,7 +14835,10 @@ pub const Analyzer = struct {
                 if (this.available == 0) {
                     return this.buf[0..this.count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[1]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
                 return ptr[0..this.buf[2]];
             }
@@ -14817,7 +14847,10 @@ pub const Analyzer = struct {
                 if (this.available == 0) {
                     return this.buf[3..3+this.count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[4]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
                 return ptr[0..this.buf[2]];
             }
@@ -14826,7 +14859,10 @@ pub const Analyzer = struct {
                 if (this.available == 0) {
                     return this.buf[0..this.count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[1]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
                 return ptr[0..this.buf[2]];
             }
@@ -14835,7 +14871,10 @@ pub const Analyzer = struct {
                 if (this.available == 0) {
                     return this.buf[3..3+this.count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[4]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[3]) << 32) | this.buf[4]);
                 return ptr[0..this.buf[2]];
             }
@@ -14932,14 +14971,24 @@ pub const Analyzer = struct {
                 }
 
                 {
-                    this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
-                    this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                    if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                        this.buf[0] = 0;
+                        this.buf[1] = @intFromPtr(k.ptr);
+                    } else {
+                        this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
+                        this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                    }
                     this.buf[2] = @intCast(k.len);
                 }
 
                 {
-                    this.buf[3] = @truncate(@intFromPtr(v.ptr) >> 32);
-                    this.buf[4] = @truncate(@intFromPtr(v.ptr));
+                    if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                        this.buf[3] = 0;
+                        this.buf[4] = @intFromPtr(v.ptr);
+                    } else {
+                        this.buf[3] = @truncate(@intFromPtr(v.ptr) >> 32);
+                        this.buf[4] = @truncate(@intFromPtr(v.ptr));
+                    }
                 }
 
                 if (amount <= 8) {
@@ -15151,7 +15200,10 @@ pub const Analyzer = struct {
                 if (!this.isAllocated()) {
                     return this.buf[0..this._count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[1]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
                 return ptr[0..this.buf[2]];
             }
@@ -15160,7 +15212,10 @@ pub const Analyzer = struct {
                 if (!this.isAllocated()) {
                     return this.buf[0..this._count];
                 }
-
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    const ptr: [*]u32 = @ptrFromInt(this.buf[1]);
+                    return ptr[0..this.buf[2]];
+                }
                 const ptr: [*]u32 = @ptrFromInt((@as(usize, this.buf[0]) << 32) | this.buf[1]);
                 return ptr[0..this.buf[2]];
             }
@@ -15237,9 +15292,13 @@ pub const Analyzer = struct {
                     const ind = this.findEmptyIndex(k2, k);
                     k[ind] = k2;
                 }
-
-                this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
-                this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    this.buf[0] = 0;
+                    this.buf[1] = @intFromPtr(k.ptr);
+                } else {
+                    this.buf[0] = @truncate(@intFromPtr(k.ptr) >> 32);
+                    this.buf[1] = @truncate(@intFromPtr(k.ptr));
+                }
                 this.buf[2] = @intCast(k.len);
                 this.buf[3] = @truncate((amount * 80) / 100);
                 this._count |= 1 << 31;
@@ -15583,17 +15642,17 @@ pub const Analyzer = struct {
 
             fn _indent(indent: u32) void {
                 for (0..indent+1) |_| {
-                    std.debug.print(" ", .{});
+                    debugPrint(" ", .{});
                 }
             }
 
             fn _printSymbols(self: *@This(), typer: *const FlowTyper, indent: u32) void {
                 if (self.terminal) {
                     _indent(indent);
-                    std.debug.print("[terminal] {} antecedents\n", .{self.antecedents.items.len});
+                    debugPrint("[terminal] {} antecedents\n", .{self.antecedents.items.len});
                 } else {
                     _indent(indent);
-                    std.debug.print("[continuation] {} antecedents\n", .{self.antecedents.items.len});
+                    debugPrint("[continuation] {} antecedents\n", .{self.antecedents.items.len});
                 }
 
                 var l_iter = self.types.iterator();
@@ -15601,7 +15660,7 @@ pub const Analyzer = struct {
                     _indent(indent);
                     printSymbol(typer.file, entry.key_ptr.*);
                     _indent(indent);
-                    std.debug.print("  --> ", .{});
+                    debugPrint("  --> ", .{});
                     //typer.analyzer.printTypeInfo(entry.value_ptr.*);
                     typer.analyzer._debug(entry.value_ptr.*);
                 }
@@ -16582,7 +16641,7 @@ pub const Analyzer = struct {
             }
 
             const target = self.file.binder.getSymbol(walk_ref) orelse {
-                std.debug.print("{?}\n",.{self.file.ast.nodes.at(walk_ref).kind});
+                debugPrint("{?}\n",.{self.file.ast.nodes.at(walk_ref).kind});
                 return error.MissingSymbol;
             };
 
@@ -17273,7 +17332,7 @@ pub const Analyzer = struct {
                 }
             }
 
-            std.debug.print("TODO (intersectType): ", .{});
+            debugPrint("TODO (intersectType): ", .{});
             this.printTypeInfo(lhs);
             this.printTypeInfo(rhs);
             return lhs; // TODO
@@ -18340,7 +18399,7 @@ pub const Analyzer = struct {
                 return this.createParameterizedType(type_params, inner);
             },
             else => {
-                std.debug.print("{any}\n", .{n.kind});
+                debugPrint("{any}\n", .{n.kind});
                 return error.NotFunctionLike;
             },
         }
@@ -18705,8 +18764,13 @@ pub const Analyzer = struct {
 
             if (this.set) |s| {
                 s.shrinkAndFree(s.count());
-                analyzer.types.at(ref).slot5 = @truncate(@intFromPtr(s) >> 32);
-                analyzer.types.at(ref).slot6 = @truncate(@intFromPtr(s));
+                if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+                    analyzer.types.at(ref).slot5 = 0;
+                    analyzer.types.at(ref).slot6 = @intFromPtr(s);
+                } else {
+                    analyzer.types.at(ref).slot5 = @truncate(@intFromPtr(s) >> 32);
+                    analyzer.types.at(ref).slot6 = @truncate(@intFromPtr(s));
+                }
             }
 
             try analyzer.interned_types.put(key, ref);
@@ -18718,8 +18782,12 @@ pub const Analyzer = struct {
 
     inline fn maybeGetUnionSet(t: *const Type) ?*const TypeSet {
         std.debug.assert(t.getKind() == .@"union");
+        if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+            if (t.slot6 == 0) return null;
+            return @ptrFromInt(t.slot6);
+        }
 
-        if (t.slot5 == 0) {
+        if (t.slot5 == 0 and t.slot6 == 0) {
             return null;
         }
 
@@ -19007,7 +19075,7 @@ pub const Analyzer = struct {
             .undefined_keyword => @intFromEnum(Kind.undefined),
             .symbol_keyword => @intFromEnum(Kind.symbol),
             .type_literal => {
-                if (n.data == null) return @intFromEnum(Kind.empty_object);
+                if (n.data == 0) return @intFromEnum(Kind.empty_object);
                 return null;
             },
             // .literal_type => {
@@ -19332,7 +19400,7 @@ pub const Analyzer = struct {
                 },
                 else => {
                     if (comptime is_debug) {
-                        std.debug.print("MISSING OBJ IMPL {any}\n", .{p[0].kind});
+                        debugPrint("MISSING OBJ IMPL {any}\n", .{p[0].kind});
                     }
                 },
             }
@@ -20860,7 +20928,7 @@ pub const Analyzer = struct {
             if (this.analysis_err_type != 0) return this.analysis_err_type;
             if (this.class_type != 0) {
                 // TODO
-                std.debug.print("TODO: class_type", .{});
+                debugPrint("TODO: class_type", .{});
                 return this.class_type;
             }
 
@@ -21478,7 +21546,7 @@ pub const Analyzer = struct {
                 if (file.binder.getSymbol(ref)) |sym_ref| {
                     if (comptime is_debug) {
                         if (sym_ref == 0) {
-                            std.debug.print("found unbound identifier\n",.{});
+                            debugPrint("found unbound identifier\n",.{});
                             printNameWithLocation(file, ref) catch unreachable;
                             unreachable;
                         }
@@ -21533,7 +21601,7 @@ pub const Analyzer = struct {
 
                 const rhs = try this.getType(file, d.right);
                 if (lhs == 0 or rhs == 0) {
-                    std.debug.print("{}, {}\n", .{ lhs, rhs });
+                    debugPrint("{}, {}\n", .{ lhs, rhs });
                     return error.TODO;
                 }
 
@@ -22199,7 +22267,7 @@ pub const Analyzer = struct {
 
         const n = this.types.at(ref);
         if (n.getKind() != .function_literal) {
-            std.debug.print("{any}\n", .{n.kind});
+            debugPrint("{any}\n", .{n.kind});
             return error.NotAFunction;
         }
 
@@ -22328,7 +22396,7 @@ pub const Analyzer = struct {
                 .alias => {
                     const r = try this.maybeResolveAlias(element);
                     if (r == element) {
-                        std.debug.print("TODO_failed_resolve_alias\n", .{});
+                        debugPrint("TODO_failed_resolve_alias\n", .{});
                         this.printTypeInfo(r);
                         // return error.TODO_failed_resolve_alias;
                         return @intFromEnum(Kind.any);
@@ -22404,12 +22472,12 @@ pub const Analyzer = struct {
         if (s.getKind() == .alias) {
             const r = try this.maybeResolveAlias(subject);
             if (r == subject) {
-                std.debug.print("subject: ", .{});
+                debugPrint("subject: ", .{});
                 this.printTypeInfo(r);
-                std.debug.print("element: ", .{});
+                debugPrint("element: ", .{});
                 this.printTypeInfo(element);
                 if (this.contextual_type) |ct| {
-                    std.debug.print("contextual type: ", .{});
+                    debugPrint("contextual type: ", .{});
                     this.printTypeInfo(ct);
                 }
                 this.printCurrentNode();
@@ -22699,7 +22767,7 @@ pub const Analyzer = struct {
             else => {},
         }
 
-        std.debug.print("{any}\n", .{t.getKind()});
+        debugPrint("{any}\n", .{t.getKind()});
         return error.TODO_get_instance_type;
     }
 
@@ -22932,7 +23000,7 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.number);
             },
             else => {
-                std.debug.print("missing op implementation: {any}\n", .{op});
+                debugPrint("missing op implementation: {any}\n", .{op});
                 this.printCurrentNode();
                 return error.TODO;
             }
@@ -23371,7 +23439,7 @@ pub const Analyzer = struct {
                                 }
                             },
                             else => {
-                                std.debug.print("unhandled spread type\n", .{});
+                                debugPrint("unhandled spread type\n", .{});
                                 this._debug(t);
                                 return notSupported(n.getKind()); // TODO
                             },
@@ -23756,7 +23824,7 @@ pub const Analyzer = struct {
         }
 
         this.printCurrentNode();
-        std.debug.print("MISSING INFER TYPE {?}\n",.{exp.kind});
+        debugPrint("MISSING INFER TYPE {?}\n",.{exp.kind});
         return error.FailedToInfer;
     }
 
@@ -23907,13 +23975,13 @@ pub const Analyzer = struct {
     }
 
     fn notSupported(n: anytype) !u32 {
-        std.debug.print("  not supported: {any}\n\n", .{n});
+        debugPrint("  not supported: {any}\n\n", .{n});
         return error.Unsupported;
     }
 
     fn fail(this: *const @This(), n: anytype, err: anyerror) !void {
         this.printCurrentNode();
-        std.debug.print("  not supported: {any}\n\n", .{n});
+        debugPrint("  not supported: {any}\n\n", .{n});
         return err;
     }
 
@@ -23927,6 +23995,10 @@ pub const Analyzer = struct {
         }
 
         if (t.slot2 == 0) return &.{};
+        if (comptime @sizeOf(usize) == @sizeOf(u32)) {
+            const ptr: [*]T = @ptrFromInt(t.slot0);
+            return ptr[0..t.slot2];      
+        }
 
         const ptr: [*]T = @ptrFromInt((@as(u64, t.slot1) << 32) | t.slot0);
 
@@ -24190,13 +24262,13 @@ pub const Analyzer = struct {
             if (ty >= @intFromEnum(Kind.zero)) {
                 const d: u30 = @intCast(ty - @intFromEnum(Kind.zero));
                 const v: i30 = @bitCast(d);
-                return std.debug.print("[number] {}\n", .{v});
+                return debugPrint("[number] {}\n", .{v});
             }
             if (isTypeParamRef(ty)) {
                 const register: u32 = ty & (~@intFromEnum(Kind.type_parameter_ref));
-                return std.debug.print("[type param ref] {}\n", .{register});
+                return debugPrint("[type param ref] {}\n", .{register});
             }
-            std.debug.print("[primitive] {any}\n", .{@as(Kind, @enumFromInt(ty))});
+            debugPrint("[primitive] {any}\n", .{@as(Kind, @enumFromInt(ty))});
             return;
         }
 
@@ -24204,60 +24276,60 @@ pub const Analyzer = struct {
         if (t.getKind() == .type_parameter) {
             const ident = getIdentFromSymbol(this.program.files.items[t.slot4].binder, t.slot0) orelse unreachable;
             const name = getSlice(ident, u8);
-            return std.debug.print("[type param] {s} @ reg{}\n", .{ name, t.slot3 });
+            return debugPrint("[type param] {s} @ reg{}\n", .{ name, t.slot3 });
         } else if (t.getKind() == .alias) {
             const ident = this.getIdentFromAlias(t) orelse unreachable;
             const name = getSlice(ident, u8);
             if (t.hasFlag(.global)) {
-                std.debug.print("[global] ", .{});
+                debugPrint("[global] ", .{});
             }
             if (t.hasFlag(.parameterized)) {
-                std.debug.print("[parameterized] ", .{});
+                debugPrint("[parameterized] ", .{});
             }
             const len = getTypeListSize(t);
-            std.debug.print("[alias] {s}<len:{}> ", .{name, len});
+            debugPrint("[alias] {s}<len:{}> ", .{name, len});
             if (t.hasFlag(.instance_alias)) {
-                return std.debug.print("[instance] ", .{});
+                return debugPrint("[instance] ", .{});
             } else if (t.hasFlag(.class_alias)) {
-                return std.debug.print("[class] ", .{});
+                return debugPrint("[class] ", .{});
             }
-            return std.debug.print("\n", .{});
+            return debugPrint("\n", .{});
         }
         if (t.hasFlag(.parameterized)) {
-            return std.debug.print("[ref] {any} [parameterized]\n", .{t.getKind()});
+            return debugPrint("[ref] {any} [parameterized]\n", .{t.getKind()});
         }
-        std.debug.print("[ref] {any}\n", .{t.getKind()});
+        debugPrint("[ref] {any}\n", .{t.getKind()});
         if (t.getKind() == .function_literal) {
-            std.debug.print("  -> ", .{});
+            debugPrint("  -> ", .{});
             this.printTypeInfo(t.slot3);
         }
         if (t.getKind() == .object_literal) {
-            std.debug.print("    ",.{});
+            debugPrint("    ",.{});
             @constCast(this)._debug(ty);
         }
         if (t.getKind() == .string_literal) {
-            std.debug.print("  '{s}'\n", .{this.getSliceFromLiteral(ty)});
+            debugPrint("  '{s}'\n", .{this.getSliceFromLiteral(ty)});
         }
         if (t.getKind() == .tuple_element) {
-            std.debug.print("  : ", .{});
+            debugPrint("  : ", .{});
             this.printTypeInfo(t.slot1);
         }
         if (t.getKind() == .tuple) {
             const elements = getSlice2(t, TypeRef);
             for (elements) |el| {
-                std.debug.print("  ", .{});
+                debugPrint("  ", .{});
                 this.printTypeInfo(el);
             }
         }
         if (t.getKind() == .@"union") {
             const elements = getSlice2(t, TypeRef);
             if (elements.len > 10) {
-                std.debug.print("  element count: {}", .{elements.len});
+                debugPrint("  element count: {}", .{elements.len});
                 return;
             }
 
             for (elements) |el| {
-                std.debug.print("  ", .{});
+                debugPrint("  ", .{});
                 this.printTypeInfo(el);
             }
         }
@@ -24281,7 +24353,7 @@ pub const Analyzer = struct {
 
     pub fn _debug(this: *@This(), ty: u32) void {
         const s = this.printType(ty) catch unreachable;
-        std.debug.print("{s}\n", .{s});
+        debugPrint("{s}\n", .{s});
     }
 
     const TypePrinter = struct {
@@ -24363,7 +24435,7 @@ pub const Analyzer = struct {
         fn parenthesizeType(this: *@This(), ref: NodeRef) !NodeRef {
             return this.synthetic_nodes.push(.{
                 .kind = .parenthesized_type,
-                .data = @ptrFromInt(ref),
+                .data = ref,
             });
         }
 
@@ -24389,7 +24461,7 @@ pub const Analyzer = struct {
             };
         }
 
-        fn copyNodePair(this: *@This(), n: *const AstNode, file_id: u32) !?*anyopaque {
+        fn copyNodePair(this: *@This(), n: *const AstNode, file_id: u32) !u64 {
             const d = getPackedData(n);
             const l = try this.copyNodeFromRef(d.left, file_id);
             const r = try this.copyNodeFromRef(d.right, file_id);
@@ -24420,7 +24492,7 @@ pub const Analyzer = struct {
                 .binding_element => this.synthetic_nodes.push(.{
                     .kind = n.kind,
                     .flags = n.flags,
-                    .data = @ptrFromInt(try this.copyNodeFromRef(unwrapRef(n), file_id)),
+                    .data = try this.copyNodeFromRef(unwrapRef(n), file_id),
                 }),
                 .array_binding_pattern => {
                     var head: NodeRef = 0;
@@ -24439,11 +24511,11 @@ pub const Analyzer = struct {
                     return this.synthetic_nodes.push(.{
                         .kind = n.kind,
                         .flags = n.flags,
-                        .data = if (head != 0) @ptrFromInt(head) else null,
+                        .data = head,
                     });
                 },
                 else => {
-                    std.debug.print("TODO {any}\n", .{n.kind});
+                    debugPrint("TODO {any}\n", .{n.kind});
                     return error.TODO;
                 },
             };
@@ -24468,7 +24540,6 @@ pub const Analyzer = struct {
         fn convertTemplatePart(this: *@This(), ref: TypeRef, kind: SyntaxKind) !NodeRef {
             if (ref == @intFromEnum(Kind.empty_string)) return this.synthetic_nodes.push(.{
                 .kind = kind,
-                .data = null,
                 .len = 0,
             });
 
@@ -24478,7 +24549,7 @@ pub const Analyzer = struct {
 
                 return this.synthetic_nodes.push(.{
                     .kind = kind,
-                    .data = slice.ptr,
+                    .data = @intFromPtr(slice.ptr),
                     .len = @intCast(slice.len),
                 });
             }
@@ -24557,16 +24628,16 @@ pub const Analyzer = struct {
                         @memcpy(x, missing);
                         return try this.synthetic_nodes.push(.{
                             .kind = .identifier,
-                            .data = x.ptr,
+                            .data = @intFromPtr(x.ptr),
                             .len = @intCast(x.len),
                         });
                     }
 
-                    std.debug.print("  {}\n", .{ty - @intFromEnum(Kind.type_parameter_ref)});
+                    debugPrint("  {}\n", .{ty - @intFromEnum(Kind.type_parameter_ref)});
                     for (0..num_type_registers) |i| {
                         const ref = this.analyzer.type_registers[i];
                         if (ref == 0) continue;
-                        std.debug.print("  {}: {}\n", .{ i, ref });
+                        debugPrint("  {}: {}\n", .{ i, ref });
                     }
 
                     return error.MissingTypeParam;
@@ -24582,7 +24653,7 @@ pub const Analyzer = struct {
 
                 return this.synthetic_nodes.push(.{
                     .kind = .numeric_literal,
-                    .data = if (val == 0) null else @ptrFromInt(@as(u64, @bitCast(val))),
+                    .data = @as(u64, @bitCast(val)),
                 });
             } else if (ty < @intFromEnum(Kind.false)) {
                 const k = this.analyzer.types.at(ty);
@@ -24604,7 +24675,7 @@ pub const Analyzer = struct {
                             if (m.get(key)) |spec| {
                                 const spec_ref = try this.synthetic_nodes.push(.{
                                     .kind = .string_literal,
-                                    .data = spec.ptr,
+                                    .data = @intFromPtr(spec.ptr),
                                     .len = @intCast(spec.len),
                                     .flags = @intFromEnum(StringFlags.double_quote),
                                 });
@@ -24621,7 +24692,7 @@ pub const Analyzer = struct {
                         if (k.hasFlag(.class_alias)) {
                             return this.synthetic_nodes.push(.{
                                 .kind = .type_query,
-                                .data = @ptrFromInt(copy),
+                                .data = copy,
                                 .len = l.head,
                             });
                         }
@@ -24642,7 +24713,7 @@ pub const Analyzer = struct {
 
                         return this.synthetic_nodes.push(.{
                             .kind = .type_query,
-                            .data = @ptrFromInt(copy),
+                            .data = copy,
                             .len = l.head,
                         });
                     },
@@ -24655,7 +24726,7 @@ pub const Analyzer = struct {
 
                             const ref = try this.synthetic_nodes.push(.{
                                 .kind = .string_literal,
-                                .data = slice.ptr,
+                                .data = @intFromPtr(slice.ptr),
                                 .len = @intCast(slice.len),
                                 .flags = @intFromEnum(StringFlags.single_quote),
                             });
@@ -24705,7 +24776,7 @@ pub const Analyzer = struct {
                         const f: u64 = @bitCast((@as(u64, k.slot0) << 32) | k.slot1);
                         return this.synthetic_nodes.push(.{
                             .kind = .numeric_literal,
-                            .data = @ptrFromInt(f),
+                            .data = f,
                         });
                     },
                     .array => {
@@ -24715,7 +24786,7 @@ pub const Analyzer = struct {
                             .union_type, .function_type, .type_operator, .infer_type => {
                                 return this.synthetic_nodes.push(.{
                                     .kind = .array_type,
-                                    .data = @ptrFromInt(try this.parenthesizeType(ref)),
+                                    .data = try this.parenthesizeType(ref),
                                 });
                             },
                             else => {},
@@ -24723,7 +24794,7 @@ pub const Analyzer = struct {
 
                         return this.synthetic_nodes.push(.{
                             .kind = .array_type,
-                            .data = @ptrFromInt(ref),
+                            .data = ref,
                         });
                     },
                     .tuple => {
@@ -24736,7 +24807,7 @@ pub const Analyzer = struct {
 
                         const ref = try this.synthetic_nodes.push(.{
                             .kind = .tuple_type,
-                            .data = if (l.head != 0) @ptrFromInt(l.head) else null,
+                            .data = l.head,
                         });
 
                         if (!hasTypeFlag(k, .readonly)) return ref;
@@ -24767,7 +24838,7 @@ pub const Analyzer = struct {
                         }
                         return this.synthetic_nodes.push(.{
                             .kind = .template_literal_type,
-                            .data = @ptrFromInt(l.head),
+                            .data = l.head,
                         });
                     },
                     .indexed => {
@@ -24793,7 +24864,7 @@ pub const Analyzer = struct {
                                         const file = printer.analyzer.program.getFileData(el.slot0);
                                         try list.append(.{
                                             .kind = .external_node,
-                                            .data = &file.ast,
+                                            .data = @intFromPtr(&file.ast),
                                             .len = el.type,
                                         });
                                         continue;
@@ -24851,7 +24922,7 @@ pub const Analyzer = struct {
 
                         return this.synthetic_nodes.push(.{
                             .kind = .class_declaration,
-                            .data = if (l.head == 0) null else toBinaryDataPtrRefs(0, l.head),
+                            .data = toBinaryDataPtrRefs(0, l.head),
                             .len = extends,
                         });
                     },
@@ -24921,14 +24992,14 @@ pub const Analyzer = struct {
                             if (hasTypeFlag(k, .spread)) {
                                 return this.synthetic_nodes.push(.{
                                     .kind = .rest_type,
-                                    .data = @ptrFromInt(inner),
+                                    .data = inner,
                                 });
                             }
 
                             if (hasTypeFlag(k, .optional)) {
                                 return this.synthetic_nodes.push(.{
                                     .kind = .optional_type,
-                                    .data = @ptrFromInt(inner),
+                                    .data = inner,
                                 });
                             }
 
@@ -24953,7 +25024,7 @@ pub const Analyzer = struct {
                         this.analyzer.contextual_this_type = @intFromEnum(Kind.this);
 
                         // this.analyzer.printTypeInfo(ty);
-                        // std.debug.print("{}, {s} -> {} [flags: {}]\n", .{
+                        // debugPrint("{}, {s} -> {} [flags: {}]\n", .{
                         //     ty,
                         //     if (getSlice2(k, ObjectLiteralMember)[0].isLazy()) "y" else "n",
                         //     try this.analyzer.hashObjectLiteral(k.flags, getSlice2(k, ObjectLiteralMember)),
@@ -24990,7 +25061,7 @@ pub const Analyzer = struct {
                             }
 
                             const copy = try this.toIdentLike(el.name);
-                            // std.debug.print("{s}\n", .{getSlice(this.synthetic_nodes.at(copy), u8)});
+                            // debugPrint("{s}\n", .{getSlice(this.synthetic_nodes.at(copy), u8)});
 
                             if (el.kind == .method) {
                                 const d = getPackedData(this.synthetic_nodes.at(t));
@@ -25024,7 +25095,7 @@ pub const Analyzer = struct {
 
                         return this.synthetic_nodes.push(.{
                             .kind = .type_literal,
-                            .data = @ptrFromInt(l.head),
+                            .data = l.head,
                         });
                     },
                     .conditional => {
@@ -25138,11 +25209,11 @@ pub const Analyzer = struct {
 
                         return this.synthetic_nodes.push(.{
                             .kind = .infer_type,
-                            .data = @ptrFromInt(inner),
+                            .data = inner,
                         });
                     },
                     else => {
-                        std.debug.print("{any} ", .{k.getKind()});
+                        debugPrint("{any} ", .{k.getKind()});
                     },
                 }
             } else {
@@ -25150,21 +25221,18 @@ pub const Analyzer = struct {
                 if (ty == @intFromEnum(Kind.empty_tuple)) {
                     return this.synthetic_nodes.push(.{
                         .kind = .tuple_type,
-                        .data = null,
                     });
                 }
 
                 if (ty == @intFromEnum(Kind.empty_object)) {
                     return this.synthetic_nodes.push(.{
                         .kind = .type_literal,
-                        .data = null,
                     });
                 }
 
                 if (ty == @intFromEnum(Kind.empty_string)) {
                     return this.synthetic_nodes.push(.{
                         .kind = .string_literal,
-                        .data = null,
                         .len = 0,
                         .flags = @intFromEnum(StringFlags.single_quote),
                     });
@@ -25188,7 +25256,7 @@ pub const Analyzer = struct {
                     .error_any => .any_keyword,
                     .null => .null_keyword,
                     else => {
-                        std.debug.print("{}\n", .{ty});
+                        debugPrint("{}\n", .{ty});
                         return error.TODO;
                     },
                 };
@@ -25198,7 +25266,7 @@ pub const Analyzer = struct {
                 });
             }
 
-            std.debug.print("{}\n", .{ty});
+            debugPrint("{}\n", .{ty});
 
             return error.TODO2;
         }

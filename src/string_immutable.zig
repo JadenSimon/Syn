@@ -881,7 +881,7 @@ pub const BOM = enum {
                 return toUTF8Alloc(allocator, trimmed_bytes_u16);
             },
             else => {
-                std.debug.print("unhandled BOM encoding: {any}\n", .{bom});
+                if (!comptime @import("builtin").target.isWasm()) std.debug.print("unhandled BOM encoding: {any}\n", .{bom});
                 return error.TODO_BOM;
             },
         }
@@ -3095,9 +3095,28 @@ pub fn withoutPrefixIfPossibleComptime(input: string, comptime prefix: string) ?
 const Allocator = std.heap.GeneralPurposeAllocator(.{});
 var gpa = Allocator{};
 
+const _allocator = if (@import("builtin").target.isWasm()) _toAllocator(&std.heap.WasmPageAllocator{}) else std.heap.c_allocator;
+fn _toAllocator(a: *const std.heap.WasmPageAllocator) std.mem.Allocator {
+    return std.mem.Allocator{
+        .ptr = @constCast(a),
+        .vtable = &std.heap.WasmPageAllocator.vtable,
+    };
+}
+
+const WasmArena = if (@import("builtin").target.isWasm()) std.heap.ArenaAllocator else void;
+var wasm_arena: WasmArena = if (@import("builtin").target.isWasm()) std.heap.ArenaAllocator.init(_allocator) else {};
+
+pub fn resetWasmArena() void {
+    wasm_arena.deinit();
+    wasm_arena = std.heap.ArenaAllocator.init(_allocator);
+}
+
 pub inline fn getAllocator() std.mem.Allocator {
     if (comptime @import("builtin").os.tag == .linux) {
         return gpa.allocator();
+    }
+    if (comptime @import("builtin").target.isWasm()) {
+        return wasm_arena.allocator();
     }
     return std.heap.c_allocator;
 }

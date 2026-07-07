@@ -118,7 +118,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const exports_ident = try data.nodes.push(.{
         .kind = .identifier,
-        .data = x2.ptr,
+        .data = @intFromPtr(x2.ptr),
         .len = @intCast(x2.len),
     });
 
@@ -126,7 +126,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const esmodule_ident = try data.nodes.push(.{
         .kind = .identifier,
-        .data = x4.ptr,
+        .data = @intFromPtr(x4.ptr),
         .len = @intCast(x4.len),
     });
 
@@ -173,13 +173,13 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         const exports_name2 = try std.fmt.allocPrint(std.heap.c_allocator, "__exports_{d}", .{_id});
                         const exports2_ident = try data.nodes.push(.{
                             .kind = .identifier,
-                            .data = exports_name2.ptr,
+                            .data = @intFromPtr(exports_name2.ptr),
                             .len = @intCast(exports_name2.len),
                         });
 
                         const clause = try data.nodes.push(.{
                             .kind = .namespace_import,
-                            .data = @ptrFromInt(exports2_ident),
+                            .data = exports2_ident,
                         });
 
                         try statements.append(.{
@@ -197,7 +197,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
                 const r = try data.nodes.push(.{
                     .kind = .identifier,
-                    .data = exports_name.ptr,
+                    .data = @intFromPtr(exports_name.ptr),
                     .len = @intCast(exports_name.len),
                 });
 
@@ -227,7 +227,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = next,
                     });
                     try replacements.put(pair[1], variable_statement);
@@ -248,7 +248,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = next,
                     });
                     if (default_import) |n| {
@@ -277,7 +277,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
                     const pattern = try data.nodes.push(.{
                         .kind = .object_binding_pattern,
-                        .data = @ptrFromInt(synthed.head),
+                        .data = synthed.head,
                     });
 
                     const decl = try data.nodes.push(.{
@@ -287,7 +287,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = next,
                     });
                     if (default_import) |n| {
@@ -314,7 +314,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                     try statements.append(.{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                 } else if (pair[0].kind == .class_declaration) {
                     const copy = try data.nodes.push(data.nodes.at(getPackedData(pair[0]).left).*);
@@ -324,7 +324,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                     const exp_statement = try data.nodes.push(.{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                         .next = pair[0].next,
                     });
 
@@ -346,7 +346,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                         const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                         const exp_statement = try data.nodes.push(.{
                             .kind = .expression_statement,
-                            .data = @ptrFromInt(exp),
+                            .data = exp,
                             .next = pair[0].next,
                         });
 
@@ -361,7 +361,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
                     const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                     try statements.append(.{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                 }
             },
@@ -374,7 +374,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
         });
         var right: NodeRef = try data.nodes.push(.{
             .kind = .void_expression,
-            .data = @ptrFromInt(zero),
+            .data = zero,
         });
 
         for (late_exports.items) |n| {
@@ -384,7 +384,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
         try statements.append(.{
             .kind = .expression_statement,
-            .data = @ptrFromInt(right),
+            .data = right,
         });
     }
 
@@ -396,7 +396,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const block = try data.nodes.push(.{
         .kind = .block,
-        .data = if (statements.head == 0) null else @ptrFromInt(statements.head),
+        .data = statements.head,
     });
 
     const arrow_fn = try data.nodes.push(.{
@@ -406,7 +406,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const arrow_fn2 = try data.nodes.push(.{
         .kind = .parenthesized_expression,
-        .data = @ptrFromInt(arrow_fn),
+        .data = arrow_fn,
     });
 
     const call_exp = try data.nodes.push(.{
@@ -416,7 +416,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const call_exp_statement = try data.nodes.push(.{
         .kind = .expression_statement,
-        .data = @ptrFromInt(call_exp),
+        .data = call_exp,
     });
 
     var printer = js_parser.Printer(js_parser.Writer, .{ .print_source_map = true, .use_replacements = true }).init(data, &b.writer);
@@ -425,7 +425,7 @@ fn printWrappedModule(b: *Bundler, f: *js_program.ParsedFileData) !void {
 
     const sf = AstNode{
         .kind = .source_file,
-        .data = @ptrFromInt(call_exp_statement),
+        .data = call_exp_statement,
     };
 
     try printer.visit(&sf);

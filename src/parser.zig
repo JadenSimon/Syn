@@ -559,7 +559,7 @@ pub const AstNode = packed struct {
     kind: SyntaxKind,
     flags: u22 = 0,
     next: NodeRef = 0,
-    data: ?*const anyopaque = null, // TODO: make this u64
+    data: u64 = 0,
     len: u32 = 0,
     extra_data: u32 = 0,
     extra_data2: u32 = 0,
@@ -572,13 +572,17 @@ pub const AstNode = packed struct {
     pub inline fn hasStringFlag(this: *const AstNode, flag: StringFlags) bool {
         return (this.flags & @intFromEnum(flag)) == @intFromEnum(flag);
     }
+
+    pub inline fn getDataPtr(this: *const AstNode) ?*const anyopaque {
+        return if (this.data != 0) @ptrFromInt(@as(usize, @truncate(this.data))) else null;
+    }
 };
 
 const AstNodeWithTrivia = packed struct {
     kind: SyntaxKind,
     flags: u22 = 0,
     next: NodeRef = 0,
-    data: ?*const anyopaque = null, // TODO: make this u64
+    data: u64 = 0,
     len: u32 = 0,
     extra_data: u32 = 0,
     extra_data2: u32 = 0,
@@ -674,12 +678,6 @@ const BinaryExpData = packed struct {
 comptime {
     if (@sizeOf(BinaryExpData) > 8) {
         @compileError("BinaryExpData must fit in 8 bytes");
-    }
-}
-
-comptime {
-    if (@sizeOf(usize) != 8) {
-        @compileError("32-bit systems are not supported");
     }
 }
 
@@ -922,7 +920,7 @@ pub fn BumpAllocatorList(comptime T: type) type {
                         // weird but technically harmless
                         if (this.allocator.at(this.prev).next == ref) break;
                         if (comptime T == AstNode) {
-                            std.debug.print("{?}\n",.{this.allocator.at(x).kind});
+                            debugPrint("{?}\n",.{this.allocator.at(x).kind});
                         }
                         @panic("Recursive appendRef");
                     }
@@ -961,19 +959,18 @@ const ParserContextState = enum {
     jsx_children,
 };
 
-pub inline fn toBinaryDataPtrRefs(left: NodeRef, right: NodeRef) *anyopaque {
-    return @ptrFromInt((@as(u64, right) << 32) | left);
+pub inline fn toBinaryDataPtrRefs(left: NodeRef, right: NodeRef) u64 {
+    return (@as(u64, right) << 32) | left;
 }
 
-pub inline fn toBinaryDataPtrRefsMaybeNull(left: NodeRef, right: NodeRef) ?*anyopaque {
-    if (left == 0 and right == 0) return null;
-    return @ptrFromInt((@as(u64, right) << 32) | left);
+pub inline fn toBinaryDataPtrRefsMaybeNull(left: NodeRef, right: NodeRef) u64 {
+    return (@as(u64, right) << 32) | left;
 }
 
 inline fn toIdentNode(ident: []const u8) AstNode {
     return .{
         .kind = .identifier,
-        .data = ident.ptr,
+        .data = @intFromPtr(ident.ptr),
         .len = @intCast(ident.len),
         .extra_data2 = @truncate(std.hash.Wyhash.hash(0, ident)),
     };
@@ -982,7 +979,7 @@ inline fn toIdentNode(ident: []const u8) AstNode {
 inline fn toIdentNode2(ident: []const u8) AstNodeWithTrivia {
     return .{
         .kind = .identifier,
-        .data = ident.ptr,
+        .data = @intFromPtr(ident.ptr),
         .len = @intCast(ident.len),
         .extra_data2 = @truncate(std.hash.Wyhash.hash(0, ident)),
     };
@@ -1127,8 +1124,8 @@ fn Parser_(comptime skip_trivia: bool) type {
         inline fn toIdentNodeWithLocation(ident: []const u8, location: u32, full_start: u32, width: u32) AstNode_ {
             return .{
                 .kind = .identifier,
-                .data = ident.ptr,
-                // .data = @ptrFromInt(offset),
+                .data = @intFromPtr(ident.ptr),
+                // .data = offset,
                 .len = @intCast(ident.len),
                 .location = location,
                 // extra_data is used by the binder to place symbol refs
@@ -1152,7 +1149,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parsePrivateIdentifier(this: *@This()) !NodeRef {
             const index = try this.pushNode(.{
                 .kind = .private_identifier,
-                .data = this.lexer.identifier.ptr,
+                .data = @intFromPtr(this.lexer.identifier.ptr),
                 .len = @intCast(this.lexer.identifier.len),
                 .location = this.getLocation(),
                 .extra_data2 = @truncate(std.hash.Wyhash.hash(0, this.lexer.identifier)),
@@ -1237,7 +1234,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                             left = .{
                                 .kind = .array_type,
-                                .data = @ptrFromInt(ref),
+                                .data = ref,
                             };
                             continue;
                         }
@@ -1308,7 +1305,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn finishMappedType(this: *@This(), exp: AstNode_, as_clause: NodeRef, flags_init: u22) !AstNode_ {
             var flags = flags_init;
-            const d: BinaryExpData = @bitCast(@intFromPtr(exp.data orelse return error.MissingData));
+            const d: BinaryExpData = @bitCast(exp.data);
 
             const parameter = try this.pushNode(.{
                 .kind = .type_parameter,
@@ -1461,7 +1458,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     // Parse as a prop signature
                     const name = try this.pushNode(.{
                         .kind = .computed_property_name,
-                        .data = @ptrFromInt(try this.pushNode(exp)),
+                        .data = try this.pushNode(exp),
                     });
                     const n = try this.parsePropertySignature(name, flags);
                     try members.append(n);
@@ -1529,7 +1526,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .type_literal,
-                .data = @ptrFromInt(members.head),
+                .data = members.head,
             };
         }
 
@@ -1557,13 +1554,13 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                             return l.append(.{
                                 .kind = .optional_type,
-                                .data = @ptrFromInt(ref),
+                                .data = ref,
                             });
                         }
 
                         return l.append(.{
                             .kind = .rest_type,
-                            .data = @ptrFromInt(ref),
+                            .data = ref,
                         });
                     }
                 }.f;
@@ -1606,7 +1603,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .tuple_type,
-                .data = @ptrFromInt(list.head),
+                .data = list.head,
             };
         }
 
@@ -1699,7 +1696,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                                 return .{
                                     .kind = .infer_type,
-                                    .data = @ptrFromInt(rhs),
+                                    .data = rhs,
                                 };
                             },
                             .key_of_keyword, .unique_keyword, .readonly_keyword => {
@@ -1761,14 +1758,14 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                         return .{
                             .kind = .type_query,
-                            .data = @ptrFromInt(val),
+                            .data = val,
                             .len = typeArgs,
                         };
                     }
 
                     return .{
                         .kind = .type_query,
-                        .data = @ptrFromInt(val),
+                        .data = val,
                     };
                 },
                 .t_minus => {
@@ -1777,7 +1774,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .literal_type,
-                        .data = @ptrFromInt(try this.pushNode(val)),
+                        .data = try this.pushNode(val),
                     };
                 },
                 .t_numeric_literal => {
@@ -1785,7 +1782,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .literal_type,
-                        .data = @ptrFromInt(try this.pushNode(val)),
+                        .data = try this.pushNode(val),
                     };
                 },
                 .t_string_literal, .t_no_substitution_template_literal => {
@@ -1793,7 +1790,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .literal_type,
-                        .data = @ptrFromInt(try this.pushNode(val)),
+                        .data = try this.pushNode(val),
                     };
                 },
                 .t_template_head => {
@@ -1801,7 +1798,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .template_literal_type,
-                        .data = @ptrFromInt(parts),
+                        .data = parts,
                     };
                 },
                 .t_new => {
@@ -1824,7 +1821,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .type_literal,
-                        .data = @ptrFromInt(members),
+                        .data = members,
                     };
                 },
                 // Could be parenthesized type or arrow fn
@@ -1839,7 +1836,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .parenthesized_type,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     };
                 },
                 // Must be an arrow fn
@@ -2167,17 +2164,18 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             const line = this.lexer.line_map.count;
             const col = @as(u32, @intCast(this.lexer.start - this.lexer.last_line));
-            std.debug.print("\n{s}\n", .{this.lexer.source.contents[this.lexer.last_line..this.lexer.current]});
-            for (0..col) |_| std.debug.print(" ",.{});
+            const end = @min(this.lexer.source.contents.len, this.lexer.current);
+            debugPrint("\n{s}\n", .{this.lexer.source.contents[this.lexer.last_line..end]});
+            for (0..col) |_| debugPrint(" ",.{});
 
             const width = this.lexer.end - this.lexer.start;
-            for (0..width) |_| std.debug.print("~",.{});
+            for (0..width) |_| debugPrint("~",.{});
 
-            std.debug.print("\n",.{});
+            debugPrint("\n",.{});
 
-            for (0..col) |_| std.debug.print(" ",.{});
-            std.debug.print("  {any}\n\n", .{this.lexer.token});
-            std.debug.print("  at {s}:{}:{}\n", .{ this.lexer.source.name orelse "", line + 1, col + 1 });
+            for (0..col) |_| debugPrint(" ",.{});
+            debugPrint("  {any}\n\n", .{this.lexer.token});
+            debugPrint("  at {s}:{}:{}\n", .{ this.lexer.source.name orelse "", line + 1, col + 1 });
         }
 
         fn emitParseError(this: *@This(), msg: []const u8) !AstNode_ {
@@ -2187,7 +2185,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 return error.Backtrack;
             }
             if (comptime is_debug) {
-                std.debug.print("{s}\n", .{msg});
+                debugPrint("{s}\n", .{msg});
                 this.printLocation();
             }
 
@@ -2380,7 +2378,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     const exp = try this.pushNode(try this.parseExpressionWithLevel(.comma));
                     try args.append(.{
                         .kind = .spread_element,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                 } else {
                     const exp = try this.parseExpressionWithLevel(.comma);
@@ -2420,7 +2418,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 else => {
                     if (comptime is_debug) {
-                        std.debug.print("Missing token in getCurrentBinaryParseLevel: {?}\n", .{this.lexer.token});
+                        debugPrint("Missing token in getCurrentBinaryParseLevel: {?}\n", .{this.lexer.token});
                     }
                     unreachable;
                 },
@@ -2473,14 +2471,14 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .t_ampersand_ampersand => .ampersand_ampersand_token,
                 else => {
                     if (comptime is_debug) {
-                        std.debug.print("Missing token in tokenToSyntaxKind: {?}\n", .{this.lexer.token});
+                        debugPrint("Missing token in tokenToSyntaxKind: {?}\n", .{this.lexer.token});
                     }
                     unreachable;
                 },
             };
         }
 
-        inline fn toBinaryDataPtr(this: *@This(), left: AstNode_, right: AstNode_) !*anyopaque {
+        inline fn toBinaryDataPtr(this: *@This(), left: AstNode_, right: AstNode_) !u64 {
             return toBinaryDataPtrRefs(try this.pushNode(left), try this.pushNode(right));
         }
 
@@ -2648,7 +2646,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         const parts = try this.parseTemplateParts(false);
                         const template = try this.pushNode(.{
                             .kind = .template_expression,
-                            .data = @ptrFromInt(parts),
+                            .data = parts,
                         });
 
                         left = .{
@@ -2977,7 +2975,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .parenthesized_expression,
-                .data = @ptrFromInt(data),
+                .data = data,
                 .location = location,
             };
         }
@@ -3046,7 +3044,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .jsx_text,
-                .data = slice.ptr,
+                .data = @intFromPtr(slice.ptr),
                 .len = @intCast(slice.len),
             };
         }
@@ -3057,7 +3055,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .string_literal,
-                .data = slice.ptr,
+                .data = @intFromPtr(slice.ptr),
                 .len = @intCast(slice.len),
                 .flags = if (this.lexer.string_literal_is_ascii) 0 else @intFromEnum(StringFlags.needs_decode),
             };
@@ -3092,7 +3090,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = kind,
-                .data = slice.ptr,
+                .data = @intFromPtr(slice.ptr),
                 .len = @intCast(slice.len),
                 .location = location,
                 .flags = flags,
@@ -3134,7 +3132,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             }
 
             if (try this.maybeParseExpression(.yield)) |ref| {
-                n.data = @ptrFromInt(ref);
+                n.data = ref;
             }
 
             return n;
@@ -3146,7 +3144,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = kind,
-                .data = @ptrFromInt(try this.pushNode(exp)),
+                .data = try this.pushNode(exp),
             };
         }
 
@@ -3156,7 +3154,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .keyword_unary_expression,
-                .data = @ptrFromInt(try this.pushNode(exp)),
+                .data = try this.pushNode(exp),
                 .len = @intFromEnum(kind),
             };
         }
@@ -3237,7 +3235,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .t_identifier => this.parseIdentifier(),
                 .t_private_identifier => this.parsePrivateIdentifier(),
                 else => {
-                    std.debug.print("{any}", .{this.lexer.token});
+                    debugPrint("{any}", .{this.lexer.token});
                     return error.SyntaxError;
                 },
             };
@@ -3267,7 +3265,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
 
                 if (this.lexer.token != .t_template_middle) {
-                    std.debug.print("{any}", .{this.lexer.token});
+                    debugPrint("{any}", .{this.lexer.token});
                     return error.SyntaxError;
                 }
 
@@ -3288,7 +3286,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             var is_first_content_node = true;
             var children = NodeList_.init(this);
-            while (true) {
+            while (this.lexer.token != .t_end_of_file) {
                 if (this.lexer.token == .t_less_than) {
                     try this.lexer.nextInsideJSXElement();
                     if (this.lexer.token == .t_slash) {
@@ -3332,16 +3330,16 @@ fn Parser_(comptime skip_trivia: bool) type {
                         try children.append(.{
                             .kind = .jsx_expression,
                             .flags = flags,
-                            .data = @ptrFromInt(try this.pushNode(.{
+                            .data = try this.pushNode(.{
                                 .kind = .spread_element,
-                                .data = @ptrFromInt(exp),
-                            })),
+                                .data = exp,
+                            }),
                         });
                     } else {
                         try children.append(.{
                             .kind = .jsx_expression,
                             .flags = flags,
-                            .data = @ptrFromInt(exp),
+                            .data = exp,
                         });
                     }
                     try this.lexer.expectJSXElementChild(.t_close_brace);
@@ -3362,7 +3360,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     try children.append(txt);
                 } else {
-                    std.debug.print("{any}", .{this.lexer.token});
+                    debugPrint("{any}", .{this.lexer.token});
                     return error.ParserError;
                 }
             }
@@ -3376,7 +3374,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .decorators = this.decorators,
                 .extra_data = this.extra_data_allocator,
             }, node);
-            std.debug.print("\n", .{});
+            debugPrint("\n", .{});
         }
 
         fn parseJSXExpression(this: *@This()) !NodeRef {
@@ -3393,7 +3391,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             const value = try this.pushNode(.{
                 .kind = .jsx_expression,
                 .flags = flags,
-                .data = @ptrFromInt(exp),
+                .data = exp,
             });
             try this.lexer.expectInsideJSXElement(.t_close_brace);
             return value;
@@ -3430,7 +3428,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .data = toBinaryDataPtrRefs(name, parameters),
                 .len = try this.pushNode(.{
                     .kind = .block,
-                    .data = if (list.head != 0) @ptrFromInt(list.head) else null,
+                    .data = list.head,
                 }),
                 .flags = flags,
                 .extra_data = type_params,
@@ -3483,6 +3481,9 @@ fn Parser_(comptime skip_trivia: bool) type {
             const flags: u22 = if (is_spread) @intFromEnum(NodeFlags.generator) else 0;
 
             while (scan_attributes) {
+                if (this.lexer.token == .t_end_of_file) {
+                    break;
+                }
                 if (this.lexer.token == .t_slash) {
                     try this.lexer.nextInsideJSXElement();
                     if (this.context_state == .jsx_children) {
@@ -3530,7 +3531,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                             const jsx_exp = try this.pushNode(.{
                                 .kind = .jsx_expression,
                                 .flags = exp_flags,
-                                .data = @ptrFromInt(try this.pushNode(exp_node)),
+                                .data = try this.pushNode(exp_node),
                             });
                             try attributes.append(.{
                                 .kind = .jsx_attribute,
@@ -3550,7 +3551,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try attributes.append(.{
                         .kind = .jsx_spread_attribute,
                         .flags = exp_flags,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                     try this.lexer.expectInsideJSXElement(.t_close_brace);
                     continue;
@@ -3611,7 +3612,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                         static_block = try this.pushNode(.{
                             .kind = .block,
-                            .data = if (list.head == 0) null else @ptrFromInt(list.head),
+                            .data = list.head,
                         });
 
                         continue;
@@ -3663,7 +3664,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             if (attributes.head != 0) {
                 attributes_ref = try this.pushNode(.{
                     .kind = .jsx_attributes,
-                    .data = @ptrFromInt(attributes.head),
+                    .data = attributes.head,
                     .extra_data2 = static_block,
                 });
             }
@@ -3699,14 +3700,14 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             try children.append(.{
                 .kind = .jsx_closing_element,
-                .data = @ptrFromInt(closing),
+                .data = closing,
             });
 
             this.node_allocator.at(opening).next = children.head;
 
             return .{
                 .kind = .jsx_element,
-                .data = @ptrFromInt(opening),
+                .data = opening,
                 .flags = flags,
             };
         }
@@ -3717,7 +3718,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .jsx_fragment,
-                .data = @ptrFromInt(children.head),
+                .data = children.head,
             };
         }
 
@@ -3791,7 +3792,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             }
             return .{
                 .kind = .jsx_class_list,
-                .data = @ptrFromInt(list.head),
+                .data = list.head,
             };
         }
 
@@ -3955,12 +3956,12 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn parseNumericLiteralBase(this: *@This(), comptime is_negative: bool) !AstNode_ {
             const location = this.getLocation(); // TODO: misses minus sign
-            const v: usize = @bitCast(if (is_negative) -this.lexer.number else this.lexer.number);
+            const v: u64 = @bitCast(if (is_negative) -this.lexer.number else this.lexer.number);
             try this.next();
 
             return .{
                 .kind = .numeric_literal,
-                .data = @ptrFromInt(v),
+                .data = v,
                 .location = location,
             };
         }
@@ -3968,12 +3969,12 @@ fn Parser_(comptime skip_trivia: bool) type {
         fn parseNumericLiteralInJsx(this: *@This(), comptime is_negative: bool) !AstNode_ {
             // FIXME: dedupe
             const location = this.getLocation();
-            const v: usize = @bitCast(if (is_negative) -this.lexer.number else this.lexer.number);
+            const v: u64 = @bitCast(if (is_negative) -this.lexer.number else this.lexer.number);
             try this.lexer.nextInsideJSXElement();
 
             return .{
                 .kind = .numeric_literal,
-                .data = @ptrFromInt(v),
+                .data = v,
                 .location = location,
             };
         }
@@ -3993,7 +3994,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .await_expression,
-                        .data = @ptrFromInt(right),
+                        .data = right,
                     };
                 },
                 .t_identifier => {
@@ -4032,7 +4033,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.next();
                     return .{
                         .kind = .bigint_literal,
-                        .data = value.ptr,
+                        .data = @intFromPtr(value.ptr),
                         .len = @intCast(value.len),
                     };
                 },
@@ -4045,7 +4046,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .regular_expression_literal,
-                        .data = value.ptr,
+                        .data = @intFromPtr(value.ptr),
                         .len = @intCast(value.len),
                         .extra_data = this.lexer.regex_flags_start orelse 0,
                     };
@@ -4055,7 +4056,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .template_expression,
-                        .data = @ptrFromInt(parts),
+                        .data = parts,
                     };
                 },
                 .t_string_literal, .t_no_substitution_template_literal => {
@@ -4090,14 +4091,14 @@ fn Parser_(comptime skip_trivia: bool) type {
                         const t = try this.parseType();
                         return .{ 
                             .kind = .reify_expression, 
-                            .data = @ptrFromInt(t),
+                            .data = t,
                         };
                     }
                     const type_params = try this.parseTypeParams();
                     const t = try this.parseType();
                     return .{ 
                         .kind = .reify_expression, 
-                        .data = @ptrFromInt(t),
+                        .data = t,
                         .len = type_params,
                     };
                 },
@@ -4329,7 +4330,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return this.pushNode(.{
                 .kind = .object_binding_pattern,
-                .data = @ptrFromInt(elements.head),
+                .data = elements.head,
             });
         }
 
@@ -4354,7 +4355,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return this.pushNode(.{
                 .kind = .array_binding_pattern,
-                .data = @ptrFromInt(elements.head),
+                .data = elements.head,
             });
         }
 
@@ -4386,7 +4387,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     const exp = try this.pushNode(try this.parseExpressionWithLevel(.comma));
                     try elements.append(.{
                         .kind = .spread_element,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                     emit_omitted_expression = false;
                 } else if (this.lexer.token == .t_comma) {
@@ -4407,7 +4408,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .array_literal_expression,
-                .data = @ptrFromInt(elements.head),
+                .data = elements.head,
                 .location = location,
             };
         }
@@ -4430,7 +4431,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .shorthand_property_assignment,
-                .data = @ptrFromInt(name),
+                .data = name,
             };
         }
 
@@ -4476,7 +4477,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 const exp = try this.pushNode(try this.parseExpressionWithLevel(.comma));
                 return .{
                     .kind = .spread_assignment,
-                    .data = @ptrFromInt(exp),
+                    .data = exp,
                 };
             } 
 
@@ -4497,7 +4498,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             const name = try this.pushNode(.{
                 .kind = .computed_property_name,
-                .data = @ptrFromInt(exp),
+                .data = exp,
             });
 
             // TODO: shorthand is invalid here
@@ -4521,7 +4522,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .object_literal_expression,
-                .data = @ptrFromInt(elements.head),
+                .data = elements.head,
             };
         }
 
@@ -4583,7 +4584,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .variable_statement,
-                .data = @ptrFromInt(decls.head),
+                .data = decls.head,
                 .flags = flags,
             };
         }
@@ -4619,7 +4620,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .block,
-                .data = @ptrFromInt(ref),
+                .data = ref,
             };
         }
 
@@ -4799,7 +4800,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = kind,
-                .data = if (name == 0 and parameters == 0) null else toBinaryDataPtrRefs(name, parameters),
+                .data = toBinaryDataPtrRefs(name, parameters),
                 .len = body,
                 .flags = flags,
                 .extra_data = typeParameters,
@@ -4858,7 +4859,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = if (comptime has_new) .construct_signature else .call_signature,
-                .data = if (params > 0 or return_type > 0) toBinaryDataPtrRefs(params, return_type) else null,
+                .data = toBinaryDataPtrRefs(params, return_type),
                 .len = type_parameters,
             };
         }
@@ -4977,7 +4978,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return this.pushNode(.{
                         .kind = .computed_property_name,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                 },
                 else => {
@@ -5187,13 +5188,6 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.maybeEatSemi();
             }
 
-            if (params == 0 and body == 0) {
-                return .{
-                    .kind = .constructor,
-                    .data = null,
-                };
-            }
-
             return .{
                 .kind = .constructor,
                 .data = toBinaryDataPtrRefs(params, body),
@@ -5207,7 +5201,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .decorator,
-                .data = @ptrFromInt(try this.pushNode(exp)),
+                .data = try this.pushNode(exp),
             };
         }
 
@@ -5228,7 +5222,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     flags.* = 0;
                     return members.append(.{
                         .kind = .class_static_block_declaration,
-                        .data = @ptrFromInt(block),
+                        .data = block,
                     });
                 }
             }
@@ -5441,7 +5435,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = kind,
-                .data = if (name == 0 and members == 0) null else toBinaryDataPtrRefs(name, members),
+                .data = toBinaryDataPtrRefs(name, members),
                 .len = extendsClause,
                 .extra_data = typeParameters,
                 .extra_data2 = implementsClauses.head,
@@ -5648,7 +5642,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     // Parse remainder as a normal for statement
                     const n = try this.pushNode(.{
                         .kind = .await_expression,
-                        .data = @ptrFromInt(try this.parseExpression()),
+                        .data = try this.parseExpression(),
                     });
 
                     return this.finishForStatement(n);
@@ -5688,7 +5682,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             // We probably parsed `in` as a binary expression
             if (this.lexer.token == .t_close_paren) {
                 if (exp.kind == .binary_expression and exp.len == @intFromEnum(SyntaxKind.in_keyword)) {
-                    const d: BinaryExpData = @bitCast(@intFromPtr(exp.data orelse return error.MissingData));
+                    const d: BinaryExpData = @bitCast(exp.data);
 
                     return this.finishForInStatementWithExp(d.left, d.right);
                 }
@@ -5721,14 +5715,14 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.lexer.next();
                 if (this.options.is_syn and this.lexer.isContextualKeyword("is")) {
                     try this.lexer.next();
-                    n.data = @ptrFromInt(try this.parseType());
+                    n.data = try this.parseType();
                     n.flags |= @intFromEnum(NodeFlags.declare);
                 } else {
-                    n.data = @ptrFromInt(try this.parseExpression());
+                    n.data = try this.parseExpression();
                 }
                 try this.lexer.expect(.t_colon);
             } else {
-                std.debug.print("{any}", .{this.lexer.token});
+                debugPrint("{any}", .{this.lexer.token});
                 return error.SyntaxError;
             }
 
@@ -5772,7 +5766,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .expression_statement,
-                .data = @ptrFromInt(exp),
+                .data = exp,
             };
         }
 
@@ -5847,7 +5841,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return .{
                     .kind = .namespace_import,
-                    .data = @ptrFromInt(ident),
+                    .data = ident,
                 };
             }
 
@@ -5855,7 +5849,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .named_imports,
-                .data = @ptrFromInt(imports),
+                .data = imports,
             };
         }
 
@@ -5874,7 +5868,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     rhs = try this.pushNode(.{
                         .kind = .external_module_reference,
-                        .data = @ptrFromInt(try this.pushNode(spec)),
+                        .data = try this.pushNode(spec),
                     });
                 } else {
                     rhs = try this.pushNode(try this.parseRemainingTypeNode(ident, .lowest));
@@ -5909,7 +5903,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             } else if (this.lexer.token == .t_asterisk or this.lexer.token == .t_open_brace) {
                 bindings = try this.pushNode(try this.parseImportBindings());
             } else {
-                std.debug.print("{any}", .{this.lexer.token});
+                debugPrint("{any}", .{this.lexer.token});
                 return error.SyntaxError;
             }
 
@@ -5945,7 +5939,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.lexer.expectContextualKeyword("from");
 
                 if (this.lexer.token != .t_string_literal) {
-                    std.debug.print("{any}", .{this.lexer.token});
+                    debugPrint("{any}", .{this.lexer.token});
                     return error.SyntaxError;
                 }
 
@@ -5983,7 +5977,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.lexer.next();
                     clause = try this.pushNode(.{
                         .kind = .namespace_export,
-                        .data = @ptrFromInt(try this.parseIdentifier()),
+                        .data = try this.parseIdentifier(),
                     });
                 }
 
@@ -5995,7 +5989,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 clause = try this.pushNode(.{
                     .kind = .named_exports,
-                    .data = @ptrFromInt(exports),
+                    .data = exports,
                 });
 
                 // We might not have `from`
@@ -6200,7 +6194,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             return .{
                 .kind = .expression_statement,
-                .data = @ptrFromInt(try this.pushNode(n)),
+                .data = try this.pushNode(n),
             };
         }
 
@@ -6212,7 +6206,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .defer_statement,
-                        .data = @ptrFromInt(statement),
+                        .data = statement,
                     };
                 },
                 .t_if, .t_while, .t_for, .t_do, .t_switch, .t_try => {
@@ -6220,7 +6214,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .defer_statement,
-                        .data = @ptrFromInt(try this.pushNode(statement)),
+                        .data = try this.pushNode(statement),
                     };
                 },
                 .t_finally => {
@@ -6229,7 +6223,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .defer_statement,
-                        .data = @ptrFromInt(statement),
+                        .data = statement,
                         .extra_data = 1,
                     };
                 },
@@ -6238,7 +6232,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .defer_statement,
-                        .data = @ptrFromInt(try this.pushNode(statement)),
+                        .data = try this.pushNode(statement),
                     };
                 },
                 .t_open_paren => {
@@ -6252,7 +6246,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                         return .{
                             .kind = .defer_statement,
-                            .data = @ptrFromInt(try this.pushNode(statement)),
+                            .data = try this.pushNode(statement),
                         };
                     }
                 },
@@ -6266,7 +6260,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return .{
                     .kind = .expression_statement,
-                    .data = @ptrFromInt(try this.pushNode(n)),
+                    .data = try this.pushNode(n),
                 };
             }
 
@@ -6326,7 +6320,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                     return .{
                         .kind = .throw_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     };
                 },
                 .t_open_brace => return this.parseBlockNode(),
@@ -6338,7 +6332,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         const n = try this.parseRemainingImportExpression(location);
                         return .{
                             .kind = .expression_statement,
-                            .data = @ptrFromInt(try this.pushNode(try this.parseRemainingExpression(.lowest, n))),
+                            .data = try this.pushNode(try this.parseRemainingExpression(.lowest, n)),
                             .location = location,
                         };
                     }
@@ -6355,7 +6349,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                         return .{
                             .kind = .export_assignment,
-                            .data = @ptrFromInt(try this.pushNode(exp)),
+                            .data = try this.pushNode(exp),
                             .len = 1, // isImportEquals
                         };
                     }
@@ -6374,7 +6368,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                         return .{
                             .kind = .export_assignment,
-                            .data = @ptrFromInt(try this.pushNode(try this.parseExpressionStatement())),
+                            .data = try this.pushNode(try this.parseExpressionStatement()),
                         };
                     }
 
@@ -6447,7 +6441,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         return n;
                     }
 
-                    const n = AstNode_{ .kind = .await_expression, .data = @ptrFromInt(try this.parseExpression()) };
+                    const n = AstNode_{ .kind = .await_expression, .data = try this.parseExpression() };
                     try this.maybeEatSemi();
 
                     return n;
@@ -6639,9 +6633,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     if (this.options.is_syn and this.lexer.token != .t_open_brace) {
                         return .{
                             .kind = .expression_statement,
-                            .data = @ptrFromInt(
-                                try this.pushNode(try this.parseKeywordUnaryExpression(.try_keyword))
-                            ),
+                            .data = try this.pushNode(try this.parseKeywordUnaryExpression(.try_keyword)),
                         };
                     }
 
@@ -6672,7 +6664,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         return n;
                     }
 
-                    n.data = @ptrFromInt(try this.parseExpression());
+                    n.data = try this.parseExpression();
                     try this.maybeEatSemi();
 
                     return n;
@@ -6681,7 +6673,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.lexer.next();
                     var n = AstNode_{ .kind = .continue_statement };
                     if (!this.lexer.has_newline_before and this.lexer.token == .t_identifier) {
-                        n.data = @ptrFromInt(try this.parseIdentifier());
+                        n.data = try this.parseIdentifier();
                     }
 
                     try this.maybeEatSemi();
@@ -6692,7 +6684,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.lexer.next();
                     var n = AstNode_{ .kind = .break_statement };
                     if (!this.lexer.has_newline_before and this.lexer.token == .t_identifier) {
-                        n.data = @ptrFromInt(try this.parseIdentifier());
+                        n.data = try this.parseIdentifier();
                     }
 
                     try this.maybeEatSemi();
@@ -6717,7 +6709,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.maybeEatSemi();
                     return .{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(try this.pushNode(.{ .kind = .debugger_keyword })),
+                        .data = try this.pushNode(.{ .kind = .debugger_keyword }),
                     };
                 },
                 .t_less_than => {
@@ -6734,7 +6726,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                             const bindings = try this.parseNamedModuleBindings(true);
                             return .{
                                 .kind = .public_declaration,
-                                .data = if (bindings == 0) null else @ptrFromInt(bindings),
+                                .data = bindings,
                                 .flags = @intFromEnum(NodeFlags.public),
                             };
                         }
@@ -6871,13 +6863,13 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             // var i: u32 = 0;
             // while (i < this.node_allocator.count) {
-            //     std.debug.print("{any}\n",.{this.node_allocator.at(i).kind});
+            //     debugPrint("{any}\n",.{this.node_allocator.at(i).kind});
             //     i += 1;
             // }
 
             const root: AstNode_ = .{
                 .kind = .source_file,
-                .data = @ptrFromInt(statements.head),
+                .data = statements.head,
             };
 
             const root_ref = try this.pushNode(root);
@@ -6935,7 +6927,7 @@ pub const Factory = struct {
     pub fn createIdentifierAllocated(this: *@This(), text: []const u8) !NodeRef {
         return this.nodes.push(.{
             .kind = .identifier,
-            .data = text.ptr,
+            .data = @intFromPtr(text.ptr),
             .len = @intCast(text.len),
         });
     }
@@ -6948,7 +6940,7 @@ pub const Factory = struct {
     pub fn createStringLiteralAllocated(this: *@This(), text: []const u8) !NodeRef {
         return this.nodes.push(.{
             .kind = .string_literal,
-            .data = text.ptr,
+            .data = @intFromPtr(text.ptr),
             .len = @intCast(text.len),
         });
     }
@@ -6956,20 +6948,20 @@ pub const Factory = struct {
     pub fn createNoSubstitutionTemplateLiteralAllocated(this: *@This(), text: []const u8) !NodeRef {
         return this.nodes.push(.{
             .kind = .no_substitution_template_literal,
-            .data = text.ptr,
+            .data = @intFromPtr(text.ptr),
             .len = @intCast(text.len),
         });
     }
 
     /// if using literal number, call with a casted value like `@as(i64, 1)`
-    pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef { // val: usize | 64 | i64 | i32 | u32
+    pub fn createNumericLiteral(this: *@This(), val: anytype) !NodeRef { // val: u64 | i64 | i32 | u32
         const d: u64 = switch (@TypeOf(val)) {
             comptime_int => {
                 // FIXME: why does bitcast not work here?
                 @compileError("Use @as(i64, <v>) for the argument");
             },
             f64 => @bitCast(val),
-            u16, i32, i64, u32, usize => @bitCast(@as(f64, @floatFromInt(val))),
+            u16, i32, i64, u32, u64, usize => @bitCast(@as(f64, @floatFromInt(val))),
             else => {
                 @compileLog(@TypeOf(val));
                 @compileError("Unhandled type");
@@ -6978,7 +6970,7 @@ pub const Factory = struct {
 
         return this.nodes.push(.{
             .kind = .numeric_literal,
-            .data = if (d == 0) null else @ptrFromInt(d),
+            .data = d,
         });
     }
 
@@ -7005,7 +6997,7 @@ pub const Factory = struct {
     pub fn createVoidZero(this: *@This()) !NodeRef {
         return this.nodes.push(.{ 
             .kind = .void_expression,
-            .data = @ptrFromInt(try this.createNumericLiteral(@as(i64, 0))),
+            .data = try this.createNumericLiteral(@as(i64, 0)),
         });
     }
 
@@ -7035,7 +7027,7 @@ pub const Factory = struct {
         const right = switch (@TypeOf(arg)) {
             NodeRef => this.assertValid(arg),
             []const u8, [:0]const u8 => try this.createStringLiteral(arg),
-            u16, i32, i64, f64, usize, comptime_int => try this.createNumericLiteral(arg),
+            u16, i32, i64, f64, u64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(arg))) {
                     break :blk try this.createStringLiteral(arg);
@@ -7190,28 +7182,28 @@ pub const Factory = struct {
     pub fn createParenthesizedExpression(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .parenthesized_expression,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
     pub fn createAwaitExpression(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .await_expression,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
     pub fn createTypeofExpression(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .typeof_expression,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
     pub fn createSpreadElement(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .spread_element,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
@@ -7219,7 +7211,7 @@ pub const Factory = struct {
         const l = try this.maybeCreateList(elements);
         return this.nodes.push(.{
             .kind = .array_literal_expression,
-            .data = if (l == 0) null else @ptrFromInt(l),
+            .data = l,
         });
     }
 
@@ -7227,7 +7219,7 @@ pub const Factory = struct {
         const l = try this.maybeCreateList(properties);
         return this.nodes.push(.{
             .kind = .object_literal_expression,
-            .data = if (l == 0) null else @ptrFromInt(l),
+            .data = l,
         });
     }
 
@@ -7258,28 +7250,28 @@ pub const Factory = struct {
     pub fn createBlock(this: *@This(), statements: anytype) !NodeRef { // statements: NodeRef | []const NodeRef
         return this.nodes.push(.{
             .kind = .block,
-            .data = @ptrFromInt(try this.maybeCreateList(statements)),
+            .data = try this.maybeCreateList(statements),
         });
     }
 
     pub fn createExpressionStatement(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .expression_statement,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
     pub fn createReturnStatement(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .return_statement,
-            .data = if (expression != 0) @ptrFromInt(expression) else null,
+            .data = expression,
         });
     }
 
     pub fn createThrowStatement(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .throw_statement,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
@@ -7301,7 +7293,7 @@ pub const Factory = struct {
     pub fn createVariableStatement(this: *@This(), declarations: NodeRef, flags: u22) !NodeRef {
         return this.nodes.push(.{
             .kind = .variable_statement,
-            .data = @ptrFromInt(this.assertValid(declarations)),
+            .data = this.assertValid(declarations),
             .flags = flags,
         });
     }
@@ -7383,21 +7375,21 @@ pub const Factory = struct {
     pub fn createComputedName(this: *@This(), name: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .computed_property_name,
-            .data = @ptrFromInt(name),
+            .data = name,
         });
     }
 
     pub fn createShorthandPropertyAssignment(this: *@This(), name: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .shorthand_property_assignment,
-            .data = @ptrFromInt(name),
+            .data = name,
         });
     }
 
     pub fn createSpreadAssignment(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .spread_assignment,
-            .data = @ptrFromInt(expression),
+            .data = expression,
         });
     }
 
@@ -7427,7 +7419,7 @@ pub const Factory = struct {
     pub fn createArrayType(this: *@This(), element_type: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .array_type,
-            .data = @ptrFromInt(element_type),
+            .data = element_type,
         });
     }
 
@@ -7446,7 +7438,7 @@ pub const Factory = struct {
     pub fn createCaseClause(this: *@This(), expression: NodeRef, statements: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .case_clause,
-            .data = @ptrFromInt(expression),
+            .data = expression,
             .len = statements,
         });
     }
@@ -7468,7 +7460,7 @@ pub const Factory = struct {
     pub fn createNamespaceImport(this: *@This(), ident: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .namespace_import,
-            .data = @ptrFromInt(this.assertValid(ident)),
+            .data = this.assertValid(ident),
         });
     }
 
@@ -7499,7 +7491,7 @@ pub const Factory = struct {
         // const comment = try std.fmt.allocPrint(getAllocator(), "// {s}", .{text}); // LEAKS
         n.extra_data2 = try this.nodes.push(.{
             .kind = .single_line_comment_trivia,
-            .data = text.ptr,
+            .data = @intFromPtr(text.ptr),
             .len = @truncate(text.len),
         });
     }
@@ -7515,6 +7507,13 @@ pub const Factory = struct {
         return ref;
     }
 };
+
+pub inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    if (comptime @import("builtin").target.isWasm()) {
+        return;
+    }
+    return std.debug.print(fmt, args);
+}
 
 const HelperTags = enum {
     known_symbol,
@@ -7679,7 +7678,7 @@ pub const Transformer = struct {
     fn createString(this: *@This(), text: []const u8) !NodeRef {
         return this.allocator.push(.{
             .kind = .string_literal,
-            .data = text.ptr,
+            .data = @intFromPtr(text.ptr),
             .len = @intCast(text.len),
         });
     }
@@ -7699,7 +7698,7 @@ pub const Transformer = struct {
 
         return .{
             .kind = .block,
-            .data = @ptrFromInt(list.head),
+            .data = list.head,
         };
     }
 
@@ -7753,7 +7752,7 @@ pub const Transformer = struct {
 
         return .{
             .kind = .variable_statement,
-            .data = @ptrFromInt(list.head),
+            .data = list.head,
         };
     }
 
@@ -7767,7 +7766,7 @@ pub const Transformer = struct {
     fn awaitExpression(this: *@This(), exp: AstNode) !AstNode {
         return .{
             .kind = .await_expression,
-            .data = @ptrFromInt(try this.allocator.push(exp)),
+            .data = try this.allocator.push(exp),
         };
     }
 
@@ -7824,7 +7823,7 @@ pub const Transformer = struct {
             .data = toBinaryDataPtrRefs(
                 try this.allocator.push(.{
                     .kind = .block,
-                    .data = @ptrFromInt(statement),
+                    .data = statement,
                 }),
                 try this.allocator.push(catch_clause),
             ),
@@ -7903,7 +7902,7 @@ pub const Transformer = struct {
                     false,
                     try this.allocator.push(.{
                         .kind = .block,
-                        .data = @ptrFromInt(r),
+                        .data = r,
                     }),
                 };
             }
@@ -7919,7 +7918,7 @@ pub const Transformer = struct {
             true,
             try this.allocator.push(.{
                 .kind = .block,
-                .data = @ptrFromInt(r),
+                .data = r,
             }),
         };
     }
@@ -7930,7 +7929,7 @@ pub const Transformer = struct {
             const first = maybeUnwrapRef(target) orelse 0;
             this.allocator.at(statement).next = first;
             var copy = target.*;
-            copy.data = @ptrFromInt(statement);
+            copy.data = statement;
             return this.allocator.push(copy);
         }
 
@@ -7938,7 +7937,7 @@ pub const Transformer = struct {
 
         return try this.allocator.push(.{
             .kind = .block,
-            .data = @ptrFromInt(statement),
+            .data = statement,
         });
     }
 
@@ -7964,7 +7963,7 @@ pub const Transformer = struct {
         inner_decl.data = toBinaryDataPtrRefs(getPackedData(decl).left, tmp_ident);
 
         var inner_statement = l.*;
-        inner_statement.data = @ptrFromInt(try this.allocator.push(inner_decl));
+        inner_statement.data = try this.allocator.push(inner_decl);
         const bound_statement = try this.prependStatement(d.right, try this.allocator.push(inner_statement));
 
         const nonNullishCheck = try this.binaryExpression(this.allocator.at(tmp_ident).*, .exclamation_equals_token, .{ .kind = .null_keyword });
@@ -7979,7 +7978,7 @@ pub const Transformer = struct {
                 try this.binaryExpression(
                     .{
                         .kind = .parenthesized_expression,
-                        .data = @ptrFromInt(try this.allocator.push(try this.binaryExpression(this.allocator.at(tmp_ident).*, .equals_token, init))),
+                        .data = try this.allocator.push(try this.binaryExpression(this.allocator.at(tmp_ident).*, .equals_token, init)),
                     },
                     .exclamation_equals_token, 
                     .{ .kind = .null_keyword }
@@ -8011,7 +8010,7 @@ pub const Transformer = struct {
         const v: f64 = @floatFromInt(ref);
         return .{
             .kind = .numeric_literal,
-            .data = @ptrFromInt(@as(usize, @bitCast(v))),
+            .data = @as(u64, @bitCast(v)),
         };
     }
 
@@ -8083,7 +8082,7 @@ pub const Transformer = struct {
 
             try body.append(.{
                 .kind = .expression_statement,
-                .data = @ptrFromInt(exp),
+                .data = exp,
             });
         }
 
@@ -8091,67 +8090,49 @@ pub const Transformer = struct {
 
         return this.allocator.push(.{
             .kind = .block,
-            .data = @ptrFromInt(body.head),
+            .data = body.head,
         });
     }
 };
 
 pub inline fn unwrapRef(node: *const AstNode) NodeRef {
-    return @intCast(@intFromPtr(node.data orelse {
-        if (comptime is_debug) {
-            std.debug.print("MISSING DATA {}\n", .{node.kind});
+    if (comptime is_debug) {
+        if (node.data == 0) {
+            debugPrint("MISSING DATA {}\n", .{node.kind});
+            unreachable;
         }
-        unreachable;
-    }));
+    }
+    return @intCast(node.data);
 }
 
 pub inline fn maybeUnwrapRef(node: *const AstNode) ?NodeRef {
-    return @intCast(@intFromPtr(node.data orelse return null));
+    return if (node.data != 0) @intCast(node.data) else null;
 }
 
 pub inline fn getPackedData(node: *const AstNode) BinaryExpData {
-    if (node.data) |p| {
-        const v = @as(u64, @intFromPtr(p));
-        return .{
-            .left = @truncate(v),
-            .right = @intCast(v >> 32),
-        };
-    }
-    return .{ .left = 0, .right = 0 };
+    const v = node.data;
+    return .{
+        .left = @truncate(v),
+        .right = @truncate(v >> 32),
+    };
 }
 
 pub inline fn getLeft(node: *const AstNode) NodeRef {
-    if (node.data) |p| {
-        const v = @as(u64, @intFromPtr(p));
-        return @truncate(v);
-    }
-    return 0;
+    return @truncate(node.data);
 }
 
 pub inline fn getRight(node: *const AstNode) NodeRef {
-    if (node.data) |p| {
-        const v = @as(u64, @intFromPtr(p));
-        return @intCast(v >> 32);
-    }
-    return 0;
+    return @intCast(node.data >> 32);
 }
 
 pub inline fn maybeGetLeft(node: *const AstNode) ?NodeRef {
-    if (node.data) |p| {
-        const v = @as(u64, @intFromPtr(p));
-        const r: NodeRef = @truncate(v);
-        return if (r != 0) r else null;
-    }
-    return null;
+    const r: NodeRef = @truncate(node.data);
+    return if (r != 0) r else null;
 }
 
 pub inline fn maybeGetRight(node: *const AstNode) ?NodeRef {
-    if (node.data) |p| {
-        const v = @as(u64, @intFromPtr(p));
-        const r: NodeRef = @intCast(v >> 32);
-        return if (r != 0) r else null;
-    }
-    return null;
+    const r: NodeRef = @intCast(node.data >> 32);
+    return if (r != 0) r else null;
 }
 
 pub inline fn hasFlag(node: *const AstNode, flag: NodeFlags) bool {
@@ -8171,7 +8152,7 @@ pub inline fn getSlice(node: *const AstNode, comptime T: type) []const T {
         return &.{};
     }
 
-    const ptr: [*]const T = @alignCast(@ptrCast(node.data orelse unreachable));
+    const ptr: [*]const T = @ptrFromInt(@as(usize, @intCast(node.data)));
 
     return ptr[0..node.len];
 }
@@ -8265,9 +8246,9 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         // TODO: everything else
         else => {
             if (comptime @import("builtin").mode == .Debug) {
-                std.debug.print("{any}", .{kind});
-                std.debug.print("\n", .{});
-                std.debug.print("\n", .{});
+                debugPrint("{any}", .{kind});
+                debugPrint("\n", .{});
+                debugPrint("\n", .{});
             }
             unreachable;
         },
@@ -8340,11 +8321,12 @@ inline fn _visitList(nodes: *const BumpAllocator(AstNode), start: NodeRef, visit
     while (ref != 0) {
         const n = nodes.at(ref);
         const r = n.next;
+        const u = ref;
+        ref = r;
         if (comptime prefetched) {
             nodes.prefetch(r);
         }
-        try visitor.visit(n, ref);
-        ref = r;
+        try visitor.visit(n, u);
     }
 }
 
@@ -8676,7 +8658,7 @@ pub fn forEachChild(
             }
         },
         else => {
-            // std.debug.print("{}\n",.{node.kind});
+            // debugPrint("{}\n",.{node.kind});
         },
     };
 }
@@ -8958,7 +8940,7 @@ pub const Binder = struct {
         });
 
         // if (getLoc(this.nodes, ident)) |loc| {
-        //     std.debug.print("[{s}:{}:{}]: symbol decl {s} -> {}\n", .{
+        //     debugPrint("[{s}:{}:{}]: symbol decl {s} -> {}\n", .{
         //         this.source_name orelse "<unknown>",
         //         loc.line + 1,
         //         loc.col + 1,
@@ -9024,7 +9006,7 @@ pub const Binder = struct {
 
 
             // if (getLoc(this.nodes, ident)) |loc| {
-            //     std.debug.print("BOUND [{s}:{}:{}]: symbol decl {s} -> {} [hash: {}] [depth: {}] [type]\n", .{
+            //     debugPrint("BOUND [{s}:{}:{}]: symbol decl {s} -> {} [hash: {}] [depth: {}] [type]\n", .{
             //         this.source_name orelse "<unknown>",
             //         loc.line + 1,
             //         loc.col + 1,
@@ -9172,7 +9154,7 @@ pub const Binder = struct {
             ident.extra_data = s;
 
             // if (getLoc(this.nodes, ident)) |loc| {
-            //     std.debug.print("[{s}:{}:{}]: symbol decl {s} -> {} [hash: {}] [depth: {}] {s}\n", .{
+            //     debugPrint("[{s}:{}:{}]: symbol decl {s} -> {} [hash: {}] [depth: {}] {s}\n", .{
             //         this.source_name orelse "<unknown>",
             //         loc.line + 1,
             //         loc.col + 1,
@@ -9349,7 +9331,7 @@ pub const Binder = struct {
             },
             else => {
                 if (comptime is_debug) {
-                    std.debug.print("{any}\n", .{binding.kind});
+                    debugPrint("{any}\n", .{binding.kind});
                 }
                 unreachable;
             },
@@ -9938,10 +9920,10 @@ pub const Binder = struct {
         if (ref == 0) return;
 
         // for (0..this.type_scopes.items.len) |_| {
-        //     std.debug.print("  ", .{});
+        //     debugPrint("  ", .{});
         // }
 
-        // std.debug.print("{any}\n", .{this.nodes.at(ref).kind});
+        // debugPrint("{any}\n", .{this.nodes.at(ref).kind});
 
         const node = this.nodes.at(ref);
         switch (node.kind) {
@@ -10601,11 +10583,11 @@ pub const Binder = struct {
                 return this.visitRef(node.len);
             },
             .case_clause, .default_clause => {
-                if (node.data) |d| {
+                if (node.kind != .default_clause) {
                     if (node.hasFlag(.declare)) {
-                        try this.visitType(@intCast(@intFromPtr(d)));
+                        try this.visitType(unwrapRef(node));
                     } else {
-                        try this.visitRef(@intCast(@intFromPtr(d)));
+                        try this.visitRef(unwrapRef(node));
                     }
                 }
 
@@ -10687,7 +10669,7 @@ pub const Binder = struct {
                 }
 
                 if (!sym.hasFlag(.namespace)) {
-                    if (d.left == 0) std.debug.print("global\n", .{}) else std.debug.print("{s}\n", .{getSlice(this.nodes.at(d.left), u8)});
+                    if (d.left == 0) debugPrint("global\n", .{}) else debugPrint("{s}\n", .{getSlice(this.nodes.at(d.left), u8)});
                 }
 
                 std.debug.assert(sym.hasFlag(.namespace));
@@ -10972,7 +10954,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
             if (n.location != 0) {
                 return decodeLocation(n.location);
             }
-            std.debug.print("missing location {}\n", .{n.kind});
+            debugPrint("missing location {}\n", .{n.kind});
         },
     }
 
@@ -11031,7 +11013,7 @@ pub const ParsedFile = struct {
         if (comptime true) return;
         const name = this.source_name orelse return;
         const new_fmt = comptime "{s}: " ++ fmt ++ "\n";
-        std.debug.print(new_fmt, .{name} ++ args);
+        debugPrint(new_fmt, .{name} ++ args);
     }
 
     pub fn deinit(this: *@This()) void {
@@ -11058,7 +11040,6 @@ pub const ParsedFile = struct {
             _ = try nodes.push(.{ .kind = .start });
             const root_ref = try nodes.push(.{
                 .kind = .source_file,
-                .data = null, 
             });
             this.* = .{
                 .ast = .{
@@ -11076,7 +11057,7 @@ pub const ParsedFile = struct {
             return this;
         }
 
-        const parse_start = std.time.microTimestamp();
+        const parse_start = microTimestamp();
         const lexer = try js_lexer.Lexer.init(.{ .contents = buf, .name = source_name }, allocator);
 
         var parser = Parser.init(lexer);
@@ -11084,11 +11065,11 @@ pub const ParsedFile = struct {
 
         const result = parser.parse() catch |err| {
             for (lexer.errors.items) |m| {
-                std.debug.print("{s}:{}:{} - {s}\n", .{source_name orelse "", m.start, m.end, m.message});
+                debugPrint("{s}:{}:{} - {s}\n", .{source_name orelse "", m.start, m.end, m.message});
             }
             return err;
         };
-        const parse_time = std.time.microTimestamp() - parse_start;
+        const parse_time = microTimestamp() - parse_start;
 
         var this = try allocator.create(@This());
         this.* = .{
@@ -11104,16 +11085,22 @@ pub const ParsedFile = struct {
 
         this.log("parse time {d:.3} (# of nodes {})", .{ parse_time, result.data.nodes.count() });
 
-        const bind_start = std.time.microTimestamp();
+        const bind_start = microTimestamp();
         try this.binder.visit(&result.root, result.root_ref);
-        this.log("bind time {d:.3} (# of symbols {})", .{ std.time.microTimestamp() - bind_start, this.binder.symbols.count() });
+        this.log("bind time {d:.3} (# of symbols {})", .{  microTimestamp() - bind_start, this.binder.symbols.count() });
 
         return this;
     }
 
+    inline fn microTimestamp() i64 {
+        if (comptime @import("builtin").target.isWasm()) return 0;
+        return std.time.microTimestamp();
+    }
+
     pub fn createFromPath(file_path: []const u8, is_lib: bool) !*@This() {
+        if (comptime @import("builtin").target.isWasm()) return error.IsWasm;
         const buf = std.fs.cwd().readFileAlloc(allocator, file_path, std.math.maxInt(u32)) catch |err| {
-            std.debug.print("failed to open file {s}: {any}\n", .{file_path, err});
+            debugPrint("failed to open file {s}: {any}\n", .{file_path, err});
             return err;
         };
         var this = try @This().createFromBuffer(buf, file_path, is_lib, null);
@@ -11123,14 +11110,8 @@ pub const ParsedFile = struct {
     }
 };
 
-pub fn getNumber(node: *const AstNode) f64 {
-    if (node.data) |d| {
-        const val: u64 = @intFromPtr(d);
-
-        return @bitCast(val);
-    }
-
-    return 0;
+pub inline fn getNumber(node: *const AstNode) f64 {
+    return @bitCast(node.data);
 }
 
 // Options are mostly aligned with `tsc`
@@ -11737,17 +11718,16 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print("</>");
                 },
                 .numeric_literal => {
-                    if (n.data) |d| {
-                        const val: u64 = @intFromPtr(d);
-                        const f: f64 = @bitCast(val);
-                        var buf: [64]u8 = undefined;
-                        if (n.hasFlag(.let)) { // hex
-                            this.print(try std.fmt.bufPrint(&buf, "0x{X}", .{@as(u64, @intFromFloat(f))}));
-                        } else {
-                            this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
-                        }
-                    } else {
+                    if (n.data == 0) {
                         this.print("0");
+                        return;
+                    }
+                    const f: f64 = @bitCast(n.data);
+                    var buf: [64]u8 = undefined;
+                    if (n.hasFlag(.let)) { // hex
+                        this.print(try std.fmt.bufPrint(&buf, "0x{X}", .{@as(u64, @intFromFloat(f))}));
+                    } else {
+                        this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
                     }
                 },
                 .qualified_name => {
@@ -11867,17 +11847,17 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this._visitLinkedList(d.right, " {", "}", "", true);
                 },
                 .break_statement => {
-                    if (n.data) |p| {
+                    if (maybeUnwrapRef(n)) |label| {
                         this.print("break ");
-                        try this.visitRef(@intFromPtr(p));
+                        try this.visitRef(label);
                     } else {
                         this.print("break");
                     }
                 },
                 .continue_statement => {
-                    if (n.data) |p| {
+                    if (maybeUnwrapRef(n)) |label| {
                         this.print("continue ");
-                        try this.visitRef(@intFromPtr(p));
+                        try this.visitRef(label);
                     } else {
                         this.print("continue");
                     }
@@ -11965,7 +11945,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .return_statement => {
                     this.print("return ");
-                    if (n.data != null) try this.visitRef(unwrapRef(n));
+                    if (n.data != 0) try this.visitRef(unwrapRef(n));
                 },
                 .yield_expression => {
                     if (hasFlag(n, .generator)) {
@@ -11973,7 +11953,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     } else {
                         this.print("yield ");
                     }
-                    if (n.data != null) try this.visitRef(unwrapRef(n));
+                    if (n.data != 0) try this.visitRef(unwrapRef(n));
                 },
                 .parenthesized_expression => {
                     if (this.needs_newline) {
@@ -12016,8 +11996,8 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(d.right);
                 },
                 .object_literal_expression => {
-                    if (n.data) |p| {
-                        try this._visitLinkedList(@intCast(@intFromPtr(p)), "{", "}", ",", true);
+                    if (maybeUnwrapRef(n)) |p| {
+                        try this._visitLinkedList(p, "{", "}", ",", true);
                     } else {
                         this.print("{}");
                     }
@@ -12340,8 +12320,8 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
                 },
                 .named_exports, .named_imports => {
-                    if (n.data) |p| {
-                        try this._visitLinkedList(@intCast(@intFromPtr(p)), "{ ", " }", ", ", false);
+                    if (maybeUnwrapRef(n)) |p| {
+                        try this._visitLinkedList(p, "{ ", " }", ", ", false);
                     } else {
                         this.print("{ }");
                     }
@@ -12365,8 +12345,8 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
                 },
                 .import_attributes => {
-                    if (n.data) |p| {
-                        try this._visitLinkedList(@intCast(@intFromPtr(p)), "{ ", " }", ", ", false);
+                    if (maybeUnwrapRef(n)) |p| {
+                        try this._visitLinkedList(p, "{ ", " }", ", ", false);
                     } else {
                         this.print("{}");
                     }
@@ -12573,7 +12553,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print(")");
                 },
                 .block => {
-                    const p = n.data orelse return this.print("{}");
+                    const p = maybeUnwrapRef(n) orelse return this.print("{}");
 
                     const old_scope = this.scope;
                     this.scope = .none;
@@ -12585,7 +12565,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     defer this.indent -= 2;
                     this.needs_newline = true;
 
-                    var ref: NodeRef = @intCast(@intFromPtr(p));
+                    var ref: NodeRef = p;
                     while (ref != 0) {
                         const u = this.getNode(ref);
                         const needs_using_scope = u.kind == .defer_statement or (u.kind == .variable_statement and hasFlag(u, .using));
@@ -12595,7 +12575,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                                 if (has_binding) {
                                     const n3 = try this.data.nodes.push(.{
                                         .kind = .defer_statement,
-                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(u)))),
+                                        .data = try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(u))),
                                         .next = u.next,
                                     });
                                     return this.visitUsingOrDeferScope(n3);
@@ -12969,7 +12949,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                                 if (has_binding) {
                                     const n3 = try this.data.nodes.push(.{
                                         .kind = .defer_statement,
-                                        .data = @ptrFromInt(try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(n2)))),
+                                        .data = try this.getTransformer().transformIfOrWhile(this.getNode(unwrapRef(n2))),
                                         .next = n2.next,
                                     });
                                     return this.visitUsingOrDeferScope(n3);
@@ -12996,7 +12976,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.printHelpers();
                 },
                 .external_node => {
-                    const data: *const AstData = @alignCast(@ptrCast(n.data orelse return error.NoData));
+                    const data: *const AstData = @ptrFromInt(@as(usize, @intCast(n.data)));
                     const start = n.len;
 
                     const old_data: AstData = this.data;
@@ -13060,7 +13040,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         return this.print(syntaxKindToString(n.kind));
                     }
                     if (comptime is_debug) {
-                        std.debug.print("MISSING {any}\n", .{n.kind});
+                        debugPrint("MISSING {any}\n", .{n.kind});
                     }
                     return error.MISSING;
                 },
@@ -13170,7 +13150,7 @@ pub fn print(data: AstData, node: AstNode) !void {
 
         pub fn write(this: *@This(), text: []const u8) void {
             this.len += text.len;
-            std.debug.print("{s}", .{text});
+            debugPrint("{s}", .{text});
         }
 
         pub inline fn pos(this: *const @This()) usize {
@@ -13263,7 +13243,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
     const req = try data.nodes.push(.{
         .kind = .identifier,
-        .data = x.ptr,
+        .data = @intFromPtr(x.ptr),
         .len = @intCast(x.len),
     });
 
@@ -13275,7 +13255,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
     const exports_ident = try data.nodes.push(.{
         .kind = .identifier,
-        .data = x2.ptr,
+        .data = @intFromPtr(x2.ptr),
         .len = @intCast(x2.len),
     });
 
@@ -13283,7 +13263,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
     const esmodule_ident = try data.nodes.push(.{
         .kind = .identifier,
-        .data = x4.ptr,
+        .data = @intFromPtr(x4.ptr),
         .len = @intCast(x4.len),
     });
 
@@ -13350,7 +13330,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = pair[0].next,
                     });
                     try replacements.put(pair[1], variable_statement);
@@ -13371,7 +13351,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = pair[0].next,
                     });
                     if (default_import) |n| {
@@ -13400,7 +13380,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
                     const pattern = try data.nodes.push(.{
                         .kind = .object_binding_pattern,
-                        .data = @ptrFromInt(synthed.head),
+                        .data = synthed.head,
                     });
 
                     const decl = try data.nodes.push(.{
@@ -13410,7 +13390,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     const variable_statement = try data.nodes.push(.{
                         .kind = .variable_statement,
                         .flags = @intFromEnum(NodeFlags.@"const"),
-                        .data = @ptrFromInt(decl),
+                        .data = decl,
                         .next = pair[0].next,
                     });
                     if (default_import) |n| {
@@ -13437,7 +13417,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                     try statements.append(.{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                     });
                 } else if (pair[0].kind == .class_declaration) {
                     const copy = try data.nodes.push(data.nodes.at(getPackedData(pair[0]).left).*);
@@ -13447,7 +13427,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                     const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                     const exp_statement = try data.nodes.push(.{
                         .kind = .expression_statement,
-                        .data = @ptrFromInt(exp),
+                        .data = exp,
                         .next = pair[0].next,
                     });
 
@@ -13469,7 +13449,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
                         const exp = try createAssignmentExpression(exports_ident, &data.nodes, copy, copy);
                         const exp_statement = try data.nodes.push(.{
                             .kind = .expression_statement,
-                            .data = @ptrFromInt(exp),
+                            .data = exp,
                             .next = pair[0].next,
                         });
 
@@ -13487,7 +13467,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
         });
         var right: NodeRef = try data.nodes.push(.{
             .kind = .void_expression,
-            .data = @ptrFromInt(zero),
+            .data = zero,
         });
 
         for (late_exports.items) |n| {
@@ -13497,7 +13477,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
         try statements.append(.{
             .kind = .expression_statement,
-            .data = @ptrFromInt(right),
+            .data = right,
         });
     }
 
@@ -13505,7 +13485,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
         const s = try copyStr(__esm_exports_helper);
         const helper = try statements.allocator.push(.{
             .kind = .verbatim_node,
-            .data = s.ptr,
+            .data = @intFromPtr(s.ptr),
             .len = @intCast(s.len),
             .extra_data = 1,
             .next = statements.head,
@@ -13526,7 +13506,7 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
 
     const sf = AstNode{
         .kind = .source_file,
-        .data = @ptrFromInt(statements.head),
+        .data = statements.head,
     };
 
     try printer.visit(&sf);
@@ -13710,7 +13690,7 @@ const SourceMap = struct {
                     size += 2; // []
                 },
                 else => {
-                    std.debug.print("{any}", .{T});
+                    debugPrint("{any}", .{T});
                     return error.TODO;
                 },
             }

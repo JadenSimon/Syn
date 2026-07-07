@@ -108,32 +108,22 @@ fn NewLexer_(
             ParserError,
         };
 
-        source: Source,
         current: usize = 0,
         start: usize = 0,
         end: usize = 0,
-        // previous_backslash_quote_in_jsx: logger.Range = logger.Range.None,
+        code_point: CodePoint = -1,
         token: T = T.t_end_of_file,
         has_newline_before: bool = false,
         is_legacy_octal_literal: bool = false,
         suppress_errors: bool = false,
-        code_point: CodePoint = -1,
         identifier: []const u8 = "",
-        // jsx_pragma: JSXPragma = .{},
-        // source_mapping_url: ?js_ast.Span = null,
+
         number: f64 = 0.0,
-        rescan_close_brace_as_template_token: bool = false,
         regex_flags_start: ?u16 = null,
-        allocator: std.mem.Allocator,
-        /// In JavaScript, strings are stored as UTF-16, but nearly every string is ascii.
-        /// This means, usually, we can skip UTF8 -> UTF16 conversions.
-        string_literal_buffer: std.ArrayList(u16),
+ 
         string_literal_slice: []const u8 = "",
-        string_literal: []const u16,
         string_literal_is_ascii: bool = false,
 
-        /// Only used for JSON stringification when bundling
-        /// This is a zero-bit type unless we're parsing JSON.
         is_ascii_only: JSONBool = JSONBoolDefault,
 
         last_line: usize = 0,
@@ -141,8 +131,12 @@ fn NewLexer_(
         full_start: u32 = 0,
 
         pause_on_comments: bool = true,
+        rescan_close_brace_as_template_token: bool = false,
 
         line_map: LineMapType = if (record_lines) undefined else {},
+
+        allocator: std.mem.Allocator,
+        source: Source,
         errors: std.ArrayListUnmanaged(Diagnostic) = .{},
 
         pub fn clone(self: *const LexerType) LexerType {
@@ -161,9 +155,7 @@ fn NewLexer_(
                 .number = self.number,
                 .rescan_close_brace_as_template_token = self.rescan_close_brace_as_template_token,
                 .allocator = self.allocator,
-                .string_literal_buffer = self.string_literal_buffer,
                 .string_literal_slice = self.string_literal_slice,
-                .string_literal = self.string_literal,
                 .string_literal_is_ascii = self.string_literal_is_ascii,
                 .is_ascii_only = self.is_ascii_only,
                 .line_map = self.line_map,
@@ -955,7 +947,7 @@ fn NewLexer_(
                         @tagName(self.token),
                     }, true);
                 } else {
-                    std.debug.print("{s} {}\n", .{self.source.name orelse "", self.last_line});
+                    if (!comptime @import("builtin").target.isWasm()) std.debug.print("{s} {}\n", .{self.source.name orelse "", self.last_line});
                     self.addError(self.start, "Expected \"{s}\" but found \"{s}\"", .{ keyword, self.raw() }, true);
                 }
                 return Error.UnexpectedSyntax;
@@ -1945,11 +1937,8 @@ fn NewLexer_(
         }
 
         pub fn initWithoutReading(source: Source, allocator: std.mem.Allocator) LexerType {
-            const empty_string_literal: JavascriptString = &emptyJavaScriptString;
             return LexerType{
                 .source = source,
-                .string_literal = empty_string_literal,
-                .string_literal_buffer = std.ArrayList(u16).init(allocator),
                 .allocator = allocator,
                 .line_map = if (comptime record_lines) LineMap.init() else {},
             };
@@ -2388,14 +2377,12 @@ fn NewLexer_(
                         lexer.string_literal_is_ascii = !needs_fixing;
                         if (needs_fixing) {
                             // slow path
-                            lexer.string_literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
+                            const literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
 
-                            if (lexer.string_literal.len == 0) {
+                            if (literal.len == 0) {
                                 lexer.has_newline_before = true;
                                 continue;
                             }
-                        } else {
-                            lexer.string_literal = &([_]u16{});
                         }
                     },
                 }
@@ -2459,14 +2446,12 @@ fn NewLexer_(
                         lexer.string_literal_slice = lexer.source.contents[original_start..lexer.end];
                         lexer.string_literal_is_ascii = !needs_fixing;
                         if (needs_fixing) {
-                            lexer.string_literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
+                            const literal = try fixWhitespaceAndDecodeJSXEntities(lexer, lexer.string_literal_slice);
 
-                            if (lexer.string_literal.len == 0) {
+                            if (literal.len == 0) {
                                 lexer.has_newline_before = true;
                                 continue;
                             }
-                        } else {
-                            lexer.string_literal = &([_]u16{});
                         }
                     },
                 }

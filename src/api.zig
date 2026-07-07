@@ -137,9 +137,9 @@ fn _printNode(sf: *const parser.ParsedFile, ref: u32, maybe_nodes: ?[]u8, maybe_
                 var n = &nodes_slice[i];
                 switch (n.kind) {
                     .identifier, .string_literal, .private_identifier, .template_head, .template_middle, .template_tail, .no_substitution_template_literal, .regular_expression_literal, .jsx_text => {
-                        const data = if (n.data) |x| @intFromPtr(x) else 0;
+                        const data = n.data;
                         if ((data >> 32) == 0xFF) {
-                            n.data = @ptrFromInt(@intFromPtr(heap.ptr) + ((data & 0xFFFFFFFF) - ast_data.source.len));
+                            n.data = @intFromPtr(heap.ptr) + ((data & 0xFFFFFFFF) - ast_data.source.len);
                         }
                     },
                     // TODO: template strings

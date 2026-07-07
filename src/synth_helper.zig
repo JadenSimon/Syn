@@ -136,7 +136,7 @@ pub const SynthInstrumenter = struct {
 
     fn getCellOrSymbol(self: *@This(), sym_ref: SymbolRef) !NodeRef {
         const ident = parser.getIdentFromSymbol(self.binder, sym_ref) orelse {
-            std.debug.print("{}\n",.{self.nodes.at(self.binder.symbols.at(sym_ref).declaration).kind});
+            if (!comptime @import("builtin").target.isWasm()) std.debug.print("{}\n",.{self.nodes.at(self.binder.symbols.at(sym_ref).declaration).kind});
             unreachable;
         };
         if (!self.needsCell(sym_ref)) {
@@ -348,7 +348,7 @@ pub const SynthInstrumenter = struct {
                 }
                 if (first == 0) {
                     const clone = try self.factory.cloneNodeRef(ref);
-                    self.nodes.at(clone).data = @ptrFromInt(head);
+                    self.nodes.at(clone).data = head;
                     try self.replacements.put(_ref, clone);
                 } else {
                     self.nodes.at(tail).next = self.nodes.at(first).next;
