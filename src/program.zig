@@ -2,7 +2,6 @@ const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
-const synth_helper = @import("./synth_helper.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 
@@ -23,6 +22,11 @@ const NodeList = parser.NodeList;
 const BumpAllocatorList = parser.BumpAllocatorList;
 
 const getPackedData = parser.getPackedData;
+const getLeft = parser.getLeft;
+const getRight = parser.getRight;
+const maybeGetLeft = parser.maybeGetLeft;
+const maybeGetRight = parser.maybeGetRight;
+
 const unwrapRef = parser.unwrapRef;
 const maybeUnwrapRef = parser.maybeUnwrapRef;
 const getNumber = parser.getNumber;
@@ -1241,6 +1245,14 @@ fn printNameWithLocation(f: *ParsedFileData, ref: NodeRef) !void {
     std.debug.print("{s} at {s}:{}:{}\n", .{ name, file_name, loc.line + 1, loc.col + 1 });
 }
 
+fn isRelativeModuleSpecifier(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+    if (spec[0] != '.') return false;
+    if (spec.len == 1 or spec[1] == '/') return true;
+    if (spec[1] != '.') return false;
+    return spec.len == 2 or spec[2] == '/';
+}
+
 const ProgramOptions = struct {
     default_libs: []const []const u8 = &.{},
     types: []const []const u8 = &.{},
@@ -2036,10 +2048,6 @@ pub const Program = struct {
 
         try this.bindModule(f);
 
-        // synth_helper.debugPrintCaptures(f.binder, &f.ast) catch |err| {
-        //     std.debug.print("synth_helper debug dump failed: {any}\n", .{err});
-        // };
-
         try this.doTopLevelCfa(f, start);
 
         const Visitor = struct {
@@ -2364,7 +2372,6 @@ pub const Program = struct {
             jsx_emit_state: ?*InlineEmitState = null,
 
             style_visitor: StyleVisitor = .{},
-            import_visitor: @import("./synth_helper.zig").ImportTransformer = undefined,
 
             helpers: std.EnumSet(Helper) = std.EnumSet(Helper).initEmpty(),
 
@@ -4854,6 +4861,7 @@ pub const Program = struct {
                 if (d.right == 0) return;
                 const cond_inner = unwrapRef(self.nodes.at(d.right));
                 try self.visit(self.nodes.at(cond_inner), cond_inner);
+                const normalized = try self.normalizeExpToBoolean(cond_inner);
 
                 var name_count: u32 = 0;
                 var ni = NodeIterator.init(self.nodes, d.left);
@@ -4865,13 +4873,13 @@ pub const Program = struct {
                         try self.factory.createIdentifier(el_name), "classList");
                     const toggle = try self.factory.createPropertyAccessExpression(cl, "toggle");
                     const call = try self.factory.createCallExpression(toggle,
-                        &.{ try self.factory.createStringLiteral(name), cond_inner });
+                        &.{ try self.factory.createStringLiteral(name), normalized });
                     try upd_body.append(try self.factory.createExpressionStatement(call));
                 } else {
                     var block_stmts = std.ArrayList(NodeRef).init(getAllocator());
                     defer block_stmts.deinit();
                     const cond_id = try self.factory.createIdentifier(try state.nextName());
-                    try block_stmts.append(try self.factory.createConstVariable(cond_id, cond_inner));
+                    try block_stmts.append(try self.factory.createConstVariable(cond_id, normalized));
                     ni = NodeIterator.init(self.nodes, d.left);
                     while (ni.next()) |name_node| {
                         const name = getSlice(name_node, u8);
@@ -5282,130 +5290,6 @@ pub const Program = struct {
                     .state = state,
                     .bridged_symbols = bridged_symbols,
                 };
-                try parser.forEachChild(self.nodes, self.nodes.at(start_ref), &v);
-            }
-
-            fn forEachChildDetectCaptures(
-                self: *@This(),
-                start_ref: NodeRef,
-                captured: *std.AutoHashMapUnmanaged(SymbolRef, void),
-            ) !void {
-                if (start_ref == 0) return;
-                const Self = *@This();
-                const V = struct {
-                    s: Self,
-                    is_capturing: bool,
-                    captured: *std.AutoHashMapUnmanaged(SymbolRef, void),
-                    excluded: std.AutoHashMapUnmanaged(SymbolRef, void),
-
-                    fn markDeclared(v: *@This(), sym_ref: SymbolRef) !void {
-                        try v.excluded.put(getAllocator(), sym_ref, {});
-                        _ = v.captured.remove(sym_ref);
-                    }
-
-                    fn maybeMarkDeclared(v: *@This(), node_ref: NodeRef) anyerror!void {
-                        if (node_ref == 0) return;
-                        const n = v.s.nodes.at(node_ref);
-                        switch (n.kind) {
-                            .array_binding_pattern, .object_binding_pattern => {
-                                var iter = NodeIterator.init(this.nodes, maybeUnwrapRef(n) orelse 0);
-                                while (iter.nextRef()) |r| {
-                                    try v.maybeMarkDeclared(r);
-                                }
-                                return;
-                            },
-                            .binding_element => {
-                                return try v.maybeMarkDeclared(getPackedData(n).left);
-                            },
-                            else => {},
-                        }
-
-                        if (v.s.file.binder.getSymbol(node_ref)) |sym_ref| {
-                            try v.markDeclared(sym_ref);
-                        }
-                    }
-
-                    pub fn visit(v: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
-                        switch (n.kind) {
-                            .identifier => {
-                                if (!v.is_capturing) return;
-                                const sym_ref = v.s.file.binder.getSymbol(ref) orelse return;
-                                if (v.excluded.contains(sym_ref)) return;
-                                try v.captured.put(getAllocator(), sym_ref, {});
-                            },
-                            .variable_declaration => {
-                                try v.maybeMarkDeclared(ref);
-                                const init_ref = getPackedData(n).right;
-                                if (init_ref != 0) {
-                                    try parser.forEachChild(v.s.nodes, v.s.nodes.at(init_ref), v);
-                                }
-                            },
-                            .function_declaration, .class_declaration => {
-                                try v.maybeMarkDeclared(ref);
-                                const saved = v.is_capturing;
-                                defer v.is_capturing = saved;
-                                v.is_capturing = true;
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                            .function_expression, .arrow_function => {
-                                if (n.kind == .function_expression) {
-                                    try v.maybeMarkDeclared(getPackedData(n).left);
-                                }
-                                const saved = v.is_capturing;
-                                defer v.is_capturing = saved;
-                                v.is_capturing = true;
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                            .method_declaration, .get_accessor, .set_accessor => {
-                                const saved = v.is_capturing;
-                                defer v.is_capturing = saved;
-                                v.is_capturing = true;
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                            .call_expression => {
-                                if (v.is_capturing) {
-                                    return try parser.forEachChild(v.s.nodes, n, v);
-                                }
-                                const d = getPackedData(n);
-                                if (v.s.nodes.at(d.left).kind == .parenthesized_expression) {
-                                    const inner = unwrapRef(v.s.nodes.at(d.left));
-                                    if (v.s.nodes.at(inner).kind == .arrow_function or v.s.nodes.at(inner).kind == .function_expression) {
-                                        try parser.forEachChild(v.s.nodes, v.s.nodes.at(inner), v);
-                                        var args_iter = NodeIterator.init(v.s.nodes, d.right);
-                                        while (args_iter.nextRef()) |r| {
-                                            try v.visit(v.s.nodes.at(r), r);
-                                        }
-                                        return;
-                                    }
-                                }
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                            .jsx_element, .jsx_self_closing_element => {
-                                const opening = if (n.kind == .jsx_element) unwrapRef(n) else ref;
-                                try v.maybeMarkDeclared(v.s.nodes.at(opening).extra_data);
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                            .parameter => {
-                                try v.maybeMarkDeclared(ref);
-                                const init_ref = getPackedData(n).right;
-                                if (init_ref != 0) {
-                                    try parser.forEachChild(v.s.nodes, v.s.nodes.at(init_ref), v);
-                                }
-                            },
-                            else => {
-                                try parser.forEachChild(v.s.nodes, n, v);
-                            },
-                        }
-                    }
-                };
-
-                var v = V{
-                    .s = self,
-                    .is_capturing = false,
-                    .captured = captured,
-                    .excluded = .{},
-                };
-                defer v.excluded.deinit(getAllocator());
                 try parser.forEachChild(self.nodes, self.nodes.at(start_ref), &v);
             }
 
@@ -6643,6 +6527,7 @@ pub const Program = struct {
 
                 const many_elements = self.willHaveManyNodes(children_start, state.containing_element_is_fragment_like);
                 const snapshot_name = try state.nextName();
+                var tmpl_ident: ?NodeRef = null;
                 // TODO: can only be released to the next element up
                 // defer state.releaseName(snapshot_name) catch unreachable;
                 {
@@ -6677,13 +6562,25 @@ pub const Program = struct {
                             try state.addStmt(try self.factory.createExpressionStatement(push_call));      
                         }
                     } else if (!many_elements and tmpl != 0) {
-                        const tmpl_assign = try self.factory.createAssignmentStatement(ident, tmpl);
-                        state.children_exp = try self.factory.createIdentifier(snapshot_name);
+                        // TODO: we can use this path if the root element of the tmpl doesn't have any slotted attributes
+                        // const tmpl_assign = try self.factory.createAssignmentStatement(ident, tmpl);
+                        // state.children_exp = try self.factory.createIdentifier(snapshot_name);
+                        // try state.addStmt(
+                        //     try self.factory.createConstVariable(
+                        //         try self.factory.createIdentifier(snapshot_name), 
+                        //         try self.factory.createArrayLiteralExpression(&.{
+                        //             unwrapRef(self.nodes.at(tmpl_assign))
+                        //         })
+                        //     )
+                        // );
+                        tmpl_ident = try self.factory.createIdentifier(try state.nextName());
+                        try state.addStmt(try self.factory.createConstVariable(tmpl_ident.?, tmpl));
+                        state.children_exp = ident;
                         try state.addStmt(
-                            try self.factory.createConstVariable(
-                                try self.factory.createIdentifier(snapshot_name), 
+                            try self.factory.createAssignmentStatement(
+                                ident, 
                                 try self.factory.createArrayLiteralExpression(&.{
-                                    unwrapRef(self.nodes.at(tmpl_assign))
+                                    tmpl_ident.?,
                                 })
                             )
                         );
@@ -6703,7 +6600,7 @@ pub const Program = struct {
                         state.children_init_ref = try self.factory.createArrayLiteralExpression(0);
                         try state.addStmt(try self.factory.createAssignmentStatement(ident, state.children_init_ref));
                     }
-                    _ = try self.inlineProcessElement2(state, el_name, node_ref, &updates);
+                    _ = try self.inlineProcessElement2(state, if (tmpl_ident) |x| getSlice(self.nodes.at(x), u8) else el_name, node_ref, &updates);
                     if (target != 0) {
                         if (many_elements and save_children_exp == 0) {
                             // `target` should be a DocumentFragment
@@ -6717,7 +6614,7 @@ pub const Program = struct {
                         if (state.stmts.items.len == 1 and tmpl != 0) {
                             _ = state.stmts.pop();
                             try state.stmts.append(try self.factory.createAssignmentStatement(ident, try self.factory.createArrayLiteralExpression(&.{tmpl})));
-                        } else if (tmpl != 0) {
+                        } else if (tmpl != 0 and tmpl_ident == null) {
                             try state.addStmt(try self.factory.createAssignmentStatement(ident, try self.factory.createIdentifier(snapshot_name)));
                         }
                     }
@@ -7228,6 +7125,7 @@ pub const Program = struct {
                             var si = NodeIterator.init(w.s.nodes, stmts_head);
                             while (si.nextRef()) |stmt_ref| {
                                 const stmt = w.s.nodes.at(stmt_ref);
+                                if (stmt.hasFlag(.static)) continue;
                                 switch (stmt.kind) {
                                     .variable_statement => {
                                         const decl_head = maybeUnwrapRef(stmt) orelse continue;
@@ -7249,7 +7147,7 @@ pub const Program = struct {
                         switch (n.kind) {
                             .identifier => {
                                 if (n.flags & (1 << 19) != 0) return; // type node ident
-                                if (ref >= w.s.file.binder.nodes.count()) return; // XXX: synthetic nodes
+                                if (ref >= w.s.file.binder.nodes.count()) return; // XXX: synthetic nodes (why are we walking synthetics??)
                                 const sym_ref = w.s.file.binder.getSymbol(ref) orelse return;
                                 try w.record(sym_ref, false);
                             },
@@ -7281,8 +7179,7 @@ pub const Program = struct {
                             },
 
                             .jsx_element, .jsx_self_closing_element => {
-                                const binding = w.s.inlineMaybeGetElementBinding(n);
-                                if (binding != null and !w.suppress_element_maps) {
+                                if (w.s.elementCanBeUpdated(n) and !w.suppress_element_maps) {
                                     const saved = w.current_node;
                                     w.current_node = ref;
                                     defer w.current_node = saved;
@@ -7293,6 +7190,23 @@ pub const Program = struct {
                                     if (n.kind == .jsx_element) try w.hoistRuns(unwrapRef(n));
                                     try w.visitChildren(n);
                                 }
+                            },
+
+                            .jsx_if_directive, .jsx_else_directive => {
+                                // currently, #if and #else are emitted using closures
+                                // so they must be treated as their own update entrypoint
+                                // despite it being impossible to update them independently
+                                //
+                                // this code could be removed if the emit for #if and #else did not use closures (which is doable)
+                                if (n.kind == .jsx_if_directive) {
+                                    try w.visit(w.s.nodes.at(getLeft(n)), getLeft(n));
+                                }
+                                const saved = w.current_node;
+                                w.current_node = ref;
+                                defer w.current_node = saved;
+                                try w.result.node_ptr_to_ref.put(getAllocator(), n, ref);
+                                try w.hoistRuns(getPackedData(n).right);
+                                try w.visitChildren(n);
                             },
 
                             .function_expression, .arrow_function,
@@ -7307,16 +7221,7 @@ pub const Program = struct {
                             .binary_expression => {
                                 const d = getPackedData(n);
                                 const op: SyntaxKind = @enumFromInt(n.len);
-                                const is_assign = switch (op) {
-                                    .equals_token,
-                                    .plus_equals_token, .minus_equals_token,
-                                    .asterisk_equals_token, .slash_equals_token,
-                                    .percent_equals_token, .asterisk_asterisk_equals_token,
-                                    .bar_equals_token, .ampersand_equals_token,
-                                    .caret_equals_token, .question_question_equals_token,
-                                    .bar_bar_equals_token, .ampersand_ampersand_equals_token => true,
-                                    else => false,
-                                };
+                                const is_assign = parser.isAssignmentOp(op);
                                 if (is_assign and w.s.nodes.at(d.left).kind == .identifier) {
                                     if (w.s.file.binder.getSymbol(d.left)) |sym_ref| {
                                         try w.record(sym_ref, true);
@@ -7621,6 +7526,32 @@ pub const Program = struct {
                                 @intFromEnum(NodeFlags.@"const")));
                         }
                     } else blk: {
+                        // XXX: handles derived
+                        if (stmt.kind == .variable_statement and stmt.hasFlag(NodeFlags.@"const")) {
+                            if (state.tree_classification) |tc| {
+                                var di = NodeIterator.init(self.nodes, unwrapRef(stmt));
+                                while (di.nextRef()) |decl_ref| {
+                                    const binding_ref = getPackedData(self.nodes.at(decl_ref)).left;
+                                    if (self.nodes.at(binding_ref).kind != .identifier) continue;
+                                    const sym_ref = self.file.binder.getSymbol(binding_ref) orelse continue;
+                                    const p = tc.producers.get(sym_ref) orelse continue;
+                                    if (!p.any_consumer_read) continue;
+                                    if (state.bridged_declarations == null) {
+                                        const q = try getAllocator().create(std.AutoHashMapUnmanaged(SymbolRef, NodeRef));
+                                        q.* = .{};
+                                        state.bridged_declarations = q;
+                                    }
+                                    if (!state.bridged_declarations.?.contains(sym_ref)) {
+                                        const can_hoist = if (state.hoistable_symbols) |m| m.get(sym_ref) orelse false else false;
+                                        if (!can_hoist) {
+                                            const b = try state.nextName();
+                                            try state.bridged_declarations.?.put(getAllocator(), sym_ref, try self.factory.createIdentifier(b));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if (stmt.kind == .variable_statement) {
                             var decl_iter = NodeIterator.init(self.nodes, unwrapRef(stmt));
                             while (decl_iter.nextRef()) |decl_ref| {
@@ -7890,6 +7821,11 @@ pub const Program = struct {
                     },
                     else => return null,
                 }
+            }
+
+            fn elementCanBeUpdated(self: *@This(), node: *const AstNode) bool {
+                if (self.inlineMaybeGetElementBinding(node) != null) return true;
+                return (node.flags & @intFromEnum(parser.JsxElementFlags.targeted)) != 0;
             }
 
             fn inlineEmitSpreadCompFn(
@@ -8230,6 +8166,9 @@ pub const Program = struct {
 
                             any_captured = p.any_consumer_captured;
                             if (p.is_captured) bridged = true;
+                            if (v.file.binder.symbols.at(sym_ref).hasFlag(.@"const") and p.any_consumer_read) {
+                                bridged = true;
+                            }
                         }
                         // TODO: a symbol across a nested #component boundary, if inside the template, 
                         // should still be treated as "captured" if we cannot prove synchronized updates
@@ -9124,7 +9063,7 @@ pub const Program = struct {
                 const attrs = getPackedData(opening).right;
                 const save_fully_static = state.is_fully_static;
                 defer state.is_fully_static = save_fully_static;
-                state.is_fully_static = save_fully_static and self.inlineMaybeGetElementBinding(n) == null;
+                state.is_fully_static = save_fully_static and self.inlineMaybeGetElementBinding(n) == null and (n.flags & @intFromEnum(parser.JsxElementFlags.targeted)) == 0;
                 var static_props_members = std.ArrayList(NodeRef).init(getAllocator());
                 defer static_props_members.deinit();
                 var has_children_like = false;
@@ -9397,7 +9336,7 @@ pub const Program = struct {
                 
                 const n = self.nodes.at(ref);
                 const is_fragment_like = self.isFragmentLike(n);
-                state.is_fully_static = !is_fragment_like and self.inlineMaybeGetElementBinding(n) == null and n.kind != .jsx_component;
+                state.is_fully_static = !is_fragment_like and self.inlineMaybeGetElementBinding(n) == null and n.kind != .jsx_component and (n.flags & @intFromEnum(parser.JsxElementFlags.targeted)) == 0;
 
                 if (is_fragment_like) state.ctx = .templated
                 else if (!self.isIntrinsicTag(self.getJsxTagRef(n))) state.ctx = .component;
@@ -10850,8 +10789,45 @@ pub const Program = struct {
                             }
                         }
                     },
+                    .shorthand_property_assignment => {
+                        const inner_ref = unwrapRef(n);
+                        try self.visit(self.nodes.at(inner_ref), inner_ref);
+                        if (self.replacements.get(inner_ref)) |v| {
+                            _ = self.replacements.swapRemove(inner_ref);
+                            const c = try self.factory.createPropertyAssignment(inner_ref, v);
+                            self.nodes.at(c).next = n.next;
+                            try self.replacements.put(ref, c);
+                        }
+                    },
                     .import_declaration => {
-                    //    try self.import_visitor.visitImportDecl(ref);
+                        const spec_ref = getPackedData(n).right;
+                        const spec = self.nodes.at(spec_ref);
+                        const spec_text = getSlice(spec, u8);
+                        if (isRelativeModuleSpecifier(spec_text)) {
+                            if (self.file.import_map.get(getHash(spec_text))) |id| {
+                                // TODO: attach final file extension to spec
+                                //const ot = self.analyzer.program.getFileData(id);
+                                _ = id;
+                            }
+                        }
+                        // we need to mark inferred `type` imports
+                        const clause = getPackedData(n).left;
+                        if (clause != 0 and !n.hasFlag(.declare)) {
+                            const bindings = getPackedData(self.nodes.at(clause)).right;
+                            if (bindings != 0 and self.nodes.at(bindings).kind == .named_imports) {
+                                var binding_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(self.nodes.at(bindings)) orelse 0);
+                                while (binding_iter.nextRef()) |x| {
+                                    const b = self.nodes.at(x);
+                                    if (b.hasFlag(.declare)) continue;
+                                    const sym = self.file.binder.symbols.at(self.file.binder.getSymbol(x) orelse continue);
+                                    if (try self.analyzer.isImportedTypeOnlySymbol(sym)) {
+                                        const copy = try self.factory.cloneNodeRef(x);
+                                        self.nodes.at(copy).flags |= @intFromEnum(NodeFlags.declare);
+                                        try self.replacements.put(x, copy);
+                                    }
+                                }
+                            }
+                        }
                     },
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
@@ -10871,12 +10847,6 @@ pub const Program = struct {
             .analyzer = a, 
             .file = f, 
             .nodes = &f.ast.nodes,
-            .factory = &factory,
-            .replacements = &r,
-        };
-
-        v.import_visitor = .{
-            .allocator = getAllocator(),
             .factory = &factory,
             .replacements = &r,
         };
@@ -12245,18 +12215,17 @@ pub const Analyzer = struct {
         pub fn append(this: *@This(), analyzer: *Analyzer, type_ref: TypeRef) !void {
             this.flags |= analyzer.getStructuralFlags(type_ref);
 
+            if (this.isAllocated()) {
+                return this.appendAllocated(analyzer, type_ref);
+            }
+
             if (this.count < 4) {
                 this.buf[this.count] = type_ref;
                 this.count += 1;
                 return;
             }
-
-            if (this.count == 4) {
-                const buf = try this.allocate(analyzer.allocator(), 8);
-                this.setAllocatedSlice(buf);
-            }
-
-            return this.appendAllocated(analyzer, type_ref);
+            const buf = try this.allocate(analyzer.allocator(), 8);
+            this.setAllocatedSlice(buf);
         }
 
         // useful when you don't want to write to a type directly
@@ -12344,13 +12313,17 @@ pub const Analyzer = struct {
                 }
 
                 t.flags |= this.flags;
+                if (this.isAllocated()) {
+                    this.deinit(_allocator);
+                    t.flags &= ~@intFromEnum(Flags.allocated_list);
+                }
 
                 return;
             }
 
             //const items_ptr: *u64 = @alignCast(@ptrCast(&t.slot1));
 
-            if (this.count <= this.buf.len) {
+            if (this.count <= this.buf.len and !this.isAllocated()) {
                 const slice = try this.allocate(_allocator, this.count);
                 //items_ptr.* = @intFromPtr(slice.ptr);
                 t.slot1 = @truncate(@intFromPtr(slice.ptr));
@@ -14342,6 +14315,11 @@ pub const Analyzer = struct {
                     // TODO: these should _technically_ be supported if a number index exists
                     if (s.getKind() == .array) return false;
                     if (s.getKind() == .tuple) return false;
+                    if (s.getKind() == .intersection) {
+                        // slow path
+                        const merged = try this.mergeIntersection(subject);
+                        return try this.inferConditionalTypeWithVariance(merged, condition, inferred, variance) orelse return null;
+                    }
 
                     this.printTypeInfo(subject);
                     return error.TODO;
@@ -14429,6 +14407,16 @@ pub const Analyzer = struct {
                 }
                 std.debug.print("{any}\n", .{n.getKind()});
                 return error.TODO4;
+            },
+            .predicate => {
+                if (this.maybeGetTypeFromRef(subject)) |s| {
+                    if (s.getKind() == .predicate) {
+                        const did_match = try this.inferConditionalTypeWithVariance(s.slot1, n.slot1, inferred, variance) orelse return null;
+                        return did_match;
+                    }
+                    return false;
+                }
+                return false; // always false now i guess?
             },
             // .class => {
             //     if (subject >= @intFromEnum(Kind.false)) return false;
@@ -16542,7 +16530,6 @@ pub const Analyzer = struct {
                     const as_d = getPackedData(node);
                     const rhs_node = self.file.ast.nodes.at(as_d.right);
                     if (rhs_node.kind == .async_keyword) {
-                        // `expr as async` — keep the Promise type, don't auto-unwrap
                         const ty = try self.analyzer.getType(self.file, ref);
                         try self.type_checker.checkAsAsyncOnNonAsyncCall(ref, ty);
                         return ty;
@@ -17287,6 +17274,7 @@ pub const Analyzer = struct {
             }
 
             std.debug.print("TODO (intersectType): ", .{});
+            this.printTypeInfo(lhs);
             this.printTypeInfo(rhs);
             return lhs; // TODO
         }
@@ -19723,9 +19711,21 @@ pub const Analyzer = struct {
             return this.createObjectLiteral(copy, source.flags, source.slot3);
         }
 
+        if (source.getKind() == .intersection) {
+            // slow path :(
+            return this.createRefinement(try this.mergeIntersection(source_ref), member);
+        }
+
         return notSupported(source.getKind());
     }
 
+    fn mergeIntersection(this: *@This(), t: TypeRef) !TypeRef {
+        var merged = Merged{ .analyzer = this };
+        for (getSlice2(this.types.at(t), TypeRef)) |u| {
+            try merged.addType(u);
+        }
+        return merged.complete();
+    }
 
     fn hashFunctionLiteral(params: *const TypeList, return_type: TypeRef, this_type: TypeRef) u64 {
         var h = std.hash.Wyhash.init(0);
@@ -20783,6 +20783,9 @@ pub const Analyzer = struct {
                     this.analysis_err_type = type_ref;
                     return;
                 }
+                if (type_ref == @intFromEnum(Kind.empty_object)) {
+                    return;
+                }
                 this.analyzer.printTypeInfo(type_ref);
                 this.analyzer.printCurrentNode();
                 return error.TODO_merge_primitive_decl;
@@ -20882,6 +20885,32 @@ pub const Analyzer = struct {
         }
     };
 
+    pub fn isImportedTypeOnlySymbol(this: *@This(), sym: *const parser.Symbol) !bool {
+        std.debug.assert(sym.hasFlag(.imported));
+        if (sym.hasFlag(.namespace)) return error.TODO;
+        const imported_file = this.program.getFileData(getOrdinal(sym));
+        const imported_ref = sym.declaration & ~@as(u32, 0b11 << 30);
+        if (imported_ref == 0) return false;
+        var imported_sym: *const parser.Symbol = undefined;
+        if (sym.declaration >> 30 == 1) { // default import
+            if (imported_file.binder.getTypeSymbol(imported_ref)) |r| {
+                imported_sym = imported_file.binder.symbols.at(r);
+            } else return false;
+        } else {
+            imported_sym = imported_file.binder.symbols.at(imported_ref);
+        }
+        if (imported_sym.hasFlag(.imported)) {
+            return this.isImportedTypeOnlySymbol(imported_sym);
+        }
+        var next = imported_sym.next;
+        while (next != 0) {
+            const s = imported_file.binder.symbols.at(next);
+            if (!s.hasFlag(.type)) return false;
+            next = s.next;
+        }
+        return imported_sym.hasFlag(.type);
+    }
+
     inline fn getTypeOfAbsoluteSymbol(this: *@This(), abs_ref: AbsoluteSymbolRef) !TypeRef {
         // we do not want to treat immediate symbols as global when finding their type
         return this._getTypeOfSymbol(this.program.getFileData(abs_ref.file_id), abs_ref.ref, false);
@@ -20944,6 +20973,10 @@ pub const Analyzer = struct {
 
                 return t;
             }
+        }
+
+        if (sym.hasFlag(.imported)) { // overlaps with `.local`?
+            return this.getTypeOfSymbol(this.program.getFileData(sym.getOrdinal()), sym.declaration);
         }
 
         return this.getTypeOfGlobalSymbol(sym.declaration);
@@ -23711,6 +23744,12 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.void);
             },
             .module_declaration => {
+                return @intFromEnum(Kind.any); // FIXME
+            },
+            .jsx_component => {
+                return @intFromEnum(Kind.any); // FIXME
+            },
+            .import_keyword => {
                 return @intFromEnum(Kind.any); // FIXME
             },
             else => {},

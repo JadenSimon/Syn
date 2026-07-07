@@ -462,7 +462,7 @@ class AstNode {
     }
 
     public get flags() {
-        return (this.buf[this.ref * 8]) >> 12
+        return (this.buf[this.ref * 8]) >> 10
     }
 
     public get next() {
@@ -791,6 +791,13 @@ class AstNode {
         }
     }
 
+    get operands() {
+        switch (this.kind) {
+            case SyntaxKind.JsxClassAttribute:
+                return this._left ??= linkedListToArray(this.l, this.buf, this.source, this) 
+        }
+    }
+
     get body(): AstNode | undefined {
         switch (this.kind) {
             case SyntaxKind.ArrowFunction:
@@ -812,6 +819,8 @@ class AstNode {
 
     get block(): AstNode | undefined  {
         switch (this.kind) {
+            case SyntaxKind.UpdateStatement:
+                if (!this.r) return
             case SyntaxKind.CatchClause:
                 return this.right    
         }
@@ -1518,6 +1527,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
     let nodeBuffer = Buffer.allocUnsafe(nodeCount > 10_000 ? 32768 : 4096)
     let buf = new Uint32Array(nodeBuffer.buffer, nodeBuffer.byteOffset)
     let allocsBeforeResize = nodeBuffer.byteLength / 32
+    let bufView = new DataView(nodeBuffer.buffer, nodeBuffer.byteOffset)
 
     const slices = new Map<any, { pointer: number; len: number }>()
 
@@ -1534,6 +1544,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         nodeBuffer = newBuf
         buf = new Uint32Array(nodeBuffer.buffer, nodeBuffer.byteOffset)
         allocsBeforeResize = (addedBytes / 32) - 1
+        bufView = new DataView(nodeBuffer.buffer, nodeBuffer.byteOffset)
         // if (buf.buffer !== nodeBuffer.buffer) {
         //     buf = new Uint32Array(nodeBuffer.buffer, nodeBuffer.byteOffset)
         //     allocsBeforeResize = (() / 32) - 1
@@ -1793,10 +1804,11 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 break
 
             case SyntaxKind.NumericLiteral: {
-                buf[offset + 0] = SyntaxKind.NumericLiteral
+                // buf[offset + 0] = SyntaxKind.NumericLiteral
                 // buf[offset + 1] = next
-                const v = new Float64Array(buf.buffer, (offset * 4) + 8, 1)
-                v[0] = Number((node as ts.NumericLiteral).text)
+                // const v = new Float64Array(buf.buffer, (offset * 4) + 8, 1)
+                bufView.setFloat64((offset * 4) + 8, Number((node as ts.NumericLiteral).text), true)
+                //v[0] = Number((node as ts.NumericLiteral).text)
                 break
             }
 
@@ -1806,13 +1818,13 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 if ((node as ts.ImportOrExportSpecifier).propertyName !== undefined) {
                     const name = serializeNode((node as ts.ImportOrExportSpecifier).name)
                     const propertyName = serializeNode((node as ts.ImportOrExportSpecifier).propertyName)
-                    buf[offset + 0] = (flags << 12) | node.kind
+                    buf[offset + 0] = (flags << 10) | node.kind
                     // buf[offset + 1] = next
                     buf[offset + 2] = propertyName
                     buf[offset + 3] = name
                 } else {
                     const name = serializeNode((node as ts.ImportOrExportSpecifier).name)
-                    buf[offset + 0] = (flags << 12) | node.kind
+                    buf[offset + 0] = (flags << 10) | node.kind
                     // buf[offset + 1] = next
                     buf[offset + 2] = name
                     buf[offset + 3] = 0
@@ -1985,7 +1997,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
 
             case SyntaxKind.VariableDeclarationList: {
                 const declarations = serializeList((node as ts.VariableDeclarationList).declarations)
-                buf[offset + 0] = (node.flags << 12) | SyntaxKind.VariableDeclarationList
+                buf[offset + 0] = (node.flags << 10) | SyntaxKind.VariableDeclarationList
                 // buf[offset + 1] = next
                 buf[offset + 2] = declarations
                 buf[offset + 3] = 0
@@ -2001,7 +2013,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 const name = serializeNode((node as ts.PropertyDeclaration).name)
                 const type = serializeNode((node as ts.PropertyDeclaration).type)
                 const initializer = serializeNode((node as ts.PropertyDeclaration).initializer)
-                buf[offset + 0] = (getFlags(node, flags) << 12) | SyntaxKind.PropertyDeclaration
+                buf[offset + 0] = (getFlags(node, flags) << 10) | SyntaxKind.PropertyDeclaration
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = initializer
@@ -2031,8 +2043,6 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
             case SyntaxKind.ImportKeyword:
             case SyntaxKind.OmittedExpression:
             case SyntaxKind.EmptyStatement:
-                buf[offset + 0] = node.kind
-                // buf[offset + 1] = next
                 break             
 
             // Typescript only
@@ -2043,7 +2053,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 }
                 const name = serializeNode((node as ts.EnumDeclaration).name)
                 const members = serializeList((node as ts.EnumDeclaration).members)
-                buf[offset + 0] = (flags << 12) | SyntaxKind.EnumDeclaration
+                buf[offset + 0] = (flags << 10) | SyntaxKind.EnumDeclaration
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = members
@@ -2073,7 +2083,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 const isNamespace = (node.flags & NodeFlags.Namespace) === NodeFlags.Namespace
                 const name = serializeNode((node as ts.ModuleDeclaration).name)
                 const body = serializeNode((node as ts.ModuleDeclaration).body)
-                buf[offset + 0] = (getFlags(node, isNamespace ? InternalNodeFlags.Let : 0) << 12) | SyntaxKind.ModuleDeclaration
+                buf[offset + 0] = (getFlags(node, isNamespace ? InternalNodeFlags.Let : 0) << 10) | SyntaxKind.ModuleDeclaration
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = body
@@ -2166,7 +2176,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 const members = serializeList((node as ts.InterfaceDeclaration).members)
                 const heritageClauses = serializeList((node as ts.InterfaceDeclaration).heritageClauses?.[0]?.types)
                 const typeParameters = serializeList((node as ts.InterfaceDeclaration).typeParameters)
-                buf[offset + 0] = (getFlags(node) << 12) | SyntaxKind.InterfaceDeclaration
+                buf[offset + 0] = (getFlags(node) << 10) | SyntaxKind.InterfaceDeclaration
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = members
@@ -2179,7 +2189,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 const name = serializeNode((node as ts.TypeAliasDeclaration).name)
                 const type = serializeNode((node as ts.TypeAliasDeclaration).type)
                 const typeParameters = serializeList((node as ts.TypeAliasDeclaration).typeParameters)
-                buf[offset + 0] = (getFlags(node) << 12) | SyntaxKind.TypeAliasDeclaration
+                buf[offset + 0] = (getFlags(node) << 10) | SyntaxKind.TypeAliasDeclaration
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = typeParameters
@@ -2190,7 +2200,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
             case SyntaxKind.UnionType:
             case SyntaxKind.IntersectionType: {
                 const types = serializeList((node as ts.UnionTypeNode | ts.IntersectionTypeNode).types)
-                buf[offset + 0] = (1 << 12) | node.kind // flags signals this is a list
+                buf[offset + 0] = (1 << 10) | node.kind // flags signals this is a list
                 // buf[offset + 1] = next
                 buf[offset + 2] = types
                 buf[offset + 3] = 0
@@ -2249,7 +2259,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
 
                 const name = serializeNode((node as ts.PropertySignature).name)
                 const type = serializeNode((node as ts.PropertySignature).type)
-                buf[offset + 0] = (getFlags(node, flags) << 12) | SyntaxKind.PropertySignature
+                buf[offset + 0] = (getFlags(node, flags) << 10) | SyntaxKind.PropertySignature
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = type
@@ -2266,7 +2276,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                 const type = serializeNode((node as ts.MethodSignature).type)
                 const parameters = serializeList((node as ts.MethodSignature).parameters)
                 const typeParameters = serializeList((node as ts.MethodSignature).typeParameters)
-                buf[offset + 0] = (getFlags(node, flags) << 12) | SyntaxKind.MethodSignature
+                buf[offset + 0] = (getFlags(node, flags) << 10) | SyntaxKind.MethodSignature
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = parameters
@@ -2435,6 +2445,14 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                     break
                 }
 
+                if (node.kind === SyntaxKind.UpdateStatement) {
+                    const operands = serializeList((node as any).operands)
+                    const block = serializeNode((node as any).block)
+                    buf[offset + 2] = operands
+                    buf[offset + 3] = block
+                    break
+                }
+
                 if (node.kind === SyntaxKind.Start) {
                     throw new Error(`Got null node [isSynthetic: ${isSynthetic}]`)
                 }
@@ -2480,6 +2498,12 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
                     break
                 case SyntaxKind.PublicKeyword:
                     flags |= InternalNodeFlags.Public
+                    break
+                case SyntaxKind.PrivateKeyword:
+                    flags |= InternalNodeFlags.Private
+                    break
+                case SyntaxKind.ProtectedKeyword:
+                    flags |= InternalNodeFlags.Protected
                     break
             }
         }
@@ -2544,7 +2568,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         }
         const expression = serializeNode(node.expression)
         const name = serializeNode(node.name)
-        buf[offset + 0] = (flags << 12) | SyntaxKind.PropertyAccessExpression
+        buf[offset + 0] = (flags << 10) | SyntaxKind.PropertyAccessExpression
         // buf[offset + 1] = next
         buf[offset + 2] = expression
         buf[offset + 3] = name
@@ -2582,7 +2606,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         }
         const expression = serializeNode(node.expression)
         const argumentExpression = serializeNode(node.argumentExpression)
-        buf[offset + 0] = (flags << 12) | SyntaxKind.ElementAccessExpression
+        buf[offset + 0] = (flags << 10) | SyntaxKind.ElementAccessExpression
         // buf[offset + 1] = next
         buf[offset + 2] = expression
         buf[offset + 3] = argumentExpression
@@ -2628,7 +2652,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
     function serializeArrowFunction(node: ts.ArrowFunction, offset: number) {
         const parameters = serializeList(node.parameters)
         const body = serializeNode(node.body)
-        buf[offset + 0] = (getFlags(node) << 12) | SyntaxKind.ArrowFunction
+        buf[offset + 0] = (getFlags(node) << 10) | SyntaxKind.ArrowFunction
         // buf[offset + 1] = next
         buf[offset + 2] = parameters
         buf[offset + 3] = body
@@ -2670,7 +2694,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         const name = serializeNode(node.name)
         const initializer = serializeNode(node.initializer)
         const type = serializeNode(node.type)
-        buf[offset + 0] = (flags << 12) | SyntaxKind.Parameter
+        buf[offset + 0] = (flags << 10) | SyntaxKind.Parameter
         // buf[offset + 1] = next
         buf[offset + 2] = name
         buf[offset + 3] = initializer
@@ -2687,7 +2711,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
 
     function serializeVariableStatement(node: ts.VariableStatement, offset: number) {
         const declarations = serializeList(node.declarationList.declarations)
-        buf[offset + 0] = (getFlags(node) << 12) | SyntaxKind.VariableStatement
+        buf[offset + 0] = (getFlags(node) << 10) | SyntaxKind.VariableStatement
         // buf[offset + 1] = next
         buf[offset + 2] = declarations
         buf[offset + 3] = 0
@@ -2712,7 +2736,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
             flags |= (1 << 6) // synthetic
         }
         const r = writeString(node.text)
-        buf[offset + 0] = (flags << 12) | node.kind
+        buf[offset + 0] = (flags << 10) | node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = r.pointer
         buf[offset + 3] = 0xFF // tagged pointer
@@ -2747,7 +2771,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         }
         const expression = serializeNode(node.expression)
         const argumentsArray = serializeList(node.arguments)
-        buf[offset + 0] = (flags << 12) | SyntaxKind.CallExpression
+        buf[offset + 0] = (flags << 10) | SyntaxKind.CallExpression
         // buf[offset + 1] = next
         buf[offset + 2] = expression
         buf[offset + 3] = argumentsArray
@@ -2773,7 +2797,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         const parameters = serializeList(node.parameters)
         const body = serializeNode(node.body)
         const type = serializeNode(node.type)
-        buf[offset + 0] = ((getFlags(node, flags)) << 12) | node.kind
+        buf[offset + 0] = ((getFlags(node, flags)) << 10) | node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = name
         buf[offset + 3] = parameters
@@ -2834,7 +2858,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         const initializer = serializeNode(node.initializer)
         const expression = serializeNode(node.expression)
         const statement = serializeNode(node.statement)
-        buf[offset + 0] = (flags << 12) | node.kind
+        buf[offset + 0] = (flags << 10) | node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = initializer
         buf[offset + 3] = expression
@@ -2847,7 +2871,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
         const typeParameters = serializeList(node.typeParameters)
         const extendsClause = serializeNode(node.heritageClauses?.filter(n => n.token !== SyntaxKind.ImplementsKeyword)?.[0]?.types[0])
         const implementsClauses = serializeList(node.implementsClauses ?? node.heritageClauses?.filter(n => n.token === SyntaxKind.ImplementsKeyword)?.[0]?.types)
-        buf[offset + 0] = (getFlags(node) << 12) | node.kind
+        buf[offset + 0] = (getFlags(node) << 10) | node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = name
         buf[offset + 3] = members
@@ -4877,6 +4901,25 @@ export function visitEachChild(node: ts.Node, visitor: (node: ts.Node) => ts.Nod
                         original: node,
                         _fn: _fn ?? node._fn,
                         children: children ?? node.children,
+                    }
+                }
+
+                break
+            }
+
+            if (node.kind === SyntaxKind.UpdateStatement) {
+                const operands = visitArrayField(node, 'operands')
+                if (isForEachChild && operands) return operands
+
+                const block = visitNode(node.block)
+                if (isForEachChild) return block
+
+                if (operands || block) {
+                    return {
+                        kind: SyntaxKind.UpdateStatement,
+                        original: node,
+                        operands: operands ?? node.operands,
+                        block: block ?? node.block,
                     }
                 }
 

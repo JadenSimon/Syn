@@ -268,6 +268,7 @@ pub const Checker = struct {
     }
 
     pub fn checkAsAsyncOnNonAsyncCall(this: *@This(), node_ref: NodeRef, call_type: TypeRef) !void {
+        if (call_type == @intFromEnum(Kind.any) or call_type == @intFromEnum(Kind.error_any)) return;
         if (try this.analyzer.maybeUnwrapPromise(call_type) == null) {
             try this.file.emitErrorFmt(node_ref, "Cannot use 'as async' on a non-async call signature", .{});
         }

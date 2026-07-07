@@ -3936,13 +3936,14 @@ fn Parser_(comptime skip_trivia: bool) type {
             return this.parseJSXContainer();
         }
 
-        fn parseRemainingImportExpression(this: *@This()) !AstNode_ {
+        fn parseRemainingImportExpression(this: *@This(), location: u32) !AstNode_ {
             if (this.lexer.token == .t_dot) {
                 return this.parseMetaProperty(.import_keyword);
             }
 
             const exp = try this.pushNode(.{
                 .kind = .import_keyword,
+                .location = location,
             });
             const arguments = try this.parseCallArgs();
 
@@ -4005,8 +4006,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                     return ident;
                 },
                 .t_import => {
+                    const location = this.getLocation();
                     try this.lexer.next();
-                    return this.parseRemainingImportExpression();
+                    return this.parseRemainingImportExpression(location);
                 },
                 .t_false => {
                     try this.next();
@@ -6332,7 +6334,13 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.lexer.next();
 
                     if (this.lexer.token == .t_dot or this.lexer.token == .t_open_paren) {
-                        return this.parseRemainingImportExpression();
+                        const location = this.getLocation();
+                        const n = try this.parseRemainingImportExpression(location);
+                        return .{
+                            .kind = .expression_statement,
+                            .data = @ptrFromInt(try this.pushNode(try this.parseRemainingExpression(.lowest, n))),
+                            .location = location,
+                        };
                     }
 
                     return this.parseImportDeclaration(full_start);
@@ -7264,7 +7272,7 @@ pub const Factory = struct {
     pub fn createReturnStatement(this: *@This(), expression: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .return_statement,
-            .data = @ptrFromInt(expression),
+            .data = if (expression != 0) @ptrFromInt(expression) else null,
         });
     }
 
@@ -7360,7 +7368,7 @@ pub const Factory = struct {
     pub fn createFunctionDeclaration(this: *@This(), name: NodeRef, params: anytype, body: anytype) !NodeRef {
         return this.nodes.push(.{
             .kind = .function_declaration,
-            .data = toBinaryDataPtrRefs(name, try this.maybeCreateList(params)),
+            .data = toBinaryDataPtrRefsMaybeNull(name, try this.maybeCreateList(params)),
             .len = try this.maybeCreateBlock(body),
         });
     }
@@ -7369,6 +7377,13 @@ pub const Factory = struct {
         return this.nodes.push(.{
             .kind = .property_assignment,
             .data = toBinaryDataPtrRefs(name, initializer),
+        });
+    }
+
+    pub fn createComputedName(this: *@This(), name: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .computed_property_name,
+            .data = @ptrFromInt(name),
         });
     }
 
@@ -8105,6 +8120,40 @@ pub inline fn getPackedData(node: *const AstNode) BinaryExpData {
     return .{ .left = 0, .right = 0 };
 }
 
+pub inline fn getLeft(node: *const AstNode) NodeRef {
+    if (node.data) |p| {
+        const v = @as(u64, @intFromPtr(p));
+        return @truncate(v);
+    }
+    return 0;
+}
+
+pub inline fn getRight(node: *const AstNode) NodeRef {
+    if (node.data) |p| {
+        const v = @as(u64, @intFromPtr(p));
+        return @intCast(v >> 32);
+    }
+    return 0;
+}
+
+pub inline fn maybeGetLeft(node: *const AstNode) ?NodeRef {
+    if (node.data) |p| {
+        const v = @as(u64, @intFromPtr(p));
+        const r: NodeRef = @truncate(v);
+        return if (r != 0) r else null;
+    }
+    return null;
+}
+
+pub inline fn maybeGetRight(node: *const AstNode) ?NodeRef {
+    if (node.data) |p| {
+        const v = @as(u64, @intFromPtr(p));
+        const r: NodeRef = @intCast(v >> 32);
+        return if (r != 0) r else null;
+    }
+    return null;
+}
+
 pub inline fn hasFlag(node: *const AstNode, flag: NodeFlags) bool {
     return (node.flags & @intFromEnum(flag)) == @intFromEnum(flag);
 }
@@ -8356,6 +8405,7 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left);
             try visitList(nodes, d.right, visitor);
         },
+        .property_assignment,
         .variable_declaration => {
             const d = getPackedData(node);
             try visitor.visit(nodes.at(d.left), d.left);
@@ -10841,6 +10891,7 @@ pub const Binder = struct {
             .identifier => n.extra_data,
             .this_keyword => if (n.extra_data != 0) n.extra_data else null,
             .function_declaration, .class_declaration, .variable_declaration, .parameter => this.getSymbol(getPackedData(n).left),
+            .import_specifier => this.getSymbol(maybeGetRight(n) orelse getLeft(n)),
             else => null,
         };
     }
@@ -10874,6 +10925,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(maybeUnwrapRef(n) orelse 0));
         },
+        .expression_statement,
         .shorthand_property_assignment,
         .delete_expression,
         .void_expression,
@@ -10895,8 +10947,9 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
         .get_accessor,
         .set_accessor,
         .type_predicate,
+        .call_expression, .new_expression,
         .element_access_expression, .binary_expression,
-        .property_access_expression, .call_expression, .qualified_name,
+        .property_access_expression, .qualified_name,
         .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
             if (n.location != 0) return decodeLocation(n.location);
             const d = getPackedData(n);

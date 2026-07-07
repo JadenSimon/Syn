@@ -218,8 +218,15 @@ pub fn printSynFile(program: *js.Object, sf: *js.Object, options: ?parser.Printe
     opt.replacements = &replacements;
 
     const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
-
-    return .{
+    if (std.mem.startsWith(u8, source.source, "/// @synth")) {
+        const reparsed = try parser.ParsedFile.createFromBuffer(result.contents, null, false, null);
+        const res = try @import("./synth_helper.zig").SynthInstrumenter.transform(&reparsed.ast, &reparsed.binder);
+        return .{ 
+            .contents = try js.ArrayBuffer.from(@constCast(res.contents)),
+            .mappings = if (res.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
+        };
+    }
+    return .{ 
         .contents = try js.ArrayBuffer.from(@constCast(result.contents)),
         .mappings = if (result.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
     };
