@@ -47,5 +47,5 @@ fn _transformSyn(source: [*:0]const u8, synth: bool) ![*:0]const u8 {
 }
 
 // -Wl,--initial-memory=16777216 // 16 * 1024 * 1024
-// zig build-exe -target wasm32-freestanding-musl -fno-entry --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig -freference-trace --initial-memory=16777216
-// zig build-exe -target wasm32-freestanding-musl -fno-entry -OReleaseSmall -fstrip --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig --initial-memory=16777216
+// zig build-exe -target wasm32-freestanding-musl -fno-entry --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig -freference-trace --initial-memory=16777216 -femit-bin=compiler.wasm
+// zig build-exe -target wasm32-freestanding-musl -fno-entry -OReleaseSmall -fstrip --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig --initial-memory=16777216 -femit-bin=compiler.wasm

@@ -3411,16 +3411,23 @@ fn Parser_(comptime skip_trivia: bool) type {
                 return_type = try this.parseType();
             }
 
-            try this.lexer.expect(.t_open_brace);
-
             var list = NodeList_.init(this);
-            while (this.lexer.token != .t_end_of_file) {
-               if (this.lexer.token == .t_close_brace) {
-                    try this.lexer.nextInsideJSXElement();
-                    break;
+            if (this.lexer.token == .t_open_brace) {
+                // FIXME: we should report an error if we didn't see the open brace
+                try this.lexer.expect(.t_open_brace);
+
+                while (this.lexer.token != .t_end_of_file) {
+                if (this.lexer.token == .t_close_brace) {
+                        try this.lexer.nextInsideJSXElement();
+                        break;
+                    }
+                    if (this.lexer.token == .t_greater_than or this.lexer.token == .t_slash) {
+                        // FIXME: report an unterminated JSX method here
+                        break;
+                    }
+                    const n = try this.parseStatement();
+                    try list.append(n);
                 }
-                const n = try this.parseStatement();
-                try list.append(n);
             }
 
             return .{
