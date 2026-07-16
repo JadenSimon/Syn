@@ -1068,9 +1068,9 @@ fn NewLexer_(
                     },
 
                     '#' => {
-                        if (comptime is_json) {
-                            return lexer.addUnsupportedSyntaxError("Private identifiers are not allowed in JSON");
-                        }
+                        // if (comptime is_json) {
+                        //     return lexer.addUnsupportedSyntaxError("Private identifiers are not allowed in JSON");
+                        // }
                         if (lexer.start == 0 and lexer.source.contents[1] == '!') {
                             // "#!/usr/bin/env node"
                             lexer.token = .t_hashbang;

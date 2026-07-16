@@ -394,6 +394,9 @@ pub const SyntaxKind = enum(u10) {
 
     start = 1022,
     parse_error = 1023,
+
+    pub const first_keyword = @This().break_keyword;
+    pub const last_keyword = @This().of_keyword;
 };
 
 const Op = struct {
@@ -459,8 +462,6 @@ pub const TypeOperators = ComptimeStringMap(SyntaxKind, .{
     .{ "unique", .unique_keyword },
     .{ "readonly", .readonly_keyword },
 });
-
-
 
 // Flags are per-kind and are used for any binary semantics
 // Good examples of this are:
@@ -551,7 +552,6 @@ pub const SyntheticMemberFlags = enum(u22) {
     setter = 1 << 0,
     getter = 1 << 2,
 };
-
 
 pub const NodeRef = u32;
 
@@ -920,7 +920,7 @@ pub fn BumpAllocatorList(comptime T: type) type {
                         // weird but technically harmless
                         if (this.allocator.at(this.prev).next == ref) break;
                         if (comptime T == AstNode) {
-                            debugPrint("{?}\n",.{this.allocator.at(x).kind});
+                            debugPrint("{?}\n", .{this.allocator.at(x).kind});
                         }
                         @panic("Recursive appendRef");
                     }
@@ -2166,14 +2166,14 @@ fn Parser_(comptime skip_trivia: bool) type {
             const col = @as(u32, @intCast(this.lexer.start - this.lexer.last_line));
             const end = @min(this.lexer.source.contents.len, this.lexer.current);
             debugPrint("\n{s}\n", .{this.lexer.source.contents[this.lexer.last_line..end]});
-            for (0..col) |_| debugPrint(" ",.{});
+            for (0..col) |_| debugPrint(" ", .{});
 
             const width = this.lexer.end - this.lexer.start;
-            for (0..width) |_| debugPrint("~",.{});
+            for (0..width) |_| debugPrint("~", .{});
 
-            debugPrint("\n",.{});
+            debugPrint("\n", .{});
 
-            for (0..col) |_| debugPrint(" ",.{});
+            for (0..col) |_| debugPrint(" ", .{});
             debugPrint("  {any}\n\n", .{this.lexer.token});
             debugPrint("  at {s}:{}:{}\n", .{ this.lexer.source.name orelse "", line + 1, col + 1 });
         }
@@ -3072,8 +3072,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 .string_literal => {
                     flags |= if (this.lexer.raw()[0] == '"') @intFromEnum(StringFlags.double_quote) else @intFromEnum(StringFlags.single_quote);
                 },
-                .no_substitution_template_literal,
-                .template_head, .template_middle, .template_tail => {
+                .no_substitution_template_literal, .template_head, .template_middle, .template_tail => {
                     flags |= @intFromEnum(StringFlags.backtick);
                 },
                 else => {},
@@ -3081,7 +3080,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             const full_start = this.lexer.full_start;
             const width = this.getFullWidth();
-            const location = if (kind == .string_literal) 
+            const location = if (kind == .string_literal)
                 this.getLocation()
             else
                 encodeLocation(this.lexer.line_map.count, @as(u32, @intCast(this.lexer.start - this.lexer.full_last_line)));
@@ -3352,7 +3351,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         txt.flags |= @intFromEnum(NodeFlags.abstract);
                         is_first_content_node = false;
                     } else {
-                        if (children.head != 0) 
+                        if (children.head != 0)
                             txt.flags |= @intFromEnum(NodeFlags.generator) // used during emit
                         else
                             txt.flags |= @intFromEnum(NodeFlags.abstract); // marks the text as immediately following the opening tag
@@ -3401,7 +3400,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             const old_state = this.context_state;
             defer this.context_state = old_state;
             this.context_state = .none;
-            
+
             const type_params = if (this.lexer.token == .t_less_than) try this.parseTypeParams() else 0;
             const parameters = try this.parseParameters();
 
@@ -3417,7 +3416,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 try this.lexer.expect(.t_open_brace);
 
                 while (this.lexer.token != .t_end_of_file) {
-                if (this.lexer.token == .t_close_brace) {
+                    if (this.lexer.token == .t_close_brace) {
                         try this.lexer.nextInsideJSXElement();
                         break;
                     }
@@ -3575,7 +3574,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     var save_lexer = std.mem.toBytes(this.lexer);
                     var should_restore = true;
                     defer {
-                        if (should_restore) 
+                        if (should_restore)
                             this.lexer = std.mem.bytesToValue(@TypeOf(this.lexer), &save_lexer);
                     }
                     try this.lexer.nextInsideJSXElement();
@@ -3586,7 +3585,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
                             try attributes.append(try this.parseJSXMethodAttribute(try this.pushNode(name), @intFromEnum(NodeFlags.@"async")));
                             should_restore = false;
-                            continue; 
+                            continue;
                         }
                     }
                 }
@@ -3595,7 +3594,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     var save_lexer = std.mem.toBytes(this.lexer);
                     var should_restore = true;
                     defer {
-                        if (should_restore) 
+                        if (should_restore)
                             this.lexer = std.mem.bytesToValue(@TypeOf(this.lexer), &save_lexer);
                     }
                     try this.lexer.nextInsideJSXElement();
@@ -3623,7 +3622,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                         });
 
                         continue;
-                    }         
+                    }
                 }
 
                 // ident
@@ -3658,7 +3657,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 if ((this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) and this.lexer.start == ident_end) {
                     // `<` or `(` must immediately follow the ident for us to treat it as valid
                     try attributes.append(try this.parseJSXMethodAttribute(n, 0));
-                    continue; 
+                    continue;
                 }
 
                 try attributes.append(.{
@@ -3834,8 +3833,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                 }
                 try this.lexer.nextJSXStyle(); // expect .t_greater_than
                 // possibly empty style directive
-                const txt = if (this.lexer.token == .t_less_than) 0 
-                    else try this.pushNode(try this.parseJSXText());
+                const txt = if (this.lexer.token == .t_less_than) 0 else try this.pushNode(try this.parseJSXText());
                 try this.lexer.expect(.t_less_than);
                 try this.lexer.expect(.t_slash);
                 if (this.context_state == .jsx_children) {
@@ -3921,7 +3919,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return this.parseJSXFragment();
             }
- 
+
             if (this.options.is_syn and this.lexer.token == .t_colon) {
                 return this.parseJSXLabeledFragment();
             }
@@ -4096,15 +4094,15 @@ fn Parser_(comptime skip_trivia: bool) type {
                     try this.lexer.next();
                     if (this.lexer.token != .t_less_than) {
                         const t = try this.parseType();
-                        return .{ 
-                            .kind = .reify_expression, 
+                        return .{
+                            .kind = .reify_expression,
                             .data = t,
                         };
                     }
                     const type_params = try this.parseTypeParams();
                     const t = try this.parseType();
-                    return .{ 
-                        .kind = .reify_expression, 
+                    return .{
+                        .kind = .reify_expression,
                         .data = t,
                         .len = type_params,
                     };
@@ -4486,7 +4484,7 @@ fn Parser_(comptime skip_trivia: bool) type {
                     .kind = .spread_assignment,
                     .data = exp,
                 };
-            } 
+            }
 
             if (this.lexer.token == .t_string_literal) {
                 const lit = try this.parseStringLiteralLikeKind(.string_literal);
@@ -4774,9 +4772,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                 typeParameters = try this.parseTypeParams();
             }
 
-            const parameters = if (comptime kind == .jsx_component) 
-                try this.parseComponentParameters() 
-            else 
+            const parameters = if (comptime kind == .jsx_component)
+                try this.parseComponentParameters()
+            else
                 try this.parseParameters();
 
             var return_type: NodeRef = 0;
@@ -4893,7 +4891,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         });
 
         fn parseTypeMember(this: *@This()) !AstNode_ {
-            // other code might not call `nextNoKeywords` 
+            // other code might not call `nextNoKeywords`
             if (this.lexer.isIdentifierOrKeyword()) {
                 const s = this.lexer.identifier;
                 const ident = toIdentNodeWithLocation(s, this.getLocation(), this.lexer.full_start, this.getFullWidth());
@@ -4944,7 +4942,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                 return this.parsePropOrMethodDecl();
             }
-    
+
             if (this.lexer.token == .t_open_paren or this.lexer.token == .t_less_than) {
                 return this.parseCallSignature(false);
             }
@@ -6535,7 +6533,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
                                 if (DeclareKeywords.List.get(this.lexer.identifier)) |t| {
                                     try this.lexer.next();
-                                    
+
                                     return switch (t) {
                                         .t_type => this.parseTypeAliasDecl(),
                                         .t_namespace => this.parseNamespaceOrModule(@intFromEnum(NodeFlags.declare), .namespace),
@@ -6555,19 +6553,13 @@ fn Parser_(comptime skip_trivia: bool) type {
                                     operands.appendRef(exp);
                                     while (this.lexer.token == .t_comma) {
                                         try this.lexer.next();
-                                        operands.appendRef( try this.pushNode(try this.parseExpressionWithLevel(.prefix)));
+                                        operands.appendRef(try this.pushNode(try this.parseExpressionWithLevel(.prefix)));
                                     }
-                                    const block = try this.parseBlock(); 
-                                    return .{
-                                        .kind = .update_statement,
-                                        .data = toBinaryDataPtrRefs(operands.head, block)
-                                    };
+                                    const block = try this.parseBlock();
+                                    return .{ .kind = .update_statement, .data = toBinaryDataPtrRefs(operands.head, block) };
                                 }
 
-                                return .{
-                                    .kind = .update_statement,
-                                    .data = toBinaryDataPtrRefs(exp, 0)
-                                };
+                                return .{ .kind = .update_statement, .data = toBinaryDataPtrRefs(exp, 0) };
                             },
                         }
                     }
@@ -7002,7 +6994,7 @@ pub const Factory = struct {
     }
 
     pub fn createVoidZero(this: *@This()) !NodeRef {
-        return this.nodes.push(.{ 
+        return this.nodes.push(.{
             .kind = .void_expression,
             .data = try this.createNumericLiteral(@as(i64, 0)),
         });
@@ -7113,7 +7105,7 @@ pub const Factory = struct {
                 if (comptime isAnonymousNodeList(@TypeOf(arg))) {
                     return this.createList(arg);
                 }
-                
+
                 @compileLog(@TypeOf(arg));
                 @compileError("Unhandled type");
             },
@@ -7129,7 +7121,7 @@ pub const Factory = struct {
                 if (comptime isAnonymousNodeList(@TypeOf(arg))) {
                     return this.createBlock(arg);
                 }
-                
+
                 @compileLog(@TypeOf(arg));
                 @compileError("Unhandled type");
             },
@@ -7159,10 +7151,8 @@ pub const Factory = struct {
     }
 
     pub fn createAssignmentStatement(this: *@This(), left: NodeRef, right: NodeRef) !NodeRef {
-        return try this.createExpressionStatement(
-            try this.createBinaryExpression(this.assertValid(left), .equals_token, this.assertValid(right))
-        );
-    } 
+        return try this.createExpressionStatement(try this.createBinaryExpression(this.assertValid(left), .equals_token, this.assertValid(right)));
+    }
 
     pub fn createPrefixUnaryExpression(this: *@This(), operator: SyntaxKind, operand: NodeRef) !NodeRef {
         return this.nodes.push(.{
@@ -7179,11 +7169,7 @@ pub const Factory = struct {
     }
 
     pub fn createConditionalExpression(this: *@This(), condition: NodeRef, when_true: NodeRef, when_false: NodeRef) !NodeRef {
-        return this.nodes.push(.{
-            .kind = .conditional_expression,
-            .data = toBinaryDataPtrRefs(condition, when_true),
-            .len = when_false
-        });
+        return this.nodes.push(.{ .kind = .conditional_expression, .data = toBinaryDataPtrRefs(condition, when_true), .len = when_false });
     }
 
     pub fn createParenthesizedExpression(this: *@This(), expression: NodeRef) !NodeRef {
@@ -7318,13 +7304,11 @@ pub const Factory = struct {
     }
 
     pub fn createConstVariable(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
-        return this.createVariableStatement(
-            try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.@"const"));
+        return this.createVariableStatement(try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.@"const"));
     }
 
     pub fn createLetVariable(this: *@This(), name: NodeRef, initializer: NodeRef) !NodeRef {
-        return this.createVariableStatement(
-            try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.let));
+        return this.createVariableStatement(try this.createVariableDeclarationSimple(name, initializer), @intFromEnum(NodeFlags.let));
     }
 
     pub fn createCatchClause(this: *@This(), binding: anytype, statements: anytype) !NodeRef { // statements: NodeRef(.block) | []const NodeRef
@@ -7346,10 +7330,7 @@ pub const Factory = struct {
     pub fn createTryStatement(this: *@This(), statements: anytype, catch_clause: NodeRef, finally_block: anytype) !NodeRef {
         return this.nodes.push(.{
             .kind = .try_statement,
-            .data = toBinaryDataPtrRefs(
-                try this.maybeCreateBlock(statements),
-                catch_clause
-            ),
+            .data = toBinaryDataPtrRefs(try this.maybeCreateBlock(statements), catch_clause),
             .len = try this.maybeCreateBlock(finally_block),
         });
     }
@@ -7623,6 +7604,22 @@ pub fn isParameterDecl(p: *const AstNode) bool {
     return (hasFlag(p, .private) or hasFlag(p, .public) or hasFlag(p, .protected) or hasFlag(p, .override) or hasFlag(p, .readonly));
 }
 
+pub fn isKeyword(kind: SyntaxKind) bool {
+    return switch (kind) {
+        SyntaxKind.first_keyword...SyntaxKind.last_keyword => true,
+        else => false,
+    };
+}
+
+pub fn isLeafNode(kind: SyntaxKind) bool {
+    return switch (kind) {
+        .string_literal, .numeric_literal, .no_substitution_template_literal => true,
+        .identifier, .private_identifier => true,
+        .empty_statement, .omitted_expression => true,
+        else => isKeyword(kind),
+    };
+}
+
 pub fn isAssignmentOp(kind: SyntaxKind) bool {
     return switch (kind) {
         .equals_token,
@@ -7649,7 +7646,7 @@ pub fn isAssignmentOp(kind: SyntaxKind) bool {
 fn isBoundControlFlow(nodes: *const BumpAllocator(AstNode), n: *const AstNode) bool {
     if (n.kind != .if_statement and n.kind != .while_statement) return false;
 
-    return nodes.at(getPackedData(n).left).kind == .variable_statement; 
+    return nodes.at(getPackedData(n).left).kind == .variable_statement;
 }
 
 pub const Transformer = struct {
@@ -7964,7 +7961,7 @@ pub const Transformer = struct {
         const tmp_decl = try this.variableDeclFromNode(tmp_ident, if (n.kind == .if_statement) init else null);
         var tmp_stmt = try this.variableStatement(&.{tmp_decl});
         tmp_stmt.flags |= @intFromEnum(if (n.kind == .if_statement) NodeFlags.@"const" else NodeFlags.let);
-        
+
         // adds `const { x } = _tmp_0` to the executing statement
         var inner_decl = decl.*;
         inner_decl.data = toBinaryDataPtrRefs(getPackedData(decl).left, tmp_ident);
@@ -7976,21 +7973,15 @@ pub const Transformer = struct {
         const nonNullishCheck = try this.binaryExpression(this.allocator.at(tmp_ident).*, .exclamation_equals_token, .{ .kind = .null_keyword });
 
         // copy the origin if/while statement and replace the exp + target statement with the injected binding
-        const subject = if (n.kind == .if_statement) 
-           // tmp_ident 
+        const subject = if (n.kind == .if_statement)
+            // tmp_ident
             try this.allocator.push(nonNullishCheck)
-        else 
+        else
             // while ((_tmp_0 = foo()) != null)
-            try this.allocator.push(
-                try this.binaryExpression(
-                    .{
-                        .kind = .parenthesized_expression,
-                        .data = try this.allocator.push(try this.binaryExpression(this.allocator.at(tmp_ident).*, .equals_token, init)),
-                    },
-                    .exclamation_equals_token, 
-                    .{ .kind = .null_keyword }
-                )
-            );
+            try this.allocator.push(try this.binaryExpression(.{
+                .kind = .parenthesized_expression,
+                .data = try this.allocator.push(try this.binaryExpression(this.allocator.at(tmp_ident).*, .equals_token, init)),
+            }, .exclamation_equals_token, .{ .kind = .null_keyword }));
 
         var copy = n.*;
         copy.data = toBinaryDataPtrRefs(subject, bound_statement);
@@ -8394,8 +8385,7 @@ pub fn forEachChild(
             try visitor.visit(nodes.at(d.left), d.left);
             try visitList(nodes, d.right, visitor);
         },
-        .property_assignment,
-        .variable_declaration => {
+        .property_assignment, .variable_declaration => {
             const d = getPackedData(node);
             try visitor.visit(nodes.at(d.left), d.left);
             try visitor.visit(nodes.at(d.right), d.right);
@@ -8525,8 +8515,7 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(node.len), node.len); // return type
             }
         },
-        .array_type,
-        .infer_type, .parenthesized_type, .rest_type, .computed_property_name => {
+        .array_type, .infer_type, .parenthesized_type, .rest_type, .computed_property_name => {
             const r = unwrapRef(node);
             try visitor.visit(nodes.at(r), r);
         },
@@ -8614,13 +8603,11 @@ pub fn forEachChild(
         .jsx_attributes, .jsx_class_list => {
             try visitList(nodes, unwrapRef(node), visitor);
         },
-        .jsx_class_attribute,
-        .jsx_attribute => {
+        .jsx_class_attribute, .jsx_attribute => {
             const d = getPackedData(node);
             if (d.right != 0) try visitor.visit(nodes.at(d.right), d.right);
         },
-        .keyword_unary_expression,
-        .jsx_expression, .jsx_spread_attribute => {
+        .keyword_unary_expression, .jsx_expression, .jsx_spread_attribute => {
             const r = unwrapRef(node);
             try visitor.visit(nodes.at(r), r);
         },
@@ -8708,6 +8695,11 @@ pub const Symbol = struct {
         this.ordinal &= ~(@as(u32, @intFromEnum(flag)) << 16);
     }
 
+    pub inline fn isStrictlyLocal(this: *const Symbol) bool {
+        const flags: u16 = @intFromEnum(SymbolFlags.late_bound) | @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.exported);
+        return ((this.ordinal >> 16) & @intFromEnum(flags)) == 0;
+    }
+
     pub inline fn getScopeDepth(this: *const Symbol) u16 {
         std.debug.assert(!this.hasFlag(.type));
         if (this.hasFlag(.global) or this.hasFlag(.imported) or this.hasFlag(.late_bound)) {
@@ -8735,14 +8727,14 @@ pub const SymbolFlags = enum(u16) {
     parameter = 1 << 8,
     late_bound = 1 << 10,
     imported = 1 << 11,
-    exported = 1 << 12,
+    exported = 1 << 12, // the "exported" flag is used for symbols created by export declarations and NOT the export modifier
     @"const" = 1 << 13,
     namespace = 1 << 14,
     type = 1 << 15,
 
     @"enum" = (1 << 8) | (1 << 14), // parameter | namespace
     type_parameter = (1 << 8) | (1 << 15), // parameter | type
-    aliased_module = (1 << 10) | (1 << 12) | (1 << 14), // late_bound | exported | namespace 
+    aliased_module = (1 << 10) | (1 << 12) | (1 << 14), // late_bound | exported | namespace
 };
 
 pub inline fn hasSymbolFlag(sym: *const Symbol, flag: SymbolFlags) bool {
@@ -8788,7 +8780,7 @@ pub const Exports = struct {
 // type z = ReturnType<f> // string | number
 //
 pub const Binder = struct {
-    pub const SymbolTable = std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef); // @import("./program.zig").Analyzer.FlowTyper.SimpleHashMap; 
+    pub const SymbolTable = std.AutoArrayHashMapUnmanaged(NodeSymbolHash, SymbolRef); // @import("./program.zig").Analyzer.FlowTyper.SimpleHashMap;
     const Scopes = std.ArrayListUnmanaged(SymbolTable);
 
     const warm_stack_depth = 16;
@@ -8897,7 +8889,8 @@ pub const Binder = struct {
             @as(u32, @intFromEnum(SymbolFlags.@"const")) << 16
         else if (this.should_mark_let)
             @as(u32, @intFromEnum(SymbolFlags.let_binding)) << 16
-        else 0;
+        else
+            0;
 
         return this.bindDeclWithFlagsOrOrdinal(ident, decl, binding, flags_or_ordinal, false);
     }
@@ -9010,7 +9003,6 @@ pub const Binder = struct {
                 .declaration = decl,
                 .ordinal = flags_and_ordinal | extra_flags,
             });
-
 
             // if (getLoc(this.nodes, ident)) |loc| {
             //     debugPrint("BOUND [{s}:{}:{}]: symbol decl {s} -> {} [hash: {}] [depth: {}] [type]\n", .{
@@ -9177,9 +9169,9 @@ pub const Binder = struct {
             // TODO: perhaps this should only be done at specific depths e.g. 2, 4, 6
             // another approach is to check unbound symbols directly after say, 2 attempts
             //
-            // var scope = if (comptime is_type) 
-            //     &this.scopes.items[this.scopes.items.len - 1] 
-            // else 
+            // var scope = if (comptime is_type)
+            //     &this.scopes.items[this.scopes.items.len - 1]
+            // else
             //     &this.type_scopes.items[this.type_scopes.items.len - 1];
 
             // try scope.put(this.allocator, getHashFromNode(ident), s);
@@ -9211,8 +9203,8 @@ pub const Binder = struct {
                 if (scopes.items[i].getEntry(h)) |entry| {
                     // if (comptime bind_types and !is_type) {
                     //     // TODO: reserve the upper bit of scoped refs to mark imported symbols.
-                    //     // Then when an imported symbol is only used as a value (not a type) we 
-                    //     // can confidently say that the symbol _isn't_ a type in this context. Mark 
+                    //     // Then when an imported symbol is only used as a value (not a type) we
+                    //     // can confidently say that the symbol _isn't_ a type in this context. Mark
                     //     // the symbol as "not a type" and then remove the bit from the reference.
                     // }
                     const ref = entry.value_ptr.*;
@@ -9262,7 +9254,7 @@ pub const Binder = struct {
 
     inline fn putImmediateSymbol(this: *@This(), hash: u32, sym_ref: SymbolRef, comptime is_type: bool) !void {
         const scopes = if (comptime is_type) &this.type_scopes else &this.scopes;
-        try scopes.items[scopes.items.len-1].put(this.allocator, hash, if (comptime track_referenced) sym_ref | (1 << 31) else sym_ref);
+        try scopes.items[scopes.items.len - 1].put(this.allocator, hash, if (comptime track_referenced) sym_ref | (1 << 31) else sym_ref);
     }
 
     fn visitParams(this: *@This(), start: NodeRef) !void {
@@ -9307,7 +9299,7 @@ pub const Binder = struct {
                         // not valid as a param
                     }
                 }
-                // TODO: you can technically do this: `const { this: foo } = { this: 1 }` 
+                // TODO: you can technically do this: `const { this: foo } = { this: 1 }`
             },
             .identifier => return this.bindDeclWithBinding(binding, decl, ref),
             .binding_element => {
@@ -9330,7 +9322,7 @@ pub const Binder = struct {
                     pos += 1;
                     if (pair[0].kind != .binding_element) {
                         // needed for omitted exp e.g. `let [x,,z] = [1,2,3]`
-                        continue; 
+                        continue;
                     }
                     this.nodes.at(pair[1]).extra_data2 = pos; // 1-indexed into the array, tells us we're working with an array binding pattern
                     try this.visitBinding(pair[1], decl);
@@ -9633,10 +9625,10 @@ pub const Binder = struct {
                 }
 
                 var aliased_exports = if (this.ns != 0)
-                    &this.namespaces.items[this.ns - 1].exports.?.aliased_exports 
-                else 
+                    &this.namespaces.items[this.ns - 1].exports.?.aliased_exports
+                else
                     &this.exports.aliased_exports;
-    
+
                 const spec = getSlice(this.nodes.at(d.right), u8);
 
                 if (d.left != 0) {
@@ -9644,10 +9636,7 @@ pub const Binder = struct {
                     if (clause.kind == .namespace_export) {
                         // export * as foo from 'foo'
                         const binding = unwrapRef(clause);
-                        const sym = try this.symbols.push(.{
-                            .binding = binding,
-                            .ordinal = @as(u32, @intFromEnum(SymbolFlags.exported) | @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.namespace)) << 16
-                        });
+                        const sym = try this.symbols.push(.{ .binding = binding, .ordinal = @as(u32, @intFromEnum(SymbolFlags.exported) | @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.namespace)) << 16 });
 
                         try aliased_exports.append(this.allocator, .{
                             .spec = spec,
@@ -9677,7 +9666,7 @@ pub const Binder = struct {
                             r = spec_node.next;
                         }
                     }
-                }  else {
+                } else {
                     // otherwise it is `export * from 'foo'`
                     const sym = try this.symbols.push(.{
                         .binding = d.right,
@@ -10251,7 +10240,7 @@ pub const Binder = struct {
         const len = scopes.items.len;
         std.debug.assert(len > 0);
         if (len < warm_stack_depth) {
-            scopes.items[len-1].clearRetainingCapacity();
+            scopes.items[len - 1].clearRetainingCapacity();
             scopes.items.len -= 1;
         } else {
             var s = scopes.pop();
@@ -10295,7 +10284,7 @@ pub const Binder = struct {
         const len = this.this_scope.items.len;
         // the symbol is created lazily. if there is no `this`, no symbol is needed
         // this uses the msb to track if the symbol has been allocated
-        const d = decl | (1 << 31); 
+        const d = decl | (1 << 31);
         if (len < warm_stack_depth) {
             this.this_scope.allocatedSlice()[len] = d;
             this.this_scope.items.len = len + 1;
@@ -10379,7 +10368,7 @@ pub const Binder = struct {
             .is_expression => {
                 const d = getPackedData(node);
                 try this.visitRef(d.left);
-                try this.visitType(d.right);  
+                try this.visitType(d.right);
             },
             .reify_expression => {
                 const prev_ordinals = this.type_ordinals;
@@ -10473,8 +10462,8 @@ pub const Binder = struct {
                     try this.pushScope();
                     defer this.popScope();
 
-                    try this.visitBinding(q.left, decl);   // conditional binding
-                    try this.visitRef(d.right);                      // `thenStatement` or `statement`
+                    try this.visitBinding(q.left, decl); // conditional binding
+                    try this.visitRef(d.right); // `thenStatement` or `statement`
                 }
 
                 // elseStatement
@@ -10908,38 +10897,15 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
                 return getLoc(nodes, nodes.at(d.left));
             }
         },
-        .return_statement,
-        .throw_statement,
-        .jsx_expression => {
+        .return_statement, .throw_statement, .jsx_expression => {
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(maybeUnwrapRef(n) orelse 0));
         },
-        .expression_statement,
-        .shorthand_property_assignment,
-        .delete_expression,
-        .void_expression,
-        .parenthesized_expression,
-        .parenthesized_type,
-        .typeof_expression,
-        .await_expression => {
+        .expression_statement, .shorthand_property_assignment, .delete_expression, .void_expression, .parenthesized_expression, .parenthesized_type, .typeof_expression, .await_expression => {
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(unwrapRef(n)));
         },
-        .jsx_attribute,
-        .jsx_class_attribute,
-        .jsx_method_attribute,
-        .jsx_element,
-        .jsx_self_closing_element,
-        .as_expression, .is_expression, .satisfies_expression,
-        .property_assignment,
-        .method_declaration,
-        .get_accessor,
-        .set_accessor,
-        .type_predicate,
-        .call_expression, .new_expression,
-        .element_access_expression, .binary_expression,
-        .property_access_expression, .qualified_name,
-        .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
+        .jsx_attribute, .jsx_class_attribute, .jsx_method_attribute, .jsx_element, .jsx_self_closing_element, .as_expression, .is_expression, .satisfies_expression, .property_assignment, .method_declaration, .get_accessor, .set_accessor, .type_predicate, .call_expression, .new_expression, .element_access_expression, .binary_expression, .property_access_expression, .qualified_name, .type_alias_declaration, .enum_declaration, .interface_declaration, .variable_declaration, .parameter, .type_parameter, .module_declaration => {
             if (n.location != 0) return decodeLocation(n.location);
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.left));
@@ -10948,11 +10914,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.right));
         },
-        .jsx_if_directive,
-        .if_statement, .while_statement,
-        .conditional_expression, .conditional_type,
-        .update_statement,
-        .postfix_unary_expression => {
+        .jsx_if_directive, .if_statement, .while_statement, .conditional_expression, .conditional_type, .update_statement, .postfix_unary_expression => {
             if (n.location != 0) return decodeLocation(n.location);
             const d = getPackedData(n);
             return getLoc(nodes, nodes.at(d.left));
@@ -10965,6 +10927,22 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
         },
     }
 
+    return null;
+}
+
+// may not be an identifier, can be a destructuring pattern
+pub fn getDeclarationNameRef(node: *const AstNode) ?NodeRef {
+    switch (node.kind) {
+        .type_alias_declaration, .interface_declaration, .class_declaration, .function_declaration, .class_expression, .function_expression => {
+            const d = getPackedData(node);
+            if (d.left != 0) return d.left;
+        },
+        .variable_declaration, .parameter, .type_parameter => {
+            const d = getPackedData(node);
+            return d.left;
+        },
+        else => {},
+    }
     return null;
 }
 
@@ -11072,7 +11050,7 @@ pub const ParsedFile = struct {
 
         const result = parser.parse() catch |err| {
             for (lexer.errors.items) |m| {
-                debugPrint("{s}:{}:{} - {s}\n", .{source_name orelse "", m.start, m.end, m.message});
+                debugPrint("{s}:{}:{} - {s}\n", .{ source_name orelse "", m.start, m.end, m.message });
             }
             return err;
         };
@@ -11094,7 +11072,7 @@ pub const ParsedFile = struct {
 
         const bind_start = microTimestamp();
         try this.binder.visit(&result.root, result.root_ref);
-        this.log("bind time {d:.3} (# of symbols {})", .{  microTimestamp() - bind_start, this.binder.symbols.count() });
+        this.log("bind time {d:.3} (# of symbols {})", .{ microTimestamp() - bind_start, this.binder.symbols.count() });
 
         return this;
     }
@@ -11107,7 +11085,7 @@ pub const ParsedFile = struct {
     pub fn createFromPath(file_path: []const u8, is_lib: bool) !*@This() {
         if (comptime @import("builtin").target.isWasm()) return error.IsWasm;
         const buf = std.fs.cwd().readFileAlloc(allocator, file_path, std.math.maxInt(u32)) catch |err| {
-            debugPrint("failed to open file {s}: {any}\n", .{file_path, err});
+            debugPrint("failed to open file {s}: {any}\n", .{ file_path, err });
             return err;
         };
         var this = try @This().createFromBuffer(buf, file_path, is_lib, null);
@@ -11139,6 +11117,7 @@ pub const PrinterOptions = struct {
     file_name: ?[]const u8 = null,
 
     replacements: ?*anyopaque = null,
+    symbol_replacements: ?*anyopaque = null,
 
     is_syn: bool = false,
 };
@@ -11977,7 +11956,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .not_emitted_statement => {},
                 .omitted_expression => {}, // appears in expressions like `[,]`
-                .array_literal_expression => { 
+                .array_literal_expression => {
                     this.print("[");
 
                     var ref = maybeUnwrapRef(n) orelse 0;
@@ -12460,7 +12439,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 },
                 .shorthand_property_assignment => {
                     if (comptime use_symbol_replacements) {
-                        const n2 = try this.getNode(unwrapRef(n));
+                        const n2 = this.getNode(unwrapRef(n));
                         const symbol_id = n2.extra_data;
                         if (symbol_id != 0) {
                             if (this.symbol_replacements.get(symbol_id)) |t| {
@@ -13073,6 +13052,13 @@ pub fn _printWithOptions(writer: *Writer, _printer: anytype, data: AstData, opti
         printer.replacements = z;
     }
 
+    if (comptime @TypeOf(printer.symbol_replacements) != void) {
+        if (options.symbol_replacements) |x| {
+            const z: *std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = @alignCast(@ptrCast(x));
+            printer.symbol_replacements = z;
+        }
+    }
+
     try printer.visit(data.nodes.at(data.start));
     if (options.emit_source_map) {
         if (options.inline_source_map) {
@@ -13102,7 +13088,14 @@ pub fn printWithOptions(data: AstData, options: PrinterOptions) !PrintResult {
             .source_map = try r.source_map.toJson(getAllocator()),
         };
     }
-    
+
+    if (options.symbol_replacements != null) {
+        if (options.emit_source_map) {
+            return _printWithOptions(&writer, Printer(Writer, .{ .use_replacements = true, .use_symbol_replacements = true, .print_source_map = true }).init(data, &writer), data, options);
+        }
+        return _printWithOptions(&writer, Printer(Writer, .{ .use_replacements = true, .use_symbol_replacements = true }).init(data, &writer), data, options);
+    }
+
     if (options.replacements != null) {
         if (options.emit_source_map) {
             return _printWithOptions(&writer, Printer(Writer, .{ .use_replacements = true, .print_source_map = true }).init(data, &writer), data, options);
@@ -13118,7 +13111,7 @@ pub fn printWithOptions(data: AstData, options: PrinterOptions) !PrintResult {
     //     var printer = if (options.replacements != null)
     //         Printer(Writer, .{ .use_replacements = true, .print_source_map = true }).init(data, &writer)
     //     else
-    //         Printer(Writer, .{ .print_source_map = true }).init(data, &writer);        
+    //         Printer(Writer, .{ .print_source_map = true }).init(data, &writer);
     //     printer.skip_types = options.skip_types;
 
     //     defer printer.source_map.deinit();
