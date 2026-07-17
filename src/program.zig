@@ -2,8 +2,6 @@ const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
-const value_graph = @import("./value_graph.zig");
-const value_syntax = @import("./value_syntax.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 const debugPrint = parser.debugPrint;
@@ -2075,37 +2073,6 @@ pub const Program = struct {
         std.debug.assert(f.ast.nodes.at(start).kind == .source_file);
 
         try this.bindModule(f);
-
-        value_graph.debugTestComputationInlining() catch |err| {
-            std.debug.print("value_graph debug test failed: {any}\n", .{err});
-        };
-        value_graph.debugTestComputationInliningMutable() catch |err| {
-            std.debug.print("value_graph debug test (mutable) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestDeadBranchElimination() catch |err| {
-            std.debug.print("value_graph debug test (dead branch elimination) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestStatementFolding() catch |err| {
-            std.debug.print("value_graph debug test (statement folding) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestMerging() catch |err| {
-            std.debug.print("value_graph debug test (merging) failed: {any}\n", .{err});
-        };
-        value_syntax.debugTestValueEmitter() catch |err| {
-            std.debug.print("value_syntax debug test failed: {any}\n", .{err});
-        };
-        value_graph.debugTestEndToEnd() catch |err| {
-            std.debug.print("value_graph debug test (end-to-end) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestEndToEnd2() catch |err| {
-            std.debug.print("value_graph debug test (end-to-end2) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestCollapseToCode() catch |err| {
-            std.debug.print("value_graph debug test (collapse to code) failed: {any}\n", .{err});
-        };
-        value_graph.debugTestCollapseToCodeSelfRef() catch |err| {
-            std.debug.print("value_graph debug test (collapse to code, self-ref) failed: {any}\n", .{err});
-        };
         try this.doTopLevelCfa(f, start);
 
         const Visitor = struct {

@@ -317,6 +317,50 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
     }
 }
 
+async function runVsonTestCase(name: string) {
+    const testsDir = path.resolve('tests')
+    const casesDir = path.resolve(testsDir, 'cases')
+    const snapshotDir = path.resolve(testsDir, 'snapshots')
+
+    const absPath = path.resolve(casesDir, name)
+    const relPath = path.relative(casesDir, absPath)
+
+    const text = await fs.promises.readFile(absPath, 'utf-8')
+    const parsed = parseTestFile(text, '.vson')
+    if (parsed.files.length !== 1) {
+        throw new Error(`.vson test cases only support 1 file, got ${parsed.files.length} (${name})`)
+    }
+
+    const emitVson = parsed.compilerOptions.emit === 'vson'
+
+    let output: string
+    try {
+        output = api.optimizeVson(parsed.files[0].text, emitVson)
+    } catch (e: any) {
+        output = `error: ${e?.message ?? e}`
+    }
+
+    const snapshotExt = emitVson ? '.vson' : '.js'
+    const snapshotPath = path.resolve(snapshotDir, relPath.replace(/\.vson$/, snapshotExt))
+    const existingSnapshot = await fs.promises.readFile(snapshotPath, 'utf-8').catch((err: any) => {
+        if (err.code !== 'ENOENT') {
+            throw err
+        }
+    })
+
+    if (existingSnapshot === undefined) {
+        await writeFile(snapshotPath, output)
+        return
+    }
+
+    if (existingSnapshot === output) {
+        return
+    }
+
+    console.log(`snapshot changed: ${path.relative(process.cwd(), snapshotPath)}`)
+    await writeFile(snapshotPath, output)
+}
+
 function lineDiff(a: string, b: string) {
     const left = a.split('\n')
     const right = b.split('\n')
@@ -362,6 +406,10 @@ export async function main(...args: string[]) {
         if (path.basename(f).startsWith('_')) continue
 
         console.log('running test case', f)
+        if (f.endsWith('.vson')) {
+            await runVsonTestCase(f)
+            continue
+        }
         await runTestCase(f, { shouldExecute })
     }
 }

@@ -15,6 +15,8 @@ const AstData = parser.AstData;
 const Factory = parser.Factory;
 const NodeIterator = parser.NodeIterator;
 const getPackedData = parser.getPackedData;
+const getLeft = parser.getLeft;
+const getRight = parser.getRight;
 const unwrapRef = parser.unwrapRef;
 const maybeUnwrapRef = parser.maybeUnwrapRef;
 const getAstSlice = parser.getSlice;
@@ -39,6 +41,10 @@ const getAstSlice = parser.getSlice;
 // out-of-range refs are not parse errors, but they MUST result in an error during reconstitution
 //  - this is because it's possible for a larger system to stitch together many parsed value graphs to produce something that can be reconstituted
 //
+// References encode signed integer values. Unlike numbers, all fixed-width reference encodings are signed
+//  - zero terminated references are parsed the same way as numbers, you then can apply the relative offset to get an absolute
+//  - the resulting integer is interpreted as a relative byte offset from the start of the type tag
+
 // unexpected EOF -> abort
 // parsers stop exactly at the terminator or declared width; subsequent bytes belong to the enclosing value.
 // strings containing a zero byte MUST be encoded as sized; there is no escaping mechanism.
@@ -46,11 +52,16 @@ const getAstSlice = parser.getSlice;
 // arrays enumerate their elements
 // objects enumerate their entries (key -> value -> key -> value -> ...)
 //  - hitting a zero byte or the declared byte width before completing a pair is a parse error
-// computations are two values: the "subject" and the "input". These may be any value.
+// computations are _parsed_ as zero or more values just like arrays. however the sematics are that:
+//  - the first value is called the "subject"
+//  - the second value, if present, is called the "input"
+//  - anything after that is the "rest" of the computation
+// computations can be made up of any other values: references, opaque, other computations, etc.
 //  - A computation is already a perfectly valid value on its own. Evaluation is something a consumer chooses to do, not something demanded by the format.
+// an empty computation isn't a syntax error but is unlikely to be useful for much
 //
-// for sized arrays and objects, decoders MUST check that the end of the trailing value is aligned with the expected width
-//  - decoders do not need to track bounds during recursion, and it is often easier to check after parsing the last expected value.
+// for sized arrays/objects/computations, decoders MUST check that the end of the trailing value is aligned with the expected width
+//  - in other words, the cursor must end exactly at the declared end. if the cursor is less than the expected end, keep parsing values
 //
 // keys are normal values, so all possible types are valid to parse even if semantically errors.
 // duplicate keys are not parse errors
@@ -63,7 +74,7 @@ const getAstSlice = parser.getSlice;
 // size bits for true/false/null
 // xxxx - unused
 
-// for strings/array/object/computed, size bit encoding:
+// for strings/array/object/computed/opaque, size bit encoding:
 // 0000 - zero terminated
 // 0001 - 0 byte width imm
 // 0010 - 1 byte width imm
@@ -132,6 +143,10 @@ const getAstSlice = parser.getSlice;
 // for all types, including zero-terminated numbers/refs, a decoder that would otherwise overflow MUST report a parse error.
 //  - a decoder is not required to handle all data widths i.e. a 32bit-only decoder may reject 8-byte refs.
 
+// THE OPAQUE KIND ISN'T SPECIAL, IT JUST HAS NO SPECIFIC INTERPRETATION OF ITS CONTENTS. SO, IT'S JUST A BUNCH OF BYTES.
+// it is a sized kind like all the other non-primitives
+// .vson cannot use opaque but the binary format .vg can.
+
 const Kind = enum(u4) {
     NUL = 0,
     undefined = 1,
@@ -144,6 +159,7 @@ const Kind = enum(u4) {
     array = 8,
     object = 9,
     computed = 10,
+    @"opaque" = 15,
 };
 
 pub const NumberType = enum(u4) {
@@ -163,11 +179,11 @@ pub const ValueRef = u32;
 
 const ValueParser = struct {
     bytes: []const u8,
-    cursor: u64 = 0,
+    cursor: usize = 0,
     nodes: BumpAllocator(ValueNode),
     root: ValueRef = 0,
     prev: ValueRef = 0,
-    pos_to_ref: std.AutoHashMapUnmanaged(u64, ValueRef) = .{},
+    pos_to_ref: std.AutoHashMapUnmanaged(usize, ValueRef) = .{},
 
     pub fn parse(bytes: []const u8) !@This() {
         var t = @This(){
@@ -175,7 +191,7 @@ const ValueParser = struct {
             .nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator),
         };
         try t.nodes.preAlloc();
-        _ = try t.nodes.push(.{});
+        _ = try t.nodes.push(.{ .kind = .NUL });
         t.root = try t.parseValue();
         return t;
     }
@@ -192,7 +208,7 @@ const ValueParser = struct {
         const slice = this.bytes[start .. this.cursor - 1];
         return .{
             .kind = .string,
-            .slot0 = @truncate(@intFromPtr(slice.ptr) >> 32),
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(slice.ptr) >> 32),
             .slot1 = @truncate(@intFromPtr(slice.ptr)),
             .slot2 = @truncate(slice.len),
         };
@@ -209,29 +225,81 @@ const ValueParser = struct {
             break :blk this.readBytesAs(c, u64);
         };
         const start = this.cursor;
-        this.cursor += u;
+        this.cursor += @intCast(u);
         const slice = this.bytes[start..this.cursor];
         return .{
             .kind = .string,
-            .slot0 = @truncate(@intFromPtr(slice.ptr) >> 32),
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(slice.ptr) >> 32),
             .slot1 = @truncate(@intFromPtr(slice.ptr)),
             .slot2 = @truncate(slice.len),
         };
     }
 
+    fn parseOpaque(this: *@This()) ValueNode {
+        // i guess strings are opaque in all but name. well except the whole utf8 thing.
+        var n = this.parseString();
+        n.kind = .@"opaque";
+        return n;
+    }
+
     pub inline fn getSlice(node: *const ValueNode) []const u8 {
         if (node.slot2 == 0) return &.{};
+        if (comptime @import("builtin").target.isWasm()) {
+            const ptr: [*]const u8 = @ptrFromInt(node.slot1);
+            return ptr[0..node.slot2];
+        }
         const ptr: [*]const u8 = @ptrFromInt((@as(u64, node.slot0) << 32) | node.slot1);
         return ptr[0..node.slot2];
     }
 
+    inline fn ByteSizedType(comptime T: type, comptime size: comptime_int) type {
+        return switch (size) {
+            1 => switch (T) {
+                u8, i8 => T,
+                i64 => i8,
+                u64 => u8,
+                f64 => unreachable,
+                else => @compileError("out of types :("),
+            },
+            2 => switch (T) {
+                u16, i16, f16 => T,
+                i64 => i16,
+                u64 => u16,
+                f64 => f16,
+                else => @compileError("out of types :("),
+            },
+            4 => switch (T) {
+                u32, i32, f32 => T,
+                i64 => i32,
+                u64 => u32,
+                f64 => f32,
+                else => @compileError("out of types :("),
+            },
+            8 => switch (T) {
+                i64, u64, f64 => T,
+                else => @compileError("out of types :("),
+            },
+            else => @compileError("unhandled size"),
+        };
+    }
+
     inline fn readBytesAs(this: *@This(), count: u8, comptime T: type) T {
         const b = this.bytes[this.cursor .. this.cursor + count];
+        if (@typeInfo(T) == .Float) {
+            const v: T = switch (count) {
+                2 => @floatCast(@as(f16, @bitCast(b[0..2].*))),
+                4 => @floatCast(@as(f32, @bitCast(b[0..4].*))),
+                8 => @floatCast(@as(f64, @bitCast(b[0..8].*))),
+                else => unreachable,
+            };
+            this.cursor += count;
+            return v;     
+        }
         const v: T = switch (count) {
-            1 => @bitCast(b[0..1]),
-            2 => @bitCast(b[0..2]),
-            4 => @bitCast(b[0..4]),
-            8 => @bitCast(b[0..8]),
+            1 => @intCast(@as(ByteSizedType(T, 1), @bitCast(b[0..1].*))),
+            2 => @intCast(@as(ByteSizedType(T, 2), @bitCast(b[0..2].*))),
+            4 => @intCast(@as(ByteSizedType(T, 4), @bitCast(b[0..4].*))),
+            8 => @intCast(@as(ByteSizedType(T, 8), @bitCast(b[0..8].*))),
             else => unreachable,
         };
         this.cursor += count;
@@ -246,7 +314,7 @@ const ValueParser = struct {
                 else => null,
             },
             .ref => switch (upper) {
-                0b0001...0b1011 => @as(i16, -1) << (upper),
+                0b0001...0b1011 => @as(i16, -1) << (upper - 1),
                 else => null,
             },
             .number => switch (upper) {
@@ -261,7 +329,7 @@ const ValueParser = struct {
         const upper: u4 = @truncate(tag >> 4);
         return switch (@as(Kind, @enumFromInt(tag & 0xF))) {
             .string, .object, .array, .computed, .ref => switch (upper) {
-                0b1100...0b1111 => 1 << (upper - 0b1100),
+                0b1100...0b1111 => @as(u8, 1) << @as(u3, @intCast(upper - 0b1100)),
                 else => null,
             },
             .number => switch (upper) {
@@ -275,7 +343,7 @@ const ValueParser = struct {
         };
     }
 
-    inline fn parsedSizedNumber(this: @This(), tag: u8) f64 {
+    inline fn parsedSizedNumber(this: *@This(), tag: u8) f64 {
         std.debug.assert(@as(Kind, @enumFromInt(tag & 0xF)) == .number);
         return switch (tag >> 4) {
             0b0111 => @floatFromInt(this.readBytesAs(1, u8)),
@@ -338,6 +406,9 @@ const ValueParser = struct {
     }
 
     pub fn getNumberFromNode(n: *const ValueNode, comptime T: type) T {
+        if (comptime @import("builtin").cpu.arch.endian() == .big) {
+            @compileError("TODO: big endian byte swap");
+        }
         std.debug.assert(n.kind == .number);
         const u: u64 = (@as(u64, n.slot0) << 32) | n.slot1;
         const t = @as(NumberType, @enumFromInt(n.slot2));
@@ -367,7 +438,7 @@ const ValueParser = struct {
     fn parseRefZ(this: *@This(), current: u64) !ValueNode {
         var n = try this.parseNumberZ();
         n.kind = .ref;
-        const absolute: u32 = @intCast(@as(i64, current) + getNumberFromNode(&n, i64));
+        const absolute: u32 = @intCast(@as(i64, @intCast(current)) + getNumberFromNode(&n, i64));
         n.slot0 = absolute;
         n.slot1 = 0;
         n.slot2 = 0;
@@ -392,7 +463,7 @@ const ValueParser = struct {
             }
             return this.parseRefZ(current);
         };
-        const absolute: u32 = @intCast(@as(i64, current) + o);
+        const absolute: u32 = @intCast(@as(i64, @intCast(current)) + o);
         return .{
             .kind = .ref,
             .slot0 = absolute,
@@ -419,30 +490,34 @@ const ValueParser = struct {
         };
     }
 
-    fn parseArrayOrObject(this: *@This(), comptime k: Kind) !ValueNode {
-        std.debug.assert(k == .array or k == .object);
+    fn parseStructure(this: *@This(), comptime k: Kind) !ValueNode {
+        std.debug.assert(k == .array or k == .object or k == .computed);
         const tag = this.parseTag();
         const u: i64 = blk: {
             if (tag >> 4 == 0) break :blk -1;
             if (getImmediate(tag)) |v| break :blk @intCast(v);
             const c = getLengthByteCount(tag) orelse unreachable;
-            break :blk this.readBytesAs(c, u64);
+            break :blk @intCast(this.readBytesAs(c, u64));
         };
 
         const start = this.cursor;
         var head: u32 = 0;
+        var expect_pair: bool = false;
         while (true) {
-            if (u == -1 and this.bytes[this.cursor] == 0) break;
-            if (u != -1 and this.cursor == start + @as(u64, @intCast(u))) break;
-            if (comptime k == .object) {
-                const key = try this.parseValue();
-                if (head == 0) head = key;
-                _ = try this.parseValue();
-            } else {
-                const el = try this.parseValue();
-                if (head == 0) head = el;
+            if (u == -1 and this.bytes[this.cursor] == 0) {
+                this.cursor += 1;
+                break;
             }
+            if (u != -1 and this.cursor >= start + @as(usize, @intCast(u))) {
+                if (this.cursor > start + @as(usize, @intCast(u))) return error.InvalidValueWidth;
+                break;
+            }
+            const el = try this.parseValue();
+            std.debug.assert(el != 0);
+            if (head == 0) head = el;
+            if (comptime k == .object) expect_pair = !expect_pair;
         }
+        if (expect_pair) return error.IncompleteKeyValuePair;
 
         this.prev = 0;
         return .{
@@ -452,30 +527,22 @@ const ValueParser = struct {
     }
 
     fn parseObject(this: *@This()) !ValueNode {
-        return this.parseArrayOrObject(.object);
+        return this.parseStructure(.object);
     }
 
     fn parseArray(this: *@This()) !ValueNode {
-        return this.parseArrayOrObject(.array);
+        return this.parseStructure(.array);
     }
 
     fn parseComputed(this: *@This()) !ValueNode {
-        const tag = this.parseTag();
-        const u: i64 = blk: {
-            if (tag >> 4 == 0) break :blk -1;
-            if (getImmediate(tag)) |v| break :blk @intCast(v);
-            const c = getLengthByteCount(tag) orelse unreachable;
-            break :blk this.readBytesAs(c, u64);
-        };
-        _ = u;
-        const subject = try this.parseValue();
-        const input = try this.parseValue();
-        this.prev = 0;
-        return .{
-            .kind = .computed,
-            .slot0 = subject,
-            .slot1 = input,
-        };
+        var n = try this.parseStructure(.computed);
+        if (n.slot0 != 0) { // #input
+            n.slot1 = this.nodes.at(n.slot0).next;
+        }
+        if (n.slot1 != 0) { // #rest
+            n.slot2 = this.nodes.at(n.slot1).next;
+        }
+        return n;
     }
 
     inline fn peekTagKind(this: *const @This()) Kind {
@@ -492,14 +559,18 @@ const ValueParser = struct {
             .number => try this.parseNumber(),
             .string => this.parseString(),
             .object => try this.parseObject(),
-            .array => try this.parseObject(),
-            .computed => try this.parseObject(),
-            .null, .undefined, .true, .false => |k| .{ .kind = k },
+            .array => try this.parseArray(),
+            .computed => try this.parseComputed(),
+            .@"opaque" => this.parseOpaque(),
+            .null, .undefined, .true, .false => |k| blk: {
+                this.cursor += 1;
+                break :blk .{ .kind = k };
+            },
             else => unreachable,
         };
         const r = try this.nodes.push(n);
         if (prev != 0) {
-            this.nodes.at(prev).next = r;
+            this.nodes.at(prev).next = @truncate(r);
         }
         this.prev = r;
         try this.pos_to_ref.put(this.nodes.pages.allocator, start, r);
@@ -881,7 +952,7 @@ const ValueGraph = struct {
     pub fn createString(this: *@This(), v: []const u8) !ValueRef {
         return this.values.nodes.push(.{
             .kind = .string,
-            .slot0 = @truncate(@intFromPtr(v.ptr) >> 32),
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
             .slot1 = @truncate(@intFromPtr(v.ptr)),
             .slot2 = @truncate(v.len),
         });
@@ -905,7 +976,7 @@ const ValueGraph = struct {
         });
     }
 
-    // Should only be used on synthetic values, for now. Will add a new key/value pair if-needed.
+    // Should only be used on synthetic values. Will add a new key/value pair if-needed.
     // key: ValueRef | []const u8 (string key)
     pub fn setProperty(this: *@This(), ref: ValueRef, key: anytype, value: ValueRef) !void {
         const n = this.getValue(ref);
@@ -919,7 +990,7 @@ const ValueGraph = struct {
             const key_node = this.getValue(s);
             const value_ref = key_node.next;
             if (try this.valuesEql(s, key_ref)) {
-                // Replace in place, preserving the chain's continuation.
+                // in-place swap
                 const continuation = this.getValue(value_ref).next;
                 this.values.nodes.at(value).next = @truncate(continuation);
                 this.values.nodes.at(s).next = @truncate(value);
@@ -929,11 +1000,11 @@ const ValueGraph = struct {
             s = this.getValue(value_ref).next;
         }
 
-        // Not found: append a new key/value pair at the tail.
+        // append
         this.values.nodes.at(key_ref).next = @truncate(value);
         this.values.nodes.at(value).next = 0;
         if (last == 0) {
-            this.values.nodes.at(this.followReplacements(ref)).slot0 = @truncate(key_ref);
+            n.slot0 = @truncate(key_ref);
         } else {
             this.values.nodes.at(last).next = @truncate(key_ref);
         }
@@ -1189,15 +1260,18 @@ const ValueGraph = struct {
 
     // shows with replacements
     pub fn printGraph(this: *@This()) !void {
+        debugPrint("{s}\n", .{try this.printGraphToString()});
+    }
+
+    pub fn printGraphToString(this: *@This()) ![]const u8 {
         var path_info = try this.buildPathInfo(this.values.root);
         defer path_info.deinit(getAllocator());
 
         var out = std.ArrayList(u8).init(getAllocator());
-        defer out.deinit();
         var path = std.AutoHashMapUnmanaged(ValueRef, void){};
         defer path.deinit(getAllocator());
         try this.printGraphValue(this.values.root, &path_info, &out, &path, 0);
-        debugPrint("{s}\n", .{out.items});
+        return out.items;
     }
 
     fn printGraphValue(
@@ -1220,12 +1294,13 @@ const ValueGraph = struct {
                 try out.writer().print("$", .{});
                 return;
             }
+            const inner = try this.followRefNode(n);
 
-            if (path_info.contains(n.slot0)) {
-                try this.formatRelativePath(path_info, ref, n.slot0, out);
+            if (path_info.contains(inner)) {
+                try this.formatRelativePath(path_info, ref, inner, out);
                 return;
             }
-            const r = this.followReplacements(n.slot0);
+            const r = this.followReplacements(inner);
             if (path_info.contains(r)) {
                 try this.formatRelativePath(path_info, ref, r, out);
                 return;
@@ -1238,7 +1313,7 @@ const ValueGraph = struct {
             }
             try path.put(getAllocator(), ref, {});
             defer _ = path.remove(ref);
-            try this.printGraphValue(n.slot0, path_info, out, path, indent_depth);
+            try this.printGraphValue(inner, path_info, out, path, indent_depth);
             return;
         }
 
@@ -1318,6 +1393,7 @@ const ValueGraph = struct {
                 try out.append(')');
             },
             .ref => unreachable, // handled above
+            .@"opaque" => try out.appendSlice("<opaque>"),
         }
     }
 
@@ -1380,7 +1456,7 @@ const ValueGraph = struct {
         const n = this.values.nodes.at(resolved);
         switch (n.kind) {
             .ref => {
-                const target = n.slot0;
+                const target = try this.followRef(resolved);
                 const target_resolved = this.followReplacements(target);
                 if (direct.contains(target_resolved)) return;
                 try direct.put(getAllocator(), target_resolved, {});
@@ -1427,7 +1503,8 @@ const ValueGraph = struct {
 
         switch (n.kind) {
             .ref => {
-                n.slot0 = try this.simplifyReplacements(n.slot0, visited);
+                const inner = try this.followRefNode(n);
+                n.slot0 = try this.simplifyReplacements(inner, visited);
             },
             .array, .object => {
                 var s = n.slot0;
@@ -1656,7 +1733,7 @@ const ReferenceCollector = struct {
         return self;
     }
 
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *@This()) void {
         self.parents.deinit(getAllocator());
         self.stack.deinit(getAllocator());
         var iter = self.references.valueIterator();
@@ -1725,7 +1802,24 @@ const ReferenceCollector = struct {
             return this.collector.parents.get(ref);
         }
 
+        // intentionally skips over postfix/prefix unary expressions
         pub fn getAssignedValue(this: *const @This(), ref: NodeRef) ?NodeRef {
+            const res = this._getAssignmentNode(ref) orelse return null;
+            return res[2];
+        }
+
+        pub fn getAssignedTarget(this: *const @This(), ref: NodeRef) ?NodeRef {
+            const res = this._getAssignmentNode(ref) orelse return null;
+            return res[1];
+        }
+
+        pub fn getAssignmentNode(this: *const @This(), ref: NodeRef) ?NodeRef {
+            const res = this._getAssignmentNode(ref) orelse return null;
+            return res[0];
+        }
+
+        // (parent, target, value?)
+        pub fn _getAssignmentNode(this: *const @This(), ref: NodeRef) ?struct { NodeRef, NodeRef, ?NodeRef } {
             const nodes = this.getNodes();
             var current_ref = ref;
             var parent_ref = this.parentRef(ref) orelse return null;
@@ -1738,12 +1832,25 @@ const ReferenceCollector = struct {
                     },
                     .binary_expression => {
                         if (parser.isAssignmentOp(@enumFromInt(p.len))) {
-                            if (getPackedData(p).left != current_ref) break;
-                            return getPackedData(p).right;
+                            if (getLeft(p) != current_ref) break;
+                            return .{parent_ref, current_ref, getRight(p)};
                         }
                         break;
                     },
-                    // TODO: destructuring can rebind params!!!
+                    .prefix_unary_expression => {
+                        const op: SyntaxKind = @enumFromInt(getLeft(p));
+                        if (op == .plus_plus_token or op == .minus_minus_token) {
+                            std.debug.assert(getRight(p) == current_ref);
+                            return .{parent_ref, current_ref, null};
+                        }
+                    },
+                    .postfix_unary_expression => {
+                        const op: SyntaxKind = @enumFromInt(getRight(p));
+                        if (op == .plus_plus_token or op == .minus_minus_token) {
+                            std.debug.assert(getLeft(p) == current_ref);
+                            return .{parent_ref, current_ref, null};
+                        }                    
+                    },
                     else => break,
                 }
             }
@@ -1789,18 +1896,18 @@ const ReferenceCollector = struct {
             while (true) {
                 const p = nodes.at(parent_ref);
                 switch (p.kind) {
-                    .await_expression, .shorthand_property_assignment, .parenthesized_expression => {
+                    .parenthesized_expression => {
                         current_ref = parent_ref;
                         parent_ref = this.parentRef(current_ref) orelse break;
                     },
-                    .array_literal_expression, .object_literal_expression => return parent_ref,
+                    .shorthand_property_assignment,
+                    .await_expression, .array_literal_expression, .object_literal_expression => return parent_ref,
                     .property_assignment => {
-                        if (getPackedData(p).right != current_ref) break;
-                        current_ref = parent_ref;
-                        parent_ref = this.parentRef(current_ref) orelse break;
+                        if (getRight(p) != current_ref) break;
+                        return parent_ref;
                     },
                     .call_expression, .new_expression => {
-                        const target = getPackedData(p).left;
+                        const target = getLeft(p);
                         if (target == current_ref) break;
                         // TODO: it'd be useful to know which argument position
                         return target;
@@ -1874,7 +1981,49 @@ const ReferenceCollector = struct {
     pub fn isAssignedTo(self: *@This(), sym_ref: parser.SymbolRef) bool {
         var iter = self.getReferenceIterator(sym_ref) orelse return false;
         while (iter.next()) |r| {
-            if (iter.getAssignedValue(r) != null) return true;
+            if (iter.getAssignmentNode(r) != null) return true;
+        }
+        return false;
+    }
+
+    // this includes assignments
+    fn isEscapePosition(self: *@This(), ref: NodeRef) bool {
+        var c = ref;
+        while (c != 0) {
+            const p_ref = self.parents.get(c) orelse return false;
+            const p = self.file.ast.nodes.at(p_ref);
+            switch (p.kind) {
+                .parenthesized_expression => {
+                    c = p_ref;
+                },
+                .shorthand_property_assignment,
+                .await_expression, .array_literal_expression, .object_literal_expression => return true,
+                .property_assignment => {
+                    if (getRight(p) != c) break;
+                    return true;
+                },
+                .call_expression, .new_expression => {
+                    if (getLeft(p) == c) break;
+                    return true;
+                },
+                .binary_expression => {
+                    if (parser.isAssignmentOp(@enumFromInt(p.len))) {
+                        return getRight(p) == c;
+                    }
+                    break;
+                },
+                else => break,
+            }
+        }
+        return false;
+    } 
+
+    pub fn isUsed(self: *@This(), sym_ref: parser.SymbolRef) bool {
+        var iter = self.getReferenceIterator(sym_ref) orelse return true;
+        while (iter.next()) |r| {
+            // we ignore any writes
+            if (iter._getAssignmentNode(r) != null) continue;
+            return true;
         }
         return false;
     }
@@ -1964,6 +2113,203 @@ fn collectParamReplacements(
     try replacer.visit(nodes.at(ref), ref);
 }
 
+// `((p1, ...) => <expr>)(a1, ...)` with a concise (non-block) body, no
+// default params, and each param used EXACTLY once — same shape and same
+// reasoning as `tryInlineTrivialArrowCall`, but as a plain AST rewrite
+// (via the printer's `replacements` map) instead of a text substitution,
+// so it fires anywhere inside a function body, not just at the codegen
+// "computed subject = call" boundary. Zero params (a plain indirection
+// wrapper, e.g. `(() => x[0])()`) is the trivial case of this — nothing
+// to substitute, just unwrap to the body.
+fn tryGetTrivialIifeBody(
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    call_ref: NodeRef,
+    replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
+) !?NodeRef {
+    const call = nodes.at(call_ref);
+    if (call.kind != .call_expression) return null;
+    const d = getPackedData(call);
+    const callee = nodes.at(d.left);
+    if (callee.kind != .parenthesized_expression) return null;
+    const arrow_ref = maybeUnwrapRef(callee) orelse return null;
+    const arrow = nodes.at(arrow_ref);
+    if (arrow.kind != .arrow_function) return null;
+
+    const body_ref = getPackedData(arrow).right;
+    const body = nodes.at(body_ref);
+    if (body.kind == .block) return null; // concise body only
+
+    const params_head = getPackedData(arrow).left;
+    var param_syms = std.ArrayListUnmanaged(parser.SymbolRef){};
+    defer param_syms.deinit(getAllocator());
+    {
+        var it = NodeIterator.init(nodes, params_head);
+        while (it.nextRef()) |p_ref| {
+            const p = nodes.at(p_ref);
+            const pd = getPackedData(p);
+            if (pd.right != 0) return null; // has a default value
+            const name_node = nodes.at(pd.left);
+            if (name_node.kind != .identifier) return null; // no destructuring
+            const sym = binder.getSymbol(pd.left) orelse return null;
+            if (sym == 0) return null;
+            try param_syms.append(getAllocator(), sym);
+        }
+    }
+
+    var arg_refs = std.ArrayListUnmanaged(NodeRef){};
+    defer arg_refs.deinit(getAllocator());
+    {
+        var it = NodeIterator.init(nodes, d.right);
+        while (it.nextRef()) |a_ref| try arg_refs.append(getAllocator(), a_ref);
+    }
+    if (param_syms.items.len != arg_refs.items.len) return null;
+
+    for (param_syms.items) |sym| {
+        var counter = SymbolUseCounter{ .nodes = nodes, .binder = binder, .sym = sym };
+        try counter.visit(nodes.at(body_ref), body_ref);
+        if (counter.count != 1) return null; // used zero or 2+ times
+    }
+
+    if (param_syms.items.len > 0) {
+        try collectParamReplacements(nodes, binder, body_ref, param_syms.items, arg_refs.items, replacements);
+    }
+    return body_ref;
+}
+
+const TrivialIifeCollector = struct {
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
+
+    pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
+        if (ref == 0) return;
+        if (node.kind == .call_expression) {
+            if (try tryGetTrivialIifeBody(self.nodes, self.binder, ref, self.replacements)) |body_ref| {
+                try self.replacements.put(ref, body_ref);
+                // The substituted body may itself contain further trivial
+                // IIFEs (e.g. one nested inside another) — keep scanning.
+                try self.visit(self.nodes.at(body_ref), body_ref);
+                return;
+            }
+        }
+        if (parser.isLeafNode(node.kind)) return;
+        try parser.forEachChild(self.nodes, node, self);
+    }
+};
+
+// Finds every trivial IIFE call anywhere under `root_ref` and records
+// `call_ref -> body_ref` (substituted) in `replacements`, for the caller
+// to print with `Printer(.{ .use_replacements = true })`.
+fn collectTrivialIifeReplacements(
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    root_ref: NodeRef,
+    replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
+) !void {
+    var collector = TrivialIifeCollector{ .nodes = nodes, .binder = binder, .replacements = replacements };
+    try collector.visit(nodes.at(root_ref), root_ref);
+}
+
+const SymbolUseCounter = struct {
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    sym: parser.SymbolRef,
+    count: u32 = 0,
+
+    pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
+        if (ref == 0) return;
+        if (node.kind == .identifier) {
+            const sym = self.binder.getSymbol(ref) orelse return;
+            if (sym == self.sym) self.count += 1;
+            return;
+        }
+        try parser.forEachChild(self.nodes, node, self);
+    }
+};
+
+// Conservative on purpose — no attempt at real effect analysis, just the
+// obvious cases: reading a plain binding, boolean coercion (`!`/`!!`),
+// literals. `!x` in particular is always effect-free regardless of what
+// `x` is, since `ToBoolean` never invokes user code (unlike `==`/`+`,
+// which go through `ToPrimitive`).
+fn isExprSideEffectFree(nodes: *const BumpAllocator(AstNode), ref: NodeRef) bool {
+    if (ref == 0) return true;
+    const n = nodes.at(ref);
+    return switch (n.kind) {
+        .identifier, .true_keyword, .false_keyword, .null_keyword, .undefined_keyword, .numeric_literal, .string_literal, .this_keyword, .no_substitution_template_literal => true,
+        .prefix_unary_expression => blk: {
+            const d = getPackedData(n);
+            const op: SyntaxKind = @enumFromInt(d.left);
+            break :blk op == .exclamation_token and isExprSideEffectFree(nodes, d.right);
+        },
+        .parenthesized_expression => isExprSideEffectFree(nodes, unwrapRef(n)),
+        else => false,
+    };
+}
+
+// Drops (or, when the RHS might have effects, reduces to a bare
+// expression statement that just keeps evaluating it) any
+// declaration/assignment writing to `sym` within `stmts`. Only valid to
+// call once the caller already knows `sym` is never READ anywhere in the
+// (fully reduced) body — that's an existing, whole-body fact computed via
+// `isSymbolUsedInStatements`/`still_used`, so this is safe regardless of
+// where in `stmts` the dead write happens to sit.
+fn dceStripDeadWritesFor(
+    nodes: *BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    stmts: *std.ArrayList(NodeRef),
+    sym: parser.SymbolRef,
+) !bool {
+    var changed = false;
+    var factory = Factory{ .nodes = nodes };
+    var i: usize = 0;
+    while (i < stmts.items.len) {
+        const stmt_ref = stmts.items[i];
+        const stmt = nodes.at(stmt_ref);
+
+        var is_write = false;
+        var rhs: NodeRef = 0;
+        if (stmt.kind == .variable_statement) {
+            if (maybeUnwrapRef(stmt)) |decls_head| {
+                const decl = nodes.at(decls_head);
+                if (decl.next == 0 and decl.kind == .variable_declaration) {
+                    const d = getPackedData(decl);
+                    const name_node = nodes.at(d.left);
+                    if (name_node.kind == .identifier and (binder.getSymbol(d.left) orelse 0) == sym) {
+                        is_write = true;
+                        rhs = d.right;
+                    }
+                }
+            }
+        } else if (stmt.kind == .expression_statement) {
+            const inner_ref = unwrapRef(stmt);
+            const inner = nodes.at(inner_ref);
+            if (inner.kind == .binary_expression and inner.len == @intFromEnum(SyntaxKind.equals_token)) {
+                const d = getPackedData(inner);
+                const lhs = nodes.at(d.left);
+                if (lhs.kind == .identifier and (binder.getSymbol(d.left) orelse 0) == sym) {
+                    is_write = true;
+                    rhs = d.right;
+                }
+            }
+        }
+
+        if (!is_write) {
+            i += 1;
+            continue;
+        }
+        changed = true;
+        if (isExprSideEffectFree(nodes, rhs)) {
+            _ = stmts.orderedRemove(i);
+            continue;
+        }
+        stmts.items[i] = try factory.createExpressionStatement(rhs);
+        i += 1;
+    }
+    return changed;
+}
+
 fn containsDollarDigit(s: []const u8) bool {
     var i: usize = 0;
     while (i + 1 < s.len) : (i += 1) {
@@ -1979,13 +2325,14 @@ fn getInnerFunctionExpr(parsed: *parser.ParsedFile) ?NodeRef {
     const stmt = parsed.ast.nodes.at(stmts_head);
     if (stmt.next != 0) return null; // must be the only top-level statement
     if (stmt.kind != .expression_statement) return null;
-    const inner_ref = maybeUnwrapRef(stmt) orelse return null;
-    const inner = parsed.ast.nodes.at(inner_ref);
-    if (inner.kind != .parenthesized_expression) return null;
-    const fn_ref = maybeUnwrapRef(inner) orelse return null;
-    const fn_node = parsed.ast.nodes.at(fn_ref);
-    if (fn_node.kind != .function_expression and fn_node.kind != .function_declaration) return null;
-    return fn_ref;
+    var inner_ref = unwrapRef(stmt);
+    var inner = parsed.ast.nodes.at(inner_ref);
+    if (inner.kind == .parenthesized_expression) {
+        inner_ref = unwrapRef(inner);
+        inner = parsed.ast.nodes.at(inner_ref);
+    }
+    if (inner.kind != .function_expression and inner.kind != .function_declaration) return null;
+    return inner_ref;
 }
 
 /// destructures an IIFE (arrow fn only)
@@ -2010,17 +2357,117 @@ fn getIifeCallExpr(parsed: *parser.ParsedFile) ?struct { arrow_ref: NodeRef, arg
     return .{ .arrow_ref = arrow_ref, .args_head = d.right };
 }
 
+// Unwraps the outer parens `getIifeCallExpr` used to require at the very
+// top, giving back whatever's inside — the actual top-level expression to
+// feed into `dceUnwrap`.
+fn getWrappedTopExpr(parsed: *parser.ParsedFile) ?NodeRef {
+    const source = parsed.ast.nodes.at(parsed.ast.start);
+    const stmts_head = maybeUnwrapRef(source) orelse return null;
+    const stmt = parsed.ast.nodes.at(stmts_head);
+    if (stmt.next != 0) return null;
+    if (stmt.kind != .expression_statement) return null;
+    return maybeUnwrapRef(stmt);
+}
+
+// One `(params => body)(args)` IIFE layer, or a bare (uncalled) arrow —
+// e.g. the closure a factory ultimately returns — recorded the same way
+// but with `args_head == 0` so the rebuild step knows not to treat it as
+// a call to reconstruct.
+const DceLayer = struct {
+    arrow_ref: NodeRef,
+    params_head: NodeRef,
+    args_head: NodeRef, // 0 = bare arrow, not itself called
+    tracked_start: usize,
+    tracked_end: usize,
+};
+
+// `tryInlineComputationCall`'s mutated-param IIFE and `tryInlineValue`'s
+// per-value IIFE can stack arbitrarily deep (each pass wraps its own
+// layer independently, with no knowledge of the others) — e.g.
+// `(_d0 => (_p0 => () => { ... })([]))("el")`. Rather than assume a fixed
+// nesting depth, this walks through as many layers as exist, collecting
+// tracked literal params from every IIFE call along the way, until it
+// finds the innermost `{ ... }` block.
+fn dceUnwrap(
+    parsed: *parser.ParsedFile,
+    expr_ref: NodeRef,
+    layers: *std.ArrayListUnmanaged(DceLayer),
+    tracked: *std.ArrayListUnmanaged(TrackedParam),
+) anyerror!?NodeRef {
+    const n = parsed.ast.nodes.at(expr_ref);
+    switch (n.kind) {
+        .block => return expr_ref,
+        .parenthesized_expression => {
+            const inner = maybeUnwrapRef(n) orelse return null;
+            return try dceUnwrap(parsed, inner, layers, tracked);
+        },
+        .arrow_function => {
+            const params_head = getPackedData(n).left;
+            const body_ref = getPackedData(n).right;
+            try layers.append(getAllocator(), .{
+                .arrow_ref = expr_ref,
+                .params_head = params_head,
+                .args_head = 0,
+                .tracked_start = tracked.items.len,
+                .tracked_end = tracked.items.len,
+            });
+            return try dceUnwrap(parsed, body_ref, layers, tracked);
+        },
+        .call_expression => {
+            const d = getPackedData(n);
+            const callee = parsed.ast.nodes.at(d.left);
+            if (callee.kind != .parenthesized_expression) return null;
+            const arrow_ref = maybeUnwrapRef(callee) orelse return null;
+            const arrow = parsed.ast.nodes.at(arrow_ref);
+            if (arrow.kind != .arrow_function) return null;
+            const params_head = getPackedData(arrow).left;
+            const args_head = d.right;
+
+            const tracked_start = tracked.items.len;
+            {
+                var params_it = NodeIterator.init(&parsed.ast.nodes, params_head);
+                var args_it = NodeIterator.init(&parsed.ast.nodes, args_head);
+                while (params_it.nextRef()) |p_ref| {
+                    const arg_ref = args_it.nextRef() orelse break;
+                    const p = parsed.ast.nodes.at(p_ref);
+                    const name_ref = getPackedData(p).left;
+                    const name_node = parsed.ast.nodes.at(name_ref);
+                    if (name_node.kind != .identifier) continue;
+                    const sym = parsed.binder.getSymbol(name_ref) orelse continue;
+                    if (sym == 0) continue;
+                    const lit = evalLiteral(&parsed.ast.nodes, arg_ref) orelse continue;
+                    try tracked.append(getAllocator(), .{ .sym = sym, .value = lit });
+                }
+            }
+            try layers.append(getAllocator(), .{
+                .arrow_ref = arrow_ref,
+                .params_head = params_head,
+                .args_head = args_head,
+                .tracked_start = tracked_start,
+                .tracked_end = tracked.items.len,
+            });
+
+            return try dceUnwrap(parsed, getPackedData(arrow).right, layers, tracked);
+        },
+        else => return null,
+    }
+}
+
 const KnownValue = union(enum) {
+    string: []const u8,
     boolean: bool,
     number: f64,
     null_,
     undefined_,
+    truthy_reference,
 
     fn toBool(self: KnownValue) bool {
         return switch (self) {
             .boolean => |b| b,
             .number => |n| n != 0,
+            .string => |s| s.len > 0,
             .null_, .undefined_ => false,
+            .truthy_reference => true,
         };
     }
 };
@@ -2031,8 +2478,14 @@ fn evalLiteral(nodes: *const BumpAllocator(AstNode), ref: NodeRef) ?KnownValue {
         .true_keyword => .{ .boolean = true },
         .false_keyword => .{ .boolean = false },
         .null_keyword => .null_,
+        .void_expression,
         .undefined_keyword => .undefined_,
         .numeric_literal => .{ .number = parser.getNumber(n) },
+        .string_literal, .no_substitution_template_literal => .{ .string = parser.getSlice(n, u8), }, // NOT DECODED!
+        .regular_expression_literal,
+        .class_expression, .class_declaration,
+        .arrow_function, .function_expression, .function_declaration,
+        .array_literal_expression, .object_literal_expression => .truthy_reference,
         else => null,
     };
 }
@@ -2040,25 +2493,34 @@ fn evalLiteral(nodes: *const BumpAllocator(AstNode), ref: NodeRef) ?KnownValue {
 const TrackedParam = struct {
     sym: parser.SymbolRef,
     value: ?KnownValue, // null = no longer statically known
+    // The graph-level value this symbol's *initial* value derives from, if
+    // any — lets `evalExprKnownValue` answer "is element 0 of this thing
+    // known-invariant" for a captured shared array/object, via
+    // `invariant_facts` (computed interprocedurally — see
+    // `computeInvariantCellFacts`).
+    graph_value: ?ValueRef = null,
 };
 
-fn evalCondition(
+// Generalizes `evalLiteral`: evaluates an arbitrary (not just literal)
+// expression to a `KnownValue` given the current `tracked` state, handling
+// the handful of shapes DCE needs to see through to reach the useful
+// facts — identifier lookups, `!`/`!==`/`===`, trivial no-arg IIFEs
+// (`(() => expr)()`), and (given `invariant_facts`) `ident[0]` where
+// `ident` derives from a graph value proven invariant at index 0.
+fn evalExprKnownValue(
     nodes: *const BumpAllocator(AstNode),
     binder: *const parser.Binder,
     expr_ref: NodeRef,
     tracked: []const TrackedParam,
-) ?bool {
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
+) ?KnownValue {
     const n = nodes.at(expr_ref);
     switch (n.kind) {
-        .true_keyword => return true,
-        .false_keyword => return false,
         .identifier => {
             const sym = binder.getSymbol(expr_ref) orelse return null;
             if (sym == 0) return null;
             for (tracked) |t| {
-                if (t.sym != sym) continue;
-                const v = t.value orelse return null;
-                return v.toBool();
+                if (t.sym == sym) return t.value;
             }
             return null;
         },
@@ -2066,15 +2528,66 @@ fn evalCondition(
             const d = getPackedData(n);
             const op: SyntaxKind = @enumFromInt(d.left);
             if (op != .exclamation_token) return null;
-            const inner = evalCondition(nodes, binder, d.right, tracked) orelse return null;
-            return !inner;
+            const inner = evalExprKnownValue(nodes, binder, d.right, tracked, invariant_facts) orelse return null;
+            return .{ .boolean = !inner.toBool() };
         },
         .parenthesized_expression => {
             const inner_ref = maybeUnwrapRef(n) orelse return null;
-            return evalCondition(nodes, binder, inner_ref, tracked);
+            return evalExprKnownValue(nodes, binder, inner_ref, tracked, invariant_facts);
         },
-        else => return null,
+        .binary_expression => {
+            const d = getPackedData(n);
+            const op: SyntaxKind = @enumFromInt(n.len);
+            if (op != .equals_equals_equals_token and op != .exclamation_equals_equals_token) return null;
+            const l = evalExprKnownValue(nodes, binder, d.left, tracked, invariant_facts) orelse return null;
+            const r = evalExprKnownValue(nodes, binder, d.right, tracked, invariant_facts) orelse return null;
+            const eq = knownValueEql(l, r);
+            return .{ .boolean = if (op == .equals_equals_equals_token) eq else !eq };
+        },
+        .element_access_expression => {
+            const d = getPackedData(n);
+            const base = nodes.at(d.left);
+            if (base.kind != .identifier) return null;
+            const idx = nodes.at(d.right);
+            if (idx.kind != .numeric_literal or parser.getNumber(idx) != 0) return null;
+            const sym = binder.getSymbol(d.left) orelse return null;
+            if (sym == 0) return null;
+            const facts = invariant_facts orelse return null;
+            for (tracked) |t| {
+                if (t.sym != sym) continue;
+                const gv = t.graph_value orelse return null;
+                if (facts.contains(gv)) return .truthy_reference;
+                return null;
+            }
+            return null;
+        },
+        .call_expression => {
+            // A trivial no-param, no-arg IIFE `(() => <expr>)()` — just an
+            // indirection wrapper, see through it to `<expr>`.
+            const d = getPackedData(n);
+            if (d.right != 0) return null; // has args
+            const callee_ref = blk: {
+                const callee = nodes.at(d.left);
+                break :blk if (callee.kind == .parenthesized_expression) (maybeUnwrapRef(callee) orelse return null) else d.left;
+            };
+            const arrow = nodes.at(callee_ref);
+            if (arrow.kind != .arrow_function) return null;
+            if (getPackedData(arrow).left != 0) return null; // has params
+            return evalExprKnownValue(nodes, binder, getPackedData(arrow).right, tracked, invariant_facts);
+        },
+        else => return evalLiteral(nodes, expr_ref),
     }
+}
+
+fn evalCondition(
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    expr_ref: NodeRef,
+    tracked: []const TrackedParam,
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
+) ?bool {
+    const v = evalExprKnownValue(nodes, binder, expr_ref, tracked, invariant_facts) orelse return null;
+    return v.toBool();
 }
 
 fn tryUpdateTrackedFromAssignment(
@@ -2082,6 +2595,7 @@ fn tryUpdateTrackedFromAssignment(
     binder: *const parser.Binder,
     stmt: *const AstNode,
     tracked: []TrackedParam,
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
 ) void {
     if (stmt.kind != .expression_statement) return;
     const inner_ref = unwrapRef(stmt);
@@ -2094,9 +2608,37 @@ fn tryUpdateTrackedFromAssignment(
     if (sym == 0) return;
     for (tracked) |*t| {
         if (t.sym != sym) continue;
-        t.value = evalLiteral(nodes, d.right);
+        t.value = evalExprKnownValue(nodes, binder, d.right, tracked, invariant_facts);
+        t.graph_value = null; // reassigned to a local expression, no longer traceable to a captured graph value
         return;
     }
+}
+
+// `let`/`const NAME = <expr>;` with a single, plain-identifier binding —
+// if `<expr>` is evaluable given the current tracked state, NAME joins
+// `tracked` too, so later statements (e.g. an `if` a few lines down) can
+// see through local aliasing instead of only ever tracking params.
+fn tryTrackNewLocal(
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    stmt: *const AstNode,
+    tracked: *std.ArrayListUnmanaged(TrackedParam),
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
+) !void {
+    if (stmt.kind != .variable_statement) return;
+    const decls_head = maybeUnwrapRef(stmt) orelse return;
+    const decl_ref = decls_head;
+    const decl = nodes.at(decl_ref);
+    if (decl.next != 0) return; // only a single declarator
+    if (decl.kind != .variable_declaration) return;
+    const d = getPackedData(decl);
+    if (d.right == 0) return; // no initializer
+    const name_node = nodes.at(d.left);
+    if (name_node.kind != .identifier) return; // no destructuring
+    const sym = binder.getSymbol(d.left) orelse return;
+    if (sym == 0) return;
+    const value = evalExprKnownValue(nodes, binder, d.right, tracked.items, invariant_facts);
+    try tracked.append(getAllocator(), .{ .sym = sym, .value = value });
 }
 
 const SymbolUseChecker = struct {
@@ -2116,6 +2658,57 @@ const SymbolUseChecker = struct {
     }
 };
 
+fn isSymbolUsedInExpr(nodes: *const BumpAllocator(AstNode), binder: *const parser.Binder, ref: NodeRef, sym: parser.SymbolRef) bool {
+    if (ref == 0) return false;
+    var checker = SymbolUseChecker{ .nodes = nodes, .binder = binder, .sym = sym };
+    checker.visit(nodes.at(ref), ref) catch return true;
+    return checker.found;
+}
+
+// A DECLARATION's own binding name, or a plain `X = RHS` assignment's own
+// LHS, doesn't count as "using" X — only genuinely reading its value does
+// (including a compound target like `a[i] = ...`, since evaluating `a`/`i`
+// there really does read them, and `+=`-style ops read-then-write). Only
+// `variable_statement`/plain-assignment `expression_statement` get this
+// distinction; anything else (notably `if_statement`) falls back to the
+// conservative "appears anywhere in this subtree" check.
+fn isSymbolUsedInStatement(
+    nodes: *const BumpAllocator(AstNode),
+    binder: *const parser.Binder,
+    stmt_ref: NodeRef,
+    sym: parser.SymbolRef,
+) bool {
+    const stmt = nodes.at(stmt_ref);
+    if (stmt.kind == .variable_statement) {
+        const decls_head = maybeUnwrapRef(stmt) orelse return false;
+        var it = NodeIterator.init(nodes, decls_head);
+        while (it.nextRef()) |decl_ref| {
+            const decl = nodes.at(decl_ref);
+            if (decl.kind != .variable_declaration) {
+                if (isSymbolUsedInExpr(nodes, binder, decl_ref, sym)) return true;
+                continue;
+            }
+            const d = getPackedData(decl);
+            if (d.right != 0 and isSymbolUsedInExpr(nodes, binder, d.right, sym)) return true;
+        }
+        return false;
+    }
+    if (stmt.kind == .expression_statement) {
+        const inner_ref = unwrapRef(stmt);
+        const inner = nodes.at(inner_ref);
+        if (inner.kind == .binary_expression and inner.len == @intFromEnum(SyntaxKind.equals_token)) {
+            const d = getPackedData(inner);
+            const lhs = nodes.at(d.left);
+            if (lhs.kind == .identifier) {
+                return isSymbolUsedInExpr(nodes, binder, d.right, sym);
+            }
+            return isSymbolUsedInExpr(nodes, binder, d.left, sym) or isSymbolUsedInExpr(nodes, binder, d.right, sym);
+        }
+        return isSymbolUsedInExpr(nodes, binder, inner_ref, sym);
+    }
+    return isSymbolUsedInExpr(nodes, binder, stmt_ref, sym);
+}
+
 fn isSymbolUsedInStatements(
     nodes: *const BumpAllocator(AstNode),
     binder: *const parser.Binder,
@@ -2123,19 +2716,35 @@ fn isSymbolUsedInStatements(
     sym: parser.SymbolRef,
 ) bool {
     for (stmts) |s| {
-        var checker = SymbolUseChecker{ .nodes = nodes, .binder = binder, .sym = sym };
-        checker.visit(nodes.at(s), s) catch return true;
-        if (checker.found) return true;
+        if (isSymbolUsedInStatement(nodes, binder, s, sym)) return true;
     }
     return false;
 }
 
+fn knownValueEql(a: ?KnownValue, b: ?KnownValue) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.meta.eql(a.?, b.?);
+}
+
+// A statement pulled unmodified out of its original block still has its
+// original `.next` pointing at whatever followed it *there* — feeding it
+// straight into a different list (`createBlock`/`createList`) fights that
+// stale link and trips "Recursive appendRef". Clone it (and clear `.next`)
+// so it's a fresh, unlinked node ready to join a new chain.
+fn cloneStmtForList(nodes: *BumpAllocator(AstNode), ref: NodeRef) !NodeRef {
+    if (ref == 0) return 0;
+    var clone = nodes.at(ref).*;
+    clone.next = 0;
+    return nodes.push(clone);
+}
+
 fn dceProcessStatement(
-    nodes: *const BumpAllocator(AstNode),
+    nodes: *BumpAllocator(AstNode),
     binder: *const parser.Binder,
     stmt_ref: NodeRef,
-    tracked: []TrackedParam,
+    tracked: *std.ArrayListUnmanaged(TrackedParam),
     out: *std.ArrayList(NodeRef),
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
 ) anyerror!bool {
     const stmt = nodes.at(stmt_ref);
     if (stmt.kind == .if_statement) {
@@ -2143,40 +2752,95 @@ fn dceProcessStatement(
         const cond_ref = d.left;
         const then_ref = d.right;
         const else_ref = stmt.len;
-        if (evalCondition(nodes, binder, cond_ref, tracked)) |taken| {
+        if (evalCondition(nodes, binder, cond_ref, tracked.items, invariant_facts)) |taken| {
             const branch = if (taken) then_ref else else_ref;
             if (branch != 0) {
                 const branch_node = nodes.at(branch);
                 if (branch_node.kind == .block) {
                     const inner_head = maybeUnwrapRef(branch_node) orelse 0;
-                    _ = try dceWalkStatements(nodes, binder, inner_head, tracked, out);
+                    _ = try dceWalkStatements(nodes, binder, inner_head, tracked, out, invariant_facts);
                 } else {
-                    _ = try dceProcessStatement(nodes, binder, branch, tracked, out);
+                    _ = try dceProcessStatement(nodes, binder, branch, tracked, out, invariant_facts);
                 }
             }
             return true;
         }
-        for (tracked) |*t| t.value = null;
-        try out.append(stmt_ref);
-        return false;
+
+        // Condition isn't statically known — that doesn't mean nothing
+        // inside is analyzable. Each branch is mutually exclusive, so walk
+        // them independently (their own reassignments can't affect each
+        // other), then merge: a tracked value survives past the `if` only
+        // if both branches agree on it (including "both still unknown").
+        // Anything either branch newly tracked (a local `const` scoped to
+        // just that branch) is branch-local and doesn't survive the merge.
+        const orig_len = tracked.items.len;
+
+        var then_tracked = try tracked.clone(getAllocator());
+        defer then_tracked.deinit(getAllocator());
+        var then_stmts = std.ArrayList(NodeRef).init(getAllocator());
+        defer then_stmts.deinit();
+        var then_changed = false;
+        if (then_ref != 0) {
+            const then_node = nodes.at(then_ref);
+            if (then_node.kind == .block) {
+                const head = maybeUnwrapRef(then_node) orelse 0;
+                then_changed = try dceWalkStatements(nodes, binder, head, &then_tracked, &then_stmts, invariant_facts);
+            } else {
+                then_changed = try dceProcessStatement(nodes, binder, then_ref, &then_tracked, &then_stmts, invariant_facts);
+            }
+        }
+
+        var else_tracked = try tracked.clone(getAllocator());
+        defer else_tracked.deinit(getAllocator());
+        var else_stmts = std.ArrayList(NodeRef).init(getAllocator());
+        defer else_stmts.deinit();
+        var else_changed = false;
+        if (else_ref != 0) {
+            const else_node = nodes.at(else_ref);
+            if (else_node.kind == .block) {
+                const head = maybeUnwrapRef(else_node) orelse 0;
+                else_changed = try dceWalkStatements(nodes, binder, head, &else_tracked, &else_stmts, invariant_facts);
+            } else {
+                else_changed = try dceProcessStatement(nodes, binder, else_ref, &else_tracked, &else_stmts, invariant_facts);
+            }
+        }
+
+        for (tracked.items[0..orig_len], 0..) |*t, i| {
+            t.value = if (knownValueEql(then_tracked.items[i].value, else_tracked.items[i].value)) then_tracked.items[i].value else null;
+            if (t.value == null) t.graph_value = null;
+        }
+
+        if (!then_changed and !else_changed) {
+            try out.append(try cloneStmtForList(nodes, stmt_ref));
+            return false;
+        }
+
+        var factory = Factory{ .nodes = nodes };
+        const new_then: NodeRef = if (then_ref == 0) 0 else if (!then_changed) then_ref else try factory.createBlock(then_stmts.items);
+        const new_else: NodeRef = if (else_ref == 0) 0 else if (!else_changed) else_ref else try factory.createBlock(else_stmts.items);
+        const new_if = try factory.createIfStatement(cond_ref, new_then, new_else);
+        try out.append(new_if);
+        return true;
     }
 
-    tryUpdateTrackedFromAssignment(nodes, binder, stmt, tracked);
-    try out.append(stmt_ref);
+    tryUpdateTrackedFromAssignment(nodes, binder, stmt, tracked.items, invariant_facts);
+    try tryTrackNewLocal(nodes, binder, stmt, tracked, invariant_facts);
+    try out.append(try cloneStmtForList(nodes, stmt_ref));
     return false;
 }
 
 fn dceWalkStatements(
-    nodes: *const BumpAllocator(AstNode),
+    nodes: *BumpAllocator(AstNode),
     binder: *const parser.Binder,
     stmts_head: NodeRef,
-    tracked: []TrackedParam,
+    tracked: *std.ArrayListUnmanaged(TrackedParam),
     out: *std.ArrayList(NodeRef),
+    invariant_facts: ?*const std.AutoHashMapUnmanaged(ValueRef, void),
 ) anyerror!bool {
     var changed = false;
     var it = NodeIterator.init(nodes, stmts_head);
     while (it.nextRef()) |stmt_ref| {
-        if (try dceProcessStatement(nodes, binder, stmt_ref, tracked, out)) changed = true;
+        if (try dceProcessStatement(nodes, binder, stmt_ref, tracked, out, invariant_facts)) changed = true;
     }
     return changed;
 }
@@ -2197,6 +2861,12 @@ fn dceWalkStatements(
 const Optimizer = struct {
     values: *ValueParser,
     graph: *ValueGraph,
+    // Graph values (typically a captured shared array/object) proven,
+    // interprocedurally, to always be truthy at index 0 across every
+    // computed node that touches them — see `computeInvariantCellFacts`.
+    // Populated once per `optimizeAll` call, before any stage mutates the
+    // graph; consumed by `tryDeadCodeElimination` via `evalExprKnownValue`.
+    invariant_facts: std.AutoHashMapUnmanaged(ValueRef, void) = .{},
 
     pub fn countReferences(this: *@This(), root: ValueRef) !std.AutoHashMapUnmanaged(ValueRef, u32) {
         var counts = std.AutoHashMapUnmanaged(ValueRef, u32){};
@@ -2303,6 +2973,36 @@ const Optimizer = struct {
         };
     }
 
+    // Unlike primitives (fungible — duplicating a `1` is harmless), arrays
+    // and objects are reference types: baking one into a literal when it's
+    // ALSO reachable from somewhere else in the graph would silently
+    // detach that other reference from the real, mutated value. Checked
+    // recursively since a nested element can be independently shared even
+    // when the container itself isn't.
+    fn canInlineAsLiteral(this: *@This(), ref: ValueRef, counts: *const std.AutoHashMapUnmanaged(ValueRef, u32)) anyerror!bool {
+        const resolved = try this.graph.followAllRefs(ref);
+        if ((try this.refCountOf(counts, resolved)) > 1) return false;
+        const n = this.graph.getValue(resolved);
+        switch (n.kind) {
+            .array => {
+                var i: u32 = 0;
+                while (this.graph.getArrayElement(n, i)) |el| : (i += 1) {
+                    if (!(try this.canInlineAsLiteral(el, counts))) return false;
+                }
+            },
+            .object => {
+                var s = n.slot0;
+                while (s != 0) {
+                    const value_ref = this.graph.getValue(s).next;
+                    if (!(try this.canInlineAsLiteral(value_ref, counts))) return false;
+                    s = this.graph.getValue(value_ref).next;
+                }
+            },
+            else => {},
+        }
+        return true;
+    }
+
     // inlines a factory fn call if the factory is only referenced once
     pub fn tryInlineComputationCall(
         this: *@This(),
@@ -2327,8 +3027,7 @@ const Optimizer = struct {
         // TODO: get rid of all this stringy code
         if (containsDollarDigit(subject_text)) return false;
 
-        const wrapped = try std.fmt.allocPrint(getAllocator(), "({s})", .{subject_text});
-        const parsed = try parser.ParsedFile.createFromBuffer(wrapped, null, false, null);
+        const parsed = try parser.ParsedFile.createFromExpression(subject_text, null);
         defer parsed.deinit();
 
         const fn_node_ref = getInnerFunctionExpr(parsed) orelse return false;
@@ -2380,7 +3079,14 @@ const Optimizer = struct {
         for (literal_texts) |*t| t.* = null;
         for (param_syms.items, 0..) |sym, i| {
             if (!mutated.contains(sym)) continue;
-            literal_texts[i] = try this.graph.tryLiteralText(input_items.items[i]) orelse return false;
+            if (try this.graph.tryLiteralText(input_items.items[i])) |t| {
+                literal_texts[i] = t;
+                continue;
+            }
+            // Not a primitive — try array/object, but only if nothing else
+            // in the graph could be relying on this being the same value.
+            if (!(try this.canInlineAsLiteral(input_items.items[i], counts))) return false;
+            literal_texts[i] = try this.graph.renderValueAsLiteral(input_items.items[i]) orelse return false;
         }
 
         var placeholders = std.ArrayListUnmanaged(NodeRef){};
@@ -2793,6 +3499,257 @@ const Optimizer = struct {
         return true;
     }
 
+    // The graph-level counterpart to `evalLiteral`: what does `ref`'s value
+    // resolve to, for the purposes of branch analysis? Doesn't require the
+    // value to be literal-*renderable* (unlike `canInlineAsLiteral`) — an
+    // array/object is unconditionally truthy regardless of what's inside
+    // it, even if that's a `.computed` sub-value we could never safely
+    // duplicate as JS text. Statement-template chains resolve through to
+    // their `$0` base, same as codegen (same runtime identity).
+    fn evalGraphKnownValue(this: *@This(), ref: ValueRef) !?KnownValue {
+        const resolved = try this.resolveIdentity(ref);
+        const base = try this.canonicalValueIdentity(resolved);
+        const n = this.graph.getValue(base);
+        return switch (n.kind) {
+            .true => .{ .boolean = true },
+            .false => .{ .boolean = false },
+            .null => .null_,
+            .undefined => .undefined_,
+            .number => .{ .number = this.graph.getDouble(n) },
+            .array, .object => .truthy_reference,
+            else => null,
+        };
+    }
+
+    // Shared with `tryDeadCodeElimination`'s own subject parsing: gets a
+    // fresh AST for a computed node's subject, plus its declared params
+    // (raw factory) or synthetic `$0..$N-1` params (already-templated),
+    // positionally aligned with `#input`. Caller owns `parsed` (must
+    // `.deinit()`) and `param_syms` (allocator-owned slice).
+    fn parseSubjectForAnalysis(this: *@This(), computed_ref: ValueRef) !?struct {
+        parsed: *parser.ParsedFile,
+        param_syms: []parser.SymbolRef,
+    } {
+        const node = this.graph.getValue(computed_ref);
+        if (node.kind != .computed) return null;
+
+        const input_ref = try this.resolveIdentity(this.graph.getInput(node));
+        const input_node = this.graph.getValue(input_ref);
+        if (input_node.kind != .array) return null;
+        var input_len: u32 = 0;
+        while (this.graph.getArrayElement(input_node, input_len)) |_| : (input_len += 1) {}
+
+        const maybe_subj = try this.getTemplatedSubject(computed_ref);
+        var wrapped: []const u8 = undefined;
+        if (maybe_subj) |s| {
+            if (!std.mem.eql(u8, s.kind, "expression-template")) return null;
+            var params_text = std.ArrayList(u8).init(getAllocator());
+            for (0..input_len) |i| {
+                if (i != 0) try params_text.appendSlice(", ");
+                try params_text.writer().print("${d}", .{i});
+            }
+            wrapped = try std.fmt.allocPrint(getAllocator(), "(({s}) => ({s}))", .{ params_text.items, s.template });
+        } else {
+            const subject_resolved = try this.resolveIdentity(this.graph.getSubject(node));
+            const subject_node = this.graph.getValue(subject_resolved);
+            if (subject_node.kind != .string) return null;
+            wrapped = try std.fmt.allocPrint(getAllocator(), "({s})", .{this.graph.getString(subject_node)});
+        }
+
+        const parsed = try parser.ParsedFile.createFromBuffer(wrapped, null, false, null);
+
+        var param_syms = std.ArrayListUnmanaged(parser.SymbolRef){};
+        if (maybe_subj != null) {
+            const wrapped_top_ref = getWrappedTopExpr(parsed) orelse {
+                parsed.deinit();
+                return null;
+            };
+            const top_expr_ref = maybeUnwrapRef(parsed.ast.nodes.at(wrapped_top_ref)) orelse {
+                parsed.deinit();
+                return null;
+            };
+            const outer_arrow = parsed.ast.nodes.at(top_expr_ref);
+            if (outer_arrow.kind != .arrow_function) {
+                parsed.deinit();
+                return null;
+            }
+            var it = NodeIterator.init(&parsed.ast.nodes, getPackedData(outer_arrow).left);
+            while (it.nextRef()) |p_ref| {
+                const p = parsed.ast.nodes.at(p_ref);
+                const name_ref = getPackedData(p).left;
+                const sym = parsed.binder.getSymbol(name_ref) orelse {
+                    parsed.deinit();
+                    return null;
+                };
+                try param_syms.append(getAllocator(), sym);
+            }
+        } else {
+            const fn_node_ref = getInnerFunctionExpr(parsed) orelse {
+                parsed.deinit();
+                return null;
+            };
+            const fn_node = parsed.ast.nodes.at(fn_node_ref);
+            var it = NodeIterator.init(&parsed.ast.nodes, getPackedData(fn_node).right);
+            while (it.nextRef()) |p_ref| {
+                const p = parsed.ast.nodes.at(p_ref);
+                const name_ref = getPackedData(p).left;
+                const name_node = parsed.ast.nodes.at(name_ref);
+                if (name_node.kind != .identifier) {
+                    parsed.deinit();
+                    return null;
+                }
+                const sym = parsed.binder.getSymbol(name_ref) orelse {
+                    parsed.deinit();
+                    return null;
+                };
+                try param_syms.append(getAllocator(), sym);
+            }
+        }
+
+        return .{ .parsed = parsed, .param_syms = try param_syms.toOwnedSlice(getAllocator()) };
+    }
+
+    const ElementUse = struct { computed_ref: ValueRef, position: u32 };
+
+    // Whole-graph pass: for every `.computed` node's `#input[i]` that
+    // resolves to an `.array` whose element 0 is a positive numeric
+    // literal (a plausible "shared counter cell"), records who uses it
+    // and at which position — grouped by the shared base value, since the
+    // whole point is finding a value used from *multiple* computed nodes.
+    fn collectElementUses(
+        this: *@This(),
+        ref: ValueRef,
+        uses: *std.AutoHashMapUnmanaged(ValueRef, std.ArrayListUnmanaged(ElementUse)),
+        visited: *std.AutoHashMapUnmanaged(ValueRef, void),
+    ) anyerror!void {
+        if (ref == 0) return;
+        const resolved = try this.resolveIdentity(ref);
+        if (visited.contains(resolved)) return;
+        try visited.put(getAllocator(), resolved, {});
+
+        const n = this.graph.getValue(resolved);
+        switch (n.kind) {
+            .array, .object => {
+                var s = n.slot0;
+                while (s != 0) {
+                    try this.collectElementUses(s, uses, visited);
+                    s = this.graph.getValue(s).next;
+                }
+            },
+            .computed => {
+                const input_ref = try this.resolveIdentity(n.slot1);
+                const input_node = this.graph.getValue(input_ref);
+                if (input_node.kind == .array) {
+                    var i: u32 = 0;
+                    while (this.graph.getArrayElement(input_node, i)) |el| : (i += 1) {
+                        const el_resolved = try this.resolveIdentity(el);
+                        const el_node = this.graph.getValue(el_resolved);
+                        if (el_node.kind != .array) continue;
+                        const elem0 = this.graph.getArrayElement(el_node, 0) orelse continue;
+                        const elem0_resolved = try this.resolveIdentity(elem0);
+                        const elem0_node = this.graph.getValue(elem0_resolved);
+                        if (elem0_node.kind != .number or this.graph.getDouble(elem0_node) <= 0) continue;
+
+                        const gp = try uses.getOrPutValue(getAllocator(), el_resolved, .{});
+                        try gp.value_ptr.append(getAllocator(), .{ .computed_ref = resolved, .position = i });
+                    }
+                }
+                try this.collectElementUses(n.slot0, uses, visited);
+                try this.collectElementUses(n.slot1, uses, visited);
+            },
+            else => {},
+        }
+    }
+
+    // Is `computed_ref`'s param at `position` (a candidate shared cell)
+    // used ONLY as `param[0]` — read, or incremented by a positive literal
+    // (`param[0] += <positive literal>`) — with no other use (which would
+    // mean it "escapes" our ability to reason about it, e.g. passed whole
+    // to some opaque function, reassigned outright, indexed elsewhere)?
+    fn checkElementUseIsSafe(this: *@This(), computed_ref: ValueRef, position: u32) !bool {
+        const analysis = try this.parseSubjectForAnalysis(computed_ref) orelse return false;
+        defer analysis.parsed.deinit();
+        if (position >= analysis.param_syms.len) return false;
+        const sym = analysis.param_syms[position];
+
+        var collector = try ReferenceCollector.init(analysis.parsed);
+        defer collector.deinit();
+        const nodes = &analysis.parsed.ast.nodes;
+
+        var iter = collector.getReferenceIterator(sym) orelse return true; // never referenced — trivially safe
+        while (iter.next()) |r| {
+            const access_ref = collector.parents.get(r) orelse return false;
+            const access = nodes.at(access_ref);
+            if (access.kind != .element_access_expression) return false; // used some other way — bail
+            const ad = getPackedData(access);
+            if (ad.left != r) return false; // used as the INDEX of some other access
+            const idx = nodes.at(ad.right);
+            if (idx.kind != .numeric_literal or parser.getNumber(idx) != 0) return false; // different index
+
+            const parent2_ref = collector.parents.get(access_ref) orelse continue; // plain read, fine
+            const parent2 = nodes.at(parent2_ref);
+            if (parent2.kind == .binary_expression) {
+                const pd = getPackedData(parent2);
+                if (pd.left == access_ref) {
+                    const op: SyntaxKind = @enumFromInt(parent2.len);
+                    if (op == .plus_equals_token) {
+                        const rhs = nodes.at(pd.right);
+                        if (rhs.kind == .numeric_literal and parser.getNumber(rhs) > 0) continue; // safe increment
+                    }
+                    return false; // some other assignment
+                }
+            }
+        }
+        return true;
+    }
+
+    // "interProcDCE": the whole-graph analysis step. Finds shared cells
+    // (element 0 of some captured array, referenced from possibly several
+    // computed nodes) whose only ever mutation, anywhere in the graph, is
+    // a positive increment on top of a positive starting value — meaning
+    // the cell is provably truthy for the entire lifetime of the program,
+    // not just at its point of capture. `tryDeadCodeElimination` consumes
+    // the result via `evalExprKnownValue`'s `ident[0]` handling. Meant to
+    // run once, early (before value inlining collapses the raw factories
+    // this depends on being able to re-parse).
+    pub fn computeInvariantCellFacts(this: *@This(), root: ValueRef) !std.AutoHashMapUnmanaged(ValueRef, void) {
+        var uses = std.AutoHashMapUnmanaged(ValueRef, std.ArrayListUnmanaged(ElementUse)){};
+        defer {
+            var it = uses.valueIterator();
+            while (it.next()) |list| list.deinit(getAllocator());
+            uses.deinit(getAllocator());
+        }
+        {
+            var visited = std.AutoHashMapUnmanaged(ValueRef, void){};
+            defer visited.deinit(getAllocator());
+            try this.collectElementUses(root, &uses, &visited);
+        }
+
+        var facts = std.AutoHashMapUnmanaged(ValueRef, void){};
+        errdefer facts.deinit(getAllocator());
+
+        var it = uses.iterator();
+        outer: while (it.next()) |entry| {
+            for (entry.value_ptr.items) |use| {
+                if (!(try this.checkElementUseIsSafe(use.computed_ref, use.position))) continue :outer;
+            }
+            try facts.put(getAllocator(), entry.key_ptr.*, {});
+        }
+
+        return facts;
+    }
+
+    // Reads params + known values straight off the graph's own
+    // `(subject, input)` — no dependency on `tryInlineComputationCall`
+    // having already baked anything into literal IIFE args. Works on
+    // EITHER shape: an already-templated expression-template (`$0..$N`
+    // positionally aligned with `#input`), or a still-raw, not-yet-inlined
+    // `function(a, b, ...) { return <expr> }` factory (its own declared
+    // params positionally aligned with `#input`). This is also why a
+    // param that DCE proves is never actually reassigned (because the
+    // branch reassigning it turned out to be dead) naturally becomes
+    // inlinable by a *later* `tryInlineComputationCall` pass without any
+    // special-casing here — it's just an unused/plain param by then.
     pub fn tryDeadCodeElimination(
         this: *@This(),
         computed_ref: ValueRef,
@@ -2802,60 +3759,127 @@ const Optimizer = struct {
 
         const node = this.graph.getValue(computed_ref);
         if (node.kind != .computed) return false;
-        const subj = try this.getTemplatedSubject(computed_ref) orelse return false;
 
-        if (!std.mem.eql(u8, subj.kind, "expression-template")) return false;
+        const input_ref = try this.resolveIdentity(this.graph.getInput(node));
+        const input_node = this.graph.getValue(input_ref);
+        if (input_node.kind != .array) return false;
+        var input_items = std.ArrayListUnmanaged(ValueRef){};
+        defer input_items.deinit(getAllocator());
+        {
+            var i: u32 = 0;
+            while (this.graph.getArrayElement(input_node, i)) |el| : (i += 1) {
+                try input_items.append(getAllocator(), el);
+            }
+        }
+        // NOTE: an empty #input is still valid to proceed with here — a
+        // templated subject can have zero external `$N`s (everything
+        // already inlined into literal text by `tryInlineValue`) while
+        // still containing a nested IIFE layer (e.g. a mutated-param
+        // binding from `tryInlineComputationCall`) that `dceUnwrap` can
+        // find independently below.
 
-        const template_text = subj.template;
+        const maybe_subj = try this.getTemplatedSubject(computed_ref);
+        if (maybe_subj) |s| {
+            if (!std.mem.eql(u8, s.kind, "expression-template")) return false;
+        }
+        const is_raw = maybe_subj == null;
 
-        const wrapped = try std.fmt.allocPrint(getAllocator(), "({s})", .{template_text});
+        var wrapped: []const u8 = undefined;
+        if (maybe_subj) |s| {
+            // `$0..$N-1` as REAL declared params (not free identifiers) so
+            // the existing symbol-based DCE machinery applies unchanged.
+            var params_text = std.ArrayList(u8).init(getAllocator());
+            for (0..input_items.items.len) |i| {
+                if (i != 0) try params_text.appendSlice(", ");
+                try params_text.writer().print("${d}", .{i});
+            }
+            wrapped = try std.fmt.allocPrint(getAllocator(), "(({s}) => ({s}))", .{ params_text.items, s.template });
+        } else {
+            const subject_resolved = try this.resolveIdentity(this.graph.getSubject(node));
+            const subject_node = this.graph.getValue(subject_resolved);
+            if (subject_node.kind != .string) return false;
+            wrapped = try std.fmt.allocPrint(getAllocator(), "({s})", .{this.graph.getString(subject_node)});
+        }
+
         const parsed = try parser.ParsedFile.createFromBuffer(wrapped, null, false, null);
         defer parsed.deinit();
 
-        const iife = getIifeCallExpr(parsed) orelse return false;
-        const arrow = parsed.ast.nodes.at(iife.arrow_ref);
-        const params_head = getPackedData(arrow).left;
-        const body_ref = getPackedData(arrow).right;
-
+        var layers = std.ArrayListUnmanaged(DceLayer){};
+        defer layers.deinit(getAllocator());
         var tracked = std.ArrayListUnmanaged(TrackedParam){};
         defer tracked.deinit(getAllocator());
-        {
-            var params_it = NodeIterator.init(&parsed.ast.nodes, params_head);
-            var args_it = NodeIterator.init(&parsed.ast.nodes, iife.args_head);
-            while (params_it.nextRef()) |p_ref| {
-                const arg_ref = args_it.nextRef() orelse break;
-                const p = parsed.ast.nodes.at(p_ref);
-                const name_ref = getPackedData(p).left;
-                const name_node = parsed.ast.nodes.at(name_ref);
-                if (name_node.kind != .identifier) continue;
-                const sym = parsed.binder.getSymbol(name_ref) orelse continue;
-                if (sym == 0) continue;
-                const lit = evalLiteral(&parsed.ast.nodes, arg_ref) orelse continue;
-                try tracked.append(getAllocator(), .{ .sym = sym, .value = lit });
-            }
-        }
-        if (tracked.items.len == 0) return false;
+        var top_param_name_refs = std.ArrayListUnmanaged(NodeRef){};
+        defer top_param_name_refs.deinit(getAllocator());
 
-        const body_node = parsed.ast.nodes.at(body_ref);
-        const Shape = enum { direct, nested_arrow };
-        var target_block_ref: NodeRef = 0;
-        var shape: Shape = .direct;
-        if (body_node.kind == .block) {
-            target_block_ref = body_ref;
-            shape = .direct;
-        } else if (body_node.kind == .arrow_function) {
-            const inner_body_ref = getPackedData(body_node).right;
-            if (parsed.ast.nodes.at(inner_body_ref).kind == .block) {
-                target_block_ref = inner_body_ref;
-                shape = .nested_arrow;
+        var start_expr_ref: NodeRef = 0;
+        if (is_raw) {
+            const fn_node_ref = getInnerFunctionExpr(parsed) orelse return false;
+            const fn_node = parsed.ast.nodes.at(fn_node_ref);
+            const params_head = getPackedData(fn_node).right;
+            var count: usize = 0;
+            {
+                var it = NodeIterator.init(&parsed.ast.nodes, params_head);
+                while (it.nextRef()) |p_ref| {
+                    const p = parsed.ast.nodes.at(p_ref);
+                    const name_ref = getPackedData(p).left;
+                    const name_node = parsed.ast.nodes.at(name_ref);
+                    if (name_node.kind != .identifier) return false; // no destructuring params
+                    const sym = parsed.binder.getSymbol(name_ref) orelse return false;
+                    if (sym == 0) return false;
+                    if (count >= input_items.items.len) return false;
+                    const val = try this.evalGraphKnownValue(input_items.items[count]);
+                    const gv = try this.resolveIdentity(input_items.items[count]);
+                    try tracked.append(getAllocator(), .{ .sym = sym, .value = val, .graph_value = gv });
+                    try top_param_name_refs.append(getAllocator(), name_ref);
+                    count += 1;
+                }
             }
+            if (count != input_items.items.len) return false; // must be exactly one param per input
+
+            const body_block_ref = fn_node.len;
+            if (body_block_ref == 0) return false;
+            const body_block = parsed.ast.nodes.at(body_block_ref);
+            const first_stmt_ref = maybeUnwrapRef(body_block) orelse return false;
+            const first_stmt = parsed.ast.nodes.at(first_stmt_ref);
+            if (first_stmt.next != 0) return false; // must be a single statement
+            if (first_stmt.kind != .return_statement) return false;
+            start_expr_ref = maybeUnwrapRef(first_stmt) orelse return false;
+        } else {
+            const wrapped_top_ref = getWrappedTopExpr(parsed) orelse return false;
+            const top_expr_ref = maybeUnwrapRef(parsed.ast.nodes.at(wrapped_top_ref)) orelse return false;
+            const outer_arrow = parsed.ast.nodes.at(top_expr_ref);
+            if (outer_arrow.kind != .arrow_function) return false;
+            const params_head = getPackedData(outer_arrow).left;
+            {
+                var params_it = NodeIterator.init(&parsed.ast.nodes, params_head);
+                var i: usize = 0;
+                while (params_it.nextRef()) |p_ref| : (i += 1) {
+                    const p = parsed.ast.nodes.at(p_ref);
+                    const name_ref = getPackedData(p).left;
+                    const sym = parsed.binder.getSymbol(name_ref) orelse return false;
+                    if (sym == 0) return false;
+                    if (i >= input_items.items.len) return false;
+                    const val = try this.evalGraphKnownValue(input_items.items[i]);
+                    const gv = try this.resolveIdentity(input_items.items[i]);
+                    try tracked.append(getAllocator(), .{ .sym = sym, .value = val, .graph_value = gv });
+                    try top_param_name_refs.append(getAllocator(), name_ref);
+                }
+            }
+            start_expr_ref = getPackedData(outer_arrow).right;
         }
-        if (target_block_ref == 0) return false;
+
+        // Zero top-level params is fine — `dceUnwrap` below may still find
+        // nested IIFE layers to track (e.g. a mutated-param binding) even
+        // when this node's own #input is empty.
+        const top_param_count = tracked.items.len;
+
+        const target_block_ref = try dceUnwrap(parsed, start_expr_ref, &layers, &tracked) orelse return false;
+        if (tracked.items.len == 0) return false;
 
         const stmts_head = maybeUnwrapRef(parsed.ast.nodes.at(target_block_ref)) orelse 0;
         var new_stmts = std.ArrayList(NodeRef).init(getAllocator());
         defer new_stmts.deinit();
-        const changed = try dceWalkStatements(&parsed.ast.nodes, &parsed.binder, stmts_head, tracked.items, &new_stmts);
+        const changed = try dceWalkStatements(&parsed.ast.nodes, &parsed.binder, stmts_head, &tracked, &new_stmts, &this.invariant_facts);
 
         var still_used = try getAllocator().alloc(bool, tracked.items.len);
         defer getAllocator().free(still_used);
@@ -2864,72 +3888,161 @@ const Optimizer = struct {
             still_used[i] = isSymbolUsedInStatements(&parsed.ast.nodes, &parsed.binder, new_stmts.items, t.sym);
             if (!still_used[i]) any_unused = true;
         }
-        if (!changed and !any_unused) return false;
 
-        var factory = Factory{ .nodes = &parsed.ast.nodes };
-        const new_block = try factory.createBlock(new_stmts.items);
-
-        var new_params = std.ArrayList(NodeRef).init(getAllocator());
-        defer new_params.deinit();
-        var new_args = std.ArrayList(NodeRef).init(getAllocator());
-        defer new_args.deinit();
-        {
-            var params_it = NodeIterator.init(&parsed.ast.nodes, params_head);
-            var args_it = NodeIterator.init(&parsed.ast.nodes, iife.args_head);
-            while (params_it.nextRef()) |p_ref| {
-                const arg_ref = args_it.nextRef() orelse break;
-                const p = parsed.ast.nodes.at(p_ref);
-                const name_ref = getPackedData(p).left;
-                var drop = false;
-                if (parsed.binder.getSymbol(name_ref)) |sym| {
-                    for (tracked.items, 0..) |t, i| {
-                        if (t.sym == sym and !still_used[i]) {
-                            drop = true;
-                            break;
-                        }
-                    }
-                }
-                if (!drop) {
-                    try new_params.append(p_ref);
-                    try new_args.append(arg_ref);
-                }
+        // A tracked symbol that's never read is dead in both directions:
+        // dropping it from an outer IIFE's params (already handled below
+        // via `still_used`) AND dropping (or defusing) whatever wrote to
+        // it in the first place — e.g. `const _v9 = !!d;` when `_v9` goes
+        // unused, or `_v10 = _v9;` when `_v10` does.
+        for (tracked.items, 0..) |t, i| {
+            if (still_used[i]) continue;
+            if (try dceStripDeadWritesFor(&parsed.ast.nodes, &parsed.binder, &new_stmts, t.sym)) {
+                still_used[i] = isSymbolUsedInStatements(&parsed.ast.nodes, &parsed.binder, new_stmts.items, t.sym);
             }
         }
 
-        const final_expr: NodeRef = switch (shape) {
-            .direct => blk: {
-                if (new_params.items.len == 0) {
-                    break :blk try factory.createArrowFunction(0, new_block, 0);
-                }
-                const new_params_list = try factory.createList(new_params.items);
-                const new_arrow = try factory.createArrowFunction(new_params_list, new_block, 0);
-                const paren_arrow = try factory.createParenthesizedExpression(new_arrow);
-                break :blk try factory.createCallExpression(paren_arrow, new_args.items);
-            },
-            .nested_arrow => blk: {
-                const orig_inner_arrow = parsed.ast.nodes.at(body_ref);
-                const inner_params_head = getPackedData(orig_inner_arrow).left;
-                const new_inner_arrow = try factory.createArrowFunction(inner_params_head, new_block, orig_inner_arrow.flags);
+        if (!changed and !any_unused) return false;
 
-                if (new_params.items.len == 0) {
-                    break :blk new_inner_arrow;
-                }
-                const new_params_list = try factory.createList(new_params.items);
-                const new_outer_arrow = try factory.createArrowFunction(new_params_list, new_inner_arrow, 0);
-                const paren_outer = try factory.createParenthesizedExpression(new_outer_arrow);
-                break :blk try factory.createCallExpression(paren_outer, new_args.items);
-            },
-        };
+        var factory = Factory{ .nodes = &parsed.ast.nodes };
+        var current_expr = try factory.createBlock(new_stmts.items);
 
-        var writer = try parser.Writer.init(template_text.len);
-        var printer = parser.Printer(parser.Writer, .{}).init(parsed.ast, &writer);
+        // Rebuild every layer, innermost to outermost, dropping only the
+        // params that became unused (each layer's own — an outer layer's
+        // param can still be used deep inside even if an inner one isn't).
+        var li: usize = layers.items.len;
+        while (li > 0) {
+            li -= 1;
+            const layer = layers.items[li];
+
+            if (layer.args_head == 0) {
+                // Bare, uncalled arrow (e.g. the closure a factory
+                // ultimately returns) — params are untouched, it's never
+                // itself invoked here.
+                const orig_arrow = parsed.ast.nodes.at(layer.arrow_ref);
+                current_expr = try factory.createArrowFunction(layer.params_head, current_expr, orig_arrow.flags);
+                continue;
+            }
+
+            var new_params = std.ArrayList(NodeRef).init(getAllocator());
+            defer new_params.deinit();
+            var new_args = std.ArrayList(NodeRef).init(getAllocator());
+            defer new_args.deinit();
+            {
+                var params_it = NodeIterator.init(&parsed.ast.nodes, layer.params_head);
+                var args_it = NodeIterator.init(&parsed.ast.nodes, layer.args_head);
+                while (params_it.nextRef()) |p_ref| {
+                    const arg_ref = args_it.nextRef() orelse break;
+                    const p = parsed.ast.nodes.at(p_ref);
+                    const name_ref = getPackedData(p).left;
+                    var drop = false;
+                    if (parsed.binder.getSymbol(name_ref)) |sym| {
+                        for (tracked.items[layer.tracked_start..layer.tracked_end], layer.tracked_start..) |t, i| {
+                            if (t.sym == sym and !still_used[i]) {
+                                drop = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!drop) {
+                        try new_params.append(p_ref);
+                        try new_args.append(arg_ref);
+                    }
+                }
+            }
+
+            if (new_params.items.len == 0) {
+                // Dropping the call entirely reduces `(params =>
+                // current_expr)(args)` to just `current_expr` — except a
+                // raw `{ ... }` block (the innermost layer's body, before
+                // any bare-arrow wrapping) isn't valid in expression
+                // position on its own, so it needs wrapping in a bare
+                // (uncalled) arrow first to stay syntactically valid. Any
+                // already-processed inner layer leaves `current_expr` as a
+                // real expression (arrow/call), which needs no wrapping.
+                if (parsed.ast.nodes.at(current_expr).kind == .block) {
+                    current_expr = try factory.createArrowFunction(0, current_expr, 0);
+                }
+                continue;
+            }
+            const new_params_list = try factory.createList(new_params.items);
+            const new_arrow = try factory.createArrowFunction(new_params_list, current_expr, 0);
+            const paren_arrow = try factory.createParenthesizedExpression(new_arrow);
+            current_expr = try factory.createCallExpression(paren_arrow, new_args.items);
+        }
+        const final_expr = current_expr;
+
+        // `(() => expr)()`-style trivial IIFEs can show up anywhere in a
+        // body — most commonly a param access wrapped for `evalGraphKnownValue`
+        // analysis purposes (`const d = (() => _c_c[0])();`) — and once
+        // proven trivial, they're just noise; unwrap them here rather than
+        // only at the codegen boundary (`tryInlineTrivialArrowCall`).
+        var iife_replacements = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
+        defer iife_replacements.deinit();
+        try collectTrivialIifeReplacements(&parsed.ast.nodes, &parsed.binder, final_expr, &iife_replacements);
+
+        var writer = try parser.Writer.init(wrapped.len);
+        var printer = parser.Printer(parser.Writer, .{ .use_replacements = true }).init(parsed.ast, &writer);
         printer.skip_types = true;
+        printer.replacements = &iife_replacements;
         try printer.visit(parsed.ast.nodes.at(final_expr));
-        const new_template_text = try getAllocator().dupe(u8, writer.buf.items);
+        const final_expr_text = try getAllocator().dupe(u8, writer.buf.items);
 
-        const new_subject = try this.createTemplatedSubject("expression-template", new_template_text);
+        // Which TOP-level params (this node's own #input positions, as
+        // opposed to any nested layer's) are still referenced — drives
+        // both which #input entries survive and, for the templated case,
+        // how surviving `$N` placeholders get renumbered.
+        var new_input_items = std.ArrayListUnmanaged(ValueRef){};
+        defer new_input_items.deinit(getAllocator());
+        var index_map = try getAllocator().alloc(u32, top_param_count);
+        defer getAllocator().free(index_map);
+        for (0..top_param_count) |i| {
+            if (!still_used[i]) {
+                index_map[i] = 0;
+                continue;
+            }
+            index_map[i] = @intCast(new_input_items.items.len);
+            try new_input_items.append(getAllocator(), input_items.items[i]);
+        }
 
-        const new_computed_node = try this.graph.createComputed(new_subject, try this.graph.createRef(node.slot1));
+        if (is_raw) {
+            // Rebuild the raw factory text directly: `function(<kept
+            // params>) { return <final_expr_text>; }`. Stays a raw
+            // (un-inlined) subject — normal inlining picks it up from
+            // here, now hopefully with fewer/no mutated params (a param
+            // whose only reassignment DCE just removed isn't "mutated"
+            // anymore).
+            var params_text = std.ArrayList(u8).init(getAllocator());
+            var first = true;
+            for (0..top_param_count) |i| {
+                if (!still_used[i]) continue;
+                if (!first) try params_text.appendSlice(", ");
+                first = false;
+                var pw = try parser.Writer.init(16);
+                var pp = parser.Printer(parser.Writer, .{}).init(parsed.ast, &pw);
+                pp.skip_types = true;
+                try pp.visit(parsed.ast.nodes.at(top_param_name_refs.items[i]));
+                try params_text.appendSlice(pw.buf.items);
+            }
+            const new_factory_text = try std.fmt.allocPrint(
+                getAllocator(),
+                "function({s}) {{\n  return {s};\n}}",
+                .{ params_text.items, final_expr_text },
+            );
+
+            const new_subject_str = try this.graph.createString(new_factory_text);
+            const new_input = try this.graph.createArrayFromItems(new_input_items.items);
+            const new_computed_node = try this.graph.createComputed(new_subject_str, new_input);
+            try this.graph.replaceValue(computed_ref, new_computed_node);
+            return true;
+        }
+
+        // Already templated: `final_expr_text` uses `$0..$N-1` (this
+        // node's own synthetic wrapper params, printed back out as plain
+        // identifier text) — remap them down to the surviving positions.
+        const remapped_template = try remapPlaceholders(final_expr_text, index_map);
+        const new_subject = try this.createTemplatedSubject("expression-template", remapped_template);
+        const new_input = try this.graph.createArrayFromItems(new_input_items.items);
+        const new_computed_node = try this.graph.createComputed(new_subject, new_input);
         try this.graph.replaceValue(computed_ref, new_computed_node);
         return true;
     }
@@ -3083,6 +4196,8 @@ const Optimizer = struct {
                 }
             }
         }
+
+        try this.graph.normalizeRefs(root);
     }
 
     pub fn optimizeAll(this: *@This(), root: ValueRef) !void {
@@ -3097,17 +4212,21 @@ const Optimizer = struct {
 
         try this.runStage(root, &state, &budget, .inline_call);
         if (budget <= 0) return;
-        try this.graph.normalizeRefs(root);
         try this.runStage(root, &state, &budget, .fold_merge);
         if (budget <= 0) return;
-        try this.graph.normalizeRefs(root);
         try this.runStage(root, &state, &budget, .inline_value);
         if (budget <= 0) return;
-        try this.graph.normalizeRefs(root);
-        try this.runStage(root, &state, &budget, .dce);
 
-        // finalize
-        try this.graph.normalizeRefs(root);
+        // interProcDCE: whole-graph analysis, computed right before DCE
+        // consumes it — computing this any earlier would key facts by
+        // ValueRefs that later stages replace, going stale by the time
+        // DCE actually looks them up (`resolveIdentity` follows
+        // replacements forward, but a frozen hashmap key doesn't track
+        // along). See `computeInvariantCellFacts`.
+        this.invariant_facts.deinit(getAllocator());
+        this.invariant_facts = try this.computeInvariantCellFacts(root);
+
+        try this.runStage(root, &state, &budget, .dce);
     }
 
     // basic value graph -> JS emitter
@@ -3128,6 +4247,15 @@ const Optimizer = struct {
     const CodegenState = struct {
         needs_binding: *const std.AutoHashMapUnmanaged(ValueRef, void),
         bindings: std.AutoHashMapUnmanaged(ValueRef, []const u8) = .{},
+        // Raw factory function text -> the binding name it was hoisted
+        // into. Keyed by TEXT, not graph identity — unlike `bindings`,
+        // this also catches two textually-identical-but-graph-distinct
+        // factory subjects (e.g. the same helper authored twice by
+        // whatever produced the graph) and reuses one binding for both.
+        factory_bindings: std.StringHashMapUnmanaged([]const u8) = .{},
+        // Factory texts seen 2+ times anywhere in the graph — only these
+        // are worth hoisting at all (see `collectFactoryTextCounts`).
+        repeated_factory_texts: *const std.StringHashMapUnmanaged(void),
         next_name: u32 = 0,
 
         fn allocName(self: *@This()) ![]const u8 {
@@ -3152,12 +4280,70 @@ const Optimizer = struct {
             try this.markNeedsBinding(root, &needs_binding, &visited);
         }
 
-        var state = CodegenState{ .needs_binding = &needs_binding };
+        // A raw factory's text is only worth its own binding if it's
+        // actually going to be reused — two graph-distinct `.computed`
+        // nodes whose subject happens to be the identical text (e.g. the
+        // same helper authored twice by whatever produced the graph).
+        // Hoisting a single-use factory just adds a declaration + an
+        // extra layer of indirection for nothing.
+        var repeated_factory_texts = std.StringHashMapUnmanaged(void){};
+        defer repeated_factory_texts.deinit(getAllocator());
+        {
+            var text_counts = std.StringHashMapUnmanaged(u32){};
+            defer text_counts.deinit(getAllocator());
+            var visited = std.AutoHashMapUnmanaged(ValueRef, void){};
+            defer visited.deinit(getAllocator());
+            try this.collectFactoryTextCounts(root, &text_counts, &visited);
+            var it = text_counts.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* > 1) try repeated_factory_texts.put(getAllocator(), entry.key_ptr.*, {});
+            }
+        }
+
+        var state = CodegenState{ .needs_binding = &needs_binding, .repeated_factory_texts = &repeated_factory_texts };
         defer state.bindings.deinit(getAllocator());
+        defer state.factory_bindings.deinit(getAllocator());
 
         var out = std.ArrayList(u8).init(getAllocator());
         const final = try this.emitValue(root, &state, &out, .sequence);
         return .{ .decls = out.items, .final = final };
+    }
+
+    fn collectFactoryTextCounts(
+        this: *@This(),
+        ref: ValueRef,
+        counts: *std.StringHashMapUnmanaged(u32),
+        visited: *std.AutoHashMapUnmanaged(ValueRef, void),
+    ) anyerror!void {
+        if (ref == 0) return;
+        const resolved = try this.resolveIdentity(ref);
+        if (visited.contains(resolved)) return;
+        try visited.put(getAllocator(), resolved, {});
+
+        const n = this.graph.getValue(resolved);
+        switch (n.kind) {
+            .array, .object => {
+                var s = n.slot0;
+                while (s != 0) {
+                    try this.collectFactoryTextCounts(s, counts, visited);
+                    s = this.graph.getValue(s).next;
+                }
+            },
+            .computed => {
+                if (try this.getTemplatedSubject(resolved) == null) {
+                    const subject_resolved = try this.resolveIdentity(this.graph.getSubject(n));
+                    const subject_node = this.graph.getValue(subject_resolved);
+                    if (subject_node.kind == .string) {
+                        const text = this.graph.getString(subject_node);
+                        const gp = try counts.getOrPutValue(getAllocator(), text, 0);
+                        gp.value_ptr.* += 1;
+                    }
+                }
+                try this.collectFactoryTextCounts(n.slot0, counts, visited);
+                try this.collectFactoryTextCounts(n.slot1, counts, visited);
+            },
+            else => {},
+        }
     }
 
     fn resolveIdentity(this: *@This(), ref: ValueRef) !ValueRef {
@@ -3252,6 +4438,82 @@ const Optimizer = struct {
         return try std.fmt.allocPrint(getAllocator(), "[{s}]", .{key_expr});
     }
 
+    // `((p1, p2, ...) => <expr>)(a1, a2, ...)` with a CONCISE (non-block)
+    // body, no default params, and each param referenced EXACTLY once in
+    // `<expr>` is just `<expr>` with each `pN` replaced by `aN` — beta
+    // reduction, no call needed at all. A param used zero times could
+    // still need its arg evaluated for side effects, and one used 2+
+    // times would duplicate that arg's evaluation — both cases just bail
+    // rather than get into that. `args_text` must already be
+    // fully-rendered, self-contained expression text for each argument,
+    // in the same order as the params.
+    fn tryInlineTrivialArrowCall(
+        subject_text: []const u8,
+        args_text: []const []const u8,
+    ) !?[]const u8 {
+        const parsed = try parser.ParsedFile.createFromExpression(subject_text, null);
+        defer parsed.deinit();
+
+        const wrapped_top_ref = getWrappedTopExpr(parsed) orelse return null;
+        const arrow_ref = wrapped_top_ref;
+        const arrow = parsed.ast.nodes.at(arrow_ref);
+        if (arrow.kind != .arrow_function) return null;
+
+        const body_ref = getPackedData(arrow).right;
+        const body = parsed.ast.nodes.at(body_ref);
+        if (body.kind == .block) return null; // not a concise body
+
+        const params_head = getPackedData(arrow).left;
+        var param_syms = std.ArrayListUnmanaged(parser.SymbolRef){};
+        defer param_syms.deinit(getAllocator());
+        {
+            var it = NodeIterator.init(&parsed.ast.nodes, params_head);
+            while (it.nextRef()) |p_ref| {
+                const p = parsed.ast.nodes.at(p_ref);
+                const pd = getPackedData(p);
+                if (pd.right != 0) return null; // has a default value
+                const name_node = parsed.ast.nodes.at(pd.left);
+                if (name_node.kind != .identifier) return null; // no destructuring
+                const sym = parsed.binder.getSymbol(pd.left) orelse return null;
+                if (sym == 0) return null;
+                try param_syms.append(getAllocator(), sym);
+            }
+        }
+        if (param_syms.items.len != args_text.len) return null;
+
+        for (param_syms.items) |sym| {
+            var counter = SymbolUseCounter{ .nodes = &parsed.ast.nodes, .binder = &parsed.binder, .sym = sym };
+            try counter.visit(parsed.ast.nodes.at(body_ref), body_ref);
+            if (counter.count != 1) return null; // used zero or 2+ times
+        }
+
+        var factory = Factory{ .nodes = &parsed.ast.nodes };
+        var placeholders = std.ArrayListUnmanaged(NodeRef){};
+        defer placeholders.deinit(getAllocator());
+        for (args_text) |arg_text| {
+            // Splicing arbitrary expression text somewhere that could
+            // demand high precedence (e.g. as the base of `.prop`) is only
+            // safe unparenthesized for a bare identifier.
+            const replacement_text = if (isIdentifier(arg_text))
+                arg_text
+            else
+                try std.fmt.allocPrint(getAllocator(), "({s})", .{arg_text});
+            try placeholders.append(getAllocator(), try factory.createIdentifierAllocated(replacement_text));
+        }
+
+        var replacements = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
+        defer replacements.deinit();
+        try collectParamReplacements(&parsed.ast.nodes, &parsed.binder, body_ref, param_syms.items, placeholders.items, &replacements);
+
+        var writer = try parser.Writer.init(subject_text.len);
+        var printer = parser.Printer(parser.Writer, .{ .use_replacements = true }).init(parsed.ast, &writer);
+        printer.skip_types = true;
+        printer.replacements = &replacements;
+        try printer.visit(parsed.ast.nodes.at(body_ref));
+
+        return try getAllocator().dupe(u8, writer.buf.items);
+    }
+
     fn emitPlainValue(this: *@This(), ref: ValueRef, state: *CodegenState, out: *std.ArrayList(u8)) anyerror![]const u8 {
         if (state.bindings.get(ref)) |name| return name;
 
@@ -3338,24 +4600,74 @@ const Optimizer = struct {
 
                 const subject_resolved = try this.resolveIdentity(this.graph.getSubject(n));
                 const subject_node = this.graph.getValue(subject_resolved);
-                if (subject_node.kind != .string) return error.UnknownComputedSubject;
-                const subject_text = this.graph.getString(subject_node);
 
                 const input_ref = try this.resolveIdentity(this.graph.getInput(n));
                 const input_node = this.graph.getValue(input_ref);
-                var args = std.ArrayList(u8).init(getAllocator());
-                try args.append('(');
-                var first = true;
+                var args_text = std.ArrayList([]const u8).init(getAllocator());
+                defer args_text.deinit();
                 if (input_node.kind == .array) {
                     var i: u32 = 0;
                     while (this.graph.getArrayElement(input_node, i)) |el| : (i += 1) {
-                        if (!first) try args.appendSlice(", ");
-                        first = false;
-                        try args.appendSlice(try this.emitValue(el, state, out, .expression));
+                        try args_text.append(try this.emitValue(el, state, out, .expression));
                     }
                 }
-                try args.append(')');
-                break :blk try std.fmt.allocPrint(getAllocator(), "({s}){s}", .{ subject_text, args.items });
+
+                // Beta reduction wins outright when it applies — try it on
+                // the raw text before deciding anything about hoisting
+                // (which only matters if we're actually going to emit a
+                // call at all).
+                if (subject_node.kind == .string) {
+                    const raw_text = this.graph.getString(subject_node);
+                    if (try tryInlineTrivialArrowCall(raw_text, args_text.items)) |reduced| {
+                        break :blk reduced;
+                    }
+                }
+
+                // A `.computed` subject means "call": evaluate the inner
+                // computation to get a callable, then invoke it with this
+                // node's own input as args (e.g. a shared closure factory
+                // referenced from multiple call sites).
+                const subject_text: []const u8 = switch (subject_node.kind) {
+                    // A raw factory's own text is always worth hoisting
+                    // into its own binding rather than splicing inline at
+                    // every call site — it's executable code, typically
+                    // substantial, and this also collapses two
+                    // graph-distinct-but-textually-identical factories
+                    // (not just graph-identity-shared ones) into one
+                    // shared declaration.
+                    .string => hoist: {
+                        const text = this.graph.getString(subject_node);
+                        if (state.factory_bindings.get(text)) |name| break :hoist name;
+                        if (!state.repeated_factory_texts.contains(text)) break :hoist text;
+                        const name = try state.allocName();
+                        try out.writer().print("let {s} = {s};\n", .{ name, text });
+                        try state.factory_bindings.put(getAllocator(), text, name);
+                        break :hoist name;
+                    },
+                    .computed => try this.emitValue(this.graph.getSubject(n), state, out, .expression),
+                    else => return error.UnknownComputedSubject,
+                };
+
+                var call = std.ArrayList(u8).init(getAllocator());
+                // A bare identifier (a hoisted binding name) is always
+                // safe to call directly. Anything else — raw `function
+                // ...` text, an arrow function, any other expression —
+                // binds too loosely to immediately-invoke without parens
+                // (`() => window(args)` calls `window`, not the arrow).
+                if (isIdentifier(subject_text)) {
+                    try call.appendSlice(subject_text);
+                } else {
+                    try call.append('(');
+                    try call.appendSlice(subject_text);
+                    try call.append(')');
+                }
+                try call.append('(');
+                for (args_text.items, 0..) |a, i| {
+                    if (i != 0) try call.appendSlice(", ");
+                    try call.appendSlice(a);
+                }
+                try call.append(')');
+                break :blk call.items;
             },
             else => return error.UnrenderableValue,
         };
@@ -3452,325 +4764,34 @@ const Optimizer = struct {
     }
 };
 
-pub fn debugTestComputationInlining() !void {
-    var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL }); // reserve index 0 as "null"
+// does not free
+pub fn optimizeValueGraph(bytes: []const u8) ![]const u8 {
+    // var values = try ValueParser.parse(bytes);
+    const values = try getAllocator().create(ValueParser);
+    defer getAllocator().destroy(values);
+    values.* = try ValueParser.parse(bytes);
 
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
     var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
+    var graph = ValueGraph{ .values = values, .replacements = &replacements };
+    var opt = Optimizer{ .values = values, .graph = &graph };
 
-    const subject_text =
-        \\function(_c_c, el) {
-        \\  return () => {
-        \\    _c_c[0] += 1;
-        \\    el[Symbol.update]();
-        \\  }
-        \\}
-    ;
-    const subject_str = try graph.createString(subject_text);
-    const num1 = try graph.createNumber(1);
-    const captured_array = try graph.createArrayFromItems(&.{num1});
-    const dom_placeholder = try graph.createString("<dom node placeholder>");
+    // try graph.printGraph();
 
-    const input_arr = try graph.createArrayFromItems(&.{ captured_array, dom_placeholder });
-    const computed = try graph.createComputed(subject_str, input_arr);
+    try opt.optimizeAll(values.root);
 
-    values.root = computed;
-
-    var counts = try opt.countReferences(values.root);
-    defer counts.deinit(getAllocator());
-
-    const applied = try opt.tryInlineComputationCall(computed, &counts);
-    debugPrint("computation inlining applied: {}\n", .{applied});
-
-    const result = graph.getValue(computed);
-    if (result.kind != .computed) return;
-    const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(result)));
-    if (subj.kind != .object) return;
-    if (try graph.getStringKeyPropertyValue(subj, "kind")) |k| {
-        debugPrint("kind: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(k)))});
-    }
-    if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-        debugPrint("template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-    }
+    const code = try opt.collapseToCode(graph.followReplacements(values.root));
+    var out = std.ArrayList(u8).init(getAllocator());
+    try out.appendSlice(code.decls);
+    try out.append('\n');
+    try out.appendSlice("const _ = ");
+    try out.appendSlice(code.final);
+    return out.items;
 }
 
-pub fn debugTestComputationInliningMutable() !void {
-    var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
 
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
 
-    const subject_text =
-        \\function(flag, el) {
-        \\  return () => {
-        \\    if (!flag) {
-        \\      flag = true;
-        \\    }
-        \\    el[Symbol.update]();
-        \\  }
-        \\}
-    ;
-    const subject_str = try graph.createString(subject_text);
-    const flag_true = try graph.createBoolean(true);
-    const dom_placeholder = try graph.createString("<dom node placeholder>");
-
-    const input_arr = try graph.createArrayFromItems(&.{ flag_true, dom_placeholder });
-    const computed = try graph.createComputed(subject_str, input_arr);
-
-    values.root = computed;
-
-    var counts = try opt.countReferences(values.root);
-    defer counts.deinit(getAllocator());
-
-    const applied = try opt.tryInlineComputationCall(computed, &counts);
-    debugPrint("computation inlining (mutable) applied: {}\n", .{applied});
-
-    const result = graph.getValue(computed);
-    if (result.kind != .computed) return;
-    const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(result)));
-    if (subj.kind != .object) return;
-    if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-        debugPrint("template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-    }
-    const new_input_ref = try graph.followAllRefs(graph.getInput(result));
-    const new_input_node = graph.getValue(new_input_ref);
-    var i: u32 = 0;
-    while (graph.getArrayElement(new_input_node, i)) |_| : (i += 1) {}
-    debugPrint("new input length: {}\n", .{i});
-}
-
-pub fn debugTestDeadBranchElimination() !void {
-    var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-
-    const subject_text =
-        \\function(flag, el) {
-        \\  return () => {
-        \\    if (!flag) {
-        \\      flag = true;
-        \\    }
-        \\    el[Symbol.update]();
-        \\  }
-        \\}
-    ;
-    const subject_str = try graph.createString(subject_text);
-    const flag_true = try graph.createBoolean(true);
-    const dom_placeholder = try graph.createString("<dom node placeholder>");
-
-    const input_arr = try graph.createArrayFromItems(&.{ flag_true, dom_placeholder });
-    const computed = try graph.createComputed(subject_str, input_arr);
-
-    values.root = computed;
-
-    var counts = try opt.countReferences(values.root);
-    defer counts.deinit(getAllocator());
-
-    const inlined = try opt.tryInlineComputationCall(computed, &counts);
-    debugPrint("dbe: inline call applied: {}\n", .{inlined});
-
-    counts.deinit(getAllocator());
-    counts = try opt.countReferences(values.root);
-
-    const dbe_applied = try opt.tryDeadCodeElimination(computed, &counts);
-    debugPrint("dbe: dead branch elimination applied: {}\n", .{dbe_applied});
-
-    const result = graph.getValue(computed);
-    if (result.kind != .computed) return;
-    const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(result)));
-    if (subj.kind != .object) return;
-    if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-        debugPrint("dbe: template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-    }
-
-    debugPrint("dbe: graph:\n", .{});
-    try graph.printGraph();
-}
-
-pub fn debugTestStatementFolding() !void {
-    var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-
-    const subject_text =
-        \\function(_c_c, el) {
-        \\  return () => {
-        \\    _c_c[0] += 1;
-        \\    el[Symbol.update]();
-        \\  }
-        \\}
-    ;
-    const subject_str = try graph.createString(subject_text);
-    const num1 = try graph.createNumber(1);
-    const captured_array = try graph.createArrayFromItems(&.{num1});
-
-    const obj_ref = try graph.createObject(0);
-    const obj_self_ref = try graph.createRef(obj_ref);
-
-    const entry_input = try graph.createArrayFromItems(&.{ captured_array, obj_self_ref });
-    const entry_value = try graph.createComputed(subject_str, entry_input);
-
-    const key_str = try graph.createString("Symbol.update");
-    values.nodes.at(key_str).next = @truncate(entry_value);
-    values.nodes.at(entry_value).next = 0;
-    values.nodes.at(obj_ref).slot0 = key_str;
-
-    values.root = obj_ref;
-
-    {
-        var pre_counts = try opt.countReferences(values.root);
-        defer pre_counts.deinit(getAllocator());
-        _ = try opt.tryInlineComputationCall(entry_value, &pre_counts);
-    }
-
-    var counts = try opt.countReferences(values.root);
-    defer counts.deinit(getAllocator());
-
-    const applied = try opt.tryPeelComputedObjectEntryIntoStatement(obj_ref, &counts);
-    debugPrint("statement folding applied: {}\n", .{applied});
-
-    const value_node = graph.getValue(try graph.followAllRefs(obj_ref));
-    if (value_node.kind != .computed) return;
-    const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(value_node)));
-    if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-        debugPrint("statement template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-    }
-
-    const input_arr_ref = try graph.followAllRefs(graph.getInput(value_node));
-    const input_arr_node = graph.getValue(input_arr_ref);
-    const residual_ref = try graph.followAllRefs(graph.getArrayElement(input_arr_node, 0).?);
-    const residual_node = graph.getValue(residual_ref);
-    debugPrint("residual $0 kind: {}\n", .{residual_node.kind});
-}
-
-pub fn debugTestMerging() !void {
-    var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-
-    const obj_ref = try graph.createObject(0);
-
-    const subject1_text =
-        \\function(_c_c, el) {
-        \\  return () => {
-        \\    _c_c[0] += 1;
-        \\    el[Symbol.update]();
-        \\  }
-        \\}
-    ;
-    const subject1_str = try graph.createString(subject1_text);
-    const num1 = try graph.createNumber(1);
-    const captured_array = try graph.createArrayFromItems(&.{num1});
-    const obj_self_ref1 = try graph.createRef(obj_ref);
-    const entry1_input = try graph.createArrayFromItems(&.{ captured_array, obj_self_ref1 });
-    const entry1_value = try graph.createComputed(subject1_str, entry1_input);
-
-    const subject2_text =
-        \\function(el) {
-        \\  return () => el.bar()
-        \\}
-    ;
-    const subject2_str = try graph.createString(subject2_text);
-    const obj_self_ref2 = try graph.createRef(obj_ref);
-    const entry2_input = try graph.createArrayFromItems(&.{obj_self_ref2});
-    const entry2_value = try graph.createComputed(subject2_str, entry2_input);
-
-    const key1_str = try graph.createString("Symbol.update");
-    const key2_str = try graph.createString("foo");
-    values.nodes.at(key1_str).next = @truncate(entry1_value);
-    values.nodes.at(entry1_value).next = @truncate(key2_str);
-    values.nodes.at(key2_str).next = @truncate(entry2_value);
-    values.nodes.at(entry2_value).next = 0;
-    values.nodes.at(obj_ref).slot0 = key1_str;
-
-    values.root = obj_ref;
-
-    {
-        var pre_counts = try opt.countReferences(values.root);
-        defer pre_counts.deinit(getAllocator());
-        _ = try opt.tryInlineComputationCall(entry1_value, &pre_counts);
-        _ = try opt.tryInlineComputationCall(entry2_value, &pre_counts);
-    }
-
-    {
-        var counts = try opt.countReferences(values.root);
-        defer counts.deinit(getAllocator());
-        const folded = try opt.tryPeelComputedObjectEntryIntoStatement(obj_ref, &counts);
-        debugPrint("statement folding applied: {}\n", .{folded});
-    }
-
-    {
-        var counts = try opt.countReferences(values.root);
-        defer counts.deinit(getAllocator());
-        const merged = try opt.tryMergeConsecutiveStatementEntries(obj_ref, &counts);
-        debugPrint("merging applied: {}\n", .{merged});
-    }
-
-    {
-        const key1_ref = graph.getValue(obj_ref).slot0;
-        const merged_value_ref = graph.getValue(key1_ref).next;
-        var counts = try opt.countReferences(values.root);
-        defer counts.deinit(getAllocator());
-        const inlined = try opt.tryInlineValue(merged_value_ref, &counts);
-        debugPrint("value inlining applied: {}\n", .{inlined});
-    }
-
-    const obj_node = graph.getValue(obj_ref);
-    var key_ref = obj_node.slot0;
-    var entry_count: u32 = 0;
-    while (key_ref != 0) {
-        entry_count += 1;
-        const key_node = graph.getValue(key_ref);
-        const value_ref = key_node.next;
-        const value_node = graph.getValue(try graph.followAllRefs(value_ref));
-        if (value_node.kind == .computed) {
-            const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(value_node)));
-            if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-                debugPrint("final template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-            }
-        }
-        key_ref = graph.getValue(value_ref).next;
-    }
-    debugPrint("remaining entry count: {}\n", .{entry_count});
-}
-
-pub fn debugTestEndToEnd() !void {
+pub fn optimizeVson(source: []const u8, emit_vson: bool) ![]const u8 {
     const alloc = getAllocator();
-    const source =
-        \\{
-        \\  "Symbol.update": (
-        \\    "function(_c_c, el) {\n  return () => {\n    _c_c[0] += 1;\n    el[Symbol.update]();\n  }\n}",
-        \\    [[1], this]
-        \\  ),
-        \\  foo: (
-        \\    "function(el) {\n  return () => el.bar()\n}",
-        \\    [this]
-        \\  ),
-        \\}
-    ;
 
     var nodes = BumpAllocator(ValueNode).init(alloc, std.heap.page_allocator);
     try nodes.preAlloc();
@@ -3779,157 +4800,31 @@ pub fn debugTestEndToEnd() !void {
     var emitter = value_syntax.ValueEmitter.init(alloc, &nodes);
     var p = try value_syntax.Parser(*value_syntax.ValueEmitter).init(&emitter, .{ .contents = source }, alloc);
     try p.parse();
+    if (emitter.had_error) return error.VsonParseError;
     const root = try emitter.finish();
-    debugPrint("e2e: had_error={}\n", .{emitter.had_error});
 
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
+    const values = try alloc.create(ValueParser);
+    defer alloc.destroy(values);
+    values.* = ValueParser{ .bytes = &.{}, .nodes = nodes };
     values.root = root;
 
-    try opt.optimizeAll(root);
+    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
+    var graph = ValueGraph{ .values = values, .replacements = &replacements };
+    var opt = Optimizer{ .values = values, .graph = &graph };
 
-    const obj_node = graph.getValue(root);
-    var key_ref = obj_node.slot0;
-    var entry_count: u32 = 0;
-    while (key_ref != 0) {
-        entry_count += 1;
-        const key_node = graph.getValue(key_ref);
-        const value_ref = key_node.next;
-        const value_node = graph.getValue(try graph.followAllRefs(value_ref));
-        if (value_node.kind == .computed) {
-            const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(value_node)));
-            if (subj.kind == .object) {
-                if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-                    debugPrint("e2e final template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-                }
-            } else if (subj.kind == .string) {
-                debugPrint("e2e raw subject (not inlined): {s}\n", .{graph.getString(subj)});
-            }
-        }
-        key_ref = graph.getValue(value_ref).next;
+    try opt.optimizeAll(values.root);
+
+    if (emit_vson) {
+        return graph.printGraphToString();
     }
-    debugPrint("e2e remaining entry count: {}\n", .{entry_count});
-}
 
-pub fn debugTestEndToEnd2() !void {
-    const alloc = getAllocator();
-    const source =
-        \\{
-        \\  s0: "function(a,b) { return () => a(b) }",
-        \\  v0: (this.s0, [this.v1, this.v2]),
-        \\  v1: ("function() { return (p) => console.log('hi', p) }", []),
-        \\  v2: { f: ("function(a) { return () => a.s0 }", [$]) },
-        \\  v3: ("function(x) { return () => x[0]++ }", [[1]]),
-        \\  v4: ("function(x) { return () => x[0] }", [this.v3.#input[0]]),
-        \\}
-    ;
-
-    var nodes = BumpAllocator(ValueNode).init(alloc, std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL }); // reserve 0 as "null"
-
-    var emitter = value_syntax.ValueEmitter.init(alloc, &nodes);
-    var p = try value_syntax.Parser(*value_syntax.ValueEmitter).init(&emitter, .{ .contents = source }, alloc);
-    try p.parse();
-    const root = try emitter.finish();
-    debugPrint("e2e: had_error={}\n", .{emitter.had_error});
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-    values.root = root;
-
-    try opt.optimizeAll(root);
-    try graph.printGraph();
-
-    const obj_node = graph.getValue(root);
-    var key_ref = obj_node.slot0;
-    var entry_count: u32 = 0;
-    while (key_ref != 0) {
-        entry_count += 1;
-        const key_node = graph.getValue(key_ref);
-        const value_ref = key_node.next;
-        const value_node = graph.getValue(try graph.followAllRefs(value_ref));
-        if (value_node.kind == .computed) {
-            const subj = graph.getValue(try graph.followAllRefs(graph.getSubject(value_node)));
-            if (subj.kind == .object) {
-                if (try graph.getStringKeyPropertyValue(subj, "template")) |t| {
-                    debugPrint("e2e final template: {s}\n", .{graph.getString(graph.getValue(try graph.followAllRefs(t)))});
-                }
-            } else if (subj.kind == .string) {
-                debugPrint("e2e raw subject (not inlined): {s}\n", .{graph.getString(subj)});
-            }
-        }
-        key_ref = graph.getValue(value_ref).next;
-    }
-    debugPrint("e2e remaining entry count: {}\n", .{entry_count});
-}
-
-pub fn debugTestCollapseToCode() !void {
-    const alloc = getAllocator();
-    const source =
-        \\{
-        \\  s0: "function(a,b) { return () => a(b) }",
-        \\  v0: (this.s0, [this.v1, this.v2]),
-        \\  v1: ("function() { return (p) => console.log('hi', p) }", []),
-        \\  v2: { f: ("function(a) { return () => a.s0 }", [$]) },
-        \\  v3: ("function(x) { return () => x[0]++ }", [[1]]),
-        \\  v4: ("function(x) { return () => x[0] }", [this.v3.#input[0]]),
-        \\}
-    ;
-
-    var nodes = BumpAllocator(ValueNode).init(alloc, std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
-
-    var emitter = value_syntax.ValueEmitter.init(alloc, &nodes);
-    var p = try value_syntax.Parser(*value_syntax.ValueEmitter).init(&emitter, .{ .contents = source }, alloc);
-    try p.parse();
-    const root = try emitter.finish();
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-    values.root = root;
-
-    try opt.optimizeAll(root);
-
-    const code = try opt.collapseToCode(graph.followReplacements(root));
-    debugPrint("collapse decls:\n{s}\n", .{code.decls});
-    debugPrint("collapse final: {s}\n", .{code.final});
-}
-
-pub fn debugTestCollapseToCodeSelfRef() !void {
-    const alloc = getAllocator();
-    const source =
-        \\{
-        \\  name: "root",
-        \\  self: $,
-        \\}
-    ;
-
-    var nodes = BumpAllocator(ValueNode).init(alloc, std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL });
-
-    var emitter = value_syntax.ValueEmitter.init(alloc, &nodes);
-    var p = try value_syntax.Parser(*value_syntax.ValueEmitter).init(&emitter, .{ .contents = source }, alloc);
-    try p.parse();
-    const root = try emitter.finish();
-
-    var values = ValueParser{ .bytes = &.{}, .nodes = nodes };
-    var replacements = std.AutoHashMapUnmanaged(ValueRef, ValueRef){};
-    var graph = ValueGraph{ .values = &values, .replacements = &replacements };
-    var opt = Optimizer{ .values = &values, .graph = &graph };
-    values.root = root;
-
-    const code = try opt.collapseToCode(graph.followReplacements(root));
-    debugPrint("collapse (self-ref) decls:\n{s}\n", .{code.decls});
-    debugPrint("collapse (self-ref) final: {s}\n", .{code.final});
+    const code = try opt.collapseToCode(graph.followReplacements(values.root));
+    var out = std.ArrayList(u8).init(alloc);
+    try out.appendSlice(code.decls);
+    try out.append('\n');
+    try out.appendSlice("const _ = ");
+    try out.appendSlice(code.final);
+    return out.items;
 }
 
 // here's a real-world computation folding example (note: this should be done after inlining, but you may do it earlier if a factory fn is only used once!)

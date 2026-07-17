@@ -795,6 +795,7 @@ pub fn BumpAllocator(comptime T: type) type {
             }
 
             // Move the count so we don't write into these "external" pages
+            // TODO: perhaps write out all 1s in the first element and bump the counter to mark the page
             this.local_count = items_per_page;
             try this.addPage();
             this.local_count = 0;
@@ -6794,11 +6795,46 @@ fn Parser_(comptime skip_trivia: bool) type {
             return .{ .kind = kind, .value = value };
         }
 
+        fn createResult(this: *@This(), first_statement: NodeRef, triple_slash: ?[]const TripleSlashDirective) !ParseResult {
+            const root: AstNode_ = .{
+                .kind = .source_file,
+                .data = first_statement,
+            };
+            const root_ref = try this.pushNode(root);
+            return .{
+                .root = root.toAstNode(),
+                .root_ref = root_ref,
+                .data = .{
+                    .start = root_ref,
+                    .source = this.lexer.source.contents,
+                    .source_name = this.lexer.source.name,
+                    .nodes = this.node_allocator,
+                    .decorators = this.decorators,
+                    .positions = this.positions,
+                    .lines = if (comptime skip_trivia or @TypeOf(this.lexer.line_map) == void) null else this.lexer.line_map,
+                    .triple_slash_directives = if (triple_slash) |x| x else &.{},
+                    .parse_errors = this.lexer.errors,
+                },
+            };
+        }
+
+        pub fn parseExpressionAsRoot(this: *@This()) !ParseResult {
+            std.debug.assert(this.lexer.full_start == 0); // we don't expect re-use, although we may change that later
+            try this.lexer.preAllocate();
+            _ = try this.pushNode(.{ .kind = .start });
+            const exp = try this.parseExpression();
+            if (this.lexer.token != .t_end_of_file) return error.ExpectedEndOfFile;
+            return this.createResult(try this.pushNode(.{
+                    .kind = .expression_statement,
+                    .data = exp,
+            }), null);
+        }
+
         pub fn parse(this: *@This()) !ParseResult {
             try this.lexer.preAllocate();
             _ = try this.pushNode(.{ .kind = .start });
 
-            var directives = std.ArrayList(TripleSlashDirective).init(this.node_allocator.pages.allocator);
+            var directives = std.ArrayList(TripleSlashDirective).init(this.node_allocator.pages.allocator); // LEAKS
 
             while (this.lexer.token != .t_end_of_file) {
                 switch (this.lexer.token) {
@@ -6866,28 +6902,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             //     i += 1;
             // }
 
-            const root: AstNode_ = .{
-                .kind = .source_file,
-                .data = statements.head,
-            };
-
-            const root_ref = try this.pushNode(root);
-
-            return .{
-                .root = root.toAstNode(),
-                .root_ref = root_ref,
-                .data = .{
-                    .start = root_ref,
-                    .source = this.lexer.source.contents,
-                    .source_name = this.lexer.source.name,
-                    .nodes = this.node_allocator,
-                    .decorators = this.decorators,
-                    .positions = this.positions,
-                    .lines = if (comptime skip_trivia or @TypeOf(this.lexer.line_map) == void) null else this.lexer.line_map,
-                    .triple_slash_directives = directives.items,
-                    .parse_errors = this.lexer.errors,
-                },
-            };
+            return this.createResult(statements.head, directives.items);
         }
     };
 }
@@ -7000,13 +7015,38 @@ pub const Factory = struct {
         });
     }
 
+    // name: []const u8 | NodeRef
+    pub fn createPropertyName(this: *@This(), name: anytype) !NodeRef {
+        switch (@TypeOf(name)) {
+            NodeRef => {
+                const n = this.nodes.at(this.assertValid(name));
+                return switch (n.kind) {
+                    .identifier, .string_literal, .numeric_literal => n,
+                    else => this.createComputedName(name),
+                };
+            },
+            []const u8, [:0]const u8 => {
+                if (!js_lexer.isIdentifier(name)) return this.createStringLiteral(name);
+                return this.createIdentifier(name);
+            },
+            else => {
+                if (comptime isComptimeString(@TypeOf(name))) {
+                    if (!js_lexer.isIdentifier(name)) return this.createStringLiteralAllocated(name);
+                    return this.createIdentifierAllocated(name);
+                }
+                @compileLog(@TypeOf(name));
+                @compileError("Unhandled type");
+            },
+        }
+    }
+
     pub fn createPropertyAccessExpression(this: *@This(), subject: NodeRef, member: anytype) !NodeRef {
         const right = switch (@TypeOf(member)) {
             NodeRef => member,
             []const u8, [:0]const u8 => try this.createIdentifier(member),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(member))) {
-                    break :blk try this.createIdentifier(member);
+                    break :blk try this.createIdentifierAllocated(member);
                 }
                 @compileLog(@TypeOf(member));
                 @compileError("Unhandled type");
@@ -7029,7 +7069,7 @@ pub const Factory = struct {
             u16, i32, i64, f64, u64, usize, comptime_int => try this.createNumericLiteral(arg),
             else => blk: {
                 if (comptime isComptimeString(@TypeOf(arg))) {
-                    break :blk try this.createStringLiteral(arg);
+                    break :blk try this.createStringLiteralAllocated(arg);
                 }
                 @compileLog(@TypeOf(arg));
                 @compileError("Unhandled type");
@@ -7038,6 +7078,38 @@ pub const Factory = struct {
 
         return this.nodes.push(.{
             .kind = .element_access_expression,
+            .data = toBinaryDataPtrRefs(subject, right),
+        });
+    }
+
+    // will either be property access or element access
+    pub fn createFieldAccess(this: *@This(), subject: NodeRef, arg: anytype) !NodeRef {
+        const right = switch (@TypeOf(arg)) {
+            NodeRef => this.assertValid(arg),
+            []const u8, [:0]const u8 => blk: {
+                if (!js_lexer.isIdentifier(arg)) break :blk try this.createStringLiteral(arg);
+                break :blk try this.createIdentifier(arg);
+            },
+            u16, i32, i64, f64, u64, usize, comptime_int => try this.createNumericLiteral(arg),
+            else => blk: {
+                if (comptime isComptimeString(@TypeOf(arg))) {
+                    if (!js_lexer.isIdentifier(arg)) break :blk try this.createStringLiteralAllocated(arg);
+                    break :blk try this.createIdentifierAllocated(arg);
+                }
+                @compileLog(@TypeOf(arg));
+                @compileError("Unhandled type");
+            },
+        };
+        const arg_node = this.nodes.at(right);
+        const is_element_access = arg_node.kind != .identifier and arg_node.kind != .private_identifier;
+        if (is_element_access) {
+            return this.nodes.push(.{
+                .kind = .element_access_expression,
+                .data = toBinaryDataPtrRefs(subject, right),
+            });
+        }
+        return this.nodes.push(.{
+            .kind = .property_access_expression,
             .data = toBinaryDataPtrRefs(subject, right),
         });
     }
@@ -7496,8 +7568,15 @@ pub const Factory = struct {
     }
 };
 
+extern fn debug_print(ptr: [*:0]const u8) void;
+
 pub inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
     if (comptime @import("builtin").target.isWasm()) {
+        if (comptime is_debug) {
+            const str = std.fmt.allocPrintZ(getAllocator(), fmt, args) catch unreachable;
+            defer getAllocator().free(str);
+            debug_print(str.ptr);
+        }
         return;
     }
     return std.debug.print(fmt, args);
@@ -7605,10 +7684,8 @@ pub fn isParameterDecl(p: *const AstNode) bool {
 }
 
 pub fn isKeyword(kind: SyntaxKind) bool {
-    return switch (kind) {
-        SyntaxKind.first_keyword...SyntaxKind.last_keyword => true,
-        else => false,
-    };
+    const v = @intFromEnum(kind);
+    return v >= @intFromEnum(SyntaxKind.first_keyword) and v <= @intFromEnum(SyntaxKind.last_keyword);
 }
 
 pub fn isLeafNode(kind: SyntaxKind) bool {
@@ -8697,7 +8774,7 @@ pub const Symbol = struct {
 
     pub inline fn isStrictlyLocal(this: *const Symbol) bool {
         const flags: u16 = @intFromEnum(SymbolFlags.late_bound) | @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.exported);
-        return ((this.ordinal >> 16) & @intFromEnum(flags)) == 0;
+        return ((this.ordinal >> 16) & flags) == 0;
     }
 
     pub inline fn getScopeDepth(this: *const Symbol) u16 {
@@ -11091,6 +11168,23 @@ pub const ParsedFile = struct {
         var this = try @This().createFromBuffer(buf, file_path, is_lib, null);
         this.owns_source = true;
 
+        return this;
+    }
+
+    pub fn createFromExpression(exp: []const u8, source_name: ?[]const u8) !*@This() {
+        std.debug.assert(exp.len != 0);
+        const lexer = try js_lexer.Lexer.init(.{ .contents = exp, .name = source_name }, allocator);
+        var parser = Parser.init(lexer);
+        const result = try parser.parseExpressionAsRoot();
+        var this = try allocator.create(@This());
+        this.* = .{
+            .ast = result.data,
+            .binder = Binder.init(&this.ast.nodes, allocator),
+            .source = exp,
+            .source_name = source_name,
+        };
+        this.binder.source_name = source_name;
+        try this.binder.visit(&result.root, result.root_ref);
         return this;
     }
 };

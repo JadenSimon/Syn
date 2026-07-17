@@ -92,6 +92,15 @@ pub fn Parser(comptime Listener: type) type {
             );
         }
 
+        inline fn stringLocation(self: *const Self) u32 {
+            return parser.encodeLocation(
+                self.lexer.line_map.count,
+                @as(u32, @intCast(
+                    self.lexer.start - self.lexer.full_last_line,
+                )),
+            );
+        }
+
         inline fn emit(self: *Self, event: ParseEvent) anyerror!void {
             try self.listener.onEvent(event);
         }
@@ -177,7 +186,7 @@ pub fn Parser(comptime Listener: type) type {
 
         fn parseString(self: *Self) anyerror!void {
             const event = ParseEventBase([]const u8){
-                .location = self.location(),
+                .location = self.stringLocation(),
                 .data = self.lexer.string_literal_slice,
             };
 
@@ -537,7 +546,7 @@ pub const ValueEmitter = struct {
         const owned = try decoded_buf.toOwnedSlice();
         return self.nodes.push(.{
             .kind = .string,
-            .slot0 = @truncate(@intFromPtr(owned.ptr) >> 32),
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(owned.ptr) >> 32),
             .slot1 = @truncate(@intFromPtr(owned.ptr)),
             .slot2 = @truncate(owned.len),
         });
@@ -797,50 +806,3 @@ pub const ValueEmitter = struct {
         return self.result;
     }
 };
-
-pub fn debugTestValueEmitter() !void {
-    const alloc = getAllocator();
-    const source =
-        \\{
-        \\  name: "root",
-        \\  items: [1, 2, { label: "child", parent_name: super.name, root_name: $.name }],
-        \\  self_items: this.items,
-        \\  first_item: $.items[0],
-        \\}
-    ;
-
-    var nodes = BumpAllocator(ValueNode).init(alloc, std.heap.page_allocator);
-    try nodes.preAlloc();
-    _ = try nodes.push(.{ .kind = .NUL }); // reserve 0 as "null"
-
-    var emitter = ValueEmitter.init(alloc, &nodes);
-    var p = try Parser(*ValueEmitter).init(&emitter, .{ .contents = source }, alloc);
-    try p.parse();
-
-    const root = try emitter.finish();
-    parser.debugPrint("value_syntax: had_error={} root={}\n", .{ emitter.had_error, root });
-
-    const name = try emitter.lookupProperty(root, "name");
-
-    const first_item_raw = try emitter.lookupProperty(root, "first_item");
-    const first_item = emitter.followRef(first_item_raw);
-    const first_item_node = nodes.at(first_item);
-    parser.debugPrint("value_syntax: first_item kind={} value={d}\n", .{ first_item_node.kind, ValueEmitter.getNumberValue(first_item_node) });
-
-    const items = try emitter.lookupProperty(root, "items");
-    const third = try emitter.lookupIndex(items, try emitter.createNumber(2));
-    const label = try emitter.lookupProperty(third, "label");
-    parser.debugPrint("value_syntax: third.label={s}\n", .{ValueEmitter.getStringSlice(nodes.at(label))});
-
-    const parent_name_raw = try emitter.lookupProperty(third, "parent_name");
-    const parent_name = emitter.followRef(parent_name_raw);
-    parser.debugPrint("value_syntax: third.parent_name == root.name? {}\n", .{parent_name == name});
-
-    const root_name_raw = try emitter.lookupProperty(third, "root_name");
-    const root_name = emitter.followRef(root_name_raw);
-    parser.debugPrint("value_syntax: third.root_name == root.name? {}\n", .{root_name == name});
-
-    const self_items_raw = try emitter.lookupProperty(root, "self_items");
-    const self_items = emitter.followRef(self_items_raw);
-    parser.debugPrint("value_syntax: self_items == items? {}\n", .{self_items == items});
-}

@@ -396,6 +396,11 @@ pub fn parseJson5(text: js.UTF8String) !*js.Value {
     return @import("./json_parser.zig").parseJson5ToJs(text.data, getAllocator());
 }
 
+pub fn optimizeVson(source: js.UTF8String, emit_vson: bool) !js.UTF8String {
+    const result = try @import("./value_graph.zig").optimizeVson(source.data, emit_vson);
+    return .{ .data = @ptrCast(@constCast(result)) };
+}
+
 pub fn getLineMap(sf: WrappedFile) !?js.ArrayBuffer {
     const lines = sf.value.ast.lines orelse return null;
     const decoded = try @import("./lexer.zig").LineMap.Decoder.decode(

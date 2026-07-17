@@ -46,6 +46,12 @@ fn _transformSyn(source: [*:0]const u8, synth: bool) ![*:0]const u8 {
     return str;
 }
 
-// -Wl,--initial-memory=16777216 // 16 * 1024 * 1024
-// zig build-exe -target wasm32-freestanding-musl -fno-entry --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig -freference-trace --initial-memory=16777216 -femit-bin=compiler.wasm
-// zig build-exe -target wasm32-freestanding-musl -fno-entry -OReleaseSmall -fstrip --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig --initial-memory=16777216 -femit-bin=compiler.wasm
+export fn optimizeValueGraph(source: [*]const u8, len: u32, outLen: *u32) [*]const u8 {
+    const buf = @import("./value_graph.zig").optimizeValueGraph(source[0..len]) catch @panic("Failed to optimize");
+    outLen.* = @truncate(buf.len);
+    return buf.ptr;
+}
+
+// -Wl,--initial-memory=268435456 // 16 * 1024 * 1024
+// zig build-exe -target wasm32-freestanding-musl -fno-entry --export=optimizeValueGraph --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig -freference-trace --initial-memory=16777216 -femit-bin=compiler.wasm
+// zig build-exe -target wasm32-freestanding-musl -fno-entry -OReleaseSmall -fstrip --export=optimizeValueGraph --export=transformSyn --export=alloc --export=free --export=clearArena wasm-main.zig --initial-memory=16777216 -femit-bin=compiler.wasm

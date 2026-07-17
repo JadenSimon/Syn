@@ -125,6 +125,7 @@ fn NewLexer_(
         string_literal_is_ascii: bool = false,
 
         is_ascii_only: JSONBool = JSONBoolDefault,
+        multiline_strings: JSONBool = JSONBoolDefault,
 
         last_line: usize = 0,
         full_last_line: u32 = 0,
@@ -566,12 +567,21 @@ fn NewLexer_(
                         lexer.step();
 
                         // Handle Windows CRLF
-                        if (lexer.code_point == '\r' and comptime !is_json) {
+                        if (lexer.code_point == '\r') {
                             lexer.step();
                             if (lexer.code_point == '\n') {
+                                if (comptime is_json and quote != 0 and quote != '`') {
+                                    if (lexer.current == lexer.start+4) lexer.multiline_strings = true;
+                                }
                                 lexer.step();
                             }
                             continue :stringLiteral;
+                        }
+
+                        if (comptime is_json and quote != 0 and quote != '`') {
+                            if (lexer.code_point == '\n' and lexer.current == lexer.start+3) {
+                                lexer.multiline_strings = true;
+                            }
                         }
 
                         if (comptime (is_json and json_options.ignore_trailing_escape_sequences)) {
@@ -605,7 +615,13 @@ fn NewLexer_(
                     },
 
                     '\r' => {
-                        if (comptime quote != '`') {
+                        if (comptime quote != '`') blk: {
+                            if (comptime is_json) {
+                                if (lexer.multiline_strings) {
+                                    try lexer.recordNewLine();
+                                    break :blk;
+                                }
+                            }
                             try lexer.addDefaultError("Unterminated string literal");
                         }
 
@@ -621,7 +637,13 @@ fn NewLexer_(
                             '`' => {
                                 try lexer.recordNewLine();
                             },
-                            else => {
+                            else => blk: {
+                                if (comptime is_json) {
+                                    if (lexer.multiline_strings) {
+                                        try lexer.recordNewLine();
+                                        break :blk;
+                                    }
+                                }
                                 try lexer.addDefaultError("Unterminated string literal");
                             },
                         }
@@ -676,6 +698,7 @@ fn NewLexer_(
             }
 
             if (comptime check_for_backslash) needs_slow_path = needs_slow_path or has_backslash;
+            if (comptime is_json) lexer.multiline_strings = false;
 
             return InnerStringLiteral{ .needs_slow_path = needs_slow_path, .suffix_len = suffix_len };
         }
@@ -683,6 +706,9 @@ fn NewLexer_(
         pub fn parseStringLiteral(lexer: *LexerType, comptime quote: CodePoint) !void {
             if (comptime quote != '`') {
                 lexer.token = T.t_string_literal;
+                if (comptime is_json) {
+                    lexer.full_last_line = @truncate(lexer.last_line);
+                }
             } else if (lexer.rescan_close_brace_as_template_token) {
                 lexer.token = T.t_template_tail;
                 lexer.full_last_line = @truncate(lexer.last_line);

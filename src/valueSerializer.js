@@ -65,10 +65,10 @@ class Encoder {
     if (typeof value === 'string') return this.encodeString(value);
     const c = value[toComputed]
     if (c) {
-        const target = typeof c === 'function' ? c : c.target
+        const subject = typeof c === 'function' ? c : c.subject
         const input = typeof c === 'function' ? [] : c.input
         return this.encodeCompound(Kind.computed, value, () => {
-            this.encode(target);
+            this.encode(subject);
             this.encode(input);
         })
     }
@@ -183,7 +183,7 @@ class Encoder {
       return;
     }
 
-    if (!bytes.includes(0)) {
+    if (bytes.includes(0)) {
       this.tag(Kind.string, 0);
       this.bytes.push(...bytes);
       this.u8(0);
