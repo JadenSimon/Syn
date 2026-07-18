@@ -2,6 +2,7 @@ const std = @import("std");
 const strings = @import("./string_immutable.zig");
 const parser = @import("./parser.zig");
 const checker = @import("./checker.zig");
+const value_graph = @import("./value_graph.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
 const debugPrint = parser.debugPrint;

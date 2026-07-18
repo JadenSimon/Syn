@@ -626,6 +626,9 @@ pub const ValueEmitter = struct {
                 } else {
                     const frame = self.stack.pop();
                     const c = frame.computation;
+                    if (c.subject != 0) {
+                        self.nodes.at(c.subject).next = @truncate(c.input);
+                    }
                     const ref = try self.nodes.push(.{ .kind = .computed, .slot0 = c.subject, .slot1 = c.input });
                     try self.pushValue(ref);
                 }

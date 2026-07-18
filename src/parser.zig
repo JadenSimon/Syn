@@ -7008,11 +7008,15 @@ pub const Factory = struct {
         return this.nodes.push(.{ .kind = .this_keyword });
     }
 
-    pub fn createVoidZero(this: *@This()) !NodeRef {
+    pub fn createVoidExpression(this: *@This(), exp: NodeRef) !NodeRef {
         return this.nodes.push(.{
             .kind = .void_expression,
-            .data = try this.createNumericLiteral(@as(i64, 0)),
-        });
+            .data = exp,
+        });  
+    }
+
+    pub fn createVoidZero(this: *@This()) !NodeRef {
+        return try this.createVoidExpression(try this.createNumericLiteral(@as(i64, 0)));
     }
 
     // name: []const u8 | NodeRef
@@ -7021,7 +7025,12 @@ pub const Factory = struct {
             NodeRef => {
                 const n = this.nodes.at(this.assertValid(name));
                 return switch (n.kind) {
-                    .identifier, .string_literal, .numeric_literal => n,
+                    .string_literal => n,
+                    .numeric_literal => {
+                        const v = getNumber(n);
+                        if (v < 0 or @round(v) != v) return this.createComputedName(name);
+                        return n;
+                    },
                     else => this.createComputedName(name),
                 };
             },
@@ -7543,6 +7552,38 @@ pub const Factory = struct {
         return this.nodes.push(.{
             .kind = .not_emitted_statement,
         });
+    }
+
+    pub fn parens(this: *@This(), dest: SyntaxKind, exp: NodeRef) !NodeRef {
+        const exp_kind = this.nodes.at(exp).kind;
+        const needs_parens = switch (dest) {
+            .void_expression => switch (exp_kind) {
+                .arrow_function,
+                .binary_expression => true,
+                else => false,
+            },
+            // return pos for arrow fn
+            .arrow_function, .expression_statement => switch (exp_kind) {
+                .object_literal_expression => true,
+                else => false,
+            },
+            .property_access_expression, .element_access_expression, .call_expression => switch (exp_kind) {
+                // flipped, allowlist
+                .numeric_literal,
+                .string_literal,
+                .identifier,
+                .this_keyword,
+                .super_keyword,
+                .call_expression,
+                .new_expression,
+                .parenthesized_expression,
+                .element_access_expression,
+                .property_access_expression => false,
+                else => true,
+            },
+            else => false,
+        };
+        return if (needs_parens) try this.createParenthesizedExpression(exp) else exp;
     }
 
     pub fn attachDebugComment(this: *@This(), target: NodeRef, text: []const u8) !void {
@@ -8385,6 +8426,14 @@ pub const NodeIterator = struct {
         this.ref = start;
         return c;
     }
+
+    pub fn tail(this: *@This()) u32 {
+        const start = this.ref;
+        var t: NodeRef = 0;
+        while (this.nextRef()) |x| t = x;
+        this.ref = start;
+        return t;
+    }
 };
 
 inline fn visitList(nodes: *const BumpAllocator(AstNode), start: NodeRef, visitor: anytype) !void {
@@ -8770,6 +8819,11 @@ pub const Symbol = struct {
 
     pub inline fn removeFlag(this: *Symbol, flag: SymbolFlags) void {
         this.ordinal &= ~(@as(u32, @intFromEnum(flag)) << 16);
+    }
+
+    pub inline fn isImportedOrExported(this: *const Symbol) bool {
+        const flags: u16 = @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.exported);
+        return ((this.ordinal >> 16) & flags) == 0;
     }
 
     pub inline fn isStrictlyLocal(this: *const Symbol) bool {
