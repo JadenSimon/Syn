@@ -1898,7 +1898,7 @@ const is_debug = @import("builtin").mode == .Debug;
 
 // treat this as a union
 // this is meant for coarse analysis and cannot be used for much beyond basic dce
-// a value only has a fact if analysis does not contradict it
+// the facts are designed to always decrease useful information as you add more of them. adding another fact should produce broader facts downstream, not change the underlying.
 const ValueFacts = enum(u32) {
     null = 1 << 0,
     undefined = 1 << 1,
@@ -1912,15 +1912,31 @@ const ValueFacts = enum(u32) {
     function = 1 << 8, 
     symbol = 1 << 9, 
 
-    falsy = 1 << 20,
-    decorated = 1 << 25, // e.g. extra descriptors 
+    zero = 1 << 15, // means "zero sized", modifies all other facts to include zero-width variants e.g. numeric zero or empty string
+    falsy = 1 << 20, // negative integers and zero are treated as falsy because we _might_ increment them later. the inclusion of `number` makes the total truthy and falsy.
+    used = 1 << 24, // cache for detecting unused bindings
+    decorated = 1 << 25, // e.g. extra descriptors and/or accessors. also used for negative numbers.
+    float = 1 << 26,
+    throws = 1 << 27,
+    infallible = 1 << 28,
     any = 1 << 29,
-    // effect = 1 << 30,
-    incomplete = 1 << 31, // this is negated so the "exact fact" path is simpler
+    incomplete = 1 << 30, // this is negated so the "exact fact" path is simpler
+    literal = 1 << 31, // struct is external
 
+    nullish = (1 << 0) | (1 << 1),
     boolean = (1 << 2) | (1 << 3),
     truthy = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 8) | (1 << 9),
     number_or_string = (1 << 6) | (1 << 7),
+    falsy_number_or_string = (1 << 6) | (1 << 7) | (1 << 20),
+
+    numeric_zero = (1 << 6) | (1 << 15), // number | zero
+    any_string = (1 << 7) | (1 << 15), // string | zero
+    negative_number = (1 << 6) | (1 << 25), // number | decorated
+
+    _falsy = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 15),
+
+    // excludes atoms
+    primitive_types = ((@intFromEnum(ValueFacts.symbol) >> 1) - 1) & ~(@intFromEnum(ValueFacts.object) - 1),
 
     pub fn hasFact(facts: u32, comptime fact: ValueFacts) bool {
         return (facts & @intFromEnum(fact)) != 0;
@@ -1928,6 +1944,18 @@ const ValueFacts = enum(u32) {
 
     pub fn hasExactFact(facts: u32, comptime fact: ValueFacts) bool {
         return facts == @intFromEnum(fact);
+    }
+
+    pub fn hasExactPrimitiveType(facts: u32, comptime fact: ValueFacts) bool {
+        return (facts & @intFromEnum(ValueFacts.primitive_types)) == @intFromEnum(fact);
+    }
+
+    pub fn excludeFact(facts: u32, comptime fact: ValueFacts) u32 {
+        return facts & ~@intFromEnum(fact);
+    }
+
+    pub fn maskFact(facts: u32, comptime fact: ValueFacts) u32 {
+        return facts & @intFromEnum(fact);
     }
 
     pub fn isAny(facts: u32) bool {
@@ -1939,11 +1967,11 @@ const ValueFacts = enum(u32) {
     }
 
     pub fn hasNullish(facts: u32) bool {
-        return hasFact(facts, .null) or hasFact(facts, .undefined);
+        return hasFact(facts, .nullish);
     }
 
     pub fn hasAnyFalsy(facts: u32) bool {
-        return hasNullish(facts) or hasFact(facts, .false) or hasFact(facts, .falsy);
+        return hasNullish(facts) or hasFact(facts, .false) or hasFact(facts, .falsy) or hasExactFact(facts, .any_string) or hasExactFact(facts, .numeric_zero);
     }
 
     pub fn isDefinitelyTruthy(facts: u32) bool {
@@ -1952,7 +1980,7 @@ const ValueFacts = enum(u32) {
         if (isAny(facts)) return false;
         return hasFact(facts, .truthy);
     }
-    
+
     pub fn coerceBool(a: u32) u32 {
         if (isAny(a)) return a;
         const truthy = hasFact(a, .truthy) or hasFact(a, .number_or_string) or hasFact(a, .true);
@@ -1962,25 +1990,91 @@ const ValueFacts = enum(u32) {
         return @intFromEnum(ValueFacts.boolean);
     }
 
+    pub fn logicalAnd(a: u32, b: u32) u32 {
+        return (a & b) | maskFact(a, ._falsy);
+    }
+
+    pub fn logicalOr(a: u32, b: u32) u32 {
+        return excludeFact(a, ._falsy) | b;
+    }
+
+    pub fn nullishCoalesce(a: u32, b: u32) u32 {
+        return excludeFact(a, .nullish) | b;
+    }
+
+    pub fn relates(a: u32, b: u32, op: parser.SyntaxKind) u32 {
+        // todo: string
+        if (isAny(a | b)) return @intFromEnum(ValueFacts.boolean);
+        if (!hasExactPrimitiveType(a | b, .number) or hasFact(a | b, .float)) return @intFromEnum(ValueFacts.boolean);
+        const delta: u8 = @popCount(a) - @popCount(b);
+        if (delta == 0) return @intFromEnum(ValueFacts.boolean);
+        _ = op;
+        // TODO: we currently cannot prove much for comparisons because there is no "exclusively negative" fact
+        // we could make .zero by itself be exclusively the numeric zero, we just need to adjust primitive type checks to account for this
+        // we would do the same thing for ".decorated": on its own, it would mean _exclusively_ a negative number. 
+        return @intFromEnum(ValueFacts.boolean);
+    }
+
     pub fn negate(a: u32) u32 {
         if (hasExactFact(a, .true)) return @intFromEnum(ValueFacts.false);
         if (hasExactFact(a, .false)) return @intFromEnum(ValueFacts.true);
         if (isDefinitelyTruthy(a) and !hasAnyFalsy(a)) return @intFromEnum(ValueFacts.false);
         if (!isDefinitelyTruthy(a) and hasAnyFalsy(a)) return @intFromEnum(ValueFacts.true);
-        // TODO: nullish/truthy/falsy
+        // TODO: nullish
         return @intFromEnum(ValueFacts.boolean);
     }
 
-    pub fn strictEquals(a: u32, b: u32) u32 {
-        // a bit too conservative
-        if (@popCount(a) != 1 or @popCount(b) != 1) return @intFromEnum(ValueFacts.boolean);
+    pub fn strictEquals(_a: u32, _b: u32) u32 {
+        const a = _a & ~@intFromEnum(ValueFacts.used);
+        const b = _b & ~@intFromEnum(ValueFacts.used);
+        if (@popCount(a) != @popCount(b)) {
+            return @intFromEnum(ValueFacts.boolean);
+        }
         if (a != b) {
-            if (a <= @intFromEnum(ValueFacts.false) or b <= @intFromEnum(ValueFacts.false)) return @intFromEnum(ValueFacts.false);
+            if (a <= @intFromEnum(ValueFacts.false) or b <= @intFromEnum(ValueFacts.false)) {
+                if (@popCount(a) != 1) return @intFromEnum(ValueFacts.boolean);
+                return @intFromEnum(ValueFacts.false);
+            }
             // also too conservative
             return @intFromEnum(ValueFacts.boolean);
         }
-        if (a <= @intFromEnum(ValueFacts.false)) return @intFromEnum(ValueFacts.true);
+        if (a <= @intFromEnum(ValueFacts.false)) {
+            return @intFromEnum(ValueFacts.true);
+        }
         return @intFromEnum(ValueFacts.boolean);
+    }
+
+    pub fn arithmeticNegation(a: u32) u32 {
+        if (a == @intFromEnum(ValueFacts.zero)) return a;
+        if (a == @intFromEnum(ValueFacts.null) or a == @intFromEnum(ValueFacts.false)) return @intFromBool(ValueFacts.numeric_zero);
+        if (a == @intFromEnum(ValueFacts.true)) return @intFromBool(ValueFacts.negative_number);
+        // todo: should set whatever flag for NaN if we have other primitives beyond number
+        if (!hasExactPrimitiveType(a, .number)) return @intFromEnum(ValueFacts.any);
+        return a ^ @intFromEnum(ValueFacts.decorated);
+    }
+
+    pub fn arithmeticAdd(a: u32, b: u32) u32 {
+        var r = a | b;
+        if ((a & @intFromEnum(ValueFacts.primitive_types) & ~@intFromEnum(ValueFacts.number_or_string)) != 0) {
+            return @intFromEnum(ValueFacts.any);
+        }
+
+        // positive + negative OR negative + positive can be zero
+        const should_add_zero = ((a ^ b) & @intFromEnum(ValueFacts.decorated)) != 0;
+        // 0 + 1 -> non-zero
+        // 0 + 0 -> zero
+        // '' + 'aa' -> non-zero
+        // 1 + 1 -> non-zero
+        // etc.
+        const should_remove_zero = ((r & @intFromEnum(ValueFacts.decorated)) == 0) and (a & b & @intFromEnum(ValueFacts.zero)) == 0;
+
+        if (should_add_zero) r |= @intFromEnum(ValueFacts.zero);
+        if (should_remove_zero) r = excludeFact(r, .zero);
+
+        // strings dominate
+        if (hasFact(r, .string)) r = excludeFact(r, .number);
+        
+        return r;
     }
 
     pub fn printInfo(a: u32) void {
@@ -2329,7 +2423,7 @@ const ReferenceCollector = struct {
     }
 
     pub fn isUsedExactlyOnce(self: *@This(), sym_ref: parser.SymbolRef) bool {
-        return (self.references.get(sym_ref) orelse 0) == 1;
+        return (self.references.get(sym_ref) orelse return false).items.len == 1;
     }
 
     pub fn getParamInit(self: *@This(), sym_ref: parser.SymbolRef) ?NodeRef {
@@ -2392,32 +2486,48 @@ const ReferenceCollector = struct {
                 if (!ValueFacts.isComplete(facts)) return @intFromEnum(ValueFacts.any);
                 return facts;
             },
-            .numeric_literal => {
-                // TODO: infinity?
-                const v = parser.getNumber(exp);
-                var r: u32 = @intFromEnum(ValueFacts.number);
-                if (v <= 0 or @round(v) != v or std.math.isNan(v)) r |= @intFromEnum(ValueFacts.falsy);
-                return r;
-            },
-            .string_literal, .no_substitution_template_literal => {
-                const v = parser.getSlice(exp, u8);
-                var r: u32 = @intFromEnum(ValueFacts.string);
-                if (v.len == 0) r |= @intFromEnum(ValueFacts.falsy);
-                return r;
-            },
-            .template_expression => @intFromEnum(ValueFacts.string) | @intFromEnum(ValueFacts.falsy),
+            .numeric_literal => getNumberFacts(parser.getNumber(exp)),
+            .string_literal, .no_substitution_template_literal => getStringFacts(parser.getSlice(exp, u8)),
+            .template_expression => @intFromEnum(ValueFacts.string) | @intFromEnum(ValueFacts.zero),
             // .call_expression => {
 
             // },
+            .postfix_unary_expression => {
+                // this case is a bit odd because we are in an expression position, so this is the fact about the result (pass through)
+                const operand = try self.getValueFacts(getLeft(exp));
+                return operand;
+            },
             .prefix_unary_expression => {
                 const op: SyntaxKind = @enumFromInt(getLeft(exp));
-                if (op == .exclamation_token) return ValueFacts.negate(try self.getValueFacts(getRight(exp)));
-                return @intFromEnum(ValueFacts.boolean);
+                const operand = try self.getValueFacts(getRight(exp));
+                return switch (op) {
+                    .minus_token => ValueFacts.arithmeticNegation(operand),
+                    .exclamation_token => ValueFacts.negate(operand),
+                    .plus_plus_token => ValueFacts.arithmeticAdd(operand, @intFromEnum(ValueFacts.number)),
+                    .minus_minus_token => ValueFacts.arithmeticAdd(operand, @intFromEnum(ValueFacts.negative_number)),
+                    else => @intFromEnum(ValueFacts.any), // TODO: bitwise not?
+                };
             },
             .binary_expression => {
                 const op: SyntaxKind = @enumFromInt(exp.len);
                 if (parser.isAssignmentOp(op)) {
-                    return self.getValueFacts(getRight(exp));
+                    var left = try self.getValueFacts(getLeft(exp));
+                    switch (op) {
+                        .equals_token => {
+                            left = 0; // direct assignments override the facts known about the lhs
+                        },
+                        .question_question_equals_token => {
+                            left = ValueFacts.excludeFact(left, .nullish);
+                        },
+                        .plus_equals_token => {
+                            return ValueFacts.arithmeticAdd(left, try self.getValueFacts(getRight(exp)));
+                        },
+                        .minus_equals_token => {
+                            return ValueFacts.arithmeticAdd(left, ValueFacts.arithmeticNegation(try self.getValueFacts(getRight(exp))));
+                        },
+                        else => return @intFromEnum(ValueFacts.any),
+                    }
+                    return left | try self.getValueFacts(getRight(exp));
                 }
                 switch (op) {
                     .equals_equals_token,
@@ -2431,6 +2541,27 @@ const ReferenceCollector = struct {
                         const negated = op == .exclamation_equals_token or op == .exclamation_equals_equals_token;
                         const result = ValueFacts.strictEquals(l, r);
                         return if (negated) ValueFacts.negate(result) else result;
+                    },
+                    .ampersand_ampersand_token => {
+                        return ValueFacts.logicalAnd(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)));
+                    },
+                    .bar_bar_token => {
+                        return ValueFacts.logicalOr(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)));
+                    },
+                    .question_question_token => {
+                        return ValueFacts.nullishCoalesce(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)));
+                    },
+                    .less_than_token, .greater_than_token, .less_than_equals_token, .greater_than_equals_token => {
+                        return ValueFacts.relates(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)), op);
+                    },
+                    .plus_token => {
+                        return ValueFacts.arithmeticAdd(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)));
+                    },
+                    .minus_token => {
+                        return ValueFacts.arithmeticAdd(try self.getValueFacts(getLeft(exp)), ValueFacts.arithmeticNegation(try self.getValueFacts(getRight(exp))));
+                    },
+                    .asterisk_token, .slash_token, .percent_token, .asterisk_asterisk_token, .bar_token, .ampersand_token, .caret_token => {
+                        return @intFromEnum(Kind.number);
                     },
                     else => return @intFromEnum(ValueFacts.any),
                 }
@@ -2449,6 +2580,7 @@ const ReferenceCollector = struct {
         try self.initSymValueFacts(sym_ref, entry.value_ptr);
 
         if (self.file.binder.symbols.at(sym_ref).hasFlag(.@"const")) {
+            entry.value_ptr.* |= @intFromEnum(ValueFacts.used); // TODO
             return entry.value_ptr.*;   
         }
         var iter = self.getReferenceIterator(sym_ref) orelse {
@@ -2459,12 +2591,176 @@ const ReferenceCollector = struct {
             if (iter._getAssignmentNode(x)) |q| {
                 const val = q[2] orelse continue; // TODO: if this is null, it is postfix/prefix unary
                 entry.value_ptr.* |= try self.getValueFacts(val);
+            } else {
+                entry.value_ptr.* |= @intFromEnum(ValueFacts.used);
             }
         }
         entry.value_ptr.* &= ~@intFromEnum(ValueFacts.incomplete);
         return entry.value_ptr.*;
     }
+
+    pub fn hasEffects(self: *@This(), exp: NodeRef) anyerror!bool {
+        const nodes = &self.file.ast.nodes;
+        const n = nodes.at(exp);
+        switch (n.kind) {
+            .identifier => {
+                if (self.file.binder.getSymbol(exp)) |sym_ref| {
+                    const sym = self.file.binder.symbols.at(sym_ref);
+                    if (sym.hasFlag(.@"const")) {
+                        return false;
+                    }
+                    if (!sym.hasFlag(.late_bound) and !sym.hasFlag(.imported) and sym.declaration != 0) {
+                        const decl = nodes.at(sym.declaration);
+                        if (decl.kind == .function_declaration or decl.kind == .class_declaration) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            },
+            .binding_element => {
+                const r = getRight(n);
+                if (r != 0 and try self.hasEffects(r)) {
+                    return true;
+                }
+                // TODO: 
+                return true;
+            },
+            .new_expression, .call_expression => {
+                return true;
+            },
+            .parenthesized_expression => {
+                return self.hasEffects(unwrapRef(n));
+            },
+            // todo: `instanceof` should be treated as effectful if we cannot find the impl
+            .binary_expression => {
+                const d = getPackedData(n);
+                if (parser.isAssignmentOp(@enumFromInt(n.len))) {
+                    return true;
+                }
+                return try self.hasEffects(d.left) or try self.hasEffects(d.right);
+            },
+            .prefix_unary_expression => {
+                const d = getPackedData(n);
+                switch (@as(SyntaxKind, @enumFromInt(d.left))) {
+                    .plus_plus_token, .minus_minus_token => {
+                        return true;
+                    },
+                    else => {}, // not always correct to do this
+                }
+                return self.hasEffects(d.right);
+            },
+            .conditional_expression => {
+                const d = getPackedData(n);
+                return try self.hasEffects(d.left) or try self.hasEffects(d.right) or try self.hasEffects(n.len);
+            },
+            .typeof_expression, .void_expression => {
+                return self.hasEffects(unwrapRef(n));
+            },
+            .numeric_literal, .string_literal, .no_substitution_template_literal, .true_keyword, .false_keyword, .null_keyword, .undefined_keyword, .arrow_function, .function_expression => {
+                return false;
+            },
+            // template_expression
+            .class_expression => {
+                return true; // TODO: static blocks
+            },
+            // statements
+            .throw_statement => return true,
+            .expression_statement => {
+                return self.hasEffects(unwrapRef(n));
+            },
+            .return_statement => {
+                if (maybeUnwrapRef(n)) |r| {
+                    return self.hasEffects(r);
+                }
+                return false;
+            },
+            .block => {
+                var statements_iter = NodeIterator.init(nodes, maybeUnwrapRef(n) orelse 0);
+                while (statements_iter.nextRef()) |s_ref| {
+                    if (try self.hasEffects(s_ref)) return true;
+                }
+                return false;
+            },
+            .if_statement => {
+                const d = getPackedData(n);
+                if (try self.hasEffects(d.left)) return true;
+                if (try self.hasEffects(d.right)) return true;
+                if (n.len != 0 and try self.hasEffects(n.len)) return true;
+                return false;
+            },
+            // should we even support `do...while` in Syn?
+            .while_statement => {
+                const d = getPackedData(n);
+                return try self.hasEffects(d.left) or try self.hasEffects(d.right);
+            },
+            .for_statement => {
+                const d = getPackedData(n);
+                if (d.left != 0 and try self.hasEffects(d.left)) return true;
+                if (d.right != 0 and try self.hasEffects(d.right)) return true;
+                if (n.len != 0 and try self.hasEffects(n.len)) return true;
+                return try self.hasEffects(n.extra_data);
+            },
+            .for_of_statement, .for_in_statement => {
+                const d = getPackedData(n);
+                return try self.hasEffects(d.left) or try self.hasEffects(d.right) or try self.hasEffects(n.len);
+            },
+            .case_clause, .default_clause => {
+                if (maybeUnwrapRef(n)) |d| {
+                    if (try self.hasEffects(d)) return true;
+                }
+                var iter = NodeIterator.init(nodes, n.len);
+                while (iter.nextRef()) |s_ref| {
+                    if (try self.hasEffects(s_ref)) return true;
+                }
+                return false;
+            },
+            .switch_statement => {
+                const d = getPackedData(n);
+                if (try self.hasEffects(d.left)) return true;
+                var iter = NodeIterator.init(nodes, d.right);
+                while (iter.nextRef()) |case_ref| {
+                    if (try self.hasEffects(case_ref)) return true;
+                }
+                return false;
+            },
+            .break_statement, .continue_statement => return false,
+            .variable_declaration => {
+                const d = getPackedData(n);
+                if (nodes.at(d.left).kind != .identifier) {
+                    if (try self.hasEffects(d.left)) return true;
+                }
+                if (d.right != 0) {
+                    return try self.hasEffects(d.right);
+                }
+                return false;
+            },
+            .variable_statement => {
+                var decls = NodeIterator.init(nodes, unwrapRef(n));
+                while (decls.nextRef()) |d_ref| {
+                    if (try self.hasEffects(d_ref)) return true;
+                }
+                return false;
+            },
+            else => return true, // assume effects by default
+        }
+    }
 };
+
+fn getNumberFacts(v: f64) u32 {
+    // TODO: infinity?
+    var r: u32 = @intFromEnum(ValueFacts.number);
+    if (v == 0) r |= @intFromEnum(ValueFacts.zero);
+    if (r < 0) r |= @intFromEnum(ValueFacts.negative_number);
+    if (@round(v) != v or std.math.isNan(v)) r |= @intFromEnum(ValueFacts.any); // TODO: handle floats/nan
+    return r;
+}
+
+fn getStringFacts(v: []const u8) u32 {
+    var r: u32 = @intFromEnum(ValueFacts.string);
+    if (v.len == 0) r |= @intFromEnum(ValueFacts.zero);
+    return r;
+}
 
 const JsCodeReducer = struct {
     refs: *ReferenceCollector,
@@ -2473,6 +2769,12 @@ const JsCodeReducer = struct {
     replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
     symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef),
     simple_reduced_structures: std.AutoHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
+    parent: NodeRef = 0,
+
+    fn replace(self: *@This(), from: NodeRef, to: NodeRef) !void {
+        self.nodes.at(to).next = self.nodes.at(from).next;
+        try self.replacements.put(from, to);
+    }
 
     fn reduceIfStatement(self: *@This(), node: *const parser.AstNode, ref: NodeRef, is_true: bool) !void {
         // TODO: preserve effects and/or bail
@@ -2493,18 +2795,41 @@ const JsCodeReducer = struct {
 
     fn reduceStructures(self: *@This()) !void {
         var symIter = self.refs.references.keyIterator();
-        outer: while (symIter.next()) |_s| {
+        while (symIter.next()) |_s| {
             const s = _s.*;
+            const sym = self.refs.file.binder.symbols.at(s);
+            if (sym.hasFlag(.@"const")) continue;
             const exp = self.refs.getSingularAccessExp(s) orelse continue;
+            const exp_node = self.refs.file.ast.nodes.at(exp);
+            if (exp_node.kind != .numeric_literal) continue;
             var iter = self.refs.getReferenceIterator(s) orelse continue;
             while (iter.next()) |x| {
-                const t = iter.getAccessExpressionLeft(x) orelse break :outer;
+                const t = iter.getAccessExpressionLeft(x) orelse unreachable;
                 const c = try self.factory.cloneNodeRef(t);
                 const p = iter.parentRef(t) orelse unreachable;
                 self.nodes.at(c).next = self.nodes.at(p).next;
                 try self.replacements.put(p, c);
             }
-            try self.simple_reduced_structures.put(getAllocator(), s, exp);
+            if (!sym.hasFlag(.late_bound)) {
+                const v = parser.getNumber(exp_node);
+                const decl = self.nodes.at(sym.declaration);
+                const init = getRight(decl);
+                const literal = self.nodes.at(init);
+                if (literal.kind != .array_literal_expression) unreachable;
+                if (@round(v) != v) unreachable;
+                if (v < 0) unreachable;
+                var i: u32 = 0;
+                var element_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(literal) orelse 0);
+                while (element_iter.nextRef()) |x| {
+                    if (i == @as(u32, @intFromFloat(v))) {
+                        try self.replacements.put(init, x);
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                try self.simple_reduced_structures.put(getAllocator(), s, exp);
+            }
         }
     }
 
@@ -2522,9 +2847,34 @@ const JsCodeReducer = struct {
                     return self.reduceIfStatement(node, ref, ValueFacts.hasExactFact(cond_facts, .true));
                 }
             },
+            .call_expression => {
+                if (try tryInlineIife(self.refs, getLeft(node), getRight(node), self.symbol_replacements)) |x| {
+                    // XXX: currently won't detect certain statement parents e.g. `if (cond) (() => {})();
+                    switch (self.nodes.at(self.parent).kind) {
+                        .source_file, .block, .start => {
+                            try self.replace(ref, try self.factory.createExpressionStatement(x));
+                        },
+                        else => try self.replace(ref, x),
+                    }
+                }
+            },
+            .block => {
+                const is_empty = maybeUnwrapRef(node) == null;
+                if (is_empty and self.parent != 0) {
+                    switch (self.nodes.at(self.parent).kind) {
+                        .source_file, .block => {
+                            try self.replace(ref, try self.factory.createNotEmittedStatement());
+                        },
+                        else => {},
+                    }
+                }
+            },
             else => {},
         }
+        const save_parent = self.parent;
+        self.parent = ref;
         try parser.forEachChild(self.nodes, node, self);
+        self.parent = save_parent;
     }
 };
 
@@ -3245,6 +3595,10 @@ const JsComputation = struct {
     is_implicit_iife: bool = false,
     root_node: NodeRef = undefined,
     symbol_replacements: std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
+    
+    // you can represent the "current execution environment" as an explicit value (as a computation or opaque)
+    // then, you thread this value into all "foreign" calls, including known subjects that depend on the execution env transitively
+    inferred_order: u32 = 0,
 
     // assumes normalized code
     // notably, we do not expect parens as the top node
@@ -3256,9 +3610,8 @@ const JsComputation = struct {
         const first = source[0];
         const last = source[source.len-1];
         if (last == ';') {
-            // the trailing semi may appear as an extra node in the ast, but this is fine
             this.is_exp = false;
-            this.file = try parser.ParsedFile.createFromBuffer(source, null, false, null);
+            this.file = try parser.ParsedFile.createFromBuffer(source[0..source.len-1], null, false, null);
         } else if (first == '(' and last == ')') {
             this.is_implicit_iife = true;
             this.file = try parser.ParsedFile.createFromExpression(source, null);
@@ -3359,20 +3712,8 @@ const JsComputation = struct {
                     .undefined => @intFromEnum(ValueFacts.undefined),
                     .object => @intFromEnum(ValueFacts.object),
                     .array => @intFromEnum(ValueFacts.object),
-                    .number => blk: {
-                        // TODO: dedupe "getNumberFacts"
-                        const v = graph.getDouble(el_node);
-                        var r: u32 = @intFromEnum(ValueFacts.number);
-                        if (v <= 0 or @round(v) != v or std.math.isNan(v)) r |= @intFromEnum(ValueFacts.falsy);
-                        break :blk r;
-                    },
-                    .string => blk: {
-                        // TODO: dedupe "getStringFacts"
-                        const v = graph.getString(el_node);
-                        var r: u32 = @intFromEnum(ValueFacts.string);
-                        if (v.len == 0) r |= @intFromEnum(ValueFacts.falsy);
-                        break :blk r;
-                    },
+                    .number => getNumberFacts(graph.getDouble(el_node)),
+                    .string => getStringFacts(graph.getString(el_node)),
                     .computed => @intFromEnum(ValueFacts.any),
                     else => @intFromEnum(ValueFacts.any),
                 };
@@ -3414,10 +3755,11 @@ fn createCommaExpressionFromList(
     arg_start: NodeRef,
     param_syms: *std.ArrayList(parser.SymbolRef),
 ) !NodeRef {
-    const factory = parser.Factory{ .nodes = refs.file.ast.nodes };
+    const nodes = &refs.file.ast.nodes;
+    var factory = parser.Factory{ .nodes = nodes };
     if (arg_start == 0) return try factory.createVoidZero();
     var l: NodeRef = 0;
-    var iter = NodeIterator.init(arg_start);
+    var iter = NodeIterator.init(nodes, arg_start);
     var needs_parens = false;
     var count: u32 = 0;
     while (iter.nextRef()) |x| {
@@ -3452,10 +3794,10 @@ fn tryInlineIife(
     refs: *ReferenceCollector,
     subject: NodeRef,
     arg_start: NodeRef,
-    symbol_replacements: *std.AutoHashMapUnmanaged(parser.SymbolRef, NodeRef),
+    symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef),
 ) !?parser.NodeRef {
     const nodes = &refs.file.ast.nodes;
-    const factory = parser.Factory{ .nodes = refs.file.ast.nodes };
+    var factory = parser.Factory{ .nodes = nodes };
     var r = subject;
     var n = nodes.at(subject);
     while (n.kind == .parenthesized_expression) {
@@ -3483,7 +3825,7 @@ fn tryInlineIife(
         if (refs.isAssignedTo(sym_ref)) return null;
         if (!refs.isUsedExactlyOnce(sym_ref)) return null;
         if (refs.getParamInit(sym_ref) != null) {
-            if (!isArgDefinitelyNotUndefined(refs, arg_start, param_syms.items.len)) {
+            if (!isArgDefinitelyNotUndefined(refs, arg_start, @intCast(param_syms.items.len))) {
                 return null;
             }
         }
@@ -3499,14 +3841,15 @@ fn tryInlineIife(
     const body = nodes.at(body_ref);
     if (body.kind == .block) {
         const s = maybeUnwrapRef(body) 
-            orelse return try createCommaExpressionFromList(refs, arg_start, param_syms);
-        const t = NodeIterator.init(nodes, s).tail();
+            orelse return try createCommaExpressionFromList(refs, arg_start, &param_syms);
+        var iter = NodeIterator.init(nodes, s);
+        const t = iter.tail();
         if (s != t) return null; // TODO: produce a block
         const u = nodes.at(t);
         switch (u.kind) {
             .return_statement => {
                 const inner = maybeUnwrapRef(u) 
-                    orelse return try createCommaExpressionFromList(refs, arg_start, param_syms);
+                    orelse return try createCommaExpressionFromList(refs, arg_start, &param_syms);
                 body_exp_ref = inner;
             },
             .expression_statement => {
@@ -3520,13 +3863,13 @@ fn tryInlineIife(
         }
     } // else: concise body
     
-    var args_iter = NodeIterator.init(arg_start);
+    var args_iter = NodeIterator.init(nodes, arg_start);
     // we'd have to show the remainder either has no effects or make a block. can't do comma exp w/o changing order.
     if (args_iter.computeLength() != param_syms.items.len) return null;
     // we cannot bail out past this point.
     var count: u32 = 0;
     while (args_iter.nextRef()) |x| {
-        const s = param_syms[count];        
+        const s = param_syms.items[count];        
         count += 1;
         // TODO: parens rules, grab reference to determine ctx
         try symbol_replacements.put(getAllocator(), s, x);
