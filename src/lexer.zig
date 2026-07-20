@@ -3352,7 +3352,7 @@ pub const LineMap = struct {
     };
 };
 
-fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
+pub fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
     return struct {
         local_count: u16 = 0,
         pages: std.ArrayListUnmanaged([]U),
@@ -3378,7 +3378,7 @@ fn SizedBumpAllocator(comptime items_per_page: u16, comptime U: type) type {
             try this.pages.append(this.allocator, page);
         }
 
-        inline fn warmup(this: *@This()) !void {
+        pub inline fn warmup(this: *@This()) !void {
             std.debug.assert(this.pages.items.len == 0);
             const page = try this.allocator.alloc(U, items_per_page);
             try this.pages.append(this.allocator, page);

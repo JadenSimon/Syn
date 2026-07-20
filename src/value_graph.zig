@@ -243,13 +243,7 @@ const ValueParser = struct {
     }
 
     pub inline fn getSlice(node: *const ValueNode) []const u8 {
-        if (node.slot2 == 0) return &.{};
-        if (comptime @import("builtin").target.isWasm()) {
-            const ptr: [*]const u8 = @ptrFromInt(node.slot1);
-            return ptr[0..node.slot2];
-        }
-        const ptr: [*]const u8 = @ptrFromInt((@as(u64, node.slot0) << 32) | node.slot1);
-        return ptr[0..node.slot2];
+        return triplesToSlice(u8, node.slot0, node.slot1, node.slot2);
     }
 
     inline fn ByteSizedType(comptime T: type, comptime size: comptime_int) type {
@@ -577,6 +571,16 @@ const ValueParser = struct {
         return r;
     }
 };
+
+fn triplesToSlice(comptime T: type, slot0: u32, slot1: u32, slot2: u32) []const T {
+    if (slot2 == 0) return &.{};
+    if (comptime @import("builtin").target.isWasm()) {
+        const ptr: [*]const T = @ptrFromInt(slot1);
+        return ptr[0..slot2];
+    }
+    const ptr: [*]const T = @ptrFromInt((@as(u64, slot0) << 32) | slot1);
+    return ptr[0..slot2];
+}
 
 inline fn valueHasEdges(node: *const ValueNode) bool {
     if (node.next != 0) return true;
@@ -1900,6 +1904,7 @@ const is_debug = @import("builtin").mode == .Debug;
 // this is meant for coarse analysis and cannot be used for much beyond basic dce
 // the facts are designed to always decrease useful information as you add more of them. adding another fact should produce broader facts downstream, not change the underlying.
 const ValueFacts = enum(u32) {
+    none = 0,
     null = 1 << 0,
     undefined = 1 << 1,
     true = 1 << 2,
@@ -1914,7 +1919,7 @@ const ValueFacts = enum(u32) {
 
     zero = 1 << 15, // means "zero sized", modifies all other facts to include zero-width variants e.g. numeric zero or empty string
     falsy = 1 << 20, // negative integers and zero are treated as falsy because we _might_ increment them later. the inclusion of `number` makes the total truthy and falsy.
-    used = 1 << 24, // cache for detecting unused bindings
+    complex = 1 << 24,
     decorated = 1 << 25, // e.g. extra descriptors and/or accessors. also used for negative numbers.
     float = 1 << 26,
     throws = 1 << 27,
@@ -1932,21 +1937,25 @@ const ValueFacts = enum(u32) {
     numeric_zero = (1 << 6) | (1 << 15), // number | zero
     any_string = (1 << 7) | (1 << 15), // string | zero
     negative_number = (1 << 6) | (1 << 25), // number | decorated
+    any_number = (1 << 6) | (1 << 15) | (1 << 25), // number | zero | decorated
+    object_or_array_or_null = (1 << 4) | (1 << 5) | (1 << 0),
+    any_structural_value = (1 << 4) | (1 << 5) | (1 << 8), // array | object | function
+    any_non_structural_non_nullish_primitive = (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 9) | (1 << 15) | (1 << 25), // nullish | boolean | number | string | symbol | zero | decorated
 
     _falsy = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 15),
 
     // excludes atoms
-    primitive_types = ((@intFromEnum(ValueFacts.symbol) >> 1) - 1) & ~(@intFromEnum(ValueFacts.object) - 1),
+    primitive_types = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9),
 
-    pub fn hasFact(facts: u32, comptime fact: ValueFacts) bool {
+    pub fn hasFact(facts: u32, fact: ValueFacts) bool {
         return (facts & @intFromEnum(fact)) != 0;
     }
 
-    pub fn hasExactFact(facts: u32, comptime fact: ValueFacts) bool {
+    pub fn hasExactFact(facts: u32, fact: ValueFacts) bool {
         return facts == @intFromEnum(fact);
     }
 
-    pub fn hasExactPrimitiveType(facts: u32, comptime fact: ValueFacts) bool {
+    pub fn hasExactPrimitiveType(facts: u32, fact: ValueFacts) bool {
         return (facts & @intFromEnum(ValueFacts.primitive_types)) == @intFromEnum(fact);
     }
 
@@ -1954,7 +1963,7 @@ const ValueFacts = enum(u32) {
         return facts & ~@intFromEnum(fact);
     }
 
-    pub fn maskFact(facts: u32, comptime fact: ValueFacts) u32 {
+    pub fn maskFact(facts: u32, fact: ValueFacts) u32 {
         return facts & @intFromEnum(fact);
     }
 
@@ -1964,6 +1973,10 @@ const ValueFacts = enum(u32) {
 
     pub fn isComplete(facts: u32) bool {
         return !hasFact(facts, .incomplete);
+    }
+
+    pub fn isComplex(facts: u32) bool {
+        return hasFact(facts, .decorated);
     }
 
     pub fn hasNullish(facts: u32) bool {
@@ -2025,8 +2038,9 @@ const ValueFacts = enum(u32) {
     }
 
     pub fn strictEquals(_a: u32, _b: u32) u32 {
-        const a = _a & ~@intFromEnum(ValueFacts.used);
-        const b = _b & ~@intFromEnum(ValueFacts.used);
+        const a = _a & ~@intFromEnum(ValueFacts.complex);
+        const b = _b & ~@intFromEnum(ValueFacts.complex);
+
         if (@popCount(a) != @popCount(b)) {
             return @intFromEnum(ValueFacts.boolean);
         }
@@ -2046,8 +2060,8 @@ const ValueFacts = enum(u32) {
 
     pub fn arithmeticNegation(a: u32) u32 {
         if (a == @intFromEnum(ValueFacts.zero)) return a;
-        if (a == @intFromEnum(ValueFacts.null) or a == @intFromEnum(ValueFacts.false)) return @intFromBool(ValueFacts.numeric_zero);
-        if (a == @intFromEnum(ValueFacts.true)) return @intFromBool(ValueFacts.negative_number);
+        if (a == @intFromEnum(ValueFacts.null) or a == @intFromEnum(ValueFacts.false)) return @intFromEnum(ValueFacts.numeric_zero);
+        if (a == @intFromEnum(ValueFacts.true)) return @intFromEnum(ValueFacts.negative_number);
         // todo: should set whatever flag for NaN if we have other primitives beyond number
         if (!hasExactPrimitiveType(a, .number)) return @intFromEnum(ValueFacts.any);
         return a ^ @intFromEnum(ValueFacts.decorated);
@@ -2084,7 +2098,159 @@ const ValueFacts = enum(u32) {
         debugPrint("false: {}\n", .{hasFact(a, .false)});
         debugPrint("truthy: {}\n", .{isDefinitelyTruthy(a)});
         debugPrint("falsy: {}\n", .{hasAnyFalsy(a)});
+        debugPrint("null: {}\n", .{hasFact(a, .null)});
+        debugPrint("undefined: {}\n", .{hasFact(a, .undefined)});
+        debugPrint("array: {}\n", .{hasFact(a, .array)});
+        debugPrint("object: {}\n", .{hasFact(a, .object)});
+        debugPrint("string: {}\n", .{hasFact(a, .any_string)});
+        debugPrint("number: {}\n", .{hasFact(a, .any_number)});
     }
+};
+
+// we may eventually use `program.zig` directly, using types to model facts instead
+// but we need the idea of a "range" type first. the current architecture for value
+// facts is kept a bit more local than types and so does not need machinery for modules
+const ValueFactLiteral = packed struct {
+    const LiteralKind = enum(u4) {
+        number,
+        string,
+        array,
+        object,
+        symbol,
+        function,
+        combination, // union or intersection
+        external, // points into another computation
+    };
+    const LiteralFlags = enum(u3) {
+        possibly_undefined = 1 << 0,
+    };
+    const CombinationFlags = enum(u3) {
+        intersection = 1 << 2,
+    };
+    const NumberFlags = enum(u3) {
+        range = 1 << 2, // ranges are always i32 starts/ends inclusive, with the max val representing infinity
+    };
+
+    kind: LiteralKind,
+    flags: u3 = 0,
+    next: u25 = 0,
+    slot0: u32 = 0,
+    slot1: u32 = 0,
+    slot2: u32 = 0,
+
+    comptime {
+        if (@sizeOf(@This()) != 16) {
+            @compileError("Expected literal struct to be 16 bytes");
+        }
+    }
+
+    pub fn createNumber(v: f64) @This() {
+        const u: u64 = @bitCast(v);
+        return .{
+            .kind = .number,
+            .slot0 = @truncate(u >> 32),
+            .slot1 = @truncate(u),
+        };
+    }
+
+    pub fn createRange(from: i32, to: i32) @This() {
+        return .{
+            .kind = .number,
+            .slot0 = @bitCast(from),
+            .slot1 = @bitCast(to),
+            .slot2 = @intFromEnum(NumberFlags.range),
+        };
+    }
+
+    pub fn createString(v: []const u8) @This() {
+        return .{
+            .kind = .string,
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
+            .slot1 = @truncate(@intFromPtr(v.ptr)),
+            .slot2 = @truncate(v.len),
+        };
+    }
+
+    pub fn collapse(this: *const @This()) u32 {
+        var r: u32 = 0;
+        switch (this.kind) {
+            .number => {
+                r |= @intFromEnum(ValueFacts.number);
+                if (this.isRange()) {
+                    const start = this.getRangeStart();
+                    const end = this.getRangeEnd();
+                    if (start < 0) {
+                        r |= @intFromEnum(ValueFacts.negative_number);
+                    } 
+                    if (start == 0 or end == 0 or (start < 0 and end > 0)) {
+                        r |= @intFromEnum(ValueFacts.zero);
+                    }
+                } else {
+                    const v = this.getDouble();
+                    if (v == 0) r |= @intFromEnum(ValueFacts.zero);
+                    if (v < 0) r |= @intFromEnum(ValueFacts.negative_number);
+                }
+            },
+            .string => {
+                r |= @intFromEnum(ValueFacts.string);
+                if (this.getLengthOrCount() == 0) r |= @intFromEnum(ValueFacts.zero);
+            },
+            .array => {
+                r |= @intFromEnum(ValueFacts.array);
+                if (this.getLengthOrCount() == 0) r |= @intFromEnum(ValueFacts.zero);
+            },
+            .object => {
+                r |= @intFromEnum(ValueFacts.object);
+                if (this.getLengthOrCount() == 0) r |= @intFromEnum(ValueFacts.zero);
+            },
+            .symbol => {
+                r |= @intFromEnum(ValueFacts.symbol);
+            },
+            .function => {
+                r |= @intFromEnum(ValueFacts.function);
+            },
+            else => {
+                r |= @intFromEnum(ValueFacts.any);
+            }
+        }
+        if (this.flags & @intFromEnum(LiteralFlags.possibly_undefined) != 0) {
+            r |= @intFromEnum(ValueFacts.undefined);
+        }
+        return r;
+    }
+
+    pub fn isRange(this: *const @This()) bool {
+        return this.kind == .number and (this.flags & @intFromBool(NumberFlags.range)) != 0;
+    }
+
+    pub fn getDouble(this: *const @This()) f64 {
+        std.debug.assert(this.kind == .number and !this.isRange());
+        const u: u64 = (@as(u64, this.slot0) << 32) | this.slot1;
+        return @bitCast(u);
+    }
+
+    pub fn getRangeStart(this: *const @This()) i32 {
+        std.debug.assert(this.isRange());
+        return @bitCast(this.slot0);
+    }
+
+    pub fn getRangeEnd(this: *const @This()) i32 {
+        std.debug.assert(this.isRange());
+        return @bitCast(this.slot1);
+    }
+
+    pub fn getString(this: *const @This()) []const u8 {
+        std.debug.assert(this.kind == .string);
+        return triplesToSlice(u8, this.slot0, this.slot1, this.slot2);
+    }
+
+    pub fn getLengthOrCount(this: *const @This()) u32 {
+        return switch (this.kind) {
+            .string, .array, .object => this.slot2,
+            else => 0,
+        };
+    }
+
 };
 
 const ReferenceCollector = struct {
@@ -2094,12 +2260,15 @@ const ReferenceCollector = struct {
     // excludes the decl reference
     references: std.AutoHashMapUnmanaged(parser.SymbolRef, std.ArrayListUnmanaged(parser.NodeRef)) = .{},
     stack: std.ArrayListUnmanaged(parser.NodeRef) = .{},
-
+    
+    decl_count: u32 = 0,
     external_facts: std.AutoHashMapUnmanaged(parser.SymbolRef, u32) = .{},
     value_facts: std.AutoHashMapUnmanaged(parser.SymbolRef, u32) = .{},
+    value_literals: @import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral) = undefined,
 
     pub fn init(file: *parser.ParsedFile) !@This() {
         var self = @This(){ .file = file };
+        self.value_literals = @import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral).init(getAllocator());
         try self.visit(file.ast.nodes.at(file.ast.start), file.ast.start);
         return self;
     }
@@ -2112,6 +2281,131 @@ const ReferenceCollector = struct {
             arr.deinit(getAllocator());
         }
         self.references.deinit(getAllocator());
+        self.value_facts.deinit(getAllocator());
+        self.external_facts.deinit(getAllocator());
+        self.value_literals.deinit();
+    }
+
+    // mutates the nodes allocator and resets both maps
+    pub fn commitInPlace(
+        self: *@This(),
+        replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
+        symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef)
+    ) !void {
+        const V = struct {
+            parent: NodeRef = 0,
+            prev: NodeRef = 0,
+            nodes: *BumpAllocator(parser.AstNode),
+            replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
+            symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef),
+
+            fn findSelfPtr(this: *@This(), old: NodeRef) *NodeRef {
+                if (this.prev != 0) {
+                    const ptr = &this.nodes.at(this.prev).next;
+                    if (ptr.* == old) return ptr;
+                }
+                if (this.parent == 0) unreachable;
+                var ptr: *NodeRef = undefined;
+                const p = this.nodes.at(this.parent);
+                std.debug.assert(!parser.isLeafNode(p.kind));
+                const slots: *[8]u32 = @ptrCast(p);
+                switch (p.kind) {
+                    .prefix_unary_expression => {
+                        ptr = &slots[3];
+                    },
+                    .postfix_unary_expression => {
+                        ptr = &slots[2];
+                    },
+                    .binary_expression => {
+                        if (slots[2] == old) ptr = &slots[2]
+                        else if (slots[3] == old) ptr = &slots[3]
+                        else unreachable;
+                    },
+                    else => {
+                        for (2..8) |i| {
+                            if (slots[i] == old) {
+                                ptr = &slots[i];
+                                break;
+                            }
+                        }
+                    },
+                }
+                std.debug.assert(ptr.* == old);
+                return ptr;
+            }
+
+            fn replaceRef(this: *@This(), old: NodeRef, new: NodeRef) void {
+                const ptr = this.findSelfPtr(old);
+                ptr.* = new;
+            }
+
+            pub fn visit(this: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
+                if (this.replacements.get(ref)) |x| {
+                    this.replaceRef(ref, x);
+                    return this.visit(this.nodes.at(x), x);
+                }
+                switch (node.kind) {
+                    .identifier => {
+                        if (this.symbol_replacements.get(node.extra_data)) |x| {
+                            this.replaceRef(ref, x);
+                            return this.visit(this.nodes.at(x), x);
+                        }
+                    },
+                    .not_emitted_statement => {
+                        // have to simplify the tree for later passes
+                        return this.replaceRef(ref, node.next);
+                    },
+                    .block => {
+                        if (node.hasFlag(.reduce_block)) {
+                            this.replaceRef(ref, unwrapRef(node));
+                            return try parser.forEachChild(this.nodes, this.nodes.at(ref), this);
+                        }
+                    },
+                    .variable_declaration => {
+                        // we are stamping the relative decl order to these nodes as an optimization and must clear them here
+                        this.nodes.at(ref).extra_data2 = 0;
+                    },
+                    else => {},
+                }
+                if (parser.isLeafNode(node.kind)) {
+                    this.prev = ref;
+                    return;
+                }
+                const save_parent = this.parent;
+                this.parent = ref;
+                this.prev = 0;
+                try parser.forEachChild(this.nodes, this.nodes.at(ref), this);
+                this.parent = save_parent;
+                this.prev = ref;
+            }
+        };
+        var v = V{
+            .nodes = &self.file.ast.nodes,
+            .replacements = replacements,
+            .symbol_replacements = symbol_replacements,
+        };
+        const start = self.file.ast.start;
+        std.debug.assert(!replacements.contains(start));
+        try v.visit(self.file.ast.nodes.at(start), start);
+        {
+            const sym_count = self.file.binder.symbols.count();
+            for (0..sym_count) |i| {
+                const sym = self.file.binder.symbols.at(i);
+                if (sym.hasFlag(.late_bound)) continue;
+                if (sym.declaration == 0) continue;
+                if (replacements.get(sym.declaration)) |x| {
+                    sym.declaration = x;
+                }
+            }
+        }
+        replacements.clearAndFree();
+        symbol_replacements.clearAndFree(getAllocator());
+        self.decl_count = 0;
+        self.parents_watermark = 1;
+        self.parents.clearRetainingCapacity();
+        self.references.clearRetainingCapacity();
+        self.value_facts.clearRetainingCapacity();
+        try self.visit(self.file.ast.nodes.at(start), start);
     }
 
     fn markParents(self: *@This()) !void {
@@ -2132,21 +2426,34 @@ const ReferenceCollector = struct {
         try entry.value_ptr.append(getAllocator(), node_ref);
     }
 
+    pub fn createLiteralFact(self: *@This(), literal: ValueFactLiteral) !u32 {
+        const c = self.value_literals.count();
+        if (c == 0) {
+            try self.value_literals.warmup();
+        }
+        try self.value_literals.append(literal);
+        return @intFromEnum(ValueFacts.literal) | c;
+    }
+
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
         if (node.kind == .identifier) {
             const sym_ref = self.file.binder.getSymbol(ref) orelse return;
             const sym = self.file.binder.symbols.at(sym_ref);
             if (sym.isImportedOrExported()) return;
+            try self.markParents();
+            try self.parents.put(getAllocator(), ref, self.stack.getLast());
             if (sym.binding == ref) return;
             if (sym.declaration != 0) {
                 if (parser.getDeclarationNameRef(self.file.ast.nodes.at(sym.declaration)) == ref) return;
             }
-            try self.markParents();
-            try self.parents.put(getAllocator(), ref, self.stack.getLast());
             try self.addReference(sym_ref, ref);
             return;
         }
         if (parser.isLeafNode(node.kind)) return;
+        if (node.kind == .variable_declaration) {
+            self.decl_count += 1;
+            self.file.ast.nodes.at(ref).extra_data2 = self.decl_count;
+        }
         try self.stack.append(getAllocator(), ref);
         defer {
             _ = self.stack.pop();
@@ -2214,13 +2521,15 @@ const ReferenceCollector = struct {
                             std.debug.assert(getRight(p) == current_ref);
                             return .{parent_ref, current_ref, null};
                         }
+                        break;
                     },
                     .postfix_unary_expression => {
                         const op: SyntaxKind = @enumFromInt(getRight(p));
                         if (op == .plus_plus_token or op == .minus_minus_token) {
                             std.debug.assert(getLeft(p) == current_ref);
                             return .{parent_ref, current_ref, null};
-                        }                    
+                        }   
+                        break;
                     },
                     else => break,
                 }
@@ -2410,16 +2719,238 @@ const ReferenceCollector = struct {
             }
         }
         return false;
-    } 
+    }
 
-    pub fn isUsed(self: *@This(), sym_ref: parser.SymbolRef) bool {
-        var iter = self.getReferenceIterator(sym_ref) orelse return true;
+    // returns the node right below the scope node as well
+    fn getScopeRef(self: *@This(), ref: NodeRef) ?struct {NodeRef, NodeRef} {
+        var c = ref;
+        while (c != 0) {
+            const p_ref = self.parents.get(c) orelse return null;
+            const p = self.file.ast.nodes.at(p_ref);
+            switch (p.kind) {
+                .source_file, .block => return .{c, p_ref},
+                .arrow_function => return .{c, p_ref},
+                .method_declaration, .get_accessor, .set_accessor,
+                .class_declaration, .class_expression,
+                .function_declaration, .function_expression => {
+                    if (c != getLeft(p)) return .{c, p_ref};
+                },
+                else => {},
+            }
+            c = p_ref;
+        }
+        return null;
+    }
+
+    pub fn hasEscapedBeforeExp(self: *@This(), sym_ref: parser.SymbolRef, exp_ref: NodeRef) !bool {
+        var iter = self.getReferenceIterator(sym_ref) orelse return false;
         while (iter.next()) |r| {
-            // we ignore any writes
+            if (r > exp_ref) break;
             if (iter._getAssignmentNode(r) != null) continue;
+            // if (iter._getAssignmentNode(r) != null) return true;
+            if (self.isEscapePosition(r)) return true;
+        }
+        return false;
+    }
+
+    fn isSimpleAccessExpressionOfSym(self: *@This(), sym_ref: parser.SymbolRef, exp_ref: NodeRef, max_depth: u8) bool {
+        return self._isSimpleAccessExpressionOfSym(sym_ref, exp_ref, 0, max_depth);
+    }
+
+    fn _isSimpleAccessExpressionOfSym(self: *@This(), sym_ref: parser.SymbolRef, exp_ref: NodeRef, depth: u8, max_depth: u8) bool {
+        const nodes = &self.file.ast.nodes;
+        const exp = nodes.at(exp_ref);
+        return switch (exp.kind) {
+            .identifier => (self.file.binder.getSymbol(exp_ref) orelse return false) == sym_ref,
+            .element_access_expression,
+            .property_access_expression => depth < max_depth and self._isSimpleAccessExpressionOfSym(sym_ref, getLeft(exp), depth + 1, max_depth),
+            .parenthesized_expression => self._isSimpleAccessExpressionOfSym(sym_ref, unwrapRef(exp), depth, max_depth),
+            else => false,
+        };
+    }
+
+    pub fn getReferenceUsageLocation(self: *@This(), exp_ref: parser.SymbolRef) NodeRef {
+        const nodes = &self.file.ast.nodes;
+        var c = exp_ref;
+        while (c != 0) {
+            const p_ref = self.parents.get(c) orelse return c;
+            std.debug.assert(p_ref != c);
+            const p = nodes.at(p_ref);
+            switch (p.kind) {
+                .source_file,
+                .expression_statement => return c,
+                .call_expression, .new_expression => return c,
+                .parameter,
+                .variable_declaration,
+                .binding_element => return c,
+                // not always accurate
+                .case_clause,
+                .switch_statement,
+                .if_statement,
+                .while_statement,
+                .for_statement,
+                .for_of_statement,
+                .for_in_statement => return c,
+                .object_literal_expression,
+                .array_literal_expression => return c, // TODO: depends, only if parent of the literal isn't an exp statement
+                .element_access_expression => {
+                    if (getRight(p) == c) return c;
+                },
+                .property_assignment => {
+                    return c;
+                },
+                .binary_expression => {
+                    if (parser.isAssignmentOp(@enumFromInt(p.len)) and getLeft(p) == c) {
+                        return c;
+                    }
+                },
+                else => {},
+            }
+            c = p_ref;
+        }
+        return exp_ref;
+    }
+
+    pub fn isUsed(self: *@This(), sym_ref: parser.SymbolRef) !bool {
+        var iter = self.getReferenceIterator(sym_ref) orelse return false;
+        while (iter.next()) |r| {
+            // we ignore any writes. this assumes that the decl initialzer is know. `max_depth` could be adjusted based on how much we know about a given value 
+            if (iter._getAssignmentNode(r)) |x| {
+                if (!self.isSimpleAccessExpressionOfSym(sym_ref, x[1], 0)) return true;
+
+                if (x[2]) |v| {
+                    if (try self.hasEffects(v)) return true;
+                }
+                // if (try self.hasEffects(getLeft(self.file.ast.nodes.at(x[1])))) return true;
+
+
+                continue;
+            }
+            const loc = self.getReferenceUsageLocation(r);
+            if (self.parents.get(loc)) |p_ref| {
+                if (self.file.ast.nodes.at(p_ref).kind == .expression_statement) {
+                    if (!try self.hasEffects(loc)) continue;
+                }
+            }
             return true;
         }
         return false;
+    }
+
+    fn isBefore(self: *@This(), a: NodeRef, b: NodeRef) bool {
+        const nodes = &self.file.ast.nodes;
+        const na = nodes.at(a);
+        const nb = nodes.at(b);
+        if (na.kind == .variable_declaration and nb.kind == .variable_declaration) {
+            return na.extra_data2 < nb.extra_data2;
+        }
+        // FIXME: we can only use the fast path if both nodes aren't synthetic
+        // return a < b;
+        return false;
+    }
+
+    fn hasSimpleDataDepsAfterDest(self: *@This(), dest: NodeRef, exp_ref: NodeRef) bool {
+        const exp = self.file.ast.nodes.at(exp_ref);
+        return switch (exp.kind) {
+            .identifier => {
+                if (self.file.binder.getSymbol(exp_ref)) |sym_ref| {
+                    const sym = self.file.binder.symbols.at(sym_ref);
+                    if (sym.hasFlag(.late_bound)) return true;
+                    if (sym.declaration == 0) return true;
+                    if (self.references.get(sym_ref)) |references| {
+                        for (references.items) |z| {
+                            if (self.hasEffects(z) catch return false) return false;
+                        }
+                    }
+                    return self.isBefore(sym.declaration, dest);
+                }
+                return false;
+            },
+            .postfix_unary_expression => self.hasSimpleDataDepsAfterDest(dest, getLeft(exp)),
+            .property_assignment,
+            .prefix_unary_expression => self.hasSimpleDataDepsAfterDest(dest, getRight(exp)),
+            .binary_expression => self.hasSimpleDataDepsAfterDest(dest, getLeft(exp)) and self.hasSimpleDataDepsAfterDest(dest, getRight(exp)),
+            .parenthesized_expression,
+            .shorthand_property_assignment,
+            .computed_property_name => self.hasSimpleDataDepsAfterDest(dest, unwrapRef(exp)),
+            .object_literal_expression, .array_literal_expression => {
+                var iter = NodeIterator.init(&self.file.ast.nodes, maybeUnwrapRef(exp) orelse return true);
+                while (iter.nextRef()) |x| {
+                    if (!self.hasSimpleDataDepsAfterDest(dest, x)) return false;
+                }
+                return true;
+            },
+            .numeric_literal, .string_literal, .no_substitution_template_literal => true,
+            else => parser.isKeyword(exp.kind),
+        };
+    }
+
+    pub fn findSingleInlineLocation(self: *@This(), sym_ref: parser.SymbolRef) !?NodeRef {
+        const sym = self.file.binder.symbols.at(sym_ref);
+        if (sym.hasFlag(.late_bound)) return null;
+        if (sym.declaration == 0) return null;
+        if (!self.isUsedExactlyOnce(sym_ref)) return null;
+        const decl = self.file.ast.nodes.at(sym.declaration);
+        if (decl.kind != .variable_declaration) return null;
+        if (try self.hasEffects(sym.declaration)) return null;
+        const p_ref = self.parents.get(sym.declaration) orelse return null;
+        const stmt = self.file.ast.nodes.at(p_ref);
+        if (stmt.kind != .variable_statement) return null;
+        var iter = self.getReferenceIterator(sym_ref) orelse return null;
+        while (iter.next()) |r| return r;
+        return null;
+    }
+
+    pub fn findEffectiveInitializer(self: *@This(), sym_ref: parser.SymbolRef) !?struct {NodeRef,NodeRef} {
+        const sym = self.file.binder.symbols.at(sym_ref);
+        if (sym.hasFlag(.late_bound)) return null;
+        if (sym.declaration == 0) return null;
+        const decl = self.file.ast.nodes.at(sym.declaration);
+        if (decl.kind != .variable_declaration) return null;
+        const p_ref = self.parents.get(sym.declaration) orelse return null;
+        const stmt = self.file.ast.nodes.at(p_ref);
+        if (stmt.kind != .variable_statement) return null;
+        const scope_ref = self.parents.get(p_ref) orelse return null;
+
+        var res: NodeRef = 0;
+        var top: NodeRef = 0;
+        var iter = self.getReferenceIterator(sym_ref) orelse return null;
+        while (iter.next()) |r| {
+            if (iter._getAssignmentNode(r)) |x| {
+                if (!self.isSimpleAccessExpressionOfSym(sym_ref, x[1], 0)) break;
+                if (x[2]) |v| {
+                    top = x[0];
+                    res = v;
+                    if (try self.hasEffects(v)) break;
+                } else break;
+
+                continue;
+            }
+            const loc = self.getReferenceUsageLocation(r);
+            if (self.parents.get(loc)) |p_ref2| {
+                if (self.file.ast.nodes.at(p_ref2).kind == .expression_statement) {
+                    if (!try self.hasEffects(loc)) continue;
+                }
+            }
+            break;
+        }
+        if (res == 0) return null;
+        const s = self.getScopeRef(top) orelse return null;
+        if (s[1] != scope_ref) return null;
+        const ref_stmt = self.file.ast.nodes.at(s[0]);
+        if (ref_stmt.kind != .expression_statement) return null; // TODO: handle other statements?
+        if (unwrapRef(ref_stmt) != top) return null; // TODO: handle cases like `x = foo(y = z)` by reducing elsewhere
+        const decl_init = getRight(decl);
+        if (!self.hasSimpleDataDepsAfterDest(sym.declaration, res)) return null;
+        if (try self.hasEffects(decl_init)) {
+            // now we gotta check intervening effects
+            var c = stmt.next;
+            while (c != 0 and c != s[0]) {
+                if (try self.hasEffects(c)) return null;
+                c = self.file.ast.nodes.at(c).next;
+            }
+        }
+        return .{top,res};
     }
 
     pub fn isUsedExactlyOnce(self: *@This(), sym_ref: parser.SymbolRef) bool {
@@ -2449,15 +2980,50 @@ const ReferenceCollector = struct {
         };
     }
 
-    fn initSymValueFacts(self: *@This(), sym_ref: parser.SymbolRef, facts: *u32) !void {
-        facts.* |= @intFromEnum(ValueFacts.incomplete);
+    pub fn typeofExp(self: *@This(), left: NodeRef, right: NodeRef) !u32 {
+        const facts = (try self.getValueFacts(left)) & ~@intFromEnum(ValueFacts.complex);
+        if (ValueFacts.isAny(facts)) return @intFromEnum(ValueFacts.boolean);
+        const n = self.file.ast.nodes.at(right);
+        switch (n.kind) {
+            .string_literal => {
+                var r: u32 = @intFromEnum(ValueFacts.boolean);
+                const v = parser.getSlice(n, u8);
+                var mask: ValueFacts = .none;
+                if (std.mem.eql(u8, v, "string")) {
+                    mask = .any_string;
+                } else if (std.mem.eql(u8, v, "number")) {
+                    mask = .any_number;
+                } else if (std.mem.eql(u8, v, "object")) {
+                    mask = .object_or_array_or_null;
+                } else if (std.mem.eql(u8, v, "function")) {
+                    mask = .function;
+                } else if (std.mem.eql(u8, v, "symbol")) {
+                    mask = .symbol;
+                } else if (std.mem.eql(u8, v, "undefined")) {
+                    mask = .undefined;
+                }
+                if (mask == .none or facts == 0) return r;
+                if (ValueFacts.maskFact(facts, mask) == facts) {
+                    r = ValueFacts.excludeFact(r, .false);
+                }
+                if (!ValueFacts.hasFact(facts, mask)) {
+                    r = ValueFacts.excludeFact(r, .true);
+                }
+                // TODO: never fact?
+                if (r == 0) return @intFromEnum(ValueFacts.boolean);
+                return r;
+            },
+            else => {},
+        }
+        return @intFromEnum(ValueFacts.boolean);
+    }
+
+    pub fn getDeclarationFacts(self: *@This(), sym_ref: parser.SymbolRef) !u32 {
         const sym = self.file.binder.symbols.at(sym_ref);
         if (sym.declaration == 0 or sym.hasFlag(.late_bound)) {
-            const ext = self.external_facts.get(sym_ref) orelse @intFromEnum(ValueFacts.any);
-            facts.* |= ext;
-        } else {
-            facts.* |= try self.getValueFacts(sym.declaration);
+            return self.external_facts.get(sym_ref) orelse @intFromEnum(ValueFacts.any);
         }
+        return try self.getValueFacts(sym.declaration);
     }
 
     fn getSimpleValueFacts(self: *@This(), exp_ref: NodeRef) u32 {
@@ -2466,7 +3032,6 @@ const ReferenceCollector = struct {
         const fact: ValueFacts = switch (exp.kind) {
             .true_keyword => .true,
             .false_keyword => .false,
-            .object_literal_expression => .object,
             .array_literal_expression => .array,
             .null_keyword => .null,
             .undefined_keyword,
@@ -2486,9 +3051,30 @@ const ReferenceCollector = struct {
                 if (!ValueFacts.isComplete(facts)) return @intFromEnum(ValueFacts.any);
                 return facts;
             },
+            .variable_declaration => {
+                const init_exp = getRight(exp);
+                if (init_exp != 0) {
+                    return try self.getValueFacts(init_exp);
+                }
+                return @intFromEnum(ValueFacts.undefined);
+            },
             .numeric_literal => getNumberFacts(parser.getNumber(exp)),
             .string_literal, .no_substitution_template_literal => getStringFacts(parser.getSlice(exp, u8)),
             .template_expression => @intFromEnum(ValueFacts.string) | @intFromEnum(ValueFacts.zero),
+            .object_literal_expression => {
+                var r = @intFromEnum(ValueFacts.object);
+                var members_iter = NodeIterator.init(&self.file.ast.nodes, maybeUnwrapRef(exp) orelse 0);
+                while (members_iter.next()) |n| {
+                    switch (n.kind) {
+                        .get_accessor, .set_accessor => {
+                            r |= @intFromEnum(ValueFacts.complex);
+                            return r;
+                        },
+                        else => {},
+                    }
+                }
+                return r;
+            },
             // .call_expression => {
 
             // },
@@ -2507,6 +3093,9 @@ const ReferenceCollector = struct {
                     .minus_minus_token => ValueFacts.arithmeticAdd(operand, @intFromEnum(ValueFacts.negative_number)),
                     else => @intFromEnum(ValueFacts.any), // TODO: bitwise not?
                 };
+            },
+            .typeof_expression => {
+                return @intFromEnum(ValueFacts.string);
             },
             .binary_expression => {
                 const op: SyntaxKind = @enumFromInt(exp.len);
@@ -2534,11 +3123,16 @@ const ReferenceCollector = struct {
                     .exclamation_equals_token,
                     .exclamation_equals_equals_token,
                     .equals_equals_equals_token => {
+                        const negated = op == .exclamation_equals_token or op == .exclamation_equals_equals_token;
+                        const left = self.file.ast.nodes.at(getLeft(exp));
+                        if (left.kind == .typeof_expression) {
+                            const result = try self.typeofExp(unwrapRef(left), getRight(exp));
+                            return if (negated) ValueFacts.negate(result) else result;
+                        }
                         const l = try self.getValueFacts(getLeft(exp));
                         if (ValueFacts.isAny(l)) return @intFromEnum(ValueFacts.boolean);
                         const r = try self.getValueFacts(getRight(exp));
                         if (ValueFacts.isAny(r)) return @intFromEnum(ValueFacts.boolean);
-                        const negated = op == .exclamation_equals_token or op == .exclamation_equals_equals_token;
                         const result = ValueFacts.strictEquals(l, r);
                         return if (negated) ValueFacts.negate(result) else result;
                     },
@@ -2561,7 +3155,7 @@ const ReferenceCollector = struct {
                         return ValueFacts.arithmeticAdd(try self.getValueFacts(getLeft(exp)), ValueFacts.arithmeticNegation(try self.getValueFacts(getRight(exp))));
                     },
                     .asterisk_token, .slash_token, .percent_token, .asterisk_asterisk_token, .bar_token, .ampersand_token, .caret_token => {
-                        return @intFromEnum(Kind.number);
+                        return @intFromEnum(ValueFacts.any_number);
                     },
                     else => return @intFromEnum(ValueFacts.any),
                 }
@@ -2576,11 +3170,12 @@ const ReferenceCollector = struct {
             return entry.value_ptr.*;
         }
         
-        entry.value_ptr.* = 0;
-        try self.initSymValueFacts(sym_ref, entry.value_ptr);
+        entry.value_ptr.* = @intFromEnum(ValueFacts.incomplete);
+        const v = try self.getDeclarationFacts(sym_ref);
+        entry.value_ptr.* |= v;
 
         if (self.file.binder.symbols.at(sym_ref).hasFlag(.@"const")) {
-            entry.value_ptr.* |= @intFromEnum(ValueFacts.used); // TODO
+            entry.value_ptr.* &= ~@intFromEnum(ValueFacts.incomplete);
             return entry.value_ptr.*;   
         }
         var iter = self.getReferenceIterator(sym_ref) orelse {
@@ -2591,8 +3186,6 @@ const ReferenceCollector = struct {
             if (iter._getAssignmentNode(x)) |q| {
                 const val = q[2] orelse continue; // TODO: if this is null, it is postfix/prefix unary
                 entry.value_ptr.* |= try self.getValueFacts(val);
-            } else {
-                entry.value_ptr.* |= @intFromEnum(ValueFacts.used);
             }
         }
         entry.value_ptr.* &= ~@intFromEnum(ValueFacts.incomplete);
@@ -2606,15 +3199,35 @@ const ReferenceCollector = struct {
             .identifier => {
                 if (self.file.binder.getSymbol(exp)) |sym_ref| {
                     const sym = self.file.binder.symbols.at(sym_ref);
-                    if (sym.hasFlag(.@"const")) {
-                        return false;
+                    if (sym.hasFlag(.late_bound)) {
+                        // TODO: check the facts, a computation as a ref transitively inherits effectful-ness
+                        return !self.external_facts.contains(sym_ref);
                     }
-                    if (!sym.hasFlag(.late_bound) and !sym.hasFlag(.imported) and sym.declaration != 0) {
-                        const decl = nodes.at(sym.declaration);
-                        if (decl.kind == .function_declaration or decl.kind == .class_declaration) {
-                            return false;
-                        }
+                    return false;
+                }
+                return true;
+            },
+            .property_access_expression,
+            .element_access_expression => {
+                if (n.kind == .element_access_expression) {
+                    if (try self.hasEffects(getRight(n))) return true;
+                }
+                const l = getLeft(n);
+                if (try self.hasEffects(l)) return true;
+                const facts = try self.getValueFacts(l);
+                if (ValueFacts.isAny(facts)) return true;
+                if (ValueFacts.maskFact(facts, .any_non_structural_non_nullish_primitive) == facts) return false;
+                if (ValueFacts.hasFact(facts, .nullish)) return true;
+                if (ValueFacts.hasFact(facts, .any_structural_value) and !ValueFacts.hasFact(facts, .complex)) {
+                    const left = nodes.at(l);
+                    switch (left.kind) {
+                        .identifier => {},
+                        .array_literal_expression, .object_literal_expression => return false,
+                        else => return true,
                     }
+                    const sym_ref = self.file.binder.getSymbol(l) orelse return true;
+                    if (try self.hasEscapedBeforeExp(sym_ref, exp)) return true;
+                    return false;
                 }
                 return true;
             },
@@ -2670,15 +3283,19 @@ const ReferenceCollector = struct {
                 return self.hasEffects(unwrapRef(n));
             },
             .return_statement => {
-                if (maybeUnwrapRef(n)) |r| {
-                    return self.hasEffects(r);
-                }
-                return false;
+                return true;
             },
             .block => {
                 var statements_iter = NodeIterator.init(nodes, maybeUnwrapRef(n) orelse 0);
                 while (statements_iter.nextRef()) |s_ref| {
                     if (try self.hasEffects(s_ref)) return true;
+                }
+                return false;
+            },
+            .array_literal_expression, .object_literal_expression => {
+                var iter = NodeIterator.init(nodes, maybeUnwrapRef(n) orelse 0);
+                while (iter.nextRef()) |r| {
+                    if (try self.hasEffects(r)) return true;
                 }
                 return false;
             },
@@ -2742,6 +3359,7 @@ const ReferenceCollector = struct {
                 }
                 return false;
             },
+            .start => return false, // nil node
             else => return true, // assume effects by default
         }
     }
@@ -2770,10 +3388,42 @@ const JsCodeReducer = struct {
     symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef),
     simple_reduced_structures: std.AutoHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
     parent: NodeRef = 0,
+    did_change: bool = false,
+    pass_count: u32 = 0,
 
     fn replace(self: *@This(), from: NodeRef, to: NodeRef) !void {
-        self.nodes.at(to).next = self.nodes.at(from).next;
+        const prior = self.replacements.get(from) orelse from;
+        self.nodes.at(to).next = self.nodes.at(prior).next;
         try self.replacements.put(from, to);
+        self.did_change = true;
+    }
+
+    fn replaceWithList(self: *@This(), from: NodeRef, to: NodeRef, tail: NodeRef) !void {
+        std.debug.assert(self.nodes.at(tail).next == 0);
+        self.nodes.at(tail).next = self.nodes.at(from).next;
+        try self.replacements.put(from, to);
+        self.did_change = true;
+    }
+
+    fn remove(self: *@This(), ref: NodeRef) !void {
+        // const n = self.nodes.at(ref);
+        const replacement = try self.factory.createNotEmittedStatement(); // TODO: add to factory
+        const prior = self.replacements.get(ref) orelse ref;
+        self.nodes.at(replacement).next = self.nodes.at(prior).next;
+        try self.replacements.put(ref, replacement);
+        self.did_change = true;
+    }
+
+    fn clone(self: *@This(), ref: NodeRef) !NodeRef {
+        const replacement = self.replacements.get(ref) orelse ref;
+        return self.factory.cloneNodeRef(replacement);
+    }
+
+    fn visitChildren(self: *@This(), ref: NodeRef) !void {
+        const save_parent = self.parent;
+        self.parent = ref;
+        try parser.forEachChild(self.nodes, self.nodes.at(ref), self);
+        self.parent = save_parent;
     }
 
     fn reduceIfStatement(self: *@This(), node: *const parser.AstNode, ref: NodeRef, is_true: bool) !void {
@@ -2781,16 +3431,13 @@ const JsCodeReducer = struct {
         const then_ref = getRight(node);
         const else_ref = node.len;
         if (!is_true) {
-            const r = if (else_ref != 0) try self.factory.cloneNodeRef(else_ref) else try self.factory.createNotEmittedStatement();
-            self.nodes.at(r).next = node.next;
-            try self.replacements.put(ref, r);
-            if (else_ref != 0) return parser.forEachChild(self.nodes, self.nodes.at(else_ref), self);
+            const r = if (else_ref != 0) try self.clone(else_ref) else try self.factory.createNotEmittedStatement();
+            try self.replace(ref, r);
+            if (else_ref != 0) try self.visitChildren(else_ref);
             return;
         }
-        const c = try self.factory.cloneNodeRef(then_ref);
-        self.nodes.at(c).next = node.next;
-        try self.replacements.put(ref, c);
-        return parser.forEachChild(self.nodes, self.nodes.at(then_ref), self);
+        try self.replace(ref, try self.clone(then_ref));
+        return try self.visitChildren(then_ref);
     }
 
     fn reduceStructures(self: *@This()) !void {
@@ -2798,19 +3445,30 @@ const JsCodeReducer = struct {
         while (symIter.next()) |_s| {
             const s = _s.*;
             const sym = self.refs.file.binder.symbols.at(s);
-            if (sym.hasFlag(.@"const")) continue;
+            const is_const = sym.hasFlag(.@"const");
+            if (sym.declaration == 0) continue; // TODO
+            if (sym.declaration != 0) {
+                const decl = self.nodes.at(sym.declaration);
+                switch (decl.kind) {
+                    .variable_declaration => {
+                        const stmt_ref = self.refs.parents.get(sym.declaration) orelse continue;
+                        if (self.nodes.at(stmt_ref).kind != .variable_statement) continue;
+                    },
+                    else => continue,
+                }
+            }
             const exp = self.refs.getSingularAccessExp(s) orelse continue;
             const exp_node = self.refs.file.ast.nodes.at(exp);
             if (exp_node.kind != .numeric_literal) continue;
             var iter = self.refs.getReferenceIterator(s) orelse continue;
             while (iter.next()) |x| {
                 const t = iter.getAccessExpressionLeft(x) orelse unreachable;
-                const c = try self.factory.cloneNodeRef(t);
+                const c = try self.clone(t);
                 const p = iter.parentRef(t) orelse unreachable;
-                self.nodes.at(c).next = self.nodes.at(p).next;
-                try self.replacements.put(p, c);
+                try self.replace(p, c);
             }
             if (!sym.hasFlag(.late_bound)) {
+                if (is_const) sym.removeFlag(.@"const");
                 const v = parser.getNumber(exp_node);
                 const decl = self.nodes.at(sym.declaration);
                 const init = getRight(decl);
@@ -2822,10 +3480,18 @@ const JsCodeReducer = struct {
                 var element_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(literal) orelse 0);
                 while (element_iter.nextRef()) |x| {
                     if (i == @as(u32, @intFromFloat(v))) {
-                        try self.replacements.put(init, x);
+                        try self.replace(init, try self.clone(x));
                         break;
                     }
                     i += 1;
+                }
+                if (is_const) {
+                    const stmt_ref = self.refs.parents.get(sym.declaration) orelse unreachable;
+                    std.debug.assert(self.nodes.at(stmt_ref).kind == .variable_statement);
+                    const c = try self.clone(stmt_ref);
+                    self.nodes.at(c).flags &= ~@intFromEnum(parser.NodeFlags.@"const");
+                    self.nodes.at(c).flags |= @intFromEnum(parser.NodeFlags.let);
+                    try self.replace(stmt_ref, c);
                 }
             } else {
                 try self.simple_reduced_structures.put(getAllocator(), s, exp);
@@ -2833,12 +3499,132 @@ const JsCodeReducer = struct {
         }
     }
 
+    fn removeUnused(self: *@This()) !void {
+        var symIter = self.refs.references.keyIterator();
+        while (symIter.next()) |s_ptr| {
+            const s = s_ptr.*;
+            const sym = self.refs.file.binder.symbols.at(s);
+            if (sym.hasFlag(.late_bound)) continue;
+
+            const decl_ref = sym.declaration;
+            const decl = self.nodes.at(decl_ref);
+
+            if (try self.refs.isUsed(s)) {
+                if (try self.refs.findEffectiveInitializer(s)) |res| {
+                    const exp = res[1];
+                    const initializer = getRight(decl);
+                    const stmt_info = self.refs.getScopeRef(res[0]) orelse unreachable;
+                    try self.remove(stmt_info[0]);
+
+                    if (try self.refs.hasEffects(initializer)) {
+                        // const p_ref = self.refs.parents.get(decl_ref) orelse unreachable;
+                        // if (self.nodes.at(p_ref).kind != .variable_statement) unreachable;
+                        // const has_one_child = self.nodes.at(unwrapRef(self.nodes.at(p_ref))).next == 0;
+                        // if (!has_one_child) unreachable;
+                        const c = try self.clone(decl_ref);
+                        const comma_exp = try self.factory.createParenthesizedExpression(
+                            try self.factory.createBinaryExpression(initializer, .comma_token, exp)
+                        );
+                        self.nodes.at(c).data = (@as(u64, comma_exp) << 32) | getLeft(decl);
+                        try self.replace(decl_ref, c);
+                        continue;
+                    }
+
+                    if (initializer == 0) {
+                        const c = try self.clone(decl_ref);
+                        self.nodes.at(c).data = (@as(u64, exp) << 32) | getLeft(decl);
+                        try self.replace(decl_ref, c);
+                    } else {
+                        try self.replace(initializer, try self.clone(exp));
+                    }
+                    continue;
+                }
+                if (self.did_change) continue; // FIXME: figure out why this affects opt
+                const p_ref = self.refs.parents.get(decl_ref) orelse continue;
+                if (self.nodes.at(p_ref).kind != .variable_statement) continue;
+                const has_one_child = self.nodes.at(unwrapRef(self.nodes.at(p_ref))).next == 0;
+                if (!has_one_child) continue;
+                if (try self.refs.findSingleInlineLocation(s)) |ref| {
+                    const init_ref = getRight(decl);
+                    const v = if (init_ref != 0) try self.factory.cloneNodeRef(init_ref) else try self.factory.createVoidZero();
+                    try self.remove(p_ref);
+                    // if (self.refs.getScopeRef(ref)) |x| {
+                    //     if (parser.getAssignmentExpFromStmt(self.nodes, x[0])) |z| blk: {
+                    //         const sy = self.refs.file.binder.getSymbol(getLeft(self.nodes.at(z))) orelse break :blk;
+                    //         if (s == sy) {
+                    //             try self.replace(z, v);
+                    //             continue;
+                    //         }
+                    //     }
+                    // }
+                    try self.replace(ref, v);
+                }
+                continue;
+            }
+
+            switch (decl.kind) {
+                .variable_declaration => {
+                    const p_ref = self.refs.parents.get(decl_ref) orelse continue;
+                    if (self.nodes.at(p_ref).kind != .variable_statement) continue;
+                    const has_one_child = self.nodes.at(unwrapRef(self.nodes.at(p_ref))).next == 0;
+                    if (!has_one_child) continue;
+                    try self.remove(p_ref);
+                },
+                else => continue,
+            }
+
+            var iter = self.refs.getReferenceIterator(s) orelse continue;
+            while (iter.next()) |r| {
+                // var rem: ?NodeRef = null;
+                // if (try self.hasEffects(getLeft(x[1]))) return true;
+                // if (x[2]) |v| {
+                //     if (try self.hasEffects(v)) return true;
+                // }
+                if (iter._getAssignmentNode(r)) |x| {
+                    if (iter.parentRef(x[0])) |p| {
+                        if (self.nodes.at(p).kind == .expression_statement) {
+                            try self.remove(p);
+                            continue;
+                        }
+                    }
+                    try self.replace(x[0], if (x[2]) |v| try self.clone(v) else return error.UnexpectedUnaryUsage);
+                    continue;
+                }
+                const loc = self.refs.getReferenceUsageLocation(r);
+                if (self.refs.parents.get(loc)) |p_ref| {
+                    if (self.nodes.at(p_ref).kind == .expression_statement) {
+                        try self.remove(p_ref);
+                    } else {
+                        std.debug.print("{?}\n",. {self.nodes.at(p_ref).kind});
+                    }
+                } else {
+                    std.debug.print("?? {s}\n",. {parser.getSlice(self.nodes.at(r), u8)});
+                    // try self.replace();
+                }
+            }
+        }
+    }
+
     pub fn reduce(self: *@This()) !void {
+        const start_time = if (comptime @import("builtin").target.isWasm()) 0 else std.time.microTimestamp();
         try self.reduceStructures();
-        try parser.forEachChild(self.nodes, self.nodes.at(self.refs.file.ast.start), self);
+        while (true) {
+            self.pass_count += 1;
+            try self.removeUnused();
+            try parser.forEachChild(self.nodes, self.nodes.at(self.refs.file.ast.start), self);
+            if (!self.did_change) break;
+            self.did_change = false;
+            try self.refs.commitInPlace(self.replacements, self.symbol_replacements);
+        }
+        const end_time = if (comptime @import("builtin").target.isWasm()) 0 else std.time.microTimestamp();
+        debugPrint("TOTAL PASSES: {}\n", .{self.pass_count});
+        debugPrint("TIME {d:.3}us\n", .{ end_time - start_time });
     }
 
     pub fn visit(self: *@This(), node: *const parser.AstNode, ref: NodeRef) anyerror!void {
+        if (self.replacements.get(ref)) |x| {
+            return self.visit(self.nodes.at(x), x);
+        }
         switch (node.kind) {
             .if_statement => {
                 const cond = getLeft(node);
@@ -2858,23 +3644,80 @@ const JsCodeReducer = struct {
                     }
                 }
             },
+            .variable_statement => {
+                const has_one_child = self.nodes.at(unwrapRef(node)).next == 0;
+                if (has_one_child) {
+                    const decl = self.nodes.at(unwrapRef(node));
+                    if (self.nodes.at(getLeft(decl)).kind == .identifier) {
+                        if (self.refs.file.binder.getSymbol(getLeft(decl))) |sym_ref| {
+                            if (!self.refs.references.contains(sym_ref) and (getRight(decl) == 0 or !try self.refs.hasEffects(getRight(decl)))) {
+                                return try self.remove(ref);
+                            }
+                        }
+                    }
+                }
+            },
+            .expression_statement => {
+                if (!try self.refs.hasEffects(ref)) {
+                    return try self.remove(ref);
+                }
+            },
             .block => {
-                const is_empty = maybeUnwrapRef(node) == null;
-                if (is_empty and self.parent != 0) {
-                    switch (self.nodes.at(self.parent).kind) {
+                const start = maybeUnwrapRef(node) orelse 0;
+                if (start == 0 and self.parent != 0) {
+                    const p = self.nodes.at(self.parent);
+                    switch (p.kind) {
                         .source_file, .block => {
-                            try self.replace(ref, try self.factory.createNotEmittedStatement());
+                            try self.remove(ref);
+                        },
+                        .if_statement, .while_statement => {
+                            // if/while (x) {} 
+                            if (getRight(p) == ref and (p.kind != .if_statement or p.len == 0)) {
+                                if (!try self.refs.hasEffects(getLeft(p))) {
+                                    try self.remove(self.parent);
+                                }
+                            }
                         },
                         else => {},
+                    }
+                }
+                // block merging
+                if (start != 0 and !self.did_change) blk: {
+                    if (self.refs.parents.get(ref)) |p_ref| {
+                        if (self.nodes.at(p_ref).kind == .labeled_statement) {
+                            break :blk;
+                        }
+                    }
+                    var iter = NodeIterator.init(self.nodes, start);
+                    var has_decl = false;
+                    var tail: NodeRef = 0;
+                    while (iter.nextRef()) |x| {
+                        switch (self.nodes.at(x).kind) {
+                            .class_declaration,
+                            .function_declaration,
+                            .variable_statement => {
+                                has_decl = true;
+                                break;
+                            },
+                            else => {
+                                tail = x;
+                            },
+                        }
+                    }
+                    if (!has_decl) {
+                        try self.visitChildren(ref);
+                        if (self.replacements.contains(tail) or self.replacements.contains(ref)) return;
+                        self.nodes.at(ref).flags |= @intFromEnum(parser.NodeFlags.reduce_block);
+                        const c = try self.clone(tail);
+                        try self.replace(tail, c);
+                        std.debug.assert(self.nodes.at(c).next == 0);
+                        self.nodes.at(c).next = node.next;
                     }
                 }
             },
             else => {},
         }
-        const save_parent = self.parent;
-        self.parent = ref;
-        try parser.forEachChild(self.nodes, node, self);
-        self.parent = save_parent;
+        try self.visitChildren(ref);
     }
 };
 

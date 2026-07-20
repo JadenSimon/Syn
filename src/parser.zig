@@ -515,7 +515,8 @@ pub const NodeFlags = enum(u22) {
     minus_readonly = (1 << 9) | (1 << 13),
     minus_optional = (1 << 10) | (1 << 17),
 
-    // upper two bits are reserved
+    // upper two bits are reserved for ephemeral usage
+    reduce_block = 1 << 21,
 };
 
 pub const StringFlags = enum(u20) {
@@ -7731,9 +7732,15 @@ pub fn isKeyword(kind: SyntaxKind) bool {
 
 pub fn isLeafNode(kind: SyntaxKind) bool {
     return switch (kind) {
+        .template_head, .template_middle, .template_tail => true,
+        .regular_expression_literal, .bigint_literal,
         .string_literal, .numeric_literal, .no_substitution_template_literal => true,
         .identifier, .private_identifier => true,
-        .empty_statement, .omitted_expression => true,
+        .empty_statement, .omitted_expression, .not_emitted_statement => true,
+        .verbatim_node => true,
+        .external_node => true,
+        .single_line_comment_trivia => true,
+        .jsx_text => true,
         else => isKeyword(kind),
     };
 }
@@ -8823,7 +8830,7 @@ pub const Symbol = struct {
 
     pub inline fn isImportedOrExported(this: *const Symbol) bool {
         const flags: u16 = @intFromEnum(SymbolFlags.imported) | @intFromEnum(SymbolFlags.exported);
-        return ((this.ordinal >> 16) & flags) == 0;
+        return ((this.ordinal >> 16) & flags) != 0;
     }
 
     pub inline fn isStrictlyLocal(this: *const Symbol) bool {
@@ -12102,6 +12109,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     try this.visitRef(unwrapRef(n));
                     this.print(")");
                 },
+                // FIXME: this can be a single "omitted node" with slot1 for subkind
                 .not_emitted_statement => {},
                 .omitted_expression => {}, // appears in expressions like `[,]`
                 .array_literal_expression => {
@@ -12372,6 +12380,9 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print("@");
                     try this.visitRef(unwrapRef(n));
                 },
+                // .comma_list_expression => {
+                //     try this._visitLinkedList(unwrapRef(n), "", "", ", ", false);      
+                // },
                 .semicolon_class_element => {
                     this.print(";");
                 },
