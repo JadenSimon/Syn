@@ -1097,9 +1097,67 @@ const ValueGraph = struct {
         this.values.nodes.at(values[values.len - 1]).next = 0;
         return values[0];
     }
+    
+    pub fn getListCount(this: *@This(), value_ref: ValueRef) !u32 {
+        const n = try this.getFollowedValue(value_ref);
+        std.debug.assert(n.kind == .array or n.kind == .object or n.kind == .computed);
+        var t = n.slot0;
+        var c: u32 = 0;
+        while (t != 0) {
+            c += 1;
+            t = this.getValue(t).next;
+        }
+        return c;
+    }
+
+    pub fn listToSlice(this: *@This(), value_ref: ValueRef, allocator: std.mem.Allocator) ![]const ValueRef {
+        const n = try this.getFollowedValue(value_ref);
+        std.debug.assert(n.kind == .array or n.kind == .object or n.kind == .computed);
+        var out = std.ArrayListUnmanaged(ValueRef){};
+        var t = n.slot0;
+        while (t != 0) {
+            try out.append(allocator, t);
+            t = this.getValue(t).next;
+        }
+        out.shrinkAndFree(allocator, out.items.len);
+        return out.items;
+    }
 
     pub fn createArrayFromItems(this: *@This(), items: []const ValueRef) !ValueRef {
         return this.createArray(try this.createList(items));
+    }
+
+    pub fn concatArraysAndDedupe(this: *@This(), a: ValueRef, b: ValueRef, mapping_dest: *std.AutoHashMap(u32, u32)) !ValueRef {
+        const stack_alloc = std.heap.stackFallback(64, getAllocator()).get();
+        const a_items = try this.listToSlice(a, stack_alloc);
+        defer stack_alloc.free(a_items);
+        const b_items = try this.listToSlice(b, stack_alloc);
+        defer stack_alloc.free(b_items);
+
+        var res = std.ArrayListUnmanaged(ValueRef){};
+        defer stack_alloc.free(res);
+        try res.ensureTotalCapacity(stack_alloc, a_items.len + b_items.len);
+        for (a_items) |x| {
+            res.appendAssumeCapacity(try this.cloneValue(x));
+        }
+
+        o: for (b_items, 0..) |x, j| {
+            const rx = try this.getFollowedValue(x);
+            for (a_items, 0..) |y, i| {
+                if (rx == try this.getFollowedValue(y)) {
+                    if (i != j) {
+                        try mapping_dest.put(@intCast(j), @intCast(i));
+                    }
+                    continue :o;
+                }
+            }
+            if (j != res.items.len) {
+                try mapping_dest.put(@intCast(j), @intCast(res.items.len));
+            }
+            res.appendAssumeCapacity(try this.cloneValue(x));
+        }
+
+        return this.createArray(try this.createList(res.items));
     }
 
     pub fn createObjectFromPairs(this: *@This(), pairs: []const [2]ValueRef) !ValueRef {
@@ -2321,12 +2379,21 @@ const ReferenceCollector = struct {
                         else if (slots[3] == old) ptr = &slots[3]
                         else unreachable;
                     },
-                    else => {
-                        for (2..8) |i| {
+                    else => outer: {
+                        for (2..7) |i| {
                             if (slots[i] == old) {
                                 ptr = &slots[i];
-                                break;
+                                break :outer;
                             }
+                        }
+                        if (comptime is_debug) {
+                            debugPrint("failed to find self ref in parent kind: {?} | self: {?}\n", .{p.kind, this.nodes.at(old).kind});
+                            debugPrint("  prev: {}\n", .{this.prev});
+                            debugPrint("  ref: {}\n  ---\n", .{old});
+                            for (2..7) |i| {
+                                debugPrint("  slot{}: {}\n", .{i, slots[i]});
+                            }
+                            unreachable;
                         }
                     },
                 }
@@ -2351,15 +2418,26 @@ const ReferenceCollector = struct {
                             return this.visit(this.nodes.at(x), x);
                         }
                     },
+                    .statement_list => {
+                        const start = unwrapRef(node);
+                        const next = node.next;
+                        this.replaceRef(ref, start);
+                        var r = start;
+                        while (r != 0) {
+                            const n = this.nodes.at(r);
+                            const u = n.next;
+                            try this.visit(n, r);
+                            if (u == 0) this.nodes.at(this.replacements.get(r) orelse r).next = next;
+                            r = u;
+                        }
+                        return;
+                    },
                     .not_emitted_statement => {
                         // have to simplify the tree for later passes
                         return this.replaceRef(ref, node.next);
                     },
-                    .block => {
-                        if (node.hasFlag(.reduce_block)) {
-                            this.replaceRef(ref, unwrapRef(node));
-                            return try parser.forEachChild(this.nodes, this.nodes.at(ref), this);
-                        }
+                    .variable_statement => {
+                        this.nodes.at(ref).extra_data = 0;
                     },
                     .variable_declaration => {
                         // we are stamping the relative decl order to these nodes as an optimization and must clear them here
@@ -2384,9 +2462,18 @@ const ReferenceCollector = struct {
             .replacements = replacements,
             .symbol_replacements = symbol_replacements,
         };
-        const start = self.file.ast.start;
+        var start = self.file.ast.start;
+        var new_start: NodeRef = 0;
+        if (replacements.get(start)) |r| {
+            new_start = r;
+            _ = replacements.swapRemove(start);
+        }
         std.debug.assert(!replacements.contains(start));
         try v.visit(self.file.ast.nodes.at(start), start);
+        if (new_start != 0) {
+            self.file.ast.start = new_start;
+            start = new_start;
+        }
         {
             const sym_count = self.file.binder.symbols.count();
             for (0..sym_count) |i| {
@@ -2453,6 +2540,11 @@ const ReferenceCollector = struct {
         if (node.kind == .variable_declaration) {
             self.decl_count += 1;
             self.file.ast.nodes.at(ref).extra_data2 = self.decl_count;
+        } else if (node.kind == .expression_statement and node.next != 0) {
+            const next = self.file.ast.nodes.at(node.next);
+            if (next.kind == .variable_statement) {
+                next.extra_data = 1; // used as a heuristic for choosing which statements _might_ reorder
+            }
         }
         try self.stack.append(getAllocator(), ref);
         defer {
@@ -2689,6 +2781,33 @@ const ReferenceCollector = struct {
         return false;
     }
 
+    pub fn isCaptured(self: *@This(), sym_ref: parser.SymbolRef) bool {
+        var iter = self.getReferenceIterator(sym_ref) orelse return false;
+        var decl_scope_ref = self.file.ast.start;
+        const sym = self.file.binder.symbols.at(sym_ref);
+        if (!sym.hasFlag(.late_bound)) {
+            if (self.getFnScopeInfo(sym.declaration)) |x| {
+                decl_scope_ref = x[1];
+            }
+        }
+        while (iter.next()) |r| {
+            const scope_info = self.getFnScopeInfo(r) orelse continue;
+            if (scope_info[1] != decl_scope_ref) return true;
+        }
+        return false;
+    }
+
+    pub fn isAllocation(self: *@This(), exp_ref: NodeRef) bool {
+        const exp = self.file.ast.nodes.at(exp_ref);
+        return switch (exp.kind) {
+            .await_expression,
+            .parenthesized_expression => self.isAllocation(unwrapRef(exp)),
+            .array_literal_expression, .object_literal_expression => true,
+            .arrow_function, .function_expression, .class_expression => true,
+            else => false,
+        };
+    }
+
     // this includes assignments
     fn isEscapePosition(self: *@This(), ref: NodeRef) bool {
         var c = ref;
@@ -2740,6 +2859,20 @@ const ReferenceCollector = struct {
             c = p_ref;
         }
         return null;
+    }
+
+    fn getFnScopeInfo(self: *@This(), ref: NodeRef) ?struct {NodeRef, NodeRef} {
+        var scope_info = self.getScopeRef(ref) orelse return null;
+        while (true) {
+            const scope = self.file.ast.nodes.at(scope_info[1]);
+            switch (scope.kind) {
+                .block, .if_statement, .for_statement, .for_in_statement, .for_of_statement, .while_statement, .switch_statement => {
+                    scope_info = self.getScopeRef(scope_info[1]) orelse return null;
+                },
+                else => break,
+            }
+        }
+        return .{scope_info[0], scope_info[1]};
     }
 
     pub fn hasEscapedBeforeExp(self: *@This(), sym_ref: parser.SymbolRef, exp_ref: NodeRef) !bool {
@@ -2849,6 +2982,26 @@ const ReferenceCollector = struct {
         return false;
     }
 
+    // always considers moving the initialization earlier in the same control flow label to be ideal
+    fn getSimpleDeclReorder(self: *@This(), node_ref: NodeRef) ?NodeRef {
+        const node = self.file.ast.nodes.at(node_ref);
+        switch (node.kind) {
+            .variable_declaration => {
+                // TODO:
+                const scope_info = self.getScopeRef(node_ref) orelse return null;
+                const scope_node = self.file.ast.nodes.at(scope_info[1]);
+                if (scope_node.kind != .block and scope_node.kind != .source_file) return null;
+                if (scope_node.hasFlag(.replaced)) return null;
+                if (unwrapRef(scope_node) == scope_info[0]) return null;
+                const init_ref = getRight(node);
+                if (init_ref != 0 and !self.hasSimpleDataDepsAfterDest(scope_info[1], init_ref)) return null;
+                return scope_info[1];
+            },
+            else => {},
+        }
+        return null;
+    }
+
     fn hasSimpleDataDepsAfterDest(self: *@This(), dest: NodeRef, exp_ref: NodeRef) bool {
         const exp = self.file.ast.nodes.at(exp_ref);
         return switch (exp.kind) {
@@ -2866,9 +3019,11 @@ const ReferenceCollector = struct {
                 }
                 return false;
             },
+            .property_access_expression,
             .postfix_unary_expression => self.hasSimpleDataDepsAfterDest(dest, getLeft(exp)),
             .property_assignment,
             .prefix_unary_expression => self.hasSimpleDataDepsAfterDest(dest, getRight(exp)),
+            .element_access_expression,
             .binary_expression => self.hasSimpleDataDepsAfterDest(dest, getLeft(exp)) and self.hasSimpleDataDepsAfterDest(dest, getRight(exp)),
             .parenthesized_expression,
             .shorthand_property_assignment,
@@ -2893,6 +3048,10 @@ const ReferenceCollector = struct {
         const decl = self.file.ast.nodes.at(sym.declaration);
         if (decl.kind != .variable_declaration) return null;
         if (try self.hasEffects(sym.declaration)) return null;
+        const decl_init = getRight(decl);
+        if (decl_init != 0 and self.isAllocation(decl_init)) {
+            if (self.isCaptured(sym_ref)) return null;
+        }
         const p_ref = self.parents.get(sym.declaration) orelse return null;
         const stmt = self.file.ast.nodes.at(p_ref);
         if (stmt.kind != .variable_statement) return null;
@@ -2904,6 +3063,7 @@ const ReferenceCollector = struct {
     pub fn findEffectiveInitializer(self: *@This(), sym_ref: parser.SymbolRef) !?struct {NodeRef,NodeRef} {
         const sym = self.file.binder.symbols.at(sym_ref);
         if (sym.hasFlag(.late_bound)) return null;
+        if (sym.hasFlag(.@"const")) return null;
         if (sym.declaration == 0) return null;
         const decl = self.file.ast.nodes.at(sym.declaration);
         if (decl.kind != .variable_declaration) return null;
@@ -3036,6 +3196,7 @@ const ReferenceCollector = struct {
             .null_keyword => .null,
             .undefined_keyword,
             .void_expression => .undefined,
+            .arrow_function, .function_expression => .function,
             else => .any,
         };
         return @intFromEnum(fact);
@@ -3147,6 +3308,9 @@ const ReferenceCollector = struct {
                     },
                     .less_than_token, .greater_than_token, .less_than_equals_token, .greater_than_equals_token => {
                         return ValueFacts.relates(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)), op);
+                    },
+                    .comma_token => {
+                        return self.getValueFacts(getRight(exp));
                     },
                     .plus_token => {
                         return ValueFacts.arithmeticAdd(try self.getValueFacts(getLeft(exp)), try self.getValueFacts(getRight(exp)));
@@ -3387,34 +3551,42 @@ const JsCodeReducer = struct {
     replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
     symbol_replacements: *std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef),
     simple_reduced_structures: std.AutoHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
+    reorders: std.AutoArrayHashMapUnmanaged(NodeRef, std.ArrayListUnmanaged(struct {u32, NodeRef})) = .{},
     parent: NodeRef = 0,
     did_change: bool = false,
     pass_count: u32 = 0,
 
     fn replace(self: *@This(), from: NodeRef, to: NodeRef) !void {
-        const prior = self.replacements.get(from) orelse from;
-        self.nodes.at(to).next = self.nodes.at(prior).next;
+        std.debug.assert(from != 0);
+        std.debug.assert(!self.replacements.contains(from));
+        const n = self.nodes.at(from);
+        n.flags |= @intFromEnum(parser.NodeFlags.replaced);
+        self.nodes.at(to).next = n.next;
         try self.replacements.put(from, to);
         self.did_change = true;
     }
 
-    fn replaceWithList(self: *@This(), from: NodeRef, to: NodeRef, tail: NodeRef) !void {
-        std.debug.assert(self.nodes.at(tail).next == 0);
-        self.nodes.at(tail).next = self.nodes.at(from).next;
-        try self.replacements.put(from, to);
+    fn placeBefore(self: *@This(), dest: NodeRef, src: NodeRef) !void {
+        std.debug.assert(dest != src);
+        const prior = self.replacements.get(dest) orelse dest;
+        self.nodes.at(src).next = prior;
+        try self.replacements.put(dest, src);
         self.did_change = true;
     }
 
     fn remove(self: *@This(), ref: NodeRef) !void {
-        // const n = self.nodes.at(ref);
+        std.debug.assert(ref != 0);
+        std.debug.assert(!self.replacements.contains(ref));
         const replacement = try self.factory.createNotEmittedStatement(); // TODO: add to factory
-        const prior = self.replacements.get(ref) orelse ref;
-        self.nodes.at(replacement).next = self.nodes.at(prior).next;
+        const n = self.nodes.at(ref);
+        n.flags |= @intFromEnum(parser.NodeFlags.replaced);
+        self.nodes.at(replacement).next = n.next;
         try self.replacements.put(ref, replacement);
         self.did_change = true;
     }
 
     fn clone(self: *@This(), ref: NodeRef) !NodeRef {
+        std.debug.assert(ref != 0);
         const replacement = self.replacements.get(ref) orelse ref;
         return self.factory.cloneNodeRef(replacement);
     }
@@ -3427,76 +3599,114 @@ const JsCodeReducer = struct {
     }
 
     fn reduceIfStatement(self: *@This(), node: *const parser.AstNode, ref: NodeRef, is_true: bool) !void {
-        // TODO: preserve effects and/or bail
+        var cond_stmt: NodeRef = 0;
+        if (try self.refs.hasEffects(getLeft(node))) {
+            cond_stmt = try self.factory.createExpressionStatement(getLeft(node));
+        }
         const then_ref = getRight(node);
         const else_ref = node.len;
         if (!is_true) {
             const r = if (else_ref != 0) try self.clone(else_ref) else try self.factory.createNotEmittedStatement();
             try self.replace(ref, r);
+            if (cond_stmt != 0) try self.placeBefore(ref, cond_stmt);
             if (else_ref != 0) try self.visitChildren(else_ref);
             return;
         }
         try self.replace(ref, try self.clone(then_ref));
+        if (cond_stmt != 0) try self.placeBefore(ref, cond_stmt);
         return try self.visitChildren(then_ref);
     }
 
-    fn reduceStructures(self: *@This()) !void {
-        var symIter = self.refs.references.keyIterator();
-        while (symIter.next()) |_s| {
-            const s = _s.*;
-            const sym = self.refs.file.binder.symbols.at(s);
-            const is_const = sym.hasFlag(.@"const");
-            if (sym.declaration == 0) continue; // TODO
-            if (sym.declaration != 0) {
-                const decl = self.nodes.at(sym.declaration);
-                switch (decl.kind) {
-                    .variable_declaration => {
-                        const stmt_ref = self.refs.parents.get(sym.declaration) orelse continue;
-                        if (self.nodes.at(stmt_ref).kind != .variable_statement) continue;
-                    },
-                    else => continue,
-                }
-            }
-            const exp = self.refs.getSingularAccessExp(s) orelse continue;
-            const exp_node = self.refs.file.ast.nodes.at(exp);
-            if (exp_node.kind != .numeric_literal) continue;
-            var iter = self.refs.getReferenceIterator(s) orelse continue;
-            while (iter.next()) |x| {
-                const t = iter.getAccessExpressionLeft(x) orelse unreachable;
-                const c = try self.clone(t);
-                const p = iter.parentRef(t) orelse unreachable;
-                try self.replace(p, c);
-            }
-            if (!sym.hasFlag(.late_bound)) {
-                if (is_const) sym.removeFlag(.@"const");
-                const v = parser.getNumber(exp_node);
-                const decl = self.nodes.at(sym.declaration);
-                const init = getRight(decl);
-                const literal = self.nodes.at(init);
-                if (literal.kind != .array_literal_expression) unreachable;
-                if (@round(v) != v) unreachable;
-                if (v < 0) unreachable;
-                var i: u32 = 0;
-                var element_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(literal) orelse 0);
-                while (element_iter.nextRef()) |x| {
-                    if (i == @as(u32, @intFromFloat(v))) {
-                        try self.replace(init, try self.clone(x));
-                        break;
-                    }
-                    i += 1;
-                }
-                if (is_const) {
-                    const stmt_ref = self.refs.parents.get(sym.declaration) orelse unreachable;
-                    std.debug.assert(self.nodes.at(stmt_ref).kind == .variable_statement);
-                    const c = try self.clone(stmt_ref);
-                    self.nodes.at(c).flags &= ~@intFromEnum(parser.NodeFlags.@"const");
-                    self.nodes.at(c).flags |= @intFromEnum(parser.NodeFlags.let);
-                    try self.replace(stmt_ref, c);
-                }
-            } else {
-                try self.simple_reduced_structures.put(getAllocator(), s, exp);
-            }
+    fn reduceSymStructures(self: *@This(), s: parser.SymbolRef) !bool {
+        const sym = self.refs.file.binder.symbols.at(s);
+        const is_const = sym.hasFlag(.@"const");
+        if (sym.declaration == 0) return false; // TODO
+        const exp = self.refs.getSingularAccessExp(s) orelse return false;
+        const exp_node = self.refs.file.ast.nodes.at(exp);
+        if (exp_node.kind != .numeric_literal) return false;
+        var iter = self.refs.getReferenceIterator(s) orelse return false;
+        while (iter.next()) |x| {
+            const t = iter.getAccessExpressionLeft(x) orelse unreachable;
+            const c = try self.clone(t);
+            const p = iter.parentRef(t) orelse unreachable;
+            try self.replace(p, c);
         }
+        if (!sym.hasFlag(.late_bound)) {
+            if (is_const) sym.removeFlag(.@"const");
+            const v = parser.getNumber(exp_node);
+            const decl = self.nodes.at(sym.declaration);
+            const init = getRight(decl);
+            const literal = self.nodes.at(init);
+            if (literal.kind != .array_literal_expression) unreachable;
+            if (@round(v) != v) unreachable;
+            if (v < 0) unreachable;
+            var i: u32 = 0;
+            var element_iter = NodeIterator.init(self.nodes, maybeUnwrapRef(literal) orelse 0);
+            while (element_iter.nextRef()) |x| {
+                if (i == @as(u32, @intFromFloat(v))) {
+                    try self.replace(init, try self.clone(x));
+                    break;
+                }
+                i += 1;
+            }
+            if (is_const) {
+                const stmt_ref = self.refs.parents.get(sym.declaration) orelse unreachable;
+                std.debug.assert(self.nodes.at(stmt_ref).kind == .variable_statement);
+                const c = try self.clone(stmt_ref);
+                self.nodes.at(c).flags &= ~@intFromEnum(parser.NodeFlags.@"const");
+                self.nodes.at(c).flags |= @intFromEnum(parser.NodeFlags.let);
+                try self.replace(stmt_ref, c);
+            }
+        } else {
+            try self.simple_reduced_structures.put(getAllocator(), s, exp);
+        }
+        return true;
+    } 
+
+    fn applyReorders(self: *@This()) !void {
+        var iter = self.reorders.iterator();
+        while (iter.next()) |x| {
+            defer x.value_ptr.clearAndFree(getAllocator());
+            std.debug.assert(x.value_ptr.items.len > 0);
+            const scope_ref = x.key_ptr.*;
+            const scope_node = self.nodes.at(scope_ref);
+            if (scope_node.hasFlag(.replaced)) continue; // bail
+            std.debug.assert(scope_node.kind == .block or scope_node.kind == .source_file);
+
+            const C = struct {
+                values: []struct {u32,NodeRef},
+                pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+                    return ctx.values[a_index][0] < ctx.values[b_index][0];
+                }
+                pub fn swap(ctx: @This(), a_index: usize, b_index: usize) void {
+                    const tmp = ctx.values[a_index];
+                    ctx.values[a_index] = ctx.values[b_index];
+                    ctx.values[b_index] = tmp;
+                }
+            };
+
+            std.mem.sortUnstableContext(0, x.value_ptr.items.len, C{
+                .values = x.value_ptr.items,
+            });
+
+            const head_ref = unwrapRef(scope_node);
+            const first_ref = x.value_ptr.items[0][1];
+            std.debug.assert(head_ref != first_ref);
+            var h = try self.clone(first_ref);
+            try self.remove(first_ref);
+            const scope_clone = try self.clone(scope_ref);
+            self.nodes.at(scope_clone).data = h;
+            for (x.value_ptr.items[1..]) |t| {
+                const r = t[1];
+                const c = try self.clone(r);
+                try self.remove(r);
+                self.nodes.at(h).next = c;
+                h = c;
+            }
+            self.nodes.at(h).next = head_ref;
+            try self.replace(scope_ref, scope_clone);
+        }
+        self.reorders.clearRetainingCapacity();
     }
 
     fn removeUnused(self: *@This()) !void {
@@ -3504,7 +3714,7 @@ const JsCodeReducer = struct {
         while (symIter.next()) |s_ptr| {
             const s = s_ptr.*;
             const sym = self.refs.file.binder.symbols.at(s);
-            if (sym.hasFlag(.late_bound)) continue;
+            if (sym.hasFlag(.late_bound) or sym.hasFlag(.parameter)) continue;
 
             const decl_ref = sym.declaration;
             const decl = self.nodes.at(decl_ref);
@@ -3539,25 +3749,29 @@ const JsCodeReducer = struct {
                     }
                     continue;
                 }
-                if (self.did_change) continue; // FIXME: figure out why this affects opt
                 const p_ref = self.refs.parents.get(decl_ref) orelse continue;
-                if (self.nodes.at(p_ref).kind != .variable_statement) continue;
-                const has_one_child = self.nodes.at(unwrapRef(self.nodes.at(p_ref))).next == 0;
+                const p_node = self.nodes.at(p_ref);
+                if (p_node.kind != .variable_statement) continue;
+                if (try self.reduceSymStructures(s)) continue;
+                const has_one_child = self.nodes.at(unwrapRef(p_node)).next == 0;
                 if (!has_one_child) continue;
+                if (p_node.extra_data == 1) {
+                    if (self.refs.getSimpleDeclReorder(decl_ref)) |dst| {
+                        const entry = try self.reorders.getOrPut(getAllocator(), dst);
+                        if (!entry.found_existing) {
+                            entry.value_ptr.* = .{};
+                        }
+                        try entry.value_ptr.append(getAllocator(), .{decl.extra_data2, p_ref});
+                        continue;
+                    }
+                }
+                if (p_node.hasFlag(.replaced)) continue;
                 if (try self.refs.findSingleInlineLocation(s)) |ref| {
                     const init_ref = getRight(decl);
                     const v = if (init_ref != 0) try self.factory.cloneNodeRef(init_ref) else try self.factory.createVoidZero();
                     try self.remove(p_ref);
-                    // if (self.refs.getScopeRef(ref)) |x| {
-                    //     if (parser.getAssignmentExpFromStmt(self.nodes, x[0])) |z| blk: {
-                    //         const sy = self.refs.file.binder.getSymbol(getLeft(self.nodes.at(z))) orelse break :blk;
-                    //         if (s == sy) {
-                    //             try self.replace(z, v);
-                    //             continue;
-                    //         }
-                    //     }
-                    // }
                     try self.replace(ref, v);
+                    continue;
                 }
                 continue;
             }
@@ -3569,6 +3783,9 @@ const JsCodeReducer = struct {
                     const has_one_child = self.nodes.at(unwrapRef(self.nodes.at(p_ref))).next == 0;
                     if (!has_one_child) continue;
                     try self.remove(p_ref);
+                },
+                .function_declaration => {
+                    try self.remove(decl_ref);
                 },
                 else => continue,
             }
@@ -3607,11 +3824,11 @@ const JsCodeReducer = struct {
 
     pub fn reduce(self: *@This()) !void {
         const start_time = if (comptime @import("builtin").target.isWasm()) 0 else std.time.microTimestamp();
-        try self.reduceStructures();
         while (true) {
             self.pass_count += 1;
             try self.removeUnused();
             try parser.forEachChild(self.nodes, self.nodes.at(self.refs.file.ast.start), self);
+            try self.applyReorders();
             if (!self.did_change) break;
             self.did_change = false;
             try self.refs.commitInPlace(self.replacements, self.symbol_replacements);
@@ -3634,13 +3851,29 @@ const JsCodeReducer = struct {
                 }
             },
             .call_expression => {
-                if (try tryInlineIife(self.refs, getLeft(node), getRight(node), self.symbol_replacements)) |x| {
+                var subject_ref = getLeft(node);
+                if (self.refs.file.binder.getSymbol(subject_ref)) |sym_ref| {
+                    const sym = self.refs.file.binder.symbols.at(sym_ref);
+                    if (!sym.hasFlag(.late_bound) and self.refs.isUsedExactlyOnce(sym_ref) and !self.nodes.at(sym.declaration).hasFlag(.replaced)) {
+                        subject_ref = sym.declaration;
+                    }
+                }
+                if (try tryInlineIife(self.refs, subject_ref, getRight(node), self.symbol_replacements)) |x| {
                     // XXX: currently won't detect certain statement parents e.g. `if (cond) (() => {})();
                     switch (self.nodes.at(self.parent).kind) {
                         .source_file, .block, .start => {
                             try self.replace(ref, try self.factory.createExpressionStatement(x));
                         },
                         else => try self.replace(ref, x),
+                    }
+                }
+            },
+            .function_declaration => {
+                if (!node.hasFlag(.@"export")) {
+                    if (self.refs.file.binder.getSymbol(getLeft(node))) |sr| {
+                        if (!self.refs.references.contains(sr) and !node.hasFlag(.replaced)) {
+                            return try self.remove(ref);
+                        }
                     }
                 }
             },
@@ -3662,19 +3895,20 @@ const JsCodeReducer = struct {
                     return try self.remove(ref);
                 }
             },
-            .block => {
+            .block => b: {
+                if (self.reorders.contains(ref)) break :b;
                 const start = maybeUnwrapRef(node) orelse 0;
                 if (start == 0 and self.parent != 0) {
                     const p = self.nodes.at(self.parent);
                     switch (p.kind) {
                         .source_file, .block => {
-                            try self.remove(ref);
+                            return try self.remove(ref);
                         },
                         .if_statement, .while_statement => {
                             // if/while (x) {} 
-                            if (getRight(p) == ref and (p.kind != .if_statement or p.len == 0)) {
+                            if (getRight(p) == ref and (p.kind != .if_statement or p.len == 0) and !self.replacements.contains(self.parent)) {
                                 if (!try self.refs.hasEffects(getLeft(p))) {
-                                    try self.remove(self.parent);
+                                    return try self.remove(self.parent);
                                 }
                             }
                         },
@@ -3682,10 +3916,14 @@ const JsCodeReducer = struct {
                     }
                 }
                 // block merging
-                if (start != 0 and !self.did_change) blk: {
+                if (start != 0) {
                     if (self.refs.parents.get(ref)) |p_ref| {
-                        if (self.nodes.at(p_ref).kind == .labeled_statement) {
-                            break :blk;
+                        const p = self.nodes.at(p_ref);
+                        if (p.kind != .block and p.kind != .source_file) {
+                            break :b;
+                        } 
+                        if (p.hasFlag(.replaced)) {
+                            break :b;
                         }
                     }
                     var iter = NodeIterator.init(self.nodes, start);
@@ -3706,12 +3944,15 @@ const JsCodeReducer = struct {
                     }
                     if (!has_decl) {
                         try self.visitChildren(ref);
-                        if (self.replacements.contains(tail) or self.replacements.contains(ref)) return;
-                        self.nodes.at(ref).flags |= @intFromEnum(parser.NodeFlags.reduce_block);
-                        const c = try self.clone(tail);
-                        try self.replace(tail, c);
-                        std.debug.assert(self.nodes.at(c).next == 0);
-                        self.nodes.at(c).next = node.next;
+                        if (self.replacements.contains(tail) or self.replacements.contains(ref) or self.replacements.contains(start)) return;
+                        if (start == tail) {
+                            const c = try self.clone(tail);
+                            try self.replace(ref, c);
+                            return;
+                        }
+                        const list = try self.factory.createStatementList(start);
+                        try self.replace(ref, list);
+                        return;
                     }
                 }
             },
@@ -4430,15 +4671,134 @@ fn dceWalkStatements(
     return changed;
 }
 
+fn skipToDollarDigit(text_: []const u8) ?u32 {
+    // const strings =struct {
+    //     pub const ascii_vector_size = 16;
+    //     pub const AsciiVector = @Vector(ascii_vector_size, u8);
+    //     pub const AsciiVectorU1 = @Vector(ascii_vector_size, u1);
+    // };
+    // var text = text_;
+    // const dollar: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '$'));
+    // const backslash: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '\\'));
+    // const digit_zero: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '0'));
+    // const digit_nine: @Vector(strings.ascii_vector_size, u8) = @splat(@as(u8, '9'));
+    // const V1x16 = strings.AsciiVectorU1;
+
+    // const text_end_len = text.len & ~(@as(usize, strings.ascii_vector_size*2) - 1);
+
+    // const text_end_ptr = text.ptr + text_end_len;
+
+    // while (text_end_ptr != text.ptr) {
+    //     const prefix: strings.AsciiVector = text.ptr[0..strings.ascii_vector_size].*;
+    //     const vec: strings.AsciiVector = text.ptr[1..strings.ascii_vector_size].*;
+    //     const suffix: strings.AsciiVector = text.ptr[2..strings.ascii_vector_size].*;
+
+    //     const is_dollar = @as(V1x16, @bitCast(vec == dollar));
+    //     const not_backslash = @as(V1x16, @bitCast(prefix != backslash));
+    //     const any_digit = @as(V1x16, @bitCast(suffix >= digit_zero)) & @as(V1x16, @bitCast(vec <= digit_nine));
+
+    //     const matches = not_backslash & is_dollar & any_digit;
+
+    //     if (@reduce(.Max, matches) > 0) {
+    //         const first = @ctz(@as(u16, @bitCast(matches)));
+    //         return @as(u32, @truncate(first + (@intFromPtr(text.ptr) - @intFromPtr(text_.ptr))));
+    //     }
+
+    //     text.ptr += strings.ascii_vector_size;
+    // }
+
+    // var i: u32 = text.len - text_end_len;
+    const text = text_;
+    var i: u32 = 0;
+    while (i < text.len-1) {
+        switch (text[i]) {
+            '\\' => {
+                i += 1;
+            },
+            '$' => switch (text[i+1]) {
+                '0'...'9' => return i,
+                else => {},
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    return null;
+}
+
+fn escapeJsComputationSubject(allocator: std.mem.Allocator, str: []const u8, count: *u32) !?[]const u8 {
+    var pos = skipToDollarDigit(str) orelse return null;
+    var out = std.ArrayList(u8).init(allocator);
+    try out.ensureTotalCapacity(str.len * 2);
+    out.appendSliceAssumeCapacity(str[0..pos]);
+    out.appendSliceAssumeCapacity("$$");
+    var i = pos+1;
+    count.* += 1;
+    while (i < str.len) {
+        pos = i + (skipToDollarDigit(str[i..]) orelse break);
+        out.appendSliceAssumeCapacity(str[i..pos]);
+        out.appendSliceAssumeCapacity("$$");
+        i = pos+1;
+        count.* += 1;
+    }
+    out.appendSliceAssumeCapacity(str[i..]);
+    out.shrinkAndFree(out.items.len);
+    return out.items;
+}
+
+fn unescapeJsComputationSubject(allocator: std.mem.Allocator, str: []const u8, count: u32) ![]const u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    try out.ensureTotalCapacity(str.len - count);
+    var i: u32 = 0;
+    while (i < str.len) {
+        const pos = i + (skipToDollarDigit(str[i..]) orelse break);
+        if (pos != 0 and str[pos-1] == '$') {
+            out.appendSliceAssumeCapacity(str[i..pos]);
+        } else {
+            out.appendSliceAssumeCapacity(str[i..pos+1]);
+        }
+        i = pos+1;
+    }
+    out.appendSliceAssumeCapacity(str[i..]);
+    return out.items;
+}
+
+pub fn fmtOrdinal(ordinal: u32, buf: []u8, include_dollar: bool) []const u8 {
+    var c: u32 = 0;
+    if (include_dollar) {
+        buf[0] = '$';
+        c += 1;
+    }
+    var n = ordinal;
+    while (n > 0) {
+        const rem: u8 = @intCast(@rem(n, 10));
+        n = n / 10;
+        buf[c] = '0' + rem;
+        c += 1;
+    }
+    if (c == 0 or (include_dollar and c == 1)) {
+        buf[c] = '0';
+        c += 1;
+    }
+    return buf[0..c];
+}
+
 // used to normalize some stuff and manage analysis state
 const JsComputation = struct {
     file: *parser.ParsedFile = undefined,
     reference_collector: ?*ReferenceCollector = null,
     is_exp: bool = true,
+    is_many: bool = false,
     is_implicit_iife: bool = false,
+    has_free_variables: bool = false,
+    has_declarations: ?bool = null,
+    template_escape_count: u32 = 0,
     root_node: NodeRef = undefined,
     symbol_replacements: std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
     
+    input_value_ref: ValueRef = 0,
+
     // you can represent the "current execution environment" as an explicit value (as a computation or opaque)
     // then, you thread this value into all "foreign" calls, including known subjects that depend on the execution env transitively
     inferred_order: u32 = 0,
@@ -4454,11 +4814,13 @@ const JsComputation = struct {
         const last = source[source.len-1];
         if (last == ';') {
             this.is_exp = false;
+            this.has_free_variables = true;
             this.file = try parser.ParsedFile.createFromBuffer(source[0..source.len-1], null, false, null);
         } else if (first == '(' and last == ')') {
             this.is_implicit_iife = true;
             this.file = try parser.ParsedFile.createFromExpression(source, null);
         } else {
+            this.has_free_variables = true;
             this.file = try parser.ParsedFile.createFromExpression(source, null);
         }
         var root_node = unwrapRef(this.file.ast.nodes.at(this.file.ast.start));
@@ -4467,6 +4829,9 @@ const JsComputation = struct {
         }
         if (this.is_exp and this.file.ast.nodes.at(root_node).kind == .parenthesized_expression) {
             root_node = unwrapRef(this.file.ast.nodes.at(root_node));
+        }
+        if (!this.is_exp and this.file.ast.nodes.at(root_node).next != 0) {
+            this.is_many = true;
         }
         this.root_node = root_node;
         return this;
@@ -4488,25 +4853,9 @@ const JsComputation = struct {
         return this.reference_collector.?;        
     }
 
-    fn fmtOrdinal(ordinal: u32, buf: []u8) []const u8 {
-        var c: u32 = 0;
-        var n = ordinal;
-        while (n > 0) {
-            const rem: u8 = @intCast(@rem(n, 10));
-            n = n / 10;
-            buf[c] = '0' + rem;
-            c += 1;
-        }
-        if (c == 0) {
-            buf[0] = '0';
-            c += 1;
-        }
-        return buf[0..c];
-    }
-
     pub fn findFreeVariable(this: *@This(), ordinal: u32) ?parser.SymbolRef {
         var buf: [16]u8 = undefined;
-        const suffix = fmtOrdinal(ordinal, &buf);
+        const suffix = fmtOrdinal(ordinal, &buf, false);
         for (this.file.binder.unbound_symbols.values()) |x| {
             const sym = this.file.binder.symbols.at(x);
             const binding = this.file.ast.nodes.at(sym.binding);
@@ -4519,24 +4868,21 @@ const JsComputation = struct {
         return null;
     }
 
+    pub fn getFreeVariableOrdinal(this: *@This(), sym_ref: parser.SymbolRef) !u32 {
+        const sym = this.file.binder.symbols.at(sym_ref);
+        const binding = this.file.ast.nodes.at(sym.binding);
+        std.debug.assert(binding.kind == .identifier);
+        const text = parser.getSlice(binding, u8);
+        if (text[0] != '$' or text.len == 1 or text[1] == '$') return error.NotAFreeVariable;
+        return std.fmt.parseInt(u32, text[1..], 10);
+    }
+
     pub fn inlineValue(this: *@This(), symbol_ref: parser.SymbolRef, graph: *ValueGraph, value_ref: ValueRef) !bool {
         const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
         const literal = try graph.valueToParseNode(value_ref, factory) orelse return false;
         try this.symbol_replacements.put(getAllocator(), symbol_ref, literal);
         return true;
     }
-
-    // pub fn inlinePartialInput(this: *@This(), graph: *ValueGraph, value_ref: ValueRef) !?ValueRef {
-    //     const val = try graph.getFollowedValue(value_ref);
-    //     const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
-    //     const literal = try graph.valueToParseNode(value_ref, factory) orelse return false;
-    //     try this.symbol_replacements.put(getAllocator(), symbol_ref, literal);
-    //     return true;
-    // }
-
-    // pub fn eval(this: *@This(), graph: *ValueGraph, input: ValueRef) anyerror!?ValueRef {
-        
-    // }
 
     pub fn simplify(this: *@This(), graph: *ValueGraph, input: ValueRef) !?ValueRef {
         const refs = try this.getReferenceCollector();
@@ -4587,10 +4933,96 @@ const JsComputation = struct {
         return try graph.createString(res.contents);
     }
 
-    pub fn mergeWith(this: *@This()) !?*JsComputation {
-        _ = this;
-        unreachable;
+    fn isBlock(this: *@This()) bool {
+        return !this.is_exp and !this.is_many and this.file.ast.nodes.at(this.root_node).kind == .block;
     }
+
+    pub fn hasDeclarations(this: *@This()) bool {
+        if (this.is_exp) return false;
+        if (this.has_declarations) |v| return v;
+        const start = if (this.isBlock()) unwrapRef(this.file.ast.nodes.at(this.root_node)) else unwrapRef(this.file.ast.nodes.at(this.file.ast.start));
+        var iter = NodeIterator.init(&this.file.ast.nodes, start);
+        this.has_declarations = true;
+        while (iter.next()) |s| {
+            switch (s.kind) {
+                .variable_statement, .function_declaration, .class_declaration => return true,
+                else => {},
+            }
+        }
+        this.has_declarations = false;
+        return false;
+    }
+
+    // this computation comes _before_ other
+    pub fn mergeWith(this: *@This(), graph: *ValueGraph, other: *JsComputation) !ValueRef {
+        const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
+        var node: NodeRef = undefined;
+        var ext_node: NodeRef = undefined;
+        if (this.is_exp and other.is_exp) {
+            ext_node = try factory.createExternalNode(&other.file.ast,other.root_node);
+            node = try factory.createBinaryExpression(this.root_node, .comma_token, ext_node);
+            node = try factory.createParenthesizedExpression(node);
+        } else if (!this.is_exp) {
+            node = if (this.isBlock()) this.root_node else this.file.ast.start;
+            var other_node = other.root_node;
+            if (!this.hasDeclarations() or !other.hasDeclarations()) {
+                if (other.isBlock()) other_node = unwrapRef(other.file.ast.nodes.at(other_node));
+                other_node = try factory.createExternalNode(&other.file.ast,other_node);
+                ext_node = other_node;
+                if (other.is_exp) other_node = try factory.createExpressionStatement(other_node);
+            } else {
+                other_node = try factory.createExternalNode(&other.file.ast,other_node);
+                ext_node = other_node;
+                if (!other.isBlock()) other_node = try factory.createBlock(other_node);
+            }
+            try factory.appendAsChild(node, other_node);
+        } else {
+            const self_node = try factory.createExpressionStatement(this.root_node);
+            ext_node = try factory.createExternalNode(&other.file.ast,if (other.isBlock()) other.root_node else other.file.ast.start);
+            node = try factory.nodes.push(.{
+                .kind = .source_file,
+                .data = self_node,
+                .next = ext_node,
+            });
+        }
+
+        var variable_mappings = std.AutoHashMap(u32, u32).init(getAllocator());
+        defer variable_mappings.deinit();
+
+        const new_input = try graph.concatArraysAndDedupe(this.input_value_ref, other.input_value_ref, &variable_mappings);
+
+        var other_symbols = &other.symbol_replacements;
+        var iter = variable_mappings.iterator();
+        const other_factory = parser.Factory{ .nodes = &other.file.ast.nodes };
+        while (iter.next()) |entry| {
+            if (other.findFreeVariable(entry.key_ptr.*)) |sym_ref| {
+                var buf: [16]u8 = undefined;
+                const ident = try other_factory.createIdentifier(fmtOrdinal(entry.value_ptr.*, &buf, true));
+                try other_symbols.put(getAllocator(), sym_ref, ident);
+            }
+        }
+
+        {
+            const external_node = factory.nodes.at(ext_node);
+            external_node.extra_data = @truncate(@intFromPtr(other_symbols));
+            if (!comptime @import("builtin").target.isWasm()) external_node.extra_data2 = @truncate(@intFromPtr(other_symbols) >> 32);
+        }
+
+        var d = this.file.ast;
+        d.nodes = factory.nodes.*;
+        d.start = node;
+        const res = try parser.printWithOptions(d, .{
+            .symbol_replacements = &this.symbol_replacements,
+        });
+
+        const subj = try graph.createString(res.contents);
+
+        return graph.createComputed(subj, new_input);
+    }
+
+    // pub fn serialize(this: *@This()) ![]const u8 {
+
+    // }
 };
 
 fn createCommaExpressionFromList(
@@ -4649,7 +5081,7 @@ fn tryInlineIife(
     }
     const params_start = switch (n.kind) {
         .arrow_function => getLeft(n),
-        .function_expression => getRight(n),
+        .function_expression, .function_declaration => getRight(n),
         else => return null,
     };
     if (n.hasFlag(.@"async")) return null;
@@ -4676,9 +5108,26 @@ fn tryInlineIife(
     }
     const body_ref = switch (n.kind) {
         .arrow_function => getRight(n),
-        .function_expression => n.len,
+        .function_expression, .function_declaration => n.len,
         else => return null,
     };
+    var args_iter = NodeIterator.init(nodes, arg_start);
+    // we'd have to show the remainder either has no effects or make a block. can't do comma exp w/o changing order.
+    if (args_iter.computeLength() != param_syms.items.len) return null;
+    // we won't inline if an arg has effects and is captured
+    var i: u32 = 0;
+    while (args_iter.nextRef()) |x| {
+        if (nodes.at(x).hasFlag(.replaced)) return null;
+        if (try refs.hasEffects(x) or refs.isAllocation(x)) {
+            const sym_ref = param_syms.items[i];
+            if (refs.isCaptured(sym_ref)) {
+                return null;
+            }
+        }
+        i += 1;
+    }
+    args_iter.ref = arg_start;
+
     std.debug.assert(body_ref != 0);
     var body_exp_ref = body_ref;
     const body = nodes.at(body_ref);
@@ -4706,9 +5155,6 @@ fn tryInlineIife(
         }
     } // else: concise body
     
-    var args_iter = NodeIterator.init(nodes, arg_start);
-    // we'd have to show the remainder either has no effects or make a block. can't do comma exp w/o changing order.
-    if (args_iter.computeLength() != param_syms.items.len) return null;
     // we cannot bail out past this point.
     var count: u32 = 0;
     while (args_iter.nextRef()) |x| {

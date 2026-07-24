@@ -615,7 +615,10 @@ pub const ValueEmitter = struct {
                     try self.stack.append(self.alloc, .{ .array = .{} });
                 } else {
                     const frame = self.stack.pop();
-                    const ref = try self.nodes.push(.{ .kind = .array, .slot0 = frame.array.head });
+                    const ref = try self.nodes.push(.{ 
+                        .kind = .array, 
+                        .slot0 = frame.array.head 
+                    });
                     try self.pushValue(ref);
                 }
             },

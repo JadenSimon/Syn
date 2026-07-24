@@ -386,11 +386,12 @@ pub const SyntaxKind = enum(u10) {
     jsx_method_attribute = 714,
     public_declaration = 715,
 
+    synthetic_node = 999, // general synthetic node. We try to use a single kind to avoid bloat
     // Used to stitch multiple ASTs together
     // Node contains a pointer to `AstData` and the start node
     external_node = 1000,
     verbatim_node = 1001, // Writes text out directly
-    // statement_list = 1002,
+    statement_list = 1002,
 
     start = 1022,
     parse_error = 1023,
@@ -516,7 +517,7 @@ pub const NodeFlags = enum(u22) {
     minus_optional = (1 << 10) | (1 << 17),
 
     // upper two bits are reserved for ephemeral usage
-    reduce_block = 1 << 21,
+    replaced = 1 << 20,
 };
 
 pub const StringFlags = enum(u20) {
@@ -6934,6 +6935,24 @@ pub const Factory = struct {
         n.next = head_ref;
     }
 
+    // mutates in place!
+    pub fn appendAsChild(this: *@This(), target: NodeRef, child: NodeRef) void {
+        var t = target;
+        const n = this.nodes.at(t);
+        std.debug.assert(n.kind == .block or n.kind == .source_file);
+        t = maybeUnwrapRef(n);
+        while (t != 0) {
+            const next = this.nodes.at(t).next;
+            if (next == 0) break;
+            t = next;
+        }
+        if (t == 0) {
+            this.nodes.at(target).data = child;
+        } else {
+            this.nodes.at(t).next = child;
+        }
+    }
+
     pub fn createIdentifier(this: *@This(), text: []const u8) !NodeRef {
         const t = try getAllocator().dupe(u8, text);
         return this.createIdentifierAllocated(t);
@@ -7115,7 +7134,7 @@ pub const Factory = struct {
         if (is_element_access) {
             return this.nodes.push(.{
                 .kind = .element_access_expression,
-                .data = toBinaryDataPtrRefs(subject, right),
+                .data = toBinaryDataPtrRefs(subject, if (arg_node.kind == .computed_property_name) unwrapRef(arg_node) else right),
             });
         }
         return this.nodes.push(.{
@@ -7552,6 +7571,21 @@ pub const Factory = struct {
     pub fn createNotEmittedStatement(this: *@This()) !NodeRef {
         return this.nodes.push(.{
             .kind = .not_emitted_statement,
+        });
+    }
+
+    pub fn createStatementList(this: *@This(), ref: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .statement_list,
+            .data = ref,
+        });
+    }
+
+    pub fn createExternalNode(this: *@This(), ptr: *AstData, ref: NodeRef) !NodeRef {
+        return this.nodes.push(.{
+            .kind = .external_node,
+            .data = @intFromPtr(ptr),
+            .len = ref,
         });
     }
 
@@ -10632,7 +10666,7 @@ pub const Binder = struct {
                             if (this.nodes.at(d.left).kind == .computed_property_name) {
                                 try this.visitRef(unwrapRef(this.nodes.at(d.left)));
                             }
-                            return try this.visitLexicalScope(el);
+                            try this.visitLexicalScope(el);
                         },
                         else => return error.TODO,
                     }
@@ -11026,7 +11060,7 @@ pub const Binder = struct {
 // kind of annoying zig 0.13 doesn't passthru anonymous struct type annotations
 pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedLocation {
     switch (n.kind) {
-        .identifier, .numeric_literal, .string_literal, .arrow_function, .array_literal_expression => {
+        .identifier, .numeric_literal, .string_literal, .arrow_function, .array_literal_expression, .super_keyword => {
             return decodeLocation(n.location);
         },
         .class_declaration, .function_declaration => {
@@ -11097,21 +11131,7 @@ pub fn getIdentFromSymbol(binder: *const Binder, ref: SymbolRef) ?*const AstNode
     if (sym.declaration == 0) return null;
     const decl = binder.nodes.at(sym.declaration);
 
-    switch (decl.kind) {
-        .type_alias_declaration, .interface_declaration, .class_declaration, .function_declaration => {
-            const d = getPackedData(decl);
-
-            return if (d.left == 0) null else binder.nodes.at(d.left);
-        },
-        .variable_declaration, .parameter, .type_parameter => {
-            const d = getPackedData(decl);
-
-            return binder.nodes.at(d.left);
-        },
-        else => {},
-    }
-
-    return null;
+    return binder.nodes.at(getDeclarationNameRef(decl) orelse return null);
 }
 
 pub fn getSliceFromSymbol(binder: *const Binder, ref: SymbolRef) ?[]const u8 {
@@ -11583,9 +11603,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         i += 1;
                         // TODO: skip over unicode escape
                     },
-                    '\n', '\r', '\t' => {
+                    '\r', '\n' => {
+                        const slice = if (s[i] == '\r') "\\r" else "\\n";
                         this.print(s[j..i]);
-                        this.print("\\n");
+                        this.print(slice);
                         j = i + 1;
                     },
                     quote_char => {
@@ -11752,7 +11773,18 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
                     this.print(getSlice(n, u8));
                 },
-                .object_keyword, .const_keyword, .undefined_keyword, .symbol_keyword, .void_keyword, .never_keyword, .unknown_keyword, .any_keyword, .for_keyword, .new_keyword, .null_keyword, .import_keyword, .default_keyword, .number_keyword, .string_keyword, .boolean_keyword, .false_keyword, .true_keyword, .super_keyword, .this_keyword, .debugger_keyword => {
+                .this_keyword => {
+                    if (comptime use_symbol_replacements) {
+                        const symbol_id = n.extra_data;
+                        if (symbol_id != 0) {
+                            if (this.symbol_replacements.get(symbol_id)) |t| {
+                                return try this.visitRef(t);
+                            }
+                        }
+                    }
+                    this.print(syntaxKindToString(n.kind));
+                },
+                .object_keyword, .const_keyword, .undefined_keyword, .symbol_keyword, .void_keyword, .never_keyword, .unknown_keyword, .any_keyword, .for_keyword, .new_keyword, .null_keyword, .import_keyword, .default_keyword, .number_keyword, .string_keyword, .boolean_keyword, .false_keyword, .true_keyword, .super_keyword, .debugger_keyword => {
                     this.print(syntaxKindToString(n.kind));
                 },
                 .indexed_access_type => {
@@ -13152,6 +13184,17 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
                     defer if (comptime use_replacements) {
                         this.replacements = old_replacements;
+                    };
+
+                    const save_symbol_replacements = this.symbol_replacements;
+                    if (comptime use_symbol_replacements) {
+                        var tmp = std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef){};
+                        const p: usize = if (comptime @import("builtin").target.isWasm()) n.extra_data else (@as(usize, n.extra_data2) << 32) | n.extra_data;
+                        if (p != 0) this.symbol_replacements = @ptrFromInt(p)
+                        else this.symbol_replacements = &tmp;
+                    }
+                    defer if (comptime use_symbol_replacements) {
+                        this.symbol_replacements = save_symbol_replacements;
                     };
 
                     try this.visitRef(start);
