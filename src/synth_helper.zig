@@ -56,10 +56,17 @@ pub const SynthInstrumenter = struct {
     depth: u16 = 1,
 
     frames: std.ArrayListUnmanaged(Frame) = .{},
+    class_or_obj_decl: NodeRef = 0,
+    class_decl_static_block: NodeRef = 0,
+    tmp_binding: NodeRef = 0, // we use 1 (as a var) for the whole file, mostly to deal with sugar
 
     assigned: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
+    escapes: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
     captured: std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = .{},
-    captured_twice: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
+    this_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
+
+    symbol_replacements: ?*std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = null,
+    dollar_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
 
     fns: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, void)) = .{},
 
@@ -85,6 +92,13 @@ pub const SynthInstrumenter = struct {
         try v.visit(ast.nodes.at(ast.start), ast.start);
         v.transforming = true;
         try v.visit(ast.nodes.at(ast.start), ast.start);
+        if (v.tmp_binding != 0) {
+            const stmt = try v.factory.createLetVariable(v.tmp_binding, 0);
+            ast.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
+            ast.nodes.at(stmt).next = parser.maybeUnwrapRef(ast.nodes.at(ast.start)) orelse 0;
+            ast.start = try v.factory.cloneNodeRef(ast.start);
+            ast.nodes.at(ast.start).data = stmt;
+        } 
 
         return try parser.printWithOptions(ast.*, .{
             .replacements = &r,
@@ -94,6 +108,71 @@ pub const SynthInstrumenter = struct {
 
     fn deinit(self: *@This()) void {
         self.frames.deinit(self.alloc);
+    }
+
+    fn isFungiblePrimitiveExp(self: *@This(), exp_ref: NodeRef) bool {
+        const exp = self.ast.nodes.at(exp_ref);
+        return switch (exp.kind) {
+            .identifier => {
+                if (self.binder.getSymbol(exp_ref)) |sym_ref| {
+                    const sym = self.binder.symbols.at(sym_ref);
+                    if (sym.hasFlag(.late_bound) or sym.declaration == 0) return false;
+                    const decl = self.ast.nodes.at(sym.declaration);
+                    if (decl.kind != .variable_declaration) return false;
+                    const init_ref = parser.getRight(decl);
+                    if (init_ref == 0) return true;
+
+                    if (decl.hasFlag(.replaced)) return false; // already seen
+                    decl.flags |= @intFromEnum(parser.NodeFlags.replaced);
+                    defer decl.flags &= ~@intFromEnum(parser.NodeFlags.replaced);
+
+                    return self.isFungiblePrimitiveExp(init_ref);
+                }
+                return false;
+            },
+            .void_expression, .delete_expression => true,
+            .numeric_literal => true,
+            .true_keyword, .false_keyword, .null_keyword, .undefined_keyword => true,
+            .string_literal, .template_literal, .no_substitution_template_literal => true,
+            .await_expression, .parenthesized_expression => self.isFungiblePrimitiveExp(parser.unwrapRef(exp)),
+            .conditional_expression => self.isFungiblePrimitiveExp(parser.getRight(exp)) and isFungiblePrimitiveExp(exp.len),
+            .prefix_unary_expression => {
+                return self.isFungiblePrimitiveExp(parser.getRight(exp));
+            },
+            .postfix_unary_expression => {
+                return self.isFungiblePrimitiveExp(parser.getLeft(exp));
+            },
+            .binary_expression => {
+                const op: parser.SyntaxKind = @enumFromInt(exp.len);
+                switch (op) {
+                    .equals_equals_token, .equals_equals_equals_token, .exclamation_equals_equals_token, .exclamation_equals_token => return true,
+                    .less_than_equals_token, .less_than_token, .greater_than_equals_token, .greater_than_token => return true,
+                    .plus_token, .minus_token, .asterisk_token, .slash_token => return true,
+                    .comma_token, .equals_token => return isFungiblePrimitiveExp(parser.getRight(exp)),
+                    else => {},
+                }
+                return self.isFungiblePrimitiveExp(parser.getLeft(exp)) and isFungiblePrimitiveExp(parser.getRight(exp));
+            },
+            else => false,
+        };
+    }
+
+    fn declInitializerNeedsCell(self: *@This(), sym_ref: SymbolRef) bool {
+        if (self.assigned.contains(sym_ref)) return true;
+        const sym = self.binder.symbols.at(sym_ref);
+        if (sym.hasFlag(.late_bound) or sym.declaration == 0) return false;
+        const decl = self.ast.nodes.at(sym.declaration);
+        switch (decl.kind) {
+            .variable_declaration => {
+                const init_ref = parser.getRight(decl);
+                if (init_ref == 0) return false;
+                return !self.isFungiblePrimitiveExp(init_ref);
+            },
+            else => {
+                if (self.escapes.contains(sym_ref)) return true;
+            },
+        }
+        return false;
     }
 
     fn markAssignedIfIdent(self: *@This(), ref: NodeRef) anyerror!void {
@@ -131,7 +210,7 @@ pub const SynthInstrumenter = struct {
     }
 
     fn needsCell(self: *@This(), sym_ref: SymbolRef) bool {
-        return self.assigned.contains(sym_ref) and self.captured_twice.contains(sym_ref);
+        return self.assigned.contains(sym_ref) and self.captured.contains(sym_ref);
     }
 
     fn getCellOrSymbol(self: *@This(), sym_ref: SymbolRef) !NodeRef {
@@ -139,14 +218,26 @@ pub const SynthInstrumenter = struct {
             if (!comptime @import("builtin").target.isWasm()) std.debug.print("{}\n",.{self.nodes.at(self.binder.symbols.at(sym_ref).declaration).kind});
             unreachable;
         };
+        if (self.this_symbols.contains(sym_ref)) {
+            const sym = self.binder.symbols.at(sym_ref);
+            if (sym.getOrdinal() == 0) {
+                // not static this
+                return self.factory.createKeywordType(.this_keyword);
+            }
+        }
         if (!self.needsCell(sym_ref)) {
             const ref = try self.factory.cloneNode(ident);
             self.nodes.at(ref).extra_data = 0;
             self.nodes.at(ref).next = 0;
             return ref;
         }
+        if (self.symbol_replacements != null) {
+            if (self.symbol_replacements.?.get(sym_ref)) |x| {
+                return try self.factory.cloneNodeRef(x);
+            }
+        }
         var buf: [256]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "_c_{s}", .{getSlice(ident, u8)});
+        const name = try std.fmt.bufPrint(&buf, "c__{s}", .{getSlice(ident, u8)});
         return try self.factory.createIdentifier(name);
     }
 
@@ -160,20 +251,9 @@ pub const SynthInstrumenter = struct {
         for (captured.keys()) |k| {
             try cap.append(self.alloc, try self.getCellOrSymbol(k));
         }
+        const subj = try self.getMicroProgramStr(decl_ref, captured);
         const cap_arr = try self.factory.createArrayLiteralExpression(cap.items);
-        const props: []const NodeRef = &.{
-            // try self.factory.createPropertyAssignment(
-            //     try self.factory.createIdentifier("valueType"),
-            //     try self.factory.createStringLiteral("function"),
-            // ),
-            try self.factory.createPropertyAssignment(
-                try self.factory.createIdentifier("program"),
-                try self.getMicroProgramStr(decl_ref, captured)
-            ),
-            try self.factory.createPropertyAssignment(try self.factory.createIdentifier("captured"), cap_arr),
-        };
-        const obj = try self.factory.createObjectLiteralExpression(props);
-        return obj;
+        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
     }
 
     fn buildSynthDataFn(
@@ -182,34 +262,42 @@ pub const SynthInstrumenter = struct {
         captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void),
     ) !NodeRef {
         const synth_data = try self.buildSynthData(decl_ref, captured);
-        return try self.factory.createArrowFunction(0, try self.factory.createParenthesizedExpression(synth_data), 0);
+        return try self.factory.createArrowFunction(0, synth_data, 0);
     }
 
-    fn buildMicroProgram(self: *@This(), decl_ref: NodeRef, captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void)) !NodeRef {
+    fn buildMicroProgram(self: *@This(), decl_ref: NodeRef, captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void), symbol_replacements: *std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef)) !NodeRef {
         var params = std.ArrayListUnmanaged(NodeRef){};
         defer params.deinit(self.alloc);
-        for (captured.keys()) |k| {
-            try params.append(self.alloc, try self.factory.createParameter(try self.getCellOrSymbol(k), 0));
+        for (captured.keys(), 0..) |k, i| {
+            var buf: [16]u8 = undefined;
+            const name = @import("./value_graph.zig").fmtOrdinal(@intCast(i), &buf, true);
+            const new_ident = try self.factory.createIdentifier(name);
+            try symbol_replacements.put(self.alloc, k, new_ident);
         }
-
-        const exp = try self.factory.cloneNodeRef(decl_ref);
-        if (self.nodes.at(exp).kind == .function_declaration) {
-            self.nodes.at(exp).kind = .function_expression;
-            self.nodes.at(exp).flags &= ~@intFromEnum(parser.NodeFlags.@"export");
+        const exp_ref = try self.factory.cloneNodeRef(decl_ref);
+        const exp = self.nodes.at(exp_ref);
+        if (exp.kind == .function_declaration or exp.kind == .method_declaration or exp.kind == .get_accessor or exp.kind == .set_accessor) {
+            exp.kind = .function_expression;
+            exp.flags &= ~(@intFromEnum(parser.NodeFlags.@"export") | @intFromEnum(parser.NodeFlags.static));
+            if (self.nodes.at(parser.getLeft(exp)).kind == .computed_property_name) {
+                exp.data = parser.getRight(exp);
+                // TODO: preserve `.name` in some cases, we need to emit `({ "[aaa]"() {} }["[aaa]"])
+            }
+        } else if (exp.kind == .class_declaration) {
+            exp.kind = .class_expression;
+            exp.flags &= ~(@intFromEnum(parser.NodeFlags.@"export"));
         }
-
-        const ret = try self.factory.createReturnStatement(exp);
-        const body: []const NodeRef = &.{ret};
-
-        return try self.factory.createFunctionDeclaration(
-            0,
-            params.items,
-            body,
-        );
+        return exp_ref;
     }
 
     fn getMicroProgramStr(self: *@This(), decl_ref: NodeRef, captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void)) !NodeRef {
-        const target = try self.buildMicroProgram(decl_ref, captured);
+        var symbol_replacements = std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef){};
+        defer symbol_replacements.deinit(self.alloc);
+        const save_symbol_replacements = self.symbol_replacements;
+        defer self.symbol_replacements = save_symbol_replacements;
+        self.symbol_replacements = &symbol_replacements;
+
+        const target = try self.buildMicroProgram(decl_ref, captured, &symbol_replacements);
         self.emitting = true;
         defer self.emitting = false;
 
@@ -219,43 +307,149 @@ pub const SynthInstrumenter = struct {
         defer replacements.deinit();
         self.replacements = &replacements;
 
+        // try self.visit(self.nodes.at(self.nodes.at(target).len), self.nodes.at(target).len);
+        try self.visit(self.nodes.at(target), target);
+
+        // escape $0 idents into $$0
+        var dollar_iter = self.dollar_symbols.iterator();
+        while (dollar_iter.next()) |entry| {
+            if (captured.contains(entry.key_ptr.*)) continue;
+            const ident = parser.getIdentFromSymbol(self.binder, entry.key_ptr.*) orelse unreachable;
+            const slice = parser.getSlice(ident, u8);
+            var buf: [32]u8 = undefined;
+            buf[0] = '$';
+            @memcpy(buf[1..slice.len+1], slice);
+            const new_ident = try self.factory.createIdentifier(buf[0..slice.len+1]);
+            try symbol_replacements.put(self.alloc, entry.key_ptr.*, new_ident);
+        }
+
         var d = self.ast.*;
         d.start = target;
-
-        try self.visit(self.nodes.at(self.nodes.at(target).len), self.nodes.at(target).len);
         d.nodes = self.nodes.*;
-
         const res = try parser.printWithOptions(d, .{
             .replacements = self.replacements,
+            .symbol_replacements = &symbol_replacements,
         });
-        var escaped = try std.ArrayList(u8).initCapacity(self.alloc, res.contents.len+1024);
-        for (res.contents) |c| {
-            switch (c) {
-                '\\', '\'' => try escaped.append('\\'),
-                '\n' => {
-                    try escaped.appendSlice("\\n");
-                    continue;
-                },
-                else => {},
+        const s = try self.factory.createStringLiteralAllocated(res.contents);
+        self.factory.nodes.at(s).flags |= @intFromEnum(parser.StringFlags.synthetic);
+        return s;
+    }
+
+    fn wrapObjectLiteralIfNeeded(self: *@This()) !void {
+        if (self.class_decl_static_block == 0) return;
+        std.debug.assert(self.class_or_obj_decl != 0);
+
+        const assign = try self.factory.createAssignmentStatement(try self.getTmpBinding(), try self.factory.cloneNodeRef(self.class_or_obj_decl));
+        var exp = try self.factory.createBinaryExpression(parser.unwrapRef(self.nodes.at(assign)), .comma_token, self.class_decl_static_block);
+        exp = try self.factory.createBinaryExpression(exp, .comma_token, try self.getTmpBinding());
+        exp = try self.factory.createParenthesizedExpression(exp);
+
+        try self.replacements.put(self.class_or_obj_decl, exp);
+    }
+
+    fn getTmpBinding(self: *@This()) !NodeRef {
+        if (self.tmp_binding != 0) return self.tmp_binding;
+        const ident = try self.factory.createIdentifier("__tmp$");
+        self.tmp_binding = ident;
+        return ident;
+    }
+
+    fn getClassLikeTarget(self: *@This()) !NodeRef {
+        std.debug.assert(self.class_or_obj_decl != 0);
+        const n = self.nodes.at(self.class_or_obj_decl);
+        if (n.kind == .class_declaration or n.kind == .class_expression) return try self.factory.createKeywordType(.this_keyword);
+        return try self.factory.cloneNodeRef(try self.getTmpBinding());
+    }
+
+    fn appendToStaticClassBlock(self: *@This(), ref: NodeRef) !void {
+        std.debug.assert(self.class_or_obj_decl != 0);
+        if (self.nodes.at(self.class_or_obj_decl).kind != .class_declaration and self.nodes.at(self.class_or_obj_decl).kind != .class_expression) {
+            std.debug.assert(self.nodes.at(ref).kind == .expression_statement); // we will unwrap
+            if (self.class_decl_static_block != 0) {
+                self.class_decl_static_block = try self.factory.createBinaryExpression(self.class_decl_static_block, .comma_token, parser.unwrapRef(self.nodes.at(ref)));
+            } else {
+                self.class_decl_static_block = parser.unwrapRef(self.nodes.at(ref));
             }
-            try escaped.append(c);
+            return;
         }
-        return try self.factory.createStringLiteralAllocated(escaped.items);
+
+        if (self.class_decl_static_block == 0) {
+            self.class_decl_static_block = try self.factory.nodes.push(.{ .kind = .class_static_block_declaration });
+            var iter = NodeIterator.init(self.nodes, parser.getRight(self.nodes.at(self.class_or_obj_decl)));
+            const t = iter.tail();
+            if (t == 0) {
+                const copy = try self.factory.cloneNodeRef(self.class_or_obj_decl);
+                self.nodes.at(copy).data = parser.toBinaryDataPtrRefs(parser.getLeft(self.nodes.at(copy)), self.class_decl_static_block);
+                try self.replacements.put(self.class_or_obj_decl, copy);
+            } else {
+                var list = parser.NodeList.init(self.nodes);
+                while (iter.nextRef()) |x| {
+                    list.appendRef(try self.factory.cloneNodeRef(x));
+                }
+                self.nodes.at(list.prev).next = self.class_decl_static_block;
+                const copy = try self.factory.cloneNodeRef(self.class_or_obj_decl);
+                self.nodes.at(copy).data = parser.toBinaryDataPtrRefs(parser.getLeft(self.nodes.at(copy)), list.head);
+                try self.replacements.put(self.class_or_obj_decl, copy);
+            }
+        }
+        const n = self.nodes.at(self.class_decl_static_block);
+        if (n.extra_data2 != 0) {
+            self.nodes.at(n.extra_data2).next = ref;
+        } else {
+            n.data = ref;
+        }
+        n.extra_data2 = ref;
     }
 
     fn visitFunction(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
         if (funcBodyRef(node) == 0) return;
         if (self.transforming) {
-            const captures = self.fns.get(ref) orelse unreachable;
             const move_key = try self.factory.createCallExpression(
                 try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
-                &.{try self.factory.createStringLiteral("__moveable__")},
+                &.{try self.factory.createStringLiteral("toComputation")},// &.{try self.factory.createStringLiteral("__moveable__")},
             );
             const save_rebindings = self.rebindings;
             defer self.rebindings = save_rebindings;
             self.rebindings = .{};
             try forEachChild(self.nodes, node, self);
             try self.drainRebindings(funcBodyRef(node));
+            const captures = self.fns.get(ref) orelse unreachable; // set before transform
+
+            if (node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor or node.kind == .constructor) {
+                switch (node.kind) {
+                    .method_declaration => {
+                        const name_ref = parser.getLeft(self.nodes.at(ref));
+                        var member_access = try self.getClassLikeTarget();
+                        if (!node.hasFlag(.static) and self.nodes.at(member_access).kind == .this_keyword) member_access = try self.factory.createFieldAccess(member_access, "prototype");
+                        member_access = try self.factory.createFieldAccess(member_access, name_ref);
+                        const synth_data = try self.buildSynthDataFn(ref, &captures);
+                        const assign = try self.factory.createAssignmentStatement(
+                            try self.factory.createElementAccessExpression(member_access, move_key),
+                            synth_data,
+                        );
+                        try self.appendToStaticClassBlock(assign);
+                    },
+                    .get_accessor, .set_accessor => {
+                        const name_ref = parser.getLeft(self.nodes.at(ref));
+                        var member_access = try self.getClassLikeTarget();
+                        if (!node.hasFlag(.static) and self.nodes.at(member_access).kind == .this_keyword) member_access = try self.factory.createFieldAccess(member_access, "prototype");
+                        const desc_call = try self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Object"), "getOwnPropertyDescriptor"), &.{
+                            member_access,
+                            if (self.nodes.at(name_ref).kind == .computed_property_name) parser.unwrapRef(self.nodes.at(name_ref)) else if (self.nodes.at(name_ref).kind == .identifier) try self.factory.createStringLiteral(parser.getSlice(self.nodes.at(name_ref), u8)) else name_ref,
+                        });
+
+                        member_access = try self.factory.createFieldAccess(desc_call, if (node.kind == .get_accessor) "get" else "set");
+                        const synth_data = try self.buildSynthDataFn(ref, &captures);
+                        const assign = try self.factory.createAssignmentStatement(
+                            try self.factory.createElementAccessExpression(member_access, move_key),
+                            synth_data,
+                        );
+                        try self.appendToStaticClassBlock(assign);
+                    },
+                    else => {},
+                }
+                return;
+            }
 
             const next = node.next;
             const clone = try self.factory.cloneNodeRef(ref);
@@ -288,6 +482,13 @@ pub const SynthInstrumenter = struct {
                 else => unreachable,
             }
             return;
+        }
+
+        if (parser.getDeclarationNameRef(node)) |x| {
+            if (self.binder.getSymbol(x)) |sym| {
+                const n = self.nodes.at(x);
+                try self.maybeRecordDollarName(sym, n);
+            }
         }
 
         self.depth += 1;
@@ -373,6 +574,24 @@ pub const SynthInstrumenter = struct {
         self.rebindings.clearRetainingCapacity();
     }
 
+    fn maybeRecordDollarName(self: *@This(), sym: SymbolRef, n: *const AstNode) !void {
+        const slice = getSlice(n, u8);
+        if (slice[0] == '$') {
+            var i: u32 = 1;
+            while (i < slice.len) {
+                switch (slice[i]) {
+                    '0'...'9' => {
+                        i += 1;
+                    },
+                    else => break,
+                }
+            }
+            if (i == slice.len) {
+                try self.dollar_symbols.put(getAllocator(), sym, {});
+            }
+        }
+    }
+
     fn classifyReference(self: *@This(), ref: NodeRef) !void {
         const sym = self.binder.getSymbol(ref) orelse return;
         if (sym == 0) return;
@@ -385,8 +604,9 @@ pub const SynthInstrumenter = struct {
             if (!self.needsCell(sym)) return;
             if (parser.getIdentFromSymbol(self.binder, sym) == self.nodes.at(ref)) {
                 var buf: [256]u8 = undefined;
-                const name = try std.fmt.bufPrint(&buf, "_c_{s}", .{getSlice(self.nodes.at(ref), u8)});
+                const name = try std.fmt.bufPrint(&buf, "c__{s}", .{getSlice(self.nodes.at(ref), u8)});
                 const new_ident = try self.factory.createIdentifier(name);
+                // self.nodes.at(new_ident).extra_data2 = sym;
                 try self.rebindings.append(self.alloc, try self.factory.createConstVariable(new_ident, try self.factory.createArrayLiteralExpression(&.{try self.factory.createIdentifier(getSlice(self.nodes.at(ref), u8))})));
             } else {
                 const z = try self.factory.createElementAccessExpression(try self.getCellOrSymbol(sym), @as(i64, 0));
@@ -396,18 +616,81 @@ pub const SynthInstrumenter = struct {
             return;
         }
 
+        if (parser.getIdentFromSymbol(self.binder, sym)) |n| {
+            try self.maybeRecordDollarName(sym, n);
+        }
+
+        const is_this = self.nodes.at(ref).kind == .this_keyword;
         const depth = s.getScopeDepth();
         for (self.frames.items) |*frame| {
             if (depth < frame.threshold) {
                 if (s.declaration == frame.decl_ref) continue;
+                if (is_this) {
+                    switch (self.nodes.at(frame.decl_ref).kind) {
+                        .class_declaration, .class_expression => continue,
+                        .function_declaration, .function_expression, .method_declaration, .get_accessor, .set_accessor, .constructor => continue,
+                        else => {},
+                    }
+                }
                 try frame.captures.put(self.alloc, sym, {});
-                if ((self.captured.get(sym) orelse frame.decl_ref) != frame.decl_ref) {
-                    try self.captured_twice.put(self.alloc, sym, {});
-                } else {
-                    try self.captured.put(self.alloc, sym, frame.decl_ref);
+                try self.captured.put(self.alloc, sym, frame.decl_ref);
+                if (is_this) {
+                    try self.this_symbols.put(self.alloc, sym, {});
                 }
             }
         }
+    }
+
+    fn visitClassLike(self: *@This(), node: *const AstNode, ref: NodeRef) !void {
+        const isClass = node.kind == .class_declaration or node.kind == .class_expression;
+        if (self.emitting) {
+            var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.unwrapRef(node));
+            while (iter.nextRef()) |el| {
+                try self.visit(self.nodes.at(el), el);
+            }
+            return;
+        }
+        if (!self.transforming) {
+            try self.frames.append(self.alloc, .{
+                .decl_ref = ref,
+                .kind = node.kind,
+                .threshold = self.depth + 1,
+            });
+        }
+
+        const save_class_decl = self.class_or_obj_decl;
+        defer self.class_or_obj_decl = save_class_decl;
+        self.class_or_obj_decl = ref;
+        const save_class_decl_static_block = self.class_decl_static_block;
+        defer self.class_decl_static_block = save_class_decl_static_block;
+        self.class_decl_static_block = 0;
+
+        var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.unwrapRef(node));
+        while (iter.nextRef()) |el| {
+            try self.visit(self.nodes.at(el), el);
+        }
+
+        if (self.transforming) {
+            if (!isClass) {
+                try self.wrapObjectLiteralIfNeeded();
+                return;
+            }
+            const captures = self.fns.get(ref) orelse unreachable;
+            const move_key = try self.factory.createCallExpression(
+                try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
+                &.{try self.factory.createStringLiteral("toComputation")},
+            );
+            const synth_data = try self.buildSynthDataFn(ref, &captures);
+            const assign = try self.factory.createAssignmentStatement(
+                try self.factory.createElementAccessExpression(try self.factory.createKeywordType(.this_keyword), move_key),
+                synth_data,
+            );
+            try self.appendToStaticClassBlock(assign);
+            return;
+        }
+
+        const frame = self.frames.pop();
+        try self.fns.put(self.alloc, ref, frame.captures);
     }
 
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
@@ -417,7 +700,7 @@ pub const SynthInstrumenter = struct {
                 try forEachChild(self.nodes, node, self);
                 return try self.drainRebindings(ref);
             }
-            if (node.kind == .arrow_function or node.kind == .function_expression or node.kind == .function_declaration) {
+            if (node.kind == .arrow_function or node.kind == .function_expression or node.kind == .function_declaration or node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor) {
                 const save_rebindings = self.rebindings;
                 defer self.rebindings = save_rebindings;
                 self.rebindings = .{};
@@ -435,7 +718,12 @@ pub const SynthInstrumenter = struct {
                 }
                 return;
             }
-            if (node.kind != .identifier) return try forEachChild(self.nodes, node, self);
+            if (node.kind == .class_declaration or node.kind == .class_expression or node.kind == .object_literal_expression) {
+                return try self.visitClassLike(node, ref);
+            }
+            if (node.kind != .identifier and node.kind != .this_keyword) {
+                return try forEachChild(self.nodes, node, self);
+            }
             if (self.binder.getSymbol(ref)) |sym_ref| {
                 if (sym_ref == 0) return;
                 const sym = self.binder.symbols.at(sym_ref);
@@ -443,7 +731,7 @@ pub const SynthInstrumenter = struct {
                 if (self.needsCell(sym_ref)) {
                     if (parser.getIdentFromSymbol(self.binder, sym_ref) == node) {
                         var buf: [256]u8 = undefined;
-                        const name = try std.fmt.bufPrint(&buf, "_c_{s}", .{getSlice(self.nodes.at(ref), u8)});
+                        const name = try std.fmt.bufPrint(&buf, "c__{s}", .{getSlice(self.nodes.at(ref), u8)});
                         const new_ident = try self.factory.createIdentifier(name);
                         try self.rebindings.append(self.alloc, try self.factory.createConstVariable(new_ident, try self.factory.createArrayLiteralExpression(&.{try self.factory.createIdentifier(getSlice(self.nodes.at(ref), u8))})));
                         return;
@@ -465,8 +753,6 @@ pub const SynthInstrumenter = struct {
             .get_accessor,
             .set_accessor,
             => try self.visitFunction(node, ref),
-
-            // .class_declaration, .class_expression => try self.enterClass(node, ref),
 
             .block => {
                 self.depth += 1;
@@ -549,9 +835,11 @@ pub const SynthInstrumenter = struct {
                 try forEachChild(self.nodes, node, self);
             },
 
-            .identifier => try self.classifyReference(ref),
+            .identifier, .this_keyword => try self.classifyReference(ref),
+            .super_keyword => {},
 
-            .this_keyword, .super_keyword => {},
+            .object_literal_expression,
+            .class_declaration, .class_expression => try self.visitClassLike(node, ref),
 
             else => try forEachChild(self.nodes, node, self),
         }
