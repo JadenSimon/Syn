@@ -38,6 +38,8 @@ function createScView(pageBuf, offset, debugScId) {
         return v.getUint8(5)
     }
     function setDepth(val) {
+        if (!val) throw new Error('invalid depth. never set depth to zero')
+        checkOneByteOverflow(val)
         return v.setUint8(5, val)
     }
     function getDepthExtent() {
@@ -128,6 +130,7 @@ function createScView(pageBuf, offset, debugScId) {
 
     const heapCellStart = peerEdgeStart+16
     function findInVert(relIdx) {
+        assertRelIdx(relIdx)
         if (allocatedInVerticals) {
             return allocatedInVerticals.get(relIdx)
         }
@@ -142,25 +145,31 @@ function createScView(pageBuf, offset, debugScId) {
             return allocatedOutVerticals.get(absHandle)
         }
         for (let i = 0; i < 6; i++) {
-            if (v.getUint32(outVertStart+(i*5)) === absHandle) {
+            if (v.getUint32(outVertStart+(i*5), true) === absHandle) {
                 return v.getUint8(outVertStart+(i*5)+4)
             }
         }
     }
     function checkOneByteOverflow(v) {
+        if (v < 0) throw new Error(`u8 underflow: ${v}`)
         if (v >= 256) throw new Error(`u8 overflow: ${v}`)
+        if (!Number.isInteger(v)) throw new Error(`got garbage: ${v}`)
     }
-    function findPeerEdge(id) {
+    function assertRelIdx(v) {
+        if (!(v >= 1 && v <= 64) || isNaN(v) || !v) throw new Error(`invalid relative index: ${v}`)
+    }
+    function findPeerEdge(relIdx) {
         if (allocatedPeerEdges) {
-            return allocatedPeerEdges.get(id)
+            return allocatedPeerEdges.get(relIdx)
         }
         for (let i = 0; i < 6; i++) {
-            if (v.getUint8(peerEdgeStart+(i*2)) === id) {
+            if (v.getUint8(peerEdgeStart+(i*2)) === relIdx) {
                 return v.getUint8(peerEdgeStart+(i*2)+1)
             }
         }
     }
     function putInVert(relIdx, val) {
+        assertRelIdx(relIdx)
         if (Number.isNaN(val) || Number.isNaN(relIdx)) throw new Error(`putInVert NaN: relIdx=${relIdx} val=${val}`)
         traceInVert(debugScId, 'inVert:' + relIdx, val)
         if (!allocatedInVerticals && val > 255) allocInVerts() // would overflow the u8 slot -- bail to the map early
@@ -268,47 +277,62 @@ function createScView(pageBuf, offset, debugScId) {
         }
         return arr
     }
+    function collectInVerticals() {
+        if (allocatedInVerticals) {
+            return [...allocatedInVerticals.keys()]
+        }
+        const base = inVerticalsStart
+        const verticalSize = 2
+        const arr = []
+        for (let i = 0; i < 6; i++) {
+            const k = v.getUint8(base+(i*verticalSize))
+            if (k === 0) break
+            // arr.push([k, v.getUint8(base+(i*verticalSize)+4)])
+            arr.push(k)
+        }
+        return arr
+    }
     // returns true when a vertical edge was added
-    function incOutVertical(relIdx) {
+    function incOutVertical(absHandle) {
         if (allocatedOutVerticals) {
-            const v = allocatedOutVerticals.get(relIdx)
-            allocatedOutVerticals.set(relIdx, (v ?? 0) + 1)
+            const v = allocatedOutVerticals.get(absHandle)
+            allocatedOutVerticals.set(absHandle, (v ?? 0) + 1)
             return !v
         }
         const base = outVertStart
         const verticalSize = 5
         for (let i = 0; i < 6; i++) {
             const k = v.getUint32(base+(i*verticalSize), true)
-            if (k === relIdx) {
+            if (k === absHandle) {
                 const cur = v.getUint8(base+(i*verticalSize)+4)
                 if (cur === 255) { // would overflow the u8 slot -- bail to the map early
                     allocOutVerts()
-                    allocatedOutVerticals.set(relIdx, cur + 1)
+                    allocatedOutVerticals.set(absHandle, cur + 1)
                     return false
                 }
                 v.setUint8(base+(i*verticalSize)+4, cur + 1)
                 return false
             }
             if (k === 0) {
-                v.setUint32(base+(i*verticalSize), relIdx, true)
+                v.setUint32(base+(i*verticalSize), absHandle, true)
                 v.setUint8(base+(i*verticalSize)+4, 1)
                 return true
             }
         }
         allocOutVerts()
-        allocatedOutVerticals.set(relIdx, 1)
+        allocatedOutVerticals.set(absHandle, 1)
         return true
         // throw new Error('out of room!')
     }
     // returns true when a vertical edge was removed
-    function decOutVertical(relIdx) {
+    function decOutVertical(absHandle) {
         if (allocatedOutVerticals) {
-            const v = allocatedOutVerticals.get(relIdx)
-            if (!v) throw new Error('womp ?')
+            const v = allocatedOutVerticals.get(absHandle)
+            if (!v || v < 0) throw new Error('womp ?')
             if (v === 1) {
-                allocatedOutVerticals.delete(relIdx)
+                allocatedOutVerticals.delete(absHandle)
             } else {
-                allocatedOutVerticals.set(relIdx, v - 1)
+                allocatedOutVerticals.set(absHandle, v - 1)
             }
             return v === 1
         }
@@ -316,7 +340,7 @@ function createScView(pageBuf, offset, debugScId) {
         const verticalSize = 5
         for (let i = 0; i < 6; i++) {
             const k = v.getUint32(base+(i*verticalSize), true)
-            if (k !== relIdx) continue
+            if (k !== absHandle) continue
             const val = v.getUint8(base+(i*verticalSize)+4)
             if (val === 1) {
                 let j = i+1
@@ -338,9 +362,15 @@ function createScView(pageBuf, offset, debugScId) {
             v.setUint8(base+(i*verticalSize)+4, val - 1)
             return false
         }
-        throw new Error('not found!')
+        throw new Error(`not found! relIdx: ${absHandle}`)
     }
     function putPeerEdge(relIdx, val) {
+        assertRelIdx(relIdx)
+        if (val < 0) throw new Error(`peer edge underflow: ${relIdx} -> ${val}`)
+        if (relIdx === getSelfLocalId() && val !== 0) {
+            printInfo()
+            throw new Error(`peer edge circularity: ${relIdx}`)
+        }
         traceInVert(debugScId, 'peerEdge:' + relIdx, val)
         if (!allocatedPeerEdges && val > 255) allocPeerEdges() // would overflow the u8 slot -- bail to the map early
         if (allocatedPeerEdges) {
@@ -401,27 +431,31 @@ function createScView(pageBuf, offset, debugScId) {
     }
     // we want to pack ref counts right beside the cells
     // the layout is ugly
-    function getLocalRc(id) {
-        if (allocatedLocalRc) return allocatedLocalRc[id-1] ?? 0
-        return v.getUint8(heapCellStart+(id-1)*5)
+    function getLocalRc(relIdx) {
+        assertRelIdx(relIdx)
+        if (allocatedLocalRc) return allocatedLocalRc[relIdx-1] ?? 0
+        return v.getUint8(heapCellStart+(relIdx-1)*5)
     }
-    function setLocalRc(id, val) {
+    function setLocalRc(relIdx, val) {
+        assertRelIdx(relIdx)
         if (!allocatedLocalRc && val > 255) allocLocalRc() // would overflow the u8 slot -- bail to the array early
         if (allocatedLocalRc) {
-            allocatedLocalRc[id-1] = val
+            allocatedLocalRc[relIdx-1] = val
             return
         }
         checkOneByteOverflow(val)
-        return v.setUint8(heapCellStart+(id-1)*5, val)
+        return v.setUint8(heapCellStart+(relIdx-1)*5, val)
     }
-    function incLocalRc(id) {
-        const nv = getLocalRc(id) + 1
-        setLocalRc(id, nv)
+    function incLocalRc(relIdx) {
+        assertRelIdx(relIdx)
+        const nv = getLocalRc(relIdx) + 1
+        setLocalRc(relIdx, nv)
         return nv
     }
-    function decLocalRc(id) {
-        const nv = getLocalRc(id) - 1
-        setLocalRc(id, nv)
+    function decLocalRc(relIdx) {
+        assertRelIdx(relIdx)
+        const nv = getLocalRc(relIdx) - 1
+        setLocalRc(relIdx, nv)
         return nv
     }
     // these assumed unbiased
@@ -443,26 +477,30 @@ function createScView(pageBuf, offset, debugScId) {
             return id
         }
         const id = getCellCount()
+        if (id === 64) throw new Error('SC cell overflow')
+        if (!(val & ~0xFF)) throw new Error(`found leaf handle under root`)
         setCellCount(id + 1)
         setHeapCellId(id, val)
         return id + 1
     }
-    function removeHeapCell(relId) {
+    function removeHeapCell(relIdx) {
+        assertRelIdx(relIdx)
         const count = getCellCount()
-        setHeapCellId(relId-1, 0)
-        if (count === relId) {
+        setHeapCellId(relIdx-1, 0)
+        if (count === relIdx) {
             setCellCount(count - 1)
         } else {
-            heapCellFreeList.push(relId)
+            heapCellFreeList.push(relIdx)
+            if (findInVert(relIdx)) putInVert(relIdx, 0)
         }
         return
     }
-    function freeHeapCell(relId, expected) {
-        const addr = getHeapCellId(relId-1)
+    function freeHeapCell(relIdx, expected) {
+        const addr = getHeapCellId(relIdx-1)
         if (addr === 0) return false
         // we aren't using "real" refs
         // if (addr !== expected) throw new Error(`bad free: ${addr} !== ${expected} [idx: ${relId}]`)
-        removeHeapCell(relId)
+        removeHeapCell(relIdx)
         return true
     }
     function collectHeapCells() {
@@ -478,9 +516,12 @@ function createScView(pageBuf, offset, debugScId) {
     const heapCellEnd = heapCellStart+(maxCells*5)
     // XXX
     function getSelfLocalId() {
-        return v.getUint8(heapCellEnd)
+        const val = v.getUint8(heapCellEnd)
+        assertRelIdx(val)
+        return val
     }
     function setSelfLocalId(val) {
+        assertRelIdx(val)
         return v.setUint8(heapCellEnd, val)
     }
     const eternalBit = 0x01
@@ -531,7 +572,8 @@ function createScView(pageBuf, offset, debugScId) {
         setFlagBit(leafBit, val)
     }
     function printInfo() {
-        console.log(`--- ${getCellCount()} cells ---`)
+        console.log('depth: ' + getDepth())
+        console.log(`--- ${getCellCount()-heapCellFreeList.length} cells ---`)
         for (const x of collectHeapCells()) {
             const name = isSc(x[1]) ? `${x[1] & ~(1 << 30)} (sc)` : x[1]
             console.log(`  ${x[0]}: ${name} (${getLocalRc(x[0])})`)
@@ -629,6 +671,7 @@ function createScView(pageBuf, offset, debugScId) {
         incOutVertical,
         decOutVertical,
         collectOutVerticals,
+        collectInVerticals,
         collectPeerEdges,
         getHeapCellId,
         setHeapCellId,
@@ -670,31 +713,49 @@ function isSc(handle) {
     return handle >> 30 === 1
 }
 
+function scanScTable() {
+    for (const sc of scTable) {
+        if (sc.parent === 0 && sc.depth === 0) {
+            throw new Error(`corrupted sc: ${sc.id}`)
+        }
+        for (const relIdx of sc.collectInVerticals()) {
+            
+        }
+    }
+}
+
 const scTable = []
 function getSc(id) {
     return scTable[id]
 }
 function createSc(parent, isRoot = false) {
     parent = typeof parent === 'number' ? parent : parent.id
-    const id = isRoot ? 0 : scTable.length+1
+    const id = scTable.length
     const [_, page] = allocPage()
     const view = createScView(page, 0, id)
     const self = {
         id,
-        parent,
+        parent: isRoot ? undefined : parent,
         ...view,
+        get depth() {
+            return view.getDepth()
+        },
     }
     view.setParentRef(id)
     if (!isRoot) {
         self.setSelfLocalId(getSc(parent).pushHeapCell(self.id | (1 << 30)))
     }
     const parentDepth = getSc(parent)?.getDepth()
-    view.setDepth((parentDepth !== undefined) ? parentDepth + 1 : 0)
+    if (parentDepth === undefined && !isRoot) throw new Error(`failed to find root`)
+    if (!isRoot) {
+        view.setDepth(parentDepth + 1)
+    }
     scTable[id] = self
     return self
 }
 
 function addEdge(from, to) {
+    if (isSc(from) || isSc(to)) throw new Error(`addEdge is only for leaf handles: ${from} -> ${to}`)
     const sc1 = getScId(from)
     const sc2 = getScId(to)
     if (sc1 === sc2) {
@@ -708,17 +769,24 @@ function addEdge(from, to) {
     const arr = [toSc, to]
     while (fromSc.parent !== toSc.parent) {
         const d1 = fromSc.depth
-        const d2 = toSc.depth 
-        if (d1 >= d2) {
+        const d2 = toSc.depth
+        if (d1 >= d2 && d1 > 0) {
             fromSc = getSc(fromSc.parent)
             if (!fromSc.incOutVertical(to)) return
         }
-        if (d1 <= d2) {
+        if (d1 <= d2 && d2 > 0) {
             const next = getSc(toSc.parent)
             // addInboundVertical(next, (toSc.id | (1 << 30)))
             arr.push(next, (toSc.id | (1 << 30)))
             toSc = next
         }
+    }
+    if (fromSc === toSc) {
+        fromSc.printInfo()
+        throw new Error('that is weird')
+    }
+    if (fromSc.depth !== toSc.depth) {
+        throw new Error(`mismatched depths: ${fromSc.depth} !== ${toSc.depth}`)
     }
     const toId = toSc.getSelfLocalId()
     const val = fromSc.findPeerEdge(toId) ?? 0
@@ -738,7 +806,21 @@ function addInboundVertical(fromSc, toHandle) {
 function removeInboundVertical(fromSc, toHandle) {
     const relId = isSc(toHandle) ? getSc(toHandle & ~(1 << 30)).getSelfLocalId() : getRelId(toHandle)
     const invc = fromSc.findInVert(relId)
-    if (!invc) throw new Error('??? no: ' + relId + ' : ' + fromSc.printInfo() + ' : ' + toHandle)
+    if (!invc) {
+        if (isSc(toHandle)) {
+            console.log('--- from info ---')
+            fromSc.printInfo()
+            console.log('-----------------')
+            getSc(toHandle & ~(1 << 30)).printInfo()
+            throw new Error('got sc')
+        }
+        const targetSc = getSc(getScId(toHandle))
+        console.log(getScId(toHandle))
+        console.log('--- target info ---')
+        targetSc.printInfo()
+        console.log('-------------------')
+        throw new Error('??? no: ' + relId + ' : ' + fromSc.printInfo() + ' : ' + toHandle)
+    }
     fromSc.putInVert(relId, invc - 1)
     if (invc === 1) {
         if (fromSc.getLocalRc(relId) === 0) {
@@ -809,18 +891,21 @@ function removeScEdge(scid1, scid2, to) {
     while (fromSc.parent !== toSc.parent) {
         const d1 = fromSc.depth
         const d2 = toSc.depth 
-        if (d1 >= d2) {
+        if (d1 >= d2 && d1 > 0) {
             fromSc = getSc(fromSc.parent)
             if (!fromSc.decOutVertical(to)) return
         }
-        if (d1 <= d2) {
+        if (d1 <= d2 && d2 > 0) {
             const next = getSc(toSc.parent)
             arr.push(next, (toSc.id | (1 << 30)))
             // removeInboundVertical(next, (toSc.id | (1 << 30)))
             toSc = next
         }
     }
-    if (removeScPeerEdge(fromSc, toSc)) return
+    if (removeScPeerEdge(fromSc, toSc)) {
+        // the entire subgraph was just removed
+        return
+    }
     for (let i = 0; i < arr.length; i += 2) {
         removeInboundVertical(arr[i], arr[i+1])
     }
@@ -864,11 +949,13 @@ function clearScEdges(sc) {
     for (const leafHandle of sc.collectOutVerticals()) {
         const scid2 = getScId(leafHandle)
         if (sc.id === scid2) {
-            const toSc = getSc(scid2)
-            if (!removeScPeerEdge(sc, toSc)) {
-                removeInboundVertical(toSc, leafHandle)
-            }
-        } else {
+            throw new Error('should never happen')
+        }
+        if (sc.isFreed()) throw new Error('unexpected free')
+        if (getSc(scid2).isFreed()) continue //throw new Error('unexpected free')
+        // FIXME: this should be bulk
+        const count = sc.findOutVert(leafHandle)
+        for (let i = 0; i < count; i++) {
             removeScEdge(sc.id, scid2, leafHandle)
         }
     }
@@ -1043,10 +1130,9 @@ function mergeGroup(psc, group, newDepthExtent) {
     const oldRelId = new Map(group.map((s) => [s.id, s.getSelfLocalId()]))
     const groupIds = new Set(group.map((s) => s.id))
 
-    // 1) consolidate psc-level support (localRc + inVert) onto newSc
     let totalRc = 0
     let totalInVert = 0
-    const perChildInVert = new Map() // old.id -> its own individual psc-level inVert value
+    const perChildInVert = new Map()
     for (const old of group) {
         const v = psc.findInVert(old.getSelfLocalId()) ?? 0
         if (v) perChildInVert.set(old.id, v)
@@ -1056,8 +1142,6 @@ function mergeGroup(psc, group, newDepthExtent) {
         psc.putInVert(newSc.getSelfLocalId(), totalInVert)
     }
 
-    // 2) redirect every other psc-sibling's individual peer edge(s) into
-    // the group so they point at newSc instead
     for (const x of psc.collectHeapCells()) {
         if (!isSc(x[1])) continue
         const sibId = x[1] & ~(1 << 30)
@@ -1066,103 +1150,90 @@ function mergeGroup(psc, group, newDepthExtent) {
         let redirected = 0
         for (const old of group) {
             const v = sib.findPeerEdge(old.getSelfLocalId())
-            if (v) redirected += v
+            if (v) {
+                redirected += v
+                sib.putPeerEdge(old.getSelfLocalId(), 0)
+                perChildInVert.set(old.id, (perChildInVert.get(old.id) ?? 0) + v)
+            }
         }
         if (redirected > 0) {
-            const existing = sib.findPeerEdge(newSc.getSelfLocalId()) ?? 0
-            sib.putPeerEdge(newSc.getSelfLocalId(), existing + redirected)
+            sib.putPeerEdge(newSc.getSelfLocalId(), redirected)
             totalRc += redirected;
         }
     }
     if (totalRc > 0) {
         psc.setLocalRc(newSc.getSelfLocalId(), totalRc)
     }
-    // 2.5) redirect each group member's OWN outgoing peer edges to psc
-    // siblings OUTSIDE the group -- old's parent is about to change, so a
-    // peer edge keyed by "relId within psc" would go stale otherwise
-    // (internal group<->group peer edges are handled separately in step 4)
+
+    const rcs = new Map()
+    const needsFixup = new Map()
     for (const old of group) {
         for (const [relId, val] of old.collectPeerEdges()) {
-            if (!val) continue
+            if (!val) throw new Error('missing val')
             const stored = psc.getHeapCellId(relId - 1)
-            if (!stored) continue
+            if (!stored) throw new Error('missing cell')
             const targetId = stored & ~(1 << 30)
-            if (groupIds.has(targetId)) continue
+            if (groupIds.has(targetId)) {
+                rcs.set(targetId, (rcs.get(targetId) ?? 0) + val)
+                let m = needsFixup.get(old)
+                if (!m) needsFixup.set(old, m = new Map())
+                m.set(getSc(targetId), [relId, val])
+                continue
+            }
             old.putPeerEdge(relId, 0)
             const target = getSc(targetId)
             const existing = newSc.findPeerEdge(target.getSelfLocalId()) ?? 0
-            newSc.putPeerEdge(target.getSelfLocalId(), existing + val)
+            newSc.putPeerEdge(target.getSelfLocalId(), existing + 1) // increment, we are counting unique local paths not total paths
         }
     }
 
-    // 2.6) mirror every one of a group member's OWN out-vertical entries
-    // onto newSc too. clearScEdges() discovers what to tear down purely by
-    // walking an SC's own out-vertical table (not its peer-edge table), so
-    // even the "simple" entries backing a peer edge that just moved to
-    // newSc in step 2.5 need a matching raw entry here, or a future bulk
-    // free of newSc would never find them.
     for (const old of group) {
         for (const targetHandle of old.collectOutVerticals()) {
             const val = old.findOutVert(targetHandle)
             if (!val) continue
-            for (let i = 0; i < val; i++) newSc.incOutVertical(targetHandle)
+            let scId = isSc(targetHandle) ? (targetHandle & ~(1 << 30)) : getScId(targetHandle)
+            let internal = false
+            while (scId !== psc.id) {
+                if (groupIds.has(scId)) { internal = true; break }
+                if (scId === 0) throw new Error('should never happen')
+                scId = getSc(scId).parent
+            }
+            if (internal) continue
             newSc.incOutVertical(targetHandle)
         }
     }
 
-    // 3) detach group members from psc and reattach under newSc
     for (const old of group) {
-        psc.setLocalRc(old.getSelfLocalId(), 0) // clean up before the relId is free-listed
+        psc.setLocalRc(old.getSelfLocalId(), 0)
         if (psc.findInVert(old.getSelfLocalId())) psc.putInVert(old.getSelfLocalId(), 0)
         psc.removeHeapCell(old.getSelfLocalId())
         const individualInVert = perChildInVert.get(old.id)
+        const rc = rcs.get(old.id)
         old.parent = newSc.id
-        old.setSelfLocalId(newSc.pushHeapCell(old.id | (1 << 30)))
+        const relIdx = newSc.pushHeapCell(old.id | (1 << 30))
+        old.setSelfLocalId(relIdx)
         bumpDepth(old, newSc.depth + 1 - old.depth)
-        // 3.5) mirror this child's own (individual, not aggregated) psc-level
-        // in-vertical support onto newSc's own in-vertical table for it --
-        // a future removal, recomputed against the post-merge tree, walks
-        // down INTO newSc looking for exactly this per-child entry
-        if (individualInVert) newSc.putInVert(old.getSelfLocalId(), individualInVert)
+        if (individualInVert) newSc.putInVert(relIdx, individualInVert)
+        if (rc) newSc.setLocalRc(relIdx, rc)
     }
 
-    // 4) rekey peer edges between group members: same relationship, just
-    // scoped one level deeper now that both endpoints share newSc as parent
-    for (const a of group) {
-        for (const b of group) {
-            if (a === b) continue
-            const staleRelId = oldRelId.get(b.id)
-            const v = a.findPeerEdge(staleRelId)
-            if (!v) continue
-            a.putPeerEdge(staleRelId, 0)
-            const freshRelId = b.getSelfLocalId()
-            const existing = a.findPeerEdge(freshRelId) ?? 0
-            a.putPeerEdge(freshRelId, existing + v)
-            newSc.setLocalRc(freshRelId, newSc.getLocalRc(freshRelId) + v)
+    for (const [k, v] of needsFixup) {
+        const m = new Map()
+        for (const [other, [relIdx, val]] of v) {
+            m.set(other.getSelfLocalId(), val)
+            k.putPeerEdge(relIdx, 0)
         }
-    }
-
-    // 5) only now remove the old (now-stale) sibling -> group peer edges --
-    // everything they were protecting has an equal-or-greater replacement
-    // on newSc already in place from step 2
-    for (const x of psc.collectHeapCells()) {
-        if (!isSc(x[1])) continue
-        const sibId = x[1] & ~(1 << 30)
-        if (sibId === newSc.id) continue
-        const sib = getSc(sibId)
-        for (const old of group) {
-            const staleRelId = oldRelId.get(old.id)
-            if (sib.findPeerEdge(staleRelId)) sib.putPeerEdge(staleRelId, 0)
+        for (const [k2, v2] of m) {
+            k.putPeerEdge(k2, v2)
         }
     }
 
     return newSc
 }
 
-// keeps the depth invariant (child.depth === parent.depth + 1) intact for
-// an SC's whole subtree after it gets moved to sit under a new parent
+// sigh
 function bumpDepth(sc, delta) {
-    if (!delta) return
+    if (!delta) throw new Error('unexpected zero delta')
     sc.setDepth(sc.depth + delta)
     for (const x of sc.collectHeapCells()) {
         if (isSc(x[1])) bumpDepth(getSc(x[1] & ~(1 << 30)), delta)
@@ -1177,28 +1248,26 @@ function allocInto(sc) {
     if (!cur.activeSc) {
         cur.activeSc = createSc(cur)
     }
-    sc = cur.activeSc ?? cur // XXX: close enough
 
-    const count = sc.getCellCount()
+    const count = cur.activeSc.getCellCount()
     if (count < 50) {
         // if (!sc.isLeafOnly()) throw new Error('but why?')
-        const fakeAddr = sc.pushHeapCell(0xFF00 + sc.getCellCount())
-        return toAbsoluteHandle(sc.id, fakeAddr)
+        const fakeAddr = cur.activeSc.pushHeapCell(0xFF00 + cur.activeSc.getCellCount())
+        return toAbsoluteHandle(cur.activeSc.id, fakeAddr)
     }
 
-    const psc = getSc(sc.parent)
-
-    const count2 = psc.getCellCount()
+    const count2 = cur.getCellCount()
     if (count2 < 50) {
         cur.activeSc = createSc(cur)
         return createTestCell(cur.activeSc)
     }
-    condense(psc)
-    cur.activeSc = createSc(psc)
+    condense(cur)
+    cur.activeSc = createSc(cur)
     return createTestCell(cur.activeSc)
 }
 
 const root = createSc(0, true)
+root.setEternal(true)
 
 function testScenario1() {
     const t1 = createSc(root)
@@ -1238,19 +1307,6 @@ function benchEdgeToggle() {
 
 const shouldFuzz = false
 
-// --- fuzz harness: random add/remove edges, cross-checked against a shadow
-// adjacency graph (edgeMap) for reachability from a pinned root. Any handle
-// reachable from the root must never appear in freedHandles -- that's the
-// one hard soundness invariant (freeing something still referenced). We do
-// NOT flag the inverse (something unreachable that never gets freed) as a
-// bug on its own, since same-SC cycles are expected to leak per the design.
-//
-// The anchor cell lives in its own dedicated SC, isolated from the churn
-// pool -- nothing else in the churn pool ever shares an SC with it, so it
-// can never get swept as a side effect of a *sibling* SC's peer-edge
-// cascade (which is legitimate per-design and not something to pin
-// against, since `isEternal`/`setEternal` exists as API surface but isn't
-// consulted by `free()` yet -- an unwired stub, not a bug).
 function fuzzTest(seed, steps, numLeafScs = 3, cellsPerLeaf = 2) {
     if (!shouldFuzz) return
     let s = seed >>> 0
@@ -1275,9 +1331,6 @@ function fuzzTest(seed, steps, numLeafScs = 3, cellsPerLeaf = 2) {
     const rootCell = createTestCell(anchorSc)
     const roots = new Set([rootCell])
 
-    // an SC that's simply never been referenced yet ("hasn't been found",
-    // per design) isn't a leak -- only an SC that HAD vertical support and
-    // then lost it entirely, while surviving, is
     const everHadSupport = new Set()
 
     const shadow = new Map()
@@ -1298,8 +1351,7 @@ function fuzzTest(seed, steps, numLeafScs = 3, cellsPerLeaf = 2) {
         return seen
     }
 
-    // pin one churn cell alive via a permanent edge from the isolated anchor,
-    // so reachability actually propagates into the churn pool
+    // pin one churn cell alive via a permanent edge from the isolated anchor
     addTestEdge(rootCell, cells[0])
     shadowAdd(rootCell, cells[0])
 
@@ -1333,7 +1385,7 @@ function fuzzTest(seed, steps, numLeafScs = 3, cellsPerLeaf = 2) {
                 }
             }
         } catch (e) {
-            if (e.message === 'out of room!') { capacitySkips++; continue } // known fixed-size-region stub, not an algo bug
+            if (e.message === 'out of room!') { capacitySkips++; continue }
             console.log('FAILED at step', step, 'op', opLog[opLog.length-1])
             console.log('full op log:', JSON.stringify(opLog))
             throw e
@@ -1347,12 +1399,7 @@ function fuzzTest(seed, steps, numLeafScs = 3, cellsPerLeaf = 2) {
             }
         }
 
-        // an SC that HAD vertical support (something in its parent's
-        // localRc, or an in-vertical from further up) and then lost it
-        // entirely, while surviving unfreed, is a real leak -- distinct
-        // from an SC that simply hasn't been referenced yet ("hasn't been
-        // found", per design), and distinct from a cycle among cells
-        // *inside* an otherwise-still-supported SC.
+        // an SC that had vertical support and then lost it but wasn't freed = leak
         for (const leafSc of leafScs) {
             if (leafSc.isFreed()) continue
             const relId = leafSc.getSelfLocalId()
@@ -1380,25 +1427,14 @@ fuzzTest(3333, 8000, 8, 8)
 fuzzTest(4444, 8000, 8, 8)
 fuzzTest(5555, 8000, 8, 8)
 
-// all 64 cells as siblings in a single SC (pure local-rc/in-vertical churn,
-// no cross-SC peer/out-vertical mechanics at all -- but with rootCell's own
-// isolated anchor SC still in the mix, so mid still has 2 children total)
 fuzzTest(6001, 8000, 1, 64)
 fuzzTest(6002, 8000, 1, 64)
 fuzzTest(6003, 8000, 1, 64)
 
-// two full 64-cell SCs as siblings -- forces heavy cross-SC out-vertical/
-// in-vertical/peer-edge overflow between two maxed-out SCs
 fuzzTest(7001, 8000, 2, 64)
 fuzzTest(7002, 8000, 2, 64)
 fuzzTest(7003, 8000, 2, 64)
 
-// --- heap cell churn: creates and directly frees cells within an SC over
-// time (not just toggling edges among a fixed pool), stressing the new
-// free-list reuse path in pushHeapCell/removeHeapCell -- specifically
-// whether a relId handed back out after being freed starts from clean
-// state (localRc, inVert) and whether collectHeapCells still enumerates
-// everything correctly once holes exist.
 function fuzzTestCellChurn(seed, steps, numLeafScs = 4, initialCellsPerLeaf = 4) {
     if (!shouldFuzz) return
     let s = seed >>> 0
@@ -1523,67 +1559,8 @@ fuzzTestCellChurn(8003, 8000)
 fuzzTestCellChurn(8004, 8000, 8, 8)
 fuzzTestCellChurn(8005, 8000, 8, 8)
 
-// --- condense() scenario test: A<->B<->C form a cycle, D and E don't
-// participate in any cycle, X is an outside sibling with a peer edge into
-// the cycle (A specifically). After condense(psc): A,B,C should be
-// wrapped into one new SC (a real SCC), D,E into another (remainder, not
-// treated as their own SCCs), and X's peer edge should be redirected to
-// point at the cycle's new wrapper instead of A directly.
-function testCondense() {
-    const psc = createSc(root)
-    const A = createSc(psc)
-    const B = createSc(psc)
-    const C = createSc(psc)
-    const D = createSc(psc)
-    const E = createSc(psc)
-    const X = createSc(psc)
-
-    const aCell = createTestCell(A)
-    const bCell = createTestCell(B)
-    const cCell = createTestCell(C)
-    createTestCell(D)
-    createTestCell(E)
-    const xCell = createTestCell(X)
-    X.setDepthExtent(5) // a different (already-condensed) generation -- not part of this bucket
-
-    addTestEdge(aCell, bCell)
-    addTestEdge(bCell, cCell)
-    addTestEdge(cCell, aCell)
-    addTestEdge(xCell, aCell)
-
-    console.log('--- condense test: before ---')
-    console.log('psc children:', psc.collectHeapCells().map((x) => x[1] & ~(1 << 30)))
-    console.log('X peer edges before:', X.collectPeerEdges())
-
-    condense(psc)
-
-    console.log('--- condense test: after ---')
-    const after = psc.collectHeapCells().map((x) => getSc(x[1] & ~(1 << 30)))
-    for (const child of after) {
-        console.log(' child', child.id, 'depthExtent', child.getDepthExtent(), 'members', child.collectHeapCells().map((c) => c[1] & ~(1 << 30)))
-    }
-    console.log('X peer edges after:', X.collectPeerEdges())
-
-    const cycleWrapper = after.find((s) => s.collectHeapCells().some((c) => (c[1] & ~(1 << 30)) === A.id))
-    const remainderWrapper = after.find((s) => s.collectHeapCells().some((c) => (c[1] & ~(1 << 30)) === D.id))
-    console.log('sanity: psc child count === 3 (X + 2 wrappers)?', after.length === 3)
-    console.log('sanity: cycle wrapper has exactly A,B,C?', cycleWrapper && cycleWrapper.getCellCount() === 3)
-    console.log('sanity: remainder wrapper has exactly D,E?', remainderWrapper && remainderWrapper.getCellCount() === 2)
-    console.log('sanity: X now points at cycle wrapper?', X.findPeerEdge(cycleWrapper.getSelfLocalId()) === 1)
-    console.log('sanity: A no longer directly a psc child?', !after.includes(A))
-}
-testCondense()
-
-// --- condense() fuzzing: build a psc with many child SCs holding cells,
-// churn random leaf-level edges among those cells (organically creating
-// real SC-level peer edges and, sometimes, real cycles), run condense one
-// or more times interleaved with more churn, and check the one hard
-// invariant: condense is a pure reorganization, never a collection pass --
-// anything reachable before a condense() call must still be reachable
-// (never end up in freedHandles) after it, and that must keep holding
-// under further churn against the now-deeper structure.
 function fuzzTestCondense(seed, numChildSCs, cellsPerChild, rounds, stepsPerRound) {
-    //if (!shouldFuzz) return
+    // if (!shouldFuzz) return
     let s = seed >>> 0
     function rnd() {
         s = (s * 1664525 + 1013904223) >>> 0
@@ -1600,8 +1577,6 @@ function fuzzTestCondense(seed, numChildSCs, cellsPerChild, rounds, stepsPerRoun
         for (let j = 0; j < cellsPerChild; j++) cells.push(createTestCell(children[i]))
     }
 
-    // anchor lives under `root` directly, siblings with `psc` itself -- never
-    // touched by condense(psc), which only ever reorganizes psc's own children
     const anchorSc = createSc(root)
     const rootCell = createTestCell(anchorSc)
     const roots = new Set([rootCell])
@@ -1634,11 +1609,12 @@ function fuzzTestCondense(seed, numChildSCs, cellsPerChild, rounds, stepsPerRoun
         if (to === from) return
         const m = edgeMap.get(from)
         const existing = m?.get(to) ?? 0
-        const isAdd = existing === 0 || rnd() < 0.6
+        const isAdd = rnd() < 0.05
         if (isAdd) {
             addTestEdge(from, to)
             shadowAdd(from, to)
         } else {
+            if (!existing) return
             removeTestEdge(from, to)
             const m2 = edgeMap.get(from)
             if (!m2 || !m2.has(to)) shadow.get(from)?.delete(to)
@@ -1659,227 +1635,35 @@ function fuzzTestCondense(seed, numChildSCs, cellsPerChild, rounds, stepsPerRoun
     let violations = 0
     let condenseErrors = 0
     for (let round = 0; round < rounds; round++) {
-        for (let i = 0; i < stepsPerRound; i++) churnStep()
-        violations += checkSoundness('pre-condense churn')
+        try {
+            for (let i = 0; i < stepsPerRound; i++) churnStep()
+            violations += checkSoundness('pre-condense churn')
+        } catch (e) {
+            console.log('CHURN ERROR:', e.message, 'round', round, 'seed', seed)
+            throw e
+        }
 
         try {
             condense(psc)
         } catch (e) {
             condenseErrors++
-            console.log('CONDENSE CRASHED:', e.message, 'round', round, 'seed', seed)
-            break
+            console.log('CONDENSE ERROR:', e.message, 'round', round, 'seed', seed)
+            throw e
         }
         violations += checkSoundness('condense')
     }
-    console.log(`condense fuzz seed=${seed} n=${numChildSCs}x${cellsPerChild} done: ${violations} violations, ${condenseErrors} condense errors, ${freedHandles.size} freed total`)
+    console.log(`condense fuzz seed=${seed} n=${numChildSCs}x${cellsPerChild}: ${violations} violations, ${condenseErrors} condense errors, ${freedHandles.size} freed total`)
 }
 
-// --- minimal-repro harness for fuzzTestCondense failures: records every
-// op (churn + condense-round markers) against a fixed-size cell pool
-// (indices stable, cells array never grows), replays them against a fresh
-// but structurally identical setup, and delta-debugs down to the smallest
-// failing sequence.
-function replayCondenseOps(ops, numChildSCs, cellsPerChild, quiet) {
-    const psc = createSc(root)
-    const children = []
-    for (let i = 0; i < numChildSCs; i++) children.push(createSc(psc))
-    const cells = []
-    for (let i = 0; i < numChildSCs; i++) {
-        for (let j = 0; j < cellsPerChild; j++) cells.push(createTestCell(children[i]))
-    }
-    const anchorSc = createSc(root)
-    const rootCell = createTestCell(anchorSc)
-    const roots = new Set([rootCell])
-    const shadow = new Map()
-    function shadowAdd(f, t) {
-        if (!shadow.has(f)) shadow.set(f, new Set())
-        shadow.get(f).add(t)
-    }
-    function reachable() {
-        const seen = new Set()
-        const stack = [...roots]
-        while (stack.length) {
-            const h = stack.pop()
-            if (seen.has(h)) continue
-            seen.add(h)
-            for (const t of shadow.get(h) ?? []) stack.push(t)
-        }
-        return seen
-    }
-    addTestEdge(rootCell, cells[0])
-    shadowAdd(rootCell, cells[0])
-
-    const origLog = console.log
-    if (quiet) console.log = () => {}
-    try {
-        for (const op of ops) {
-            if (op[0] === 'add') {
-                addTestEdge(cells[op[1]], cells[op[2]])
-                shadowAdd(cells[op[1]], cells[op[2]])
-            } else if (op[0] === 'remove') {
-                removeTestEdge(cells[op[1]], cells[op[2]])
-                const m2 = edgeMap.get(cells[op[1]])
-                if (!m2 || !m2.has(cells[op[2]])) shadow.get(cells[op[1]])?.delete(cells[op[2]])
-            } else if (op[0] === 'condense') {
-                condense(psc)
-            }
-            for (const h of reachable()) {
-                if (freedHandles.has(h)) return 'SOUNDNESS: ' + h
-            }
-        }
-        return null
-    } catch (e) {
-        return e.message
-    } finally {
-        if (quiet) console.log = origLog
-    }
-}
-
-function isValidCondenseSequence(ops) {
-    const counts = new Map()
-    for (const op of ops) {
-        if (op[0] === 'condense') continue
-        const key = op[1] + ':' + op[2]
-        const c = counts.get(key) ?? 0
-        if (op[0] === 'add') counts.set(key, c + 1)
-        else {
-            if (c <= 0) return false
-            counts.set(key, c - 1)
-        }
-    }
-    return true
-}
-
-function ddminCondense(ops, numChildSCs, cellsPerChild, matchesErr) {
-    let current = ops.slice()
-    let changed = true
-    while (changed) {
-        changed = false
-        for (let i = 0; i < current.length; i++) {
-            const candidate = current.slice(0, i).concat(current.slice(i + 1))
-            if (!isValidCondenseSequence(candidate)) continue
-            if (matchesErr(replayCondenseOps(candidate, numChildSCs, cellsPerChild, true))) {
-                current = candidate
-                changed = true
-                break
-            }
-        }
-    }
-    return current
-}
-
-function findCondenseMinimalRepro(seed, numChildSCs, cellsPerChild, rounds, stepsPerRound) {
-    let s = seed >>> 0
-    function rnd() {
-        s = (s * 1664525 + 1013904223) >>> 0
-        return s / 0xFFFFFFFF
-    }
-    function rndInt(n) { return Math.floor(rnd() * n) }
-
-    const psc = createSc(root)
-    const children = []
-    for (let i = 0; i < numChildSCs; i++) children.push(createSc(psc))
-    const cells = []
-    const cellIndex = new Map()
-    for (let i = 0; i < numChildSCs; i++) {
-        for (let j = 0; j < cellsPerChild; j++) {
-            const h = createTestCell(children[i])
-            cellIndex.set(h, cells.length)
-            cells.push(h)
-        }
-    }
-    const anchorSc = createSc(root)
-    const rootCell = createTestCell(anchorSc)
-    const roots = new Set([rootCell])
-    const shadow = new Map()
-    function shadowAdd(f, t) {
-        if (!shadow.has(f)) shadow.set(f, new Set())
-        shadow.get(f).add(t)
-    }
-    function reachable() {
-        const seen = new Set()
-        const stack = [...roots]
-        while (stack.length) {
-            const h = stack.pop()
-            if (seen.has(h)) continue
-            seen.add(h)
-            for (const t of shadow.get(h) ?? []) stack.push(t)
-        }
-        return seen
-    }
-    addTestEdge(rootCell, cells[0])
-    shadowAdd(rootCell, cells[0])
-
-    const opLog = []
-    let foundErr = null
-    outer: for (let round = 0; round < rounds; round++) {
-        for (let i = 0; i < stepsPerRound; i++) {
-            const live = cells.filter((h) => !freedHandles.has(h))
-            if (live.length < 2) continue
-            const fromH = live[rndInt(live.length)]
-            const toH = live[rndInt(live.length)]
-            if (toH === fromH) continue
-            const from = cellIndex.get(fromH)
-            const to = cellIndex.get(toH)
-            const m = edgeMap.get(cells[from])
-            const existing = m?.get(cells[to]) ?? 0
-            const isAdd = existing === 0 || rnd() < 0.6
-            opLog.push([isAdd ? 'add' : 'remove', from, to])
-            if (isAdd) {
-                addTestEdge(cells[from], cells[to])
-                shadowAdd(cells[from], cells[to])
-            } else {
-                removeTestEdge(cells[from], cells[to])
-                const m2 = edgeMap.get(cells[from])
-                if (!m2 || !m2.has(cells[to])) shadow.get(cells[from])?.delete(cells[to])
-            }
-            for (const h of reachable()) {
-                if (freedHandles.has(h)) {
-                    foundErr = 'SOUNDNESS: ' + h
-                    break outer
-                }
-            }
-        }
-        opLog.push(['condense'])
-        try {
-            condense(psc)
-        } catch (e) {
-            foundErr = e.message
-            break outer
-        }
-        for (const h of reachable()) {
-            if (freedHandles.has(h)) {
-                foundErr = 'SOUNDNESS: ' + h
-                break outer
-            }
-        }
-    }
-
-    console.log('found error:', foundErr, 'after', opLog.length, 'ops')
-    if (!foundErr) return
-    const errPrefix = foundErr.startsWith('SOUNDNESS') ? 'SOUNDNESS' : foundErr
-    const minimal = ddminCondense(opLog, numChildSCs, cellsPerChild, (e) => e && (e.startsWith(errPrefix) || (errPrefix === 'SOUNDNESS' && e.startsWith('SOUNDNESS'))))
-    console.log('minimal repro (', minimal.length, 'ops ):', JSON.stringify(minimal))
-    console.log('minimal replay error:', replayCondenseOps(minimal, numChildSCs, cellsPerChild, true))
-}
-
-fuzzTestCondense(9001, 12, 4, 4, 300)
+fuzzTestCondense(9001, 12, 4, 4, 200)
 fuzzTestCondense(9002, 12, 4, 4, 300)
 fuzzTestCondense(9003, 20, 3, 5, 400)
 fuzzTestCondense(9004, 20, 3, 5, 400)
 fuzzTestCondense(9005, 8, 8, 6, 500)
-fuzzTestCondense(9006, 16, 16, 10, 1000)
-fuzzTestCondense(9007, 32, 32, 20, 2000)
+fuzzTestCondense(9006, 16, 16, 10, 500)
+fuzzTestCondense(9007, 32, 32, 20, 500)
+fuzzTestCondense(9008, 63, 63, 20, 500)
 
-// findCondenseMinimalRepro(9007, 32, 32, 20, 2000)
-
-// --- chaos/soak test: continuously allocInto() a single logical SC
-// (self-balancing via activeSc + condense as it grows), while applying
-// random mutations to whatever cells we currently believe are alive,
-// proportional to how many of those there are. Not checking a specific
-// invariant here -- just observing, over wall-clock time, whether/why
-// memory (page count is the real cost: 4MB per SC ever created) keeps
-// growing even as cells get collected.
 function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
     // if (!shouldFuzz) return
     let s = seed >>> 0
@@ -1889,11 +1673,6 @@ function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
     }
     function rndInt(n) { return Math.floor(rnd() * n) }
 
-    // optional soundness verification (off by default -- adds real overhead:
-    // a shadow adjacency graph plus a reachability walk after every
-    // mutation). Anchored the same way as the other fuzzers: an isolated
-    // SC, sibling to `top`, never itself subject to condense(top)'s
-    // reorganization, pinned to the very first allocated cell.
     let roots, shadow, shadowAdd, reachable
     if (verify) {
         const anchorSc = createSc(root)
@@ -1915,9 +1694,7 @@ function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
             }
             return seen
         }
-        // pinned once the first real cell exists, below
     }
-    let pinnedRoot = false
     let violations = 0
     function checkSoundness(label) {
         if (!verify) return
@@ -1960,7 +1737,7 @@ function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
     while (Date.now() - startTime < durationMs) {
         iterations++
 
-        const numAlloc = 1 + rndInt(3)
+        const numAlloc = 1 + rndInt(4)
         for (let i = 0; i < numAlloc; i++) {
             const h = allocInto(top)
             alive.push(h)
@@ -1978,9 +1755,10 @@ function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
             const from = liveNow[rndInt(liveNow.length)]
             const to = liveNow[rndInt(liveNow.length)]
             if (from === to) continue
+            if (freedHandles.has(from) || freedHandles.has(to)) continue
             const m = edgeMap.get(from)
             const existing = m?.get(to) ?? 0
-            const isAdd = existing === 0 || rnd() < 0.5
+            const isAdd = existing === 0 || rnd() < 0.7
             if (isAdd) {
                 addTestEdge(from, to)
                 if (verify) shadowAdd(from, to)
@@ -2015,13 +1793,249 @@ function chaosTest(seed, durationMs, mutationRate = 0.02, verify = false) {
     console.log(`  live-cell-to-page ratio: ${(alive.filter((h) => !freedHandles.has(h)).length / pages.length).toFixed(2)}`)
 }
 
-chaosTest(42424, 16000, 0.02, true)
+  // chaosTest(42424, 30000, 0.5, true)
 
-// --- minimal-repro harness for chaosTest soundness violations: records
-// every individual action (alloc / add / remove, using stable indices into
-// the append-only `alive` array) and stops at the first violation, then
-// delta-debugs down to the smallest failing sequence.
-function chaosFindRepro(seed, maxActions, mutationRate) {
+// --- stack-shaped chaos test: a program has an execution stack, not a pile
+// of cells floating in the void. A chaos "agent" maintains a stack of
+// frames (one SC each, all siblings under a stable `framesParent`).
+// allocInto() always targets the *active* frame (stack.at(-1)). Pushing a
+// frame links it to its caller via a real edge (frame[i] -> frame[i+1],
+// through a dedicated anchor cell each frame gets on creation) -- popping
+// removes exactly that edge, simulating "the call returned." Everything
+// else (escaped references into a popped frame from cross-frame edges,
+// etc.) is left to fall out of the refcounting naturally, same as real
+// closures capturing stack state.
+//
+// The agent also sometimes creates edges *across* frames in either
+// direction (active -> non-active, and non-active -> active), which is
+// exactly the kind of thing a real closure capturing an outer variable
+// (or a callee handing a value up to its caller) would do.
+function chaosStackTest(seed, durationMs, opts = {}) {
+    const {
+        pushProb: basePushProb = 0.1,
+        popProb: basePopProb = 0.08,
+        allocProb = 0.5,
+        crossEdgeProb = 0.15,
+        maxGoalDepth = 500,
+        verify = false,
+    } = opts
+
+    let s = seed >>> 0
+    function rnd() {
+        s = (s * 1664525 + 1013904223) >>> 0
+        return s / 0xFFFFFFFF
+    }
+    function rndInt(n) { return Math.floor(rnd() * n) }
+
+    const eternal = createSc(root)
+    const eternalCell = createTestCell(eternal)
+    let roots, shadow, shadowAdd, reachable
+    let violations = 0
+    if (verify) {
+        roots = new Set([eternalCell])
+        shadow = new Map()
+        shadowAdd = (f, t) => {
+            if (!shadow.has(f)) shadow.set(f, new Set())
+            shadow.get(f).add(t)
+        }
+        reachable = () => {
+            const seen = new Set()
+            const stack = [...roots]
+            while (stack.length) {
+                const h = stack.pop()
+                if (seen.has(h)) continue
+                seen.add(h)
+                for (const t of shadow.get(h) ?? []) stack.push(t)
+            }
+            return seen
+        }
+    }
+    function checkSoundness(label) {
+        if (!verify) return
+        for (const h of reachable()) {
+            if (freedHandles.has(h)) {
+                violations++
+                console.log('BUG:', label, 'freed a still-reachable cell!', h)
+            }
+        }
+    }
+    function scanAllIntegrity(label) {
+        for (let id = 0; id < scTable.length; id++) {
+            const sc = scTable[id]
+            if (!sc) continue
+            const problems = sc.checkIntegrity()
+            if (problems.length) {
+                console.log(`INTEGRITY VIOLATION at ${label}: SC ${id} ->`, problems)
+                return true
+            }
+        }
+        return false
+    }
+
+    const framesParent = createSc(root)
+    // frame descriptor: { sc, anchorCell, cells: [] }
+    const frames = []
+
+    function pushFrame() {
+        if (framesParent.getCellCount() >= 50) condense(framesParent)
+        const sc = createSc(framesParent)
+        // sc must stay SC-only: allocInto(sc) will give it activeSc children,
+        // so the anchor leaf cell needs its own dedicated leaf-only container
+        const leafSc = createSc(sc)
+        const anchorCell = createTestCell(leafSc)
+        const frame = { sc, anchorCell, cells: [] }
+        if (frames.length) {
+            const caller = frames[frames.length - 1]
+            if (freedHandles.has(caller.anchorCell)) {
+                console.log(reachable?.(caller.anchorCell))
+                throw new Error('caller anchor was freed')
+            }
+            addTestEdge(caller.anchorCell, anchorCell) // caller -> callee frame link
+            if (verify) shadowAdd(caller.anchorCell, anchorCell)
+        } else {
+            addTestEdge(eternalCell, anchorCell)
+            if (verify) shadowAdd(eternalCell, anchorCell)
+        }
+        frames.push(frame)
+        return frame
+    }
+
+    function popFrame() {
+        if (frames.length < 2) return // keep at least one frame around
+        const callee = frames.pop()
+        const caller = frames[frames.length - 1]
+        removeTestEdge(caller.anchorCell, callee.anchorCell) // "the call returned"
+        if (verify) shadow.get(caller.anchorCell)?.delete(callee.anchorCell)
+    }
+
+    pushFrame()
+
+    // a real call stack drifts toward some depth (recursion, call chains)
+    // rather than wandering with flat push/pop odds -- pick a goal depth
+    // and bias push/pop toward it, re-rolling a new goal once reached.
+    // Still leaves genuine variation: the bias nudges the odds, it doesn't
+    // replace them, so it'll still sometimes move the "wrong" way or just
+    // sit there alloc'ing/cross-linking for a while.
+    let goalDepth = 1 + rndInt(maxGoalDepth)
+    let goalsReached = 0
+
+    const startTime = Date.now()
+    let iterations = 0
+    let allocCount = 0
+    let pushCount = 0
+    let popCount = 0
+    let crossEdgeCount = 0
+    const startPages = pages.length
+    const startScCount = scTable.length
+
+    function iterate() {
+        iterations++
+
+        if (frames.length === goalDepth) {
+            goalDepth = 1 + rndInt(maxGoalDepth)
+            goalsReached++
+        }
+        const depthDelta = goalDepth - frames.length // >0 wants push, <0 wants pop
+        const bias = Math.min(0.35, Math.abs(depthDelta) * 0.02)
+        const pushProb = depthDelta > 0 ? basePushProb + bias : Math.max(0.01, basePushProb - bias)
+        const popProb = depthDelta < 0 ? basePopProb + bias : Math.max(0.01, basePopProb - bias)
+
+        const roll = rnd()
+
+        if (roll < pushProb) {
+            pushFrame()
+            pushCount++
+        } else if (roll < pushProb + popProb) {
+            popFrame()
+            popCount++
+        } else if (roll < pushProb + popProb + allocProb) {
+            const active = frames[frames.length - 1]
+            const h = allocInto(active.sc)
+            if (freedHandles.has(active.anchorCell)) throw new Error('anchor was freed')
+            addTestEdge(active.anchorCell, h) // reachable via the frame itself, like a real local slot
+            if (verify) shadowAdd(active.anchorCell, h)
+            active.cells.push(h)
+            allocCount++
+        } else if (roll < pushProb + popProb + allocProb + crossEdgeProb && frames.length > 1) {
+            const active = frames[frames.length - 1]
+            const otherIdx = rndInt(frames.length - 1)
+            const other = frames[otherIdx]
+            if (active.cells.length > 1 && other.cells.length > 1) {
+                // index 0 is always the frame's anchor cell -- reserved for
+                // the structural push/pop chain link, never a valid random
+                // cross-edge target
+                const activeCell = active.cells[1 + rndInt(active.cells.length - 1)]
+                const otherCell = other.cells[1 + rndInt(other.cells.length - 1)]
+                if (!freedHandles.has(activeCell) && !freedHandles.has(otherCell)) {
+                    const forward = rnd() < 0.5
+                    const from = forward ? activeCell : otherCell
+                    const to = forward ? otherCell : activeCell
+                    const m = edgeMap.get(from)
+                    const existing = m?.get(to) ?? 0
+                    if (existing === 0 || rnd() < 0.6) {
+                        addTestEdge(from, to)
+                        if (verify) shadowAdd(from, to)
+                    } else {
+                        removeTestEdge(from, to)
+                        if (verify) {
+                            const m2 = edgeMap.get(from)
+                            if (!m2 || !m2.has(to)) shadow.get(from)?.delete(to)
+                        }
+                    }
+                    crossEdgeCount++
+                }
+            }
+        }
+
+        // drop freed cells from frame bookkeeping periodically (our own
+        // bookkeeping only, not cg.js state)
+        if (iterations % 200 === 0) {
+            for (const f of frames) f.cells = f.cells.filter((h) => !freedHandles.has(h))
+        }
+
+        checkSoundness(`iter=${iterations}`)
+        if (scanAllIntegrity(`iter=${iterations}`)) return
+
+        if (iterations % 2000 === 0) {
+            const elapsed = Date.now() - startTime
+            console.log(
+                `[t=${elapsed}ms] iter=${iterations} frames=${frames.length} goal=${goalDepth} allocated=${allocCount}` +
+                ` pushed=${pushCount} popped=${popCount} crossEdges=${crossEdgeCount} freed=${freedHandles.size}` +
+                ` scCount=${scTable.length} pages=${pages.length} (${((pages.length * 4) / 1024).toFixed(1)}MB)`
+            )
+        }
+    }
+
+    while (Date.now() - startTime < durationMs) {
+        try {
+            iterate()
+        } catch (err) {
+            console.log('failed at iter', iterations, 'frame count', frames.length)
+            throw err
+        }
+    }
+
+    console.log(`chaos stack test seed=${seed} done: ${iterations} iterations in ${Date.now() - startTime}ms`)
+    if (verify) console.log(`  soundness violations: ${violations}`)
+    console.log(`  frames alive=${frames.length}, pushed=${pushCount} popped=${popCount}, goal depths reached=${goalsReached}`)
+    console.log(`  allocated=${allocCount} crossEdges=${crossEdgeCount} freed=${freedHandles.size}`)
+    console.log(`  scCount: ${startScCount} -> ${scTable.length} (+${scTable.length - startScCount})`)
+    console.log(`  pages: ${startPages} -> ${pages.length} (+${pages.length - startPages}, ${(((pages.length - startPages) * 4) / 1024).toFixed(1)}MB)`)
+}
+
+ chaosStackTest(24683, 16000, { verify: false })
+
+ chaosStackTest(24682, 16000, { verify: true })
+
+ chaosStackTest(24681, 16000, { verify: true })
+
+// --- minimal-repro harness for chaosStackTest: records a flat, fully
+// resolved op log (push/pop/alloc/cross, with frames identified by a
+// stable monotonic id -- never reused, unlike array position -- and cells
+// identified by stable per-frame indices) and stops at the first crash or
+// soundness violation. Then delta-debugs it down.
+function chaosStackFindRepro(seed, maxActions, opts = {}) {
+    const { pushProb: basePushProb = 0.1, popProb: basePopProb = 0.08, allocProb = 0.5, crossEdgeProb = 0.15, maxGoalDepth = 500 } = opts
     let s = seed >>> 0
     function rnd() {
         s = (s * 1664525 + 1013904223) >>> 0
@@ -2049,63 +2063,108 @@ function chaosFindRepro(seed, maxActions, mutationRate) {
         return seen
     }
 
-    const real_top = createSc(root)
-    const top = createSc(real_top)
-    let alive = []
-    let pinnedRoot = false
+    const framesParent = createSc(root)
+    const frames = [] // { id, sc, anchorCell, cells: [] } -- stack, id is monotonic
+    let nextFrameId = 0
+
     const opLog = []
     let foundErr = null
 
-    for (let action = 0; action < maxActions; action++) {
-        const doAlloc = alive.length === 0 || rnd() < 0.3
-        if (doAlloc) {
-            opLog.push(['alloc'])
-            let h
-            try {
-                h = allocInto(top)
-            } catch (e) {
-                foundErr = e.message
-                break
-            }
-            alive.push(h)
-            if (!pinnedRoot) {
-                addTestEdge(rootCell, h)
-                shadowAdd(rootCell, h)
-                pinnedRoot = true
-            }
+    function pushFrame() {
+        opLog.push(['push'])
+        if (framesParent.getCellCount() >= 50) condense(framesParent)
+        const sc = createSc(framesParent)
+        const leafSc = createSc(sc)
+        const anchorCell = createTestCell(leafSc)
+        const frame = { id: nextFrameId++, sc, anchorCell, cells: [anchorCell] }
+        if (frames.length) {
+            const caller = frames[frames.length - 1]
+            addTestEdge(caller.anchorCell, anchorCell)
+            shadowAdd(caller.anchorCell, anchorCell)
         } else {
-            const liveNow = alive.filter((h) => !freedHandles.has(h))
-            if (liveNow.length < 2) continue
-            const fromH = liveNow[rndInt(liveNow.length)]
-            const toH = liveNow[rndInt(liveNow.length)]
-            if (fromH === toH) continue
-            const from = alive.indexOf(fromH)
-            const to = alive.indexOf(toH)
-            const m = edgeMap.get(fromH)
-            const existing = m?.get(toH) ?? 0
-            const isAdd = existing === 0 || rnd() < 0.5
-            opLog.push([isAdd ? 'add' : 'remove', from, to])
-            try {
-                if (isAdd) {
-                    addTestEdge(fromH, toH)
-                    shadowAdd(fromH, toH)
-                } else {
-                    removeTestEdge(fromH, toH)
-                    const m2 = edgeMap.get(fromH)
-                    if (!m2 || !m2.has(toH)) shadow.get(fromH)?.delete(toH)
-                }
-            } catch (e) {
-                foundErr = e.message
-                break
-            }
+            addTestEdge(rootCell, anchorCell)
+            shadowAdd(rootCell, anchorCell)
         }
+        frames.push(frame)
+    }
 
+    function popFrame() {
+        if (frames.length < 2) return
+        opLog.push(['pop'])
+        const callee = frames.pop()
+        const caller = frames[frames.length - 1]
+        removeTestEdge(caller.anchorCell, callee.anchorCell)
+        shadow.get(caller.anchorCell)?.delete(callee.anchorCell)
+    }
+
+    pushFrame()
+    opLog.length = 0 // the initial frame is created unconditionally by both this fn and replayStackOps -- don't double-log it
+
+    let goalDepth = 1 + rndInt(maxGoalDepth)
+    let goalsReached = 0
+
+    function checkErr() {
         for (const h of reachable()) {
-            if (freedHandles.has(h)) {
-                foundErr = 'SOUNDNESS: ' + h
-                break
-            }
+            if (freedHandles.has(h)) return 'SOUNDNESS: ' + h
         }
+        return null
+    }
+
+    for (let action = 0; action < maxActions; action++) {
+        if (frames.length === goalDepth) {
+            goalDepth = 1 + rndInt(maxGoalDepth)
+            goalsReached++
+        }
+        const depthDelta = goalDepth - frames.length
+        const bias = Math.min(0.35, Math.abs(depthDelta) * 0.02)
+        const pushProb = depthDelta > 0 ? basePushProb + bias : Math.max(0.01, basePushProb - bias)
+        const popProb = depthDelta < 0 ? basePopProb + bias : Math.max(0.01, basePopProb - bias)
+        const roll = rnd()
+        try {
+            if (roll < pushProb) {
+                pushFrame()
+            } else if (roll < pushProb + popProb) {
+                popFrame()
+            } else if (roll < pushProb + popProb + allocProb) {
+                const active = frames[frames.length - 1]
+                opLog.push(['alloc'])
+                const h = allocInto(active.sc)
+                addTestEdge(active.anchorCell, h)
+                shadowAdd(active.anchorCell, h)
+                active.cells.push(h)
+            } else if (roll < pushProb + popProb + allocProb + crossEdgeProb && frames.length > 1) {
+                const active = frames[frames.length - 1]
+                const otherIdx = rndInt(frames.length - 1)
+                const other = frames[otherIdx]
+                if (active.cells.length > 1 && other.cells.length > 1) {
+                    const activeCellIdx = 1 + rndInt(active.cells.length - 1)
+                    const otherCellIdx = 1 + rndInt(other.cells.length - 1)
+                    const activeCell = active.cells[activeCellIdx]
+                    const otherCell = other.cells[otherCellIdx]
+                    if (!freedHandles.has(activeCell) && !freedHandles.has(otherCell)) {
+                        const forward = rnd() < 0.5
+                        const from = forward ? activeCell : otherCell
+                        const to = forward ? otherCell : activeCell
+                        const m = edgeMap.get(from)
+                        const existing = m?.get(to) ?? 0
+                        const isAdd = existing === 0 || rnd() < 0.5
+                        opLog.push(['cross', other.id, activeCellIdx, otherCellIdx, forward, isAdd])
+                        if (isAdd) {
+                            addTestEdge(from, to)
+                            shadowAdd(from, to)
+                        } else {
+                            removeTestEdge(from, to)
+                            const m2 = edgeMap.get(from)
+                            if (!m2 || !m2.has(to)) shadow.get(from)?.delete(to)
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            foundErr = e.message
+            break
+        }
+        foundErr = checkErr()
         if (foundErr) break
     }
 
@@ -2113,7 +2172,7 @@ function chaosFindRepro(seed, maxActions, mutationRate) {
     return { opLog, foundErr }
 }
 
-function replayChaosOps(ops, quiet) {
+function replayStackOps(ops, quiet, skipReachCheck) {
     const anchorSc = createSc(root)
     const rootCell = createTestCell(anchorSc)
     const roots = new Set([rootCell])
@@ -2133,41 +2192,78 @@ function replayChaosOps(ops, quiet) {
         }
         return seen
     }
-    const top = createSc(root)
-    let alive = []
-    let pinnedRoot = false
+
+    const framesParent = createSc(root)
+    const frames = []
+    const framesById = new Map()
+    let nextFrameId = 0
+
+    function pushFrame() {
+        if (framesParent.getCellCount() >= 50) condense(framesParent)
+        const sc = createSc(framesParent)
+        const leafSc = createSc(sc)
+        const anchorCell = createTestCell(leafSc)
+        const frame = { id: nextFrameId++, sc, anchorCell, cells: [anchorCell] }
+        if (frames.length) {
+            const caller = frames[frames.length - 1]
+            addTestEdge(caller.anchorCell, anchorCell)
+            shadowAdd(caller.anchorCell, anchorCell)
+        } else {
+            addTestEdge(rootCell, anchorCell)
+            shadowAdd(rootCell, anchorCell)
+        }
+        frames.push(frame)
+        framesById.set(frame.id, frame)
+    }
+    function popFrame() {
+        if (frames.length < 2) return
+        const callee = frames.pop()
+        const caller = frames[frames.length - 1]
+        removeTestEdge(caller.anchorCell, callee.anchorCell)
+        shadow.get(caller.anchorCell)?.delete(callee.anchorCell)
+    }
+
+    pushFrame()
 
     const origLog = console.log
     if (quiet) console.log = () => {}
     try {
         for (const op of ops) {
-            if (op[0] === 'alloc') {
-                const h = allocInto(top)
-                alive.push(h)
-                if (!pinnedRoot) {
-                    addTestEdge(rootCell, h)
-                    shadowAdd(rootCell, h)
-                    pinnedRoot = true
+            if (op[0] === 'push') {
+                pushFrame()
+            } else if (op[0] === 'pop') {
+                popFrame()
+            } else if (op[0] === 'alloc') {
+                const active = frames[frames.length - 1]
+                const h = allocInto(active.sc)
+                addTestEdge(active.anchorCell, h)
+                shadowAdd(active.anchorCell, h)
+                active.cells.push(h)
+            } else if (op[0] === 'cross') {
+                const [, otherFrameId, activeCellIdx, otherCellIdx, forward, isAdd] = op
+                const active = frames[frames.length - 1]
+                const other = framesById.get(otherFrameId)
+                if (!other || !active) continue
+                const activeCell = active.cells[activeCellIdx]
+                const otherCell = other.cells[otherCellIdx]
+                if (activeCell === undefined || otherCell === undefined) continue
+                const from = forward ? activeCell : otherCell
+                const to = forward ? otherCell : activeCell
+                if (freedHandles.has(from) || freedHandles.has(to)) continue
+                if (isAdd) {
+                    addTestEdge(from, to)
+                    shadowAdd(from, to)
+                } else {
+                    if (!(edgeMap.get(from)?.get(to) > 0)) continue
+                    removeTestEdge(from, to)
+                    const m2 = edgeMap.get(from)
+                    if (!m2 || !m2.has(to)) shadow.get(from)?.delete(to)
                 }
-            } else if (op[0] === 'add') {
-                const fromH = alive[op[1]]
-                const toH = alive[op[2]]
-                if (fromH === undefined || toH === undefined) continue
-                if (freedHandles.has(fromH) || freedHandles.has(toH)) continue
-                addTestEdge(fromH, toH)
-                shadowAdd(fromH, toH)
-            } else if (op[0] === 'remove') {
-                const fromH = alive[op[1]]
-                const toH = alive[op[2]]
-                if (fromH === undefined || toH === undefined) continue
-                if (freedHandles.has(fromH) || freedHandles.has(toH)) continue
-                if (!(edgeMap.get(fromH)?.get(toH) > 0)) continue
-                removeTestEdge(fromH, toH)
-                const m2 = edgeMap.get(fromH)
-                if (!m2 || !m2.has(toH)) shadow.get(fromH)?.delete(toH)
             }
-            for (const h of reachable()) {
-                if (freedHandles.has(h)) return 'SOUNDNESS: ' + h
+            if (!skipReachCheck) {
+                for (const h of reachable()) {
+                    if (freedHandles.has(h)) return 'SOUNDNESS: ' + h
+                }
             }
         }
         return null
@@ -2178,14 +2274,14 @@ function replayChaosOps(ops, quiet) {
     }
 }
 
-function ddminChaos(ops, matchesErr) {
+function ddminStack(ops, matchesErr, skipReachCheck) {
     let current = ops.slice()
     let changed = true
     while (changed) {
         changed = false
         for (let i = 0; i < current.length; i++) {
             const candidate = current.slice(0, i).concat(current.slice(i + 1))
-            if (matchesErr(replayChaosOps(candidate, true))) {
+            if (matchesErr(replayStackOps(candidate, true, skipReachCheck))) {
                 current = candidate
                 changed = true
                 break
@@ -2195,95 +2291,65 @@ function ddminChaos(ops, matchesErr) {
     return current
 }
 
-// const { opLog: chaosOpLog, foundErr: chaosFoundErr } = chaosFindRepro(42424, 20000, 0.02)
-// if (chaosFoundErr) {
-//     const errPrefix = chaosFoundErr.startsWith('SOUNDNESS') ? 'SOUNDNESS' : chaosFoundErr
-//     const minimalChaos = ddminChaos(chaosOpLog, (e) => e && (e.startsWith(errPrefix)))
-//     console.log('minimal chaos repro (', minimalChaos.length, 'ops):', JSON.stringify(minimalChaos))
-//     console.log('minimal replay error:', replayChaosOps(minimalChaos, false))
-// }
+function testCutawayScenario() {
+    const parent = createSc(root)
+    const topSc = createSc(parent)
+    const otherSc = createSc(parent)
+    const a = createTestCell(topSc)
+    const b = createTestCell(otherSc)
+    addTestEdge(a, b)
+    console.log('established a->b. topSc cutaway?', topSc.isCutaway(), 'otherSc cutaway?', otherSc.isCutaway())
 
-function replayCellChurnOps(ops, numLeafScs, initialCellsPerLeaf, quiet) {
-    const mid = createSc(root)
-    const leafScs = []
-    for (let i = 0; i < numLeafScs; i++) leafScs.push(createSc(mid))
-    const anchorSc = createSc(mid)
-    const rootCell = createTestCell(anchorSc)
-    let cells = []
-    for (let i = 0; i < numLeafScs; i++) {
-        for (let j = 0; j < initialCellsPerLeaf; j++) cells.push(createTestCell(leafScs[i]))
-    }
-    addTestEdge(rootCell, cells[0])
+    // simulate topSc becoming garbage -- a "cutaway"
+    free(topSc.id | (1 << 30))
+    console.log('after freeing topSc: topSc cutaway/freed =', topSc.isCutaway(), topSc.isFreed(),
+        '| otherSc cutaway/freed =', otherSc.isCutaway(), otherSc.isFreed(),
+        '| a freed?', freedHandles.has(a), '| b freed?', freedHandles.has(b))
 
-    const origLog = console.log
-    if (quiet) console.log = () => {}
+    // simulate a stale reference still using topSc for a new allocation
+    // (mirrors the historical activeSc-staleness bug in allocInto)
+    const c = createTestCell(topSc)
+    console.log('created c in (already cutaway) topSc: c =', c)
+
     try {
-        for (const op of ops) {
-            if (op[0] === 'create') {
-                if (leafScs[op[1]].isFreed()) continue // matches liveLeafScs filtering: never target an already-freed SC
-                cells.push(createTestCell(leafScs[op[1]]))
-            } else if (op[0] === 'free') {
-                if (freedHandles.has(cells[op[1]])) continue // matches live-filtering: never target an already-freed cell
-                free(cells[op[1]])
-            } else if (op[0] === 'add') {
-                if (freedHandles.has(cells[op[1]]) || freedHandles.has(cells[op[2]])) continue
-                addTestEdge(cells[op[1]], cells[op[2]])
-            } else if (op[0] === 'remove') {
-                if (freedHandles.has(cells[op[1]]) || freedHandles.has(cells[op[2]])) continue
-                if (!(edgeMap.get(cells[op[1]])?.get(cells[op[2]]) > 0)) continue // no such edge to remove
-                removeTestEdge(cells[op[1]], cells[op[2]])
-            }
-        }
-        return null
+        addTestEdge(c, a)
+        console.log('addTestEdge(c, a) [same, dead SC] succeeded')
     } catch (e) {
-        return e.message
-    } finally {
-        if (quiet) console.log = origLog
+        console.log('addTestEdge(c, a) threw:', e.message)
     }
-}
 
-function isValidCellChurnSequence(ops) {
-    const created = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]) // initial 4x4 pool indices
-    let nextIdx = 16
-    const freed = new Set()
-    const edgeCounts = new Map()
-    for (const op of ops) {
-        if (op[0] === 'create') {
-            created.add(nextIdx)
-            nextIdx++
-        } else if (op[0] === 'free') {
-            if (!created.has(op[1]) || freed.has(op[1])) return false
-            freed.add(op[1])
-        } else if (op[0] === 'add') {
-            if (!created.has(op[1]) || !created.has(op[2])) return false
-            if (freed.has(op[1]) || freed.has(op[2])) return false
-            const key = op[1] + ':' + op[2]
-            edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1)
-        } else if (op[0] === 'remove') {
-            if (!created.has(op[1]) || !created.has(op[2])) return false
-            const key = op[1] + ':' + op[2]
-            const c = edgeCounts.get(key) ?? 0
-            if (c <= 0) return false
-            edgeCounts.set(key, c - 1)
-        }
+    try {
+        addTestEdge(c, b)
+        console.log('addTestEdge(c, b) [cross into otherSc] succeeded')
+        removeTestEdge(c, b)
+        console.log('removeTestEdge(c, b) succeeded')
+    } catch (e) {
+        console.log('cross edge via stale topSc threw:', e.message)
     }
-    return true
 }
+testCutawayScenario()
 
-function ddminCellChurn(ops, numLeafScs, initialCellsPerLeaf, matchesErr) {
-    let current = ops.slice()
-    let changed = true
-    while (changed) {
-        changed = false
-        for (let i = 0; i < current.length; i++) {
-            const candidate = current.slice(0, i).concat(current.slice(i + 1))
-            if (matchesErr(replayCellChurnOps(candidate, numLeafScs, initialCellsPerLeaf, true))) {
-                current = candidate
-                changed = true
-                break
-            }
-        }
-    }
-    return current
+// minimal repro: A->B->C chain across 3 sibling SCs. Merging the SCs
+// containing A and B (bypassing condense, calling mergeGroup directly)
+// should leave the merged SC with NO out-vertical entry for the A->B edge,
+// since B now lives inside the same merged SC as A -- that edge is now
+// internal (rekeyed as a peer edge in step 4), not something "leaving" the
+// merged SC. Step 2.6 currently mirrors it anyway, which is wrong.
+function testMergeGroupInternalEdgeBug() {
+    const scA = createSc(root)
+    const scB = createSc(root)
+    const scC = createSc(root)
+    const a = createTestCell(scA)
+    const b = createTestCell(scB)
+    const c = createTestCell(scC)
+    addTestEdge(a, b)
+    addTestEdge(b, c)
+
+    const newSc = mergeGroup(root, [scA, scB], 1)
+    console.log('--- merged SC (should contain A and B, C should NOT appear as an out-vertical target) ---')
+    newSc.printInfo()
+    scA.printInfo()
+    scB.printInfo()
 }
+testMergeGroupInternalEdgeBug()
 
