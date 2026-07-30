@@ -761,8 +761,11 @@ pub fn BumpAllocator(comptime T: type) type {
         }
 
         pub fn deinit(this: *@This()) void {
-            // TODO
-            _ = this;
+            for (this.pages.items) |p| {
+                this.page_allocator.free(p);
+            }
+            this.pages.deinit();
+            this.local_count = 0;
         }
 
         fn addUnmanagedItems(this: *@This(), buf: []T) !void {
@@ -6953,6 +6956,15 @@ pub const Factory = struct {
         }
     }
 
+    pub fn prependAsChild(this: *@This(), target: NodeRef, child: NodeRef) void {
+        var t = target;
+        const n = this.nodes.at(t);
+        std.debug.assert(n.kind == .block or n.kind == .source_file);
+        t = maybeUnwrapRef(n) orelse 0;
+        this.nodes.at(child).next = t;
+        this.nodes.at(target).data = child;
+    }
+
     pub fn createIdentifier(this: *@This(), text: []const u8) !NodeRef {
         const t = try getAllocator().dupe(u8, text);
         return this.createIdentifierAllocated(t);
@@ -8475,6 +8487,11 @@ pub const NodeIterator = struct {
         this.ref = start;
         return t;
     }
+
+    pub fn tailOf(nodes: *const BumpAllocator(AstNode), start: NodeRef) u32 {
+        var this = @This().init(nodes, start);
+        return this.tail();
+    }
 };
 
 inline fn visitList(nodes: *const BumpAllocator(AstNode), start: NodeRef, visitor: anytype) !void {
@@ -9039,8 +9056,21 @@ pub const Binder = struct {
         };
     }
 
-    pub fn deinit(this: @This()) void {
-        _ = this; // TODO
+    pub fn deinit(this: *@This()) void {
+        this.symbols.deinit();
+        for (this.scopes.items) |*x| x.deinit(this.allocator);
+        for (this.type_scopes.items) |*x| x.deinit(this.allocator);
+        this.scopes.deinit(this.allocator);
+        this.type_scopes.deinit(this.allocator);
+        this.this_scope.deinit(this.allocator);
+        this.unbound_symbols.deinit(this.allocator);
+        this.unbound_type_symbols.deinit(this.allocator);
+        for (this.namespaces.items) |*ns| {
+            ns.symbols.deinit(this.allocator);
+            ns.type_symbols.deinit(this.allocator);
+        }
+        this.namespaces.deinit(this.allocator);
+        // FIXME: need to do the rest of the stuff
     }
 
     inline fn initScopes(allocator: std.mem.Allocator) Scopes {
@@ -11313,6 +11343,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
         using,
         async_using,
     };
+    const print_symbol_ids = false;
 
     return struct {
         data: AstData,
@@ -11772,6 +11803,13 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     }
 
                     this.print(getSlice(n, u8));
+
+                    if (comptime print_symbol_ids) {
+                        this.print(" <");
+                        var buf: [16]u8 = undefined;
+                        this.print(try std.fmt.bufPrint(&buf, "{}", .{n.extra_data}));
+                        this.print(">");
+                    }
                 },
                 .this_keyword => {
                     if (comptime use_symbol_replacements) {

@@ -607,7 +607,7 @@ const ValueGraph = struct {
     }
 
     pub fn setNext(this: *@This(), from: ValueRef, to: ValueRef) void {
-        this.assertFreshNode(from);
+        // this.assertFreshNode(from);
         this.values.nodes.at(from).next = @truncate(to);
     }
 
@@ -908,6 +908,24 @@ const ValueGraph = struct {
         }
     }
 
+    fn getAllocatedGraphBinding(this: *@This(), value_ref: ValueRef) !?[]const u8 {
+        const _f = try this.followAllRefs(value_ref);
+        if (this.getValue(_f).kind != .computed) return null;
+        const f = this.getSubject(this.getValue(_f));
+        const v = this.getValue(f);
+        if (v.kind != .object) return null;
+        if (try this.getStringKeyPropertyValue(v, "kind")) |kind| {
+            if (!std.mem.eql(u8, kind, "binding")) return null;
+        }
+        if (try this.getStringKeyPropertyValue(v, "name")) |name| {
+            return this.getString(this.getValue(name));
+        }
+        var buf: [32]u8 = undefined;
+        const name = try getAllocator().dupe(u8, try std.fmt.bufPrint(&buf, "$d{}", .{f}));
+        try this.setProperty(f, "name", try this.createString(name));
+        return name;
+    }
+
     pub fn valueToParseNode(this: *@This(), ref: ValueRef, factory: parser.Factory) anyerror!?NodeRef {
         const n = this.getValue(ref);
         return switch (n.kind) {
@@ -955,7 +973,16 @@ const ValueGraph = struct {
                 }
                 return try factory.createObjectLiteralExpression(list.head);
             },
+            .computed => {
+                if (try this.getAllocatedGraphBinding(ref)) |name| {
+                    return try factory.createIdentifier(name);
+                }
+                return null;
+            },
             .ref => {
+                if (try this.getAllocatedGraphBinding(ref)) |name| {
+                    return try factory.createIdentifier(name);
+                }
                 const inner = try this.followRefNode(n);
                 if (this.getRefCount(inner) > 1) {
                     var buf: [32]u8 = undefined;
@@ -965,6 +992,90 @@ const ValueGraph = struct {
                 return try this.valueToParseNode(inner, factory);
             },
             else => return null,
+        };
+    }
+
+    pub fn valueToParseNode2(this: *@This(), ref: ValueRef, factory: *parser.Factory, values_arr: *std.ArrayListUnmanaged(ValueRef), free_variables: *std.AutoHashMap(ValueRef, NodeRef)) anyerror!NodeRef {
+        if (free_variables.get(ref)) |x| {
+            return x;
+        }
+        const n = this.getValue(ref);
+        return switch (n.kind) {
+            .string => {
+                const z = try factory.createStringLiteralAllocated(this.getString(n));
+                factory.nodes.at(z).flags |= @intFromEnum(parser.StringFlags.synthetic);
+                return z;
+            },
+            .number => {
+                const v = this.getDouble(n);
+                return try factory.createNumericLiteral(v);
+            },
+            .true => try factory.createTrue(),
+            .false => try factory.createFalse(),
+            .undefined => try factory.createUndefined(),
+            .null => try factory.createNull(),
+            .array => {
+                var list = parser.NodeList.init(factory.nodes);
+                var s = n.slot0;
+                while (s != 0) {
+                    const v = try this.valueToParseNode2(s, factory, values_arr, free_variables);
+                    list.appendRef(v);
+                    s = this.getValue(s).next;
+                }
+                return try factory.createArrayLiteralExpression(list.head);
+            },
+            .object => {
+                var list = parser.NodeList.init(factory.nodes);
+                var s = n.slot0;
+                var k: NodeRef = 0;
+                while (s != 0) {
+                    if (k != 0) {
+                        const v = try this.valueToParseNode2(s, factory, values_arr, free_variables);
+                        list.appendRef(try factory.createPropertyAssignment(k, v));
+                        k = 0;
+                    } else {
+                        const c = this.getValue(try this.followAllRefs(s));
+                        if (c.kind == .string) {
+                            k = try factory.createPropertyName(this.getString(c));
+                        } else {
+                            k = try this.valueToParseNode2(s, factory, values_arr, free_variables);
+                        }
+                    }
+                    s = this.getValue(s).next;
+                }
+                return try factory.createObjectLiteralExpression(list.head);
+            },
+            .computed => {
+                var buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&buf, "${}", .{values_arr.items.len});
+                try values_arr.append(getAllocator(), try this.cloneValue(ref));
+                const ident = try factory.createIdentifier(name);
+                try free_variables.put(ref, ident);
+                return ident;
+            },
+            .ref => {
+                const followed = try this.followAllRefs(ref);
+                if (this.getRefCount(followed) > 1) {
+                    if (free_variables.get(followed)) |x| {
+                        return x;
+                    }
+                    const v = this.getValue(followed);
+                    switch (v.kind) {
+                        .array, .object, .computed, .@"opaque" => {
+                            var buf: [32]u8 = undefined;
+                            const name = try std.fmt.bufPrint(&buf, "${}", .{values_arr.items.len});
+                            try values_arr.append(getAllocator(), try this.cloneValue(ref));
+                            const ident = try factory.createIdentifier(name);
+                            try free_variables.put(followed, ident);
+                            return ident;
+                        },
+                        else => return this.valueToParseNode2(ref, factory, values_arr, free_variables),
+                    }
+                    unreachable;
+                }
+                return try this.valueToParseNode2(followed, factory, values_arr, free_variables);
+            },
+            else => unreachable,
         };
     }
 
@@ -1224,7 +1335,7 @@ const ValueGraph = struct {
     // Should only be used on synthetic values. Will add a new key/value pair if-needed.
     // key: ValueRef | []const u8 (string key)
     pub fn setProperty(this: *@This(), ref: ValueRef, key: anytype, value: ValueRef) !void {
-        this.assertFreshNode(ref);
+        // this.assertFreshNode(ref);
         const n = this.getValue(ref);
         std.debug.assert(n.kind == .object);
 
@@ -1354,6 +1465,26 @@ const ValueGraph = struct {
             else => {},
         }
         return false;
+    }
+
+    pub fn isStructurallyClosed(this: *@This(), ref: ValueRef) bool {
+        if (ref == 0) return false;
+        const v = this.getValue(ref);
+        switch (v.kind) {
+            .ref, .@"opaque" => {
+                if (this.getRefCount(ref) > 1) return false;
+            },
+            .object, .array, .computed => {
+                if (this.getRefCount(ref) > 1) return false;
+                var s = v.slot0;
+                while (s != 0) {
+                    if (!this.isStructurallyClosed(s)) return false;
+                    s = this.getValue(s).next;
+                }
+            },
+            else => {},
+        }
+        return true;
     }
 
     pub fn referencesSelf(this: *@This(), ref: ValueRef) !bool {
@@ -1977,6 +2108,7 @@ const ValueFacts = enum(u32) {
 
     zero = 1 << 15, // means "zero sized", modifies all other facts to include zero-width variants e.g. numeric zero or empty string
     falsy = 1 << 20, // negative integers and zero are treated as falsy because we _might_ increment them later. the inclusion of `number` makes the total truthy and falsy.
+    effects = 1 << 23,
     complex = 1 << 24,
     decorated = 1 << 25, // e.g. extra descriptors and/or accessors. also used for negative numbers.
     float = 1 << 26,
@@ -2506,10 +2638,7 @@ const ReferenceCollector = struct {
     }
 
     fn addReference(self: *@This(), sym_ref: parser.SymbolRef, node_ref: parser.NodeRef) !void {
-        const entry = try self.references.getOrPut(getAllocator(), sym_ref);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = std.ArrayListUnmanaged(parser.NodeRef){};
-        }
+        const entry = try self.references.getOrPutValue(getAllocator(), sym_ref, .{});
         try entry.value_ptr.append(getAllocator(), node_ref);
     }
 
@@ -2524,12 +2653,13 @@ const ReferenceCollector = struct {
 
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
         if (node.kind == .identifier) {
+            if (node.extra_data == 0) return;
             const sym_ref = self.file.binder.getSymbol(ref) orelse return;
             const sym = self.file.binder.symbols.at(sym_ref);
             if (sym.isImportedOrExported()) return;
             try self.markParents();
             try self.parents.put(getAllocator(), ref, self.stack.getLast());
-            if (sym.binding == ref) return;
+            if (sym.binding == ref and !sym.hasFlag(.late_bound)) return;
             if (sym.declaration != 0) {
                 if (parser.getDeclarationNameRef(self.file.ast.nodes.at(sym.declaration)) == ref) return;
             }
@@ -3466,8 +3596,11 @@ const ReferenceCollector = struct {
                 if (self.file.binder.getSymbol(exp)) |sym_ref| {
                     const sym = self.file.binder.symbols.at(sym_ref);
                     if (sym.hasFlag(.late_bound)) {
+                        if (self.external_facts.get(sym_ref)) |v| {
+                            return ValueFacts.hasFact(v, .effects) or ValueFacts.isAny(v);
+                        }
                         // TODO: check the facts, a computation as a ref transitively inherits effectful-ness
-                        return !self.external_facts.contains(sym_ref);
+                        return true;
                     }
                     return false;
                 }
@@ -3658,6 +3791,7 @@ const JsCodeReducer = struct {
     parent: NodeRef = 0,
     did_change: bool = false,
     pass_count: u32 = 0,
+    is_top_level_exp: bool = false,
 
     fn replace(self: *@This(), from: NodeRef, to: NodeRef) !void {
         std.debug.assert(from != 0);
@@ -4100,7 +4234,8 @@ const JsCodeReducer = struct {
                     }
                 }
             },
-            .expression_statement => {
+            .expression_statement => b: {
+                if (self.is_top_level_exp and self.parent == 0) break :b;
                 if (!try self.refs.hasEffects(ref)) {
                     return try self.remove(ref);
                 }
@@ -4992,6 +5127,8 @@ const JsComputation = struct {
     reference_collector: ?*ReferenceCollector = null,
     is_exp: bool = true,
     is_many: bool = false,
+    merged: bool = false, // can no longer be used (but should not be freed yet)
+    needs_rebind: bool = false,
     has_declarations: ?bool = null,
     root_node: NodeRef = undefined,
     symbol_replacements: std.AutoArrayHashMapUnmanaged(parser.SymbolRef, NodeRef) = .{},
@@ -5009,12 +5146,13 @@ const JsComputation = struct {
         const this = try getAllocator().create(@This());
         errdefer getAllocator().destroy(this);
         this.* = .{};
-        const last = source[source.len-1];
+        const trimmed = std.mem.trim(u8, source, "\r\n\t ");
+        const last = trimmed[trimmed.len-1];
         if (last == ';') {
             this.is_exp = false;
-            this.file = try parser.ParsedFile.createFromBuffer(source[0..source.len-1], null, false, null);
+            this.file = try parser.ParsedFile.createFromBuffer(trimmed[0..trimmed.len-1], null, false, null);
         } else {
-            this.file = try parser.ParsedFile.createFromExpression(source, null);
+            this.file = try parser.ParsedFile.createFromExpression(trimmed, null);
         }
         var root_node = unwrapRef(this.file.ast.nodes.at(this.file.ast.start));
         if (this.is_exp and this.file.ast.nodes.at(root_node).kind == .expression_statement) {
@@ -5036,6 +5174,7 @@ const JsComputation = struct {
             c.deinit();
             getAllocator().destroy(c);
         }
+        this.symbol_replacements.deinit(getAllocator());
     }
 
     fn getReferenceCollector(this: *@This()) !*ReferenceCollector {
@@ -5056,6 +5195,11 @@ const JsComputation = struct {
             const text = parser.getSlice(binding, u8);
             if (text.len != suffix.len+1) continue;
             if (text[0] != '$' or text.len == 1 or text[1] == '$') continue;
+            if (this.symbol_replacements.get(x)) |b| {
+                const n = this.file.ast.nodes.at(b);
+                if (std.mem.eql(u8, parser.getSlice(n, u8)[1..], suffix)) return x;
+                continue;
+            }
             if (std.mem.eql(u8, text[1..], suffix)) return x;
         }
         return null;
@@ -5070,10 +5214,141 @@ const JsComputation = struct {
         return std.fmt.parseInt(u32, text[1..], 10);
     }
 
-    pub fn inlineValue(this: *@This(), symbol_ref: parser.SymbolRef, graph: *ValueGraph, value_ref: ValueRef) !bool {
+    pub fn getFreeVariableUsageCount(this: *@This(), ordinal: u32) !u32 {
+        const sym_ref = this.findFreeVariable(ordinal) orelse return 0;
+        const refs = try this.getReferenceCollector();
+        const list = refs.references.get(sym_ref) orelse return 0;
+        return @intCast(list.items.len);
+    }
+
+    pub fn hasNoInputs(this: *@This(), graph: *ValueGraph) !bool {
+        const v = try graph.getFollowedValue(this.input_value_ref);
+        return v.slot0 == 0;
+    }
+
+    fn prependStatement(this: *@This(), stmt: NodeRef) void {
+        var factory = parser.Factory{ .nodes = &this.file.ast.nodes };
+        factory.prependAsChild(this.file.ast.start, stmt);
+        this.is_exp = false;
+        this.is_many = true;
+    }
+
+    pub fn inlineValues(this: *@This(), graph: *ValueGraph) !bool {
+        const arr = try graph.listToSlice(this.input_value_ref, getAllocator());
+        defer getAllocator().free(arr);
+        if (arr.len == 0) return false;
+
+        var closed_values = std.AutoHashMap(ValueRef, void).init(getAllocator());
+        defer closed_values.deinit();
+
+        var can_inline_any = false;
+        for (arr) |x| {
+            if (graph.getRefCount(x) > 1) continue;
+            if (!graph.isStructurallyClosed(x)) continue;
+            try closed_values.put(x, {});
+            can_inline_any = true;
+            break;
+        }
+        if (!can_inline_any) return false;
+
+        var new_input = std.ArrayListUnmanaged(ValueRef){};
+        defer new_input.deinit(getAllocator());
+
+        const refs = try this.getReferenceCollector();
+
+        var factory = parser.Factory{ .nodes = &this.file.ast.nodes };
+
+        var free_variables = std.AutoHashMap(ValueRef, NodeRef).init(getAllocator());
+        defer free_variables.deinit();
+
+        for (arr, 0..) |x, i| {
+            const sym_ref = this.findFreeVariable(@truncate(i)) orelse continue;
+            if (graph.getRefCount(x) > 1 or !closed_values.contains(x)) {
+                if (new_input.items.len != i) {
+                    var buf: [32]u8 = undefined;
+                    const ident = try factory.createIdentifier(fmtOrdinal(@truncate(i), &buf, true));
+                    const new_sym = try this.file.binder.symbols.push(this.file.binder.symbols.at(sym_ref).*);
+                    this.file.ast.nodes.at(ident).extra_data = new_sym;
+                    this.file.binder.symbols.at(new_sym).binding = ident;
+                    try this.symbol_replacements.put(getAllocator(), sym_ref, ident);
+                }
+                try new_input.append(getAllocator(), try graph.cloneValue(x));
+                continue;
+            }
+            const ref_count = if (refs.references.get(sym_ref)) |z| z.items.len else 0;
+            
+            if (ref_count == 0) continue;
+            const literal = try graph.valueToParseNode2(x, &factory, &new_input, &free_variables);
+            const should_dedupe = switch (factory.nodes.at(literal).kind) {
+                .numeric_literal, .true_keyword, .false_keyword, .null_keyword, .undefined_keyword => false,
+                else => true,
+            };
+            if (ref_count > 1 and should_dedupe) {
+                var buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&buf, "_d{}", .{i});
+                const ident = try factory.createIdentifier(name);
+                const new_sym = try this.file.binder.symbols.push(this.file.binder.symbols.at(sym_ref).*);
+                this.file.ast.nodes.at(ident).extra_data = new_sym;
+                this.file.binder.symbols.at(new_sym).binding = ident;
+                try free_variables.put(x, ident);
+                this.prependStatement(try factory.createLetVariable(ident, literal));
+                try this.symbol_replacements.put(getAllocator(), sym_ref, ident);
+            } else {
+                try this.symbol_replacements.put(getAllocator(), sym_ref, literal);
+            }
+        }
+        
+        const new_input_ref = try graph.createArrayFromItems(new_input.items);
+        try graph.replaceValue(this.input_value_ref, new_input_ref);
+        this.input_value_ref = new_input_ref;
+
+        return true;
+    }
+
+    pub fn inlineValue(this: *@This(), sym_ref: parser.SymbolRef, graph: *ValueGraph, value_ref: ValueRef) !bool {
         const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
-        const literal = try graph.valueToParseNode(value_ref, factory) orelse return false;
-        try this.symbol_replacements.put(getAllocator(), symbol_ref, literal);
+
+        var other_computation: ?*JsComputation = null;
+        defer if (other_computation) |c| c.deinit();
+
+        var literal = try graph.valueToParseNode(value_ref, factory) orelse blk: {
+            const followed = try graph.getFollowedValue(value_ref);
+            if (followed.kind != .computed) return false;
+            const subj = try graph.getFollowedValue(graph.getSubject(followed));
+            if (subj.kind != .string) return false;
+            const c = try JsComputation.init(graph.getString(subj));
+            other_computation = c;
+            if (!c.is_exp) {
+                return false; // TODO: need to figure out best way to model explicit outflows
+            }
+            var base = try factory.createExternalNode(&c.file.ast, c.root_node);
+            base = try factory.createParenthesizedExpression(base);
+            break :blk base;
+        };
+        const should_dedupe = switch (this.file.ast.nodes.at(literal).kind) {
+            .identifier => false,
+            .true_keyword, .false_keyword, .null_keyword, .undefined_keyword => false,
+            .numeric_literal => false, // TODO: only tiny numbers/strings should duplicate
+            else => true,
+        };
+        if (should_dedupe) {
+            const refs = try this.getReferenceCollector();
+            const ref_count = refs.references.get(sym_ref) orelse 0;
+            if (ref_count > 1) {
+                var buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&buf, "$d{}", .{value_ref});
+                const stmt = try factory.createLetVariable(try factory.createIdentifier(name), literal);
+                this.file.ast.nodes.at(stmt).next = maybeUnwrapRef(this.file.ast.nodes.at(this.file.ast.start)) orelse 0;
+                literal = try factory.createIdentifier(name);
+                this.file.ast.start = try factory.nodes.push(.{
+                    .kind = .source_file,
+                    .data = stmt,
+                });
+                this.is_exp = false;
+                this.is_many = true;
+            }
+        }
+        try this.symbol_replacements.put(getAllocator(), sym_ref, literal);
         return true;
     }
 
@@ -5096,12 +5371,12 @@ const JsComputation = struct {
                     .false => @intFromEnum(ValueFacts.false),
                     .null => @intFromEnum(ValueFacts.null),
                     .undefined => @intFromEnum(ValueFacts.undefined),
-                    .object => @intFromEnum(ValueFacts.object),
-                    .array => @intFromEnum(ValueFacts.array),
+                    .object => @intFromEnum(ValueFacts.object) | @intFromEnum(ValueFacts.effects),
+                    .array => @intFromEnum(ValueFacts.array) | @intFromEnum(ValueFacts.effects),
                     .number => getNumberFacts(graph.getDouble(el_node)),
                     .string => getStringFacts(graph.getString(el_node)),
-                    .computed => @intFromEnum(ValueFacts.any),
-                    else => @intFromEnum(ValueFacts.any),
+                    .computed => @intFromEnum(ValueFacts.any) | @intFromEnum(ValueFacts.effects),
+                    else => @intFromEnum(ValueFacts.any) | @intFromEnum(ValueFacts.effects),
                 };
                 try refs.external_facts.put(getAllocator(), sym_ref, f);
             }
@@ -5116,11 +5391,27 @@ const JsComputation = struct {
             .factory = .{ .nodes = &this.file.ast.nodes },
             .replacements = &replacements,
             .symbol_replacements = &this.symbol_replacements,
+            .is_top_level_exp = this.is_exp,
         };
+        if (this.symbol_replacements.count() > 0) {
+            try refs.commitInPlace(&replacements, &this.symbol_replacements);
+        }
         try reducer.reduce();
 
         var d = this.file.ast;
         d.start = replacements.get(d.start) orelse d.start;
+        if (this.is_exp) {
+            const f = maybeUnwrapRef(this.file.ast.nodes.at(d.start)) orelse 0;
+            if (f != 0) {
+                const n = this.file.ast.nodes.at(f);
+                if (n.next == 0 and n.kind == .expression_statement) {
+                    d.start = unwrapRef(n);
+                } else {
+                    this.is_exp = false;
+                    this.is_many = true;
+                }
+            }
+        }
 
         const res = try parser.printWithOptions(d, .{
             .replacements = &replacements,
@@ -5150,6 +5441,69 @@ const JsComputation = struct {
         return false;
     }
 
+    fn rebind(this: *@This()) !void {
+        this.needs_rebind = false;
+        const V = struct {
+            nodes: *BumpAllocator(parser.AstNode),
+            pub fn visit(self: *@This(), node: *const AstNode, _: NodeRef) anyerror!void {
+                switch (node.kind) {
+                    // TODO: class not covered by forEachChild
+                    .identifier, .this_keyword => {
+                        node.extra_data = 0;
+                    },
+                    else => {},
+                }
+                return parser.forEachChild(&self.nodes, node, self);
+            }
+        };
+        var v = V{ .nodes = &this.file.ast.nodes };
+        try v.visit(this.file.ast.nodes.at(this.file.ast.start), this.file.ast.start);
+        this.file.binder.deinit();
+        this.file.binder = this.file.binder.init(&this.file.ast.nodes, getAllocator());
+        try this.file.binder.visit(this.file.ast.nodes.at(this.file.ast.start), this.file.ast.start);
+    }
+
+    fn mergeIntoSelf(this: *@This(), other: *JsComputation) !void {
+        std.debug.assert(!other.merged);
+        other.merged = true;
+        const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
+        var node: NodeRef = undefined;
+        var ext_node: NodeRef = undefined;
+        if (this.is_exp and other.is_exp) {
+            ext_node = try factory.createExternalNode(&other.file.ast,other.root_node);
+            node = try factory.createBinaryExpression(this.root_node, .comma_token, ext_node);
+            node = try factory.createParenthesizedExpression(node);
+        } else if (!this.is_exp) {
+            node = if (this.isBlock()) this.root_node else this.file.ast.start;
+            var other_node = other.root_node;
+            if (!this.hasDeclarations() or !other.hasDeclarations()) {
+                if (other.isBlock()) other_node = unwrapRef(other.file.ast.nodes.at(other_node));
+                other_node = try factory.createExternalNode(&other.file.ast,other_node);
+                ext_node = other_node;
+                if (other.is_exp) other_node = try factory.createExpressionStatement(other_node);
+            } else {
+                other_node = try factory.createExternalNode(&other.file.ast,other_node);
+                ext_node = other_node;
+                if (!other.isBlock()) other_node = try factory.createBlock(other_node);
+            }
+            try factory.appendAsChild(node, other_node);
+            this.is_many = true;
+        } else {
+            const self_node = try factory.createExpressionStatement(this.root_node);
+            ext_node = try factory.createExternalNode(&other.file.ast,if (other.isBlock()) other.root_node else other.file.ast.start);
+            node = try factory.nodes.push(.{
+                .kind = .source_file,
+                .data = self_node,
+                .next = ext_node,
+            });
+            this.is_many = true;
+        }
+        this.root_node = node;
+        var start = node;
+        if (this.is_exp) start = try factory.createExpressionStatement(start);
+        this.file.ast.start = start;
+    }
+
     // this computation comes _before_ other
     pub fn mergeWith(this: *@This(), graph: *ValueGraph, other: *JsComputation) !ValueRef {
         const factory = parser.Factory{ .nodes = &this.file.ast.nodes };
@@ -5173,6 +5527,7 @@ const JsComputation = struct {
                 if (!other.isBlock()) other_node = try factory.createBlock(other_node);
             }
             try factory.appendAsChild(node, other_node);
+            this.is_many = true;
         } else {
             const self_node = try factory.createExpressionStatement(this.root_node);
             ext_node = try factory.createExternalNode(&other.file.ast,if (other.isBlock()) other.root_node else other.file.ast.start);
@@ -5181,6 +5536,7 @@ const JsComputation = struct {
                 .data = self_node,
                 .next = ext_node,
             });
+            this.is_many = true;
         }
 
         var variable_mappings = std.AutoHashMap(u32, u32).init(getAllocator());
@@ -5220,6 +5576,190 @@ const JsComputation = struct {
     // pub fn serialize(this: *@This()) ![]const u8 {
 
     // }
+
+
+    // attempts to turn something like `{ foo: 1, bar: ("123"), baz: (345) }` into:
+    // 
+    // ("$0.bar = $1; $0.baz = $2;", [{ foo: 1 }, ("123"), (345)])
+    pub fn parameterizeObjectComputations(graph: *ValueGraph, value: ValueRef) !ValueRef {
+        const followed = try graph.getFollowedValue(value);
+        if (followed.kind != .object) return value;
+
+        var computations = std.AutoHashMap(ValueRef, ValueRef).init(getAllocator());
+        defer computations.deinit();
+
+        var s = followed.slot0;
+        while (s != 0) {
+            const k_ref = s;
+            const k = graph.getValue(s);
+            s = k.next;
+            const v = graph.getValue(s);
+            const v_ref = s;
+            s = v.next;
+            if ((try graph.getFollowedValue(k_ref)).kind == .string and (try graph.getFollowedValue(v_ref)).kind == .computed) {
+                try computations.put(k_ref, v_ref);
+            }
+        }
+
+        if (computations.count() == 0) return value;
+
+        var nodes = BumpAllocator(ValueNode).init(getAllocator(), std.heap.page_allocator);
+        defer nodes.deinit();
+        try nodes.preAlloc();
+        _ = try nodes.push(.{ .kind = .NUL });
+        var factory = parser.Factory{ .nodes = &nodes };
+
+        var output_values = std.ArrayList(ValueRef).init(getAllocator());
+        defer output_values.deinit();
+
+        const residual = try graph.cloneValue(value);
+        try output_values.append(residual);
+
+        var count: u32 = 1;
+        var buf: [16]u8 = undefined;
+        const first_ident = try factory.createIdentifier(fmtOrdinal(0, &buf, true));
+        var statements = parser.NodeList.init(&nodes);
+        var iter = computations.iterator();
+        while (iter.next()) |entry| {
+            const k = graph.getString(try graph.getFollowedValue(entry.key_ptr.*));
+            const v = try factory.createIdentifier(fmtOrdinal(count, &buf, true));
+            try graph.deleteKey(residual, entry.key_ptr.*);
+            count += 1;
+            try output_values.append(try graph.cloneValue(entry.value_ptr.*));
+            statements.appendRef(try factory.createAssignmentStatement(try factory.createFieldAccess(first_ident, k), v));
+        }
+
+        const sf = try factory.nodes.push(.{
+            .kind = .source_file,
+            .data = statements.head,
+        });
+
+        const res = try parser.printWithOptions(.{ .start = sf, .nodes = nodes.* }, .{});
+        const final = try graph.createComputed(
+            try graph.createString(res.contents),
+            try graph.createArrayFromItems(output_values.items),
+        );
+        return final;
+    }
+};
+
+const JsEmitter = struct {
+    decl_count: u32 = 0,
+    factory: *parser.Factory,
+    graph: *ValueGraph,
+    statements: std.ArrayListUnmanaged(NodeRef) = .{},
+    computations: std.AutoHashMapUnmanaged(ValueRef, *JsComputation) = .{},
+    visited: std.AutoHashMapUnmanaged(ValueRef, []const u8) = .{},
+
+    pub fn deinit(this: *@This()) void {
+        var iter1 = this.computations.iterator();
+        while (iter1.next()) |entry| entry.value_ptr.deinit();
+        var iter2 = this.visited.iterator();
+        while (iter2.next()) |entry| {
+            if (entry.value_ptr) |p| getAllocator().free(p);
+        }
+        this.computations.deinit(getAllocator());
+        this.visited.deinit(getAllocator());
+    }
+
+    fn isOwnedGraphBinding(this: *@This(), value_ref: ValueRef) bool {
+        const v = this.graph.getValue(value_ref);
+        if (v.kind != .object) return false;
+        if (try this.graph.getStringKeyPropertyValue(v, "kind")) |kind| {
+            return std.mem.eql(u8, kind, "binding");
+        }
+        return false;
+    }
+
+    fn getAllocatedGraphBinding(this: *@This(), value_ref: ValueRef) !?[]const u8 {
+        const _f = try this.graph.followAllRefs(value_ref);
+        if (this.graph.getValue(_f).kind != .computed) return null;
+        const f = this.graph.getSubject(this.graph.getValue(_f));
+        const v = this.graph.getValue(f);
+        if (v.kind != .object) return null;
+        if (try this.graph.getStringKeyPropertyValue(v, "kind")) |kind| {
+            if (!std.mem.eql(u8, kind, "binding")) return null;
+        }
+        if (try this.graph.getStringKeyPropertyValue(v, "name")) |name| {
+            return this.graph.getString(this.graph.getValue(name));
+        }
+        var buf: [32]u8 = undefined;
+        const name = try getAllocator().dupe(u8, try std.fmt.bufPrint(&buf, "_d{}", .{this.decl_count}));
+        this.decl_count += 1;
+        try this.graph.setProperty(f, "name", try this.graph.createString(name));
+        return name;
+    }
+
+    pub fn valueToParseNode(this: *@This(), ref: ValueRef) anyerror!NodeRef {
+        const n = this.graph.getValue(ref);
+        return switch (n.kind) {
+            .string => {
+                const z = try this.factory.createStringLiteralAllocated(this.graph.getString(n));
+                this.factory.nodes.at(z).flags |= @intFromEnum(parser.StringFlags.synthetic);
+                return z;
+            },
+            .number => {
+                const v = this.graph.getDouble(n);
+                return try this.factory.createNumericLiteral(v);
+            },
+            .true => try this.factory.createTrue(),
+            .false => try this.factory.createFalse(),
+            .undefined => try this.factory.createUndefined(),
+            .null => try this.factory.createNull(),
+            .array => {
+                var list = parser.NodeList.init(this.factory.nodes);
+                var s = n.slot0;
+                while (s != 0) {
+                    const v = try this.valueToParseNode(s);
+                    list.appendRef(v);
+                    s = this.graph.getValue(s).next;
+                }
+                return try this.factory.createArrayLiteralExpression(list.head);
+            },
+            .object => {
+                var list = parser.NodeList.init(this.factory.nodes);
+                var s = n.slot0;
+                var k: NodeRef = 0;
+                while (s != 0) {
+                    if (k != 0) {
+                        const v = try this.valueToParseNode(s);
+                        list.appendRef(try this.factory.createPropertyAssignment(k, v));
+                        k = 0;
+                    } else {
+                        const c = this.graph.getValue(try this.graph.followAllRefs(s));
+                        if (c.kind == .string) {
+                            k = try this.factory.createPropertyName(this.graph.getString(c));
+                        } else {
+                            k = try this.valueToParseNode(s);
+                        }
+                    }
+                    s = this.graph.getValue(s).next;
+                }
+                return try this.factory.createObjectLiteralExpression(list.head);
+            },
+            .computed => {
+                if (try this.getAllocatedGraphBinding(ref)) |name| {
+                    return try this.factory.createIdentifier(name);
+                }
+                return null;
+            },
+            .ref => {
+                if (try this.getAllocatedGraphBinding(ref)) |name| {
+                    return try this.factory.createIdentifier(name);
+                }
+                const inner = try this.graph.followRefNode(n);
+                if (this.graph.getRefCount(inner) > 1) {
+                    var buf: [32]u8 = undefined;
+                    const s = try std.fmt.bufPrint(&buf, "$00{}", .{inner});
+                    return try this.factory.createIdentifier(s);
+                }
+                return try this.valueToParseNode(inner);
+            },
+            else => return null,
+        };
+    }
+
+
 };
 
 fn createCommaExpressionFromList(
@@ -5470,6 +6010,15 @@ const Optimizer = struct {
         });
     }
 
+    fn createGraphBinding(this: *@This()) !ValueRef {
+        const kind_key = try this.graph.createString("kind");
+        const kind_val = try this.graph.createString("binding");
+        const obj = try this.graph.createObjectFromPairs(&.{
+            .{ kind_key, kind_val },
+        });
+        return try this.graph.createComputed(obj, 0);
+    }
+
     const TemplatedSubject = struct {
         kind: []const u8,
         template: []const u8,
@@ -5530,12 +6079,65 @@ const Optimizer = struct {
         return true;
     }
 
-    // inlines a factory fn call if the factory is only referenced once
+    // Converts a raw "$0, $1, ..." free-variable subject (the standard
+    // convention for computation subjects going forward) into the internal
+    // templated-subject representation the rest of the pipeline
+    // (fold/merge/dce/codegen) already knows how to work with, after
+    // reducing it via `JsComputation` (constant folding/dead-branch
+    // elimination from known value facts). Also trims trailing free
+    // variables that are no longer referenced after reduction — the graph's
+    // job, since only it knows whether an input value is otherwise unused.
+    fn tryNormalizeFreeVariableSubject(this: *@This(), computed_ref: ValueRef, subject_text: []const u8, input_ref: ValueRef) !bool {
+        var comp = try JsComputation.init(subject_text);
+        defer comp.deinit();
+        comp.input_value_ref = input_ref;
+        _ = try comp.inlineValues(this.graph);
+
+        var text = subject_text;
+        if (try comp.simplify(this.graph, input_ref)) |reduced_ref| {
+            text = this.graph.getString(try this.graph.getFollowedValue(reduced_ref));
+            std.debug.print("{s}\n", .{text});
+        }
+
+        const followed_input = try this.graph.getFollowedValue(input_ref);
+        var new_input_ref = input_ref;
+        if (followed_input.kind == .array) {
+            var items = std.ArrayListUnmanaged(ValueRef){};
+            defer items.deinit(getAllocator());
+            {
+                var i: u32 = 0;
+                while (this.graph.getArrayElement(followed_input, i)) |el| : (i += 1) {
+                    try items.append(getAllocator(), el);
+                }
+            }
+            var trimmed = false;
+            while (items.items.len > 0) {
+                const last_idx: u32 = @intCast(items.items.len - 1);
+                if ((try comp.getFreeVariableUsageCount(last_idx)) != 0) break;
+                _ = items.pop();
+                trimmed = true;
+            }
+            if (trimmed) new_input_ref = try this.graph.createArrayFromItems(items.items);
+        }
+
+        const kind = if (comp.is_exp) "expression-template" else "statement-template";
+        const subject_obj = try this.createTemplatedSubject(kind, text);
+        const new_computed = try this.graph.createComputed(subject_obj, new_input_ref);
+        try this.graph.replaceValue(computed_ref, new_computed);
+        return true;
+    }
+
+    // A subject is either a plain JS expression referencing its input values
+    // as free variables ($0, $1, ...), or (if it ends in `;`) one or more
+    // statements. This normalizes it into the internal templated-subject
+    // representation (via `JsComputation` for fact-based reduction), which
+    // the rest of the pipeline knows how to fold/merge/dce/emit.
     pub fn tryInlineComputationCall(
         this: *@This(),
         computed_ref: ValueRef,
         counts: *const std.AutoHashMapUnmanaged(ValueRef, u32),
     ) !bool {
+        _ = counts;
         const node = this.graph.getValue(computed_ref);
         if (node.kind != .computed) return false;
 
@@ -5543,146 +6145,8 @@ const Optimizer = struct {
         const subject_node = this.graph.getValue(subject_ref);
         if (subject_node.kind != .string) return false;
 
-        var comp = try JsComputation.init(this.graph.getString(subject_node));
-        if (try comp.simplify(this.graph, this.graph.getInput(node))) |x| {
-            const qq = this.graph.getString(this.graph.getValue(x));
-            std.debug.print("{s}\n", .{qq});
-        }
-
-        if ((try this.refCountOf(counts, subject_ref)) > 1) return false;
-
-        const input_ref = try this.graph.followAllRefs(this.graph.getInput(node));
-        const input_node = this.graph.getValue(input_ref);
-        if (input_node.kind != .array) return false;
-
         const subject_text = this.graph.getString(subject_node);
-
-        // TODO: get rid of all this stringy code
-        if (containsDollarDigit(subject_text)) return false;
-
-        const parsed = try parser.ParsedFile.createFromExpression(subject_text, null);
-        defer parsed.deinit();
-
-        const fn_node_ref = getInnerFunctionExpr(parsed) orelse return false;
-        const fn_node = parsed.ast.nodes.at(fn_node_ref);
-
-        const params_head = getPackedData(fn_node).right;
-        var param_syms = std.ArrayListUnmanaged(parser.SymbolRef){};
-        defer param_syms.deinit(getAllocator());
-        {
-            var it = NodeIterator.init(&parsed.ast.nodes, params_head);
-            while (it.nextRef()) |p_ref| {
-                const p = parsed.ast.nodes.at(p_ref);
-                const name_ref = getPackedData(p).left;
-                const name_node = parsed.ast.nodes.at(name_ref);
-                if (name_node.kind != .identifier) return false; // no destructuring params
-                const sym = parsed.binder.getSymbol(name_ref) orelse return false;
-                if (sym == 0) return false;
-                try param_syms.append(getAllocator(), sym);
-            }
-        }
-
-        // Input array must have exactly one element per param.
-        var input_items = std.ArrayListUnmanaged(ValueRef){};
-        defer input_items.deinit(getAllocator());
-        {
-            var i: u32 = 0;
-            while (this.graph.getArrayElement(input_node, i)) |el| : (i += 1) {
-                try input_items.append(getAllocator(), el);
-            }
-        }
-        if (input_items.items.len != param_syms.items.len) return false;
-
-        const body_block_ref = fn_node.len;
-        if (body_block_ref == 0) return false;
-        const body_block = parsed.ast.nodes.at(body_block_ref);
-        const first_stmt_ref = maybeUnwrapRef(body_block) orelse return false;
-        const first_stmt = parsed.ast.nodes.at(first_stmt_ref);
-        if (first_stmt.next != 0) return false; // must be a single statement
-        if (first_stmt.kind != .return_statement) return false;
-        const expr_ref = maybeUnwrapRef(first_stmt) orelse return false;
-
-        // mutated params cannot directly use $N idents, we use an IIFE instead to give it a binding
-        var mutated = std.AutoArrayHashMapUnmanaged(parser.SymbolRef, void){};
-        defer mutated.deinit(getAllocator());
-        try collectAssignedParams(&parsed.ast.nodes, &parsed.binder, expr_ref, param_syms.items, &mutated);
-
-        var literal_texts = try getAllocator().alloc(?[]const u8, param_syms.items.len);
-        defer getAllocator().free(literal_texts);
-        for (literal_texts) |*t| t.* = null;
-        for (param_syms.items, 0..) |sym, i| {
-            if (!mutated.contains(sym)) continue;
-            if (try this.graph.tryLiteralText(input_items.items[i])) |t| {
-                literal_texts[i] = t;
-                continue;
-            }
-            if (!(try this.canInlineAsLiteral(input_items.items[i], counts))) return false;
-            literal_texts[i] = try this.graph.renderValueAsLiteral(input_items.items[i]) orelse return false;
-        }
-
-        var placeholders = std.ArrayListUnmanaged(NodeRef){};
-        defer placeholders.deinit(getAllocator());
-        var new_input_items = std.ArrayListUnmanaged(ValueRef){};
-        defer new_input_items.deinit(getAllocator());
-        var bound_names = std.ArrayListUnmanaged([]const u8){};
-        defer bound_names.deinit(getAllocator());
-        var bound_literals = std.ArrayListUnmanaged([]const u8){};
-        defer bound_literals.deinit(getAllocator());
-
-        var factory = Factory{ .nodes = &parsed.ast.nodes };
-        for (param_syms.items, 0..) |sym, i| {
-            if (mutated.contains(sym)) {
-                var buf: [16]u8 = undefined;
-                const name = try std.fmt.bufPrint(&buf, "_p{d}", .{bound_names.items.len});
-                const owned = try getAllocator().dupe(u8, name);
-                try placeholders.append(getAllocator(), try factory.createIdentifierAllocated(owned));
-                try bound_names.append(getAllocator(), owned);
-                try bound_literals.append(getAllocator(), literal_texts[i].?);
-            } else {
-                var buf: [16]u8 = undefined;
-                const name = try std.fmt.bufPrint(&buf, "${d}", .{new_input_items.items.len});
-                const owned = try getAllocator().dupe(u8, name);
-                try placeholders.append(getAllocator(), try factory.createIdentifierAllocated(owned));
-                try new_input_items.append(getAllocator(), try this.graph.createRef(input_items.items[i]));
-            }
-        }
-
-        var replacements = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
-        defer replacements.deinit();
-        try collectParamReplacements(&parsed.ast.nodes, &parsed.binder, expr_ref, param_syms.items, placeholders.items, &replacements);
-
-        var writer = try parser.Writer.init(subject_text.len);
-        var printer = parser.Printer(parser.Writer, .{ .use_replacements = true }).init(parsed.ast, &writer);
-        printer.skip_types = true;
-        printer.replacements = &replacements;
-        try printer.visit(parsed.ast.nodes.at(expr_ref));
-
-        const template_text = if (bound_names.items.len == 0)
-            try getAllocator().dupe(u8, writer.buf.items)
-        else blk: {
-            var out = std.ArrayList(u8).init(getAllocator());
-            try out.append('(');
-            for (bound_names.items, 0..) |n, i| {
-                if (i != 0) try out.appendSlice(", ");
-                try out.appendSlice(n);
-            }
-            try out.appendSlice(" => ");
-            try out.appendSlice(writer.buf.items);
-            try out.appendSlice(")(");
-            for (bound_literals.items, 0..) |l, i| {
-                if (i != 0) try out.appendSlice(", ");
-                try out.appendSlice(l);
-            }
-            try out.append(')');
-            break :blk out.items;
-        };
-
-        const subject_obj = try this.createTemplatedSubject("expression-template", template_text);
-
-        const new_input = try this.graph.createArrayFromItems(new_input_items.items);
-        const new_computed = try this.graph.createComputed(subject_obj, new_input);
-        try this.graph.replaceValue(computed_ref, new_computed);
-        return true;
+        return this.tryNormalizeFreeVariableSubject(computed_ref, subject_text, this.graph.getInput(node));
     }
 
     // we remove computed values in property assignment position so that they become assignment statements
@@ -6567,8 +7031,7 @@ const Optimizer = struct {
     }
 
     // stages run in order over the graph but can be staggered per-node.
-    // a given stage only runs over a node once
-    const Stage = enum { inline_call, fold_merge, inline_value, dce };
+    const Stage = enum { reduce };
 
     fn tryOptimizeTargetStage(
         this: *@This(),
@@ -6578,20 +7041,7 @@ const Optimizer = struct {
     ) !bool {
         const n = this.graph.getValue(ref);
         return switch (stage) {
-            .inline_call => if (n.kind == .computed) try this.tryInlineComputationCall(ref, counts) else false,
-            .fold_merge => blk: {
-                var changed = false;
-                if (n.kind == .object) {
-                    if (try this.tryPeelComputedObjectEntryIntoStatement(ref, counts)) changed = true;
-                }
-                // `n` might be a new node now
-                if (this.graph.getValue(ref).kind == .computed) {
-                    if (try this.tryMergeConsecutiveStatementEntries(ref, counts)) changed = true;
-                }
-                break :blk changed;
-            },
-            .inline_value => if (n.kind == .computed) try this.tryInlineValue(ref, counts) else false,
-            .dce => if (n.kind == .computed) try this.tryDeadCodeElimination(ref, counts) else false,
+            .reduce => if (n.kind == .computed) try this.tryInlineComputationCall(ref, counts) else false,
         };
     }
 
@@ -6654,17 +7104,12 @@ const Optimizer = struct {
         // approximates an average # of passes per relevant value
         var budget: i64 = @as(i64, @intCast(state.targets.items.len)) * 4;
 
-        try this.runStage(root, &state, &budget, .inline_call);
+        try this.runStage(root, &state, &budget, .reduce);
         if (budget <= 0) return;
-        try this.runStage(root, &state, &budget, .fold_merge);
-        if (budget <= 0) return;
-        try this.runStage(root, &state, &budget, .inline_value);
-        if (budget <= 0) return;
-
-        this.invariant_facts.deinit(getAllocator());
-        this.invariant_facts = try this.computeInvariantCellFacts(root);
-
-        try this.runStage(root, &state, &budget, .dce);
+        // try this.runStage(root, &state, &budget, .fold_merge);
+        // if (budget <= 0) return;
+        // try this.runStage(root, &state, &budget, .inline_value);
+        // if (budget <= 0) return;
     }
 
     // basic value graph -> JS emitter
@@ -6997,7 +7442,6 @@ const Optimizer = struct {
             },
             .computed => blk: {
                 if (try this.getTemplatedSubject(ref)) |subj| {
-                    if (!std.mem.eql(u8, subj.kind, "expression-template")) return error.UnknownComputedSubject;
                     const input_ref = try this.resolveIdentity(this.graph.getInput(n));
                     const input_node = this.graph.getValue(input_ref);
                     var subst = std.ArrayList([]const u8).init(getAllocator());
@@ -7007,7 +7451,13 @@ const Optimizer = struct {
                             try subst.append(try this.emitValue(el, state, out, .expression));
                         }
                     }
-                    break :blk try substitutePlaceholders(subj.template, subst.items);
+                    const substituted = try substitutePlaceholders(subj.template, subst.items);
+                    if (std.mem.eql(u8, subj.kind, "expression-template")) {
+                        break :blk substituted;
+                    }
+                    // a statement-template used as a plain value (not a mutation
+                    // chain off a self-referencing base): wrap it as an IIFE
+                    break :blk try std.fmt.allocPrint(getAllocator(), "(() => {{\n{s}\n}})()", .{substituted});
                 }
 
                 const subject_resolved = try this.resolveIdentity(this.graph.getSubject(n));
