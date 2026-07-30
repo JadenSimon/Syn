@@ -2,6 +2,7 @@
 
 const putInVertTrace = []
 function traceInVert(scId, relIdx, val) {
+    return
     const stack = new Error().stack.split('\n').slice(2, 6).join(' | ')
     putInVertTrace.push({ scId, relIdx, val, stack })
     if (putInVertTrace.length > 200000) putInVertTrace.shift()
@@ -745,22 +746,24 @@ function scanScTable() {
     }
 }
 
+const scIds = []
 const scTable = []
 function getSc(id) {
     return scTable[id]
 }
 function createSc(parent, isRoot = false) {
     parent = typeof parent === 'number' ? parent : parent.id
-    const id = scTable.length
+    const id = scIds.length ? scIds.pop() : scTable.length
     let page
     if (!isRoot && pageFreeList.length) {
         const [oldId, p] = pageFreeList.pop()
         page = p
         scTable[oldId] = undefined
-        // for (let relId = 1; relId <= 64; relId++) {
-        //     freedHandles.delete(toAbsoluteHandle(oldId, relId))
-        // }
-        // freedHandles.delete(oldId | (1 << 30))
+        scIds.push(oldId)
+        for (let relId = 1; relId <= 64; relId++) {
+            freedHandles.delete(toAbsoluteHandle(oldId, relId))
+        }
+        freedHandles.delete(oldId | (1 << 30))
     } else {
         const [_, p] = allocPage()
         page = p
@@ -1617,7 +1620,7 @@ fuzzTestCellChurn(8004, 8000, 8, 8)
 fuzzTestCellChurn(8005, 8000, 8, 8)
 
 function fuzzTestCondense(seed, numChildSCs, cellsPerChild, rounds, stepsPerRound) {
-    // if (!shouldFuzz) return
+    if (!shouldFuzz) return
     let s = seed >>> 0
     function rnd() {
         s = (s * 1664525 + 1013904223) >>> 0
@@ -1941,7 +1944,7 @@ function chaosStackTest(seed, durationMs, opts = {}) {
     }
 
     function popFrame() {
-        if (frames.length < 1) return
+        if (frames.length < 2) return
         const callee = frames.pop()
         const caller = frames[frames.length - 1]
         removeTestEdge(caller.anchorCell, callee.anchorCell)
@@ -1991,7 +1994,7 @@ function chaosStackTest(seed, durationMs, opts = {}) {
         } else if (roll < pushProb + popProb) {
             popFrame()
             popCount++
-        } else if (roll < pushProb + popProb + allocProb) {
+        } else if (roll < pushProb + popProb + allocProb && frames.length > 1) {
             const allocStart = performance.now()
             const active = frames[frames.length - 1]
             const batch = 1 + rndInt(16)
@@ -2033,12 +2036,6 @@ function chaosStackTest(seed, durationMs, opts = {}) {
                     crossEdgeCount++
                 }
             }
-        }
-
-        // drop freed cells from frame bookkeeping periodically (our own
-        // bookkeeping only, not cg.js state)
-        if (iterations % 200 === 0) {
-            for (const f of frames) f.cells = f.cells.filter((h) => !freedHandles.has(h))
         }
 
         checkSoundness(`iter=${iterations}`)
@@ -2094,7 +2091,7 @@ function chaosStackTest(seed, durationMs, opts = {}) {
 //chaosStackTest(24683, 16000, { verify: false })
 
  // chaosStackTest(24682, 100_000, { verify: false })
- chaosStackTest(24683, 100_000_000, { verify: false })
+ chaosStackTest(24684, 200_000_000, { verify: false })
 
  // chaosStackTest(24681, 16000, { verify: true })
 
