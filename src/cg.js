@@ -217,6 +217,10 @@ function createScView(pageBuf, offset, debugScId) {
         allocatedInVerticals.set(relIdx, val)
         // throw new Error('out of room!')
     }
+    function incInVert(relIdx, amt = 1) {
+        const v = findInVert(relIdx) ?? 0
+        putInVert(relIdx, v + amt)
+    }
     function putOutVert(absId, val) {
         traceInVert(debugScId, 'outVert:' + absId, val)
         if (!allocatedOutVerticals && val > 255) allocOutVerts() // would overflow the u8 slot -- bail to the map early
@@ -328,7 +332,10 @@ function createScView(pageBuf, offset, debugScId) {
     function decOutVertical(absHandle) {
         if (allocatedOutVerticals) {
             const v = allocatedOutVerticals.get(absHandle)
-            if (!v || v < 0) throw new Error('womp ?')
+            if (!v || v < 0) {
+                printInfo()
+                throw new Error('womp ?')
+            }
             if (v === 1) {
                 allocatedOutVerticals.delete(absHandle)
             } else {
@@ -668,8 +675,9 @@ function createScView(pageBuf, offset, debugScId) {
             v.setUint8(peerEdgeStart+(i*2)+1, 0)
         }
     }
-    function clearOutVerts() {
+    function clearOutVerts(allocOnly) {
         allocatedOutVerticals = undefined
+        if (allocOnly) return
         const base = outVertStart
         const verticalSize = 5
         for (let i = 0; i < 6; i++) {
@@ -752,13 +760,8 @@ function createScView(pageBuf, offset, debugScId) {
         return m
     }
     function fixupCoalescedPeerEdges(relIdxMap) {
-        if (!coalescedPeerEdges) return
-        const nm = new Map()
-        for (const [k, v] of coalescedPeerEdges) {
-            const kn = relIdxMap.get(k) ?? k
-            nm.set(kn, v)
-        }
-        coalescedPeerEdges = nm
+        if (!relIdxMap.size) return
+        coalescedPeerEdges = relIdxMap
     }
     return {
         checkIntegrity,
@@ -792,6 +795,7 @@ function createScView(pageBuf, offset, debugScId) {
         putPeerEdge,
         incLocalRc,
         decLocalRc,
+        incInVert,
         incOutVertical,
         decOutVertical,
         collectOutVerticals,
@@ -1003,6 +1007,7 @@ function freeCutawaySc(scid, sc = getSc(scid)) {
     if (sc.allocParent) {
         sc.allocParent.activeSc = undefined
     }
+    sc.clearOutVerts(true)
     new Uint8Array(sc.page).fill(0)
     pageFreeList.push([sc.id, sc.page])
     sc.setFreed(true)
@@ -1024,6 +1029,19 @@ function free(handle) {
             freeScCells(sc)
             sc.clearHeapCells()
             clearScEdges(sc)
+        } else {
+            // reentrant, if our parent is not freed/cutaway we will clean our edges
+            const p = getSc(sc.parent)
+            if (!p.isFreed() && !p.isCutaway()) {
+                const edges = sc.collectPeerEdges()
+                sc.clearPeerEdges()
+                for (const [relIdx, val] of edges) {
+                    p.setLocalRc(relIdx, p.getLocalRc(relIdx) - val)
+                    const sib = getSc(p.getHeapCellId(relIdx-1) & ~(1 << 30))
+                    sib.incInVert(relIdx, -val)
+                    if (p.isFreed() || p.isCutaway()) break
+                }
+            }
         }
         freeCutawaySc(scid, sc)
     } else {
@@ -1071,23 +1089,11 @@ function removeScEdge(scid1, scid2, to) {
         if (d1 <= d2 && d2 > 0) {
             const next = getSc(toSc.parent)
             arr.push(next, (toSc.id | (1 << 30)))
-            // removeInboundVertical(next, (toSc.id | (1 << 30)))
             toSc = next
         }
     }
     if (removeScPeerEdge(fromSc, toSc)) {
         // the entire subgraph was just removed
-        return
-    }
-    const cv = fromSc.takeCoalescedPeerEdge(toSc.getSelfLocalId(), to)
-    if (cv) {
-        const t = cv + 1
-        for (let j = 0; j < t; j++) {
-            for (let i = 0; i < arr.length; i += 2) {
-                if (arr[i].isFreed()) continue
-                removeInboundVertical(arr[i], arr[i+1])
-            }
-        }
         return
     }
     for (let i = 0; i < arr.length; i += 2) {
@@ -1116,8 +1122,9 @@ function clearScEdges(sc) {
         if (sc.id === scid2) {
             throw new Error('should never happen')
         }
-        if (sc.isFreed()) break // it's possible that we cut away a higher level structure during this walk
-        if (getSc(scid2).isFreed()) break
+        // it's possible that we cut away a higher level structure during this walk
+        if (sc.isFreed()) break        
+        if (getSc(scid2).isFreed()) continue
         // FIXME: this should be bulk
         while (sc.findOutVert(leafHandle)) {
             removeScEdge(sc.id, scid2, leafHandle)
@@ -1126,7 +1133,9 @@ function clearScEdges(sc) {
 }
 
 function freeScCells(sc) {
-    for (const cell of sc.collectHeapCells()) {
+    const cells = sc.collectHeapCells()
+    sc.clearHeapCells()
+    for (const cell of cells) {
         if (isSc(cell[1])) {
             freeCutawaySc(cell[1] & ~(1 << 30))
             continue
@@ -1294,6 +1303,7 @@ function condense(psc, useAll = false) {
         if (!isSc(x[1])) continue
         const newSc = getSc(x[1] & ~(1 << 30))
         if (newSc.isFreed()) continue
+        assertScConsistency(newSc)
         const relId = newSc.getSelfLocalId()
         if (psc.getLocalRc(relId) === 0 && !psc.findInVert(relId)) {
             free(newSc.id | (1 << 30))
@@ -1304,9 +1314,11 @@ function condense(psc, useAll = false) {
     for (const x of psc.collectHeapCells()) {
         if (!isSc(x[1])) continue
         const child = getSc(x[1] & ~(1 << 30))
+        assertScConsistency(child)
         depthExtent = Math.max(child.getDepthExtent() + 1, depthExtent)
     }
     psc.setDepthExtent(depthExtent)
+    assertScConsistency(psc)
 }
 
 function detectSimpleScCycle(parentSc, relIdx, child) {
@@ -1326,7 +1338,9 @@ function detectSimpleScCycle(parentSc, relIdx, child) {
         if (edges2.length > 3) continue
         for (const y of edges2) {
             if (y[0] === relIdx) {
+                parentSc.printInfo()
                 free(child.id | (1 << 30))
+                if (!parentSc.isFreed()) assertScConsistency(parentSc)
                 return true
             }
         }
@@ -1343,7 +1357,7 @@ function simplifySc(sc, recursed) {
             const child = getSc(x[1] & ~(1 << 30))
             if (child.isFreed() || sc.isFreed()) return
             if (detectSimpleScCycle(sc, x[0], child)) return
-            // if (!sc.hasCoalesced() && child.getLiveCellCount()+count<64 && !child.activeSc && !child.isLeafSc() && sc.getLocalRc(x[0]) === 0) {
+            // if (child.getLiveCellCount()+count<64 && !child.activeSc && !child.isLeafSc() && sc.getLocalRc(x[0]) === 0 && child.getLiveCellCount() > 1) {
             //     pruneSparseSc(child, sc)
             //     return
             // }
@@ -1353,7 +1367,6 @@ function simplifySc(sc, recursed) {
     }
     if (sc.activeSc) return
     const child = sc.collectHeapCells()[0]
-    if (!child[0]) return
     if (!isSc(child[1])) return
     const parent = getSc(sc.parent)
     const childSc = getSc(child[1] & ~(1 << 30))
@@ -1386,7 +1399,10 @@ function simplifySc(sc, recursed) {
     sc.setReplaced(true)
     free(sc.id | (1 << 30))
     const r = simplifySc(childSc, true) ?? childSc
+    if (r.isFreed()) return r
     if (!recursed) bumpDepth(r, d-1)
+    assertScConsistency(parent)
+    assertScConsistency(r)
     return r
 }
 
@@ -1404,9 +1420,6 @@ function mergeGroup(psc, group) {
         if (v) perChildInVert.set(old.id, v)
         totalInVert += v
     }
-    if (totalInVert > 0) {
-        psc.putInVert(newSc.getSelfLocalId(), totalInVert)
-    }
 
     for (const x of psc.collectHeapCells()) {
         if (!isSc(x[1])) continue
@@ -1417,9 +1430,23 @@ function mergeGroup(psc, group) {
         for (const old of group) {
             const v = sib.findPeerEdge(old.getSelfLocalId())
             if (v) {
-                redirected += v
+                const coalesced = sib.getCoalescedPeerEdges(old.getSelfLocalId())
                 sib.putPeerEdge(old.getSelfLocalId(), 0)
+                if (coalesced) {
+                    // when consuming coalesced peer edges, we must reflect them in the up verticals
+                    // this is most easily done by subtracting the extra counts
+                    for (const [target, amt] of coalesced) {
+                        let p = getSc(getScId(target))
+                        p.incInVert(getRelId(target), -amt)
+                        while (p !== old) {
+                            const parent = getSc(p.parent)
+                            parent.incInVert(p.getSelfLocalId(), -amt)
+                            p = parent
+                        }
+                    }
+                }
                 perChildInVert.set(old.id, (perChildInVert.get(old.id) ?? 0) + v)
+                redirected += v
             }
         }
         if (redirected > 0) {
@@ -1429,6 +1456,9 @@ function mergeGroup(psc, group) {
     }
     if (totalRc > 0) {
         psc.setLocalRc(newSc.getSelfLocalId(), totalRc)
+    }
+    if (totalInVert > 0) {
+        psc.putInVert(newSc.getSelfLocalId(), totalInVert)
     }
 
     const rcs = new Map()
@@ -1494,17 +1524,24 @@ function mergeGroup(psc, group) {
             if (!psc.findOutVert(targetHandle)) {
                 // this is an out vert to a peer under psc
                 const target = getSc(peerId)
-                const coalesced = oldCoalesced.get(target.getSelfLocalId())?.get(targetHandle)
-                if (coalesced) {
-                    oldCoalesced.get(target.getSelfLocalId()).delete(targetHandle)
-                    newSc.incCoalescedPeerEdge(target.getSelfLocalId(), targetHandle, coalesced)
-                }
+                // const coalesced = oldCoalesced.get(target.getSelfLocalId())?.get(targetHandle)
+                // if (coalesced) {
+                //     oldCoalesced.get(target.getSelfLocalId()).delete(targetHandle)
+                //     newSc.incCoalescedPeerEdge(target.getSelfLocalId(), targetHandle, coalesced)
+                // }
                 if (didAdd) {
                     const existing = newSc.findPeerEdge(target.getSelfLocalId()) ?? 0
                     newSc.putPeerEdge(target.getSelfLocalId(), existing + 1)
                 } else {
                     psc.decLocalRc(target.getSelfLocalId())
-                    newSc.incCoalescedPeerEdge(target.getSelfLocalId(), targetHandle)
+                    let p = getSc(getScId(targetHandle))
+                    p.incInVert(getRelId(targetHandle), -1)
+                    while (p !== target) {
+                        const parent = getSc(p.parent)
+                        parent.incInVert(p.getSelfLocalId(), -1)
+                        p = parent
+                    }
+                    // newSc.incCoalescedPeerEdge(target.getSelfLocalId(), targetHandle)
                 }
                 continue
             }
@@ -1531,14 +1568,21 @@ function mergeGroup(psc, group) {
         const m = new Map()
         const fixupMap = new Map()
         for (const [other, [relIdx, val]] of v) {
-            fixupMap.set(relIdx, other.getSelfLocalId())
+            const c = k.takeCoalescedPeerEdgesForPeer(relIdx)
+            if (c) fixupMap.set(other.getSelfLocalId(), c)
             m.set(other.getSelfLocalId(), val)
-            k.putPeerEdge(relIdx, 0)
+            k.putPeerEdge(relIdx, 0, true)
         }
         for (const [k2, v2] of m) {
             k.putPeerEdge(k2, v2)
         }
         k.fixupCoalescedPeerEdges(fixupMap)
+    }
+
+    assertScConsistency(newSc)
+    assertScConsistency(psc)
+    for (const x of group) {
+        assertScConsistency(x)
     }
 
     for (const x of group) {
@@ -1550,12 +1594,16 @@ function mergeGroup(psc, group) {
         if (newSc.isFreed()) return
     }
 
+    assertScConsistency(newSc)
+    assertScConsistency(psc)
+
     let depthExtent = 0
     for (const x of group) {
         if (x.isFreed()) continue
         const c = simplifySc(x) ?? x
         // const c = x
         depthExtent = Math.max(c.getDepthExtent()+1, depthExtent)
+        if (newSc.isFreed()) return
     }
     newSc.setDepthExtent(depthExtent)
 
@@ -1621,7 +1669,6 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
     }
 
     for (const a of children) {
-        if (a.hasCoalesced()) throw new Error('whoops')
         const m = new Map()
         for (const b of children) {
             if (a === b) continue
@@ -1638,6 +1685,10 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
     }
 
 
+    for (const [relIdx, val] of sc.collectPeerEdges()) {
+        parent.setLocalRc(relIdx, parent.getLocalRc(relIdx) - val)
+    }
+
     function findPeer(handle) {
         let p = getSc(getScId(handle))
         while (true) {
@@ -1651,18 +1702,14 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
         throw new Error('not expected')
     }
 
+    const didResetPeer = new Set()
     for (const targetHandle of sc.collectOutVerticals()) {
         if (parent.findOutVert(targetHandle)) {
-            if (!outVertMapping.has(targetHandle)) {
+            const from = outVertMapping.get(targetHandle)
+            if (!from) {
                 throw new Error('child missing outvert')
             }
-            const val = sc.findOutVert(targetHandle)
-            if (val === 1) {
-                if (outVertMapping.get(targetHandle) && outVertMapping.get(targetHandle)?.size !== val) throw new Error('aa')
-                parent.incOutVertical(targetHandle)
-            } else {
-                for (let i = 0; i < val-1; i++) parent.incOutVertical(targetHandle)
-            }
+            for (let i = 0; i < from.size-1; i++) parent.incOutVertical(targetHandle)
             continue
         }
         const foundPeer = findPeer(targetHandle)
@@ -1677,6 +1724,16 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
             parent.incLocalRc(peerIdx)
             x.putPeerEdge(peerIdx, (x.findPeerEdge(peerIdx) ?? 0) + 1)
         }
+        const deltaIn = from.size-1
+        if (deltaIn) {
+            let p = getSc(getScId(targetHandle))
+            p.incInVert(getRelId(targetHandle), deltaIn)
+            while (p !== foundPeer) {
+                const parent = getSc(p.parent)
+                parent.incInVert(p.getSelfLocalId(), deltaIn)
+                p = parent
+            }
+        }
     }
     sc.clearOutVerts()
     sc.clearPeerEdges()
@@ -1686,6 +1743,7 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
     for (const x of children) {
         assertScConsistency(x)
     }
+    assertScConsistency(parent)
 }
 
 function checkScConsistency(sc) {
@@ -1736,41 +1794,42 @@ function checkScConsistency(sc) {
         if (!tag) problems.push(`in-vert ${relId}: no such child cell on sc`)
     }
 
-    for (const [relId] of childCells) {
+    for (const [relId, addr] of childCells) {
         const rc = sc.getLocalRc(relId) ?? 0
         let expected = 0
         for (const c of children) {
             if (c.getSelfLocalId() === relId) continue
             expected += c.findPeerEdge(relId) ?? 0
         }
-        if (rc !== expected) problems.push(`localRc[${relId}] = ${rc}, expected ${expected} from children's peer edges`)
+        if (rc !== expected) problems.push(`${addr}: localRc[${relId}] = ${rc}, expected ${expected} from children's peer edges`)
     }
 
     if (!sc.isLeafSc()) {
+        let uniqueEdges = 0
         const childOutVertSum = new Map()
         for (const c of children) {
             for (const h of c.collectOutVerticals()) {
                 const isPeer = resolvesAsPeerOf(c, h)
                 if (isPeer) continue
                 childOutVertSum.set(h, (childOutVertSum.get(h) ?? 0) + (c.findOutVert(h) ?? 0))
+                uniqueEdges += 1
             }
         }
-        let peerResolvedSum = 0
-        // for (const h of sc.collectOutVerticals()) {
-        //     const v = sc.findOutVert(h)
-        //     const isPeer = resolvesAsPeerOf(sc, h)
-        //     //const onSc = sc.findOutVert(h) ?? 0
-        //     if (isPeer) {
-        //         peerResolvedSum += v
-        //         //if (onSc) problems.push(`out-vert ${h}: resolves as a peer edge at sc's level AND exists on sc (should be one or the other)`)
-        //     }
-        // }
         let scTotal = 0
-        for (const h of sc.collectOutVerticals()) scTotal += sc.findOutVert(h) ?? 0
+        for (const h of sc.collectOutVerticals()) {
+            const isPeer = resolvesAsPeerOf(sc, h)
+            if (!isPeer && !childOutVertSum.has(h)) {
+                problems.push(`parent has out-vert that no children has: ${h}`)
+            }
+            scTotal += sc.findOutVert(h) ?? 0
+        }
         let childTotal = 0
         for (const v of childOutVertSum.values()) childTotal += v
-        if (scTotal !== childTotal - peerResolvedSum) {
-            problems.push(`out-vert sum mismatch: sc=${scTotal}, children=${childTotal}, peerResolved=${peerResolvedSum} (expected sc === children - peerResolved)`)
+        if (scTotal > childTotal) {
+            problems.push(`out-vert sum mismatch: sc=${scTotal}, children=${childTotal} (expected sc <= children)`)
+        }
+        if (uniqueEdges !== scTotal) {
+            problems.push(`out-vert uniqueness mismatch: sc=${scTotal} !== children=${uniqueEdges}`)
         }
     }
 
@@ -1781,13 +1840,29 @@ function checkScConsistency(sc) {
             if (!isSc(x[1])) continue
             const sibId = x[1] & ~(1 << 30)
             if (sibId === sc.id) continue
-            fromSiblings += getSc(sibId).findPeerEdge(scRelId) ?? 0
+            const sibSc = getSc(sibId)
+            fromSiblings += sibSc.findPeerEdge(scRelId) ?? 0
+            const extras = sibSc.getCoalescedPeerEdges(scRelId)
+            if (extras) {
+                for (const [k, v] of extras) fromSiblings += v
+            }
         }
         const fromParent = parent.findInVert(scRelId) ?? 0
         let scInVertSum = 0
         for (const relId of sc.collectInVerticals()) scInVertSum += sc.findInVert(relId) ?? 0
         if (scInVertSum !== fromSiblings + fromParent) {
             problems.push(`in-vert sum mismatch: sc=${scInVertSum}, expected ${fromSiblings + fromParent} (siblings=${fromSiblings} + parent=${fromParent})`)
+        }
+    }
+
+    if (!sc.isLeafSc()) {
+        const c = parent.getCellCount()
+        for (let i = 0; i < c; i++) {
+            const coalesced = sc.getCoalescedPeerEdges(i+1)
+            if (coalesced) {
+                const edge = sc.findPeerEdge(i+1)
+                if (!edge) problems.push(`missing peer edge for coalesced edge`)
+            }
         }
     }
 
@@ -1799,22 +1874,33 @@ function checkScConsistency(sc) {
         let internalPeerSum = 0
         for (const a of children) {
             for (const [relId, val] of a.collectPeerEdges()) {
-                if (childIds.has(getSc(sc.getHeapCellId(relId - 1) & ~(1 << 30))?.id)) internalPeerSum += val
+                if (childIds.has(getSc(sc.getHeapCellId(relId - 1) & ~(1 << 30))?.id)) {
+                    internalPeerSum += val
+                    const extras = a.getCoalescedPeerEdges(relId)
+                    if (extras) {
+                        for (const [k, v] of extras) {
+                            internalPeerSum += v
+                        }
+                    }
+                }
             }
         }
         let scInVertSum = 0
         for (const relId of sc.collectInVerticals()) scInVertSum += sc.findInVert(relId) ?? 0
         if (scInVertSum !== childInVertSum - internalPeerSum) {
-            problems.push(`in-vert sum (children view) mismatch: sc=${scInVertSum}, children=${childInVertSum}, internalPeer=${internalPeerSum}`)
+            problems.push(`in-vert sum (children view) mismatch: sc=${scInVertSum} + internalPeer=${internalPeerSum} (${scInVertSum+internalPeerSum}) !== children=${childInVertSum}`)
         }
     }
 
     return problems
 }
 
+const shouldCheckConsistency = true
 function assertScConsistency(sc) {
+    if (!shouldCheckConsistency) return
     const problems = checkScConsistency(sc)
     if (!problems.length) return
+    sc.printInfo()
     for (const x of problems) {
         console.log(x)
     }
