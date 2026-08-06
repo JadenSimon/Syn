@@ -1,0 +1,1029 @@
+"use strict";
+
+// Opcodes
+//
+// Every instruction is `[Op.X, ...operands]`.
+// Operands:
+//   r, r1, r2, ...   register index
+//   k                constant pool index
+//   idx              abs index into bytecode array
+
+// heap design
+// - no tagged handles
+// - zero prefix = relative handle
+// - cells allocated in 8 byte increments, but addressed in 4 byte increments. 4 byte alignment OK
+// - low 8 bits = offset into an SC
+// - remaining high bits = decoded into start of the SC (raw ptr) via base addr. we reserve 16gb virtual mem ahead of time.
+// - start of the SC is the SC itself
+// - leaf SCs for stack frames don't have internal ref counters
+// - 0x0 and 0xFFFF_FFXX cannot be used as the first word of a heap cell
+
+
+const Op = {
+    Mov: 0x00,                // [rsrc, rdst]  reg[rdst] = reg[rsrc]
+
+    Star: 0x01,               // [r]     reg[r] = acc
+    Star0: 0x02,              // []      reg[0] = acc
+    Star1: 0x03,              // []      reg[1] = acc
+    Star2: 0x04,              // []      reg[2] = acc
+    Star3: 0x05,              // []      reg[3] = acc
+    Star4: 0x06,              // []      reg[4] = acc
+    Star5: 0x07,              // []      reg[5] = acc
+    Star6: 0x08,              // []      reg[6] = acc
+    Star7: 0x09,              // []      reg[7] = acc
+
+    LdaImm: 0x22,           // [n]           acc = n (SIGNED)
+    LdaZero: 0x23,     // []            acc = 0
+    LdaConst: 0x24,       // [k]           acc = constants[k]
+    LdaUndefined: 0x26, // []
+    LdaNull: 0x27,         // []
+    LdaTrue: 0x28,         // []
+    LdaFalse: 0x29,       // []
+    Ldar: 0x2A,     // [r]           acc = reg[r]
+    Ldar0: 0x2B,     // []           acc = reg[0]
+    Ldar1: 0x2C,     // []           acc = reg[1]
+    Ldar2: 0x2D,     // []           acc = reg[2]
+    Ldar3: 0x2E,     // []           acc = reg[3]
+
+    Add: 0x30, Sub: 0x31, Mul: 0x32, Div: 0x33, Mod: 0x34, Exp: 0x35,
+    BitOr: 0x36, BitAnd: 0x37, BitXor: 0x38,
+    ShiftLeft: 0x39, ShiftRight: 0x3A, ShiftRightLogical: 0x3B,
+    TestEqual: 0x3C, TestStrictEqual: 0x3D,
+    TestLessThan: 0x3E, TestGreaterThan: 0x3F,
+    TestLessThanOrEqual: 0x40, TestGreaterThanOrEqual: 0x41,
+    TestIn: 0x42, TestInstanceOf: 0x43,
+
+    // AddImm, ModImm, BitOrImm, BitAndImm, BitXorImm, ShiftLeftImm, ShiftRightImm, ShiftRightLogicalImm
+
+    Inc: 0x4A, Dec: 0x4B, Negate: 0x4C, BitNot: 0x4D,
+    LogicalNot: 0x4E, TypeOf: 0x4F,
+
+    Jump: 0x60,                       // [idx]
+    JumpIfToBooleanTrue: 0x61,   // [idx]  if (acc) pc = off
+    JumpIfToBooleanFalse: 0x62, // [idx]  if (!acc) pc = off
+    // JumpIfNull: 0x2D,           // [idx]
+    // JumpIfUndefined: 0x2E, // [idx]
+
+    // normal call -> first arg is recv?
+    Call: 0x63,           // [rcallee, rargStart, argCount]   
+    CallConst: 0x64,
+    CallBuiltin: 0x66,
+    Construct: 0x69,
+    Catch: 0x76, // registers an EH
+    Throw: 0x77,        // [err]
+    Rethrow: 0x78,      // []
+    Return: 0x79,       // []
+
+
+
+    GetProperty: 0x80, // [rkey]   acc = acc[reg[rkey]]
+    SetProperty: 0x81, // [robj, rkey]   reg[robj][reg[rkey]] = acc
+    DeleteProperty: 0x82,   // [rkey] acc = delete acc[reg[rkey]]
+
+    GetPropertyImm: 0x90, // [unsigned imm] acc = acc[imm]
+    SetPropertyImm: 0x91, // [robj, unsigned imm] reg[robj][imm] = acc
+
+    CreateEmptyObject: 0xA0, // []  acc = {}
+    CreateEmptyArray: 0xA1,   // []  acc = []
+
+    CreateClosure: 0xC5, // consumes a function template inside constant pool. frames are templated and resolved at this point
+
+    // these change the interpretation of the next instruction similar to V8's ignition bytecode
+    // we need to specialize the dispatch directly for this, we don't want to be checking which width we have in the fast path
+    Width2: 0xF0, // 2 byte operands
+    Width4: 0xF1, // 4 byte operands
+    Width8: 0xF2, // 8 byte operands
+
+    // variable length. this is NOT a deopt, it is a runtime assertion that aborts the program
+    Assert: 0xFF, // [assertionKind, ...args] 
+}
+
+// u8
+const AssertionKind = {
+    AccumulatorIs: 0,       // [Type]
+    AccumulatorIsNot: 1,    // [Type]
+    RegisterIs: 10,         // [regIdx, Type]
+    RegisterIsNot: 11,      // [regIdx, Type]
+    // these assertions happen inside operations that consume registers w/ the acc
+    NextRegisterIs: 20,     // [Type]
+    // NextRegisterIsNot: 21,  // [Type]
+}
+
+let hasPendingRegisterAssertion = 0
+let pendingRegisterAssertionType = 0
+
+// T is expected
+// U is current type, which may be wider than T or absent for reg loads
+function checkType(val, T, U) {
+    if (U === undefined) {
+        if (val & 1) {
+            val = val >> 1
+            U = Type.Handle
+        } else {
+            U = Type.Smi
+        }
+    }
+    if (T === U) return true
+    if (U === Type.Handle) {
+        // TODO: better checks
+        // also, register assertions should ideally happen during the register load in the op
+        // otherwise it's harder to propagate facts correctly due to `Intrinsics.load` being opaque
+        return getNarrowedTypeFromHeapCell(val) === T
+    }
+    return false
+}
+
+function assert(ok) {
+    if (!ok) throw "Assertion failed"
+}
+
+function assertIs(val, T, U) {
+    assert(checkType(val, T, U))
+    if (U === undefined) {
+        if (typeNeedsHandleInRegister(T)) {
+            assert((val & 1) === 1)
+        } else {
+            assert((val & 1) === 0)
+        }
+    }
+}
+
+function assertIsNot(val, T, U) {
+    assert(!checkType(val, T, U))
+    if (U === undefined) {
+        if (!typeNeedsHandleInRegister(T)) {
+            assert((val & 1) === 1)
+        } else {
+            assert((val & 1) === 0)
+        }
+    }
+}
+
+function assertCurrentRegValue(v) {
+    if (hasPendingRegisterAssertion) {
+        hasPendingRegisterAssertion = 0
+        assertIs(v, pendingRegisterAssertionType)
+    }
+}
+
+function getNarrowedTypeFromHeapCell(val) {
+    switch (Intrinsics.load(val, Type.Handle)) {
+        case True: return Type.True
+        case False: return Type.False
+        case Null: return Type.Null
+        case Undefined: return Type.Undefined
+
+        // heap numbers
+        case HeapF64: return Type.f64
+        case HeapU64: return Type.u64
+        case HeapI64: return Type.i64
+        case HeapU32: return Type.u32
+        case HeapI32: return Type.i32
+    }   
+}
+
+
+function typeNeedsHandleInRegister(T) {
+    return T >= Type.u32
+}
+
+const Type = {
+    Smi: 0,
+    u8: 1,
+    i8: 2,
+    u16: 3,
+    i16: 4, // i16/u16/u8/i8 end up as SMIs in acc/regs
+    u32: 5,
+    i32: 6,
+    u64: 7,
+    i64: 8,
+    f64: 9,
+
+    NativePtr: 19, // void ptr
+    Handle: 20, // opaque heap handle
+
+    // special types, these don't exist in the interpreter but are useful for assertions
+    Float: 26,
+    Integer: 27,
+    Undefined: 28,
+    Null: 29,
+    Nullish: 30,
+    True: 35,
+    False: 36,
+    String: 37,
+    Array: 38,
+    Object: 39,
+    RegExp: 40,
+    Function: 41, // any function
+    Symbol: 42,
+    Boolean: 43,
+    Promise: 44, // exactly a Promise
+    PromiseLike: 45,
+    Error: 46, // exactly an Error
+    ErrorLike: 47,
+    AsyncFunction: 48,
+
+    // some basic fn specializations
+    Receiverless: 70,
+
+    Computation: 80, // the primitive
+
+    AnyArrayBuffer: 90,
+    ArrayBuffer: 91,
+    SharedArrayBuffer: 92,
+
+    // Typed arrays
+    U8Array: 100,
+    U16Array: 101,
+    U32Array: 102,
+    U64Array: 103,
+
+    I8Array: 104,
+    I16Array: 105,
+    I32Array: 106,
+    I64Array: 107,
+
+    F16Array: 108,
+    F32Array: 109,
+    F64Array: 110,    
+
+    // Some internal types
+    CFunction: 151, // uses a C call conv
+    JSFunction: 152, // same as NativeFunction, but entry point is the `interpret` fn + bytecode
+    NativeFunction: 153, // uses our call conv
+
+    InterpreterFrame: 160,
+}
+
+function sizeof(T) {
+    switch (T) {
+        case Type.u64:
+        case Type.i64:
+        case Type.f64: return 8
+        case Type.u32:
+        case Type.i32:
+        case Type.Handle: return 4
+        case Type.u16:
+        case Type.i16: return 2
+        case Type.u8:
+        case Type.i8: return 1
+        default:
+            return 4
+    }
+}
+
+const maxIntf64Cmp = 2**53
+const maxSmi = 2**31 // a smi is already bit shifted by 1
+
+const TypeName = Object.fromEntries(Object.entries(Type).map(([k, v]) => [v, k]))
+
+const cellBytes = 8
+const slotBytes = 4
+const heapBytes = 1 << 20
+const heapBuffer = new ArrayBuffer(heapBytes)
+const heapView = new DataView(heapBuffer)
+let heapTop = cellBytes
+
+const Intrinsics = {
+    Type,
+    accType: 0,
+    OF: 0,
+    as: function(v, T) {
+        return v
+    },
+    stackalloc: function(num, T) {
+        const buf = new ArrayBuffer(num*sizeof(T))
+        switch (T) {
+            case Type.u32: return new Uint32Array(buf)
+            case Type.i32: return new Int32Array(buf)            
+            throw `not handled: ${T}`
+        }
+    },
+    alloc: function(numSlots) {
+        const bytes = Math.max(8, numSlots*4)
+        if (heapTop + bytes > heapBytes) throw new Error('heap exhausted')
+        const handle = heapTop
+        heapTop += bytes
+        return handle
+    },
+    store: function(ptr, val, T) {
+        switch (T) {
+            case Type.u8: heapView.setUint8(ptr, val); return
+            case Type.i8: heapView.setInt8(ptr, val); return
+            case Type.u16: heapView.setUint16(ptr, val, true); return
+            case Type.i16: heapView.setInt16(ptr, val, true); return
+            case Type.u32: heapView.setUint32(ptr, val >>> 0, true); return
+            case Type.i32: heapView.setInt32(ptr, val, true); return
+            case Type.f64: heapView.setFloat64(ptr, val, true); return
+            case Type.Handle: heapView.setUint32(ptr, val >>> 0, true); return
+            case Type.u64:
+            case Type.i64: {
+                const lo = val >>> 0
+                const hi = Math.floor(val / 0x1_0000_0000) | 0
+                heapView.setUint32(ptr, lo, true)
+                heapView.setInt32(ptr + 4, hi, true)
+                return
+            }
+            default:
+                throw new Error(`store: unsupported type ${TypeName[T]}`)
+        }
+    },
+    load: function(ptr, T) {
+        switch (T) {
+            case Type.u8: return heapView.getUint8(ptr)
+            case Type.i8: return heapView.getInt8(ptr)
+            case Type.u16: return heapView.getUint16(ptr, true)
+            case Type.i16: return heapView.getInt16(ptr, true)
+            case Type.u32: return heapView.getUint32(ptr, true)
+            case Type.i32: return heapView.getInt32(ptr, true)
+            case Type.f64: return heapView.getFloat64(ptr, true)
+            case Type.Handle: return heapView.getUint32(ptr, true)
+            case Type.u64: {
+                const lo = heapView.getUint32(ptr, true)
+                const hi = heapView.getUint32(ptr + 4, true)
+                return hi * 0x1_0000_0000 + lo
+            }
+            case Type.i64: {
+                const lo = heapView.getUint32(ptr, true)
+                const hi = heapView.getInt32(ptr + 4, true)
+                return hi * 0x1_0000_0000 + lo
+            }
+            default:
+                throw new Error(`load: unsupported type ${TypeName[T]}`)
+        }
+    },
+    // selects between two values using the cond
+    // cond _must_ be a bool! we will not coerce
+    select: function(cond, v1, v2) {
+        return cond ? v1 : v2
+    },
+    // converts T -> U
+    convert: function(v, T, U) {
+        if (T === U) return v
+        if (U === Type.f64) return Number(v)
+        if (T === Type.f64) return Math.trunc(v)
+        return v
+    },
+    cmpf64: function(a, b) {
+        return a > a
+    },
+    // use with f64 and i64/u64 comparisons
+    // assumes a is `f64`
+    cmpmixed64: function(a, b, T) {
+        if (b > -maxIntf64Cmp && b < maxIntf64Cmp) {
+            return Intrinsics.cmpf64(a, Intrinsics.convert(b, T, Type.f64))
+        }
+        return false // todo
+    },
+    isInteger: function(v) {
+        return Number.isInteger(v)
+    }
+}
+
+const Null = Intrinsics.alloc(0)
+const Undefined = Intrinsics.alloc(0)
+const True = Intrinsics.alloc(0)
+const False = Intrinsics.alloc(0)
+
+function tagHandle(handle) {
+    return (handle << 1) | 1
+}
+
+const TaggedNull = tagHandle(Null)
+const TaggedUndefined = tagHandle(Undefined)
+const TaggedTrue = tagHandle(True)
+const TaggedFalse = tagHandle(False)
+
+// some type descriptors
+const HeapF64 = Intrinsics.alloc(0)
+const HeapI64 = Intrinsics.alloc(0)
+const HeapU64 = Intrinsics.alloc(0)
+const HeapU32 = Intrinsics.alloc(0)
+const HeapI32 = Intrinsics.alloc(0)
+
+function promoteType(t1, t2) {
+    if (t1 === t2) return t1
+    if (t1 === Type.Smi) return t2
+    if (t2 === Type.Smi) return t1
+    if (t1 === Type.f64) return t1
+    if (t2 === Type.f64) return t2
+    return Type.i64
+}
+
+const SMI_MAX = maxSmi / 2 - 1
+const SMI_MIN = -(maxSmi / 2)
+
+function narrowSmi(raw, wideType) {
+    if (Intrinsics.isInteger(raw) && raw >= SMI_MIN && raw <= SMI_MAX) return Type.Smi
+    return wideType
+}
+
+let resolvedType
+function resolveNumeric(val, T) {
+    if (T === Type.Smi) { resolvedType = Type.Smi; return val >> 1 }
+    if (T !== Type.Handle) { resolvedType = T; return val }
+    const m = maybeGetNumericHeapType(val)
+    if (m === undefined) throw new Error(`not a numeric handle: ${val}`)
+    resolvedType = m
+    return taggedUnbox(val, m)
+}
+
+function smiTaggedOp(opName, a, b) {
+    switch (opName) {
+        case 'add': return Intrinsics.add32(a, b)
+        case 'sub': return Intrinsics.sub32(a, b)
+        case 'mod': return Intrinsics.mod32(a, b)
+        case 'bitor': return Intrinsics.bitor32(a, b)
+        case 'bitand': return Intrinsics.bitand32(a, b)
+        case 'bitxor': return Intrinsics.bitxor32(a, b)
+        default: return undefined
+    }
+}
+
+function binOpDirect(opName, a, T, b, U) {
+    if (T === Type.Smi && T === U) {
+        const raw = smiTaggedOp(opName, a, b)
+        if (raw !== undefined) {
+            Intrinsics.accType = Type.Smi
+            if (!Intrinsics.OF) {    
+                return raw
+            }
+            const raw2 = Intrinsics[opName + '64'](a / 2, b / 2)
+            Intrinsics.accType = raw2 > 0 ? Type.u64 : Type.i64
+            return raw2
+        }
+    }
+
+    a = resolveNumeric(a, T); T = resolvedType
+    b = resolveNumeric(b, U); U = resolvedType
+    const C = promoteType(T, U)
+    a = Intrinsics.convert(a, T, C)
+    b = Intrinsics.convert(b, U, C)
+    let raw
+    if (C === Type.f64) raw = Intrinsics[opName + 'f64'](a, b)
+    else if (C === Type.Smi) raw = Intrinsics[opName + '32'](a, b)
+    else raw = Intrinsics[opName + '64'](a, b)
+    Intrinsics.accType = narrowSmi(raw, C)
+    return raw
+}
+
+function binOp(opName, a, T, b) {
+    if (hasPendingRegisterAssertion) {
+        hasPendingRegisterAssertion = 0
+        assertIs(b, pendingRegisterAssertionType)
+    }
+    if (b & 1) return binOpDirect(opName, a, T, b >> 1, Type.Handle)
+    return binOpDirect(opName, a, T, b, Type.Smi)
+}
+
+function divOp(a, T, rawB) {
+    assertCurrentRegValue(rawB)
+    let b, U
+    if ((rawB & 1) === 0) { b = rawB; U = Type.Smi }
+    else { b = rawB >> 1; U = Type.Handle }
+    a = resolveNumeric(a, T); T = resolvedType
+    b = resolveNumeric(b, U); U = resolvedType
+    const raw = Intrinsics.divf64(Intrinsics.convert(a, T, Type.f64), Intrinsics.convert(b, U, Type.f64))
+    Intrinsics.accType = narrowSmi(raw, Type.f64)
+    return raw
+}
+
+function shiftRightOp(a, T, rawB) {
+    assertCurrentRegValue(rawB)
+    let b, U
+    if ((rawB & 1) === 0) { b = rawB; U = Type.Smi }
+    else { b = rawB >> 1; U = Type.Handle }
+    a = resolveNumeric(a, T); T = resolvedType
+    b = resolveNumeric(b, U); U = resolvedType
+    const C = promoteType(T, U)
+    const opName = C === Type.u64 ? 'shrl' : 'shr'
+    a = Intrinsics.convert(a, T, C)
+    b = Intrinsics.convert(b, U, C)
+    const raw = C === Type.Smi ? Intrinsics[opName + '32'](a, b) : Intrinsics[opName + '64'](a, b)
+    Intrinsics.accType = narrowSmi(raw, C)
+    return raw
+}
+
+function compareOp(op, a, T, rawB) {
+    assertCurrentRegValue(rawB)
+    let b, U
+    if ((rawB & 1) === 0) { b = rawB; U = Type.Smi }
+    else { b = rawB >> 1; U = Type.Handle }
+    if (T !== Type.Smi || U !== Type.Smi) {
+        a = resolveNumeric(a, T); T = resolvedType
+        b = resolveNumeric(b, U); U = resolvedType
+        const C = promoteType(T, U)
+        a = Intrinsics.convert(a, T, C)
+        b = Intrinsics.convert(b, U, C)
+    }
+    switch (op) {
+        case 0: return a < b
+        case 1: return a > b
+        case 2: return a <= b
+        case 3: return a >= b
+    }
+    throw new Error(`missing op: ${op}`)
+}
+
+Intrinsics.add32 = (a, b) => {
+    const raw = a + b
+    Intrinsics.OF = (((a ^ raw) & (b ^ raw)) < 0) ? 1 : 0
+    return raw
+}
+Intrinsics.sub32 = (a, b) => {
+    const raw = a - b
+    Intrinsics.OF = (((a ^ b) & (a ^ raw)) < 0) ? 1 : 0
+    return raw
+}
+Intrinsics.mul32 = (a, b) => { Intrinsics.OF = 0; return Math.imul(a, b) }
+Intrinsics.mod32 = (a, b) => { Intrinsics.OF = 0; return (a % b) }
+Intrinsics.pow32 = (a, b) => { Intrinsics.OF = 0; return (a ** b) }
+Intrinsics.bitor32 = (a, b) => { Intrinsics.OF = 0; return a | b }
+Intrinsics.bitand32 = (a, b) => { Intrinsics.OF = 0; return a & b }
+Intrinsics.bitxor32 = (a, b) => { Intrinsics.OF = 0; return a ^ b }
+Intrinsics.shl32 = (a, b) => { 
+    const raw = a << b
+    Intrinsics.OF = 0 // ((a ^ raw) < 0) ? 1 : 0
+    return raw
+}
+Intrinsics.shr32 = (a, b) => { Intrinsics.OF = 0; return a >> b }
+Intrinsics.shrl32 = (a, b) => { Intrinsics.OF = 0; return a >>> b }
+
+Intrinsics.add64 = (a, b) => a + b
+Intrinsics.sub64 = (a, b) => a - b
+Intrinsics.mul64 = (a, b) => a * b
+Intrinsics.mod64 = (a, b) => a % b
+Intrinsics.pow64 = (a, b) => a ** b
+Intrinsics.bitor64 = Intrinsics.bitori64
+Intrinsics.bitand64 = Intrinsics.bitandi64
+Intrinsics.bitxor64 = Intrinsics.bitxori64
+Intrinsics.shl64 = Intrinsics.shli64
+Intrinsics.shr64 = Intrinsics.shri64   
+Intrinsics.shrl64 = Intrinsics.shrli64
+
+Intrinsics.addf64 = (a, b) => a + b
+Intrinsics.subf64 = (a, b) => a - b
+Intrinsics.mulf64 = (a, b) => a * b
+Intrinsics.divf64 = (a, b) => a / b
+Intrinsics.modf64 = (a, b) => a % b
+Intrinsics.powf64 = (a, b) => a ** b
+
+function splitI64(v) {
+    return [v >>> 0, Math.floor(v / 0x1_0000_0000) | 0]
+}
+function joinI64(lo, hi) {
+    return hi * 0x1_0000_0000 + (lo >>> 0)
+}
+function shiftLeft64(v, amount) {
+    amount &= 63
+    const [lo, hi] = splitI64(v)
+    if (amount === 0) return [lo, hi]
+    if (amount < 32) return [(lo << amount) >>> 0, ((hi << amount) | (lo >>> (32 - amount))) | 0]
+    return [0, (lo << (amount - 32)) | 0]
+}
+function shiftRightArith64(v, amount) {
+    amount &= 63
+    const [lo, hi] = splitI64(v)
+    if (amount === 0) return [lo, hi]
+    if (amount < 32) return [((lo >>> amount) | (hi << (32 - amount))) >>> 0, hi >> amount]
+    return [(hi >> (amount - 32)) >>> 0, hi >> 31]
+}
+function shiftRightLogical64(v, amount) {
+    amount &= 63
+    const [lo, hiSigned] = splitI64(v)
+    const hi = hiSigned >>> 0
+    if (amount === 0) return [lo, hi | 0]
+    if (amount < 32) return [((lo >>> amount) | (hi << (32 - amount))) >>> 0, (hi >>> amount) | 0]
+    return [(hi >>> (amount - 32)) >>> 0, 0]
+}
+Intrinsics.bitori64 = (a, b) => { const [al, ah] = splitI64(a), [bl, bh] = splitI64(b); return joinI64(al | bl, ah | bh) }
+Intrinsics.bitandi64 = (a, b) => { const [al, ah] = splitI64(a), [bl, bh] = splitI64(b); return joinI64(al & bl, ah & bh) }
+Intrinsics.bitxori64 = (a, b) => { const [al, ah] = splitI64(a), [bl, bh] = splitI64(b); return joinI64(al ^ bl, ah ^ bh) }
+Intrinsics.shli64 = (a, b) => joinI64(...shiftLeft64(a, b))
+Intrinsics.shri64 = (a, b) => joinI64(...shiftRightArith64(a, b))
+Intrinsics.shrli64 = (a, b) => joinI64(...shiftRightLogical64(a, b))
+Intrinsics.bitnoti64 = (a) => { const [lo, hi] = splitI64(a); return joinI64(~lo, ~hi) }
+
+function taggedBox(val, T) {
+    const handle = Intrinsics.alloc(3)
+    let m
+    switch (T) {
+        case Type.f64: m = HeapF64; break
+        case Type.u64: m = HeapU64; break
+        case Type.i64: m = HeapI64; break
+        case Type.u32: m = HeapU32; break
+        case Type.i32: m = HeapI32; break
+        default: throw `unhandled: ${T}`
+    }
+    Intrinsics.store(handle, m, Type.Handle)
+    Intrinsics.store(handle+4, val, T)
+    return handle
+}
+
+function maybeGetNumericHeapType(handle) {
+    const m = Intrinsics.load(handle, Type.Handle)
+    switch (m) {
+        case HeapF64: return Type.f64
+        case HeapU64: return Type.u64
+        case HeapI64: return Type.i64
+        case HeapU32: return Type.u32
+        case HeapI32: return Type.i32
+    }
+}
+
+function taggedUnbox(handle, T) {
+    return Intrinsics.load(handle+4, T)
+}
+
+function handleToBool(handle) {
+    if (handle === True) return true
+    if (handle === False || handle === Undefined || handle === Null) return false
+    const m = maybeGetNumericHeapType(handle)
+    if (!m) return true
+    return !!taggedUnbox(handle, m)
+}
+
+class BytecodeFunction {
+    constructor({ name = '<anonymous>', paramCount = 0, registerCount, code, constants, maxWidth = 1 }) {
+        this.name = name
+        this.paramCount = paramCount
+        this.registerCount = registerCount
+        this.code = codeToArrayBuffer(code)
+        this.constants = constants
+        this.maxWidth = maxWidth
+    }
+}
+
+function codeToArrayBuffer(code) {
+    let len = 0
+    for (const instr of code) len += instr.length
+    const buf = new ArrayBuffer(len)
+    const view = new Uint8Array(buf)
+    let i = 0
+    for (const instr of code) {
+        for (const b of instr) view[i++] = b
+    }
+    return view
+}
+
+function storeReg(regs, idx, acc, accType) {
+    if (accType === Type.Smi) { regs[idx] = acc; return }
+    if (accType === Type.Handle) { regs[idx] = (acc << 1) | 1; return }
+    regs[idx] = (taggedBox(acc, accType) << 1) | 1
+}
+
+
+function loadReg(regs, idx, regCount) {
+    const raw = regs[idx]
+    if (raw & 1) { regs[regCount] = Type.Handle; return raw >> 1 }
+    regs[regCount] = Type.Smi
+    return raw
+}
+
+function signExtendSmi1Byte(v) {
+    return (Intrinsics.as(v, Type.i32) << 24) >> 23
+}
+
+function signExtendSmi2Byte(v) {
+    return (Intrinsics.as(v, Type.i32) << 16) >> 15
+}
+
+let isNativeSmall
+function getNativeEndianness() {
+    if (isNativeSmall !== undefined) return isNativeSmall
+    const arr = new Uint16Array(1)
+    arr[0] = 1
+    const v = (new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength))[0]
+    return isNativeSmall = (v === 1)
+}
+
+function interpret2(fn, thisArg, args) {
+    const code = fn.code
+    const constants = fn.constants
+    const regCount = fn.registerCount
+
+    const regs = Intrinsics.stackalloc(regCount + 1, Type.i32)
+    const argc = fn.paramCount
+    for (let i = 0; i < argc; i++) regs[i] = args[i]
+
+    const view = fn.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined
+
+    let acc = Intrinsics.as(0, Type.i64)
+    let pc = Intrinsics.as(0, Type.u32)
+    pc = 0 // XXX: `as` is treated as opaque
+
+    for (;;) {
+        const instr = code[pc++]
+        switch (instr) {
+            case Op.Mov: regs[code[pc+2]] = regs[code[pc+1]]; pc += 2; break
+            case Op.Star: storeReg(regs, code[pc++], acc, regs[regCount]); break
+            case Op.Star0: storeReg(regs, 0, acc, regs[regCount]);break
+            case Op.Star1: storeReg(regs, 1, acc, regs[regCount]); break
+            case Op.Star2: storeReg(regs, 2, acc, regs[regCount]); break
+            case Op.Star3: storeReg(regs, 3, acc, regs[regCount]); break
+            case Op.Star4: storeReg(regs, 4, acc, regs[regCount]); break
+            case Op.Star5: storeReg(regs, 5, acc, regs[regCount]); break
+            case Op.Star6: storeReg(regs, 6, acc, regs[regCount]); break
+            case Op.Star7: storeReg(regs, 7, acc, regs[regCount]); break
+
+            case Op.LdaConst: acc = constants[code[pc++]]; regs[regCount] = Type.Handle; break
+            case Op.LdaImm: acc = signExtendSmi1Byte(code[pc++]); regs[regCount] = Type.Smi; break
+            case Op.LdaUndefined: acc = Undefined; regs[regCount] = Type.Handle; break
+            case Op.LdaNull: acc = Null; regs[regCount] = Type.Handle; break
+            case Op.LdaTrue: acc = True; regs[regCount] = Type.Handle; break
+            case Op.LdaFalse: acc = False; regs[regCount] = Type.Handle; break
+            case Op.LdaZero: acc = 0; regs[regCount] = Type.Smi; break
+
+            case Op.Ldar: acc = loadReg(regs, code[pc++], regCount); break
+            case Op.Ldar0: acc = loadReg(regs, 0, regCount); break
+            case Op.Ldar1: acc = loadReg(regs, 1, regCount); break
+            case Op.Ldar2: acc = loadReg(regs, 2, regCount); break
+            case Op.Ldar3: acc = loadReg(regs, 3, regCount); break
+
+            case Op.Add: { acc = binOp('add', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.Sub: { acc = binOp('sub', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.Mul: { acc = binOp('mul', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.Div: { acc = divOp(acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.Mod: { acc = binOp('mod', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.Exp: { acc = binOp('pow', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.BitOr: { acc = binOp('bitor', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.BitAnd: { acc = binOp('bitand', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.BitXor: { acc = binOp('bitxor', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.ShiftLeft: { acc = binOp('shl', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.ShiftRight: { acc = shiftRightOp(acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+            case Op.ShiftRightLogical: { acc = binOp('shrl', acc, regs[regCount], regs[code[pc++]]); regs[regCount] = Intrinsics.accType; break }
+
+            case Op.TestEqual: throw new Error('==: not implemented')
+            case Op.TestStrictEqual: {
+                const rawB = regs[code[pc++]]
+                assertCurrentRegValue(rawB)
+                let braw, bT
+                if ((rawB & 1) === 0) { braw = rawB; bT = Type.Smi } else { braw = rawB >> 1; bT = Type.Handle }
+                if (regs[regCount] === Type.Handle || bT === Type.Handle) throw new Error('TestStrictEqual: not implemented for Handle operands')
+                const eq = (regs[regCount] === bT) && (acc === braw)
+                acc = eq ? True : False; regs[regCount] = Type.Handle
+                break
+            }
+            case Op.TestLessThan: { const r = compareOp(0, acc, regs[regCount], regs[code[pc++]]); acc = r ? True : False; regs[regCount] = Type.Handle; break }
+            case Op.TestGreaterThan: { const r = compareOp(1, acc, regs[regCount], regs[code[pc++]]); acc = r ? True : False; regs[regCount] = Type.Handle; break }
+            case Op.TestLessThanOrEqual: { const r = compareOp(2, acc, regs[regCount], regs[code[pc++]]); acc = r ? True : False; regs[regCount] = Type.Handle; break }
+            case Op.TestGreaterThanOrEqual: { const r = compareOp(3, acc, regs[regCount], regs[code[pc++]]); acc = r ? True : False; regs[regCount] = Type.Handle; break }
+
+            case Op.TestIn: throw new Error('TestIn: not implemented')
+            case Op.TestInstanceOf: throw new Error('TestInstanceOf: not implemented')
+
+            case Op.Inc: {
+                const T = regs[regCount]
+                if (T === Type.Smi) {
+                    acc = binOpDirect('add', acc, T, 1 << 1, Type.Smi); 
+                } else {
+                    acc = binOpDirect('add', acc, T, 1 << 1, Type.Smi); 
+                }
+                regs[regCount] = Intrinsics.accType; 
+                break 
+            }
+            case Op.Dec: { acc = binOpDirect('sub', acc, regs[regCount], 1 << 1, Type.Smi); regs[regCount] = Intrinsics.accType; break }
+            case Op.Negate: { acc = binOpDirect('sub', 0, Type.Smi, acc, regs[regCount]); regs[regCount] = Intrinsics.accType; break }
+            case Op.BitNot: {
+                const T = regs[regCount]
+                const a = resolveNumeric(acc, T); const rT = resolvedType
+                const raw = rT === Type.Smi
+                    ? Intrinsics.bitxor32(a, -1)
+                    : Intrinsics.bitnoti64(Intrinsics.convert(a, rT, Type.i64))
+                acc = raw; regs[regCount] = narrowSmi(raw, rT === Type.Smi ? Type.Smi : Type.i64)
+                break
+            }
+            case Op.LogicalNot: {
+                const T = regs[regCount]
+                const b = T === Type.Handle ? handleToBool(acc) : !!acc
+                acc = b ? False : True; regs[regCount] = Type.Handle
+                break
+            }
+            case Op.TypeOf: throw new Error('TypeOf: not implemented')
+
+            case Op.Jump: pc = code[pc]; break
+            case Op.JumpIfToBooleanTrue: {
+                const cond = regs[regCount] === Type.Handle ? handleToBool(acc) : !!acc
+                const target = code[pc++]
+                pc = Intrinsics.select(cond, target, pc)
+                break
+            }
+            case Op.JumpIfToBooleanFalse:  {
+                const cond = regs[regCount] === Type.Handle ? handleToBool(acc) : !!acc
+                const target = code[pc++]
+                pc = Intrinsics.select(cond, pc, target)
+                break
+            }
+            // case Op.JumpIfNull: pc = (acc === Null) ? instr[1] : pc + 1; break
+            // case Op.JumpIfUndefined: pc = (acc === Undefined) ? instr[1] : pc + 1; break
+
+            case Op.Call: {
+                const k = code[pc++]
+                const rargStart = code[pc++]
+                const argCount = code[pc++]
+                const rawCallee = regs[k]
+                const calleeRaw = (rawCallee & 1) === 0 ? rawCallee : (rawCallee >> 1) 
+                const argRegs = regs.subarray(rargStart, rargStart + argCount) 
+                acc = interpret2(calleeRaw, undefined, argRegs)
+                regs[regCount] = Intrinsics.accType
+                break
+            }
+
+            case Op.CallConst: {
+                const k = code[pc++]
+                const rargStart = code[pc++]
+                const argCount = code[pc++]
+                const argRegs = regs.subarray(rargStart, rargStart + argCount)
+                acc = interpret2(constants[k], undefined, argRegs)
+                regs[regCount] = Intrinsics.accType
+                break
+            }
+
+            case Op.Return: {
+                Intrinsics.accType = regs[regCount]
+                return acc
+            }
+
+            case Op.GetProperty: throw new Error('GetProperty: not implemented')
+            case Op.SetProperty: throw new Error('SetProperty: not implemented')
+            case Op.DeleteProperty: throw new Error('DeleteProperty: not implemented')
+            case Op.CreateEmptyObject: throw new Error('CreateEmptyObject: not implemented')
+            case Op.CreateEmptyArray: throw new Error('CreateEmptyArray: not implemented')
+
+            case Op.Width2: {
+                const next = code[pc++]
+                switch (next) {
+                    case Op.LdaImm:
+                        acc = signExtendSmi2Byte(view.getInt16(pc, getNativeEndianness())); regs[regCount] = Type.Smi; pc += 2;
+                        break
+                    case Op.LdaConst:
+                        acc = constants[view.getUint16(pc, getNativeEndianness())]; regs[regCount] = Type.Handle; pc += 2;
+                        break
+                    case Op.Jump:
+                        pc = view.getUint16(pc, getNativeEndianness());
+                        break
+                    default: throw `todo 2 byte op: ${next}`
+                }
+                break
+            }
+
+            case Op.Assert: {
+                const kind = code[pc++]
+                switch (kind) {
+                    case AssertionKind.AccumulatorIs: {
+                        assertIs(acc, code[pc++], regs[regCount])
+                        break
+                    }
+                    case AssertionKind.AccumulatorIsNot: {
+                        assertIsNot(acc, code[pc++], regs[regCount])
+                        break
+                    }
+                    case AssertionKind.NextRegisterIs: {
+                        hasPendingRegisterAssertion = 1
+                        pendingRegisterAssertionType = code[pc++]
+                        break
+                    }
+                    default: throw `unknown assertion kind: ${kind}`
+                }
+            }
+
+            default:
+                throw new Error(`unknown opcode: ${instr}`)
+        }
+    }
+}
+
+function makeConstants(values = []) {
+    return values
+}
+
+const addFn = new BytecodeFunction({
+    name: 'add',
+    paramCount: 2,
+    registerCount: 2,
+    constants: makeConstants(),
+    code: [
+        [Op.Ldar, 0],   // acc = a
+        [Op.Add, 1],    // acc = acc + b
+        [Op.Return],
+    ],
+})
+
+// while -> do/while transform?
+// function sumTo(n) { let acc = 0; let i = 0; while (i < n) { acc += i; i += 1 } return acc }
+const sumToFn2 = new BytecodeFunction({
+    name: 'sumTo',
+    paramCount: 1,   // r0 = n
+    registerCount: 3, // r0 = n, r1 = acc, r2 = i
+    constants: makeConstants(),
+    code: [
+        /*  0 */ [Op.LdaZero],
+        /*  1 */ [Op.Star1],              // acc = 0
+        /*  2 */ [Op.Star2],              // i = 0
+        /*  3 */ [Op.Ldar2],              // loop: acc(reg) = i
+        /*  4 */ [Op.TestLessThan, 0],    // acc = i < n
+        /*  5 */ [Op.JumpIfToBooleanFalse, 17],
+        /*  6 */ [Op.Ldar1],
+        /*  7 */ [Op.Add, 2],             // acc = acc(local) + i
+        /*  8 */ [Op.Star1],              // acc(local) = acc
+        /*  9 */ [Op.Ldar2],
+        /* 10 */ [Op.Inc],                // acc = i + 1
+        /* 11 */ [Op.Star2],              // i = acc
+        /* 12 */ [Op.Jump, 3],
+        /* 13 */ [Op.Ldar1],
+        /* 14 */ [Op.Return],
+    ],
+})
+
+
+function bench(f, c = 100_000) {
+    const p = performance.now()
+    for (let i = 0; i < c; i++) {
+        f()
+    }
+    return performance.now() - p
+}
+
+let x = 0
+function sumTo3(n) {
+    let acc = 0; let i = 0; while (i < n) { 
+        acc += i; i += 1 
+        x += 1
+        if (x === acc) x = 0
+    } return acc 
+}
+
+function sumToMany4(m, n) {
+    x = 0
+    let total = 0
+    for (let i = 0; i < m; i++) {
+        total += sumTo3(n)
+        x = 0
+    }
+    return total
+}
+
+
+function runExamples() {
+    console.log(sumTo3(5))
+    const r = interpret2(sumToFn2, undefined, [5 << 1])
+    console.log('x sumTo2(5) =', r, Intrinsics.accType)
+    const args1 = new Int32Array([15 << 1])
+    console.log(bench(() => interpret2(sumToFn2, undefined, args1)))
+    console.log(bench(() => interpret2(sumToFn2, undefined, args1)))
+
+    // console.log(bench(() => interpret2(sumToFn2, undefined, [150 << 1])))
+    // console.log(bench(() => interpret2(sumToFn2, undefined, [150 << 1])))
+
+    console.log(bench(() => sumTo3(15)))
+    console.log(bench(() => sumTo3(15)))
+
+    console.log(bench(() => sumToMany4(100_000, 150), 1))
+    console.log(bench(() => sumToMany4(100_000, 150), 1))
+}
+
+runExamples()
+
+function heapDemo() {
+    const MAP_POINT = 42
+    const cell = Intrinsics.alloc(4)
+    Intrinsics.store(cell, MAP_POINT, Type.u32)
+    Intrinsics.store(cell + 1 * slotBytes, 7, Type.i32)
+    Intrinsics.store(cell + 2 * slotBytes, 3.5, Type.f64)
+    console.log('heap cell map =', Intrinsics.load(cell, Type.u32))
+    console.log('heap cell x =', Intrinsics.load(cell + 1 * slotBytes, Type.i32))
+    console.log('heap cell y =', Intrinsics.load(cell + 2 * slotBytes, Type.f64))
+}
+heapDemo()
+
+function boxingDemo2() {
+    function tagf64(v) { return (taggedBox(v, Type.f64) << 1) | 1 }
+    function tagSmi(v) { return v << 1 }
+
+    Intrinsics.accType = 0
+    console.log('interpret2 add(2.5, 2.5) =', interpret2(addFn, undefined, [tagf64(2.5), tagf64(2.5)]), TypeName[Intrinsics.accType])
+    console.log('interpret2 add(2.5, 1) =', interpret2(addFn, undefined, [tagf64(2.5), tagSmi(1)]), TypeName[Intrinsics.accType])
+    console.log('interpret2 add(1e300, 1e300) =', interpret2(addFn, undefined, [tagf64(1e300), tagf64(1e300)]), TypeName[Intrinsics.accType])
+
+    const big = SMI_MAX
+    const res = interpret2(addFn, undefined, [tagSmi(big), tagSmi(big)])
+    console.log(`interpret2 add(${big}, ${big}) =`, res, TypeName[Intrinsics.accType], '(expected value', big + big, '-- widened to i64/u64)')
+
+    const negateFn = new BytecodeFunction({
+        name: 'negate', paramCount: 1, registerCount: 1, constants: makeConstants(),
+        code: [[Op.Ldar, 0], [Op.Negate], [Op.Return]],
+    })
+    const negRaw = interpret2(negateFn, undefined, [tagSmi(5)])
+    console.log('interpret2 negate(5) =', negRaw >> 1, TypeName[Intrinsics.accType], '(expected -5 Smi)')
+}
+boxingDemo2()
+
+function f(x, y) {
+    for (let i = 0; i < 12; i++) {
+        x = x * y
+    }
+    // v8 stores f64 on heap
+    // --interpreted_frames_native_stack --print_all_exceptions
+    throw new Error('')
+    return x
+}
