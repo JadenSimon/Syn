@@ -183,6 +183,7 @@ function createScView(pageBuf, offset, debugScId) {
             }
             return
         }
+        checkOneByteOverflow(val)
         for (let i = 0; i < 6; i++) {
             const k = v.getUint8(inVerticalsStart+(i*2))
             if (k === relIdx) {
@@ -449,6 +450,7 @@ function createScView(pageBuf, offset, debugScId) {
         assertRelIdx(relIdx)
         if (!allocatedLocalRc && val > 255) allocLocalRc() // would overflow the u8 slot -- bail to the array early
         if (allocatedLocalRc) {
+            if (val < 0) throw new Error(`${relIdx}: RC underflow: ${val}`)
             allocatedLocalRc[relIdx-1] = val
             return
         }
@@ -1036,6 +1038,7 @@ function free(handle) {
                 const edges = sc.collectPeerEdges()
                 sc.clearPeerEdges()
                 for (const [relIdx, val] of edges) {
+                    if (!p.getLocalRc(relIdx)) continue
                     p.setLocalRc(relIdx, p.getLocalRc(relIdx) - val)
                     const sib = getSc(p.getHeapCellId(relIdx-1) & ~(1 << 30))
                     sib.incInVert(relIdx, -val)
@@ -1350,6 +1353,7 @@ function detectSimpleScCycle(parentSc, relIdx, child) {
 
 function simplifySc(sc, recursed) {
     if (sc.depth <= 2) return
+    if (sc.getDepthExtent() < 4 || sc.depth > 5) return
     const count = sc.getLiveCellCount()
     if (count !== 1) {
         for (const x of sc.collectHeapCells()) {
@@ -1357,10 +1361,10 @@ function simplifySc(sc, recursed) {
             const child = getSc(x[1] & ~(1 << 30))
             if (child.isFreed() || sc.isFreed()) return
             if (detectSimpleScCycle(sc, x[0], child)) return
-            // if (child.getLiveCellCount()+count<64 && !child.activeSc && !child.isLeafSc() && sc.getLocalRc(x[0]) === 0 && child.getLiveCellCount() > 1) {
-            //     pruneSparseSc(child, sc)
-            //     return
-            // }
+            if (child.getLiveCellCount()+count<64 && !child.activeSc && !child.isLeafSc() && sc.getLocalRc(x[0]) === 0 && child.getLiveCellCount() > 1) {
+                pruneSparseSc(child, sc)
+                return
+            }
             simplifySc(child)
         }
         return
@@ -1636,7 +1640,7 @@ function pruneSparseSc(sc, parent = getSc(sc.parent)) {
         return getSc(tag & ~(1 << 30))
     })
 
-    if (parent.getCellCount() + children.length > 64) {
+    if (parent.getLiveCellCount() + children.length > 64) {
         throw new Error('not enough capacity in parent')
     }
 
@@ -1789,6 +1793,7 @@ function checkScConsistency(sc) {
 
     for (const relId of sc.collectInVerticals()) {
         const val = sc.findInVert(relId)
+        if (val < 0) problems.push(`in-vert ${relId}: negative in vert`)
         if (!val) { problems.push(`in-vert ${relId}: listed but value is falsy`); continue }
         const tag = sc.getHeapCellId(relId - 1)
         if (!tag) problems.push(`in-vert ${relId}: no such child cell on sc`)
@@ -2498,7 +2503,52 @@ function countTotalScs(sc) {
     return c
 }
 
-function chaosStackTest(seed, durationMs, opts = {}) {
+function createGcTimer() {
+    const { PerformanceObserver, constants } = require('node:perf_hooks')
+
+    let gcTime = 0
+    let gcCount = 0
+
+    const gcKinds = {
+        [constants.NODE_PERFORMANCE_GC_MAJOR]: 0,
+        [constants.NODE_PERFORMANCE_GC_MINOR]: 0,
+        [constants.NODE_PERFORMANCE_GC_INCREMENTAL]: 0,
+        [constants.NODE_PERFORMANCE_GC_WEAKCB]: 0,
+    }
+
+    const obs = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+            gcTime += entry.duration
+            gcCount++
+
+            if (entry.kind in gcKinds) {
+                gcKinds[entry.kind] += entry.duration
+            }
+        }
+    })
+
+    obs.observe({ entryTypes: ['gc'] })
+
+    function consumeGcStats() {
+        const stats = {
+            totalMs: gcTime,
+            count: gcCount,
+            majorMs: gcKinds[constants.NODE_PERFORMANCE_GC_MAJOR],
+            minorMs: gcKinds[constants.NODE_PERFORMANCE_GC_MINOR],
+            incrementalMs: gcKinds[constants.NODE_PERFORMANCE_GC_INCREMENTAL],
+            weakCbMs: gcKinds[constants.NODE_PERFORMANCE_GC_WEAKCB],
+        }
+
+        gcTime = 0
+        gcCount = 0
+        for (const k in gcKinds) gcKinds[k] = 0
+
+        return stats
+    }
+    return { consumeGcStats }
+}
+
+async function chaosStackTest(seed, durationMs, opts = {}) {
     const {
         pushProb: basePushProb = 0.1,
         popProb: basePopProb = 0.08,
@@ -2506,6 +2556,8 @@ function chaosStackTest(seed, durationMs, opts = {}) {
         crossEdgeProb = 0.30,
         maxGoalDepth = 500,
         maxEdgesPerLocalCell = 4,
+        extraMutationsPerBatch = 0,
+        extraAllocationsPerBatch = 16,
         verify = false,
     } = opts
 
@@ -2641,6 +2693,7 @@ function chaosStackTest(seed, durationMs, opts = {}) {
         return false
     }
 
+    const gcTimer = createGcTimer()
     const framesParent = createSc(root)
     let framesBulk = createSc(framesParent)
     // frame descriptor: { sc, anchorCell, cells: [] }
@@ -2702,11 +2755,14 @@ function chaosStackTest(seed, durationMs, opts = {}) {
     let popCount = 0
     let crossEdgeCount = 0
     let allocTime = 0
+    let mutationTime = 0
+    let popFrameTime = 0
+    let pushFrameTime = 0
     let totalFreed = 0
     const startPages = pages.length
     const startScCount = scTable.length
 
-    function iterate() {
+    async function iterate() {
         iterations++
 
         if (frames.length === goalDepth) {
@@ -2721,15 +2777,19 @@ function chaosStackTest(seed, durationMs, opts = {}) {
         const roll = rnd()
 
         if (roll < pushProb) {
+            const frameTimeStart = performance.now()
             pushFrame()
             pushCount++
+            pushFrameTime += performance.now() - frameTimeStart
         } else if (roll < pushProb + popProb) {
+            const popFrameStart = performance.now()
             popFrame()
             popCount++
+            popFrameTime += performance.now() - popFrameStart
         } else if (roll < pushProb + popProb + allocProb && frames.length > 1) {
             const allocStart = performance.now()
             const active = frames[frames.length - 1]
-            const batch = 1 + rndInt(16)
+            const batch = 1 + rndInt(extraAllocationsPerBatch)
             for (let i = 0; i < batch; i++) {
                 const h = allocInto(active.sc)
                 checkSoundnessAndFree(`allocInto inside frame ${frames.length}`)
@@ -2741,31 +2801,36 @@ function chaosStackTest(seed, durationMs, opts = {}) {
             }
             allocTime += performance.now() - allocStart
         } else if (roll < pushProb + popProb + allocProb + crossEdgeProb && frames.length > 2) {
-            const active = frames[frames.length - 1]
-            const otherIdx = 1 + rndInt(frames.length - 2)
-            const other = frames[otherIdx]
-            if (active.cells.length > 1 && other.cells.length > 1) {
-                const batch = 1 + rndInt(4)
-                for (let i = 0; i < batch; i++) {
-                    const activeCell = active.cells[1 + rndInt(active.cells.length - 1)]
-                    const otherCell = other.cells[1 + rndInt(other.cells.length - 1)]
-                    if (!freedHandles.has(activeCell) && !freedHandles.has(otherCell)) {
-                        const forward = rnd() < 0.5
-                        const from = forward ? activeCell : otherCell
-                        const to = forward ? otherCell : activeCell
-                        const m = edgeMap.get(from)
-                        const existing = m?.get(to) ?? 0
-                        if (existing === 0 || ((!forward || (m?.size ?? 0) < maxEdgesPerLocalCell) && rnd() < 0.6)) {
-                            addTestEdge(from, to)
-                            if (verify) shadowAdd(from, to)
-                        } else {
-                            removeTestEdge(from, to)
-                            if (verify) shadow.get(from)?.delete(to)
+            const mutationStart = performance.now()
+            const batch = 1 + rndInt(extraMutationsPerBatch)
+            for (let j = 0; j < batch; j++) {
+                const active = frames[frames.length - 1]
+                const otherIdx = 1 + rndInt(frames.length - 2)
+                const other = frames[otherIdx]
+                if (active.cells.length > 1 && other.cells.length > 1) {
+                    const batch = 1 + rndInt(4)
+                    for (let i = 0; i < batch; i++) {
+                        const activeCell = active.cells[1 + rndInt(active.cells.length - 1)]
+                        const otherCell = other.cells[1 + rndInt(other.cells.length - 1)]
+                        if (!freedHandles.has(activeCell) && !freedHandles.has(otherCell)) {
+                            const forward = rnd() < 0.5
+                            const from = forward ? activeCell : otherCell
+                            const to = forward ? otherCell : activeCell
+                            const m = edgeMap.get(from)
+                            const existing = m?.get(to) ?? 0
+                            if (existing === 0 || ((!forward || (m?.size ?? 0) < maxEdgesPerLocalCell) && rnd() < 0.6)) {
+                                addTestEdge(from, to)
+                                if (verify) shadowAdd(from, to)
+                            } else {
+                                removeTestEdge(from, to)
+                                if (verify) shadow.get(from)?.delete(to)
+                            }
+                            crossEdgeCount++
                         }
-                        crossEdgeCount++
                     }
                 }
             }
+            mutationTime += performance.now() - mutationStart
         }
 
         checkSoundnessAndFree(`iter=${iterations}`)
@@ -2777,28 +2842,32 @@ function chaosStackTest(seed, durationMs, opts = {}) {
             framesParent.printInfo()
             frames[0].sc.printInfo()
             cleanFreed()
+            await new Promise(r => setTimeout(r))
+            console.log(gcTimer.consumeGcStats())
             console.log(
                 `[t=${elapsed}ms] iter=${iterations} frames=${frames.length} goal=${goalDepth} allocated=${allocCount}` +
-                ` pushed=${pushCount} popped=${popCount} crossEdges=${crossEdgeCount} freed=${totalFreed} allocTime=${Math.round(allocTime)}ms` +
+                ` pushed=${pushCount} popped=${popCount} crossEdges=${crossEdgeCount} freed=${totalFreed} allocTime=${Math.round(allocTime)}ms mutTime=${Math.round(mutationTime)}ms frameTime=${Math.round(pushFrameTime)}ms popTime=${Math.round(popFrameTime)}ms` +
                 ` cells=${countTotalCellCount(framesParent)} scCount=${scTable.length} pages=${pages.length} (${((pages.length * 4) / 1024).toFixed(1)}MB)`
             )
-            allocTime = 0
+            allocTime = mutationTime = pushFrameTime = popFrameTime = 0
             {
                 const v8 = require("v8");
-                v8.getHeapSpaceStatistics().filter(x => x.space_size > 0).forEach(s =>
-                    console.log(
-                        `${s.space_name.padEnd(22)} ` +
-                        `${(s.space_used_size / 1048576).toFixed(1).padStart(6)} / ` +
-                        `${(s.space_size / 1048576).toFixed(1).padStart(6)} MB` +
-                        `  phys=${(s.physical_space_size / 1048576).toFixed(1).padStart(6)} MB`
-                    ));
+                v8.getHeapSpaceStatistics().filter(x => x.space_size > 0)
+                    .filter(x => x.space_name != 'code_space' && x.space_name !== 'trusted_space')
+                    .forEach(s =>
+                        console.log(
+                            `${s.space_name.padEnd(22)} ` +
+                            `${(s.space_used_size / 1048576).toFixed(1).padStart(6)} / ` +
+                            `${(s.space_size / 1048576).toFixed(1).padStart(6)} MB` +
+                            `  phys=${(s.physical_space_size / 1048576).toFixed(1).padStart(6)} MB`
+                        ));
             }
         }
     }
 
     while (Date.now() - startTime < durationMs) {
         try {
-            iterate()
+            await iterate()
         } catch (err) {
             console.log('failed at iter', iterations, 'frame count', frames.length)
             throw err
@@ -2816,7 +2885,12 @@ function chaosStackTest(seed, durationMs, opts = {}) {
 //chaosStackTest(24683, 16000, { verify: false })
 
  // chaosStackTest(24682, 100_000, { verify: false })
- chaosStackTest(24684, 200_000_000, { verify: false })
+chaosStackTest(24684, 200_000_000, { verify: false }) // peaks around 31mb 
+// chaosStackTest(24685, 200_000_000, { verify: false })
+
+ // chaosStackTest(24684, 200_000_000, { verify: false, extraMutationsPerBatch: 8 })
+ // chaosStackTest(24684, 200_000_000, { verify: false, extraMutationsPerBatch: 8, maxGoalDepth: 250 })
+ // chaosStackTest(24684, 200_000_000, { verify: false, extraMutationsPerBatch: 24, maxGoalDepth: 750 })
 
  // chaosStackTest(24681, 16000, { verify: true })
 
@@ -2853,7 +2927,7 @@ function testCutawayScenario() {
         console.log('cross edge via stale topSc threw:', e.message)
     }
 }
-testCutawayScenario()
+//testCutawayScenario()
 
 function testMergeGroupInternalEdgeBug() {
     const scA = createSc(root)
@@ -2871,5 +2945,5 @@ function testMergeGroupInternalEdgeBug() {
     scA.printInfo()
     scB.printInfo()
 }
-testMergeGroupInternalEdgeBug()
+//testMergeGroupInternalEdgeBug()
 
