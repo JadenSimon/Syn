@@ -61,4 +61,6 @@ class TestClass {
     bar() {
         return this.data
     }
+
+    readonly [a: number]: number
 }

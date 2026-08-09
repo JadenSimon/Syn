@@ -69,9 +69,10 @@ const Op = {
     CallConst: 0x64,
     CallBuiltin: 0x66,
     Construct: 0x69,
-    Catch: 0x76, // registers an EH
-    Throw: 0x77,        // [err]
-    Rethrow: 0x78,      // []
+    CatchEnter: 0x75, // [relIdx] registers an EH
+    CatchExit: 0x76, // [relIdx] pops EH + jmp
+    Throw: 0x77,        // [] uses acc
+    Rethrow: 0x78,      // [] does not add anything to the trace
     Return: 0x79,       // []
 
 
@@ -82,6 +83,9 @@ const Op = {
 
     GetPropertyImm: 0x90, // [unsigned imm] acc = acc[imm]
     SetPropertyImm: 0x91, // [robj, unsigned imm] reg[robj][imm] = acc
+
+    GetAccProperty: 0x94, // [robj, rdst]    reg[rdst] = reg[robj][acc]
+    SetAccProperty: 0x95, // [robj, rval]    reg[robj][acc] = reg[rval]
 
     CreateEmptyObject: 0xA0, // []  acc = {}
     CreateEmptyArray: 0xA1,   // []  acc = []
@@ -97,6 +101,73 @@ const Op = {
     // variable length. this is NOT a deopt, it is a runtime assertion that aborts the program
     Assert: 0xFF, // [assertionKind, ...args] 
 }
+// const switchDispatchOrder = [
+//   "Mov",
+//   "Star",
+//   "Star0",
+//   "Star1",
+//   "Star2",
+//   "Star3",
+//   "Star4",
+//   "Star5",
+//   "Star6",
+//   "Star7",
+//   "LdaConst",
+//   "LdaImm",
+//   "LdaUndefined",
+//   "LdaNull",
+//   "LdaTrue",
+//   "LdaFalse",
+//   "LdaZero",
+//   "Ldar",
+//   "Ldar0",
+//   "Ldar1",
+//   "Ldar2",
+//   "Ldar3",
+//   "Add",
+//   "Sub",
+//   "Mul",
+//   "Div",
+//   "Mod",
+//   "Exp",
+//   "BitOr",
+//   "BitAnd",
+//   "BitXor",
+//   "ShiftLeft",
+//   "ShiftRight",
+//   "ShiftRightLogical",
+//   "TestEqual",
+//   "TestStrictEqual",
+//   "TestLessThan",
+//   "TestGreaterThan",
+//   "TestLessThanOrEqual",
+//   "TestGreaterThanOrEqual",
+//   "TestIn",
+//   "TestInstanceOf",
+//   "Inc",
+//   "Dec",
+//   "Negate",
+//   "BitNot",
+//   "LogicalNot",
+//   "TypeOf",
+//   "Jump",
+//   "JumpIfToBooleanTrue",
+//   "JumpIfToBooleanFalse",
+//   "Call",
+//   "CallConst",
+//   "Return",
+//   "GetProperty",
+//   "SetProperty",
+//   "DeleteProperty",
+//   "CreateEmptyObject",
+//   "CreateEmptyArray",
+//   "Width2",
+//   "Assert",
+// ]
+// for (const [k, v] of Object.entries(Op)) {
+//     Op[k] = switchDispatchOrder.indexOf(k)
+// }
+// grep -oP '^\s{12}case Op\.\K[A-Za-z0-9]+' src/vm.js | awk '{printf "  \"%s\",\n", $0}'
 
 // u8
 const AssertionKind = {
@@ -107,6 +178,9 @@ const AssertionKind = {
     // these assertions happen inside operations that consume registers w/ the acc
     NextRegisterIs: 20,     // [Type]
     // NextRegisterIsNot: 21,  // [Type]
+
+    // sets up the interpreter for symbolic evaluation
+    Instrument: 255,
 }
 
 let hasPendingRegisterAssertion = 0
@@ -280,9 +354,13 @@ const TypeName = Object.fromEntries(Object.entries(Type).map(([k, v]) => [v, k])
 const cellBytes = 8
 const slotBytes = 4
 const heapBytes = 1 << 20
-const heapBuffer = new ArrayBuffer(heapBytes)
-const heapView = new DataView(heapBuffer)
+const stackBytes = 1 << 20
+const memBuffer = new ArrayBuffer(heapBytes+stackBytes)
+const memView = new DataView(memBuffer)
 let heapTop = cellBytes
+let stackPointer = heapBytes // hmmm this stack grows the wrong way. whatever
+
+const externalObjects = [] // JS objects
 
 const Intrinsics = {
     Type,
@@ -291,13 +369,26 @@ const Intrinsics = {
     as: function(v, T) {
         return v
     },
+    addressof: function(buf) {
+        return buf.byteOffset
+    },
     stackalloc: function(num, T) {
-        const buf = new ArrayBuffer(num*sizeof(T))
+        const start = stackPointer
+        if (T === undefined) {
+            stackPointer += num
+            return start
+        }
+        const bytes = num*sizeof(T)
+        stackPointer += bytes
         switch (T) {
-            case Type.u32: return new Uint32Array(buf)
-            case Type.i32: return new Int32Array(buf)            
+            case Type.u32: return new Uint32Array(memBuffer, start, num)
+            case Type.i32: return new Int32Array(memBuffer, start, num)
             throw `not handled: ${T}`
         }
+    },
+    stackfree: function(num, T) {
+        const bytes = num*sizeof(T)
+        stackPointer -= bytes
     },
     alloc: function(numSlots) {
         const bytes = Math.max(8, numSlots*4)
@@ -308,20 +399,20 @@ const Intrinsics = {
     },
     store: function(ptr, val, T) {
         switch (T) {
-            case Type.u8: heapView.setUint8(ptr, val); return
-            case Type.i8: heapView.setInt8(ptr, val); return
-            case Type.u16: heapView.setUint16(ptr, val, true); return
-            case Type.i16: heapView.setInt16(ptr, val, true); return
-            case Type.u32: heapView.setUint32(ptr, val >>> 0, true); return
-            case Type.i32: heapView.setInt32(ptr, val, true); return
-            case Type.f64: heapView.setFloat64(ptr, val, true); return
-            case Type.Handle: heapView.setUint32(ptr, val >>> 0, true); return
+            case Type.u8: memView.setUint8(ptr, val); return
+            case Type.i8: memView.setInt8(ptr, val); return
+            case Type.u16: memView.setUint16(ptr, val, true); return
+            case Type.i16: memView.setInt16(ptr, val, true); return
+            case Type.u32: memView.setUint32(ptr, val >>> 0, true); return
+            case Type.i32: memView.setInt32(ptr, val, true); return
+            case Type.f64: memView.setFloat64(ptr, val, true); return
+            case Type.Handle: memView.setUint32(ptr, val >>> 0, true); return
             case Type.u64:
             case Type.i64: {
                 const lo = val >>> 0
                 const hi = Math.floor(val / 0x1_0000_0000) | 0
-                heapView.setUint32(ptr, lo, true)
-                heapView.setInt32(ptr + 4, hi, true)
+                memView.setUint32(ptr, lo, true)
+                memView.setInt32(ptr + 4, hi, true)
                 return
             }
             default:
@@ -330,22 +421,22 @@ const Intrinsics = {
     },
     load: function(ptr, T) {
         switch (T) {
-            case Type.u8: return heapView.getUint8(ptr)
-            case Type.i8: return heapView.getInt8(ptr)
-            case Type.u16: return heapView.getUint16(ptr, true)
-            case Type.i16: return heapView.getInt16(ptr, true)
-            case Type.u32: return heapView.getUint32(ptr, true)
-            case Type.i32: return heapView.getInt32(ptr, true)
-            case Type.f64: return heapView.getFloat64(ptr, true)
-            case Type.Handle: return heapView.getUint32(ptr, true)
+            case Type.u8: return memView.getUint8(ptr)
+            case Type.i8: return memView.getInt8(ptr)
+            case Type.u16: return memView.getUint16(ptr, true)
+            case Type.i16: return memView.getInt16(ptr, true)
+            case Type.u32: return memView.getUint32(ptr, true)
+            case Type.i32: return memView.getInt32(ptr, true)
+            case Type.f64: return memView.getFloat64(ptr, true)
+            case Type.Handle: return memView.getUint32(ptr, true)
             case Type.u64: {
-                const lo = heapView.getUint32(ptr, true)
-                const hi = heapView.getUint32(ptr + 4, true)
+                const lo = memView.getUint32(ptr, true)
+                const hi = memView.getUint32(ptr + 4, true)
                 return hi * 0x1_0000_0000 + lo
             }
             case Type.i64: {
-                const lo = heapView.getUint32(ptr, true)
-                const hi = heapView.getInt32(ptr + 4, true)
+                const lo = memView.getUint32(ptr, true)
+                const hi = memView.getInt32(ptr + 4, true)
                 return hi * 0x1_0000_0000 + lo
             }
             default:
@@ -400,6 +491,17 @@ const HeapI64 = Intrinsics.alloc(0)
 const HeapU64 = Intrinsics.alloc(0)
 const HeapU32 = Intrinsics.alloc(0)
 const HeapI32 = Intrinsics.alloc(0)
+
+const JSFunction = Intrinsics.alloc(0)
+
+// only used for symbolic evaluation
+// unknowns may be specialized further
+const Unknown = Intrinsics.alloc(0)
+function allocOpaque() {
+    const h = Intrinsics.alloc(2)
+    Intrinsics.store(h, Unknown, Type.Handle)
+    return h
+}
 
 function promoteType(t1, t2) {
     if (t1 === t2) return t1
@@ -504,23 +606,31 @@ function shiftRightOp(a, T, rawB) {
     return raw
 }
 
-function compareOp(op, a, T, rawB) {
-    assertCurrentRegValue(rawB)
-    let b, U
-    if ((rawB & 1) === 0) { b = rawB; U = Type.Smi }
-    else { b = rawB >> 1; U = Type.Handle }
-    if (T !== Type.Smi || U !== Type.Smi) {
+const compareOpSuffixes = {
+    0: 'lt',
+    1: 'gt',
+    2: 'lte',
+    3: 'gte',
+}
+
+function compareOp(op, a, T, b) {
+    assertCurrentRegValue(b)
+    if (T !== Type.Smi || (b & 1)) {
+        let U
+        if (b & 1) { b = b >> 1; U = Type.Handle } else { U = Type.Smi }
         a = resolveNumeric(a, T); T = resolvedType
         b = resolveNumeric(b, U); U = resolvedType
         const C = promoteType(T, U)
         a = Intrinsics.convert(a, T, C)
         b = Intrinsics.convert(b, U, C)
+        const width = C === Type.f64 ? 'f64' : '64'
+        return Intrinsics[`cmp${width}${compareOpSuffixes[op]}`](a, b)
     }
     switch (op) {
-        case 0: return a < b
-        case 1: return a > b
-        case 2: return a <= b
-        case 3: return a >= b
+        case 0: return Intrinsics.cmp32lt(a, b)
+        case 1: return Intrinsics.cmp32gt(a, b)
+        case 2: return Intrinsics.cmp32lte(a, b)
+        case 3: return Intrinsics.cmp32gte(a, b)
     }
     throw new Error(`missing op: ${op}`)
 }
@@ -567,6 +677,16 @@ Intrinsics.mulf64 = (a, b) => a * b
 Intrinsics.divf64 = (a, b) => a / b
 Intrinsics.modf64 = (a, b) => a % b
 Intrinsics.powf64 = (a, b) => a ** b
+
+Intrinsics.cmp32gt = (a, b) => a > b
+Intrinsics.cmp32lt = (a, b) => a < b
+Intrinsics.cmp64lt = Intrinsics.cmpf64lt = Intrinsics.cmp32lt 
+Intrinsics.cmp64gt = Intrinsics.cmpf64gt = Intrinsics.cmp32gt
+
+Intrinsics.cmp32gte = (a, b) => a >= b
+Intrinsics.cmp32lte = (a, b) => a <= b
+Intrinsics.cmp64lte = Intrinsics.cmpf64lte = Intrinsics.cmp32lte 
+Intrinsics.cmp64gte = Intrinsics.cmpf64gte = Intrinsics.cmp32gte
 
 function splitI64(v) {
     return [v >>> 0, Math.floor(v / 0x1_0000_0000) | 0]
@@ -643,6 +763,142 @@ function handleToBool(handle) {
     return !!taggedUnbox(handle, m)
 }
 
+function storeHandle(dest, offset, handle) {
+    Intrinsics.store(dest + offset, handle, Type.Handle)
+}
+
+// an "Object" is the only TD with conventional field descriptors
+// certain Object variants are wrappers around a different base. wrapping a function uniquely preserves its "typeof" value.
+const BaseTypeKind = {
+    Oddball: 1, // true/false/undefined/null etc.
+    String: 2,
+    Number: 3,
+    Symbol: 4,
+    Array: 5,
+    Object: 6,
+    Function: 7,
+
+    StringTable: 128,
+    NativeStruct: 132,
+}
+
+const TDFlags = {
+    Callable: 1 << 0,
+    // anything managing data offheap will need this set
+    HasDestructor: 1 << 1,
+    // means an instance _might_ be ok to stack allocate
+    StackAllocatable: 1 << 7,
+}
+
+// all strings are assumed utf-8 unless named otherwise
+const StringVariant = {
+    Inline: 1, // slot1 contains packed code units, length is extraSlots + 1. The TD _is_ the string!
+    Internal: 2, // instance has the index into a string table, slot1 of the TD is the string table
+    External: 3, // slot1 says if the instance is heap allocated or is a raw ptr (including static addr)
+}
+
+
+// two-byte "category"
+// * low byte is the general kind like object/function/array/string
+// * high byte is a variant
+// third byte is # of extra inline slots used by this TD
+// high byte is a bitset used for various reflective purposes. 
+//  - expresses information that usually can be found elsewhere but is useful for general purpose logic e.g. debugging 
+// 
+// interpretation of the second slot depends on the above. some TDs may use extra inline slots _and_ this slot for "extra info"
+// JS object TDs use the 2nd slot for the "parent" TD
+function createTypeDescriptor(base, variant = 0, bitset = 0, slot1 = 0, extraSlots = 0) {
+    const handle = Intrinsics.alloc(2)
+    Intrinsics.store(handle, base, Type.u8)
+    Intrinsics.store(handle+1, variant, Type.u8)
+    Intrinsics.store(handle+2, extraSlots, Type.u8)
+    Intrinsics.store(handle+3, bitset, Type.u8)
+    Intrinsics.store(handle+4, slot1, Type.u32)
+    return handle
+}
+
+function createObjectLikeTD(base, variant = 0, parent = 0) {
+    if (base < BaseTypeKind.Object) throw `Invalid object-like: ${base}`
+    let bitset = 0
+    if (base === BaseTypeKind.Function) bitset |= TDFlags.Callable
+
+}
+
+// not created at runtime, keys are always indices the static string table
+function createNativeStructTD(desc) {
+
+}
+
+const HeapMapOffsets = {
+    count: 0,
+    capacity: 4,
+    entries: 8,
+}
+
+function mapEntryKey(entries, i) { return Intrinsics.load(entries + i * 8, Type.u32) }
+function mapEntryVal(entries, i) { return Intrinsics.load(entries + i * 8 + 4, Type.u32) }
+
+function mapFindIndex(header, key) {
+    const entries = Intrinsics.load(header + HeapMapOffsets.entries, Type.Handle)
+    const count = Intrinsics.load(header + HeapMapOffsets.count, Type.u32)
+    for (let i = 0; i < count; i++) {
+        if (mapEntryKey(entries, i) === key) return i
+    }
+    return -1
+}
+
+class HeapMap {
+    constructor(capacity = 4) {
+        const header = Intrinsics.alloc(3)
+        const entries = Intrinsics.alloc(capacity * 2)
+        Intrinsics.store(header + HeapMapOffsets.count, 0, Type.u32)
+        Intrinsics.store(header + HeapMapOffsets.capacity, capacity, Type.u32)
+        storeHandle(header, HeapMapOffsets.entries, entries)
+        this.header = header
+    }
+
+    has(key) {
+        return mapFindIndex(this.header, key) >= 0
+    }
+
+    get(key) {
+        const i = mapFindIndex(this.header, key)
+        if (i < 0) return undefined
+        const entries = Intrinsics.load(this.header + HeapMapOffsets.entries, Type.Handle)
+        return mapEntryVal(entries, i)
+    }
+
+    set(key, value) {
+        const header = this.header
+        let entries = Intrinsics.load(header + HeapMapOffsets.entries, Type.Handle)
+
+        const existing = mapFindIndex(header, key)
+        if (existing >= 0) {
+            Intrinsics.store(entries + existing * 8 + 4, value, Type.u32)
+            return this
+        }
+
+        let count = Intrinsics.load(header + HeapMapOffsets.count, Type.u32)
+        const capacity = Intrinsics.load(header + HeapMapOffsets.capacity, Type.u32)
+        if (count >= capacity) {
+            const newCapacity = capacity * 2
+            const newEntries = Intrinsics.alloc(newCapacity * 2)
+            for (let i = 0; i < count; i++) {
+                Intrinsics.store(newEntries + i * 8, mapEntryKey(entries, i), Type.u32)
+                Intrinsics.store(newEntries + i * 8 + 4, mapEntryVal(entries, i), Type.u32)
+            }
+            Intrinsics.store(header + HeapMapOffsets.capacity, newCapacity, Type.u32)
+            storeHandle(header, HeapMapOffsets.entries, newEntries)
+            entries = newEntries
+        }
+
+        Intrinsics.store(entries + count * 8, key, Type.u32)
+        Intrinsics.store(entries + count * 8 + 4, value, Type.u32)
+        Intrinsics.store(header + HeapMapOffsets.count, count + 1, Type.u32)
+        return this
+    }
+}
+
 class BytecodeFunction {
     constructor({ name = '<anonymous>', paramCount = 0, registerCount, code, constants, maxWidth = 1 }) {
         this.name = name
@@ -697,16 +953,30 @@ function getNativeEndianness() {
     return isNativeSmall = (v === 1)
 }
 
-function interpret2(fn, thisArg, args) {
-    const code = fn.code
-    const constants = fn.constants
-    const regCount = fn.registerCount
+let currentEh = 0 // u32 stack handle
+function registerEh(pc, frameIdx) {
+    const saveEh = currentEh
+    const handle = Intrinsics.stackalloc(12)
+    Intrinsics.store(handle, saveEh, Type.u32)
+    Intrinsics.store(handle+4, pc, Type.u32)
+    Intrinsics.store(handle+8, frameIdx << 1, Type.u32)
+    currentEh = handle
+}
 
-    const regs = Intrinsics.stackalloc(regCount + 1, Type.i32)
-    const argc = fn.paramCount
-    for (let i = 0; i < argc; i++) regs[i] = args[i]
+function interpret(fn, thisArg, args, instrumentCb) {
+    const frames = []
+    let fp = 0
+    let code = fn.code
+    let constants = fn.constants
+    let regCount = fn.registerCount
 
-    const view = fn.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined
+    let regs = Intrinsics.stackalloc(regCount + 1, Type.i32)
+    {
+        const argc = fn.paramCount
+        for (let i = 0; i < argc; i++) regs[i] = args[i]
+    }
+
+    let view = fn.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined
 
     let acc = Intrinsics.as(0, Type.i64)
     let pc = Intrinsics.as(0, Type.u32)
@@ -717,7 +987,7 @@ function interpret2(fn, thisArg, args) {
         switch (instr) {
             case Op.Mov: regs[code[pc+2]] = regs[code[pc+1]]; pc += 2; break
             case Op.Star: storeReg(regs, code[pc++], acc, regs[regCount]); break
-            case Op.Star0: storeReg(regs, 0, acc, regs[regCount]);break
+            case Op.Star0: storeReg(regs, 0, acc, regs[regCount]); break
             case Op.Star1: storeReg(regs, 1, acc, regs[regCount]); break
             case Op.Star2: storeReg(regs, 2, acc, regs[regCount]); break
             case Op.Star3: storeReg(regs, 3, acc, regs[regCount]); break
@@ -817,31 +1087,88 @@ function interpret2(fn, thisArg, args) {
             // case Op.JumpIfNull: pc = (acc === Null) ? instr[1] : pc + 1; break
             // case Op.JumpIfUndefined: pc = (acc === Undefined) ? instr[1] : pc + 1; break
 
-            case Op.Call: {
-                const k = code[pc++]
-                const rargStart = code[pc++]
-                const argCount = code[pc++]
-                const rawCallee = regs[k]
-                const calleeRaw = (rawCallee & 1) === 0 ? rawCallee : (rawCallee >> 1) 
-                const argRegs = regs.subarray(rargStart, rargStart + argCount) 
-                acc = interpret2(calleeRaw, undefined, argRegs)
-                regs[regCount] = Intrinsics.accType
-                break
-            }
+            case Op.Call: throw "todo"
 
             case Op.CallConst: {
                 const k = code[pc++]
                 const rargStart = code[pc++]
                 const argCount = code[pc++]
-                const argRegs = regs.subarray(rargStart, rargStart + argCount)
-                acc = interpret2(constants[k], undefined, argRegs)
-                regs[regCount] = Intrinsics.accType
+                const target = constants[k]
+                const newRegCount = target.registerCount
+                const newFp = stackPointer
+                const newRegs = Intrinsics.stackalloc(newRegCount + 1, Type.i32)
+                for (let i = 0; i < argCount; i++) newRegs[i] = regs[rargStart+i]
+                frames.push([pc, fn, regs, fp])
+                regCount = newRegCount
+                constants = target.constants
+                regs = newRegs
+                code = target.code
+                view = target.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined
+                pc = 0
+                fp = newFp
                 break
             }
 
             case Op.Return: {
                 Intrinsics.accType = regs[regCount]
+                stackPointer = fp
+                if (fp) {
+                    const f = frames.pop()
+                    pc = f[0]
+                    fn = f[1]
+                    regs = f[2]
+                    fp = f[3]
+                    code = fn.code
+                    constants = fn.constants
+                    regCount = fn.registerCount
+                    view = fn.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined
+                    regs[regCount] = Intrinsics.accType
+                    continue
+                }
                 return acc
+            }
+
+            case Op.Throw: {
+                if (!currentEh) {
+                    throw "ohhhh nooooo"
+                }
+                const saveEh = Intrinsics.load(currentEh, Type.u32)
+                const targetPc = Intrinsics.load(currentEh+4, Type.u32)
+                const frameIdx = Intrinsics.load(currentEh+8, Type.u32)
+                Intrinsics.store(currentEh+8, frameIdx | 1, Type.u32)
+                const actualIdx = frameIdx >> 1
+                let f
+                while (frames.length > actualIdx) {
+                    f = frames.pop() // TODO: record frames
+                }
+                pc = targetPc
+                if (f) {
+                    fn = f[1]
+                    regs = f[2]
+                    fp = f[3]
+                    code = fn.code
+                    constants = fn.constants
+                    regCount = fn.registerCount
+                    view = fn.maxWidth > 1 ? new DataView(code.buffer, code.byteOffset, code.byteLength) : undefined     
+                }
+                break
+            }
+
+            case Op.CatchEnter: {
+                const offset = code[pc++]
+                registerEh(pc+offset, frames.length)
+                break
+            }
+
+            case Op.CatchExit: {
+                const offset = code[pc++]
+                const saveEh = Intrinsics.load(currentEh, Type.u32)
+                const frameIdx = Intrinsics.load(currentEh+8, Type.u32)
+                Intrinsics.stackfree(3, Type.u32)
+                currentEh = saveEh
+                const skipCatchBlock = !(frameIdx & 1)
+                pc = Intrinsics.select(skipCatchBlock, pc+offset, pc)
+                break
             }
 
             case Op.GetProperty: throw new Error('GetProperty: not implemented')
@@ -881,6 +1208,22 @@ function interpret2(fn, thisArg, args) {
                     case AssertionKind.NextRegisterIs: {
                         hasPendingRegisterAssertion = 1
                         pendingRegisterAssertionType = code[pc++]
+                        break
+                    }
+                    case AssertionKind.Instrument: {
+                        function setPc(val) { pc = val }
+                        function getPc() { return pc }
+                        function getRegs() { return regs }
+                        function getAcc() { return acc }
+                        function getFn() { return fn }
+                        instrumentCb({
+                            setPc,
+                            getPc,
+                            getAcc,
+                            getRegs,
+                            getFn,
+                            frames,
+                        })
                         break
                     }
                     default: throw `unknown assertion kind: ${kind}`
@@ -935,6 +1278,97 @@ const sumToFn2 = new BytecodeFunction({
     ],
 })
 
+const sumToManyFn3 = new BytecodeFunction({
+    name: 'sumToMany',
+    paramCount: 2,   // r0 = n, r1 = n2
+    registerCount: 4, // r2 = acc, r3 = i
+    constants: makeConstants([sumToFn2]),
+    code: [
+        /*  0 */ [Op.LdaZero],
+        /*  1 */ [Op.Star2],              // acc = 0
+        /*  2 */ [Op.Star3],              // i = 0
+        /*  3 */ [Op.Ldar2],              // loop: acc(reg) = i
+        /*  4 */ [Op.CallConst, 0, 1, 1], // acc = acc(local) + i
+        /* 5 */ [Op.Add, 2],            
+        /* 6 */ [Op.Star2],             
+        /* 7 */ [Op.Ldar3],
+        /* 8 */ [Op.Inc],                 // acc = i + 1
+        /* 9 */ [Op.Star3],               // i = acc
+        /* 11 */ [Op.TestLessThan, 0],    // acc = i < n
+        /* 12 */ [Op.JumpIfToBooleanTrue, 3],
+        /* 13 */ [Op.Ldar2],
+        /* 14 */ [Op.Return],
+    ],
+})
+
+const tryThrowFn = new BytecodeFunction({
+    name: 'tryThrow',
+    paramCount: 0,
+    registerCount: 2,   // r0 unused, r1 = caught error
+    constants: makeConstants(),
+    code: [
+        /* byte  0 */ [Op.CatchEnter, 3],  // EH target -> CatchExit @ byte 5
+        /* byte  2 */ [Op.LdaImm, 7],      // acc = 7 (error)
+        /* byte  4 */ [Op.Throw],          // throw acc
+        /* byte  5 */ [Op.CatchExit, 6],   // no error -> skip to byte 13
+        /* byte  7 */ [Op.Star1],          // catch: r1 = e (= 7)
+        /* byte  8 */ [Op.LdaImm, 100],    // acc = 100
+        /* byte 10 */ [Op.Add, 1],         // acc = 100 + r1 = 107
+        /* byte 12 */ [Op.Return],
+    ],
+})
+
+const tryNoThrowFn = new BytecodeFunction({
+    name: 'tryNoThrow',
+    paramCount: 0,
+    registerCount: 1,
+    constants: makeConstants(),
+    code: [
+        /* byte  0 */ [Op.CatchEnter, 2],  // EH target -> CatchExit @ byte 4
+        /* byte  2 */ [Op.LdaImm, 5],      // acc = 5 (no throw)
+        /* byte  4 */ [Op.CatchExit, 3],   // no error -> skip to byte 9
+        /* byte  6 */ [Op.LdaImm, 99],     // catch handler (skipped)
+        /* byte  8 */ [Op.Return],
+        /* byte  9 */ [Op.Return],         // normal path: return acc (= 5)
+    ],
+})
+
+const throwerFn = new BytecodeFunction({
+    name: 'thrower',
+    paramCount: 0,
+    registerCount: 1,
+    constants: makeConstants(),
+    code: [
+        /* byte 0 */ [Op.LdaImm, 7],   // acc = 7 (error)
+        /* byte 2 */ [Op.Throw],       // no local EH -> unwinds to caller
+    ],
+})
+
+const tryCallFn = new BytecodeFunction({
+    name: 'tryCall',
+    paramCount: 0,
+    registerCount: 2,   // r1 = caught error
+    constants: makeConstants([throwerFn]),
+    code: [
+        /* byte  0 */ [Op.CatchEnter, 4],     // EH target -> CatchExit @ byte 6
+        /* byte  2 */ [Op.CallConst, 0, 0, 0], // thrower()  (k=0, rargStart=0, argc=0)
+        /* byte  6 */ [Op.CatchExit, 5],      // no error -> skip to byte 14
+        /* byte  8 */ [Op.Star1],             // catch: r1 = e (= 7)
+        /* byte  9 */ [Op.LdaImm, 100],       // acc = 100
+        /* byte 11 */ [Op.Add, 1],            // acc = 100 + r1 = 107
+        /* byte 13 */ [Op.Return],
+    ],
+})
+
+function tryCatchDemo() {
+    const caught = interpret(tryThrowFn, undefined, [])
+    console.log('tryThrow() =', caught >> 1, '(expected 107)')
+    const normal = interpret(tryNoThrowFn, undefined, [])
+    console.log('tryNoThrow() =', normal >> 1, '(expected 5)')
+    const crossFrame = interpret(tryCallFn, undefined, [])
+    console.log('tryCall() =', crossFrame >> 1, '(expected 107)')
+}
+tryCatchDemo()
 
 function bench(f, c = 100_000) {
     const p = performance.now()
@@ -943,6 +1377,14 @@ function bench(f, c = 100_000) {
     }
     return performance.now() - p
 }
+
+
+function sumTo4(n) {
+    let acc = 0; let i = 0; while (i < n) { 
+        acc += i; i += 1 
+    } return acc 
+}
+
 
 let x = 0
 function sumTo3(n) {
@@ -963,23 +1405,46 @@ function sumToMany4(m, n) {
     return total
 }
 
+function sumToMany5(m, n) {
+    let total = 0
+    for (let i = 0; i < m; i++) {
+        total += sumTo4(n)
+    }
+    return total
+}
+
 
 function runExamples() {
     console.log(sumTo3(5))
-    const r = interpret2(sumToFn2, undefined, [5 << 1])
+    const r = interpret(sumToFn2, undefined, [5 << 1])
     console.log('x sumTo2(5) =', r, Intrinsics.accType)
     const args1 = new Int32Array([15 << 1])
-    console.log(bench(() => interpret2(sumToFn2, undefined, args1)))
-    console.log(bench(() => interpret2(sumToFn2, undefined, args1)))
+    console.log(bench(() => interpret(sumToFn2, undefined, args1)))
+    console.log(bench(() => interpret(sumToFn2, undefined, args1)))
+
+    const args2 = new Int32Array([3 << 1, 5 << 1])
+    console.log(bench(() => interpret(sumToManyFn3, undefined, args2)))
+    console.log(bench(() => interpret(sumToManyFn3, undefined, args2)))
 
     // console.log(bench(() => interpret2(sumToFn2, undefined, [150 << 1])))
     // console.log(bench(() => interpret2(sumToFn2, undefined, [150 << 1])))
 
     console.log(bench(() => sumTo3(15)))
     console.log(bench(() => sumTo3(15)))
+    console.log(bench(() => sumTo4(15)))
+    console.log(bench(() => sumTo4(15)))
+
+    args2[0] = 100_000 << 1
+    args2[1] = 15 << 1
+    console.log(bench(() => interpret(sumToManyFn3, undefined, args2), 1))
+
 
     console.log(bench(() => sumToMany4(100_000, 150), 1))
     console.log(bench(() => sumToMany4(100_000, 150), 1))
+
+        console.log(bench(() => sumToMany5(100_000, 15), 1))
+    console.log(bench(() => sumToMany5(100_000, 15), 1))
+
 }
 
 runExamples()
@@ -996,24 +1461,37 @@ function heapDemo() {
 }
 heapDemo()
 
+function mapDemo() {
+    const m = new HeapMap(2) // start small so we exercise a grow
+    m.set(10, 100).set(20, 200).set(30, 300) // 3rd insert forces capacity 2 -> 4
+    console.log('map has 20 =', m.has(20), '(expected true)')
+    console.log('map has 99 =', m.has(99), '(expected false)')
+    console.log('map get 10 =', m.get(10), '(expected 100)')
+    console.log('map get 30 =', m.get(30), '(expected 300)')
+    console.log('map get 99 =', m.get(99), '(expected undefined)')
+    m.set(20, 999) // update in place
+    console.log('map get 20 after update =', m.get(20), '(expected 999)')
+}
+mapDemo()
+
 function boxingDemo2() {
     function tagf64(v) { return (taggedBox(v, Type.f64) << 1) | 1 }
     function tagSmi(v) { return v << 1 }
 
     Intrinsics.accType = 0
-    console.log('interpret2 add(2.5, 2.5) =', interpret2(addFn, undefined, [tagf64(2.5), tagf64(2.5)]), TypeName[Intrinsics.accType])
-    console.log('interpret2 add(2.5, 1) =', interpret2(addFn, undefined, [tagf64(2.5), tagSmi(1)]), TypeName[Intrinsics.accType])
-    console.log('interpret2 add(1e300, 1e300) =', interpret2(addFn, undefined, [tagf64(1e300), tagf64(1e300)]), TypeName[Intrinsics.accType])
+    console.log('interpret2 add(2.5, 2.5) =', interpret(addFn, undefined, [tagf64(2.5), tagf64(2.5)]), TypeName[Intrinsics.accType])
+    console.log('interpret2 add(2.5, 1) =', interpret(addFn, undefined, [tagf64(2.5), tagSmi(1)]), TypeName[Intrinsics.accType])
+    console.log('interpret2 add(1e300, 1e300) =', interpret(addFn, undefined, [tagf64(1e300), tagf64(1e300)]), TypeName[Intrinsics.accType])
 
     const big = SMI_MAX
-    const res = interpret2(addFn, undefined, [tagSmi(big), tagSmi(big)])
+    const res = interpret(addFn, undefined, [tagSmi(big), tagSmi(big)])
     console.log(`interpret2 add(${big}, ${big}) =`, res, TypeName[Intrinsics.accType], '(expected value', big + big, '-- widened to i64/u64)')
 
     const negateFn = new BytecodeFunction({
         name: 'negate', paramCount: 1, registerCount: 1, constants: makeConstants(),
         code: [[Op.Ldar, 0], [Op.Negate], [Op.Return]],
     })
-    const negRaw = interpret2(negateFn, undefined, [tagSmi(5)])
+    const negRaw = interpret(negateFn, undefined, [tagSmi(5)])
     console.log('interpret2 negate(5) =', negRaw >> 1, TypeName[Intrinsics.accType], '(expected -5 Smi)')
 }
 boxingDemo2()

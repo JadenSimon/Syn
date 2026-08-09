@@ -47,6 +47,13 @@ pub const Reifier = struct {
         return prop;
     }
 
+    fn getMachineIntrinsic(this: *@This(), ref: u32, kind: u8, width: u24) !*js.Value {
+        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
+        const prop = try type_module.getNamedProperty(this.env, "getMachineDataType");
+        const f: *js.Function = @ptrCast(prop);
+        return try f.callWithThisArg(this.env, type_module, .{ref, kind, width});
+    }
+
     fn createSavedShape(this: *@This(), ty: TypeRef, comptime name: [:0]const u8) !*js.Object {
         const val = try this.createShape(name);
        // try this.type_map.put(this.allocator, ty, @ptrCast(val));
@@ -206,6 +213,12 @@ pub const Reifier = struct {
                 for (types) |u| {
                     if (u < @intFromEnum(Kind.false)) {
                         const t2 = this.analyzer.types.at(u);
+                        if (t2.getKind() != .tuple_element) {
+                            try this.callMethod(o, "add", .{
+                                @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
+                            });
+                            continue;
+                        }
                         const el_type = t2.slot1;
                         try this.callMethod(o, "add", .{
                             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
@@ -217,6 +230,7 @@ pub const Reifier = struct {
                         @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
                     });
                 }
+                try this.callMethod(o, "simplify", .{});
                 return o;
             },
             // .tuple_element => {
@@ -266,6 +280,9 @@ pub const Reifier = struct {
                 }
 
                 return o;
+            },
+            .machine_data_type => {
+                return try this.getMachineIntrinsic(ty, @intCast(t.slot0), @intCast(t.slot1));
             },
             else => {},
             // class

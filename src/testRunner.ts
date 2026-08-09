@@ -281,7 +281,7 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
             }
         })
 
-        if (opt?.shouldExecute && k === '.js') {
+        if ((opt?.shouldExecute || parsed.compilerOptions.run) && k === '.js') {
             const f = v[0]
             const reifier = (prog as any).getReifier()
             runSynModule(f.text, f.absPath, reifier)

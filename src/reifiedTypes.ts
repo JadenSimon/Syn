@@ -141,6 +141,12 @@ export function createTypeNamespace() {
         add(t: any) {
             this.elements.push({ type: t })
         }
+        simplify() {
+            let idx = 0
+            for (const el of this.elements) {
+                (this as any)[idx++] = el.type
+            }
+        }
     }
 
     const cache = new Map<number, any>()
@@ -277,9 +283,58 @@ export function createTypeNamespace() {
         return f
     }
 
+    // float | int | uint
+    type MachineDataTypeInfo = { kind: 0 | 1 | 2, width: number, sym: symbol }
+    const machineDataTypes = new Map<number, MachineDataTypeInfo>()
+    const machineDataTypeSyms = new Map<symbol, MachineDataTypeInfo>()
+    function getMachineDataType(key: number, kind: 0 | 1 | 2, width: number) {
+        let x = machineDataTypes.get(key)
+        if (!x) {
+            const sym = Symbol()
+            machineDataTypes.set(key, x = { kind, width, sym })
+            machineDataTypeSyms.set(sym, x)
+        }
+        return x.sym
+    }
+
+    function isSigned(t: _type) {
+        const o = machineDataTypeSyms.get(t)
+        if (!o) return
+        if (o.kind === 0) return
+        return o.kind === 1
+    }
+
+    function getBitWidth(t: _type) {
+        const o = machineDataTypeSyms.get(t)
+        return o?.width
+    }
+
+    function isFloat(t: _type) {
+        const o = machineDataTypeSyms.get(t)
+        return o?.kind === 0
+    }
+
+    function isInteger(t: _type) {
+        const o = machineDataTypeSyms.get(t)
+        if (!o) return false
+        return o.kind === 1 || o.kind === 2
+    }
+
+    function isArrayType(t: _type) {
+        return t instanceof ArrayType
+    }
+
     return {
         kind,
         findDiscriminant,
+
+        getMachineDataType,
+        isSigned,
+        isFloat,
+        isInteger,
+        getBitWidth,
+        
+        isArrayType,
 
         any,
         never,

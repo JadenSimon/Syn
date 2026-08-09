@@ -2974,6 +2974,11 @@ pub const Program = struct {
 
                         return self.factory.createBinaryExpression(typeof_check, .ampersand_ampersand_token, test_call);
                     },
+                    .machine_data_type => {
+                        const machine_data_kind: Analyzer.MachineDataTypeKind = @enumFromInt(t.slot0);
+                        const width: u24 = @intCast(t.slot1);
+                        return self.generateMachineDataTypeCheck(subject, machine_data_kind, width, null);
+                    },
                     else => {},
                     // module_namespace
                     // symbol_literal (only well-known symbols)
@@ -2981,6 +2986,88 @@ pub const Program = struct {
 
                 self.analyzer.printTypeInfo(ty);
                 return error.TODO_unhandled_allocated_type;
+            }
+
+            const MachineBounds = struct { min: f64, max: f64, is_integer: bool };
+            const MachineType = struct { kind: Analyzer.MachineDataTypeKind, width: u24 };
+
+            fn machineDataTypeBounds(kind: Analyzer.MachineDataTypeKind, width: u24) MachineBounds {
+                const w: i32 = @intCast(width);
+                return switch (kind) {
+                    .uint => .{ .min = 0, .max = std.math.ldexp(@as(f64, 1), w) - 1, .is_integer = true },
+                    .int => blk: {
+                        const half = std.math.ldexp(@as(f64, 1), w - 1);
+                        break :blk .{ .min = -half, .max = half - 1, .is_integer = true };
+                    },
+                    .float => blk: {
+                        const max: f64 = switch (width) {
+                            16 => 65504,
+                            32 => @as(f64, std.math.floatMax(f32)),
+                            else => std.math.floatMax(f64),
+                        };
+                        break :blk .{ .min = -max, .max = max, .is_integer = false };
+                    },
+                };
+            }
+
+            fn generateMachineDataTypeCheck(self: *@This(), subject: NodeRef, kind: Analyzer.MachineDataTypeKind, width: u24, subject_info: ?MachineType) anyerror!u32 {
+                if (kind == .float) {
+                    if (width == 16 or width == 32) {
+                        if (subject_info) |s| {
+                            if (s.kind == .float and s.width <= width) {
+                                return self.factory.createTrue();
+                            }
+                        }
+                        const math_ident = try self.factory.createIdentifier("Math");
+                        const round_access = if (width == 16)
+                            try self.factory.createPropertyAccessExpression(math_ident, "f16round")
+                        else
+                            try self.factory.createPropertyAccessExpression(math_ident, "fround");
+                        const round_call = try self.factory.createCallExpression(round_access, subject);
+                        return self.factory.createBinaryExpression(round_call, .equals_equals_equals_token, subject);
+                    }
+
+                    if (subject_info != null) {
+                        return self.factory.createTrue();
+                    }
+                    return self.typeofExp(subject, "number");
+                }
+
+                const b = machineDataTypeBounds(kind, width);
+                const subject_bounds: ?MachineBounds = if (subject_info) |s| machineDataTypeBounds(s.kind, s.width) else null;
+
+                var result: ?NodeRef = null;
+
+                const known_integer = subject_bounds != null and subject_bounds.?.is_integer;
+                if (!known_integer) {
+                    const number_ident = try self.factory.createIdentifier("Number");
+                    const is_integer_access = try self.factory.createPropertyAccessExpression(number_ident, "isInteger");
+                    result = try self.factory.createCallExpression(is_integer_access, subject);
+                }
+
+                if (subject_bounds == null or subject_bounds.?.min < b.min) {
+                    const min_lit = try self.factory.createNumericLiteral(b.min);
+                    const ge = try self.factory.createBinaryExpression(subject, .greater_than_equals_token, min_lit);
+                    result = if (result) |r| try self.factory.createBinaryExpression(r, .ampersand_ampersand_token, ge) else ge;
+                }
+
+                if (subject_bounds == null or subject_bounds.?.max > b.max) {
+                    const max_lit = try self.factory.createNumericLiteral(b.max);
+                    const le = try self.factory.createBinaryExpression(subject, .less_than_equals_token, max_lit);
+                    result = if (result) |r| try self.factory.createBinaryExpression(r, .ampersand_ampersand_token, le) else le;
+                }
+
+                return result orelse self.factory.createTrue();
+            }
+
+            fn followAliases(self: *@This(), ty: TypeRef, eval_flags: u32) !TypeRef {
+                const ft = try self.analyzer.evaluateType(ty, eval_flags);
+                if (self.analyzer.maybePeekAliasName(ft)) |n| {
+                    if (strings.eqlComptime(n, "Int") or strings.eqlComptime(n, "Float")) {
+                        return try self.analyzer.evaluateType(ft, eval_flags);
+                    }
+                }
+                return ft;
             }
 
             fn generateNarrowedIsExpression(self: *@This(), subject: NodeRef, ty: TypeRef, subject_type: TypeRef) anyerror!u32 {
@@ -2995,13 +3082,26 @@ pub const Program = struct {
                 if (!try self.analyzer.isAssignableTo(ty, subject_type)) {
                     return self.factory.createFalse();
                 }
-
-                const et = try self.analyzer.evaluateType(ty, @intFromEnum(Analyzer.EvaluationFlags.no_objects));
+                const eval_flags = @intFromEnum(Analyzer.EvaluationFlags.no_objects);
+                const et = try self.followAliases(ty, eval_flags);
                 if (et >= @intFromEnum(Kind.false)) {
+                    // TODO: need to deal with machine data types here and numeric literals
                     return self.generateIsExpression(subject, et);
                 }
 
-                const st = try self.analyzer.evaluateType(subject_type, @intFromEnum(Analyzer.EvaluationFlags.no_objects));
+                const st = try self.followAliases(subject_type, eval_flags);
+                if (et < @intFromEnum(Kind.false) and self.analyzer.getKindOfRef(et) == .machine_data_type) {
+                    const et_t = self.analyzer.types.at(et);
+                    var subject_info: ?MachineType = null;
+                    if (st < @intFromEnum(Kind.false) and self.analyzer.getKindOfRef(st) == .machine_data_type) {
+                        const st_t = self.analyzer.types.at(st);
+                        subject_info = .{ .kind = @enumFromInt(st_t.slot0), .width = @intCast(st_t.slot1) };
+                    } else if (st == @intFromEnum(Kind.number)) {
+                        subject_info = .{ .kind = .float, .width = 64 };
+                    }
+                    return self.generateMachineDataTypeCheck(subject, @enumFromInt(et_t.slot0), @intCast(et_t.slot1), subject_info);
+                }
+
                 if (st >= @intFromEnum(Kind.false) or self.analyzer.getKindOfRef(st) != .@"union") {
                     return self.generateIsExpression(subject, et);
                 }
@@ -9924,9 +10024,12 @@ pub const Program = struct {
                             try self.replacements.put(ref, try self.factory.createTrue());
                             return;
                         }
+                        const eval_flags = (1 << 0) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases) | @intFromEnum(Analyzer.EvaluationFlags.no_enum_aliases) | @intFromEnum(Analyzer.EvaluationFlags.no_globals) | @intFromEnum(Analyzer.EvaluationFlags.no_unions);
+                        const followed_r = try self.analyzer.evaluateType(r, eval_flags);
+                        const followed_l = try self.analyzer.evaluateType(l, eval_flags);
 
                         const sub = self.unwrapSubject(d.left);
-                        const result = try self.generateNarrowedIsExpression(sub, r, l);
+                        const result = try self.generateNarrowedIsExpression(sub, followed_r, followed_l);
                         try self.addReplacement(ref, result);
                         return;
                     },
@@ -11366,6 +11469,7 @@ pub const Analyzer = struct {
         predicate,
 
         module_namespace, // Special case of an object literal
+        machine_data_type,
 
         // Intrinsics
         false = 1 << 31,
@@ -11406,6 +11510,9 @@ pub const Analyzer = struct {
         string_lowercase,
         string_capitalize,
         string_uncapitalize,
+        intrinsic_int, // these create the types but aren't directly the type
+        intrinsic_float, 
+        lookup_type,
         no_infer,
         this_type_marker, // TODO: typescript doesn't use `intrinsic` to mark this decl
 
@@ -11652,6 +11759,9 @@ pub const Analyzer = struct {
         .{ "Uppercase", .string_uppercase },
         .{ "Capitalize", .string_capitalize },
         .{ "Uncapitalize", .string_uncapitalize },
+        .{ "LookupType", .lookup_type },
+        .{ "Int", .intrinsic_int },
+        .{ "Float", .intrinsic_float },
     });
 
     const TypeList = struct {
@@ -12513,7 +12623,7 @@ pub const Analyzer = struct {
     }
 
     inline fn isCallableIntrinsic(ref: TypeRef) bool {
-        return ref >= @intFromEnum(Kind.string_uppercase) and ref <= @intFromEnum(Kind.string_uncapitalize);
+        return ref >= @intFromEnum(Kind.string_uppercase) and ref <= @intFromEnum(Kind.lookup_type);
     }
 
     fn getIntrinsicStringArg(this: *@This()) !TypeRef {
@@ -12560,11 +12670,32 @@ pub const Analyzer = struct {
         return try this.createSyntheticStringLiteral(buf, true);
     }
 
+    fn callLookupType(this: *@This()) !TypeRef {
+        const arg0 = try this.getIntrinsicStringArg();
+        const fallback = this.type_registers[1];
+        if (fallback == 0) return error.MissingArg;
+        const hashed: u32 = @truncate(std.hash.Wyhash.hash(0, this.getStringLiteralTypeSlice(this.types.at(arg0))));
+        const index = this.program.ambient.global_types.get(hashed) orelse return fallback;
+        return this.getTypeOfGlobalSymbol(index);
+    }
+
+    fn callCreateMachineDataType(this: *@This(), is_float: bool) !TypeRef {
+        const resolved = try this.evaluateType(this.type_registers[0], 0);
+        const width: u24 = @intCast(this.getInt32FromType(resolved));
+        if (is_float) return try this.createMachineDataType(.float, width);
+        const is_signed = try this.isAssignableTo(this.type_registers[1], @intFromEnum(Kind.true));
+        if (is_signed) return try this.createMachineDataType(.int, width);
+        return try this.createMachineDataType(.uint, width);
+    }
+
     fn callIntrinsicType(this: *@This(), ref: TypeRef) !TypeRef {
         switch (@as(Kind, @enumFromInt(ref))) {
             .string_capitalize => return this.capitlizeOrUncapitalize(true),
             .string_uncapitalize => return this.capitlizeOrUncapitalize(false),
             .string_uppercase, .string_lowercase => return error.TODO_string_uppercase,
+            .lookup_type => return this.callLookupType(),
+            .intrinsic_int => return this.callCreateMachineDataType(false),
+            .intrinsic_float => return this.callCreateMachineDataType(true),
             else => unreachable,
         }
     }
@@ -17130,6 +17261,9 @@ pub const Analyzer = struct {
                         if (x != dst) return this.isAssignableTo(src, x);
                     }
                 }
+                if (n.getKind() == .machine_data_type) {
+                    if (dst == @intFromEnum(Kind.number) or dst >= @intFromEnum(Kind.zero)) return true;
+                }
                 return false;
             }
         }
@@ -17154,6 +17288,9 @@ pub const Analyzer = struct {
                         }
 
                         return false;
+                    },
+                    .machine_data_type => {
+                        if (src == @intFromEnum(Kind.number) or src >= @intFromEnum(Kind.zero)) return true;
                     },
                     else => {},
                 }
@@ -17381,6 +17518,10 @@ pub const Analyzer = struct {
                     //  type R = X2 extends X1 ? true : false
                     //                                        --> true
                 },
+                .machine_data_type => {
+                    // TODO: don't do this!
+                    if (src_type.getKind() == .machine_data_type or src_type.getKind() == .number_literal) return true;
+                 },
                 else => {},
             }
             return false;
@@ -19472,6 +19613,13 @@ pub const Analyzer = struct {
         return ref;
     }
 
+    fn maybePeekAliasName(this: *const @This(), ty: TypeRef) ?[]const u8 {
+        if (ty >= @intFromEnum(Kind.false)) return null;
+        const t = this.types.at(ty);
+        if (t.getKind() != .alias) return null;
+        return parser.getSlice(this.getIdentFromAlias(t) orelse return null, u8);
+    }
+
     fn applyMappedFlags(mapping_flags: u32, element_flags: u24) u24 {
         var result = element_flags;
 
@@ -19935,6 +20083,27 @@ pub const Analyzer = struct {
         const f = this.program.getFileData(k.slot0);
         const n = f.ast.nodes.at(k.slot1);
         return getSlice(n, u8);
+    }
+
+    pub const MachineDataTypeKind = enum(u8) { float = 0, int = 1, uint = 2 };
+
+    fn createMachineDataType(this: *@This(), kind: MachineDataTypeKind, width: u24) !TypeRef {
+        const flags: u24 = 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(&.{@as(u8, @intFromEnum(Kind.machine_data_type))});
+        h.update(&@as([3]u8, @bitCast(flags)));
+        h.update(&.{@as(u8, @intFromEnum(kind))});
+        h.update(&@as([3]u8, @bitCast(width)));
+        const key = h.final();
+        if (this.interned_types.get(key)) |t| return t;
+        const t = try this.types.push(.{
+            .kind = @intFromEnum(Kind.machine_data_type),
+            .flags = flags,
+            .slot0 = @intFromEnum(kind),
+            .slot1 = width,
+        });
+        try this.interned_types.put(key, t);
+        return t;
     }
 
     fn getMemberType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !TypeRef {
@@ -21032,8 +21201,7 @@ pub const Analyzer = struct {
                         },
                     }
                 }
-
-                return this.createTupleType(&elements);
+                return try this.createTupleType(&elements);
             },
             .identifier => {
                 // Equivalent to `type_reference` with no args
@@ -24707,6 +24875,21 @@ pub const Analyzer = struct {
                             .kind = .infer_type,
                             .data = inner,
                         });
+                    },
+                    .machine_data_type => {
+                        const machine_data_kind: Analyzer.MachineDataTypeKind = @enumFromInt(k.slot0);
+                        const width: u24 = @intCast(k.slot1);
+                        var buf: [16]u8 = undefined;
+                        const prefix = switch (machine_data_kind) {
+                            .float => "f",
+                            .int => "i",
+                            .uint => "u",
+                        };
+                        const s = try std.fmt.bufPrint(&buf, "{s}{d}", .{prefix, width});
+                        var factory = parser.Factory{ .nodes = &this.synthetic_nodes };
+                        const z = try factory.createIdentifier(s); 
+                        this.synthetic_nodes.at(z).flags |= 1 << 19;
+                        return z;
                     },
                     else => {
                         debugPrint("{any} ", .{k.getKind()});

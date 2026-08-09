@@ -116,6 +116,7 @@ declare namespace Type {
     const any: unique symbol
     const never: unique symbol
     const unknown: unique symbol
+    const intrinsic: unique symbol // represents "other" intrinsics not expressed above
 
     type Intrinsic = 
         | typeof string
@@ -127,6 +128,7 @@ declare namespace Type {
         | typeof any
         | typeof never
         | typeof unknown
+        | typeof intrinsic
 
     function isArrayType(t: Type): t is Array
     function isTuple(t: Type): t is Tuple

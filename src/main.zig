@@ -85,6 +85,14 @@ pub fn main() !void {
             outfile = args.next() orelse return error.ExpectedFilename;
         }
 
+        if (std.mem.eql(u8, a, "--synth")) {
+            const contents =  try std.fs.cwd().readFileAlloc(std.heap.c_allocator, s.name.?, std.math.maxInt(usize));
+            const instrumented = try @import("./parser.zig").ParsedFile.createFromBuffer(contents, s.name, false, null);
+            const res = try @import("./synth_helper.zig").SynthInstrumenter.transform(&instrumented.ast, &instrumented.binder);
+            std.debug.print("{s}\n",.{res.contents});
+            return;
+        }
+
         // const lexer = try js_lexer.Lexer.init(s, std.heap.c_allocator);
         // var parser = js_parser.Parser.init(lexer);
         // // parser.options.allow_jsx = true;

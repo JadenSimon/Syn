@@ -5372,7 +5372,24 @@ fn Parser_(comptime skip_trivia: bool) type {
                         }
                     },
                     .t_private_identifier, .t_open_bracket => {
-                        var n = try this.parsePropOrMethodDecl();
+                        var n = blk: {
+                            if (this.lexer.token == .t_open_bracket) {
+                                // unfortunately this may be an index signature
+                                try this.lexer.next();
+                                const exp = try this.parseExpression();
+                                if (this.lexer.token == .t_colon) {
+                                    flags |= @intFromEnum(NodeFlags.declare);
+                                    break :blk try this.finishIndexSignature(exp, 0);
+                                }
+                                const name = try this.pushNode(.{
+                                    .kind = .computed_property_name,
+                                    .data = exp,
+                                });
+                                try this.lexer.expect(.t_close_bracket);
+                                break :blk try this.parseMethodOrPropertyAfterName(name);
+                            }
+                            break :blk try this.parsePropOrMethodDecl();
+                        };
                         n.flags = flags;
                         try members.append(n);
                         flags = 0;
@@ -8402,12 +8419,14 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .slash_token => "/",
         .greater_than_greater_than_token => ">>",
         .greater_than_greater_than_equals_token => ">>=",
+        .greater_than_greater_than_greater_than_token => ">>>",
         .greater_than_greater_than_greater_than_equals_token => ">>>=",
         .caret_token => "^",
         .ampersand_token => "&",
         .bar_token => "|",
         .greater_than_equals_token => ">=",
         .less_than_less_than_token => "<<",
+        .less_than_less_than_equals_token => "<<=",
         .less_than_equals_token => "<=",
         .tilde_token => "~",
         .exclamation_token => "!",
@@ -11938,7 +11957,12 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     if (n.hasFlag(.let)) { // hex
                         this.print(try std.fmt.bufPrint(&buf, "0x{X}", .{@as(u64, @intFromFloat(f))}));
                     } else {
-                        this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
+                        // FIXME: don't do this here, use a flag to track if we parsed the exponent literal
+                        if (@abs(f) > std.math.maxInt(u64)) {
+                            this.print(try std.fmt.bufPrint(&buf, "{}", .{f}));
+                        } else {
+                            this.print(try std.fmt.bufPrint(&buf, "{d}", .{f}));
+                        }
                     }
                 },
                 .qualified_name => {
@@ -12138,7 +12162,6 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     if (n.len != 0) try this.printTypeArgs(n.len);
                 },
                 .reify_expression => {
-                    // this.print("reify ");
                     const call_exp = try this.getTransformer().transformReifyExpression(unwrapRef(n), n.len);
                     try this.visit(&call_exp);
                 },
@@ -12514,6 +12537,11 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         }
 
                         const n2 = this.data.nodes.at(ref);
+                        if (this.skip_types and n2.hasFlag(.declare)) {
+                            ref = n2.next;
+                            continue;
+                        }
+
                         try this.visit(n2);
                         ref = n2.next;
                         this.needs_newline = true;

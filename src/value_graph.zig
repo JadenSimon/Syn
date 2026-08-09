@@ -811,6 +811,11 @@ const ValueGraph = struct {
         return ValueParser.getSlice(n);
     }
 
+    pub fn getOpaque(_: *@This(), n: *const ValueNode) []u8 {
+        std.debug.assert(n.kind == .@"opaque");
+        return triplesToSlice(u8, n.slot0, n.slot1, n.slot2);
+    }
+
     pub fn getDouble(_: *@This(), n: *const ValueNode) f64 {
         std.debug.assert(n.kind == .number);
         return ValueParser.getNumberFromNode(n, f64);
@@ -1188,6 +1193,23 @@ const ValueGraph = struct {
             .slot0 = ref,
             .slot1 = 0,
             .slot2 = 1,
+        });
+    }
+
+    pub fn createOpaque(this: *@This(), v: []u8) !ValueRef {
+        return this.values.nodes.push(.{
+            .kind = .@"opaque",
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
+            .slot1 = @truncate(@intFromPtr(v.ptr)),
+            .slot2 = @truncate(v.len),
+        });
+    }
+
+    // same kind of value but with fewer assumptions on structure
+    pub fn createComputation(this: *@This(), start: ValueRef) !ValueRef {
+        return this.values.nodes.push(.{
+            .kind = .computed,
+            .slot0 = start,
         });
     }
 
@@ -2116,7 +2138,7 @@ const ValueFacts = enum(u32) {
     infallible = 1 << 28,
     any = 1 << 29,
     incomplete = 1 << 30, // this is negated so the "exact fact" path is simpler
-    literal = 1 << 31, // struct is external
+    allocated_fact = 1 << 31, // struct is external, used for more precise analysis
 
     nullish = (1 << 0) | (1 << 1),
     boolean = (1 << 2) | (1 << 3),
@@ -2158,7 +2180,7 @@ const ValueFacts = enum(u32) {
     }
 
     pub fn isAny(facts: u32) bool {
-        return hasFact(facts, .any) or hasFact(facts, .incomplete);
+        return hasFact(facts, .any) or hasFact(facts, .incomplete) or isAllocatedFact(facts);
     }
 
     pub fn isComplete(facts: u32) bool {
@@ -2171,6 +2193,39 @@ const ValueFacts = enum(u32) {
 
     pub fn hasNullish(facts: u32) bool {
         return hasFact(facts, .nullish);
+    }
+
+    // should be cleared if spawning threads
+    threadlocal var allocated_facts: ?@import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral) = null;
+    threadlocal var interned_strings: ?std.StringHashMapUnmanaged(u32) = null;
+
+    pub fn isAllocatedFact(facts: u32) bool {
+        return (facts & @intFromEnum(ValueFacts.allocated_fact)) != 0;
+    }
+    
+    pub fn getAllocatedFact(facts: u32) *ValueFactLiteral {
+        std.debug.assert(isAllocatedFact(facts));
+        return allocated_facts.?.at(facts & ~@intFromEnum(ValueFacts.allocated_fact));
+    }
+
+    pub fn allocateFact(fact: ValueFactLiteral) !u32 {
+        if (allocated_facts == null) {
+            allocated_facts = @import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral).init(getAllocator());
+            interned_strings = .{};
+        }
+        if (fact.kind == .string) {
+            if (interned_strings.?.get(fact.getString())) |x| return x;
+        }
+        const c = allocated_facts.?.count();
+        if (c == 0) {
+            try allocated_facts.?.warmup();
+        }
+        try allocated_facts.?.append(fact);
+        const ref: u32 = @intFromEnum(ValueFacts.allocated_fact) | c;
+        if (fact.kind == .string) {
+            try interned_strings.?.put(getAllocator(), fact.getString(), ref);
+        }
+        return ref;
     }
 
     pub fn hasAnyFalsy(facts: u32) bool {
@@ -2297,9 +2352,7 @@ const ValueFacts = enum(u32) {
     }
 };
 
-// we may eventually use `program.zig` directly, using types to model facts instead
-// but we need the idea of a "range" type first. the current architecture for value
-// facts is kept a bit more local than types and so does not need machinery for modules
+// FIXME: drop this in favor of only using the type engine
 const ValueFactLiteral = packed struct {
     const LiteralKind = enum(u4) {
         number,
@@ -2320,6 +2373,25 @@ const ValueFactLiteral = packed struct {
     const NumberFlags = enum(u3) {
         range = 1 << 2, // ranges are always i32 starts/ends inclusive, with the max val representing infinity
     };
+    const ArrayFlags = enum(u3) {
+        typed_array = 1 << 2,
+    };
+    const TypedArrayKind = enum(u4) {
+        u8, i8,
+        u16, i16, f16,
+        u32, i32, f32,
+        u64, i64, f64,
+
+        pub fn fromType(comptime T: type) @This() {
+            switch (T) {
+                u8 => .u8, i8 => .i8,
+                u16 => .u16, i16 => .i16, f16 => .f16,
+                u32 => .u32, i32 => .i32, f32 => .f32,
+                u64 => .u64, i64 => .i64, f64 => .f64,
+                else => @compileError("Invalid type"),
+            }
+        }
+    };
 
     kind: LiteralKind,
     flags: u3 = 0,
@@ -2334,7 +2406,7 @@ const ValueFactLiteral = packed struct {
         }
     }
 
-    pub fn createNumber(v: f64) @This() {
+    pub fn createNumberf64(v: f64) @This() {
         const u: u64 = @bitCast(v);
         return .{
             .kind = .number,
@@ -2358,6 +2430,17 @@ const ValueFactLiteral = packed struct {
             .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
             .slot1 = @truncate(@intFromPtr(v.ptr)),
             .slot2 = @truncate(v.len),
+        };
+    }
+
+    pub fn createTypedArray(comptime T: type, v: []T) @This() {
+        const len: u28 = @intCast(v.len);
+        return .{
+            .kind = .array,
+            .flags = @intFromEnum(ArrayFlags.typed_array),
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
+            .slot1 = @truncate(@intFromPtr(v.ptr)),
+            .slot2 = (@intFromEnum(TypedArrayKind.fromType(T)) << 28) | len,
         };
     }
 
@@ -2413,6 +2496,15 @@ const ValueFactLiteral = packed struct {
         return this.kind == .number and (this.flags & @intFromBool(NumberFlags.range)) != 0;
     }
 
+    pub fn isTypedArray(this: *const @This()) bool {
+        return this.kind == .array and (this.flags & @intFromBool(ArrayFlags.typed_array)) != 0;
+    }
+
+    pub fn getTypedArrayKind(this: *const @This()) TypedArrayKind {
+        std.debug.assert(this.isTypedArray());
+        return @enumFromInt(this.slot2 >> 28);
+    }
+
     pub fn getDouble(this: *const @This()) f64 {
         std.debug.assert(this.kind == .number and !this.isRange());
         const u: u64 = (@as(u64, this.slot0) << 32) | this.slot1;
@@ -2436,11 +2528,63 @@ const ValueFactLiteral = packed struct {
 
     pub fn getLengthOrCount(this: *const @This()) u32 {
         return switch (this.kind) {
+            .array => if (this.isTypedArray()) this.slot2 & std.math.maxInt(u28) else this.slot2,
             .string, .array, .object => this.slot2,
             else => 0,
         };
     }
 
+    pub fn createAllocatedObject() !u32 {
+        const v = try getAllocator().create(std.AutoArrayHashMap(u32, u32));
+        v.* = std.AutoArrayHashMap(u32, u32).init(getAllocator());
+        return ValueFacts.allocateFact(.{
+            .kind = .object,
+            .slot0 = if (comptime @import("builtin").target.isWasm()) 0 else @truncate(@intFromPtr(v.ptr) >> 32),
+            .slot1 = @truncate(@intFromPtr(v.ptr)),
+            .slot2 = 0,
+        });
+    }
+
+    fn getObjectPropertyMap(this: *@This()) *std.AutoArrayHashMap(u32, u32) {
+        std.debug.assert(this.kind == .object);
+        if (comptime @import("builtin").target.isWasm()) {
+            return @ptrFromInt(this.slot1);
+        }
+        return @ptrFromInt((@as(u64, this.slot0) << 32) | this.slot1);
+    }
+
+    pub fn setProperty(this: *@This(), name: u32, value: u32) !void {
+        const m = this.getObjectPropertyMap();
+        try m.put(name, value);
+        this.slot2 = m.count();
+    }
+
+    pub fn setNamedProperty(this: *@This(), name: []const u8, value: u32) !void {
+        const k = try ValueFacts.allocateFact(ValueFactLiteral.createString(name));
+        try this.setProperty(k, value);
+    }
+
+    pub fn getProperty(this: *@This(), name: u32) ?u32 {
+        const m = this.getObjectPropertyMap();
+        return m.get(name);
+    }
+
+    pub fn getNamedProperty(this: *@This(), name: []const u8) !?u32 {
+        const k = try ValueFacts.allocateFact(ValueFactLiteral.createString(name));
+        return this.getProperty(k);
+    }
+
+    pub fn deleteProperty(this: *@This(), name: u32) !bool {
+        const m = this.getObjectPropertyMap();
+        const did_remove = m.swapRemove(name);
+        this.slot2 = m.count();
+        return did_remove;
+    }
+
+    pub fn deleteNamedProperty(this: *@This(), name: []const u8) !bool {
+        const k = try ValueFacts.allocateFact(ValueFactLiteral.createString(name));
+        return try this.deleteNamedProperty(k);
+    }
 };
 
 const ReferenceCollector = struct {
@@ -2454,11 +2598,9 @@ const ReferenceCollector = struct {
     decl_count: u32 = 0,
     external_facts: std.AutoHashMapUnmanaged(parser.SymbolRef, u32) = .{},
     value_facts: std.AutoHashMapUnmanaged(parser.SymbolRef, u32) = .{},
-    value_literals: @import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral) = undefined,
 
     pub fn init(file: *parser.ParsedFile) !@This() {
         var self = @This(){ .file = file };
-        self.value_literals = @import("./lexer.zig").SizedBumpAllocator(8, ValueFactLiteral).init(getAllocator());
         try self.visit(file.ast.nodes.at(file.ast.start), file.ast.start);
         return self;
     }
@@ -2473,7 +2615,6 @@ const ReferenceCollector = struct {
         self.references.deinit(getAllocator());
         self.value_facts.deinit(getAllocator());
         self.external_facts.deinit(getAllocator());
-        self.value_literals.deinit();
     }
 
     // mutates the nodes allocator and resets both maps
@@ -2640,15 +2781,6 @@ const ReferenceCollector = struct {
     fn addReference(self: *@This(), sym_ref: parser.SymbolRef, node_ref: parser.NodeRef) !void {
         const entry = try self.references.getOrPutValue(getAllocator(), sym_ref, .{});
         try entry.value_ptr.append(getAllocator(), node_ref);
-    }
-
-    pub fn createLiteralFact(self: *@This(), literal: ValueFactLiteral) !u32 {
-        const c = self.value_literals.count();
-        if (c == 0) {
-            try self.value_literals.warmup();
-        }
-        try self.value_literals.append(literal);
-        return @intFromEnum(ValueFacts.literal) | c;
     }
 
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
@@ -3579,6 +3711,7 @@ const ReferenceCollector = struct {
             return entry.value_ptr.*;
         };
         while (iter.next()) |x| {
+            // this is overly conservative
             if (iter._getAssignmentNode(x)) |q| {
                 const val = q[2] orelse continue; // TODO: if this is null, it is postfix/prefix unary
                 entry.value_ptr.* |= try self.getValueFacts(val);
@@ -4318,6 +4451,310 @@ const JsCodeReducer = struct {
         try self.visitChildren(ref);
     }
 };
+
+// const PartialEvaluator = struct {
+//     const OpaqueValue = union(u8) {
+//         ArrayBuffer: []ValueRef,
+//         TypedArray: struct {
+//             buffer: ValueRef,
+//             byte_offset: ValueRef,
+//             byte_length: ValueRef,
+//             element_type: ValueFactLiteral.TypedArrayKind,
+//         },
+
+//         pub fn toBytes(this: @This(), alloc: std.mem.Allocator) ![]u8 {
+//             const p = try alloc.alloc(u8, @sizeOf(OpaqueValue));
+//             @memcpy(p, @as([@sizeOf(OpaqueValue)]u8, @bitCast(this)));
+//             return p;
+//         }
+
+//         pub fn fromBytes(bytes: []u8) *OpaqueValue {
+//             const p: *OpaqueValue = @alignCast(@ptrCast(bytes.ptr));
+//             return p;
+//         }
+//     };
+
+//     graph: *ValueGraph,
+//     // lazy init
+//     unknown_val: ValueRef = 0,
+//     undefined_val: ValueRef = 0,
+//     null_val: ValueRef = 0,
+//     true_val: ValueRef = 0,
+//     false_val: ValueRef = 0,
+//     goto_string: ValueRef = 0,
+//     // cache parsing and analysis
+//     js_computations: std.AutoHashMapUnmanaged(ValueRef, *JsComputation) = .{},
+//     // per-computation. this is overly simplistic and won't model getters/setters
+//     js_symbol_states: std.AutoHashMapUnmanaged(ValueRef, std.AutoHashMap(parser.SymbolRef, ValueRef)) = .{},
+//     js_current_file: *parser.ParsedFile = undefined,
+
+//     pub fn deinit(this: *@This()) void {
+//         {
+//             var iter = this.js_computations.iterator();
+//             while (iter.next()) |entry| entry.value_ptr.deinit();
+//         }
+//         {
+//             var iter = this.js_symbol_states.iterator();
+//             while (iter.next()) |entry| entry.value_ptr.deinit();
+//         }
+//         this.js_computations.deinit(getAllocator());
+//         this.js_symbol_states.deinit(getAllocator());
+//     }
+
+//     fn getUnknown(this: *@This()) !ValueRef {
+//         if (this.unknown_val != 0) return this.unknown_val;
+//         this.unknown_val = try this.graph.createComputation(0);
+//         return this.unknown_val;
+//     }
+
+//     fn getUndefined(this: *@This()) !ValueRef {
+//         if (this.undefined_val != 0) return this.undefined_val;
+//         this.undefined_val = try this.graph.createUndefined();
+//         return this.undefined_val;
+//     }
+
+//     fn getNull(this: *@This()) !ValueRef {
+//         if (this.null_val != 0) return this.null_val;
+//         this.null_val = try this.graph.createNull();
+//         return this.null_val;
+//     }
+
+//     fn getTrue(this: *@This()) !ValueRef {
+//         if (this.true_val != 0) return this.true_val;
+//         this.true_val = try this.graph.createBoolean(true);
+//         return this.true_val;
+//     }
+
+//     fn getFalse(this: *@This()) !ValueRef {
+//         if (this.false_val != 0) return this.false_val;
+//         this.false_val = try this.graph.createBoolean(false);
+//         return this.false_val;
+//     }
+
+//     fn getGotoString(this: *@This()) !ValueRef {
+//         if (this.goto_string != 0) return this.goto_string;
+//         this.goto_string = try this.graph.createString("goto");
+//         return this.goto_string;
+//     }
+
+//     // we use an empty computation `()` to mean "unknown"
+//     // this won't follow Ref values
+//     fn isUnknown(this: *@This(), ref: ValueRef) bool {
+//         // it's fine if unknown val isn't initialized yet
+//         if (ref == this.unknown_val) return true;
+//         const v = this.graph.getValue(ref);
+//         if (v.kind != .computed) return false;
+//         return this.graph.getSubject(v) == 0;
+//     }
+
+//     // dest should be another computation
+//     fn createGoto(this: *@This(), dest: ValueRef) !ValueRef {
+//         return this.graph.createComputed(try this.getGotoString(), dest);
+//     }
+
+//     fn getJsComputation(this: *@This(), ctx: ValueRef) anyerror!*JsComputation {
+//         std.debug.assert(!this.isUnknown(ctx));
+//         const v = try this.graph.getFollowedValue(ctx);
+//         std.debug.assert(v.kind == .computed);
+//         const entry = try this.js_computations.getOrPut(getAllocator(), ctx);
+//         if (entry.found_existing) return entry.value_ptr.*;
+//         const subj_ref = this.graph.getSubject(v);
+//         const subj = try this.graph.getFollowedValue(subj_ref);
+//         const subj_str = this.graph.getString(subj);
+//         if (std.mem.eql(u8, subj_str, "goto")) {
+//             return this.getJsComputation(this.graph.getInput(v));
+//         }
+//         const c = try JsComputation.init(subj_str);
+//         c.input_value_ref = this.graph.getInput(v);
+//         entry.value_ptr.* = c;
+//         return c;
+//     }
+
+//     // do not hold this pointer thru recursive eval calls
+//     fn getJsSymbolStates(this: *@This(), ctx: ValueRef) !*std.AutoHashMap(parser.SymbolRef, ValueRef) {
+//         const entry = try this.js_symbol_states.getOrPut(getAllocator(), ctx);
+//         if (!entry.found_existing) {
+//             entry.value_ptr.* = std.AutoHashMap(parser.SymbolRef, ValueRef).init(getAllocator());
+//         }
+//         return entry.value_ptr;
+//     }
+
+//     fn getValueOfSymbol(this: *@This(), ctx: ValueRef, sym_ref: parser.SymbolRef) !ValueRef {
+//         const m = try this.getJsSymbolStates(ctx);
+//         if (m.get(sym_ref)) |x| return x;
+//         return this.getUndefined();
+//     }
+
+//     fn setValueOfSymbol(this: *@This(), ctx: ValueRef, sym_ref: parser.SymbolRef, val: ValueRef) !ValueRef {
+//         const m = try this.getJsSymbolStates(ctx);
+//         try m.put(sym_ref, val);
+//     }
+
+//     fn getU32(this: *@This(), val: ValueRef) ?u32 {
+//         if (this.isUnknown(val)) return null;
+//         const v = this.graph.getValue(val);
+//         return @intFromFloat(this.graph.getDouble(v));
+//     }
+
+//     fn getI32(this: *@This(), val: ValueRef) ?i32 {
+//         if (this.isUnknown(val)) return null;
+//         const v = this.graph.getValue(val);
+//         return @intFromFloat(this.graph.getDouble(v));
+//     }
+
+//     fn setArrayIndexedProperty(this: *@This(), subject: ValueRef, index: u32, val: ValueRef) !void {
+//         const v = try this.graph.getFollowedValue(subject);
+//         if (v.kind == .array) {
+//             return try this.graph.setProperty(subject, index, val);
+//         }
+//         if (v.kind == .@"opaque") {
+//             const q = OpaqueValue.fromBytes(this.graph.getOpaque(v));
+//             switch (q.*) {
+//                 .ArrayBuffer => |x| {
+//                     x[index] = val;
+//                 },
+//                 .TypedArray => |x| {
+//                     const offset = this.getU32(x.byte_offset) orelse return;
+//                     if (x.element_type == .u8) {
+//                         return this.setArrayIndexedProperty(x.buffer, index+offset, val);
+//                     }
+//                     if (x.element_type == .i32) {
+//                         // not very efficient
+//                         const b: [4]u8 = @bitCast(this.getI32(val) orelse return);
+//                         for (b, 0..) |el, i| {
+//                             try this.setArrayIndexedProperty(x.buffer, index+offset+@as(u32,@truncate(i)), el);
+//                         }
+//                         return;
+//                     }
+//                 },
+//                 else => return error.Unknown,
+//             }
+//             return;
+//         }
+//         return error.Unknown;
+//     }
+
+//     // we do not store literal bytes because we need to represent "unknown" as a byte still
+//     fn createArrayBuffer(this: *@This(), ctx: ValueRef, size: u32) !ValueRef {
+//         _ = ctx;
+//         const v = try getAllocator().alloc(ValueRef, size);
+//         const s: OpaqueValue = .{ .ArrayBuffer = v };
+//         return this.graph.createOpaque(try s.toBytes(getAllocator()));
+//     }
+
+//     fn createTypedArray(this: *@This(), ctx: ValueRef, args_start: NodeRef, type_name: []const u8) !ValueRef {
+//         const c = try this.getJsComputation(ctx);
+//         var iter = NodeIterator.init(&c.file.ast.nodes, args_start);
+//         var arg_count: u8 = 0;
+//         var args: [3]ValueRef = undefined;
+//         while (iter.nextRef()) |x| {
+//             const v = try this.evalJsExp(ctx, x);
+//             if (arg_count > 3) continue;
+//             args[arg_count] = v;
+//             arg_count += 1;
+//         }
+//         var kind: ValueFactLiteral.TypedArrayKind = undefined;
+//         if (std.mem.eql(u8, type_name, "Uint8Array")) {
+//             kind = .u8;
+//         } else if (std.mem.eql(u8, type_name, "Int32Array")) {
+//             kind = .i32;
+//         } else {
+//             return error.UnhandledTypedArray;
+//         }
+//         if (arg_count == 0) {
+//             args[0] = try this.createArrayBuffer(ctx, 0);
+//             args[1] = try this.graph.createNumber(0);
+//             args[2] = try this.graph.createNumber(0);
+//             arg_count = 3;
+//         } else {
+//             if (arg_count < 2) {
+//                 args[1] = try this.graph.createNumber(0);
+//                 arg_count += 1;
+//             }
+//             const q = try this.graph.getFollowedValue(args[0]);
+//             if (q.kind == .number) {
+//                 const amt = try this.graph.getDouble(q);
+//                 if (arg_count < 3) {
+//                     args[2] = args[0];
+//                     arg_count += 1;
+//                 }
+//                 args[0] = try this.createArrayBuffer(ctx, @intFromFloat(amt));
+//             } else if (q.kind == .array) {
+//                 const count = try this.graph.getListCount(q.slot0);
+//                 args[0] = try this.createArrayBuffer(ctx, count);
+//                 args[2] = try this.graph.createNumber(count);
+//                 arg_count = 3;
+//                 const z = OpaqueValue.fromBytes(this.graph.getOpaque(this.graph.getValue(args[0])));
+//                 if (kind != .u8) return error.UnhandledKind;
+//                 var k = q.slot0;
+//                 var i: u32 = 0;
+//                 while (k != 0) {
+//                     const el = this.graph.getValue(k);
+//                     z.ArrayBuffer[i] = @intFromFloat(this.graph.getDouble(el));
+//                     i += 1;
+//                     k = el.next;
+//                 }
+//             }
+//         }
+//         std.debug.assert(arg_count == 3);
+//         const s: OpaqueValue = .{ .TypedArray = .{
+//             .buffer = args[0],
+//             .byte_offset = args[1],
+//             .byte_length = args[2],
+//             .element_type = kind,
+//         } };
+//         return s.toBytes(getAllocator());
+//     }
+
+//     fn accessVal(this: *@This(), subject: ValueRef, element: ValueRef) !ValueRef {
+//         if (this.isUnknown(subject) or this.isUnknown(element)) return try this.getUnknown();
+//         const v = this.graph.getValue(subject);
+//         if (v.kind == .@"opaque") {
+
+//         }
+//     }
+
+//     fn evalJsExp(this: *@This(), ctx: ValueRef, node_ref: NodeRef) !ValueRef {
+//         const n = this.js_current_file.ast.nodes.at(node_ref);
+//         return switch (n.kind) {
+//             .identifier => {
+//                 if (this.js_current_file.binder.getSymbol(node_ref)) |sym_ref| {
+//                     return this.getValueOfSymbol(ctx, sym_ref);
+//                 }
+//                 return try this.getUnknown();
+//             },
+//             .new_expression => {
+//                 const target_ref = parser.getLeft(n);
+//                 const target = this.js_current_file.ast.nodes.at(target_ref);
+//                 if (target.kind == .identifier) {
+//                     // this needs to check if the symbol is truly global. it does not.
+//                     const ident = parser.getSlice(target, u8);
+//                     if (std.mem.eql(u8, ident, "Uint8Array") or std.mem.eql(u8, ident, "Int32Array")) {
+//                         return this.createTypedArray(ctx, parser.getRight(n), ident);
+//                     }
+//                 } 
+//                 return try this.getUnknown();
+//             },
+//             .property_access_expression => {
+//                 const l =
+//             },
+//             .numeric_literal => try this.graph.createNumber(parser.getNumber(n)),
+//             // not normalized
+//             .string_literal => try this.graph.createString(parser.getSlice(n, u8)),
+//             .undefined_keyword => try this.getUndefined(),
+//             .null_keyword => try this.graph.createNull(),
+//             .true_keyword => try this.getTrue(),
+//             .false_keyword => try this.getFalse(),
+//             else => try this.getUnknown(),
+//         };
+//     }
+
+//     // returns null if we could not partially eval anything
+//     // otherwise produces a new computation
+//     fn evalJs(this: *@This(), ctx: ValueRef) !?ValueRef {
+        
+//     }
+// };
 
 // sigh
 fn stripIndexZero(text: []const u8, name: []const u8) ![]const u8 {
