@@ -58,6 +58,8 @@ const Op = {
     Inc: 0x4A, Dec: 0x4B, Negate: 0x4C, BitNot: 0x4D,
     LogicalNot: 0x4E, TypeOf: 0x4F,
 
+    // TODO: CoerceToBoolean - !!x
+
     Jump: 0x60,                       // [idx]
     JumpIfToBooleanTrue: 0x61,   // [idx]  if (acc) pc = off
     JumpIfToBooleanFalse: 0x62, // [idx]  if (!acc) pc = off
@@ -547,13 +549,20 @@ function binOpDirect(opName, a, T, b, U) {
         const raw = smiTaggedOp(opName, a, b)
         if (raw !== undefined) {
             Intrinsics.accType = Type.Smi
-            if (!Intrinsics.OF) {    
+            if (!Intrinsics.checkoverflow()) {    
                 return raw
             }
             const raw2 = Intrinsics[opName + '64'](a / 2, b / 2)
             Intrinsics.accType = raw2 > 0 ? Type.u64 : Type.i64
             return raw2
         }
+    }
+
+    if (opName === 'add' && (T === Type.Handle || U === Type.Handle) && (isString(a) || isString(b))) {
+        // TODO: doesn't handle mixed concats
+        const r = strconcat(a, b)
+        Intrinsics.accType = Type.handle
+        return r
     }
 
     a = resolveNumeric(a, T); T = resolvedType
@@ -634,7 +643,7 @@ function compareOp(op, a, T, b) {
     }
     throw new Error(`missing op: ${op}`)
 }
-
+Intrinsics.checkoverflow = () => Intrinsics.OF
 Intrinsics.add32 = (a, b) => {
     const raw = a + b
     Intrinsics.OF = (((a ^ raw) & (b ^ raw)) < 0) ? 1 : 0
@@ -751,6 +760,11 @@ function maybeGetNumericHeapType(handle) {
     }
 }
 
+function isString(handle) {
+    const m = Intrinsics.load(handle, Type.Handle)
+    return getTDBase(m) === BaseTypeKind.String
+}
+
 function taggedUnbox(handle, T) {
     return Intrinsics.load(handle+4, T)
 }
@@ -817,17 +831,64 @@ function createTypeDescriptor(base, variant = 0, bitset = 0, slot1 = 0, extraSlo
     return handle
 }
 
-function createObjectLikeTD(base, variant = 0, parent = 0) {
-    if (base < BaseTypeKind.Object) throw `Invalid object-like: ${base}`
-    let bitset = 0
-    if (base === BaseTypeKind.Function) bitset |= TDFlags.Callable
-
-}
-
 // not created at runtime, keys are always indices the static string table
 function createNativeStructTD(desc) {
 
 }
+
+function getTDBase(ptr) {
+    return Intrinsics.load(ptr, Type.u8)
+}
+
+// const StaticString = createTypeDescriptor(BaseTypeKind.String, StringVariant.External)
+const HeapString = createTypeDescriptor(BaseTypeKind.String, StringVariant.External)
+
+function memcpy(dst, src, amt) {
+    for (let i = 0; i < amt; i++) {
+        const v = Intrinsics.load(src+i, Type.u8)
+        Intrinsics.store(dst+i, v, Type.u8)
+    }
+}
+
+function allocString(buf, len) {
+    const slots = (len >> 2)+2 // (TD + len)
+    const dest = Intrinsics.alloc(slots)
+    storeHandle(dest, 0, HeapString)
+    Intrinsics.store(dest+4, len, Type.u32)
+    memcpy(dest+8, buf, len)
+    return dest
+}
+
+// assumes HeapString
+function streql(a, b) {
+    if (a === b) return true
+    const l1 = Intrinsics.load(a+4, Type.u32)
+    const l2 = Intrinsics.load(b+4, Type.u32)
+    if (l1 !== l2) return false
+    const s1 = a+8
+    const s2 = b+8
+    for (let i = 0; i < l1; i++) {
+        const v1 = Intrinsics.load(s1+i, Type.u8)
+        const v2 = Intrinsics.load(s2+i, Type.u8)
+        if (v1 !== v2) return false
+    }
+    return true
+}
+
+function strconcat(a, b) {
+    const l1 = Intrinsics.load(a+4, Type.u32)
+    const l2 = Intrinsics.load(b+4, Type.u32)
+    const t = l1 + l2
+    const c = Intrinsics.stackalloc(t)
+    memcpy(c, a+8, l1)
+    memcpy(c+l1, b+8, l2)
+    const r = allocString(c, t)
+    Intrinsics.stackfree(c, Type.u8)
+    return r
+}
+
+// fully dynamic
+const DynamicObject = createTypeDescriptor(BaseTypeKind.Object, 0) 
 
 const HeapMapOffsets = {
     count: 0,
@@ -953,6 +1014,8 @@ function getNativeEndianness() {
     return isNativeSmall = (v === 1)
 }
 
+Intrinsics.getNativeEndianness = getNativeEndianness
+
 let currentEh = 0 // u32 stack handle
 function registerEh(pc, frameIdx) {
     const saveEh = currentEh
@@ -1045,9 +1108,15 @@ function interpret(fn, thisArg, args, instrumentCb) {
             case Op.Inc: {
                 const T = regs[regCount]
                 if (T === Type.Smi) {
-                    acc = binOpDirect('add', acc, T, 1 << 1, Type.Smi); 
+                    const z = acc
+                    acc = Intrinsics.add32(z, 1 << 1)
+                    if (Intrinsics.checkoverflow()) {
+                        acc = Intrinsics.add64(z / 2, 1)
+                        regs[regCount] = Type.u64
+                    }
+                    break
                 } else {
-                    acc = binOpDirect('add', acc, T, 1 << 1, Type.Smi); 
+                    acc = binOpDirect('add', acc, T, 1 << 1, Type.Smi) 
                 }
                 regs[regCount] = Intrinsics.accType; 
                 break 
@@ -1181,13 +1250,13 @@ function interpret(fn, thisArg, args, instrumentCb) {
                 const next = code[pc++]
                 switch (next) {
                     case Op.LdaImm:
-                        acc = signExtendSmi2Byte(view.getInt16(pc, getNativeEndianness())); regs[regCount] = Type.Smi; pc += 2;
+                        acc = signExtendSmi2Byte(view.getInt16(pc, Intrinsics.getNativeEndianness())); regs[regCount] = Type.Smi; pc += 2;
                         break
                     case Op.LdaConst:
-                        acc = constants[view.getUint16(pc, getNativeEndianness())]; regs[regCount] = Type.Handle; pc += 2;
+                        acc = constants[view.getUint16(pc, Intrinsics.getNativeEndianness())]; regs[regCount] = Type.Handle; pc += 2;
                         break
                     case Op.Jump:
-                        pc = view.getUint16(pc, getNativeEndianness());
+                        pc = view.getUint16(pc, Intrinsics.getNativeEndianness());
                         break
                     default: throw `todo 2 byte op: ${next}`
                 }

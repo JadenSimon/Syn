@@ -1,0 +1,415 @@
+/// <reference lib="machine" />
+/// <reference lib="reify" />
+
+"use wrapped";
+
+import * as x from './mem'
+
+// for bootstrapping we do not use native sizes
+type usize = u32
+
+export function bitsizeof<T>(t: reify T): u32 {
+    if (t is Type.Object | Type.Tuple) {
+        return bitsizeof(reify usize)
+    }
+    if (t is Type.Union) {
+        let s: u32 = 0
+        for (const x of t) {
+            const v = sizeof(x)
+            if (v > s) s = v
+        }
+        return s
+    }
+    if (t is Type.Machine) {
+        // XXX: we are failing to resolve `Type.Machine`, bad namespace merge
+        if ((t as any)?.isConcrete) {
+            if (!t.isConcrete()) throw `not concrete: ${t}`
+            return t.width as u32
+        }
+    }
+
+    // literals
+    if (t === undefined) return 0
+    if (t === Type.boolean) return 1
+    if (t === true || t === false) return 1
+    // for exact literals, we choose the nearest aligned representation
+    if (t is u8 || t is i8) return 8
+    if (t is u16) return 16
+    if (t is u32) return 32
+    throw `invalid type: ${t}`
+}
+
+export function sizeof<T>(t: reify T): u32 {
+    return (bitsizeof(t) + 7) >> 3
+}
+
+export type StructView<T> = WrapInnerStructs<T> & {
+    __id: u32
+    __address: usize
+}
+
+type WrapInnerStructs<T> = T extends object ? {
+    [P in keyof T]: T[P] extends number ? T[P] : StructView<T[P]>
+} : T
+
+export type PackedView<T> = T & {
+    __id: u32
+    __scalar: usize
+}
+
+// we precompute this stuff to make it easier to work with
+interface StructViewFactory<T> {
+    id: u32
+    sizeof: u32
+    (ptr: usize): StructView<T>
+}
+const structViews = new Map<u32, StructViewFactory<any>>()
+const cachedStructViews = new Map<Type, StructViewFactory<any>>()
+function getStructView(T: Type) {
+    //if (const cached = cachedStructViews.get(T)) return cached
+    const cached = cachedStructViews.get(T)
+    if (cached) return cached
+    return DefineStructView(T)
+}
+
+// We treat a "struct" as a view over a memory address
+export function DefineStructView<T>(T: reify T): StructViewFactory<T> {
+    if (!(T is Type.Object)) throw `Unable to create struct for type: ${T}`
+    const size = sizeof(T as Type) // FIXME: Type & Type.Object is busted
+    const id = (cachedStructViews.size as u32) + 1
+    type Self = { __address: usize }
+    let offset: usize = 0
+    const f = function(ptr: usize) {
+        const o = { __id: id, __address: ptr }
+        return Object.defineProperties(o, Object.fromEntries(descriptors)) as StructView<T>
+    }
+    f.id = id
+    f.sizeof = size
+    cachedStructViews.set(T, f)
+    const descriptors = Object.entries(T).filter(([k]) => !k.startsWith('__')).map(([k, v]) => {
+        const from = offset
+        offset += sizeof(v)
+        const load = createLoadFn(v)
+        const store = createStoreFn(v)
+        return [k, {
+            get: function(this: Self) {
+                return load(this.__address, from)
+            },
+            set: function(this: Self, val: any) {
+                store(this.__address, from, val)
+            },
+            enumerable: true,
+            configurable: true,
+        } satisfies PropertyDescriptor]
+    })
+    structViews.set(id, f)
+    return f
+}
+
+function createStoreFn(T: Type) {
+    if (T is Type.Object) {
+        return (addr: usize, offset: usize, v: any) => {
+            if (!v) {
+                Intrinsics.store(addr+offset, 0, Types.u32)
+            } else {
+                const __address = v.__address
+                Intrinsics.store(addr+offset, __address, Types.u32)
+            }
+        }
+    }
+    const U = lowerType(T)
+    return (addr: usize, offset: usize, v: any) => {
+        Intrinsics.store(addr+offset, v, U)
+    }
+}
+
+function createLoadFn(T: Type) {
+    if (T is Type.Object) {
+        const view = getStructView(T)
+        return (addr: usize, offset: usize) => {
+            const ptr = Intrinsics.load(addr+offset, Types.u32)
+            if (!ptr) return
+            return view(ptr)
+        }
+    }
+    const U = lowerType(T)
+    return (addr: usize, offset: usize) => {
+        return Intrinsics.load(addr+offset, U)
+    }
+}
+
+// FIXME: analyzer breaks on expando `sizeof`
+export function New<T>(view: StructViewFactory<T>): StructView<T> {
+    const ptr = Intrinsics.alloc(view.sizeof)
+    const s = view(ptr)
+    return s
+}
+
+export function StackNew<T>(view: StructViewFactory<T>): StructView<T> {
+    const ptr = Intrinsics.stackalloc(view.sizeof)
+    const s = view(ptr)
+    return s
+}
+
+interface MakeByteBitpackResult {
+    setters: ((cur: u8, val: any) => u8)[]
+    getters: ((cur: u8) => any)[]
+    bitsUsed: usize
+    rem: Type[]
+}
+
+// packs low -> high
+function makeBitpack(types: Type[]): MakeByteBitpackResult {
+    let bitsUsed: usize = 0
+    let i = 0
+    const limit = bitsizeof(reify u8)
+    const getters: MakeByteBitpackResult['getters'] = []
+    const setters: MakeByteBitpackResult['setters'] = []
+    for (const x of types) {
+        const next = bitsizeof(x)
+        if (bitsUsed + next > limit) break
+        const shift = bitsUsed as u8
+        const mask = (((1 << next)-1) & 0xFF) as u8 // FIXME: cast should not be needed
+        const isSigned = x is Type.Machine && x.isInt() && x.signed === true
+        if (isSigned) {
+            const T = (Types.u1 + (x.width as number)) as Types
+            const U = (Types.i1 + (x.width as number)) as Types
+            getters.push(cur => Intrinsics.bitconvert((cur >> shift) & mask, T, U))
+            setters.push((cur, val) => (cur | ((Intrinsics.bitconvert(val, U, T) & mask) << shift)) as u8)
+        } else {
+            getters.push(cur => (cur >> shift) & mask)
+            setters.push((cur, val) => (cur | ((val << shift))) as u8)
+        }
+        i += 1
+        bitsUsed += next
+    }
+    const rem = types.slice(i)
+    return { getters, setters, bitsUsed, rem }
+}
+
+
+export interface Slice<T> {
+    ptr: usize
+    len: usize
+    __phantom: T
+}
+
+export function assert(x: unknown): asserts x {
+    if (!x) throw "Assertion failed"
+}
+
+export function alignUp(x: usize, alignment: usize): usize {
+    return (x + alignment - 1) & ~(alignment - 1)
+}
+
+// we don't want to reify directly here
+export enum Types {
+    u8,
+    u16,
+    u32,
+    u64,
+    i8,
+    i16,
+    i32,
+    i64,
+    f64,
+    bool,
+
+    // sometimes, it's just easier to keep it simple
+    u1, u2, u3, u4, u5, u6, u7,
+    u9, u10, u11, u12, u13, u14, u15, u17,
+    u19, u20, u21, u22, u23, u24, u25, u26,
+    u27, u28, u29, u30, u31,
+
+    i1, i2, i3, i4, i5, i6, i7,
+}
+
+function lowerType(T: Type): Types {
+    switch (T) {
+        case reify u8: return Types.u8
+        case reify u16: return Types.u16
+        case reify u32: return Types.u32
+        case reify u64: return Types.u64
+        case reify i8: return Types.i8
+        case reify i16: return Types.i16
+        case reify i32: return Types.i32
+        case reify i64: return Types.i64
+        // case reify f16: return Types.f16
+        // case reify f32: return Types.f32
+        case reify f64: return Types.f64
+        default: throw `Cannot lower type: ${String(T)}`
+    }
+}
+
+function intrinsicLoad(ptr: usize, T: Types.u8): u8
+function intrinsicLoad(ptr: usize, T: Types.u16): u16
+function intrinsicLoad(ptr: usize, T: Types.u32): u32
+function intrinsicLoad(ptr: usize, T: Types.i8): i8
+function intrinsicLoad(ptr: usize, T: Types.i16): i16
+function intrinsicLoad(ptr: usize, T: Types.i32): i32
+function intrinsicLoad(ptr: usize, T: Types.f64): f64
+function intrinsicLoad(ptr: usize, T: Types): number
+function intrinsicLoad(ptr: usize, T: Types) {
+    switch (T) {
+        case Types.u8: return memView.getUint8(ptr)
+        case Types.i8: return memView.getInt8(ptr)
+        case Types.u16: return memView.getUint16(ptr, true)
+        case Types.i16: return memView.getInt16(ptr, true)
+        case Types.u32: return memView.getUint32(ptr, true)
+        case Types.i32: return memView.getInt32(ptr, true)
+        case Types.f64: return memView.getFloat64(ptr, true)
+        case Types.u64: {
+            const lo = memView.getUint32(ptr, true)
+            const hi = memView.getUint32(ptr + 4, true)
+            return hi * 0x1_0000_0000 + lo
+        }
+        case Types.i64: {
+            const lo = memView.getUint32(ptr, true)
+            const hi = memView.getInt32(ptr + 4, true)
+            return hi * 0x1_0000_0000 + lo
+        }
+        default:
+            throw new Error(`load: unsupported type ${T}`)
+    }
+}
+
+export const Intrinsics = {
+    addressof: function(v: any): usize {
+        const addr = v.__address
+        if (addr === undefined) throw `No address found: ${v}`
+        return addr
+    },
+    stackalloc: function(amt: usize) {
+        stackPointer -= amt
+        return stackPointer
+    },
+    stackfree: function(amt: usize) {
+        stackPointer += amt
+    },
+    // heap alloc/free
+    alloc: function(amt: usize) {
+        return allocBlock(amt)
+    },
+    free: function(ptr: usize | { __address: usize }) {
+        // FIXME: analyzer is busted on excluding usize here 
+        freeBlock(typeof ptr === 'number' ? ptr : (ptr as any).__address)
+    },
+    store: function(ptr: usize, val: usize, T: Types) {
+        switch (T) {
+            case Types.u8: memView.setUint8(ptr, val); return
+            case Types.i8: memView.setInt8(ptr, val); return
+            case Types.u16: memView.setUint16(ptr, val, true); return
+            case Types.i16: memView.setInt16(ptr, val, true); return
+            case Types.u32: memView.setUint32(ptr, val >>> 0, true); return
+            case Types.i32: memView.setInt32(ptr, val, true); return
+            case Types.f64: memView.setFloat64(ptr, val, true); return
+            case Types.u64:
+            case Types.i64: {
+                const lo = val >>> 0
+                const hi = Math.floor(val / 0x1_0000_0000) | 0
+                memView.setUint32(ptr, lo, true)
+                memView.setInt32(ptr + 4, hi, true)
+                return
+            }
+            default:
+                throw new Error(`store: unsupported type ${T}`)
+        }
+    },
+    load: intrinsicLoad,
+    // direct reinterpretation
+    bitconvert: function(v: any, T: Types, U: Types) {
+        if (v === true) return 1
+        if (v === false) return 0
+        if (U === Types.bool) return v ? true : false
+        if (T >= Types.i1 && T <= Types.i7) {
+            const bits = 1 + (T - Types.i1)
+            const max = 1 << bits
+            return v < 0 ? v + max : v
+        }
+        if (U >= Types.i1 && U <= Types.i7) {
+            const bits = (U - Types.i1)
+            const max = 1 << bits
+            return v >= max ? v - (max << 1) : v
+        }
+        return v
+    },
+    // selects between two values using the cond
+    // cond _must_ be a bool! we will not coerce
+    select: function<T, U>(cond: boolean, v1: T, v2: U) {
+        return cond ? v1 : v2
+    },
+    // converts T -> U
+    convert: function(v: any, T: Types, U: Types) {
+        if (T === U) return v
+        if (U === Types.f64) return Number(v)
+        if (T === Types.f64) return Math.trunc(v)
+        return v
+    },
+    isinteger: function(v: number) {
+        return Number.isInteger(v)
+    }
+}
+
+
+interface HeapBlock {
+    size: usize
+    next?: HeapBlock
+}
+
+const HeapBlock = DefineStructView(reify HeapBlock)
+
+const minSplit: u16 = 16
+const maxMem: usize = 1 << 24
+const memBuffer = new ArrayBuffer(maxMem)
+const memView = new DataView(memBuffer)
+let stackPointer: usize = maxMem 
+
+let freeListHead = HeapBlock(0)
+freeListHead.size = (1 << 23) as usize
+
+function allocBlock(amt: usize) {
+    const aligned = alignUp(amt, 4)
+    let block = freeListHead
+    while (block.size < aligned || (block.size & (1 << 29))) {
+        if (!block.next) throw `Failed to allocated: ${aligned}`
+        block = block.next
+    }
+
+    if (block.size > HeapBlock.sizeof+aligned+minSplit) {
+        const next = block.next
+        const start = block.size + aligned
+        const rem = block.size - HeapBlock.sizeof+aligned
+        block.size = aligned
+        const split = HeapBlock(start)
+        split.size = rem
+        split.next = next
+        block.next = split
+    }
+
+    block.size |= (1 << 29) // mark
+    return Intrinsics.addressof(block) + HeapBlock.sizeof
+}
+
+function getBlock(ptr: usize) {
+    const addr = ptr - HeapBlock.sizeof
+    return HeapBlock(addr)
+}
+
+function freeBlock(ptr: usize) {
+    const block = getBlock(ptr)
+    block.size &= ~(1 << 29)
+}
+
+const Example = DefineStructView(reify {
+    a: u32
+    b: u32
+    c: {
+        a: u32
+    }
+})
+
+const allocated = New(Example)
+allocated.a = 1
+console.log(allocated.a)
+
+console.log(allocated.c)

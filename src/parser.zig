@@ -11122,7 +11122,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(maybeUnwrapRef(n) orelse 0));
         },
-        .expression_statement, .shorthand_property_assignment, .delete_expression, .void_expression, .parenthesized_expression, .parenthesized_type, .typeof_expression, .await_expression => {
+        .expression_statement, .shorthand_property_assignment, .delete_expression, .void_expression, .parenthesized_expression, .parenthesized_type, .typeof_expression, .await_expression, .variable_statement => {
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(unwrapRef(n)));
         },
@@ -11158,7 +11158,7 @@ pub fn getDeclarationNameRef(node: *const AstNode) ?NodeRef {
             const d = getPackedData(node);
             if (d.left != 0) return d.left;
         },
-        .variable_declaration, .parameter, .type_parameter => {
+        .variable_declaration, .parameter, .type_parameter, .enum_declaration => {
             const d = getPackedData(node);
             return d.left;
         },

@@ -361,6 +361,49 @@ async function runVsonTestCase(name: string) {
     await writeFile(snapshotPath, output)
 }
 
+async function testEngine() {
+    const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
+
+    const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
+    const prog = api.createProgram(roots, {})
+
+    const results: ({ name: string, text: string })[] = []
+    const emitted = new Map<string, string>()
+    const sourceFiles = prog.getSourceFiles().filter(sf => sf.fileName.endsWith('.syn'))
+    const promises = []
+    for (const sf of sourceFiles) {
+        const p = new Promise<void>((resolve, reject) => {
+            const expected = new Set<string>()
+            const x = prog.emit(sf, (name, text) => {
+                results.push({ name, text })
+                emitted.set(name, text)
+                expected.delete(name)
+                if (expected.size === 0) {
+                    resolve()
+                }
+            })
+            x.emittedFiles?.forEach(f => expected.add(f))
+        })
+        promises.push(p)
+    }
+
+    await Promise.all(promises)
+
+    const f = results[0]
+    const reifier = (prog as any).getReifier()
+    return runSynModule(f.text, path.resolve('src/engine/intrinsics.syn'), reifier, false, (from, name) => {
+        let r = path.resolve(path.dirname(from), name)
+        let sourceName = r
+        const extname = path.extname(r)
+        if (!extname) {
+            sourceName = `${r}.syn`
+            r = `${r}.js`
+        }
+        const text = emitted.get(r)
+        return [r, text]
+    })
+}
+
 function lineDiff(a: string, b: string) {
     const left = a.split('\n')
     const right = b.split('\n')
@@ -397,6 +440,8 @@ async function gatherTestCases() {
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
+    if (filter === '--engine') return testEngine()
+
     const shouldExecute = args[1] === '--reify'
 
     for (const f of files) {

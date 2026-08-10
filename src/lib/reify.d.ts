@@ -110,7 +110,6 @@ declare namespace Type {
     const string: unique symbol
     const number: unique symbol
     const boolean: unique symbol
-    const bigint: unique symbol
     const symbol: unique symbol
     const object: unique symbol
     const any: unique symbol
@@ -122,7 +121,6 @@ declare namespace Type {
         | typeof string
         | typeof number
         | typeof boolean
-        | typeof bigint
         | typeof symbol
         | typeof object
         | typeof any
@@ -146,7 +144,6 @@ declare namespace Type {
         | boolean
         | string
         | number
-        | bigint
 
     // the checker uses this to narrow a type
     interface Kinds {
@@ -162,6 +159,8 @@ declare namespace Type {
         // enum ?
     }
 
+    interface ExtraKinds {}
+
     function kind(t: Type): keyof Kinds
 }
 
@@ -175,4 +174,5 @@ type Type =
     | Type.Intrinsic
     | Type.Literal
     | Type.TypeFunction
+    | Type.ExtraKinds[keyof Type.ExtraKinds]
 

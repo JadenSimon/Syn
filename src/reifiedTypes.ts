@@ -71,6 +71,72 @@ class Template {
     }
 }
 
+class Machine {
+    static Int: typeof Int
+    static Float: typeof Float
+
+    constructor(public readonly width: _type) {}
+
+    isInt(): this is Int {
+        return this instanceof Int
+    }
+
+    isFloat(): this is Float {
+        return this instanceof Float
+    }
+
+    isConcrete() {
+        return typeof this.width === 'number'
+    }
+}
+
+class Int extends Machine {
+    constructor(
+        width: _type, 
+        public readonly signed: _type,
+        public readonly alignment?: _type,
+        public readonly endianness?: _type, // 'be' | 'le' | undefined
+    ) {
+        super(width)
+    }
+
+    public get name() {
+        if (!this.isConcrete()) return 'Int'
+        const parts = [this.signed ? 'i' : 'u']
+        parts.push(this.width)
+        if (this.endianness) parts.push(this.endianness)
+        const res = parts.join('')
+        if (this.alignment) return `Align<${res}, ${this.alignment}>`
+        return res
+    }
+
+    public isConcrete(): boolean {
+        if (this.endianness !== undefined) {
+            if (this.endianness !== 'be' && this.endianness !== 'le') return false
+        }
+        if (this.alignment && typeof this.alignment !== 'number') return false
+        if (typeof this.signed !== 'boolean') return false
+        if (typeof this.width !== 'number') return false
+        return true
+    }
+
+    protected toString() {
+        return `[type ${this.name}]`
+    }
+}
+
+class Float extends Machine {
+    protected toString() {
+        const name = `f${this.width}`
+        return `[type ${name}]`
+    }
+}
+
+Machine.Int = Int
+Machine.Float = Float
+
+// class Vec<T, C> extends Machine {}
+
 // TODO: all mutable methods on Set and Array should throw
 class Union2 extends Set {
     constructor(private readonly elements: any[]) {
@@ -190,6 +256,7 @@ export function createTypeNamespace() {
         if (t instanceof Union) return 'union'
         if (t instanceof ArrayType) return 'array'
         if (t instanceof Tuple) return 'tuple'
+        if (t instanceof Machine) return 'machine'
 
         return 'object'
     }
@@ -206,6 +273,7 @@ export function createTypeNamespace() {
         if (t instanceof Union) return true
         if (t instanceof ArrayType) return true
         if (t instanceof Tuple) return true
+        if (t instanceof Machine) return true
 
         return false
     }
@@ -284,40 +352,41 @@ export function createTypeNamespace() {
     }
 
     // float | int | uint
-    type MachineDataTypeInfo = { kind: 0 | 1 | 2, width: number, sym: symbol }
-    const machineDataTypes = new Map<number, MachineDataTypeInfo>()
-    const machineDataTypeSyms = new Map<symbol, MachineDataTypeInfo>()
+    const machineDataTypes = new Map<number, Machine>()
     function getMachineDataType(key: number, kind: 0 | 1 | 2, width: number) {
         let x = machineDataTypes.get(key)
         if (!x) {
-            const sym = Symbol()
-            machineDataTypes.set(key, x = { kind, width, sym })
-            machineDataTypeSyms.set(sym, x)
+            switch (kind) {
+                case 0: x = new Float(width); break;
+                case 1: x = new Int(width, true); break;
+                case 2: x = new Int(width, false); break;
+            }
+            machineDataTypes.set(key, x)
         }
-        return x.sym
+        return x
     }
 
     function isSigned(t: _type) {
-        const o = machineDataTypeSyms.get(t)
+        const o = machineDataTypes.get(t)
         if (!o) return
-        if (o.kind === 0) return
-        return o.kind === 1
+        if (!o.isInt()) return
+        return o.signed
     }
 
     function getBitWidth(t: _type) {
-        const o = machineDataTypeSyms.get(t)
+        const o = machineDataTypes.get(t)
         return o?.width
     }
 
     function isFloat(t: _type) {
-        const o = machineDataTypeSyms.get(t)
-        return o?.kind === 0
+        const o = machineDataTypes.get(t)
+        return o?.isFloat()
     }
 
-    function isInteger(t: _type) {
-        const o = machineDataTypeSyms.get(t)
+    function isInt(t: _type) {
+        const o = machineDataTypes.get(t)
         if (!o) return false
-        return o.kind === 1 || o.kind === 2
+        return o.isInt()
     }
 
     function isArrayType(t: _type) {
@@ -331,7 +400,7 @@ export function createTypeNamespace() {
         getMachineDataType,
         isSigned,
         isFloat,
-        isInteger,
+        isInt,
         getBitWidth,
         
         isArrayType,
@@ -350,6 +419,7 @@ export function createTypeNamespace() {
         Union,
         Tuple,
         Object: ObjectType,
+        Machine,
 
         __ArrayType,
         __Object,
@@ -626,7 +696,7 @@ class _Object extends NullClass {
     }
 }
 
-export function runSynModule(text: string, fileName: string, reifier: { types: any, __reify: any }) {
+export function runSynModule(text: string, fileName: string, reifier: { types: any, __reify: any }, cjs = true, resolve?: (from: string, name: string) => [absPath: string, text: string]) {
     ;(globalThis as any).Type = reifier.types
     const ctx = vm.createContext({
         __filename: fileName,
@@ -640,5 +710,23 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
     }, {
         origin: fileName,
     })
+    if (!cjs) {
+        const m = new vm.SourceTextModule(text, {
+            identifier: fileName,
+            context: ctx,
+        })
+        return (async function() {
+            await m.link(async (spec: string, m: vm.Module) => {
+                const p = resolve?.(m.identifier, spec)
+                if (!p) return
+                const m2 = new vm.SourceTextModule(p[1], {
+                    identifier: p[0],
+                    context: ctx,  
+                })
+                return m2
+            })
+            return await m.evaluate()
+        })()
+    }
     return vm.runInContext('"use strict";\n' + text, ctx)
 }

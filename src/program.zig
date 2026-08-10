@@ -1691,6 +1691,7 @@ pub const Program = struct {
                 while (sym_iter.next()) |sym_entry| {
                     const symbols = this.ambient.globals_allocator.at(global_ref).symbols;
                     if (symbols.items.len != 1) {
+                        if (comptime suppress_gaps) continue;
                         return error.TODO_multiple_ambient_module_decls;
                     }
 
@@ -2391,6 +2392,7 @@ pub const Program = struct {
             analyzer: *Analyzer,
             replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
             is_async_ctx: bool = true, // we start in a module
+            checked_mode: u2 = 0, // 1 = checked, 2 = wrapped
             should_use_parens: bool = false,
             as_type_node: ?*const AstNode = null,
             run_directive_symbols: std.AutoHashMapUnmanaged(u32, void) = .{},
@@ -2403,6 +2405,10 @@ pub const Program = struct {
             helpers: std.EnumSet(Helper) = std.EnumSet(Helper).initEmpty(),
 
             type_helpers: std.AutoArrayHashMapUnmanaged(TypeRef, []const u8) = .{},
+
+            // key = (mode << 16) | (kind << 8) | width -> helper fn name
+            // (mode 1 = `__assertU32`, mode 2 = `__wrapU32`)
+            machine_helpers: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .{},
 
             fn requireHelper(self: *@This(), comptime h: Helper) []const u8 {
                 self.helpers.insert(h);
@@ -2752,6 +2758,19 @@ pub const Program = struct {
 
                             // only handle symbols in the same file (TODO: handle more)
                             if (alias_file_id != self.file.id) {
+                                // FIXME: this is wrong
+                                if (comptime suppress_gaps) {
+                                    const other = try self.analyzer.program.getBoundFile(alias_file_id);
+                                    const sym = other.binder.symbols.at(sym_ref);
+                                    const decl = other.ast.nodes.at(sym.declaration);
+                                    const ident_ref = getPackedData(decl).left;
+                                    const ident = other.ast.nodes.at(ident_ref);
+                                    const name = getSlice(ident, u8);
+
+                                    const class_ident = try self.factory.createIdentifier(name);
+                                    return self.factory.createBinaryExpression(subject, .instanceof_keyword, try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Type"), class_ident));
+                                }
+                                self.analyzer.printTypeInfo(ty);
                                 return error.InstanceOfCrossFileNotSupported;
                             }
 
@@ -3058,6 +3077,118 @@ pub const Program = struct {
                 }
 
                 return result orelse self.factory.createTrue();
+            }
+
+            fn detectCheckedDirective(self: *@This(), stmts_head: NodeRef) ?u2 {
+                var ref = stmts_head;
+                while (ref != 0) {
+                    const s = self.nodes.at(ref);
+                    if (s.kind != .expression_statement) return null;
+                    const e = self.nodes.at(unwrapRef(s));
+                    if (e.kind != .string_literal) return null;
+                    const text = getSlice(e, u8);
+                    if (std.mem.eql(u8, text, "use checked")) return 1;
+                    if (std.mem.eql(u8, text, "use wrapped")) return 2;
+                    ref = s.next;
+                }
+                return null;
+            }
+
+            fn isCheckedArithmeticOp(operator: u32) bool {
+                return switch (@as(SyntaxKind, @enumFromInt(operator))) {
+                    .plus_plus_token, .minus_minus_token => true,
+                    .plus_token, .minus_token, .asterisk_token, .asterisk_asterisk_token, .slash_token, .percent_token => true,
+                    else => false,
+                };
+            }
+
+            fn machineTypeOfExp(self: *@This(), ref: NodeRef) !?MachineType {
+                const lt = try self.analyzer.getType(self.file, ref);
+                const eval_flags = @intFromEnum(Analyzer.EvaluationFlags.no_unions) | @intFromEnum(Analyzer.EvaluationFlags.no_objects) | @intFromEnum(Analyzer.EvaluationFlags.no_enum_aliases) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases);
+                const et = try self.followAliases(lt, eval_flags);
+                if (et >= @intFromEnum(Kind.false)) return null;
+                if (self.analyzer.getKindOfRef(et) != .machine_data_type) return null;
+                const t = self.analyzer.types.at(et);
+                return MachineType{ .kind = @enumFromInt(t.slot0), .width = @intCast(t.slot1) };
+            }
+
+            fn requireMachineHelper(self: *@This(), mt: MachineType, mode: u2) ![]const u8 {
+                const key: u32 = (@as(u32, mode) << 16) | (@as(u32, @intFromEnum(mt.kind)) << 8) | mt.width;
+                if (self.machine_helpers.get(key)) |existing| return existing;
+                const letter: u8 = switch (mt.kind) {
+                    .uint => 'U',
+                    .int => 'I',
+                    .float => 'F',
+                };
+                const prefix = if (mode == 2) "__wrap" else "__assert";
+                const name = try std.fmt.allocPrint(getAllocator(), "{s}{c}{d}", .{ prefix, letter, mt.width });
+                try self.machine_helpers.put(getAllocator(), key, name);
+                return name;
+            }
+
+            fn generateMachineWrap(self: *@This(), subject: NodeRef, kind: Analyzer.MachineDataTypeKind, width: u24) anyerror!NodeRef {
+                if (kind == .float) {
+                    const math = try self.factory.createIdentifier("Math");
+                    return switch (width) {
+                        16 => self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(math, "f16round"), subject),
+                        32 => self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(math, "fround"), subject),
+                        else => subject,
+                    };
+                }
+
+                const is_signed = kind == .int;
+
+                if (width > 32) {
+                    const trunc = try self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Math"), "trunc"), subject);
+                    // const cond_trunc = try self.factory.createConditionalExpression(try self.factory.createIdentifier("t"), trunc, subject);
+                    const big = try self.factory.createCallExpression(try self.factory.createIdentifier("BigInt"), trunc);
+                    const as_fn = try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("BigInt"), if (is_signed) "asIntN" else "asUintN");
+                    const wrapped = try self.factory.createCallExpression(as_fn, &.{ try self.factory.createNumericLiteral(@as(i64, width)), big });
+                    return self.factory.createCallExpression(try self.factory.createIdentifier("Number"), wrapped);
+                }
+
+                if (is_signed) {
+                    if (width == 32) {
+                        return self.factory.createBinaryExpression(subject, .bar_token, try self.factory.createNumericLiteral(@as(i64, 0)));
+                    }
+                    const shift = @as(i64, 32) - @as(i64, width);
+                    const shl = try self.factory.createBinaryExpression(subject, .less_than_less_than_token, try self.factory.createNumericLiteral(shift));
+                    return self.factory.createBinaryExpression(shl, .greater_than_greater_than_token, try self.factory.createNumericLiteral(shift));
+                }
+
+                if (width == 32) {
+                    return self.factory.createBinaryExpression(subject, .greater_than_greater_than_greater_than_token, try self.factory.createNumericLiteral(@as(i64, 0)));
+                }
+                const mask = (@as(i64, 1) << @as(u6, @intCast(width))) - 1;
+                return self.factory.createBinaryExpression(subject, .ampersand_token, try self.factory.createNumericLiteral(mask));
+            }
+
+            fn buildMachineHelperDecl(self: *@This(), key: u32, name: []const u8) !NodeRef {
+                const mode: u2 = @intCast(key >> 16);
+                const kind: Analyzer.MachineDataTypeKind = @enumFromInt((key >> 8) & 0xff);
+                const width: u24 = @intCast(key & 0xff);
+
+                const body = if (mode == 2)
+                    try self.generateMachineWrap(try self.factory.createIdentifier("v"), kind, width)
+                else blk: {
+                    const check = try self.generateMachineDataTypeCheck(try self.factory.createIdentifier("v"), kind, width, null);
+                    const assert_call = try self.factory.createCallExpression(try self.factory.createIdentifier("assert"), check);
+                    const assert_stmt = try self.factory.createExpressionStatement(assert_call);
+                    const ret_stmt = try self.factory.createReturnStatement(try self.factory.createIdentifier("v"));
+                    break :blk try self.factory.createBlock(&.{ assert_stmt, ret_stmt });
+                };
+
+                const param = try self.factory.createParameter(try self.factory.createIdentifier("v"), 0);
+                const name_ident = try self.factory.createIdentifierAllocated(name);
+
+                // if (mode == 2 and width > 32 and kind != .float) {
+                //     const skip_trunc_param = try self.factory.createParameter(try self.factory.createIdentifier("t"), 0);
+                //     const arrow = try self.factory.createArrowFunction(try self.factory.createList(&.{param, skip_trunc_param}), body, 0);
+                //     return self.factory.createConstVariable(name_ident, arrow);     
+                // }
+
+                const arrow = try self.factory.createSingleParamArrowFunction(param, body, 0);
+                return self.factory.createConstVariable(name_ident, arrow);
             }
 
             fn followAliases(self: *@This(), ty: TypeRef, eval_flags: u32) !TypeRef {
@@ -10091,6 +10222,21 @@ pub const Program = struct {
 
                             return try parser.forEachChild(self.nodes, n, self);
                         }
+
+                        if (self.checked_mode > 0 and isCheckedArithmeticOp(operator)) {
+                            const l = parser.getLeft(n);
+                            if (try self.machineTypeOfExp(l)) |mt| {
+                                try parser.forEachChild(self.nodes, n, self);
+                                const helper_name = try self.requireMachineHelper(mt, self.checked_mode);
+                                const clone = try self.nodes.push(n.*);
+                                self.nodes.at(clone).next = 0;
+                                const call = try self.factory.createCallExpression(try self.factory.createIdentifier(helper_name), &.{clone});
+                                self.nodes.at(call).next = n.next;
+                                try self.replacements.put(ref, call);
+                                return;
+                            }
+                        }
+
                         return try parser.forEachChild(self.nodes, n, self);
                     },
                     .await_expression => {
@@ -10493,6 +10639,14 @@ pub const Program = struct {
                             }
                         }
                     },
+                    .source_file, .block => {
+                        const saved = self.checked_mode;
+                        defer self.checked_mode = saved;
+                        if (self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0)) |mode| {
+                            self.checked_mode = mode;
+                        }
+                        try parser.forEachChild(self.nodes, n, self);
+                    },
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
                     },
@@ -10520,7 +10674,7 @@ pub const Program = struct {
 
         try v.visit(f.ast.nodes.at(start), start);
 
-        if (v.helpers.count() > 0) {
+        if (v.helpers.count() > 0 or v.machine_helpers.count() > 0) {
             const source = f.ast.nodes.at(start);
             const first_stmt_ref = maybeUnwrapRef(source) orelse return r;
             var first_emit = r.get(first_stmt_ref) orelse first_stmt_ref;
@@ -10573,6 +10727,18 @@ pub const Program = struct {
             }
             if (v.helpers.contains(.swap_tree)) {
                 try pushHelper.run(&f.ast.nodes, Visitor.helper_code.swap_tree, &helper_head, &helper_tail);
+            }
+            {
+                var it = v.machine_helpers.iterator();
+                while (it.next()) |entry| {
+                    const decl_ref = try v.buildMachineHelperDecl(entry.key_ptr.*, entry.value_ptr.*);
+                    if (helper_tail != 0) {
+                        f.ast.nodes.at(helper_tail).next = decl_ref;
+                    } else {
+                        helper_head = decl_ref;
+                    }
+                    helper_tail = decl_ref;
+                }
             }
             if (helper_tail != 0) {
                 if (first_emit == first_stmt_ref) {
@@ -11431,6 +11597,7 @@ const Ambient = struct {
 };
 
 const is_debug = @import("builtin").mode == .Debug;
+const suppress_gaps = true;
 
 pub const Analyzer = struct {
     const num_type_registers = 8;
@@ -15825,6 +15992,15 @@ pub const Analyzer = struct {
                         init_type = t;
                     }
                 }
+
+                // XXX: we can't track literals w/ machine data types, so, we cannot narrow here
+                if (!is_const and declared_type != 0) {
+                    if (try self.analyzer.maybeGetMachineDataType(declared_type)) |_| {
+                        try self.current_flow.types.put(self.analyzer.allocator(), sym, declared_type);
+                        continue;
+                    }
+                }
+
                 try self.current_flow.types.put(self.analyzer.allocator(), sym, init_type);
             }
         }
@@ -16222,8 +16398,9 @@ pub const Analyzer = struct {
                         },
                         .slash_token, .minus_token, .plus_token, .asterisk_token => {
                             const d = getPackedData(node);
-                            _ = try self.visitExpression(d.left);
+                            const lhs = try self.visitExpression(d.left);
                             _ = try self.visitExpression(d.right);
+                            if (try self.analyzer.maybeGetMachineDataType(lhs)) |x| return x;
                             return @intFromEnum(Kind.number);
                         },
                         else => {},
@@ -17126,6 +17303,10 @@ pub const Analyzer = struct {
                 const result = try this.excludeType(evaluated, excluded);
 
                 return if (result != evaluated) result else from;
+            },
+            .machine_data_type => {
+                if (excluded == @intFromEnum(Kind.number)) return @intFromEnum(Kind.never);
+                return from; // TODO
             },
             else => return from, // TODO
         }
@@ -20409,6 +20590,10 @@ pub const Analyzer = struct {
                     const name = try this.propertyNameToType(file, name_ref);
                     try members.append(ObjectLiteralMember.initLazy(.method, name, file.id, pair[1], member_flags));
                 },
+                .index_signature => {
+                    if (comptime suppress_gaps) continue;
+                    return error.TODO;
+                },
                 else => return error.TODO,
             }
         }
@@ -21495,7 +21680,10 @@ pub const Analyzer = struct {
                 if (lhs.kind == .call_expression) {
                     return this.getType(file, d.left);
                 }
-                if (lhs.kind != .identifier) return error.TODO_exp_with_type_args;
+                if (lhs.kind != .identifier) {
+                    if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+                    return error.TODO_exp_with_type_args;
+                }
 
                 const sym_ref = lhs.extra_data;
                 if (d.right == 0) {
@@ -21731,6 +21919,8 @@ pub const Analyzer = struct {
                     return ty;
                 }
 
+                // FIXME: we aren't merging namespaces across files (?)
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
                 this.printCurrentNode();
                 return error.SymbolNotInMergedNamespace;
             }
@@ -22483,6 +22673,28 @@ pub const Analyzer = struct {
 
         return try this.getGlobalTypeSymbolAlias("RegExp", .{}) orelse @intFromEnum(Kind.empty_object);
     }
+    
+    fn followAliasForMachineDataType(this: *@This(), ty: TypeRef, eval_flags: u32) !TypeRef {
+        const ft = try this.evaluateType(ty, eval_flags);
+        if (this.maybePeekAliasName(ft)) |n| {
+            if (strings.eqlComptime(n, "Int") or strings.eqlComptime(n, "Float")) {
+                return try this.evaluateType(ft, eval_flags);
+            }
+        }
+        return ft;
+    }
+
+    fn maybeGetMachineDataType(this: *@This(), ref: TypeRef) !?TypeRef {
+        if (ref >= @intFromEnum(Kind.false)) return null;
+        const u = this.types.at(ref);
+        if (u.getKind() == .machine_data_type) return ref;
+        if (u.getKind() != .alias) return null;
+        const eval_flags = @intFromEnum(Analyzer.EvaluationFlags.no_unions) | @intFromEnum(Analyzer.EvaluationFlags.no_objects) | @intFromEnum(Analyzer.EvaluationFlags.no_enum_aliases) | @intFromEnum(Analyzer.EvaluationFlags.no_instance_aliases);
+        const et = try this.followAliasForMachineDataType(ref, eval_flags);
+        if (et >= @intFromEnum(Kind.false)) return null;
+        if (this.getKindOfRef(et) != .machine_data_type) return null;
+        return et;
+    }
 
     fn handleFailedInferCall(this: *@This(), file: *ParsedFileData, ref: NodeRef, n: *const Type, args_start: NodeRef) !TypeRef {
         const apparent = try this.resolveWithTypeArgsSlice(n, &.{});
@@ -22593,6 +22805,8 @@ pub const Analyzer = struct {
                 if (rhs == @intFromEnum(Kind.string)) {
                     return @intFromEnum(Kind.string);
                 }
+                // TODO: should only applied if we see the directive
+                if (try this.maybeGetMachineDataType(lhs)) |x| return x;
 
                 if (lhs == @intFromEnum(Kind.number) or rhs == @intFromEnum(Kind.number)) return @intFromEnum(Kind.number);
                 if (!this.is_const_context and !this.is_const_variable_context) return @intFromEnum(Kind.number);
@@ -22607,9 +22821,15 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.number);
             },
             .percent_token => {
+                const lhs = try this.getType(file, d.left);
+                if (try this.maybeGetMachineDataType(lhs)) |x| return x;
+
                 return @intFromEnum(Kind.number);
             },
             .minus_token => {
+                const lhs = try this.getType(file, d.left);
+                if (try this.maybeGetMachineDataType(lhs)) |x| return x;
+
                 // FIXME: should be semantic error if either type isn't a number
                 return @intFromEnum(Kind.number);
             },
@@ -22663,7 +22883,10 @@ pub const Analyzer = struct {
             .instanceof_keyword, .in_keyword => {
                 return @intFromEnum(Kind.boolean);
             },
-            .asterisk_token, .minus_equals_token, .plus_equals_token => {
+            .asterisk_token, .minus_equals_token, .plus_equals_token, .bar_equals_token, .ampersand_equals_token => {
+                const lhs = try this.getType(file, d.left);
+                if (try this.maybeGetMachineDataType(lhs)) |x| return x;
+
                 return @intFromEnum(Kind.number);
             },
             else => {
@@ -22767,7 +22990,12 @@ pub const Analyzer = struct {
                 return switch (@as(SyntaxKind, @enumFromInt(d.left))) {
                     // TODO: return boolean type unless the expression is exactly true or false, in which case invert it
                     .exclamation_token => @intFromEnum(Kind.boolean),
-                    .plus_token, .plus_plus_token, .minus_minus_token => @intFromEnum(Kind.number),
+                    .plus_token, .plus_plus_token, .minus_minus_token => blk: {
+                        const rhs = try this.getType(file, d.right);
+                        if (try this.maybeGetMachineDataType(rhs)) |x| return x;
+
+                        break :blk @intFromEnum(Kind.number);
+                    },
                     .minus_token => blk: {
                         if (!this.is_const_context) break :blk @intFromEnum(Kind.number);
 
@@ -23467,6 +23695,9 @@ pub const Analyzer = struct {
                 return this.types.at(t).slot3;
             },
             .postfix_unary_expression => {
+                const lhs = try this.getType(file, getLeft(exp));
+                if (try this.maybeGetMachineDataType(lhs)) |x| return x;
+
                 return @intFromEnum(Kind.number);
             },
             .reify_expression => return @intFromEnum(Kind.never), // FIXME: impl this
@@ -23484,6 +23715,9 @@ pub const Analyzer = struct {
                 return @intFromEnum(Kind.any); // FIXME
             },
             .import_keyword => {
+                return @intFromEnum(Kind.any); // FIXME
+            },
+            .bigint_keyword => {
                 return @intFromEnum(Kind.any); // FIXME
             },
             else => {},
@@ -24276,7 +24510,10 @@ pub const Analyzer = struct {
                         break :blk getIdentFromSymbol(b, g.symbols.items[0].ref) orelse return error.NoIdentFound;
                     }
                 }
-                break :blk getIdentFromSymbol(f.binder, k.slot4) orelse return error.NoIdentFound;
+                break :blk getIdentFromSymbol(f.binder, k.slot4) orelse {
+                    std.debug.print("{} {?}\n",.{k.slot4, f.ast.nodes.at(sym.declaration).kind});
+                    return error.NoIdentFound;
+                };
             };
             return try this.copyNodeNoNext(ident);
         }
