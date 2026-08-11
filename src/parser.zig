@@ -11122,7 +11122,7 @@ pub fn getLoc(nodes: *const BumpAllocator(AstNode), n: *const AstNode) ?DecodedL
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(maybeUnwrapRef(n) orelse 0));
         },
-        .expression_statement, .shorthand_property_assignment, .delete_expression, .void_expression, .parenthesized_expression, .parenthesized_type, .typeof_expression, .await_expression, .variable_statement => {
+        .expression_statement, .shorthand_property_assignment, .delete_expression, .void_expression, .parenthesized_expression, .parenthesized_type, .typeof_expression, .await_expression, .variable_statement, .spread_element => {
             if (n.location != 0) return decodeLocation(n.location);
             return getLoc(nodes, nodes.at(unwrapRef(n)));
         },

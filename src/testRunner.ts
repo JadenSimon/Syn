@@ -389,9 +389,11 @@ async function testEngine() {
 
     await Promise.all(promises)
 
-    const f = results[0]
+    const entry = 'intrinsics'
+
+    const f = results.find(x => x.name.includes(entry))!
     const reifier = (prog as any).getReifier()
-    return runSynModule(f.text, path.resolve('src/engine/intrinsics.syn'), reifier, false, (from, name) => {
+    return runSynModule(f.text, path.resolve(`src/engine/${entry}.syn`), reifier, false, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
         let sourceName = r
         const extname = path.extname(r)

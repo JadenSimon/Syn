@@ -13399,7 +13399,7 @@ pub const Analyzer = struct {
 
         return switch (this.types.at(type_ref).getKind()) {
             .string_literal, .template_literal => .string,
-            .number_literal => .number,
+            .number_literal, .machine_data_type => .number,
             .bigint_literal => .bigint,
             .symbol_literal => .symbol,
             .function_literal => .function,
@@ -13936,6 +13936,15 @@ pub const Analyzer = struct {
                         s.slot5 = r;
                         return try this.inferConditionalTypeWithVariance(r, condition, inferred, variance);
                     }
+                    if (s.getKind() == .indexed) {
+                        const inner = try this.evaluateType(subject, 0);
+                        if (inner == subject) return false;
+                        if (comptime suppress_gaps) {
+                            // FIXME: this technically shouldn't be a blocker
+                            if (this.isParameterizedRef(inner)) return false;
+                        }
+                        return this.inferConditionalTypeWithVariance(inner, condition, inferred, variance);
+                    }
                     return false;
                 }
 
@@ -13950,7 +13959,10 @@ pub const Analyzer = struct {
                 }
 
                 // `void` is always assignable to as a return type
-                if (n.slot3 == @intFromEnum(Kind.void) and variance == .covariant) {} else {
+                if (n.slot3 == @intFromEnum(Kind.void) and variance == .covariant) {} else blk: {
+                    if (s.slot3 == @intFromEnum(Kind.void) and variance == .contravariant) {
+                        if (!isTypeParamRef(n.slot3)) break :blk;
+                    }
                     const did_match_return = try this.inferConditionalTypeWithVariance(s.slot3, n.slot3, inferred, variance) orelse return null;
                     if (!did_match_return) return false;
                 }
@@ -14279,6 +14291,7 @@ pub const Analyzer = struct {
                     }
                     return false;
                 }
+                this.printTypeInfo(subject);
                 debugPrint("{any}\n", .{n.getKind()});
                 return error.TODO4;
             },
@@ -14291,6 +14304,27 @@ pub const Analyzer = struct {
                     return false;
                 }
                 return false; // always false now i guess?
+            },
+            .machine_data_type => {
+                if (this.maybeGetTypeFromRef(subject)) |s| {
+                    if (s.getKind() == .machine_data_type) {
+                        const k1 = this.getMachineTypeKind(s);
+                        const k2 = this.getMachineTypeKind(n);
+                        if (k1 != k2) return false; // TODO: int / uint can be compared in some cases
+                        const w1 = this.getMachineTypeWidth(s);
+                        const w2 = this.getMachineTypeWidth(n);
+                        if (variance == .invariant) return w1 == w2;
+                        if (variance == .contravariant) return w1 > w2;
+                        return w2 > w1;
+                    }
+                    return false;
+                }
+                if (subject == @intFromEnum(Kind.void)) {
+                    return false;
+                }
+                this.printTypeInfo(subject);
+                debugPrint("{any}\n", .{n.getKind()});
+                return error.TODO5;
             },
             // .class => {
             //     if (subject >= @intFromEnum(Kind.false)) return false;
@@ -20290,6 +20324,18 @@ pub const Analyzer = struct {
         return t;
     }
 
+    fn getMachineTypeWidth(this: *@This(), t: *const Type) u24 {
+        _ = this;
+        std.debug.assert(t.getKind() == .machine_data_type);
+        return @intCast(t.slot1);
+    }
+
+    fn getMachineTypeKind(this: *@This(), t: *const Type) MachineDataTypeKind {
+        _ = this;
+        std.debug.assert(t.getKind() == .machine_data_type);
+        return @enumFromInt(t.slot0);
+    }
+
     fn getMemberType(this: *@This(), file: *ParsedFileData, ref: NodeRef) !TypeRef {
         const n = file.ast.nodes.at(ref);
         switch (n.kind) {
@@ -21126,13 +21172,26 @@ pub const Analyzer = struct {
         if (type_ref < @intFromEnum(Kind.false)) {
             const t = this.types.at(type_ref);
             if (t.getKind() == .function_literal) {
+                if (t.slot4 == 0) {
+                    if (comptime suppress_gaps) {
+                        return @intFromEnum(Kind.any);
+                    }
+                    return error.MissingThisType;
+                }
                 return t.slot4;
             }
 
             // This can potentially expose a bare parameter
             if (t.getKind() == .parameterized) {
                 if (t.slot3 < @intFromEnum(Kind.false) and this.types.at(t.slot3).getKind() == .function_literal) {
-                    return this.types.at(t.slot3).slot4;
+                    const u = this.types.at(t.slot3);
+                    if (u.slot4 == 0) {
+                        if (comptime suppress_gaps) {
+                            return @intFromEnum(Kind.any);
+                        }
+                        return error.MissingThisType;
+                    }
+                    return u.slot4;
                 }
             }
         }
@@ -21260,6 +21319,11 @@ pub const Analyzer = struct {
             },
             .type_predicate => {
                 const d = getPackedData(node);
+                if (d.right == 0) {
+                    // FIXME: this is an `asserts` return type with no `is` type
+                    std.debug.assert(node.len == 1);
+                    if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+                }
                 const sym_ref = file.binder.getSymbol(d.left) orelse return error.MissingSymbol;
                 const t = try this.getType(file, d.right);
                 const sym = file.binder.symbols.at(sym_ref);
@@ -22467,6 +22531,8 @@ pub const Analyzer = struct {
                 // we'll treat this the same as `(typeof C)[T]`
                 return this.accessTypeWithHash(s.slot1, element, hash, set_this_type);
             }
+            // FIXME: this is breaking on the `nil` (0) type when using dynamic `this`
+            if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             this.printCurrentNode();
             return try notSupported(s.getKind());
         }
@@ -22886,7 +22952,7 @@ pub const Analyzer = struct {
             .instanceof_keyword, .in_keyword => {
                 return @intFromEnum(Kind.boolean);
             },
-            .asterisk_token, .minus_equals_token, .plus_equals_token, .bar_equals_token, .ampersand_equals_token => {
+            .asterisk_token, .minus_equals_token, .plus_equals_token, .bar_equals_token, .ampersand_equals_token, .slash_token, .slash_equals_token => {
                 const lhs = try this.getType(file, d.left);
                 if (try this.maybeGetMachineDataType(lhs)) |x| return x;
 
@@ -22993,6 +23059,7 @@ pub const Analyzer = struct {
                 return switch (@as(SyntaxKind, @enumFromInt(d.left))) {
                     // TODO: return boolean type unless the expression is exactly true or false, in which case invert it
                     .exclamation_token => @intFromEnum(Kind.boolean),
+                    .tilde_token,
                     .plus_token, .plus_plus_token, .minus_minus_token => blk: {
                         const rhs = try this.getType(file, d.right);
                         if (try this.maybeGetMachineDataType(rhs)) |x| return x;
@@ -23722,6 +23789,10 @@ pub const Analyzer = struct {
             },
             .bigint_keyword => {
                 return @intFromEnum(Kind.any); // FIXME
+            },
+            .spread_element => {
+                // FIXME: grab the inner exp type?
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             },
             else => {},
         }
