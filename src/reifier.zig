@@ -103,6 +103,30 @@ pub const Reifier = struct {
         _ = try f.call(.{n, v});
     }
 
+    fn buildTuple(this: *@This(), o: *js.Object, types: []const TypeRef) !void {
+        for (types) |u| {
+            if (u < @intFromEnum(Kind.false)) {
+                const t2 = this.analyzer.types.at(u);
+                if (t2.getKind() != .tuple_element) {
+                    try this.callMethod(o, "add", .{
+                        @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
+                    });
+                    continue;
+                }
+                const el_type = t2.slot1;
+                try this.callMethod(o, "add", .{
+                    @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
+                });
+                continue;
+            }
+
+            try this.callMethod(o, "add", .{
+                @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
+            });
+        }
+        try this.callMethod(o, "simplify", .{});
+    }
+
     fn reifyType(this: *@This(), ty: program.Analyzer.TypeRef) anyerror!*anyopaque {
         if (this.analyzer.isParameterizedRef(ty)) {
             this.analyzer.printTypeInfo(ty);
@@ -210,27 +234,7 @@ pub const Reifier = struct {
             .tuple => {
                 const o = try this.createSavedShape(ty, "__Tuple");
                 const types = getSlice2(t, TypeRef);
-                for (types) |u| {
-                    if (u < @intFromEnum(Kind.false)) {
-                        const t2 = this.analyzer.types.at(u);
-                        if (t2.getKind() != .tuple_element) {
-                            try this.callMethod(o, "add", .{
-                                @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                            });
-                            continue;
-                        }
-                        const el_type = t2.slot1;
-                        try this.callMethod(o, "add", .{
-                            @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
-                        });
-                        continue;
-                    }
-
-                    try this.callMethod(o, "add", .{
-                        @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    });
-                }
-                try this.callMethod(o, "simplify", .{});
+                try this.buildTuple(o, types);
                 return o;
             },
             // .tuple_element => {
@@ -281,13 +285,30 @@ pub const Reifier = struct {
 
                 return o;
             },
+            .function_literal => {
+                if (try this.hasCached(ty)) {
+                    return try this.getCached(ty);
+                }
+
+                const o = try this.createSavedShape(ty, "__FunctionType");
+                try this.setCached(ty, @ptrCast(o));
+
+                const tuple = try this.createSavedShape(ty, "__Tuple");
+                try this.buildTuple(tuple, getSlice2(t, TypeRef));
+                try this.setField(o, "params", @ptrCast(tuple));
+                if (t.slot3 != @intFromEnum(Kind.void)) {
+                    const v = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(t.slot3))));
+                    try this.setField(o, "returns", v);
+                }
+
+                return o;
+            },
             .machine_data_type => {
                 return try this.getMachineIntrinsic(ty, @intCast(t.slot0), @intCast(t.slot1));
             },
             else => {},
             // class
             // template_literal
-            // function_literal
             // module_namespace
             // symbol_literal (only well-known symbols)
         }

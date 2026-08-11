@@ -7,9 +7,26 @@ import * as x from './mem'
 
 // for bootstrapping we do not use native sizes
 type usize = u32
+const nativeWord = 4
 
 export function bitsizeof<T>(t: reify T): u32 {
-    if (t is Type.Object | Type.Tuple) {
+    // if (t is Type.Object) {
+    //     let s: u32 = 0
+    //     for (const [k, v] of Object.entries(t)) {
+    //         if (k.startsWith('__phantom')) continue
+    //         s += bitsizeof(v)
+    //     }
+    //     return s
+    // }
+    // if (t is Type.Tuple) {
+    //     let s: u32 = 0
+    //     for (const x of t) {
+    //         s += bitsizeof(x)
+    //     }
+    //     return s
+    // }
+    if (t is Type.Tuple | Type.Object) {
+        // all structural types are allocated independently
         return bitsizeof(reify usize)
     }
     if (t is Type.Union) {
@@ -43,13 +60,22 @@ export function sizeof<T>(t: reify T): u32 {
     return (bitsizeof(t) + 7) >> 3
 }
 
+// export type Ptr<T> = {
+//     ptr: usize
+//     __phantom: T
+// }
+
 export type StructView<T> = WrapInnerStructs<T> & {
-    __id: u32
     __address: usize
 }
 
+// type WrapInnerStructs<T> = T extends object ? {
+//     [P in keyof T]: T[P] extends number ? T[P] 
+//         : T extends Ptr<infer U> ? StructView<U> : StructView<T[P]>
+// } : T
 type WrapInnerStructs<T> = T extends object ? {
-    [P in keyof T]: T[P] extends number ? T[P] : StructView<T[P]>
+    [P in keyof T]: T[P] extends number ? T[P] 
+        : P extends `__${string}` ? T[P] : StructView<T[P]>
 } : T
 
 export type PackedView<T> = T & {
@@ -80,7 +106,7 @@ export function DefineStructView<T>(T: reify T): StructViewFactory<T> {
     type Self = { __address: usize }
     let offset: usize = 0
     const f = function(ptr: usize) {
-        const o = { __id: id, __address: ptr }
+        const o = { __address: ptr }
         return Object.defineProperties(o, Object.fromEntries(descriptors)) as StructView<T>
     }
     f.id = id
@@ -106,15 +132,52 @@ export function DefineStructView<T>(T: reify T): StructViewFactory<T> {
     return f
 }
 
+function fieldOffset(T: Type.Object, name: string) {
+    let offset: usize = 0
+    for (const [k, v] of Object.entries(T)) {
+        if (k === name) return offset
+        offset += sizeof(v)
+    }
+    throw `No field named "${name}" found in type: ${T}`
+}
+
+function getRcInfo(T: Type.Object) {
+    const field = T['$rc']
+    if (!field) return
+    return [fieldOffset(T, '$rc'), lowerType(field)] as const
+}
+
+// returns true if we freed `addr`
+// ref counted structs are never stored on the stack, so this is fine
+function adjustRc(addr: usize, offset: usize, T: Types, amt: i8) {
+    const cur = Intrinsics.load(addr+offset, T) as u32
+    if (-amt >= cur) {
+        Intrinsics.free(addr)
+        return true
+    }
+    Intrinsics.store(addr+offset, cur+amt, T)
+    return false
+}
+
 function createStoreFn(T: Type) {
     if (T is Type.Object) {
-        return (addr: usize, offset: usize, v: any) => {
+        const f = (addr: usize, offset: usize, v: any) => {
             if (!v) {
                 Intrinsics.store(addr+offset, 0, Types.u32)
             } else {
                 const __address = v.__address
                 Intrinsics.store(addr+offset, __address, Types.u32)
             }
+        }
+        const rcInfo = getRcInfo(T)
+        if (!rcInfo) return f
+        return (addr: usize, offset: usize, v: any) => {
+            const prev = Intrinsics.load(addr+offset, Types.u32)
+            const __address = v?.__address
+            f(addr, offset, v)
+            if (prev === __address) return
+            if (prev !== 0) adjustRc(prev, rcInfo[0], rcInfo[1], -1)
+            if (__address !== 0) adjustRc(__address, rcInfo[0], rcInfo[1], 1)
         }
     }
     const U = lowerType(T)
@@ -161,7 +224,6 @@ interface MakeByteBitpackResult {
 // packs low -> high
 function makeBitpack(types: Type[]): MakeByteBitpackResult {
     let bitsUsed: usize = 0
-    let i = 0
     const limit = bitsizeof(reify u8)
     const getters: MakeByteBitpackResult['getters'] = []
     const setters: MakeByteBitpackResult['setters'] = []
@@ -170,28 +232,21 @@ function makeBitpack(types: Type[]): MakeByteBitpackResult {
         if (bitsUsed + next > limit) break
         const shift = bitsUsed as u8
         const mask = (((1 << next)-1) & 0xFF) as u8 // FIXME: cast should not be needed
+        const invMask = ~(mask << next) as u8
         const isSigned = x is Type.Machine && x.isInt() && x.signed === true
         if (isSigned) {
             const T = (Types.u1 + (x.width as number)) as Types
             const U = (Types.i1 + (x.width as number)) as Types
             getters.push(cur => Intrinsics.bitconvert((cur >> shift) & mask, T, U))
-            setters.push((cur, val) => (cur | ((Intrinsics.bitconvert(val, U, T) & mask) << shift)) as u8)
+            setters.push((cur, val) => ((cur & invMask) | ((Intrinsics.bitconvert(val, U, T) & mask) << shift)) as u8)
         } else {
             getters.push(cur => (cur >> shift) & mask)
-            setters.push((cur, val) => (cur | ((val << shift))) as u8)
+            setters.push((cur, val) => ((cur & invMask) | ((val & mask) << shift)) as u8)
         }
-        i += 1
         bitsUsed += next
     }
-    const rem = types.slice(i)
+    const rem = types.slice(getters.length)
     return { getters, setters, bitsUsed, rem }
-}
-
-
-export interface Slice<T> {
-    ptr: usize
-    len: usize
-    __phantom: T
 }
 
 export function assert(x: unknown): asserts x {
@@ -201,6 +256,43 @@ export function assert(x: unknown): asserts x {
 export function alignUp(x: usize, alignment: usize): usize {
     return (x + alignment - 1) & ~(alignment - 1)
 }
+
+export function memcpy(dst: usize, src: usize, len: usize): void {
+    let i: usize = 0
+    while ((len-i) >= 4) {
+        const v = Intrinsics.load(src+i, Types.u32)
+        Intrinsics.store(dst+i, v, Types.u32)
+        i += 4
+    }
+    while ((len-i) >= 2) {
+        const v = Intrinsics.load(src+i, Types.u16)
+        Intrinsics.store(dst+i, v, Types.u16)
+        i += 2
+    }
+    if (i !== len) {
+        const v = Intrinsics.load(src+i, Types.u8)
+        Intrinsics.store(dst+i, v, Types.u8)  
+    }
+}
+
+export function memsetByte(dst: usize, len: usize, fill: u8): void {
+    while (len >= 8) {
+        len -= 8
+        Intrinsics.store(dst+len, fill, Types.u64)
+    }
+    while (len >= 4) {
+        len -= 4
+        Intrinsics.store(dst+len, fill, Types.u32)
+    }
+    while (len >= 2) {
+        len -= 2
+        Intrinsics.store(dst+len, fill, Types.u16)
+    }
+    if (len) {
+        Intrinsics.store(dst+1, fill, Types.u8)  
+    }
+}
+
 
 // we don't want to reify directly here
 export enum Types {
@@ -214,6 +306,8 @@ export enum Types {
     i64,
     f64,
     bool,
+
+    usize,
 
     // sometimes, it's just easier to keep it simple
     u1, u2, u3, u4, u5, u6, u7,
@@ -237,6 +331,7 @@ function lowerType(T: Type): Types {
         // case reify f16: return Types.f16
         // case reify f32: return Types.f32
         case reify f64: return Types.f64
+        // case reify usize: return Types.usize
         default: throw `Cannot lower type: ${String(T)}`
     }
 }
@@ -244,6 +339,7 @@ function lowerType(T: Type): Types {
 function intrinsicLoad(ptr: usize, T: Types.u8): u8
 function intrinsicLoad(ptr: usize, T: Types.u16): u16
 function intrinsicLoad(ptr: usize, T: Types.u32): u32
+function intrinsicLoad(ptr: usize, T: Types.usize): usize
 function intrinsicLoad(ptr: usize, T: Types.i8): i8
 function intrinsicLoad(ptr: usize, T: Types.i16): i16
 function intrinsicLoad(ptr: usize, T: Types.i32): i32
@@ -255,6 +351,7 @@ function intrinsicLoad(ptr: usize, T: Types) {
         case Types.i8: return memView.getInt8(ptr)
         case Types.u16: return memView.getUint16(ptr, true)
         case Types.i16: return memView.getInt16(ptr, true)
+        case Types.usize: // XXX
         case Types.u32: return memView.getUint32(ptr, true)
         case Types.i32: return memView.getInt32(ptr, true)
         case Types.f64: return memView.getFloat64(ptr, true)
@@ -273,6 +370,11 @@ function intrinsicLoad(ptr: usize, T: Types) {
     }
 }
 
+const maxMem: usize = 1 << 24
+
+let stackPointer: usize = maxMem 
+let framePointer: usize = 0 
+
 export const Intrinsics = {
     addressof: function(v: any): usize {
         const addr = v.__address
@@ -285,6 +387,18 @@ export const Intrinsics = {
     },
     stackfree: function(amt: usize) {
         stackPointer += amt
+    },
+    getStackPointer: function() {
+        return stackPointer
+    },
+    setStackPointer: function(v: usize) {
+        stackPointer = v
+    },
+    getFramePointer: function() {
+        return framePointer
+    },
+    setFramePointer: function(v: usize) {
+        framePointer = v
     },
     // heap alloc/free
     alloc: function(amt: usize) {
@@ -300,10 +414,11 @@ export const Intrinsics = {
             case Types.i8: memView.setInt8(ptr, val); return
             case Types.u16: memView.setUint16(ptr, val, true); return
             case Types.i16: memView.setInt16(ptr, val, true); return
+            case Types.usize: // XXX
             case Types.u32: memView.setUint32(ptr, val >>> 0, true); return
             case Types.i32: memView.setInt32(ptr, val, true); return
             case Types.f64: memView.setFloat64(ptr, val, true); return
-            case Types.u64:
+            case Types.u64: memView.setBigUint64(ptr, BigInt(val), true)
             case Types.i64: {
                 const lo = val >>> 0
                 const hi = Math.floor(val / 0x1_0000_0000) | 0
@@ -359,10 +474,8 @@ interface HeapBlock {
 const HeapBlock = DefineStructView(reify HeapBlock)
 
 const minSplit: u16 = 16
-const maxMem: usize = 1 << 24
 const memBuffer = new ArrayBuffer(maxMem)
 const memView = new DataView(memBuffer)
-let stackPointer: usize = maxMem 
 
 let freeListHead = HeapBlock(0)
 freeListHead.size = (1 << 23) as usize
@@ -399,6 +512,162 @@ function freeBlock(ptr: usize) {
     const block = getBlock(ptr)
     block.size &= ~(1 << 29)
 }
+
+interface InternalSlice<T> {
+    ptr: usize
+    len: usize // len*alignment to get byteLength
+    __view: StructViewFactory<T>
+    __address: usize
+}
+
+
+interface SliceMethods<T> {
+    at(idx: usize): StructView<T>
+}
+
+const InternalSlice = DefineStructView(reify InternalSlice<any>)
+
+export function StructList<T>(T: StructViewFactory<T>, count: usize, alloc: (bytes: usize) => usize) {
+    const slice_ptr = alloc(InternalSlice.sizeof)
+    const s = InternalSlice(slice_ptr) as StructView<InternalSlice<any>> & SliceMethods<T>
+    s.__view = T
+    s.ptr = alloc(count * T.sizeof)
+    s.len = count
+
+    function at(this: InternalSlice<any>, idx: usize) {
+        if (idx >= this.len) throw `Slice out of bounds: len -> ${this.len}; idx -> ${idx}`
+        const view = this.__view
+        const addr = this.ptr + idx*view.sizeof
+        return view(addr)
+    }
+
+    s.at = at
+    return s
+}
+
+interface ScalarSlice {
+    ptr: usize
+    len: usize // len*alignment to get byteLength
+    __sizeof: u32
+    __address: usize
+}
+
+interface ScalarSliceMethods<T> {
+    at(idx: usize): T
+    set(idx: usize, val: T): void
+}
+
+export function Slice<T>(T: reify T, count: usize, alloc: (bytes: usize) => usize) {
+    assert(T is Type.Machine && T.isConcrete())
+    assert(T.width % 8)
+
+    const slice_ptr = alloc(InternalSlice.sizeof)
+    const s = InternalSlice(slice_ptr) as any as ScalarSlice & ScalarSliceMethods<T>
+    s.__sizeof = (T.width as u32) >> 3
+    s.ptr = alloc(count * s.__sizeof)
+    s.len = count
+
+    const U = lowerType(T)
+
+    function at(this: ScalarSlice, idx: usize) {
+        if (idx >= this.len) throw `Slice out of bounds: len -> ${this.len}; idx -> ${idx}`
+        const addr = this.ptr + idx*this.__sizeof
+        return Intrinsics.load(addr, U) as T
+    }
+
+    function set(this: ScalarSlice, idx: usize, val: T) {
+        if (idx >= this.len) throw `Slice out of bounds: len -> ${this.len}; idx -> ${idx}`
+        const addr = this.ptr + idx*this.__sizeof
+        return Intrinsics.store(addr, val as any, U)
+    }
+
+    s.at = at
+    s.set = set
+    return s
+}
+
+interface AllocationArena {
+    head: usize
+    tail: usize
+    remaining: usize
+}
+
+interface AllocationArenaMethods {
+    free(): void
+    steal(): this // copies the frame into a new handle, taking ownership of existing handles
+    New<T>(T: StructViewFactory<T>): StructView<T>
+}
+
+const InternalArena = DefineStructView(reify AllocationArena)
+
+export type Arena = StructView<AllocationArena> & AllocationArenaMethods
+
+// This does not stack allocate but is itself stack allocated. 
+// You cannot free individual allocations.
+// 
+// ```syn
+//  const f = Arena()
+//  defer f.free()
+//  const b = f.New(Foo)
+// ```
+export function Arena(): Arena {
+    const arena = StackNew(InternalArena) as Arena
+    arena.remaining = 0
+    arena.head = 0
+
+    function addChunk(a: StructView<AllocationArena>, amt: usize) {
+        const aligned = alignUp(amt, 4)
+        const chunk = Intrinsics.alloc(aligned+8)
+        if (a.head === 0) {
+            a.head = chunk
+            Intrinsics.store(chunk+4, 0, Types.u32)
+        } else {
+            assert(a.tail !== 0)
+            Intrinsics.store(a.tail+4, chunk, Types.u32)
+        }
+        Intrinsics.store(chunk, aligned, Types.u32)
+        a.tail = chunk
+        a.remaining = aligned
+    }
+
+    arena.free = function() {
+        let ptr = this.head
+        while (ptr) {
+            const next = Intrinsics.load(ptr+4, Types.u32)
+            Intrinsics.free(ptr)
+            ptr = next
+        }
+        // simple debug check for double free, release would skip this code
+        if (this.head === 0 && this.remaining !== 0) throw `Arena was double freed`
+        this.head = 0
+        this.remaining = 1
+    }
+
+    arena.steal = function() {
+        const ret = StackNew(InternalArena) as Arena
+        const this_addr = Intrinsics.addressof(this)
+        memcpy(Intrinsics.addressof(ret), this_addr, InternalArena.sizeof)
+        memsetByte(this_addr, InternalArena.sizeof, 0)
+        return ret
+    }
+
+    arena.New = function(T) {
+        const amt = T.sizeof
+        if (amt > this.remaining) {
+            // we can also try searching from `head` for a possible spot
+            addChunk(this, (amt << 1) + (amt >> 1))
+        }
+        const rem = this.remaining
+        assert(amt <= rem)
+        this.remaining = rem - amt
+        const base = this.tail
+        const addr = (base+8) + (Intrinsics.load(base, Types.u32) - rem)
+        return T(addr)
+    }
+
+    return arena
+}
+
 
 const Example = DefineStructView(reify {
     a: u32

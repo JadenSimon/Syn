@@ -14192,6 +14192,9 @@ pub const Analyzer = struct {
                         return try this.inferConditionalTypeWithVariance(merged, condition, inferred, variance) orelse return null;
                     }
 
+                    // TODO: class literal
+                    if (comptime suppress_gaps) return false;
+
                     this.printTypeInfo(subject);
                     return error.TODO;
                 }

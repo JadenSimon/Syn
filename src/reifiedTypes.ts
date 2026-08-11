@@ -201,7 +201,12 @@ export function createTypeNamespace() {
     class Union extends Set {}
     class ObjectType {}
     class ArrayType {}
-    class FunctionType {}
+    class FunctionType {
+        constructor(
+            public readonly params?: Tuple,
+            public readonly returns?: _type
+        ) {}
+    }
     class Tuple {
         elements = [] as any[]
         add(t: any) {
@@ -212,6 +217,10 @@ export function createTypeNamespace() {
             for (const el of this.elements) {
                 (this as any)[idx++] = el.type
             }
+            (this as any)[Symbol.iterator] = () => this.elements.map(x => x.type)[Symbol.iterator]()
+        }
+        slice(a: number, b?: number) {
+            return this.elements.slice(a, b).map(x => x.type)
         }
     }
 
@@ -323,6 +332,10 @@ export function createTypeNamespace() {
         return new ArrayType()
     }
 
+    function __FunctionType() {
+        return new FunctionType()
+    }
+
     function typeToTypeId(t: _type): number {
         switch (kind(t)) {
             case 'array':
@@ -420,12 +433,14 @@ export function createTypeNamespace() {
         Tuple,
         Object: ObjectType,
         Machine,
+        Function: FunctionType,
 
         __ArrayType,
         __Object,
         __Tuple,
         __Union,
         __TypeFunction,
+        __FunctionType,
 
         __getCachedType,
         __hasCachedType,
