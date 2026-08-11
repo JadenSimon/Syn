@@ -10771,6 +10771,7 @@ pub const Binder = struct {
                 defer this.popScope();
 
                 try this.hoist(this.nodes.at(d.left), d.left);
+                try this.visitRef(d.left);
 
                 if (d.right != 0) {
                     try this.visitRef(d.right);

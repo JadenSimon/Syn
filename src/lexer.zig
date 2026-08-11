@@ -3746,8 +3746,8 @@ pub fn decodeJSEscapeSequences(text: []const u8, buf: *std.ArrayList(u8), compti
             },
             else => {
                 info.non_ascii = true;
-                // try buf.ensureUnusedCapacity(4);
-                const len = try std.unicode.utf8Encode(@intCast(iter.c), buf.items[buf.items.len..]);
+                try buf.ensureUnusedCapacity(4);
+                const len = try std.unicode.utf8Encode(@intCast(iter.c), buf.allocatedSlice()[buf.items.len..]);
                 buf.items.len += len;
             },
         }

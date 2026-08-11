@@ -1,0 +1,368 @@
+/// <reference lib="machine" />
+/// <reference lib="reify" />
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+
+const Types = intrinsics.Types
+const Intrinsics = intrinsics.Intrinsics
+
+type usize = u32
+export type Handle = u32
+
+// an "Object" is the only TD with conventional field descriptors
+// certain Object variants are wrappers around a different base. wrapping a function uniquely preserves its "typeof" value.
+enum BaseTypeKind {
+    oddball = 1, // true/false/undefined/null etc.
+    string = 2,
+    number = 3,
+    symbol = 4,
+    array = 5,
+    object = 6,
+    fn = 7,
+
+    string_table = 128,
+    native_struct = 132,
+}
+
+enum TDFlags {
+    callable = 1 << 0,
+    // anything managing data offheap will need this set
+    has_destructor = 1 << 1,
+    // means an instance _might_ be ok to stack allocate
+    stack_allocatable = 1 << 7,
+}
+
+// all strings are assumed utf-8 unless named otherwise
+enum StringVariant {
+    inline = 1, // slot1 contains packed code units, length is extraSlots + 1. The TD _is_ the string!
+    internal = 2, // instance has the index into a string table, slot1 of the TD is the string table
+    external = 3, // slot1 says if the instance is heap allocated or is a raw ptr (including static addr)
+}
+
+// shared data for describing the interpretation of a heap cell
+interface TypeDescriptorHeader {
+    kind: u8
+    variant: u8
+    extraSlots: u8 // # of extra slots, these live past the header
+    flags: u8
+    slot1: u32
+}
+
+const TypeDescriptor = intrinsics.DefineStructView(reify TypeDescriptorHeader)
+
+function allocTypeDescriptor(kind: u8, variant: u8, extraSlots: u8, flags: u8) {
+    const size = TypeDescriptor.sizeof + (extraSlots as u32) * 4
+    const td = TypeDescriptor(Intrinsics.alloc(size))
+    td.kind = kind
+    td.variant = variant
+    td.extraSlots = extraSlots
+    td.flags = flags
+    td.slot1 = 0
+    return td
+}
+
+// ---- strings --------------------------------------------------------------
+// utf-8 centric
+interface HeapString {
+    td: Handle
+    length: u32     // byte length
+    ptr: usize      // -> utf-8 bytes (external variant)
+}
+
+const HeapString = intrinsics.DefineStructView(reify HeapString)
+
+const externalStringTD = allocTypeDescriptor(BaseTypeKind.string, StringVariant.external, 0, TDFlags.has_destructor)
+
+function allocString(bytes: Uint8Array): Handle {
+    const length = bytes.length as u32
+    const dataPtr = Intrinsics.alloc(length === 0 ? 1 : length)
+    for (let i: u32 = 0; i < length; i++) {
+        Intrinsics.store(dataPtr, i, bytes[i], Types.u8)
+    }
+
+    const str = intrinsics.New(HeapString)
+    str.td = Intrinsics.addressof(externalStringTD)
+    str.length = length
+    str.ptr = dataPtr
+    return Intrinsics.addressof(str)
+}
+
+// copies `s` (as utf-8) onto the heap, returns the string instance's address
+function fromJsString(s: string): Handle {
+    const bytes = new TextEncoder().encode(s)
+    return allocString(bytes)
+}
+
+function stringLength(addr: Handle): u32 {
+    return HeapString(addr).length
+}
+
+function stringToJs(addr: Handle): string {
+    const str = HeapString(addr)
+    const length = str.length
+    const ptr = str.ptr
+    const bytes = new Uint8Array(length)
+    for (let i: u32 = 0; i < length; i++) {
+        bytes[i] = Intrinsics.load(ptr, i, Types.u8)
+    }
+    return new TextDecoder().decode(bytes)
+}
+
+function stringBytesEqual(a: Handle, b: Handle): boolean {
+    const sa = HeapString(a)
+    const sb = HeapString(b)
+    if (sa.length !== sb.length) return false
+    const pa = sa.ptr
+    const pb = sb.ptr
+    for (let i: u32 = 0; i < sa.length; i++) {
+        if (Intrinsics.load(pa, i, Types.u8) !== Intrinsics.load(pb, i, Types.u8)) return false
+    }
+    return true
+}
+
+// ---- objects --------------------------------------------------------------
+
+enum PropFlags {
+    enumerable = 1 << 0,
+    configurable = 1 << 1,
+    writable = 1 << 2,
+    has_getter = 1 << 3,
+    has_setter = 1 << 4,
+}
+
+const dataPropertyFlags: u8 = PropFlags.enumerable | PropFlags.configurable | PropFlags.writable
+
+interface FullPropertyDescriptor {
+    flags: u8
+    slot0: u32 // value, or getter
+    slot1: u32 // setter (accessor only)
+}
+
+const FullPropertyDescriptor = intrinsics.DefineStructView(reify FullPropertyDescriptor)
+
+interface PropertyEntry {
+    key: Handle
+    descriptor: Handle // -> FullPropertyDescriptor
+}
+
+const PropertyEntry = intrinsics.DefineStructView(reify PropertyEntry)
+
+interface PropertyDict {
+    count: u32
+    capacity: u32
+    entries: usize // -> PropertyEntry[capacity]
+}
+
+const PropertyDict = intrinsics.DefineStructView(reify PropertyDict)
+
+interface HeapObject {
+    td: Handle
+    properties?: Handle // -> PropertyDict
+}
+
+const HeapObject = intrinsics.DefineStructView(reify HeapObject)
+
+
+const objectTDs = new Map<Handle, Handle>()
+
+function objectTDFor(proto: Handle): Handle {
+    const cached = objectTDs.get(proto)
+    if (cached !== undefined) return cached
+    const td = allocTypeDescriptor(BaseTypeKind.object, 0, 0, 0)
+    td.slot1 = proto
+    const addr = Intrinsics.addressof(td)
+    objectTDs.set(proto, addr)
+    return addr
+}
+
+function makeObject(proto: Handle): Handle {
+    const obj = intrinsics.New(HeapObject)
+    obj.td = objectTDFor(proto)
+    return Intrinsics.addressof(obj)
+}
+
+function setPrototypeOf(obj: Handle, proto: Handle): void {
+    HeapObject(obj).td = objectTDFor(proto)
+}
+
+function prototypeOf(obj: Handle): Handle {
+    return TypeDescriptor(HeapObject(obj).td).slot1
+}
+
+function makePropertyDict(capacity: u32): Handle {
+    const dict = intrinsics.New(PropertyDict)
+    dict.count = 0
+    dict.capacity = capacity
+    dict.entries = Intrinsics.alloc(capacity * PropertyEntry.sizeof)
+    return Intrinsics.addressof(dict)
+}
+
+function objectDict(obj: Handle): Handle {
+    const o = HeapObject(obj)
+    if (o.properties) return o.properties
+    const dict = makePropertyDict(4)
+    o.properties = dict
+    return dict
+}
+
+function findEntry(dictAddr: Handle, key: Handle): Handle {
+    const dict = PropertyDict(dictAddr)
+    const entries = dict.entries
+    const count = dict.count
+    for (let i: u32 = 0; i < count; i++) {
+        const e = PropertyEntry(entries + i * PropertyEntry.sizeof)
+        if (stringBytesEqual(e.key, key)) return Intrinsics.addressof(e)
+    }
+    return 0
+}
+
+function growDict(dictAddr: Handle): void {
+    const dict = PropertyDict(dictAddr)
+    const newCap = dict.capacity * 2
+    const newEntries = Intrinsics.alloc(newCap * PropertyEntry.sizeof)
+    intrinsics.memcpy(newEntries, dict.entries, dict.count * PropertyEntry.sizeof)
+    dict.capacity = newCap
+    dict.entries = newEntries
+}
+
+function setProperty(obj: Handle, key: Handle, value: Handle): void {
+    const dictAddr = objectDict(obj)
+
+    const found = findEntry(dictAddr, key)
+    if (found) {
+        const desc = FullPropertyDescriptor(PropertyEntry(found).descriptor)
+        desc.slot0 = value
+        desc.flags = dataPropertyFlags
+        return
+    }
+
+    const dict = PropertyDict(dictAddr)
+    if (dict.count >= dict.capacity) growDict(dictAddr)
+
+    const desc = intrinsics.New(FullPropertyDescriptor)
+    desc.slot0 = value
+    desc.slot1 = 0
+    desc.flags = dataPropertyFlags
+
+    const count = dict.count
+    const e = PropertyEntry(dict.entries + count * PropertyEntry.sizeof)
+    e.key = key
+    e.descriptor = Intrinsics.addressof(desc)
+    dict.count = count + 1
+}
+
+function getOwnProperty(obj: Handle, key: Handle): Handle {
+    const o = HeapObject(obj)
+    if (!o.properties) return 0
+    const e = findEntry(o.properties, key)
+    if (e === 0) return 0
+    return PropertyEntry(e).descriptor
+}
+
+function hasProperty(obj: Handle, key: Handle): boolean {
+    let cur = obj
+    while (cur !== 0) {
+        if (getOwnProperty(cur, key) !== 0) return true
+        cur = prototypeOf(cur)
+    }
+    return false
+}
+
+function getProperty(obj: Handle, key: Handle): Handle {
+    let cur = obj
+    while (cur !== 0) {
+        const desc = getOwnProperty(cur, key)
+        if (desc !== 0) return FullPropertyDescriptor(desc).slot0
+        cur = prototypeOf(cur)
+    }
+    return 0
+}
+
+// the interpreter has two modes which can influence some of these flags
+// one of the modes does not use SMIs and has native width registers, but lacks Number.prototype.
+// in "native" mode, interpretation is entirely implied by usage instead of tracked independently
+enum FunctionBytecodeFlags {
+    has_rest_param = 1 << 0,
+    has_effects = 1 << 1, // conservative, _excludes_ allocations, `throw` is not considered an effect
+    has_no_stack_escapes = 1 << 2, // returns are not considered escapes
+    has_no_stack_returns = 1 << 3, // only stack allocated handles are stack returns
+    has_no_handle_returns = 1 << 4, // means this fn only returns simple scalars e.g. `return 1 + 1`
+    has_captures = 1 << 5,
+
+    uses_this = 1 << 9,
+    uses_callback = 1 << 10, // one of the params is known to be called in a code path
+    uses_throw = 1 << 11,
+
+    // max size of the bytecode operands. you should check `uses_u64_bytecode` first.
+    uses_u16_bytecode = 1 << 12,
+    uses_u32_bytecode = 1 << 13,
+    uses_u64_bytecode = uses_u16_bytecode | uses_u32_bytecode,
+
+    assumes_native_mode = 1 << 15,
+}
+
+interface FunctionBytecode {
+    source?: Handle // string
+    flags: u16
+    paramCount: u16 // we won't bother supporting more than this, rest params will use a flag. they will still appear apart of this count
+    registerCount: u32
+    bytecode: usize
+    bytecodeLen: u32 
+    constants: usize
+    constantsLen: u32
+}
+const FunctionBytecode = intrinsics.DefineStructView(reify FunctionBytecode)
+
+
+// ---- self test --------------------------------------
+{
+    const assert = intrinsics.assert
+
+    // strings: utf-8 roundtrip (é is 2 bytes)
+    const hello = fromJsString("héllo")
+    assert(stringLength(hello) === 6)
+    assert(stringToJs(hello) === "héllo")
+    assert(stringBytesEqual(hello, fromJsString("héllo")))
+    assert(!stringBytesEqual(hello, fromJsString("world")))
+
+    // objects + prototype chain
+    const proto = makeObject(0)
+    setProperty(proto, fromJsString("kind"), fromJsString("base"))
+
+    const obj = makeObject(proto)
+    const nameKey = fromJsString("name")
+    setProperty(obj, nameKey, fromJsString("widget"))
+
+    assert(hasProperty(obj, nameKey))
+    assert(stringToJs(getProperty(obj, nameKey)) === "widget")
+
+    // "kind" is not own but is inherited
+    assert(getOwnProperty(obj, fromJsString("kind")) === 0)
+    assert(hasProperty(obj, fromJsString("kind")))
+    assert(stringToJs(getProperty(obj, fromJsString("kind"))) === "base")
+
+    // shared TD: same prototype -> same TD handle
+    const obj2 = makeObject(proto)
+    assert(HeapObject(obj).td === HeapObject(obj2).td)
+
+    // overwrite in place
+    setProperty(obj, nameKey, fromJsString("gadget"))
+    assert(stringToJs(getProperty(obj, nameKey)) === "gadget")
+
+    // force a dict grow (initial capacity 4)
+    for (let i = 0; i < 10; i++) {
+        setProperty(obj, fromJsString("k" + i), fromJsString("v" + i))
+    }
+    assert(stringToJs(getProperty(obj, fromJsString("k7"))) === "v7")
+
+    console.log("heap self-test passed")
+}
+
+// 1. true/false are not distinct from 1/0, they are the same (also like number, you cannot use prototype methods on them)
+// 2. null/undefined are both numeric 0
+// 3. floating point ops are explicit
+// 4. no using number primitives for Number.prototype methods (for now)
+// 5. cannot use numeric keys w/o boxing them explicitly
+

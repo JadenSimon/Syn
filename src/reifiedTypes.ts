@@ -721,6 +721,8 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         performance,
         Buffer,
         JSON,
+        TextDecoder,
+        TextEncoder,
         exports: {},
     }, {
         origin: fileName,
@@ -734,9 +736,12 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             await m.link(async (spec: string, m: vm.Module) => {
                 const p = resolve?.(m.identifier, spec)
                 if (!p) return
-                const m2 = new vm.SourceTextModule(p[1], {
+                const m2 = new vm.SourceTextModule(`let __filename = import.meta.filename\n` + p[1], {
                     identifier: p[0],
-                    context: ctx,  
+                    context: ctx,
+                    initializeImportMeta: (meta, m) => {
+                        meta.filename = m.identifier.replace('.js', '.syn')
+                    },
                 })
                 return m2
             })

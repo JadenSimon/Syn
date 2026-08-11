@@ -361,11 +361,13 @@ async function runVsonTestCase(name: string) {
     await writeFile(snapshotPath, output)
 }
 
-async function testEngine() {
+async function testEngine(entrypoint = 'heap') {
     const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
 
     const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
-    const prog = api.createProgram(roots, {})
+    const prog = api.createProgram(roots, {
+        lib: ['reify', 'machine'],
+    })
 
     const results: ({ name: string, text: string })[] = []
     const emitted = new Map<string, string>()
@@ -389,11 +391,9 @@ async function testEngine() {
 
     await Promise.all(promises)
 
-    const entry = 'intrinsics'
-
-    const f = results.find(x => x.name.includes(entry))!
+    const f = results.find(x => x.name.includes(entrypoint))!
     const reifier = (prog as any).getReifier()
-    return runSynModule(f.text, path.resolve(`src/engine/${entry}.syn`), reifier, false, (from, name) => {
+    return runSynModule(f.text, path.resolve(`src/engine/${entrypoint}.syn`), reifier, false, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
         let sourceName = r
         const extname = path.extname(r)
@@ -442,7 +442,7 @@ async function gatherTestCases() {
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
-    if (filter === '--engine') return testEngine()
+    if (filter === '--engine') return testEngine(args[1])
 
     const shouldExecute = args[1] === '--reify'
 
