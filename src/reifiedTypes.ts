@@ -736,6 +736,20 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         return (async function() {
             const modules = new Map<string, any>()
             await m.link(async (spec: string, m: vm.Module) => {
+                if (spec === 'typescript') {
+                    const cached = modules.get(spec)
+                    if (cached) return cached
+                    const exports = Object.keys(ts)
+                    if (!exports.includes('default')) exports.push('default')
+                    const mod = new vm.SyntheticModule(exports, function() {
+                        for (const k of exports) {
+                            this.setExport(k, ts[k])
+                        }
+                        this.setExport('default', ts)
+                    }, { context: ctx })
+                    modules.set(spec, mod)
+                    return mod
+                }
                 const p = resolve?.(m.identifier, spec)
                 if (!p) return
                 const cached = modules.get(p[0])

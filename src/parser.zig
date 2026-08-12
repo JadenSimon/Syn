@@ -479,7 +479,7 @@ pub const NodeFlags = enum(u22) {
     none = 0,
     let = 1 << 0, // hex for numbers
     @"const" = 1 << 1,
-    using = 1 << 2,
+    using = 1 << 2, // means "uses this" inside fn decl/exp
     @"async" = 1 << 3,
     await_using = (1 << 2) | (1 << 3),
 
@@ -518,6 +518,11 @@ pub const NodeFlags = enum(u22) {
 
     // upper two bits are reserved for ephemeral usage
     replaced = 1 << 20,
+};
+
+pub const FnFlags = enum(u22) {
+    uses_this = 1 << 2,
+    @"async" = 1 << 3,
 };
 
 pub const StringFlags = enum(u20) {
@@ -9649,7 +9654,12 @@ pub const Binder = struct {
                 }
 
                 if (node.len != 0) {
-                    return this.hoistAndVisit(this.nodes.at(node.len));
+                    try this.hoistAndVisit(this.nodes.at(node.len));
+                    // we bound `this`
+                    if ((this.this_scope.items[this.this_scope.items.len - 1] >> 31) != 1) {
+                        @constCast(node).flags |= @intFromEnum(FnFlags.uses_this);
+                    }
+                    return;
                 }
             },
             .constructor => {

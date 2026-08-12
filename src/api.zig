@@ -567,6 +567,20 @@ pub fn callTypeFunction(reifier: *js.Object, target: u32, args: js.Array(u32)) !
     return @ptrCast(result);
 }
 
+pub fn isLateBoundSymbol(sf: WrappedFile, sym_ref: u32) bool {
+    const sym = sf.value.binder.symbols.at(sym_ref);
+    return sym.hasFlag(.late_bound);
+}
+
+pub fn usesThisBinding(sf: WrappedFile, node_ref: u32) bool {
+    const node = sf.value.ast.nodes.at(node_ref);
+    switch (node.kind) {
+        .function_declaration, .function_expression, .method_declaration, .get_accessor, .set_accessor => {},
+        else => return false,
+    }
+    return node.hasFlag(.using);
+}
+
 comptime {
     js.registerModule(@This());
 }

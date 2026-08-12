@@ -21724,6 +21724,7 @@ pub const Analyzer = struct {
                 return this.getType(file, unwrapRef(node));
             },
             .import_type => {
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
                 // Binder should attach relevant symbol to rhs
                 return error.TODO;
             },

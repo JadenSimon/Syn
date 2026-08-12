@@ -1355,6 +1355,39 @@ class AstNode {
             character: pos - lines[l-1],
         }
     }
+
+    public isLateBoundSymbol(): boolean {
+        if (this.kind !== SyntaxKind.Identifier) return false
+        const sym_ref = this.extra
+        if (!sym_ref) return false
+        const sf = getSourceFileInternal(this as any)
+        if (sf === undefined) {
+            throw new Error(`No source file found`)
+        }
+        return api.isLateBoundSymbol(sf.handle, sym_ref)
+    }
+
+    public usesThisBinding(): boolean {
+        switch (this.kind) {
+            case SyntaxKind.FunctionDeclaration:
+            case SyntaxKind.FunctionExpression:
+            case SyntaxKind.GetAccessor:
+            case SyntaxKind.SetAccessor:
+            case SyntaxKind.MethodDeclaration:
+                break
+            default: return false
+        }
+        const sf = getSourceFileInternal(this as any)
+        if (sf === undefined) {
+            throw new Error(`No source file found`)
+        }
+        return api.usesThisBinding(sf.handle, this.ref)
+    }
+
+    public getf64() {
+        const view = new Float64Array(this.buf.buffer, (this.ref * 32) + 8, 1)
+        return view[0]
+    }
 }
 
 export function forEachChild<T>(

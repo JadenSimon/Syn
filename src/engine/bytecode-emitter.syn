@@ -1,32 +1,620 @@
 "use wrapped";
 
 import * as heap from './heap'
-import { Op } from './vm'
+import * as intrinsics from './intrinsics'
+import { Op, createInterpreter, makeFunctionFromBytes } from './vm'
+import ts from 'typescript'
 
-// we will have parts of the `typescript` API available to us
-type ts = typeof import('typescript')
-declare var ts: ts
+const Types = intrinsics.Types
+const Intrinsics = intrinsics.Intrinsics
+const inRange = intrinsics.inRange
 
-type Node = import('typescript').Node
+type usize = u32
+type Handle = heap.Handle
 
-function getSymbolId(node: Node) {
+function isLateBoundSymbol(node: ts.Node) {
+    return (node as any).isLateBoundSymbol?.() ?? false
+}
+
+function getSymbolId(node: ts.Node) {
     return (node as any).extra
 }
 
-function test() {
-    const sf = ts.createSourceFile('test.js', 'function(a, b) { return a + b }', ts.ScriptTarget.Latest)
-    function visit(node: Node): any {
-        if (node.kind === ts.SyntaxKind.Identifier) {
-            const symId = getSymbolId(node)
-            if (symId === 0) {
-                // if it's zero, then it's not a lexical ident
-                return
-            }
-            console.log(node.getText(), symId)
-        }
-        return ts.forEachChild(node, visit)
-    }
-    visit(sf)
+function usesThisBinding(node: ts.Node) {
+    return (node as any).usesThisBinding?.() ?? false
 }
 
-test()
+type EmitResult = {
+    code: number[]           // opcodes + byte operands
+    constants: any[]         // string = intern/late-bound name (-> heap string), number = raw scalar
+    constantIsHandle: boolean[]
+    paramCount: number
+    registerCount: number
+    lateBound: Map<number, number> // symbol id -> constant pool slot
+}
+
+function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitResult {
+    const code: number[] = []
+    const constants: any[] = []
+    const constantIsHandle: boolean[] = []
+
+    const internMap = new Map<string, number>()  // interning key -> slot
+    const symToReg = new Map<number, number>()    // symbol id -> register
+    const lateBound = new Map<number, number>()   // symbol id -> constant slot
+
+    let nextReg = 0
+    let maxReg = 0
+    let thisReg: number | undefined = undefined // register holding `this`, if the fn uses it
+
+    function allocReg(): number {
+        const r = nextReg
+        nextReg = nextReg + 1
+        if (nextReg > maxReg) maxReg = nextReg
+        return r
+    }
+    function freeReg() { nextReg = nextReg - 1 }
+
+    function emitByte(b: number) {
+        if (b < 0 || b > 255) throw `operand out of byte range: ${b} (TODO: width prefixes)`
+        code.push(b)
+    }
+    function emit1(op: number) { code.push(op) }
+    function emit2(op: number, operand: number) { code.push(op); emitByte(operand) }
+
+    function emitLoadImm(val: number) {
+        if (inRange(Types.i8, val)) { code.push(Op.LdaImm); code.push(val & 0xFF); return }
+        if (inRange(Types.i16, val)) {
+            code.push(Op.Width2); code.push(Op.LdaImm)
+            code.push(val & 0xFF); code.push((val >>> 8) & 0xFF)
+            return
+        }
+        if (inRange(Types.i32, val)) {
+            code.push(Op.Width4); code.push(Op.LdaImm)
+            code.push(val & 0xFF); code.push((val >>> 8) & 0xFF)
+            code.push((val >>> 16) & 0xFF); code.push((val >>> 24) & 0xFF)
+            return
+        }
+        throw `immediate too large: ${val}`
+    }
+
+    function emitLoadConst(slot: number) {
+        if (slot <= 0xFF) { code.push(Op.LdaConst); code.push(slot); return }
+        if (slot <= 0xFFFF) {
+            code.push(Op.Width2); code.push(Op.LdaConst)
+            code.push(slot & 0xFF); code.push((slot >>> 8) & 0xFF)
+            return
+        }
+        if (slot <= 0xFFFFFFFF) {
+            code.push(Op.Width4); code.push(Op.LdaConst)
+            code.push(slot & 0xFF); code.push((slot >>> 8) & 0xFF)
+            code.push((slot >>> 16) & 0xFF); code.push((slot >>> 24) & 0xFF)
+            return
+        }
+        throw `constant pool index too large: ${slot}`
+    }
+
+    function internString(s: string): number {
+        const existing = internMap.get(s)
+        if (existing !== undefined) return existing
+        const slot = constants.length
+        constants.push(s)
+        constantIsHandle.push(true)
+        internMap.set(s, slot)
+        return slot
+    }
+    function internNumber(v: number): number {
+        const key = "##" + v
+        const existing = internMap.get(key)
+        if (existing !== undefined) return existing
+        const slot = constants.length
+        constants.push(v)
+        constantIsHandle.push(false)
+        internMap.set(key, slot)
+        return slot
+    }
+    function lateBoundSlot(symId: number, name: string): number {
+        const existing = lateBound.get(symId)
+        if (existing !== undefined) return existing
+        const slot = constants.length
+        constants.push(name)
+        constantIsHandle.push(true)
+        lateBound.set(symId, slot)
+        return slot
+    }
+
+    function emitNumber(v: number) {
+        if (!Number.isInteger(v)) throw "float literals are not supported yet"
+        if (inRange(Types.i8, v)) {
+            return emitLoadImm(v)
+        }
+        emitLoadConst(internNumber(v))
+    }
+
+    function emitLiteral(v: FoldResultValue) {
+        if (v === true) return emit1(Op.LdaTrue)
+        if (v === false) return emit1(Op.LdaFalse)
+        if (v === null) return emit1(Op.LdaNull)
+        if (v === undefined) return emit1(Op.LdaUndefined)
+        if (typeof v === 'string') return emitLoadConst(internString(v));
+        intrinsics.assert(typeof v === 'number')
+        return emitNumber(v)
+    }
+
+    function isLexicalIdent(node: ts.Node): boolean {
+        if (!ts.isIdentifier(node)) return false
+        if (isLateBoundSymbol(node)) return false
+        return symToReg.has(getSymbolId(node))
+    }
+
+    const foldedVariables = new Map<number, [FoldResultValue]>()
+    function tryFoldVariableDecl(node: ts.VariableDeclaration) {
+        if (!node.initializer) return false
+        if (!ts.isIdentifier(node.name)) return false
+        // ASSUMES CONST BINDING
+        // MUST NOT HAVE BEEN REF'D YET
+        const symId = getSymbolId(node.name)
+        if (symToReg.has(symId)) return false
+        // simple = just constant fold it
+        if (const r = tryFoldExp(node.initializer)) {
+            if (r[0] === 'value') {
+                foldedVariables.set(symId, [r[1]])
+                return true
+            }
+        }
+        return false
+    }
+
+    function isDeadCode(node: ts.Node) {
+        // extremely simple DCE, don't expect much from it
+        switch (node.kind) {
+            case ts.SyntaxKind.ExpressionStatement:
+                switch ((node as ts.ExpressionStatement).expression.kind) {
+                    case ts.SyntaxKind.NumericLiteral:
+                    case ts.SyntaxKind.StringLiteral: return true
+                }
+        }
+        return false
+    }
+
+    function mapBinaryOp(kind: ts.SyntaxKind): number {
+        switch (kind) {
+            case ts.SyntaxKind.PlusToken: return Op.Add
+            case ts.SyntaxKind.MinusToken: return Op.Sub
+            case ts.SyntaxKind.AsteriskToken: return Op.Mul
+            case ts.SyntaxKind.SlashToken: return Op.Div
+            case ts.SyntaxKind.PercentToken: return Op.Mod
+            case ts.SyntaxKind.AsteriskAsteriskToken: return Op.Exp
+            case ts.SyntaxKind.AmpersandToken: return Op.BitAnd
+            case ts.SyntaxKind.BarToken: return Op.BitOr
+            case ts.SyntaxKind.CaretToken: return Op.BitXor
+            case ts.SyntaxKind.LessThanLessThanToken: return Op.ShiftLeft
+            case ts.SyntaxKind.GreaterThanGreaterThanToken: return Op.ShiftRight
+            case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken: return Op.ShiftRightLogical
+            case ts.SyntaxKind.LessThanToken: return Op.TestLessThan
+            case ts.SyntaxKind.GreaterThanToken: return Op.TestGreaterThan
+            case ts.SyntaxKind.LessThanEqualsToken: return Op.TestLessThanOrEqual
+            case ts.SyntaxKind.GreaterThanEqualsToken: return Op.TestGreaterThanOrEqual
+            case ts.SyntaxKind.EqualsEqualsToken: return Op.TestEqual
+            case ts.SyntaxKind.EqualsEqualsEqualsToken: return Op.TestStrictEqual
+            default: throw `unsupported binary operator: ${ts.SyntaxKind[kind]}`
+        }
+    }
+
+    function tryFoldInts(kind: ts.SyntaxKind, lv: number, rv: number): number {
+        switch (kind) {
+            case ts.SyntaxKind.PlusToken: return lv + rv
+            case ts.SyntaxKind.MinusToken: return lv - rv
+            case ts.SyntaxKind.AsteriskToken: return Math.imul(lv, rv)
+            case ts.SyntaxKind.AmpersandToken: return lv & rv
+            case ts.SyntaxKind.BarToken: return lv | rv
+            case ts.SyntaxKind.CaretToken: return lv ^ rv
+            case ts.SyntaxKind.LessThanLessThanToken: return lv << rv
+            case ts.SyntaxKind.GreaterThanGreaterThanToken: return lv >> rv
+            case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken: return lv >>> rv
+            case ts.SyntaxKind.LessThanToken: return lv < rv ? 1 : 0
+            case ts.SyntaxKind.GreaterThanToken: return lv > rv ? 1 : 0
+            case ts.SyntaxKind.LessThanEqualsToken: return lv <= rv ? 1 : 0
+            case ts.SyntaxKind.GreaterThanEqualsToken: return lv >= rv ? 1 : 0
+            case ts.SyntaxKind.EqualsEqualsToken:
+            case ts.SyntaxKind.EqualsEqualsEqualsToken: return lv === rv ? 1 : 0
+            case ts.SyntaxKind.SlashToken:
+                if (rv === 0) throw `Invalid expression: ${lv} / ${rv}`
+                return Math.trunc(lv / rv) // idiv
+            case ts.SyntaxKind.PercentToken:
+                if (rv === 0) throw `Invalid expression: ${lv} % ${rv}`
+                return lv % rv
+            case ts.SyntaxKind.AsteriskAsteriskToken:
+                const res = lv**rv
+                if (!Number.isInteger(res)) throw `Invalid expression: ${lv} ** ${rv} = ${res}`
+                return res
+            default: throw "not foldable"
+        }
+    }
+
+    function isFoldable(kind: ts.SyntaxKind): boolean {
+        switch (kind) {
+            // these are only foldable in native mode (we throw here if it would produce NaN)
+            case ts.SyntaxKind.SlashToken:
+            case ts.SyntaxKind.PercentToken:
+                return true
+            case ts.SyntaxKind.CommaToken: return false
+            case ts.SyntaxKind.PlusEqualsToken:
+            case ts.SyntaxKind.MinusEqualsToken:
+            case ts.SyntaxKind.SlashEqualsToken:
+            case ts.SyntaxKind.AsteriskEqualsToken:
+            case ts.SyntaxKind.AmpersandEqualsToken:
+            case ts.SyntaxKind.BarEqualsToken:
+            case ts.SyntaxKind.CaretEqualsToken:
+            case ts.SyntaxKind.QuestionQuestionEqualsToken:
+            case ts.SyntaxKind.BarBarEqualsToken:
+            case ts.SyntaxKind.AmpersandAmpersandEqualsToken:
+            case ts.SyntaxKind.EqualsToken:
+                return false
+            default: return true
+        }
+    }
+
+    function isLogicalOp(kind: ts.SyntaxKind): boolean {
+        return kind === ts.SyntaxKind.BarBarToken || kind === ts.SyntaxKind.AmpersandAmpersandToken || kind === ts.SyntaxKind.QuestionQuestionToken
+    }
+
+    const foldedResults = new Map<ts.Expression, FoldResult | false>()
+    type FoldResultValue = string | number | boolean | undefined | null
+    type FoldResult = 
+        | [kind: 'value', value: FoldResultValue]
+        | [kind: 'residual', node: ts.Expression]
+    function tryFoldExp(node: ts.Expression): FoldResult | undefined {
+        if (ts.isParenthesizedExpression(node)) {
+            return tryFoldExp(node.expression)
+        }
+        if (ts.isNumericLiteral(node)) {
+            const val = (node as any).getf64()
+            return ['value', val]
+        }
+        if (ts.isStringLiteral(node)) {
+            return ['value', node.text]
+        }
+        if (node.kind === ts.SyntaxKind.TrueKeyword) {
+            return ['value', true]
+        }
+        if (node.kind === ts.SyntaxKind.FalseKeyword) {
+            return ['value', false]
+        }
+        if (node.kind === ts.SyntaxKind.NullKeyword) {
+            return ['value', null]
+        }
+        if (node.kind === ts.SyntaxKind.UndefinedKeyword) {
+            return ['value', undefined]
+        }
+        if (const r = foldedResults.get(node)) return r ? r : undefined
+
+        function tryGetNumber(opKind: ts.SyntaxKind, n: ts.Expression) {
+            const v = tryFoldExp(n)
+            if (!v || v[0] === 'residual') return
+            const operand = v[1]
+            if (typeof operand !== 'number') throw `Unexpected operand: ${ts.SyntaxKind[opKind]} ${operand}`
+            return operand
+        }
+
+        function tryGetAnyValue(n: ts.Expression) {
+            const v = tryFoldExp(n)
+            if (!v || v[0] === 'residual') return
+            return v
+        }
+
+        function fold(): FoldResult | undefined  {
+            if (ts.isConditionalExpression(node)) {
+                const cond = tryFoldExp(node.condition)
+                if (!cond || cond[0] === 'residual') return
+                if (cond[1]) {
+                    return tryFoldExp(node.whenTrue) ?? ['residual', node.whenTrue]
+                }
+                return tryFoldExp(node.whenFalse) ?? ['residual', node.whenFalse]
+            } else if (ts.isBinaryExpression(node)) {
+                const opKind = node.operatorToken.kind
+                if (!isFoldable(opKind)) return
+                const v1 = tryFoldExp(node.left)
+                if (!v1 || v1[0] === 'residual') return
+                const l = v1[1]
+
+                if (isLogicalOp(opKind)) {
+                    if (opKind === ts.SyntaxKind.BarBarToken) {
+                        if (l) return ['value', l]
+                        return tryFoldExp(node.right) ?? ['residual', node.right]
+                    }
+                    if (opKind === ts.SyntaxKind.AmpersandAmpersandToken) {
+                        if (!l) return ['value', l]
+                        return tryFoldExp(node.right) ?? ['residual', node.right]
+                    }
+                    if (opKind === ts.SyntaxKind.QuestionQuestionToken) {
+                        if (l !== undefined && l !== null) return ['value', l]
+                        return tryFoldExp(node.right) ?? ['residual', node.right]
+                    }
+                }
+
+                const v2 = tryFoldExp(node.right)
+                if (!v2 || v2[0] === 'residual') {
+                    return
+                }
+                const r = v2[1]
+
+                if (typeof l === 'string' || typeof r === 'string') {
+                    intrinsics.assert(opKind === ts.SyntaxKind.PlusToken)
+                    return ['value', l + (r as string)]
+                }
+                if (typeof l === 'number' && typeof r === 'number') {
+                    intrinsics.assert(Number.isInteger(l) && Number.isInteger(r))
+                    return ['value', tryFoldInts(opKind, l, r)]
+                }
+
+                throw `Unexpected operands: ${l} ${ts.SyntaxKind[opKind]} ${r}`
+            } else if (ts.isPrefixUnaryExpression(node)) {
+                const opKind = node.operator
+                if (opKind === ts.SyntaxKind.MinusToken) {
+                    if (const v = tryGetNumber(opKind, node.operand)) {
+                        return ['value', -v]
+                    }
+                } else if (opKind === ts.SyntaxKind.TildeToken) {
+                    if (const v = tryGetNumber(opKind, node.operand)) {
+                        return ['value', ~v]
+                    }
+                } else if (opKind === ts.SyntaxKind.ExclamationToken) {
+                    if (const v = tryGetAnyValue(node.operand)) {
+                        return ['value', !v]
+                    }
+                }
+            } else if (ts.isIdentifier(node)) {
+                const symId = getSymbolId(node)
+                if (!symId) return
+                if (const x = foldedVariables.get(symId)) {
+                    return ['value', x[0]]
+                }
+            }
+        }
+
+        const r = fold()
+        if (!r) {
+            foldedResults.set(node, false)
+            return
+        }
+        foldedResults.set(node, r)
+        return r
+    }
+
+    function emitBinary(node: ts.BinaryExpression) {
+        const kind = node.operatorToken.kind
+
+        if (kind === ts.SyntaxKind.CommaToken) {
+            emitExpr(node.left)
+            emitExpr(node.right)
+            return
+        }
+
+        if (ts.isNumericLiteral(node.left) && ts.isNumericLiteral(node.right) && isFoldable(kind)) {
+            const lv = Number(node.left.text)
+            const rv = Number(node.right.text)
+            if (Number.isInteger(lv) && Number.isInteger(rv)) { emitNumber(tryFoldInts(kind, lv, rv)); return }
+        }
+
+        const op = mapBinaryOp(kind)
+
+        if (isLexicalIdent(node.right)) {
+            emitExpr(node.left)
+            emit2(op, symToReg.get(getSymbolId(node.right))!)
+            return
+        }
+
+        emitExpr(node.left)
+        const rL = allocReg(); emit2(Op.Star, rL)
+        emitExpr(node.right)
+        const rR = allocReg(); emit2(Op.Star, rR)
+        emit2(Op.Ldar, rL)
+        emit2(op, rR)
+        freeReg() // rR
+        freeReg() // rL
+    }
+
+    function emitIdentifier(node: ts.Identifier) {
+        const symId = getSymbolId(node)
+        if (symId === 0) throw `non-lexical identifier: ${node.getText()}`
+        if (isLateBoundSymbol(node)) { emitLoadConst(lateBoundSlot(symId, node.getText())); return }
+        const reg = symToReg.get(symId)
+        if (reg !== undefined) {
+            return emit2(Op.Ldar, reg)
+        }
+        // was folded
+        const v = foldedVariables.get(symId)
+        if (!v) throw `unresolved identifier: ${node.getText()}`
+        return emitLiteral(v[0])
+    }
+
+    function emitExpr(node: ts.Expression): void {
+        if (const r = tryFoldExp(node)) {
+            if (r[0] === 'value') {
+                return emitLiteral(r[1])
+            }
+            return emitExpr(r[1]) // residual
+        }
+        if (ts.isParenthesizedExpression(node)) { emitExpr(node.expression); return }
+        if (node.kind === ts.SyntaxKind.ThisKeyword) {
+            if (thisReg !== undefined) { emit2(Op.Ldar, thisReg); return }
+            // generally should not happen?
+            emitLoadConst(lateBoundSlot(getSymbolId(node), "this"))
+            return
+        }
+        if (ts.isNumericLiteral(node)) { emitNumber(Number(node.text)); return }
+        if (ts.isStringLiteral(node)) { emitLoadConst(internString(node.text)); return }
+        if (ts.isIdentifier(node)) { emitIdentifier(node); return }
+        if (ts.isBinaryExpression(node)) { emitBinary(node); return }
+        throw `unsupported expression: ${ts.SyntaxKind[node.kind]}`
+    }
+
+    function emitVariableStatement(node: ts.VariableStatement) {
+        const isConst = !!ts.getModifiers(node)?.find(x => x.kind === ts.SyntaxKind.ConstKeyword)
+        for (const decl of node.declarationList.declarations) {
+            if (!ts.isIdentifier(decl.name)) throw "destructuring bindings are not supported"
+            const symId = getSymbolId(decl.name)
+            if (symId === 0) throw "binding has no symbol id"
+            if (isConst) {
+                if (tryFoldVariableDecl(decl)) continue
+            }
+            const reg = allocReg()
+            symToReg.set(symId, reg)
+            if (decl.initializer) { emitExpr(decl.initializer); emit2(Op.Star, reg) }
+        }
+    }
+
+    function emitBlock(node: ts.Block) {
+        const savedReg = nextReg
+        for (const s of node.statements) emitStatement(s)
+        nextReg = savedReg
+    }
+
+    function emitStatement(node: ts.Statement) {
+        if (isDeadCode(node)) return
+        if (ts.isReturnStatement(node)) {
+            if (node.expression) emitExpr(node.expression)
+            emit1(Op.Return)
+            return
+        }
+        if (ts.isExpressionStatement(node)) { emitExpr(node.expression); return }
+        if (ts.isVariableStatement(node)) { emitVariableStatement(node); return }
+        if (ts.isBlock(node)) { emitBlock(node); return }
+        if (ts.isFunctionDeclaration(node)) throw "nested function declarations are not supported"
+        throw `unsupported statement: ${ts.SyntaxKind[node.kind]}`
+    }
+
+    for (const p of fn.parameters) {
+        if (!ts.isIdentifier(p.name)) throw "destructuring parameters are not supported"
+        if (p.dotDotDotToken) throw "rest parameters are not supported"
+        if (p.initializer) throw "default parameter values are not supported"
+        symToReg.set(getSymbolId(p.name), allocReg())
+    }
+
+    if (usesThisBinding(fn)) {
+        thisReg = allocReg()
+        emit2(Op.Star, thisReg)
+    }
+
+    if (!fn.body) throw "function has no body"
+    if (ts.isBlock(fn.body)) {
+        emitBlock(fn.body)
+    } else {
+        emitExpr(fn.body) // arrow fn
+    }
+
+    if (code.at(-1) !== Op.Return) {
+        emit1(Op.Return)
+    }
+
+    return {
+        code,
+        constants,
+        constantIsHandle,
+        paramCount: fn.parameters.length,
+        registerCount: maxReg,
+        lateBound,
+    }
+}
+
+function unwrapParensOrExpStatement(node: ts.Node) {
+    if (ts.isParenthesizedExpression(node) || ts.isExpressionStatement(node)) {
+        return unwrapParensOrExpStatement(node.expression)
+    }
+    return node
+}
+
+function compile(src: string): EmitResult {
+    const sf = ts.createSourceFile('input.js', src, ts.ScriptTarget.Latest)
+    const fn = sf.statements[0]
+    if (!fn) throw "found no statements in source"
+    const exp = unwrapParensOrExpStatement(fn)
+    if (ts.isArrowFunction(exp) || ts.isFunctionExpression(exp)) {
+        return emitFunction(exp)
+    }
+    if (!ts.isFunctionDeclaration(fn)) 
+        throw "expected the source to be a single function declaration/expression"
+    return emitFunction(fn)
+}
+
+function testBytecodeEmit(str: string, name = 'f') {
+    const r = compile(str)
+    console.log(`${name}: code`, r.code)
+    console.log(`${name}: constants`, r.constants, r.constantIsHandle)
+    console.log(`${name}: lateBound`, r.lateBound)
+}
+
+function emitTest() {
+    testBytecodeEmit('function add(a, b) { let c = a + b; return c * 2 }')
+
+    testBytecodeEmit('function f(a) { return a + g + "hi" + (2 * 20) }')
+
+    testBytecodeEmit('function f(a) { const x = 10*10; return x+x+a }', 'constReduce')
+}
+emitTest()
+
+function finalize(result: EmitResult): Handle {
+    const constants: number[] = []
+    for (let i = 0; i < result.constants.length; i++) {
+        if (result.constantIsHandle[i]) constants.push(heap.fromJsString(result.constants[i]))
+        else constants.push(result.constants[i])
+    }
+    return makeFunctionFromBytes(result.code, result.paramCount as u16, result.registerCount as u32, constants)
+}
+
+function e2eTest(code: string, _args: any[]) {
+    const interpret = createInterpreter(true) // native mode
+    const fn = finalize(compile(code))
+    const args = Intrinsics.stackalloc(_args.length * 4 as usize)
+    for (let i = 0; i < _args.length; i++) {
+        Intrinsics.store(args, 4*i as u32, _args[i], Types.u32)
+    }
+    const r = interpret(fn, 0, args, _args.length as u32)
+    Intrinsics.stackfree(_args.length * 4 as usize)
+    return r & (2**32)-1 // TODO: the intrinsics should be truncating
+}
+
+function runTest() {
+    console.log(e2eTest('(x => x + -1);', [2]))
+
+    const interpret = createInterpreter(true) // native mode
+
+    const addFn = finalize(compile('function add(a, b) { let c = a + b; return c * 2 }'))
+    const args = Intrinsics.stackalloc(2 * 4)
+    Intrinsics.store(args, 0, 2, Types.u32)
+    Intrinsics.store(args, 4, 3, Types.u32)
+    const r = interpret(addFn, 0, args, 2)
+    Intrinsics.stackfree(2 * 4)
+    intrinsics.assert(r === 10) // (2 + 3) * 2
+    console.log("compiled add(2, 3) =", r)
+
+    const gFn = finalize(compile('function g(x) { return x * 10 + (3 - 1) }'))
+    const a2 = Intrinsics.stackalloc(4)
+    Intrinsics.store(a2, 0, 4, Types.u32)
+    const r2 = interpret(gFn, 0, a2, 1)
+    Intrinsics.stackfree(4)
+    intrinsics.assert(r2 === 42) // 4 * 10 + 2
+    console.log("compiled g(4) =", r2)
+
+    let bigSrc = 'function big() {'
+    for (let v = 200; v <= 500; v++) bigSrc = bigSrc + ' ' + v + ';'
+    bigSrc = bigSrc + ' return 456 }'
+    const bigFn = finalize(compile(bigSrc))
+    const a3 = Intrinsics.stackalloc(4)
+    const r3 = interpret(bigFn, 0, a3, 0)
+    Intrinsics.stackfree(4)
+    intrinsics.assert(r3 === 456)
+    console.log("compiled big() =", r3, "(via Width2 LdaConst, 301 constants)")
+
+    const thisFn = finalize(compile('function useThis(a) { return this + a }'))
+    const a4 = Intrinsics.stackalloc(4)
+    Intrinsics.store(a4, 0, 2, Types.u32)
+    const r4 = interpret(thisFn, 40, a4, 1) // thisArg = 40
+    Intrinsics.stackfree(4)
+    intrinsics.assert(r4 === 42) // this(40) + a(2)
+    console.log("compiled useThis(2) with this=40 =", r4)
+
+    console.log("bytecode-emitter end-to-end passed")
+}
+runTest()
+
