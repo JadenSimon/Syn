@@ -711,10 +711,11 @@ class _Object extends NullClass {
     }
 }
 
-export function runSynModule(text: string, fileName: string, reifier: { types: any, __reify: any }, cjs = true, resolve?: (from: string, name: string) => [absPath: string, text: string]) {
+export function runSynModule(text: string, fileName: string, reifier: { types: any, __reify: any }, cjs = true, resolve?: (from: string, name: string) => [absPath: string, text: string], ts?: any) {
     ;(globalThis as any).Type = reifier.types
     const ctx = vm.createContext({
         __filename: fileName,
+        ts,
         Type: reifier.types,
         __reify: reifier.__reify,
         console: console,
@@ -733,9 +734,12 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             context: ctx,
         })
         return (async function() {
+            const modules = new Map<string, any>()
             await m.link(async (spec: string, m: vm.Module) => {
                 const p = resolve?.(m.identifier, spec)
                 if (!p) return
+                const cached = modules.get(p[0])
+                if (cached) return cached
                 const m2 = new vm.SourceTextModule(`let __filename = import.meta.filename\n` + p[1], {
                     identifier: p[0],
                     context: ctx,
@@ -743,6 +747,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
                         meta.filename = m.identifier.replace('.js', '.syn')
                     },
                 })
+                modules.set(p[0], m2)
                 return m2
             })
             return await m.evaluate()

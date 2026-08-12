@@ -3079,6 +3079,33 @@ pub const Program = struct {
                 return result orelse self.factory.createTrue();
             }
 
+            fn lowerEnumDeclaration(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                const enum_type = try self.analyzer.getType(self.file, ref);
+                const members = Analyzer.getSlice2(self.analyzer.types.at(enum_type), Analyzer.ObjectLiteralMember);
+
+                var props = std.ArrayList(NodeRef).init(getAllocator());
+                defer props.deinit();
+
+                for (members) |*m| {
+                    if (m.kind != .property) continue;
+                    const key_id = try self.factory.createIdentifier(self.analyzer.getSliceFromLiteral(m.name));
+
+                    const vty = try m.getType(self.analyzer);
+                    const value_node = if (vty < @intFromEnum(Kind.false) and self.analyzer.getKindOfRef(vty) == .string_literal)
+                        try self.factory.createStringLiteral(self.analyzer.getSliceFromLiteral(vty))
+                    else
+                        try self.factory.createNumericLiteral(self.analyzer.getDoubleFromType(vty));
+
+                    try props.append(try self.factory.createPropertyAssignment(key_id, value_node));
+                }
+
+                const name_ident = try self.factory.createIdentifier(getSlice(self.nodes.at(getPackedData(n).left), u8));
+                const decl = try self.factory.createConstVariable(name_ident, try self.factory.createObjectLiteralExpression(props.items));
+                if (n.hasFlag(.@"export")) self.nodes.at(decl).flags |= @intFromEnum(NodeFlags.@"export");
+                self.nodes.at(decl).next = n.next;
+                try self.replacements.put(ref, decl);
+            }
+
             fn detectCheckedDirective(self: *@This(), stmts_head: NodeRef) ?u2 {
                 var ref = stmts_head;
                 while (ref != 0) {
@@ -3385,7 +3412,7 @@ pub const Program = struct {
 
                     if (needs_break) {
                         const break_stmt = try self.factory.createBreakStatement();
-                        const last_copy = try self.factory.cloneNode(self.nodes.at(last_stmt_ref));
+                        const last_copy = try self.factory.cloneNodeRef(last_stmt_ref);
                         self.nodes.at(last_copy).next = break_stmt;
                         try self.addReplacement(last_stmt_ref, last_copy);
                     }
@@ -3422,7 +3449,7 @@ pub const Program = struct {
 
                 if (needs_break) {
                     const break_stmt = try self.factory.createBreakStatement();
-                    const last_copy = try self.factory.cloneNode(last_stmt);
+                    const last_copy = try self.factory.cloneNodeRef(last_stmt_ref);
                     self.nodes.at(last_copy).next = break_stmt;
                     try self.addReplacement(last_stmt_ref, last_copy);
                 }
@@ -10437,8 +10464,7 @@ pub const Program = struct {
                             result_head = cloned_stmt;
                         }
 
-                        try self.replacements.put(ref, result_head);
-
+                        try self.addReplacement(ref, result_head);
                         try parser.forEachChild(self.nodes, n, self);
                     },
                     .variable_statement => {
@@ -10647,6 +10673,7 @@ pub const Program = struct {
                         }
                         try parser.forEachChild(self.nodes, n, self);
                     },
+                    .enum_declaration => try self.lowerEnumDeclaration(n, ref),
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
                     },
@@ -21637,14 +21664,17 @@ pub const Analyzer = struct {
                 const old_context = this.is_const_context;
                 defer this.is_const_context = old_context;
                 this.is_const_context = true;
+                const save_const_decl_context = this.is_const_variable_context;
+                defer this.is_const_variable_context = save_const_decl_context;
+                this.is_const_variable_context = true;
 
                 var prior_val: ?TypeRef = null;
 
                 while (iter.next()) |m| {
+                    std.debug.assert(m.kind == .enum_member);
                     const d2 = getPackedData(m);
                     const lhs = file.ast.nodes.at(d2.left);
                     std.debug.assert(lhs.kind == .identifier); // TODO: binder needs to treat `['ok']` as a symbol in enum declarations
-
                     const z = blk: {
                         if (d2.right != 0) {
                             break :blk try this.getType(file, d2.right);
@@ -21657,6 +21687,7 @@ pub const Analyzer = struct {
                     };
 
                     prior_val = z;
+                    std.debug.assert(lhs.extra_data != 0);
                     try file.cached_symbol_types.put(this.allocator(), lhs.extra_data, z);
 
                     try members.append(this.allocator(), .{

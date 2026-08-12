@@ -403,7 +403,7 @@ async function testEngine(entrypoint = 'heap') {
         }
         const text = emitted.get(r)
         return [r, text]
-    })
+    }, api)
 }
 
 function lineDiff(a: string, b: string) {
