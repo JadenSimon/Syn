@@ -20787,6 +20787,8 @@ pub const Analyzer = struct {
                 if (type_ref == @intFromEnum(Kind.empty_object)) {
                     return;
                 }
+                // FIXME: need to handle stuff like `number & { x: ... }`
+                if (comptime suppress_gaps) return;
                 this.analyzer.printTypeInfo(type_ref);
                 this.analyzer.printCurrentNode();
                 return error.TODO_merge_primitive_decl;

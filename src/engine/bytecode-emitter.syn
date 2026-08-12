@@ -47,6 +47,8 @@ type EmitResult = {
     selfSlot?: number
 }
 
+const useCallerRegs = true
+
 function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitResult {
     const code: number[] = []
     const constants: any[] = []
@@ -61,7 +63,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
     let maxReg = 0
     let thisReg: number | undefined = undefined
     let prevOpOffset: number = -1
-    let prevLoadOrStoreOffset: number = -1
+    let prevStoreOffset: number = -1
+    let skipNextLookbehind = false
     // jumps should not update the "prev op" values
 
     function findConstPoolSlot(node: ts.Expression) {
@@ -94,7 +97,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         emitByte(operand) 
     }
     function star(reg: number) {
-        prevOpOffset = prevLoadOrStoreOffset = code.length
+        prevOpOffset = prevStoreOffset = code.length
         if (reg <= 15) {
             const op = Op.Star0 + reg
             code.push(op)
@@ -107,7 +110,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             if (prev === reg) return
         }
 
-        prevOpOffset = prevLoadOrStoreOffset = code.length
+        prevOpOffset = code.length
         if (reg <= 3) {
             const op = Op.Ldar0 + reg
             code.push(op)
@@ -151,9 +154,13 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
     }
 
     function lookbehindForReg() {
-        if (prevLoadOrStoreOffset !== code.length-1) return
-        const op = code[prevLoadOrStoreOffset]
-        if (op >= Op.Ldar0 && op <= Op.Ldar3) return op - Op.Ldar0
+        if (skipNextLookbehind) {
+            // we cannot skip if we're going to be jumped into
+            skipNextLookbehind = false
+            return
+        }
+        if (prevStoreOffset === -1 || prevOpOffset !== prevStoreOffset) return
+        const op = code[prevStoreOffset]
         if (op >= Op.Star0 && op <= Op.Star15) return op - Op.Star0
     }
 
@@ -175,6 +182,21 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         const off = target - (at + 2)
         if (!inRange(Types.i16, off)) throw `jump offset out of range: ${off}`
         code.push(off & 0xFF); code.push((off >>> 8) & 0xFF)
+    }
+
+    function emitStarPlaceholder(): number {
+        // TODO: select size based on bounded # of regs needed
+        // the prediction does not need to be perfect, just needs to bound it
+        const at = code.length
+        code.push(Op.Star0);
+        return at
+    }
+
+    function patchStar(at: number) {
+        const reg = allocReg()
+        if (reg > 15) throw `TODO: patch larger stores`
+        code[at] += reg
+        return reg
     }
 
     type LoopLabels = { breaks: number[], continues: number[], continueTarget: number }
@@ -263,16 +285,109 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         return false
     }
 
+    function hasEffects(node: ts.Node): boolean {
+        switch (node.kind) {
+            case ts.SyntaxKind.ParenthesizedExpression:
+                return hasEffects((node as ts.ParenthesizedExpression).expression)
+            case ts.SyntaxKind.PrefixUnaryExpression:
+                if (isAssignmentUnary((node as ts.PrefixUnaryExpression).operator)) return true
+                return hasEffects((node as ts.PrefixUnaryExpression).operand)
+            case ts.SyntaxKind.TrueKeyword:
+            case ts.SyntaxKind.FalseKeyword:
+            case ts.SyntaxKind.NullKeyword:
+            case ts.SyntaxKind.UndefinedKeyword:
+            case ts.SyntaxKind.NumericLiteral:
+            case ts.SyntaxKind.StringLiteral: 
+                return false
+        }
+        return true
+    }
+
     function isDeadCode(node: ts.Node) {
         // extremely simple DCE, don't expect much from it
         switch (node.kind) {
             case ts.SyntaxKind.ExpressionStatement:
-                switch ((node as ts.ExpressionStatement).expression.kind) {
-                    case ts.SyntaxKind.NumericLiteral:
-                    case ts.SyntaxKind.StringLiteral: return true
-                }
+                return !hasEffects((node as ts.ExpressionStatement).expression)
         }
         return false
+    }
+
+    function maxRegAllocsNeeded(exp: ts.Expression): number {
+        if (const r = tryFoldExp(exp)) {
+            if (r[0] === 'value') return 0
+            return maxRegAllocsNeeded(r[1]) // residual
+        }
+
+        // isFirstOperand can be set when we know we will always spill anyway
+        function visit(n: ts.Expression, isAcc = false): number {
+            switch (n.kind) {
+                case ts.SyntaxKind.NumericLiteral:
+                case ts.SyntaxKind.StringLiteral: 
+                case ts.SyntaxKind.TrueKeyword:
+                case ts.SyntaxKind.FalseKeyword:
+                case ts.SyntaxKind.NullKeyword:
+                case ts.SyntaxKind.UndefinedKeyword:
+                    return isAcc ? 0 : 1 // need a tmp to spill
+
+                case ts.SyntaxKind.ArrayLiteralExpression:
+                    const elements = (n as ts.ArrayLiteralExpression).elements
+                    let inner = 0
+                    for (const x of elements) {
+                        if (ts.isSpreadElement(x)) {
+                            throw `Unhandled array element kind: ${ts.SyntaxKind[x.kind]}`
+                        }
+                        inner = Math.max(inner, 1 + visit(x, true))
+                    }
+                    return (isAcc ? 0 : 1) + inner
+
+                case ts.SyntaxKind.ObjectLiteralExpression:
+                    const properties = (n as ts.ObjectLiteralExpression).properties
+                    let inner = 0
+                    for (const x of properties) {
+                        if (ts.isShorthandPropertyAssignment(x)) {
+                            inner = Math.max(inner, isLexicalIdent(x.name) ? 0 : 1)
+                            continue
+                        }
+                        if (ts.isPropertyAssignment(x)) {
+                            // FIXME: computed names
+                            inner = Math.max(inner, 1 + visit(x.initializer, true))
+                            continue
+                        }
+                        throw `Unhandled property kind: ${ts.SyntaxKind[x.kind]}`
+                    }
+                    return (isAcc ? 0 : 1) + inner
+
+                case ts.SyntaxKind.Identifier:
+                    if (isAcc) return 0
+                    return isLexicalIdent(n) ? 0 : 1
+                case ts.SyntaxKind.AwaitExpression:
+                    return 1 // assumes we need to spill acc
+                case ts.SyntaxKind.ParenthesizedExpression: 
+                    return visit((n as ts.ParenthesizedExpression).expression, isAcc)
+                case ts.SyntaxKind.BinaryExpression:
+                    const l = visit((n as ts.ParenthesizedExpression).expression, isAcc)
+                    const r = visit((n as ts.ParenthesizedExpression).expression, false)
+                    if (r === 0) return l
+                    return l + r + 1 // spill
+                case ts.SyntaxKind.PrefixUnaryExpression:
+                case ts.SyntaxKind.PostfixUnaryExpression:
+                    const operand = (n as ts.PrefixUnaryExpression | ts.PostfixUnaryExpression).operand
+                    const operator = (n as ts.PrefixUnaryExpression | ts.PostfixUnaryExpression).operator
+                    if (!isAssignmentUnary(operator)) return visit(operand, isAcc)
+                    return visit(operand, isAcc) + 1
+                case ts.SyntaxKind.CallExpression:
+                    const l = visit((n as ts.CallExpression).expression, isAcc)
+                    const args = (n as ts.CallExpression).arguments
+                    // may overestimate for the callee
+                    return Math.max(l, 1) + args.length + Math.max(...args.map(x => maxRegAllocsNeeded(x)))
+                case ts.SyntaxKind.ConditionalExpression:
+                    const x = n as ts.ConditionalExpression
+                    return Math.max(visit(x.condition, isAcc), visit(x.whenTrue, isAcc), visit(x.whenFalse, isAcc))
+
+                default: throw `Unhandled exp kind: ${ts.SyntaxKind[n.kind]}`
+            }
+        }
+        return visit(exp, true)
     }
 
     function mapBinaryOp(kind: ts.SyntaxKind): number {
@@ -532,7 +647,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             emit2(op, symToReg.get(getSymbolId(node.right))!)
         } else {
             emitExpr(node.right)
-            const rR = allocReg(); emit2(Op.Star, rR)
+            const rR = allocReg(); star(rR)
             ldar(reg)
             emit2(op, rR)
             freeReg()
@@ -589,7 +704,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         const symId = getSymbolId(operand)
         if (symId === 0) throw `non-lexical identifier: ${operand.getText()}`
         const dst = symToReg.get(symId)
-        assert(dst)
+        assert(dst !== undefined)
         if (!isPrefix) return emit2(op, dst)
 
         ldar(dst)
@@ -661,7 +776,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         }
         if (ts.isParenthesizedExpression(node)) { emitExpr(node.expression); return }
         if (node.kind === ts.SyntaxKind.ThisKeyword) {
-            if (thisReg !== undefined) { emit2(Op.Ldar, thisReg); return }
+            if (thisReg !== undefined) { ldar(thisReg); return }
             // generally should not happen?
             emitLoadConst(lateBoundSlot(getSymbolId(node), "this"))
             return
@@ -682,10 +797,25 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         callee: number,
         args: ts.NodeArray<ts.Expression>
     ) {
-        const rArgStart = nextReg
-        defer nextReg = rArgStart
+        const saveNextReg = nextReg
+        defer nextReg = saveNextReg
 
-        const allocated = new Array(args.length)
+        const nargs = args.length
+        const allocated = new Array(nargs)
+        if (useCallerRegs) {
+            for (let i = 0; i < nargs; i++) {
+                const arg = args[i]
+                if (ts.isSpreadElement(arg)) throw "spread arguments are not supported"
+                emitExpr(arg)
+                allocated[i] = emitStarPlaceholder()
+            }
+            for (let i = nargs-1; i >= 0; i--) {
+                allocated[i] = patchStar(allocated[i])
+            }
+            emit1(Op[callOp]); emitByte(callee); emitByte(allocated.at(-1) ?? 0); emitByte(nargs)
+            return
+        }
+
         for (let i = 0; i < args.length; i++) {
             const arg = args[i]
             if (ts.isSpreadElement(arg)) throw "spread arguments are not supported"
@@ -695,9 +825,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             emitExpr(args[i])
             star(allocated[i])
         }
-        const nargs = args.length
 
-        emit1(Op[callOp]); emitByte(callee); emitByte(rArgStart); emitByte(nargs)
+        emit1(Op[callOp]); emitByte(callee); emitByte(saveNextReg); emitByte(nargs)
     }
 
     function emitCall(node: ts.CallExpression) {
@@ -726,9 +855,13 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             if (isConst) {
                 if (tryFoldVariableDecl(decl)) continue
             }
+            if (!isReferencedSymbol(decl.name)) {
+                if (decl.initializer) emitSideEffect(decl.initializer)
+                continue
+            }
             const reg = allocReg()
             symToReg.set(symId, reg)
-            if (decl.initializer) { emitExpr(decl.initializer); emit2(Op.Star, reg) }
+            if (decl.initializer) { emitExpr(decl.initializer); star(reg) }
         }
     }
 
@@ -782,6 +915,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         defer labels = saveLabels
         const ctx = { breaks: [], continues: [], continueTarget: -1 }
         labels = ctx
+        skipNextLookbehind = true
 
         if (c && c[0] === 'value') {
             // unconditional
@@ -794,17 +928,17 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             const bodyTop = code.length
             emitStatement(node.statement)
             patchJump(toTest)
-            for (const p of ctx.continues) patchJump(p) // continue -> condition test
+            for (const p of ctx.continues) patchJump(p) 
             emitExpr(node.expression)
             emitJumpTo(Op.JumpIfToBooleanTrue, bodyTop)
         }
 
-        for (const p of ctx.breaks) patchJump(p) // break -> after loop
+        for (const p of ctx.breaks) patchJump(p) 
     }
 
     function emitFor(node: ts.ForStatement) {
         const savedReg = nextReg
-        defer nextReg = savedReg // for-init bindings die when the loop ends
+        defer nextReg = savedReg 
 
         if (node.initializer) {
             if (ts.isVariableDeclarationList(node.initializer)) {
@@ -829,6 +963,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         defer labels = saveLabels
         const ctx = { breaks: [], continues: [], continueTarget: -1 }
         labels = ctx
+        skipNextLookbehind = true
 
         if (condAlwaysTrue) {
             const bodyTop = code.length
@@ -878,6 +1013,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         if (!ts.isIdentifier(p.name)) throw "destructuring parameters are not supported"
         if (p.dotDotDotToken) throw "rest parameters are not supported"
         if (p.initializer) throw "default parameter values are not supported"
+        if (!isReferencedSymbol(p.name)) continue
         symToReg.set(getSymbolId(p.name), allocReg())
     }
 
@@ -939,9 +1075,9 @@ function compile(src: string): EmitResult {
 
 function testBytecodeEmit(str: string, name = 'f') {
     const r = compile(str)
-    console.log(`${name}: code`, r.code)
+    console.log(`${name}: code`, r.code, r.code.length)
     console.log(`${name}: constants`, r.constants, r.constantIsHandle)
-    console.log(`${name}: lateBound`, r.lateBound)
+    console.log(`${name}: lateBound`, r.lateBound, 'regs:', r.registerCount)
 }
 
 function emitTest() {
@@ -977,11 +1113,18 @@ function finalize(result: EmitResult): Handle {
 }
 
 function e2eTest(code: string, _args: any[]) {
-    const interpret = createInterpreter(true) // native mode
+    const interpret = createInterpreter(true, useCallerRegs) // native mode
     const fn = finalize(compile(code))
     const args = Intrinsics.stackalloc(_args.length * 4 as usize)
-    for (let i = 0; i < _args.length; i++) {
-        Intrinsics.store(args, 4*i as u32, _args[i], Types.u32)
+    if (useCallerRegs) {
+        const reversed = _args.reverse()
+        for (let i = 0; i < reversed.length; i++) {
+            Intrinsics.store(args, 4*i as u32, reversed[i], Types.u32)
+        }
+    } else {
+        for (let i = 0; i < _args.length; i++) {
+            Intrinsics.store(args, 4*i as u32, _args[i], Types.u32)
+        }
     }
     const r = interpret(fn, 0, args, _args.length as u32)
     Intrinsics.stackfree(_args.length * 4 as usize)
@@ -1134,6 +1277,14 @@ function runTest() {
 
     assert(e2eTest('function f(a) { return a <= 1 ? a : a+f(a-1) }', [10]) === 55)
     assert(e2eTest('function f(a) { return a >= 10 ? a : a+f(a+1) }', [1]) === 55)
+
+    // unused param
+    testBytecodeEmit('function f(a,b) { const x = a++; const y = a; return y+a }', 'unused_param')
+    assert(e2eTest('function f(a,b) { const x = a++; const y = a; return y+a  }', [1]) === 4)
+
+    // unused var with side effects
+    testBytecodeEmit('function f(a) { const x = a++; return a }', 'unused')
+    assert(e2eTest('function f(a) { const x = a++; return a }', [1]) === 2)
 
     console.log("bytecode-emitter end-to-end passed")
 }

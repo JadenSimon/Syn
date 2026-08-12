@@ -367,6 +367,8 @@ async function testEngine(entrypoint = 'heap') {
     const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
     const prog = api.createProgram(roots, {
         lib: ['reify', 'machine'],
+        sourceMap: true,
+        inlineSourceMap: true,
     })
 
     const results: ({ name: string, text: string })[] = []

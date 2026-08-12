@@ -733,6 +733,8 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             identifier: fileName,
             context: ctx,
         })
+        const namesToSource = new Map<string, string>()
+        namesToSource.set(fileName, text)
         return (async function() {
             const modules = new Map<string, any>()
             await m.link(async (spec: string, m: vm.Module) => {
@@ -754,18 +756,71 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
                 if (!p) return
                 const cached = modules.get(p[0])
                 if (cached) return cached
-                const m2 = new vm.SourceTextModule(`let __filename = import.meta.filename\n` + p[1], {
+                const src = `let __filename = import.meta.filename\n` + p[1]
+                namesToSource.set(p[0], src)
+                const m2 = new vm.SourceTextModule(src, {
                     identifier: p[0],
                     context: ctx,
                     initializeImportMeta: (meta, m) => {
                         meta.filename = m.identifier.replace('.js', '.syn')
                     },
+                    lineOffset: -1,
                 })
                 modules.set(p[0], m2)
                 return m2
             })
-            return await m.evaluate()
+            return await m.evaluate().catch(err => {
+                applySourceMaps(namesToSource, err)
+                throw err
+            })
         })()
     }
     return vm.runInContext('"use strict";\n' + text, ctx)
 }
+
+
+import { SourceMap } from "node:module"
+function applySourceMaps(nameToSource: Map<string, string>, err: Error) {
+    const trace = err.stack
+    if (!trace) return
+
+    const sourcemaps = new Map<string, any>()
+    function getSourceMap(name: string) {
+        const m = sourcemaps.get(name)
+        if (m !== undefined) return m
+        const src = nameToSource.get(name)
+        if (!src) return
+
+        const match = src.match(
+            /\/\/[#@]\s*sourceMappingURL=data:application\/json(?:;charset=utf-8)?;base64,([^\s]+)/
+        );
+        if (!match) return null
+        const sourceMap = match
+            ? new SourceMap(
+                JSON.parse(Buffer.from(match[1], "base64").toString("utf8"))
+            )
+            : null;
+        sourcemaps.set(name, sourceMap)
+        return sourceMap
+    }
+
+    err.stack = trace.replace(
+        /([^\s\(:]+):(\d+):(\d+)/g,
+        (_, name, line, column) => {
+            const sourceMap = getSourceMap(name)
+            if (!sourceMap) return _
+
+            const mapped = sourceMap.findEntry(
+                Number(line) - 1,
+                Number(column) - 1
+            )
+
+            if (!mapped?.originalSource) return _
+
+            return `${mapped.originalSource}:${
+                mapped.originalLine + 1
+            }:${mapped.originalColumn + 1}`
+        }
+    )
+}
+
