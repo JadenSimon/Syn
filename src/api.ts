@@ -378,6 +378,11 @@ export const enum SyntaxKind {
     PublicDeclaration = 715,
     Start = 1022,
     ParseError = 1023,
+
+    FirstAssignment = EqualsToken,
+    LastAssignment = CaretEqualsToken,
+    FirstCompoundAssignment = PlusEqualsToken,
+    LastCompoundAssignment = CaretEqualsToken,
 }
 
 function isTypeNodeKind(kind: SyntaxKind) {
@@ -1365,6 +1370,15 @@ class AstNode {
             throw new Error(`No source file found`)
         }
         return api.isLateBoundSymbol(sf.handle, sym_ref)
+    }
+
+    public isReferencedSymbol(): boolean {
+        if (this.kind !== SyntaxKind.Identifier) return false
+        const sym_ref = this.extra
+        if (!sym_ref) return false
+        const sf = getSourceFileInternal(this as any)
+        if (sf === undefined) throw new Error(`No source file found`)
+        return api.isReferencedSymbol(sf.handle, sym_ref)
     }
 
     public usesThisBinding(): boolean {

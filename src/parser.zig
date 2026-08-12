@@ -5580,7 +5580,8 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             var condition: NodeRef = 0;
             if (this.lexer.token != .t_semicolon) {
-                condition = try this.pushNode(try this.parseExpressionStatement());
+                condition = try this.parseExpression();
+                try this.lexer.expect(.t_semicolon);
             } else {
                 // to handle `for(;;)`
                 try this.lexer.next();
@@ -5588,7 +5589,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
             var incrementor: NodeRef = 0;
             if (this.lexer.token != .t_close_paren) {
-                incrementor = try this.pushNode(try this.parseExpressionStatement());
+                incrementor = try this.parseExpression();
             }
 
             try this.lexer.expect(.t_close_paren);
@@ -11730,7 +11731,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
             var t = this.getTransformer();
             const is_async = this.needsAsyncUsingScope(ref);
 
-            // this.addHelper(.call_dispose);
+            this.addHelper(.call_dispose);
             this.addHelper(.run_defers);
             this.addHelper(.known_symbol);
 
