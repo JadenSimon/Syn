@@ -282,7 +282,6 @@ pub const Reifier = struct {
                     const v = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(inner))));
                     try o.setProperty(this.env, name, v);
                 }
-
                 return o;
             },
             .function_literal => {

@@ -21109,6 +21109,7 @@ pub const Analyzer = struct {
     }
 
     fn evaluateQuery(this: *@This(), t: *Type, flags: u32) !TypeRef {
+        std.debug.assert(t.getKind() == .query);
         _ = flags;
 
         if (t.slot5 != 0) return t.slot5;

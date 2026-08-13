@@ -48,7 +48,10 @@ type EmitResult = {
 
 const useCallerRegs = true
 
-function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitResult {
+function emitFunction(
+    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression,
+    constContext?: Record<string, any> // will be used to specialize bytecode later
+): EmitResult {
     const code: number[] = []
     const constants: any[] = []
     const constantKinds: ConstantKind[] = []
@@ -82,6 +85,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
     function freeReg() { nextReg = nextReg - 1 }
 
     function emitByte(b: number) {
+        if (b === undefined) throw `not a byte: ${b}`
         if (b < 0 || b > 255) throw `operand out of byte range: ${b} (TODO: width prefixes)`
         code.push(b)
     }
@@ -89,10 +93,23 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         prevOpOffset = code.length
         code.push(op) 
     }
-    function emit2(op: number, operand: number) { 
+    function emit2(op: number, operand: number) {
         prevOpOffset = code.length
-        code.push(op); 
-        emitByte(operand) 
+        code.push(op);
+        emitByte(operand)
+    }
+    function emit3(op: number, operand1: number, operand2: number) {
+        prevOpOffset = code.length
+        code.push(op)
+        emitByte(operand1)
+        emitByte(operand2)
+    }
+    function emit4(op: number, operand1: number, operand2: number, operand3: number) {
+        prevOpOffset = code.length
+        code.push(op)
+        emitByte(operand1)
+        emitByte(operand2)
+        emitByte(operand3)
     }
     function star(reg: number) {
         prevOpOffset = prevStoreOffset = code.length
@@ -227,6 +244,10 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         constantKinds.push(ConstantKind.number)
         internMap.set(key, slot)
         return slot
+    }
+    function internValue(s: string | number): number {
+        if (typeof s === 'string') return internString(s)
+        return internNumber(s)
     }
     function lateBoundSlot(symId: number, name: string, kind = ConstantKind.late_bound): number {
         const existing = lateBound.get(symId)
@@ -658,8 +679,81 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         return kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment
     }
 
+    function finishPropertyAccessAssignment(
+        node: ts.BinaryExpression,
+        getOp: number,
+        setOp: number,
+        robj: number,
+        keySlot: number,
+    ) {
+        const kind = node.operatorToken.kind
+        if (kind === ts.SyntaxKind.EqualsToken) {
+            emitExpr(node.right) // acc = value
+            emit3(setOp, robj, keySlot)
+            return
+        }
+
+        const op = compoundBinaryOp(kind)
+        if (isLexicalIdent(node.right)) {
+            ldar(robj)
+            emit2(getOp, keySlot) // acc = obj[key]
+            emit2(op, symToReg.get(getSymbolId(node.right))!)
+        } else {
+            emitExpr(node.right)
+            const rR = allocReg(); star(rR)
+            ldar(robj)
+            emit2(getOp, keySlot) // acc = obj[key]
+            emit2(op, rR)
+            freeReg()
+        }
+        emit3(setOp, robj, keySlot)
+    }
+
+    function emitPropertyAccessAssignment(
+        node: ts.BinaryExpression, 
+        target: ts.PropertyAccessExpression | ts.ElementAccessExpression
+    ) {
+        if (target.questionDotToken) throw `optional chaining assignment is not supported`
+        const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression        
+        
+        emitExpr(target.expression) // acc = object
+        const robj = allocReg(); star(robj)
+        defer freeReg()
+
+        const keySlot = isConstName ? internString(target.name.text) : allocReg()
+        defer if (!isConstName) freeReg()
+
+        if (!isConstName) {
+            if (const val = tryFoldExp(target.argumentExpression)) {
+                if (val[0] === 'value' && typeof val[1] === 'string') {
+                    return finishPropertyAccessAssignment(
+                        node,
+                        Op.GetPropertyConst,
+                        Op.SetPropertyConst,
+                        robj,
+                        internValue(val[1]),
+                    )
+                }
+            }
+            emitExpr(target.argumentExpression)
+            star(keySlot)
+        }
+
+        finishPropertyAccessAssignment(
+            node,
+            isConstName ? Op.GetPropertyConst : Op.GetProperty,
+            isConstName ? Op.SetPropertyConst : Op.SetProperty,
+            robj,
+            keySlot,
+        )
+    }
+
     function emitAssignment(node: ts.BinaryExpression) {
         const target = node.left
+        if (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+            emitPropertyAccessAssignment(node, target)
+            return
+        }
         if (!ts.isIdentifier(target)) throw `unsupported assignment target: ${ts.SyntaxKind[target.kind]}`
         const symId = getSymbolId(target)
         if (symId === 0) throw `non-lexical assignment target: ${target.getText()}`
@@ -689,6 +783,46 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             freeReg()
         }
         star(reg)
+    }
+
+    function emitPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number, shouldSpillRecv = true) {
+        if (node.questionDotToken) throw `optional chaining is not supported`
+
+        emitExpr(node.expression) // acc = object
+
+        if (receiverReg === undefined && isLexicalIdent(node.expression)) {
+            receiverReg = symToReg.get(getSymbolId(node))!
+            shouldSpillRecv = false
+        }
+
+        if (receiverReg !== undefined && shouldSpillRecv) star(receiverReg)
+
+        const isConstName = node.kind === ts.SyntaxKind.PropertyAccessExpression
+        const keySlot = isConstName ? internString(node.name.text) : allocReg()
+        defer if (!isConstName) freeReg()
+
+        let spilledRecv: number | undefined
+        defer if (spilledRecv) freeReg()
+
+        if (!isConstName) {
+            if (const val = tryFoldExp(node.argumentExpression)) {
+                if (val[0] === 'value' && typeof val[1] === 'string') {
+                    return emit2(Op.GetPropertyConst, internValue(val[1]))
+                }
+            }
+            if (isLexicalIdent(node.argumentExpression)) {
+                return emit2(Op.GetProperty, symToReg.get(getSymbolId(node.argumentExpression))!)
+            }
+            if (receiverReg === undefined && shouldSpillRecv) {
+                spilledRecv = allocReg()
+                star(spilledRecv)
+            }
+            emitExpr(node.argumentExpression)
+            star(keySlot)
+        }
+
+        if (!isConstName && shouldSpillRecv) ldar(spilledRecv ?? receiverReg!)
+        emit2(isConstName ? Op.GetPropertyConst : Op.GetProperty, keySlot)
     }
 
     function emitLogicalOp(node: ts.BinaryExpression) {
@@ -839,6 +973,9 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         if (ts.isPrefixUnaryExpression(node)) { emitPrefixUnary(node); return }
         if (ts.isPostfixUnaryExpression(node)) { emitPostfixUnary(node); return }
         if (ts.isConditionalExpression(node)) { emitConditionalExp(node); return }
+        if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) { 
+            return void emitPropertyAccess(node);
+        }
         if (ts.isCallExpression(node) || ts.isNewExpression(node)) { 
             return void emitCallOrConstruct(node) 
         }
@@ -848,7 +985,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
     function emitCallArgs(
         callOp: keyof typeof Op,
         callee: number,
-        args: ReadonlyArray<ts.Expression>
+        args: ReadonlyArray<ts.Expression>,
+        thisReg?: number
     ) {
         const saveNextReg = nextReg
         defer nextReg = saveNextReg
@@ -865,7 +1003,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             for (let i = nargs-1; i >= 0; i--) {
                 allocated[i] = patchStar(allocated[i])
             }
-            emit1(Op[callOp]); emitByte(callee); emitByte(allocated[0] ?? 0); emitByte(nargs)
+            if (thisReg !== undefined) ldar(thisReg)
+            emit4(Op[callOp], callee, allocated[0] ?? 0, nargs)
             return
         }
 
@@ -878,8 +1017,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             emitExpr(args[i])
             star(allocated[i])
         }
-
-        emit1(Op[callOp]); emitByte(callee); emitByte(saveNextReg); emitByte(nargs)
+        if (thisReg !== undefined) ldar(thisReg)
+        emit4(Op[callOp], callee, saveNextReg, nargs)
     }
 
     function emitCallOrConstruct(node: ts.CallExpression | ts.NewExpression) {
@@ -888,6 +1027,28 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
 
         if (const slot = findConstPoolSlot(node.expression)) {
             return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
+        }
+
+        // method call: `o.method(...)` passes `o` as `this`
+        if (!isConstruct && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))) {
+            let receiverReg = allocReg()
+            const originalRecv = receiverReg
+            defer if (originalRecv === receiverReg) freeReg()
+
+            if (isLexicalIdent(node.expression.expression)) {
+                freeReg()
+                receiverReg = symToReg.get(getSymbolId(node.expression.expression))!
+                emitPropertyAccess(node.expression, receiverReg, false)
+            } else {
+                emitPropertyAccess(node.expression, receiverReg) // acc = method, receiverReg = `o`
+            }
+
+            const rCallee = allocReg()
+            defer freeReg()
+
+            star(rCallee)
+
+            return emitCallArgs('Call', rCallee, node.arguments ?? [], receiverReg)
         }
 
         emitExpr(node.expression) // callee -> acc
@@ -1113,8 +1274,18 @@ function unwrapParensOrExpStatement(node: ts.Node) {
     return node
 }
 
+// very hacky but good enough
+function fixupMethodLikeDecl(src: string) {
+    src = src.trim()
+    if (src.startsWith('get ') || src.startsWith('set ')) src = src.slice(4)
+    if (src.startsWith('function')) return src
+    if (src.startsWith('(')) return src
+    if (src.startsWith('async')) return src // todo: async method fixup
+    return `function ${src}`
+}
+
 function compile(src: string): EmitResult {
-    const sf = ts.createSourceFile('input.js', src, ts.ScriptTarget.Latest)
+    const sf = ts.createSourceFile('input.js', fixupMethodLikeDecl(src), ts.ScriptTarget.Latest)
     const fn = sf.statements[0]
     if (!fn) throw "found no statements in source"
     const exp = unwrapParensOrExpStatement(fn)
@@ -1131,7 +1302,7 @@ for (const [name, val] of Object.entries(Op)) OpNames[val as number] = name
 
 // ops whose operand is a variable-width value (governed by a Width2/Width4/Width8 prefix)
 const ImmOps = new Set([Op.LdaImm])
-const ConstOps = new Set([Op.LdaConst])
+const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst])
 const JumpOps = new Set([Op.Jump, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
 
 const RegOperandCounts: Record<number, number> = {
@@ -1147,6 +1318,7 @@ const RegOperandCounts: Record<number, number> = {
     [Op.IncPost]: 1, [Op.DecPost]: 1,
     [Op.GetProperty]: 1,
     [Op.SetProperty]: 2,
+    [Op.SetPropertyConst]: 1,
 }
 
 type CodeInstruction = {
@@ -1169,14 +1341,16 @@ function createCodeIterator(bytes: readonly u8[]) {
         cursor = cursor + 1
         return b
     }
-    function readSigned(width: 1 | 2 | 4): number {
+    function readSigned(width: 1 | 2 | 4 | 8): number {
+        if (width === 8) throw "todo: 8 wide"
         let v = 0
         for (let i = 0; i < width; i++) v = v | (readByte() << (8 * i))
         const bits = width * 8
         const signBit = 1 << (bits - 1)
         return (v ^ signBit) - signBit
     }
-    function readUnsigned(width: 1 | 2 | 4): number {
+    function readUnsigned(width: 1 | 2 | 4 | 8): number {
+        if (width === 8) throw "todo: 8 wide"
         let v = 0
         for (let i = 0; i < width; i++) v = v | (readByte() << (8 * i))
         return v >>> 0
@@ -1211,9 +1385,16 @@ function createCodeIterator(bytes: readonly u8[]) {
             return inst
         }
 
+        if (inst.opname.endsWith('Const')) {
+            inst.opname = inst.opname.slice(0, -5)
+        }
+
         const regCount = RegOperandCounts[opcode]
         if (regCount !== undefined) {
-            for (let i = 0; i < regCount; i++) inst.regs.push(readByte())
+            for (let i = 0; i < regCount; i++) inst.regs.push(width === 1 ? readByte() : readUnsigned(width))
+            if (ConstOps.has(opcode)) {
+                inst.constSlot = width === 8 ? undefined : readUnsigned(width as 1 | 2 | 4)
+            }
             return inst
         }
 
@@ -1235,12 +1416,22 @@ function createCodeIterator(bytes: readonly u8[]) {
         if (opcode === Op.Call || opcode === Op.Construct) {
             inst.regs.push(readByte(), readByte()) // callee, argStart
             inst.regs.push(readByte()) // nargs
+            if (inst.regs[2] === 0) {
+                inst.regs.length = 1
+            } else {
+                inst.regs[2] += inst.regs[1]
+            }
             return inst
         }
         if (opcode === Op.CallConst || opcode === Op.ConstructConst) {
             inst.constSlot = readByte() 
             inst.regs.push(readByte())
             inst.regs.push(readByte())
+            if (inst.regs[1] === 0) {
+                inst.regs.length = 0
+            } else {
+                inst.regs[1] += inst.regs[0]
+            }
             return inst
         }
 
@@ -1298,7 +1489,8 @@ function finalize(result: EmitResult, ctx?: Ctx): Handle {
             const name = result.constants[i]
             if (!ctx) throw `Cannot finalize late bound symbol without a ctx obj: ${name}`
             if (!(name in ctx)) throw `Failed to find symbol: ${name}`
-            result.constants[i] = heap.fromJsValue(ctx[name], f => compileJsFn(f, ctx))
+            // for testing
+            constants[i] = heap.fromJsValue(ctx[name], f => compileJsFn(f, ctx))
             continue
         }
         if (kinds[i] === ConstantKind.string) constants[i] = heap.fromJsString(result.constants[i])
@@ -1319,8 +1511,8 @@ interface Ctx {
     readonly [ctxSym]: unique symbol
     [key: string]: any
 }
-function createCtx(): Ctx {
-    return { [ctxSym]: Symbol('ctx brand') } as any
+function createCtx(o: Record<string, any> = {}): Ctx {
+    return Object.assign({ [ctxSym]: Symbol('ctx brand') }, o) as any
 }
 function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
@@ -1332,7 +1524,7 @@ function compileJsFn(f: Function, ctx: Ctx): any {
     return _f[key] = finalize(compiled, ctx)
 }
 
-function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx: Ctx = createCtx()) {
+function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx: Ctx = createCtx()): any {
     const fromJsValue = (v: any) => heap.fromJsValue(v, f => compileJsFn(f, ctx))
 
     const source = code is string ? code : code.toString()
@@ -1355,10 +1547,29 @@ function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx
     Intrinsics.stackfree(_args.length * 4 as usize)
 
     const realResult = r & (2**32)-1 // TODO: the intrinsics should be truncating to `nt`
-    const f = code is string ? (new Function('return ' + code))() : code
-    const expectedResult = f.apply(thisArg, _args)
-    console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
-    assert(realResult === expectedResult)
+    function disasmIfBad(expected: any): void {
+        const cond = realResult === expected
+        if (!cond) {
+            const x = disassemble(compiled.code as u8[])
+            console.log(compiled.constants)
+            console.log(`disasm:\n${x}`)
+        }
+        assert(cond)
+    }
+    if (compiled.constantKinds.some(x => x === ConstantKind.late_bound)) {
+        const indices = compiled.constantKinds.map((x, i) => x === ConstantKind.late_bound ? i : -1).filter(x => x !== -1)
+        const paramNames = indices.map(x => compiled.constants[x])
+        const paramValues = paramNames.map(x => ctx[x])
+        const f = (new Function(...paramNames, 'return ' + code))(...paramValues)
+        const expectedResult = f.apply(thisArg, _args)
+        console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
+        disasmIfBad(expectedResult)
+    } else {
+        const f = code is string ? (new Function('return ' + code))() : code
+        const expectedResult = f.apply(thisArg, _args)
+        console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
+        disasmIfBad(expectedResult)
+    }
     
     return realResult
 }
@@ -1459,6 +1670,31 @@ function runTest() {
     e2eTest('function f(a, b) { return a && b }', [3, 5])
     e2eTest('function f(a, b) { return a ?? b }', [3, 5])
     e2eTest('function f(a, b, c) { return (a || b) && c }', [0, 3, 5])
+
+    // late bound
+    e2eTest('function late() { return a }', [], null, createCtx({ a: 1 }))
+
+    // property assignment
+    e2eTest('function assign(o, y) { return o.x = y }', [{}, 3])
+    e2eTest('function assign2(o, y) { return o["x"] = y }', [{}, 3]) // element access
+    e2eTest('function assign3(o, y) { return o["x"] += y }', [{ x: 0 }, 3]) // element access
+    e2eTest('function assign4(o, y) { return o["x"+"y"] += y }', [{ xy: 1 }, 3]) // element access
+
+    // property read
+    e2eTest('function read(o) { return o.x }', [{ x: 5 }])
+
+    // read after write
+    e2eTest('function assignThenRead(o, y) { o.x = y; return o.x }', [{}, 7])
+
+    // compound property assignment
+    e2eTest('function compoundProp(o) { o.x += 5; return o.x }', [{ x: 10 }])
+    e2eTest('function compoundPropRhs(o, y) { o.x *= y; return o.x }', [{ x: 3 }, 4])
+
+    // recv
+    e2eTest('function methodCall(o) { return o.bar() }', [{ x: 1, bar() { return this.x } }])
+    e2eTest('function methodCall2(o) { return o["bar"]() }', [{ x: 1, bar() { return this.x } }])
+    testBytecodeEmit('function methodCall3(o,k) { return o[k]() }')
+    e2eTest('function methodCall3(o,k) { return o[k]() }', [{ x: 1, bar() { return this.x } }, "bar"])
 
     console.log("bytecode-emitter end-to-end passed")
 }

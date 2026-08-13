@@ -11486,6 +11486,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
         inline fn getTransformer(this: *@This()) *Transformer {
             if (this.transformer) |*t| return t;
+            this.data.nodes = this.data.nodes.clone() catch unreachable;
             this.transformer = .{ .allocator = &this.data.nodes };
 
             return &this.transformer.?;
