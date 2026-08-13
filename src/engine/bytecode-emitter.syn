@@ -838,15 +838,17 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         if (ts.isBinaryExpression(node)) { emitBinary(node); return }
         if (ts.isPrefixUnaryExpression(node)) { emitPrefixUnary(node); return }
         if (ts.isPostfixUnaryExpression(node)) { emitPostfixUnary(node); return }
-        if (ts.isCallExpression(node)) { emitCall(node); return }
         if (ts.isConditionalExpression(node)) { emitConditionalExp(node); return }
+        if (ts.isCallExpression(node) || ts.isNewExpression(node)) { 
+            return void emitCallOrConstruct(node) 
+        }
         throw `unsupported expression: ${ts.SyntaxKind[node.kind]}`
     }
 
     function emitCallArgs(
         callOp: keyof typeof Op,
         callee: number,
-        args: ts.NodeArray<ts.Expression>
+        args: ReadonlyArray<ts.Expression>
     ) {
         const saveNextReg = nextReg
         defer nextReg = saveNextReg
@@ -880,11 +882,12 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         emit1(Op[callOp]); emitByte(callee); emitByte(saveNextReg); emitByte(nargs)
     }
 
-    function emitCall(node: ts.CallExpression) {
-        if ((node as any).questionDotToken) throw "optional call is not supported"
+    function emitCallOrConstruct(node: ts.CallExpression | ts.NewExpression) {
+        const isConstruct = node.kind === ts.SyntaxKind.NewExpression
+        if (!isConstruct && (node as ts.CallExpression).questionDotToken) throw "optional call is not supported"
 
         if (const slot = findConstPoolSlot(node.expression)) {
-            return emitCallArgs('CallConst', slot, node.arguments)
+            return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
         }
 
         emitExpr(node.expression) // callee -> acc
@@ -894,7 +897,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
 
         star(rCallee)
 
-        return emitCallArgs('Call', rCallee, node.arguments)
+        return emitCallArgs(isConstruct ? 'Construct' : 'Call', rCallee, node.arguments ?? [])
     }
 
     function emitVariableStatement(node: ts.VariableStatement) {
@@ -1229,12 +1232,12 @@ function createCodeIterator(bytes: readonly u8[]) {
             return inst
         }
 
-        if (opcode === Op.Call) {
+        if (opcode === Op.Call || opcode === Op.Construct) {
             inst.regs.push(readByte(), readByte()) // callee, argStart
             inst.regs.push(readByte()) // nargs
             return inst
         }
-        if (opcode === Op.CallConst) {
+        if (opcode === Op.CallConst || opcode === Op.ConstructConst) {
             inst.constSlot = readByte() 
             inst.regs.push(readByte())
             inst.regs.push(readByte())
@@ -1283,12 +1286,19 @@ function emitTest() {
 }
 emitTest()
 
-function finalize(result: EmitResult): Handle {
+function finalize(result: EmitResult, ctx?: Ctx): Handle {
     const kinds = result.constantKinds
     const constants = new Array(kinds.length)
     for (let i = 0; i < result.constants.length; i++) {
         if (kinds[i] === ConstantKind.function_) {
             if (result.selfSlot !== i) throw `Missing fn const slot: ${i}`
+            continue
+        }
+        if (kinds[i] === ConstantKind.late_bound) {
+            const name = result.constants[i]
+            if (!ctx) throw `Cannot finalize late bound symbol without a ctx obj: ${name}`
+            if (!(name in ctx)) throw `Failed to find symbol: ${name}`
+            result.constants[i] = heap.fromJsValue(ctx[name], f => compileJsFn(f, ctx))
             continue
         }
         if (kinds[i] === ConstantKind.string) constants[i] = heap.fromJsString(result.constants[i])
@@ -1303,30 +1313,52 @@ function finalize(result: EmitResult): Handle {
     return res
 }
 
-function e2eTest(code: string, _args: any[], thisArg: u32 = 0, hasSimpleArgs = true) {
+// this _will_ tag the fn to dedupe compilations
+const ctxSym = Symbol('ctx')
+interface Ctx {
+    readonly [ctxSym]: unique symbol
+    [key: string]: any
+}
+function createCtx(): Ctx {
+    return { [ctxSym]: Symbol('ctx brand') } as any
+}
+function compileJsFn(f: Function, ctx: Ctx): any {
+    const key = ctx[ctxSym]
+    const _f = f as any
+    if (const prev = _f[key]) return prev
+    const compiled = compile(_f.toString()) // TODO: use computations
+    // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
+    _f[key] = compiled
+    return _f[key] = finalize(compiled, ctx)
+}
+
+function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx: Ctx = createCtx()) {
+    const fromJsValue = (v: any) => heap.fromJsValue(v, f => compileJsFn(f, ctx))
+
+    const source = code is string ? code : code.toString()
     const interpret = createInterpreter(true, useCallerRegs) // native mode
-    const compiled = compile(code)
-    const fn = finalize(compiled)
+    const compiled = compile(source)
+    const fn = finalize(compiled, ctx)
     const args = Intrinsics.stackalloc(_args.length * 4 as usize)
     if (useCallerRegs) {
         const reversed = _args.slice().reverse()
         for (let i = 0; i < reversed.length; i++) {
-            Intrinsics.store(args, 4*i as u32, reversed[i], Types.u32)
+            Intrinsics.store(args, 4*i as u32, fromJsValue(reversed[i]), Types.u32)
         }
     } else {
         for (let i = 0; i < _args.length; i++) {
             Intrinsics.store(args, 4*i as u32, _args[i], Types.u32)
         }
     }
-    const r = interpret(fn, thisArg, args, _args.length as u32)
+    const compiledThisArg = fromJsValue(thisArg)
+    const r = interpret(fn, compiledThisArg, args, _args.length as u32)
     Intrinsics.stackfree(_args.length * 4 as usize)
+
     const realResult = r & (2**32)-1 // TODO: the intrinsics should be truncating to `nt`
-    if (hasSimpleArgs && compiled.constantKinds.every(x => x === ConstantKind.number)) {
-        const f = (new Function('return ' + code))()
-        const expectedResult = f.apply(thisArg === 0 ? null : thisArg, _args)
-        console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
-        assert(realResult === expectedResult)
-    }
+    const f = code is string ? (new Function('return ' + code))() : code
+    const expectedResult = f.apply(thisArg, _args)
+    console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
+    assert(realResult === expectedResult)
     
     return realResult
 }
@@ -1399,15 +1431,15 @@ function runTest() {
     console.log("compiled nested: f(5)=", e2eTest(nestSrc, [5]))
     intrinsics.assert(e2eTest(nestSrc, [5]) === 10)
 
-    const addOne = finalize(compile('function addOne(x) { return x + 1 }'))
-    const rc = e2eTest('function apply(f, x) { return f(x) }', [addOne, 5], undefined, false)
-    console.log("compiled call: apply(addOne, 5) =", rc)
-    intrinsics.assert(rc === 6)
+    e2eTest(
+        'function apply(f, x) { return f(x) }', 
+        [function addOne(x: number) { return x + 1 }, 5]
+    )
 
-    const add2 = finalize(compile('function add2(x, y) { return x + y }'))
-    const rc2 = e2eTest('function call2(f, a, b) { return f(a, b) }', [add2, 20, 22], undefined, false)
-    console.log("compiled call: call2(add2, 20, 22) =", rc2)
-    assert(rc2 === 42)
+    e2eTest(
+        'function call2(f, a, b) { return f(a, b) }', 
+        [function add2(x: number, y: number) { return x + y }, 20, 22]
+    )
 
     assert(e2eTest('function f(a) { return a <= 1 ? a : a+f(a-1) }', [10]) === 55)
     assert(e2eTest('function f(a) { return a >= 10 ? a : a+f(a+1) }', [1]) === 55)
