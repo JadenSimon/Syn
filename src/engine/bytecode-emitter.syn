@@ -40,7 +40,6 @@ type EmitResult = {
     code: number[]           // opcodes + byte operands
     constants: any[]
     constantKinds: ConstantKind[]
-    constantIsHandle: boolean[]
     paramCount: number
     registerCount: number
     lateBound: Map<number, number> // symbol id -> constant pool slot
@@ -52,7 +51,6 @@ const useCallerRegs = true
 function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitResult {
     const code: number[] = []
     const constants: any[] = []
-    const constantIsHandle: boolean[] = []
     const constantKinds: ConstantKind[] = []
 
     const internMap = new Map<string, number>()  // interning key -> slot
@@ -217,7 +215,6 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         const slot = constants.length
         constants.push(s)
         constantKinds.push(ConstantKind.string)
-        constantIsHandle.push(true)
         internMap.set(s, slot)
         return slot
     }
@@ -228,7 +225,6 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         const slot = constants.length
         constants.push(v)
         constantKinds.push(ConstantKind.number)
-        constantIsHandle.push(false)
         internMap.set(key, slot)
         return slot
     }
@@ -238,7 +234,6 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         const slot = constants.length
         constants.push(name)
         constantKinds.push(kind)
-        constantIsHandle.push(true)
         lateBound.set(symId, slot)
         return slot
     }
@@ -365,10 +360,15 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
                 case ts.SyntaxKind.ParenthesizedExpression: 
                     return visit((n as ts.ParenthesizedExpression).expression, isAcc)
                 case ts.SyntaxKind.BinaryExpression:
-                    const l = visit((n as ts.ParenthesizedExpression).expression, isAcc)
-                    const r = visit((n as ts.ParenthesizedExpression).expression, false)
+                    const bin = n as ts.BinaryExpression
+                    if (isLogicalOp(bin.operatorToken.kind)) {
+                        // no spill
+                        return Math.max(visit(bin.left, isAcc), visit(bin.right, isAcc))
+                    }
+                    const l = visit(bin.left, false)
+                    const r = visit(bin.right, false)
                     if (r === 0) return l
-                    return l + r + 1 // spill
+                    return Math.max(Math.max(l-1, 0), Math.max(r, 0) + (isCommutativeBinaryExp(bin.operatorToken.kind) ? 0 : 1)) + (isAcc ? 1 : 0)
                 case ts.SyntaxKind.PrefixUnaryExpression:
                 case ts.SyntaxKind.PostfixUnaryExpression:
                     const operand = (n as ts.PrefixUnaryExpression | ts.PostfixUnaryExpression).operand
@@ -376,10 +376,14 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
                     if (!isAssignmentUnary(operator)) return visit(operand, isAcc)
                     return visit(operand, isAcc) + 1
                 case ts.SyntaxKind.CallExpression:
-                    const l = visit((n as ts.CallExpression).expression, isAcc)
+                    const subj = (n as ts.CallExpression).expression
                     const args = (n as ts.CallExpression).arguments
-                    // may overestimate for the callee
-                    return Math.max(l, 1) + args.length + Math.max(...args.map(x => maxRegAllocsNeeded(x)))
+                    const argMax = Math.max(...args.map(x => Math.max(0, maxRegAllocsNeeded(x)-1)))
+                    if (findConstPoolSlot(subj) !== undefined) {
+                        return argMax + args.length + (isAcc ? 0 : 1)
+                    }
+                    const l = maxRegAllocsNeeded(subj)
+                    return 1 + args.length + Math.max(l, argMax) + (isAcc ? 0 : 1)
                 case ts.SyntaxKind.ConditionalExpression:
                     const x = n as ts.ConditionalExpression
                     return Math.max(visit(x.condition, isAcc), visit(x.whenTrue, isAcc), visit(x.whenFalse, isAcc))
@@ -408,7 +412,9 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             case ts.SyntaxKind.GreaterThanToken: return Op.TestGreaterThan
             case ts.SyntaxKind.LessThanEqualsToken: return Op.TestLessThanOrEqual
             case ts.SyntaxKind.GreaterThanEqualsToken: return Op.TestGreaterThanOrEqual
-            case ts.SyntaxKind.EqualsEqualsToken: return Op.TestEqual
+            case ts.SyntaxKind.ExclamationEqualsToken:
+            case ts.SyntaxKind.ExclamationEqualsEqualsToken: return Op.TestNotStrictEqual
+            case ts.SyntaxKind.EqualsEqualsToken:
             case ts.SyntaxKind.EqualsEqualsEqualsToken: return Op.TestStrictEqual
             default: throw `unsupported binary operator: ${ts.SyntaxKind[kind]}`
         }
@@ -431,6 +437,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             case ts.SyntaxKind.GreaterThanEqualsToken: return lv >= rv ? 1 : 0
             case ts.SyntaxKind.EqualsEqualsToken:
             case ts.SyntaxKind.EqualsEqualsEqualsToken: return lv === rv ? 1 : 0
+            case ts.SyntaxKind.ExclamationEqualsToken:
+            case ts.SyntaxKind.ExclamationEqualsEqualsToken: return lv !== rv ? 1 : 0
             case ts.SyntaxKind.SlashToken:
                 if (rv === 0) throw `Invalid expression: ${lv} / ${rv}`
                 return Math.trunc(lv / rv) // idiv
@@ -473,6 +481,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
     }
 
     let foldDepth = 0 // so we can cache intermediate failures on the way back up
+    let foldMaxDepth = 0
     const foldedResults = new Map<ts.Expression, FoldResult | false>()
     type FoldResultValue = string | number | boolean | undefined | null
     type FoldResult = 
@@ -502,6 +511,9 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             return ['value', undefined]
         }
         if (const r = foldedResults.get(node)) return r ? r : undefined
+
+        const isTop = foldDepth === 0
+        defer foldMaxDepth = isTop ? 0 : Math.max(foldMaxDepth, foldDepth)
 
         foldDepth += 1
         defer foldDepth -= 1
@@ -556,6 +568,13 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
                 }
                 const r = v2[1]
 
+                if (opKind === ts.SyntaxKind.EqualsEqualsEqualsToken || opKind === ts.SyntaxKind.EqualsEqualsToken) {
+                    return ['value', l === r]
+                }
+                if (opKind === ts.SyntaxKind.ExclamationEqualsEqualsToken || opKind === ts.SyntaxKind.ExclamationEqualsToken) {
+                    return ['value', l !== r]
+                }
+
                 if (typeof l === 'string' || typeof r === 'string') {
                     intrinsics.assert(opKind === ts.SyntaxKind.PlusToken)
                     return ['value', l + (r as string)]
@@ -592,11 +611,28 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
 
         const r = fold()
         if (!r) {
-            if (foldDepth >= 3) foldedResults.set(node, false)
+            if ((foldMaxDepth - foldDepth) >= 3) foldedResults.set(node, false)
             return
         }
         foldedResults.set(node, r)
         return r
+    }
+
+    function isCommutativeBinaryExp(kind: ts.SyntaxKind): boolean {
+        switch (kind) {
+            case ts.SyntaxKind.PlusToken:
+            case ts.SyntaxKind.AsteriskToken:
+            case ts.SyntaxKind.AmpersandToken:
+            case ts.SyntaxKind.BarToken:
+            case ts.SyntaxKind.CaretToken:
+            case ts.SyntaxKind.ExclamationEqualsToken:
+            case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+            case ts.SyntaxKind.EqualsEqualsToken:
+            case ts.SyntaxKind.EqualsEqualsEqualsToken:
+                return true
+            default:
+                return false
+        }
     }
 
     // `x <op>= e` -> the binary op behind the compound assignment
@@ -655,6 +691,16 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         star(reg)
     }
 
+    function emitLogicalOp(node: ts.BinaryExpression) {
+        const kind = node.operatorToken.kind
+        emitExpr(node.left) // acc = left
+        // `??` is treated the same as `||` in native for now
+        const jumpOp = kind === ts.SyntaxKind.AmpersandAmpersandToken ? Op.JumpIfToBooleanFalse : Op.JumpIfToBooleanTrue
+        const overRight = emitJumpPlaceholder(jumpOp)
+        emitExpr(node.right) // acc = right
+        patchJump(overRight)
+    }
+
     function emitBinary(node: ts.BinaryExpression) {
         const kind = node.operatorToken.kind
 
@@ -665,6 +711,8 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             emitExpr(node.right)
             return
         }
+
+        if (isLogicalOp(kind)) { emitLogicalOp(node); return }
 
         if (ts.isNumericLiteral(node.left) && ts.isNumericLiteral(node.right) && isFoldable(kind)) {
             const lv = Number(node.left.text)
@@ -682,12 +730,15 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
 
         emitExpr(node.left)
         const rL = allocReg(); star(rL)
+        defer freeReg()
         emitExpr(node.right)
+        if (isCommutativeBinaryExp(kind)) {
+            return emit2(op, rL)
+        }
         const rR = allocReg(); star(rR)
         ldar(rL)
         emit2(op, rR)
-        freeReg() // rR
-        freeReg() // rL
+        freeReg()
     }
 
     function isAssignmentUnary(op: ts.SyntaxKind) {
@@ -812,7 +863,7 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
             for (let i = nargs-1; i >= 0; i--) {
                 allocated[i] = patchStar(allocated[i])
             }
-            emit1(Op[callOp]); emitByte(callee); emitByte(allocated.at(-1) ?? 0); emitByte(nargs)
+            emit1(Op[callOp]); emitByte(callee); emitByte(allocated[0] ?? 0); emitByte(nargs)
             return
         }
 
@@ -1045,7 +1096,6 @@ function emitFunction(fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.Functio
         code,
         constants,
         constantKinds,
-        constantIsHandle,
         paramCount: fn.parameters.length,
         registerCount: maxReg,
         lateBound,
@@ -1073,11 +1123,152 @@ function compile(src: string): EmitResult {
     return emitFunction(fn)
 }
 
+const OpNames: Record<number, string> = {}
+for (const [name, val] of Object.entries(Op)) OpNames[val as number] = name
+
+// ops whose operand is a variable-width value (governed by a Width2/Width4/Width8 prefix)
+const ImmOps = new Set([Op.LdaImm])
+const ConstOps = new Set([Op.LdaConst])
+const JumpOps = new Set([Op.Jump, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
+
+const RegOperandCounts: Record<number, number> = {
+    [Op.Mov]: 2,
+    [Op.Star]: 1,
+    [Op.Ldar]: 1,
+    [Op.Add]: 1, [Op.Sub]: 1, [Op.Mul]: 1, [Op.Div]: 1, [Op.Mod]: 1, [Op.Exp]: 1,
+    [Op.BitOr]: 1, [Op.BitAnd]: 1, [Op.BitXor]: 1,
+    [Op.ShiftLeft]: 1, [Op.ShiftRight]: 1, [Op.ShiftRightLogical]: 1,
+    [Op.TestNotStrictEqual]: 1, [Op.TestStrictEqual]: 1,
+    [Op.TestLessThan]: 1, [Op.TestGreaterThan]: 1,
+    [Op.TestLessThanOrEqual]: 1, [Op.TestGreaterThanOrEqual]: 1,
+    [Op.IncPost]: 1, [Op.DecPost]: 1,
+    [Op.GetProperty]: 1,
+    [Op.SetProperty]: 2,
+}
+
+type CodeInstruction = {
+    pos: usize
+    width: 1 | 2 | 4 | 8
+    opcode: number
+    opname: string
+    regs: number[]      // fixed-width (1-byte) register operands, in order
+    imm?: number         // decoded LdaImm value (sign-extended), if applicable
+    constSlot?: number   // decoded LdaConst/CallConst constant pool slot, if applicable
+    jumpOffset?: number  // decoded relative jump offset, if applicable
+    jumpTarget?: usize    // absolute byte offset the jump lands on, if applicable
+}
+
+function createCodeIterator(bytes: readonly u8[]) {
+    let cursor = 0
+
+    function readByte(): number {
+        const b = bytes[cursor]
+        cursor = cursor + 1
+        return b
+    }
+    function readSigned(width: 1 | 2 | 4): number {
+        let v = 0
+        for (let i = 0; i < width; i++) v = v | (readByte() << (8 * i))
+        const bits = width * 8
+        const signBit = 1 << (bits - 1)
+        return (v ^ signBit) - signBit
+    }
+    function readUnsigned(width: 1 | 2 | 4): number {
+        let v = 0
+        for (let i = 0; i < width; i++) v = v | (readByte() << (8 * i))
+        return v >>> 0
+    }
+
+    function next(): CodeInstruction | undefined {
+        if (cursor === bytes.length) return
+
+        const pos = cursor as usize
+        let width: 1 | 2 | 4 | 8 = 1
+        let opcode = readByte()
+        if (opcode === Op.Width2) { width = 2; opcode = readByte() }
+        else if (opcode === Op.Width4) { width = 4; opcode = readByte() }
+        else if (opcode === Op.Width8) { width = 8; opcode = readByte() }
+
+        const inst: CodeInstruction = {
+            pos,
+            width,
+            opcode,
+            opname: OpNames[opcode] ?? `UNKNOWN(0x${opcode.toString(16)})`,
+            regs: [],
+        }
+
+        if (opcode >= Op.Star0 && opcode <= Op.Star15) {
+            inst.opname = 'Star'
+            inst.regs.push(opcode - Op.Star0)
+            return inst
+        }
+        if (opcode >= Op.Ldar0 && opcode <= Op.Ldar3) {
+            inst.opname = 'Ldar'
+            inst.regs.push(opcode - Op.Ldar0)
+            return inst
+        }
+
+        const regCount = RegOperandCounts[opcode]
+        if (regCount !== undefined) {
+            for (let i = 0; i < regCount; i++) inst.regs.push(readByte())
+            return inst
+        }
+
+        if (ImmOps.has(opcode)) {
+            inst.imm = width === 8 ? undefined : readSigned(width as 1 | 2 | 4)
+            return inst
+        }
+        if (ConstOps.has(opcode)) {
+            inst.constSlot = width === 8 ? undefined : readUnsigned(width as 1 | 2 | 4)
+            return inst
+        }
+        if (JumpOps.has(opcode)) {
+            const off = width === 8 ? undefined : readSigned(width as 1 | 2 | 4)
+            inst.jumpOffset = off
+            if (off !== undefined) inst.jumpTarget = (cursor + off) as usize
+            return inst
+        }
+
+        if (opcode === Op.Call) {
+            inst.regs.push(readByte(), readByte()) // callee, argStart
+            inst.regs.push(readByte()) // nargs
+            return inst
+        }
+        if (opcode === Op.CallConst) {
+            inst.constSlot = readByte() 
+            inst.regs.push(readByte())
+            inst.regs.push(readByte())
+            return inst
+        }
+
+        // no-operand ops
+        return inst
+    }
+
+    return { next }
+}
+
+function disassemble(code: readonly u8[]): string {
+    const it = createCodeIterator(code)
+    const lines: string[] = []
+    while (const inst = it.next()) {
+        let line = `${String(inst.pos).padStart(4, ' ')}: ${inst.opname}`
+        if (inst.width !== 1) line = line + ` (W${inst.width})`
+        if (inst.constSlot !== undefined) line = line + ` [const:${inst.constSlot}]`
+        for (const r of inst.regs) line = line + ` r${r}`
+        if (inst.imm !== undefined) line = line + ` #${inst.imm}`
+        if (inst.jumpTarget !== undefined) line = line + ` -> ${inst.jumpTarget} (${inst.jumpOffset! >= 0 ? '+' : ''}${inst.jumpOffset})`
+        lines.push(line)
+    }
+    return lines.join('\n')
+}
+
 function testBytecodeEmit(str: string, name = 'f') {
     const r = compile(str)
     console.log(`${name}: code`, r.code, r.code.length)
-    console.log(`${name}: constants`, r.constants, r.constantIsHandle)
+    console.log(`${name}: constants`, r.constants, r.constantKinds)
     console.log(`${name}: lateBound`, r.lateBound, 'regs:', r.registerCount)
+    console.log(`${name}: disasm\n${disassemble(r.code as u8[])}`)
 }
 
 function emitTest() {
@@ -1100,7 +1291,7 @@ function finalize(result: EmitResult): Handle {
             if (result.selfSlot !== i) throw `Missing fn const slot: ${i}`
             continue
         }
-        if (result.constantIsHandle[i]) constants[i] = heap.fromJsString(result.constants[i])
+        if (kinds[i] === ConstantKind.string) constants[i] = heap.fromJsString(result.constants[i])
         else constants[i] = result.constants[i]
     }
     const res = makeFunctionFromBytes(result.code, result.paramCount as u16, result.registerCount as u32, constants)
@@ -1112,12 +1303,13 @@ function finalize(result: EmitResult): Handle {
     return res
 }
 
-function e2eTest(code: string, _args: any[]) {
+function e2eTest(code: string, _args: any[], thisArg: u32 = 0, hasSimpleArgs = true) {
     const interpret = createInterpreter(true, useCallerRegs) // native mode
-    const fn = finalize(compile(code))
+    const compiled = compile(code)
+    const fn = finalize(compiled)
     const args = Intrinsics.stackalloc(_args.length * 4 as usize)
     if (useCallerRegs) {
-        const reversed = _args.reverse()
+        const reversed = _args.slice().reverse()
         for (let i = 0; i < reversed.length; i++) {
             Intrinsics.store(args, 4*i as u32, reversed[i], Types.u32)
         }
@@ -1126,154 +1318,96 @@ function e2eTest(code: string, _args: any[]) {
             Intrinsics.store(args, 4*i as u32, _args[i], Types.u32)
         }
     }
-    const r = interpret(fn, 0, args, _args.length as u32)
+    const r = interpret(fn, thisArg, args, _args.length as u32)
     Intrinsics.stackfree(_args.length * 4 as usize)
-    return r & (2**32)-1 // TODO: the intrinsics should be truncating
+    const realResult = r & (2**32)-1 // TODO: the intrinsics should be truncating to `nt`
+    if (hasSimpleArgs && compiled.constantKinds.every(x => x === ConstantKind.number)) {
+        const f = (new Function('return ' + code))()
+        const expectedResult = f.apply(thisArg === 0 ? null : thisArg, _args)
+        console.log(f.name, '(...) =', expectedResult, 'actual=', realResult)
+        assert(realResult === expectedResult)
+    }
+    
+    return realResult
 }
 
 function runTest() {
-    const interpret = createInterpreter(true) // native mode
-
-    const addFn = finalize(compile('function add(a, b) { let c = a + b; return c * 2 }'))
-    const args = Intrinsics.stackalloc(2 * 4)
-    Intrinsics.store(args, 0, 2, Types.u32)
-    Intrinsics.store(args, 4, 3, Types.u32)
-    const r = interpret(addFn, 0, args, 2)
-    Intrinsics.stackfree(2 * 4)
+    const r = e2eTest('function add(a, b) { let c = a + b; return c * 2 }', [2, 3])
     intrinsics.assert(r === 10) // (2 + 3) * 2
     console.log("compiled add(2, 3) =", r)
 
-    const gFn = finalize(compile('function g(x) { return x * 10 + (3 - 1) }'))
-    const a2 = Intrinsics.stackalloc(4)
-    Intrinsics.store(a2, 0, 4, Types.u32)
-    const r2 = interpret(gFn, 0, a2, 1)
-    Intrinsics.stackfree(4)
+    const r2 = e2eTest('function g(x) { return x * 10 + (3 - 1) }', [4])
     intrinsics.assert(r2 === 42) // 4 * 10 + 2
     console.log("compiled g(4) =", r2)
 
     let bigSrc = 'function big() {'
     for (let v = 200; v <= 500; v++) bigSrc = bigSrc + ' ' + v + ';'
     bigSrc = bigSrc + ' return 456 }'
-    const bigFn = finalize(compile(bigSrc))
-    const a3 = Intrinsics.stackalloc(4)
-    const r3 = interpret(bigFn, 0, a3, 0)
-    Intrinsics.stackfree(4)
+    const r3 = e2eTest(bigSrc, [])
     intrinsics.assert(r3 === 456)
     console.log("compiled big() =", r3, "(via Width2 LdaConst, 301 constants)")
 
-    const thisFn = finalize(compile('function useThis(a) { return this + a }'))
-    const a4 = Intrinsics.stackalloc(4)
-    Intrinsics.store(a4, 0, 2, Types.u32)
-    const r4 = interpret(thisFn, 40, a4, 1) // thisArg = 40
-    Intrinsics.stackfree(4)
+    const r4 = e2eTest('function useThis(a) { return this + a }', [2], 40)
     intrinsics.assert(r4 === 42) // this(40) + a(2)
     console.log("compiled useThis(2) with this=40 =", r4)
 
-    const ifFn = finalize(compile('function f(x) { if (x > 5) { return 100 } return 0 }'))
-    const runIf = (x: number) => {
-        const a = Intrinsics.stackalloc(4)
-        Intrinsics.store(a, 0, x, Types.u32)
-        const r = interpret(ifFn, 0, a, 1)
-        Intrinsics.stackfree(4)
-        return r
-    }
+    const ifSrc = 'function f(x) { if (x > 5) { return 100 } return 0 }'
+    const runIf = (x: number) => e2eTest(ifSrc, [x])
     intrinsics.assert(runIf(10) === 100)
     intrinsics.assert(runIf(3) === 0)
     console.log("compiled if: f(10)=", runIf(10), " f(3)=", runIf(3))
 
     // constant-folded condition: only the taken branch is emitted
-    const constIf = finalize(compile('function h() { if (true) { return 7 } return 8 }'))
-    const noArgs2 = Intrinsics.stackalloc(4)
-    intrinsics.assert(interpret(constIf, 0, noArgs2, 0) === 7)
-    Intrinsics.stackfree(4)
+    intrinsics.assert(e2eTest('function h() { if (true) { return 7 } return 8 }', []) === 7)
     console.log("compiled const-if h() = 7")
 
     // while (loop rotation + conditional jump-back)
-    const whileFn = finalize(compile('function w(x) { while (x > 5) { return 1 } return 0 }'))
-    const runW = (x: number) => {
-        const a = Intrinsics.stackalloc(4)
-        Intrinsics.store(a, 0, x, Types.u32)
-        const r = interpret(whileFn, 0, a, 1)
-        Intrinsics.stackfree(4)
-        return r
-    }
+    const whileSrc = 'function w(x) { while (x > 5) { return 1 } return 0 }'
+    const runW = (x: number) => e2eTest(whileSrc, [x])
     intrinsics.assert(runW(10) === 1)
     intrinsics.assert(runW(3) === 0)
     console.log("compiled while: w(10)=", runW(10), " w(3)=", runW(3))
 
     // assignment + a iterating while loop
-    const sumTo = finalize(compile(
-        'function sumTo(n) { let acc = 0; let i = 0; while (i < n) { acc = acc + i; i = i + 1 } return acc }'
-    ))
-    const runSum = (n: number) => {
-        const a = Intrinsics.stackalloc(4)
-        Intrinsics.store(a, 0, n, Types.u32)
-        const r = interpret(sumTo, 0, a, 1)
-        Intrinsics.stackfree(4)
-        return r
-    }
+    const sumToSrc = 'function sumTo(n) { let acc = 0; let i = 0; while (i < n) { acc = acc + i; i = i + 1 } return acc }'
+    const runSum = (n: number) => e2eTest(sumToSrc, [n])
     intrinsics.assert(runSum(5) === 10)  // 0+1+2+3+4
     intrinsics.assert(runSum(100) === 4950)
     console.log("compiled sumTo(5)=", runSum(5), " sumTo(100)=", runSum(100))
 
     // compound assignment
-    const compFn = finalize(compile('function f(x) { x += 10; x *= 2; return x }'))
-    const runComp = (x: number) => {
-        const a = Intrinsics.stackalloc(4)
-        Intrinsics.store(a, 0, x, Types.u32)
-        const r = interpret(compFn, 0, a, 1)
-        Intrinsics.stackfree(4)
-        return r
-    }
+    const compSrc = 'function f(x) { x += 10; x *= 2; return x }'
+    const runComp = (x: number) => e2eTest(compSrc, [x])
     intrinsics.assert(runComp(5) === 30) // (5 + 10) * 2
     console.log("compiled compound f(5) =", runComp(5))
 
-    const run1 = (fn: Handle, x: number) => {
-        const a = Intrinsics.stackalloc(4)
-        Intrinsics.store(a, 0, x, Types.u32)
-        const r = interpret(fn, 0, a, 1)
-        Intrinsics.stackfree(4)
-        return r
-    }
-
     // for loop
-    const forFn = finalize(compile('function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { s += i } return s }'))
-    intrinsics.assert(run1(forFn, 5) === 10)   // 0+1+2+3+4
-    intrinsics.assert(run1(forFn, 10) === 45)
-    console.log("compiled for: f(5)=", run1(forFn, 5), " f(10)=", run1(forFn, 10))
+    const forSrc = 'function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { s += i } return s }'
+    intrinsics.assert(e2eTest(forSrc, [5]) === 10)   // 0+1+2+3+4
+    intrinsics.assert(e2eTest(forSrc, [10]) === 45)
+    console.log("compiled for: f(5)=", e2eTest(forSrc, [5]), " f(10)=", e2eTest(forSrc, [10]))
 
-    const brkFn = finalize(compile('function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { if (i === 3) { break } s += i } return s }'))
-    intrinsics.assert(run1(brkFn, 100) === 3) // 0+1+2, break at 3
-    console.log("compiled break: f(100)=", run1(brkFn, 100))
+    const brkSrc = 'function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { if (i === 3) { break } s += i } return s }'
+    intrinsics.assert(e2eTest(brkSrc, [100]) === 3) // 0+1+2, break at 3
+    console.log("compiled break: f(100)=", e2eTest(brkSrc, [100]))
 
-    const contFn = finalize(compile('function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { if (i % 2 === 1) { continue } s += i } return s }'))
-    intrinsics.assert(run1(contFn, 10) === 20) // 0+2+4+6+8
-    console.log("compiled continue: f(10)=", run1(contFn, 10))
+    const contSrc = 'function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { if (i % 2 === 1) { continue } s += i } return s }'
+    intrinsics.assert(e2eTest(contSrc, [10]) === 20) // 0+2+4+6+8
+    console.log("compiled continue: f(10)=", e2eTest(contSrc, [10]))
 
-    const nestFn = finalize(compile('function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { let j = 0; while (true) { if (j >= i) { break } s += 1; j += 1 } } return s }'))
-    intrinsics.assert(run1(nestFn, 5) === 10)
-    console.log("compiled nested: f(5)=", run1(nestFn, 5))
+    const nestSrc = 'function f(n) { let s = 0; for (let i = 0; i < n; i += 1) { let j = 0; while (true) { if (j >= i) { break } s += 1; j += 1 } } return s }'
+    console.log("compiled nested: f(5)=", e2eTest(nestSrc, [5]))
+    intrinsics.assert(e2eTest(nestSrc, [5]) === 10)
 
     const addOne = finalize(compile('function addOne(x) { return x + 1 }'))
-    const apply = finalize(compile('function apply(f, x) { return f(x) }'))
-    const ca = Intrinsics.stackalloc(2 * 4)
-    Intrinsics.store(ca, 0, addOne, Types.u32) // f = addOne handle
-    Intrinsics.store(ca, 4, 5, Types.u32)      // x = 5
-    const rc = interpret(apply, 0, ca, 2)
-    Intrinsics.stackfree(2 * 4)
-    intrinsics.assert(rc === 6)
+    const rc = e2eTest('function apply(f, x) { return f(x) }', [addOne, 5], undefined, false)
     console.log("compiled call: apply(addOne, 5) =", rc)
+    intrinsics.assert(rc === 6)
 
     const add2 = finalize(compile('function add2(x, y) { return x + y }'))
-    const call2 = finalize(compile('function call2(f, a, b) { return f(a, b) }'))
-    const cb = Intrinsics.stackalloc(3 * 4)
-    Intrinsics.store(cb, 0, add2, Types.u32)
-    Intrinsics.store(cb, 4, 20, Types.u32)
-    Intrinsics.store(cb, 8, 22, Types.u32)
-    const rc2 = interpret(call2, 0, cb, 3)
-    Intrinsics.stackfree(3 * 4)
-    intrinsics.assert(rc2 === 42)
+    const rc2 = e2eTest('function call2(f, a, b) { return f(a, b) }', [add2, 20, 22], undefined, false)
     console.log("compiled call: call2(add2, 20, 22) =", rc2)
+    assert(rc2 === 42)
 
     assert(e2eTest('function f(a) { return a <= 1 ? a : a+f(a-1) }', [10]) === 55)
     assert(e2eTest('function f(a) { return a >= 10 ? a : a+f(a+1) }', [1]) === 55)
@@ -1285,6 +1419,14 @@ function runTest() {
     // unused var with side effects
     testBytecodeEmit('function f(a) { const x = a++; return a }', 'unused')
     assert(e2eTest('function f(a) { const x = a++; return a }', [1]) === 2)
+
+    // logical ops
+    e2eTest('function f(a, b) { return a || b }', [0, 5])
+    e2eTest('function f(a, b) { return a || b }', [3, 5])
+    e2eTest('function f(a, b) { return a && b }', [0, 5])
+    e2eTest('function f(a, b) { return a && b }', [3, 5])
+    e2eTest('function f(a, b) { return a ?? b }', [3, 5])
+    e2eTest('function f(a, b, c) { return (a || b) && c }', [0, 3, 5])
 
     console.log("bytecode-emitter end-to-end passed")
 }

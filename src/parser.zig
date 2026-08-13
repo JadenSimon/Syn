@@ -12840,7 +12840,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                         }
 
                         if (comptime enable_conditional_bindings) {
-                            if (u.kind == .if_statement and this.getNode(getPackedData(u).left).kind == .variable_statement) {
+                            if (isBoundControlFlow(&this.data.nodes, u)) {
                                 const transformed = try this.getTransformer().transformIfOrWhile(u);
                                 try this.visitRef(transformed);
                                 ref = this.getNode(transformed).next;
