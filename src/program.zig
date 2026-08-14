@@ -14349,6 +14349,9 @@ pub const Analyzer = struct {
                 if (subject == @intFromEnum(Kind.void)) {
                     return false;
                 }
+                if (subject >= @intFromEnum(Kind.zero)) {
+                    if (comptime suppress_gaps) return true; // FIXME: we need to check the bounds
+                }
                 this.printTypeInfo(subject);
                 debugPrint("{any}\n", .{n.getKind()});
                 return error.TODO5;
@@ -22378,6 +22381,9 @@ pub const Analyzer = struct {
                 else => {},
             }
         }
+        if (comptime suppress_gaps) {
+            if (element == @intFromEnum(Kind.undefined)) return @intFromEnum(Kind.error_any);
+        }
         const hash = try this.getMemberNameHash(element);
 
         return try this.accessTypeWithHash(subject, element, hash, true) orelse @intFromEnum(Kind.undefined);
@@ -23831,6 +23837,12 @@ pub const Analyzer = struct {
             },
             .spread_element => {
                 // FIXME: grab the inner exp type?
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+            },
+            .is_expression => {
+                if (comptime suppress_gaps) return @intFromEnum(Kind.boolean);
+            },
+            .variable_statement => {
                 if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             },
             else => {},

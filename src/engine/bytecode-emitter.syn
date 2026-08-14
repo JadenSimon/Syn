@@ -36,6 +36,17 @@ enum ConstantKind {
     late_bound, // so, unknown
 }
 
+interface EhRange {
+    start: number
+    end: number
+    handler: number
+}
+
+interface Labels {
+    eh: EhRange[]
+    jump: number[]
+}
+
 type EmitResult = {
     code: number[]           // opcodes + byte operands
     constants: any[]
@@ -44,9 +55,19 @@ type EmitResult = {
     registerCount: number
     lateBound: Map<number, number> // symbol id -> constant pool slot
     selfSlot?: number
+    labels?: Labels
 }
 
 const useCallerRegs = true
+const calleeOnFrame = true
+
+function isShortStore(opcode: number) {
+    return opcode >= Op.Star0 && opcode <= Op.Star15
+}
+
+function isShortLoad(opcode: number) {
+    return opcode >= Op.Ldar0 && opcode <= Op.Ldar3
+}
 
 function emitFunction(
     fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression,
@@ -60,6 +81,32 @@ function emitFunction(
     const symToReg = new Map<number, number>()    // symbol id -> register
     const lateBound = new Map<number, number>()   // symbol id -> constant slot
 
+    const regState: [number, number][] = [] // tracks the most recent store pc against the reg
+    const maxLookbehind = 16
+    const lookbehindBuffer = new Uint32Array(maxLookbehind)
+    let lookbehindPos = 0
+    let lookbehindCount = 0
+    function pushLookbehind(pos: number) {
+        if (lookbehindCount < maxLookbehind) {
+            lookbehindCount += 1
+        } else {
+            lookbehindPos = (lookbehindPos + 1) % maxLookbehind
+        }
+        const p = (lookbehindCount + lookbehindPos) % maxLookbehind
+        lookbehindBuffer[p] = pos as any 
+    }
+    function popLookbehind(amt = 1) {
+        assert(lookbehindCount > amt-1)
+        lookbehindCount -= amt
+    }
+    // returns the _position_ of the last op, starting at 0
+    function lookbehind(amt: number) {
+        assert(amt >= 0)
+        if (amt > lookbehindCount) return
+        const p = (lookbehindCount + lookbehindPos - amt) & (maxLookbehind-1)
+        return lookbehindBuffer[p]
+    }
+
     let nextReg = 0
     let maxReg = 0
     let thisReg: number | undefined = undefined
@@ -67,6 +114,15 @@ function emitFunction(
     let prevStoreOffset: number = -1
     let skipNextLookbehind = false
     // jumps should not update the "prev op" values
+    
+    // used for less common constructs
+    let extraLabels: Labels | undefined
+    function getExtraLabels() {
+        return extraLabels ??= {
+            eh: [],
+            jump: [],
+        }
+    }
 
     function findConstPoolSlot(node: ts.Expression) {
         if (node.kind !== ts.SyntaxKind.Identifier) return
@@ -79,10 +135,18 @@ function emitFunction(
     function allocReg(): number {
         const r = nextReg
         nextReg = nextReg + 1
-        if (nextReg > maxReg) maxReg = nextReg
+        if (nextReg > maxReg) {
+            maxReg = nextReg
+            if (regState.length < maxReg) {
+                regState.length = maxReg
+                regState[regState.length-1] = [-1, -1]
+            }
+        }
         return r
     }
-    function freeReg() { nextReg = nextReg - 1 }
+    function freeReg(): void {
+        nextReg = nextReg - 1
+    }
 
     function emitByte(b: number) {
         if (b === undefined) throw `not a byte: ${b}`
@@ -91,28 +155,75 @@ function emitFunction(
     }
     function emit1(op: number) { 
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         code.push(op) 
     }
     function emit2(op: number, operand: number) {
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         code.push(op);
         emitByte(operand)
     }
     function emit3(op: number, operand1: number, operand2: number) {
+        if (op === Op.Call) {
+            if (tryReplaceToMov()) {
+                let n = 0
+                let dst0: number | undefined
+                let prevDst = 0
+                let prevSrc = 0
+                while (true) {
+                    const l = lookbehind(n)
+                    if (l === undefined || code[l] !== Op.MovPacked) break
+                    const d = code[l+1]
+                    const src = d >> 4
+                    const dst = d & 0xF
+                    if (n === 0) {
+                        dst0 = dst
+                    } else if (dst !== prevDst+1 || src !== prevSrc-1) {
+                        break
+                    }
+                    prevDst = dst
+                    prevSrc = src
+                    n += 1
+                }
+
+                const lStore = lookbehind(n)
+                const lConst = lookbehind(n+1)
+                if (n > 0 && dst0! > maxReg && lStore !== undefined && lConst !== undefined
+                    && isShortStore(code[lStore]) && (code[lStore] - Op.Star0) === maxReg
+                    && code[lConst] === Op.LdaConst) {
+                    const regStart = prevSrc
+                    prevOpOffset = lConst
+                    popLookbehind(n+1)
+                    code[lConst] = Op.CallConstFrom
+                    code[lConst+2] = dst0!-1
+                    code[lConst+3] = regStart // rargstart
+                    code[lConst+4] = n // nargs
+                    code.length = lConst+5
+                    return
+                }
+            }
+        }
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         code.push(op)
         emitByte(operand1)
         emitByte(operand2)
     }
     function emit4(op: number, operand1: number, operand2: number, operand3: number) {
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         code.push(op)
         emitByte(operand1)
         emitByte(operand2)
         emitByte(operand3)
     }
     function star(reg: number) {
-        prevOpOffset = prevStoreOffset = code.length
+        const pc = code.length
+        regState[reg][0] = pc
+        regState[reg][1] = prevOpOffset
+        prevOpOffset = prevStoreOffset = pc
+        pushLookbehind(pc)
         if (reg <= 15) {
             const op = Op.Star0 + reg
             code.push(op)
@@ -120,12 +231,28 @@ function emitFunction(
             code.push(Op.Star, reg)
         }
     }
+    function tryReplaceToMov(): boolean {
+        const pc0 = lookbehind(0) as number
+        const pc1 = lookbehind(1) as number
+        if (pc0 === undefined || pc1 === undefined) return false
+        if (isShortStore(code[pc0]) && isShortLoad(code[pc1])) {
+            const dst = code[pc0] - Op.Star0
+            const src = code[pc1] - Op.Ldar0
+            code[pc1] = Op.MovPacked
+            code[pc0] = dst | (src << 4)
+            prevOpOffset = pc1
+            popLookbehind()
+            return true
+        }
+        return false
+    }
     function ldar(reg: number) {
-        if (const prev = lookbehindForReg()) {
+        tryReplaceToMov()
+        if (const prev = lookbehindForReg(reg)) {
             if (prev === reg) return
         }
-
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         if (reg <= 3) {
             const op = Op.Ldar0 + reg
             code.push(op)
@@ -136,6 +263,7 @@ function emitFunction(
 
     function emitLoadImm(val: number) {
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         if (inRange(Types.i8, val)) { code.push(Op.LdaImm); code.push(val & 0xFF); return }
         if (inRange(Types.i16, val)) {
             code.push(Op.Width2); code.push(Op.LdaImm)
@@ -153,6 +281,7 @@ function emitFunction(
 
     function emitLoadConst(slot: number) {
         prevOpOffset = code.length
+        pushLookbehind(prevOpOffset)
         if (slot <= 0xFF) { code.push(Op.LdaConst); code.push(slot); return }
         if (slot <= 0xFFFF) {
             code.push(Op.Width2); code.push(Op.LdaConst)
@@ -168,11 +297,16 @@ function emitFunction(
         throw `constant pool index too large: ${slot}`
     }
 
-    function lookbehindForReg() {
+    function lookbehindForReg(reg: number) {
         if (skipNextLookbehind) {
             // we cannot skip if we're going to be jumped into
             skipNextLookbehind = false
             return
+        }
+        if (const prev = (regState[reg] as [number, number] | undefined)) {
+            if (prev[0] !== -1 && (code as any)[prev[0]] - Op.Star0 === reg) {
+                if (prevOpOffset === prev[1] || prevOpOffset === prev[0]) return reg
+            }
         }
         if (prevStoreOffset === -1 || prevOpOffset !== prevStoreOffset) return
         const op = code[prevStoreOffset]
@@ -180,6 +314,7 @@ function emitFunction(
     }
 
     function emitJumpPlaceholder(jumpOp: number): number {
+        pushLookbehind(code.length)
         code.push(Op.Width2); code.push(jumpOp)
         const at = code.length
         code.push(0); code.push(0) // filled in by patchJump
@@ -192,6 +327,7 @@ function emitFunction(
         code[at + 1] = (off >>> 8) & 0xFF
     }
     function emitJumpTo(jumpOp: number, target: number) {
+        pushLookbehind(code.length)
         code.push(Op.Width2); code.push(jumpOp)
         const at = code.length
         const off = target - (at + 2)
@@ -199,17 +335,35 @@ function emitFunction(
         code.push(off & 0xFF); code.push((off >>> 8) & 0xFF)
     }
 
+    const patchStarState: number[] = []
     function emitStarPlaceholder(): number {
         // TODO: select size based on bounded # of regs needed
         // the prediction does not need to be perfect, just needs to bound it
         const at = code.length
-        code.push(Op.Star0);
+        pushLookbehind(at)
+        code.push(Op.Star0)
+        patchStarState.push(prevOpOffset)
         return at
     }
 
     function patchStar(at: number) {
         const reg = allocReg()
         if (reg > 15) throw `TODO: patch larger stores`
+        code[at] += reg
+        regState[reg][0] = at
+        regState[reg][1] = patchStarState.pop()!
+        return reg
+    }
+
+    function patchStarArg(at: number, idx: number) {
+        const state = patchStarState.pop()!
+        const reg = maxReg + idx
+        // easier to treat these regs as volatile for the caller
+        // regState[reg] ??= [-1, -1]
+        // regState[reg][0] = at
+        // regState[reg][1] = state
+        if (reg > 15) throw `TODO: patch larger stores`
+        assert(code[at] === Op.Star0 || code[at-1] === Op.MovPacked)
         code[at] += reg
         return reg
     }
@@ -306,8 +460,17 @@ function emitFunction(
             case ts.SyntaxKind.ParenthesizedExpression:
                 return hasEffects((node as ts.ParenthesizedExpression).expression)
             case ts.SyntaxKind.PrefixUnaryExpression:
-                if (isAssignmentUnary((node as ts.PrefixUnaryExpression).operator)) return true
+                if (isAssignmentUnary((node as ts.PrefixUnaryExpression).operator)) {
+                    return true
+                }
                 return hasEffects((node as ts.PrefixUnaryExpression).operand)
+            case ts.SyntaxKind.BinaryExpression:
+                if (isAssignmentOp((node as ts.BinaryExpression).operatorToken.kind)) {
+                    return true
+                }
+                return hasEffects((node as ts.BinaryExpression).left) || hasEffects((node as ts.BinaryExpression).right)
+            case ts.SyntaxKind.ConditionalExpression:
+                return hasEffects((node as ts.ConditionalExpression).condition) || hasEffects((node as ts.ConditionalExpression).whenTrue) || hasEffects((node as ts.ConditionalExpression).whenFalse)
             case ts.SyntaxKind.TrueKeyword:
             case ts.SyntaxKind.FalseKeyword:
             case ts.SyntaxKind.NullKeyword:
@@ -325,7 +488,7 @@ function emitFunction(
             case ts.SyntaxKind.ExpressionStatement:
                 return !hasEffects((node as ts.ExpressionStatement).expression)
         }
-        return false
+        return !hasEffects(node)
     }
 
     function maxRegAllocsNeeded(exp: ts.Expression): number {
@@ -835,7 +998,7 @@ function emitFunction(
         patchJump(overRight)
     }
 
-    function emitBinary(node: ts.BinaryExpression) {
+    function emitBinary(node: ts.BinaryExpression): void {
         const kind = node.operatorToken.kind
 
         if (isAssignmentOp(kind)) { emitAssignment(node); return }
@@ -860,6 +1023,12 @@ function emitFunction(
             emitExpr(node.left)
             emit2(op, symToReg.get(getSymbolId(node.right))!)
             return
+        }
+
+        if (isLexicalIdent(node.left) && isCommutativeBinaryExp(kind)) {
+            const rL = symToReg.get(getSymbolId(node.left))!
+            emitExpr(node.right)
+            return emit2(op, rL)
         }
 
         emitExpr(node.left)
@@ -948,7 +1117,12 @@ function emitFunction(
         }
         // was folded
         const v = foldedVariables.get(symId)
-        if (!v) throw `unresolved identifier: ${node.getText()}`
+        if (!v) {
+            if (const slot = lateBound.get(symId)) {
+                return void emitLoadConst(slot)
+            }
+            throw `unresolved identifier: ${node.getText()}`
+        }
         return emitLiteral(v[0])
     }
 
@@ -1000,13 +1174,23 @@ function emitFunction(
                 emitExpr(arg)
                 allocated[i] = emitStarPlaceholder()
             }
-            for (let i = nargs-1; i >= 0; i--) {
-                allocated[i] = patchStar(allocated[i])
+            // for (let i = nargs-1; i >= 0; i--) {
+            //     allocated[i] = patchStarArg(allocated[i], nargs-i)
+            // }
+            for (let i = 0; i < nargs; i++) {
+                patchStarArg(allocated[i], nargs-i)
             }
+            if (calleeOnFrame) patchStarArg(callee, 0)
             if (thisReg !== undefined) ldar(thisReg)
-            emit4(Op[callOp], callee, allocated[0] ?? 0, nargs)
+            if (calleeOnFrame) {
+                emit3(Op[callOp], maxReg, nargs) // maxReg holds callee
+            } else {
+                emit4(Op[callOp], callee, allocated[0] ?? 0, nargs)
+            }
             return
         }
+
+        assert(!calleeOnFrame)
 
         for (let i = 0; i < args.length; i++) {
             const arg = args[i]
@@ -1025,11 +1209,10 @@ function emitFunction(
         const isConstruct = node.kind === ts.SyntaxKind.NewExpression
         if (!isConstruct && (node as ts.CallExpression).questionDotToken) throw "optional call is not supported"
 
-        if (const slot = findConstPoolSlot(node.expression)) {
-            return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
-        }
+        // if (const slot = findConstPoolSlot(node.expression)) {
+        //     return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
+        // }
 
-        // method call: `o.method(...)` passes `o` as `this`
         if (!isConstruct && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))) {
             let receiverReg = allocReg()
             const originalRecv = receiverReg
@@ -1043,6 +1226,10 @@ function emitFunction(
                 emitPropertyAccess(node.expression, receiverReg) // acc = method, receiverReg = `o`
             }
 
+            if (calleeOnFrame) {
+                return emitCallArgs('Call', emitStarPlaceholder(), node.arguments ?? [], receiverReg)
+            }
+
             const rCallee = allocReg()
             defer freeReg()
 
@@ -1052,6 +1239,9 @@ function emitFunction(
         }
 
         emitExpr(node.expression) // callee -> acc
+        if (calleeOnFrame) {
+            return emitCallArgs(isConstruct ? 'Construct' : 'Call', emitStarPlaceholder(), node.arguments ?? [])
+        }
 
         const rCallee = allocReg()
         defer freeReg()
@@ -1061,26 +1251,34 @@ function emitFunction(
         return emitCallArgs(isConstruct ? 'Construct' : 'Call', rCallee, node.arguments ?? [])
     }
 
+    function emitVariableDecl(decl: ts.VariableDeclaration, isConst = false) {
+        if (!ts.isIdentifier(decl.name)) throw "destructuring bindings are not supported"
+        const symId = getSymbolId(decl.name)
+        if (symId === 0) throw "binding has no symbol id"
+        if (isConst) {
+            if (tryFoldVariableDecl(decl)) return
+        }
+        if (!isReferencedSymbol(decl.name)) {
+            if (decl.initializer) emitSideEffect(decl.initializer)
+            return
+        }
+        const reg = allocReg()
+        symToReg.set(symId, reg)
+        if (decl.initializer) { 
+            emitExpr(decl.initializer)
+            star(reg)
+        }
+    }
+
     function emitVariableStatement(node: ts.VariableStatement) {
         const isConst = !!ts.getModifiers(node)?.find(x => x.kind === ts.SyntaxKind.ConstKeyword)
         for (const decl of node.declarationList.declarations) {
-            if (!ts.isIdentifier(decl.name)) throw "destructuring bindings are not supported"
-            const symId = getSymbolId(decl.name)
-            if (symId === 0) throw "binding has no symbol id"
-            if (isConst) {
-                if (tryFoldVariableDecl(decl)) continue
-            }
-            if (!isReferencedSymbol(decl.name)) {
-                if (decl.initializer) emitSideEffect(decl.initializer)
-                continue
-            }
-            const reg = allocReg()
-            symToReg.set(symId, reg)
-            if (decl.initializer) { emitExpr(decl.initializer); star(reg) }
+            emitVariableDecl(decl, isConst)
         }
     }
 
     function emitSideEffect(n: ts.Node) {
+        if (isDeadCode(n)) return
         if (ts.isExpressionStatement(n)) { emitExpr(n.expression); return }
         emitExpr(n as ts.Expression)
     }
@@ -1200,6 +1398,44 @@ function emitFunction(
         for (const p of ctx.breaks) patchJump(p) // break -> after loop
     }
 
+    // TODO: `finally` which requires swapping out subsequent control flow labels w/ jumps
+    function emitTryStatement(node: ts.TryStatement) {
+        if (node.finallyBlock) throw "TODO: finally block"
+        const extras = getExtraLabels()
+        const range: EhRange = {
+            start: code.length,
+            end: 0,
+            handler: 0,
+        }
+        emitBlock(node.tryBlock)
+        range.end = code.length
+        // FIXME: we don't need a jump if the block ends with an unconditional jump
+        const handleEnd = extras.jump.length
+        emit2(Op.JumpLabel, handleEnd)
+
+        if (!node.catchClause) {
+            range.handler = code.length
+            emit1(Op.ReThrow)
+            extras.jump[handleEnd] = code.length
+        } else {
+            prevStoreOffset = -1 // acc was clobbered
+            range.handler = code.length
+            const decl = node.catchClause.variableDeclaration
+            if (decl) {
+                emitVariableDecl(decl)
+                star(symToReg.get(getSymbolId(decl.name))!)
+            }
+            emitBlock(node.catchClause.block)
+            extras.jump[handleEnd] = code.length
+        }
+
+        extras.eh.push(range)
+    }
+
+    function emitSwitch(node: ts.SwitchStatement) {
+        
+    }
+
     function emitStatement(node: ts.Statement) {
         if (isDeadCode(node)) return
         if (ts.isReturnStatement(node)) {
@@ -1219,17 +1455,52 @@ function emitFunction(
         } else if (ts.isContinueStatement(node)) {
             if (node.label) throw "labeled continue is not supported"
             emitContinue(); return
+        } else if (ts.isTryStatement(node)) {
+            return void emitTryStatement(node)
+        }
+        else if (ts.isThrowStatement(node)) {
+            emitExpr(node.expression)
+            return void emit1(Op.Throw)
         }
         if (ts.isFunctionDeclaration(node)) throw "nested function declarations are not supported"
         throw `unsupported statement: ${ts.SyntaxKind[node.kind]}`
     }
 
-    for (const p of fn.parameters) {
+    function emitDefaultInit(exp: ts.Expression, reg: number, effectOnly = false) {
+        ldar(reg)
+        const ph = emitJumpPlaceholder(Op.JumpIfNotUndefined)
+        emitExpr(exp)
+        if (!effectOnly) star(reg)
+        patchJump(ph)
+    }
+
+    let defaultInitIndex = -1
+    for (let i = 0; i < fn.parameters.length; i++) {
+        const p = fn.parameters[i]
         if (!ts.isIdentifier(p.name)) throw "destructuring parameters are not supported"
         if (p.dotDotDotToken) throw "rest parameters are not supported"
-        if (p.initializer) throw "default parameter values are not supported"
-        if (!isReferencedSymbol(p.name)) continue
-        symToReg.set(getSymbolId(p.name), allocReg())
+        if (p.initializer && defaultInitIndex === -1) defaultInitIndex = i
+        // we have to assign it even if unused
+        const reg = allocReg()
+        symToReg.set(getSymbolId(p.name), reg)
+    }
+    if (defaultInitIndex !== -1) {
+        for (let i = defaultInitIndex; i < fn.parameters.length; i++) {
+            const p = fn.parameters[i]
+            assert(p.initializer)
+            const name = p.name as ts.Identifier
+            const reg = symToReg.get(getSymbolId(name))!
+            if (!isReferencedSymbol(name)) {
+                if (hasEffects(p.initializer)) {
+                    emitDefaultInit(p.initializer, reg, true)
+                }
+                continue
+            }
+            emitDefaultInit(p.initializer, reg)
+        }
+    }
+    for (let i = fn.parameters.length-1; i >= 0; i--) {
+        if (!isReferencedSymbol(fn.parameters[i].name as any)) freeReg()
     }
 
     if (usesThisBinding(fn)) {
@@ -1264,6 +1535,7 @@ function emitFunction(
         registerCount: maxReg,
         lateBound,
         selfSlot,
+        labels: extraLabels,
     }
 }
 
@@ -1284,7 +1556,7 @@ function fixupMethodLikeDecl(src: string) {
     return `function ${src}`
 }
 
-function compile(src: string): EmitResult {
+export function compile(src: string): EmitResult {
     const sf = ts.createSourceFile('input.js', fixupMethodLikeDecl(src), ts.ScriptTarget.Latest)
     const fn = sf.statements[0]
     if (!fn) throw "found no statements in source"
@@ -1303,7 +1575,7 @@ for (const [name, val] of Object.entries(Op)) OpNames[val as number] = name
 // ops whose operand is a variable-width value (governed by a Width2/Width4/Width8 prefix)
 const ImmOps = new Set([Op.LdaImm])
 const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst])
-const JumpOps = new Set([Op.Jump, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
+const JumpOps = new Set([Op.Jump, Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfNotUndefined, Op.JumpIfNotNull, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
 
 const RegOperandCounts: Record<number, number> = {
     [Op.Mov]: 2,
@@ -1326,11 +1598,13 @@ type CodeInstruction = {
     width: 1 | 2 | 4 | 8
     opcode: number
     opname: string
-    regs: number[]      // fixed-width (1-byte) register operands, in order
-    imm?: number         // decoded LdaImm value (sign-extended), if applicable
-    constSlot?: number   // decoded LdaConst/CallConst constant pool slot, if applicable
-    jumpOffset?: number  // decoded relative jump offset, if applicable
-    jumpTarget?: usize    // absolute byte offset the jump lands on, if applicable
+    regs: number[]          // register operands, in order
+    imm?: number            // decoded value (sign-extended)
+    constSlot?: number      // decoded constant pool slot,
+    jumpOffset?: number     // decoded relative jump offset
+    jumpTarget?: usize      // absolute byte offset the jump lands on
+    jumpLabel?: number      // slots into the labeled jump table
+    copyTo?: number
 }
 
 function createCodeIterator(bytes: readonly u8[]) {
@@ -1384,7 +1658,23 @@ function createCodeIterator(bytes: readonly u8[]) {
             inst.regs.push(opcode - Op.Ldar0)
             return inst
         }
-
+        if (opcode === Op.JumpLabel) {
+            inst.jumpLabel = readUnsigned(width)
+            return inst
+        }
+        if (opcode === Op.CallConstFrom) {
+            inst.constSlot = readByte()
+            inst.copyTo = readByte()
+            inst.regs.push(readByte())
+            inst.regs.push(readByte())
+            return inst
+        }
+        if (opcode === Op.MovPacked) {
+            inst.opname = 'Mov'
+            const val = readByte()
+            inst.regs.push(val & 0xF, val >> 4) // dst, src
+            return inst
+        }
         if (inst.opname.endsWith('Const')) {
             inst.opname = inst.opname.slice(0, -5)
         }
@@ -1414,12 +1704,22 @@ function createCodeIterator(bytes: readonly u8[]) {
         }
 
         if (opcode === Op.Call || opcode === Op.Construct) {
+            if (calleeOnFrame) {
+                inst.regs.push(readByte())
+                inst.regs.push(readByte())
+                if (inst.regs[1] === 0) {
+                    inst.regs.length = 0
+                } else {
+                    inst.regs[1] += inst.regs[0]-1
+                }
+                return inst
+            }
             inst.regs.push(readByte(), readByte()) // callee, argStart
             inst.regs.push(readByte()) // nargs
             if (inst.regs[2] === 0) {
                 inst.regs.length = 1
             } else {
-                inst.regs[2] += inst.regs[1]
+                inst.regs[2] += inst.regs[1]-1
             }
             return inst
         }
@@ -1430,7 +1730,7 @@ function createCodeIterator(bytes: readonly u8[]) {
             if (inst.regs[1] === 0) {
                 inst.regs.length = 0
             } else {
-                inst.regs[1] += inst.regs[0]
+                inst.regs[1] += inst.regs[0]-1
             }
             return inst
         }
@@ -1442,16 +1742,24 @@ function createCodeIterator(bytes: readonly u8[]) {
     return { next }
 }
 
-function disassemble(code: readonly u8[]): string {
+export function disassemble(code: readonly u8[], paramCount?: number, maxRegs?: number): string {
     const it = createCodeIterator(code)
     const lines: string[] = []
     while (const inst = it.next()) {
         let line = `${String(inst.pos).padStart(4, ' ')}: ${inst.opname}`
         if (inst.width !== 1) line = line + ` (W${inst.width})`
         if (inst.constSlot !== undefined) line = line + ` [const:${inst.constSlot}]`
-        for (const r of inst.regs) line = line + ` r${r}`
+        for (const r of inst.regs) {
+            if (maxRegs === undefined || paramCount === undefined) {
+                line = line + ` r${r}`
+                continue
+            }
+            const name = r < paramCount ? `p${r}` : r >= maxRegs ? `a${r-maxRegs}` : `r${r-paramCount}`
+            line = line + ` ${name}`
+        }
         if (inst.imm !== undefined) line = line + ` #${inst.imm}`
         if (inst.jumpTarget !== undefined) line = line + ` -> ${inst.jumpTarget} (${inst.jumpOffset! >= 0 ? '+' : ''}${inst.jumpOffset})`
+        if (inst.jumpLabel !== undefined) line = line + ` -> [label:${inst.jumpLabel}]`
         lines.push(line)
     }
     return lines.join('\n')
@@ -1462,7 +1770,7 @@ function testBytecodeEmit(str: string, name = 'f') {
     console.log(`${name}: code`, r.code, r.code.length)
     console.log(`${name}: constants`, r.constants, r.constantKinds)
     console.log(`${name}: lateBound`, r.lateBound, 'regs:', r.registerCount)
-    console.log(`${name}: disasm\n${disassemble(r.code as u8[])}`)
+    console.log(`${name}: disasm\n${disassemble(r.code as u8[], r.paramCount, r.registerCount)}`)
 }
 
 function emitTest() {
@@ -1502,6 +1810,34 @@ function finalize(result: EmitResult, ctx?: Ctx): Handle {
         const v = heap.FunctionBytecode(res)
         Intrinsics.store(v.constants, result.selfSlot*4 as u32, res, Types.u32)
     }
+    if (result.labels !== undefined) {
+        const ehArr = result.labels.eh
+        const jumpArr = result.labels.jump
+
+        const v = heap.FunctionBytecode(res)
+        v.labels = intrinsics.New(heap.FunctionBytecodeLabels)
+        const labels = v.labels
+
+        labels.ehRangesCount = ehArr.length as u32
+        labels.jumpLabelsCount = jumpArr.length as u32
+        if (labels.ehRangesCount) {
+            labels.ehRanges = intrinsics.Alloc(heap.CoveredRange, labels.ehRangesCount)
+            for (let i: u32 = 0; i < ehArr.length; i++) {
+                assert(ehArr[i].handler) // we assume we will never start on a handler
+                assert(ehArr[i].end > ehArr[i].start)
+                labels.ehRanges[i].start = ehArr[i].start as u32
+                labels.ehRanges[i].end = ehArr[i].end as u32
+                labels.ehRanges[i].handler = ehArr[i].handler as u32
+            }
+        }
+        if (labels.jumpLabelsCount) {
+            labels.jumpLabels = intrinsics.Alloc(Types.u32, labels.jumpLabelsCount)
+            for (let i: u32 = 0; i < jumpArr.length; i++) {
+                assert(jumpArr[i])
+                labels.jumpLabels[i] = jumpArr[i] as u32
+            }
+        }
+    }
     return res
 }
 
@@ -1511,10 +1847,10 @@ interface Ctx {
     readonly [ctxSym]: unique symbol
     [key: string]: any
 }
-function createCtx(o: Record<string, any> = {}): Ctx {
+export function createCtx(o: Record<string, any> = {}): Ctx {
     return Object.assign({ [ctxSym]: Symbol('ctx brand') }, o) as any
 }
-function compileJsFn(f: Function, ctx: Ctx): any {
+export function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
     const _f = f as any
     if (const prev = _f[key]) return prev
@@ -1528,12 +1864,31 @@ function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx
     const fromJsValue = (v: any) => heap.fromJsValue(v, f => compileJsFn(f, ctx))
 
     const source = code is string ? code : code.toString()
-    const interpret = createInterpreter(true, useCallerRegs) // native mode
+    const interpret = createInterpreter(true, useCallerRegs, calleeOnFrame) // native mode
     const compiled = compile(source)
     const fn = finalize(compiled, ctx)
-    const args = Intrinsics.stackalloc(_args.length * 4 as usize)
+    const m = compiled.paramCount
+    let framesize = m * 4 as usize
+    if (calleeOnFrame) {
+        framesize += 4
+    }
+    const sp = Intrinsics.sp()
+    defer { 
+        assert(sp === Intrinsics.sp())
+        intrinsics.memsetByte(sp-framesize, framesize, 0)
+    }
+    const args = Intrinsics.stackalloc(framesize)
+    defer Intrinsics.stackfree(framesize)
+    if (calleeOnFrame) {
+        Intrinsics.store(args, m*4 as usize, fn, Types.u32)
+    }
+
+    const zerodArgs = _args.slice()
+    while (zerodArgs.length < m) zerodArgs.push(0)
+    zerodArgs.length = m
+
     if (useCallerRegs) {
-        const reversed = _args.slice().reverse()
+        const reversed = zerodArgs.reverse()
         for (let i = 0; i < reversed.length; i++) {
             Intrinsics.store(args, 4*i as u32, fromJsValue(reversed[i]), Types.u32)
         }
@@ -1543,8 +1898,7 @@ function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx
         }
     }
     const compiledThisArg = fromJsValue(thisArg)
-    const r = interpret(fn, compiledThisArg, args, _args.length as u32)
-    Intrinsics.stackfree(_args.length * 4 as usize)
+    const r = interpret(calleeOnFrame ? 0 : fn, compiledThisArg, args, zerodArgs.length as u32)
 
     const realResult = r & (2**32)-1 // TODO: the intrinsics should be truncating to `nt`
     function disasmIfBad(expected: any): void {
@@ -1572,6 +1926,12 @@ function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx
     }
     
     return realResult
+}
+
+function e2eTestPrint(...args: Parameters<typeof e2eTest>) {
+    assert(args[0] is string)
+    testBytecodeEmit(args[0])
+    return e2eTest(...args)
 }
 
 function runTest() {
@@ -1695,6 +2055,31 @@ function runTest() {
     e2eTest('function methodCall2(o) { return o["bar"]() }', [{ x: 1, bar() { return this.x } }])
     testBytecodeEmit('function methodCall3(o,k) { return o[k]() }')
     e2eTest('function methodCall3(o,k) { return o[k]() }', [{ x: 1, bar() { return this.x } }, "bar"])
+
+    // repeat calls
+    testBytecodeEmit('function manyCalls(o,k) { return o[k]() + o[k]() + o[k]() }')
+    e2eTest('function manyCalls(o,k) { return o[k]() + o[k]() + o[k]() }', [{ x: 1, bar() { return this.x } }, "bar"])
+    testBytecodeEmit(`function add2(a, b) {
+    const q = add(a, b)
+    return add(a, b) + q
+}`)
+    e2eTest(`function add2(a, b) {
+    const q = add(a, b)
+    return add(a, b) + q
+}`,[2,3], undefined, createCtx({ 
+        add: function add(a: number, b: number) { let c = a + b; return c * 2 } 
+    }))
+
+    // default init
+    e2eTest('function init(x, y = 1) { return x + y }', [1])
+    e2eTestPrint('function init2(x, _ = 1) { return x }', [1])
+    e2eTest('function init3(x, f, _ = f(x++)) { return x }', [1, () => 2])
+    e2eTest('function init4(x, f, y = f()) { return x + y }', [1, () => 2, 3])
+
+    // try/catch
+    e2eTest('function eh() { try { throw 1 } catch (e) { return e + 1 } }', [1])
+    e2eTest('function nothrow(x) { try { x += 1 } catch (e) { return e + 1 } return x }', [1])
+
 
     console.log("bytecode-emitter end-to-end passed")
 }
