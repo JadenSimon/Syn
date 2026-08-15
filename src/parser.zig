@@ -6307,6 +6307,7 @@ fn Parser_(comptime skip_trivia: bool) type {
         }
 
         fn parseCatchClause(this: *@This()) !NodeRef {
+            if (this.lexer.token != .t_catch) return 0;
             try this.lexer.next();
             var variable_decl: NodeRef = 0;
             if (this.lexer.token == .t_open_paren) {

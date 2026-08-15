@@ -586,6 +586,95 @@ pub fn usesThisBinding(sf: WrappedFile, node_ref: u32) bool {
     return node.hasFlag(.using);
 }
 
+// used for testing lowered machine code
+pub fn callNativeFn(handle: u32, args: js.Array(u32)) !u32 {
+    const arg_count = args.elements.len;
+    const call_mod = @import("std").builtin.CallModifier.auto;
+    return switch (arg_count) {
+        0 => @call(call_mod, try getNativePtr(fn() callconv(.C) u32, handle), .{}),
+        1 => @call(call_mod, try getNativePtr(fn(usize) callconv(.C) u32, handle), .{args.elements[0]}),
+        2 => @call(call_mod, try getNativePtr(fn(usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1]}),
+        3 => @call(call_mod, try getNativePtr(fn(usize, usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1], args.elements[2]}),
+        4 => @call(call_mod, try getNativePtr(fn(usize, usize, usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1], args.elements[2], args.elements[3]}),
+        else => error.TooManyArgs,
+    };
+}
+
+var native_fn_handle_to_ptr: ?*std.AutoHashMapUnmanaged(u32, usize) = null;
+fn mapNativePtr(ptr: usize) !u32 {
+    if (native_fn_handle_to_ptr) |m| {
+        const handle = @as(u32, @intCast(m.count()))+1;
+        try m.put(getAllocator(), handle, ptr);
+        return handle;
+    }
+    const m = try getAllocator().create(std.AutoHashMapUnmanaged(u32, usize));
+    m.* = .{};
+    native_fn_handle_to_ptr = m;
+    const handle: u32 = 1;
+    try m.put(getAllocator(), handle, ptr);
+    return handle;
+}
+
+fn getNativePtr(comptime T: type, handle: u32) !*const T {
+    const m = native_fn_handle_to_ptr orelse return error.NoHandleMap;
+    const ptr = m.get(handle) orelse return error.FailedToMapHandle;
+    return @ptrFromInt(ptr);
+}
+
+const builtin = @import("builtin");
+const posix = std.posix;
+
+const is_darwin_arm = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
+
+extern "c" fn sys_icache_invalidate(start: *const anyopaque, size: usize) void;
+extern "c" fn pthread_jit_write_protect_np(enabled: c_int) void;
+extern "c" fn __clear_cache(start: [*]u8, end: [*]u8) callconv(.C) c_int;
+
+pub fn createExecutableCode(buf: js.ReferencedBuffer) !u32 {
+    const code = buf.data; // machine code
+    const page_size = std.mem.page_size;
+    const len = std.mem.alignForward(usize, code.len, page_size);
+
+    const map_flags: posix.MAP = if (is_darwin_arm)
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true }
+    else
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+
+    const initial_prot = if (is_darwin_arm)
+        posix.PROT.READ | posix.PROT.WRITE | posix.PROT.EXEC
+    else
+        posix.PROT.READ | posix.PROT.WRITE;
+
+    const mem = try posix.mmap(
+        null,
+        len,
+        initial_prot,
+        map_flags,
+        -1,
+        0,
+    );
+    errdefer posix.munmap(mem);
+
+    if (is_darwin_arm) {
+        pthread_jit_write_protect_np(0);
+    }
+
+    @memcpy(mem[0..code.len], code);
+
+    if (is_darwin_arm) {
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(mem.ptr, code.len);
+    } else {
+        try posix.mprotect(mem, posix.PROT.READ | posix.PROT.EXEC);
+        if (builtin.cpu.arch.isARM() or builtin.cpu.arch.isAARCH64()) {
+            _ = __clear_cache(mem.ptr, mem.ptr + code.len);
+        }
+    }
+
+    const ptr: usize = @intFromPtr(mem.ptr);
+    return mapNativePtr(ptr);
+}
+
 comptime {
     js.registerModule(@This());
 }

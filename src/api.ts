@@ -6622,3 +6622,10 @@ export const sys = createSystem()
 export function optimizeVson(source: string, emitVson = false): string {
     return api.optimizeVson(source, emitVson)
 }
+
+export function createNativeFn(source: ArrayBuffer) {
+    const handle = api.createExecutableCode(Buffer.from(source))
+    return (...args: any[]) => {
+        return api.callNativeFn(handle, args)
+    }
+}
