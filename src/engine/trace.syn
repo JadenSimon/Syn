@@ -1,0 +1,871 @@
+"use wrapped";
+
+import * as heap from './heap'
+import * as intrinsics from './intrinsics'
+import * as bytecode from './bytecode-emitter'
+import { Op, createInterpreter } from './vm'
+
+const Types = intrinsics.Types
+const Intrinsics = intrinsics.Intrinsics
+const inRange = intrinsics.inRange
+const assert = intrinsics.assert
+
+type usize = u32
+type Handle = heap.Handle
+
+const CondJumpOpcodes = new Set<number>([
+    Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfToBooleanFalse,
+    Op.JumpIfNotNull, Op.JumpIfNotUndefined, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue,
+])
+
+const TerminalOpcodes = new Set<number>([Op.Return, Op.Throw, Op.ReThrow])
+
+type BlockKind = 'linear' | 'jump' | 'branch' | 'exit'
+
+interface CfgBlock {
+    index: number
+    start: number   
+    end: number     // pc of the terminating instruction
+    kind: BlockKind
+    succs: number[]
+    preds: number[]
+    idom: number
+    ipdom: number   // immediate post-dominator
+    loop: number    // innermost enclosing loop header, -1 if none
+
+    unknownIn: Set<number>
+    unknownOut: Set<number>
+    hasUnknown: boolean
+    unknownBranch: boolean
+}
+
+interface Cfg {
+    blocks: CfgBlock[]
+    blockAt: Map<number, number>      // leader pc -> block index
+    loops: Map<number, Set<number>>   // header block -> body blocks
+    paramCount: number
+    anyUnknown: boolean
+}
+
+function computeIdoms(n: number, entry: number, preds: number[][], succs: number[][]): number[] {
+    const postorder: number[] = []
+    const seen = new Set<number>()
+    const stackNode: number[] = [entry]
+    const stackNext: number[] = [0]
+    seen.add(entry)
+    while (stackNode.length) {
+        const depth = stackNode.length - 1
+        const b = stackNode[depth]
+        const i = stackNext[depth]
+        if (i < succs[b].length) {
+            stackNext[depth] = i + 1
+            const s = succs[b][i]
+            if (!seen.has(s)) {
+                seen.add(s)
+                stackNode.push(s)
+                stackNext.push(0)
+            }
+            continue
+        }
+        stackNode.pop()
+        stackNext.pop()
+        postorder.push(b)
+    }
+
+    const rpoNum: number[] = []
+    for (let i = 0; i < n; i++) rpoNum.push(-1)
+    const rpo: number[] = []
+    for (let i = postorder.length - 1; i >= 0; i--) {
+        rpoNum[postorder[i]] = rpo.length
+        rpo.push(postorder[i])
+    }
+
+    const idom: number[] = []
+    for (let i = 0; i < n; i++) idom.push(-1)
+    idom[entry] = entry
+
+    function intersect(a: number, b: number): number {
+        while (a !== b) {
+            while (rpoNum[a] > rpoNum[b]) a = idom[a]
+            while (rpoNum[b] > rpoNum[a]) b = idom[b]
+        }
+        return a
+    }
+
+    let changed = true
+    while (changed) {
+        changed = false
+        for (let i = 1; i < rpo.length; i++) {
+            const b = rpo[i]
+            let newIdom = -1
+            for (const p of preds[b]) {
+                if (rpoNum[p] === -1 || idom[p] === -1) continue
+                newIdom = newIdom === -1 ? p : intersect(p, newIdom)
+            }
+            if (newIdom !== -1 && idom[b] !== newIdom) {
+                idom[b] = newIdom
+                changed = true
+            }
+        }
+    }
+    return idom
+}
+
+function buildCfg(code: readonly u8[], paramCount: number): Cfg {
+    const insts: bytecode.CodeInstruction[] = []
+    {
+        const it = bytecode.createCodeIterator(code)
+        while (const inst = it.next()) insts.push(inst)
+    }
+    const codeLen = code.length
+
+    function endOf(i: number): number {
+        return i + 1 < insts.length ? insts[i + 1].pos : codeLen
+    }
+
+    const leaderSet = new Set<number>()
+    leaderSet.add(0)
+    for (let i = 0; i < insts.length; i++) {
+        const inst = insts[i]
+        if (TerminalOpcodes.has(inst.opcode)) {
+            leaderSet.add(endOf(i))
+            continue
+        }
+        if (inst.jumpTarget !== undefined) {
+            leaderSet.add(inst.jumpTarget)
+            leaderSet.add(endOf(i))
+            continue
+        }
+        if (inst.opcode === Op.JumpAcc || inst.opcode === Op.JumpLabel) {
+            throw `trace2: indirect jump at ${inst.pos} is not supported yet`
+        }
+    }
+
+    const leaders: number[] = []
+    for (const l of leaderSet) {
+        if (l < codeLen) leaders.push(l)
+    }
+    leaders.sort((a, b) => a - b)
+
+    const blockAt = new Map<number, number>()
+    for (let i = 0; i < leaders.length; i++) blockAt.set(leaders[i], i)
+
+    const blocks: CfgBlock[] = []
+    for (let i = 0; i < leaders.length; i++) {
+        blocks.push({
+            index: i,
+            start: leaders[i],
+            end: leaders[i],
+            kind: 'linear',
+            succs: [],
+            preds: [],
+            idom: -1,
+            ipdom: -1,
+            loop: -1,
+            unknownIn: new Set<number>(),
+            unknownOut: new Set<number>(),
+            hasUnknown: false,
+            unknownBranch: false,
+        })
+    }
+
+    const blockInsts: bytecode.CodeInstruction[][] = []
+    for (let i = 0; i < blocks.length; i++) blockInsts.push([])
+    const posToIdx = new Map<number, number>()
+    {
+        let bi = 0
+        for (let i = 0; i < insts.length; i++) {
+            posToIdx.set(insts[i].pos, i)
+            while (bi + 1 < blocks.length && insts[i].pos >= blocks[bi + 1].start) bi++
+            blockInsts[bi].push(insts[i])
+        }
+    }
+
+    for (let bi = 0; bi < blocks.length; bi++) {
+        const b = blocks[bi]
+        const own = blockInsts[bi]
+        if (own.length === 0) throw `trace2: empty block at ${b.start}`
+        const last = own[own.length - 1]
+        const lastIdx = posToIdx.get(last.pos)!
+        b.end = last.pos
+
+        if (TerminalOpcodes.has(last.opcode)) {
+            b.kind = 'exit'
+            continue
+        }
+        if (last.jumpTarget !== undefined) {
+            if (CondJumpOpcodes.has(last.opcode)) {
+                b.kind = 'branch'
+                b.succs.push(blockAt.get(endOf(lastIdx))!)
+                b.succs.push(blockAt.get(last.jumpTarget)!)
+            } else {
+                b.kind = 'jump'
+                b.succs.push(blockAt.get(last.jumpTarget)!)
+            }
+            continue
+        }
+        const fall = endOf(lastIdx)
+        if (fall < codeLen) b.succs.push(blockAt.get(fall)!)
+    }
+
+    for (const b of blocks) {
+        for (const s of b.succs) blocks[s].preds.push(b.index)
+    }
+
+    const n = blocks.length
+    const succs: number[][] = []
+    const preds: number[][] = []
+    for (const b of blocks) {
+        succs.push(b.succs)
+        preds.push(b.preds)
+    }
+
+    const idom = computeIdoms(n, 0, preds, succs)
+    for (let i = 0; i < n; i++) blocks[i].idom = idom[i]
+
+    function dominates(a: number, b: number): boolean {
+        let cur = b
+        for (;;) {
+            if (cur === a) return true
+            if (cur === 0 || cur === -1) return false
+            cur = blocks[cur].idom
+        }
+    }
+
+    {
+        const rsuccs: number[][] = []
+        const rpreds: number[][] = []
+        for (let i = 0; i < n; i++) {
+            rsuccs.push(preds[i].slice())
+            rpreds.push(succs[i].slice())
+        }
+        const exitNodes: number[] = []
+        for (let i = 0; i < n; i++) {
+            if (succs[i].length === 0) {
+                exitNodes.push(i)
+                rpreds[i].push(n)
+            }
+        }
+        rsuccs.push(exitNodes)
+        rpreds.push([])
+        const ipdom = computeIdoms(n + 1, n, rpreds, rsuccs)
+        for (let i = 0; i < n; i++) blocks[i].ipdom = ipdom[i] === n ? -1 : ipdom[i]
+    }
+
+    const loops = new Map<number, Set<number>>()
+    for (let u = 0; u < n; u++) {
+        for (const v of blocks[u].succs) {
+            if (!dominates(v, u)) continue
+            let body = loops.get(v)
+            if (!body) loops.set(v, body = new Set<number>())
+            body.add(v)
+            const stack = [u]
+            while (stack.length) {
+                const x = stack.pop()!
+                if (body.has(x)) continue
+                body.add(x)
+                for (const p of blocks[x].preds) stack.push(p)
+            }
+        }
+    }
+
+    for (const entry of loops) {
+        const header = entry[0]
+        const body = entry[1]
+        for (const b of body) {
+            const cur = blocks[b].loop
+            if (cur === -1 || body.size < loops.get(cur)!.size) blocks[b].loop = header
+        }
+    }
+
+    const anyUnknown = propagateUnknowns(blocks, blockInsts, loops, paramCount)
+
+    return { blocks, blockAt, loops, paramCount, anyUnknown }
+}
+
+function setEquals(a: Set<number>, b: Set<number>): boolean {
+    if (a.size !== b.size) return false
+    for (const x of a) {
+        if (!b.has(x)) return false
+    }
+    return true
+}
+
+function propagateUnknowns(
+    blocks: CfgBlock[],
+    blockInsts: bytecode.CodeInstruction[][],
+    loops: Map<number, Set<number>>,
+    paramCount: number,
+): boolean {
+    const n = blocks.length
+
+    const seeds: Set<number>[] = []
+    for (let i = 0; i < n; i++) seeds.push(new Set<number>())
+
+    function transfer(bi: number): boolean {
+        const b = blocks[bi]
+        const live = new Set<number>(b.unknownIn)
+        let hasUnknown = false
+        let unknownBranch = false
+
+        const own = blockInsts[bi]
+        for (let i = 0; i < own.length; i++) {
+            const inst = own[i]
+            const reads = bytecode.getRegReads(inst)
+            let tainted = false
+            for (const r of reads) {
+                if (live.has(r)) { tainted = true; break }
+            }
+            if (tainted) {
+                hasUnknown = true
+                if (i === own.length - 1 && b.kind === 'branch') unknownBranch = true
+            }
+            for (const w of bytecode.getRegWrites(inst)) {
+                if (tainted) live.add(w)
+                else live.delete(w)
+            }
+        }
+
+        b.hasUnknown = hasUnknown
+        b.unknownBranch = unknownBranch
+        if (setEquals(live, b.unknownOut)) return false
+        b.unknownOut = live
+        return true
+    }
+
+    function dataFixpoint(): void {
+        let changed = true
+        while (changed) {
+            changed = false
+            for (let bi = 0; bi < n; bi++) {
+                const b = blocks[bi]
+                const merged = new Set<number>(seeds[bi])
+                if (bi === 0) {
+                    for (let i = 0; i < paramCount; i++) merged.add(i)
+                }
+                for (const p of b.preds) {
+                    for (const r of blocks[p].unknownOut) merged.add(r)
+                }
+                if (!setEquals(merged, b.unknownIn)) {
+                    b.unknownIn = merged
+                    changed = true
+                }
+                if (transfer(bi)) changed = true
+            }
+        }
+    }
+
+    function addControlSeeds(): boolean {
+        let added = false
+        for (const b of blocks) {
+            if (!b.unknownBranch) continue
+
+            let merge = -1
+            let region: number[] = []
+            const header = b.loop
+            if (header !== -1 && b.succs.length === 2) {
+                const body = loops.get(header)!
+                const in0 = body.has(b.succs[0])
+                const in1 = body.has(b.succs[1])
+                if (in0 !== in1) {
+                    merge = header
+                    region = [...body]
+                }
+            }
+            if (merge === -1) {
+                merge = b.ipdom
+                if (merge === -1) continue
+                const seen = new Set<number>()
+                const stack = b.succs.slice()
+                while (stack.length) {
+                    const x = stack.pop()!
+                    if (x === merge || seen.has(x)) continue
+                    seen.add(x)
+                    for (const s of blocks[x].succs) stack.push(s)
+                }
+                region = [...seen]
+            }
+
+            const seed = seeds[merge]
+            for (const x of region) {
+                for (const inst of blockInsts[x]) {
+                    for (const w of bytecode.getRegWrites(inst)) {
+                        if (seed.has(w)) continue
+                        seed.add(w)
+                        added = true
+                    }
+                }
+            }
+        }
+        return added
+    }
+
+    for (let round = 0; round <= n + 1; round++) {
+        dataFixpoint()
+        if (!addControlSeeds()) break
+    }
+
+    for (const b of blocks) {
+        if (b.hasUnknown) return true
+    }
+    return false
+}
+
+function printCfg(cfg: Cfg): string {
+    function regs(s: Set<number>): string {
+        const parts: string[] = []
+        for (const r of s) {
+            parts.push(r === -1 ? 'acc' : r < cfg.paramCount ? `p${r}` : `r${r - cfg.paramCount}`)
+        }
+        parts.sort()
+        return parts.join(',')
+    }
+    const lines: string[] = []
+    lines.push(cfg.anyUnknown ? 'function may see unknowns' : 'function is fully concrete')
+    for (const b of cfg.blocks) {
+        let line = `B${b.index} [${b.start}..${b.end}] ${b.kind}`
+        if (b.succs.length) line = line + ` -> ${b.succs.map(s => 'B' + s).join(', ')}`
+        if (b.kind === 'branch' && b.ipdom !== -1) line = line + `  (rejoins at B${b.ipdom})`
+        if (cfg.loops.has(b.index)) {
+            const body = [...cfg.loops.get(b.index)!].map(x => 'B' + x).join(',')
+            line = line + `  [loop header, body {${body}}]`
+        }
+        line = line + (b.hasUnknown ? '  unknown' : '  concrete')
+        if (b.unknownBranch) line = line + '/branch'
+        if (b.unknownIn.size) line = line + ` in{${regs(b.unknownIn)}}`
+        if (b.unknownOut.size) line = line + ` out{${regs(b.unknownOut)}}`
+        lines.push(line)
+    }
+    return lines.join('\n')
+}
+
+interface Phi {
+    label: number
+    value: number                    // tagged nan
+    block: number                    // rejoin point
+    slot: number
+    incoming: Map<number, number>    // pred block -> value arriving on that edge
+}
+
+type RegionKind = 'loop' | 'forward'
+
+interface Region {
+    kind: RegionKind
+    merge: number      // block idx where control rejoins
+    changed: boolean   
+    entries: number
+}
+
+const maxLoopIterations = 64
+const maxRounds = 8
+
+function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}) {
+    const compiled = bytecode.compile(code)
+    const cfg = buildCfg(compiled.code as u8[], compiled.paramCount)
+    if (opts.verbose) {
+        console.log(bytecode.disassemble(compiled.code as any, compiled.paramCount, compiled.registerCount))
+    }
+    if (opts.verbose || opts.showCfg) {
+        console.log(printCfg(cfg))
+    }
+    function makeSetFilter(numbers: number[]) {
+        const bits = new Uint32Array((numbers[numbers.length - 1] >>> 5) + 1)
+
+        for (let i = 0; i < numbers.length; i++) {
+            const x = numbers[i]
+            bits[x >>> 5] |= 1 << (x & 31)
+        }
+
+        return (x: number) =>
+            (bits[x >>> 5] & (1 << (x & 31))) !== 0
+    }
+
+    const isBlock = makeSetFilter([...cfg.blockAt.keys()])
+
+    const finalized = bytecode.finalize(compiled)
+    const interpret = createInterpreter(true, true, true)
+
+    const mem = new Float64Array(intrinsics.heapMaxAddress * 2)
+    let lowSp = mem.length
+
+    const load = Intrinsics.load
+    const store = Intrinsics.store
+    const stackalloc = Intrinsics.stackalloc
+    const sp = Intrinsics.sp
+
+    const phiByNan = new Map<number, Phi>()
+    const paramByNan = new Map<number, string>()
+    const published = new Map<number, Map<number, Phi>>()
+    let phiCounter = 0
+    let placedNewPhi = false
+
+    function publish(block: number, slot: number): void {
+        let bySlot = published.get(block)
+        if (!bySlot) published.set(block, bySlot = new Map<number, Phi>())
+        if (bySlot.has(slot)) return
+        const value = tracer.createUniqueNan()
+        const phi: Phi = {
+            label: phiCounter++,
+            value,
+            block,
+            slot,
+            incoming: new Map<number, number>(),
+        }
+        bySlot.set(slot, phi)
+        phiByNan.set(tracer.getNanId(value), phi)
+        placedNewPhi = true
+    }
+
+    function sameValue(a: number, b: number): boolean {
+        if (a === b) return true
+        const ia = tracer.getNanId(a)
+        const ib = tracer.getNanId(b)
+        if (ia && ib) return ia === ib
+        return false
+    }
+
+    const regions: Region[] = []
+    const regionAtMerge = new Map<number, Region>()
+    const symbolicHeaders = new Set<number>()
+
+    function openRegion(kind: RegionKind, merge: number): Region {
+        const r: Region = { kind, merge, changed: true, entries: 0 }
+        regions.push(r)
+        regionAtMerge.set(merge, r)
+        return r
+    }
+
+    function closeRegion(r: Region): void {
+        const i = regions.indexOf(r)
+        if (i >= 0) regions.splice(i, 1)
+        if (regionAtMerge.get(r.merge) === r) regionAtMerge.delete(r.merge)
+    }
+
+    let curBlock = -1
+    let lastReportedPc = -1
+    const exits: number[] = []
+
+    function onEnterBlock(b: number): void {
+        const pred = curBlock
+        curBlock = b
+
+        if (!regionAtMerge.has(b) && symbolicHeaders.has(b)) openRegion('loop', b)
+
+        const region = regionAtMerge.get(b)
+        if (!region) return
+
+        region.entries++
+        if (region.entries > maxLoopIterations) {
+            throw `trace2: region at B${b} did not converge after ${maxLoopIterations} entries`
+        }
+        region.changed = false
+
+        const bySlot = published.get(b)
+        if (bySlot) {
+            for (const entry of bySlot) {
+                const slot = entry[0]
+                const phi = entry[1]
+                const arriving = mem[slot]
+                const prev = phi.incoming.get(pred)
+                if (prev === undefined || !sameValue(prev, arriving)) {
+                    phi.incoming.set(pred, arriving)
+                    region.changed = true
+                }
+                mem[slot] = phi.value as f64
+            }
+        }
+
+        if (region.kind === 'forward') closeRegion(region)
+    }
+
+    let decisions: number[] = []
+    let decisionIdx = 0
+    function decideForward(v1: number, v2: number): number {
+        if (decisionIdx < decisions.length) {
+            const d = decisions[decisionIdx]
+            decisionIdx++
+            return d ? v1 : v2
+        }
+        decisions.push(0)
+        decisionIdx++
+        return v2
+    }
+    function advancePath(): boolean {
+        while (decisions.length && decisions[decisions.length - 1] === 1) decisions.pop()
+        if (!decisions.length) return false
+        decisions[decisions.length - 1] = 1
+        return true
+    }
+    const tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
+        stackalloc: (amt) => {
+            const p = stackalloc(amt)
+            lowSp = Math.min(lowSp, p)
+            return p
+        },
+        load: (ptr, offset, T) => {
+            if (ptr > intrinsics.heapMaxAddress) {
+                tracer.markHandled()
+                return mem[ptr + offset]
+            }
+            return load(ptr, offset, T)
+        },
+        store: (ptr, offset, val, T) => {
+            if (ptr <= intrinsics.heapMaxAddress) return store(ptr, offset, val, T)
+            const slot = ptr + offset
+            for (const r of regions) publish(r.merge, slot)
+            mem[slot] = val as any
+            tracer.markHandled()
+        },
+        jmp: (pc, off) => {
+            if (off !== 0) return pc + off
+            if (pc !== lastReportedPc && isBlock(pc)) {
+                if (!regions.length) {
+                    curBlock = cfg.blockAt.get(pc)!
+                    lastReportedPc = pc
+                    return pc
+                }
+                if (const b = cfg.blockAt.get(pc)) onEnterBlock(b)
+            }
+            lastReportedPc = pc
+            return pc
+        },
+        branch: (cond, v1, v2) => {
+            if (!regions.length) {
+                if (!isNaN(cond as any)) {
+                    return cond ? v1 : v2
+                }
+            }
+
+            tracer.markHandled()
+
+            const header = cfg.blocks[curBlock].loop
+            let isLoopBranch = false
+            let contPc = 0
+            let exitPc = 0
+            if (header !== -1) {
+                const body = cfg.loops.get(header)!
+                const in1 = body.has(cfg.blockAt.get(v1)!)
+                const in2 = body.has(cfg.blockAt.get(v2)!)
+                if (in1 !== in2) {
+                    isLoopBranch = true
+                    contPc = in1 ? v1 : v2
+                    exitPc = in1 ? v2 : v1
+                }
+            }
+
+            if (!isNaN(cond as any)) {
+                const taken = cond ? v1 : v2
+                if (isLoopBranch && taken === exitPc) {
+                    if (const r = regionAtMerge.get(header)) closeRegion(r)
+                }
+                return taken
+            }
+
+            if (isLoopBranch) {
+                symbolicHeaders.add(header)
+                const r = regionAtMerge.get(header) ?? openRegion('loop', header)
+                if (r.changed) return contPc
+                closeRegion(r)
+                return exitPc
+            }
+
+            const rejoin = cfg.blocks[curBlock].ipdom
+            if (rejoin !== -1 && !regionAtMerge.has(rejoin)) openRegion('forward', rejoin)
+            return decideForward(v1, v2)
+        },
+        canexit: (acc) => {
+            tracer.markHandled()
+            exits.push(acc)
+            return true
+        },
+        call: (target: any, thisArg: any, regStart: any, regCount: any, cb: any) => {
+            // TODO
+            tracer.markHandled()
+            return tracer.createUniqueNan()
+        },
+    })
+    defer tracer.dispose()
+
+    const spBefore = sp()
+    const args = Intrinsics.stackalloc(4 + compiled.paramCount * 4 as u32)
+    const paramSlots: number[] = []
+    for (let i: u32 = 0; i < compiled.paramCount; i++) paramSlots.push(args + i * 4)
+    const regsBase = args - 4 + compiled.paramCount * 4
+
+    function runOnce(): void {
+        mem.fill(0, lowSp)
+        Intrinsics.store(args, compiled.paramCount * 4 as u32, finalized, Types.u32)
+        for (let i: u32 = 0; i < compiled.paramCount; i++) {
+            const arg = tracer.createUniqueNan()
+            paramByNan.set(tracer.getNanId(arg), `p${i}`)
+            Intrinsics.store(args, i * 4, arg, Types.u32)
+        }
+        curBlock = -1
+        lastReportedPc = -1
+        regions.length = 0
+        regionAtMerge.clear()
+        decisionIdx = 0
+        interpret(finalized, 0, args, compiled.paramCount as u32)
+    }
+
+    let rounds = 0
+    for (;;) {
+        placedNewPhi = false
+        exits.length = 0
+        decisions = []
+        for (;;) {
+            runOnce()
+            if (!advancePath()) break
+        }
+        rounds++
+        if (!placedNewPhi || rounds >= maxRounds) break
+    }
+    sp(spBefore)
+
+    function slotName(slot: number): string {
+        const pi = paramSlots.indexOf(slot)
+        if (pi >= 0) return `p${pi}`
+        const r = (regsBase - slot) / 4
+        return r < compiled.paramCount ? `p${r}` : `r${r - compiled.paramCount}`
+    }
+
+    function opInputs(t: any): any[] {
+        if (t.b !== undefined) return [t.a, t.b]
+        if (t.a !== undefined) return [t.a]
+        if (t.op === 'select') return [t.args[0], t.args[1], t.args[2]]
+        if (t.op === 'ret') return [t.args[0]]
+        return t.args
+    }
+
+    const emitted = new Set<number>()
+    const phiLines: string[] = []
+
+    function render(v: number): string {
+        const id = tracer.getNanId(v)
+        if (!id) return String(v)
+        if (const phi = phiByNan.get(id)) {
+            emitPhi(phi)
+            return `phi${phi.label}`
+        }
+        if (const name = paramByNan.get(id)) return name
+        if (const t = tracer.getTraceFromUnknown(v)) {
+            const parts = opInputs(t).map(x => render(x))
+            return `(${t.op}, ${parts.join(', ')})`
+        }
+        return `?${id}`
+    }
+
+    function emitPhi(phi: Phi): void {
+        if (emitted.has(phi.label)) return
+        emitted.add(phi.label)
+        const parts: string[] = []
+        for (const entry of phi.incoming) parts.push(`B${entry[0]}: ${render(entry[1])}`)
+        phiLines.push(`  phi${phi.label} @ B${phi.block}[${slotName(phi.slot)}] = phi(${parts.join(', ')})`)
+    }
+
+    const lines: string[] = []
+    const seenExits = new Set<string>()
+    for (const e of exits) {
+        const s = `(ret, ${render(e)})`
+        if (seenExits.has(s)) continue
+        seenExits.add(s)
+        lines.push(s)
+    }
+    for (const l of phiLines) lines.push(l)
+    return {
+        cfg,
+        exits,
+        rounds,
+        text: lines.join('\n'),
+        traces: tracer.getTraces(),
+    }
+}
+
+function t(n: number) {
+    let c = 0
+    for (let i = 0; i < 10; i++) {
+        c += i
+    }
+    let s = 0; for (let i = 0; i < n; i += 1) { s += i } return s + c
+}
+
+function testTrace(fn: Function, name: string, verbose = false) {
+    const start = (performance as any).now()
+    console.log(`--- ${name} ---`)
+    const r = trace(fn.toString(), { verbose, showCfg: true })!
+    console.log(r.text)
+    console.log('dur', (performance as any).now() - start)
+}
+
+testTrace(t, 't', true)
+
+testTrace(function allConcrete() {
+    let s = 0
+    for (let i = 0; i < 10; i++) s += i
+    return s * 2
+}, 'allConcrete')
+
+testTrace(function linear(n: number) {
+    const a = n * 3
+    const b = a + 1
+    return b - n
+}, 'linear')
+
+testTrace(function ifElse(n: number) {
+    let x = 1
+    if (n > 3) { x = n + 10 } else { x = 20 }
+    return x + 5
+}, 'ifElse')
+
+testTrace(function maybeZero(n: number) {
+    let x = 5
+    let i = 0
+    while (i < n) { x = x + 1; i = i + 1 }
+    return x
+}, 'maybeZero')
+
+testTrace(function nested(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < 3; j = j + 1) s = s + j
+    }
+    return s
+}, 'nested')
+
+testTrace(function nested2(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < i; j = j + 1) {
+            for (let k = j; k >= 0; k += i) {
+                s = s + k
+            }
+        }
+    }
+    return s
+}, 'nested2')
+
+testTrace(function allConcrete2() {
+    let s = 0
+    for (let i = 0; i < 10_000; i++) {
+        s += i
+        if (s > 10) {
+            s -= i % 5
+        }
+        if (s > 100_000) {
+            s -= 100_000
+        }
+    }
+    return s * 2
+}, 'allConcrete2')
+
+testTrace(function withCall(x: number, f: any) {
+    const x1 = x*8
+    const x2 = x*8
+    return f(x1, x2) + f(x1, x2)
+}, 'withCall')
+
+testTrace(function withCall2(f: any, e: number) {
+    const a = 2*e
+    const b = f(a)
+    return f()
+}, 'withCall2')
