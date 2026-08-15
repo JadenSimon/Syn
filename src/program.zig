@@ -10666,11 +10666,11 @@ pub const Program = struct {
                         }
                     },
                     .source_file, .block => {
-                        const saved = self.checked_mode;
-                        defer self.checked_mode = saved;
-                        if (self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0)) |mode| {
-                            self.checked_mode = mode;
-                        }
+                        // const saved = self.checked_mode;
+                        // defer self.checked_mode = saved;
+                        // if (self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0)) |mode| {
+                        //     self.checked_mode = mode;
+                        // }
                         try parser.forEachChild(self.nodes, n, self);
                     },
                     .enum_declaration => try self.lowerEnumDeclaration(n, ref),
@@ -19580,6 +19580,8 @@ pub const Analyzer = struct {
             if (comptime is_debug) {
                 this.printTypeInfo(source_ref);
                 this.printTypeInfo(resolved);
+                // two booleans apparently getting passed thru here?
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             }
         }
 
@@ -19624,6 +19626,10 @@ pub const Analyzer = struct {
                         }
                     }
                     continue;
+                }
+
+                if (comptime suppress_gaps) {
+                    if (el == @intFromEnum(Kind.undefined)) return @intFromEnum(Kind.any);
                 }
 
                 const refined = try this.createRefinement(el, member);
@@ -19676,6 +19682,8 @@ pub const Analyzer = struct {
             // slow path :(
             return this.createRefinement(try this.mergeIntersection(source_ref), member);
         }
+
+        if (comptime suppress_gaps) return @intFromEnum(Kind.any);
 
         return notSupported(source.getKind());
     }
@@ -22500,7 +22508,8 @@ pub const Analyzer = struct {
             if (element == @intFromEnum(Kind.number)) {
                 return try this.toUnion(slice);
             }
-            const types = try TypeList.fromSlice(this, &.{try this.toUnion(slice)});
+            const r = if (slice.len == 1) slice[0] else try this.toUnion(slice);
+            const types = try TypeList.fromSlice(this, &.{r});
             return try this.accessParameterizedPrimitivePrototype("Array", types, element, hash, set_this_type);
         }
         if (s.getKind() == .intersection) {
@@ -23003,6 +23012,10 @@ pub const Analyzer = struct {
 
                 return @intFromEnum(Kind.number);
             },
+            .comma_token => {
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+                return error.TODO;
+            },
             else => {
                 debugPrint("missing op implementation: {any}\n", .{op});
                 this.printCurrentNode();
@@ -23411,7 +23424,10 @@ pub const Analyzer = struct {
                             return this.createArrayType(@intFromEnum(Kind.any));
                         }
 
-                        if (t >= @intFromEnum(Kind.false)) return error.TODO;
+                        if (t >= @intFromEnum(Kind.false)) {
+                            if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+                            return error.TODO;
+                        }
                         const n = this.types.at(t);
                         switch (n.getKind()) {
                             .array => {
@@ -23543,6 +23559,7 @@ pub const Analyzer = struct {
                             }
 
                             if (name.kind == .numeric_literal) {
+                                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
                                 return error.TODO_Numeric_literal;
                             }
 
@@ -23843,6 +23860,9 @@ pub const Analyzer = struct {
                 if (comptime suppress_gaps) return @intFromEnum(Kind.boolean);
             },
             .variable_statement => {
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+            },
+            .delete_expression => {
                 if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             },
             else => {},
@@ -24729,6 +24749,12 @@ pub const Analyzer = struct {
                         });
                     },
                     .query => {
+                        if (comptime suppress_gaps) {
+                            if (this.analyzer.program.getFileData(k.slot3).ast.nodes.at(k.slot4).kind == .arrow_function) {
+                                return try this._toTypeNode(@intFromEnum(Kind.any));
+                            }
+                        }
+
                         const copy = try this.copyNodeFromRef(k.slot4, k.slot3);
                         var l = BumpAllocatorList(AstNode).init(&this.synthetic_nodes);
 

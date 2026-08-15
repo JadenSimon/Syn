@@ -4,6 +4,10 @@ import * as heap from './heap'
 import * as intrinsics from './intrinsics'
 import * as bytecode from './bytecode-emitter'
 import { Op, createInterpreter } from './vm'
+import * as lowering from './lowering'
+
+// bound eagerly so the module evaluates (and runs its self-test) at load time
+const lowerResidual = lowering.lowerResidual
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -439,12 +443,35 @@ function printCfg(cfg: Cfg): string {
     return lines.join('\n')
 }
 
-interface Phi {
+// A value that is live into a rejoin point. This is deliberately NOT an IR
+// node: OpTrace is the intrinsic op set and a phi is not a machine op. It is
+// bookkeeping that says "at block B, slot S has this identity", plus what each
+// incoming edge assigns to it.
+// The value graph closes on itself because the identity is stable, so nothing
+// has to be written down in the trace stream to express the merge.
+interface BlockParam {
     label: number
-    value: number                    // tagged nan
-    block: number                    // rejoin point
+    value: number                    // tagged nan: the stable identity
+    block: number                    // rejoin point that owns it
     slot: number
     incoming: Map<number, number>    // pred block -> value arriving on that edge
+}
+
+// A branch whose predicate was unknown. The predicate is already an ordinary
+// traced value (`lt`, `ne`, ...) whose operands bottom out in the same symbols
+// everything else uses
+//
+// It is recorded per incoming edge, because the predicate usually lives in the
+// accumulator, which is edge-carried and has no memory slot to publish. For a
+// rotated loop the entry edge computes `i < n` from the initial i while the
+// back edge computes it from the incremented one. Multiple conditions can 
+// exist for a single branch, so they are stored as block params.
+interface SymbolicBranch {
+    block: number
+    condByEdge: Map<number, number>  // pred block -> predicate value on that edge
+    thenBlock: number
+    elseBlock: number
+    isLoop: boolean
 }
 
 type RegionKind = 'loop' | 'forward'
@@ -493,27 +520,28 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
     const stackalloc = Intrinsics.stackalloc
     const sp = Intrinsics.sp
 
-    const phiByNan = new Map<number, Phi>()
+    const blockParamByNan = new Map<number, BlockParam>()
     const paramByNan = new Map<number, string>()
-    const published = new Map<number, Map<number, Phi>>()
-    let phiCounter = 0
-    let placedNewPhi = false
+    const published = new Map<number, Map<number, BlockParam>>()
+    const symbolicBranches = new Map<number, SymbolicBranch>()
+    let valueCounter = 0
+    let placedNewParam = false
 
     function publish(block: number, slot: number): void {
         let bySlot = published.get(block)
-        if (!bySlot) published.set(block, bySlot = new Map<number, Phi>())
+        if (!bySlot) published.set(block, bySlot = new Map<number, BlockParam>())
         if (bySlot.has(slot)) return
         const value = tracer.createUniqueNan()
-        const phi: Phi = {
-            label: phiCounter++,
+        const bp: BlockParam = {
+            label: valueCounter++,
             value,
             block,
             slot,
             incoming: new Map<number, number>(),
         }
-        bySlot.set(slot, phi)
-        phiByNan.set(tracer.getNanId(value), phi)
-        placedNewPhi = true
+        bySlot.set(slot, bp)
+        blockParamByNan.set(tracer.getNanId(value), bp)
+        placedNewParam = true
     }
 
     function sameValue(a: number, b: number): boolean {
@@ -542,12 +570,25 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
     }
 
     let curBlock = -1
+    let curPred = -1     // which edge we arrived at curBlock on
+    let entryTarget = -1
+    let entryPred = -1
     let lastReportedPc = -1
-    const exits: number[] = []
+    const exitIds: number[] = []    // value id, or 0 when the return folded
+    const exitConsts: number[] = [] // the folded value, when it did
+    const exitBlocks: number[] = [] // which block returned
 
     function onEnterBlock(b: number): void {
         const pred = curBlock
+        curPred = pred
         curBlock = b
+        enteredBlocks.add(b)
+        // everything before the first parameterized block folded to constants,
+        // so that block is where the residual program begins
+        if (entryTarget === -1 && (published.has(b) || symbolicHeaders.has(b))) {
+            entryTarget = b
+            entryPred = pred
+        }
 
         if (!regionAtMerge.has(b) && symbolicHeaders.has(b)) openRegion('loop', b)
 
@@ -564,18 +605,26 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
         if (bySlot) {
             for (const entry of bySlot) {
                 const slot = entry[0]
-                const phi = entry[1]
+                const bp = entry[1]
                 const arriving = mem[slot]
-                const prev = phi.incoming.get(pred)
+                const prev = bp.incoming.get(pred)
                 if (prev === undefined || !sameValue(prev, arriving)) {
-                    phi.incoming.set(pred, arriving)
+                    bp.incoming.set(pred, arriving)
                     region.changed = true
                 }
-                mem[slot] = phi.value as f64
+                mem[slot] = bp.value as f64
             }
         }
 
-        if (region.kind === 'forward') closeRegion(region)
+        if (region.kind === 'forward') {
+            // the enclosing loop must keep going until this rejoin settles too
+            if (region.changed) {
+                for (const r of regions) {
+                    if (r.kind === 'loop') r.changed = true
+                }
+            }
+            closeRegion(region)
+        }
     }
 
     let decisions: number[] = []
@@ -589,6 +638,32 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
         decisions.push(0)
         decisionIdx++
         return v2
+    }
+    // per-site alternation counter for branches inside a loop
+    const armVisits = new Map<number, number>()
+    const enteredBlocks = new Set<number>()
+
+    // A region is only allowed to converge once every symbolic branch inside 
+    // it has actually had both of its successors entered, so a rejoin can 
+    // never be declared settled while one of its predecessors has never run.
+    function armsCovered(header: number): boolean {
+        const body = cfg.loops.get(header)
+        if (!body) return true
+        for (const b of body) {
+            const sb = symbolicBranches.get(b)
+            if (!sb) continue
+            // the header's own exit edge leaves the body, so it can never 
+            // be covered while we are still going around
+            if (body.has(sb.thenBlock) && !enteredBlocks.has(sb.thenBlock)) return false
+            if (body.has(sb.elseBlock) && !enteredBlocks.has(sb.elseBlock)) return false
+        }
+        return true
+    }
+    function enclosingLoop(): Region | undefined {
+        for (const r of regions) {
+            if (r.kind === 'loop') return r
+        }
+        return undefined
     }
     function advancePath(): boolean {
         while (decisions.length && decisions[decisions.length - 1] === 1) decisions.pop()
@@ -619,8 +694,11 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
         jmp: (pc, off) => {
             if (off !== 0) return pc + off
             if (pc !== lastReportedPc && isBlock(pc)) {
-                if (!regions.length) {
+                // stay out of the way entirely while nothing has ever gone symbolic
+                if (!regions.length && published.size === 0 && symbolicHeaders.size === 0) {
+                    curPred = curBlock
                     curBlock = cfg.blockAt.get(pc)!
+                    enteredBlocks.add(curBlock)
                     lastReportedPc = pc
                     return pc
                 }
@@ -661,21 +739,46 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
                 return taken
             }
 
+            let sb = symbolicBranches.get(curBlock)
+            if (!sb) {
+                sb = {
+                    block: curBlock,
+                    condByEdge: new Map<number, number>(),
+                    thenBlock: cfg.blockAt.get(isLoopBranch ? contPc : v1)!,
+                    elseBlock: cfg.blockAt.get(isLoopBranch ? exitPc : v2)!,
+                    isLoop: isLoopBranch,
+                }
+                symbolicBranches.set(curBlock, sb)
+            }
+            // per edge, and overwritten each visit, only the last one is converged
+            sb.condByEdge.set(curPred, cond as any)
+
             if (isLoopBranch) {
                 symbolicHeaders.add(header)
                 const r = regionAtMerge.get(header) ?? openRegion('loop', header)
-                if (r.changed) return contPc
+                if (r.changed || !armsCovered(header)) return contPc
                 closeRegion(r)
                 return exitPc
             }
 
             const rejoin = cfg.blocks[curBlock].ipdom
             if (rejoin !== -1 && !regionAtMerge.has(rejoin)) openRegion('forward', rejoin)
+            // A branch inside a symbolic loop cannot be explored by re-running.
+            // Alternate arms instead and let the loop's own fixpoint merge them
+            // at the rejoin.
+            if (enclosingLoop() !== undefined) {
+                const n = (armVisits.get(curBlock) ?? 0) + 1
+                armVisits.set(curBlock, n)
+                return (n & 1) ? v2 : v1
+            }
             return decideForward(v1, v2)
         },
         canexit: (acc) => {
             tracer.markHandled()
-            exits.push(acc)
+            const id = tracer.getNanId(acc as any)
+            exitIds.push(id)
+            exitConsts.push(id ? 0 : acc as any)
+            exitBlocks.push(curBlock)
             return true
         },
         call: (target: any, thisArg: any, regStart: any, regCount: any, cb: any) => {
@@ -691,34 +794,48 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
     const paramSlots: number[] = []
     for (let i: u32 = 0; i < compiled.paramCount; i++) paramSlots.push(args + i * 4)
     const regsBase = args - 4 + compiled.paramCount * 4
+    const paramIds: number[] = []
 
     function runOnce(): void {
         mem.fill(0, lowSp)
         Intrinsics.store(args, compiled.paramCount * 4 as u32, finalized, Types.u32)
         for (let i: u32 = 0; i < compiled.paramCount; i++) {
-            const arg = tracer.createUniqueNan()
-            paramByNan.set(tracer.getNanId(arg), `p${i}`)
-            Intrinsics.store(args, i * 4, arg, Types.u32)
+            // incoming symbols are created once and reused on every path, so
+            // values computed on different paths unify into one graph. we keep
+            // the id and rebuild the nan, rather than storing the double
+            if (paramIds.length <= i) {
+                const arg = tracer.createUniqueNan()
+                paramIds[i] = tracer.getNanId(arg)
+                paramByNan.set(paramIds[i], `p${i}`)
+            }
+            Intrinsics.store(args, i * 4, intrinsics.getNanFromId(paramIds[i]) as any, Types.u32)
         }
         curBlock = -1
+        curPred = -1
+        entryTarget = -1
+        entryPred = -1
         lastReportedPc = -1
         regions.length = 0
         regionAtMerge.clear()
         decisionIdx = 0
+        armVisits.clear()
+        enteredBlocks.clear()
         interpret(finalized, 0, args, compiled.paramCount as u32)
     }
 
     let rounds = 0
     for (;;) {
-        placedNewPhi = false
-        exits.length = 0
+        placedNewParam = false
+        exitIds.length = 0
+        exitConsts.length = 0
+        exitBlocks.length = 0
         decisions = []
         for (;;) {
             runOnce()
             if (!advancePath()) break
         }
         rounds++
-        if (!placedNewPhi || rounds >= maxRounds) break
+        if (!placedNewParam || rounds >= maxRounds) break
     }
     sp(spBefore)
 
@@ -729,52 +846,263 @@ function trace(code: string, opts: { verbose?: boolean, showCfg?: boolean } = {}
         return r < compiled.paramCount ? `p${r}` : `r${r - compiled.paramCount}`
     }
 
-    function opInputs(t: any): any[] {
-        if (t.b !== undefined) return [t.a, t.b]
-        if (t.a !== undefined) return [t.a]
-        if (t.op === 'select') return [t.args[0], t.args[1], t.args[2]]
-        if (t.op === 'ret') return [t.args[0]]
-        return t.args
+    // FIXME: dedupe with lowering
+    function operandIndices(t: any): number[] {
+        if (t.op === 'select') return [0, 1, 2]
+        if (t.op === 'load') return [0, 1]
+        if (t.op === 'store') return [0, 1, 2]
+        if (t.op === 'ret') return [0]
+        if (t.op === 'stackalloc' || t.op === 'stackfree') return [0]
+        if (t.b !== undefined) return [0, 1]
+        if (t.a !== undefined) return [0]
+        return []
     }
 
-    const emitted = new Set<number>()
-    const phiLines: string[] = []
-
-    function render(v: number): string {
-        const id = tracer.getNanId(v)
-        if (!id) return String(v)
-        if (const phi = phiByNan.get(id)) {
-            emitPhi(phi)
-            return `phi${phi.label}`
-        }
+    const rendering = new Set<number>()
+    function renderId(id: number): string {
+        if (const bp = blockParamByNan.get(id)) return `v${bp.label}`
         if (const name = paramByNan.get(id)) return name
-        if (const t = tracer.getTraceFromUnknown(v)) {
-            const parts = opInputs(t).map(x => render(x))
-            return `(${t.op}, ${parts.join(', ')})`
+        if (rendering.has(id)) return `?${id}`
+        if (const t = tracer.getTraceById(id)) {
+            rendering.add(id)
+            const s = renderTrace(t)
+            rendering.delete(id)
+            return s
         }
         return `?${id}`
     }
 
-    function emitPhi(phi: Phi): void {
-        if (emitted.has(phi.label)) return
-        emitted.add(phi.label)
+    function renderTrace(t: any): string {
+        if (!t) return '?'
         const parts: string[] = []
-        for (const entry of phi.incoming) parts.push(`B${entry[0]}: ${render(entry[1])}`)
-        phiLines.push(`  phi${phi.label} @ B${phi.block}[${slotName(phi.slot)}] = phi(${parts.join(', ')})`)
+        for (const j of operandIndices(t)) {
+            const id = t.argIds[j] ?? 0
+            parts.push(id === 0 ? String(t.args[j]) : renderId(id))
+        }
+        return `(${t.op}, ${parts.join(', ')})`
     }
 
+    function render(v: number): string {
+        const id = tracer.getNanId(v)
+        if (!id) return String(v)
+        return renderId(id)
+    }
+
+    // a block parameter only matters if something reachable from an exit or a
+    // branch predicate actually reads it
+    const liveParams = new Set<number>()
+    const markedIds = new Set<number>()
+    function markId(id: number): void {
+        if (markedIds.has(id)) return
+        markedIds.add(id)
+        if (const bp = blockParamByNan.get(id)) {
+            if (liveParams.has(bp.label)) return
+            liveParams.add(bp.label)
+            for (const e of bp.incoming) markValue(e[1])
+            return
+        }
+        if (const t = tracer.getTraceById(id)) {
+            for (const j of operandIndices(t)) {
+                const aid = t.argIds[j] ?? 0
+                if (aid !== 0) markId(aid)
+            }
+        }
+    }
+    function markValue(v: number): void {
+        const id = tracer.getNanId(v)
+        if (id) markId(id)
+    }
+    for (const id of exitIds) { if (id) markId(id) }
+    for (const entry of symbolicBranches) {
+        for (const e of entry[1].condByEdge) markValue(e[1])
+    }
+
+    // The residual is blocks with parameters and edge arguments
     const lines: string[] = []
+    for (let b = 0; b < cfg.blocks.length; b++) {
+        const bySlot = published.get(b)
+        const br = symbolicBranches.get(b)
+        const params: BlockParam[] = []
+        if (bySlot) {
+            for (const p of bySlot.values()) {
+                if (liveParams.has(p.label)) params.push(p)
+            }
+        }
+        if (!params.length && !br) continue
+
+        // A predicate computed inside the block from its own parameters is the
+        // same value on every edge, so it belongs in the block. One that came
+        // in through the accumulator differs per edge 
+        let condIsParam = false
+        let condInBlock = 0
+        if (br) {
+            const distinct = new Set<number>()
+            for (const e of br.condByEdge) distinct.add(tracer.getNanId(e[1]))
+            condIsParam = distinct.size > 1
+            if (!condIsParam) {
+                for (const e of br.condByEdge) condInBlock = e[1]
+            }
+        }
+
+        const names = params.map(p => `v${p.label}:${slotName(p.slot)}`)
+        if (condIsParam) names.push('c:cond')
+        lines.push(`B${b}${names.length ? `(${names.join(', ')})` : ''}:`)
+
+        const byPred = new Map<number, string[]>()
+        function argsFor(pred: number): string[] {
+            let args = byPred.get(pred)
+            if (!args) byPred.set(pred, args = [])
+            return args
+        }
+        for (const p of params) {
+            for (const e of p.incoming) argsFor(e[0]).push(`v${p.label} = ${render(e[1])}`)
+        }
+        if (condIsParam) {
+            for (const e of br!.condByEdge) argsFor(e[0]).push(`c = ${render(e[1])}`)
+        }
+        for (const e of byPred) lines.push(`  <- ${e[0] < 0 ? 'entry' : 'B' + e[0]}(${e[1].join(', ')})`)
+
+        if (br) {
+            const c = condIsParam ? 'c' : render(condInBlock)
+            lines.push(`  ${br.isLoop ? 'loop' : 'br'} ${c} ? B${br.thenBlock} : B${br.elseBlock}`)
+        }
+    }
+
+    // ---- structured residual ---------------------------------------------
+    function buildResidual(): lowering.Residual {
+        const blocks: lowering.ResidualBlock[] = []
+        const byIndex = new Map<number, lowering.ResidualBlock>()
+        function blockFor(i: number): lowering.ResidualBlock {
+            if (const b = byIndex.get(i)) return b
+            const b: lowering.ResidualBlock = {
+                index: i, idom: cfg.blocks[i].idom, params: [], paramNames: [], edges: [],
+                term: '', condId: 0, thenBlock: -1, elseBlock: -1,
+                jumpTo: -1, retId: 0, retConst: 0,
+            }
+            byIndex.set(i, b)
+            blocks.push(b)
+            return b
+        }
+
+        // parameters, and the predicate when it is edge-carried
+        for (let i = 0; i < cfg.blocks.length; i++) {
+            const bySlot = published.get(i)
+            const br = symbolicBranches.get(i)
+            const params: BlockParam[] = []
+            if (bySlot) {
+                for (const p of bySlot.values()) {
+                    if (liveParams.has(p.label)) params.push(p)
+                }
+            }
+            let condParamId = 0
+            if (br) {
+                const distinct = new Set<number>()
+                for (const e of br.condByEdge) distinct.add(tracer.getNanId(e[1]))
+                if (distinct.size > 1) condParamId = tracer.getNanId(tracer.createUniqueNan())
+            }
+            if (!params.length && !br) continue
+
+            const rb = blockFor(i)
+            for (const p of params) {
+                rb.params.push(tracer.getNanId(p.value))
+                rb.paramNames.push(`v${p.label}:${slotName(p.slot)}`)
+            }
+            if (condParamId) {
+                rb.params.push(condParamId)
+                rb.paramNames.push('c:cond')
+            }
+
+            // edge arguments, positionally aligned with params
+            const argsByPred = new Map<number, lowering.ResidualEdge>()
+            function slotFor(pred: number): lowering.ResidualEdge {
+                let a = argsByPred.get(pred)
+                if (!a) {
+                    argsByPred.set(pred, a = { pred, args: [], argConsts: [] })
+                    for (let k = 0; k < rb.params.length; k++) {
+                        a.args.push(0)
+                        a.argConsts.push(0)
+                    }
+                }
+                return a
+            }
+            // an argument is either a traced value or a folded literal
+            function setArg(pred: number, k: number, v: number): void {
+                const e = slotFor(pred)
+                const id = tracer.getNanId(v)
+                e.args[k] = id
+                if (!id) e.argConsts[k] = v
+            }
+            for (let k = 0; k < params.length; k++) {
+                for (const e of params[k].incoming) setArg(e[0], k, e[1])
+            }
+            if (br) {
+                for (const e of br.condByEdge) {
+                    if (condParamId) setArg(e[0], rb.params.length - 1, e[1])
+                    else rb.condId = tracer.getNanId(e[1])
+                }
+            }
+            for (const e of argsByPred) rb.edges.push(e[1])
+
+            if (br) {
+                rb.term = 'branch'
+                if (condParamId) rb.condId = condParamId
+                rb.thenBlock = br.thenBlock
+                rb.elseBlock = br.elseBlock
+            }
+        }
+
+        // a predecessor that only supplies edge arguments becomes a block that
+        // performs the copies and jumps
+        for (const b of blocks) {
+            for (const e of b.edges) {
+                if (e.pred < 0 || e.pred === entryPred) continue
+                const p = blockFor(e.pred)
+                if (p.term === '') { p.term = 'jump'; p.jumpTo = b.index }
+            }
+        }
+
+        for (let k = 0; k < exitIds.length; k++) {
+            const rb = blockFor(exitBlocks[k])
+            if (rb.term !== '' && rb.term !== 'ret') continue
+            rb.term = 'ret'
+            rb.retId = exitIds[k]
+            rb.retConst = exitConsts[k]
+        }
+
+        blocks.sort((a, b) => a.index - b.index)
+        const entryBlock = entryTarget >= 0 ? byIndex.get(entryTarget) : undefined
+        let entryArgs: number[] = []
+        let entryArgConsts: number[] = []
+        if (entryBlock) {
+            for (const e of entryBlock.edges) {
+                if (e.pred !== entryPred) continue
+                entryArgs = e.args
+                entryArgConsts = e.argConsts
+            }
+            entryBlock.edges = entryBlock.edges.filter(e => e.pred !== entryPred)
+        }
+        return {
+            entryTarget: entryBlock ? entryTarget : -1,
+            entryArgs,
+            entryArgConsts,
+            blocks,
+            paramIds,
+            traces: tracer.getTraces(),
+        }
+    }
+
     const seenExits = new Set<string>()
-    for (const e of exits) {
-        const s = `(ret, ${render(e)})`
+    for (let k = 0; k < exitIds.length; k++) {
+        const id = exitIds[k]
+        const s = `ret ${id ? renderId(id) : String(exitConsts[k])}`
         if (seenExits.has(s)) continue
         seenExits.add(s)
         lines.push(s)
     }
-    for (const l of phiLines) lines.push(l)
     return {
         cfg,
-        exits,
+        residual: buildResidual(),
+        exitIds,
         rounds,
         text: lines.join('\n'),
         traces: tracer.getTraces(),
@@ -795,6 +1123,15 @@ function testTrace(fn: Function, name: string, verbose = false) {
     const r = trace(fn.toString(), { verbose, showCfg: true })!
     console.log(r.text)
     console.log('dur', (performance as any).now() - start)
+}
+
+// js source -> bytecode -> trace -> residual -> machine code
+function testCompile(fn: Function, name: string, regBudget?: number) {
+    console.log(`=== compile ${name}${regBudget ? ` (${regBudget} regs)` : ''} ===`)
+    const r = trace(fn.toString(), { showCfg: (globalThis as any).__cfg })!
+    console.log(r.text)
+    const l = lowerResidual(r.residual, { regBudget })
+    console.log(l.listing)
 }
 
 testTrace(t, 't', true)
@@ -869,3 +1206,49 @@ testTrace(function withCall2(f: any, e: number) {
     const b = f(a)
     return f()
 }, 'withCall2')
+
+testTrace(function earlyExit(a: number, b: number) {
+    if (a < 0) return b
+    return a + b
+}, 'earlyExit')
+
+testCompile(function addTwo(a: number, b: number) { return a + b }, 'addTwo')
+testCompile(function sumTo(n: number) { let s = 0; for (let i = 0; i < n; i = i + 1) s = s + i; return s }, 'sumTo')
+testCompile(t, 't')
+testCompile(function folds() { let s = 0; for (let i = 0; i < 10; i++) s += i; return s * 2 }, 'folds')
+;(globalThis as any).__cfg = true
+testCompile(function sumTo2(n: number) { 
+    // adding the "c" adds an extra ~100 intructions BUT it should ideally be peeled away
+    // conventional optimizing compilers struggle with this case too
+    let s = 0; 
+    // let c = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i; 
+        if (s > 10) {
+            s -= i % 5;
+        }
+        // if (c < 1) c += 1
+    }
+    return s // + c
+}, 'sumTo2')
+
+// constant on the left of the comparison: `10 < s`  is commuted into `s > 10`
+testCompile(function cmpLeft(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i
+        if (10 < s) s = s - 3
+    }
+    return s
+}, 'cmpLeft')
+
+// uses artificial register pressure to force spills
+testCompile(function sumTo2b(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i
+        if (s > 10) s -= i % 5
+    }
+    return s
+}, 'sumTo2 spilled', 1)
+
