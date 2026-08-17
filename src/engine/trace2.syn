@@ -1,0 +1,1172 @@
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as bytecode from './bytecode-emitter'
+import { Op, createInterpreter } from './vm'
+
+const Types = intrinsics.Types
+const Intrinsics = intrinsics.Intrinsics
+const assert = intrinsics.assert
+
+// registers above anything the compiler hands out, for the accumulator and for
+// nothing else. It is a register only so that `Ldar`/`Star` can reach it
+// TODO: compute this using the bytecode reg count instead e.g. +1
+const ACC_REG = 200
+
+const TerminalOpcodes = new Set<number>([Op.Return, Op.Throw, Op.ReThrow])
+const CondJumpOpcodes = new Set<number>([
+    Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfToBooleanFalse,
+    Op.JumpIfNotNull, Op.JumpIfNotUndefined, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue,
+])
+
+function findLeaders(code: readonly u8[], codeLen: number): number[] {
+    const set = new Set<number>([0])
+    const it = bytecode.createCodeIterator(code)
+    const insts: bytecode.CodeInstruction[] = []
+    while (const inst = it.next()) {
+        if (inst.pos >= codeLen) break
+        insts.push(inst)
+    }
+    for (let i = 0; i < insts.length; i++) {
+        const inst = insts[i]
+        const after = i + 1 < insts.length ? insts[i + 1].pos : codeLen
+        if (TerminalOpcodes.has(inst.opcode)) { set.add(after); continue }
+        if (inst.jumpTarget !== undefined) {
+            set.add(inst.jumpTarget)
+            set.add(after)
+        }
+    }
+    const out: number[] = []
+    for (const l of set) {
+        if (l < codeLen) out.push(l)
+    }
+    out.sort((a, b) => a - b)
+    return out
+}
+
+interface Blocks {
+    leaders: number[]
+    succs: number[][]
+    insts: bytecode.CodeInstruction[][]
+    inCycle: boolean[]
+    symPred: boolean[]     // the block ends in a branch nobody can fold
+    symIn: Set<number>[]
+    writes: Set<number>[]
+    cycleWrites: Set<number>[]
+    readSlots: number[][]
+    liveIn: Set<number>[]
+}
+
+interface Step {
+    kind: string          // 'goto' | 'branch' | 'ret'
+    outs: Float64Array    // slot values on the way out
+    target: number        // pc, for goto
+    condId: number        // predicate: kept as an id, a tagged nan does not
+    condConst: number     // survive a field or an array that started numeric
+    thenPc: number
+    elsePc: number
+    valueId: number       // returned value, same reason
+    valueConst: number
+}
+
+const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
+
+const CallOpcodes = new Set<number>([
+    Op.Call, Op.CallConst, Op.CallConstFrom, Op.Construct, Op.ConstructConst,
+])
+
+function deriveBlocks(
+    code: readonly u8[], codeLen: number, paramCount: number,
+    accSlot: number, tokenSlot: number,
+): Blocks {
+    // A call reads the call before it and writes itself, so effects order
+    // themselves by depending on each other. Ordinary values are fungible and
+    // would be reordered freely, which is exactly what must not happen here
+    // TODO: certain intrinsics are effectful too, though those can be 
+    // represented as calls anyway
+    function readsOf(inst: bytecode.CodeInstruction): number[] {
+        const out: number[] = []
+        for (const r of bytecode.getRegReads(inst)) out.push(r === -1 ? accSlot : r)
+        if (CallOpcodes.has(inst.opcode)) out.push(tokenSlot)
+        return out
+    }
+    function writesOf(inst: bytecode.CodeInstruction): number[] {
+        const out: number[] = []
+        for (const r of bytecode.getRegWrites(inst)) out.push(r === -1 ? accSlot : r)
+        if (CallOpcodes.has(inst.opcode)) out.push(tokenSlot)
+        return out
+    }
+
+    const leaders = findLeaders(code, codeLen)
+    const n = leaders.length
+    const at = new Map<number, number>()
+    for (let i = 0; i < n; i++) at.set(leaders[i], i)
+
+    const all: bytecode.CodeInstruction[] = []
+    {
+        const it = bytecode.createCodeIterator(code)
+        while (const inst = it.next()) {
+            if (inst.pos >= codeLen) break
+            all.push(inst)
+        }
+    }
+    const insts: bytecode.CodeInstruction[][] = []
+    for (let i = 0; i < n; i++) insts.push([])
+    {
+        let bi = 0
+        for (const inst of all) {
+            while (bi + 1 < n && inst.pos >= leaders[bi + 1]) bi++
+            insts[bi].push(inst)
+        }
+    }
+
+    const succs: number[][] = []
+    for (let i = 0; i < n; i++) {
+        const own = insts[i]
+        const last = own[own.length - 1]
+        const after = i + 1 < n ? leaders[i + 1] : codeLen
+        const s: number[] = []
+        if (!TerminalOpcodes.has(last.opcode)) {
+            if (last.jumpTarget !== undefined) {
+                if (CondJumpOpcodes.has(last.opcode)) s.push(at.get(after)!)
+                s.push(at.get(last.jumpTarget)!)
+            } else if (after < codeLen) s.push(at.get(after)!)
+        }
+        succs.push(s)
+    }
+
+    // a cycle is a block that can reach itself :)
+    const inCycle: boolean[] = []
+    for (let i = 0; i < n; i++) {
+        const seen = new Set<number>()
+        const stack = succs[i].slice()
+        let hit = false
+        while (stack.length) {
+            const x = stack.pop()!
+            if (x === i) { hit = true; break }
+            if (seen.has(x)) continue
+            seen.add(x)
+            for (const y of succs[x]) stack.push(y)
+        }
+        inCycle.push(hit)
+    }
+
+    // which registers can hold something derived from an argument.
+    // a write from known inputs makes the register known again
+    const symIn: Set<number>[] = []
+    const writes: Set<number>[] = []
+    for (let i = 0; i < n; i++) {
+        symIn.push(new Set<number>())
+        const w = new Set<number>()
+        for (const inst of insts[i]) {
+            for (const r of writesOf(inst)) w.add(r)
+        }
+        writes.push(w)
+    }
+    for (let i = 0; i < paramCount; i++) symIn[0].add(i)
+
+    const symPred: boolean[] = []
+    for (let i = 0; i < n; i++) symPred.push(false)
+    const symOut: Set<number>[] = []
+    for (let i = 0; i < n; i++) symOut.push(new Set<number>())
+
+    function cycleBlocks(h: number): number[] {
+        const fwd = new Set<number>()
+        const stack = succs[h].slice()
+        while (stack.length) {
+            const x = stack.pop()!
+            if (fwd.has(x)) continue
+            fwd.add(x)
+            for (const y of succs[x]) stack.push(y)
+        }
+        const out: number[] = []
+        for (const x of fwd) {
+            // in the cycle if it can get back to the header
+            const seen = new Set<number>()
+            const st = succs[x].slice()
+            while (st.length) {
+                const y = st.pop()!
+                if (y === h) { out.push(x); break }
+                if (seen.has(y)) continue
+                seen.add(y)
+                for (const z of succs[y]) st.push(z)
+            }
+        }
+        return out
+    }
+
+    let changed = true
+    while (changed) {
+        changed = false
+        for (let i = 0; i < n; i++) {
+            const live = new Set<number>(symIn[i])
+            let predSym = false
+            const own = insts[i]
+            for (let k = 0; k < own.length; k++) {
+                const inst = own[k]
+                let tainted = false
+                for (const r of readsOf(inst)) {
+                    if (live.has(r)) { tainted = true; break }
+                }
+                // whatever a call returns, nobody can fold it
+                if (CallOpcodes.has(inst.opcode)) tainted = true
+                for (const w of writesOf(inst)) {
+                    if (tainted) live.add(w)
+                    else live.delete(w)
+                }
+                if (k === own.length - 1 && CondJumpOpcodes.has(inst.opcode)) {
+                    predSym = live.has(accSlot)
+                }
+            }
+            if (predSym !== symPred[i]) { symPred[i] = predSym; changed = true }
+            for (const r of live) {
+                if (symOut[i].has(r)) continue
+                symOut[i].add(r)
+                changed = true
+            }
+            for (const t of succs[i]) {
+                for (const r of symOut[i]) {
+                    if (symIn[t].has(r)) continue
+                    symIn[t].add(r)
+                    changed = true
+                }
+            }
+        }
+        if (changed) continue
+        // A cycle nobody can fold runs an unknowable number of times, so
+        // everything it writes is unknowable where it starts
+        // TODO: some writes are always known despite being in a symbolic block
+        for (let i = 0; i < n; i++) {
+            if (!inCycle[i] || !symPred[i]) continue
+            for (const x of cycleBlocks(i)) {
+                for (const w of writes[x]) {
+                    if (symIn[i].has(w)) continue
+                    symIn[i].add(w)
+                    changed = true
+                }
+            }
+        }
+    }
+
+    // Backward liveness. A slot the group writes before it reads is scratch 
+    // that happens to live in the same place. Without this the inner loop's 
+    // temporaries ride along as parameters of the outer one
+    const liveIn: Set<number>[] = []
+    for (let i = 0; i < n; i++) liveIn.push(new Set<number>())
+    {
+        let going = true
+        while (going) {
+            going = false
+            for (let i = n - 1; i >= 0; i--) {
+                const live = new Set<number>()
+                for (const t of succs[i]) {
+                    for (const r of liveIn[t]) live.add(r)
+                }
+                const own = insts[i]
+                for (let k = own.length - 1; k >= 0; k--) {
+                    for (const w of writesOf(own[k])) live.delete(w)
+                    for (const r of readsOf(own[k])) live.add(r)
+                }
+                // liveness is what reaches from here,
+                // and a slot that stops being read has to stop being live
+                let same = live.size === liveIn[i].size
+                if (same) {
+                    for (const r of live) {
+                        if (liveIn[i].has(r)) continue
+                        same = false
+                        break
+                    }
+                }
+                if (same) continue
+                liveIn[i] = live
+                going = true
+            }
+        }
+    }
+
+    const cycleWrites: Set<number>[] = []
+    for (let i = 0; i < n; i++) {
+        const w = new Set<number>()
+        if (inCycle[i]) {
+            for (const x of cycleBlocks(i)) {
+                for (const r of writes[x]) w.add(r)
+            }
+            for (const r of writes[i]) w.add(r)
+        }
+        cycleWrites.push(w)
+    }
+
+    // what a block itself reads. not liveness. 
+    // copies by themselves don't make something unknown
+    const readSlots: number[][] = []
+    for (let i = 0; i < n; i++) {
+        const rs = new Set<number>()
+        for (const inst of insts[i]) {
+            for (const r of readsOf(inst)) rs.add(r)
+        }
+        readSlots.push([...rs])
+    }
+
+    return { leaders, succs, insts, inCycle, symPred, symIn, writes, cycleWrites, liveIn, readSlots }
+}
+
+export function trace2(code: string, opts: { verbose?: boolean } = {}) {
+    const compiled = bytecode.compile(code)
+    const codeLen = compiled.code.length
+
+    // Return first, then Ldar. after the two-byte Ldar the pc lands past both,
+    // which is how we know the entry sequence is done. The other way round it
+    // would fall straight into the Return
+    const SYN_RET = codeLen
+    const SYN_LDAR = codeLen + 1
+    const SYN_END = codeLen + 3
+    ;(compiled.code as u8[]).push(Op.Return as u8, Op.Ldar as u8, ACC_REG as u8)
+
+    const B = deriveBlocks(compiled.code as u8[], codeLen, compiled.paramCount, ACC_REG, ACC_REG + 2)
+    const leaders = B.leaders
+    const isLeader = new Set<number>(leaders)
+    const blockOf = new Map<number, number>()
+    for (let i = 0; i < leaders.length; i++) blockOf.set(leaders[i], i)
+
+    if (opts.verbose) {
+        console.log(bytecode.disassemble(compiled.code as any, compiled.paramCount, compiled.registerCount))
+        for (let i = 0; i < leaders.length; i++) {
+            console.log(`B${i} @${leaders[i]} -> ${B.succs[i].map(x => 'B' + x).join(',')}`
+                + `${B.inCycle[i] ? '  cyclic' : ''}${B.symPred[i] ? '  unfoldable-branch' : ''}`)
+            console.log('   ins: ', ...B.liveIn[i])
+        }
+    }
+
+    const finalized = bytecode.finalize(compiled)
+    const interpret = createInterpreter(true, true, true)
+
+    const mem = new Float64Array(intrinsics.heapMaxAddress * 2)
+    const load = Intrinsics.load
+    const store = Intrinsics.store
+    const sp = Intrinsics.sp
+
+    // ---- values ----------------------------------------------------------
+    interface Node {
+        op: string
+        argIds: number[]     // 0 where the argument is a literal
+        argConsts?: Float64Array // allocated late
+        label: string
+    }
+    const nodes = new Map<number, Node>()
+    const nodeCache = new Map<string, number>()
+
+    function mk(op: string, args: Float64Array, label: string = ''): any {
+        const argIds: number[] = []
+        const argConsts = new Float64Array(args.length)
+        const parts: string[] = [op, label]
+        for (let i = 0; i < args.length; i++) {
+            const id = tracer.getNanId(args[i])
+            argIds.push(id)
+            argConsts[i] = args[i]
+            parts.push(id ? `v${id}` : `c${args[i]}`)
+        }
+        tracer.assertIsTaggedNanStill(args)
+        const key = parts.join('|')
+        if (const hit = nodeCache.get(key)) return intrinsics.getNanFromId(hit) as any
+        const v = tracer.createUniqueNan()
+        const id = tracer.getNanId(v)
+        nodeCache.set(key, id)
+        nodes.set(id, { op, argIds, argConsts, label })
+        tracer.assertIsTaggedNanStill(nodes.get(id), label)
+        return v
+    }
+
+    // ---- the interpreter, one block at a time ----------------------------
+    const spBefore = sp()
+    const args = Intrinsics.stackalloc(4 + compiled.paramCount * 4 as u32)
+    const regsBase = args - 4 + compiled.paramCount * 4
+    // one past the accumulator: where a `ret` leaves the answer, so that
+    // returning is a slot being written
+    const RESULT = ACC_REG + 1
+    // the call before this one
+    const TOKEN = ACC_REG + 2
+    const slotCount = ACC_REG + 3
+    function slotAddr(r: number): number { return regsBase - r * 4 }
+    const ACC = ACC_REG
+
+    interface Reified { params: number[], selfId: number, paramIds: number[] }
+    const reified = new Map<number, Reified>()
+    const built = new Set<number>()
+
+    function watch(b: number): boolean {
+        for (const r of B.readSlots[b]) {
+            if (tracer.getNanId(mem[slotAddr(r)])) return true
+        }
+        return false
+    }
+
+    let phase = 0
+    let resumePc = 0
+    let injectedRet = false
+    let stopNext = false
+    const emptyState = new Float64Array(0)
+    let step: Step = { kind: '', outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
+
+    const tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
+        load: (ptr, offset, T) => {
+            if (ptr > intrinsics.heapMaxAddress) {
+                tracer.markHandled()
+                return mem[ptr + offset]
+            }
+            return load(ptr, offset, T)
+        },
+        store: (ptr, offset, val, T) => {
+            if (ptr <= intrinsics.heapMaxAddress) return store(ptr, offset, val, T)
+            mem[ptr + offset] = val as any
+            tracer.markHandled()
+        },
+        dispatch: (pc) => {
+            // the interpreter always begins at zero; the first decode is where
+            // we say otherwise. `resumePc` is the block we actually want
+            if (phase === 0) { phase = 1; return SYN_LDAR }
+            if (phase === 1) { phase = 2; return resumePc }
+            if (pc >= codeLen) {
+                injectedRet = true
+                step.target = pc
+                return SYN_RET
+            }
+            if (!isLeader.has(pc)) return pc
+            if (!stopNext && !reified.has(blockOf.get(pc)!)) {
+                tracer.setActive(watch(blockOf.get(pc)!))
+                return pc
+            }
+            injectedRet = true
+            step.target = pc
+            return SYN_RET
+        },
+        branch: (cond, v1, v2) => {
+            tracer.markHandled()
+            const id = tracer.getNanId(cond as any)
+            if (!id) return cond ? v1 : v2   // it folds, so it is not a choice
+            const kn = nodes.get(id)
+            if (kn && kn.op === 'nonzero') return v1   // already asked, already known
+            step.kind = 'branch'
+            step.condId = id
+            step.thenPc = v1
+            step.elsePc = v2
+            stopNext = true
+            return v1
+        },
+        canexit: (acc) => {
+            tracer.markHandled()
+            if (injectedRet) {
+                if (step.kind !== 'branch') step.kind = 'goto'
+                mem[slotAddr(ACC)] = acc as any
+            } else {
+                step.kind = 'ret'
+                step.valueId = tracer.getNanId(acc as any)
+                step.valueConst = step.valueId ? 0 : acc as any
+            }
+            return true
+        },
+        call: (target: any, thisArg: any, regStart: any, nargs: any, cb: any) => {
+            // whatever it answers is unknowable, so from here on we watch
+            tracer.setActive(true)
+            tracer.markHandled()
+            const cargs = new Float64Array(3 + nargs)
+            cargs[0] = mem[slotAddr(TOKEN)]
+            cargs[1] = target ? target : mem[regStart + nargs * 4]
+            cargs[2] = thisArg
+            for (let i = 0; i < nargs; i++) cargs[3+i] = mem[regStart + i * 4]
+            const v = tracer.traceOp('call', cargs, Types.u32)
+            mem[slotAddr(TOKEN)] = v as any
+            return v
+        },
+    })
+    defer tracer.dispose()
+
+
+    function runBlock(b: number, ins: Float64Array): Step {
+        for (let r = 0; r < slotCount; r++) mem[slotAddr(r)] = ins[r] as f64
+        Intrinsics.store(args, compiled.paramCount * 4 as u32, finalized, Types.u32)
+        phase = 0
+        resumePc = leaders[b]
+        injectedRet = false
+        stopNext = false
+        step = { kind: '', outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
+        // Nothing unknown went in, so nothing unknown can come out
+        let concrete = true
+        for (const r of B.liveIn[b]) {
+            if (tracer.getNanId(ins[r])) { concrete = false; break }
+        }
+        if (concrete) tracer.setActive(false)
+        const saved = sp()
+        interpret(finalized, 0, args, compiled.paramCount as u32)
+        tracer.setActive(true)
+        sp(saved)
+        const outs = new Float64Array(slotCount)
+        for (let r = 0; r < slotCount; r++) outs[r] = mem[slotAddr(r)]
+        step.outs = outs
+        return step
+    }
+
+    // ---- evaluation ------------------------------------------------------
+    function keyOf(b: number, ins: Float64Array): string {
+        const parts: string[] = ['b' + b]
+        for (let i = 0; i < ins.length; i++) {
+            const id = tracer.getNanId(ins[i])
+            parts.push(id ? `v${id}` : `c${ins[i]}`)
+        }
+        return parts.join(',')
+    }
+
+    const stateMemo = new Map<string, Float64Array>()
+    let dispatches = 0
+    const maxDispatches = 100000
+
+    // a block being applied to arguments we cannot fold, that can reach itself
+    const loops = new Map<number, { block: number, params: number[], body: any, init: number[] }>()
+
+    // blocks are given their identity here, rather than during eval
+    function reifyBlocks(): void {
+        for (let b = 0; b < leaders.length; b++) {
+            if (!B.inCycle[b] || !B.symPred[b]) continue
+            const params: number[] = []
+            for (const slot of B.symIn[b]) {
+                if (!B.cycleWrites[b].has(slot)) continue   // not carried round
+                if (!B.liveIn[b].has(slot)) continue        // written before read
+                params.push(slot)
+            }
+            params.sort((x, y) => x - y)
+
+            const selfId = tracer.getNanId(tracer.createUniqueNan())
+            nodes.set(selfId, {
+                op: 'block', argIds: [], argConsts: new Float64Array(0), label: `B${b}`,
+            })
+            const paramIds: number[] = []
+            for (const slot of params) {
+                const id = tracer.getNanId(tracer.createUniqueNan())
+                names.set(id, slot === ACC ? 'acc' : `s${slot}`)
+                paramIds.push(id)
+            }
+            reified.set(b, { params, selfId, paramIds })
+        }
+    }
+
+    function evalFrom(b: number, ins: Float64Array): Float64Array {
+        const R = reified.get(b)
+        if (R) {
+            const a = new Float64Array(R.params.length + 1)
+            a[0] = intrinsics.getNanFromId(R.selfId) as any
+            for (let i = 0; i < R.params.length; i++) a[i + 1] = ins[R.params[i]] as f64
+            const app = mk('apply', a)
+
+            if (!built.has(b)) {
+                built.add(b)
+                const ins2 = new Float64Array(slotCount)
+                for (let i = 0; i < ins.length; i++) ins2[i] = ins[i]
+                for (let i = 0; i < R.params.length; i++) {
+                    ins2[R.params[i]] = intrinsics.getNanFromId(R.paramIds[i]) as any
+                }
+                const body = continueFrom(runBlock(b, ins2), ins2)
+                const results = new Map<number, number>()
+                for (let i = 0; i < slotCount; i++) {
+                    const id = tracer.getNanId(body[i])
+                    if (id) results.set(i, id)
+                }
+                loops.set(R.selfId, { block: b, params: R.params, results })
+            }
+
+            // the state after the dispatch: each slot of it is that dispatch,
+            // asked for one slot. The application is preserved underneath, so
+            // this collapses straight back to "here are the blocks, they run"
+            const out = new Float64Array(slotCount)
+            for (let i = 0; i < ins.length; i++) out[i] = ins[i]
+            const pargs = new Float64Array(2)
+            pargs[0] = app
+            pargs[1] = RESULT
+            out[RESULT] = mk('proj', pargs, 'result')
+            return out
+        }
+
+        const key = keyOf(b, ins)
+        if (const hit = stateMemo.get(key)) return hit
+        if (dispatches++ > maxDispatches) throw `trace2: gave up after ${maxDispatches} dispatches`
+
+        // Reconvergence is this and nothing else: two paths that arrive with
+        // the same arguments get the same state back, so they were never two
+        const out = continueFrom(runBlock(b, ins), ins)
+        stateMemo.set(key, out)
+        return out
+    }
+
+    function continueFrom(r: Step, ins: Float64Array): Float64Array {
+        if (r.kind === 'ret') {
+            const out = new Float64Array(slotCount)
+            for (let i = 0; i < r.outs.length; i++) out[i] = r.outs[i]
+            out[RESULT] = r.valueId ? intrinsics.getNanFromId(r.valueId) as any : r.valueConst
+            return out
+        }
+        if (r.kind === 'goto') return evalFrom(blockOf.get(r.target)!, r.outs)
+        // Taking an arm is knowing something, and the place to put that is the
+        // state itself: the slots holding the predicate hold its value there.
+        // Falsy is exactly zero, so the else arm is always exact; truthy is
+        // merely nonzero, so the then arm only narrows for a comparison, which
+        // is the one thing that answers 1
+        const ct = tracer.getTraceById(r.condId)
+        const exactTrue = ct !== undefined && CompareOps.has(ct.op)
+        // "not zero" is a value like anything else, and it keeps the original
+        // underneath, so it says what is known without losing what it knows it
+        // about. A comparison answers 1 exactly, so there it is just 1
+        let thenIn = r.outs
+        if (exactTrue) thenIn = known(r.outs, r.condId, 1)
+        else thenIn = knownValue(r.outs, r.condId, nonzeroOf(r.condId))
+        let elseIn = known(r.outs, r.condId, 0)
+
+        // Comparing against zero and not getting it is the same thing a bare
+        // `if (x)` says, so it lands on the value that already says it. This is
+        // what an early exit on a null check leaves behind
+        if (ct && (ct.op === 'eq' || ct.op === 'ne')) {
+            const z = againstZero(ct)
+            if (z) {
+                if (ct.op === 'eq') elseIn = knownValue(elseIn, z, nonzeroOf(z))
+                else thenIn = knownValue(thenIn, z, nonzeroOf(z))
+            }
+        }
+        // an equality that holds says the two are one value, which is exact in
+        // a way truthiness is not: the wider slot simply holds the narrower.
+        // `ne` failing says the same thing, so it lands on the other arm
+        if (ct && ct.op === 'eq') thenIn = unified(thenIn, ct)
+        if (ct && ct.op === 'ne') elseIn = unified(elseIn, ct)
+        const a = evalFrom(blockOf.get(r.thenPc)!, thenIn)
+        const c = evalFrom(blockOf.get(r.elsePc)!, elseIn)
+
+        // per slot, so a slot both sides agree on was never a choice
+        const out = new Float64Array(slotCount)
+        const sel = new Float64Array(3)
+        for (let i = 0; i < slotCount; i++) {
+            if (sameValue(a[i], c[i])) { out[i] = a[i]; continue }
+            sel[0] = intrinsics.getNanFromId(r.condId) as any
+            sel[1] = a[i]
+            sel[2] = c[i]
+            out[i] = mk('select', sel)
+        }
+        return out
+    }
+
+    function unified(st: Float64Array, t: any): Float64Array {
+        const ia = t.argIds[0] ?? 0
+        const ib = t.argIds[1] ?? 0
+        if (ia && !ib) return knownValue(st, ia, t.args[1])
+        if (ib && !ia) return knownValue(st, ib, t.args[0])
+        if (ia && ib) return knownValue(st, ib, intrinsics.getNanFromId(ia) as any)
+        return st
+    }
+
+    function nonzeroOf(id: number): any {
+        const one = new Float64Array(1)
+        one[0] = intrinsics.getNanFromId(id) as any
+        return mk('nonzero', one)
+    }
+
+    // the operand of a comparison whose other side is the literal zero
+    function againstZero(t: any): number {
+        const ia = t.argIds[0] ?? 0
+        const ib = t.argIds[1] ?? 0
+        if (ia && !ib && t.args[1] === 0) return ia
+        if (ib && !ia && t.args[0] === 0) return ib
+        return 0
+    }
+
+    function known(st: Float64Array, id: number, v: number): Float64Array {
+        return knownValue(st, id, v)
+    }
+    function knownValue(st: Float64Array, id: number, v: any): Float64Array {
+        let hit = false
+        for (let i = 0; i < slotCount; i++) {
+            if (tracer.getNanId(st[i]) === id) { hit = true; break }
+        }
+        if (!hit) return st
+        const out = new Float64Array(slotCount)
+        for (let i = 0; i < slotCount; i++) {
+            out[i] = tracer.getNanId(st[i]) === id ? v : st[i]
+        }
+        return out
+    }
+
+    function sameValue(a: any, b: any): boolean {
+        const ia = tracer.getNanId(a)
+        const ib = tracer.getNanId(b)
+        if (ia || ib) return ia === ib
+        return a === b
+    }
+
+    // ---- run -------------------------------------------------------------
+    const paramIds: number[] = []
+    const names = new Map<number, string>()
+    const ins = new Float64Array(slotCount)
+    for (let i = 0; i < compiled.paramCount; i++) {
+        const v = tracer.createUniqueNan()
+        const id = tracer.getNanId(v)
+        paramIds.push(id)
+        names.set(id, `p${i}`)
+        ins[i] = intrinsics.getNanFromId(id) as any
+    }
+
+    reifyBlocks()
+    const finalState = evalFrom(0, ins)
+    const result = finalState[RESULT]
+    sp(spBefore)
+
+    // ---- printing --------------------------------------------------------
+    // A value used in more than one place is written once and named, which is
+    // the only thing the rendering has to say about sharing
+    const shared = new Map<number, string>()
+    const defOrder: number[] = []
+    function survey(roots: number[]): void {
+        const refs = new Map<number, number>()
+        const order: number[] = []
+        function walk(id: number): void {
+            const c = (refs.get(id) ?? 0) + 1
+            refs.set(id, c)
+            if (c > 1) return
+            const kids: number[] = []
+            const n = nodes.get(id)
+            if (n) {
+                for (const a of n.argIds) {
+                    if (a) kids.push(a)
+                }
+            } else {
+                const t = tracer.getTraceById(id)
+                if (t) {
+                    for (const j of operandIndices(t)) {
+                        const aid = t.argIds[j] ?? 0
+                        if (aid) kids.push(aid)
+                    }
+                }
+            }
+            for (const k of kids) walk(k)
+            order.push(id)          // after its own, so definitions read downward
+        }
+        for (const r of roots) {
+            if (r) walk(r)
+        }
+        let next = 1
+        for (const id of order) {
+            if ((refs.get(id) ?? 0) < 2) continue
+            if (names.has(id) || loops.has(id)) continue
+            if (!nodes.has(id) && !tracer.getTraceById(id)) continue
+            shared.set(id, `V${next++}`)
+            defOrder.push(id)
+        }
+    }
+
+    const rendering = new Set<number>()
+    function render(v: any): string {
+        const id = tracer.getNanId(v)
+        if (!id) return String(v)
+        const nm = names.get(id)
+        if (nm) return nm
+        const lp = loops.get(id)
+        if (lp) return `B${lp.block}`
+        const sh = shared.get(id)
+        if (sh) return sh
+        if (rendering.has(id)) return `?${id}`
+        return expand(id)
+    }
+
+    function expand(id: number): string {
+        rendering.add(id)
+        let s = `?${id}`
+        const n = nodes.get(id)
+        if (n) {
+            const parts: string[] = []
+            for (let i = 0; i < n.argIds.length; i++) {
+                parts.push(n.argIds[i] ? render(intrinsics.getNanFromId(n.argIds[i]) as any) : String(n.argConsts![i]))
+            }
+            // the projection is transparent when it is the block's result:
+            // asking for that value and running the block are the same thing
+            // both of these keep the value they are about, so they say nothing
+            // the reader needs at this level
+            s = n.op === 'nonzero'
+                ? parts[0]
+                : n.op === 'proj'
+                ? (n.label === 'result' ? parts[0] : `${parts[0]}.${n.label}`)
+                : `(${n.op}${n.label ? ' ' + n.label : ''}, ${parts.join(', ')})`
+        } else {
+            const t = tracer.getTraceById(id)
+            if (t) {
+                const parts: string[] = []
+                for (const j of operandIndices(t)) {
+                    const aid = t.argIds[j] ?? 0
+                    parts.push(aid ? render(intrinsics.getNanFromId(aid) as any) : String(t.args[j]))
+                }
+                s = `(${t.op}, ${parts.join(', ')})`
+            }
+        }
+        rendering.delete(id)
+        return s
+    }
+
+    function operandIndices(t: any): number[] {
+        if (t.op === 'call') {
+            const r: number[] = []
+            for (let i = 0; i < t.args.length; i++) r.push(i)
+            return r
+        }
+        if (t.op === 'select') return [0, 1, 2]
+        if (t.op === 'load') return [0, 1]
+        if (t.b !== undefined) return [0, 1]
+        if (t.a !== undefined) return [0]
+        return []
+    }
+
+    const roots: number[] = []
+    for (const e of loops) {
+        const rid = e[1].results.get(RESULT)
+        if (rid) roots.push(rid)
+    }
+    roots.push(tracer.getNanId(result))
+    survey(roots)
+
+    const lines: string[] = []
+    for (const id of defOrder) lines.push(`${shared.get(id)}: ${expand(id)}`)
+    for (const e of loops) {
+        const l = e[1]
+        const ps = l.params.map(s => s === ACC ? 'acc' : `s${s}`).join(', ')
+        const rid = l.results.get(RESULT)
+        lines.push(`B${l.block}(${ps}) = ${rid ? render(intrinsics.getNanFromId(rid) as any) : '?'}`)
+    }
+    lines.push(`= ${render(result)}`)
+    lines.push(`  ${dispatches} dispatches, ${stateMemo.size} distinct`)
+    return { text: lines.join('\n'), result, dispatches }
+}
+
+function show(fn: Function, verbose = false) {
+    console.log(`--- ${fn.name} ---`)
+    const r = trace2(fn.toString(), { verbose })
+    console.log(r.text)
+}
+
+show(function linear(n: number) {
+    const a = n * 3
+    const b = a + 1
+    return b - n
+})
+
+show(function folds() {
+    let s = 0
+    for (let i = 0; i < 10; i++) s += i
+    return s * 2
+})
+
+show(function sameBranchedAssignment(n: number, a: any) {
+    let x: number
+    if (n > 0) {
+        x = a
+    } else {
+        x = a
+    }
+    return x
+})
+
+show(function differentBranches(n: number, a: any) {
+    let x: number
+    if (n > 0) {
+        x = a + 1
+    } else {
+        x = a
+    }
+    return x
+})
+
+show(function symbolicLoop(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i
+    return s
+})
+
+show(function constantInterior(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i
+        let d = 0
+        for (let j = 0; j < 3; j++) d += j
+        s += d
+    }
+    return s
+})
+
+show(function equalityCheck(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        if (i === 5) {
+            return i
+        }
+    }
+    return s
+})
+
+
+show(function nested2(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < i; j = j + 1) {
+            for (let k = j; k >= 0; k += i) {
+                s = s + k
+            }
+        }
+    }
+    return s
+})
+
+show(function loopInvariant(n: number, arg: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        const x = arg*5
+        s += x
+    }
+    return s
+})
+
+show(function multipleWrites(n: number, arg: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = 1
+            v = 2
+        }
+        s += u + v
+    }
+    return s
+})
+
+show(function multipleSymbolicWrites(n: number, arg: number, a: number, b: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = a
+            v = b
+        }
+        s += u + v
+    }
+    return s
+})
+
+
+show(function multipleSymbolicWritesRet(n: number, arg: number, a: number, b: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = a
+            v = b
+            return u
+        }
+        s += u + v
+    }
+    return s
+})
+
+show(function conditionalCall(n: number, f1: any, f2: any) {
+    if (n > 0) {
+        f1()
+    }
+    return f2()
+})
+
+show(function conditionalCallCse(n: number, f1: any, f2: any) {
+    if (n > 0) {
+        const x = (n*5)+5
+        f1(x)
+    }
+    return f2((n*5)+5)
+})
+
+show(function conditionalCallCse2(cond: boolean, n: number, f1: any, f2: any) {
+    if (!cond) return -1
+    if (n > 0) {
+        const x = (n*5)+5
+        f1(x)
+    }
+    return f2((n*5)+5)
+})
+
+show(function branchedSameCall(cond: boolean, f1: any) {
+    if (cond) {
+        f1()
+    } else {
+        f1()
+    }
+})
+
+show(function branchedSameCallEffects(cond: boolean, f1: any, f2: any) {
+    if (cond) {
+        f1()
+    } else {
+        f2()
+        f1()
+    }
+})
+
+show(function branchedSameCallEffectsNested(cond: boolean, cond2: boolean, f1: any, f2: any) {
+    if (cond) {
+        f1()
+    } else {
+        if (cond2) f2()
+        f1()
+    }
+})
+
+show(function equalityRefine(x: number) {
+    if (x === 5) return x + 1
+    return x
+})
+
+show(function equalityRepeat(x: number) {
+    if (x === 5) {
+        if (x === 5) return 1
+        return 2
+    }
+    return 3
+})
+
+show(function refinedTruthy(x: number, f: any) {
+    if (x) {
+        if (x) return 1
+        return 2
+    }
+    return 3
+})
+
+show(function refinedEarlyExitNe(x: any) {
+    if (x === 0) return
+    return x ? x() : -1
+})
+
+// x is y, and y is not zero, so x is not zero
+// the join block is not reified and is reached without a pending stop, but the
+// work after it is not concrete
+show(function joinArith(n: number, a: any, b: any) {
+    let x: any
+    if (n > 0) x = a
+    else x = b
+    return x * 2 + 7
+})
+
+show(function refinedSymbolicEq(x: any, y: any) {
+    if (x !== y) return
+    if (y === 0) return
+    return x ? 1 : -1
+})
+
+show(function refinedSymbolicNe(x: any, y: any) {
+    if (x === y) return
+    if (y === 0) return
+    return x ? 1 : -1
+})
+
+show(function refinedLoopVar(x: number, f: any) {
+    for (let i = 0; i < x; i++) {
+        if (i === 0) {
+            f()
+            continue
+        }
+    }
+})
+
+show(function branchedSameCallEffectsDce(cond: boolean, f1: any, f2: any) {
+    if (cond) {
+        f1()
+    } else {
+        if (cond) f2()
+        f1()
+    }
+})
+
+show(function branchedMutatedCond(cond: boolean, f1: any, f2: any) {
+    if (cond) {
+        f1()
+    } else {
+        cond = true
+        if (cond) f2()
+        f1()
+    }
+})
+
+show(function branchedMutatedCond2(cond: boolean, f1: any, f2: any) {
+    if (cond) {
+        f1()
+    } else {
+        let i = 0
+        let j = 0
+        while (i < 100) {
+            i += 1
+            j += i
+            if (i % 2) j -= 2
+        }
+        cond = j > 10000
+        if (cond) f2()
+        f1()
+    }
+})
+
+show(function withCall(x: number, f: any) {
+    const x1 = x*8
+    const x2 = x*8
+    return f(x1, x2) + f(x1, x2)
+})
+
+show(function allConcreteExpensive() {
+    let s = 0
+    for (let i = 0; i < 10_000; i++) {
+        s += i
+        if (s > 10) {
+            s -= i % 5
+        }
+        if (s > 100_000) {
+            s -= 100_000
+        }
+    }
+    return s * 2
+})
+
+show(function partialConcreteExpensive(n: number) {
+    let s = 0
+    for (let j = 0; j < n; j++) {
+        for (let i = 0; i < 10_000; i++) {
+            s += i
+            if (s > 10) {
+                s -= i % 5
+            }
+            if (s > 100_000) {
+                s -= 100_000
+            }
+        }
+    }
+    return s * 2
+})
+
+show(function partialConcreteExpensive2(n: number) {
+    let s = 0
+    for (let j = 0; j < n; j++) {
+        let tmp = 0
+        for (let i = 0; i < 10_000; i++) {
+            tmp += i
+            if (tmp > 10) {
+                tmp -= i % 5
+            }
+            if (tmp > 100_000) {
+                tmp -= 100_000
+            }
+        }
+        s += tmp
+    }
+    return s * 2
+})
+
+// TODO: a block needs to not collapse if any effects are along its path
+// show(function tailCall(f: any) {
+//     f(1)
+//     return 2
+// })

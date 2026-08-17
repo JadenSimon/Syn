@@ -16,6 +16,9 @@ export interface Target {
     readonly retReg: number
     readonly allocatable: number[] // pool the register allocator may use
     readonly scratch: number[]     // reserved, never allocated (immediates etc)
+    readonly volatiles: number[]
+    readonly callerSaved: number[]
+    readonly calleeSaved: number[]
     createAssembler(): Assembler
 }
 
@@ -38,6 +41,7 @@ export interface Assembler {
     bindLabel(id: number): void
     jump(id: number): void
     jumpIfNonZero(reg: number, id: number): void
+    blr(reg: number): void
     ret(): void
     words(): number[]
     bytes(): number[]
@@ -133,15 +137,15 @@ export function createAarch64Assembler(): Assembler {
 
                 // `cbnz c, A / b B / A:` tests the wrong way round, invert it
                 // and fall through to A instead of jumping over the branch
-                if (it.kind === 'cbnz' && i + 1 < items.length && items[i + 1].kind === 'b') {
-                    const over = items[i + 1]
-                    if (fallsThroughTo(i + 1, it.label)) {
-                        it.kind = 'cbz'
-                        it.label = over.label
-                        items.splice(i + 1, 1)
-                        changed = true
-                        break
-                    }
+                if ((it.kind === 'cbnz' || it.kind === 'cbz' || it.kind === 'bcond')
+                    && i + 1 < items.length && items[i + 1].kind === 'b'
+                    && fallsThroughTo(i + 1, it.label)) {
+                    if (it.kind === 'bcond') it.cond = it.cond ^ 1
+                    else it.kind = it.kind === 'cbnz' ? 'cbz' : 'cbnz'
+                    it.label = items[i + 1].label
+                    items.splice(i + 1, 1)
+                    changed = true
+                    break
                 }
 
                 // `cset Xd, cc / cbnz Xd, L` re-tests flags that are already
@@ -506,6 +510,7 @@ export function createAarch64Assembler(): Assembler {
         jumpIfNonZero: (reg, id) => {
             items.push({ kind: 'cbnz', word: 0, text: '', label: id, reg, cond: -1 })
         },
+        blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
         ret: () => emit(0xD65F03C0, 'ret'),
         words,
         bytes: () => {
@@ -538,9 +543,17 @@ export const aarch64: Target = {
     name: 'aarch64',
     wordBytes: 8,
     argRegs: [0, 1, 2, 3, 4, 5, 6, 7],
+    // x8 is also a ret reg but is used to hold an addr for a struct, provided by the caller
     retReg: 0,
     allocatable: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
     scratch: [16, 17], // ip0/ip1, used for immediates and rem
+    volatiles: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 30],
+    callerSaved: [9, 10, 11, 12, 13, 14, 15],
+    calleeSaved: [19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+
+    // fp: 29
+    // link reg: 30
+    // sp: 31
     createAssembler: createAarch64Assembler,
 }
 
@@ -575,6 +588,11 @@ export interface LowerResult {
 
 // which entries of `args` are real inputs, i.e. dropping the trailing type tags
 export function operandIndices(t: intrinsics.OpTrace): number[] {
+    if (t.op === 'call') {
+        const r: number[] = []
+        for (let i = 0; i < t.args.length; i++) r.push(i)
+        return r
+    }
     if (t.op === 'select') return [0, 1, 2]
     if (t.op === 'load') return [0, 1]
     if (t.op === 'store') return [0, 1, 2]
@@ -585,286 +603,45 @@ export function operandIndices(t: intrinsics.OpTrace): number[] {
     return []
 }
 
-export function lower(traces: readonly OpTrace[], opts: LowerOptions = {}): LowerResult {
-    const target = opts.target ?? aarch64
-    const params = opts.params ?? []
-    const argRegCount = Math.min(opts.argRegCount ?? target.argRegs.length, target.argRegs.length)
-
-    // ---- values -----------------------------------------------------------
-    const ins: any[][] = []
-    const inIds: number[][] = []
-    const resultIds: number[] = []
-    for (let i = 0; i < traces.length; i++) {
-        const t = traces[i] as any
-        const idx = operandIndices(t)
-        const vals: any[] = []
-        const ids: number[] = []
-        for (const j of idx) {
-            vals.push(t.args[j])
-            ids.push(t.argIds[j] ?? 0)
-        }
-        ins.push(vals)
-        inIds.push(ids)
-        resultIds.push(t.resultId ?? 0)
-    }
-
-    const defOf = new Map<number, number>()
-    for (let i = 0; i < traces.length; i++) {
-        const id = resultIds[i]
-        if (id === 0) continue
-        if (!defOf.has(id)) defOf.set(id, i)
-    }
-
-    const paramIds: number[] = opts.paramIds ?? params.map(p => getNanId(p))
-    for (let i = 0; i < paramIds.length; i++) {
-        const id = paramIds[i]
-        if (!id) throw `lowering: parameter #${i} is not an unknown value`
-        if (defOf.has(id)) throw `lowering: parameter #${i} is also computed by a traced op`
-    }
-
-    // ---- liveness / dce ---------------------------------------------------
-    const live: boolean[] = []
-    for (let i = 0; i < traces.length; i++) live.push(EffectfulOps.has((traces[i] as any).op))
-    for (let i = traces.length - 1; i >= 0; i--) {
-        if (!live[i]) continue
-        for (const id of inIds[i]) {
-            if (id === 0) continue
-            const d = defOf.get(id)
-            if (d !== undefined && d < i) live[d] = true
-        }
-    }
-
-    const order: number[] = []
-    for (let i = 0; i < traces.length; i++) {
-        if (live[i]) order.push(i)
-    }
-
-    // ---- last use ---------------------------------------------------------
-    // position within `order`, so freeing is a single comparison per operand
-    const lastUse = new Map<number, number>()
-    for (let k = 0; k < order.length; k++) {
-        for (const id of inIds[order[k]]) {
-            if (id !== 0) lastUse.set(id, k)
-        }
-    }
-    // ---- register allocation ----------------------------------------------
-    const asm = target.createAssembler()
-    const regOf = new Map<number, number>()
-    const taken = new Set<number>()
-
-    function allocReg(id: number): number {
-        for (const r of target.allocatable) {
-            if (taken.has(r)) continue
-            taken.add(r)
-            regOf.set(id, r)
-            return r
-        }
-        throw `lowering: out of registers (no spilling yet, ${target.allocatable.length} available)`
-    }
-    function freeIfDead(id: number, k: number): void {
-        if (lastUse.get(id) !== k) return
-        const r = regOf.get(id)
-        if (r === undefined) return
-        taken.delete(r)
-        regOf.delete(id)
-    }
-
-    // params land in their ABI positions before anything else runs
-    for (let i = 0; i < paramIds.length; i++) {
-        const id = paramIds[i]
-        if (!lastUse.has(id)) continue // unused argument
-        if (i < argRegCount) {
-            const r = target.argRegs[i]
-            taken.add(r)
-            regOf.set(id, r)
-            continue
-        }
-        const r = allocReg(id)
-        asm.entryStackArg(r, i - argRegCount)
-    }
-
-    // an operand that is a plain number gets materialized into scratch
-    let scratchTurn = 0
-    function operandReg(v: any, id: number): number {
-        if (id !== 0) {
-            const r = regOf.get(id)
-            if (r === undefined) throw `lowering: value ${id} used before it is defined`
-            return r
-        }
-        const r = target.scratch[scratchTurn % target.scratch.length]
-        scratchTurn++
-        asm.movImm(r, v)
-        return r
-    }
-
-    for (let k = 0; k < order.length; k++) {
-        const ti = order[k]
-        const t = traces[ti] as any
-        const op: string = t.op
-        const operands = ins[ti]
-        const operandIds = inIds[ti]
-        scratchTurn = 0
-
-        // an operand encoded directly into the instruction must be recognized
-        // before anything is materialized, or we emit a dead movz for it
-        const litB = operandIds[1] === 0 && t.b >= 0 && t.b <= 0xFFF
-        const litA = operandIds[0] === 0 && operandIds[1] !== 0
-            && t.a >= 0 && t.a <= 0xFFF
-        let folded = -1
-        if (op === 'load' || op === 'store') folded = 1              // offset
-        else if (op === 'stackalloc' || op === 'stackfree') folded = 0 // amt
-        else if ((op === 'add' || op === 'sub') && litB) folded = 1
-        else if (CompareOps.has(op) && litB) folded = 1
-        else if (CompareOps.has(op) && litA) folded = 0
-        else if (op === 'add' && litA) folded = 0
-        const useImm = folded === 1 && (op === 'add' || op === 'sub')
-        const cmpImm = folded === 1 && CompareOps.has(op)
-        const cmpSwap = folded === 0 && CompareOps.has(op)
-        const addSwap = folded === 0 && op === 'add'
-
-        // resolve operands first, then release anything that dies here, so the
-        // result can reuse an input register
-        const inRegs: number[] = []
-        for (let j = 0; j < operands.length; j++) {
-            if (j === folded) {
-                inRegs.push(-1)
-                continue
-            }
-            inRegs.push(operandReg(operands[j], operandIds[j]))
-        }
-        for (const id of operandIds) {
-            if (id !== 0) freeIfDead(id, k)
-        }
-
-        const resultId = resultIds[ti]
-        const signed = eitherSigned(t.T ?? Types.u64, t.U ?? t.T ?? Types.u64)
-
-        if (op === 'ret') {
-            asm.mov(target.retReg, inRegs[0])
-            asm.ret()
-            continue
-        }
-        if (op === 'store') {
-            if (operandIds[1] !== 0) throw `lowering: computed store offsets are not supported yet`
-            asm.store(inRegs[0], t.offset, inRegs[2], t.T)
-            continue
-        }
-        if (op === 'stackfree') {
-            if (operandIds[0] !== 0) throw `lowering: dynamic stackfree is not supported yet`
-            asm.spAdjust(-t.amt)
-            continue
-        }
-
-        if (resultId === 0) throw `lowering: op '${op}' produced no value`
-        const dst = allocReg(resultId)
-
-        if (op === 'load') {
-            if (operandIds[1] !== 0) throw `lowering: computed load offsets are not supported yet`
-            asm.load(dst, inRegs[0], t.offset, t.T)
-            continue
-        }
-        if (op === 'stackalloc') {
-            if (operandIds[0] !== 0) throw `lowering: dynamic stackalloc is not supported yet`
-            asm.spAdjust(t.amt)
-            asm.spRead(dst)
-            continue
-        }
-        if (op === 'select') {
-            asm.select(dst, inRegs[0], inRegs[1], inRegs[2])
-            continue
-        }
-        if (op === 'convert' || op === 'bitconvert') {
-            if (op === 'bitconvert') asm.mov(dst, inRegs[0])
-            else asm.convert(dst, inRegs[0], t.T, t.U)
-            continue
-        }
-        if (UnaryOps.has(op)) {
-            asm.unary(op, dst, inRegs[0])
-            continue
-        }
-        if (CompareOps.has(op)) {
-            if (cmpImm) asm.compareImm(op, dst, inRegs[0], t.b, signed)
-            else if (cmpSwap) asm.compareImm(SwappedCmp[op], dst, inRegs[1], t.a, signed)
-            else asm.compare(op, dst, inRegs[0], inRegs[1], signed)
-            continue
-        }
-        if (BinaryOps.has(op)) {
-            if (addSwap) {
-                asm.addImm(dst, inRegs[1], t.a)
-                continue
-            }
-            if (useImm) {
-                if (op === 'add') asm.addImm(dst, inRegs[0], t.b)
-                else asm.subImm(dst, inRegs[0], t.b)
-                continue
-            }
-            asm.binary(op, dst, inRegs[0], inRegs[1], signed)
-            continue
-        }
-
-        throw `lowering: no rule for op '${op}'`
-    }
-
-    return {
-        target,
-        words: asm.words(),
-        bytes: asm.bytes(),
-        listing: asm.listing(),
-        regOf,
-    }
-}
-
 // lowerResidual - blocks with parameters, edge arguments, and predicates
 
 export interface ResidualEdge {
-    pred: number         // source block index, < 0 for the function entry
-    args: number[]       // value ids, positionally aligned with the target's params
+    target: number       // node index this bundle arrives at, -1 if it returns
+    args: number[]       // value ids, in the target's parameter order
     argConsts: number[]  // the literal, where the corresponding id is 0
+    // the calls made while travelling this bundle, in order. They are already
+    // in the value graph and this changes nothing about it -- an edge is just
+    // the stretch of straight-line work between two nodes, so it is where the
+    // question "what may not be held in a temporary here" gets asked
+    calls: number[]
 }
 
-export interface ResidualBlockBase {
-    index: number
-    idom: number          // immediate dominator, for placing shared values
-    params: number[]      // value ids bound on entry
-    paramNames: string[]  // for the listing only
-    edges: ResidualEdge[]
-}
-
-export interface ResidualJumpBlock extends ResidualBlockBase {
-    term: 'jump' 
-    jumpTo: number
-}
-
-export interface ResidualBranchBlock extends ResidualBlockBase {
-    term: 'branch' 
+export interface ResidualNode {
+    label: number        // for the listing only
+    idom: number         // for placing shared values
+    params: number[]
+    term: string         // 'branch' | 'ret' | 'goto'
     condId: number
-    thenBlock: number
-    elseBlock: number
-}
-
-export interface ResidualRetBlock extends ResidualBlockBase {
-    term: 'ret' 
+    thenEdge: number
+    elseEdge: number
+    gotoEdge: number
     retId: number
     retConst: number
+    // the last call on the way out. Its value is discarded, but it and the
+    // chain behind it still have to be emitted: the exit is what keeps them
+    retTokenId: number
 }
 
-export type ResidualBlock = 
-    | ResidualJumpBlock
-    | ResidualBranchBlock
-    | ResidualRetBlock
-
 export interface Residual {
-    entryTarget: number   // block the residual starts at, -1 if straight-line
-    entryArgs: number[]
-    entryArgConsts: number[]
-    blocks: ResidualBlock[]
+    entryEdge: number
+    nodes: ResidualNode[]
+    edges: ResidualEdge[]
     paramIds: number[]
     traces: readonly OpTrace[]
 }
 
 const allocRegs = [9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27]
 const tempRegs = [8, 16, 17, 1, 2, 3, 4, 5, 6, 7]
-const calleeSaved = new Set<number>([19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
 
 // used to track liveness and intervals
 interface Unit {
@@ -882,6 +659,10 @@ interface Unit {
     isRet: boolean
     retId: number
     retConst: number
+    calls: number[]
+    // the last call on the way out. Its value is discarded, but it and the
+    // chain behind it still have to be emitted: the exit is what keeps them
+    retTokenId: number
 }
 
 export function lowerResidual(residual: Residual, opts: LowerOptions = {}): LowerResult {
@@ -894,13 +675,10 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
         if (id && !defOf.has(id)) defOf.set(id, t)
     }
 
-    const blockAt = new Map<number, ResidualBlock>()
-    for (const b of residual.blocks) blockAt.set(b.index, b)
-
     const isParam = new Set<number>()
     for (const id of residual.paramIds) isParam.add(id)
-    for (const b of residual.blocks) {
-        for (const id of b.params) isParam.add(id)
+    for (const n of residual.nodes) {
+        for (const id of n.params) isParam.add(id)
     }
 
     // A value graph bottoms out in parameters; those are the only values whose
@@ -929,98 +707,86 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     }
 
     // ---- emission order ---------------------------------------------------
+    // One unit per node and per bundle. A bundle carrying nothing is not a unit
+    // at all -- control just branches straight to its target.
     const units: Unit[] = []
-    const unitOfBlock = new Map<number, number>()
-    let nextSplit = 100000
+    const edgeLabel: number[] = []
+    for (let i = 0; i < residual.edges.length; i++) edgeLabel.push(-1)
+    let nextLabel = 100000
 
     function newUnit(kind: string, label: number): Unit {
         const u: Unit = {
             kind, label, succs: [], uses: [], defs: [],
             edgeTo: -1, edgeArgs: [], edgeConsts: [],
             cond: 0, thenLabel: -1, elseLabel: -1,
-            isRet: false, retId: 0, retConst: 0,
+            isRet: false, retId: 0, retConst: 0, retTokenId: 0, calls: [],
         }
         units.push(u)
         return u
     }
-
-    const noEdge: ResidualEdge = { pred: -1, args: [], argConsts: [] }
-    function edgeFrom(b: ResidualBlock, pred: number): ResidualEdge {
-        for (const e of b.edges) {
-            if (e.pred === pred) return e
-        }
-        return noEdge
+    function labelOfEdge(ei: number): number {
+        const e = residual.edges[ei]
+        if (e.target < 0) throw `lowering: bundle ${ei} never arrives anywhere`
+        if (!e.args.length && !e.calls.length) return residual.nodes[e.target].label
+        if (edgeLabel[ei] < 0) edgeLabel[ei] = nextLabel++
+        return edgeLabel[ei]
     }
 
-    if (residual.entryTarget >= 0) {
+    {
+        // the entry bundle runs first
+        const e = residual.edges[residual.entryEdge]
+        if (e.target < 0) throw `lowering: the entry bundle never arrives at a node`
         const u = newUnit('entry', -1)
-        u.edgeTo = residual.entryTarget
-        u.edgeArgs = residual.entryArgs
-        u.edgeConsts = residual.entryArgConsts
-        u.uses = usesOf(residual.entryArgs)
+        u.edgeTo = e.target
+        u.edgeArgs = e.args
+        u.edgeConsts = e.argConsts
+        u.uses = usesOf(e.args)
+        u.calls = e.calls
+        u.thenLabel = residual.nodes[e.target].label
     }
-    for (const b of residual.blocks) {
-        unitOfBlock.set(b.index, units.length)
-        const u = newUnit('block', b.index)
-        u.defs = b.params.slice()
-        if (b.term === 'branch') {
-            u.cond = b.condId
-            u.uses = usesOf([b.condId])
-        } else if (b.term === 'jump') {
-            const e = edgeFrom(blockAt.get(b.jumpTo)!, b.index)
-            u.edgeTo = b.jumpTo
+    // a bundle is placed just before the node it feeds, so a loop's back edge
+    // falls through into the test rather than branching to it
+    for (let ni = 0; ni < residual.nodes.length; ni++) {
+        const n = residual.nodes[ni]
+        for (let ei = 0; ei < residual.edges.length; ei++) {
+            const e = residual.edges[ei]
+            if (e.target !== ni || ei === residual.entryEdge) continue
+            if (!e.args.length && !e.calls.length) continue
+            const u = newUnit('edge', labelOfEdge(ei))
+            u.edgeTo = ni
             u.edgeArgs = e.args
             u.edgeConsts = e.argConsts
             u.uses = usesOf(e.args)
-        } else if (b.term === 'ret') {
-            u.isRet = true
-            u.retId = b.retId
-            u.retConst = b.retConst
-            u.uses = usesOf([b.retId])
+            u.calls = e.calls
+            u.thenLabel = n.label
         }
-        // an edge that also carries arguments becomes a block of its own
-        if (b.term === 'branch') {
-            const thenB = blockAt.get(b.thenBlock)
-            const elseB = blockAt.get(b.elseBlock)
-            const te = thenB ? edgeFrom(thenB, b.index) : noEdge
-            const ee = elseB ? edgeFrom(elseB, b.index) : noEdge
-            u.thenLabel = te.args.length ? nextSplit++ : b.thenBlock
-            u.elseLabel = ee.args.length ? nextSplit++ : b.elseBlock
-            if (te.args.length) {
-                const s = newUnit('split', u.thenLabel)
-                s.edgeTo = b.thenBlock
-                s.edgeArgs = te.args
-                s.edgeConsts = te.argConsts
-                s.uses = usesOf(te.args)
-            }
-            if (ee.args.length) {
-                const s = newUnit('split', u.elseLabel)
-                s.edgeTo = b.elseBlock
-                s.edgeArgs = ee.args
-                s.edgeConsts = ee.argConsts
-                s.uses = usesOf(ee.args)
-            }
+        const u = newUnit('node', n.label)
+        u.defs = n.params.slice()
+        if (n.term === 'branch') {
+            u.cond = n.condId
+            u.uses = usesOf([n.condId])
+            u.thenLabel = labelOfEdge(n.thenEdge)
+            u.elseLabel = labelOfEdge(n.elseEdge)
+        } else if (n.term === 'ret') {
+            u.isRet = true
+            u.retId = n.retId
+            u.retConst = n.retConst
+            u.retTokenId = n.retTokenId
+            u.uses = usesOf([n.retId, n.retTokenId])
+        } else {
+            u.thenLabel = labelOfEdge(n.gotoEdge)
         }
     }
 
-    // successors, now that every block has a unit
+    const unitOfLabel = new Map<number, number>()
     for (let i = 0; i < units.length; i++) {
-        const u = units[i]
+        if (units[i].label >= 0 && !unitOfLabel.has(units[i].label)) unitOfLabel.set(units[i].label, i)
+    }
+    for (const u of units) {
         if (u.isRet) continue
-        if (u.cond) {
-            for (const lb of [u.thenLabel, u.elseLabel]) {
-                if (const bi = unitOfBlock.get(lb)) u.succs.push(bi)
-                else {
-                    for (let j = 0; j < units.length; j++) {
-                        if (units[j].label === lb) u.succs.push(j)
-                    }
-                }
-            }
-            continue
-        }
-        if (u.edgeTo >= 0) {
-            const bi = unitOfBlock.get(u.edgeTo)
-            if (bi !== undefined) u.succs.push(bi)
+        for (const lb of [u.thenLabel, u.elseLabel]) {
+            if (lb < 0) continue
+            if (const t = unitOfLabel.get(lb)) u.succs.push(t)
         }
     }
 
@@ -1041,7 +807,7 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     // A computation value referenced from more than one unit is materialized once,
     // at the block dominating those uses, and kept in a register from there 
     const idomOf = new Map<number, number>()
-    for (const b of residual.blocks) idomOf.set(b.index, b.idom)
+    for (const n of residual.nodes) idomOf.set(n.label, n.idom)
     function dominates(a: number, b: number): boolean {
         let cur = b
         for (;;) {
@@ -1062,23 +828,26 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     }
 
     // which block a unit's computation belongs to (a split sits on its branch)
+    // which node's dominance region a unit computes in; a bundle belongs to
+    // the node it feeds
     const blockOfUnit: number[] = []
-    for (const u of units) {
-        if (u.kind === 'block') blockOfUnit.push(u.label)
-        else if (u.kind === 'split') blockOfUnit.push(-1)
-        else blockOfUnit.push(-1)
-    }
+    const unitOfBlock = new Map<number, number>()
     for (let i = 0; i < units.length; i++) {
-        if (units[i].kind !== 'split') continue
-        for (let j = i - 1; j >= 0; j--) {
-            if (units[j].kind === 'block') { blockOfUnit[i] = units[j].label; break }
-        }
+        const u = units[i]
+        if (u.kind === 'node') {
+            blockOfUnit.push(u.label)
+            unitOfBlock.set(u.label, i)
+        } else if (u.kind === 'edge') {
+            blockOfUnit.push(u.thenLabel)
+        } else blockOfUnit.push(-1)
     }
 
     function rootsOf(u: Unit): number[] {
         const r: number[] = []
         if (u.cond) r.push(u.cond)
         if (u.isRet && u.retId) r.push(u.retId)
+        if (u.isRet && u.retTokenId) r.push(u.retTokenId)
+        for (const c of u.calls) r.push(c)
         for (const a of u.edgeArgs) {
             if (a) r.push(a)
         }
@@ -1133,18 +902,22 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
             }
             for (const r of rootsOf(units[i])) walk(r)
             if (!hit) continue
-            if (firstUse < 0) firstUse = i
+            if (firstUse < 0 || posOf[i] < posOf[firstUse]) firstUse = i
             const b = blockOfUnit[i]
             if (b < 0) continue
             blk = blk < 0 ? b : lca(blk, b)
         }
         const du = blk >= 0 ? unitOfBlock.get(blk) : undefined
-        // if the layout does not already place the definition first, leave the value alone
-        if (du === undefined || firstUse < 0 || posOf[du] > posOf[firstUse]) {
-            globals.delete(g)
+        if (du !== undefined && firstUse >= 0 && posOf[du] <= posOf[firstUse]) {
+            defUnitOf.set(g, du)
             continue
         }
-        defUnitOf.set(g, du)
+        const t = defOf.get(g)
+        if (t && t.op === 'call' && firstUse >= 0) {
+            defUnitOf.set(g, firstUse)
+            continue
+        }
+        globals.delete(g)
     }
     const definedAt: number[][] = []
     for (let i = 0; i < units.length; i++) definedAt.push([])
@@ -1239,8 +1012,8 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
 
     // a value returned as-is is worth having in the return register already
     const returnedIds = new Set<number>()
-    for (const b of residual.blocks) {
-        if (b.term === 'ret' && b.retId) returnedIds.add(b.retId)
+    for (const n of residual.nodes) {
+        if (n.term === 'ret' && n.retId) returnedIds.add(n.retId)
     }
 
     const intervals: number[] = []
@@ -1286,7 +1059,7 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
         }
         const r = free.shift()!
         regOf.set(v, r)
-        if (calleeSaved.has(r) && usedCalleeSaved.indexOf(r) < 0) usedCalleeSaved.push(r)
+        if (target.calleeSaved.includes(r) && usedCalleeSaved.indexOf(r) < 0) usedCalleeSaved.push(r)
         addActive(v)
     }
 
@@ -1310,8 +1083,23 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     }
 
     // ---- frame ------------------------------------------------------------
+    // A call goes through memory in every direction: every volatile is written
+    // out before it and read back after, the arguments are staged in their own
+    // slots, and the result comes back through one more. Nothing has to reason
+    // about what was live in which register, which is the point -- it is slow
+    // and it is obviously correct, and the allocator can be taught later.
+    let hasCall = false
+    for (const t of residual.traces) {
+        if (t.op === 'call') { hasCall = true; break }
+    }
+    const volatiles = target.volatiles
     const spillBase = usedCalleeSaved.length * 8
-    const frameBytes = ((usedCalleeSaved.length + spillCount) * 8 + 15) & ~15
+    const callBase = spillBase + spillCount * 8
+    // one slot per volatile, then the eight argument slots, then the result
+    const callBytes = hasCall ? (volatiles.length + 9) * 8 : 0
+    const frameBytes = ((usedCalleeSaved.length + spillCount) * 8 + callBytes + 15) & ~15
+    const argBase = callBase + volatiles.length * 8
+    const resultBase = argBase + 8 * 8
 
     // ---- emission ---------------------------------------------------------
     const temps: number[] = []
@@ -1329,6 +1117,16 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     function takeTemp(): number {
         if (tempNext >= temps.length) throw `lowering: out of temporaries in a block`
         return temps[tempNext++]
+    }
+
+    let calleeSavedNext = 0
+    function takeCalleeSaved(): number {
+        if (calleeSavedNext >= target.calleeSaved.length) throw `lowering: out of callee saved regs`
+        return target.calleeSaved[calleeSavedNext++]
+    }
+    function freeCalleeSaved(reg: number) {
+        intrinsics.assert(calleeSavedNext > 0)
+        calleeSavedNext -= 1
     }
 
     // a shared value occupies its register from its definition site onwards;
@@ -1410,12 +1208,36 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
             else asm.subImm(dst, inRegs[0], t.b)
         } else if (BinaryOps.has(op)) {
             asm.binary(op, dst, inRegs[0], inRegs[1], signed)
+        } else if (op === 'call') {
+            emitCall(t, inRegs, dst)
         } else {
             throw `lowering: no rule for op '${op}'`
         }
         localOf.set(id, dst)
         if (globals.has(id) && regOf.get(id) === dst) materialized.add(id)
         return dst
+    }
+
+    // inRegs is [token, callee, this, ...args]. The token is an ordinary value
+    // and emitting it is what puts this call after the one before it; having
+    // done that, its register is of no further interest
+    function emitCall(t: any, inRegs: number[], dst: number): void {
+        const nargs = inRegs.length - 3
+        if (nargs > argRegCount) throw `lowering: ${nargs} call arguments, only ${argRegCount} fit in registers`
+        // stage first, while the operands are still where they were computed
+        for (let i = 0; i < nargs; i++) asm.store(31, argBase + i * 8, inRegs[3 + i], Types.u64)
+        asm.store(31, resultBase, inRegs[1], Types.u64)   // the callee, in the slot its result will use
+        for (let i = 0; i < volatiles.length; i++) {
+            asm.store(31, callBase + i * 8, volatiles[i], Types.u64)
+        }
+        for (let i = 0; i < nargs; i++) asm.load(target.argRegs[i], 31, argBase + i * 8, Types.u64)
+        asm.load(16, 31, resultBase, Types.u64)
+        asm.blr(16)
+        asm.store(31, resultBase, target.retReg, Types.u64)
+        for (let i = 0; i < volatiles.length; i++) {
+            asm.load(volatiles[i], 31, callBase + i * 8, Types.u64)
+        }
+        asm.load(dst, 31, resultBase, Types.u64)
     }
 
     function collectRegs(id: number, out: Set<number>, seen: Set<number>): void {
@@ -1438,12 +1260,12 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     // its destination unless something still pending reads that register, and
     // only a genuine cycle needs a temporary.
     function emitEdge(u: Unit): void {
-        const block = blockAt.get(u.edgeTo)
-        if (!block) throw `lowering: edge to unknown block B${u.edgeTo}`
+        const block = residual.nodes[u.edgeTo]
+        if (!block) throw `lowering: bundle into unknown node ${u.edgeTo}`
         const args = u.edgeArgs
         const consts = u.edgeConsts
         if (args.length !== block.params.length) {
-            throw `lowering: edge into B${u.edgeTo} passes ${args.length} args for ${block.params.length} params`
+            throw `lowering: bundle into ${block.label} passes ${args.length} args for ${block.params.length} params`
         }
         const n = args.length
         const dest: number[] = []
@@ -1546,6 +1368,8 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
         localOf.clear()
         // the definition site may not itself use the value, so ask for it
         for (const g of definedAt[k]) emitValue(g)
+        for (const c of u.calls) emitValue(c)
+        if (u.isRet && u.retTokenId) emitValue(u.retTokenId)
 
         if (u.isRet) {
             if (u.retId) asm.mov(target.retReg, emitValue(u.retId, target.retReg))
@@ -1562,10 +1386,11 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
         }
         if (u.edgeTo >= 0) {
             emitEdge(u)
-            asm.jump(u.edgeTo)
+            asm.jump(u.thenLabel)
             continue
         }
-        throw `lowering: unit ${u.kind} has no terminator`
+        // a node that only merges values: straight on to its single successor
+        asm.jump(u.thenLabel)
     }
 
     return {
@@ -1577,107 +1402,3 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
     }
 }
 
-// ============================================================================
-// self test
-// ============================================================================
-
-function traceFn(build: (mk: () => number) => void): { traces: OpTrace[], paramIds: number[] } {
-    const paramIds: number[] = []
-    const tracer = intrinsics.createIntrinsicsTracer(Intrinsics)
-    build(() => {
-        const v = tracer.createUniqueNan()
-        paramIds.push(tracer.getNanId(v)) // capture while it is still fresh
-        return v
-    })
-    tracer.dispose()
-    return { traces: tracer.getTraces(), paramIds }
-}
-
-function check(name: string, got: number[], expected: number[]): void {
-    if (got.length !== expected.length) {
-        throw `${name}: expected ${expected.length} instructions, got ${got.length}`
-    }
-    for (let i = 0; i < got.length; i++) {
-        if (got[i] === expected[i]) continue
-        throw `${name}: word ${i} is 0x${got[i].toString(16)}, expected 0x${expected[i].toString(16)}`
-    }
-}
-
-{
-    const u32 = Types.u32
-
-
-    // add(a, b) => a + b
-    {
-        const r = traceFn(mk => {
-            const a = mk()
-            const b = mk()
-            Intrinsics.ret(Intrinsics.add(a, b, u32, u32), u32)
-        })
-        const l = lower(r.traces, { paramIds: r.paramIds })
-        console.log('lowering: add(a, b)\n' + l.listing)
-        check('add', l.words, [
-            0x8B010000, // add x0, x0, x1
-            0xD65F03C0, // ret
-        ])
-    }
-
-    // muladd(a, b, c) => a * b + c
-    {
-        const r = traceFn(mk => {
-            const a = mk()
-            const b = mk()
-            const c = mk()
-            const m = Intrinsics.mul(a, b, u32, u32)
-            Intrinsics.ret(Intrinsics.add(m, c, u32, u32), u32)
-        })
-        const l = lower(r.traces, { paramIds: r.paramIds })
-        console.log('\nlowering: muladd(a, b, c)\n' + l.listing)
-        check('muladd', l.words, [
-            0x9B017C00, // mul x0, x0, x1
-            0x8B020000, // add x0, x0, x2
-            0xD65F03C0, // ret
-        ])
-    }
-
-    // addConst(a) => a + 45
-    {
-        const r = traceFn(mk => {
-            const a = mk()
-            Intrinsics.ret(Intrinsics.add(a, 45, u32, u32), u32)
-        })
-        const l = lower(r.traces, { paramIds: r.paramIds })
-        console.log('\nlowering: addConst(a)\n' + l.listing)
-        check('addConst', l.words, [
-            0x9100B400, // add x0, x0, #45
-            0xD65F03C0, // ret
-        ])
-    }
-
-    // isLess(a, b) => (a < b) | 0     -- exercises cmp/cset
-    {
-        const r = traceFn(mk => {
-            const a = mk()
-            const b = mk()
-            const c = Intrinsics.lt(a, b, u32, u32)
-            Intrinsics.ret(Intrinsics.select(c, 1, 0, u32), u32)
-        })
-        const l = lower(r.traces, { paramIds: r.paramIds })
-        console.log('\nlowering: isLess(a, b)\n' + l.listing)
-    }
-
-    // rem/div and a memory round trip
-    {
-        const r = traceFn(mk => {
-            const p = mk() as u32
-            const n = mk()
-            const q = Intrinsics.rem(n, 5, u32, u32)
-            Intrinsics.store(p, 8, q, u32)
-            Intrinsics.ret(Intrinsics.load(p, 8, u32), u32)
-        })
-        const l = lower(r.traces, { paramIds: r.paramIds })
-        console.log('\nlowering: remStoreLoad(p, n)\n' + l.listing)
-    }
-
-    console.log('\nlowering self-test passed')
-}

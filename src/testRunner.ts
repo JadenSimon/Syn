@@ -8,6 +8,7 @@ const filenameMarker = '// @filename:'
 interface VirtualFile {
     name: string
     text: string
+    lineoffset?: number
 }
 
 function parseTestFile(text: string, extname = '.ts') {
@@ -36,7 +37,7 @@ function parseTestFile(text: string, extname = '.ts') {
         line += 1
     }
 
-    let currentFile: any = { line }
+    let currentFile: any = { line, lineoffset: line }
     const files: (VirtualFile & { line: number })[] = []
 
     while (i < text.length) {
@@ -267,7 +268,14 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
         }
 
         const name = path.relative(testsDir, f.source)
-        group.push({ name, text: f.text, order: roots.indexOf(f.source), absPath: f.source })
+        const order = roots.indexOf(f.source)
+        group.push({ 
+            name, 
+            text: f.text, 
+            order,
+            absPath: f.source,
+            lineoffset: parsed.files[order].lineoffset,
+        })
     }
 
     for (const [k, v] of groups) {

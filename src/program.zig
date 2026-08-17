@@ -24750,7 +24750,7 @@ pub const Analyzer = struct {
                     },
                     .query => {
                         if (comptime suppress_gaps) {
-                            if (this.analyzer.program.getFileData(k.slot3).ast.nodes.at(k.slot4).kind == .arrow_function) {
+                            if (this.analyzer.program.getFileData(k.slot3).ast.nodes.at(k.slot4).kind == .arrow_function or this.analyzer.program.getFileData(k.slot3).ast.nodes.at(k.slot4).kind == .function_declaration) {
                                 return try this._toTypeNode(@intFromEnum(Kind.any));
                             }
                         }

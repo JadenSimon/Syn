@@ -72,7 +72,7 @@ pub const SynthInstrumenter = struct {
 
     ignored: ?*const std.AutoArrayHashMapUnmanaged(SymbolRef, void) = null,
 
-    pub fn transform(ast: *AstData, binder: *const Binder) !parser.PrintResult {
+    pub fn transform(ast: *AstData, binder: *const Binder, printer_opt: ?parser.PrinterOptions) !parser.PrintResult {
         const nodes = try ast.nodes.clone();
         ast.nodes = nodes;
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
@@ -98,12 +98,13 @@ pub const SynthInstrumenter = struct {
             ast.nodes.at(stmt).next = parser.maybeUnwrapRef(ast.nodes.at(ast.start)) orelse 0;
             ast.start = try v.factory.cloneNodeRef(ast.start);
             ast.nodes.at(ast.start).data = stmt;
-        } 
+        }
 
-        return try parser.printWithOptions(ast.*, .{
-            .replacements = &r,
+        var opts: parser.PrinterOptions = printer_opt orelse .{
             .emit_source_map = true,
-        });
+        };
+        opts.replacements = &r;
+        return try parser.printWithOptions(ast.*, opts);
     }
 
     fn deinit(self: *@This()) void {

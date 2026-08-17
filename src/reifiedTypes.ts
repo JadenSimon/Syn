@@ -775,7 +775,17 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             })
         })()
     }
-    return vm.runInContext('"use strict";\n' + text, ctx)
+    try {
+        return vm.runInContext('"use strict";\n' + text, ctx, {
+            filename: fileName,
+            lineOffset: -1,
+        })
+    } catch (err) {
+        const namesToSource = new Map()
+        namesToSource.set(fileName, '"use strict";\n' + text)
+        applySourceMaps(namesToSource, err as any)
+        throw err
+    }
 }
 
 
@@ -815,9 +825,7 @@ function applySourceMaps(nameToSource: Map<string, string>, err: Error) {
                 Number(column) - 1
             )
 
-            if (!mapped?.originalSource) return _
-
-            return `${mapped.originalSource}:${
+            return `${mapped.originalSource ?? name}:${
                 mapped.originalLine + 1
             }:${mapped.originalColumn + 1}`
         }

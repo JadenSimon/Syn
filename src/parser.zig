@@ -11350,6 +11350,7 @@ pub const PrinterOptions = struct {
     // Source maps
     emit_source_map: bool = false,
     inline_source_map: bool = false,
+    try_remap_inline: bool = false,
     source_map_root_dir: ?[]const u8 = null,
     file_name: ?[]const u8 = null,
 
@@ -11390,7 +11391,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
 
         scope: Scope = .none,
 
-        source_map: SourceMap,
+        source_map: SourceMapPrinter,
 
         helpers: u32 = 0,
 
@@ -11416,7 +11417,7 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
             return .{
                 .data = data,
                 .sink = sink,
-                .source_map = SourceMap.init(getAllocator()),
+                .source_map = SourceMapPrinter.init(getAllocator()),
             };
         }
 
@@ -13341,6 +13342,16 @@ pub fn _printWithOptions(writer: *Writer, _printer: anytype, data: AstData, opti
         }
     }
 
+    if (options.emit_source_map) {
+        if (options.try_remap_inline) {
+            if (try ParsedSourceMap.fromInline(getAllocator(), data.source)) |x| {
+                const ptr = try getAllocator().create(ParsedSourceMap);
+                ptr.* = x;
+                printer.source_map.prior = ptr;
+            }
+        }
+    }
+
     try printer.visit(data.nodes.at(data.start));
     if (options.emit_source_map) {
         if (options.inline_source_map) {
@@ -13482,7 +13493,7 @@ pub fn printInMemoryWithTypes(data: AstData, node: AstNode) ![]const u8 {
     return writer.buf.items;
 }
 
-pub fn printWithSourceMap(data: AstData, node: AstNode) !struct { contents: []const u8, source_map: SourceMap } {
+pub fn printWithSourceMap(data: AstData, node: AstNode) !struct { contents: []const u8, source_map: SourceMapPrinter } {
     var writer = try Writer.init(data.source.len);
     var printer = Printer(Writer, .{ .print_source_map = true }).init(data, &writer);
     printer.skip_types = true;
@@ -13494,7 +13505,7 @@ pub fn printWithSourceMap(data: AstData, node: AstNode) !struct { contents: []co
     };
 }
 
-pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents: []const u8, source_map: SourceMap } {
+pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents: []const u8, source_map: SourceMapPrinter } {
     var data = try _data.clone();
 
     var replacements = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
@@ -13799,8 +13810,12 @@ pub fn printToCjs(_data: AstData, _replacements: ?*anyopaque) !struct { contents
     };
 }
 
-const SourceMap = struct {
+const SourceMapPrinter = struct {
     const base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const enable_remapping = true; // should be specialized later
+    const PriorMappingType = if (enable_remapping) ?*ParsedSourceMap else void;
+
+    prior: PriorMappingType = if (enable_remapping) null else {},
 
     sources: std.ArrayList([]const u8),
     names: std.ArrayList([]const u8),
@@ -13830,6 +13845,12 @@ const SourceMap = struct {
         this.sources.deinit();
         this.names.deinit();
         this.mappings.deinit();
+        if (comptime enable_remapping) {
+            if (this.prior) |x| {
+                x.deinit();
+                getAllocator().destroy(x);
+            }
+        }
     }
 
     inline fn encodeBase64(n: u32) u8 {
@@ -13887,7 +13908,7 @@ const SourceMap = struct {
         this.source_index_delta = new_delta;
     }
 
-    pub fn encodeSegment(this: *@This(), pos: usize, source_line: u32, source_col: u32) !void {
+    fn _encodeSegment(this: *@This(), pos: usize, source_line: u32, source_col: u32) !void {
         const col: u32 = @intCast(pos - this.last_line_pos);
         if (col == source_col and this.line == source_line and this.source_index_delta == 0) {
             return;
@@ -13907,6 +13928,20 @@ const SourceMap = struct {
         this.prev_source_col = source_col;
         this.source_index_delta = 0;
         this.needs_comma = true;
+    }
+
+    pub inline fn encodeSegment(this: *@This(), pos: usize, source_line: u32, source_col: u32) !void {
+        if (!comptime enable_remapping) {
+            return this._encodeSegment(pos, source_line, source_col);
+        }
+        const m: *ParsedSourceMap = this.prior orelse return this._encodeSegment(pos, source_line, source_col);
+        var mapped_line = source_line;
+        var mapped_col = source_col;
+        if (m.lookup(source_line, source_col)) |seg| {
+            mapped_line = seg.source_line;
+            mapped_col = seg.source_col;
+        }
+        return this._encodeSegment(pos, mapped_line, mapped_col);
     }
 
     // inline fn writeSeparators(this: *@This()) !void {
@@ -14052,5 +14087,188 @@ const SourceMap = struct {
         _ = std.base64.standard.Encoder.encode(buf[prefix.len..], json_str);
 
         return buf;
+    }
+};
+
+const SourceMapSegment = struct {
+    gen_col: u32,
+    source_index: i32 = -1,
+    source_line: u32 = 0,
+    source_col: u32 = 0,
+    name_index: i32 = -1,
+};
+
+const ParsedSourceMap = struct {
+    sources: std.ArrayList([]const u8),
+    names: std.ArrayList([]const u8),
+
+    lines: std.ArrayList(std.ArrayList(SourceMapSegment)),
+
+    pub fn deinit(this: *@This()) void {
+        this.sources.deinit();
+        this.names.deinit();
+        for (this.lines.items) |*l| l.deinit();
+        this.lines.deinit();
+    }
+
+    fn decodeBase64(c: u8) !u6 {
+        return switch (c) {
+            'A'...'Z' => @intCast(c - 'A'),
+            'a'...'z' => @intCast(c - 'a' + 26),
+            '0'...'9' => @intCast(c - '0' + 52),
+            '+' => 62,
+            '/' => 63,
+            else => error.InvalidBase64,
+        };
+    }
+
+    fn decodeVlq(str: []const u8, i: *usize) !i32 {
+        var result: u32 = 0;
+        var shift: u5 = 0;
+
+        while (true) {
+            if (i.* >= str.len) return error.UnexpectedEndOfMappings;
+
+            const digit = try decodeBase64(str[i.*]);
+            i.* += 1;
+
+            result |= @as(u32, digit & 0x1F) << shift;
+            if ((digit & 0x20) == 0) break;
+            shift += 5;
+        }
+
+        const negate = (result & 1) != 0;
+        const value = result >> 1;
+        return if (negate) -@as(i32, @intCast(value)) else @as(i32, @intCast(value));
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, sources: std.ArrayList([]const u8), names: std.ArrayList([]const u8), raw_mappings: []const u8) !ParsedSourceMap {
+        var lines = std.ArrayList(std.ArrayList(SourceMapSegment)).init(allocator);
+        var current_line = std.ArrayList(SourceMapSegment).init(allocator);
+
+        var gen_col: i32 = 0;
+        var source_index: i32 = 0;
+        var source_line: i32 = 0;
+        var source_col: i32 = 0;
+        var name_index: i32 = 0;
+
+        var i: usize = 0;
+        while (i < raw_mappings.len) {
+            const c = raw_mappings[i];
+
+            if (c == ';') {
+                try lines.append(current_line);
+                current_line = std.ArrayList(SourceMapSegment).init(allocator);
+                gen_col = 0;
+                i += 1;
+                continue;
+            }
+
+            if (c == ',') {
+                i += 1;
+                continue;
+            }
+
+            gen_col += try decodeVlq(raw_mappings, &i);
+            var seg = SourceMapSegment{ .gen_col = @intCast(gen_col) };
+
+            const at_delim = i >= raw_mappings.len or raw_mappings[i] == ',' or raw_mappings[i] == ';';
+            if (!at_delim) {
+                source_index += try decodeVlq(raw_mappings, &i);
+                source_line += try decodeVlq(raw_mappings, &i);
+                source_col += try decodeVlq(raw_mappings, &i);
+                seg.source_index = source_index;
+                seg.source_line = @intCast(source_line);
+                seg.source_col = @intCast(source_col);
+
+                const at_delim2 = i >= raw_mappings.len or raw_mappings[i] == ',' or raw_mappings[i] == ';';
+                if (!at_delim2) {
+                    name_index += try decodeVlq(raw_mappings, &i);
+                    seg.name_index = name_index;
+                }
+            }
+
+            try current_line.append(seg);
+        }
+        try lines.append(current_line);
+
+        return .{
+            .sources = sources,
+            .names = names,
+            .lines = lines,
+        };
+    }
+
+    // Finds the segment covering `col` on `line`
+    pub fn lookup(this: *const @This(), line: u32, col: u32) ?SourceMapSegment {
+        if (line >= this.lines.items.len) return null;
+
+        const segs = this.lines.items[line].items;
+        if (segs.len == 0 or segs[0].gen_col > col) return null;
+
+        var lo: usize = 0;
+        var hi: usize = segs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (segs[mid].gen_col <= col) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        return segs[lo - 1];
+    }
+
+    // searches for an inline source map comment from the bottom up
+    // gives up if it sees } or )
+    pub fn fromInline(allocator: std.mem.Allocator, src: []const u8) !?ParsedSourceMap {
+        const prefix = "//# sourceMappingURL=data:application/json;base64,";
+
+        var end = src.len;
+        while (true) {
+            const start = if (std.mem.lastIndexOfScalar(u8, src[0..end], '\n')) |idx| idx + 1 else 0;
+            const line = std.mem.trim(u8, src[start..end], " \t\r");
+
+            if (std.mem.startsWith(u8, line, prefix)) {
+                const b64 = line[prefix.len..];
+
+                const decoder = std.base64.standard.Decoder;
+                const json_len = try decoder.calcSizeForSlice(b64);
+                const json_buf = try allocator.alloc(u8, json_len);
+                defer allocator.free(json_buf);
+                try decoder.decode(json_buf, b64);
+
+                const RawJson = struct {
+                    sources: [][]const u8 = &.{},
+                    names: [][]const u8 = &.{},
+                    mappings: []const u8 = "",
+                };
+
+                const parsed = try std.json.parseFromSlice(RawJson, allocator, json_buf, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+
+                var sources = std.ArrayList([]const u8).init(allocator);
+                for (parsed.value.sources) |s| {
+                    try sources.append(try allocator.dupe(u8, s));
+                }
+
+                var names = std.ArrayList([]const u8).init(allocator);
+                for (parsed.value.names) |n| {
+                    try names.append(try allocator.dupe(u8, n));
+                }
+
+                return try ParsedSourceMap.parse(allocator, sources, names, parsed.value.mappings);
+            }
+
+            if (line.len != 0 and (std.mem.indexOfScalar(u8, line, '}') != null or std.mem.indexOfScalar(u8, line, ')') != null)) {
+                return null;
+            }
+
+            if (start == 0) break;
+            end = start - 1; // skip the newline itself
+        }
+
+        return null;
     }
 };

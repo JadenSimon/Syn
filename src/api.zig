@@ -219,8 +219,9 @@ pub fn printSynFile(program: *js.Object, sf: *js.Object, options: ?parser.Printe
 
     const result = try parser.printWithOptions(p.getFileData(id).ast, opt);
     if (std.mem.startsWith(u8, source.source, "/// @synth")) {
+        opt.try_remap_inline = true;
         const reparsed = try parser.ParsedFile.createFromBuffer(result.contents, null, false, null);
-        const res = try @import("./synth_helper.zig").SynthInstrumenter.transform(&reparsed.ast, &reparsed.binder);
+        const res = try @import("./synth_helper.zig").SynthInstrumenter.transform(&reparsed.ast, &reparsed.binder, opt);
         return .{ 
             .contents = try js.ArrayBuffer.from(@constCast(res.contents)),
             .mappings = if (res.source_map) |m| try js.ArrayBuffer.from(@constCast(m)) else null,
@@ -619,6 +620,12 @@ fn getNativePtr(comptime T: type, handle: u32) !*const T {
     const m = native_fn_handle_to_ptr orelse return error.NoHandleMap;
     const ptr = m.get(handle) orelse return error.FailedToMapHandle;
     return @ptrFromInt(ptr);
+}
+
+pub fn toNativePtrAddr(handle: u32) !usize {
+    const m = native_fn_handle_to_ptr orelse return error.NoHandleMap;
+    const ptr = m.get(handle) orelse return error.FailedToMapHandle;
+    return ptr;
 }
 
 const builtin = @import("builtin");
