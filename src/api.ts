@@ -6625,7 +6625,11 @@ export function optimizeVson(source: string, emitVson = false): string {
 
 export function createNativeFn(source: ArrayBuffer) {
     const handle = api.createExecutableCode(Buffer.from(source))
-    return (...args: any[]) => {
+    return Object.assign((...args: any[]) => {
         return api.callNativeFn(handle, args)
-    }
+    }, { handle })
+}
+
+export function toNativePtrAddr(fn: Function & { handle: number }): bigint | number {
+    return api.toNativePtrAddr(fn.handle)
 }

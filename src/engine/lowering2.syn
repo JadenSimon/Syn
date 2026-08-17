@@ -1,0 +1,748 @@
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as lowering from './lowering'
+
+const Types = intrinsics.Types
+type Ty = intrinsics.Types
+
+// A graph is values and blocks and nothing else.
+//
+// A block is a value you can apply. Applying it to arguments you cannot fold is
+// a jump; the arguments are its parameters. That is the only way a value ever
+// reaches a place from two directions, so it is the only thing here that needs
+// a place decided for it in advance -- everything else is a tree, and a tree is
+// emitted by walking it.
+
+export interface GraphNode {
+    op: string                // 'add' | 'lt' | 'call' | 'select' | 'apply' | 'block' | ...
+    argIds: number[]          // operands only; 0 where the operand is a literal
+    argConsts: Float64Array   // the literal, where the id beside it is 0
+    T: Ty
+    U: Ty
+    offset: number            // load
+}
+
+export interface GraphBlock {
+    id: number                // the value that is this block; 0 for the entry
+    params: number[]          // bound on entry, in the order `apply` passes them
+    resultId: number          // the tail: what it answers, effects included
+    resultConst: number
+}
+
+export interface Graph {
+    nodes: Map<number, GraphNode>
+    params: number[]          // the function's arguments; free in every block
+    blocks: GraphBlock[]      // blocks[0] is the entry
+}
+
+const BinaryOps = new Set<string>([
+    'add', 'sub', 'mul', 'div', 'rem', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
+])
+const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
+const UnaryOps = new Set<string>(['neg', 'not'])
+const OneOperandOps = new Set<string>(['load', 'convert', 'bitconvert', 'neg', 'not'])
+// what may be computed again without that meaning anything. `load` is absent on
+// purpose: memory is not a value, and reading it twice is two reads
+const PureOps = new Set<string>([
+    'add', 'sub', 'mul', 'div', 'rem', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
+    'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'select', 'convert', 'bitconvert',
+])
+// the same comparison the other way round, so a literal can move to the right
+const SwappedCmp: Record<string, string> = {
+    lt: 'gt', gt: 'lt', le: 'ge', ge: 'le', eq: 'eq', ne: 'ne',
+}
+
+const XZR = 31
+const SP = 31
+const LR = 30
+
+// Enough to hold every operand of the widest instruction at once, plus the
+// place its result is built. Nothing lives in one of these for longer than the
+// instruction being written, so a call cannot disturb them
+const SCRATCH = [12, 13, 14, 15]
+
+export interface LowerGraphOptions {
+    target?: lowering.Target
+    regBudget?: number        // shrink the pool, to exercise the frame
+}
+
+export interface LowerGraphResult {
+    target: lowering.Target
+    words: number[]
+    bytes: number[]
+    listing: string
+}
+
+export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
+    const target = opts.target ?? lowering.aarch64
+    const nodes = g.nodes
+
+    function nodeOf(id: number): GraphNode | undefined {
+        return id ? nodes.get(id) : undefined
+    }
+
+    const blockIndex = new Map<number, number>()
+    for (let i = 0; i < g.blocks.length; i++) blockIndex.set(g.blocks[i].id, i)
+
+    // ---- where values live -------------------------------------------------
+    // Everything that outlives a straight-line stretch is a parameter -- of the
+    // function, or of a block -- so parameters are the only things that have to
+    // survive a call. Temporaries never do: a call is emitted in the middle of
+    // the expression that contains it, and whatever is pending around it is
+    // pending in this same pool.
+    //
+    // So there is one register question and the graph answers it. If anything
+    // calls out, the pool is callee-saved and a call costs one `blr`; if
+    // nothing does, the pool is the volatiles, the arguments are already in the
+    // front of it, and there is no frame at all.
+    let callsOut = false
+    for (const e of nodes) {
+        if (e[1].op === 'call') { callsOut = true; break }
+    }
+    const wide: number[] = []
+    for (const r of callsOut ? target.calleeSaved : target.allocatable) {
+        if (SCRATCH.indexOf(r) < 0) wide.push(r)
+    }
+    const pool = opts.regBudget ? wide.slice(0, opts.regBudget) : wide
+    if (!pool.length) throw `lowering2: the register pool cannot be empty`
+
+    const P = g.params.length
+    if (P > target.argRegs.length) {
+        throw `lowering2: ${P} arguments, only ${target.argRegs.length} of them arrive in registers`
+    }
+    let maxParams = 0
+    for (const b of g.blocks) {
+        if (b.params.length > maxParams) maxParams = b.params.length
+    }
+    // A home is just "the n-th place a value can sit". The first several are
+    // registers and the rest are slots in the frame, so running out of
+    // registers is not an event -- the next home is simply further away, and
+    // one comparison is the whole of spilling
+    const REGS = pool.length
+    function isReg(h: number): boolean { return h < REGS }
+
+    // A block's parameters always take the same homes, so an edge is a parallel
+    // copy into a known place and nothing has to be looked up
+    const homeOf = new Map<number, number>()
+    for (let i = 0; i < P; i++) homeOf.set(g.params[i], i)
+    for (const b of g.blocks) {
+        for (let i = 0; i < b.params.length; i++) homeOf.set(b.params[i], P + i)
+    }
+
+    // A value built only out of the function's arguments is the same value
+    // every time it is asked for, so asking for it inside a block that can
+    // reach itself is asking again for nothing. Those get a home like the
+    // arguments they are made of -- which is what, to a loop, they are.
+    //
+    // Effects are never invariant however much their operands are: a call is
+    // not the same call twice
+    const pinned: number[] = []
+    {
+        const known = new Map<number, boolean>()
+        function invariant(id: number): boolean {
+            if (!id) return true
+            const hit = known.get(id)
+            if (hit !== undefined) return hit
+            const h = homeOf.get(id)
+            if (h !== undefined) {
+                known.set(id, h < P)      // an argument yes, a block parameter no
+                return h < P
+            }
+            const n = nodeOf(id)
+            if (!n || !PureOps.has(n.op)) {
+                known.set(id, false)
+                return false
+            }
+            let r = true
+            for (const a of n.argIds) {
+                if (!invariant(a)) { r = false; break }
+            }
+            known.set(id, r)
+            return r
+        }
+        // the largest invariant values anything but the entry asks for; their
+        // operands come with them, so there is no reason to name those too
+        const seen = new Set<number>()
+        function look(id: number): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            if (homeOf.has(id)) return           // it already has one
+            if (invariant(id) && nodeOf(id)) {
+                if (pinned.indexOf(id) < 0) pinned.push(id)
+                return
+            }
+            const n = nodeOf(id)
+            if (!n) return
+            for (const a of n.argIds) look(a)
+        }
+        for (let i = 1; i < g.blocks.length; i++) look(g.blocks[i].resultId)
+        // and only as many as a register can hold: paying a frame slot to avoid
+        // an `add` is not a saving
+        while (pinned.length && P + maxParams + pinned.length >= REGS) pinned.pop()
+    }
+    const pinHome = new Map<number, number>()
+    for (let k = 0; k < pinned.length; k++) {
+        pinHome.set(pinned[k], P + maxParams + k)
+        homeOf.set(pinned[k], P + maxParams + k)
+    }
+
+    const tempBase = P + maxParams + pinned.length
+
+    const CALLEE = target.scratch[1]
+
+    // How many places want each value. One is the interesting number: a value
+    // wanted once is consumed exactly once, so its home is free at that use and
+    // there is nothing to remember about it. Everything else keeps its home for
+    // as long as the stretch it was computed in
+    const refs = new Map<number, number>()
+    function count(id: number): void {
+        if (!id) return
+        refs.set(id, (refs.get(id) ?? 0) + 1)
+    }
+    for (const e of nodes) {
+        for (const a of e[1].argIds) count(a)
+    }
+    for (const b of g.blocks) count(b.resultId)
+    function wantedAgain(id: number): boolean {
+        return (refs.get(id) ?? 0) > 1
+    }
+
+    let asm = target.createAssembler()
+    let nextHome = tempBase
+    let maxHome = tempBase
+    let nextLabel = 0
+    let localOf = new Map<number, number>()
+    let freeHomes: number[] = []
+
+    // known after one pass, which is the only reason there are two
+    let saveCount = 0
+    let spillCount = 0
+    let spillBase = 0
+
+    // every return has already put its answer in the result register, so they
+    // are all the same return. Where there is no frame to give back this is one
+    // branch instead of one `ret`, and the assembler drops the last of them
+    const exitLabel = g.blocks.length
+
+    function takeHome(): number {
+        if (freeHomes.length) return freeHomes.pop()!
+        const h = nextHome++
+        if (nextHome > maxHome) maxHome = nextHome
+        return h
+    }
+    // an operand's home goes back the moment the instruction that reads it is
+    // about to be written, so a result routinely lands on top of its own input
+    function release(n: GraphNode, k: number, h: number): void {
+        if (h < 0 || h < tempBase) return
+        const id = n.argIds[k]
+        if (id && (wantedAgain(id) || homeOf.has(id))) return
+        // `after` makes a value and its effects one value, so two ids can name
+        // one home. Whoever is still being kept there keeps it
+        for (const v of localOf.values()) {
+            if (v === h) return
+        }
+        freeHomes.push(h)
+    }
+
+    function slotAddr(h: number): number { return spillBase + (h - REGS) * 8 }
+    function read(h: number, scratch: number): number {
+        if (isReg(h)) return pool[h]
+        asm.load(scratch, SP, slotAddr(h), Types.u64)
+        return scratch
+    }
+    function readInto(h: number, reg: number): void {
+        if (!isReg(h)) { asm.load(reg, SP, slotAddr(h), Types.u64); return }
+        if (pool[h] !== reg) asm.mov(reg, pool[h])
+    }
+    // the register an instruction may build its result in, and what to do about
+    // it afterwards if that result does not live in a register
+    function writeReg(h: number): number { return isReg(h) ? pool[h] : SCRATCH[3] }
+    function flush(h: number, r: number): void {
+        if (!isReg(h)) asm.store(SP, slotAddr(h), r, Types.u64)
+    }
+    function storeHome(h: number, reg: number): void {
+        if (!isReg(h)) { asm.store(SP, slotAddr(h), reg, Types.u64); return }
+        if (pool[h] !== reg) asm.mov(pool[h], reg)
+    }
+    function moveHome(from: number, to: number): void {
+        if (from === to) return
+        if (isReg(to)) { readInto(from, pool[to]); return }
+        asm.store(SP, slotAddr(to), read(from, SCRATCH[0]), Types.u64)
+    }
+
+    // ---- values ------------------------------------------------------------
+    function emitValue(id: number, hint: number = -1): number {
+        const h = homeOf.get(id)
+        if (h !== undefined) return h
+        const cached = localOf.get(id)
+        if (cached !== undefined) return cached
+        const n = nodeOf(id)
+        if (!n) throw `lowering2: value ${id} has no definition and is not a parameter`
+        const want = hint >= 0 ? hint : (prefer.get(id) ?? -1)
+        const dst = n.op === 'call' ? emitCall(n, want) : emitOp(n, want)
+        if (wantedAgain(id)) localOf.set(id, dst)
+        return dst
+    }
+
+    // a literal needs a home only where something insists on one; ordinarily it
+    // is written straight into the instruction, or into a scratch register
+    function operandHome(n: GraphNode, k: number): number {
+        if (n.argIds[k]) return emitValue(n.argIds[k])
+        const h = takeHome()
+        const r = writeReg(h)
+        asm.movImm(r, n.argConsts[k])
+        flush(h, r)
+        return h
+    }
+
+    function emitOp(n: GraphNode, hint: number): number {
+        const op = n.op
+        const signed = lowering.isSignedType(n.T) || lowering.isSignedType(n.U)
+
+        // the effects happened, and then this is the value
+        if (op === 'after') {
+            release(n, 0, operandHome(n, 0))
+            return operandHome(n, 1)
+        }
+        if (op === 'load' && n.argIds[1]) {
+            throw `lowering2: computed load offsets are not supported yet`
+        }
+
+        // Every operand first, because computing one is a recursion that may
+        // want any register at all. Only once that is over does anything move
+        // into a register it then has to stay in
+        const arity = op === 'select' ? 3 : OneOperandOps.has(op) ? 1 : 2
+        const h: number[] = []
+        for (let k = 0; k < arity; k++) h.push(n.argIds[k] ? emitValue(n.argIds[k]) : -1)
+        for (let k = 0; k < arity; k++) release(n, k, h[k])
+
+        const hd = hint >= 0 ? hint : takeHome()
+        const d = writeReg(hd)
+
+        function inReg(k: number): number {
+            if (h[k] >= 0) return read(h[k], SCRATCH[k])
+            const v = n.argConsts[k]
+            if (v === 0) return XZR
+            asm.movImm(SCRATCH[k], v)
+            return SCRATCH[k]
+        }
+
+        // a literal small enough for an immediate field belongs in the
+        // instruction; add and the comparisons commute, so one on the left can
+        // be moved to the right
+        const litB = !n.argIds[1] && n.argConsts[1] >= 0 && n.argConsts[1] <= 0xFFF
+        const litA = !n.argIds[0] && !!n.argIds[1] && n.argConsts[0] >= 0 && n.argConsts[0] <= 0xFFF
+
+        if (op === 'select') {
+            asm.select(d, inReg(0), inReg(1), inReg(2))
+        } else if (op === 'load') {
+            asm.load(d, inReg(0), n.offset, n.T)
+        } else if (op === 'convert') {
+            asm.convert(d, inReg(0), n.T, n.U)
+        } else if (op === 'bitconvert') {
+            asm.mov(d, inReg(0))
+        } else if (UnaryOps.has(op)) {
+            asm.unary(op, d, inReg(0))
+        } else if (op === 'add' && litB) {
+            asm.addImm(d, inReg(0), n.argConsts[1])
+        } else if (op === 'sub' && litB) {
+            asm.subImm(d, inReg(0), n.argConsts[1])
+        } else if (op === 'add' && litA) {
+            asm.addImm(d, inReg(1), n.argConsts[0])
+        } else if (CompareOps.has(op) && litB) {
+            asm.compareImm(op, d, inReg(0), n.argConsts[1], signed)
+        } else if (CompareOps.has(op) && litA) {
+            asm.compareImm(SwappedCmp[op], d, inReg(1), n.argConsts[0], signed)
+        } else if (CompareOps.has(op)) {
+            asm.compare(op, d, inReg(0), inReg(1), signed)
+        } else if (BinaryOps.has(op)) {
+            asm.binary(op, d, inReg(0), inReg(1), signed)
+        } else {
+            throw `lowering2: no rule for op '${op}'`
+        }
+        flush(hd, d)
+        return hd
+    }
+
+    // The token is an ordinary operand, and emitting it is what puts this call
+    // after the one before it. Having done that its home is of no interest.
+    //
+    // Nothing worth keeping is ever in a volatile: the pool is callee-saved
+    // because this graph calls out, and the scratch registers are dead between
+    // instructions. So a call is a `blr` and the moves that feed it
+    function emitCall(n: GraphNode, hint: number): number {
+        const nargs = n.argIds.length - 3
+        if (nargs > target.argRegs.length) {
+            throw `lowering2: ${nargs} call arguments, only ${target.argRegs.length} fit in registers`
+        }
+        if (n.argIds[0]) release(n, 0, emitValue(n.argIds[0]))
+
+        const h: number[] = []
+        for (let i = 0; i < nargs; i++) h.push(n.argIds[3 + i] ? emitValue(n.argIds[3 + i]) : -1)
+        const callee = n.argIds[1] ? emitValue(n.argIds[1]) : -1
+        for (let i = 0; i < nargs; i++) release(n, 3 + i, h[i])
+        release(n, 1, callee)
+
+        for (let i = 0; i < nargs; i++) {
+            if (h[i] < 0) asm.movImm(target.argRegs[i], n.argConsts[3 + i])
+            else readInto(h[i], target.argRegs[i])
+        }
+        if (callee < 0) asm.movImm(CALLEE, n.argConsts[1])
+        else readInto(callee, CALLEE)
+        asm.blr(CALLEE)
+
+        const hd = hint >= 0 ? hint : takeHome()
+        const d = writeReg(hd)
+        if (d !== target.retReg) asm.mov(d, target.retReg)
+        flush(hd, d)
+        return hd
+    }
+
+    // ---- tails -------------------------------------------------------------
+    // A tail is a value, and which of the three shapes it has is a question the
+    // graph already answers: it dispatches, or it chooses between things that
+    // are not both values, or it is the answer.
+    function condOf(id: number): number {
+        const n = nodeOf(id)
+        return n && n.op === 'select' ? n.argIds[0] : 0
+    }
+    function armId(id: number, cond: number, take: boolean): number {
+        const n = nodeOf(id)
+        if (!n || n.op !== 'select' || n.argIds[0] !== cond) return id
+        return n.argIds[take ? 1 : 2]
+    }
+    function armConst(id: number, c: number, cond: number, take: boolean): number {
+        const n = nodeOf(id)
+        if (!n || n.op !== 'select' || n.argIds[0] !== cond) return c
+        return n.argConsts[take ? 1 : 2]
+    }
+    function valueOf(id: number): number {
+        const n = nodeOf(id)
+        return n && n.op === 'after' ? n.argIds[1] : id
+    }
+    function effectOf(id: number): number {
+        const n = nodeOf(id)
+        return n && n.op === 'after' ? n.argIds[0] : 0
+    }
+
+    // An arm that dispatches has to be a branch. So does a pair of arms whose
+    // effects differ, because a token that merged into a `csel` would mean both
+    // chains ran. Anything else stays a value and becomes one `csel`
+    function needsControl(id: number): boolean {
+        const inner = valueOf(id)
+        const n = nodeOf(inner)
+        if (n && n.op === 'apply') return true
+        const c = condOf(inner)
+        if (!c) return false
+        const a = armId(inner, c, true)
+        const b = armId(inner, c, false)
+        if (effectOf(a) !== effectOf(b)) return true
+        return needsControl(a) || needsControl(b)
+    }
+
+    // does getting `from` involve getting `to`? A dispatch's arguments are
+    // reached; what the block does with them afterwards is its own business
+    function reaches(from: number, to: number): boolean {
+        if (!from || !to) return false
+        const seen = new Set<number>()
+        const stack: number[] = [from]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (id === to) return true
+            if (seen.has(id)) continue
+            seen.add(id)
+            const n = nodeOf(id)
+            if (!n || n.op === 'block') continue
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
+                if (n.argIds[i]) stack.push(n.argIds[i])
+            }
+        }
+        return false
+    }
+
+    // Where a value computed before a branch is on its way into a block
+    // parameter, it may as well be built in that parameter's home. That puts
+    // two values in one home, so it is only allowed when what the parameter
+    // holds is not wanted again except through the value replacing it -- the
+    // accumulator shape, `s = f(s, ...)`, where the test wants `f(s, ...)` too
+    let prefer = new Map<number, number>()
+
+    function coneHas(root: number, target: number, stop: number): boolean {
+        if (!root) return false
+        const seen = new Set<number>()
+        const stack: number[] = [root]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (id === target) return true
+            if (id === stop || seen.has(id)) continue
+            seen.add(id)
+            const n = nodeOf(id)
+            if (!n || n.op === 'block') continue
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
+                if (n.argIds[i]) stack.push(n.argIds[i])
+            }
+        }
+        return false
+    }
+
+    // every value some edge in this tail would copy into parameter i
+    function edgeArgs(id: number, out: Map<number, number[]>): void {
+        const n = nodeOf(id)
+        if (!n) return
+        if (n.op === 'after') { edgeArgs(n.argIds[1], out); return }
+        if (n.op === 'apply') {
+            for (let i = 1; i < n.argIds.length; i++) {
+                if (!n.argIds[i]) continue
+                const k = i - 1
+                if (!out.has(k)) out.set(k, [])
+                out.get(k)!.push(n.argIds[i])
+            }
+            return
+        }
+        if (n.op === 'select') {
+            edgeArgs(n.argIds[1], out)
+            edgeArgs(n.argIds[2], out)
+        }
+    }
+
+    function planHomes(b: GraphBlock): void {
+        prefer = new Map<number, number>()
+        if (!needsControl(b.resultId)) return
+        const inner = valueOf(b.resultId)
+        const c = condOf(inner)
+        if (!c) return
+        const dests = new Map<number, number[]>()
+        edgeArgs(inner, dests)
+        const taken = new Set<number>()
+        for (const e of dests) {
+            const i = e[0]
+            if (i >= b.params.length) continue
+            const home = P + i
+            if (taken.has(home)) continue
+            const p = b.params[i]
+            for (const x of e[1]) {
+                if (!wantedAgain(x)) continue
+                if (!coneHas(c, x, 0)) continue          // computed before the branch
+                if (!coneHas(x, p, 0)) continue          // it is what replaces the parameter
+                if (coneHas(b.resultId, p, x)) continue  // and nobody else wants the old one
+                prefer.set(x, home)
+                taken.add(home)
+                break
+            }
+        }
+    }
+
+    function emitTail(resId: number, resConst: number): void {
+        // the effects come first because they came first; what is left is the
+        // answer, and it is the only thing left
+        let id = resId
+        let konst = resConst
+        const w = nodeOf(id)
+        if (w && w.op === 'after') {
+            // usually the answer is the last call, or is built out of it, and
+            // then asking for the answer is already asking for the effects.
+            // Asking twice would compute it somewhere nobody wanted it
+            if (!reaches(w.argIds[1], w.argIds[0])) release(w, 0, operandHome(w, 0))
+            id = w.argIds[1]
+            konst = w.argConsts[1]
+        }
+
+        const n = nodeOf(id)
+        if (n && n.op === 'apply') {
+            emitEdge(n)
+            return
+        }
+        if (needsControl(id)) {
+            const c = condOf(id)
+            const cr = read(emitValue(c), SCRATCH[0])
+            const other = nextLabel++
+            asm.jumpIfZero(cr, other)
+            // the arms are two paths, not two blocks: nothing rejoins, so each
+            // gets the homes the other was going to get
+            const savedNext = nextHome
+            const savedFree = freeHomes
+            const savedLocals = localOf
+            freeHomes = savedFree.slice()
+            localOf = new Map<number, number>(savedLocals)
+            emitTail(armId(id, c, true), armConst(id, konst, c, true))
+            nextHome = savedNext
+            freeHomes = savedFree
+            localOf = savedLocals
+            asm.bindLabel(other)
+            emitTail(armId(id, c, false), armConst(id, konst, c, false))
+            return
+        }
+        if (id) readInto(emitValue(id), target.retReg)
+        else asm.movImm(target.retReg, konst)
+        asm.jump(exitLabel)
+    }
+
+    function emitEdge(n: GraphNode): void {
+        const bi = blockIndex.get(n.argIds[0])
+        if (bi === undefined) throw `lowering2: apply of something that is not a block`
+        const b = g.blocks[bi]
+        const nargs = n.argIds.length - 1
+        if (nargs !== b.params.length) {
+            throw `lowering2: block ${bi} takes ${b.params.length} arguments, given ${nargs}`
+        }
+
+        const arg: number[] = []      // value ids; 0 where the argument is a literal
+        const con: number[] = []
+        const dst: number[] = []
+        for (let i = 0; i < nargs; i++) {
+            arg.push(n.argIds[1 + i])
+            con.push(n.argConsts[1 + i])
+            dst.push(P + i)
+        }
+
+        // which homes computing this argument would read: a parameter is its
+        // own home, anything already materialized is wherever it was put, and
+        // everything else is asked of its operands
+        function readsHomes(id: number, out: Set<number>, seen: Set<number>): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            const h = homeOf.get(id)
+            if (h !== undefined) { out.add(h); return }
+            const l = localOf.get(id)
+            if (l !== undefined) { out.add(l); return }
+            const nd = nodeOf(id)
+            if (!nd) return
+            for (const a of nd.argIds) readsHomes(a, out, seen)
+        }
+        // Does argument j still need dst[i] to hold what it holds now? Reaching
+        // it through argument i does not count: once i is written, i's value is
+        // in dst[i] and j reads the new one from there
+        function stillWanted(j: number, i: number): boolean {
+            const seen = new Set<number>()
+            if (arg[i]) seen.add(arg[i])
+            const out = new Set<number>()
+            readsHomes(arg[j], out, seen)
+            return out.has(dst[i])
+        }
+
+        // An argument is computed into its destination, not into a temporary
+        // that is then copied there. Nothing rejoins after this, so the
+        // destination is as good a place to work as any other
+        function emitInto(i: number, into: number): void {
+            if (!arg[i]) {
+                const r = writeReg(into)
+                asm.movImm(r, con[i])
+                flush(into, r)
+                return
+            }
+            moveHome(emitValue(arg[i], into), into)
+        }
+
+        const pending: boolean[] = []
+        for (let i = 0; i < nargs; i++) pending.push(true)
+        const parkedAt: number[] = []
+        const parkedFor: number[] = []
+        let remaining = nargs
+        while (remaining > 0) {
+            let moved = false
+            for (let i = 0; i < nargs; i++) {
+                if (!pending[i]) continue
+                let blocked = false
+                for (let j = 0; j < nargs; j++) {
+                    if (j === i || !pending[j]) continue
+                    if (stillWanted(j, i)) { blocked = true; break }
+                }
+                if (blocked) continue
+                emitInto(i, dst[i])
+                pending[i] = false
+                remaining--
+                moved = true
+            }
+            if (moved) continue
+            // a genuine cycle: park one of them and the rest can go
+            for (let i = 0; i < nargs; i++) {
+                if (!pending[i]) continue
+                const t = takeHome()
+                emitInto(i, t)
+                parkedAt.push(t)
+                parkedFor.push(dst[i])
+                pending[i] = false
+                remaining--
+                break
+            }
+        }
+        for (let k = 0; k < parkedAt.length; k++) moveHome(parkedAt[k], parkedFor[k])
+        asm.jump(bi)
+    }
+
+    // ---- frame -------------------------------------------------------------
+    // only a pool that outlives a call has to be given back to the caller, and
+    // that is exactly the pool we chose because there was one
+    function frameBytes(): number {
+        const saved = callsOut ? (saveCount + 1) * 8 : 0
+        return (saved + spillCount * 8 + 15) & ~15
+    }
+    function prologue(): void {
+        const fb = frameBytes()
+        if (fb) asm.spAdjust(fb)
+        if (callsOut) {
+            for (let i = 0; i < saveCount; i++) asm.store(SP, i * 8, pool[i], Types.u64)
+            asm.store(SP, saveCount * 8, LR, Types.u64)
+        }
+        for (let i = 0; i < P; i++) storeHome(i, target.argRegs[i])
+    }
+    function epilogue(): void {
+        if (callsOut) {
+            for (let i = 0; i < saveCount; i++) asm.load(pool[i], SP, i * 8, Types.u64)
+            asm.load(LR, SP, saveCount * 8, Types.u64)
+        }
+        const fb = frameBytes()
+        if (fb) asm.spAdjust(-fb)
+    }
+
+    // the invariants are built once, here, where the arguments they are made of
+    // have just arrived. `emitOp` rather than `emitValue`, because the whole
+    // point is that every later ask finds the home instead of the work
+    function definePinned(): void {
+        for (const id of pinned) {
+            const h = pinHome.get(id)!
+            moveHome(emitOp(nodeOf(id)!, h), h)
+        }
+    }
+
+    function emitAll(): void {
+        nextLabel = exitLabel + 1
+        for (let i = 0; i < g.blocks.length; i++) {
+            const b = g.blocks[i]
+            asm.bindLabel(i)
+            nextHome = tempBase
+            freeHomes = []
+            localOf = new Map<number, number>()
+            if (i === 0) {
+                prologue()
+                definePinned()
+                nextHome = tempBase
+                freeHomes = []
+                localOf = new Map<number, number>()
+            }
+            planHomes(b)
+            emitTail(b.resultId, b.resultConst)
+        }
+        asm.bindLabel(exitLabel)
+        epilogue()
+        asm.ret()
+    }
+
+    // The prologue has to know how much of the pool the body used and how much
+    // of it did not fit, and the body is what says so. Running it twice is
+    // cheaper than a second traversal that has to be kept in step with this one
+    emitAll()
+    saveCount = maxHome < REGS ? maxHome : REGS
+    spillCount = maxHome > REGS ? maxHome - REGS : 0
+    spillBase = callsOut ? (saveCount + 1) * 8 : 0
+    asm = target.createAssembler()
+    emitAll()
+
+    return {
+        target,
+        words: asm.words(),
+        bytes: asm.bytes(),
+        listing: asm.listing(),
+    }
+}

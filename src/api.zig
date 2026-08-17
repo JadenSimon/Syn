@@ -588,15 +588,15 @@ pub fn usesThisBinding(sf: WrappedFile, node_ref: u32) bool {
 }
 
 // used for testing lowered machine code
-pub fn callNativeFn(handle: u32, args: js.Array(u32)) !u32 {
+pub fn callNativeFn(handle: u32, args: js.Array(i64)) !i64 {
     const arg_count = args.elements.len;
     const call_mod = @import("std").builtin.CallModifier.auto;
     return switch (arg_count) {
-        0 => @call(call_mod, try getNativePtr(fn() callconv(.C) u32, handle), .{}),
-        1 => @call(call_mod, try getNativePtr(fn(usize) callconv(.C) u32, handle), .{args.elements[0]}),
-        2 => @call(call_mod, try getNativePtr(fn(usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1]}),
-        3 => @call(call_mod, try getNativePtr(fn(usize, usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1], args.elements[2]}),
-        4 => @call(call_mod, try getNativePtr(fn(usize, usize, usize, usize) callconv(.C) u32, handle), .{args.elements[0], args.elements[1], args.elements[2], args.elements[3]}),
+        0 => @call(call_mod, try getNativePtr(fn() callconv(.C) i64, handle), .{}),
+        1 => @call(call_mod, try getNativePtr(fn(i64) callconv(.C) i64, handle), .{args.elements[0]}),
+        2 => @call(call_mod, try getNativePtr(fn(i64, i64) callconv(.C) i64, handle), .{args.elements[0], args.elements[1]}),
+        3 => @call(call_mod, try getNativePtr(fn(i64, i64, i64) callconv(.C) i64, handle), .{args.elements[0], args.elements[1], args.elements[2]}),
+        4 => @call(call_mod, try getNativePtr(fn(i64, i64, i64, i64) callconv(.C) i64, handle), .{args.elements[0], args.elements[1], args.elements[2], args.elements[3]}),
         else => error.TooManyArgs,
     };
 }

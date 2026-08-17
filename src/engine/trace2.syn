@@ -1,8 +1,14 @@
 "use wrapped";
 
+import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as bytecode from './bytecode-emitter'
 import { Op, createInterpreter } from './vm'
+import * as lowering from './lowering'
+import * as lowering2 from './lowering2'
+
+// bound eagerly so the module evaluates (and runs its self-test) at load time
+const lowerGraph = lowering2.lowerGraph
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -59,6 +65,7 @@ interface Blocks {
 
 interface Step {
     kind: string          // 'goto' | 'branch' | 'ret'
+    from: number          // block id where this step orginated from
     outs: Float64Array    // slot values on the way out
     target: number        // pc, for goto
     condId: number        // predicate: kept as an id, a tagged nan does not
@@ -126,11 +133,17 @@ function deriveBlocks(
         const last = own[own.length - 1]
         const after = i + 1 < n ? leaders[i + 1] : codeLen
         const s: number[] = []
+        // Both arms returning leaves a jump to one past the end, which is not a
+        // block: falling off the end is a return, and a return has nowhere to go
+        function to(pc: number): void {
+            const t = at.get(pc)
+            if (t !== undefined) s.push(t)
+        }
         if (!TerminalOpcodes.has(last.opcode)) {
             if (last.jumpTarget !== undefined) {
-                if (CondJumpOpcodes.has(last.opcode)) s.push(at.get(after)!)
-                s.push(at.get(last.jumpTarget)!)
-            } else if (after < codeLen) s.push(at.get(after)!)
+                if (CondJumpOpcodes.has(last.opcode)) to(after)
+                to(last.jumpTarget)
+            } else if (after < codeLen) to(after)
         }
         succs.push(s)
     }
@@ -405,7 +418,7 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
     let injectedRet = false
     let stopNext = false
     const emptyState = new Float64Array(0)
-    let step: Step = { kind: '', outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
+    let step: Step = { kind: '', from: 0, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
 
     const tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
         load: (ptr, offset, T) => {
@@ -488,7 +501,7 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         resumePc = leaders[b]
         injectedRet = false
         stopNext = false
-        step = { kind: '', outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
+        step = { kind: '', from: b, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
         // Nothing unknown went in, so nothing unknown can come out
         let concrete = true
         for (const r of B.liveIn[b]) {
@@ -519,8 +532,10 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
     let dispatches = 0
     const maxDispatches = 100000
 
-    // a block being applied to arguments we cannot fold, that can reach itself
-    const loops = new Map<number, { block: number, params: number[], body: any, init: number[] }>()
+    // a block being applied to arguments we cannot fold, that can reach itself.
+    // `state` is what the block leaves behind: the whole thing, because the
+    // answer is one slot of it and the effects it performed are another
+    const loops = new Map<number, { block: number, params: number[], state: Float64Array }>()
 
     // blocks are given their identity here, rather than during eval
     function reifyBlocks(): void {
@@ -564,12 +579,7 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
                     ins2[R.params[i]] = intrinsics.getNanFromId(R.paramIds[i]) as any
                 }
                 const body = continueFrom(runBlock(b, ins2), ins2)
-                const results = new Map<number, number>()
-                for (let i = 0; i < slotCount; i++) {
-                    const id = tracer.getNanId(body[i])
-                    if (id) results.set(i, id)
-                }
-                loops.set(R.selfId, { block: b, params: R.params, results })
+                loops.set(R.selfId, { block: b, params: R.params, state: body })
             }
 
             // the state after the dispatch: each slot of it is that dispatch,
@@ -580,7 +590,7 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
             const pargs = new Float64Array(2)
             pargs[0] = app
             pargs[1] = RESULT
-            out[RESULT] = mk('proj', pargs, 'result')
+            out[RESULT] = after(mk('proj', pargs, 'result'), ins[TOKEN])
             return out
         }
 
@@ -596,10 +606,13 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
     }
 
     function continueFrom(r: Step, ins: Float64Array): Float64Array {
+        assert(r.kind)
+        console.log(r.kind, r.target)
         if (r.kind === 'ret') {
             const out = new Float64Array(slotCount)
             for (let i = 0; i < r.outs.length; i++) out[i] = r.outs[i]
-            out[RESULT] = r.valueId ? intrinsics.getNanFromId(r.valueId) as any : r.valueConst
+            const v = r.valueId ? intrinsics.getNanFromId(r.valueId) as any : r.valueConst
+            out[RESULT] = after(v, out[TOKEN])
             return out
         }
         if (r.kind === 'goto') return evalFrom(blockOf.get(r.target)!, r.outs)
@@ -647,6 +660,19 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
             out[i] = mk('select', sel)
         }
         return out
+    }
+
+    // What a block answers is not separable from what it did. A value that
+    // arrived after some effects is that value and those effects, so a block
+    // whose answer folded to a constant still says what it performed, and two
+    // arms that answer the same thing having done different things are still
+    // two different answers. Nothing has to be carried alongside
+    function after(v: any, token: any): any {
+        if (!tracer.getNanId(token)) return v
+        const a = new Float64Array(2)
+        a[0] = token
+        a[1] = v
+        return mk('after', a)
     }
 
     function unified(st: Float64Array, t: any): Float64Array {
@@ -721,7 +747,8 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
     function survey(roots: number[]): void {
         const refs = new Map<number, number>()
         const order: number[] = []
-        function walk(id: number): void {
+        function walk(id0: number): void {
+            const id = throughAfter(id0)
             const c = (refs.get(id) ?? 0) + 1
             refs.set(id, c)
             if (c > 1) return
@@ -756,9 +783,19 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         }
     }
 
+    // An `after` that says nothing is not a value the reader has to see, so it
+    // is not one the sharing analysis should count either
+    function throughAfter(id: number): number {
+        for (;;) {
+            const n = nodes.get(id)
+            if (!n || n.op !== 'after' || !reaches(n.argIds[1], n.argIds[0])) return id
+            id = n.argIds[1]
+        }
+    }
+
     const rendering = new Set<number>()
     function render(v: any): string {
-        const id = tracer.getNanId(v)
+        const id = throughAfter(tracer.getNanId(v))
         if (!id) return String(v)
         const nm = names.get(id)
         if (nm) return nm
@@ -783,10 +820,14 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
             // asking for that value and running the block are the same thing
             // both of these keep the value they are about, so they say nothing
             // the reader needs at this level
+            // an `after` whose value already reaches its token says nothing the
+            // reader cannot see, which is the usual case: the answer is the call
             s = n.op === 'nonzero'
                 ? parts[0]
                 : n.op === 'proj'
                 ? (n.label === 'result' ? parts[0] : `${parts[0]}.${n.label}`)
+                : n.op === 'after'
+                ? (reaches(n.argIds[1], n.argIds[0]) ? parts[1] : `(after, ${parts[0]}, ${parts[1]})`)
                 : `(${n.op}${n.label ? ' ' + n.label : ''}, ${parts.join(', ')})`
         } else {
             const t = tracer.getTraceById(id)
@@ -801,6 +842,39 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         }
         rendering.delete(id)
         return s
+    }
+
+    // does getting `from` involve getting `to`? Blocks are where the walk
+    // stops: what a block does is the block's business, not its caller's
+    function reaches(from: number, to: number): boolean {
+        if (!from || !to) return false
+        const seen = new Set<number>()
+        const stack: number[] = [from]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (id === to) return true
+            if (seen.has(id)) continue
+            seen.add(id)
+            const n = nodes.get(id)
+            if (n) {
+                // a dispatch's arguments are the caller's values and are
+                // reached; what the block then does with them is not
+                const from = n.op === 'apply' ? 1 : 0
+                if (n.op !== 'block') {
+                    for (let i = from; i < n.argIds.length; i++) {
+                        if (n.argIds[i]) stack.push(n.argIds[i])
+                    }
+                }
+                continue
+            }
+            const t = tracer.getTraceById(id)
+            if (!t) continue
+            for (const j of operandIndices(t)) {
+                const a = t.argIds[j] ?? 0
+                if (a) stack.push(a)
+            }
+        }
+        return false
     }
 
     function operandIndices(t: any): number[] {
@@ -818,7 +892,7 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
 
     const roots: number[] = []
     for (const e of loops) {
-        const rid = e[1].results.get(RESULT)
+        const rid = tracer.getNanId(e[1].state[RESULT])
         if (rid) roots.push(rid)
     }
     roots.push(tracer.getNanId(result))
@@ -829,18 +903,126 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
     for (const e of loops) {
         const l = e[1]
         const ps = l.params.map(s => s === ACC ? 'acc' : `s${s}`).join(', ')
-        const rid = l.results.get(RESULT)
-        lines.push(`B${l.block}(${ps}) = ${rid ? render(intrinsics.getNanFromId(rid) as any) : '?'}`)
+        lines.push(`B${l.block}(${ps}) = ${render(l.state[RESULT])}`)
     }
     lines.push(`= ${render(result)}`)
     lines.push(`  ${dispatches} dispatches, ${stateMemo.size} distinct`)
-    return { text: lines.join('\n'), result, dispatches }
+
+    // ---- graph -------------------------------------------------------------
+    // What leaves here is the same thing that was built: values, and the blocks
+    // that are values. `nonzero` and `proj` say nothing an instruction could
+    // say, so they collapse into their argument on the way out; a trace's
+    // trailing type tags become fields, so nothing downstream has to know which
+    // of a node's arguments were really arguments.
+    function buildGraph(): lowering2.Graph {
+        const out = new Map<number, lowering2.GraphNode>()
+        const seen = new Set<number>()
+
+        // A parameter is not a definition. The tracer will hand one back all
+        // the same -- a void `ret` answers its own argument, so the argument's
+        // id ends up naming that trace -- and believing it would give a
+        // parameter a body that is itself
+        const isParam = new Set<number>(paramIds)
+        for (const e of reified) {
+            for (const id of e[1].paramIds) isParam.add(id)
+        }
+
+        function resolve(id: number): number {
+            for (;;) {
+                const n = nodes.get(id)
+                if (n && (n.op === 'nonzero' || n.op === 'proj')) { id = n.argIds[0]; continue }
+                return id
+            }
+        }
+
+        function visit(id0: number): number {
+            const id = resolve(id0)
+            if (!id || seen.has(id)) return id
+            seen.add(id)
+            if (isParam.has(id)) return id
+            const n = nodes.get(id)
+            if (n) {
+                const argIds: number[] = []
+                const argConsts = new Float64Array(n.argIds.length)
+                for (let i = 0; i < n.argIds.length; i++) {
+                    argIds.push(visit(n.argIds[i]))
+                    argConsts[i] = n.argConsts![i]
+                }
+                out.set(id, {
+                    op: n.op, argIds, argConsts,
+                    T: Types.u64, U: Types.u64, offset: 0,
+                })
+                return id
+            }
+            const t = tracer.getTraceById(id)
+            if (!t) return id       // a parameter: it has no definition
+            const idx = lowering.operandIndices(t)
+            const argIds: number[] = []
+            const argConsts = new Float64Array(idx.length)
+            for (let k = 0; k < idx.length; k++) {
+                argIds.push(visit(t.argIds[idx[k]] ?? 0))
+                argConsts[k] = t.args[idx[k]]
+            }
+            out.set(id, {
+                op: t.op, argIds, argConsts,
+                T: (t as any).T ?? Types.u64,
+                U: (t as any).U ?? (t as any).T ?? Types.u64,
+                offset: (t as any).offset ?? 0,
+            })
+            return id
+        }
+
+        function tail(v: any): number[] {
+            const id = tracer.getNanId(v)
+            return id ? [visit(id), 0] : [0, v]
+        }
+
+        const blocks: lowering2.GraphBlock[] = []
+        const er = tail(finalState[RESULT])
+        blocks.push({ id: 0, params: [], resultId: er[0], resultConst: er[1] })
+        for (const e of loops) {
+            const l = e[1]
+            const R = reified.get(l.block)!
+            const r = tail(l.state[RESULT])
+            blocks.push({ id: e[0], params: R.paramIds.slice(), resultId: r[0], resultConst: r[1] })
+        }
+        return { nodes: out, params: paramIds, blocks }
+    }
+
+
+    return { text: lines.join('\n'), result, dispatches, graph: buildGraph() }
 }
 
 function show(fn: Function, verbose = false) {
     console.log(`--- ${fn.name} ---`)
     const r = trace2(fn.toString(), { verbose })
     console.log(r.text)
+}
+
+// js source -> bytecode -> value graph -> residual -> machine code -> answer.
+// Several input sets per case, because a wrong refinement deletes code rather
+// than breaking it: the result stays plausible and is quietly missing a term
+function testCompile2(fn: Function, inputs: number[][], name: string = fn.name, regBudget?: number) {
+    console.log(`=== compile ${name} ===`)
+    const r = trace2(fn.toString())
+    console.log(r.text)
+    const l = lowerGraph(r.graph, { regBudget })
+    console.log(`   # inst: ${l.words.length}`)
+    const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
+    console.log(`  ${l.words.length} instructions`)
+    let failed = false
+    for (const args of inputs) {
+        const expected = fn(...args)
+        const actual = native(...args)
+        const ok = actual === expected
+        if (!ok) failed = true
+        console.log(`  ${ok ? 'ok  ' : 'BAD '} ${name}(${args.join(', ')}) = ${actual}, expected ${expected}`)
+    }
+    if (failed) {
+        console.log(l.listing)
+        throw `trace2: ${name} does not agree with itself`
+    }
+    return l
 }
 
 show(function linear(n: number) {
@@ -1165,8 +1347,618 @@ show(function partialConcreteExpensive2(n: number) {
     return s * 2
 })
 
-// TODO: a block needs to not collapse if any effects are along its path
-// show(function tailCall(f: any) {
-//     f(1)
-//     return 2
-// })
+show(function gen8_min(a: number, b: number) {
+    let s1 = 2
+    if (s1 >= a) {
+
+    } else {
+        s1 = 1
+    }
+    for (let q0 = 0; q0 < 1; q0++) {
+        a = b
+    }
+    return s1
+}, true)
+
+testCompile2(function gen8_min(a: number, b: number) {
+    let s1 = 2
+    if (s1 >= a) {
+
+    } else {
+        s1 = 1
+    }
+    for (let q0 = 0; q0 < 1; q0++) {
+        a = b
+    }
+    return s1
+}, [[15, 18]])
+
+// ---- differential ---------------------------------------------------------
+
+testCompile2(function cLinear(n: number) {
+    const a = n * 3
+    const b = a + 1
+    return b - n
+}, [[0], [1], [7], [123], [-1]])
+
+testCompile2(function cFolds() {
+    let s = 0
+    for (let i = 0; i < 10; i++) s += i
+    return s * 2
+}, [[]])
+
+testCompile2(function cSameBranchedAssignment(n: number, a: number) {
+    let x: number
+    if (n > 0) x = a
+    else x = a
+    return x
+}, [[1, 5], [0, 5], [4, 9]])
+
+testCompile2(function cDifferentBranches(n: number, a: number) {
+    let x: number
+    if (n > 0) x = a + 1
+    else x = a
+    return x
+}, [[1, 5], [0, 5], [4, 9]])
+
+testCompile2(function cSymbolicLoop(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i
+    return s
+}, [[0], [1], [2], [23]])
+
+testCompile2(function cConstantInterior(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i
+        let d = 0
+        for (let j = 0; j < 3; j++) d += j
+        s += d
+    }
+    return s
+}, [[0], [1], [5]])
+
+testCompile2(function cEqualityCheck(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        if (i === 5) return i
+    }
+    return s
+}, [[0], [3], [5], [9]])
+
+testCompile2(function cEqualityRefine(x: number) {
+    if (x === 5) return x + 1
+    return x
+}, [[5], [4], [0]])
+
+testCompile2(function cEqualityRepeat(x: number) {
+    if (x === 5) {
+        if (x === 5) return 1
+        return 2
+    }
+    return 3
+}, [[5], [4]])
+
+testCompile2(function cRefinedTruthy(x: number) {
+    if (x) {
+        if (x) return 1
+        return 2
+    }
+    return 3
+}, [[0], [1], [7]])
+
+testCompile2(function cJoinArith(n: number, a: number, b: number) {
+    let x: number
+    if (n > 0) x = a
+    else x = b
+    return x * 2 + 7
+}, [[1, 3, 4], [0, 3, 4], [6, 11, 13]])
+
+testCompile2(function cRefinedSymbolicEq(x: number, y: number) {
+    if (x !== y) return 0
+    if (y === 0) return 0
+    return x ? 1 : 2
+}, [[1, 2], [0, 0], [3, 3]])
+
+testCompile2(function cRefinedSymbolicNe(x: number, y: number) {
+    if (x === y) return 0
+    if (y === 0) return 0
+    return x ? 1 : 2
+}, [[1, 2], [0, 0], [3, 3], [0, 4]])
+
+testCompile2(function cLoopInvariant(n: number, arg: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        const x = arg * 5
+        s += x
+    }
+    return s
+}, [[0, 3], [1, 3], [4, 3]])
+
+testCompile2(function cMultipleWrites(n: number, arg: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = 1
+            v = 2
+        }
+        s += u + v
+    }
+    return s
+}, [[0, 0], [3, 0], [3, 5]])
+
+testCompile2(function cMultipleSymbolicWrites(n: number, arg: number, a: number, b: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = a
+            v = b
+        }
+        s += u + v
+    }
+    return s
+}, [[0, 0, 7, 9], [3, 0, 7, 9], [3, 5, 7, 9]])
+
+// three levels, each carrying its own counter round. `nested2` above is the
+// same shape but does not terminate for real inputs, so it stays a `show`
+testCompile2(function cNested3(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < i; j = j + 1) {
+            for (let k = 0; k < j; k = k + 1) {
+                s = s + k + i
+            }
+        }
+    }
+    return s
+}, [[0], [1], [2], [4], [9]])
+
+testCompile2(function cPartialConcreteExpensive2(n: number) {
+    let s = 0
+    for (let j = 0; j < n; j++) {
+        let tmp = 0
+        for (let i = 0; i < 10_000; i++) {
+            tmp += i
+            if (tmp > 10) tmp -= i % 5
+            if (tmp > 100_000) tmp -= 100_000
+        }
+        s += tmp
+    }
+    return s * 2
+}, [[0], [1], [3]])
+
+testCompile2(function sumTo2(n: number) { 
+    let s = 0; 
+    for (let i = 0; i < n; i++) {
+        s = s + i;
+        if (s > 10) {
+            s -= i % 5
+        }
+    }
+    return s
+}, [[20]])
+
+testCompile2(function cMultipleSymbolicWritesRet(n: number, arg: number, a: number, b: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        let u = 0
+        let v = 0
+        if (arg > 1) {
+            u = a
+            v = b
+            return u
+        }
+        s += u + v
+    }
+    return s
+}, [[0, 0, 7, 9], [3, 0, 7, 9], [3, 5, 7, 9]])
+
+testCompile2(function cPartialConcreteExpensive(n: number) {
+    let s = 0
+    for (let j = 0; j < n; j++) {
+        for (let i = 0; i < 10_000; i++) {
+            s += i
+            if (s > 10) s -= i % 5
+            if (s > 100_000) s -= 100_000
+        }
+    }
+    return s * 2
+}, [[0], [1], [2]])
+
+// The value the test needs is on its way into `s`, but the other arm still
+// wants the old `s`, so it must not be built there. If it is, this quietly
+// returns the wrong number rather than crashing
+testCompile2(function cCoalesceGuard(n: number) {
+    let s = 1
+    for (let i = 0; i < n; i++) {
+        const t = s + i
+        if (t > 10) s = t
+        else s = s * 2
+    }
+    return s
+}, [[0], [1], [3], [5], [9]])
+
+// the same shape as `sumTo2`, where the value does belong in the parameter's
+// home, but with too few registers for that home to be a register
+testCompile2(function cCoalesceSpilled(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) {
+        s = s + i
+        if (s > 10) s -= i % 5
+    }
+    return s
+}, [[0], [1], [20]], 'cCoalesceSpilled @2 regs', 2)
+
+// `a` is never referenced and `b` is only written, so the emitter used to hand
+// `b`'s register to the first local while still storing to it
+testCompile2(function cParamRegister(a: number, b: number) {
+    let s0 = 1
+    let s1 = 2
+    b = 7
+    return s0 + s1
+}, [[16, 15], [0, 0]])
+
+// found by the generator: fully concrete, so the answer is 3 and nothing else
+testCompile2(function cGen0(a: number, b: number) {
+    let s0 = 1
+    let s1 = 2
+    for (let q0 = 0; q0 < 5; q0++) {
+        b = ((8 * (5 % (q0 + 1))) % 10007) % 10007
+        b = ((4 * s0) % 10007) % 10007
+    }
+    return (s0 + s1) % 10007
+}, [[16, 15], [0, 0]])
+
+// KNOWN BAD, found by the generator and not yet diagnosed: the outer `if`
+// folds away although its test depends on `a`, and the answer becomes the
+// constant 3. The graph is already wrong, so this is upstream of the lowering
+show(function cGen8(a: number, b: number) {
+    let s0 = 1
+    let s1 = 2
+    if ((s1 + 13) >= ((a * 10) % 10007)) {
+        if (b === 2) {
+            b = (((s1 + 5) * (5 % (s1 + 1))) % 10007) % 10007
+            b = (((s1 + 1) * 2) % 10007) % 10007
+        } else {
+            a = a % 10007
+        }
+    } else {
+        s1 = (s0 + (s1 + 1) * 3) % 10007
+        s1 = 19 % 10007
+    }
+    for (let q0 = 0; q0 < 5; q0++) {
+        a = ((6 + b * 3) + q0) % 10007
+    }
+    return (s0 + s1) % 10007   // cGen8(15, 18) is 20, and the graph says 3
+})
+
+// ---- generated programs ----------------------------------------------------
+// Every case above is a shape somebody thought of, which is the wrong property
+// for a suite whose job is to license changes nobody has thought about yet.
+// These are shapes nobody thought of: small programs drawn from a grammar the
+// tracer already covers, compiled and then asked the same questions as their
+// own source. Each one is also compiled with the register pool cut down, so a
+// bug that needs a particular value to land in the frame has somewhere to show.
+//
+// Everything stays non-negative and under 10007. The machine is 64-bit and
+// unsigned where js is a double, and those two only agree in that range, so a
+// disagreement outside it would say nothing about the compiler
+
+function makeRandom(seed: number) {
+    let s = (seed >>> 0) || 1
+    return function next(n: number): number {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0
+        return s % n
+    }
+}
+
+function genSource(next: (n: number) => number, name: string, params: string[]): string {
+    const lines: string[] = []
+    let loops = 0
+    function pad(d: number): string {
+        let out = '    '
+        for (let i = 0; i < d; i++) out += '    '
+        return out
+    }
+    function expr(read: string[], d: number): string {
+        const r = d >= 2 ? next(4) : next(10)
+        if (r < 2) return read[next(read.length)]
+        if (r < 4) return String(next(20))
+        const a = expr(read, d + 1)
+        const b = expr(read, d + 1)
+        const k = next(4)
+        if (k === 0) return `(${a} + ${b})`
+        if (k === 1) return `((${a} * ${b}) % 10007)`
+        if (k === 2) return `(${a} % (${b} + 1))`
+        return `(${a} + ${b} * 3)`
+    }
+    const CmpText = ['<', '>', '<=', '>=', '===', '!==']
+    function cond(read: string[]): string {
+        return `${expr(read, 1)} ${CmpText[next(CmpText.length)]} ${expr(read, 1)}`
+    }
+    // a loop counter is readable but never assignable, so every loop finishes
+    function block(read: string[], write: string[], d: number): void {
+        const n = 1 + next(2)
+        for (let i = 0; i < n; i++) {
+            const r = d >= 1 ? next(5) : next(10)
+            if (r < 4) {
+                lines.push(`${pad(d)}${write[next(write.length)]} = ${expr(read, 0)} % 10007`)
+            } else if (r < 6) {
+                lines.push(`${pad(d)}if (${cond(read)}) {`)
+                block(read, write, d + 1)
+                lines.push(`${pad(d)}} else {`)
+                block(read, write, d + 1)
+                lines.push(`${pad(d)}}`)
+            } else if (r < 8) {
+                const iv = `q${loops++}`
+                lines.push(`${pad(d)}for (let ${iv} = 0; ${iv} < ${1 + next(5)}; ${iv}++) {`)
+                block(read.concat([iv]), write, d + 1)
+                lines.push(`${pad(d)}}`)
+            } else {
+                lines.push(`${pad(d)}return ${expr(read, 0)} % 10007`)
+            }
+        }
+    }
+    const write = ['s0', 's1'].concat(params)
+    lines.push(`function ${name}(${params.join(', ')}) {`)
+    lines.push(`    let s0 = 1`)
+    lines.push(`    let s1 = 2`)
+    block(params.concat(['s0', 's1']), write, 0)
+    lines.push(`    return (s0 + s1) % 10007`)
+    lines.push(`}`)
+    return lines.join('\n')
+}
+
+function testGenerated(count: number, seed: number) {
+    console.log(`=== generated (${count} programs, seed ${seed}) ===`)
+    const next = makeRandom(seed)
+    let checks = 0
+    let failed = 0
+    for (let k = 0; k < count; k++) {
+        const params = ['a', 'b']
+        const src = genSource(next, `gen${k}`, params)
+        const fn = (new Function(`return ${src}`) as any)()
+        const inputs: number[][] = []
+        for (let t = 0; t < 4; t++) {
+            const args: number[] = []
+            for (let i = 0; i < params.length; i++) args.push(next(20))
+            inputs.push(args)
+        }
+        let r: any
+        try { r = trace2(src) } catch (e) { console.log(src); throw e }
+        for (const budget of [0, 1, 2, 3, 4]) {
+            let l: any
+            try {
+                l = lowerGraph(r.graph, { regBudget: budget ? budget : undefined })
+            } catch (e) { console.log(src); throw e }
+            const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
+            let bad = false
+            for (const args of inputs) {
+                const expected = fn(...args)
+                const actual = native(...args)
+                checks++
+                if (actual === expected) continue
+                if (!bad) {
+                    bad = true
+                    failed++
+                    console.log(`  BAD  gen${k} @${budget || 'full'} (${args.join(', ')})`
+                        + ` = ${actual}, expected ${expected}`)
+                    if (failed <= 2) console.log(src)
+                }
+            }
+        }
+    }
+    if (failed) throw `trace2: ${failed} generated programs disagree with themselves`
+    console.log(`  ok   ${count} programs, ${checks} answers agree`)
+}
+
+// testGenerated(200, 12345)
+
+// ---- differential, under register pressure ---------------------------------
+// The same answers out of a pool too small to hold the working set, so the part
+// of `home` that is not a register at all is actually exercised. A budget below
+// `1 + block parameters` spills parameters too, not just temporaries
+
+testCompile2(function cSpillLoop(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i * 3 + (i % 7)
+    return s
+}, [[0], [1], [9], [40]], 'cSpillLoop', 9)
+
+testCompile2(function cSpillLoop2(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i * 3 + (i % 7)
+    return s
+}, [[0], [1], [9], [40]], 'cSpillLoop @4 regs', 4)
+
+testCompile2(function cSpillLoop3(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i * 3 + (i % 7)
+    return s
+}, [[0], [1], [9], [40]], 'cSpillLoop @2 regs', 2)
+
+testCompile2(function cSpillLoop4(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i++) s = s + i * 3 + (i % 7)
+    return s
+}, [[0], [1], [9], [40]], 'cSpillLoop @1 reg', 1)
+
+// three levels, five block parameters: at this budget most of them are frame
+testCompile2(function cSpillNested(n: number) {
+    let s = 0
+    for (let i = 0; i < n; i = i + 1) {
+        for (let j = 0; j < i; j = j + 1) {
+            for (let k = 0; k < j; k = k + 1) s = s + k + i
+        }
+    }
+    return s
+}, [[0], [1], [2], [4], [9]], 'cSpillNested @3 regs', 3)
+
+testCompile2(function cSpillBranch(n: number, a: number, b: number) {
+    let x: number
+    if (n > 0) x = a
+    else x = b
+    return x * 2 + 7
+}, [[1, 3, 4], [0, 3, 4], [6, 11, 13]], 'cSpillBranch @2 regs', 2)
+
+// ---- differential, with calls ---------------------------------------------
+// A call needs something callable, so a compiled function stands in for one and
+// its address arrives as two halves. Nothing here can run in js, so the answers
+// are written out; and because a call whose result is discarded leaves the
+// answer alone, the count of `blr` is checked too -- that is where a hoisted
+// effect shows up and a compared value does not
+
+// blr xN, whatever N is
+function countBlr(bytes: number[]): number {
+    let n = 0
+    for (let i = 0; i + 3 < bytes.length; i += 4) {
+        const w = (bytes[i] as number) | ((bytes[i + 1] as number) << 8)
+            | ((bytes[i + 2] as number) << 16) | ((bytes[i + 3] as number) << 24)
+        if ((w & 0xFFFFFC1F) >>> 0 === 0xD63F0000) n++
+    }
+    return n
+}
+
+function testNative(fn: Function, cases: number[][], blrs: number = -1, name: string = fn.name, regBudget?: number) {
+    console.log(`=== compile ${name} ===`)
+    const r = trace2(fn.toString())
+    console.log(r.text)
+    const l = lowerGraph(r.graph, { regBudget })
+    const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
+    console.log(`  ${l.words.length} instructions`)
+    let failed = false
+    for (const c of cases) {
+        const args = c.slice(0, c.length - 1)
+        const expected = c[c.length - 1]
+        const actual = native(...args)
+        const ok = actual === expected
+        if (!ok) failed = true
+        console.log(`  ${ok ? 'ok  ' : 'BAD '} ${name}(${args.join(', ')}) = ${actual}, expected ${expected}`)
+    }
+    if (blrs >= 0) {
+        const got = countBlr(l.bytes)
+        const ok = got === blrs
+        if (!ok) failed = true
+        console.log(`  ${ok ? 'ok  ' : 'BAD '} ${name} makes ${got} calls, expected ${blrs}`)
+    }
+    if (failed) {
+        console.log(l.listing)
+        throw `trace2: ${name} does not agree with itself`
+    }
+    return l
+}
+
+{
+    const sub2 = testCompile2(function cSub2(a: number, b: number) { return a - b },
+        [[9, 2], [1, 1]])
+    const addr = (ts as any).toNativePtrAddr((ts as any).createNativeFn(new Uint8Array(sub2.bytes)))
+    const lo = addr & 0xFFFF_FFFF
+    const hi = Math.trunc(addr / 0x1_0000_0000)
+
+    testNative(function cCallTwice(fl: number, fh: number, x: number) {
+        const f: any = fl | (fh << 32)
+        const v1 = f(x, 2)
+        return f(v1, 3)
+    }, [[lo, hi, 10, 5], [lo, hi, 100, 95]], 2)
+
+    testNative(function cConditionalCall(fl: number, fh: number, n: number) {
+        const f: any = fl | (fh << 32)
+        if (n > 0) f(n, 1)
+        return f(n + 10, 2)
+    }, [[lo, hi, 5, 13], [lo, hi, 0, 8]], 3)
+
+    testNative(function cBranchedSameCall(fl: number, fh: number, cond: number) {
+        const f: any = fl | (fh << 32)
+        if (cond) return f(10, 1)
+        else return f(10, 1)
+    }, [[lo, hi, 1, 9], [lo, hi, 0, 9]], 1)
+
+    testNative(function cBranchedSameCallEffects(fl: number, fh: number, cond: number) {
+        const f: any = fl | (fh << 32)
+        if (cond) return f(10, 1)
+        f(10, 2)
+        return f(10, 3)
+    }, [[lo, hi, 1, 9], [lo, hi, 0, 7]], 3)
+
+    // the shared call is the same call on two paths and a different one on the
+    // third, so placing it where it dominates all of its uses runs it twice
+    testNative(function cBranchedSameCallEffectsNested(fl: number, fh: number, cond: number, cond2: number) {
+        const f: any = fl | (fh << 32)
+        if (cond) return f(10, 1)
+        if (cond2) f(10, 2)
+        return f(10, 1)
+    }, [[lo, hi, 1, 0, 9], [lo, hi, 0, 1, 9], [lo, hi, 0, 0, 9]], 4)
+
+    // the first call is wanted twice in one stretch: once as the effect the
+    // second one follows, and once as a number to add
+    testNative(function cWithCall(fl: number, fh: number, x: number) {
+        const f: any = fl | (fh << 32)
+        const a = x * 8
+        const b = x * 2
+        return f(a, b) + f(a, b)
+    }, [[lo, hi, 1, 12], [lo, hi, 5, 60]], 2)
+
+    // one pure value shared by two arms that call different things
+    testNative(function cCallCse(fl: number, fh: number, n: number) {
+        const f: any = fl | (fh << 32)
+        if (n > 0) f((n * 5) + 5, 1)
+        return f((n * 5) + 5, 2)
+    }, [[lo, hi, 1, 8], [lo, hi, 0, 3]], 3)
+
+    // the second test cannot hold where the first did not, so its call is
+    // not code at all
+    testNative(function cCallDce(fl: number, fh: number, cond: number) {
+        const f: any = fl | (fh << 32)
+        if (cond) return f(10, 1)
+        if (cond) f(10, 2)
+        return f(10, 1)
+    }, [[lo, hi, 1, 9], [lo, hi, 0, 9]], 1)
+
+    // `x` is known not to be zero by the time it is asked whether it is true
+    testNative(function cRefinedEarlyExit(fl: number, fh: number, x: number) {
+        const f: any = fl | (fh << 32)
+        if (x === 0) return 0
+        return x ? f(x, 1) : 999
+    }, [[lo, hi, 0, 0], [lo, hi, 7, 6]], 1)
+
+    // a call and a frame at the same time: the spill area sits above the saved
+    // registers, and the pool is still callee-saved so the call is still a `blr`
+    testNative(function cSpillCallInLoop(fl: number, fh: number, n: number) {
+        const f: any = fl | (fh << 32)
+        let s = 100
+        for (let i = 0; i < n; i++) s = f(s, i)
+        return s
+    }, [[lo, hi, 0, 100], [lo, hi, 1, 100], [lo, hi, 5, 90]], 1, 'cSpillCallInLoop @4 regs', 4)
+
+    testNative(function cCallInLoop(fl: number, fh: number, n: number) {
+        const f: any = fl | (fh << 32)
+        let s = 100
+        for (let i = 0; i < n; i++) s = f(s, i)
+        return s
+    }, [[lo, hi, 0, 100], [lo, hi, 1, 100], [lo, hi, 5, 90]], 1)
+}
+
+
+testCompile2(function gen8(a, b) {
+    let s0 = 1
+    let s1 = 2
+    if ((s1 + 13) >= ((a * 10) % 10007)) {
+        if (b === 2) {
+            b = (((s1 + 5) * (5 % (s1 + 1))) % 10007) % 10007
+            b = (((s1 + 1) * 2) % 10007) % 10007
+        } else {
+            a = a % 10007
+        }
+    } else {
+        s1 = (s0 + (s1 + 1) * 3) % 10007
+        s1 = 19 % 10007
+    }
+    for (let q0 = 0; q0 < 5; q0++) {
+        a = ((6 + b * 3) + q0) % 10007
+    }
+    return (s0 + s1) % 10007
+}, [[15, 18]])
