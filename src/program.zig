@@ -23006,7 +23006,7 @@ pub const Analyzer = struct {
             .instanceof_keyword, .in_keyword => {
                 return @intFromEnum(Kind.boolean);
             },
-            .asterisk_token, .minus_equals_token, .plus_equals_token, .bar_equals_token, .ampersand_equals_token, .slash_token, .slash_equals_token, .asterisk_asterisk_token, .asterisk_asterisk_equals_token => {
+            .asterisk_token, .minus_equals_token, .plus_equals_token, .bar_equals_token, .ampersand_equals_token, .slash_token, .slash_equals_token, .asterisk_asterisk_token, .asterisk_asterisk_equals_token, .equals_equals_token, .exclamation_equals_token => {
                 const lhs = try this.getType(file, d.left);
                 if (try this.maybeGetMachineDataType(lhs)) |x| return x;
 

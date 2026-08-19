@@ -41,6 +41,7 @@ const SwappedCmp: Record<string, string> = {
     lt: 'gt', gt: 'lt', le: 'ge', ge: 'le', eq: 'eq', ne: 'ne',
 }
 
+// TODO: move these to assembler
 const XZR = 31
 const SP = 31
 const LR = 30
@@ -57,6 +58,96 @@ export interface LowerGraphResult {
     words: number[]
     bytes: number[]
     listing: string
+}
+
+export function simplifyCountedLoop(g: Graph): Graph | undefined {
+    if (g.blocks.length !== 2) return
+    const entry = g.blocks[0]
+    const loop = g.blocks[1]
+    const start = g.nodes.get(entry.resultId)
+    const select = g.nodes.get(loop.resultId)
+    if (!start || start.op !== 'apply' || start.argIds[0] !== loop.id) return
+    if (!select || select.op !== 'select') return
+
+    const cond = g.nodes.get(select.argIds[0])
+    const back = g.nodes.get(select.argIds[1])
+    if (!cond || cond.op !== 'lt' || !back || back.op !== 'apply' || back.argIds[0] !== loop.id) return
+    if (lowering.isSignedType(cond.T) || lowering.isSignedType(cond.U)) return
+
+    const iv = loop.params.indexOf(cond.argIds[0])
+    const acc = loop.params.indexOf(select.argIds[2])
+    if (iv < 0 || acc < 0 || iv === acc) return
+    if (!isZero(start, 1 + iv) || !isZero(start, 1 + acc)) return
+    if (!isIncrement(g.nodes.get(back.argIds[1 + iv]), loop.params[iv])) return
+
+    const accUpdate = g.nodes.get(back.argIds[1 + acc])
+    if (!accUpdate || accUpdate.op !== 'add') return
+    let stepSlot = -1
+    if (accUpdate.argIds[0] === loop.params[acc]) stepSlot = 1
+    else if (accUpdate.argIds[1] === loop.params[acc]) stepSlot = 0
+    else return
+
+    for (let i = 0; i < loop.params.length; i++) {
+        if (i === iv || i === acc) continue
+        if (back.argIds[1 + i] !== loop.params[i]) return
+    }
+
+    const bound = entryOperand(cond, 1)
+    const step = entryOperand(accUpdate, stepSlot)
+    if (!bound || !step) return
+
+    let nextId = 1
+    for (const id of g.nodes.keys()) if (id >= nextId) nextId = id + 1
+    for (const id of g.params) if (id >= nextId) nextId = id + 1
+    for (const b of g.blocks) {
+        if (b.id >= nextId) nextId = b.id + 1
+        for (const id of b.params) if (id >= nextId) nextId = id + 1
+    }
+
+    const result: GraphNode = {
+        op: 'mul',
+        argIds: [bound.id, step.id],
+        argConsts: new Float64Array([bound.value, step.value]),
+        T: accUpdate.T,
+        U: accUpdate.U,
+        offset: 0,
+    }
+    const nodes = new Map<number, GraphNode>()
+    nodes.set(nextId, result)
+    copyReachable(bound.id)
+    copyReachable(step.id)
+    return {
+        nodes,
+        params: g.params.slice(),
+        blocks: [{ id: 0, params: [], resultId: nextId, resultConst: 0 }],
+    }
+
+    function isZero(n: GraphNode, i: number): boolean {
+        return !n.argIds[i] && n.argConsts[i] === 0
+    }
+
+    function isIncrement(n: GraphNode | undefined, param: number): boolean {
+        if (!n || n.op !== 'add') return false
+        return (n.argIds[0] === param && !n.argIds[1] && n.argConsts[1] === 1)
+            || (n.argIds[1] === param && !n.argIds[0] && n.argConsts[0] === 1)
+    }
+
+    function entryOperand(n: GraphNode, slot: number): { id: number, value: number } | undefined {
+        const id = n.argIds[slot]
+        if (!id) return { id: 0, value: n.argConsts[slot] }
+        if (g.params.indexOf(id) >= 0) return { id, value: 0 }
+        const i = loop.params.indexOf(id)
+        if (i < 0 || back!.argIds[1 + i] !== id) return
+        return { id: start!.argIds[1 + i], value: start!.argConsts[1 + i] }
+    }
+
+    function copyReachable(id: number): void {
+        if (!id || nodes.has(id) || g.params.indexOf(id) >= 0) return
+        const n = g.nodes.get(id)
+        if (!n) return
+        nodes.set(id, n)
+        for (const arg of n.argIds) copyReachable(arg)
+    }
 }
 
 export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
@@ -97,9 +188,116 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
     for (const b of g.blocks) {
         for (let i = 0; i < b.params.length; i++) homeOf.set(b.params[i], P + i)
     }
+    coalesceEntryParams()
+
+    const fixedRegs = new Map<number, number>()
+    const retHome = reusableCallAccumulator()
+    if (retHome >= 0 && retHome < REGS) fixedRegs.set(retHome, target.retReg)
+
+    function regOf(h: number): number {
+        return fixedRegs.get(h) ?? pool[h]
+    }
+
+    function coalesceEntryParams(): void {
+        if (g.blocks.length !== 2) return
+        const b = g.blocks[1]
+        const start = nodeOf(g.blocks[0].resultId)
+        if (!start || start.op !== 'apply' || start.argIds[0] !== b.id) return
+
+        const backs: GraphNode[] = []
+        const seen = new Set<number>()
+        function scan(id: number): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            const n = nodeOf(id)
+            if (!n) return
+            if (n.op === 'apply') {
+                if (n.argIds[0] === b.id) backs.push(n)
+                for (let i = 1; i < n.argIds.length; i++) scan(n.argIds[i])
+                return
+            }
+            for (const a of n.argIds) scan(a)
+        }
+        scan(b.resultId)
+        if (!backs.length) return
+
+        for (let i = 0; i < b.params.length; i++) {
+            const p = start.argIds[1 + i]
+            if (!p || g.params.indexOf(p) < 0) continue
+            let unchanged = true
+            for (const edge of backs) {
+                if (edge.argIds[1 + i] !== b.params[i]) { unchanged = false; break }
+            }
+            if (unchanged) homeOf.set(p, P + i)
+        }
+    }
+
+    function reusableCallAccumulator(): number {
+        if (!callsOut || g.blocks.length !== 2 || pool.indexOf(target.retReg) >= 0) return -1
+        const b = g.blocks[1]
+        const calls = new Set<number>()
+        const backs: GraphNode[] = []
+        const seen = new Set<number>()
+
+        function scan(id: number): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            const n = nodeOf(id)
+            if (!n) return
+            if (n.op === 'call') calls.add(id)
+            if (n.op === 'apply') {
+                if (n.argIds[0] === b.id) backs.push(n)
+                for (let i = 1; i < n.argIds.length; i++) scan(n.argIds[i])
+                return
+            }
+            for (const a of n.argIds) scan(a)
+        }
+        scan(b.resultId)
+        if (!calls.size || !backs.length) return -1
+
+        for (let i = 0; i < b.params.length; i++) {
+            const p = b.params[i]
+            const updates = new Set<number>()
+            let ok = true
+            for (const edge of backs) {
+                const id = edge.argIds[1 + i]
+                const n = nodeOf(id)
+                if (!n || n.op !== 'call' || n.argIds[3] !== p) { ok = false; break }
+                updates.add(id)
+            }
+            if (!ok || updates.size !== calls.size) continue
+            for (const id of calls) {
+                if (!updates.has(id)) { ok = false; break }
+            }
+            if (!ok) continue
+
+            for (const edge of backs) {
+                for (let j = 0; j < b.params.length; j++) {
+                    if (j !== i && needsOld(edge.argIds[1 + j], p, updates, new Set<number>())) {
+                        ok = false
+                        break
+                    }
+                }
+                if (!ok) break
+            }
+            if (ok) return P + i
+        }
+        return -1
+    }
+
+    function needsOld(id: number, p: number, stop: Set<number>, seen: Set<number>): boolean {
+        if (!id || stop.has(id) || seen.has(id)) return false
+        if (id === p) return true
+        seen.add(id)
+        const n = nodeOf(id)
+        if (!n) return false
+        for (const a of n.argIds) if (needsOld(a, p, stop, seen)) return true
+        return false
+    }
 
     const pinned: number[] = []
     {
+        const functionParams = new Set<number>(g.params)
         const known = new Map<number, boolean>()
         function invariant(id: number): boolean {
             if (!id) return true
@@ -107,8 +305,9 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
             if (hit !== undefined) return hit
             const h = homeOf.get(id)
             if (h !== undefined) {
-                known.set(id, h < P)
-                return h < P
+                const r = functionParams.has(id)
+                known.set(id, r)
+                return r
             }
             const n = nodeOf(id)
             if (!n || !PureOps.has(n.op)) {
@@ -168,11 +367,17 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
     let localOf = new Map<number, number>()
     let freeHomes: number[] = []
 
-    let saveCount = 0
+    let savedRegs: number[] = []
+    let calleeWrites = new Map<number, number>()
     let spillCount = 0
     let spillBase = 0
 
     const exitLabel = g.blocks.length
+
+    function markWrite(reg: number): void {
+        if (target.calleeSaved.indexOf(reg) < 0) return
+        calleeWrites.set(reg, (calleeWrites.get(reg) ?? 0) + 1)
+    }
 
     function takeHome(): number {
         if (freeHomes.length) return freeHomes.pop()!
@@ -192,25 +397,41 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
 
     function slotAddr(h: number): number { return spillBase + (h - REGS) * 8 }
     function read(h: number, scratch: number): number {
-        if (isReg(h)) return pool[h]
+        if (isReg(h)) return regOf(h)
         asm.load(scratch, SP, slotAddr(h), Types.u64)
         return scratch
     }
     function readInto(h: number, reg: number): void {
-        if (!isReg(h)) { asm.load(reg, SP, slotAddr(h), Types.u64); return }
-        if (pool[h] !== reg) asm.mov(reg, pool[h])
+        if (!isReg(h)) {
+            asm.load(reg, SP, slotAddr(h), Types.u64)
+            markWrite(reg)
+            return
+        }
+        if (regOf(h) !== reg) {
+            asm.mov(reg, regOf(h))
+            markWrite(reg)
+        }
     }
-    function writeReg(h: number): number { return isReg(h) ? pool[h] : SCRATCH[3] }
+    function writeReg(h: number): number {
+        if (!isReg(h)) return SCRATCH[3]
+        const r = regOf(h)
+        markWrite(r)
+        return r
+    }
     function flush(h: number, r: number): void {
         if (!isReg(h)) asm.store(SP, slotAddr(h), r, Types.u64)
     }
     function storeHome(h: number, reg: number): void {
         if (!isReg(h)) { asm.store(SP, slotAddr(h), reg, Types.u64); return }
-        if (pool[h] !== reg) asm.mov(pool[h], reg)
+        const dst = regOf(h)
+        if (dst !== reg) {
+            asm.mov(dst, reg)
+            markWrite(dst)
+        }
     }
     function moveHome(from: number, to: number): void {
         if (from === to) return
-        if (isReg(to)) { readInto(from, pool[to]); return }
+        if (isReg(to)) { readInto(from, regOf(to)); return }
         asm.store(SP, slotAddr(to), read(from, SCRATCH[0]), Types.u64)
     }
 
@@ -240,15 +461,30 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
         const op = n.op
         const signed = lowering.isSignedType(n.T) || lowering.isSignedType(n.U)
 
+        if (op === 'nil-effect') return -1
         if (op === 'after') {
             release(n, 0, operandHome(n, 0))
             return operandHome(n, 1)
         }
-        if (op === 'load' && n.argIds[1]) {
-            throw `lowering2: computed load offsets are not supported yet`
+        if (op === 'store') {
+            const h: number[] = []
+            for (let k = 0; k < 4; k++) h.push(n.argIds[k] ? emitValue(n.argIds[k]) : -1)
+            const base = h[1] >= 0 ? read(h[1], SCRATCH[0]) : SCRATCH[0]
+            if (h[1] < 0) asm.movImm(base, n.argConsts[1])
+            const val = h[3] >= 0 ? read(h[3], SCRATCH[2]) : SCRATCH[2]
+            if (h[3] < 0) asm.movImm(val, n.argConsts[3])
+            if (h[2] >= 0) {
+                const offset = read(h[2], SCRATCH[1])
+                asm.binary('add', SCRATCH[3], base, offset, false)
+                asm.store(SCRATCH[3], 0, val, n.T)
+            } else {
+                asm.store(base, n.argConsts[2], val, n.T)
+            }
+            for (let k = 1; k < 4; k++) release(n, k, h[k])
+            return -1
         }
 
-        const arity = op === 'select' ? 3 : OneOperandOps.has(op) ? 1 : 2
+        const arity = op === 'select' ? 3 : op === 'load' && n.argIds[1] ? 2 : OneOperandOps.has(op) ? 1 : 2
         const h: number[] = []
         for (let k = 0; k < arity; k++) h.push(n.argIds[k] ? emitValue(n.argIds[k]) : -1)
         for (let k = 0; k < arity; k++) release(n, k, h[k])
@@ -270,7 +506,12 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
         if (op === 'select') {
             asm.select(d, inReg(0), inReg(1), inReg(2))
         } else if (op === 'load') {
-            asm.load(d, inReg(0), n.offset, n.T)
+            if (n.argIds[1]) {
+                asm.binary('add', SCRATCH[2], inReg(0), inReg(1), false)
+                asm.load(d, SCRATCH[2], 0, n.T)
+            } else {
+                asm.load(d, inReg(0), n.offset, n.T)
+            }
         } else if (op === 'convert') {
             asm.convert(d, inReg(0), n.T, n.U)
         } else if (op === 'bitconvert') {
@@ -315,9 +556,10 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
             if (h[i] < 0) asm.movImm(target.argRegs[i], n.argConsts[3 + i])
             else readInto(h[i], target.argRegs[i])
         }
-        if (callee < 0) asm.movImm(CALLEE, n.argConsts[1])
-        else readInto(callee, CALLEE)
-        asm.blr(CALLEE)
+        let calleeReg = CALLEE
+        if (callee < 0) asm.movImm(calleeReg, n.argConsts[1])
+        else calleeReg = read(callee, calleeReg)
+        asm.blr(calleeReg)
 
         const hd = hint >= 0 ? hint : takeHome()
         const d = writeReg(hd)
@@ -444,7 +686,23 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
         }
         if (needsControl(id)) {
             const c = condOf(id)
-            const cr = read(emitValue(c), SCRATCH[0])
+            const yesId = armId(id, c, true)
+            const noId = armId(id, c, false)
+            const yes = nodeOf(yesId)
+            const no = nodeOf(noId)
+            const ch = emitValue(c)
+            if (sameEdgeArgs(yes, no)) {
+                const nargs = yes!.argIds.length - 1
+                if (ch < P || ch >= P + nargs) {
+                    const yesBlock = edgeBlock(yes!)
+                    const noBlock = edgeBlock(no!)
+                    emitEdgeCopies(yes!)
+                    asm.jumpIfZero(read(ch, SCRATCH[0]), noBlock)
+                    asm.jump(yesBlock)
+                    return
+                }
+            }
+            const cr = read(ch, SCRATCH[0])
             const other = nextLabel++
             asm.jumpIfZero(cr, other)
             const savedNext = nextHome
@@ -465,7 +723,17 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
         asm.jump(exitLabel)
     }
 
-    function emitEdge(n: GraphNode): void {
+    function sameEdgeArgs(a: GraphNode | undefined, b: GraphNode | undefined): boolean {
+        if (!a || !b || a.op !== 'apply' || b.op !== 'apply') return false
+        if (a.argIds.length !== b.argIds.length) return false
+        for (let i = 1; i < a.argIds.length; i++) {
+            if (a.argIds[i] !== b.argIds[i]) return false
+            if (!a.argIds[i] && a.argConsts[i] !== b.argConsts[i]) return false
+        }
+        return true
+    }
+
+    function edgeBlock(n: GraphNode): number {
         const bi = blockIndex.get(n.argIds[0])
         if (bi === undefined) throw `lowering2: apply of something that is not a block`
         const b = g.blocks[bi]
@@ -473,6 +741,17 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
         if (nargs !== b.params.length) {
             throw `lowering2: block ${bi} takes ${b.params.length} arguments, given ${nargs}`
         }
+        return bi
+    }
+
+    function emitEdge(n: GraphNode): void {
+        const bi = edgeBlock(n)
+        emitEdgeCopies(n)
+        asm.jump(bi)
+    }
+
+    function emitEdgeCopies(n: GraphNode): void {
+        const nargs = n.argIds.length - 1
 
         const arg: number[] = []
         for (let i = 0; i < nargs; i++) {
@@ -506,7 +785,8 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
                 flush(into, r)
                 return
             }
-            moveHome(emitValue(arg[i], into), into)
+            const from = emitValue(arg[i], into)
+            if (from >= 0) moveHome(from, into)
         }
 
         const pending = new Array<boolean>(nargs).fill(true)
@@ -541,26 +821,25 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
             }
         }
         for (let k = 0; k < parkedAt.length; k++) moveHome(parkedAt[k], parkedFor[k])
-        asm.jump(bi)
     }
 
     function frameBytes(): number {
-        const saved = callsOut ? (saveCount + 1) * 8 : 0
+        const saved = callsOut ? (savedRegs.length + 1) * 8 : 0
         return (saved + spillCount * 8 + 15) & ~15
     }
     function prologue(): void {
         const fb = frameBytes()
         if (fb) asm.spAdjust(fb)
         if (callsOut) {
-            for (let i = 0; i < saveCount; i++) asm.store(SP, i * 8, pool[i], Types.u64)
-            asm.store(SP, saveCount * 8, LR, Types.u64)
+            for (let i = 0; i < savedRegs.length; i++) asm.store(SP, i * 8, savedRegs[i], Types.u64)
+            asm.store(SP, savedRegs.length * 8, LR, Types.u64)
         }
-        for (let i = 0; i < P; i++) storeHome(i, target.argRegs[i])
+        for (let i = 0; i < P; i++) storeHome(homeOf.get(g.params[i])!, target.argRegs[i])
     }
     function epilogue(): void {
         if (callsOut) {
-            for (let i = 0; i < saveCount; i++) asm.load(pool[i], SP, i * 8, Types.u64)
-            asm.load(LR, SP, saveCount * 8, Types.u64)
+            for (let i = 0; i < savedRegs.length; i++) asm.load(savedRegs[i], SP, i * 8, Types.u64)
+            asm.load(LR, SP, savedRegs.length * 8, Types.u64)
         }
         const fb = frameBytes()
         if (fb) asm.spAdjust(-fb)
@@ -597,10 +876,15 @@ export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphRe
     }
 
     emitAll()
-    saveCount = maxHome < REGS ? maxHome : REGS
+    for (const r of asm.elidedWrites()) {
+        const n = calleeWrites.get(r) ?? 0
+        if (n > 0) calleeWrites.set(r, n - 1)
+    }
+    savedRegs = pool.filter(r => (calleeWrites.get(r) ?? 0) > 0)
     spillCount = maxHome > REGS ? maxHome - REGS : 0
-    spillBase = callsOut ? (saveCount + 1) * 8 : 0
+    spillBase = callsOut ? (savedRegs.length + 1) * 8 : 0
     asm = target.createAssembler()
+    calleeWrites = new Map<number, number>()
     emitAll()
 
     return {

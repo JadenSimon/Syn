@@ -682,6 +682,25 @@ pub fn createExecutableCode(buf: js.ReferencedBuffer) !u32 {
     return mapNativePtr(ptr);
 }
 
+var native_ptr_to_len: ?*std.AutoHashMapUnmanaged(usize, usize) = null;
+pub fn rawAlloc(num_bytes: u32) !usize {
+    if (native_ptr_to_len == null) {
+        const m = try getAllocator().create(std.AutoHashMapUnmanaged(usize, usize));
+        m.* = .{};
+        native_ptr_to_len = m;
+    }
+    const s = try getAllocator().alloc(u8, num_bytes);
+    const m = native_ptr_to_len orelse unreachable;
+    try m.put(getAllocator(), @intFromPtr(s.ptr), s.len);
+    return @intFromPtr(s.ptr);
+}
+
+pub fn rawFree(ptr: usize) !void {
+    const m = native_ptr_to_len orelse return error.NothingToFree;
+    const entry = m.fetchRemove(ptr) orelse return error.NothingToFree;
+    getAllocator().free(@as([*]u8, @ptrFromInt(entry.key))[0..entry.value]);
+}
+
 comptime {
     js.registerModule(@This());
 }

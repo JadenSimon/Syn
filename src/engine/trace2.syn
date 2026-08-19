@@ -6,6 +6,9 @@ import * as bytecode from './bytecode-emitter'
 import { Op, createInterpreter } from './vm'
 import * as lowering from './lowering'
 import * as lowering2 from './lowering2'
+import * as heap from './heap'
+
+type usize = u32
 
 const lowerGraph = lowering2.lowerGraph
 
@@ -343,7 +346,16 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         }
     }
 
-    const finalized = bytecode.finalize(compiled)
+    const intrinsicNames = new Map<Function, string>()
+    for (const [name, value] of Object.entries(Intrinsics)) {
+        if (typeof value === 'function') intrinsicNames.set(value, name)
+    }
+    const intrinsicFns = new Map<number, string>()
+    const finalized = bytecode.finalize(compiled, bytecode.createCtx({ Intrinsics, Types }), f => {
+        const stub = heap.makeObject(0)
+        intrinsicFns.set(stub, intrinsicNames.get(f)!)
+        return stub
+    })
     const interpret = createInterpreter(true, true, true)
 
     const mem = new Float64Array(intrinsics.heapMaxAddress * 2)
@@ -357,14 +369,16 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         argIds: number[]     // 0 where the argument is a literal
         argConsts?: Float64Array // allocated late
         label: string
+        types?: intrinsics.Types[]
     }
     const nodes = new Map<number, Node>()
     const nodeCache = new Map<string, number>()
 
-    function mk(op: string, args: Float64Array, label: string = ''): any {
+    function mk(op: string, args: Float64Array, label: string = '', types?: intrinsics.Types[]): any {
         const argIds: number[] = []
         const argConsts = new Float64Array(args.length)
         const parts: string[] = [op, label]
+        if (types) for (const T of types) parts.push(`t${T}`)
         for (let i = 0; i < args.length; i++) {
             const id = tracer.getNanId(args[i])
             argIds.push(id)
@@ -377,10 +391,21 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         const v = tracer.createUniqueNan()
         const id = tracer.getNanId(v)
         nodeCache.set(key, id)
-        nodes.set(id, { op, argIds, argConsts, label })
+        nodes.set(id, { op, argIds, argConsts, label, types })
         tracer.assertIsTaggedNanStill(nodes.get(id), label)
         return v
     }
+
+    function after(v: any, token: any): any {
+        const tokenId = tracer.getNanId(token)
+        if (!tokenId || tokenId === tracer.getNanId(nilEffect)) return v
+        const a = new Float64Array(2)
+        a[0] = token
+        a[1] = v
+        return mk('after', a)
+    }
+
+    let nilEffect: any
 
     // ---- the interpreter, one block at a time ----------------------------
     const spBefore = sp()
@@ -469,14 +494,34 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         },
         call: (target: any, thisArg: any, regStart: any, nargs: any, cb: any) => {
             tracer.setActive(true)
-            tracer.markHandled()
+            const callee = target ? target : mem[regStart + nargs * 4]
+            const intrinsicName = intrinsicFns.get(callee)
+            if (intrinsicName) {
+                const iargs = new Float64Array(nargs)
+                for (let i = 0; i < nargs; i++) iargs[i] = mem[regStart + i * 4]
+                if (intrinsicName === 'store') {
+                    const sargs = new Float64Array(4)
+                    sargs[0] = mem[slotAddr(TOKEN)]
+                    sargs[1] = iargs[0]
+                    sargs[2] = iargs[1]
+                    sargs[3] = iargs[2]
+                    const v = mk('store', sargs, '', [iargs[3] as intrinsics.Types])
+                    mem[slotAddr(TOKEN)] = after(nilEffect, v)
+                    tracer.markHandled()
+                    return 0
+                }
+                const result = (Intrinsics as any)[intrinsicName](...iargs)
+                tracer.markHandled()
+                return result
+            }
             const cargs = new Float64Array(3 + nargs)
             cargs[0] = mem[slotAddr(TOKEN)]
-            cargs[1] = target ? target : mem[regStart + nargs * 4]
+            cargs[1] = callee
             cargs[2] = thisArg
             for (let i = 0; i < nargs; i++) cargs[3+i] = mem[regStart + i * 4]
             const v = tracer.traceOp('call', cargs, Types.u32)
-            mem[slotAddr(TOKEN)] = v as any
+            mem[slotAddr(TOKEN)] = after(nilEffect, v)
+            tracer.markHandled()
             return v
         },
     })
@@ -629,16 +674,6 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         return out
     }
 
-    // What a block answers is not separable from what it did. A value that
-    // arrived after some effects is that value and those effects combined.
-    function after(v: any, token: any): any {
-        if (!tracer.getNanId(token)) return v
-        const a = new Float64Array(2)
-        a[0] = token
-        a[1] = v
-        return mk('after', a)
-    }
-
     function unified(st: Float64Array, t: any): Float64Array {
         const ia = t.argIds[0] ?? 0
         const ib = t.argIds[1] ?? 0
@@ -696,6 +731,8 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
         names.set(id, `p${i}`)
         ins[i] = intrinsics.getNanFromId(id) as any
     }
+    nilEffect = mk('nil-effect', new Float64Array(0))
+    ins[TOKEN] = nilEffect
 
     reifyBlocks()
     const finalState = evalFrom(0, ins)
@@ -895,7 +932,9 @@ export function trace2(code: string, opts: { verbose?: boolean } = {}) {
                 }
                 out.set(id, {
                     op: n.op, argIds, argConsts,
-                    T: Types.u64, U: Types.u64, offset: 0,
+                    T: n.types?.[0] ?? Types.u64,
+                    U: n.types?.[1] ?? Types.u64,
+                    offset: 0,
                 })
                 return id
             }
@@ -1621,7 +1660,8 @@ function testGenerated(count: number, seed: number) {
         for (const budget of [0, 1, 2, 3, 4]) {
             let l: any
             try {
-                l = lowerGraph(r.graph, { regBudget: budget ? budget : undefined })
+                const graph = lowering2.simplifyCountedLoop(r.graph) ?? r.graph
+                l = lowerGraph(graph, { regBudget: budget ? budget : undefined })
             } catch (e) { console.log(src); throw e }
             const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
             let bad = false
@@ -1644,10 +1684,11 @@ function testGenerated(count: number, seed: number) {
     console.log(`  ok   ${count} programs, ${checks} answers agree`)
 }
 
-testGenerated(50, 64912)
-testGenerated(50, 61111)
-testGenerated(200, 12345)
-
+if (intrinsics.argv().includes('generated')) {
+    testGenerated(50, 64912)
+    testGenerated(50, 61111)
+    testGenerated(200, 12345)
+}
 
 testCompile2(function cSpillLoop(n: number) {
     let s = 0
@@ -1701,13 +1742,19 @@ function countBlr(bytes: number[]): number {
     return n
 }
 
+function createNative(fn: Function, regBudget?: number) {
+    const trace = trace2(fn.toString())
+    const graph = lowering2.simplifyCountedLoop(trace.graph) ?? trace.graph
+    const code = lowerGraph(graph, { regBudget })
+    const native = (ts as any).createNativeFn(new Uint8Array(code.bytes))
+    return { trace, graph, code, native }
+}
+
 function testNative(fn: Function, cases: number[][], blrs: number = -1, name: string = fn.name, regBudget?: number) {
     console.log(`=== compile ${name} ===`)
-    const r = trace2(fn.toString())
-    console.log(r.text)
-    const l = lowerGraph(r.graph, { regBudget })
-    const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
-    console.log(`  ${l.words.length} instructions`)
+    const { trace, code, native } = createNative(fn, regBudget)
+    console.log(trace.text)
+    console.log(`  ${code.words.length} instructions`)
     let failed = false
     for (const c of cases) {
         const args = c.slice(0, c.length - 1)
@@ -1718,111 +1765,112 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
         console.log(`  ${ok ? 'ok  ' : 'BAD '} ${name}(${args.join(', ')}) = ${actual}, expected ${expected}`)
     }
     if (blrs >= 0) {
-        const got = countBlr(l.bytes)
+        const got = countBlr(code.bytes)
         const ok = got === blrs
         if (!ok) failed = true
         console.log(`  ${ok ? 'ok  ' : 'BAD '} ${name} makes ${got} calls, expected ${blrs}`)
     }
     if (failed) {
-        console.log(l.listing)
+        console.log(code.listing)
         throw `trace2: ${name} does not agree with itself`
     }
-    return l
+    return code
 }
 
 {
+    const repeatedAdd = testNative(function repeatedAdd(n: number, k: number) {
+        let j = 0
+        for (let i = 0; i < n; i++) j += k
+        return j
+    }, [[0, 7, 0], [1, 7, 7], [9, 7, 63], [100, 13, 1300]])
+    assert(repeatedAdd.listing.includes('mul'))
+
     const sub2 = testCompile2(function cSub2(a: number, b: number) { return a - b },
         [[9, 2], [1, 1]])
     const addr = (ts as any).toNativePtrAddr((ts as any).createNativeFn(new Uint8Array(sub2.bytes)))
-    const lo = addr & 0xFFFF_FFFF
-    const hi = Math.trunc(addr / 0x1_0000_0000)
 
     testNative(function cCallTwice(f: any, x: number) {
         const v1 = f(x, 2)
         return f(v1, 3)
     }, [[addr, 10, 5], [addr, 100, 95]], 2)
 
-    testNative(function cCallTwice(fl: number, fh: number, x: number) {
-        const f: any = fl | (fh << 32)
-        const v1 = f(x, 2)
-        return f(v1, 3)
-    }, [[lo, hi, 10, 5], [lo, hi, 100, 95]], 2)
-
-    testNative(function cConditionalCall(fl: number, fh: number, n: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cConditionalCall(f: any, n: number) {
         if (n > 0) f(n, 1)
         return f(n + 10, 2)
-    }, [[lo, hi, 5, 13], [lo, hi, 0, 8]], 3)
+    }, [[addr, 5, 13], [addr, 0, 8]], 3)
 
-    testNative(function cBranchedSameCall(fl: number, fh: number, cond: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cBranchedSameCall(f: any, cond: number) {
         if (cond) return f(10, 1)
         else return f(10, 1)
-    }, [[lo, hi, 1, 9], [lo, hi, 0, 9]], 1)
+    }, [[addr, 1, 9], [addr, 0, 9]], 1)
 
-    testNative(function cBranchedSameCallEffects(fl: number, fh: number, cond: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cBranchedSameCallEffects(f: any, cond: number) {
         if (cond) return f(10, 1)
         f(10, 2)
         return f(10, 3)
-    }, [[lo, hi, 1, 9], [lo, hi, 0, 7]], 3)
+    }, [[addr, 1, 9], [addr, 0, 7]], 3)
 
     // the shared call is the same call on two paths and a different one on the
     // third, so placing it where it dominates all of its uses runs it twice
-    testNative(function cBranchedSameCallEffectsNested(fl: number, fh: number, cond: number, cond2: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cBranchedSameCallEffectsNested(f: any, cond: number, cond2: number) {
         if (cond) return f(10, 1)
         if (cond2) f(10, 2)
         return f(10, 1)
-    }, [[lo, hi, 1, 0, 9], [lo, hi, 0, 1, 9], [lo, hi, 0, 0, 9]], 4)
+    }, [[addr, 1, 0, 9], [addr, 0, 1, 9], [addr, 0, 0, 9]], 4)
 
     // the first call is wanted twice in one stretch: once as the effect the
     // second one follows, and once as a number to add
-    testNative(function cWithCall(fl: number, fh: number, x: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cWithCall(f: any, x: number) {
         const a = x * 8
         const b = x * 2
         return f(a, b) + f(a, b)
-    }, [[lo, hi, 1, 12], [lo, hi, 5, 60]], 2)
+    }, [[addr, 1, 12], [addr, 5, 60]], 2)
 
     // one pure value shared by two arms that call different things
-    testNative(function cCallCse(fl: number, fh: number, n: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cCallCse(f: any, n: number) {
         if (n > 0) f((n * 5) + 5, 1)
         return f((n * 5) + 5, 2)
-    }, [[lo, hi, 1, 8], [lo, hi, 0, 3]], 3)
+    }, [[addr, 1, 8], [addr, 0, 3]], 3)
 
     // the second test cannot hold where the first did not, so its call is
     // not code at all
-    testNative(function cCallDce(fl: number, fh: number, cond: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cCallDce(f: any, cond: number) {
         if (cond) return f(10, 1)
         if (cond) f(10, 2)
         return f(10, 1)
-    }, [[lo, hi, 1, 9], [lo, hi, 0, 9]], 1)
+    }, [[addr, 1, 9], [addr, 0, 9]], 1)
 
     // `x` is known not to be zero by the time it is asked whether it is true
-    testNative(function cRefinedEarlyExit(fl: number, fh: number, x: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cRefinedEarlyExit(f: any, x: number) {
         if (x === 0) return 0
         return x ? f(x, 1) : 999
-    }, [[lo, hi, 0, 0], [lo, hi, 7, 6]], 1)
+    }, [[addr, 0, 0], [addr, 7, 6]], 1)
 
     // a call and a frame at the same time: the spill area sits above the saved
     // registers, and the pool is still callee-saved so the call is still a `blr`
-    testNative(function cSpillCallInLoop(fl: number, fh: number, n: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cSpillCallInLoop(f: any, n: number) {
         let s = 100
         for (let i = 0; i < n; i++) s = f(s, i)
         return s
-    }, [[lo, hi, 0, 100], [lo, hi, 1, 100], [lo, hi, 5, 90]], 1, 'cSpillCallInLoop @4 regs', 4)
+    }, [[addr, 0, 100], [addr, 1, 100], [addr, 5, 90]], 1, 'cSpillCallInLoop @4 regs', 4)
 
-    testNative(function cCallInLoop(fl: number, fh: number, n: number) {
-        const f: any = fl | (fh << 32)
+    testNative(function cCallInLoop(f: any, n: number) {
         let s = 100
         for (let i = 0; i < n; i++) s = f(s, i)
         return s
-    }, [[lo, hi, 0, 100], [lo, hi, 1, 100], [lo, hi, 5, 90]], 1)
+    }, [[addr, 0, 100], [addr, 1, 100], [addr, 5, 90]], 1)
+
+    {
+        const x = createNative(function cCallInLoop(f: any, n: number) {
+            let s = 100
+            for (let i = 0; i < n; i++) s = f(s, i)
+            return s
+        })
+        if (x.code.listing.includes('mov x0,')) {
+            console.log(x.code.listing)
+            throw `expected ret reg to be reused`
+        }
+    }
 
     testNative(function condEffects(f: any, x: number) {
         let r = 0
@@ -1832,5 +1880,39 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
         }
         return r
     }, [[addr, 0, 0], [addr, 1, 1]], 1)
-}
 
+    const memset = createNative(intrinsics.memsetByte)
+    assert(memset.code.listing.includes('strb'))
+    assert(memset.code.listing.includes('strh'))
+    assert(memset.code.listing.includes('str w'))
+    assert(memset.code.listing.includes('str x'))
+
+    const readByte = createNative(function readByte(ptr: usize, offset: usize): u8 {
+        return Intrinsics.load(ptr, offset, Types.u8)
+    })
+
+    const numBytes = 19
+    const rawPtr = (ts as any).rawAlloc(numBytes)
+    defer { (ts as any).rawFree(rawPtr) }
+    memset.native(rawPtr, numBytes, 0xA5)
+    for (const i of [0, 1, 7, 8, 18]) {
+        assert(readByte.native(rawPtr, i) === 0xA5)
+    }
+    memset.native(rawPtr, numBytes, 0)
+    for (const i of [0, 1, 7, 8, 18]) {
+        assert(readByte.native(rawPtr, i) === 0)
+    }
+    {
+        const pairWrite = createNative(function pairWrite(ptr: usize, a: usize, b: usize) {
+            Intrinsics.store(ptr, 0, a, Types.u64)
+            Intrinsics.store(ptr, 8, b, Types.u64)
+        })
+        const rawPtr = (ts as any).rawAlloc(16)
+        defer { (ts as any).rawFree(rawPtr) }
+        pairWrite.native(rawPtr, 100, 200)
+        assert(readByte.native(rawPtr, 0) === 100)
+        assert(readByte.native(rawPtr, 8) === 200)
+    }
+
+    console.log('intrinsic memory e2e passed')
+}

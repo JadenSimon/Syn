@@ -44,6 +44,7 @@ export interface Assembler {
     jumpIfZero(reg: number, id: number): void
     blr(reg: number): void
     ret(): void
+    elidedWrites(): number[]
     words(): number[]
     bytes(): number[]
     listing(): string
@@ -93,10 +94,17 @@ interface AsmItem {
     label: number  // branch target, or the label's own id
     reg: number    // for cbnz/cbz/cset
     cond: number   // for cset/bcond
+    storeBase?: number
+    storeOffset?: number
+    storeBytes?: number
+    loadBase?: number
+    loadOffset?: number
+    loadBytes?: number
 }
 
 export function createAarch64Assembler(): Assembler {
     const items: AsmItem[] = []
+    const removedWrites: number[] = []
     let finished = false
 
     function emit(word: number, asm: string): void {
@@ -107,6 +115,20 @@ export function createAarch64Assembler(): Assembler {
     // decoding the encoding back out
     function emitCset(word: number, asm: string, dst: number, cond: number): void {
         items.push({ kind: 'cset', word: word >>> 0, text: asm, label: -1, reg: dst, cond })
+    }
+
+    function emitStore(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
+        items.push({
+            kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
+            storeBase: base, storeOffset: offset, storeBytes: bytes,
+        })
+    }
+
+    function emitLoad(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
+        items.push({
+            kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
+            loadBase: base, loadOffset: offset, loadBytes: bytes,
+        })
     }
 
     function isBranch(kind: string): boolean {
@@ -128,6 +150,39 @@ export function createAarch64Assembler(): Assembler {
             changed = false
             for (let i = 0; i < items.length; i++) {
                 const it = items[i]
+
+                if (it.loadBytes === 8 && i + 1 < items.length) {
+                    const next = items[i + 1]
+                    const offset = it.loadOffset!
+                    if (next.loadBytes === 8 && next.loadBase === it.loadBase
+                        && next.loadOffset === offset + 8 && it.reg !== it.loadBase
+                        && it.reg !== next.reg && offset >= -512 && offset <= 504) {
+                        const imm = offset / 8
+                        it.word = (0xA9400000 | ((imm & 0x7F) << 15) | (next.reg << 10)
+                            | (it.loadBase! << 5) | it.reg) >>> 0
+                        it.text = `ldp ${x(it.reg)}, ${x(next.reg)}, [${base(it.loadBase!)}, #${offset}]`
+                        it.loadBytes = undefined
+                        items.splice(i + 1, 1)
+                        changed = true
+                        break
+                    }
+                }
+
+                if (it.storeBytes === 8 && i + 1 < items.length) {
+                    const next = items[i + 1]
+                    const offset = it.storeOffset!
+                    if (next.storeBytes === 8 && next.storeBase === it.storeBase
+                        && next.storeOffset === offset + 8 && offset >= -512 && offset <= 504) {
+                        const imm = offset / 8
+                        it.word = (0xA9000000 | ((imm & 0x7F) << 15) | (next.reg << 10)
+                            | (it.storeBase! << 5) | it.reg) >>> 0
+                        it.text = `stp ${x(it.reg)}, ${x(next.reg)}, [${base(it.storeBase!)}, #${offset}]`
+                        it.storeBytes = undefined
+                        items.splice(i + 1, 1)
+                        changed = true
+                        break
+                    }
+                }
 
                 // an unconditional branch to the next instruction is just noise
                 if (it.kind === 'b' && fallsThroughTo(i, it.label)) {
@@ -158,6 +213,7 @@ export function createAarch64Assembler(): Assembler {
                         // cbz branches when the predicate was false
                         br.cond = br.kind === 'cbz' ? (it.cond ^ 1) : it.cond
                         br.kind = 'bcond'
+                        removedWrites.push(it.reg)
                         items.splice(i, 1)
                         changed = true
                         break
@@ -175,11 +231,70 @@ export function createAarch64Assembler(): Assembler {
         }
     }
 
+    function threadBranches(): void {
+        const labelIndex = new Map<number, number>()
+        const addrOf = new Map<number, number>()
+        let pc = 0
+        for (let i = 0; i < items.length; i++) {
+            const it = items[i]
+            if (it.kind === 'label') {
+                labelIndex.set(it.label, i)
+                addrOf.set(it.label, pc)
+            } else {
+                pc++
+            }
+        }
+
+        function forwarded(label: number): number {
+            const seen = new Set<number>()
+            while (!seen.has(label)) {
+                seen.add(label)
+                const i = labelIndex.get(label)
+                if (i === undefined) break
+                let j = i + 1
+                while (j < items.length && items[j].kind === 'label') j++
+                if (j >= items.length || items[j].kind !== 'b') break
+                label = items[j].label
+            }
+            return label
+        }
+
+        let at = 0
+        for (const it of items) {
+            if (it.kind === 'label') continue
+            if (isBranch(it.kind)) {
+                const label = forwarded(it.label)
+                const target = addrOf.get(label)
+                if (target !== undefined) {
+                    const delta = target - at
+                    const limit = it.kind === 'b' ? 1 << 25 : 1 << 18
+                    if (delta >= -limit && delta < limit) it.label = label
+                }
+            }
+            at++
+        }
+
+        const referenced = new Set<number>()
+        for (const it of items) if (isBranch(it.kind)) referenced.add(it.label)
+        for (let i = items.length - 1; i >= 0; i--) {
+            if (items[i].kind !== 'b') continue
+            let first = i
+            while (first > 0 && items[first - 1].kind === 'label') first--
+            if (first === i || first === 0 || items[first - 1].kind !== 'b') continue
+            let used = false
+            for (let j = first; j < i; j++) {
+                if (referenced.has(items[j].label)) { used = true; break }
+            }
+            if (!used) items.splice(first, i - first + 1)
+        }
+    }
+
     // assign word addresses and encode the displacements
     function resolve(): void {
         if (finished) return
         finished = true
         peephole()
+        threadBranches()
 
         const addrOf = new Map<number, number>()
         let pc = 0
@@ -287,16 +402,17 @@ export function createAarch64Assembler(): Assembler {
         const sfx = bytes === 1 ? 'b' : bytes === 2 ? 'h' : bytes === 4 && signed ? 'sw' : ''
         if (signed && bytes < 4) name = 'ldrs'
         else if (signed && bytes === 4) { name = 'ldr'; }
-        emit(0x39000000 | (size << 30) | (opc << 22) | (imm << 10) | (n << 5) | t,
-            `${name}${signed && bytes === 4 ? 'sw' : sfx} ${reg}, [${base(n)}, #${byteOffset}]`)
+        emitLoad(0x39000000 | (size << 30) | (opc << 22) | (imm << 10) | (n << 5) | t,
+            `${name}${signed && bytes === 4 ? 'sw' : sfx} ${reg}, [${base(n)}, #${byteOffset}]`,
+            t, n, byteOffset, bytes)
     }
     function strUnsigned(t: number, n: number, byteOffset: number, bytes: number): void {
         const scale = bytes === 1 ? 0 : bytes === 2 ? 1 : bytes === 4 ? 2 : 3
         const imm = byteOffset >> scale
         const sfx = bytes === 1 ? 'b' : bytes === 2 ? 'h' : ''
         const reg = bytes === 8 ? x(t) : w(t)
-        emit(0x39000000 | (scale << 30) | (0 << 22) | (imm << 10) | (n << 5) | t,
-            `str${sfx} ${reg}, [${base(n)}, #${byteOffset}]`)
+        emitStore(0x39000000 | (scale << 30) | (0 << 22) | (imm << 10) | (n << 5) | t,
+            `str${sfx} ${reg}, [${base(n)}, #${byteOffset}]`, t, n, byteOffset, bytes)
     }
 
     function fitsScaled(byteOffset: number, bytes: number): boolean {
@@ -516,6 +632,10 @@ export function createAarch64Assembler(): Assembler {
         },
         blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
         ret: () => emit(0xD65F03C0, 'ret'),
+        elidedWrites: () => {
+            resolve()
+            return removedWrites.slice()
+        },
         words,
         bytes: () => {
             const b: number[] = []
@@ -1474,4 +1594,3 @@ export function lowerResidual(residual: Residual, opts: LowerOptions = {}): Lowe
         regOf,
     }
 }
-

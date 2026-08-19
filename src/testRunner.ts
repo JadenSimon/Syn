@@ -369,7 +369,7 @@ async function runVsonTestCase(name: string) {
     await writeFile(snapshotPath, output)
 }
 
-async function testEngine(entrypoint = 'heap') {
+async function testEngine(entrypoint = 'heap', argv: string[] = []) {
     const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
 
     const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
@@ -403,6 +403,7 @@ async function testEngine(entrypoint = 'heap') {
 
     const f = results.find(x => x.name.includes(entrypoint))!
     const reifier = (prog as any).getReifier()
+    ;(reifier as any).__argv = argv // XXX
     return runSynModule(f.text, path.resolve(`src/engine/${entrypoint}.syn`), reifier, false, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
         let sourceName = r
@@ -452,7 +453,7 @@ async function gatherTestCases() {
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
-    if (filter === '--engine') return testEngine(args[1])
+    if (filter === '--engine') return testEngine(args[1], args.slice(1))
 
     const shouldExecute = args[1] === '--reify'
 

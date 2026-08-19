@@ -718,6 +718,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         ts,
         Type: reifier.types,
         __reify: reifier.__reify,
+        __argv: (reifier as any).__argv,
         console: console,
         performance,
         Buffer,
