@@ -723,11 +723,11 @@ pub const SynthInstrumenter = struct {
                 return try self.drainRebindings(funcBodyRef(node));
             }
             if (node.kind == .shorthand_property_assignment) {
-                const inner_ref = maybeUnwrapRef(node) orelse unreachable;
+                const inner_ref = parser.unwrapRef(node);
                 try self.visit(self.nodes.at(inner_ref), inner_ref);
                 if (self.replacements.get(inner_ref)) |v| {
                     _ = self.replacements.swapRemove(inner_ref);
-                    const assign = try self.factory.createPropertyAssignment(ref, v);
+                    const assign = try self.factory.createPropertyAssignment(inner_ref, v);
                     self.nodes.at(assign).next = node.next;
                     try self.replacements.put(ref, assign);
                 }
@@ -815,11 +815,11 @@ pub const SynthInstrumenter = struct {
             },
 
             .shorthand_property_assignment => {
-                const inner_ref = maybeUnwrapRef(node) orelse unreachable;
+                const inner_ref = parser.unwrapRef(node);
                 try self.classifyReference(inner_ref);
                 if (self.replacements.get(inner_ref)) |v| {
                     _ = self.replacements.swapRemove(inner_ref);
-                    const assign = try self.factory.createPropertyAssignment(ref, v);
+                    const assign = try self.factory.createPropertyAssignment(inner_ref, v);
                     self.nodes.at(assign).next = node.next;
                     try self.replacements.put(ref, assign);
                 }

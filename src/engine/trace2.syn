@@ -1,3 +1,5 @@
+/// @synth
+
 "use wrapped";
 
 import ts from 'typescript' // XXX: used for `api.zig`
@@ -71,6 +73,39 @@ interface Step {
     elsePc: number
     valueId: number
     valueConst: number
+}
+
+interface Node {
+    op: string
+    argIds: number[]
+    argConsts?: Float64Array
+    label: string
+    types?: intrinsics.Types[]
+}
+
+interface TraceFrame {
+    dispatch(pc: number): number
+    branch(cond: any, v1: number, v2: number): number
+    canexit(acc: any): boolean
+    call(target: any, thisArg: any, regStart: number, nargs: number, cb: any): any
+}
+
+interface SessionBlock {
+    params: number[]
+    result: any
+}
+
+interface TraceRuntime {
+    tracer: any
+    mem: Float64Array
+    heapOverlay: Map<number, any>
+    viewAddresses: Map<number, any>
+    nodes: Map<number, Node>
+    nodeCache: Map<string, number>
+    blocks: Map<number, SessionBlock>
+    frames: TraceFrame[]
+    nilEffect?: any
+    depth: number
 }
 
 const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
@@ -319,7 +354,169 @@ function deriveBlocks(
     return { leaders, succs, insts, inCycle, symPred, symIn, writes, cycleWrites, liveIn, readSlots }
 }
 
-export function trace2(code: string, opts: { verbose?: boolean, captures?: any[] } = {}) {
+export interface TraceSession {
+    intrinsicContext: Record<string, any>
+    objectBuiltins: Record<string, any>
+    intrinsicFns: Map<number, string>
+    functionStubs: Map<Function, number>
+    stubFunctions: Map<number, Function>
+    compiledFunctions: Map<Function, number>
+    runtime?: TraceRuntime
+    fromJsValue(v: any): u32
+    context(captures?: any[]): Record<string, any>
+    linkFunction(f: Function): u32
+    finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
+    compileLinked(f: Function): u32
+    enterTrace(): TraceRuntime
+    leaveTrace(): void
+}
+
+export function createTraceSession(): TraceSession {
+    const intrinsicNames = new Map<Function, string>()
+    for (const [name, value] of Object.entries(Intrinsics)) {
+        if (typeof value === 'function') intrinsicNames.set(value, name)
+    }
+    const intrinsicContext = { ...Intrinsics }
+    const objectBuiltins = { setPrototypeOf: Object.setPrototypeOf }
+    const intrinsicFns = new Map<number, string>()
+    const functionStubs = new Map<Function, number>()
+    const stubFunctions = new Map<number, Function>()
+    const compiledFunctions = new Map<Function, number>()
+    let runtime: TraceRuntime | undefined
+
+    function context(captures: any[] = []): Record<string, any> {
+        const ctx: Record<string, any> = { Intrinsics: intrinsicContext, Types, Object: objectBuiltins }
+        for (let i = 0; i < captures.length; i++) {
+            ctx[`$${i}`] = captures[i] === Intrinsics ? intrinsicContext : captures[i]
+        }
+        return ctx
+    }
+
+    function linkFunction(f: Function): u32 {
+        const prev = functionStubs.get(f)
+        if (prev !== undefined) return prev as u32
+        const stub = heap.makeObject(0)
+        functionStubs.set(f, stub)
+        stubFunctions.set(stub, f)
+        const intrinsicName = intrinsicNames.get(f)
+        if (intrinsicName !== undefined) intrinsicFns.set(stub, intrinsicName)
+        return stub
+    }
+
+    const fromJsValue = heap.createJsValueConverter(linkFunction)
+
+    function finalize(compiled: bytecode.EmitResult, captures?: any[]): u32 {
+        return bytecode.finalize(
+            compiled,
+            bytecode.createCtx(context(captures)),
+            linkFunction,
+            fromJsValue,
+        )
+    }
+
+    function compileLinked(f: Function): u32 {
+        const prev = compiledFunctions.get(f)
+        if (prev !== undefined) return prev as u32
+        const computation = intrinsics.getComputation(f)
+        const emitted = bytecode.compile(computation[0])
+        const handle = finalize(emitted, computation[1])
+        compiledFunctions.set(f, handle)
+        return handle
+    }
+
+    function enterTrace(): TraceRuntime {
+        if (!runtime) {
+            const mem = new Float64Array(intrinsics.heapMaxAddress * 2)
+            const heapOverlay = new Map<number, any>()
+            const viewAddresses = new Map<number, any>()
+            const nodes = new Map<number, Node>()
+            const nodeCache = new Map<string, number>()
+            const blocks = new Map<number, SessionBlock>()
+            const frames: TraceFrame[] = []
+            let tracer: any
+            function frame(): TraceFrame {
+                const f = frames[frames.length - 1]
+                if (!f) throw 'trace2: intrinsic used without an active trace frame'
+                return f
+            }
+            tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
+                load: (ptr, offset, T) => {
+                    if (ptr > intrinsics.heapMaxAddress) {
+                        tracer.markHandled()
+                        return mem[ptr + offset]
+                    }
+                    const overlaid = heapOverlay.get(ptr + offset)
+                    if (overlaid !== undefined) {
+                        tracer.markHandled()
+                        return overlaid
+                    }
+                    return tracer.saved.load(ptr, offset, T)
+                },
+                store: (ptr, offset, val, T) => {
+                    if (ptr <= intrinsics.heapMaxAddress) {
+                        const addr = ptr + offset
+                        if (tracer.getNanId(val)) {
+                            heapOverlay.set(addr, val)
+                            tracer.markHandled()
+                            return
+                        }
+                        heapOverlay.delete(addr)
+                        return tracer.saved.store(ptr, offset, val, T)
+                    }
+                    mem[ptr + offset] = val as any
+                    tracer.markHandled()
+                },
+                dispatch: pc => frame().dispatch(pc),
+                branch: (cond, v1, v2) => frame().branch(cond, v1, v2),
+                canexit: acc => frame().canexit(acc),
+                call: (target, thisArg, regStart, nargs, cb) => frame().call(target, thisArg, regStart, nargs, cb),
+            })
+            runtime = {
+                tracer, mem, heapOverlay, viewAddresses, nodes, nodeCache, blocks, frames,
+                depth: 0,
+            }
+            session.runtime = runtime
+        }
+        runtime.depth++
+        return runtime
+    }
+
+    function leaveTrace(): void {
+        const r = runtime!
+        if (--r.depth) return
+        r.tracer.dispose()
+        runtime = undefined
+        session.runtime = undefined
+    }
+
+    const session: TraceSession = {
+        intrinsicContext,
+        objectBuiltins,
+        intrinsicFns,
+        functionStubs,
+        stubFunctions,
+        compiledFunctions,
+        runtime,
+        fromJsValue,
+        context,
+        linkFunction,
+        finalize,
+        compileLinked,
+        enterTrace,
+        leaveTrace,
+    }
+    return session
+}
+
+export interface TraceOptions {
+    verbose?: boolean
+    captures?: any[]
+    session?: TraceSession
+    inputs?: { thisArg: any, args: Float64Array, effect: any }
+}
+
+export function trace2(code: string, opts: TraceOptions = {}) {
+    const session = opts.session ?? createTraceSession()
     const compiled = bytecode.compile(code)
     const codeLen = compiled.code.length
     const ACC = compiled.registerCount
@@ -347,68 +544,17 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         }
     }
 
-    const intrinsicNames = new Map<Function, string>()
-    for (const [name, value] of Object.entries(Intrinsics)) {
-        if (typeof value === 'function') intrinsicNames.set(value, name)
-    }
-    const intrinsicContext = { ...Intrinsics }
-    const intrinsicFns = new Map<number, string>()
-    const functionStubs = new Map<Function, number>()
-    const stubFunctions = new Map<number, Function>()
-    const compiledFunctions = new Map<Function, number>()
-    const objectBuiltins = { setPrototypeOf: Object.setPrototypeOf }
-
-    function linkFunction(f: Function): u32 {
-        const prev = functionStubs.get(f)
-        if (prev !== undefined) return prev as u32
-        const stub = heap.makeObject(0)
-        functionStubs.set(f, stub)
-        stubFunctions.set(stub, f)
-        const intrinsicName = intrinsicNames.get(f)
-        if (intrinsicName !== undefined) intrinsicFns.set(stub, intrinsicName)
-        return stub
-    }
-
-    function compileLinked(f: Function): number {
-        const prev = compiledFunctions.get(f)
-        if (prev !== undefined) return prev
-        const computation = intrinsics.getComputation(f)
-        const ctx: Record<string, any> = { Intrinsics: intrinsicContext, Types, Object: objectBuiltins }
-        for (let i = 0; i < computation[1].length; i++) {
-            const value = computation[1][i]
-            ctx[`$${i}`] = value === Intrinsics ? intrinsicContext : value
-        }
-        const emitted = bytecode.compile(computation[0])
-        const handle = bytecode.finalize(emitted, bytecode.createCtx(ctx), linkFunction)
-        compiledFunctions.set(f, handle)
-        return handle
-    }
-
-    const ctx: Record<string, any> = { Intrinsics: intrinsicContext, Types, Object: objectBuiltins }
-    const captures = opts.captures ?? []
-    for (let i = 0; i < captures.length; i++) {
-        ctx[`$${i}`] = captures[i] === Intrinsics ? intrinsicContext : captures[i]
-    }
-    const finalized = bytecode.finalize(compiled, bytecode.createCtx(ctx), linkFunction)
+    const finalized = session.finalize(compiled, opts.captures)
     const interpret = createInterpreter(true, 3)
-
-    const mem = new Float64Array(intrinsics.heapMaxAddress * 2)
-    const heapOverlay = new Map<number, any>()
-    const load = Intrinsics.load
-    const store = Intrinsics.store
+    const runtime = session.enterTrace()
+    defer session.leaveTrace()
+    const tracer = runtime.tracer
+    const mem = runtime.mem
+    const nodes = runtime.nodes
+    const nodeCache = runtime.nodeCache
     const sp = Intrinsics.sp
 
     // ---- values ----------------------------------------------------------
-    interface Node {
-        op: string
-        argIds: number[]     // 0 where the argument is a literal
-        argConsts?: Float64Array // allocated late
-        label: string
-        types?: intrinsics.Types[]
-    }
-    const nodes = new Map<number, Node>()
-    const nodeCache = new Map<string, number>()
-
     function mk(op: string, args: Float64Array, label: string = '', types?: intrinsics.Types[]): any {
         const argIds: number[] = []
         const argConsts = new Float64Array(args.length)
@@ -440,6 +586,12 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         return mk('after', a)
     }
 
+    function valuePart(v: any): any {
+        const n = nodes.get(tracer.getNanId(v))
+        if (!n || n.op !== 'after') return v
+        return n.argIds[1] ? intrinsics.getNanFromId(n.argIds[1]) : n.argConsts![1]
+    }
+
     let nilEffect: any
 
     // ---- the interpreter, one block at a time ----------------------------
@@ -447,9 +599,15 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
     const args = Intrinsics.stackalloc(Math.max(compiled.paramCount, 1) * 4 as u32)
     const frame = sp() - frameSize(compiled.registerCount as u32, 3)
     const regsBase = frameRegs(frame)
+    const thisArg = opts.inputs ? opts.inputs.thisArg : 0
     function slotAddr(r: number): number { return regsBase + r * 4 }
 
-    interface Reified { params: number[], selfId: number, paramIds: number[] }
+    interface Reified {
+        params: number[]
+        selfId: number
+        paramIds: number[]
+        retainedViews: Map<number, number>
+    }
     const reified = new Map<number, Reified>()
     const built = new Set<number>()
 
@@ -464,39 +622,11 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
     let resumePc = 0
     let injectedRet = false
     let stopNext = false
-    let inlineDepth = 0
     const emptyState = new Float64Array(0)
     let step: Step = { kind: '', from: 0, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
 
-    const tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
-        load: (ptr, offset, T) => {
-            if (ptr > intrinsics.heapMaxAddress) {
-                tracer.markHandled()
-                return mem[ptr + offset]
-            }
-            const overlaid = heapOverlay.get(ptr + offset)
-            if (overlaid !== undefined) {
-                tracer.markHandled()
-                return overlaid
-            }
-            return load(ptr, offset, T)
-        },
-        store: (ptr, offset, val, T) => {
-            if (ptr <= intrinsics.heapMaxAddress) {
-                const addr = ptr + offset
-                if (tracer.getNanId(val)) {
-                    heapOverlay.set(addr, val)
-                    tracer.markHandled()
-                    return
-                }
-                heapOverlay.delete(addr)
-                return store(ptr, offset, val, T)
-            }
-            mem[ptr + offset] = val as any
-            tracer.markHandled()
-        },
+    const traceFrame: TraceFrame = {
         dispatch: (pc) => {
-            if (inlineDepth) return pc
             if (phase === 0) { phase = 1; return SYN_LDAR }
             if (phase === 1) { phase = 2; return resumePc }
             if (pc >= codeLen) {
@@ -517,7 +647,6 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
             tracer.markHandled()
             const id = tracer.getNanId(cond as any)
             if (!id) return cond ? v1 : v2
-            if (inlineDepth) throw 'trace2: symbolic control in an inline callee'
             const kn = nodes.get(id)
             if (kn && kn.op === 'nonzero') return v1
             step.kind = 'branch'
@@ -529,7 +658,6 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         },
         canexit: (acc) => {
             tracer.markHandled()
-            if (inlineDepth) return true
             if (injectedRet) {
                 if (step.kind !== 'branch') step.kind = 'goto'
                 mem[slotAddr(ACC)] = acc as any
@@ -543,7 +671,7 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         call: (target: any, thisArg: any, regStart: any, nargs: any, cb: any) => {
             tracer.setActive(true)
             const callee = target
-            const intrinsicName = intrinsicFns.get(callee)
+            const intrinsicName = session.intrinsicFns.get(callee)
             if (intrinsicName) {
                 const iargs = new Float64Array(nargs)
                 for (let i = 0; i < nargs; i++) iargs[i] = mem[regStart + i * 4]
@@ -558,24 +686,51 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
                     tracer.markHandled()
                     return 0
                 }
+                if (intrinsicName === 'addressof') {
+                    const address = runtime.viewAddresses.get(iargs[0])
+                    if (address !== undefined) {
+                        tracer.markHandled()
+                        return address
+                    }
+                }
                 const result = (Intrinsics as any)[intrinsicName](...iargs)
                 tracer.markHandled()
                 return result
             }
-            const linked = stubFunctions.get(callee)
+            const linked = session.stubFunctions.get(callee)
             if (linked) {
-                if (linked === Object.setPrototypeOf) {
+                if (linked === session.objectBuiltins.setPrototypeOf) {
                     const obj = mem[regStart]
                     heap.setPrototypeOf(obj as u32, mem[regStart + 4] as u32)
                     tracer.markHandled()
                     return obj
                 }
-                if (typeof (linked as any)[Symbol.for('toComputation')] === 'function') {
-                    inlineDepth++
-                    const result = cb(compileLinked(linked), thisArg, regStart, nargs)
-                    inlineDepth--
+                if ((linked as any).shouldInline
+                    && typeof (linked as any)[Symbol.for('toComputation')] === 'function') {
+                    const args = new Float64Array(nargs)
+                    for (let i = 0; i < nargs; i++) args[i] = mem[regStart + i * 4]
+                    const computation = intrinsics.getComputation(linked)
+                    let nested: any
+                    tracer.setActive(false)
+                    try {
+                        try {
+                            nested = trace2(computation[0], {
+                                captures: computation[1],
+                                session,
+                                inputs: { thisArg, args, effect: mem[slotAddr(TOKEN)] },
+                            })
+                        } catch (e) {
+                            throw `trace2: while tracing ${linked.name || '<anonymous>'}: ${e}`
+                        }
+                    } finally {
+                        tracer.setActive(true)
+                    }
+                    mem[slotAddr(TOKEN)] = nested.effect
+                    if (typeof (linked as any).id === 'number' && typeof (linked as any).sizeof === 'number') {
+                        runtime.viewAddresses.set(nested.value, args[0])
+                    }
                     tracer.markHandled()
-                    return result
+                    return nested.value
                 }
             }
             const cargs = new Float64Array(3 + nargs)
@@ -588,8 +743,12 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
             tracer.markHandled()
             return v
         },
-    })
-    defer tracer.dispose()
+    }
+    runtime.frames.push(traceFrame)
+    tracer.setActive(true)
+    defer {
+        assert(runtime.frames.pop() === traceFrame)
+    }
 
 
     function runBlock(b: number, ins: Float64Array): Step {
@@ -601,13 +760,13 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         stopNext = false
         step = { kind: '', from: b, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
         // Nothing unknown went in, so nothing unknown can come out
-        let concrete = true
+        let concrete = !tracer.getNanId(thisArg) && runtime.heapOverlay.size === 0
         for (const r of B.liveIn[b]) {
             if (tracer.getNanId(ins[r])) { concrete = false; break }
         }
         if (concrete) tracer.setActive(false)
         const saved = sp()
-        interpret(finalized, 0, args, compiled.paramCount as u32)
+        interpret(finalized, thisArg, args, compiled.paramCount as u32)
         tracer.setActive(true)
         sp(saved)
         const outs = new Float64Array(slotCount)
@@ -653,13 +812,16 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
                 names.set(id, slot === ACC ? 'acc' : `s${slot}`)
                 paramIds.push(id)
             }
-            reified.set(b, { params, selfId, paramIds })
+            reified.set(b, { params, selfId, paramIds, retainedViews: new Map<number, number>() })
         }
     }
 
     function evalFrom(b: number, ins: Float64Array): Float64Array {
         const R = reified.get(b)
         if (R) {
+            for (const [slot, value] of R.retainedViews) {
+                if (ins[slot] !== value) throw 'trace2: shaped value changed at block entry'
+            }
             const a = new Float64Array(R.params.length + 1)
             a[0] = intrinsics.getNanFromId(R.selfId) as any
             for (let i = 0; i < R.params.length; i++) a[i + 1] = ins[R.params[i]] as f64
@@ -670,7 +832,13 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
                 const ins2 = new Float64Array(slotCount)
                 for (let i = 0; i < ins.length; i++) ins2[i] = ins[i]
                 for (let i = 0; i < R.params.length; i++) {
-                    ins2[R.params[i]] = intrinsics.getNanFromId(R.paramIds[i]) as any
+                    const slot = R.params[i]
+                    const value = ins[slot]
+                    if (runtime.viewAddresses.has(value) && !B.cycleWrites[b].has(slot)) {
+                        R.retainedViews.set(slot, value)
+                    } else {
+                        ins2[slot] = intrinsics.getNanFromId(R.paramIds[i]) as any
+                    }
                 }
                 const body = continueFrom(runBlock(b, ins2), ins2)
                 loops.set(R.selfId, { block: b, params: R.params, state: body })
@@ -789,18 +957,31 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
     const names = new Map<number, string>()
     const ins = new Float64Array(slotCount)
     for (let i = 0; i < compiled.paramCount; i++) {
-        const v = tracer.createUniqueNan()
-        const id = tracer.getNanId(v)
-        paramIds.push(id)
-        names.set(id, `p${i}`)
-        ins[i] = intrinsics.getNanFromId(id) as any
+        if (opts.inputs) {
+            ins[i] = i < opts.inputs.args.length ? opts.inputs.args[i] : 0
+        } else {
+            const v = tracer.createUniqueNan()
+            const id = tracer.getNanId(v)
+            paramIds.push(id)
+            names.set(id, `p${i}`)
+            ins[i] = v
+        }
     }
-    nilEffect = mk('nil-effect', new Float64Array(0))
-    ins[TOKEN] = nilEffect
+    if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', new Float64Array(0))
+    nilEffect = runtime.nilEffect
+    ins[ACC] = thisArg
+    ins[TOKEN] = opts.inputs ? opts.inputs.effect : nilEffect
 
     reifyBlocks()
     const finalState = evalFrom(0, ins)
     const result = finalState[RESULT]
+    for (const e of loops) {
+        const l = e[1]
+        runtime.blocks.set(e[0], {
+            params: reified.get(l.block)!.paramIds.slice(),
+            result: l.state[RESULT],
+        })
+    }
     sp(spBefore)
 
     // ---- printing --------------------------------------------------------
@@ -863,6 +1044,8 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         if (nm) return nm
         const lp = loops.get(id)
         if (lp) return `B${lp.block}`
+        const block = nodes.get(id)
+        if (block?.op === 'block') return block.label
         const sh = shared.get(id)
         if (sh) return sh
         if (rendering.has(id)) return `?${id}`
@@ -969,8 +1152,8 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         const seen = new Set<number>()
 
         const isParam = new Set<number>(paramIds)
-        for (const e of reified) {
-            for (const id of e[1].paramIds) isParam.add(id)
+        for (const block of runtime.blocks.values()) {
+            for (const id of block.params) isParam.add(id)
         }
 
         function resolve(id: number): number {
@@ -1028,17 +1211,18 @@ export function trace2(code: string, opts: { verbose?: boolean, captures?: any[]
         const blocks: lowering2.GraphBlock[] = []
         const er = tail(finalState[RESULT])
         blocks.push({ id: 0, params: [], resultId: er[0], resultConst: er[1] })
-        for (const e of loops) {
-            const l = e[1]
-            const R = reified.get(l.block)!
-            const r = tail(l.state[RESULT])
-            blocks.push({ id: e[0], params: R.paramIds.slice(), resultId: r[0], resultConst: r[1] })
+        for (const [id, block] of runtime.blocks) {
+            const r = tail(block.result)
+            blocks.push({ id, params: block.params.slice(), resultId: r[0], resultConst: r[1] })
         }
-        return { nodes: out, params: paramIds, blocks }
+        return lowering2.packageBlocks({ nodes: out, params: paramIds, blocks })
     }
 
 
-    return { text: lines.join('\n'), result, dispatches, graph: buildGraph() }
+    return {
+        text: lines.join('\n'), result, value: valuePart(result), effect: finalState[TOKEN], dispatches,
+        graph: buildGraph(), session,
+    }
 }
 
 function show(fn: Function, verbose = false) {
@@ -1052,7 +1236,6 @@ function testCompile2(fn: Function, inputs: number[][], name: string = fn.name, 
     const r = trace2(fn.toString())
     console.log(r.text)
     const l = lowerGraph(r.graph, { regBudget })
-    console.log(`   # inst: ${l.words.length}`)
     const native = (ts as any).createNativeFn(new Uint8Array(l.bytes))
     console.log(`  ${l.words.length} instructions`)
     let failed = false
@@ -1809,14 +1992,41 @@ function countBlr(bytes: number[]): number {
 const typeDescriptorOfComputation = intrinsics.getComputation(heap.typeDescriptorOf)
 const setTypeDescriptorOfComputation = intrinsics.getComputation(heap.setTypeDescriptorOf)
 
-function traceFunction(fn: Function) {
-    if (typeof (fn as any)[Symbol.for('toComputation')] !== 'function') return trace2(fn.toString())
-    const computation = intrinsics.getComputation(fn)
-    return trace2(computation[0], { captures: computation[1] })
+function nestedBranch(x: number): number {
+    if (x > 10) return x - 3
+    return x + 5
+}
+(nestedBranch as any).shouldInline = true
+
+function nestedBranchCaller(x: number): number {
+    return nestedBranch(x) * 2
 }
 
-function createNative(fn: Function, regBudget?: number) {
-    const trace = traceFunction(fn)
+function nestedLoop(n: number): number {
+    let sum = 0
+    for (let i = 0; i < n; i++) sum += i
+    return sum
+}
+(nestedLoop as any).shouldInline = true
+
+function nestedLoopCaller(n: number): number {
+    return nestedLoop(n)
+}
+
+function nestedLoopValue(n: number): number {
+    return nestedLoop(n) + 3
+}
+
+function traceFunction(fn: Function, session: TraceSession = createTraceSession()) {
+    if (typeof (fn as any)[Symbol.for('toComputation')] !== 'function') {
+        return trace2(fn.toString(), { session })
+    }
+    const computation = intrinsics.getComputation(fn)
+    return trace2(computation[0], { captures: computation[1], session })
+}
+
+function createNative(fn: Function, regBudget?: number, session: TraceSession = createTraceSession()) {
+    const trace = traceFunction(fn, session)
     const graph = lowering2.simplifyCountedLoop(trace.graph) ?? trace.graph
     const code = lowerGraph(graph, { regBudget })
     const native = (ts as any).createNativeFn(new Uint8Array(code.bytes))
@@ -1851,20 +2061,48 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
 }
 
 {
-    const trace = trace2(typeDescriptorOfComputation[0], { captures: typeDescriptorOfComputation[1] })
+    const accessorSession = createTraceSession()
+    const trace = trace2(typeDescriptorOfComputation[0], {
+        captures: typeDescriptorOfComputation[1], session: accessorSession,
+    })
     const graph = lowering2.simplifyCountedLoop(trace.graph) ?? trace.graph
     const code = lowerGraph(graph)
     const readInlineCell = (ts as any).createNativeFn(new Uint8Array(code.bytes))
-    const writeTrace = trace2(setTypeDescriptorOfComputation[0], { captures: setTypeDescriptorOfComputation[1] })
+    const writeTrace = trace2(setTypeDescriptorOfComputation[0], {
+        captures: setTypeDescriptorOfComputation[1], session: accessorSession,
+    })
     const writeCode = lowerGraph(writeTrace.graph)
     const writeInlineCell = (ts as any).createNativeFn(new Uint8Array(writeCode.bytes))
+    assert(!code.listing.includes('blr'))
+    assert(!writeCode.listing.includes('blr'))
+    assert(writeCode.listing.includes('str w'))
     const inlineCellPtr = (ts as any).rawAlloc(4)
     defer { (ts as any).rawFree(inlineCellPtr) }
     writeInlineCell(inlineCellPtr, 0x12345678)
     assert(readInlineCell(inlineCellPtr) === 0x12345678)
-    assert(!code.listing.includes('blr'))
-    assert(!writeCode.listing.includes('blr'))
-    assert(writeCode.listing.includes('str w'))
+
+    testNative(nestedBranchCaller, [[0, 10], [7, 24], [11, 16], [100, 194]], 0)
+    testNative(nestedLoopCaller, [[0, 0], [1, 0], [5, 10], [20, 190]], 0)
+    testNative(nestedLoopValue, [[0, 3], [1, 3], [5, 13], [20, 193]], 0)
+
+    {
+        const x = intrinsics.getComputation(heap.setPrototypeOf)
+        const trace = trace2(x[0], { captures: x[1], session: accessorSession })
+        let calls = 0
+        for (const n of trace.graph.nodes.values()) if (n.op === 'call') calls++
+        assert(calls === 1)
+    }
+
+    {
+        const accessorSession = createTraceSession()
+        const x = intrinsics.getComputation(heap.getOwnProperty)
+        const trace = trace2(x[0], { captures: x[1], session: accessorSession })
+        const graph = lowering2.simplifyCountedLoop(trace.graph) ?? trace.graph
+        const code = lowerGraph(graph, { hoistEntryExit: true })
+        assert(!code.listing.includes('csel'))
+        assert(code.listing.indexOf('ldr w16') < code.listing.indexOf('sub sp'))
+        assert(code.listing.indexOf('cbz x16') < code.listing.indexOf('sub sp'))
+    }
 
     const repeatedAdd = testNative(function repeatedAdd(n: number, k: number) {
         let j = 0
@@ -2000,6 +2238,17 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
         pairWrite.native(rawPtr, 100, 200)
         assert(readByte.native(rawPtr, 0) === 100)
         assert(readByte.native(rawPtr, 8) === 200)
+    }
+    {
+        const unscaled = createNative(function unscaled(ptr: usize, value: u32): u32 {
+            Intrinsics.store(ptr, 1, value, Types.u32)
+            return Intrinsics.load(ptr, 1, Types.u32)
+        })
+        assert(unscaled.code.listing.includes('stur w'))
+        assert(unscaled.code.listing.includes('ldur w'))
+        const rawPtr = (ts as any).rawAlloc(8)
+        defer { (ts as any).rawFree(rawPtr) }
+        assert(unscaled.native(rawPtr, 0x12345678) === 0x12345678)
     }
 
     console.log('intrinsic memory e2e passed')
