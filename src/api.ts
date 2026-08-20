@@ -6633,3 +6633,11 @@ export function createNativeFn(source: ArrayBuffer) {
 export function toNativePtrAddr(fn: Function & { handle: number }): bigint | number {
     return api.toNativePtrAddr(fn.handle)
 }
+
+export function rawAlloc(numBytes: number): bigint | number {
+    return api.rawAlloc(numBytes)
+}
+
+export function rawFree(ptr: bigint | number): void {
+    return api.rawFree(ptr)
+}

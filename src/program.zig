@@ -22391,6 +22391,7 @@ pub const Analyzer = struct {
         }
         if (comptime suppress_gaps) {
             if (element == @intFromEnum(Kind.undefined)) return @intFromEnum(Kind.error_any);
+            if (element == @intFromEnum(Kind.symbol)) return @intFromEnum(Kind.error_any);
         }
         const hash = try this.getMemberNameHash(element);
 

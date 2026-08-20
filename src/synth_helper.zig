@@ -216,7 +216,15 @@ pub const SynthInstrumenter = struct {
 
     fn getCellOrSymbol(self: *@This(), sym_ref: SymbolRef) !NodeRef {
         const ident = parser.getIdentFromSymbol(self.binder, sym_ref) orelse {
-            if (!comptime @import("builtin").target.isWasm()) std.debug.print("{}\n",.{self.nodes.at(self.binder.symbols.at(sym_ref).declaration).kind});
+            if (self.this_symbols.contains(sym_ref)) {
+                const sym = self.binder.symbols.at(sym_ref);
+                if (sym.getOrdinal() == 0) {
+                    return self.factory.createKeywordType(.this_keyword);
+                }
+            }
+            if (!comptime @import("builtin").target.isWasm()) {
+                std.debug.print("{}\n",.{self.nodes.at(self.binder.symbols.at(sym_ref).declaration).kind});
+            }
             unreachable;
         };
         if (self.this_symbols.contains(sym_ref)) {
@@ -234,7 +242,9 @@ pub const SynthInstrumenter = struct {
         }
         if (self.symbol_replacements != null) {
             if (self.symbol_replacements.?.get(sym_ref)) |x| {
-                return try self.factory.cloneNodeRef(x);
+                const y = try self.factory.cloneNodeRef(x);
+                self.nodes.at(y).next = 0;
+                return y;
             }
         }
         var buf: [256]u8 = undefined;
@@ -323,6 +333,10 @@ pub const SynthInstrumenter = struct {
             const new_ident = try self.factory.createIdentifier(buf[0..slice.len+1]);
             try symbol_replacements.put(self.alloc, entry.key_ptr.*, new_ident);
         }
+
+        // if (parser.getDeclarationNameRef(self.nodes.at(decl_ref))) |x| {
+        //     std.debug.print("emitting: {s}\n", .{parser.getSlice(self.nodes.at(x), u8)});
+        // }
 
         var d = self.ast.*;
         d.start = target;
@@ -645,7 +659,7 @@ pub const SynthInstrumenter = struct {
     fn visitClassLike(self: *@This(), node: *const AstNode, ref: NodeRef) !void {
         const isClass = node.kind == .class_declaration or node.kind == .class_expression;
         if (self.emitting) {
-            var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.unwrapRef(node));
+            var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.maybeUnwrapRef(node) orelse 0);
             while (iter.nextRef()) |el| {
                 try self.visit(self.nodes.at(el), el);
             }
@@ -666,7 +680,7 @@ pub const SynthInstrumenter = struct {
         defer self.class_decl_static_block = save_class_decl_static_block;
         self.class_decl_static_block = 0;
 
-        var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.unwrapRef(node));
+        var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.maybeUnwrapRef(node) orelse 0);
         while (iter.nextRef()) |el| {
             try self.visit(self.nodes.at(el), el);
         }
