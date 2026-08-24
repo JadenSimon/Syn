@@ -48,16 +48,12 @@ const SwappedCmp: Record<string, string> = {
 }
 
 // TODO: move these to assembler
-const XZR = 31
 const SP = 31
 const LR = 30
-
-const SCRATCH = [12, 13, 14, 15]
 
 export interface LowerGraphOptions {
     target?: lowering.Target
     regBudget?: number
-    hoistEntryExit?: boolean
 }
 
 export interface LowerGraphResult {
@@ -65,12 +61,6 @@ export interface LowerGraphResult {
     words: number[]
     bytes: number[]
     listing: string
-}
-
-export interface ValuePlan {
-    homes: Map<number, number>
-    blocks: number[]
-    text: string
 }
 
 // TODO:
@@ -258,1244 +248,6 @@ export function pruneBlockParams(g: Graph): Graph {
     return { nodes, params: g.params, blocks }
 }
 
-export function planValueGraph(g: Graph): ValuePlan {
-    const blockOf = new Map<number, GraphBlock>()
-    for (const b of g.blocks) blockOf.set(b.id, b)
-    const uses = new Map<number, number>()
-    for (const n of g.nodes.values()) {
-        for (const id of n.argIds) if (id) uses.set(id, (uses.get(id) ?? 0) + 1)
-    }
-
-    const parent = new Map<number, number>()
-    const fixed = new Map<number, number>()
-    const homes = new Map<number, number>()
-    const conflicts: string[] = []
-    function root(id: number): number {
-        const p = parent.get(id)
-        if (p === undefined) { parent.set(id, id); return id }
-        if (p === id) return id
-        const r = root(p)
-        parent.set(id, r)
-        return r
-    }
-    function unite(a: number, b: number): void {
-        if (!a || !b) return
-        let ra = root(a)
-        let rb = root(b)
-        if (ra === rb) return
-        const ah = fixed.get(ra)
-        const bh = fixed.get(rb)
-        if (ah !== undefined && bh !== undefined && ah !== bh) {
-            conflicts.push(`r${ah} -> r${bh}`)
-            return
-        }
-        parent.set(rb, ra)
-        if (ah === undefined && bh !== undefined) fixed.set(ra, bh)
-    }
-    function fix(id: number, home: number): void {
-        if (!id) return
-        const r = root(id)
-        const old = fixed.get(r)
-        if (old !== undefined && old !== home) conflicts.push(`r${old} -> r${home}`)
-        else fixed.set(r, home)
-    }
-    function inPlaceInput(n: GraphNode): number {
-        if (OneOperandOps.has(n.op) || UnaryOps.has(n.op)) return 0
-        if (!BinaryOps.has(n.op)) return -1
-        if (n.argIds[0] && (uses.get(n.argIds[0]) ?? 0) === 1) return 0
-        if (n.argIds[1] && (uses.get(n.argIds[1]) ?? 0) === 1) return 1
-        return -1
-    }
-
-    let tokenSlot = -1
-    for (const n of g.nodes.values()) {
-        if (n.op === 'proj' && n.label?.endsWith('.token')) tokenSlot = n.argConsts[1]
-    }
-    const demandedBlocks = new Set<number>()
-    const scannedBlocks = new Set<number>()
-    const scanned = new Set<string>()
-    const conditions = new Set<number>()
-    const outputHomes = new Map<string, number>()
-    const outputEffects = new Set<string>()
-    const rootApps = new Set<number>()
-    const continuations = new Map<string, number>()
-
-    function demand(id: number, home: number = -1, effect = false): void {
-        if (!id) return
-        const key = `${id}:${home}:${effect ? 1 : 0}`
-        if (scanned.has(key)) return
-        scanned.add(key)
-        const n = g.nodes.get(id)
-        if (!n) {
-            if (home >= 0) fix(id, home)
-            return
-        }
-        if (n.op === 'after') {
-            demand(n.argIds[0], -1, true)
-            demand(n.argIds[1], home)
-            return
-        }
-        if (n.op === 'proj') {
-            const app = g.nodes.get(n.argIds[0])
-            if (!app || app.op !== 'apply') throw `lowering2: projection of a non-application`
-            const target = app.argIds[0]
-            const slot = n.argConsts[1]
-            const terminal = n.label?.slice(0, n.label.lastIndexOf('.')) ?? ''
-            if (effect || slot === tokenSlot) {
-                outputEffects.add(`${target}:${terminal}:${slot}`)
-            } else if (home >= 0) {
-                outputHomes.set(`${target}:${terminal}:${slot}`, home)
-                continuations.set(terminal, home)
-            }
-            rootApps.add(n.argIds[0])
-            scanApply(app)
-            return
-        }
-        if (n.op === 'apply') { scanApply(n); return }
-        if (home >= 0) fix(id, home)
-        if (n.op === 'call' && !effect) fix(id, 0)
-        if (n.op === 'select') {
-            conditions.add(n.argIds[0])
-            demand(n.argIds[0])
-            demand(n.argIds[1], home, effect)
-            demand(n.argIds[2], home, effect)
-            return
-        }
-        const inPlace = home >= 0 ? inPlaceInput(n) : -1
-        if (inPlace >= 0 && n.argIds[inPlace]
-            && (uses.get(n.argIds[inPlace]) ?? 0) === 1) {
-            for (let i = 0; i < n.argIds.length; i++) {
-                demand(n.argIds[i], i === inPlace ? home : -1)
-            }
-            return
-        }
-        if (n.op === 'call') {
-            demand(n.argIds[1])
-            for (let i = 3; i < n.argIds.length; i++) {
-                demand(n.argIds[i], i === 3 ? 0 : -1)
-            }
-            if (n.argIds[0]) demand(n.argIds[0], -1, true)
-            return
-        }
-        for (const arg of n.argIds) demand(arg)
-    }
-
-    function scanApply(n: GraphNode): void {
-        const target = n.argIds[0]
-        const block = blockOf.get(target)
-        if (!block) throw `lowering2: apply of something that is not a block`
-        demandedBlocks.add(target)
-        for (let i = 0; i < block.params.length; i++) {
-            const id = n.argIds[i + 1]
-            if (block.inputs?.[i] !== tokenSlot) unite(id, block.params[i])
-            demand(id, -1, block.inputs?.[i] === tokenSlot)
-        }
-        if (scannedBlocks.has(target)) return
-        scannedBlocks.add(target)
-        demand(block.bodyId)
-    }
-
-    const entry = g.blocks[0]
-    demand(entry.bodyId)
-
-    let changed = true
-    const handledStates = new Set<string>()
-    while (changed) {
-        changed = false
-        for (const blockId of demandedBlocks) {
-            const block = blockOf.get(blockId)!
-            const seen = new Set<number>()
-            function states(id: number): void {
-                if (!id || seen.has(id)) return
-                seen.add(id)
-                const n = g.nodes.get(id)
-                if (!n) return
-                if (n.op === 'state') {
-                    for (let i = 0; i < (block.slots?.length ?? 0); i++) {
-                        const h = outputHomes.get(`${blockId}:${n.label}:${block.slots![i]}`)
-                        if (h === undefined) continue
-                        const k = `${id}:${i}:${h}`
-                        if (handledStates.has(k)) continue
-                        handledStates.add(k)
-                        if (n.argIds[i]) fix(n.argIds[i], h)
-                        demand(n.argIds[i], h)
-                        changed = true
-                    }
-                    return
-                }
-                if (n.op === 'apply') { scanApply(n); return }
-                for (const arg of n.argIds) states(arg)
-            }
-            states(block.bodyId)
-        }
-    }
-
-    for (const [id, n] of g.nodes) {
-        if (n.op === 'call' && parent.has(id)) fix(id, 0)
-    }
-
-    const used = new Set<number>()
-    for (const id of parent.keys()) used.add(root(id))
-    let next = 0
-    for (const h of fixed.values()) if (h >= next) next = h + 1
-    for (const r of used) {
-        let h = fixed.get(root(r))
-        if (h === undefined) h = next++
-        homes.set(r, h)
-    }
-    for (const id of parent.keys()) homes.set(id, homes.get(root(id))!)
-
-    const tokenIds = new Set<number>()
-    for (const b of g.blocks) {
-        for (let i = 0; i < b.params.length; i++) {
-            if (b.inputs?.[i] === tokenSlot) tokenIds.add(b.params[i])
-        }
-    }
-
-    function value(id: number, literal: number): string {
-        if (!id) return String(literal)
-        const n = g.nodes.get(id)
-        const h = homes.get(id)
-        if (!n) {
-            if (tokenIds.has(id)) return 'token'
-            const p = g.params.indexOf(id)
-            return p >= 0 ? `p${p}` : h === undefined ? `v${id}` : `r${h}`
-        }
-        if (n.op === 'nil-effect') return 'nil'
-        if (n.op === 'proj') return h === undefined ? n.label ?? `v${id}` : `r${h}`
-        if (n.op === 'apply') return edge(n)
-        const args: string[] = []
-        for (let i = 0; i < n.argIds.length; i++) {
-            args.push(value(n.argIds[i], n.argConsts[i]))
-        }
-        const expr = `${n.op}(${args.join(', ')})`
-        return h === undefined || conditions.has(id) ? expr : `r${h}=${expr}`
-    }
-    function edge(n: GraphNode): string {
-        const b = blockOf.get(n.argIds[0])!
-        const args: string[] = []
-        for (let i = 0; i < b.params.length; i++) {
-            if (b.inputs?.[i] === tokenSlot) {
-                const id = n.argIds[i + 1]
-                args.push(g.nodes.get(id)?.op === 'nil-effect' ? 'nil' : 'token')
-                continue
-            }
-            args.push(value(n.argIds[i + 1], n.argConsts[i + 1]))
-        }
-        return `B${n.argIds[0]}(${args.join(', ')})`
-    }
-    function tail(id: number, literal: number, pad: string, owner?: GraphBlock): string[] {
-        if (!id) return [`${pad}return ${literal}`]
-        const n = g.nodes.get(id)
-        if (!n) return [`${pad}return ${value(id, literal)}`]
-        if (n.op === 'after') return tail(n.argIds[1], n.argConsts[1], pad, owner)
-        if (n.op === 'apply') return [`${pad}goto ${edge(n)}`]
-        if (n.op === 'state') {
-            const args: string[] = []
-            for (let i = 0; i < (owner?.slots?.length ?? 0); i++) {
-                const key = `${owner!.id}:${n.label}:${owner!.slots![i]}`
-                if (!outputHomes.has(key) && !outputEffects.has(key)) continue
-                args.push(value(n.argIds[i], n.argConsts[i]))
-            }
-            return [`${pad}goto ${n.label}(${args.join(', ')})`]
-        }
-        if (n.op === 'select') {
-            return [
-                `${pad}if ${value(n.argIds[0], n.argConsts[0])}`,
-                ...tail(n.argIds[1], n.argConsts[1], pad + '  ', owner),
-                `${pad}else`,
-                ...tail(n.argIds[2], n.argConsts[2], pad + '  ', owner),
-            ]
-        }
-        return [`${pad}return ${value(id, literal)}`]
-    }
-
-    const lines: string[] = []
-    for (const id of rootApps) lines.push(`entry: goto ${edge(g.nodes.get(id)!)}`)
-    for (const e of continuations) lines.push(`${e[0]}: return r${e[1]}`)
-    for (const id of demandedBlocks) {
-        const b = blockOf.get(id)!
-        const params: string[] = []
-        for (let i = 0; i < b.params.length; i++) {
-            params.push(b.inputs?.[i] === tokenSlot ? 'token' : `r${homes.get(b.params[i])}`)
-        }
-        lines.push(`B${id}(${params.join(', ')}):`)
-        lines.push(...tail(b.bodyId, b.bodyConst, '  ', b))
-    }
-    if (conflicts.length) lines.push(`copies: ${conflicts.join(', ')}`)
-    return { homes, blocks: [...demandedBlocks], text: lines.join('\n') }
-}
-
-export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
-    g = liftCommonApplications(g)
-    const target = opts.target ?? lowering.aarch64
-    const asm = target.createAssembler()
-    const plan = planValueGraph(g)
-    const blockOf = new Map<number, GraphBlock>()
-    for (const b of g.blocks) blockOf.set(b.id, b)
-
-    let resultId = g.blocks[0].bodyId
-    let resultConst = g.blocks[0].bodyConst
-    const effectRootId = resultId
-    if (g.nodes.get(resultId)?.op === 'after') {
-        const n = g.nodes.get(resultId)!
-        resultId = n.argIds[1]
-        resultConst = n.argConsts[1]
-    }
-    const projectionIds: number[] = []
-    function findProjection(id: number, seen = new Set<number>()): void {
-        if (!id || seen.has(id)) return
-        seen.add(id)
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'proj') {
-            projectionIds.push(id)
-            return
-        }
-        for (const arg of n.argIds) findProjection(arg, seen)
-    }
-    findProjection(resultId)
-    let projection = g.nodes.get(projectionIds[0])
-    if (projection) {
-        for (const id of projectionIds) {
-            if (g.nodes.get(id)!.argIds[0] !== projection.argIds[0]) { projection = undefined; break }
-        }
-    }
-    const entry = projection ? g.nodes.get(projection.argIds[0]) : undefined
-    if (projection && (!entry || entry.op !== 'apply')) {
-        throw 'lowering2: projected result is not an application'
-    }
-
-    const blocks = new Set<number>(plan.blocks)
-    let callsOut = false
-    const seen = new Set<number>()
-    function inspect(id: number): void {
-        if (!id || seen.has(id)) return
-        seen.add(id)
-        if (g.params.indexOf(id) >= 0) return
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'call') callsOut = true
-        for (const arg of n.argIds) inspect(arg)
-    }
-    inspect(effectRootId)
-    for (const id of blocks) inspect(blockOf.get(id)!.bodyId)
-
-    let tokenSlot = -1
-    for (const n of g.nodes.values()) {
-        if (n.op === 'proj' && n.label?.endsWith('.token')) tokenSlot = n.argConsts[1]
-    }
-    const scheduledCalls = new Set<number>()
-    function markEffect(id: number): void {
-        if (!id || scheduledCalls.has(id)) return
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'call') {
-            scheduledCalls.add(id)
-            markEffect(n.argIds[0])
-        } else if (n.op === 'after') {
-            markEffect(n.argIds[0])
-        }
-    }
-    for (const n of g.nodes.values()) {
-        if (n.op === 'call' || n.op === 'after') markEffect(n.argIds[0])
-        if (n.op !== 'apply') continue
-        const block = blockOf.get(n.argIds[0])
-        for (let i = 1; i < n.argIds.length; i++) {
-            if (block?.inputs?.[i - 1] === tokenSlot) markEffect(n.argIds[i])
-        }
-    }
-
-    const refs = new Map<number, number>()
-    const reachable = new Set<number>()
-    function countRefs(id: number): void {
-        if (!id || reachable.has(id)) return
-        reachable.add(id)
-        const n = g.nodes.get(id)
-        if (!n) return
-        for (const arg of n.argIds) {
-            if (arg) refs.set(arg, (refs.get(arg) ?? 0) + 1)
-            countRefs(arg)
-        }
-    }
-    countRefs(effectRootId)
-    for (const id of blocks) countRefs(blockOf.get(id)!.bodyId)
-    const costs = new Map<number, number>()
-    function expressionCost(id: number): number {
-        if (!id) return 0
-        const known = costs.get(id)
-        if (known !== undefined) return known
-        const n = g.nodes.get(id)
-        if (!n || !PureOps.has(n.op) || n.op === 'select') return 0
-        let cost = n.op === 'rem' ? 2 : 1
-        costs.set(id, cost)
-        for (const arg of n.argIds) cost += expressionCost(arg)
-        costs.set(id, cost)
-        return cost
-    }
-    const localCandidates = new Set<number>()
-    for (const id of reachable) {
-        const n = g.nodes.get(id)
-        if ((refs.get(id) ?? 0) > 1 && n && expressionCost(id) > 1) localCandidates.add(id)
-    }
-
-    interface LiveAtCall {
-        homes: Set<number>
-        params: Set<number>
-        locals: Set<number>
-        calls: Set<number>
-        executed: Set<number>
-    }
-    const crossingHomes = new Set<number>()
-    const crossingParams = new Set<number>()
-    const crossingLocals = new Set<number>()
-    const crossingCalls = new Set<number>()
-    const paramsAtCall = new Map<number, Set<number>>()
-    const callsAtCall = new Map<number, Set<number>>()
-    function addLive(into: Map<number, Set<number>>, id: number, live: Set<number>): void {
-        let values = into.get(id)
-        if (!values) { values = new Set<number>(); into.set(id, values) }
-        for (const value of live) values.add(value)
-    }
-    function copyLive(s: LiveAtCall): LiveAtCall {
-        return {
-            homes: new Set<number>(s.homes), params: new Set<number>(s.params),
-            locals: new Set<number>(s.locals),
-            calls: new Set<number>(s.calls), executed: new Set<number>(s.executed),
-        }
-    }
-    function mergeLive(into: LiveAtCall, a: LiveAtCall, b: LiveAtCall): void {
-        into.homes = new Set<number>([...a.homes, ...b.homes])
-        into.params = new Set<number>([...a.params, ...b.params])
-        into.locals = new Set<number>([...a.locals, ...b.locals])
-        into.calls = new Set<number>([...a.calls, ...b.calls])
-        into.executed = new Set<number>()
-        for (const id of a.executed) if (b.executed.has(id)) into.executed.add(id)
-    }
-    function useLeaf(id: number, s: LiveAtCall): void {
-        const p = g.params.indexOf(id)
-        if (p >= 0) { s.params.add(p); return }
-        const h = plan.homes.get(id)
-        if (h !== undefined) s.homes.add(h)
-    }
-    function executeCall(id: number, n: GraphNode, s: LiveAtCall): void {
-        if (s.executed.has(id)) return
-        s.executed.add(id)
-        s.calls.delete(id)
-        addLive(paramsAtCall, id, s.params)
-        addLive(callsAtCall, id, s.calls)
-        for (const h of s.homes) crossingHomes.add(h)
-        for (const p of s.params) crossingParams.add(p)
-        for (const local of s.locals) crossingLocals.add(local)
-        for (const call of s.calls) crossingCalls.add(call)
-        for (let i = n.argIds.length - 1; i >= 3; i--) useValue(n.argIds[i], s, true)
-        useValue(n.argIds[1], s, true)
-        useEffect(n.argIds[0], s)
-    }
-    function useEffect(id: number, s: LiveAtCall): void {
-        if (!id) return
-        const n = g.nodes.get(id)
-        if (n?.op === 'call') { executeCall(id, n, s); return }
-        useValue(id, s)
-    }
-    function useValue(id: number, s: LiveAtCall, deferCall = false): void {
-        if (!id) return
-        if (localCandidates.has(id)) s.locals.add(id)
-        const n = g.nodes.get(id)
-        if (!n) { useLeaf(id, s); return }
-        if (n.op === 'call') {
-            s.calls.add(id)
-            if (!deferCall && !scheduledCalls.has(id)) executeCall(id, n, s)
-            return
-        }
-        if (n.op === 'after') {
-            useValue(n.argIds[1], s, true)
-            useEffect(n.argIds[0], s)
-            return
-        }
-        if (n.op === 'select') {
-            const yes = copyLive(s)
-            const no = copyLive(s)
-            useValue(n.argIds[1], yes)
-            useValue(n.argIds[2], no)
-            mergeLive(s, yes, no)
-            useValue(n.argIds[0], s)
-            return
-        }
-        if (n.op === 'apply') {
-            const block = blockOf.get(n.argIds[0])
-            for (let i = n.argIds.length - 1; i >= 1; i--) {
-                if (block?.inputs?.[i - 1] === tokenSlot) continue
-                useValue(n.argIds[i], s, true)
-            }
-            for (let i = n.argIds.length - 1; i >= 1; i--) {
-                if (block?.inputs?.[i - 1] === tokenSlot) useEffect(n.argIds[i], s)
-            }
-            return
-        }
-        for (let i = n.argIds.length - 1; i >= 0; i--) useValue(n.argIds[i], s)
-    }
-    function analyzeCalls(id: number): void {
-        useValue(id, {
-            homes: new Set<number>(), params: new Set<number>(),
-            locals: new Set<number>(),
-            calls: new Set<number>(), executed: new Set<number>(),
-        })
-    }
-    analyzeCalls(effectRootId)
-    for (const id of blocks) analyzeCalls(blockOf.get(id)!.bodyId)
-
-    function spillHome(slot: number): number { return -slot - 1 }
-    function isSpill(home: number): boolean { return home < 0 }
-
-    const physicalHome = new Map<number, number>()
-    physicalHome.set(0, target.retReg)
-    const saved: number[] = []
-    let homeZeroUsed = false
-    for (const h of plan.homes.values()) if (h === 0) homeZeroUsed = true
-    const assigned = new Set<number>()
-    if (homeZeroUsed) assigned.add(target.retReg)
-    let spillCount = 0
-    let registerHomes = opts.regBudget === undefined ? Infinity
-        : Math.max(0, opts.regBudget - (homeZeroUsed ? 1 : 0))
-    function takeHome(crossesCall = false): number {
-        if (registerHomes > 0) {
-            const pool = crossesCall ? target.calleeSaved : target.allocatable
-            for (const r of pool) {
-                if (assigned.has(r) || target.scratch.indexOf(r) >= 0) continue
-                assigned.add(r)
-                if (target.calleeSaved.indexOf(r) >= 0) saved.push(r)
-                registerHomes--
-                return r
-            }
-        }
-        return spillHome(spillCount++)
-    }
-    const abstractHomes = new Set<number>()
-    for (const h of plan.homes.values()) if (h !== 0) abstractHomes.add(h)
-    for (const h of abstractHomes) {
-        physicalHome.set(h, takeHome(crossingHomes.has(h)))
-    }
-    const paramRelocationHome = new Map<number, number>()
-    for (const p of crossingParams) paramRelocationHome.set(p, takeHome(true))
-    let relocatedParams = new Set<number>()
-
-    const callDemands = new Map<number, number>()
-    const expandedCalls = new Set<number>()
-    function countCallDemands(id: number, effect = false): void {
-        if (!id) return
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'call') {
-            if (!effect) callDemands.set(id, (callDemands.get(id) ?? 0) + 1)
-            if (expandedCalls.has(id)) return
-            expandedCalls.add(id)
-            countCallDemands(n.argIds[0], true)
-            countCallDemands(n.argIds[1])
-            for (let i = 3; i < n.argIds.length; i++) countCallDemands(n.argIds[i])
-            return
-        }
-        for (let i = 0; i < n.argIds.length; i++) {
-            const isEffect = (n.op === 'after' || n.op === 'store') && i === 0
-                || n.op === 'apply' && blockOf.get(n.argIds[0])?.inputs?.[i - 1] === tokenSlot
-            countCallDemands(n.argIds[i], isEffect)
-        }
-    }
-    countCallDemands(effectRootId)
-    for (const id of blocks) countCallDemands(blockOf.get(id)!.bodyId)
-    const stableCalls = new Set<number>(crossingCalls)
-    for (const [id, count] of callDemands) if (count > 1) stableCalls.add(id)
-    function collectCalls(id: number, into: Set<number>): void {
-        if (!id) return
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'call') { into.add(id); return }
-        for (const arg of n.argIds) collectCalls(arg, into)
-    }
-    for (const n of g.nodes.values()) {
-        if (n.op !== 'call' || !n.argIds[0]) continue
-        const effects = new Set<number>()
-        const values = new Set<number>()
-        collectCalls(n.argIds[0], effects)
-        collectCalls(n.argIds[1], values)
-        for (let i = 3; i < n.argIds.length; i++) collectCalls(n.argIds[i], values)
-        for (const id of effects) if (values.has(id)) stableCalls.add(id)
-    }
-    const callRelocationHome = new Map<number, number>()
-    for (const id of stableCalls) if (crossingCalls.has(id)) callRelocationHome.set(id, takeHome(true))
-    let materializedCalls = new Set<number>()
-    let relocatedCalls = new Set<number>()
-
-    const localHome = new Map<number, number>()
-    for (const id of localCandidates) localHome.set(id, takeHome(crossingLocals.has(id)))
-    let materializedValues = new Set<number>()
-    const scopedHomes = new Map<number, number>()
-
-    const tokenValues = new Set<number>()
-    for (const b of g.blocks) {
-        for (let i = 0; i < b.params.length; i++) if (b.inputs?.[i] === tokenSlot) tokenValues.add(b.params[i])
-    }
-
-    const maxLabel = Math.max(0, ...g.blocks.map(b => b.id))
-    const exitLabel = maxLabel + 1
-    let nextLabel = exitLabel + 1
-    const terminalLabels = new Map<string, number>()
-    let activeTerminal: string | undefined
-    interface Instance {
-        block: GraphBlock
-        start: number
-        continuation: number
-        requests: { projection: GraphNode, resultHome: number }[]
-        root: boolean
-    }
-    let activeInstance: Instance | undefined
-    const instances: Instance[] = []
-    function terminalLabel(terminal: string): number {
-        let label = terminalLabels.get(terminal)
-        if (label === undefined) { label = nextLabel++; terminalLabels.set(terminal, label) }
-        return label
-    }
-
-    const spillBase = (saved.length + (callsOut ? 1 : 0)) * 8
-    function spillOffset(home: number): number { return spillBase + (-home - 1) * 8 }
-    function valueHome(id: number): number | undefined {
-        const p = g.params.indexOf(id)
-        if (p >= 0) return relocatedParams.has(p) ? paramRelocationHome.get(p)! : target.argRegs[p]
-        const h = plan.homes.get(id)
-        return h === undefined ? undefined : physicalHome.get(h)
-    }
-    function projectionHome(n: GraphNode, fallback: number): number {
-        if (n.label?.endsWith('.return') || n.label?.endsWith('.token')) return fallback
-        const app = g.nodes.get(n.argIds[0])
-        const block = app?.op === 'apply' ? blockOf.get(app.argIds[0]) : undefined
-        const index = block?.inputs?.indexOf(n.argConsts[1]) ?? -1
-        if (index < 0) return fallback
-        return valueHome(block!.params[index]) ?? fallback
-    }
-    function retainedValueHome(id: number): number | undefined {
-        if ((refs.get(id) ?? 0) <= 1) return
-        const n = g.nodes.get(id)
-        if (!n || PureOps.has(n.op) || n.op === 'call' || n.op === 'proj'
-            || n.op === 'apply' || n.op === 'after' || n.op === 'state'
-            || n.op === 'store' || n.op === 'nil-effect') return
-        return valueHome(id)
-    }
-    function residentHome(id: number): number | undefined {
-        const scoped = scopedHomes.get(id)
-        if (scoped !== undefined) return scoped
-        if (activeTerminal && projectionIds.indexOf(id) >= 0) {
-            const n = g.nodes.get(id)!
-            const terminal = n.label?.slice(0, n.label.lastIndexOf('.'))
-            if (terminal === activeTerminal) return projectionHome(n, target.retReg)
-        }
-        if (materializedValues.has(id)) return localHome.get(id) ?? retainedValueHome(id)
-        if (g.nodes.has(id)) return
-        return valueHome(id)
-    }
-    function readHome(home: number, into: number): number {
-        if (!isSpill(home)) return home
-        asm.load(into, SP, spillOffset(home), Types.u64)
-        return into
-    }
-    function writeHome(home: number, from: number): void {
-        if (isSpill(home)) asm.store(SP, spillOffset(home), from, Types.u64)
-        else if (home !== from) asm.mov(home, from)
-    }
-    function literalReg(value: number, into: number): number {
-        asm.movImm(into, value)
-        return into
-    }
-    function expressionTemp(protectedRegs: Set<number>, preferred?: number): number {
-        if (preferred !== undefined && !protectedRegs.has(preferred)) return preferred
-        for (const r of target.scratch) if (!protectedRegs.has(r)) return r
-        for (const r of target.allocatable) {
-            if (!assigned.has(r) && !protectedRegs.has(r)) return r
-        }
-        throw 'lowering2: reverse lowering needs an expression temporary'
-    }
-    function operand(id: number, value: number, scratch: number, protectedRegs = new Set<number>()): number {
-        const into = expressionTemp(protectedRegs, scratch)
-        const home = residentHome(id)
-        if (home !== undefined) return readHome(home, into)
-        if (!id) return literalReg(value, into)
-        return emitValue(id, into, protectedRegs)
-    }
-    function moveValue(id: number, value: number, into: number, protectedRegs = new Set<number>()): void {
-        if (!id) { asm.movImm(into, value); return }
-        const home = residentHome(id)
-        if (home !== undefined) {
-            const r = readHome(home, into)
-            if (r !== into) asm.mov(into, r)
-            return
-        }
-        const result = emitValue(id, into, protectedRegs)
-        if (result !== into) asm.mov(into, result)
-    }
-    function moveValueHome(id: number, value: number, home: number, protectedRegs = new Set<number>()): void {
-        if (!isSpill(home)) { moveValue(id, value, home, protectedRegs); return }
-        const temp = expressionTemp(protectedRegs)
-        moveValue(id, value, temp, protectedRegs)
-        writeHome(home, temp)
-    }
-    function emitProjections(requests: { projection: GraphNode, resultHome: number }[]): void {
-        const app = g.nodes.get(requests[0].projection.argIds[0])
-        if (!app || app.op !== 'apply') throw 'lowering2: projection without an application'
-        const block = blockOf.get(app.argIds[0])
-        if (!block) throw 'lowering2: projection of an unknown computation'
-        const instance: Instance = {
-            block, start: nextLabel++, continuation: nextLabel++, requests, root: false,
-        }
-        emitApply(app, instance.start)
-        asm.bindLabel(instance.continuation)
-        instances.push(instance)
-    }
-    function parallelMoves(moves: { src: number, dst: number }[]): void {
-        const pending = moves.filter(m => m.src !== m.dst)
-        while (pending.length) {
-            let at = -1
-            for (let i = 0; i < pending.length; i++) {
-                let needed = false
-                for (let j = 0; j < pending.length; j++) {
-                    if (i !== j && pending[j].src === pending[i].dst) { needed = true; break }
-                }
-                if (!needed) { at = i; break }
-            }
-            if (at >= 0) {
-                const m = pending.splice(at, 1)[0]
-                asm.mov(m.dst, m.src)
-                continue
-            }
-            const parked = pending[0].src
-            asm.mov(target.scratch[0], parked)
-            for (const m of pending) if (m.src === parked) m.src = target.scratch[0]
-        }
-    }
-    function emitCall(id: number, n: GraphNode, into: number): number {
-        const stable = stableCalls.has(id)
-        if (stable && materializedCalls.has(id)) {
-            const home = relocatedCalls.has(id) ? callRelocationHome.get(id)! : target.retReg
-            return readHome(home, into)
-        }
-        if (n.argIds[0] && !tokenValues.has(n.argIds[0]) && g.nodes.get(n.argIds[0])?.op !== 'nil-effect') {
-            emitValue(n.argIds[0], target.scratch[0])
-        }
-        const callee = operand(n.argIds[1], n.argConsts[1], target.scratch[1])
-        if (target.argRegs.indexOf(callee) >= 0) {
-            asm.mov(target.scratch[1], callee)
-        }
-        const callReg = target.argRegs.indexOf(callee) >= 0 ? target.scratch[1] : callee
-        const args: { id: number, value: number, dst: number }[] = []
-        for (let i = 3; i < n.argIds.length; i++) {
-            args.push({ id: n.argIds[i], value: n.argConsts[i], dst: target.argRegs[i - 3] })
-        }
-        preserveCallResults(id)
-        assignValues(args, new Set<number>([callReg]))
-        asm.blr(callReg)
-        if (stable) {
-            materializedCalls.add(id)
-            relocatedCalls.delete(id)
-            return target.retReg
-        }
-        if (into !== target.retReg) asm.mov(into, target.retReg)
-        return into
-    }
-    function preserveCallResults(callId: number): void {
-        for (const p of paramsAtCall.get(callId) ?? []) {
-            if (relocatedParams.has(p)) continue
-            writeHome(paramRelocationHome.get(p)!, target.argRegs[p])
-            relocatedParams.add(p)
-        }
-        for (const id of callsAtCall.get(callId) ?? []) {
-            if (!materializedCalls.has(id)) continue
-            if (relocatedCalls.has(id)) continue
-            const home = callRelocationHome.get(id)
-            if (home === undefined) continue
-            writeHome(home, target.retReg)
-            relocatedCalls.add(id)
-        }
-    }
-    function emitValue(id: number, into: number, protectedRegs = new Set<number>()): number {
-        const known = residentHome(id)
-        if (known !== undefined) return readHome(known, into)
-        const home = localHome.get(id) ?? retainedValueHome(id)
-        const result = emitFreshValue(id, home !== undefined && !isSpill(home) ? home : into, protectedRegs)
-        if (home === undefined) return result
-        writeHome(home, result)
-        materializedValues.add(id)
-        return isSpill(home) ? result : home
-    }
-    function emitFreshValue(id: number, into: number, protectedRegs: Set<number>): number {
-        const n = g.nodes.get(id)
-        if (!n) throw `lowering2: reverse lowering has no value ${id}`
-        if (n.op === 'nil-effect') return into
-        if (n.op === 'after') {
-            if (n.argIds[0] && n.argIds[0] !== n.argIds[1]) emitValue(n.argIds[0], expressionTemp(protectedRegs))
-            return operand(n.argIds[1], n.argConsts[1], into, protectedRegs)
-        }
-        if (n.op === 'proj') {
-            const home = projectionHome(n, into)
-            emitProjections([{ projection: n, resultHome: home }])
-            return readHome(home, into)
-        }
-        if (n.op === 'is-state') {
-            asm.movImm(into, n.label === activeTerminal ? 1 : 0)
-            return into
-        }
-        if (n.op === 'call') return emitCall(id, n, into)
-        if (n.op === 'store') {
-            if (n.argIds[0] && !tokenValues.has(n.argIds[0]) && g.nodes.get(n.argIds[0])?.op !== 'nil-effect') {
-                emitValue(n.argIds[0], expressionTemp(protectedRegs), protectedRegs)
-            }
-            const base = operand(n.argIds[1], n.argConsts[1], expressionTemp(protectedRegs), protectedRegs)
-            const held = new Set<number>(protectedRegs)
-            held.add(base)
-            let address = base
-            let offset = n.argConsts[2]
-            if (n.argIds[2]) {
-                const off = operand(n.argIds[2], n.argConsts[2], expressionTemp(held), held)
-                held.add(off)
-                address = expressionTemp(held)
-                asm.binary('add', address, base, off, false)
-                offset = 0
-            }
-            held.add(address)
-            const value = operand(n.argIds[3], n.argConsts[3], expressionTemp(held), held)
-            asm.store(address, offset, value, n.T)
-            return into
-        }
-        if (n.op === 'load') {
-            const base = operand(n.argIds[0], n.argConsts[0], expressionTemp(protectedRegs), protectedRegs)
-            if (n.argIds[1]) {
-                const held = new Set<number>(protectedRegs)
-                held.add(base)
-                const offset = operand(n.argIds[1], n.argConsts[1], expressionTemp(held), held)
-                const address = expressionTemp(new Set<number>([...held, offset]))
-                asm.binary('add', address, base, offset, false)
-                asm.load(into, address, 0, n.T)
-            } else {
-                asm.load(into, base, n.offset, n.T)
-            }
-            return into
-        }
-        if (n.op === 'select') {
-            const shared = sharedSelectValue(n, into)
-            let previousShared: number | undefined
-            if (shared !== undefined) {
-                moveValue(shared, 0, into, protectedRegs)
-                previousShared = scopedHomes.get(shared)
-                scopedHomes.set(shared, into)
-                if (residentHome(n.argIds[2]) === into) {
-                    const done = nextLabel++
-                    emitCondition(n.argIds[0], n.argConsts[0], done)
-                    moveValue(n.argIds[1], n.argConsts[1], into)
-                    asm.bindLabel(done)
-                    if (previousShared === undefined) scopedHomes.delete(shared)
-                    else scopedHomes.set(shared, previousShared)
-                    return into
-                }
-            }
-            const no = nextLabel++
-            const done = nextLabel++
-            emitCondition(n.argIds[0], n.argConsts[0], no)
-            const before = new Set<number>(materializedCalls)
-            const relocatedBefore = new Set<number>(relocatedCalls)
-            const paramsBefore = new Set<number>(relocatedParams)
-            const valuesBefore = new Set<number>(materializedValues)
-            moveValue(n.argIds[1], n.argConsts[1], into)
-            const yesCalls = new Set<number>(materializedCalls)
-            const yesRelocated = new Set<number>(relocatedCalls)
-            const yesParams = new Set<number>(relocatedParams)
-            const yesValues = new Set<number>(materializedValues)
-            asm.jump(done)
-            asm.bindLabel(no)
-            materializedCalls = before
-            relocatedCalls = relocatedBefore
-            relocatedParams = paramsBefore
-            materializedValues = valuesBefore
-            moveValue(n.argIds[2], n.argConsts[2], into)
-            for (const id of yesCalls) if (!materializedCalls.has(id)) yesCalls.delete(id)
-            materializedCalls = yesCalls
-            for (const id of yesRelocated) if (!relocatedCalls.has(id)) yesRelocated.delete(id)
-            relocatedCalls = yesRelocated
-            for (const p of yesParams) if (!relocatedParams.has(p)) yesParams.delete(p)
-            relocatedParams = yesParams
-            for (const id of yesValues) {
-                if (!materializedValues.has(id)) yesValues.delete(id)
-            }
-            materializedValues = yesValues
-            asm.bindLabel(done)
-            if (shared !== undefined) {
-                if (previousShared === undefined) scopedHomes.delete(shared)
-                else scopedHomes.set(shared, previousShared)
-            }
-            return into
-        }
-        if (CompareOps.has(n.op)) {
-            const a = operand(n.argIds[0], n.argConsts[0], expressionTemp(protectedRegs), protectedRegs)
-            const held = new Set<number>(protectedRegs)
-            held.add(a)
-            if (!n.argIds[1] && n.argConsts[1] >= 0 && n.argConsts[1] <= 0xFFF) {
-                asm.compareImm(n.op, into, a, n.argConsts[1], lowering.isSignedType(n.T))
-            } else {
-                const b = operand(n.argIds[1], n.argConsts[1], expressionTemp(held), held)
-                asm.compare(n.op, into, a, b, lowering.isSignedType(n.T))
-            }
-            return into
-        }
-        if (n.op === 'convert') {
-            const a = operand(n.argIds[0], n.argConsts[0], into, protectedRegs)
-            asm.convert(into, a, n.T, n.U)
-            return into
-        }
-        if (n.op === 'bitconvert') {
-            const a = operand(n.argIds[0], n.argConsts[0], into, protectedRegs)
-            if (a !== into) asm.mov(into, a)
-            return into
-        }
-        if (UnaryOps.has(n.op)) {
-            const a = operand(n.argIds[0], n.argConsts[0], into, protectedRegs)
-            asm.unary(n.op, into, a)
-            return into
-        }
-        if (BinaryOps.has(n.op)) {
-            let ai = n.argIds[0], av = n.argConsts[0]
-            let bi = n.argIds[1], bv = n.argConsts[1]
-            const commutative = n.op === 'add' || n.op === 'mul' || n.op === 'or'
-                || n.op === 'and' || n.op === 'xor'
-            if (!ai && bi && commutative) {
-                const ti = ai, tv = av
-                ai = bi; av = bv; bi = ti; bv = tv
-            }
-            if (commutative && residentHome(bi) === into && residentHome(ai) !== into) {
-                const ti = ai, tv = av
-                ai = bi; av = bv; bi = ti; bv = tv
-            }
-            const rhsNeedsDestination = readsHome(bi, into)
-            const lhsIsDestination = residentHome(ai) === into
-            const lhsProtected = new Set<number>(protectedRegs)
-            if (rhsNeedsDestination && !lhsIsDestination) lhsProtected.add(into)
-            const lhsInto = rhsNeedsDestination && !lhsIsDestination
-                ? expressionTemp(lhsProtected) : into
-            const a = operand(ai, av, lhsInto, lhsProtected)
-            if (!bi && Number.isInteger(bv) && bv >= 0 && bv <= 0xFFF
-                && (n.op === 'add' || n.op === 'sub')) {
-                if (n.op === 'add') asm.addImm(into, a, bv)
-                else asm.subImm(into, a, bv)
-                return into
-            }
-            const held = new Set<number>(protectedRegs)
-            held.add(a)
-            held.add(into)
-            const b = operand(bi, bv, expressionTemp(held), held)
-            let dst = into
-            if (n.op === 'rem' && (dst === a || dst === b)) {
-                dst = expressionTemp(new Set<number>([...held, b]))
-            }
-            asm.binary(n.op, dst, a, b, lowering.isSignedType(n.T))
-            if (dst !== into) asm.mov(into, dst)
-            return into
-        }
-        throw `lowering2: reverse lowering does not support value '${n.op}' yet`
-    }
-    function emitCondition(id: number, value: number, falseLabel: number): void {
-        if (!id) {
-            if (!value) asm.jump(falseLabel)
-            return
-        }
-        const n = g.nodes.get(id)
-        if (n && CompareOps.has(n.op)) {
-            let op = n.op
-            let ai = n.argIds[0], av = n.argConsts[0]
-            let bi = n.argIds[1], bv = n.argConsts[1]
-            if (!ai && bi && Number.isInteger(av) && av >= 0 && av <= 0xFFF) {
-                op = SwappedCmp[op]
-                const ti = ai, tv = av
-                ai = bi; av = bv; bi = ti; bv = tv
-            }
-            const a = operand(ai, av, target.scratch[0])
-            if (!bi && Number.isInteger(bv) && bv >= 0 && bv <= 0xFFF) {
-                asm.compareImm(op, target.scratch[0], a, bv, lowering.isSignedType(n.T))
-            } else {
-                const b = operand(bi, bv, target.scratch[1])
-                asm.compare(op, target.scratch[0], a, b, lowering.isSignedType(n.T))
-            }
-            asm.jumpIfZero(target.scratch[0], falseLabel)
-            return
-        }
-        asm.jumpIfZero(operand(id, value, target.scratch[0]), falseLabel)
-    }
-    function readsHome(id: number, home: number, seen = new Set<number>()): boolean {
-        if (!id || seen.has(id)) return false
-        seen.add(id)
-        if (residentHome(id) === home) return true
-        const n = g.nodes.get(id)
-        if (!n) return false
-        for (const arg of n.argIds) if (readsHome(arg, home, seen)) return true
-        return false
-    }
-    function containsValue(id: number, wanted: number, seen = new Set<number>()): boolean {
-        if (!id || seen.has(id)) return false
-        if (id === wanted) return true
-        seen.add(id)
-        const n = g.nodes.get(id)
-        if (!n) return false
-        for (const arg of n.argIds) if (containsValue(arg, wanted, seen)) return true
-        return false
-    }
-    function readsHomeOutside(id: number, home: number, excluded: number, seen = new Set<number>()): boolean {
-        if (!id || id === excluded || seen.has(id)) return false
-        seen.add(id)
-        if (residentHome(id) === home) return true
-        const n = g.nodes.get(id)
-        if (!n) return false
-        for (const arg of n.argIds) if (readsHomeOutside(arg, home, excluded, seen)) return true
-        return false
-    }
-    function sharedSelectValue(n: GraphNode, into: number): number | undefined {
-        const candidates: number[] = []
-        function collect(id: number, seen = new Set<number>()): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const v = g.nodes.get(id)
-            if (!v) return
-            if (PureOps.has(v.op) && v.op !== 'select'
-                && containsValue(n.argIds[1], id) && containsValue(n.argIds[2], id)) candidates.push(id)
-            for (const arg of v.argIds) collect(arg, seen)
-        }
-        collect(n.argIds[0])
-        candidates.sort((a, b) => expressionCost(b) - expressionCost(a))
-        for (const id of candidates) {
-            if (!safeInto(id, into)) continue
-            if (readsHomeOutside(n.argIds[0], into, id)
-                || readsHomeOutside(n.argIds[1], into, id)
-                || readsHomeOutside(n.argIds[2], into, id)) continue
-            return id
-        }
-    }
-    function safeInto(id: number, reg: number): boolean {
-        if (!id || residentHome(id) !== undefined) return true
-        const n = g.nodes.get(id)
-        if (!n || n.op === 'call') return true
-        if (n.op === 'select') {
-            return safeInto(n.argIds[1], reg) && safeInto(n.argIds[2], reg)
-        }
-        if (!BinaryOps.has(n.op)) return false
-        let ai = n.argIds[0], bi = n.argIds[1]
-        const commutative = n.op === 'add' || n.op === 'mul' || n.op === 'or'
-            || n.op === 'and' || n.op === 'xor'
-        if (!ai && bi && commutative) { ai = bi; bi = 0 }
-        const firstPreserves = residentHome(ai) === reg
-        return safeInto(ai, reg) && (firstPreserves || !readsHome(bi, reg))
-    }
-    function assignValues(
-        pending: { id: number, value: number, dst: number }[],
-        protectedRegs = new Set<number>(),
-    ): void {
-        const moves: { src: number, dst: number }[] = []
-        const tempPool = target.allocatable.filter(r => !assigned.has(r)
-            && target.scratch.indexOf(r) < 0 && !protectedRegs.has(r))
-        let nextTemp = 0
-        while (pending.length) {
-            let at = -1
-            for (let i = 0; i < pending.length; i++) {
-                const p = pending[i]
-                if (!isSpill(p.dst) && !safeInto(p.id, p.dst)) continue
-                let needed = false
-                for (let j = 0; j < pending.length; j++) {
-                    if (i !== j && readsHome(pending[j].id, p.dst)) { needed = true; break }
-                }
-                if (!needed) { at = i; break }
-            }
-            if (at >= 0) {
-                const p = pending.splice(at, 1)[0]
-                moveValueHome(p.id, p.value, p.dst, protectedRegs)
-                continue
-            }
-            const p = pending.shift()!
-            const temp = tempPool[nextTemp++]
-            if (temp === undefined) throw 'lowering2: reverse lowering needs an assignment temporary'
-            moveValue(p.id, p.value, temp, protectedRegs)
-            moves.push({ src: temp, dst: p.dst })
-        }
-        for (const m of moves) if (isSpill(m.dst)) writeHome(m.dst, m.src)
-        parallelMoves(moves.filter(m => !isSpill(m.dst)))
-    }
-    function emitApply(n: GraphNode, targetLabel?: number): void {
-        const block = blockOf.get(n.argIds[0])
-        if (!block || !blocks.has(block.id)) throw 'lowering2: reverse lowering found an unknown application'
-        const pending: { id: number, value: number, dst: number }[] = []
-        const effects: number[] = []
-        for (let i = 0; i < block.params.length; i++) {
-            const into = valueHome(block.params[i])
-            if (into === undefined) {
-                if (n.argIds[i + 1]) effects.push(n.argIds[i + 1])
-                continue
-            }
-            if (pending.some(p => p.dst === into)) continue
-            pending.push({ id: n.argIds[i + 1], value: n.argConsts[i + 1], dst: into })
-        }
-        const projectionGroups = new Map<number, { projection: GraphNode, resultHome: number, id: number }[]>()
-        for (const p of pending) {
-            const projection = g.nodes.get(p.id)
-            // FIXME: language server CFA should not need both checks
-            if (!projection || projection?.op !== 'proj') continue
-            let group = projectionGroups.get(projection.argIds[0])
-            if (!group) { group = []; projectionGroups.set(projection.argIds[0], group) }
-            group.push({ projection, resultHome: p.dst, id: p.id })
-        }
-        for (const id of effects) {
-            const projection = g.nodes.get(id)
-            if (!projection || projection?.op !== 'proj') continue
-            let group = projectionGroups.get(projection.argIds[0])
-            if (!group) { group = []; projectionGroups.set(projection.argIds[0], group) }
-            group.push({ projection, resultHome: target.scratch[0], id })
-        }
-        for (const group of projectionGroups.values()) {
-            if (group.length < 2) continue
-            emitProjections(group.map(x => ({ projection: x.projection, resultHome: x.resultHome })))
-            for (const x of group) {
-                const i = pending.findIndex(p => p.id === x.id)
-                if (i >= 0) pending.splice(i, 1)
-                const e = effects.indexOf(x.id)
-                if (e >= 0) effects.splice(e, 1)
-            }
-        }
-        for (const effect of effects) {
-            if (pending.some(p => p.id === effect)) continue
-            if (tokenValues.has(effect) || g.nodes.get(effect)?.op === 'nil-effect') continue
-            emitValue(effect, expressionTemp(new Set<number>()))
-        }
-        assignValues(pending)
-        const label = targetLabel ?? (activeInstance?.block.id === block.id ? activeInstance.start : block.id)
-        asm.jump(label)
-    }
-    function emitState(n: GraphNode, owner: GraphBlock): void {
-        if (activeInstance && !activeInstance.root) {
-            for (const request of activeInstance.requests) {
-                const p = request.projection
-                const terminal = p.label?.slice(0, p.label.lastIndexOf('.'))
-                if (terminal !== n.label) {
-                    throw `lowering2: nested computation exited through '${n.label}', expected '${terminal}'`
-                }
-                if (p.label?.endsWith('.token')) continue
-                const returns = p.label?.endsWith('.return')
-                const index = returns ? (owner.slots?.length ?? 0) : (owner.slots?.indexOf(p.argConsts[1]) ?? -1)
-                if (index < 0 || index >= n.argIds.length) throw `lowering2: nested terminal does not provide '${p.label}'`
-                moveValueHome(n.argIds[index], n.argConsts[index], request.resultHome)
-            }
-            asm.jump(activeInstance.continuation)
-            return
-        }
-        const requested = projectionIds.find(id => {
-            const p = g.nodes.get(id)!
-            return p.label?.slice(0, p.label.lastIndexOf('.')) === n.label
-        })
-        if (requested !== undefined) {
-            const p = g.nodes.get(requested)!
-            const returns = p.label?.endsWith('.return')
-            const index = returns ? (owner.slots?.length ?? 0) : (owner.slots?.indexOf(p.argConsts[1]) ?? -1)
-            if (index < 0 || index >= n.argIds.length) {
-                throw `lowering2: terminal '${n.label}' does not provide '${p.label}'`
-            }
-            moveValueHome(n.argIds[index], n.argConsts[index], projectionHome(p, target.retReg))
-        }
-        asm.jump(terminalLabel(n.label ?? ''))
-    }
-    function emitTail(id: number, value: number, owner?: GraphBlock): void {
-        if (!id) { asm.movImm(target.retReg, value); asm.jump(exitLabel); return }
-        const n = g.nodes.get(id)
-        if (!n) { moveValue(id, value, target.retReg); asm.jump(exitLabel); return }
-        if (n.op === 'after') {
-            const effectProjection = g.nodes.get(n.argIds[0])
-            const valueProjection = g.nodes.get(n.argIds[1])
-            if (effectProjection?.op === 'proj' && valueProjection?.op === 'proj'
-                && effectProjection.argIds[0] === valueProjection.argIds[0]) {
-                emitProjections([
-                    { projection: effectProjection, resultHome: target.scratch[0] },
-                    { projection: valueProjection, resultHome: target.retReg },
-                ])
-                asm.jump(exitLabel)
-                return
-            }
-            if (n.argIds[0] && n.argIds[0] !== n.argIds[1]) emitValue(n.argIds[0], target.scratch[0])
-            emitTail(n.argIds[1], n.argConsts[1], owner)
-            return
-        }
-        if (n.op === 'apply') { emitApply(n); return }
-        if (n.op === 'state') {
-            if (!owner) throw 'lowering2: state outside a computation'
-            emitState(n, owner)
-            return
-        }
-        if (n.op === 'select') {
-            const condition = g.nodes.get(n.argIds[0])
-            if (condition?.op === 'is-state' && activeTerminal !== undefined) {
-                const branch = condition.label === activeTerminal ? 1 : 2
-                emitTail(n.argIds[branch], n.argConsts[branch], owner)
-                return
-            }
-            const no = nextLabel++
-            emitCondition(n.argIds[0], n.argConsts[0], no)
-            const before = new Set<number>(materializedCalls)
-            const relocatedBefore = new Set<number>(relocatedCalls)
-            const paramsBefore = new Set<number>(relocatedParams)
-            const valuesBefore = new Set<number>(materializedValues)
-            emitTail(n.argIds[1], n.argConsts[1], owner)
-            asm.bindLabel(no)
-            materializedCalls = before
-            relocatedCalls = relocatedBefore
-            relocatedParams = paramsBefore
-            materializedValues = valuesBefore
-            emitTail(n.argIds[2], n.argConsts[2], owner)
-            return
-        }
-        moveValue(id, value, target.retReg)
-        asm.jump(exitLabel)
-    }
-
-    const frameBytes = (spillBase + spillCount * 8 + 15) & ~15
-    if (frameBytes) asm.spAdjust(frameBytes)
-    for (let i = 0; i < saved.length; i++) asm.store(SP, i * 8, saved[i], Types.u64)
-    if (callsOut) asm.store(SP, saved.length * 8, LR, Types.u64)
-    const rootBlock = entry ? blockOf.get(entry.argIds[0]) : undefined
-    const rootInstance: Instance | undefined = rootBlock ? {
-        block: rootBlock, start: rootBlock.id, continuation: -1,
-        requests: [{ projection: projection!, resultHome: projectionHome(projection!, target.retReg) }], root: true,
-    } : undefined
-    if (entry) emitApply(entry, rootInstance!.start)
-    else emitTail(resultId, resultConst)
-    if (rootInstance) {
-        activeInstance = rootInstance
-        materializedValues = new Set<number>()
-        asm.bindLabel(rootInstance.start)
-        emitTail(rootBlock!.bodyId, rootBlock!.bodyConst, rootBlock)
-    }
-    for (let i = 0; i < instances.length; i++) {
-        const instance = instances[i]
-        activeInstance = instance
-        materializedValues = new Set<number>()
-        asm.bindLabel(instance.start)
-        emitTail(instance.block.bodyId, instance.block.bodyConst, instance.block)
-    }
-    activeInstance = undefined
-    if (projection) {
-        for (const [terminal, label] of terminalLabels) {
-            asm.bindLabel(label)
-            activeTerminal = terminal
-            materializedValues = new Set<number>()
-            emitTail(resultId, resultConst)
-        }
-        activeTerminal = undefined
-    }
-    asm.bindLabel(exitLabel)
-    for (let i = 0; i < saved.length; i++) asm.load(saved[i], SP, i * 8, Types.u64)
-    if (callsOut) asm.load(LR, SP, saved.length * 8, Types.u64)
-    if (frameBytes) asm.spAdjust(-frameBytes)
-    asm.ret()
-
-    return { target, words: asm.words(), bytes: asm.bytes(), listing: asm.listing() }
-}
-
 export function analyzeValueGraph(g: Graph) {
     const usedBy = new Map<number, number[]>()
     const demands = new Map<number, Set<number>>()
@@ -1521,7 +273,6 @@ export function analyzeValueGraph(g: Graph) {
     const blockBodyValues = new Map<number, number[]>()
     const blockIndices = new Map<number, number>()
     const blockByLabel = new Map<string, number>()
-    const containingBlock = new Map<number, number>()
     const hasCallEffects = new Set<number>()
     for (let i = 0; i < g.blocks.length; i++) {
         const b = g.blocks[i]
@@ -1564,7 +315,6 @@ export function analyzeValueGraph(g: Graph) {
                 if (n) {
                     blockBodyValues.get(blockId)!.push(valId)
                 }
-                containingBlock.set(valId, blockId)
             }
         }
 
@@ -1621,7 +371,7 @@ export function analyzeValueGraph(g: Graph) {
                 for (let i = 1; i < n.argIds.length; i++) {
                     visit(n.argIds[i], !b.consumesEffectToken || i !== n.argIds.length-1)
                 }
-                return 
+                return
             }
             const b = getGraphBlock(blockId)
             for (let i = 1; i < n.argIds.length; i++) {
@@ -2071,7 +821,7 @@ export function dumpGraph(g: Graph): string {
     return out.join('\n')
 }
 
-export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
+export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
     g = pruneBlockParams(packageBlocks(liftCommonApplications(g)))
     const target = opts.target ?? lowering.aarch64
     const asm = target.createAssembler()
@@ -2157,7 +907,10 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
         return reg
     }
     function place(id: number, home: number): void {
-        if (isSlot(home)) homeOf.set(id, home)
+        if (isSlot(home)) {
+            reusableSlots.delete(home)
+            homeOf.set(id, home)
+        }
         else bind(id, home)
     }
     function freeValue(v: number, site = materializing): void {
@@ -2409,7 +1162,7 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
             })
             return
         }
-        throw `lowering3: cannot produce '${n.op}'`
+        throw `lowering3: cannot produce '${n.op}'\n${dumpGraph(g)}`
     }
 
     function buildArith(id: number, n: GraphNode, signed: boolean, want: number): void {
@@ -2502,7 +1255,13 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
             moves.push({ dst: a.dst, src })
         }
         shuffle(moves)
-        for (const c of consts) put(() => asm.movImm(c.dst, c.src))
+        for (const c of consts) {
+            if (isSlot(c.dst)) put(() => {
+                asm.movImm(SWAP, c.src)
+                asm.store(SP, slotOffset(c.dst), SWAP, Types.u64)
+            })
+            else put(() => asm.movImm(c.dst, c.src))
+        }
         return landed
     }
 
@@ -2593,7 +1352,7 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
             if (!n.argIds[ri] && imm >= 0 && imm <= 0xFFF) {
                 const ra = at(a, guard)
                 finish(id)
-                const flag = freeReg(volatiles, guard)
+                const flag = freeReg(volatiles, NOTHING)
                 if (flag < 0) throw 'lowering3: out of registers'
                 put(() => {
                     asm.compareImm(op, flag, ra, imm, signed)
@@ -2607,7 +1366,7 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
             const rb = at(b, guard)
             guard.add(rb)
             finish(id)
-            const flag = freeReg(volatiles, guard)
+            const flag = freeReg(volatiles, NOTHING)
             if (flag < 0) throw 'lowering3: out of registers'
             put(() => {
                 asm.compare(op, flag, ra, rb, signed)
@@ -2719,6 +1478,8 @@ export function lowerValueGraph3(g: Graph, opts: LowerGraphOptions = {}): LowerG
         homeOf.clear()
         heldBy.clear()
         done.clear()
+        reusableSlots.clear()
+        for (let i = 1; i <= slotCount; i++) reusableSlots.add(-i)
         put(() => asm.bindLabel(b.id))
         if (id === g.blocks[0].id) {
             for (let i = 0; i < g.params.length; i++) {
@@ -2790,41 +1551,11 @@ export function packageBlocks(g: Graph): Graph {
         return addNode('apply', [target, ...argIds], constants)
     }
 
-    const functionParams = new Set<number>(g.params)
     let packaged = 0
     while (packageOne()) {
         if (++packaged > 100) throw `lowering2: block packaging did not converge (${blocks.length} blocks)`
     }
     const resultBlocks = reachableBlocks()
-
-    const tokens = new Set<number>()
-    for (const n of nodes.values()) {
-        if (n.op === 'after' || n.op === 'call' || n.op === 'store') tokens.add(n.argIds[0])
-    }
-    const spread = new Set<number>()
-    function markTokens(id: number): void {
-        if (!id || spread.has(id)) return
-        spread.add(id)
-        const n = nodes.get(id)
-        if (!n) return
-        if (n.op === 'apply') {
-            const target = blockOf.get(n.argIds[0])
-            if (target) {
-                for (let i = 0; i < target.params.length; i++) {
-                    if (tokens.has(n.argIds[i + 1])) tokens.add(target.params[i])
-                }
-                for (const a of n.argIds) markTokens(a)
-                markTokens(target.bodyId)
-                return
-            }
-        }
-        for (const a of n.argIds) markTokens(a)
-    }
-    markTokens(g.blocks[0].bodyId)
-    for (const b of resultBlocks) {
-        const last = b.params[b.params.length - 1]
-        b.consumesEffectToken = last !== undefined && tokens.has(last)
-    }
 
     validate(resultBlocks)
     return { nodes, params: g.params.slice(), blocks: resultBlocks }
@@ -2833,7 +1564,7 @@ export function packageBlocks(g: Graph): Graph {
         const globals = new Set<number>(g.params)
         for (const b of result) {
             const available = new Set<number>(b.params)
-            for (const p of globals) available.add(p)
+            if (b.id === g.blocks[0].id) for (const p of globals) available.add(p)
             const seen = new Set<number>()
             function walk(id: number, owner: number): void {
                 if (!id || seen.has(id) || available.has(id)) return
@@ -2912,8 +1643,18 @@ export function packageBlocks(g: Graph): Graph {
         const targetBlock = blockOf.get(target)
         if (!targetBlock) throw `lowering2: apply of something that is not a block`
 
+        function addEnvironment(ids: number[], constants: Float64Array, env: number[], tokenLast: boolean) {
+            const at = tokenLast ? ids.length - 1 : ids.length
+            const nextIds = [...ids.slice(0, at), ...env, ...ids.slice(at)]
+            const nextConstants = new Float64Array(nextIds.length)
+            nextConstants.set(constants.slice(0, at))
+            nextConstants.set(constants.slice(at), at + env.length)
+            return [nextIds, nextConstants] as [number[], Float64Array]
+        }
+
         const region = new Set<number>()
         const terminals = new Map<string, number>()
+        const tokenTerminals = new Set<string>()
         function discover(blockId: number): void {
             if (region.has(blockId)) return
             const block = blockOf.get(blockId)
@@ -2929,6 +1670,7 @@ export function packageBlocks(g: Graph): Graph {
                         throw `lowering2: inconsistent state '${n.label}'`
                     }
                     terminals.set(n.label!, n.argIds.length)
+                    if (block.consumesEffectToken) tokenTerminals.add(n.label!)
                     return
                 }
                 if (n.op === 'apply') { discover(n.argIds[0]); return }
@@ -2947,7 +1689,6 @@ export function packageBlocks(g: Graph): Graph {
         const captureParams: number[] = []
         const captureOf = new Map<number, number>()
         function capture(id: number): number {
-            if (functionParams.has(id)) return id
             const prev = captureOf.get(id)
             if (prev !== undefined) return prev
             const param = fresh()
@@ -2963,7 +1704,7 @@ export function packageBlocks(g: Graph): Graph {
         }
         const surveyed = new Set<number>()
         function surveyFree(id: number): void {
-            if (!id || surveyed.has(id) || functionParams.has(id) || regionParams.has(id)) return
+            if (!id || surveyed.has(id) || regionParams.has(id)) return
             surveyed.add(id)
             const n = nodes.get(id)
             if (!n) { capture(id); return }
@@ -3076,10 +1817,14 @@ export function packageBlocks(g: Graph): Graph {
         for (const e of terminals) {
             const env = environment()
             const result = continuationResults.get(e[0])!
+            const params = fieldsOf.get(e[0])!
             const continuation: GraphBlock = {
                 id: continuationOf.get(e[0])!,
-                params: [...fieldsOf.get(e[0])!, ...env],
+                params: tokenTerminals.has(e[0])
+                    ? [...params.slice(0, -1), ...env, params[params.length - 1]]
+                    : [...params, ...env],
                 bodyId: remapCaptures(result[0], env), bodyConst: result[1],
+                consumesEffectToken: tokenTerminals.has(e[0]),
             }
             continuations.push(continuation)
         }
@@ -3115,22 +1860,26 @@ export function packageBlocks(g: Graph): Graph {
             }
             if (n.op === 'state') {
                 const ids: number[] = [continuationOf.get(n.label!)!]
-                const constants = new Float64Array(n.argIds.length + 1 + env.length)
+                const constants = new Float64Array(n.argIds.length + 1)
                 for (let i = 0; i < n.argIds.length; i++) {
                     ids.push(cloneValue(n.argIds[i], memo, env))
                     constants[i + 1] = n.argConsts[i]
                 }
-                ids.push(...env)
-                return addNode('apply', ids, constants)
+                const args = addEnvironment(ids, constants, env, tokenTerminals.has(n.label!))
+                return addNode('apply', args[0], args[1])
             }
             const ids = n.argIds.slice()
-            const constants = new Float64Array(ids.length + (n.op === 'apply' && region.has(ids[0]) ? env.length : 0))
-            constants.set(n.argConsts)
+            let constants = n.argConsts.slice()
             if (n.op === 'apply') {
                 const internal = region.has(ids[0])
+                const target = blockOf.get(ids[0])
                 ids[0] = clonedBlocks.get(ids[0]) ?? ids[0]
                 for (let i = 1; i < n.argIds.length; i++) ids[i] = cloneValue(ids[i], memo, env)
-                if (internal) ids.push(...env)
+                if (internal) {
+                    const args = addEnvironment(ids, constants, env, target?.consumesEffectToken ?? false)
+                    ids.splice(0, ids.length, ...args[0])
+                    constants = args[1]
+                }
             } else {
                 for (let i = 0; i < ids.length; i++) ids[i] = cloneValue(ids[i], memo, env)
             }
@@ -3142,13 +1891,17 @@ export function packageBlocks(g: Graph): Graph {
         for (const blockId of region) {
             const source = blockOf.get(blockId)!
             const env = clonedEnv.get(blockId)!
+            const params = source.params.map(p => clonedParams.get(p)!)
             const cloned: GraphBlock = {
                 id: clonedBlocks.get(blockId)!,
-                params: [...source.params.map(p => clonedParams.get(p)!), ...env],
+                params: source.consumesEffectToken
+                    ? [...params.slice(0, -1), ...env, params[params.length - 1]]
+                    : [...params, ...env],
                 inputs: source.inputs?.slice(),
                 slots: source.slots?.slice(),
                 bodyId: cloneValue(source.bodyId, new Map<number, number>(), env),
                 bodyConst: source.bodyConst,
+                consumesEffectToken: source.consumesEffectToken,
             }
             blocks.push(cloned)
             blockOf.set(cloned.id, cloned)
@@ -3158,12 +1911,10 @@ export function packageBlocks(g: Graph): Graph {
             blockOf.set(continuation.id, continuation)
         }
 
-        const args = call.argIds.slice(1)
-        const constants = new Float64Array(args.length + captures.length + 1)
-        constants.set(call.argConsts.slice(1), 1)
-        args.unshift(clonedBlocks.get(target)!)
-        args.push(...captures)
-        return addNode('apply', args, constants)
+        const args = [clonedBlocks.get(target)!, ...call.argIds.slice(1)]
+        const constants = call.argConsts.slice()
+        const applied = addEnvironment(args, constants, captures, targetBlock.consumesEffectToken ?? false)
+        return addNode('apply', applied[0], applied[1])
     }
 
     function reachableBlocks(): GraphBlock[] {
@@ -3283,911 +2034,5 @@ export function simplifyCountedLoop(g: Graph): Graph | undefined {
         if (!n) return
         nodes.set(id, n)
         for (const arg of n.argIds) copyReachable(arg)
-    }
-}
-
-export function lowerGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
-    g = packageBlocks(g)
-    const target = opts.target ?? lowering.aarch64
-    const nodes = g.nodes
-
-    function nodeOf(id: number): GraphNode | undefined {
-        return id ? nodes.get(id) : undefined
-    }
-
-    const blockIndex = new Map<number, number>()
-    for (let i = 0; i < g.blocks.length; i++) blockIndex.set(g.blocks[i].id, i)
-
-    let callsOut = false
-    for (const e of nodes) {
-        if (e[1].op === 'call') { callsOut = true; break }
-    }
-    const wide: number[] = []
-    for (const r of callsOut ? target.calleeSaved : target.allocatable) {
-        if (SCRATCH.indexOf(r) < 0) wide.push(r)
-    }
-    const pool = opts.regBudget ? wide.slice(0, opts.regBudget) : wide
-    if (!pool.length) throw `lowering2: the register pool cannot be empty`
-
-    const P = g.params.length
-    if (P > target.argRegs.length) {
-        throw `lowering2: ${P} arguments, only ${target.argRegs.length} of them arrive in registers`
-    }
-    let maxParams = 0
-    for (const b of g.blocks) {
-        if (b.params.length > maxParams) maxParams = b.params.length
-    }
-    const REGS = pool.length
-    function isReg(h: number): boolean { return h < REGS }
-
-    interface EntryExit {
-        valueId: number
-        load?: GraphNode
-        loadBase?: number
-        exitWhenZero: boolean
-        exitConst: number
-        bodyId: number
-        bodyConst: number
-    }
-    function findEntryExit(): EntryExit | undefined {
-        if (!opts.hoistEntryExit || !target.scratch.length) return
-        const root = nodeOf(g.blocks[0]?.bodyId)
-        if (!root || root.op !== 'select') return
-
-        const yesExit = !root.argIds[1] && !!root.argIds[2]
-        const noExit = !root.argIds[2] && !!root.argIds[1]
-        if (!yesExit && !noExit) return
-
-        let valueId = root.argIds[0]
-        let trueWhenZero = false
-        const condition = nodeOf(valueId)
-        if (condition && (condition.op === 'eq' || condition.op === 'ne')) {
-            const k = !condition.argIds[0] && condition.argConsts[0] === 0 ? 1
-                : !condition.argIds[1] && condition.argConsts[1] === 0 ? 0 : -1
-            if (k < 0) return
-            valueId = condition.argIds[k]
-            trueWhenZero = condition.op === 'eq'
-        }
-
-        const param = g.params.indexOf(valueId)
-        let load: GraphNode | undefined
-        let loadBase: number | undefined
-        if (param < 0) {
-            load = nodeOf(valueId)
-            if (!load || load.op !== 'load' || load.argIds[1]) return
-            loadBase = g.params.indexOf(load.argIds[0])
-            if (loadBase < 0) return
-        }
-
-        return {
-            valueId, load, loadBase,
-            exitWhenZero: yesExit ? trueWhenZero : !trueWhenZero,
-            exitConst: root.argConsts[yesExit ? 1 : 2],
-            bodyId: root.argIds[yesExit ? 2 : 1],
-            bodyConst: root.argConsts[yesExit ? 2 : 1],
-        }
-    }
-    const entryExit = findEntryExit()
-
-    const homeOf = new Map<number, number>()
-    for (let i = 0; i < P; i++) homeOf.set(g.params[i], i)
-    for (const b of g.blocks) {
-        for (let i = 0; i < b.params.length; i++) homeOf.set(b.params[i], P + i)
-    }
-    coalesceEntryParams()
-
-    const fixedRegs = new Map<number, number>()
-    const preferredHome = new Map<number, number>()
-    let retHome = reusableCallAccumulator()
-    if (retHome >= 0 && retHome < REGS) fixedRegs.set(retHome, target.retReg)
-    else retHome = planSingleCallHomes()
-
-    function regOf(h: number): number {
-        return fixedRegs.get(h) ?? pool[h]
-    }
-
-    function coalesceEntryParams(): void {
-        if (g.blocks.length !== 2) return
-        const b = g.blocks[1]
-        const start = nodeOf(g.blocks[0].bodyId)
-        if (!start || start.op !== 'apply' || start.argIds[0] !== b.id) return
-
-        const backs: GraphNode[] = []
-        const seen = new Set<number>()
-        function scan(id: number): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const n = nodeOf(id)
-            if (!n) return
-            if (n.op === 'apply') {
-                if (n.argIds[0] === b.id) backs.push(n)
-                for (let i = 1; i < n.argIds.length; i++) scan(n.argIds[i])
-                return
-            }
-            for (const a of n.argIds) scan(a)
-        }
-        scan(b.bodyId)
-        if (!backs.length) return
-
-        for (let i = 0; i < b.params.length; i++) {
-            const p = start.argIds[1 + i]
-            if (!p || g.params.indexOf(p) < 0) continue
-            let unchanged = true
-            for (const edge of backs) {
-                if (edge.argIds[1 + i] !== b.params[i]) { unchanged = false; break }
-            }
-            if (unchanged) homeOf.set(p, P + i)
-        }
-    }
-
-    function reusableCallAccumulator(): number {
-        if (!callsOut || g.blocks.length !== 2 || pool.indexOf(target.retReg) >= 0) return -1
-        const b = g.blocks[1]
-        const calls = new Set<number>()
-        const backs: GraphNode[] = []
-        const seen = new Set<number>()
-
-        function scan(id: number): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const n = nodeOf(id)
-            if (!n) return
-            if (n.op === 'call') calls.add(id)
-            if (n.op === 'apply') {
-                if (n.argIds[0] === b.id) backs.push(n)
-                for (let i = 1; i < n.argIds.length; i++) scan(n.argIds[i])
-                return
-            }
-            for (const a of n.argIds) scan(a)
-        }
-        scan(b.bodyId)
-        if (!calls.size || !backs.length) return -1
-
-        for (let i = 0; i < b.params.length; i++) {
-            const p = b.params[i]
-            const updates = new Set<number>()
-            let ok = true
-            for (const edge of backs) {
-                const id = edge.argIds[1 + i]
-                const n = nodeOf(id)
-                if (!n || n.op !== 'call' || n.argIds[3] !== p) { ok = false; break }
-                updates.add(id)
-            }
-            if (!ok || updates.size !== calls.size) continue
-            for (const id of calls) {
-                if (!updates.has(id)) { ok = false; break }
-            }
-            if (!ok) continue
-
-            for (const edge of backs) {
-                for (let j = 0; j < b.params.length; j++) {
-                    if (j !== i && needsOld(edge.argIds[1 + j], p, updates, new Set<number>())) {
-                        ok = false
-                        break
-                    }
-                }
-                if (!ok) break
-            }
-            if (ok) return P + i
-        }
-        return -1
-    }
-
-    function needsOld(id: number, p: number, stop: Set<number>, seen: Set<number>): boolean {
-        if (!id || stop.has(id) || seen.has(id)) return false
-        if (id === p) return true
-        seen.add(id)
-        const n = nodeOf(id)
-        if (!n) return false
-        for (const a of n.argIds) if (needsOld(a, p, stop, seen)) return true
-        return false
-    }
-
-    function planSingleCallHomes(): number {
-        const calls: number[] = []
-        const seen = new Set<number>()
-        function findCalls(id: number): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const n = nodeOf(id)
-            if (!n) return
-            if (n.op === 'call') calls.push(id)
-            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) findCalls(n.argIds[i])
-        }
-        for (const b of g.blocks) findCalls(b.bodyId)
-        if (calls.length !== 1) return -1
-
-        const callId = calls[0]
-        const call = nodeOf(callId)!
-        function contains(id: number, wanted: number, visited: Set<number>): boolean {
-            if (!id || visited.has(id)) return false
-            if (id === wanted) return true
-            visited.add(id)
-            const n = nodeOf(id)
-            if (!n) return false
-            for (const a of n.argIds) if (contains(a, wanted, visited)) return true
-            return false
-        }
-        function usedAfterCall(wanted: number): boolean {
-            const visited = new Set<number>()
-            function walk(id: number): boolean {
-                if (!id || id === callId || visited.has(id)) return false
-                if (id === wanted) return true
-                visited.add(id)
-                const n = nodeOf(id)
-                if (!n) return false
-                for (const a of n.argIds) if (walk(a)) return true
-                return false
-            }
-            for (const b of g.blocks) if (walk(b.bodyId)) return true
-            return false
-        }
-
-        for (let i = 0; i < P && i < REGS; i++) {
-            const p = g.params[i]
-            const incoming = target.argRegs[i]
-            if (usedAfterCall(p) || contains(call.argIds[1], p, new Set<number>())) continue
-            let safe = true
-            for (let k = 3; k < call.argIds.length; k++) {
-                if (contains(call.argIds[k], p, new Set<number>())
-                    && target.argRegs[k - 3] !== incoming) {
-                    safe = false
-                    break
-                }
-            }
-            if (safe) fixedRegs.set(i, incoming)
-        }
-
-        if (fixedRegs.get(0) !== target.retReg) return -1
-        preferredHome.set(callId, 0)
-        return 0
-    }
-
-    const pinned: number[] = []
-    {
-        const functionParams = new Set<number>(g.params)
-        const known = new Map<number, boolean>()
-        function invariant(id: number): boolean {
-            if (!id) return true
-            const hit = known.get(id)
-            if (hit !== undefined) return hit
-            const h = homeOf.get(id)
-            if (h !== undefined) {
-                const r = functionParams.has(id)
-                known.set(id, r)
-                return r
-            }
-            const n = nodeOf(id)
-            if (!n || !PureOps.has(n.op)) {
-                known.set(id, false)
-                return false
-            }
-            let r = true
-            for (const a of n.argIds) {
-                if (!invariant(a)) { r = false; break }
-            }
-            known.set(id, r)
-            return r
-        }
-        const seen = new Set<number>()
-        function look(id: number): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            if (homeOf.has(id)) return
-            if (invariant(id) && nodeOf(id)) {
-                if (pinned.indexOf(id) < 0) pinned.push(id)
-                return
-            }
-            const n = nodeOf(id)
-            if (!n) return
-            for (const a of n.argIds) look(a)
-        }
-        for (let i = 1; i < g.blocks.length; i++) look(g.blocks[i].bodyId)
-        const carry = entryExit?.load ? 1 : 0
-        while (pinned.length && P + maxParams + pinned.length + carry >= REGS) pinned.pop()
-    }
-    const pinHome = new Map<number, number>()
-    for (let k = 0; k < pinned.length; k++) {
-        pinHome.set(pinned[k], P + maxParams + k)
-        homeOf.set(pinned[k], P + maxParams + k)
-    }
-
-    const entryCarryHome = entryExit?.load ? P + maxParams + pinned.length : -1
-    if (entryCarryHome >= 0) homeOf.set(entryExit!.valueId, entryCarryHome)
-    const tempBase = P + maxParams + pinned.length + (entryCarryHome >= 0 ? 1 : 0)
-
-    const CALLEE = target.scratch[1]
-
-    const refs = new Map<number, number>()
-    function count(id: number): void {
-        if (!id) return
-        refs.set(id, (refs.get(id) ?? 0) + 1)
-    }
-    for (const e of nodes) {
-        for (const a of e[1].argIds) count(a)
-    }
-    for (const b of g.blocks) count(b.bodyId)
-    function wantedAgain(id: number): boolean {
-        return (refs.get(id) ?? 0) > 1
-    }
-
-    let asm = target.createAssembler()
-    let nextHome = tempBase
-    let maxHome = tempBase
-    let nextLabel = 0
-    let localOf = new Map<number, number>()
-    let freeHomes: number[] = []
-
-    let savedRegs: number[] = []
-    let calleeWrites = new Map<number, number>()
-    let spillCount = 0
-    let spillBase = 0
-
-    const exitLabel = g.blocks.length
-    const fastExitLabel = entryExit ? exitLabel + 1 : -1
-    let entryScratchLive = false
-
-    function markWrite(reg: number): void {
-        if (target.calleeSaved.indexOf(reg) < 0) return
-        calleeWrites.set(reg, (calleeWrites.get(reg) ?? 0) + 1)
-    }
-
-    function takeHome(): number {
-        if (freeHomes.length) return freeHomes.pop()!
-        const h = nextHome++
-        if (nextHome > maxHome) maxHome = nextHome
-        return h
-    }
-    function release(n: GraphNode, k: number, h: number): void {
-        if (h < 0 || h < tempBase) return
-        const id = n.argIds[k]
-        if (id && (wantedAgain(id) || homeOf.has(id))) return
-        for (const v of localOf.values()) {
-            if (v === h) return
-        }
-        freeHomes.push(h)
-    }
-
-    function slotAddr(h: number): number { return spillBase + (h - REGS) * 8 }
-    function read(h: number, scratch: number): number {
-        if (isReg(h)) return regOf(h)
-        asm.load(scratch, SP, slotAddr(h), Types.u64)
-        return scratch
-    }
-    function readInto(h: number, reg: number): void {
-        if (!isReg(h)) {
-            asm.load(reg, SP, slotAddr(h), Types.u64)
-            markWrite(reg)
-            return
-        }
-        if (regOf(h) !== reg) {
-            asm.mov(reg, regOf(h))
-            markWrite(reg)
-        }
-    }
-    function writeReg(h: number): number {
-        if (!isReg(h)) return SCRATCH[3]
-        const r = regOf(h)
-        markWrite(r)
-        return r
-    }
-    function flush(h: number, r: number): void {
-        if (!isReg(h)) asm.store(SP, slotAddr(h), r, Types.u64)
-    }
-    function storeHome(h: number, reg: number): void {
-        if (!isReg(h)) { asm.store(SP, slotAddr(h), reg, Types.u64); return }
-        const dst = regOf(h)
-        if (dst !== reg) {
-            asm.mov(dst, reg)
-            markWrite(dst)
-        }
-    }
-    function moveHome(from: number, to: number): void {
-        if (from === to) return
-        if (isReg(to)) { readInto(from, regOf(to)); return }
-        asm.store(SP, slotAddr(to), read(from, SCRATCH[0]), Types.u64)
-    }
-
-    function emitValue(id: number, hint: number = -1): number {
-        const h = homeOf.get(id)
-        if (h !== undefined) return h
-        const cached = localOf.get(id)
-        if (cached !== undefined) return cached
-        const n = nodeOf(id)
-        if (!n) throw `lowering2: value ${id} has no definition and is not a parameter`
-        const want = hint >= 0 ? hint : (prefer.get(id) ?? preferredHome.get(id) ?? -1)
-        const dst = n.op === 'call' ? emitCall(n, want) : emitOp(n, want)
-        if (wantedAgain(id)) localOf.set(id, dst)
-        return dst
-    }
-
-    function operandHome(n: GraphNode, k: number): number {
-        if (n.argIds[k]) return emitValue(n.argIds[k])
-        const h = takeHome()
-        const r = writeReg(h)
-        asm.movImm(r, n.argConsts[k])
-        flush(h, r)
-        return h
-    }
-
-    function emitOp(n: GraphNode, hint: number): number {
-        const op = n.op
-        const signed = lowering.isSignedType(n.T) || lowering.isSignedType(n.U)
-
-        if (op === 'nil-effect') return -1
-        if (op === 'after') {
-            release(n, 0, operandHome(n, 0))
-            return operandHome(n, 1)
-        }
-        if (op === 'store') {
-            const h: number[] = []
-            for (let k = 0; k < 4; k++) h.push(n.argIds[k] ? emitValue(n.argIds[k]) : -1)
-            const base = h[1] >= 0 ? read(h[1], SCRATCH[0]) : SCRATCH[0]
-            if (h[1] < 0) asm.movImm(base, n.argConsts[1])
-            const val = h[3] >= 0 ? read(h[3], SCRATCH[2]) : SCRATCH[2]
-            if (h[3] < 0) asm.movImm(val, n.argConsts[3])
-            if (h[2] >= 0) {
-                const offset = read(h[2], SCRATCH[1])
-                asm.binary('add', SCRATCH[3], base, offset, false)
-                asm.store(SCRATCH[3], 0, val, n.T)
-            } else {
-                asm.store(base, n.argConsts[2], val, n.T)
-            }
-            for (let k = 1; k < 4; k++) release(n, k, h[k])
-            return -1
-        }
-
-        const arity = op === 'select' ? 3 : op === 'load' && n.argIds[1] ? 2 : OneOperandOps.has(op) ? 1 : 2
-        const h: number[] = []
-        for (let k = 0; k < arity; k++) h.push(n.argIds[k] ? emitValue(n.argIds[k]) : -1)
-        for (let k = 0; k < arity; k++) release(n, k, h[k])
-
-        const hd = hint >= 0 ? hint : takeHome()
-        const d = writeReg(hd)
-
-        function inReg(k: number): number {
-            if (h[k] >= 0) return read(h[k], SCRATCH[k])
-            const v = n.argConsts[k]
-            if (v === 0) return XZR
-            asm.movImm(SCRATCH[k], v)
-            return SCRATCH[k]
-        }
-
-        const litB = !n.argIds[1] && n.argConsts[1] >= 0 && n.argConsts[1] <= 0xFFF
-        const litA = !n.argIds[0] && !!n.argIds[1] && n.argConsts[0] >= 0 && n.argConsts[0] <= 0xFFF
-
-        if (op === 'select') {
-            asm.select(d, inReg(0), inReg(1), inReg(2))
-        } else if (op === 'load') {
-            if (n.argIds[1]) {
-                asm.binary('add', SCRATCH[2], inReg(0), inReg(1), false)
-                asm.load(d, SCRATCH[2], 0, n.T)
-            } else {
-                asm.load(d, inReg(0), n.offset, n.T)
-            }
-        } else if (op === 'convert') {
-            asm.convert(d, inReg(0), n.T, n.U)
-        } else if (op === 'bitconvert') {
-            asm.mov(d, inReg(0))
-        } else if (UnaryOps.has(op)) {
-            asm.unary(op, d, inReg(0))
-        } else if (op === 'add' && litB) {
-            asm.addImm(d, inReg(0), n.argConsts[1])
-        } else if (op === 'sub' && litB) {
-            asm.subImm(d, inReg(0), n.argConsts[1])
-        } else if (op === 'add' && litA) {
-            asm.addImm(d, inReg(1), n.argConsts[0])
-        } else if (CompareOps.has(op) && litB) {
-            asm.compareImm(op, d, inReg(0), n.argConsts[1], signed)
-        } else if (CompareOps.has(op) && litA) {
-            asm.compareImm(SwappedCmp[op], d, inReg(1), n.argConsts[0], signed)
-        } else if (CompareOps.has(op)) {
-            asm.compare(op, d, inReg(0), inReg(1), signed)
-        } else if (BinaryOps.has(op)) {
-            asm.binary(op, d, inReg(0), inReg(1), signed)
-        } else {
-            throw `lowering2: no rule for op '${op}'`
-        }
-        flush(hd, d)
-        return hd
-    }
-
-    function emitCall(n: GraphNode, hint: number): number {
-        const nargs = n.argIds.length - 3
-        if (nargs > target.argRegs.length) {
-            throw `lowering2: ${nargs} call arguments, only ${target.argRegs.length} fit in registers`
-        }
-        if (n.argIds[0]) release(n, 0, emitValue(n.argIds[0]))
-
-        const h: number[] = []
-        for (let i = 0; i < nargs; i++) h.push(n.argIds[3 + i] ? emitValue(n.argIds[3 + i]) : -1)
-        const callee = n.argIds[1] ? emitValue(n.argIds[1]) : -1
-        for (let i = 0; i < nargs; i++) release(n, 3 + i, h[i])
-        release(n, 1, callee)
-
-        for (let i = 0; i < nargs; i++) {
-            if (h[i] < 0) asm.movImm(target.argRegs[i], n.argConsts[3 + i])
-            else readInto(h[i], target.argRegs[i])
-        }
-        let calleeReg = CALLEE
-        if (callee < 0) asm.movImm(calleeReg, n.argConsts[1])
-        else calleeReg = read(callee, calleeReg)
-        asm.blr(calleeReg)
-
-        const hd = hint >= 0 ? hint : takeHome()
-        const d = writeReg(hd)
-        if (d !== target.retReg) asm.mov(d, target.retReg)
-        flush(hd, d)
-        return hd
-    }
-
-    function condOf(id: number): number {
-        const n = nodeOf(id)
-        return n && n.op === 'select' ? n.argIds[0] : 0
-    }
-    function armId(id: number, cond: number, take: boolean): number {
-        const n = nodeOf(id)
-        if (!n || n.op !== 'select' || n.argIds[0] !== cond) return id
-        return n.argIds[take ? 1 : 2]
-    }
-    function armConst(id: number, c: number, cond: number, take: boolean): number {
-        const n = nodeOf(id)
-        if (!n || n.op !== 'select' || n.argIds[0] !== cond) return c
-        return n.argConsts[take ? 1 : 2]
-    }
-    function valueOf(id: number): number {
-        const n = nodeOf(id)
-        return n && n.op === 'after' ? n.argIds[1] : id
-    }
-    function effectOf(id: number): number | undefined {
-        const n = nodeOf(id)
-        if (!n) return 0
-        if (n.op === 'after') return n.argIds[0]
-        if (n.op !== 'select') return 0
-        const a = effectOf(n.argIds[1])
-        const b = effectOf(n.argIds[2])
-        return a === b ? a : undefined
-    }
-
-    function canSpeculate(id: number, seen = new Set<number>()): boolean {
-        if (!id || seen.has(id)) return true
-        seen.add(id)
-        const n = nodeOf(id)
-        if (!n) return true
-        if (!PureOps.has(n.op)) return false
-        for (const arg of n.argIds) if (!canSpeculate(arg, seen)) return false
-        return true
-    }
-
-    function needsControl(id: number): boolean {
-        const inner = valueOf(id)
-        const n = nodeOf(inner)
-        if (n && n.op === 'apply') return true
-        const c = condOf(inner)
-        if (!c) return false
-        const a = armId(inner, c, true)
-        const b = armId(inner, c, false)
-        const ae = effectOf(a)
-        const be = effectOf(b)
-        if (ae === undefined || be === undefined || ae !== be) return true
-        const av = valueOf(a)
-        const bv = valueOf(b)
-        if (av !== bv && (!canSpeculate(av) || !canSpeculate(bv))) return true
-        return needsControl(a) || needsControl(b)
-    }
-
-    let prefer = new Map<number, number>()
-
-    function coneHas(root: number, target: number, stop: number): boolean {
-        if (!root) return false
-        const seen = new Set<number>()
-        const stack: number[] = [root]
-        while (stack.length) {
-            const id = stack.pop()!
-            if (id === target) return true
-            if (id === stop || seen.has(id)) continue
-            seen.add(id)
-            const n = nodeOf(id)
-            if (!n || n.op === 'block') continue
-            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
-                if (n.argIds[i]) stack.push(n.argIds[i])
-            }
-        }
-        return false
-    }
-
-    function edgeArgs(id: number, out: Map<number, number[]>): void {
-        const n = nodeOf(id)
-        if (!n) return
-        if (n.op === 'after') { edgeArgs(n.argIds[1], out); return }
-        if (n.op === 'apply') {
-            for (let i = 1; i < n.argIds.length; i++) {
-                if (!n.argIds[i]) continue
-                const k = i - 1
-                if (!out.has(k)) out.set(k, [])
-                out.get(k)!.push(n.argIds[i])
-            }
-            return
-        }
-        if (n.op === 'select') {
-            edgeArgs(n.argIds[1], out)
-            edgeArgs(n.argIds[2], out)
-        }
-    }
-
-    function planHomes(b: GraphBlock): void {
-        prefer = new Map<number, number>()
-        if (!needsControl(b.bodyId)) return
-        const inner = valueOf(b.bodyId)
-        const c = condOf(inner)
-        if (!c) return
-        const dests = new Map<number, number[]>()
-        edgeArgs(inner, dests)
-        const taken = new Set<number>()
-        for (const e of dests) {
-            const i = e[0]
-            if (i >= b.params.length) continue
-            const home = P + i
-            if (taken.has(home)) continue
-            const p = b.params[i]
-            for (const x of e[1]) {
-                if (!wantedAgain(x)) continue
-                if (!coneHas(c, x, 0)) continue
-                if (!coneHas(x, p, 0)) continue
-                if (coneHas(b.bodyId, p, x)) continue
-                prefer.set(x, home)
-                taken.add(home)
-                break
-            }
-        }
-    }
-
-    function emitTail(resId: number, resConst: number): void {
-        let id = resId
-        let konst = resConst
-        const w = nodeOf(id)
-        if (w && w.op === 'after') {
-            if (!coneHas(w.argIds[1], w.argIds[0], 0)) release(w, 0, operandHome(w, 0))
-            id = w.argIds[1]
-            konst = w.argConsts[1]
-        }
-
-        const n = nodeOf(id)
-        if (n && n.op === 'apply') {
-            emitEdge(n)
-            return
-        }
-        if (needsControl(id)) {
-            const c = condOf(id)
-            const yesId = armId(id, c, true)
-            const noId = armId(id, c, false)
-            const yes = nodeOf(yesId)
-            const no = nodeOf(noId)
-            const ch = emitValue(c)
-            if (sameEdgeArgs(yes, no)) {
-                const nargs = yes!.argIds.length - 1
-                if (ch < P || ch >= P + nargs) {
-                    const yesBlock = edgeBlock(yes!)
-                    const noBlock = edgeBlock(no!)
-                    emitEdgeCopies(yes!)
-                    asm.jumpIfZero(read(ch, SCRATCH[0]), noBlock)
-                    asm.jump(yesBlock)
-                    return
-                }
-            }
-            const cr = read(ch, SCRATCH[0])
-            const other = nextLabel++
-            asm.jumpIfZero(cr, other)
-            const savedNext = nextHome
-            const savedFree = freeHomes
-            const savedLocals = localOf
-            freeHomes = savedFree.slice()
-            localOf = new Map<number, number>(savedLocals)
-            emitTail(armId(id, c, true), armConst(id, konst, c, true))
-            nextHome = savedNext
-            freeHomes = savedFree
-            localOf = savedLocals
-            asm.bindLabel(other)
-            emitTail(armId(id, c, false), armConst(id, konst, c, false))
-            return
-        }
-        if (id) readInto(emitValue(id, retHome), target.retReg)
-        else asm.movImm(target.retReg, konst)
-        asm.jump(exitLabel)
-    }
-
-    function sameEdgeArgs(a: GraphNode | undefined, b: GraphNode | undefined): boolean {
-        if (!a || !b || a.op !== 'apply' || b.op !== 'apply') return false
-        if (a.argIds.length !== b.argIds.length) return false
-        for (let i = 1; i < a.argIds.length; i++) {
-            if (a.argIds[i] !== b.argIds[i]) return false
-            if (!a.argIds[i] && a.argConsts[i] !== b.argConsts[i]) return false
-        }
-        return true
-    }
-
-    function edgeBlock(n: GraphNode): number {
-        const bi = blockIndex.get(n.argIds[0])
-        if (bi === undefined) throw `lowering2: apply of something that is not a block`
-        const b = g.blocks[bi]
-        const nargs = n.argIds.length - 1
-        if (nargs !== b.params.length) {
-            throw `lowering2: block ${bi} takes ${b.params.length} arguments, given ${nargs}`
-        }
-        return bi
-    }
-
-    function emitEdge(n: GraphNode): void {
-        const bi = edgeBlock(n)
-        emitEdgeCopies(n)
-        asm.jump(bi)
-    }
-
-    function emitEdgeCopies(n: GraphNode): void {
-        const nargs = n.argIds.length - 1
-
-        const arg: number[] = []
-        for (let i = 0; i < nargs; i++) {
-            arg.push(n.argIds[1 + i])
-        }
-
-        function readsHomes(id: number, out: Set<number>, seen: Set<number>): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const h = homeOf.get(id)
-            if (h !== undefined) { out.add(h); return }
-            const l = localOf.get(id)
-            if (l !== undefined) { out.add(l); return }
-            const nd = nodeOf(id)
-            if (!nd) return
-            for (const a of nd.argIds) readsHomes(a, out, seen)
-        }
-
-        function stillWanted(j: number, i: number): boolean {
-            const seen = new Set<number>()
-            if (arg[i]) seen.add(arg[i])
-            const out = new Set<number>()
-            readsHomes(arg[j], out, seen)
-            return out.has(P + i)
-        }
-
-        function emitInto(i: number, into: number): void {
-            if (!arg[i]) {
-                const r = writeReg(into)
-                asm.movImm(r, n.argConsts[1 + i])
-                flush(into, r)
-                return
-            }
-            const from = emitValue(arg[i], into)
-            if (from >= 0) moveHome(from, into)
-        }
-
-        const pending = new Array<boolean>(nargs).fill(true)
-        const parkedAt: number[] = []
-        const parkedFor: number[] = []
-        let remaining = nargs
-        while (remaining > 0) {
-            let moved = false
-            for (let i = 0; i < nargs; i++) {
-                if (!pending[i]) continue
-                let blocked = false
-                for (let j = 0; j < nargs; j++) {
-                    if (j === i || !pending[j]) continue
-                    if (stillWanted(j, i)) { blocked = true; break }
-                }
-                if (blocked) continue
-                emitInto(i, P + i)
-                pending[i] = false
-                remaining--
-                moved = true
-            }
-            if (moved) continue
-            for (let i = 0; i < nargs; i++) {
-                if (!pending[i]) continue
-                const t = takeHome()
-                emitInto(i, t)
-                parkedAt.push(t)
-                parkedFor.push(P + i)
-                pending[i] = false
-                remaining--
-                break
-            }
-        }
-        for (let k = 0; k < parkedAt.length; k++) moveHome(parkedAt[k], parkedFor[k])
-    }
-
-    function frameBytes(): number {
-        const saved = callsOut ? (savedRegs.length + 1) * 8 : 0
-        return (saved + spillCount * 8 + 15) & ~15
-    }
-    function prologue(): void {
-        const fb = frameBytes()
-        if (fb) asm.spAdjust(fb)
-        if (callsOut) {
-            for (let i = 0; i < savedRegs.length; i++) asm.store(SP, i * 8, savedRegs[i], Types.u64)
-            asm.store(SP, savedRegs.length * 8, LR, Types.u64)
-        }
-        if (entryScratchLive) {
-            if (entryCarryHome < 0) throw 'lowering2: entry scratch has no destination'
-            storeHome(entryCarryHome, target.scratch[0])
-            entryScratchLive = false
-        }
-        for (let i = 0; i < P; i++) storeHome(homeOf.get(g.params[i])!, target.argRegs[i])
-    }
-    function epilogue(): void {
-        if (callsOut) {
-            for (let i = 0; i < savedRegs.length; i++) asm.load(savedRegs[i], SP, i * 8, Types.u64)
-            asm.load(LR, SP, savedRegs.length * 8, Types.u64)
-        }
-        const fb = frameBytes()
-        if (fb) asm.spAdjust(-fb)
-    }
-
-    function definePinned(): void {
-        for (const id of pinned) {
-            const h = pinHome.get(id)!
-            moveHome(emitOp(nodeOf(id)!, h), h)
-        }
-    }
-
-    function emitAll(): void {
-        nextLabel = exitLabel + (entryExit ? 2 : 1)
-        entryScratchLive = false
-        for (let i = 0; i < g.blocks.length; i++) {
-            const b = g.blocks[i]
-            asm.bindLabel(i)
-            nextHome = tempBase
-            freeHomes = []
-            localOf = new Map<number, number>()
-            if (i === 0) {
-                if (entryExit) {
-                    let r: number
-                    if (entryExit.load) {
-                        r = target.scratch[0]
-                        asm.load(r, target.argRegs[entryExit.loadBase!], entryExit.load.offset, entryExit.load.T)
-                        entryScratchLive = true
-                    } else {
-                        r = target.argRegs[g.params.indexOf(entryExit.valueId)]
-                    }
-                    if (entryExit.exitWhenZero) asm.jumpIfZero(r, fastExitLabel)
-                    else asm.jumpIfNonZero(r, fastExitLabel)
-                }
-                prologue()
-                definePinned()
-                nextHome = tempBase
-                freeHomes = []
-                localOf = new Map<number, number>()
-            }
-            planHomes(b)
-            if (i === 0 && entryExit) emitTail(entryExit.bodyId, entryExit.bodyConst)
-            else emitTail(b.bodyId, b.bodyConst)
-        }
-        asm.bindLabel(exitLabel)
-        epilogue()
-        asm.ret()
-        if (entryExit) {
-            asm.bindLabel(fastExitLabel)
-            asm.movImm(target.retReg, entryExit.exitConst)
-            asm.ret()
-        }
-    }
-
-    emitAll()
-    for (const r of asm.elidedWrites()) {
-        const n = calleeWrites.get(r) ?? 0
-        if (n > 0) calleeWrites.set(r, n - 1)
-    }
-    savedRegs = pool.filter(r => (calleeWrites.get(r) ?? 0) > 0)
-    spillCount = maxHome > REGS ? maxHome - REGS : 0
-    spillBase = callsOut ? (savedRegs.length + 1) * 8 : 0
-    asm = target.createAssembler()
-    calleeWrites = new Map<number, number>()
-    emitAll()
-
-    return {
-        target,
-        words: asm.words(),
-        bytes: asm.bytes(),
-        listing: asm.listing(),
     }
 }

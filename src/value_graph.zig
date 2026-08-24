@@ -5544,6 +5544,7 @@ pub fn fmtOrdinal(ordinal: u32, buf: []u8, include_dollar: bool) []const u8 {
         buf[0] = '$';
         c += 1;
     }
+    const start = c;
     var n = ordinal;
     while (n > 0) {
         const rem: u8 = @intCast(@rem(n, 10));
@@ -5555,6 +5556,7 @@ pub fn fmtOrdinal(ordinal: u32, buf: []u8, include_dollar: bool) []const u8 {
         buf[c] = '0';
         c += 1;
     }
+    std.mem.reverse(u8, buf[start..c]);
     return buf[0..c];
 }
 

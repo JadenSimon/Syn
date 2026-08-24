@@ -8551,7 +8551,7 @@ pub fn forEachChild(
         .block, .variable_statement, .object_literal_expression, .array_literal_expression, .template_expression, .class_static_block_declaration => {
             try visitList(nodes, maybeUnwrapRef(node) orelse 0, visitor);
         },
-        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .typeof_expression, .spread_element => {
+        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .typeof_expression, .spread_element, .throw_statement => {
             const ref = unwrapRef(node);
             try visitor.visit(nodes.at(ref), ref);
         },
@@ -8643,7 +8643,12 @@ pub fn forEachChild(
             if (d.left != 0) try visitor.visit(nodes.at(d.left), d.left);
             try visitor.visit(nodes.at(d.right), d.right);
         },
-        .case_clause, .default_clause => {
+        .case_clause => {
+            const ref = unwrapRef(node);
+            try visitor.visit(nodes.at(ref), ref);
+            try visitList(nodes, node.len, visitor);
+        },
+        .default_clause => {
             try visitList(nodes, node.len, visitor);
         },
         .switch_statement => {

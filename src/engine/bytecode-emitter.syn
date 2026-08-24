@@ -326,14 +326,14 @@ function emitFunction(
         return reg
     }
 
-    type LoopLabels = { breaks: number[], continues: number[], continueTarget: number }
+    type LoopLabels = { breaks: number[], continues: number[], continueTarget: number, canContinue: boolean }
     let labels: LoopLabels | undefined = undefined
     function emitBreak() {
         if (!labels) throw "`break` outside of a loop"
         labels.breaks.push(emitJumpPlaceholder(Op.Jump))
     }
     function emitContinue() {
-        if (!labels) throw "`continue` outside of a loop"
+        if (!labels?.canContinue) throw "`continue` outside of a loop"
         if (labels.continueTarget >= 0) { emitJumpTo(Op.Jump, labels.continueTarget); return }
         labels.continues.push(emitJumpPlaceholder(Op.Jump))
     }
@@ -841,6 +841,15 @@ function emitFunction(
         const robj = allocReg(); star(robj)
         defer freeReg()
 
+        if (target.kind === ts.SyntaxKind.ElementAccessExpression) {
+            const key = tryFoldExp(target.argumentExpression)
+            if (key?.[0] === 'value' && typeof key[1] === 'number') {
+                if (!Number.isInteger(key[1]) || key[1] < 0 || key[1] > 0xFF) throw 'array index does not fit in bytecode'
+                finishPropertyAccessAssignment(node, Op.GetPropertyImm, Op.SetPropertyImm, robj, key[1])
+                return
+            }
+        }
+
         const keySlot = isConstName ? internString(target.name.text) : allocReg()
         defer if (!isConstName) freeReg()
 
@@ -917,6 +926,15 @@ function emitFunction(
         }
 
         if (receiverReg !== undefined && shouldSpillRecv) star(receiverReg)
+
+        if (node.kind === ts.SyntaxKind.ElementAccessExpression) {
+            const key = tryFoldExp(node.argumentExpression)
+            if (key?.[0] === 'value' && typeof key[1] === 'number') {
+                if (!Number.isInteger(key[1]) || key[1] < 0 || key[1] > 0xFF) throw 'array index does not fit in bytecode'
+                emit2(Op.GetPropertyImm, key[1])
+                return
+            }
+        }
 
         const isConstName = node.kind === ts.SyntaxKind.PropertyAccessExpression
         const keySlot = isConstName ? internString(node.name.text) : allocReg()
@@ -1107,6 +1125,22 @@ function emitFunction(
         ldar(robj)
     }
 
+    function emitArrayLiteral(node: ts.ArrayLiteralExpression): void {
+        if (node.elements.length > 0x100) throw 'array literals larger than 256 elements are not supported'
+        emit1(Op.CreateEmptyArray)
+        const rarray = allocReg()
+        star(rarray)
+        defer freeReg()
+        for (let i = 0; i < node.elements.length; i++) {
+            const element = node.elements[i]
+            if (ts.isSpreadElement(element)) throw 'spread array elements are not supported'
+            if (ts.isOmittedExpression(element)) emit1(Op.LdaUndefined)
+            else emitExpr(element)
+            emit3(Op.SetPropertyImm, rarray, i)
+        }
+        ldar(rarray)
+    }
+
     function emitExpr(node: ts.Expression): void {
         if (const r = tryFoldExp(node)) {
             if (r[0] === 'value') {
@@ -1128,6 +1162,7 @@ function emitFunction(
         if (ts.isPrefixUnaryExpression(node)) { emitPrefixUnary(node); return }
         if (ts.isPostfixUnaryExpression(node)) { emitPostfixUnary(node); return }
         if (ts.isConditionalExpression(node)) { emitConditionalExp(node); return }
+        if (ts.isArrayLiteralExpression(node)) { emitArrayLiteral(node); return }
         if (ts.isObjectLiteralExpression(node)) { emitObjectLiteral(node); return }
         if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) { 
             return void emitPropertyAccess(node);
@@ -1279,7 +1314,7 @@ function emitFunction(
 
         const saveLabels = labels
         defer labels = saveLabels
-        const ctx = { breaks: [], continues: [], continueTarget: -1 }
+        const ctx = { breaks: [], continues: [], continueTarget: -1, canContinue: true }
         labels = ctx
         skipNextLookbehind = true
 
@@ -1327,7 +1362,7 @@ function emitFunction(
 
         const saveLabels = labels
         defer labels = saveLabels
-        const ctx = { breaks: [], continues: [], continueTarget: -1 }
+        const ctx = { breaks: [], continues: [], continueTarget: -1, canContinue: true }
         labels = ctx
         skipNextLookbehind = true
 
@@ -1386,7 +1421,134 @@ function emitFunction(
     }
 
     function emitSwitch(node: ts.SwitchStatement) {
-        
+        const savedReg = nextReg
+        defer nextReg = savedReg
+
+        emitExpr(node.expression)
+        const discriminant = allocReg()
+        star(discriminant)
+
+        const clauses = node.caseBlock.clauses
+        const targets: number[][] = clauses.map(() => [])
+        const defaults: number[] = []
+        let defaultClause = -1
+        const integers: { value: number, clause: number }[] = []
+        let allIntegers = true
+        for (let i = 0; i < clauses.length; i++) {
+            const clause = clauses[i]
+            if (ts.isDefaultClause(clause)) {
+                if (defaultClause < 0) defaultClause = i
+                continue
+            }
+            const folded = tryFoldExp(clause.expression)
+            if (!folded || folded[0] !== 'value' || typeof folded[1] !== 'number'
+                || !Number.isInteger(folded[1])) {
+                allIntegers = false
+                continue
+            }
+            integers.push({ value: folded[1], clause: i })
+        }
+
+        function jumpToDefault(): void {
+            defaults.push(emitJumpPlaceholder(Op.Jump))
+        }
+        function match(value: number, clause: number): void {
+            emitNumber(value)
+            emit2(Op.TestStrictEqual, discriminant)
+            targets[clause].push(emitJumpPlaceholder(Op.JumpIfToBooleanTrue))
+        }
+
+        const firstByValue = new Map<number, { value: number, clause: number }>()
+        if (allIntegers) {
+            for (const entry of integers) {
+                if (!firstByValue.has(entry.value)) firstByValue.set(entry.value, entry)
+            }
+        }
+        const unique = [...firstByValue.values()]
+
+        if (allIntegers && unique.length) {
+            unique.sort((a, b) => a.value - b.value)
+            const min = unique[0].value
+            const max = unique[unique.length - 1].value
+            const span = max - min + 1
+            const dense = unique.length >= 3 && span <= unique.length * 2
+            if (dense) {
+                if (min === 0) ldar(discriminant)
+                else {
+                    emitNumber(min)
+                    const bias = allocReg(); star(bias)
+                    ldar(discriminant)
+                    emit2(Op.Sub, bias)
+                    freeReg()
+                }
+                const index = allocReg(); star(index)
+                emitNumber(span - 1)
+                emit2(Op.TestLessThan, index)
+                defaults.push(emitJumpPlaceholder(Op.JumpIfToBooleanTrue))
+                emitNumber(4)
+                const scale = allocReg(); star(scale)
+                ldar(index)
+                emit2(Op.Mul, scale)
+                freeReg()
+                freeReg()
+                emit1(Op.JumpAcc)
+                const byValue = new Map<number, number>()
+                for (const entry of unique) byValue.set(entry.value, entry.clause)
+                for (let value = min; value <= max; value++) {
+                    const clause = byValue.get(value)
+                    const at = emitJumpPlaceholder(Op.Jump)
+                    if (clause === undefined) defaults.push(at)
+                    else targets[clause].push(at)
+                }
+            } else {
+                unique.sort((a, b) => (a.value >>> 0) - (b.value >>> 0))
+                function tree(entries: typeof unique): void {
+                    if (!entries.length) { jumpToDefault(); return }
+                    const mid = entries.length >> 1
+                    const pivot = entries[mid]
+                    match(pivot.value, pivot.clause)
+                    const left = entries.slice(0, mid)
+                    const right = entries.slice(mid + 1)
+                    if (!left.length) { tree(right); return }
+                    if (!right.length) { tree(left); return }
+                    emitNumber(pivot.value)
+                    emit2(Op.TestGreaterThan, discriminant)
+                    const toRight = emitJumpPlaceholder(Op.JumpIfToBooleanFalse)
+                    tree(left)
+                    patchJump(toRight)
+                    tree(right)
+                }
+                tree(unique)
+            }
+        } else {
+            for (let i = 0; i < clauses.length; i++) {
+                const clause = clauses[i]
+                if (ts.isDefaultClause(clause)) continue
+                emitExpr(clause.expression)
+                emit2(Op.TestStrictEqual, discriminant)
+                targets[i].push(emitJumpPlaceholder(Op.JumpIfToBooleanTrue))
+            }
+            jumpToDefault()
+        }
+
+        const savedLabels = labels
+        defer labels = savedLabels
+        const ctx: LoopLabels = {
+            breaks: [],
+            continues: savedLabels?.continues ?? [],
+            continueTarget: savedLabels?.continueTarget ?? -1,
+            canContinue: savedLabels?.canContinue ?? false,
+        }
+        labels = ctx
+        freeReg()
+        for (let i = 0; i < clauses.length; i++) {
+            for (const at of targets[i]) patchJump(at)
+            if (i === defaultClause) for (const at of defaults) patchJump(at)
+            skipNextLookbehind = true
+            for (const statement of clauses[i].statements) emitStatement(statement)
+        }
+        if (defaultClause < 0) for (const at of defaults) patchJump(at)
+        for (const at of ctx.breaks) patchJump(at)
     }
 
     function emitStatement(node: ts.Statement) {
@@ -1403,6 +1565,7 @@ function emitFunction(
         if (ts.isIfStatement(node)) { emitIf(node); return }
         if (ts.isWhileStatement(node)) { emitWhile(node); return }
         if (ts.isForStatement(node)) { emitFor(node); return }
+        if (ts.isSwitchStatement(node)) { emitSwitch(node); return }
         if (ts.isBreakStatement(node)) {
             if (node.label) throw "labeled break is not supported"
             emitBreak(); return
@@ -1549,6 +1712,7 @@ const RegOperandCounts: Record<number, number> = {
     [Op.GetProperty]: 1,
     [Op.SetProperty]: 2,
     [Op.SetPropertyConst]: 1,
+    [Op.SetPropertyImm]: 1,
 }
 
 export type CodeInstruction = {
@@ -1642,6 +1806,7 @@ export function createCodeIterator(bytes: readonly u8[]) {
         if (opcode === Op.Return || opcode === Op.Throw || opcode === Op.ReThrow) {
             inst.readsAcc = true
         }
+        if (opcode === Op.JumpAcc) inst.readsAcc = true
 
         const regCount = RegOperandCounts[opcode]
         if (regCount !== undefined) {
@@ -1662,6 +1827,15 @@ export function createCodeIterator(bytes: readonly u8[]) {
             if (ConstOps.has(opcode)) {
                 inst.constSlot = width === 8 ? undefined : readUnsigned(width as 1 | 2 | 4)
             }
+            if (opcode === Op.SetPropertyImm) {
+                inst.imm = width === 8 ? undefined : readUnsigned(width as 1 | 2 | 4)
+            }
+            return inst
+        }
+
+        if (opcode === Op.GetPropertyImm) {
+            inst.readsAcc = inst.writesAcc = true
+            inst.imm = width === 8 ? undefined : readUnsigned(width as 1 | 2 | 4)
             return inst
         }
 
@@ -2017,6 +2191,61 @@ function runTest() {
     console.log("compiled nested: f(5)=", e2eTest(nestSrc, [5]))
     intrinsics.assert(e2eTest(nestSrc, [5]) === 10)
 
+    function opcodes(src: string): number[] {
+        const it = createCodeIterator(compile(src).code as u8[])
+        const out: number[] = []
+        while (const inst = it.next()) out.push(inst.opcode)
+        return out
+    }
+
+    const denseSwitch = `function denseSwitch(x) {
+        let y = 0
+        switch (x) {
+            case 10: y = 100; break
+            case 11: y = 110
+            case 12: y += 2; break
+            case 14: return 140
+            default: y = 9
+        }
+        return y
+    }`
+    assert(opcodes(denseSwitch).includes(Op.JumpAcc))
+    e2eTest(denseSwitch, [10])
+    e2eTest(denseSwitch, [11])
+    e2eTest(denseSwitch, [12])
+    e2eTest(denseSwitch, [13])
+    e2eTest(denseSwitch, [14])
+
+    const sparseSwitch = `function sparseSwitch(x) {
+        switch (x) {
+            case 1: return 10
+            case 100: return 20
+            case 10000: return 30
+            case 100000: return 40
+            default: return 50
+        }
+    }`
+    const sparseOps = opcodes(sparseSwitch)
+    assert(!sparseOps.includes(Op.JumpAcc))
+    assert(sparseOps.includes(Op.TestGreaterThan))
+    e2eTest(sparseSwitch, [1])
+    e2eTest(sparseSwitch, [10000])
+    e2eTest(sparseSwitch, [99])
+
+    const generalSwitch = `function generalSwitch(x, a, b) {
+        switch (x) {
+            case a: return 10
+            default: return 30
+            case b: return 20
+        }
+    }`
+    const generalOps = opcodes(generalSwitch)
+    assert(!generalOps.includes(Op.JumpAcc))
+    assert(!generalOps.includes(Op.TestGreaterThan))
+    e2eTest(generalSwitch, [7, 7, 8])
+    e2eTest(generalSwitch, [8, 7, 8])
+    e2eTest(generalSwitch, [9, 7, 8])
+
     e2eTest(
         'function apply(f, x) { return f(x) }', 
         [function addOne(x: number) { return x + 1 }, 5]
@@ -2060,6 +2289,9 @@ function runTest() {
 
     // read after write
     e2eTest('function assignThenRead(o, y) { o.x = y; return o.x }', [{}, 7])
+
+    e2eTest('function arrayLiteral(a, b) { const x = [a, b]; return x[0] + x[1] + x.length }', [4, 7])
+    e2eTest('function arrayStore(a) { const x = [1, 2]; x[1] = a; return x[1] }', [9])
 
     // compound property assignment
     e2eTest('function compoundProp(o) { o.x += 5; return o.x }', [{ x: 10 }])
