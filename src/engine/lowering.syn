@@ -20,7 +20,15 @@ export interface Target {
     readonly volatiles: number[]
     readonly callerSaved: number[]
     readonly calleeSaved: number[]
+    readonly syscall: SyscallConvention
     createAssembler(): Assembler
+}
+
+export interface SyscallConvention {
+    readonly numberReg: number
+    readonly argRegs: number[]
+    readonly retReg: number
+    readonly trap: number
 }
 
 export interface Assembler {
@@ -43,7 +51,9 @@ export interface Assembler {
     jump(id: number): void
     jumpIfNonZero(reg: number, id: number): void
     jumpIfZero(reg: number, id: number): void
+    br(reg: number): void
     blr(reg: number): void
+    syscall(id: number): void
     ret(): void
     elidedWrites(): number[]
     words(): number[]
@@ -108,9 +118,25 @@ interface AsmItem {
     zeroReg?: number
     adjustReg?: number   // for self-modifying `add/sub rn, rn, #imm`
     adjustDelta?: number // signed: +imm for add, -imm for sub
+    moveDst?: number
+    moveSrc?: number
 }
 
-export function createAarch64Assembler(): Assembler {
+export const aarch64DarwinSyscall: SyscallConvention = {
+    numberReg: 16,
+    argRegs: [0, 1, 2, 3, 4, 5],
+    retReg: 0,
+    trap: 0x80,
+}
+
+export const aarch64LinuxSyscall: SyscallConvention = {
+    numberReg: 8,
+    argRegs: [0, 1, 2, 3, 4, 5],
+    retReg: 0,
+    trap: 0,
+}
+
+export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall): Assembler {
     const items: AsmItem[] = []
     const removedWrites: number[] = []
     let finished = false
@@ -235,6 +261,26 @@ export function createAarch64Assembler(): Assembler {
     }
 
     function peephole(): void {
+        const values: number[] = []
+        function resetMoves(): void {
+            for (let r = 0; r < 32; r++) values[r] = r
+        }
+        resetMoves()
+        for (let i = 0; i < items.length; i++) {
+            const it = items[i]
+            if (it.moveDst === undefined) {
+                resetMoves()
+                continue
+            }
+            const dst = it.moveDst
+            const value = values[it.moveSrc!]
+            if (values[dst] === value) {
+                items.splice(i--, 1)
+                continue
+            }
+            values[dst] = value
+        }
+
         let changed = true
         while (changed) {
             changed = false
@@ -275,6 +321,21 @@ export function createAarch64Assembler(): Assembler {
                 }
 
                 if (it.adjustReg !== undefined && i + 1 < items.length) {
+                    if (items[i + 1].storeBytes === 8 && i + 2 < items.length) {
+                        const next = items[i + 2]
+                        const offset = items[i + 1].storeOffset!
+                        if (next.storeBytes === 8 && next.storeBase === items[i + 1].storeBase
+                            && next.storeOffset === offset + 8 && offset >= -512 && offset <= 504) {
+                            const imm = offset / 8
+                            items[i + 1].word = (0xA9000000 | ((imm & 0x7F) << 15) | (next.reg << 10)
+                                | (items[i + 1].storeBase! << 5) | items[i + 1].reg) >>> 0
+                            items[i + 1].text = `stp ${x(items[i + 1].reg)}, ${x(next.reg)}, [${base(items[i + 1].storeBase!)}, #${offset}]`
+                            items[i + 1].storeBytes = undefined
+                            items.splice(i + 2, 1)
+                            changed = true
+                            break
+                        }
+                    }
                     const nx = items[i + 1]
                     const rn = it.adjustReg!
                     const delta = it.adjustDelta!
@@ -685,7 +746,11 @@ export function createAarch64Assembler(): Assembler {
 
     function mov(dst: number, src: number): void {
         if (dst === src) return
-        emit(0xAA0003E0 | (src << 16) | dst, `mov ${x(dst)}, ${x(src)}`)
+        items.push({
+            kind: 'insn', word: (0xAA0003E0 | (src << 16) | dst) >>> 0,
+            text: `mov ${x(dst)}, ${x(src)}`, label: -1, reg: -1, cond: -1,
+            moveDst: dst, moveSrc: src,
+        })
     }
 
     function binary(op: string, dst: number, a: number, b: number, signed: boolean): void {
@@ -871,7 +936,16 @@ export function createAarch64Assembler(): Assembler {
         jumpIfZero: (reg, id) => {
             items.push({ kind: 'cbz', word: 0, text: '', label: id, reg, cond: -1 })
         },
+        br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`),
         blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
+        syscall: (id: number) => {
+            movImm(syscallConvention.numberReg, id)
+            const trap = syscallConvention.trap
+            if (!Number.isInteger(trap) || trap < 0 || trap > 0xFFFF) {
+                throw `aarch64: invalid syscall trap ${trap}`
+            }
+            emit(0xD4000001 | (trap << 5), `svc #${trap}`)
+        },
         ret: () => emit(0xD65F03C0, 'ret'),
         elidedWrites: () => {
             resolve()
@@ -917,11 +991,19 @@ export const aarch64: Target = {
     volatiles: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 30],
     callerSaved: [9, 10, 11, 12, 13, 14, 15],
     calleeSaved: [19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+    syscall: aarch64DarwinSyscall,
 
     // fp: 29
     // link reg: 30
     // sp: 31
-    createAssembler: createAarch64Assembler,
+    createAssembler: () => createAarch64Assembler(aarch64DarwinSyscall),
+}
+
+export const aarch64Linux: Target = {
+    ...aarch64,
+    name: 'aarch64-linux',
+    syscall: aarch64LinuxSyscall,
+    createAssembler: () => createAarch64Assembler(aarch64LinuxSyscall),
 }
 
 export interface LowerOptions {

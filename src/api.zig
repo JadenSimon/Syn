@@ -628,6 +628,22 @@ pub fn toNativePtrAddr(handle: u32) !usize {
     return ptr;
 }
 
+pub fn getArrayBufferPtr(b: js.ArrayBuffer) !usize {
+    return @intFromPtr(b.buf.ptr);
+}
+
+extern "c" fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
+extern "c" fn dlsym(handle: *anyopaque, name: [*:0]const u8) ?*anyopaque;
+
+pub fn lookupNativeSymbol(name: js.UTF8String) !usize {
+    const symbol = try getAllocator().allocSentinel(u8, name.data.len, 0);
+    defer getAllocator().free(symbol);
+    @memcpy(symbol, name.data);
+    const handle = dlopen(null, 1) orelse return error.FailedToOpenCurrentProcess;
+    const ptr = dlsym(handle, symbol) orelse return error.NativeSymbolNotFound;
+    return @intFromPtr(ptr);
+}
+
 const builtin = @import("builtin");
 const posix = std.posix;
 

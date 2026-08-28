@@ -29,12 +29,25 @@ function isReferencedSymbol(node: ts.Node) {
     return (node as any).isReferencedSymbol?.() ?? false
 }
 
+function getEncodedLocation(node: ts.Node) {
+    return (node as any).location ?? 0
+}
+
+function getDecodedLocation(loc: number): { line: number; col: number } {
+    return (ts as any).decodeLocation(loc)
+}
+
 enum ConstantKind {
     number,
     string,
     function_, // ??? FIXME: this breaks if you try to use "function" because it gets treated as a keyword :/
     late_bound, // so, unknown
+    nested_function,
+    scope,
 }
+
+type ScopeBinding = { slot: number, parentSlot: number }
+type OuterSymbol = { scopeSlot: number, reg: number }
 
 interface EhRange {
     start: number
@@ -56,6 +69,8 @@ export type EmitResult = {
     lateBound: Map<number, number> // symbol id -> constant pool slot
     selfSlot?: number
     labels?: Labels
+    scopeBindings: ScopeBinding[]
+    sourceMapping: [pc: number, pos: number][] // uses encoded line/col
 }
 
 function isShortStore(opcode: number) {
@@ -68,15 +83,56 @@ function isShortLoad(opcode: number) {
 
 function emitFunction(
     fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression,
-    constContext?: Record<string, any> // will be used to specialize bytecode later
+    constContext?: Record<string, any>,
+    outerSymbols: Map<number, OuterSymbol> = new Map<number, OuterSymbol>(),
 ): EmitResult {
     const code: number[] = []
     const constants: any[] = []
     const constantKinds: ConstantKind[] = []
+    const sourceMapping: EmitResult['sourceMapping'] = []
 
     const internMap = new Map<string, number>()  // interning key -> slot
     const symToReg = new Map<number, number>()    // symbol id -> register
     const lateBound = new Map<number, number>()   // symbol id -> constant slot
+    const scopedSymbols = new Map<number, OuterSymbol>()
+    const scopeSlots = new Map<number, number>()
+    const scopeBindings: ScopeBinding[] = []
+
+    function bindScope(outer: OuterSymbol): OuterSymbol {
+        let slot = scopeSlots.get(outer.scopeSlot)
+        if (slot === undefined) {
+            slot = constants.length
+            constants.push(0)
+            constantKinds.push(ConstantKind.scope)
+            scopeSlots.set(outer.scopeSlot, slot)
+            scopeBindings.push({ slot, parentSlot: outer.scopeSlot })
+        }
+        return { scopeSlot: slot, reg: outer.reg }
+    }
+    function scopedSymbol(symId: number): OuterSymbol | undefined {
+        const prev = scopedSymbols.get(symId)
+        if (prev) return prev
+        const outer = outerSymbols.get(symId)
+        if (!outer) return
+        const scoped = bindScope(outer)
+        scopedSymbols.set(symId, scoped)
+        return scoped
+    }
+
+    // only used for source mapping
+    // DOES NOT COVER MUCH CURRENTLY
+    // mainly covers idents
+    let currentNode: ts.Node = fn
+    function emitSourceMapping() {
+        const pos = getEncodedLocation(currentNode)
+        if (!pos) return
+        const top = sourceMapping[sourceMapping.length - 1]
+        if (top?.[1] !== pos) {
+            const pc = lookbehind(0)
+            if (pc === undefined) return
+            sourceMapping.push([pc, pos])
+        }
+    }
 
     const regState: [number, number][] = [] // tracks the most recent store pc against the reg
     const maxLookbehind = 16
@@ -153,13 +209,15 @@ function emitFunction(
     function emit1(op: number) { 
         prevOpOffset = code.length
         pushLookbehind(prevOpOffset)
-        code.push(op) 
+        code.push(op)
+        emitSourceMapping()
     }
     function emit2(op: number, operand: number) {
         prevOpOffset = code.length
         pushLookbehind(prevOpOffset)
         code.push(op);
         emitByte(operand)
+        emitSourceMapping()
     }
     function emit3(op: number, operand1: number, operand2: number) {
         prevOpOffset = code.length
@@ -167,6 +225,7 @@ function emitFunction(
         code.push(op)
         emitByte(operand1)
         emitByte(operand2)
+        emitSourceMapping()
     }
     function emit4(op: number, operand1: number, operand2: number, operand3: number) {
         prevOpOffset = code.length
@@ -175,6 +234,7 @@ function emitFunction(
         emitByte(operand1)
         emitByte(operand2)
         emitByte(operand3)
+        emitSourceMapping()
     }
     function star(reg: number) {
         const pc = code.length
@@ -217,6 +277,7 @@ function emitFunction(
         } else {
             code.push(Op.Ldar, reg)
         }
+        emitSourceMapping()
     }
 
     function emitLoadImm(val: number) {
@@ -429,6 +490,11 @@ function emitFunction(
                 return hasEffects((node as ts.BinaryExpression).left) || hasEffects((node as ts.BinaryExpression).right)
             case ts.SyntaxKind.ConditionalExpression:
                 return hasEffects((node as ts.ConditionalExpression).condition) || hasEffects((node as ts.ConditionalExpression).whenTrue) || hasEffects((node as ts.ConditionalExpression).whenFalse)
+            case ts.SyntaxKind.TemplateExpression:
+                for (const span of (node as ts.TemplateExpression).templateSpans) {
+                    if (hasEffects(span.expression)) return true
+                }
+                return false
             case ts.SyntaxKind.TrueKeyword:
             case ts.SyntaxKind.FalseKeyword:
             case ts.SyntaxKind.NullKeyword:
@@ -476,6 +542,13 @@ function emitFunction(
                         inner = Math.max(inner, 1 + visit(x, true))
                     }
                     return (isAcc ? 0 : 1) + inner
+
+                case ts.SyntaxKind.TemplateExpression:
+                    let templateInner = 0
+                    for (const span of (n as ts.TemplateExpression).templateSpans) {
+                        templateInner = Math.max(templateInner, visit(span.expression, true))
+                    }
+                    return (isAcc ? 0 : 1) + 2 + templateInner
 
                 case ts.SyntaxKind.ObjectLiteralExpression:
                     const properties = (n as ts.ObjectLiteralExpression).properties
@@ -887,6 +960,23 @@ function emitFunction(
         if (!ts.isIdentifier(target)) throw `unsupported assignment target: ${ts.SyntaxKind[target.kind]}`
         const symId = getSymbolId(target)
         if (symId === 0) throw `non-lexical assignment target: ${target.getText()}`
+        const scoped = scopedSymbol(symId)
+        if (scoped) {
+            const kind = node.operatorToken.kind
+            if (kind === ts.SyntaxKind.EqualsToken) {
+                emitExpr(node.right)
+                emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
+                return
+            }
+            const op = compoundBinaryOp(kind)
+            emitExpr(node.right)
+            const rhs = allocReg(); star(rhs)
+            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            emit2(op, rhs)
+            freeReg()
+            emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
+            return
+        }
         if (isLateBoundSymbol(target)) throw `cannot assign to free variable: ${target.getText()}`
         const reg = symToReg.get(symId)
         if (reg === undefined) {
@@ -1084,13 +1174,21 @@ function emitFunction(
     }
 
     function emitIdentifier(node: ts.Identifier) {
+        const saveCurrentNode = currentNode
+        defer currentNode = saveCurrentNode
+        currentNode = node
+
         const symId = getSymbolId(node)
         if (symId === 0) throw `non-lexical identifier: ${node.getText()}`
-        if (isLateBoundSymbol(node)) { emitLoadConst(lateBoundSlot(symId, node.getText())); return }
+        if (const scoped = scopedSymbol(symId)) {
+            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            return
+        }
         const reg = symToReg.get(symId)
         if (reg !== undefined) {
             return ldar(reg)
         }
+        if (isLateBoundSymbol(node)) { emitLoadConst(lateBoundSlot(symId, node.getText())); return }
         // was folded
         const v = foldedVariables.get(symId)
         if (!v) {
@@ -1141,7 +1239,35 @@ function emitFunction(
         ldar(rarray)
     }
 
+    function emitTemplateExpression(node: ts.TemplateExpression): void {
+        emitLoadConst(internString(node.head.text))
+        const result = allocReg()
+        star(result)
+        defer freeReg()
+        function concat(): void {
+            const value = allocReg()
+            star(value)
+            ldar(result)
+            emit2(Op.Add, value)
+            star(result)
+            freeReg()
+        }
+        for (const span of node.templateSpans) {
+            emitExpr(span.expression)
+            concat()
+            if (span.literal.text) {
+                emitLoadConst(internString(span.literal.text))
+                concat()
+            }
+        }
+        ldar(result)
+    }
+
     function emitExpr(node: ts.Expression): void {
+        const saveCurrentNode = currentNode
+        defer currentNode = saveCurrentNode
+        currentNode = node
+
         if (const r = tryFoldExp(node)) {
             if (r[0] === 'value') {
                 return emitLiteral(r[1])
@@ -1162,6 +1288,7 @@ function emitFunction(
         if (ts.isPrefixUnaryExpression(node)) { emitPrefixUnary(node); return }
         if (ts.isPostfixUnaryExpression(node)) { emitPostfixUnary(node); return }
         if (ts.isConditionalExpression(node)) { emitConditionalExp(node); return }
+        if (ts.isTemplateExpression(node)) { emitTemplateExpression(node); return }
         if (ts.isArrayLiteralExpression(node)) { emitArrayLiteral(node); return }
         if (ts.isObjectLiteralExpression(node)) { emitObjectLiteral(node); return }
         if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) { 
@@ -1553,6 +1680,11 @@ function emitFunction(
 
     function emitStatement(node: ts.Statement) {
         if (isDeadCode(node)) return
+
+        const saveCurrentNode = currentNode
+        defer currentNode = saveCurrentNode
+        currentNode = node
+  
         if (ts.isReturnStatement(node)) {
             if (node.expression) emitExpr(node.expression)
             else emit1(Op.LdaUndefined) // clobber
@@ -1578,7 +1710,24 @@ function emitFunction(
             emitExpr(node.expression)
             return void emit1(Op.Throw)
         }
-        if (ts.isFunctionDeclaration(node)) throw "nested function declarations are not supported"
+        if (ts.isFunctionDeclaration(node)) {
+            if (!node.name) throw 'nested function declaration has no name'
+            const reg = allocReg()
+            symToReg.set(getSymbolId(node.name), reg)
+            const childOuter = new Map<number, OuterSymbol>()
+            for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
+            for (const [sym, location] of outerSymbols) {
+                const scoped = scopedSymbol(sym)
+                if (scoped) childOuter.set(sym, scoped)
+            }
+            const nested = emitFunction(node, constContext, childOuter)
+            const slot = constants.length
+            constants.push(nested)
+            constantKinds.push(ConstantKind.nested_function)
+            emit2(Op.CreateClosure, slot)
+            star(reg)
+            return
+        }
         throw `unsupported statement: ${ts.SyntaxKind[node.kind]}`
     }
 
@@ -1631,6 +1780,10 @@ function emitFunction(
     if (!ts.isArrowFunction(fn) && fn.name && isReferencedSymbol(fn.name)) {
         const slot = lateBoundSlot(getSymbolId(fn.name), fn.name.text, ConstantKind.function_)
         selfSlot = slot
+        const reg = allocReg()
+        symToReg.set(getSymbolId(fn.name), reg)
+        emitLoadConst(slot)
+        star(reg)
     }
 
     if (!fn.body) throw "function has no body"
@@ -1655,6 +1808,8 @@ function emitFunction(
         lateBound,
         selfSlot,
         labels: extraLabels,
+        scopeBindings,
+        sourceMapping,
     }
 }
 
@@ -1694,7 +1849,7 @@ const OpNames: Record<number, string> = {}
 for (const [name, val] of Object.entries(Op)) OpNames[val as number] = name
 
 const ImmOps = new Set([Op.LdaImm])
-const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst])
+const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst, Op.CreateClosure])
 export const ConditionalJumpOps = new Set([Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfNotUndefined, Op.JumpIfNotNull, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
 const JumpOps = new Set([Op.Jump, ...ConditionalJumpOps])
 
@@ -1792,6 +1947,13 @@ export function createCodeIterator(bytes: readonly u8[]) {
             inst.opname = 'Mov'
             const val = readByte()
             inst.regs.push(val & 0xF, val >> 4) // dst, src
+            return inst
+        }
+        if (opcode === Op.LoadFrame || opcode === Op.StoreFrame) {
+            inst.readsAcc = opcode === Op.StoreFrame
+            inst.writesAcc = opcode === Op.LoadFrame
+            inst.constSlot = readByte()
+            readByte()
             return inst
         }
         if (inst.opname.endsWith('Const')) {
@@ -1939,7 +2101,8 @@ export function isAlwaysLiteral(inst: CodeInstruction): boolean {
     return inst.opcode >= Op.LdaConst && inst.opcode <= Op.LdaFalse
 }
 
-export function disassemble(code: readonly u8[], paramCount?: number, maxRegs?: number): string {
+export function disassemble(code: readonly u8[], paramCount?: number, maxRegs?: number, mappings?: EmitResult['sourceMapping']): string {
+    const pcToEncodedLoc = new Map<number, number>(mappings)
     const it = createCodeIterator(code)
     const lines: string[] = []
     while (const inst = it.next()) {
@@ -1957,6 +2120,10 @@ export function disassemble(code: readonly u8[], paramCount?: number, maxRegs?: 
         if (inst.imm !== undefined) line = line + ` #${inst.imm}`
         if (inst.jumpTarget !== undefined) line = line + ` -> ${inst.jumpTarget} (${inst.jumpOffset! >= 0 ? '+' : ''}${inst.jumpOffset})`
         if (inst.jumpLabel !== undefined) line = line + ` -> [label:${inst.jumpLabel}]`
+        if (const loc = pcToEncodedLoc.get(inst.pos)) {
+            const lc = getDecodedLocation(loc)
+            line = line.padEnd(32, ' ') + ` @ ${lc.line+1}:${lc.col+1}`
+        }
         lines.push(line)
     }
     return lines.join('\n')
@@ -2004,14 +2171,31 @@ export function finalize(
             constants[i] = fromJsValue(ctx[name])
             continue
         }
+        if (kinds[i] === ConstantKind.nested_function) {
+            constants[i] = finalize(result.constants[i], ctx, compileFn, fromJsValue)
+            continue
+        }
+        if (kinds[i] === ConstantKind.scope) {
+            constants[i] = 0
+            continue
+        }
         if (kinds[i] === ConstantKind.string) constants[i] = heap.fromJsString(result.constants[i])
         else constants[i] = result.constants[i]
     }
     const res = makeFunctionFromBytes(result.code, result.paramCount as u16, result.registerCount as u32, constants)
+    if (result.scopeBindings.length) {
+        const fn = heap.FunctionBytecode(res)
+        fn.scopeBindingsCount = result.scopeBindings.length as u32
+        const bindings = intrinsics.Alloc(heap.ScopeBinding, fn.scopeBindingsCount)
+        fn.scopeBindings = Intrinsics.addressof(bindings)
+        for (let i: u32 = 0; i < fn.scopeBindingsCount; i++) {
+            bindings[i].slot = result.scopeBindings[i].slot as u32
+            bindings[i].parentSlot = result.scopeBindings[i].parentSlot as u32
+        }
+    }
     if (result.selfSlot !== undefined) {
-        // FIXME: the above check is broken in native mode!
         const v = heap.FunctionBytecode(res)
-        Intrinsics.store(v.constants, result.selfSlot*4 as u32, res, Types.u32)
+        Intrinsics.store(v.constants, result.selfSlot*8 as u32, res, Types.u64)
     }
     if (result.labels !== undefined) {
         const ehArr = result.labels.eh
@@ -2245,7 +2429,6 @@ function runTest() {
     e2eTest(generalSwitch, [7, 7, 8])
     e2eTest(generalSwitch, [8, 7, 8])
     e2eTest(generalSwitch, [9, 7, 8])
-
     e2eTest(
         'function apply(f, x) { return f(x) }', 
         [function addOne(x: number) { return x + 1 }, 5]
@@ -2292,6 +2475,7 @@ function runTest() {
 
     e2eTest('function arrayLiteral(a, b) { const x = [a, b]; return x[0] + x[1] + x.length }', [4, 7])
     e2eTest('function arrayStore(a) { const x = [1, 2]; x[1] = a; return x[1] }', [9])
+    e2eTest('function nestedCapture(a) { let x = 2; function add(b) { x = x + b; return x + a } return add(3) }', [7])
 
     // compound property assignment
     e2eTest('function compoundProp(o) { o.x += 5; return o.x }', [{ x: 10 }])

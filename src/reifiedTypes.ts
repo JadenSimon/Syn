@@ -219,7 +219,10 @@ export function createTypeNamespace() {
             }
             (this as any)[Symbol.iterator] = () => this.elements.map(x => x.type)[Symbol.iterator]()
         }
-        slice(a: number, b?: number) {
+        map(cb: any) {
+            return this.elements.map(x => cb(x.type))
+        }
+        slice(a?: number, b?: number) {
             return this.elements.slice(a, b).map(x => x.type)
         }
     }
@@ -721,6 +724,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         __argv: (reifier as any).__argv,
         console: console,
         performance,
+        process,
         Buffer,
         JSON,
         TextDecoder,

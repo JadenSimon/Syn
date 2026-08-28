@@ -22,6 +22,7 @@ enum BaseTypeKind {
     array = 5,
     object = 6,
     fn = 7,
+    proxy = 8,
 
     string_table = 128,
     native_struct = 132,
@@ -164,6 +165,25 @@ interface HeapObject {
 }
 
 const HeapObject = intrinsics.DefineStructView(reify HeapObject)
+
+interface HeapProxy {
+    td: Handle
+    properties: Handle
+    getter: Handle
+    setter: Handle
+}
+
+const HeapProxy = intrinsics.DefineStructView(reify HeapProxy)
+const proxyTD = allocTypeDescriptor(BaseTypeKind.proxy, 0, 0, 0)
+
+function makeProxy(getter: Handle, setter: Handle): Handle {
+    const proxy = intrinsics.New(HeapProxy)
+    proxy.td = Intrinsics.addressof(proxyTD)
+    proxy.properties = 0
+    proxy.getter = getter
+    proxy.setter = setter
+    return Intrinsics.addressof(proxy)
+}
 
 
 const objectTDs = new Map<Handle, Handle>()
@@ -331,6 +351,21 @@ export function getPropertyDescriptor(obj: Handle, key: Handle): Handle {
     return 0
 }
 
+export function getPropertyProxy(obj: Handle): Handle {
+    let cur = obj
+    while (cur !== 0) {
+        if (TypeDescriptor(HeapObject(cur).td).kind === BaseTypeKind.proxy) return cur
+        cur = prototypeOf(cur)
+    }
+    return 0
+}
+(getPropertyProxy as any).shouldInline = true
+
+export function getProxyGetter(proxy: Handle): Handle {
+    return HeapProxy(proxy).getter
+}
+(getProxyGetter as any).shouldInline = true
+
 function hasProperty(obj: Handle, key: Handle): boolean {
     let cur = obj
     while (cur !== 0) {
@@ -365,11 +400,33 @@ export function createJsValueConverter(compileFn?: (f: Function) => Handle): (v:
     return v => fromJsValueInner(v, compileFn, seen)
 }
 
+// used for caching in test harnesses
+const rawHeapHandle = Symbol('heap.handle')
+export function createHeapHandle(handle: u32): any {
+    return { [rawHeapHandle]: handle }
+}
+
 function fromJsObjectInner(o: object, compileFn: ((f: Function) => Handle) | undefined, seen: Map<object, Handle>): Handle {
     if (o instanceof Map) throw 'heap: Map values cannot be materialized'
-    const prev = seen.get(o)
-    if (prev !== undefined) return prev
-    const obj = makeObject(0)
+    if (const prev = seen.get(o)) return prev
+    const isProxy = '__proxy' in o
+    const isView = isProxy && Object.prototype.hasOwnProperty.call(o, '__address')
+    if (isProxy && !isView) {
+        const obj = makeProxy(0, 0)
+        seen.set(o, obj)
+        const proxy = HeapProxy(obj)
+        const value: any = o
+        proxy.getter = fromJsValueInner(value.__proxyGet, compileFn, seen)
+        proxy.setter = fromJsValueInner(value.__proxySet, compileFn, seen)
+        return obj
+    }
+    if (rawHeapHandle in o) {
+        const h = o[rawHeapHandle] as u32
+        seen.set(o, h)
+        return h
+    }
+    const proto = isView ? fromJsObjectInner(Object.getPrototypeOf(o), compileFn, seen) : 0
+    const obj = makeObject(proto)
     seen.set(o, obj)
     const descriptors: any = (Object as any).getOwnPropertyDescriptors(o)
     for (const k of Object.keys(descriptors)) {
@@ -411,6 +468,7 @@ function fromJsValueInner(v: any, compileFn: ((f: Function) => Handle) | undefin
         throw 'todo'
     }
     if (typeof v === 'number') return v as u32
+    if (typeof v === 'bigint') return Number(v) as u32
     if (typeof v === 'string') return fromJsString(v)
     if (v !== null && typeof v === 'object') return fromJsObjectInner(v, compileFn, seen)
     return v ? 1 : 0
@@ -419,7 +477,7 @@ function fromJsValueInner(v: any, compileFn: ((f: Function) => Handle) | undefin
 // the interpreter has two modes which can influence some of these flags
 // one of the modes does not use SMIs and has native width registers, but lacks Number.prototype.
 // in "native" mode, interpretation is entirely implied by usage instead of tracked independently
-enum FunctionBytecodeFlags {
+export enum FunctionBytecodeFlags {
     has_rest_param = 1 << 0,
     has_effects = 1 << 1, // conservative, _excludes_ allocations, `throw` is not considered an effect
     has_no_stack_escapes = 1 << 2, // returns are not considered escapes
@@ -465,9 +523,54 @@ interface FunctionBytecode {
     bytecodeLen: u32 
     constants: usize
     constantsLen: u32
+    scopeBindings: usize
+    scopeBindingsCount: u32
     labels?: FunctionBytecodeLabels
 }
 export const FunctionBytecode = intrinsics.DefineStructView(reify FunctionBytecode)
+
+interface ScopeBinding {
+    slot: u32
+    parentSlot: u32
+}
+export const ScopeBinding = intrinsics.DefineStructView(reify ScopeBinding)
+
+export function makeClosure(template: Handle, parent: Handle, frame: usize): Handle {
+    const src = FunctionBytecode(template)
+    const fn = intrinsics.New(FunctionBytecode)
+    fn.source = src.source
+    fn.flags = src.flags
+    fn.paramCount = src.paramCount
+    fn.registerCount = src.registerCount
+    fn.bytecode = src.bytecode
+    fn.bytecodeLen = src.bytecodeLen
+    fn.constantsLen = src.constantsLen
+    fn.labels = src.labels
+    fn.scopeBindings = src.scopeBindings
+    fn.scopeBindingsCount = src.scopeBindingsCount
+    const nativeConstants = !!(src.flags & FunctionBytecodeFlags.assumes_native_mode)
+    const constantBytes = nativeConstants ? 8 : 4
+    const constantType = nativeConstants ? Types.u64 : Types.u32
+    const constants = Intrinsics.alloc(src.constantsLen === 0 ? 1 : src.constantsLen * constantBytes)
+    intrinsics.memcpy(constants, src.constants, src.constantsLen * constantBytes)
+    fn.constants = constants
+    const parentFn = FunctionBytecode(parent)
+    const nativeParentConstants = !!(parentFn.flags & FunctionBytecodeFlags.assumes_native_mode)
+    const parentConstantBytes = nativeParentConstants ? 8 : 4
+    const parentConstantType = nativeParentConstants ? Types.u64 : Types.u32
+    for (let i: u32 = 0; i < src.scopeBindingsCount; i++) {
+        const binding = ScopeBinding(src.scopeBindings + i * ScopeBinding.sizeof)
+        let scope: usize
+        if (binding.parentSlot === 0xFFFFFFFF) {
+            scope = Intrinsics.alloc(4)
+            Intrinsics.store(scope, 0, frame, Types.u32)
+        } else {
+            scope = Intrinsics.load(parentFn.constants, binding.parentSlot * parentConstantBytes, parentConstantType)
+        }
+        Intrinsics.store(constants, binding.slot * constantBytes, scope, constantType)
+    }
+    return Intrinsics.addressof(fn)
+}
 
 interface MachineFunctionParam {
     name?: Handle // -> heap str

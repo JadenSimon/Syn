@@ -1045,14 +1045,14 @@ class AstNode {
                 return this.left
 
             case SyntaxKind.ForStatement:
-                return this.right
+                return this.r ? this.right : undefined
         }
     }
 
     get incrementor(): AstNode | undefined {
         switch (this.kind) {
             case SyntaxKind.ForStatement:
-                return this.lenNode
+                return this.len ? this.lenNode : undefined
         }
     }
 
@@ -1517,7 +1517,7 @@ export function isParameterPropertyDeclaration(node: TsNode, parent: TsNode) {
     return parent.kind === SyntaxKind.Constructor && node.kind === SyntaxKind.Parameter && hasAnyFlag(node, parameterPropFlags)
 }
 
-function decodeLocation(loc: number) {
+export function decodeLocation(loc: number) {
     switch (loc >> 30) {
         case 0b00:
             return {
@@ -6640,4 +6640,12 @@ export function rawAlloc(numBytes: number): bigint | number {
 
 export function rawFree(ptr: bigint | number): void {
     return api.rawFree(ptr)
+}
+
+export function getArrayBufferPtr(b: ArrayBuffer): bigint | number {
+    return api.getArrayBufferPtr(b)
+}
+
+export function lookupNativeSymbol(name: string) {
+    return api.lookupNativeSymbol(name)
 }

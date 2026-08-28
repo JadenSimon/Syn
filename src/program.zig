@@ -12094,6 +12094,7 @@ pub const Analyzer = struct {
             }
             const buf = try this.allocate(analyzer.allocator(), 8);
             this.setAllocatedSlice(buf);
+            return this.appendAllocated(analyzer, type_ref);
         }
 
         // useful when you don't want to write to a type directly
@@ -22443,6 +22444,10 @@ pub const Analyzer = struct {
                 // return @intFromEnum(Kind.never);
             }
             if (subject == @intFromEnum(Kind.void) or subject == @intFromEnum(Kind.unknown)) return @intFromEnum(Kind.never); // TODO emit error
+
+            if (comptime suppress_gaps) {
+                return @intFromEnum(Kind.error_any);
+            }
 
             this.printTypeInfo(subject);
             this.printTypeInfo(element);
