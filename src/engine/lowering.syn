@@ -31,11 +31,18 @@ export interface SyscallConvention {
     readonly trap: number
 }
 
+export interface Relocation {
+    offset: number
+    kind: 'aarch64-pool' | 'aarch64-call' | 'aarch64-jump'
+    target: number
+}
+
 export interface Assembler {
     entryStackArg(dst: number, index: number): void
     movImm(dst: number, value: number): void
     mov(dst: number, src: number): void
     binary(op: string, dst: number, a: number, b: number, signed: boolean): void
+    binaryImm(op: string, dst: number, a: number, imm: number, signed: boolean): void
     addImm(dst: number, a: number, imm: number): void
     subImm(dst: number, a: number, imm: number): void
     compare(op: string, dst: number, a: number, b: number, signed: boolean): void
@@ -45,6 +52,7 @@ export interface Assembler {
     select(dst: number, cond: number, a: number, b: number): void
     load(dst: number, base: number, offset: number, T: Ty): void
     store(base: number, offset: number, src: number, T: Ty): void
+    extract?(dst: number, src: number, offset: number, width: number): void
     spAdjust(bytes: number): void
     spRead(dst: number): void
     bindLabel(id: number): void
@@ -53,11 +61,15 @@ export interface Assembler {
     jumpIfZero(reg: number, id: number): void
     br(reg: number): void
     blr(reg: number): void
+    loadPool(dst: number, slot: number): void
+    callLocal(target: number): void
+    jumpLocal(target: number): void
     syscall(id: number): void
     ret(): void
     elidedWrites(): number[]
     words(): number[]
     bytes(): number[]
+    relocations(): Relocation[]
     listing(): string
 }
 
@@ -118,8 +130,13 @@ interface AsmItem {
     zeroReg?: number
     adjustReg?: number   // for self-modifying `add/sub rn, rn, #imm`
     adjustDelta?: number // signed: +imm for add, -imm for sub
+    relocationKind?: Relocation['kind']
+    relocationTarget?: number
     moveDst?: number
     moveSrc?: number
+    shiftDst?: number
+    shiftSrc?: number
+    shiftAmount?: number
 }
 
 export const aarch64DarwinSyscall: SyscallConvention = {
@@ -593,6 +610,20 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return w
     }
 
+    function relocations(): Relocation[] {
+        resolve()
+        const out: Relocation[] = []
+        let offset = 0
+        for (const it of items) {
+            if (it.kind === 'label') continue
+            if (it.relocationKind !== undefined) {
+                out.push({ offset, kind: it.relocationKind, target: it.relocationTarget! })
+            }
+            offset += 4
+        }
+        return out
+    }
+
     function x(r: number): string {
         assert(Number.isInteger(r) && r >= 0 && r <= 31)
         return r === XZR ? 'xzr' : `x${r}`
@@ -613,6 +644,50 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
     function dataProc2(base: number, name: string, d: number, n: number, m: number): void {
         emit(base | (m << 16) | (n << 5) | d, `${name} ${x(d)}, ${x(n)}, ${x(m)}`)
+    }
+
+    function lsrImm(dst: number, src: number, amount: number): void {
+        emit(0xD3400000 | (amount << 16) | (63 << 10) | (src << 5) | dst,
+            `lsr ${x(dst)}, ${x(src)}, #${amount}`)
+        const item = items[items.length - 1]
+        item.shiftDst = dst
+        item.shiftSrc = src
+        item.shiftAmount = amount
+    }
+
+   function extract(dst: number, src: number, lsb: number, width: number): void {
+        if (!Number.isInteger(lsb) || !Number.isInteger(width)
+            || lsb < 0 || width <= 0 || lsb + width > 64) {
+            throw `aarch64: invalid ubfx range ${lsb}:${width}`
+        }
+        const imms = lsb + width - 1
+        emit(0xD3400000 | (lsb << 16) | (imms << 10) | (src << 5) | dst,
+            `ubfx ${x(dst)}, ${x(src)}, #${lsb}, #${width}`)
+    }
+
+    function logicalImmediate(value: number): number | undefined {
+        if (!Number.isSafeInteger(value)) return
+        const wanted = BigInt.asUintN(64, BigInt(value))
+        const one = BigInt(1)
+        for (let size = 2; size <= 64; size *= 2) {
+            const bits = BigInt(size)
+            const mask = (one << bits) - one
+            const element = wanted & mask
+            let pattern = BigInt(0)
+            for (let at = 0; at < 64; at += size) pattern |= element << BigInt(at)
+            if (pattern !== wanted || element === BigInt(0) || element === mask) continue
+            for (let rotate = 0; rotate < size; rotate++) {
+                const r = BigInt(rotate)
+                const run = ((element << r) | (element >> (bits - r))) & mask
+                if ((run & (run + one)) !== BigInt(0)) continue
+                let ones = 0
+                for (let v = run; v; v >>= one) ones++
+                const levels = size - 1
+                const N = size === 64 ? 1 : 0
+                const imms = (((~levels) << 1) | (ones - 1)) & 0x3F
+                return (N << 12) | (rotate << 6) | imms
+            }
+        }
     }
 
     function movz(d: number, imm16: number, hw: number): void {
@@ -797,6 +872,37 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         throw `aarch64: unsupported binary op '${op}'`
     }
 
+    function binaryImm(op: string, dst: number, a: number, imm: number, signed: boolean): void {
+        if ((op === 'shl' || op === 'shr' || op === 'ushr')
+            && Number.isInteger(imm) && imm >= 0 && imm < 64) {
+            if (op === 'shl') {
+                const immr = (64 - imm) & 63
+                const imms = 63 - imm
+                emit(0xD3400000 | (immr << 16) | (imms << 10) | (a << 5) | dst,
+                    `lsl ${x(dst)}, ${x(a)}, #${imm}`)
+            } else {
+                if (op === 'ushr') lsrImm(dst, a, imm)
+                else emit(0x93400000 | (imm << 16) | (63 << 10) | (a << 5) | dst,
+                    `asr ${x(dst)}, ${x(a)}, #${imm}`)
+            }
+            return
+        }
+        if (op === 'and' || op === 'or' || op === 'xor') {
+            const encoded = logicalImmediate(imm)
+            if (encoded !== undefined) {
+                const base = op === 'and' ? 0x92000000 : op === 'or' ? 0xB2000000 : 0xD2000000
+                const N = (encoded >>> 12) & 1
+                const immr = (encoded >>> 6) & 0x3F
+                const imms = encoded & 0x3F
+                emit(base | (N << 22) | (immr << 16) | (imms << 10) | (a << 5) | dst,
+                    `${op === 'or' ? 'orr' : op === 'xor' ? 'eor' : 'and'} ${x(dst)}, ${x(a)}, #${imm}`)
+                return
+            }
+        }
+        movImm(scratchB, imm)
+        binary(op, dst, a, scratchB, signed)
+    }
+
     function condFor(op: string, signed: boolean): number {
         let cond = COND_EQ
         if (op === 'eq') cond = COND_EQ
@@ -842,6 +948,20 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const bytes = accessBytes(to)
         const signed = isSignedType(to)
         if (bytes === 8) return mov(dst, src)
+        const previous = items[items.length - 1]
+        if (!signed && previous?.shiftDst === src && dst === src) {
+            const lsb = previous.shiftAmount!
+            const width = bytes * 8
+            if (lsb + width <= 64) {
+                previous.word = (0xD3400000 | (lsb << 16) | ((lsb + width - 1) << 10)
+                    | (previous.shiftSrc! << 5) | dst) >>> 0
+                previous.text = `ubfx ${x(dst)}, ${x(previous.shiftSrc!)}, #${lsb}, #${width}`
+                previous.shiftDst = undefined
+                previous.shiftSrc = undefined
+                previous.shiftAmount = undefined
+                return
+            }
+        }
         if (bytes === 4) {
             if (signed) {
                 emit(0x93407C00 | (src << 5) | dst, `sxtw ${x(dst)}, ${w(src)}`)
@@ -909,6 +1029,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         movImm,
         mov,
         binary,
+        binaryImm,
         addImm: (dst, a, imm) => addImmRaw(dst, a, imm, false, false),
         subImm: (dst, a, imm) => subImmRaw(dst, a, imm, false, false),
         compare,
@@ -918,6 +1039,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         select,
         load,
         store,
+        extract,
         spAdjust: (bytes) => {
             if (bytes === 0) return
             if (bytes > 0) subImmRaw(SP, SP, bytes, true, true)
@@ -938,6 +1060,28 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         },
         br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`),
         blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
+        loadPool: (dst: number, slot: number) => {
+            items.push({
+                kind: 'insn', word: (0x90000000 | dst) >>> 0,
+                text: `adrp ${x(dst)}, pool[${slot}]`, label: -1, reg: dst, cond: -1,
+                relocationKind: 'aarch64-pool', relocationTarget: slot,
+            })
+            emit(0xF9400000 | (dst << 5) | dst, `ldr ${x(dst)}, [${x(dst)}, pool[${slot}]]`)
+        },
+        callLocal: (target: number) => {
+            items.push({
+                kind: 'insn', word: 0x94000000, text: `bl fn[${target}]`,
+                label: -1, reg: -1, cond: -1,
+                relocationKind: 'aarch64-call', relocationTarget: target,
+            })
+        },
+        jumpLocal: (target: number) => {
+            items.push({
+                kind: 'insn', word: 0x14000000, text: `b fn[${target}]`,
+                label: -1, reg: -1, cond: -1,
+                relocationKind: 'aarch64-jump', relocationTarget: target,
+            })
+        },
         syscall: (id: number) => {
             movImm(syscallConvention.numberReg, id)
             const trap = syscallConvention.trap
@@ -959,6 +1103,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
             return b
         },
+        relocations,
         listing: () => {
             resolve()
             const lines: string[] = []

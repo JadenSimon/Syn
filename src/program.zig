@@ -20864,6 +20864,14 @@ pub const Analyzer = struct {
                     }
                     try this.addType(ref);
                 },
+                .query => {
+                    const ref = try this.analyzer.evaluateQuery(k, 0);
+                    if (ref == type_ref) {
+                        this.analyzer._debug(ref);
+                        return this.analyzer.fail(ref, error.RecursiveQuery);
+                    }
+                    try this.addType(ref);
+                },
                 else => {
                     this.analyzer._debug(type_ref);
                     _ = try notSupported(k.getKind());

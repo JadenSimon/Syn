@@ -554,9 +554,8 @@ pub const SynthInstrumenter = struct {
             },
             .block => {
                 const first = maybeUnwrapRef(self.nodes.at(ref)) orelse 0;
-                var head = if (first != 0) try self.factory.cloneNodeRef(first) else 0;
-                var tail = head;
-                if (first != 0) try self.replacements.put(first, head);
+                var head: NodeRef = 0;
+                var tail: NodeRef = 0;
                 for (self.rebindings.items) |x| {
                     if (tail != 0) self.nodes.at(tail).next = x;
                     if (head == 0) head = x;
@@ -567,7 +566,9 @@ pub const SynthInstrumenter = struct {
                     self.nodes.at(clone).data = head;
                     try self.replacements.put(_ref, clone);
                 } else {
-                    self.nodes.at(tail).next = self.nodes.at(first).next;
+                    const clone = try self.factory.cloneNodeRef(first);
+                    self.nodes.at(tail).next = clone;
+                    try self.replacements.put(first, head);
                 }
             },
             else => {
@@ -622,7 +623,8 @@ pub const SynthInstrumenter = struct {
                 const name = try std.fmt.bufPrint(&buf, "c__{s}", .{getSlice(self.nodes.at(ref), u8)});
                 const new_ident = try self.factory.createIdentifier(name);
                 // self.nodes.at(new_ident).extra_data2 = sym;
-                try self.rebindings.append(self.alloc, try self.factory.createConstVariable(new_ident, try self.factory.createArrayLiteralExpression(&.{try self.factory.createIdentifier(getSlice(self.nodes.at(ref), u8))})));
+                const initializer = try self.factory.createArrayLiteralExpression(&.{try self.factory.createIdentifier(getSlice(self.nodes.at(ref), u8))});
+                try self.rebindings.append(self.alloc, try self.factory.createConstVariable(new_ident, initializer));
             } else {
                 const z = try self.factory.createElementAccessExpression(try self.getCellOrSymbol(sym), @as(i64, 0));
                 try self.replacements.put(ref, z);

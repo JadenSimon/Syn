@@ -1,0 +1,678 @@
+/// @synth
+/// <reference lib="machine" />
+/// <reference lib="reify" />
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as syscalls from './syscalls'
+
+type usize = u32
+type Handle = u32
+type ScId = u16
+const Types = intrinsics.Types
+const slotScale = 8
+const slotMask = 0xffff
+const scIdMask = 0xffff
+const scChunkBytes = 4 * 1024
+const accountingCapacity = 16
+
+enum ScFlags {
+    eternal = 1 << 0,
+}
+
+enum ScType {
+    general,
+}
+
+interface HeapState {
+    scTable: u64
+    slabNext: u64
+    slabEnd: u64
+    nextScId: ScId
+    maxScs: ScId
+    rootSc: ScId
+}
+
+interface ScHeader {
+    owner: Handle
+    type: u8
+    flags: u8
+    depth: u8
+    depthExtent: u8
+    enumerateEdges: u64
+    nextSlot: u16
+    capacity: u16
+}
+
+interface ScCellData {
+    header: u64
+    localRefs: Handle
+    inboundRefs: Handle
+    outboundRefs: Handle
+    peerRefs: Handle
+}
+
+export const Heap = intrinsics.DefineStructView(reify HeapState)
+export const Sc = intrinsics.DefineStructView(reify ScHeader)
+export const ScCell = intrinsics.DefineStructView(reify ScCellData)
+
+const heapSize = Heap.sizeof
+const scCellSize = ScCell.sizeof
+const heapTableOffset = (heapSize + 7) & ~7
+const scHeaderSize = (Sc.sizeof + 7) & ~7
+
+function allocate(bytes: usize): usize {
+    const ptr = syscalls.mmap(
+        0, bytes,
+        syscalls.PROT_READ | syscalls.PROT_WRITE,
+        syscalls.MAP_PRIVATE | syscalls.MAP_ANON,
+        -1 as any, 0,
+    )
+    intrinsics.assert(ptr !== -1)
+    return ptr
+}
+
+function allocateScChunk(heapPtr: usize): usize {
+    const heap = Heap(heapPtr)
+    const ptr = heap.slabNext as usize
+    const next = ptr + scChunkBytes
+    intrinsics.assert(next <= heap.slabEnd)
+    heap.slabNext = next
+    return ptr
+}
+
+function getScRaw(heapPtr: usize, id: ScId): usize {
+    const heap = Heap(heapPtr)
+    intrinsics.assert(id > 0 && id < heap.nextScId)
+    return intrinsics.Intrinsics.load(heap.scTable as usize, id * 8, Types.u64) as usize
+}
+
+function setScRaw(heapPtr: usize, id: ScId, ptr: usize): void {
+    const heap = Heap(heapPtr)
+    intrinsics.assert(id > 0 && id < heap.maxScs)
+    intrinsics.Intrinsics.store(heap.scTable as usize, id * 8, ptr, Types.u64)
+}
+
+function scCellPtr(heapPtr: usize, ptr: usize): usize {
+    return resolve(heapPtr, Sc(ptr).owner)
+}
+
+intrinsics.tagInline(scCellPtr)
+
+function accountingPtr(heapPtr: usize, handle: Handle): usize {
+    return resolve(heapPtr, handle)
+}
+intrinsics.tagInline(accountingPtr)
+
+function localRefs(heapPtr: usize, ptr: usize): usize {
+    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).localRefs)
+}
+intrinsics.tagInline(localRefs)
+
+function inboundRefs(heapPtr: usize, ptr: usize): usize {
+    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).inboundRefs)
+}
+
+function outboundRefs(heapPtr: usize, ptr: usize): usize {
+    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).outboundRefs)
+}
+
+function peerRefs(heapPtr: usize, ptr: usize): usize {
+    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).peerRefs)
+}
+
+function makeHandle(sc: ScId, slot: u16): Handle {
+    return (((sc as u32) << 16) + slot) as Handle
+}
+
+export function handleSc(handle: Handle): ScId {
+    return ((handle >>> 16) & scIdMask) as ScId
+}
+
+export function handleSlot(handle: Handle): u16 {
+    return (handle & slotMask) as u16
+}
+
+intrinsics.tagInline(handleSc)
+intrinsics.tagInline(handleSlot)
+
+export function resolve(heapPtr: usize, handle: Handle): usize {
+    const raw = getScRaw(heapPtr, handleSc(handle))
+    return raw + scHeaderSize + handleSlot(handle) * slotScale
+}
+
+function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8): void {
+    const sc = Sc(ptr)
+    sc.owner = owner
+    sc.type = ScType.general
+    sc.flags = 0
+    sc.depth = depth
+    sc.depthExtent = 0
+    sc.enumerateEdges = enumerateEdges
+    sc.nextSlot = 1
+    sc.capacity = ((scChunkBytes - scHeaderSize) / slotScale) as u16
+}
+
+function initScAccounting(heapPtr: usize, id: ScId, ptr: usize, cellHandle: Handle): void {
+    const data = ScCell(resolve(heapPtr, cellHandle))
+    data.header = ptr
+    const bytes = accountingCapacity * 8
+    data.localRefs = allocCell(heapPtr, id, bytes)
+    data.inboundRefs = allocCell(heapPtr, id, bytes)
+    data.outboundRefs = allocCell(heapPtr, id, bytes)
+    data.peerRefs = allocCell(heapPtr, handleSc(cellHandle), bytes)
+}
+
+export function allocCell(heapPtr: usize, scId: ScId, bytes: usize): Handle {
+    const sc = Sc(getScRaw(heapPtr, scId))
+    const slots = ((bytes + 7) >> 3) as u16
+    const start = sc.nextSlot
+    intrinsics.assert(slots > 0 && start + slots <= sc.capacity + 1)
+    sc.nextSlot = start + slots
+    return makeHandle(scId, start)
+}
+
+export function createHeap(
+    maxScs: ScId,
+    enumerateEdges: u64,
+): usize {
+    intrinsics.assert(maxScs > 1 && maxScs <= scIdMask)
+    const tableBytes = maxScs * 8
+    const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
+    const heapPtr = allocate(slabStartOffset + maxScs * scChunkBytes)
+    const heap = Heap(heapPtr)
+    heap.scTable = heapPtr + heapTableOffset
+    heap.slabNext = heapPtr + slabStartOffset
+    heap.slabEnd = heap.slabNext as usize + maxScs * scChunkBytes
+    heap.nextScId = 2
+    heap.maxScs = maxScs
+    heap.rootSc = 1
+
+    const root = allocateScChunk(heapPtr)
+    setScRaw(heapPtr, 1, root)
+    initSc(root, 0, enumerateEdges, 0)
+    const rootCell = allocCell(heapPtr, 1, scCellSize)
+    Sc(root).owner = rootCell
+    initScAccounting(heapPtr, 1, root, rootCell)
+    Sc(root).flags = ScFlags.eternal
+    return heapPtr
+}
+
+export function createSc(
+    heapPtr: usize,
+    parentId: ScId,
+    enumerateEdges: u64,
+): ScId {
+    const heap = Heap(heapPtr)
+    const id = heap.nextScId
+    intrinsics.assert(id < heap.maxScs)
+
+    const owner = allocCell(heapPtr, parentId, scCellSize)
+    const ptr = allocateScChunk(heapPtr)
+    const parent = Sc(getScRaw(heapPtr, parentId))
+    initSc(ptr, owner, enumerateEdges, parent.depth + 1)
+    setScRaw(heapPtr, id, ptr)
+    heap.nextScId = id + 1
+    initScAccounting(heapPtr, id, ptr, owner)
+    if (parent.depthExtent === 0) parent.depthExtent = 1
+    return id
+}
+
+export function getSc(heapPtr: usize, id: ScId) {
+    return Sc(getScRaw(heapPtr, id))
+}
+
+export function rootSc(heapPtr: usize): ScId {
+    return Heap(heapPtr).rootSc
+}
+
+export function scOwner(heapPtr: usize, id: ScId): Handle {
+    return Sc(getScRaw(heapPtr, id)).owner
+}
+
+export function scDepth(heapPtr: usize, id: ScId): u8 {
+    return Sc(getScRaw(heapPtr, id)).depth
+}
+
+export function scFlags(heapPtr: usize, id: ScId): u8 {
+    return Sc(getScRaw(heapPtr, id)).flags
+}
+
+export function scEdgeEnumerator(heapPtr: usize, id: ScId): u64 {
+    return Sc(getScRaw(heapPtr, id)).enumerateEdges
+}
+
+export function scAddress(heapPtr: usize, id: ScId): usize {
+    return getScRaw(heapPtr, id)
+}
+
+export function scCellHeader(heapPtr: usize, handle: Handle): usize {
+    return ScCell(resolve(heapPtr, handle)).header as usize
+}
+
+function refCount(ptr: usize, slot: u16): u32 {
+    return sparseCount(ptr, accountingCapacity, slot)
+}
+
+function addRef(ptr: usize, slot: u16): u32 {
+    return addSparse(ptr, accountingCapacity, slot)
+}
+
+function removeRef(ptr: usize, slot: u16): u32 {
+    return removeSparse(ptr, accountingCapacity, slot)
+}
+
+intrinsics.tagInline(addRef)
+intrinsics.tagInline(removeRef)
+
+function sparseCount(ptr: usize, capacity: u16, key: u32): u32 {
+    for (let i = 0; i < capacity; i++) {
+        const offset = i * 8
+        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
+        if (entry === key) return intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
+        if (entry === 0) return 0
+    }
+    return 0
+}
+
+function addSparse(ptr: usize, capacity: u16, key: u32): u32 {
+    for (let i = 0; i < capacity; i++) {
+        const offset = i * 8
+        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
+        if (entry === key) {
+            const count = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32) + 1
+            intrinsics.Intrinsics.store(ptr, offset + 4, count, Types.u32)
+            return count
+        }
+        if (entry === 0) {
+            intrinsics.Intrinsics.store(ptr, offset, key, Types.u32)
+            intrinsics.Intrinsics.store(ptr, offset + 4, 1, Types.u32)
+            return 1
+        }
+    }
+    intrinsics.assert(false)
+    return 0
+}
+
+function removeSparse(ptr: usize, capacity: u16, key: u32): u32 {
+    for (let i = 0; i < capacity; i++) {
+        const offset = i * 8
+        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
+        if (entry === 0) break
+        if (entry !== key) continue
+        const count = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
+        intrinsics.assert(count > 0)
+        intrinsics.Intrinsics.store(ptr, offset + 4, count - 1, Types.u32)
+        return count - 1
+    }
+    intrinsics.assert(false)
+    return 0
+}
+
+function peerKey(from: u16, to: u16): u32 {
+    return ((from as u32) << 16) + to
+}
+
+function parentSc(sc: any): ScId {
+    return handleSc(sc.owner)
+}
+
+intrinsics.tagInline(parentSc)
+
+function edgeBoundary(heapPtr: usize, sourceId: ScId, targetId: ScId): u32 {
+    let left = sourceId
+    let right = targetId
+    while (left !== right) {
+        const a = Sc(getScRaw(heapPtr, left))
+        const b = Sc(getScRaw(heapPtr, right))
+        const ap = parentSc(a)
+        const bp = parentSc(b)
+        if (ap === bp) return ((right as u32) << 16) + left
+        if (a.depth > b.depth) {
+            left = ap
+        } else if (b.depth > a.depth) {
+            right = bp
+        } else {
+            left = ap
+            right = bp
+        }
+    }
+    return ((right as u32) << 16) + left
+}
+
+function addOutboundPath(heapPtr: usize, sourceId: ScId, boundary: u32, target: Handle): boolean {
+    const end = (boundary & slotMask) as ScId
+    let current = sourceId
+    for (;;) {
+        const ptr = getScRaw(heapPtr, current)
+        const sc = Sc(ptr)
+        if (addSparse(outboundRefs(heapPtr, ptr), accountingCapacity, target) !== 1) return false
+        if (current === end) return true
+        current = parentSc(sc)
+    }
+}
+
+function removeOutboundPath(heapPtr: usize, sourceId: ScId, boundary: u32, target: Handle): boolean {
+    const end = (boundary & slotMask) as ScId
+    let current = sourceId
+    for (;;) {
+        const ptr = getScRaw(heapPtr, current)
+        const sc = Sc(ptr)
+        if (removeSparse(outboundRefs(heapPtr, ptr), accountingCapacity, target) !== 0) return false
+        if (current === end) return true
+        current = parentSc(sc)
+    }
+}
+
+function addInboundPath(heapPtr: usize, targetId: ScId, end: ScId, target: Handle, includeEnd: boolean): Handle {
+    let current = targetId
+    let projected = target
+    while (current !== end) {
+        const ptr = getScRaw(heapPtr, current)
+        const sc = Sc(ptr)
+        addRef(inboundRefs(heapPtr, ptr), handleSlot(projected))
+        projected = sc.owner
+        current = parentSc(sc)
+    }
+    if (includeEnd) {
+        const ptr = getScRaw(heapPtr, current)
+        addRef(inboundRefs(heapPtr, ptr), handleSlot(projected))
+    }
+    return projected
+}
+
+function removeInboundPath(heapPtr: usize, targetId: ScId, end: ScId, target: Handle, includeEnd: boolean): Handle {
+    let current = targetId
+    let projected = target
+    while (current !== end) {
+        const ptr = getScRaw(heapPtr, current)
+        const sc = Sc(ptr)
+        removeRef(inboundRefs(heapPtr, ptr), handleSlot(projected))
+        projected = sc.owner
+        current = parentSc(sc)
+    }
+    if (includeEnd) {
+        const ptr = getScRaw(heapPtr, current)
+        removeRef(inboundRefs(heapPtr, ptr), handleSlot(projected))
+    }
+    return projected
+}
+
+export function addEdge(heapPtr: usize, from: Handle, to: Handle): void {
+    const fromId = handleSc(from)
+    const toId = handleSc(to)
+    intrinsics.assert(fromId > 0 && toId > 0)
+    const fromPtr = getScRaw(heapPtr, fromId)
+    if (fromId === toId) {
+        addRef(localRefs(heapPtr, fromPtr), handleSlot(to))
+        return
+    }
+
+    const boundary = edgeBoundary(heapPtr, fromId, toId)
+    const boundaryFrom = (boundary & slotMask) as ScId
+    const boundaryTo = (boundary >>> 16) as ScId
+    if (!addOutboundPath(heapPtr, fromId, boundary, to)) return
+    const commonBoundary = boundaryFrom === boundaryTo
+    const target = addInboundPath(heapPtr, toId, boundaryTo, to, !commonBoundary)
+    if (commonBoundary) {
+        const common = getScRaw(heapPtr, boundaryTo)
+        addRef(localRefs(heapPtr, common), handleSlot(target))
+        return
+    }
+
+    const left = Sc(getScRaw(heapPtr, boundaryFrom))
+    const right = Sc(getScRaw(heapPtr, boundaryTo))
+    const parentId = parentSc(left)
+    intrinsics.assert(parentId > 0 && parentId === parentSc(right))
+    const parentPtr = getScRaw(heapPtr, parentId)
+    const fromSlot = handleSlot(left.owner)
+    const toSlot = handleSlot(right.owner)
+    addSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    addRef(localRefs(heapPtr, parentPtr), toSlot)
+}
+
+export function removeEdge(heapPtr: usize, from: Handle, to: Handle): void {
+    const fromId = handleSc(from)
+    const toId = handleSc(to)
+    intrinsics.assert(fromId > 0 && toId > 0)
+    const fromPtr = getScRaw(heapPtr, fromId)
+    if (fromId === toId) {
+        removeRef(localRefs(heapPtr, fromPtr), handleSlot(to))
+        return
+    }
+
+    const boundary = edgeBoundary(heapPtr, fromId, toId)
+    const boundaryFrom = (boundary & slotMask) as ScId
+    const boundaryTo = (boundary >>> 16) as ScId
+    if (!removeOutboundPath(heapPtr, fromId, boundary, to)) return
+    const commonBoundary = boundaryFrom === boundaryTo
+    const target = removeInboundPath(heapPtr, toId, boundaryTo, to, !commonBoundary)
+    if (commonBoundary) {
+        const common = getScRaw(heapPtr, boundaryTo)
+        removeRef(localRefs(heapPtr, common), handleSlot(target))
+        return
+    }
+
+    const left = Sc(getScRaw(heapPtr, boundaryFrom))
+    const right = Sc(getScRaw(heapPtr, boundaryTo))
+    const parentId = parentSc(left)
+    intrinsics.assert(parentId > 0 && parentId === parentSc(right))
+    const parentPtr = getScRaw(heapPtr, parentId)
+    const fromSlot = handleSlot(left.owner)
+    const toSlot = handleSlot(right.owner)
+    removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    removeRef(localRefs(heapPtr, parentPtr), toSlot)
+}
+
+export function localRefCount(heapPtr: usize, handle: Handle): u32 {
+    const ptr = getScRaw(heapPtr, handleSc(handle))
+    return refCount(localRefs(heapPtr, ptr), handleSlot(handle))
+}
+
+export function inboundRefCount(heapPtr: usize, handle: Handle): u32 {
+    const ptr = getScRaw(heapPtr, handleSc(handle))
+    return refCount(inboundRefs(heapPtr, ptr), handleSlot(handle))
+}
+
+export function outboundRefCount(heapPtr: usize, from: Handle, to: Handle): u32 {
+    const ptr = getScRaw(heapPtr, handleSc(from))
+    return sparseCount(outboundRefs(heapPtr, ptr), accountingCapacity, to)
+}
+
+export function peerRefCount(heapPtr: usize, parentId: ScId, fromOwner: Handle, toOwner: Handle): u32 {
+    const ptr = getScRaw(heapPtr, parentId)
+    return sparseCount(
+        peerRefs(heapPtr, ptr),
+        accountingCapacity,
+        peerKey(handleSlot(fromOwner), handleSlot(toOwner)),
+    )
+}
+
+function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
+    intrinsics.assert(maxScs > 1 && maxScs <= scIdMask)
+    const tableBytes = maxScs * 8
+    const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
+    const heapPtr = intrinsics.Intrinsics.alloc(slabStartOffset + maxScs * scChunkBytes)
+    const heap = Heap(heapPtr)
+    heap.scTable = heapPtr + heapTableOffset
+    heap.slabNext = heapPtr + slabStartOffset
+    heap.slabEnd = heap.slabNext as usize + maxScs * scChunkBytes
+    heap.nextScId = 2
+    heap.maxScs = maxScs
+    heap.rootSc = 1
+
+    const root = allocateScChunk(heapPtr)
+    setScRaw(heapPtr, 1, root)
+    initSc(root, 0, enumerateEdges, 0)
+    const rootCell = allocCell(heapPtr, 1, scCellSize)
+    Sc(root).owner = rootCell
+    initScAccounting(heapPtr, 1, root, rootCell)
+    Sc(root).flags = ScFlags.eternal
+    return heapPtr
+}
+
+function createInterpretedSc(
+    heapPtr: usize,
+    parentId: ScId,
+    enumerateEdges: u64,
+): ScId {
+    const heap = Heap(heapPtr)
+    const id = heap.nextScId
+    intrinsics.assert(id < heap.maxScs)
+
+    const owner = allocCell(heapPtr, parentId, scCellSize)
+    const ptr = allocateScChunk(heapPtr)
+    const parent = Sc(getScRaw(heapPtr, parentId))
+    initSc(ptr, owner, enumerateEdges, parent.depth + 1)
+    setScRaw(heapPtr, id, ptr)
+    heap.nextScId = id + 1
+    initScAccounting(heapPtr, id, ptr, owner)
+    if (parent.depthExtent === 0) parent.depthExtent = 1
+    return id
+}
+
+function benchAddRemove(iter: number, heap: usize, localFrom: Handle, localTo: Handle) {
+    for (let i = 0; i < iter; i++) {
+        addEdge(heap, localFrom, localTo)
+        removeEdge(heap, localFrom, localTo)
+    }
+}
+
+export function selfTest(select: (apis: any) => any): void {
+    const shared = {
+        allocCell,
+        addEdge,
+        removeEdge,
+        localRefCount,
+        inboundRefCount,
+        outboundRefCount,
+        peerRefCount,
+        rootSc,
+        scOwner,
+        scDepth,
+        scFlags,
+        scEdgeEnumerator,
+        scAddress,
+        scCellHeader,
+        edgeBoundary,
+        handleSc,
+        handleSlot,
+        resolve,
+        benchAddRemove,
+    }
+    const api = select({
+        native: { createHeap, createSc, ...shared },
+        interpreted: {
+            createHeap: createInterpretedHeap,
+            createSc: createInterpretedSc,
+            ...shared,
+        },
+    })
+    // v8.setFlagsFromString('--print-opt-code --code-comments')
+    const heap = api.createHeap(16, 0)
+    const root = api.rootSc(heap)
+    const child = api.createSc(heap, root, 11)
+    const sibling = api.createSc(heap, root, 12)
+    const grandchild = api.createSc(heap, child, 13)
+    const cousin = api.createSc(heap, sibling, 14)
+    const childOwner = api.scOwner(heap, child)
+    const siblingOwner = api.scOwner(heap, sibling)
+    const grandchildOwner = api.scOwner(heap, grandchild)
+    const cousinOwner = api.scOwner(heap, cousin)
+    intrinsics.assert(api.scFlags(heap, root) === 1)
+    intrinsics.assert(api.scDepth(heap, child) === 1)
+    intrinsics.assert(api.scDepth(heap, sibling) === 1)
+    intrinsics.assert(api.scDepth(heap, grandchild) === 2)
+    intrinsics.assert(api.scEdgeEnumerator(heap, child) === 11)
+    intrinsics.assert(api.handleSc(childOwner) === root)
+    intrinsics.assert(api.handleSlot(childOwner) > 0)
+    intrinsics.assert(api.scCellHeader(heap, childOwner) === api.scAddress(heap, child))
+    intrinsics.assert(api.scCellHeader(heap, grandchildOwner) === api.scAddress(heap, grandchild))
+    intrinsics.assert(api.edgeBoundary(heap, child, sibling) === ((sibling << 16) + child))
+
+    const localFrom = api.allocCell(heap, child, 8)
+    const localTo = api.allocCell(heap, child, 8)
+    const remoteTo = api.allocCell(heap, sibling, 8)
+    api.addEdge(heap, localFrom, localTo)
+    api.addEdge(heap, localFrom, localTo)
+    intrinsics.assert(api.localRefCount(heap, localTo) === 2)
+    api.removeEdge(heap, localFrom, localTo)
+    api.removeEdge(heap, localFrom, localTo)
+    intrinsics.assert(api.localRefCount(heap, localTo) === 0)
+
+    {
+        const iters = 500_000
+        const p = performance.now()
+        api.benchAddRemove(iters, heap, localFrom, localTo)
+        console.log(`benchAddRemove (iters: ${iters})`, ((performance.now() - p)*1000).toFixed(3), 'us')
+    }
+
+    api.addEdge(heap, localFrom, remoteTo)
+    api.addEdge(heap, localFrom, remoteTo)
+    intrinsics.assert(api.outboundRefCount(heap, localFrom, remoteTo) === 2)
+    intrinsics.assert(api.inboundRefCount(heap, remoteTo) === 1)
+    intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 1)
+    intrinsics.assert(api.localRefCount(heap, siblingOwner) === 1)
+    api.removeEdge(heap, localFrom, remoteTo)
+    intrinsics.assert(api.outboundRefCount(heap, localFrom, remoteTo) === 1)
+    intrinsics.assert(api.inboundRefCount(heap, remoteTo) === 1)
+    api.removeEdge(heap, localFrom, remoteTo)
+    intrinsics.assert(api.outboundRefCount(heap, localFrom, remoteTo) === 0)
+    intrinsics.assert(api.inboundRefCount(heap, remoteTo) === 0)
+    intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 0)
+    intrinsics.assert(api.localRefCount(heap, siblingOwner) === 0)
+
+    const grandFrom = api.allocCell(heap, grandchild, 8)
+    const grandTo = api.allocCell(heap, grandchild, 8)
+    const cousinTo = api.allocCell(heap, cousin, 8)
+
+    api.addEdge(heap, grandFrom, cousinTo)
+    api.addEdge(heap, grandFrom, cousinTo)
+    intrinsics.assert(api.outboundRefCount(heap, grandFrom, cousinTo) === 2)
+    intrinsics.assert(api.outboundRefCount(heap, grandchildOwner, cousinTo) === 1)
+    intrinsics.assert(api.inboundRefCount(heap, cousinTo) === 1)
+    intrinsics.assert(api.inboundRefCount(heap, cousinOwner) === 1)
+    intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 1)
+    intrinsics.assert(api.localRefCount(heap, siblingOwner) === 1)
+    api.removeEdge(heap, grandFrom, cousinTo)
+    intrinsics.assert(api.outboundRefCount(heap, grandFrom, cousinTo) === 1)
+    intrinsics.assert(api.outboundRefCount(heap, grandchildOwner, cousinTo) === 1)
+    api.removeEdge(heap, grandFrom, cousinTo)
+    intrinsics.assert(api.outboundRefCount(heap, grandFrom, cousinTo) === 0)
+    intrinsics.assert(api.outboundRefCount(heap, grandchildOwner, cousinTo) === 0)
+    intrinsics.assert(api.inboundRefCount(heap, cousinTo) === 0)
+    intrinsics.assert(api.inboundRefCount(heap, cousinOwner) === 0)
+    intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 0)
+    intrinsics.assert(api.localRefCount(heap, siblingOwner) === 0)
+
+    api.addEdge(heap, grandFrom, localTo)
+    api.addEdge(heap, grandFrom, localTo)
+    intrinsics.assert(api.outboundRefCount(heap, grandFrom, localTo) === 2)
+    intrinsics.assert(api.outboundRefCount(heap, grandchildOwner, localTo) === 1)
+    intrinsics.assert(api.localRefCount(heap, localTo) === 1)
+    intrinsics.assert(api.inboundRefCount(heap, localTo) === 0)
+    api.removeEdge(heap, grandFrom, localTo)
+    intrinsics.assert(api.localRefCount(heap, localTo) === 1)
+    api.removeEdge(heap, grandFrom, localTo)
+    intrinsics.assert(api.outboundRefCount(heap, grandFrom, localTo) === 0)
+    intrinsics.assert(api.outboundRefCount(heap, grandchildOwner, localTo) === 0)
+    intrinsics.assert(api.localRefCount(heap, localTo) === 0)
+
+    api.addEdge(heap, localFrom, grandTo)
+    api.addEdge(heap, localFrom, grandTo)
+    intrinsics.assert(api.outboundRefCount(heap, localFrom, grandTo) === 2)
+    intrinsics.assert(api.inboundRefCount(heap, grandTo) === 1)
+    intrinsics.assert(api.localRefCount(heap, grandchildOwner) === 1)
+    api.removeEdge(heap, localFrom, grandTo)
+    intrinsics.assert(api.inboundRefCount(heap, grandTo) === 1)
+    api.removeEdge(heap, localFrom, grandTo)
+    intrinsics.assert(api.outboundRefCount(heap, localFrom, grandTo) === 0)
+    intrinsics.assert(api.inboundRefCount(heap, grandTo) === 0)
+    intrinsics.assert(api.localRefCount(heap, grandchildOwner) === 0)
+}
+
+if (intrinsics.argv()[0] === 'cg') {
+    selfTest(apis => apis.interpreted)
+    console.log('cg interpreted self-test passed')
+}

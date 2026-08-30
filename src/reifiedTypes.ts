@@ -1,4 +1,5 @@
 import * as vm from 'node:vm'
+import * as v8 from 'node:v8'
 
 const any = Symbol.for('Type.any')
 const never = Symbol.for('Type.never')
@@ -725,7 +726,9 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         console: console,
         performance,
         process,
+        setTimeout,
         Buffer,
+        v8,
         JSON,
         TextDecoder,
         TextEncoder,
@@ -738,10 +741,12 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             identifier: fileName,
             context: ctx,
         })
+        const modules = new Map<string, any>()
+        modules.set(fileName, m)
+        modules.set(fileName.replace('.syn', '.js'), m)
         const namesToSource = new Map<string, string>()
         namesToSource.set(fileName, text)
         return (async function() {
-            const modules = new Map<string, any>()
             await m.link(async (spec: string, m: vm.Module) => {
                 if (spec === 'typescript') {
                     const cached = modules.get(spec)
@@ -766,6 +771,13 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
                 const m2 = new vm.SourceTextModule(src, {
                     identifier: p[0],
                     context: ctx,
+                    importModuleDynamically: (spec, from) => {
+                        const p2 = resolve?.(from.identifier.replace('.js', '.syn'), spec)
+                        if (!p2) return
+                        const cached = modules.get(p2[0])
+                        if (cached) return cached
+                        throw `todo: dynamic import ${spec}`
+                    },
                     initializeImportMeta: (meta, m) => {
                         meta.filename = m.identifier.replace('.js', '.syn')
                     },

@@ -1,0 +1,436 @@
+/// @synth
+
+"use wrapped";
+
+import ts from 'typescript' // XXX: used for `api.zig`
+import * as intrinsics from './intrinsics'
+import * as syscalls from './syscalls'
+import { Graph, GraphNode, LowerGraphResult, lowerValueGraph } from './lowering2'
+
+type usize = u32
+
+const Intrinsics = intrinsics.Intrinsics
+const Types = intrinsics.Types
+
+const poolTag = Symbol('native.pool')
+interface PoolValue {
+    [poolTag]: true
+    value: number | bigint
+}
+
+export function pool(value: number | bigint): any {
+    return { [poolTag]: true, value }
+}
+
+function isPoolValue(value: any): value is PoolValue {
+    return !!value?.[poolTag]
+}
+
+let nativeMapper: any
+let nativeCopier: any
+let nativeSealer: any
+let nativeInvoker: any
+const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64'
+const sys_icache_invalidate = darwinArm64
+    ? (ts as any).lookupNativeSymbol('sys_icache_invalidate') : undefined
+const pthread_jit_write_protect_np = darwinArm64
+    ? (ts as any).lookupNativeSymbol('pthread_jit_write_protect_np') : undefined
+
+function mapCodePage(len: usize): usize {
+    const r = syscalls.mmap(
+        0, len,
+        // (syscalls.PROT_READ | syscalls.PROT_WRITE | (darwinArm64 ? syscalls.PROT_EXEC : 0)) as any,
+        // (syscalls.MAP_PRIVATE | syscalls.MAP_ANON | (darwinArm64 ? syscalls.MAP_JIT : 0)) as any,
+        (syscalls.PROT_READ | syscalls.PROT_WRITE) as any,
+        (syscalls.MAP_PRIVATE | syscalls.MAP_ANON) as any,
+        -1 as any, 0,
+    )
+    // if (darwinArm64) {
+    //     pthread_jit_write_protect_np(0)
+    // }
+    return r
+}
+
+function copyCode(dst: usize, src: usize, len: usize): usize {
+    let offset: u32 = 0
+    while ((len - offset) >= 8) {
+        Intrinsics.store(dst, offset, Intrinsics.load(src, offset, Types.u64), Types.u64)
+        offset += 8
+    }
+    while (offset < len) {
+        Intrinsics.store(dst, offset, Intrinsics.load(src, offset, Types.u8), Types.u8)
+        offset += 1
+    }
+    return dst
+}
+
+function sealCodePage(ptr: usize, len: usize): u32 {
+    // if (darwinArm64) {
+    //     pthread_jit_write_protect_np(1)
+    //     return sys_icache_invalidate(ptr, len)
+    // }
+    const status = syscalls.mprotect(ptr, len, syscalls.PROT_READ | syscalls.PROT_EXEC)
+    if (status === 0 && darwinArm64) sys_icache_invalidate(ptr, len)
+    return status
+}
+
+function invokeNative(target: any, args: usize, nargs: usize): usize {
+    if (nargs === 0) return target()
+    const a0 = Intrinsics.load(args, 0, Types.u64)
+    if (nargs === 1) return target(a0)
+    const a1 = Intrinsics.load(args, 8, Types.u64)
+    if (nargs === 2) return target(a0, a1)
+    const a2 = Intrinsics.load(args, 16, Types.u64)
+    if (nargs === 3) return target(a0, a1, a2)
+    const a3 = Intrinsics.load(args, 24, Types.u64)
+    if (nargs === 4) return target(a0, a1, a2, a3)
+    const a4 = Intrinsics.load(args, 32, Types.u64)
+    if (nargs === 5) return target(a0, a1, a2, a3, a4)
+    return 0
+}
+function getNativeBootstraps() {
+    if (nativeMapper) return
+    const mapper = lowerValueGraph(trace2(mapCodePage).graph)
+    const copier = lowerValueGraph(trace2(copyCode).graph)
+    const sealer = lowerValueGraph(trace2(sealCodePage).graph)
+    const invoker = lowerValueGraph(trace2(invokeNative).graph)
+    nativeMapper = (ts as any).createNativeFn(new Uint8Array(mapper.bytes))
+    nativeCopier = (ts as any).createNativeFn(new Uint8Array(copier.bytes))
+    nativeSealer = (ts as any).createNativeFn(new Uint8Array(sealer.bytes))
+    nativeInvoker = (ts as any).createNativeFn(new Uint8Array(invoker.bytes))
+}
+
+interface CodePage {
+    ptr: any
+    length: number
+    used: number
+    sealed: boolean
+}
+let writableCodePage: CodePage | undefined
+
+function addPtr(ptr: any, offset: number): any {
+    return typeof ptr === 'bigint' ? ptr + BigInt(offset) : ptr + offset
+}
+
+function reserveCode(length: number): { page: CodePage, ptr: any } {
+    getNativeBootstraps()
+    let page = writableCodePage
+    let offset = page ? (page.used + 15) & ~15 : 0
+    if (!page || offset + length > page.length) {
+        const mappedLength = (Math.max(length, 4096) + 4095) & ~4095
+        const ptr = nativeMapper(mappedLength)
+        if (!ptr) throw 'failed to map native code page'
+        page = { ptr, length: mappedLength, used: 0, sealed: false }
+        writableCodePage = page
+        offset = 0
+    }
+    page.used = offset + length
+    return { page, ptr: addPtr(page.ptr, offset) }
+}
+
+function sealCode(page: CodePage): void {
+    if (page.sealed) return
+    const status = nativeSealer(page.ptr, page.length)
+    if (status !== 0) throw `mprotect failed: ${status}`
+    page.sealed = true
+    if (writableCodePage === page) writableCodePage = undefined
+}
+
+export function installNative(bytes: number[]) {
+    const code = new Uint8Array(bytes)
+    const src = (ts as any).getArrayBufferPtr(code.buffer)
+    const { page, ptr } = reserveCode(code.byteLength)
+    if (!nativeCopier(ptr, src, code.byteLength)) throw 'failed to copy native code'
+    return Object.assign((...args: any[]) => {
+        sealCode(page)
+        const values = new BigInt64Array(Math.max(args.length, 1))
+        for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
+        const argsPtr = (ts as any).getArrayBufferPtr(values.buffer)
+        return nativeInvoker(ptr, argsPtr, args.length)
+    }, { ptr, codePage: page })
+}
+
+interface NativeUnit {
+    fn: Function
+    symbol: number
+    code: LowerGraphResult
+}
+
+function marker(kind: number, id: number): number {
+    return Number.MAX_SAFE_INTEGER - (kind << 20) - id
+}
+
+function nativeStub(fn: Function, symbol: number): Function {
+    const names: string[] = []
+    for (let i = 0; i < fn.length; i++) names.push(`arg${i}`)
+    const stub: any = new Function(...names, `throw new Error('Unlinked local function')`)
+    stub.__native = marker(1, symbol)
+    stub.__args = Array.from({ length: fn.length }, () => Types.u64)
+    stub.__returns = Types.u64
+    return stub
+}
+
+function rewriteTargets(
+    graph: Graph,
+    locals: Map<number, number>,
+    pooled: Map<number, number>,
+): Graph {
+    const nodes = new Map<number, GraphNode>()
+    const localNodes = new Map<number, number>()
+    const poolNodes = new Map<number, number>()
+    let nextId = graph.maxId
+    function valueNode(op: string, value: number, cache: Map<number, number>): number {
+        const known = cache.get(value)
+        if (known !== undefined) return known
+        const id = nextId++
+        nodes.set(id, {
+            op, argIds: [0], argConsts: new Float64Array([value]),
+            T: Types.usize, U: Types.usize, offset: 0,
+        })
+        cache.set(value, id)
+        return id
+    }
+    for (const [id, n] of graph.nodes) {
+        const ids = n.argIds.slice()
+        const consts = n.argConsts.slice()
+        let changed = false
+        for (let i = 0; i < ids.length; i++) {
+            if (ids[i]) continue
+            const local = locals.get(consts[i])
+            if (local !== undefined && n.op === 'call' && i === 1) {
+                ids[i] = valueNode('local-target', local, localNodes)
+                consts[i] = 0
+                changed = true
+                continue
+            }
+            const slot = pooled.get(consts[i])
+            if (slot !== undefined) {
+                ids[i] = valueNode('pool-entry', slot, poolNodes)
+                consts[i] = 0
+                changed = true
+            }
+        }
+        nodes.set(id, changed ? { ...n, argIds: ids, argConsts: consts } : n)
+    }
+    const blocks = graph.blocks.map(block => {
+        if (block.bodyId) return block
+        const slot = pooled.get(block.bodyConst)
+        if (slot === undefined) return block
+        return { ...block, bodyId: valueNode('pool-entry', slot, poolNodes), bodyConst: 0 }
+    })
+    return { ...graph, maxId: nextId, nodes, params: graph.params, blocks }
+}
+
+function align(value: number, amount: number): number {
+    return (value + amount - 1) & -amount
+}
+
+function patchImage(
+    image: Uint8Array,
+    base: number | bigint,
+    units: NativeUnit[],
+    offsets: number[],
+    poolOffset: number,
+): void {
+    const view = new DataView(image.buffer, image.byteOffset, image.byteLength)
+    const imageBase = BigInt(base)
+    const one = BigInt(1)
+    const pageShift = BigInt(12)
+    const callShift = BigInt(2)
+    for (let i = 0; i < units.length; i++) {
+        const unit = units[i]
+        for (const relocation of unit.code.relocations) {
+            const offset = offsets[i] + relocation.offset
+            const pc = imageBase + BigInt(offset)
+            let word = view.getUint32(offset, true)
+            if (relocation.kind === 'aarch64-pool') {
+                const target = imageBase + BigInt(poolOffset + relocation.target * 8)
+                const pages = (target >> pageShift) - (pc >> pageShift)
+                if (pages < -(one << BigInt(20)) || pages >= (one << BigInt(20))) throw 'native: pool is out of ADRP range'
+                const imm = Number(BigInt.asUintN(21, pages))
+                word = (word & ~((3 << 29) | (0x7FFFF << 5)))
+                    | ((imm & 3) << 29) | (((imm >>> 2) & 0x7FFFF) << 5)
+                view.setUint32(offset, word >>> 0, true)
+                const pageOffset = Number(target & BigInt(0xFFF))
+                if (pageOffset & 7) throw 'native: unaligned pool entry'
+                const load = view.getUint32(offset + 4, true)
+                view.setUint32(offset + 4, ((load & ~(0xFFF << 10)) | ((pageOffset >> 3) << 10)) >>> 0, true)
+                continue
+            }
+            const targetOffset = offsets[relocation.target]
+            if (targetOffset === undefined) throw `native: unknown local function ${relocation.target}`
+            const delta = (imageBase + BigInt(targetOffset) - pc) >> callShift
+            if (delta < -(one << BigInt(25)) || delta >= (one << BigInt(25))) throw 'native: local call is out of range'
+            const imm = Number(BigInt.asUintN(26, delta))
+            const baseWord = relocation.kind === 'aarch64-call' ? 0x94000000 : 0x14000000
+            view.setUint32(offset, (baseWord | imm) >>> 0, true)
+        }
+    }
+}
+
+function installImage(units: NativeUnit[], values: (number | bigint)[]) {
+    const offsets: number[] = []
+    let length = 0
+    for (const unit of units) {
+        length = align(length, 16)
+        offsets[unit.symbol] = length
+        length += unit.code.bytes.length
+    }
+    const poolOffset = align(length, 8)
+    length = poolOffset + values.length * 8
+    const image = new Uint8Array(length)
+    for (const unit of units) image.set(unit.code.bytes, offsets[unit.symbol])
+    const view = new DataView(image.buffer)
+    for (let i = 0; i < values.length; i++) {
+        view.setBigUint64(poolOffset + i * 8, BigInt.asUintN(64, BigInt(values[i])), true)
+    }
+    const reserved = reserveCode(image.byteLength)
+    patchImage(image, reserved.ptr, units, offsets, poolOffset)
+    const src = (ts as any).getArrayBufferPtr(image.buffer)
+    if (!nativeCopier(reserved.ptr, src, image.byteLength)) throw 'failed to copy native image'
+    const entries = offsets.map(offset => addPtr(reserved.ptr, offset))
+    return {
+        entries,
+        page: reserved.page,
+        image,
+        poolOffset,
+    }
+}
+
+export function createNatives(fns: Record<string, Function>) {
+    getNativeBootstraps()
+    const symbols = new Map<Function, number>()
+    const functions: Function[] = []
+    const roots = new Map<string, number>()
+    const units: NativeUnit[] = []
+    const poolValues: (number | bigint)[] = []
+    const poolSlots = new Map<PoolValue, number>()
+    const session = createTraceSession()
+    function intern(f: Function): number {
+        const known = symbols.get(f)
+        if (known !== undefined) return known
+        const id = functions.length
+        symbols.set(f, id)
+        functions.push(f)
+        return id
+    }
+    for (const [name, fn] of Object.entries(fns)) {
+        intrinsics.assert(typeof fn === 'function')
+        roots.set(name, intern(fn))
+    }
+    intrinsics.assert(roots.size > 0)
+    for (let symbol = 0; symbol < functions.length; symbol++) {
+        const current = functions[symbol]
+        const traceDebug = intrinsics.argv().includes('trace-debug')
+            || intrinsics.argv().includes(`trace-debug:${current.name}`)
+        if (traceDebug) console.log('trace native', current.name)
+        const computation = intrinsics.getComputation(current)
+        const localMarkers = new Map<number, number>()
+        const poolMarkers = new Map<number, number>()
+        const mapCapture = (capture: any) => {
+            if (isPoolValue(capture)) {
+                let slot = poolSlots.get(capture)
+                if (slot === undefined) {
+                    slot = poolValues.length
+                    poolSlots.set(capture, slot)
+                    poolValues.push(capture.value)
+                }
+                const value = marker(2, slot)
+                poolMarkers.set(value, slot)
+                return value
+            }
+            if (typeof capture !== 'function') return capture
+            const linked: any = capture
+            if (Number.isSafeInteger(linked.__syscall)
+                || Number.isSafeInteger(linked.__native)
+                || linked.shouldInline) return capture
+            try {
+                intrinsics.getComputation(capture)
+            } catch {
+                return capture
+            }
+            const target = intern(capture)
+            const stub: any = nativeStub(capture, target)
+            localMarkers.set(stub.__native, target)
+            return stub
+        }
+        const traced = trace2(computation[0], {
+            captures: computation[1], session, mapCapture, verbose: traceDebug,
+        })
+        traced.graph.name = current.name
+        if (traceDebug) console.log(traced.text)
+        const graph = rewriteTargets(traced.graph, localMarkers, poolMarkers)
+        intrinsics.assert(graph.params.length <= 5)
+        const debug = intrinsics.argv().includes('lower-debug')
+            || intrinsics.argv().includes(`lower-debug:${current.name}`)
+        if (debug) console.log('lower native', current.name)
+        const code = lowerValueGraph(graph, { debug })
+        if (debug) console.log(code.listing)
+        units.push({ fn: current, symbol, code })
+    }
+    const installed = installImage(units, poolValues)
+    const result: Record<string, any> = {}
+    for (const [name, symbol] of roots) {
+        const ptr = installed.entries[symbol]
+        result[name] = Object.assign((...args: any[]) => {
+            sealCode(installed.page)
+            const values = new BigInt64Array(Math.max(args.length, 1))
+            for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
+            const argsPtr = (ts as any).getArrayBufferPtr(values.buffer)
+            return nativeInvoker(ptr, argsPtr, args.length)
+        }, { ptr, codePage: installed.page, image: installed, units })
+    }
+    return result
+}
+
+export function createNative(fn: Function) {
+    return createNatives({ fn }).fn
+}
+
+export function createProgramStack() {
+    const maxProgramStack = 64*1024*1024
+    const rawAddr = mapCodePage(maxProgramStack as u32)
+    const cell = rawAddr+maxProgramStack-8
+    const addr = symbolicMemory(rawAddr)
+    const rawWriteCell = createNative((v: usize) => {
+        Intrinsics.store(addr, 0, v, Types.u64)
+    })
+    rawWriteCell(cell)
+
+    function mark(): usize { 
+        return Intrinsics.load(addr, 0, Types.u64) as usize
+    }
+    function reset(marker: usize) {
+        Intrinsics.store(addr, 0, marker, Types.u64)
+    }
+    function alloc(numBytes: usize) {
+        const aligned = (numBytes + 7) & ~7
+        const ptr = Intrinsics.load(addr, 0, Types.u64)-aligned
+        Intrinsics.store(addr, 0, ptr, Types.u64)
+        return ptr
+    }
+    function free(numBytes: usize) {
+        // this fn is the easiest one to break stuff with
+        const aligned = (numBytes + 7) & ~7
+        const ptr = Intrinsics.load(addr, 0, Types.u64)+aligned
+        Intrinsics.store(addr, 0, ptr, Types.u64)
+    }
+
+    intrinsics.tagInline(mark)
+    intrinsics.tagInline(reset)
+    intrinsics.tagInline(alloc)
+    intrinsics.tagInline(free)
+
+    return {
+        mark,
+        reset,
+        alloc,
+        free,
+    }
+}
+
+// cyclic
+const traceModule = await import('./trace2')
+const trace2 = traceModule.trace2
+const createTraceSession = traceModule.createTraceSession
+const symbolicMemory = traceModule.symbolicMemory
