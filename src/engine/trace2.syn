@@ -93,6 +93,7 @@ interface TraceFrame {
     dispatch(pc: number): number
     branch(cond: any, v1: number, v2: number): number
     canexit(acc: any): boolean
+    panic(acc: any): void
     call(target: any, thisArg: any, regStart: number, nargs: number, cb: any): any
 }
 
@@ -363,8 +364,9 @@ export interface TraceSession {
     symbolicMemory: Set<number>
     symbolicDispatch: Function
     symbolicJmp: Function
-    symbolicAssert: Function
     symbolicBranch: Function
+    symbolicPanic: Function
+    symbolicError: Function
     runtime?: TraceRuntime
     fromJsValue(v: any): u32
     linkFunction(f: Function): u32
@@ -419,11 +421,11 @@ export function createTraceSession(): TraceSession {
     const intrinsicNames = new Map<Function, string>()
     function symbolicDispatch(pc: number): number { return pc }
     function symbolicJmp(pc: number, off: number): number { return pc + off }
-    function symbolicAssert(_condition: any): void {}
     function symbolicBranch(cond: boolean, v1: usize, v2: usize) {
         return cond ? v1 : v2
     }
     function symbolicPanic(err: any, T: any) {}
+    function symbolicError(message: any) {}
     const intrinsicContext: Record<string, any> = { ...Intrinsics }
     for (const [name, value] of Object.entries(Intrinsics)) {
         if (typeof value !== 'function') continue
@@ -437,7 +439,7 @@ export function createTraceSession(): TraceSession {
     intrinsicContext.jmp = symbolicJmp
     intrinsicContext.branch = symbolicBranch
     intrinsicContext.panic = symbolicPanic
-    const moduleContext = { ...intrinsics, assert: symbolicAssert }
+    const moduleContext = { ...intrinsics }
     const objectBuiltins = { setPrototypeOf: Object.setPrototypeOf }
     const intrinsicFns = getCachedIntrinsics().stubs
     const functionStubs = new Map<Function, number>()
@@ -448,7 +450,7 @@ export function createTraceSession(): TraceSession {
 
     function context(captures: any[] = []): Record<string, any> {
         const ctx: Record<string, any> = {
-            Intrinsics: intrinsicContext, Object: objectBuiltins, Error,
+            Intrinsics: intrinsicContext, Object: objectBuiltins, Error: symbolicError,
             intrinsics: moduleContext, heap, syscalls,
         }
         for (let i = 0; i < captures.length; i++) {
@@ -548,10 +550,7 @@ export function createTraceSession(): TraceSession {
                     mem[ptr + offset] = val as any
                     tracer.markHandled()
                 },
-                panic: () => {
-                    // TODO
-                    tracer.markHandled()
-                },
+                panic: (acc) => frame().panic(acc),
                 dispatch: pc => frame().dispatch(pc),
                 branch: (cond, v1, v2) => frame().branch(cond, v1, v2),
                 canexit: acc => frame().canexit(acc),
@@ -587,7 +586,8 @@ export function createTraceSession(): TraceSession {
         symbolicBranch,
         symbolicDispatch,
         symbolicJmp,
-        symbolicAssert,
+        symbolicPanic,
+        symbolicError,
         runtime,
         fromJsValue,
         linkFunction,
@@ -620,6 +620,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
     if (captures && opts.mapCapture) captures = captures.map(opts.mapCapture)
     const session = opts.session ?? createTraceSession()
+    const debugTrace = typeof input === 'function'
+        && intrinsics.argv().includes(`trace-debug:${input.name}`)
     const compiled = bytecode.compile(code)
     const codeLen = compiled.code.length
     const ACC = compiled.registerCount
@@ -714,6 +716,22 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return mk('after', a)
     }
 
+   function valToString(v: any) {
+        if (const id = tracer.getNanId(v)) {
+            const o = nodes.get(id) ?? tracer.getTraceById(id)
+            if (!o) return names.get(id) ?? `param@${id}`
+            const parts: string[] = [`[symbolic@${id}] ${o.op}`]
+            for (let i = 0; i < o.argIds; i++) {
+                const u = o.argIds[i]
+                if (u) parts.push(valToString(intrinsics.getNanFromId(u)))
+                else parts.push(o.argConsts[i] ?? o.args?.[i] ?? '?')
+            }
+            return `(${parts.join(', ')})`
+        } else {
+            return v
+        }
+    }
+
     function valuePart(v: any): any {
         const n = nodes.get(tracer.getNanId(v))
         if (!n || n.op !== 'after') return v
@@ -774,11 +792,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             tracer.markHandled()
             return { value }
         }
-        if (linked === session.intrinsicContext.panic) {
-            tracer.markHandled()
+        if (linked === session.symbolicPanic) {
+            traceFrame.panic(mem[regStart])
             return { value: 0 }
         }
-        if (linked === session.symbolicAssert) {
+        if (linked === session.symbolicError) {
             tracer.markHandled()
             return { value: 0 }
         }
@@ -843,7 +861,18 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             } finally {
                 tracer.setActive(true)
             }
+            if (intrinsics.argv().includes('assert-inline') && linked === intrinsics.assert) {
+                console.log('inline assert', {
+                    arg: args[0], argId: tracer.getNanId(args[0]),
+                    value: nested.value, valueId: tracer.getNanId(nested.value),
+                    graph: nested.text,
+                })
+            }
             mem[slotAddr(TOKEN)] = nested.effect
+            if (nodes.get(tracer.getNanId(nested.value))?.op === 'panic') {
+                traceFrame.panic(nested.value)
+                return { value: 0 }
+            }
             if (typeof (linked as any).id === 'number' && typeof (linked as any).sizeof === 'number') {
                 runtime.viewAddresses.set(nested.value, args[0])
             }
@@ -881,13 +910,18 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 step.target = pc
                 return SYN_RET
             }
+            if (stopNext) {
+                injectedRet = true
+                step.target = pc
+                return SYN_RET
+            }
             if (!isLeader.has(pc)) return pc
             if (activeRegion && !activeRegion.members.has(blockOf.get(pc)!)) {
                 injectedRet = true
                 step.target = pc
                 return SYN_RET
             }
-            if (!stopNext && !reified.has(blockOf.get(pc)!)) {
+            if (!reified.has(blockOf.get(pc)!)) {
                 tracer.setActive(watch(blockOf.get(pc)!))
                 return pc
             }
@@ -898,6 +932,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         branch: (cond, v1, v2) => {
             tracer.markHandled()
             const id = tracer.getNanId(cond as any)
+            if (debugTrace) console.log('trace branch intrinsic', { cond, id, v1, v2 })
             if (!id) return cond ? v1 : v2
             const kn = nodes.get(id)
             if (kn && kn.op === 'nonzero') return v1
@@ -910,6 +945,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         },
         canexit: (acc) => {
             tracer.markHandled()
+            if (step.kind === 'panic') return true
             if (injectedRet) {
                 if (step.kind !== 'branch') step.kind = 'goto'
                 mem[slotAddr(ACC)] = acc as any
@@ -919,6 +955,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 step.valueConst = step.valueId ? 0 : acc as any
             }
             return true
+        },
+        panic: (_acc): void => {
+            tracer.markHandled()
+            step.kind = 'panic'
+            stopNext = true
         },
         call: (target: any, thisArg: any, regStart: any, nargs: any, cb: any) => {
             tracer.setActive(true)
@@ -1001,6 +1042,15 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function runBlock(b: number, ins: Float64Array, region?: Reified): Step {
         for (let r = 0; r < slotCount; r++) mem[slotAddr(r)] = ins[r] as f64
         for (let i = 0; i < compiled.paramCount; i++) mem[args + i * 4] = ins[i] as f64
+        if (debugTrace && b === 0) {
+            console.log('trace frame input', {
+                sp: sp(), args, frame, regsBase, memLength: mem.length,
+                inputIds: Array.from({ length: compiled.paramCount }, (_, i) => tracer.getNanId(ins[i])),
+                argIds: Array.from({ length: compiled.paramCount }, (_, i) => tracer.getNanId(mem[args + i * 4])),
+                regIds: Array.from({ length: compiled.paramCount }, (_, i) => tracer.getNanId(mem[slotAddr(i)])),
+                selectWrapped: Intrinsics.select !== tracer.saved.select,
+            })
+        }
         phase = 0
         resumePc = leaders[b]
         injectedRet = false
@@ -1179,6 +1229,22 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function selectResults(cond: any, a: EvalResult, b: EvalResult): EvalResult {
+        const ap = nodes.get(tracer.getNanId(a.value))?.op === 'panic'
+        const bp = nodes.get(tracer.getNanId(b.value))?.op === 'panic'
+        if (ap && bp) return { value: a.value, state: a.state }
+        if (ap || bp) {
+            const live = ap ? b : a
+            const out = new Float64Array(slotCount)
+            for (let i = 0; i < slotCount; i++) out[i] = live.state[i]
+            const args = new Float64Array(3)
+            args[0] = cond
+            args[1] = ap ? a.value : a.state[TOKEN]
+            args[2] = bp ? b.value : b.state[TOKEN]
+            out[TOKEN] = mk('select', args)
+            args[1] = ap ? a.value : nilEffect
+            args[2] = bp ? b.value : nilEffect
+            return { value: after(live.value, mk('select', args)), state: out }
+        }
         const out = new Float64Array(slotCount)
         const args = new Float64Array(3)
         args[0] = cond
@@ -1249,6 +1315,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function continueRegion(r: Step, R: Reified): any {
         assert(r.kind)
+        if (r.kind === 'panic') return mk('panic', emptyState)
         if (r.kind === 'ret') {
             const v = r.valueId ? intrinsics.getNanFromId(r.valueId) : r.valueConst
             return terminal(R, r.outs, 'return', -1, after(v, r.outs[TOKEN]))
@@ -1278,6 +1345,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function continueFrom(r: Step): EvalResult {
         assert(r.kind)
+        if (r.kind === 'panic') return { value: mk('panic', emptyState), state: r.outs }
         if (r.kind === 'ret') {
             const v = r.valueId ? intrinsics.getNanFromId(r.valueId) : r.valueConst
             return { value: after(v, r.outs[TOKEN]), state: r.outs }
@@ -1287,6 +1355,14 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const branch = branchInputs(r)
         const a = evalFrom(blockOf.get(r.thenPc)!, branch[0])
         const c = evalFrom(blockOf.get(r.elsePc)!, branch[1])
+
+        if (debugTrace) {
+            console.log('trace branch', {
+                from: r.from, cond: r.condId, thenPc: r.thenPc, elsePc: r.elsePc,
+                thenValue: tracer.getNanId(a.value), elseValue: tracer.getNanId(c.value),
+                thenToken: tracer.getNanId(a.state[TOKEN]), elseToken: tracer.getNanId(c.state[TOKEN]),
+            })
+        }
 
         return selectResults(intrinsics.getNanFromId(r.condId), a, c)
     }
@@ -1389,7 +1465,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', new Float64Array(0))
     nilEffect = runtime.nilEffect
     ins[ACC] = thisArg
-    ins[TOKEN] = opts.inputs ? opts.inputs.effect ?? nilEffect : nilEffect
+    ins[TOKEN] = opts.inputs?.effect ?? nilEffect
 
     reifyBlocks()
 
@@ -1530,16 +1606,17 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 ? (n.label === 'result' ? parts[0] : `${parts[0]}.${n.label}`)
                 : n.op === 'after'
                 ? (reaches(n.argIds[1], n.argIds[0]) ? parts[1] : `(after, ${parts[0]}, ${parts[1]})`)
+                : n.argIds.length === 0 ? `(${n.op})`
                 : `(${n.op}${n.label ? ' ' + n.label : ''}, ${parts.join(', ')})`
         } else {
             const t = tracer.getTraceById(id)
             if (t) {
-                const parts: string[] = []
+                const parts: string[] = [t.op]
                 for (const j of operandIndices(t)) {
                     const aid = t.argIds[j] ?? 0
                     parts.push(aid ? render(intrinsics.getNanFromId(aid) as any) : String(t.args[j]))
                 }
-                s = `(${t.op}, ${parts.join(', ')})`
+                s = `(${parts.join(', ')})`
             }
         }
         rendering.delete(id)
@@ -1735,6 +1812,16 @@ function testSyscallLowering() {
 testSyscallLowering()
 
 function testMmapSyscall() {
+    function mapConcrete(): usize {
+        return syscalls.mmap(
+            0, 4096,
+            syscalls.PROT_READ | syscalls.PROT_WRITE,
+            syscalls.MAP_PRIVATE | syscalls.MAP_ANON,
+            -1 as any, 0,
+        )
+    }
+    const concreteTrace = trace2(mapConcrete)
+    assert([...concreteTrace.graph.nodes.values()].some(n => n.op === 'call'))
     function mapMemory(length: usize): usize {
         return syscalls.mmap(
             0, length,
@@ -1784,6 +1871,13 @@ function testStaticMemory() {
         Intrinsics.store(memory, 0, next, Types.u32)
         return next
     }
+    function readInline(): u32 {
+        return Intrinsics.load(memory, 0, Types.u32) as u32
+    }
+    intrinsics.tagInline(readInline)
+    function readThroughConcreteCall(): u32 {
+        return readInline() + 1
+    }
     function release(): u32 {
         return syscalls.munmap(ptr, 4096)
     }
@@ -1792,6 +1886,9 @@ function testStaticMemory() {
     assert(counter.graph.params.length === 0)
     assert(counter.native() === 1)
     assert(counter.native() === 2)
+    const reader = createNative(readThroughConcreteCall)
+    assert([...reader.graph.nodes.values()].some(n => n.op === 'load'))
+    assert(reader.native() === 3)
     assert(free() === 0)
 }
 testStaticMemory()
@@ -2456,7 +2553,6 @@ testNativeCompile(function cGen0(a: number, b: number) {
     return (s0 + s1) % 10007
 }, [[16, 15], [0, 0]])
 
-
 function makeRandom(seed: number) {
     let s = (seed >>> 0) || 1
     return function next(n: number): number {
@@ -2555,7 +2651,17 @@ function testGenerated(count: number, seed: number) {
                     failed++
                     console.log(`  BAD  gen${k} @${budget || 'full'} (${args.join(', ')})`
                         + ` = ${actual}, expected ${expected}`)
-                    if (failed <= 2) console.log(src)
+                    if (failed <= 2) {
+                        console.log(src)
+                        if (intrinsics.argv().includes(`gen${k}`)) {
+                            console.log(r.text)
+                            console.log(lowerValueGraph(r.graph, {
+                                regBudget: budget ? budget : undefined,
+                                debug: true,
+                            }).listing)
+                        }
+                        console.log(l.listing)
+                    }
                 }
             }
         }
@@ -2647,7 +2753,12 @@ function nestedLoopValue(n: number): number {
 }
 
 function createNative(fn: Function, regBudget?: number, session: TraceSession = createTraceSession()) {
-    const trace = trace2(fn, { session })
+    const debug = intrinsics.argv().includes(`trace-debug:${fn.name}`)
+    const trace = trace2(fn, { session, verbose: debug })
+    if (debug) {
+        console.log(trace.text)
+        console.log(lowering2.dumpGraph(trace.graph))
+    }
     const graph = trace.graph
     const code = lowerValueGraph(trace.graph, { regBudget })
     const r = graph.params.length <= 5
@@ -2800,6 +2911,113 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
     }, [[0, 0], [1, 0], [7, 7]])
     assert(doubleNot.listing.includes('cset') && doubleNot.listing.includes('ne'))
 
+    testNativeCompile(function cLogicalNotThird(a: u32, b: u32, value: u32): u32 {
+        return !value ? a : b
+    }, [[11, 22, 0], [11, 22, 1]])
+
+    function cConditionalPanic(cond: number, value: number) {
+        let result = value
+        if (cond) {
+            result = 99
+            Intrinsics.panic(result)
+        }
+        return result + 1
+    }
+    const panicTrace = trace2(cConditionalPanic)
+    let panicId = 0
+    for (const [id, n] of panicTrace.graph.nodes) {
+        if (n.op !== 'panic') continue
+        assert(n.argIds.length === 0)
+        panicId = id
+    }
+    assert(panicId)
+    for (const n of panicTrace.graph.nodes.values()) {
+        if (n.argIds.includes(panicId)) assert(n.op === 'select')
+    }
+    testNativeCompile(cConditionalPanic, [[0, 4], [0, 20]])
+
+    function cInlineAssert(value: u32): u32 {
+        intrinsics.assert(value !== 0)
+        return value + 1
+    }
+    show(cInlineAssert, true)
+    const assertTrace = trace2(cInlineAssert)
+    if (intrinsics.argv().includes('assert-inline')) {
+        console.log('assert helper:', trace2(intrinsics.assert).text)
+        console.log('assert caller:', assertTrace.text)
+    }
+    assert([...assertTrace.graph.nodes.values()].some(n => n.op === 'panic'))
+    testNativeCompile(cInlineAssert, [[1], [20]])
+
+    function cAssertRange(value: u32): u32 {
+        intrinsics.assert(value > 1 && value < 10)
+        return value + 1
+    }
+    assert(![...trace2(cAssertRange).graph.nodes.values()].some(n => n.op === 'call'))
+    testNativeCompile(cAssertRange, [[2], [9]])
+
+    function cAssertShortCircuit(value: u32, other: u32, fn: () => u32): u32 {
+        intrinsics.assert(value > 0 && other > 0)
+        return fn()
+    }
+    const shortAssert = trace2(cAssertShortCircuit)
+    assert([...shortAssert.graph.nodes.values()].filter(n => n.op === 'call').length === 1)
+
+    const rotated = testNativeCompile(function cRotateDoWhile(n: u32): u32 {
+        let i: u32 = 0
+        let sum: u32 = 0
+        do {
+            sum += i
+            i++
+        } while (i < n)
+        return sum
+    }, [[0], [1], [5]])
+    console.log(rotated.listing)
+
+    type StrengthView = { key: u32, value: u32 }
+    const StrengthView = intrinsics.DefineStructView(reify StrengthView)
+    function cStrengthReduce(ptr: usize, n: u32, key: u32): u32 {
+        for (let i: u32 = 0; i < n; i++) {
+            const value = StrengthView(ptr + i * 8)
+            if (value.key === key) return value.value
+        }
+        throw 'unreachable'
+    }
+    if (intrinsics.argv().includes('trace-debug:cStrengthReduce')) {
+        const traced = trace2(cStrengthReduce)
+        console.log(lowering2.dumpGraph(traced.graph))
+        lowering2.lowerValueGraph(traced.graph, { debug: true })
+    }
+    const strength = createNative(cStrengthReduce)
+    const strengthData = new Uint32Array([2, 20, 7, 70, 9, 90])
+    const strengthPtr = (ts as any).getArrayBufferPtr(strengthData.buffer)
+    assert(strength.native(strengthPtr, 3, 7) === 70)
+    assert(strength.native(strengthPtr, 3, 9) === 90)
+    assert(!strength.code.listing.includes('mul'))
+    assert(strength.code.listing.includes('lsl'))
+    assert(strength.code.listing.includes('#8'))
+    if (intrinsics.argv().includes('strength')) console.log(strength.code.listing)
+
+    function cPointerInduction(ptr: usize, n: u32): u32 {
+        let sum: u32 = 0
+        for (let i: u32 = 0; i < n; i++) {
+            sum += Intrinsics.load(ptr, i * 8, Types.u32) as u32
+        }
+        return sum
+    }
+    const inductionData = new Uint32Array([2, 0, 7, 0, 9, 0])
+    const inductionPtr = (ts as any).getArrayBufferPtr(inductionData.buffer)
+    const induction = createNative(cPointerInduction)
+    assert(induction.native(inductionPtr, 0) === 0)
+    assert(induction.native(inductionPtr, 1) === 2)
+    assert(induction.native(inductionPtr, 3) === 18)
+    const inductionLoop = induction.code.listing.indexOf('L')
+    assert(inductionLoop >= 0)
+    assert(induction.code.listing.indexOf('lsl') < inductionLoop)
+    assert(!induction.code.listing.slice(inductionLoop).includes('lsl'))
+    assert(induction.code.listing.slice(inductionLoop).includes('#8'))
+    if (intrinsics.argv().includes('induction')) console.log(induction.code.listing)
+
     testNative(function cCallTwice(f: any, x: number) {
         const v1 = f(x, 2)
         return f(v1, 3)
@@ -2893,7 +3111,6 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
         }
         return r
     }, [[addr, 0, 0], [addr, 1, 1]], 1)
-
     const memset = createNative(intrinsics.memsetByte)
     console.log(memset.code.listing)
     assert(memset.code.listing.includes('strb'))
