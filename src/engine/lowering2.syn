@@ -208,6 +208,78 @@ export function liftCommonEffects(g: Graph): Graph {
     return { ...g, maxId: nextId, nodes, params: g.params, blocks: g.blocks }
 }
 
+export function reduceEffectDependencies(g: Graph): Graph {
+    const nodes = new Map<number, GraphNode>(g.nodes)
+    let nextId = g.maxId
+    let changed = false
+    let nil = 0
+    for (const [id, n] of nodes) if (n.op === 'nil-effect') { nil = id; break }
+    if (!nil) return g
+
+    for (const [id, n] of nodes) {
+        if (n.op !== 'select') continue
+        let survivor = -1
+        for (let i = 1; i < n.argIds.length; i++) {
+            if (nodes.get(n.argIds[i])?.op === 'panic') continue
+            if (survivor >= 0) { survivor = -2; break }
+            survivor = i
+        }
+        if (survivor < 0) continue
+        const args = new Float64Array(2)
+        args[0] = n.argConsts[0]
+        args[1] = n.argConsts[survivor]
+        nodes.set(id, {
+            ...n, op: 'after',
+            argIds: [n.argIds[0], n.argIds[survivor]],
+            argConsts: args,
+        })
+        changed = true
+    }
+
+    const memo = new Map<number, number>()
+    const active = new Set<number>()
+    function sequence(a: number, b: number, source: GraphNode): number {
+        if (a === nil) return b
+        if (b === nil || a === b) return a
+        const id = nextId++
+        nodes.set(id, {
+            ...source, op: 'after', argIds: [a, b], argConsts: new Float64Array(2),
+        })
+        return id
+    }
+    function effects(id: number): number {
+        if (!id) return nil
+        const known = memo.get(id)
+        if (known !== undefined) return known
+        if (active.has(id)) return id
+        active.add(id)
+        const n = nodes.get(id)
+        let out = id
+        if (!n || n.op === 'nil-effect') out = nil
+        else if (n.op === 'after') {
+            out = sequence(effects(n.argIds[0]), effects(n.argIds[1]), n)
+        } else if (n.op === 'load' || n.op === 'is-state' || PureOps.has(n.op)) {
+            out = nil
+            for (const arg of n.argIds) out = sequence(out, effects(arg), n)
+        }
+        active.delete(id)
+        memo.set(id, out)
+        return out
+    }
+
+    for (const [id, n] of [...nodes]) {
+        if (n.op !== 'after' && n.op !== 'call' && n.op !== 'store') continue
+        const effect = effects(n.argIds[0])
+        if (effect === n.argIds[0]) continue
+        const argIds = n.argIds.slice()
+        argIds[0] = effect
+        nodes.set(id, { ...n, argIds })
+        changed = true
+    }
+    if (!changed) return g
+    return { ...g, maxId: nextId, nodes, params: g.params, blocks: g.blocks }
+}
+
 export function pureValues(g: Graph): Set<number> {
     const pure = new Set<number>()
     const checked = new Set<number>()
@@ -1611,7 +1683,18 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             return o1 - o2
         }
         const seenForSpill = new Set<number>()
+        function materializedValue(id: number): number {
+            const seen = new Set<number>()
+            while (id && !seen.has(id)) {
+                seen.add(id)
+                const n = g.nodes.get(id)
+                if (n?.op !== 'after') break
+                id = n.argIds[1]
+            }
+            return id
+        }
         function visitForSpill(id: number, crossed: Set<number>) {
+            id = materializedValue(id)
             if (seenForSpill.has(id)) return
             seenForSpill.add(id)
             const uses = usedBy.get(id)
@@ -1911,8 +1994,18 @@ export function rematerializeValues(g: Graph, analysis = analyzeValueGraph(g)): 
         if (known !== undefined) return known
         const n = g.nodes.get(id)
         if (!n || !analysis.pure.has(id) || n.op === 'select') return MAX_COST + 1
+        if ((n.op === 'convert' || n.op === 'bitconvert') && n.argIds[0]) {
+            const inner = g.nodes.get(n.argIds[0])
+            if (inner && (inner.op === 'shl' || inner.op === 'shr' || inner.op === 'ushr')
+                && !inner.argIds[1]) {
+                costs.set(id, 1)
+                costs.set(n.argIds[0], 1)
+                return 1
+            }
+        }
         let c = 1
-        const immediate = n.op === 'add' || n.op === 'sub' || CompareOps.has(n.op)
+        const immediate = n.op === 'add' || n.op === 'sub' || n.op === 'shl'
+            || n.op === 'shr' || n.op === 'ushr' || CompareOps.has(n.op)
         if (!immediate) {
             for (let i = 0; i < n.argIds.length; i++) if (!n.argIds[i]) c++
         }
@@ -1959,6 +2052,22 @@ export function rematerializeValues(g: Graph, analysis = analyzeValueGraph(g)): 
         into.set(clone, { ...n, argIds: args, argConsts: n.argConsts.slice() })
         return clone
     }
+    function cloneModifier(id: number, into: Map<number, GraphNode>, memo: Map<number, number>): number {
+        const known = memo.get(id)
+        if (known !== undefined) return known
+        const n = g.nodes.get(id)
+        if (!n || cost(id) > MAX_COST) return id
+        const clone = nextId++
+        memo.set(id, clone)
+        const args = n.argIds.slice()
+        for (let i = 0; i < args.length; i++) {
+            if (args[i] && g.nodes.has(args[i]) && cost(args[i]) <= MAX_COST) {
+                args[i] = cloneModifier(args[i], into, memo)
+            }
+        }
+        into.set(clone, { ...n, argIds: args, argConsts: n.argConsts.slice() })
+        return clone
+    }
 
     for (const [id, boundary] of analysis.shouldSpillUntil) {
         const n = g.nodes.get(id)
@@ -1985,6 +2094,26 @@ export function rematerializeValues(g: Graph, analysis = analyzeValueGraph(g)): 
             if (!consumer) continue
             for (let i = 0; i < consumer.argIds.length; i++) {
                 if (consumer.argIds[i] === id) consumer.argIds[i] = clone
+            }
+        }
+    }
+
+    const selectConditions = new Set<number>()
+    for (const n of g.nodes.values()) if (n.op === 'select' && n.argIds[0]) selectConditions.add(n.argIds[0])
+    for (const [id] of analysis.shouldSpillUntil) {
+        if (cost(id) > MAX_COST) continue
+        for (const use of new Set(analysis.usedBy.get(id) ?? [])) {
+            if (!selectConditions.has(use)) continue
+            const consumer = g.nodes.get(use)
+            if (!consumer || !CompareOps.has(consumer.op)) continue
+            const useRank = analysis.reverseOrder.get(use) ?? -1
+            if (useRank < 0 || (analysis.usedBy.get(id) ?? []).some(other =>
+                other !== use && (analysis.reverseOrder.get(other) ?? -1) < useRank)) continue
+            const into = writable()
+            const clone = cloneModifier(id, into, new Map<number, number>())
+            const updated = into.get(use)!
+            for (let i = 0; i < updated.argIds.length; i++) {
+                if (updated.argIds[i] === id) updated.argIds[i] = clone
             }
         }
     }
@@ -2016,14 +2145,20 @@ export function dumpGraph(g: Graph): string {
     return out.join('\n')
 }
 
-export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
+export function normalizeValueGraph(g: Graph): Graph {
     g = simplifyCountedLoop(g) ?? g
     g = liftCommonEffects(g)
     g = packageBlocks(liftCommonApplications(g))
+    g = reduceEffectDependencies(g)
     g = strengthReduceLoops(g) ?? g
     g = pruneBlockParams(g)
     optimizeValueGraph(g)
     g = simplifyBitOperations(g) ?? g
+    return g
+}
+
+export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
+    g = normalizeValueGraph(g)
     const target = opts.target ?? lowering.aarch64
     const asm = target.createAssembler()
     let analysis = analyzeValueGraph(g, opts)
@@ -2093,18 +2228,31 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         return -slotCount
     }
 
-    const code: (() => void)[] = []
+    interface EmitRegion {
+        parent?: EmitRegion
+        children: EmitRegion[]
+        writes: Set<number>
+        owned: number[]
+        exitLabel: number
+        group: number
+    }
+    const rootRegion: EmitRegion = {
+        children: [], writes: new Set(), owned: [], exitLabel: -1, group: -1,
+    }
+    let currentRegion = rootRegion
+    let currentBlock = 0
+    let nextRegionGroup = 0
+    interface ReleaseEvent { released: { value: number, home: number }[] }
+    interface TransferEvent {
+        dst: number
+        src: number
+        consumed?: { value: number, home: number }
+    }
+    const code: ((() => void) | ReleaseEvent | TransferEvent)[] = []
     function put(fn: () => void): void { code.push(fn) }
-    function transfer(dst: number, src: number): void {
+    function transfer(dst: number, src: number, consumed?: { value: number, home: number }): void {
         if (dst === src) return
-        if (isSlot(src) && isSlot(dst)) {
-            put(() => {
-                asm.load(SWAP, SP, slotOffset(src), Types.u64)
-                asm.store(SP, slotOffset(dst), SWAP, Types.u64)
-            })
-        } else if (isSlot(src)) put(() => asm.load(dst, SP, slotOffset(src), Types.u64))
-        else if (isSlot(dst)) put(() => asm.store(SP, slotOffset(dst), src, Types.u64))
-        else put(() => asm.mov(dst, src))
+        code.push({ dst, src, consumed })
     }
 
     const homeOf = new Map<number, number>()
@@ -2121,7 +2269,10 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         if (opts.debug) console.log('home +', id, reg, 'at', materializing, 'over', heldBy.get(reg) ?? '-')
         homeOf.set(id, reg)
         heldBy.set(reg, id)
-        if (isPreserved(reg)) usedPreserved.add(reg)
+        if (isPreserved(reg)) {
+            usedPreserved.add(reg)
+            currentRegion.writes.add(reg)
+        }
         return reg
     }
     function place(id: number, home: number): void {
@@ -2140,9 +2291,16 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         if (!isSlot(home) && heldBy.get(home) === v) heldBy.delete(home)
     }
     function finish(id = materializing): void {
-        for (const v of releaseAt.get(id) ?? []) freeValue(v, id)
-        for (const v of temporariesAt.get(id) ?? []) freeValue(v, id)
+        const released: { value: number, home: number }[] = []
+        function release(v: number): void {
+            const home = homeOf.get(v)
+            if (home !== undefined) released.push({ value: v, home })
+            freeValue(v, id)
+        }
+        for (const v of releaseAt.get(id) ?? []) release(v)
+        for (const v of temporariesAt.get(id) ?? []) release(v)
         temporariesAt.delete(id)
+        if (released.length) code.push({ released })
     }
 
     function narrowTo(root: number): void {
@@ -2238,6 +2396,18 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
     let nextLabel = 0
     for (const b of g.blocks) if (b.id >= nextLabel) nextLabel = b.id + 1
     const exitLabel = nextLabel++
+    rootRegion.exitLabel = exitLabel
+    const savedIndex = new Map<number, number>()
+
+    function regionExit(region: EmitRegion | undefined): number {
+        while (region && region !== rootRegion && !region.owned.length) region = region.parent
+        return region && region !== rootRegion ? region.exitLabel : exitLabel
+    }
+
+    function jumpToExit(): void {
+        const region = currentRegion
+        put(() => asm.jump(regionExit(region)))
+    }
 
     const sig = new Map<number, number[]>()
     const forwards = (b: GraphBlock) => g.nodes.get(b.bodyId)?.op === 'apply'
@@ -2296,7 +2466,10 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             if (r < 0) { homes.push(takeSlot()); continue }
             taken.add(r)
             homes.push(r)
-            if (isPreserved(r)) usedPreserved.add(r)
+            if (isPreserved(r)) {
+                usedPreserved.add(r)
+                rootRegion.writes.add(r)
+            }
         }
         sig.set(id, homes)
     }
@@ -2324,6 +2497,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             if (!g.nodes.has(id)) {
                 throw `lowering3: parameter ${id} was released at ${freedAt.get(id)} before rematerializing ${materializing} (freed at ${freedAt.get(materializing)})\n${dumpGraph(g)}`
             }
+            assert(!done.has(id))
             build(id, want)
         }
         return id
@@ -2340,6 +2514,14 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         return out
     }
 
+    function forceMaterializeBefore(id: number) {
+        for (const value of materializeBefore.get(id) ?? []) {
+            const valueNode = g.nodes.get(value)
+            if (!valueNode || !MaterializedPureOps.has(valueNode.op)) continue
+            if (!homeOf.has(value) && !done.has(value)) build(value)
+        }
+    }
+
     function build(id: number, want = -1): void {
         const outer = materializing
         if (opts.debug) console.log('build', id, 'from', outer)
@@ -2349,11 +2531,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         if (!n) throw `lowering3: no definition for value ${id} while materializing ${materializing}`
         const signed = lowering.isSignedType(n.T) || lowering.isSignedType(n.U)
 
-        for (const value of materializeBefore.get(id) ?? []) {
-            const valueNode = g.nodes.get(value)
-            if (!valueNode || !MaterializedPureOps.has(valueNode.op)) continue
-            if (!homeOf.has(value) && !done.has(value)) build(value)
-        }
+        forceMaterializeBefore(id)
 
         if (n.op === 'call') { buildCall(id, n); return }
         if (n.op === 'select') { buildSelect(id, n, want); return }
@@ -2380,17 +2558,6 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             const T = n.T
             const U = n.U
             const converts = n.op === 'convert'
-            if (asm.extract && n.argIds[0] && converts && (U === Types.u16 || U === Types.u8)) {
-                const inner = g.nodes.get(n.argIds[0])
-                if (inner?.op === 'ushr' && releaseAt.get(id)?.has(n.argIds[0]) && !inner!.argIds[1]) {
-                    const ra = at(demand(inner.argIds[0], inner.argConsts[0]), NOTHING)
-                    finish()
-                    const dst = regFor(id, want)
-                    const shiftAmount = inner.argConsts[1]
-                    put(() => asm.extract!(dst, ra, shiftAmount, U == Types.u16 ? 16 : 8))
-                    return
-                }
-            }
             const a = demand(n.argIds[0], n.argConsts[0])
             const ra = at(a, NOTHING)
             finish()
@@ -2475,7 +2642,10 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             const here = v === undefined ? undefined : settled.get(v)
             if (here === undefined || claimed.has(here)) continue
             claimed.add(here)
-            if (isPreserved(here)) usedPreserved.add(here)
+            if (isPreserved(here)) {
+                usedPreserved.add(here)
+                currentRegion.writes.add(here)
+            }
             s.dst = here
             s.settle!(here)
         }
@@ -2488,7 +2658,10 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             if (r < 0) for (const c of preserved) if (!claimed.has(c)) { r = c; break }
             if (r < 0) r = takeSlot()
             claimed.add(r)
-            if (isPreserved(r)) usedPreserved.add(r)
+            if (isPreserved(r)) {
+                usedPreserved.add(r)
+                currentRegion.writes.add(r)
+            }
             s.dst = r
             s.settle!(r)
         }
@@ -2541,6 +2714,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
                 id: n.argIds[i], konst: n.argConsts[i],
             })
         }
+        done.add(id)
         const linkReg = handOver(id, slots, [sequenceIdx, () => effect(n.argIds[0])], CALLEE)
         if (syscall) {
             const number = syscall.argConsts[0]
@@ -2553,7 +2727,6 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         } else {
             put(() => tailCall === id ? asm.br(linkReg) : asm.blr(linkReg))
         }
-        done.add(id)
         for (const x of volatiles) {
             if (const v = heldBy.get(x)) {
                 freedAt.set(v, id)
@@ -2620,6 +2793,9 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
     }
 
     function buildLoad(id: number, n: GraphNode, want: number) {
+        const outer = materializing
+        materializing = id
+        defer materializing = outer
         done.add(id)
         const T = n.T, offset = n.offset
         if (!n.argIds[1]) {
@@ -2738,9 +2914,9 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             const v = demand(id, konst, target.retReg)
             const src = homeOf.get(v)!
             finish(site)
-            transfer(target.retReg, src)
+            transfer(target.retReg, src, { value: v, home: src })
         }
-        put(() => asm.jump(exitLabel))
+        jumpToExit()
     }
 
     function emitApply(id: number, n: GraphNode, jump = true): void {
@@ -2777,8 +2953,40 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
 
     function emitState(id: number, n: GraphNode): void {
         const at = analysis.returnsAt.get(id)
-        if (at === undefined) { put(() => asm.jump(exitLabel)); return }
+        if (at === undefined) { jumpToExit(); return }
         returnValue(id, n.argIds[at], n.argConsts[at])
+    }
+
+    function exitsFunction(id: number, seen = new Set<number>()): boolean {
+        if (!id || seen.has(id)) return true
+        seen.add(id)
+        const n = g.nodes.get(id)
+        if (!n) return true
+        if (n.op === 'after') return exitsFunction(n.argIds[1], seen)
+        if (n.op === 'select') {
+            return exitsFunction(n.argIds[1], new Set(seen))
+                && exitsFunction(n.argIds[2], new Set(seen))
+        }
+        if (n.op === 'apply' || n.op === 'proj') return false
+        return true
+    }
+
+    function emitTailRegion(id: number, konst: number, group: number): void {
+        if (currentBlock !== g.blocks[0].id || !exitsFunction(id)) {
+            emitTail(id, konst)
+            return
+        }
+        const parent = currentRegion
+        const region: EmitRegion = {
+            parent, children: [], writes: new Set(), owned: [], exitLabel: nextLabel++, group,
+        }
+        parent.children.push(region)
+        currentRegion = region
+        put(() => {
+            for (const r of region.owned) asm.store(SP, savedIndex.get(r)! * 8, r, Types.u64)
+        })
+        emitTail(id, konst)
+        currentRegion = parent
     }
 
     function emitTail(id: number, konst: number): void {
@@ -2805,17 +3013,18 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             const otherwise = nextLabel++
             condition(id, n.argIds[0], n.argConsts[0], otherwise)
             const before = snapshot()
+            const group = nextRegionGroup++
             narrowTo(n.argIds[1])
-            emitTail(n.argIds[1], n.argConsts[1])
+            emitTailRegion(n.argIds[1], n.argConsts[1], group)
             restore(before)
             put(() => asm.bindLabel(otherwise))
             narrowTo(n.argIds[2])
-            emitTail(n.argIds[2], n.argConsts[2])
+            emitTailRegion(n.argIds[2], n.argConsts[2], group)
             return
         }
         if (n.op === 'apply') { emitApply(id, n); return }
         if (n.op === 'state') { emitState(id, n); return }
-        if (n.op === 'panic') { put(() => asm.jump(exitLabel)); return }
+        if (n.op === 'panic') { jumpToExit(); return }
         if (n.op === 'proj') {
             const app = g.nodes.get(n.argIds[0])
             if (!app || app.op !== 'apply') throw 'lowering3: projection of a non-application'
@@ -2827,6 +3036,8 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
 
     for (const id of order) {
         const b = blockOf.get(id)!
+        currentBlock = id
+        currentRegion = rootRegion
         homeOf.clear()
         heldBy.clear()
         done.clear()
@@ -2856,15 +3067,90 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         emitTail(b.bodyId, b.bodyConst)
     }
 
+    function promoteCommonRegionWrites(region: EmitRegion): Set<number> {
+        const subtree: Set<number>[] = []
+        const groups = new Map<number, number[]>()
+        for (let i = 0; i < region.children.length; i++) {
+            const child = region.children[i]
+            subtree.push(promoteCommonRegionWrites(child))
+            const siblings = groups.get(child.group)
+            if (siblings) siblings.push(i)
+            else groups.set(child.group, [i])
+        }
+        for (const siblings of groups.values()) {
+            if (siblings.length < 2) continue
+            const common = new Set(subtree[siblings[0]])
+            for (let i = 1; i < siblings.length; i++) {
+                const writes = subtree[siblings[i]]
+                for (const r of common) if (!writes.has(r)) common.delete(r)
+            }
+            for (const r of common) region.writes.add(r)
+        }
+        const all = new Set(region.writes)
+        for (const writes of subtree) for (const r of writes) all.add(r)
+        return all
+    }
+
+    function assignRegionRegisters(region: EmitRegion, inherited: Set<number>): void {
+        region.owned = [...region.writes].filter(r => !inherited.has(r))
+        const watermark = new Set(inherited)
+        for (const r of region.owned) watermark.add(r)
+        for (const child of region.children) assignRegionRegisters(child, watermark)
+    }
+    promoteCommonRegionWrites(rootRegion)
+    assignRegionRegisters(rootRegion, new Set())
+
     const saved = target.calleeSaved.filter(r => usedPreserved.has(r))
+    for (let i = 0; i < saved.length; i++) savedIndex.set(saved[i], i)
     frameBase = (saved.length + (callsOut ? 1 : 0)) * 8
     const frameBytes = (frameBase + slotCount * 8 + 15) & ~15
     if (frameBytes) asm.spAdjust(frameBytes)
-    for (let i = 0; i < saved.length; i++) asm.store(SP, i * 8, saved[i], Types.u64)
+    for (const r of rootRegion.owned) asm.store(SP, savedIndex.get(r)! * 8, r, Types.u64)
     if (callsOut) asm.store(SP, saved.length * 8, LR, Types.u64)
-    for (const fn of code) fn()
+    let released: { value: number, home: number }[] = []
+    for (const item of code) {
+        if (typeof item !== 'function') {
+            if ('released' in item) {
+                released.push(...item.released)
+                continue
+            }
+            const { dst, src, consumed } = item
+            if (isSlot(src) && isSlot(dst)) {
+                asm.load(SWAP, SP, slotOffset(src), Types.u64)
+                asm.store(SP, slotOffset(dst), SWAP, Types.u64)
+            } else if (isSlot(src)) asm.load(dst, SP, slotOffset(src), Types.u64)
+            else if (isSlot(dst)) asm.store(SP, slotOffset(dst), src, Types.u64)
+            else asm.mov(dst, src)
+            if (consumed) released.push(consumed)
+            if (released.length) {
+                asm.released(released)
+                released = []
+            }
+            continue
+        }
+        item()
+        if (released.length) {
+            asm.released(released)
+            released = []
+        }
+    }
+
+    const epilogues: EmitRegion[] = []
+    function collectEpilogues(region: EmitRegion): void {
+        for (const child of region.children) collectEpilogues(child)
+        if (region !== rootRegion && region.owned.length) epilogues.push(region)
+    }
+    collectEpilogues(rootRegion)
+    for (let i = 0; i < epilogues.length; i++) {
+        const region = epilogues[i]
+        asm.bindLabel(region.exitLabel)
+        for (const r of region.owned) asm.load(r, SP, savedIndex.get(r)! * 8, Types.u64)
+        const target = regionExit(region.parent)
+        const next = i + 1 < epilogues.length ? epilogues[i + 1].exitLabel : exitLabel
+        if (target !== next) asm.jump(target)
+    }
     asm.bindLabel(exitLabel)
-    for (let i = 0; i < saved.length; i++) asm.load(saved[i], SP, i * 8, Types.u64)
+    for (const r of rootRegion.owned) asm.load(r, SP, savedIndex.get(r)! * 8, Types.u64)
     if (callsOut) asm.load(LR, SP, saved.length * 8, Types.u64)
     if (frameBytes) asm.spAdjust(-frameBytes)
     if (!tailCall) asm.ret()

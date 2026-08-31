@@ -5,7 +5,9 @@
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as syscalls from './syscalls'
-import { Graph, GraphNode, LowerGraphResult, lowerValueGraph } from './lowering2'
+import {
+    Graph, GraphNode, LowerGraphResult, analyzeValueGraph, lowerValueGraph, normalizeValueGraph,
+} from './lowering2'
 
 type usize = u32
 
@@ -170,6 +172,77 @@ function nativeStub(fn: Function, symbol: number): Function {
     return stub
 }
 
+interface InlineScore {
+    cost: number
+    pressure: number
+}
+
+function obviousInline(graph: Graph): InlineScore | undefined {
+    if (graph.blocks.length !== 1) return
+    const root = graph.blocks[0].bodyId
+    const reachable = new Set<number>()
+    const uses = new Map<number, number>()
+    function visit(id: number): void {
+        if (!id || reachable.has(id)) return
+        reachable.add(id)
+        const n = graph.nodes.get(id)
+        if (!n) return
+        for (const arg of n.argIds) {
+            if (!arg) continue
+            uses.set(arg, (uses.get(arg) ?? 0) + 1)
+            visit(arg)
+        }
+    }
+    visit(root)
+
+    const free = new Set<number>()
+    for (const id of reachable) {
+        const n = graph.nodes.get(id)
+        if (n?.op !== 'load' || !n.argIds[1]) continue
+        const offset = graph.nodes.get(n.argIds[1])
+        if (offset?.op === 'shl' && !offset.argIds[1]
+            && offset.argConsts[1] >= 0 && offset.argConsts[1] <= 4
+            && uses.get(n.argIds[1]) === 1) free.add(n.argIds[1])
+    }
+
+    let cost = 0
+    const cheap = new Set([
+        'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'shr', 'ushr',
+        'neg', 'not', 'convert', 'bitconvert', 'load',
+    ])
+    for (const id of reachable) {
+        const n = graph.nodes.get(id)
+        if (!n || n.op === 'nil-effect' || free.has(id)) continue
+        if (n.op === 'after') {
+            if (graph.nodes.get(n.argIds[0])?.op !== 'nil-effect') return
+            continue
+        }
+        if (!cheap.has(n.op)) return
+        cost += n.op === 'load' ? 1 : n.op === 'mul' ? 2 : 1
+    }
+    if (cost > 4) return
+
+    const analysis = analyzeValueGraph(graph)
+    const live = new Set<number>()
+    const materialized = new Set<number>()
+    let pressure = 0
+    function schedule(id: number): void {
+        if (!id || materialized.has(id)) return
+        materialized.add(id)
+        const n = graph.nodes.get(id)
+        if (!n) return
+        for (const i of analysis.operandOrder.get(id) ?? n.argIds.map((_, i) => i)) {
+            schedule(n.argIds[i])
+        }
+        for (const released of analysis.releaseAt.get(id) ?? []) live.delete(released)
+        if (n.op !== 'nil-effect' && n.op !== 'after' && !free.has(id)) live.add(id)
+        if (live.size > pressure) pressure = live.size
+    }
+    schedule(root)
+    if (pressure > 1) return
+    return { cost, pressure }
+}
+
 function rewriteTargets(
     graph: Graph,
     locals: Map<number, number>,
@@ -306,6 +379,48 @@ export function createNatives(fns: Record<string, Function>) {
     const poolValues: (number | bigint)[] = []
     const poolSlots = new Map<PoolValue, number>()
     const session = createTraceSession()
+    const inlineScores = new Map<Function, InlineScore | false>()
+    let inlineMarker = 0
+    function analyzeInline(fn: Function): boolean {
+        const known = inlineScores.get(fn)
+        if (known !== undefined) return known !== false
+        inlineScores.set(fn, false)
+        try {
+            const computation = intrinsics.getComputation(fn)
+            const candidate = trace2(computation[0], {
+                captures: computation[1],
+                session: createTraceSession(),
+                mapCapture(capture: any) {
+                    if (typeof capture !== 'function') return capture
+                    const linked: any = capture
+                    if (Number.isSafeInteger(linked.__syscall)
+                        || Number.isSafeInteger(linked.__native)
+                        || linked.shouldInline) return capture
+                    try {
+                        intrinsics.getComputation(capture)
+                    } catch {
+                        return capture
+                    }
+                    return nativeStub(capture, inlineMarker++)
+                },
+            })
+            const score = obviousInline(normalizeValueGraph(candidate.graph))
+            if (!score) return false
+            inlineScores.set(fn, score)
+            if (intrinsics.argv().includes('native-inline')) {
+                console.log('native inline', fn.name, score)
+            }
+            return true
+        } catch (e) {
+            if (intrinsics.argv().includes('native-inline')) {
+                console.log('native no-inline', fn.name, e)
+            }
+            return false
+        }
+    }
+    function shouldInline(fn: Function): boolean {
+        return inlineScores.get(fn) !== false && inlineScores.has(fn)
+    }
     function intern(f: Function): number {
         const known = symbols.get(f)
         if (known !== undefined) return known
@@ -319,6 +434,29 @@ export function createNatives(fns: Record<string, Function>) {
         roots.set(name, intern(fn))
     }
     intrinsics.assert(roots.size > 0)
+    const discovered = new Set<Function>()
+    const pending = [...functions]
+    while (pending.length) {
+        const fn = pending.pop()!
+        if (discovered.has(fn)) continue
+        discovered.add(fn)
+        let computation: [string, any[]]
+        try {
+            computation = intrinsics.getComputation(fn)
+        } catch {
+            continue
+        }
+        for (const capture of computation[1]) {
+            if (typeof capture !== 'function') continue
+            const linked: any = capture
+            if (Number.isSafeInteger(linked.__syscall) || Number.isSafeInteger(linked.__native)) continue
+            if (!discovered.has(capture)) pending.push(capture)
+        }
+    }
+    for (const fn of discovered) {
+        const linked: any = fn
+        if (!linked.shouldInline) analyzeInline(fn)
+    }
     for (let symbol = 0; symbol < functions.length; symbol++) {
         const current = functions[symbol]
         if (intrinsics.argv().includes('native-symbols')) console.log('native symbol', symbol, current.name)
@@ -344,7 +482,8 @@ export function createNatives(fns: Record<string, Function>) {
             const linked: any = capture
             if (Number.isSafeInteger(linked.__syscall)
                 || Number.isSafeInteger(linked.__native)
-                || linked.shouldInline) return capture
+                || linked.shouldInline
+                || shouldInline(capture)) return capture
             try {
                 intrinsics.getComputation(capture)
             } catch {
@@ -356,7 +495,7 @@ export function createNatives(fns: Record<string, Function>) {
             return stub
         }
         const traced = trace2(computation[0], {
-            captures: computation[1], session, mapCapture, verbose: traceDebug,
+            captures: computation[1], session, mapCapture, shouldInline, verbose: traceDebug,
         })
         traced.graph.name = current.name
         if (traceDebug) console.log(traced.text)
