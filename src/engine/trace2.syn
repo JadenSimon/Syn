@@ -21,7 +21,7 @@ const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
 const assert = intrinsics.assert
 
-const TerminalOpcodes = new Set<number>([Op.Return, Op.Throw, Op.ReThrow])
+const TerminalOpcodes = new Set<number>([Op.Return, Op.ReturnVoid, Op.Throw, Op.ReThrow])
 const CondJumpOpcodes = new Set<number>([
     Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfToBooleanFalse,
     Op.JumpIfNotNull, Op.JumpIfNotUndefined, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue,
@@ -93,6 +93,7 @@ interface TraceFrame {
     dispatch(pc: number): number
     branch(cond: any, v1: number, v2: number): number
     canexit(acc: any): boolean
+    voidvalue(): any
     panic(acc: any): void
     call(target: any, thisArg: any, regStart: number, nargs: number, cb: any): any
 }
@@ -554,6 +555,7 @@ export function createTraceSession(): TraceSession {
                 dispatch: pc => frame().dispatch(pc),
                 branch: (cond, v1, v2) => frame().branch(cond, v1, v2),
                 canexit: acc => frame().canexit(acc),
+                voidvalue: () => frame().voidvalue(),
                 call: (target, thisArg, regStart, nargs, cb) => frame().call(target, thisArg, regStart, nargs, cb),
             })
             runtime = {
@@ -958,6 +960,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             return true
         },
+        voidvalue: () => {
+            tracer.markHandled()
+            return mk('void', emptyState, '', [Types.u32])
+        },
         panic: (_acc): void => {
             tracer.markHandled()
             step.kind = 'panic'
@@ -994,6 +1000,31 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (intrinsicName) {
                 const iargs = new Float64Array(nargs)
                 for (let i = 0; i < nargs; i++) iargs[i] = mem[regStart + i * 4]
+                if (intrinsicName === 'callcontext') {
+                    tracer.markHandled()
+                    return mk('call-context', new Float64Array(0), '', [Types.usize])
+                }
+                if (intrinsicName === 'load' && iargs[2] === Types.fnptr) {
+                    const loadArgs = new Float64Array(2)
+                    loadArgs[0] = iargs[0]
+                    loadArgs[1] = iargs[1]
+                    const loaded = after(
+                        mk('load', loadArgs, '', [Types.fnptr]),
+                        mem[slotAddr(TOKEN)],
+                    )
+                    let context = iargs[0]
+                    if (tracer.getNanId(iargs[1]) || iargs[1] !== 0) {
+                        const addressArgs = new Float64Array(2)
+                        addressArgs[0] = iargs[0]
+                        addressArgs[1] = iargs[1]
+                        context = mk('add', addressArgs, '', [Types.usize, Types.usize])
+                    }
+                    const targetArgs = new Float64Array(2)
+                    targetArgs[0] = loaded
+                    targetArgs[1] = context
+                    tracer.markHandled()
+                    return mk('indirect-target', targetArgs, '', [Types.fnptr])
+                }
                 if (intrinsicName === 'store') {
                     const sargs = new Float64Array(4)
                     sargs[0] = mem[slotAddr(TOKEN)]
@@ -1894,6 +1925,81 @@ function testStaticMemory() {
     assert(free() === 0)
 }
 testStaticMemory()
+
+function testIndirectCallContext() {
+    function nestedCallee(): u32 {
+        return 0
+    }
+    function indirectCallee(expected: usize): u32 {
+        return Intrinsics.callcontext() === expected ? 1 : 0
+    }
+    function indirectCalleeAcrossCall(expected: usize, nestedSlot: usize): u32 {
+        const fn = Intrinsics.load(nestedSlot, 0, Types.fnptr) as any
+        fn()
+        return Intrinsics.callcontext() === expected ? 1 : 0
+    }
+    function indirectCaller(slot: usize): u32 {
+        const fn = Intrinsics.load(slot, 0, Types.fnptr) as any
+        return fn(slot) + 1
+    }
+    function indirectOffsetCaller(base: usize): u32 {
+        const fn = Intrinsics.load(base, 8, Types.fnptr) as any
+        return fn(base + 8) + 1
+    }
+    function indirectCallerAcrossCall(slot: usize, nestedSlot: usize): u32 {
+        const fn = Intrinsics.load(slot, 0, Types.fnptr) as any
+        return fn(slot, nestedSlot) + 1
+    }
+
+    const callee = createNative(indirectCallee)
+    const nested = createNative(nestedCallee)
+    const across = createNative(indirectCalleeAcrossCall)
+    const cell = new BigUint64Array(2)
+    cell[0] = BigInt(callee.native.ptr)
+    cell[1] = BigInt(callee.native.ptr)
+    const nestedCell = new BigUint64Array(1)
+    nestedCell[0] = BigInt(nested.native.ptr)
+    const acrossCell = new BigUint64Array(1)
+    acrossCell[0] = BigInt(across.native.ptr)
+    const slot = Number((ts as any).getArrayBufferPtr(cell.buffer))
+    const nestedSlot = Number((ts as any).getArrayBufferPtr(nestedCell.buffer))
+    const acrossSlot = Number((ts as any).getArrayBufferPtr(acrossCell.buffer))
+    const caller = createNative(indirectCaller)
+    const offsetCaller = createNative(indirectOffsetCaller)
+    const acrossCaller = createNative(indirectCallerAcrossCall)
+    assert([...caller.graph.nodes.values()].some(n => n.op === 'indirect-target'))
+    assert(caller.code.listing.includes('x15'))
+    assert(caller.native(slot) === 2)
+    assert(offsetCaller.native(slot) === 2)
+    const acrossResult = acrossCaller.native(acrossSlot, nestedSlot)
+    if (intrinsics.argv().includes('indirect-context')) {
+        console.log(lowering2.dumpGraph(across.graph))
+        console.log(across.code.listing)
+        console.log(lowering2.dumpGraph(acrossCaller.graph))
+        console.log(acrossCaller.code.listing)
+        console.log('indirect context across call', acrossResult)
+    }
+    assert(acrossResult === 2)
+
+    type FnHolder = { c: u64, f: intrinsics.FnPtr<(a: u64, b: u64) => u64> }
+    const FnHolder = intrinsics.DefineStructView(reify FnHolder)
+    function f(a: u64, b: u64): u64 {
+        const ctx = Intrinsics.callcontext()
+        const c = Intrinsics.load(ctx, -8, Types.u64)
+        return a + b + c
+    }
+    function f2(ref: usize): u64 {
+        const v = FnHolder(ref)
+        return v.f(1, 2)
+    }
+    const fNative = createNative(f)
+    const f2Native = createNative(f2)
+    const cell2 = new BigUint64Array(2)
+    cell2[0] = BigInt(3)
+    cell2[1] = BigInt(fNative.native.ptr)
+    assert(f2Native.native((ts as any).getArrayBufferPtr(cell2.buffer)) === 6)
+}
+testIndirectCallContext()
 
 let totalInst = 0
 process.on('beforeExit', () => console.log('TOTAL INST COUNT', totalInst))
@@ -3037,6 +3143,39 @@ function testNative(fn: Function, cases: number[][], blrs: number = -1, name: st
     assert(unreachableTail.listing.split('cmp').length - 1 === 1)
     assert(!unreachableTail.listing.includes('movz x0, #0'))
     if (intrinsics.argv().includes('unreachable-tail')) console.log(unreachableTail.listing)
+
+    function cVoidStore(ptr: usize, x: u32): void {
+        Intrinsics.store(ptr, 0, x, Types.u32)
+    }
+    const voidData = new Uint32Array([0, 0])
+    const voidPtr = (ts as any).getArrayBufferPtr(voidData.buffer)
+    const voidStore = createNative(cVoidStore)
+    voidStore.native(voidPtr, 7)
+    assert(voidData[0] === 7)
+    assert(voidStore.code.listing.includes('str'))
+    assert(!voidStore.code.listing.includes('movz x0'))
+
+    function cVoidEarlyReturn(ptr: usize, x: u32): void {
+        if (x === 0) return
+        Intrinsics.store(ptr, 0, x, Types.u32)
+    }
+    const voidEarly = createNative(cVoidEarlyReturn)
+    voidEarly.native(voidPtr + 4, 11)
+    assert(voidData[1] === 11)
+    voidEarly.native(voidPtr + 4, 0)
+    assert(voidData[1] === 11)
+    assert(!voidEarly.code.listing.includes('movz x0'))
+
+    const cVoidArrowBody = (ptr: usize, x: u32) => { Intrinsics.store(ptr, 0, x, Types.u32) }
+    const voidArrow = lowerValueGraph(trace2(cVoidArrowBody).graph)
+    assert(voidArrow.listing === lowerValueGraph(trace2(cVoidStore).graph).listing)
+
+    function cMixedVoidReturn(x: u32) {
+        if (x === 1) return 1
+    }
+    const mixedVoid = createNative(cMixedVoidReturn)
+    assert(mixedVoid.native(1) === 1)
+    assert(mixedVoid.native(0) === 0)
 
     testNative(function cCallTwice(f: any, x: number) {
         const v1 = f(x, 2)
