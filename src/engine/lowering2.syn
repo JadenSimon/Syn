@@ -214,7 +214,23 @@ export function reduceEffectDependencies(g: Graph): Graph {
     let changed = false
     let nil = 0
     for (const [id, n] of nodes) if (n.op === 'nil-effect') { nil = id; break }
-    if (!nil) return g
+    function nilEffect(): number {
+        if (!nil) {
+            nil = nextId++
+            nodes.set(nil, {
+                op: 'nil-effect', argIds: [], argConsts: new Float64Array(0),
+                T: Types.u64, U: Types.u64, offset: 0,
+            })
+        }
+        return nil
+    }
+
+    const tokenParams = new Set<number>()
+    const blockOf = new Map<number, GraphBlock>()
+    for (const b of g.blocks) {
+        blockOf.set(b.id, b)
+        if (b.consumesEffectToken && b.params.length) tokenParams.add(b.params[b.params.length - 1])
+    }
 
     for (const [id, n] of nodes) {
         if (n.op !== 'select') continue
@@ -236,43 +252,193 @@ export function reduceEffectDependencies(g: Graph): Graph {
         changed = true
     }
 
-    const memo = new Map<number, number>()
+    const siblingOf = new Map<number, number>()
+    const ambiguous = new Set<number>()
+    for (const n of nodes.values()) {
+        if (n.op !== 'select') continue
+        const a = n.argIds[1]
+        const b = n.argIds[2]
+        if (!a || !b || a === b) {
+            if (a) ambiguous.add(a)
+            if (b) ambiguous.add(b)
+            continue
+        }
+        const prevA = siblingOf.get(a)
+        if (prevA !== undefined && prevA !== b) ambiguous.add(a)
+        else siblingOf.set(a, b)
+        const prevB = siblingOf.get(b)
+        if (prevB !== undefined && prevB !== a) ambiguous.add(b)
+        else siblingOf.set(b, a)
+    }
+
+    const evalArms = new Map<number, Set<number>>()
+    const dataArms = new Map<number, Set<number>>()
+    const demanded = new Set<number>()
+    {
+        const queue: [id: number, arms: Set<number>, used: boolean][] = []
+        function send(id: number, arms: Set<number>, mark: number, used: boolean): void {
+            if (!id) return
+            const next = new Set<number>(arms)
+            if (mark) next.add(mark)
+            queue.push([id, next, used])
+        }
+        function narrow(map: Map<number, Set<number>>, id: number, arms: Set<number>): boolean {
+            const prev = map.get(id)
+            if (!prev) { map.set(id, new Set<number>(arms)); return true }
+            const drop: number[] = []
+            for (const a of prev) if (!arms.has(a)) drop.push(a)
+            for (const a of drop) prev.delete(a)
+            return drop.length > 0
+        }
+        for (const b of g.blocks) {
+            send(b.bodyId, new Set<number>(), 0, false)
+            send(b.bodyId, new Set<number>(), 0, true)
+        }
+        while (queue.length) {
+            const [id, arms, used] = queue.pop()!
+            if (used) demanded.add(id)
+            if (!narrow(used ? dataArms : evalArms, id, arms)) continue
+            const n = nodes.get(id)
+            if (!n) continue
+            const evalCtx = evalArms.get(id) ?? arms
+            const dataCtx = dataArms.get(id) ?? evalCtx
+            const isUsed = demanded.has(id)
+            if (n.op === 'select') {
+                send(n.argIds[0], evalCtx, 0, false)
+                if (isUsed) send(n.argIds[0], dataCtx, 0, true)
+                for (let i = 1; i < n.argIds.length; i++) {
+                    const arm = n.argIds[i]
+                    if (!arm) continue
+                    const mark = ambiguous.has(arm) ? 0 : arm
+                    send(arm, evalCtx, mark, false)
+                    if (isUsed) send(arm, dataCtx, mark, true)
+                }
+            } else if (n.op === 'after') {
+                send(n.argIds[0], evalCtx, 0, false)
+                send(n.argIds[1], evalCtx, 0, false)
+                if (isUsed) send(n.argIds[1], dataCtx, 0, true)
+            } else if (n.op === 'call' || n.op === 'store') {
+                send(n.argIds[0], evalCtx, 0, false)
+                for (let i = 1; i < n.argIds.length; i++) {
+                    send(n.argIds[i], evalCtx, 0, false)
+                    send(n.argIds[i], evalCtx, 0, true)
+                }
+            } else if (n.op === 'apply') {
+                const b = blockOf.get(n.argIds[0])
+                for (let i = 1; i < n.argIds.length; i++) {
+                    send(n.argIds[i], evalCtx, 0, false)
+                    if (!b?.consumesEffectToken || i !== n.argIds.length - 1) {
+                        send(n.argIds[i], evalCtx, 0, true)
+                    }
+                }
+            } else {
+                for (const a of n.argIds) {
+                    send(a, evalCtx, 0, false)
+                    if (isUsed) send(a, dataCtx, 0, true)
+                }
+            }
+        }
+    }
+
+    function released(load: number, at: number): boolean {
+        const reads = dataArms.get(load)
+        const runs = evalArms.get(at)
+        if (!reads || !runs) return false
+        for (const arm of reads) {
+            const other = siblingOf.get(arm)
+            if (other !== undefined && runs.has(other)) return true
+        }
+        return false
+    }
+
+    const memos = [new Map<number, number>(), new Map<number, number>()]
     const active = new Set<number>()
     function sequence(a: number, b: number, source: GraphNode): number {
-        if (a === nil) return b
-        if (b === nil || a === b) return a
+        if (!a) return b
+        if (!b || a === b) return a
         const id = nextId++
         nodes.set(id, {
             ...source, op: 'after', argIds: [a, b], argConsts: new Float64Array(2),
         })
         return id
     }
-    function effects(id: number): number {
-        if (!id) return nil
+    // `ordered` reductions are for writers
+    function effects(id: number, ordered: boolean): number {
+        if (!id) return 0
+        const memo = memos[ordered ? 1 : 0]
         const known = memo.get(id)
         if (known !== undefined) return known
         if (active.has(id)) return id
         active.add(id)
         const n = nodes.get(id)
         let out = id
-        if (!n || n.op === 'nil-effect') out = nil
+        if (!n) out = tokenParams.has(id) ? id : 0
+        else if (n.op === 'nil-effect') out = 0
         else if (n.op === 'after') {
-            out = sequence(effects(n.argIds[0]), effects(n.argIds[1]), n)
+            const a = effects(n.argIds[0], ordered)
+            const b = effects(n.argIds[1], ordered)
+            out = a === n.argIds[0] && b === n.argIds[1] ? id : sequence(a, b, n)
+        } else if (n.op === 'load' && ordered && demanded.has(id)) {
+            out = id
         } else if (n.op === 'load' || n.op === 'is-state' || PureOps.has(n.op)) {
-            out = nil
-            for (const arg of n.argIds) out = sequence(out, effects(arg), n)
+            out = 0
+            for (const arg of n.argIds) out = sequence(out, effects(arg, ordered), n)
         }
         active.delete(id)
         memo.set(id, out)
         return out
     }
 
+    function isOperand(n: GraphNode, id: number): boolean {
+        for (let i = 1; i < n.argIds.length; i++) if (n.argIds[i] === id) return true
+        return false
+    }
+
+    function flatten(id: number, out: number[]): void {
+        const n = nodes.get(id)
+        if (n?.op === 'after') {
+            flatten(n.argIds[0], out)
+            flatten(n.argIds[1], out)
+            return
+        }
+        if (id) out.push(id)
+    }
+
+    function dropReleased(effect: number, at: number, source: GraphNode): number {
+        const parts: number[] = []
+        flatten(effect, parts)
+        let drops = 0
+        for (const p of parts) if (nodes.get(p)?.op === 'load' && released(p, at)) drops++
+        if (!drops) return effect
+        let out = 0
+        for (const p of parts) {
+            if (nodes.get(p)?.op === 'load' && released(p, at)) continue
+            out = sequence(out, p, source)
+        }
+        return out
+    }
+
+    const reduced: [id: number, n: GraphNode, effect: number][] = []
     for (const [id, n] of [...nodes]) {
         if (n.op !== 'after' && n.op !== 'call' && n.op !== 'store') continue
-        const effect = effects(n.argIds[0])
+        let effect = effects(n.argIds[0], n.op !== 'after')
+        if (n.op !== 'after') effect = dropReleased(effect, id, n)
+        for (;;) {
+            const e = nodes.get(effect)
+            if (!e) break
+            if (e.op === 'load' && isOperand(n, effect)) { effect = 0; break }
+            if (e.op !== 'after') break
+            const tail = e.argIds[1]
+            if (nodes.get(tail)?.op !== 'load' || !isOperand(n, tail)) break
+            effect = e.argIds[0]
+        }
         if (effect === n.argIds[0]) continue
+        reduced.push([id, n, effect])
+    }
+    for (const [id, n, effect] of reduced) {
         const argIds = n.argIds.slice()
-        argIds[0] = effect
+        argIds[0] = effect || nilEffect()
+        if (argIds[0] === n.argIds[0]) continue
         nodes.set(id, { ...n, argIds })
         changed = true
     }
@@ -2149,8 +2315,8 @@ export function normalizeValueGraph(g: Graph): Graph {
     g = simplifyCountedLoop(g) ?? g
     g = liftCommonEffects(g)
     g = packageBlocks(liftCommonApplications(g))
-    g = reduceEffectDependencies(g)
     g = strengthReduceLoops(g) ?? g
+    g = reduceEffectDependencies(g)
     g = pruneBlockParams(g)
     optimizeValueGraph(g)
     g = simplifyBitOperations(g) ?? g

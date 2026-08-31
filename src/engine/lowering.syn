@@ -142,6 +142,8 @@ interface AsmItem {
     addLeft?: number
     addRight?: number
     addImmediate?: number
+    addShiftReg?: number
+    addShiftAmount?: number
     logicalDst?: number
     logicalSrc?: number
     logicalImmediate?: number
@@ -1048,6 +1050,84 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         strUnsigned(src, scratchA, 0, bytes)
     }
 
+    function itemDefs(item: AsmItem, out: number[]): boolean {
+        if (item.kind !== 'insn') return false
+        if (item.shiftDst !== undefined) { out.push(item.shiftDst); return true }
+        if (item.addDst !== undefined) { out.push(item.addDst); return true }
+        if (item.adjustReg !== undefined) { out.push(item.adjustReg); return true }
+        if (item.logicalDst !== undefined) { out.push(item.logicalDst); return true }
+        if (item.moveDst !== undefined) { out.push(item.moveDst); return true }
+        if (item.convertDst !== undefined) { out.push(item.convertDst); return true }
+        if (item.extractDst !== undefined) { out.push(item.extractDst); return true }
+        if (item.zeroReg !== undefined) { out.push(item.zeroReg); return true }
+        if (item.loadBase !== undefined) { out.push(item.word & 0x1F); return true }
+        if (item.storeBase !== undefined) return true
+        if (item.cmpLeft !== undefined) return true
+        return false
+    }
+    function itemUses(item: AsmItem, out: number[]): boolean {
+        if (item.kind !== 'insn') return false
+        if (item.shiftSrc !== undefined) { out.push(item.shiftSrc); return true }
+        if (item.addLeft !== undefined) {
+            out.push(item.addLeft)
+            if (item.addRight !== undefined) out.push(item.addRight)
+            return true
+        }
+        if (item.adjustReg !== undefined) { out.push(item.adjustReg); return true }
+        if (item.logicalSrc !== undefined) { out.push(item.logicalSrc); return true }
+        if (item.moveSrc !== undefined) { out.push(item.moveSrc); return true }
+        if (item.convertSrc !== undefined) { out.push(item.convertSrc); return true }
+        if (item.extractSrc !== undefined) { out.push(item.extractSrc); return true }
+        if (item.zeroReg !== undefined) return true
+        if (item.loadBase !== undefined) { out.push(item.loadBase); return true }
+        if (item.storeBase !== undefined) {
+            out.push(item.storeBase)
+            out.push(item.word & 0x1F)
+            return true
+        }
+        if (item.cmpLeft !== undefined) {
+            out.push(item.cmpLeft)
+            if (item.cmpRight !== undefined) out.push(item.cmpRight)
+            return true
+        }
+        return false
+    }
+    function canReorderOver(item: AsmItem): boolean {
+        const defs: number[] = []
+        const uses: number[] = []
+        return itemDefs(item, defs) && itemUses(item, uses)
+    }
+    function noInterference(from: number, to: number, index: number, source: number): boolean {
+        for (let i = from; i < to; i++) {
+            const defs: number[] = []
+            const uses: number[] = []
+            if (!itemDefs(items[i], defs) || !itemUses(items[i], uses)) return false
+            for (const r of defs) if (r === index || r === source) return false
+            for (const r of uses) if (r === index) return false
+        }
+        return true
+    }
+
+    function collapseIndexedLoad(addAt: number): boolean {
+        const add = items[addAt]
+        const load = items[addAt + 1]
+        if (!add || !load || add.kind !== 'insn' || load.kind !== 'insn') return false
+        if (add.addDst === undefined || add.addLeft === undefined
+            || add.addShiftReg === undefined || add.addShiftAmount !== 3) return false
+        if (load.loadBytes !== 8 || load.loadOffset !== 0) return false
+        if (load.loadBase !== add.addDst || load.reg !== add.addDst) return false
+        const index = add.addShiftReg
+        const baseReg = add.addLeft
+        if (baseReg === index) return false
+        load.word = (0xF8607800 | (index << 16) | (baseReg << 5) | load.reg) >>> 0
+        load.text = `ldr ${x(load.reg)}, [${x(baseReg)}, ${x(index)}, lsl #3]`
+        load.loadBase = undefined
+        load.loadOffset = undefined
+        load.loadBytes = undefined
+        items.splice(addAt, 1)
+        return true
+    }
+
     function released(values: { value: number, home: number }[]): void {
         const dead = new Set<number>()
         for (const value of values) if (value.home >= 0) dead.add(value.home)
@@ -1131,29 +1211,70 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
         }
 
-        if (items.length >= 3) {
-            const load = items[items.length - 1]
-            const add = items[items.length - 2]
-            const shift = items[items.length - 3]
-            if (load.kind === 'insn' && add.kind === 'insn' && shift.kind === 'insn'
-                && load.loadBytes === 8 && load.loadOffset === 0
-                && add.addDst === load.loadBase && load.reg === add.addDst
-                && shift.shiftDst !== undefined && shift.shiftSrc !== undefined
-                && shift.shiftKind === 'lsl' && shift.shiftAmount === 3
-                && shift.shiftDst === shift.shiftSrc && dead.has(shift.shiftDst)) {
-                const index = shift.shiftDst
-                const baseReg = add.addLeft === index ? add.addRight
-                    : add.addRight === index ? add.addLeft : undefined
-                if (baseReg !== undefined && baseReg !== index) {
-                    load.word = (0xF8607800 | (index << 16) | (baseReg << 5) | load.reg) >>> 0
-                    load.text = `ldr ${x(load.reg)}, [${x(baseReg)}, ${x(index)}, lsl #3]`
-                    load.loadBase = undefined
-                    load.loadOffset = undefined
-                    load.loadBytes = undefined
-                    items.splice(items.length - 3, 2)
-                    return
-                }
+        for (let maskAt = items.length - 1; maskAt >= 1 && maskAt >= items.length - 2; maskAt--) {
+            const mask = items[maskAt]
+            if (mask.kind !== 'insn' || mask.logicalOp !== 'and'
+                || mask.logicalDst === undefined || mask.logicalSrc === undefined
+                || mask.logicalDst !== mask.logicalSrc) continue
+            const bytes = mask.logicalImmediate === 0xFFFF ? 2
+                : mask.logicalImmediate === 0xFF ? 1 : 0
+            if (!bytes) continue
+            let at = maskAt - 1
+            for (; at >= 0; at--) {
+                const ld = items[at]
+                if (ld.kind !== 'insn') { at = -1; break }
+                if (ld.loadBase !== undefined && ld.loadOffset !== undefined
+                    && ld.loadBytes !== undefined && ld.loadBytes > bytes
+                    && ld.reg === mask.logicalDst) break
+                if (!canReorderOver(ld)) { at = -1; break }
             }
+            if (at < 0) continue
+            const ld = items[at]
+            const offset = ld.loadOffset!
+            if (offset < 0 || offset % bytes !== 0 || offset / bytes >= 4096) continue
+            if (!noInterference(at + 1, maskAt, ld.reg, ld.reg)) continue
+            const size = bytes === 1 ? 0 : 1
+            ld.word = (0x39000000 | (size << 30) | (1 << 22) | ((offset / bytes) << 10)
+                | (ld.loadBase! << 5) | ld.reg) >>> 0
+            const from = ld.loadBase === SP ? 'sp' : x(ld.loadBase!)
+            ld.text = `ldr${bytes === 1 ? 'b' : 'h'} ${w(ld.reg)}, [${from}, #${offset}]`
+            ld.loadBytes = bytes
+            items.splice(maskAt, 1)
+            return
+        }
+
+        for (let addAt = items.length - 1; addAt >= 1 && addAt >= items.length - 2; addAt--) {
+            const add = items[addAt]
+            if (add.kind !== 'insn' || add.addDst === undefined
+                || add.addLeft === undefined || add.addRight === undefined) continue
+            let at = addAt - 1
+            for (; at >= 0; at--) {
+                const shift = items[at]
+                if (shift.kind !== 'insn') { at = -1; break }
+                if (shift.shiftKind === 'lsl' && shift.shiftDst !== undefined
+                    && shift.shiftSrc !== undefined && shift.shiftAmount !== undefined
+                    && shift.shiftAmount > 0 && shift.shiftAmount <= 63
+                    && dead.has(shift.shiftDst)
+                    && (add.addLeft === shift.shiftDst || add.addRight === shift.shiftDst)) break
+                if (!canReorderOver(shift)) { at = -1; break }
+            }
+            if (at < 0) continue
+            const shift = items[at]
+            const index = shift.shiftDst!
+            const source = shift.shiftSrc!
+            const baseReg = add.addRight === index ? add.addLeft : add.addRight
+            if (baseReg === index) continue
+            if (!noInterference(at + 1, addAt, index, source)) continue
+            add.word = (0x8B000000 | (source << 16) | (shift.shiftAmount! << 10)
+                | (baseReg << 5) | add.addDst) >>> 0
+            add.text = `add ${x(add.addDst)}, ${x(baseReg)}, ${x(source)}, lsl #${shift.shiftAmount}`
+            add.addLeft = baseReg
+            add.addRight = undefined
+            add.addShiftReg = source
+            add.addShiftAmount = shift.shiftAmount
+            items.splice(at, 1)
+            collapseIndexedLoad(addAt - 1)
+            return
         }
 
         if (items.length < 3) return
