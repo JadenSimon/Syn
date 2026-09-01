@@ -16,12 +16,17 @@ const slotScale = 8
 const slotMask = 0xffff
 const scIdMask = 0xffff
 const scChunkBytes = 4 * 1024
-const accountingCapacity = 16
+const accountingCapacity = 16 as u16
 const refCountMask = 0x3fffffff
 const supportStateMask = 0xc0000000
 const supportPending = 0x40000000
 const supportDestroying = 0x80000000
 const supportDestroyed = 0xc0000000
+
+enum StaticEnumerator {
+    none,
+    singleEdge,
+}
 
 enum ScFlags {
     eternal = 1 << 0,
@@ -29,6 +34,7 @@ enum ScFlags {
 
 enum ScType {
     general,
+    pool,
 }
 
 interface HeapState {
@@ -49,6 +55,9 @@ interface ScHeader {
     enumerateEdges: u64
     nextSlot: u16
     capacity: u16
+    freeSlot: u16
+    cellSlots: u16
+    poolStart: u16
 }
 
 interface ScCellData {
@@ -75,7 +84,7 @@ function allocate(bytes: usize): usize {
         syscalls.MAP_PRIVATE | syscalls.MAP_ANON,
         -1 as any, 0,
     )
-    intrinsics.assert(ptr !== -1)
+    intrinsics.assert((ptr as any) !== -1)
     return ptr
 }
 
@@ -192,15 +201,27 @@ function destroyCellWith(
         removeEdge(heapPtr, handle, target)
     }
     finishDestroy(heapPtr, handle)
+    releaseCell(heapPtr, handle)
+    return true
+}
+
+function destroySingleEdgeCell(heapPtr: usize, handle: Handle): boolean {
+    if (!beginDestroy(heapPtr, handle)) return false
+    const target = enumerateSingleEdge(resolve(heapPtr, handle), 0)
+    if (target !== 0) removeEdge(heapPtr, handle, target)
+    finishDestroy(heapPtr, handle)
+    releaseCell(heapPtr, handle)
     return true
 }
 
 export function destroyCell(heapPtr: usize, handle: Handle): boolean {
     const ptr = getScRaw(heapPtr, handleSc(handle))
     const enumerateEdges = Sc(ptr).enumerateEdges
+    if (enumerateEdges === StaticEnumerator.singleEdge) return destroySingleEdgeCell(heapPtr, handle)
     if (enumerateEdges !== 0) return destroyCellWith(heapPtr, handle, enumerateEdges as any)
     if (!beginDestroy(heapPtr, handle)) return false
     finishDestroy(heapPtr, handle)
+    releaseCell(heapPtr, handle)
     return true
 }
 
@@ -215,9 +236,6 @@ export function handleSc(handle: Handle): ScId {
 export function handleSlot(handle: Handle): u16 {
     return (handle & slotMask) as u16
 }
-
-intrinsics.tagInline(handleSc)
-intrinsics.tagInline(handleSlot)
 
 export function resolve(heapPtr: usize, handle: Handle): usize {
     const raw = getScRaw(heapPtr, handleSc(handle))
@@ -234,6 +252,9 @@ function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8): void
     sc.enumerateEdges = enumerateEdges
     sc.nextSlot = 1
     sc.capacity = ((scChunkBytes - scHeaderSize) / slotScale) as u16
+    sc.freeSlot = 0
+    sc.cellSlots = 0
+    sc.poolStart = 0
 }
 
 function initScAccounting(heapPtr: usize, id: ScId, ptr: usize, cellHandle: Handle): void {
@@ -246,20 +267,52 @@ function initScAccounting(heapPtr: usize, id: ScId, ptr: usize, cellHandle: Hand
     data.peerRefs = allocCell(heapPtr, handleSc(cellHandle), bytes)
 }
 
-export function allocCell(heapPtr: usize, scId: ScId, bytes: usize): Handle {
-    const sc = Sc(getScRaw(heapPtr, scId))
-    const slots = ((bytes + 7) >> 3) as u16
+function allocBump(scId: ScId, ptr: usize, slots: u16): Handle {
+    const sc = Sc(ptr)
     const start = sc.nextSlot
     intrinsics.assert(slots > 0 && start + slots <= sc.capacity + 1)
     sc.nextSlot = start + slots
     return makeHandle(scId, start)
 }
 
+function allocPool(heapPtr: usize, scId: ScId, ptr: usize, slots: u16): Handle {
+    const sc = Sc(ptr)
+    intrinsics.assert(slots === sc.cellSlots)
+    const free = sc.freeSlot
+    if (free === 0) return allocBump(scId, ptr, slots)
+    const handle = makeHandle(scId, free)
+    sc.freeSlot = intrinsics.Intrinsics.load(resolve(heapPtr, handle), 0, Types.u16)
+    setSupportState(heapPtr, handle, 0)
+    return handle
+}
+
+export function allocCell(heapPtr: usize, scId: ScId, bytes: usize): Handle {
+    const ptr = getScRaw(heapPtr, scId)
+    const sc = Sc(ptr)
+    const slots = ((bytes + 7) >> 3) as u16
+    if (sc.type === ScType.general) return allocBump(scId, ptr, slots)
+    if (sc.type === ScType.pool) return allocPool(heapPtr, scId, ptr, slots)
+    intrinsics.assert(false)
+}
+
+function releaseCell(heapPtr: usize, handle: Handle): void {
+    const sc = Sc(getScRaw(heapPtr, handleSc(handle)))
+    if (sc.type === ScType.general) return
+    if (sc.type === ScType.pool) {
+        const slot = handleSlot(handle)
+        intrinsics.assert(slot >= sc.poolStart && (slot - sc.poolStart) % sc.cellSlots === 0)
+        intrinsics.Intrinsics.store(resolve(heapPtr, handle), 0, sc.freeSlot, Types.u16)
+        sc.freeSlot = slot
+        return
+    }
+    intrinsics.assert(false)
+}
+
 export function createHeap(
     maxScs: ScId,
     enumerateEdges: u64,
 ): usize {
-    intrinsics.assert(maxScs > 1 && maxScs <= scIdMask)
+    intrinsics.assert(maxScs > 1 && (maxScs as any) <= scIdMask)
     const tableBytes = maxScs * 8
     const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
     const heapPtr = allocate(slabStartOffset + maxScs * scChunkBytes)
@@ -299,6 +352,26 @@ export function createSc(
     initScAccounting(heapPtr, id, ptr, owner)
     if (parent.depthExtent === 0) parent.depthExtent = 1
     return id
+}
+
+function configurePool(heapPtr: usize, id: ScId, cellBytes: usize): ScId {
+    const sc = Sc(getScRaw(heapPtr, id))
+    const slots = ((cellBytes + 7) >> 3) as u16
+    intrinsics.assert(slots > 0)
+    sc.type = ScType.pool
+    sc.cellSlots = slots
+    sc.poolStart = sc.nextSlot
+    sc.freeSlot = 0
+    return id
+}
+
+export function createPoolSc(
+    heapPtr: usize,
+    parentId: ScId,
+    enumerateEdges: u64,
+    cellBytes: usize,
+): ScId {
+    return configurePool(heapPtr, createSc(heapPtr, parentId, enumerateEdges), cellBytes)
 }
 
 export function getSc(heapPtr: usize, id: ScId) {
@@ -366,7 +439,7 @@ function removeSupportRef(heapPtr: usize, ptr: usize, handle: Handle, eager: boo
 }
 
 function sparseCount(ptr: usize, capacity: u16, key: u32): u32 {
-    for (let i = 0; i < capacity; i++) {
+    for (let i: u32 = 0; i < capacity; i++) {
         const offset = i * 8
         const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
         if (entry === key) return intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
@@ -377,7 +450,7 @@ function sparseCount(ptr: usize, capacity: u16, key: u32): u32 {
 
 function putSparse(ptr: usize, capacity: u16, key: u32, value: u32): void {
     intrinsics.assert(key > 0)
-    for (let i = 0; i < capacity; i++) {
+    for (let i: u32 = 0; i < capacity; i++) {
         const offset = i * 8
         const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
         if (entry === key) {
@@ -394,7 +467,7 @@ function putSparse(ptr: usize, capacity: u16, key: u32, value: u32): void {
 }
 
 function addSparse(ptr: usize, capacity: u16, key: u32): u32 {
-    for (let i = 0; i < capacity; i++) {
+    for (let i: u32 = 0; i < capacity; i++) {
         const offset = i * 8
         const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
         if (entry === key) {
@@ -409,11 +482,10 @@ function addSparse(ptr: usize, capacity: u16, key: u32): u32 {
         }
     }
     intrinsics.assert(false)
-    return 0
 }
 
 function removeSparse(ptr: usize, capacity: u16, key: u32): u32 {
-    for (let i = 0; i < capacity; i++) {
+    for (let i: u32 = 0; i < capacity; i++) {
         const offset = i * 8
         const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
         if (entry === 0) break
@@ -424,7 +496,6 @@ function removeSparse(ptr: usize, capacity: u16, key: u32): u32 {
         return count - 1
     }
     intrinsics.assert(false)
-    return 0
 }
 
 function peerKey(from: u16, to: u16): u32 {
@@ -621,7 +692,7 @@ export function peerRefCount(heapPtr: usize, parentId: ScId, fromOwner: Handle, 
 }
 
 function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
-    intrinsics.assert(maxScs > 1 && maxScs <= scIdMask)
+    intrinsics.assert(maxScs > 1 && (maxScs as any) <= scIdMask)
     const tableBytes = maxScs * 8
     const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
     const heapPtr = intrinsics.Intrinsics.alloc(slabStartOffset + maxScs * scChunkBytes)
@@ -663,6 +734,15 @@ function createInterpretedSc(
     return id
 }
 
+function createInterpretedPoolSc(
+    heapPtr: usize,
+    parentId: ScId,
+    enumerateEdges: u64,
+    cellBytes: usize,
+): ScId {
+    return configurePool(heapPtr, createInterpretedSc(heapPtr, parentId, enumerateEdges), cellBytes)
+}
+
 function benchAddRemove(iter: number, heap: usize, localFrom: Handle, localTo: Handle) {
     addEdge(heap, localFrom, localTo)
     for (let i = 0; i < iter; i++) {
@@ -678,7 +758,12 @@ function enumerateSingleEdge(ptr: usize, index: u32): Handle {
 }
 
 function setSingleEdge(heapPtr: usize, source: Handle, target: Handle): void {
-    intrinsics.Intrinsics.store(resolve(heapPtr, source), 0, target, Types.u32)
+    const ptr = resolve(heapPtr, source)
+    const previous = intrinsics.Intrinsics.load(ptr, 0, Types.u32) as Handle
+    if (previous === target) return
+    if (target !== 0) addEdge(heapPtr, source, target)
+    intrinsics.Intrinsics.store(ptr, 0, target, Types.u32)
+    if (previous !== 0) removeEdge(heapPtr, source, previous)
 }
 
 export function selfTest(select: (apis: any) => any): void {
@@ -713,10 +798,11 @@ export function selfTest(select: (apis: any) => any): void {
         benchAddRemove,
     }
     const api = select({
-        native: { createHeap, createSc, ...shared },
+        native: { createHeap, createSc, createPoolSc, ...shared },
         interpreted: {
             createHeap: createInterpretedHeap,
             createSc: createInterpretedSc,
+            createPoolSc: createInterpretedPoolSc,
             ...shared,
         },
     })
@@ -847,7 +933,6 @@ export function selfTest(select: (apis: any) => any): void {
     const source = api.allocCell(heap, destructibleSc, 8)
     const target = api.allocCell(heap, destructibleSc, 8)
     api.setSingleEdge(heap, source, target)
-    api.addEdge(heap, source, target)
     intrinsics.assert(api.supportCount(heap, source) === 0)
     intrinsics.assert(api.supportCount(heap, target) === 1)
     const destroyed = enumeratorAddress
@@ -857,6 +942,35 @@ export function selfTest(select: (apis: any) => any): void {
     intrinsics.assert(api.supportState(heap, source) === supportDestroyed)
     intrinsics.assert(api.supportCount(heap, target) === 0)
     intrinsics.assert(api.supportState(heap, target) === supportDestroyed)
+
+    const pool = api.createPoolSc(heap, root, 0, 16)
+    const pooled = api.allocCell(heap, pool, 16)
+    const nextPooled = api.allocCell(heap, pool, 16)
+    intrinsics.assert(pooled !== nextPooled)
+    intrinsics.assert(api.destroyCell(heap, pooled))
+    intrinsics.assert(api.supportState(heap, pooled) === supportDestroyed)
+    const reused = api.allocCell(heap, pool, 16)
+    intrinsics.assert(reused === pooled)
+    intrinsics.assert(api.supportState(heap, reused) === 0)
+
+    {
+        const pool1 = api.createPoolSc(heap, root, StaticEnumerator.singleEdge, 16)
+        const pool2 = api.createPoolSc(heap, root, StaticEnumerator.singleEdge, 16)
+        const a = api.allocCell(heap, pool1, 16)
+        const b = api.allocCell(heap, pool2, 16)
+        const c = api.allocCell(heap, pool2, 16)
+        api.setSingleEdge(heap, a, b)
+        api.setSingleEdge(heap, b, c)
+        intrinsics.assert(api.enumerateSingleEdge(api.resolve(heap, a), 0) === b)
+        intrinsics.assert(api.enumerateSingleEdge(api.resolve(heap, b), 0) === c)
+        intrinsics.assert(api.supportCount(heap, b) === 1)
+        intrinsics.assert(api.supportCount(heap, c) === 1)
+        api.setSingleEdge(heap, a, 0)
+        intrinsics.assert(api.enumerateSingleEdge(api.resolve(heap, a), 0) === 0)
+        intrinsics.assert(api.supportState(heap, a) === 0)
+        intrinsics.assert(api.supportState(heap, b) === supportDestroyed)
+        intrinsics.assert(api.supportState(heap, c) === supportDestroyed)
+    }
 }
 
 if (intrinsics.argv()[0] === 'cg') {
