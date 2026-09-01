@@ -5,6 +5,7 @@ const any = Symbol.for('Type.any')
 const never = Symbol.for('Type.never')
 const unknown = Symbol.for('Type.unknown')
 const Void = Symbol.for('Type.void')
+const baseType = Symbol('Type.base')
 
 const number = Symbol.for('Type.number')
 const string = Symbol.for('Type.string')
@@ -200,7 +201,11 @@ function defineNonEnumerable(o: any, p: PropertyKey, value: any) {
 
 export function createTypeNamespace() {
     class Union extends Set {}
-    class ObjectType {}
+    class ObjectType {
+        __setBase(base: any) {
+            defineNonEnumerable(this, baseType, base)
+        }
+    }
     class ArrayType {}
     class FunctionType {
         constructor(
@@ -324,6 +329,10 @@ export function createTypeNamespace() {
         return new ObjectType()
     }
 
+    function getBase(t: any) {
+        return t[baseType]
+    }
+
     function __Tuple() {
         return new Tuple()
     }
@@ -436,6 +445,7 @@ export function createTypeNamespace() {
         Union,
         Tuple,
         Object: ObjectType,
+        getBase,
         Machine,
         Function: FunctionType,
 
@@ -848,4 +858,3 @@ function applySourceMaps(nameToSource: Map<string, string>, err: Error) {
         }
     )
 }
-

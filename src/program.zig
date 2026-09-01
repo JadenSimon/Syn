@@ -17184,6 +17184,26 @@ pub const Analyzer = struct {
             return rhs;
         }
 
+        // XXX
+        if (lhs < @intFromEnum(Kind.false) and rhs < @intFromEnum(Kind.false)) {
+            const lhs_type = this.types.at(lhs);
+            const rhs_type = this.types.at(rhs);
+            const object_ref, const base_ref = if (lhs_type.getKind() == .object_literal and rhs_type.getKind() == .machine_data_type)
+                .{ lhs, rhs }
+            else if (rhs_type.getKind() == .object_literal and lhs_type.getKind() == .machine_data_type)
+                .{ rhs, lhs }
+            else
+                .{ @as(TypeRef, 0), @as(TypeRef, 0) };
+            if (object_ref != 0) {
+                const object = this.types.at(object_ref);
+                const members = getSlice2(object, ObjectLiteralMember);
+                const copy = try this.allocator().alloc(ObjectLiteralMember, members.len);
+                @memcpy(copy, members);
+                const base = if (object.slot3 == 0) base_ref else try this.intersectType(object.slot3, base_ref);
+                return this.createObjectLiteral(copy, object.flags, base);
+            }
+        }
+
         if (lhs >= @intFromEnum(Kind.false)) {
             if (lhs == @intFromEnum(Kind.this)) {
                 return this.createIntersectionType(&.{ lhs, rhs }, 0);

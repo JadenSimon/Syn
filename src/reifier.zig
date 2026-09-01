@@ -272,6 +272,11 @@ pub const Reifier = struct {
                 const o = try this.createSavedShape(ty, "__Object");
                 try this.setCached(ty, @ptrCast(o));
 
+                if (t.slot3 != 0) {
+                    const base = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(t.slot3))));
+                    try this.callMethod(o, "__setBase", .{base});
+                }
+
                 const members = getSlice2(t, program.Analyzer.ObjectLiteralMember);
                 for (members) |*u| {
                     if (u.kind != .property) continue; // TODO

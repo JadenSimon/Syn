@@ -247,6 +247,7 @@ function rewriteTargets(
     graph: Graph,
     locals: Map<number, number>,
     pooled: Map<number, number>,
+    heapHandles: Map<number, number>,
 ): Graph {
     const nodes = new Map<number, GraphNode>()
     const localNodes = new Map<number, number>()
@@ -264,6 +265,18 @@ function rewriteTargets(
         return id
     }
     for (const [id, n] of graph.nodes) {
+        if (n.op === 'heap-handle') {
+            const handle = n.argConsts[0]
+            const slot = heapHandles.get(handle)
+            if (n.argIds[0] || slot === undefined) {
+                throw `native: unresolved heap handle ${handle} in ${graph.name ?? 'anonymous graph'} at %${id}`
+            }
+            nodes.set(id, {
+                op: 'pool-entry', argIds: [0], argConsts: new Float64Array([slot]),
+                T: Types.fnptr, U: Types.fnptr, offset: 0,
+            })
+            continue
+        }
         const ids = n.argIds.slice()
         const consts = n.argConsts.slice()
         let changed = false
@@ -291,6 +304,9 @@ function rewriteTargets(
         if (slot === undefined) return block
         return { ...block, bodyId: valueNode('pool-entry', slot, poolNodes), bodyConst: 0 }
     })
+    for (const [id, n] of nodes) {
+        if (n.op === 'heap-handle') throw `native: heap handle survived target rewriting at %${id}`
+    }
     return { ...graph, maxId: nextId, nodes, params: graph.params, blocks }
 }
 
@@ -304,12 +320,18 @@ function patchImage(
     units: NativeUnit[],
     offsets: number[],
     poolOffset: number,
+    localPoolTargets: Map<number, number>,
 ): void {
     const view = new DataView(image.buffer, image.byteOffset, image.byteLength)
     const imageBase = BigInt(base)
     const one = BigInt(1)
     const pageShift = BigInt(12)
     const callShift = BigInt(2)
+    for (const [slot, symbol] of localPoolTargets) {
+        const targetOffset = offsets[symbol]
+        if (targetOffset === undefined) throw `native: unknown pooled local function ${symbol}`
+        view.setBigUint64(poolOffset + slot * 8, imageBase + BigInt(targetOffset), true)
+    }
     for (let i = 0; i < units.length; i++) {
         const unit = units[i]
         for (const relocation of unit.code.relocations) {
@@ -341,7 +363,11 @@ function patchImage(
     }
 }
 
-function installImage(units: NativeUnit[], values: (number | bigint)[]) {
+function installImage(
+    units: NativeUnit[],
+    values: (number | bigint)[],
+    localPoolTargets: Map<number, number>,
+) {
     const offsets: number[] = []
     let length = 0
     for (const unit of units) {
@@ -358,7 +384,7 @@ function installImage(units: NativeUnit[], values: (number | bigint)[]) {
         view.setBigUint64(poolOffset + i * 8, BigInt.asUintN(64, BigInt(values[i])), true)
     }
     const reserved = reserveCode(image.byteLength)
-    patchImage(image, reserved.ptr, units, offsets, poolOffset)
+    patchImage(image, reserved.ptr, units, offsets, poolOffset, localPoolTargets)
     const src = (ts as any).getArrayBufferPtr(image.buffer)
     if (!nativeCopier(reserved.ptr, src, image.byteLength)) throw 'failed to copy native image'
     const entries = offsets.map(offset => addPtr(reserved.ptr, offset))
@@ -378,6 +404,9 @@ export function createNatives(fns: Record<string, Function>) {
     const units: NativeUnit[] = []
     const poolValues: (number | bigint)[] = []
     const poolSlots = new Map<PoolValue, number>()
+    const nativePointerSlots = new Map<number, number>()
+    const localFunctionSlots = new Map<number, number>()
+    const localPoolTargets = new Map<number, number>()
     const session = createTraceSession()
     const inlineScores = new Map<Function, InlineScore | false>()
     let inlineMarker = 0
@@ -428,6 +457,23 @@ export function createNatives(fns: Record<string, Function>) {
         symbols.set(f, id)
         functions.push(f)
         return id
+    }
+    function pointerSlot(ptr: number): number {
+        const known = nativePointerSlots.get(ptr)
+        if (known !== undefined) return known
+        const slot = poolValues.length
+        poolValues.push(ptr)
+        nativePointerSlots.set(ptr, slot)
+        return slot
+    }
+    function localFunctionSlot(symbol: number): number {
+        const known = localFunctionSlots.get(symbol)
+        if (known !== undefined) return known
+        const slot = poolValues.length
+        poolValues.push(0)
+        localFunctionSlots.set(symbol, slot)
+        localPoolTargets.set(slot, symbol)
+        return slot
     }
     for (const [name, fn] of Object.entries(fns)) {
         intrinsics.assert(typeof fn === 'function')
@@ -499,7 +545,25 @@ export function createNatives(fns: Record<string, Function>) {
         })
         traced.graph.name = current.name
         if (traceDebug) console.log(traced.text)
-        const graph = rewriteTargets(traced.graph, localMarkers, poolMarkers)
+        const heapHandleSlots = new Map<number, number>()
+        for (const n of traced.graph.nodes.values()) {
+            if (n.op !== 'heap-handle') continue
+            const handle = n.argConsts[0]
+            const linked = session.stubFunctions.get(handle) as any
+            if (!linked) throw `native: heap handle ${handle} is not a linked function`
+            const marker = linked.__native
+            const local = localMarkers.get(marker)
+            if (local !== undefined) {
+                heapHandleSlots.set(handle, localFunctionSlot(local))
+                continue
+            }
+            if (Number.isSafeInteger(marker)) {
+                heapHandleSlots.set(handle, pointerSlot(marker))
+                continue
+            }
+            heapHandleSlots.set(handle, localFunctionSlot(intern(linked)))
+        }
+        const graph = rewriteTargets(traced.graph, localMarkers, poolMarkers, heapHandleSlots)
         intrinsics.assert(graph.params.length <= 5)
         const debug = intrinsics.argv().includes('lower-debug')
             || intrinsics.argv().includes(`lower-debug:${current.name}`)
@@ -508,7 +572,7 @@ export function createNatives(fns: Record<string, Function>) {
         if (debug) console.log(`--- ${current.name} listing ---\n`, code.listing)
         units.push({ fn: current, symbol, code })
     }
-    const installed = installImage(units, poolValues)
+    const installed = installImage(units, poolValues, localPoolTargets)
     const result: Record<string, any> = {}
     for (const [name, symbol] of roots) {
         const ptr = installed.entries[symbol]
