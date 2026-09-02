@@ -8,7 +8,7 @@ import * as intrinsics from './intrinsics'
 import * as syscalls from './syscalls'
 
 type usize = u32
-type Handle = u32
+type Handle = intrinsics.Handle
 type ScId = u16
 type EdgeEnumerator = (ptr: usize, index: u32) => Handle
 const Types = intrinsics.Types
@@ -35,6 +35,7 @@ enum ScFlags {
 enum ScType {
     general,
     pool,
+    branch,
 }
 
 interface HeapState {
@@ -44,6 +45,11 @@ interface HeapState {
     nextScId: ScId
     maxScs: ScId
     rootSc: ScId
+}
+
+interface BuildState {
+    depth: u32
+    childCount: u32
 }
 
 interface ScHeader {
@@ -58,6 +64,8 @@ interface ScHeader {
     freeSlot: u16
     cellSlots: u16
     poolStart: u16
+    firstChild: ScId
+    nextSibling: ScId
 }
 
 interface ScCellData {
@@ -66,14 +74,23 @@ interface ScCellData {
     inboundRefs: Handle
     outboundRefs: Handle
     peerRefs: Handle
+    localSupport: u8
+    supportFlags: u8
+    inboundVertical: u16
 }
 
 export const Heap = intrinsics.DefineStructView(reify HeapState)
 export const Sc = intrinsics.DefineStructView(reify ScHeader)
 export const ScCell = intrinsics.DefineStructView(reify ScCellData)
+const Build = intrinsics.DefineStructView(reify BuildState)
 
 const heapSize = Heap.sizeof
 const scCellSize = ScCell.sizeof
+const buildMaxDepth = 32
+const buildMaxChildren = 256
+const buildFramesOffset = (Build.sizeof + 7) & ~7
+const buildChildrenOffset = buildFramesOffset + buildMaxDepth * 8
+const buildContextSize = buildChildrenOffset + buildMaxChildren * 4
 const heapTableOffset = (heapSize + 7) & ~7
 const scHeaderSize = (Sc.sizeof + 7) & ~7
 
@@ -134,15 +151,39 @@ function outboundRefs(heapPtr: usize, ptr: usize): usize {
 }
 
 function peerRefs(heapPtr: usize, ptr: usize): usize {
-    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).peerRefs)
+    const handle = ScCell(scCellPtr(heapPtr, ptr)).peerRefs
+    intrinsics.assert(handle !== 0)
+    return accountingPtr(heapPtr, handle)
 }
 
+function ensurePeerRefs(heapPtr: usize, id: ScId, ptr: usize): void {
+    const data = ScCell(scCellPtr(heapPtr, ptr))
+    if (data.peerRefs !== 0) return
+    data.peerRefs = allocBump(id, ptr, accountingCapacity)
+}
+
+function hasInlineSupport(heapPtr: usize, handle: Handle): boolean {
+    return Sc(getScRaw(heapPtr, handleSc(handle))).type === ScType.branch
+}
+
+function inlineSupport(heapPtr: usize, handle: Handle): any {
+    return ScCell(resolve(heapPtr, handle))
+}
+intrinsics.tagInline(inlineSupport)
+
 function supportStateAt(heapPtr: usize, handle: Handle): u32 {
+    if (hasInlineSupport(heapPtr, handle)) {
+        return ((inlineSupport(heapPtr, handle).supportFlags as u32) << 30) as u32
+    }
     const ptr = getScRaw(heapPtr, handleSc(handle))
     return ((sparseCount(inboundRefs(heapPtr, ptr), accountingCapacity, handleSlot(handle)) & supportStateMask) >>> 0) as u32
 }
 
 export function supportCount(heapPtr: usize, handle: Handle): u32 {
+    if (hasInlineSupport(heapPtr, handle)) {
+        const cell = inlineSupport(heapPtr, handle)
+        return cell.localSupport + cell.inboundVertical
+    }
     const ptr = getScRaw(heapPtr, handleSc(handle))
     const slot = handleSlot(handle)
     return refCount(localRefs(heapPtr, ptr), slot) + refCount(inboundRefs(heapPtr, ptr), slot)
@@ -153,6 +194,10 @@ export function supportState(heapPtr: usize, handle: Handle): u32 {
 }
 
 function setSupportState(heapPtr: usize, handle: Handle, state: u32): void {
+    if (hasInlineSupport(heapPtr, handle)) {
+        inlineSupport(heapPtr, handle).supportFlags = state >>> 30
+        return
+    }
     const ptr = getScRaw(heapPtr, handleSc(handle))
     const refs = inboundRefs(heapPtr, ptr)
     const slot = handleSlot(handle)
@@ -225,6 +270,74 @@ export function destroyCell(heapPtr: usize, handle: Handle): boolean {
     return true
 }
 
+export function initBuild(buildPtr: usize): void {
+    const build = Build(buildPtr)
+    build.depth = 0
+    build.childCount = 0
+}
+
+function buildFramePtr(buildPtr: usize, depth: u32): usize {
+    return buildPtr + buildFramesOffset + depth * 8
+}
+
+function buildChild(buildPtr: usize, index: u32): Handle {
+    return intrinsics.Intrinsics.load(buildPtr + buildChildrenOffset, index * 4, Types.u32) as Handle
+}
+
+export function beginBuild(heapPtr: usize, buildPtr: usize, scId: ScId, bytes: usize): Handle {
+    const build = Build(buildPtr)
+    const handle = allocCell(heapPtr, scId, bytes)
+    const depth = build.depth
+    intrinsics.assert(depth < buildMaxDepth)
+    if (depth !== 0) {
+        const parent = intrinsics.Intrinsics.load(buildFramePtr(buildPtr, depth - 1), 0, Types.u32) as Handle
+        const count = build.childCount
+        intrinsics.assert(count < buildMaxChildren)
+        intrinsics.Intrinsics.store(buildPtr + buildChildrenOffset, count * 4, handle, Types.u32)
+        build.childCount = count + 1
+        addEdge(heapPtr, parent, handle)
+    }
+    const frame = buildFramePtr(buildPtr, depth)
+    intrinsics.Intrinsics.store(frame, 0, handle, Types.u32)
+    intrinsics.Intrinsics.store(frame, 4, build.childCount, Types.u32)
+    build.depth = depth + 1
+    return handle
+}
+
+function finishBuildWith(
+    heapPtr: usize,
+    handle: Handle,
+    enumerateEdges: EdgeEnumerator,
+): void {
+    const ptr = resolve(heapPtr, handle)
+    for (let index: u32 = 0;; index++) {
+        const target = enumerateEdges(ptr, index)
+        if (target === 0) break
+        addEdge(heapPtr, handle, target)
+    }
+}
+
+export function finishBuild(heapPtr: usize, buildPtr: usize, handle: Handle): void {
+    const build = Build(buildPtr)
+    const depth = build.depth - 1
+    const frame = buildFramePtr(buildPtr, depth)
+    intrinsics.assert((intrinsics.Intrinsics.load(frame, 0, Types.u32) as Handle) === handle)
+    const start = intrinsics.Intrinsics.load(frame, 4, Types.u32)
+    const end = build.childCount
+    const enumerateEdges = Sc(getScRaw(heapPtr, handleSc(handle))).enumerateEdges
+    if (enumerateEdges === StaticEnumerator.singleEdge) {
+        const target = enumerateSingleEdge(resolve(heapPtr, handle), 0)
+        if (target !== 0) addEdge(heapPtr, handle, target)
+    } else if (enumerateEdges !== 0) {
+        finishBuildWith(heapPtr, handle, enumerateEdges as any)
+    }
+    for (let i = start; i < end; i++) {
+        removeEdge(heapPtr, handle, buildChild(buildPtr, i))
+    }
+    build.childCount = start
+    build.depth = depth
+}
+
 function makeHandle(sc: ScId, slot: u16): Handle {
     return (((sc as u32) << 16) + slot) as Handle
 }
@@ -242,10 +355,10 @@ export function resolve(heapPtr: usize, handle: Handle): usize {
     return raw + scHeaderSize + handleSlot(handle) * slotScale
 }
 
-function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8): void {
+function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8, type: ScType): void {
     const sc = Sc(ptr)
     sc.owner = owner
-    sc.type = ScType.general
+    sc.type = type
     sc.flags = 0
     sc.depth = depth
     sc.depthExtent = 0
@@ -255,16 +368,28 @@ function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8): void
     sc.freeSlot = 0
     sc.cellSlots = 0
     sc.poolStart = 0
+    sc.firstChild = 0
+    sc.nextSibling = 0
 }
 
 function initScAccounting(heapPtr: usize, id: ScId, ptr: usize, cellHandle: Handle): void {
     const data = ScCell(resolve(heapPtr, cellHandle))
     data.header = ptr
     const bytes = accountingCapacity * 8
-    data.localRefs = allocCell(heapPtr, id, bytes)
-    data.inboundRefs = allocCell(heapPtr, id, bytes)
-    data.outboundRefs = allocCell(heapPtr, id, bytes)
-    data.peerRefs = allocCell(heapPtr, handleSc(cellHandle), bytes)
+    if (Sc(ptr).type === ScType.branch) {
+        data.localRefs = 0 as Handle
+        data.inboundRefs = 0 as Handle
+    } else {
+        data.localRefs = allocCell(heapPtr, id, bytes)
+        data.inboundRefs = allocCell(heapPtr, id, bytes)
+    }
+    data.outboundRefs = Sc(ptr).type === ScType.branch
+        ? allocBump(id, ptr, accountingCapacity)
+        : allocCell(heapPtr, id, bytes)
+    data.peerRefs = 0 as Handle
+    data.localSupport = 0
+    data.supportFlags = 0
+    data.inboundVertical = 0
 }
 
 function allocBump(scId: ScId, ptr: usize, slots: u16): Handle {
@@ -292,12 +417,17 @@ export function allocCell(heapPtr: usize, scId: ScId, bytes: usize): Handle {
     const slots = ((bytes + 7) >> 3) as u16
     if (sc.type === ScType.general) return allocBump(scId, ptr, slots)
     if (sc.type === ScType.pool) return allocPool(heapPtr, scId, ptr, slots)
+    if (sc.type === ScType.branch) {
+        intrinsics.assert(slots === ((scCellSize + 7) >> 3))
+        return allocBump(scId, ptr, slots)
+    }
     intrinsics.assert(false)
 }
 
 function releaseCell(heapPtr: usize, handle: Handle): void {
     const sc = Sc(getScRaw(heapPtr, handleSc(handle)))
     if (sc.type === ScType.general) return
+    if (sc.type === ScType.branch) return
     if (sc.type === ScType.pool) {
         const slot = handleSlot(handle)
         intrinsics.assert(slot >= sc.poolStart && (slot - sc.poolStart) % sc.cellSlots === 0)
@@ -326,7 +456,7 @@ export function createHeap(
 
     const root = allocateScChunk(heapPtr)
     setScRaw(heapPtr, 1, root)
-    initSc(root, 0, enumerateEdges, 0)
+    initSc(root, 0 as Handle, enumerateEdges, 0, ScType.general)
     const rootCell = allocCell(heapPtr, 1, scCellSize)
     Sc(root).owner = rootCell
     initScAccounting(heapPtr, 1, root, rootCell)
@@ -334,10 +464,11 @@ export function createHeap(
     return heapPtr
 }
 
-export function createSc(
+function createScWithType(
     heapPtr: usize,
     parentId: ScId,
     enumerateEdges: u64,
+    type: ScType,
 ): ScId {
     const heap = Heap(heapPtr)
     const id = heap.nextScId
@@ -346,12 +477,24 @@ export function createSc(
     const owner = allocCell(heapPtr, parentId, scCellSize)
     const ptr = allocateScChunk(heapPtr)
     const parent = Sc(getScRaw(heapPtr, parentId))
-    initSc(ptr, owner, enumerateEdges, parent.depth + 1)
+    ensurePeerRefs(heapPtr, parentId, getScRaw(heapPtr, parentId))
+    initSc(ptr, owner, enumerateEdges, parent.depth + 1, type)
+    const sc = Sc(ptr)
+    sc.nextSibling = parent.firstChild
+    parent.firstChild = id
     setScRaw(heapPtr, id, ptr)
     heap.nextScId = id + 1
     initScAccounting(heapPtr, id, ptr, owner)
     if (parent.depthExtent === 0) parent.depthExtent = 1
     return id
+}
+
+export function createSc(heapPtr: usize, parentId: ScId, enumerateEdges: u64): ScId {
+    return createScWithType(heapPtr, parentId, enumerateEdges, ScType.general)
+}
+
+export function createBranchSc(heapPtr: usize, parentId: ScId): ScId {
+    return createScWithType(heapPtr, parentId, 0, ScType.branch)
 }
 
 function configurePool(heapPtr: usize, id: ScId, cellBytes: usize): ScId {
@@ -389,13 +532,13 @@ export function scOwner(heapPtr: usize, id: ScId): Handle {
 export function refSc(heapPtr: usize, id: ScId): void {
     const owner = Sc(getScRaw(heapPtr, id)).owner
     const parentPtr = getScRaw(heapPtr, handleSc(owner))
-    addSupportRef(heapPtr, localRefs(heapPtr, parentPtr), owner)
+    addInboundSupport(heapPtr, parentPtr, owner)
 }
 
 export function unrefSc(heapPtr: usize, id: ScId): void {
     const owner = Sc(getScRaw(heapPtr, id)).owner
     const parentPtr = getScRaw(heapPtr, handleSc(owner))
-    removeSupportRef(heapPtr, localRefs(heapPtr, parentPtr), owner, true)
+    removeInboundSupport(heapPtr, parentPtr, owner, true)
 }
 
 export function scDepth(heapPtr: usize, id: ScId): u8 {
@@ -448,6 +591,78 @@ function removeSupportRef(heapPtr: usize, ptr: usize, handle: Handle, eager: boo
     const count = removeRef(ptr, handleSlot(handle))
     if (count === 0) supportRemoved(heapPtr, handle, eager)
     return count
+}
+
+function localCount(heapPtr: usize, ptr: usize, handle: Handle): u32 {
+    if (Sc(ptr).type === ScType.branch) return inlineSupport(heapPtr, handle).localSupport
+    return refCount(localRefs(heapPtr, ptr), handleSlot(handle))
+}
+
+function inboundCount(heapPtr: usize, ptr: usize, handle: Handle): u32 {
+    if (Sc(ptr).type === ScType.branch) return inlineSupport(heapPtr, handle).inboundVertical
+    return refCount(inboundRefs(heapPtr, ptr), handleSlot(handle))
+}
+
+function setLocalCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
+    if (Sc(ptr).type === ScType.branch) {
+        intrinsics.assert(count <= 0xff)
+        inlineSupport(heapPtr, handle).localSupport = count
+        return
+    }
+    setRefCount(localRefs(heapPtr, ptr), handleSlot(handle), count)
+}
+
+function setInboundCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
+    if (Sc(ptr).type === ScType.branch) {
+        intrinsics.assert(count <= 0xffff)
+        inlineSupport(heapPtr, handle).inboundVertical = count
+        return
+    }
+    setRefCount(inboundRefs(heapPtr, ptr), handleSlot(handle), count)
+}
+
+function addLocalCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
+    setLocalCount(heapPtr, ptr, handle, localCount(heapPtr, ptr, handle) + count)
+}
+
+function addInboundCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
+    setInboundCount(heapPtr, ptr, handle, inboundCount(heapPtr, ptr, handle) + count)
+}
+
+function addLocalSupport(heapPtr: usize, ptr: usize, handle: Handle): u32 {
+    if (Sc(ptr).type !== ScType.branch) return addSupportRef(heapPtr, localRefs(heapPtr, ptr), handle)
+    const cell = inlineSupport(heapPtr, handle)
+    intrinsics.assert(cell.localSupport < 0xff)
+    cell.localSupport = cell.localSupport + 1
+    supportAdded(heapPtr, handle)
+    return cell.localSupport
+}
+
+function removeLocalSupport(heapPtr: usize, ptr: usize, handle: Handle, eager: boolean): u32 {
+    if (Sc(ptr).type !== ScType.branch) return removeSupportRef(heapPtr, localRefs(heapPtr, ptr), handle, eager)
+    const cell = inlineSupport(heapPtr, handle)
+    intrinsics.assert(cell.localSupport > 0)
+    cell.localSupport = cell.localSupport - 1
+    if (cell.localSupport + cell.inboundVertical === 0) supportRemoved(heapPtr, handle, eager)
+    return cell.localSupport
+}
+
+function addInboundSupport(heapPtr: usize, ptr: usize, handle: Handle): u32 {
+    if (Sc(ptr).type !== ScType.branch) return addSupportRef(heapPtr, inboundRefs(heapPtr, ptr), handle)
+    const cell = inlineSupport(heapPtr, handle)
+    intrinsics.assert(cell.inboundVertical < 0xffff)
+    cell.inboundVertical = cell.inboundVertical + 1
+    supportAdded(heapPtr, handle)
+    return cell.inboundVertical
+}
+
+function removeInboundSupport(heapPtr: usize, ptr: usize, handle: Handle, eager: boolean): u32 {
+    if (Sc(ptr).type !== ScType.branch) return removeSupportRef(heapPtr, inboundRefs(heapPtr, ptr), handle, eager)
+    const cell = inlineSupport(heapPtr, handle)
+    intrinsics.assert(cell.inboundVertical > 0)
+    cell.inboundVertical = cell.inboundVertical - 1
+    if (cell.localSupport + cell.inboundVertical === 0) supportRemoved(heapPtr, handle, eager)
+    return cell.inboundVertical
 }
 
 function sparseCount(ptr: usize, capacity: u16, key: u32): u32 {
@@ -508,6 +723,28 @@ function removeSparse(ptr: usize, capacity: u16, key: u32): u32 {
         return count - 1
     }
     intrinsics.assert(false)
+}
+
+function sparseEntries(ptr: usize): [u32, u32][] {
+    const result: [u32, u32][] = []
+    for (let i: u32 = 0; i < accountingCapacity; i++) {
+        const offset = i * 8
+        const key = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
+        if (key === 0) break
+        const value = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
+        if (value !== 0) result.push([key, value])
+    }
+    return result
+}
+
+function addSparseCount(ptr: usize, key: u32, count: u32): void {
+    const current = sparseCount(ptr, accountingCapacity, key)
+    putSparse(ptr, accountingCapacity, key, current + count)
+}
+
+function setRefCount(ptr: usize, slot: u16, count: u32): void {
+    const raw = sparseCount(ptr, accountingCapacity, slot)
+    putSparse(ptr, accountingCapacity, slot, ((raw & supportStateMask) >>> 0) + count)
 }
 
 function peerKey(from: u16, to: u16): u32 {
@@ -571,13 +808,13 @@ function addInboundPath(heapPtr: usize, targetId: ScId, end: ScId, target: Handl
     while (current !== end) {
         const ptr = getScRaw(heapPtr, current)
         const sc = Sc(ptr)
-        addSupportRef(heapPtr, inboundRefs(heapPtr, ptr), projected)
+        addInboundSupport(heapPtr, ptr, projected)
         projected = sc.owner
         current = parentSc(sc)
     }
     if (includeEnd) {
         const ptr = getScRaw(heapPtr, current)
-        addSupportRef(heapPtr, inboundRefs(heapPtr, ptr), projected)
+        addInboundSupport(heapPtr, ptr, projected)
     }
     return projected
 }
@@ -594,7 +831,7 @@ function removeInboundPath(
     while (current !== end) {
         const ptr = getScRaw(heapPtr, current)
         const sc = Sc(ptr)
-        removeSupportRef(heapPtr, inboundRefs(heapPtr, ptr), projected, eager)
+        removeInboundSupport(heapPtr, ptr, projected, eager)
         projected = sc.owner
         current = parentSc(sc)
     }
@@ -607,7 +844,7 @@ export function addEdge(heapPtr: usize, from: Handle, to: Handle): void {
     intrinsics.assert(fromId > 0 && toId > 0)
     const fromPtr = getScRaw(heapPtr, fromId)
     if (fromId === toId) {
-        addSupportRef(heapPtr, localRefs(heapPtr, fromPtr), to)
+        addLocalSupport(heapPtr, fromPtr, to)
         return
     }
 
@@ -619,7 +856,7 @@ export function addEdge(heapPtr: usize, from: Handle, to: Handle): void {
     const target = addInboundPath(heapPtr, toId, boundaryTo, to, !commonBoundary)
     if (commonBoundary) {
         const common = getScRaw(heapPtr, boundaryTo)
-        addSupportRef(heapPtr, localRefs(heapPtr, common), target)
+        addLocalSupport(heapPtr, common, target)
         return
     }
 
@@ -630,8 +867,8 @@ export function addEdge(heapPtr: usize, from: Handle, to: Handle): void {
     const parentPtr = getScRaw(heapPtr, parentId)
     const fromSlot = handleSlot(left.owner)
     const toSlot = handleSlot(right.owner)
-    addSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
-    addSupportRef(heapPtr, localRefs(heapPtr, parentPtr), right.owner)
+    const peers = addSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    if (peers === 1) addLocalSupport(heapPtr, parentPtr, right.owner)
 }
 
 function removeEdgeWith(heapPtr: usize, from: Handle, to: Handle, eager: boolean): void {
@@ -640,7 +877,7 @@ function removeEdgeWith(heapPtr: usize, from: Handle, to: Handle, eager: boolean
     intrinsics.assert(fromId > 0 && toId > 0)
     const fromPtr = getScRaw(heapPtr, fromId)
     if (fromId === toId) {
-        removeSupportRef(heapPtr, localRefs(heapPtr, fromPtr), to, eager)
+        removeLocalSupport(heapPtr, fromPtr, to, eager)
         return
     }
 
@@ -652,11 +889,11 @@ function removeEdgeWith(heapPtr: usize, from: Handle, to: Handle, eager: boolean
     const target = removeInboundPath(heapPtr, toId, boundaryTo, to, eager)
     if (!commonBoundary) {
         const ptr = getScRaw(heapPtr, boundaryTo)
-        removeSupportRef(heapPtr, inboundRefs(heapPtr, ptr), target, eager)
+        removeInboundSupport(heapPtr, ptr, target, eager)
     }
     if (commonBoundary) {
         const common = getScRaw(heapPtr, boundaryTo)
-        removeSupportRef(heapPtr, localRefs(heapPtr, common), target, eager)
+        removeLocalSupport(heapPtr, common, target, eager)
         return
     }
 
@@ -667,8 +904,8 @@ function removeEdgeWith(heapPtr: usize, from: Handle, to: Handle, eager: boolean
     const parentPtr = getScRaw(heapPtr, parentId)
     const fromSlot = handleSlot(left.owner)
     const toSlot = handleSlot(right.owner)
-    removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
-    removeSupportRef(heapPtr, localRefs(heapPtr, parentPtr), right.owner, eager)
+    const peers = removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    if (peers === 0) removeLocalSupport(heapPtr, parentPtr, right.owner, eager)
 }
 
 export function removeEdge(heapPtr: usize, from: Handle, to: Handle): void {
@@ -681,12 +918,12 @@ export function removeEdgeDeferred(heapPtr: usize, from: Handle, to: Handle): vo
 
 export function localRefCount(heapPtr: usize, handle: Handle): u32 {
     const ptr = getScRaw(heapPtr, handleSc(handle))
-    return refCount(localRefs(heapPtr, ptr), handleSlot(handle))
+    return localCount(heapPtr, ptr, handle)
 }
 
 export function inboundRefCount(heapPtr: usize, handle: Handle): u32 {
     const ptr = getScRaw(heapPtr, handleSc(handle))
-    return refCount(inboundRefs(heapPtr, ptr), handleSlot(handle))
+    return inboundCount(heapPtr, ptr, handle)
 }
 
 export function outboundRefCount(heapPtr: usize, from: Handle, to: Handle): u32 {
@@ -701,6 +938,293 @@ export function peerRefCount(heapPtr: usize, parentId: ScId, fromOwner: Handle, 
         accountingCapacity,
         peerKey(handleSlot(fromOwner), handleSlot(toOwner)),
     )
+}
+
+function isBelow(heapPtr: usize, id: ScId, ancestor: ScId): boolean {
+    let current = id
+    while (current !== 0) {
+        if (current === ancestor) return true
+        const parent = parentSc(Sc(getScRaw(heapPtr, current)))
+        if (parent === current) return false
+        current = parent
+    }
+    return false
+}
+
+function childScs(heapPtr: usize, parentId: ScId): ScId[] {
+    const children: ScId[] = []
+    let child = Sc(getScRaw(heapPtr, parentId)).firstChild
+    while (child !== 0) {
+        children.push(child)
+        child = Sc(getScRaw(heapPtr, child)).nextSibling
+    }
+    return children
+}
+
+function bumpDepth(heapPtr: usize, id: ScId): void {
+    const sc = Sc(getScRaw(heapPtr, id))
+    sc.depth = sc.depth + 1
+    let child = sc.firstChild
+    while (child !== 0) {
+        const next = Sc(getScRaw(heapPtr, child)).nextSibling
+        bumpDepth(heapPtr, child)
+        child = next
+    }
+}
+
+function removeBoundarySupport(heapPtr: usize, sourceId: ScId, target: Handle): void {
+    const targetId = handleSc(target)
+    const boundary = edgeBoundary(heapPtr, sourceId, targetId)
+    const boundaryFrom = (boundary & slotMask) as ScId
+    const boundaryTo = (boundary >>> 16) as ScId
+    const commonBoundary = boundaryFrom === boundaryTo
+    const projected = removeInboundPath(heapPtr, targetId, boundaryTo, target, false)
+    if (commonBoundary) {
+        const ptr = getScRaw(heapPtr, boundaryTo)
+        removeLocalSupport(heapPtr, ptr, projected, false)
+        return
+    }
+    const boundaryPtr = getScRaw(heapPtr, boundaryTo)
+    removeInboundSupport(heapPtr, boundaryPtr, projected, false)
+    const left = Sc(getScRaw(heapPtr, boundaryFrom))
+    const right = Sc(getScRaw(heapPtr, boundaryTo))
+    const parentId = parentSc(left)
+    const parentPtr = getScRaw(heapPtr, parentId)
+    const peers = removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity,
+        peerKey(handleSlot(left.owner), handleSlot(right.owner)))
+    if (peers === 0) removeLocalSupport(heapPtr, parentPtr, right.owner, false)
+}
+
+export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId {
+    intrinsics.assert(group.length > 1)
+    const parentPtr = getScRaw(heapPtr, parentId)
+    const parent = Sc(parentPtr)
+    const groupIds = new Set<number>(group)
+    const oldOwners = new Map<number, Handle>()
+    const oldSlots = new Map<number, u16>()
+    const oldLocal = new Map<number, u32>()
+    const oldInbound = new Map<number, u32>()
+    const outboundByChild = new Map<number, [u32, u32][]>()
+    for (const id of group) {
+        const sc = Sc(getScRaw(heapPtr, id))
+        intrinsics.assert(parentSc(sc) === parentId)
+        oldOwners.set(id, sc.owner)
+        const slot = handleSlot(sc.owner)
+        oldSlots.set(id, slot)
+        oldLocal.set(id, localCount(heapPtr, parentPtr, sc.owner))
+        oldInbound.set(id, inboundCount(heapPtr, parentPtr, sc.owner))
+        outboundByChild.set(id, sparseEntries(outboundRefs(heapPtr, getScRaw(heapPtr, id))))
+    }
+    const parentPeers = sparseEntries(peerRefs(heapPtr, parentPtr))
+    const wrapperId = createBranchSc(heapPtr, parentId)
+    const wrapperPtr = getScRaw(heapPtr, wrapperId)
+    const wrapper = Sc(wrapperPtr)
+    const wrapperSlot = handleSlot(wrapper.owner)
+    ensurePeerRefs(heapPtr, wrapperId, wrapperPtr)
+    let child = wrapper.nextSibling
+    let parentTail = wrapperId
+    wrapper.nextSibling = 0
+    while (child !== 0) {
+        const childSc = Sc(getScRaw(heapPtr, child))
+        const next = childSc.nextSibling
+        if (groupIds.has(child)) {
+            childSc.nextSibling = wrapper.firstChild
+            wrapper.firstChild = child
+        } else {
+            Sc(getScRaw(heapPtr, parentTail)).nextSibling = child
+            parentTail = child
+            childSc.nextSibling = 0
+        }
+        child = next
+    }
+    const newOwners = new Map<number, Handle>()
+    const oldSlotToId = new Map<number, number>()
+    for (const id of group) oldSlotToId.set(oldSlots.get(id)!, id)
+
+    for (const id of group) {
+        const sc = Sc(getScRaw(heapPtr, id))
+        const oldOwner = oldOwners.get(id)!
+        const oldData = ScCell(resolve(heapPtr, oldOwner))
+        const newOwner = allocCell(heapPtr, wrapperId, scCellSize)
+        const data = ScCell(resolve(heapPtr, newOwner))
+        data.header = oldData.header
+        data.localRefs = oldData.localRefs
+        data.inboundRefs = oldData.inboundRefs
+        data.outboundRefs = oldData.outboundRefs
+        data.peerRefs = oldData.peerRefs
+        data.localSupport = 0
+        data.supportFlags = oldData.supportFlags
+        data.inboundVertical = 0
+        sc.owner = newOwner
+        newOwners.set(id, newOwner)
+        bumpDepth(heapPtr, id)
+    }
+
+    const parentPeerPtr = peerRefs(heapPtr, parentPtr)
+    const wrapperPeerPtr = peerRefs(heapPtr, wrapperPtr)
+    let wrapperSupport: u32 = 0
+    const incomingPeer = new Map<number, u32>()
+    for (const [key, count] of parentPeers) {
+        const fromSlot = (key >>> 16) as u16
+        const toSlot = (key & slotMask) as u16
+        const fromId = oldSlotToId.get(fromSlot)
+        const toId = oldSlotToId.get(toSlot)
+        if (!fromId && !toId) continue
+        putSparse(parentPeerPtr, accountingCapacity, key, 0)
+        if (fromId && toId) {
+            addSparseCount(wrapperPeerPtr,
+                peerKey(handleSlot(newOwners.get(fromId)!), handleSlot(newOwners.get(toId)!)), count)
+            addLocalCount(heapPtr, wrapperPtr, newOwners.get(toId)!, 1)
+            incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
+        } else if (toId) {
+            const key = peerKey(fromSlot, wrapperSlot)
+            const existing = sparseCount(parentPeerPtr, accountingCapacity, key)
+            addSparseCount(parentPeerPtr, key, count)
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(toId)!, count)
+            if (existing === 0) wrapperSupport++
+            incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
+        } else {
+            addSparseCount(parentPeerPtr, peerKey(wrapperSlot, toSlot), count)
+        }
+    }
+
+    for (const id of group) {
+        const vertical = oldInbound.get(id)!
+        const remainder = oldLocal.get(id)! - (incomingPeer.get(id) ?? 0)
+        setLocalCount(heapPtr, parentPtr, oldOwners.get(id)!, 0)
+        setInboundCount(heapPtr, parentPtr, oldOwners.get(id)!, 0)
+        if (vertical) {
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id)!, vertical)
+            addInboundCount(heapPtr, parentPtr, wrapper.owner, vertical)
+        }
+        if (remainder) {
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id)!, remainder)
+            wrapperSupport += remainder
+        }
+    }
+    if (wrapperSupport) addLocalCount(heapPtr, parentPtr, wrapper.owner, wrapperSupport)
+
+    const targetSources = new Map<number, number>()
+    const wrapperOutboundPtr = outboundRefs(heapPtr, wrapperPtr)
+    for (const id of group) {
+        for (const [target, count] of outboundByChild.get(id)!) {
+            if (!count) continue
+            let internal = false
+            const targetId = handleSc(target as Handle)
+            for (const member of group) {
+                if (isBelow(heapPtr, targetId, member)) { internal = true; break }
+            }
+            if (internal) continue
+            addSparseCount(wrapperOutboundPtr, target, 1)
+            targetSources.set(target, (targetSources.get(target) ?? 0) + 1)
+        }
+    }
+    for (const [target, sources] of targetSources) {
+        const boundary = edgeBoundary(heapPtr, wrapperId, handleSc(target as Handle))
+        if ((boundary & slotMask) !== wrapperId) continue
+        for (let i = 1; i < sources; i++) removeBoundarySupport(heapPtr, wrapperId, target as Handle)
+    }
+
+    let extent: u8 = 0
+    for (const id of group) {
+        const child = Sc(getScRaw(heapPtr, id))
+        const value = child.depthExtent + 1
+        if (value > extent) extent = value
+    }
+    wrapper.depthExtent = extent
+    if (wrapper.depthExtent + 1 > parent.depthExtent) parent.depthExtent = wrapper.depthExtent + 1
+    return wrapperId
+}
+
+export function condense(heapPtr: usize, parentId: ScId, useAll: boolean): ScId[] {
+    const parentPtr = getScRaw(heapPtr, parentId)
+    const parent = Sc(parentPtr)
+    const children = childScs(heapPtr, parentId)
+    const buckets = new Map<number, ScId[]>()
+    for (const id of children) {
+        const child = Sc(getScRaw(heapPtr, id))
+        if (useAll) continue
+        const vertical = inboundCount(heapPtr, parentPtr, child.owner) !== 0
+        const depth = vertical
+            ? (child.depthExtent as number) - (parent.depthExtent as number)
+            : child.depthExtent as number
+        const bucket = buckets.get(depth) ?? []
+        bucket.push(id)
+        buckets.set(depth, bucket)
+    }
+    let selected = children
+    if (!useAll) {
+        selected = []
+        let bestDepth = 0
+        for (const [depth, bucket] of buckets) {
+            if (selected.length === 0 || bucket.length > selected.length
+                || (bucket.length === selected.length && depth < bestDepth)) {
+                selected = bucket.slice()
+                bestDepth = depth
+            }
+        }
+        for (const [depth, bucket] of buckets) {
+            if (depth === bestDepth) continue
+            if (bestDepth >= 0 && depth < 0) continue
+            if (depth < bestDepth) selected.push(...bucket)
+        }
+    }
+    if (selected.length < 2) return []
+
+    const selectedSet = new Set<number>(selected)
+    const slotToChild = new Map<number, ScId>()
+    for (const id of selected) slotToChild.set(handleSlot(Sc(getScRaw(heapPtr, id)).owner), id)
+    const neighbors = new Map<number, ScId[]>()
+    for (const id of selected) neighbors.set(id, [])
+    for (const [key, count] of sparseEntries(peerRefs(heapPtr, parentPtr))) {
+        if (!count) continue
+        const from = slotToChild.get(key >>> 16)
+        const to = slotToChild.get(key & slotMask)
+        if (from && to && selectedSet.has(from) && selectedSet.has(to)) neighbors.get(from)!.push(to)
+    }
+
+    let nextIndex = 0
+    const indices = new Map<number, number>()
+    const lowlinks = new Map<number, number>()
+    const stack: ScId[] = []
+    const onStack = new Set<number>()
+    const components: ScId[][] = []
+    function connect(id: ScId): void {
+        const index = nextIndex++
+        indices.set(id, index)
+        lowlinks.set(id, index)
+        stack.push(id)
+        onStack.add(id)
+        for (const target of neighbors.get(id)!) {
+            if (!indices.has(target)) {
+                connect(target)
+                lowlinks.set(id, Math.min(lowlinks.get(id)!, lowlinks.get(target)!))
+            } else if (onStack.has(target)) {
+                lowlinks.set(id, Math.min(lowlinks.get(id)!, indices.get(target)!))
+            }
+        }
+        if (lowlinks.get(id) !== indices.get(id)) return
+        const component: ScId[] = []
+        for (;;) {
+            const child = stack.pop()!
+            onStack.delete(child)
+            component.push(child)
+            if (child === id) break
+        }
+        components.push(component)
+    }
+    for (const id of selected) if (!indices.has(id)) connect(id)
+
+    const groups: ScId[][] = []
+    const remainder: ScId[] = []
+    for (const component of components) {
+        if (component.length > 1) groups.push(component)
+        else remainder.push(component[0])
+    }
+    if (remainder.length > 1) groups.push(remainder)
+    const wrappers: ScId[] = []
+    for (const group of groups) wrappers.push(mergeGroup(heapPtr, parentId, group))
+    return wrappers
 }
 
 function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
@@ -718,7 +1242,7 @@ function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
 
     const root = allocateScChunk(heapPtr)
     setScRaw(heapPtr, 1, root)
-    initSc(root, 0, enumerateEdges, 0)
+    initSc(root, 0 as Handle, enumerateEdges, 0, ScType.general)
     const rootCell = allocCell(heapPtr, 1, scCellSize)
     Sc(root).owner = rootCell
     initScAccounting(heapPtr, 1, root, rootCell)
@@ -726,10 +1250,11 @@ function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
     return heapPtr
 }
 
-function createInterpretedSc(
+function createInterpretedScWithType(
     heapPtr: usize,
     parentId: ScId,
     enumerateEdges: u64,
+    type: ScType,
 ): ScId {
     const heap = Heap(heapPtr)
     const id = heap.nextScId
@@ -738,12 +1263,24 @@ function createInterpretedSc(
     const owner = allocCell(heapPtr, parentId, scCellSize)
     const ptr = allocateScChunk(heapPtr)
     const parent = Sc(getScRaw(heapPtr, parentId))
-    initSc(ptr, owner, enumerateEdges, parent.depth + 1)
+    ensurePeerRefs(heapPtr, parentId, getScRaw(heapPtr, parentId))
+    initSc(ptr, owner, enumerateEdges, parent.depth + 1, type)
+    const sc = Sc(ptr)
+    sc.nextSibling = parent.firstChild
+    parent.firstChild = id
     setScRaw(heapPtr, id, ptr)
     heap.nextScId = id + 1
     initScAccounting(heapPtr, id, ptr, owner)
     if (parent.depthExtent === 0) parent.depthExtent = 1
     return id
+}
+
+function createInterpretedSc(heapPtr: usize, parentId: ScId, enumerateEdges: u64): ScId {
+    return createInterpretedScWithType(heapPtr, parentId, enumerateEdges, ScType.general)
+}
+
+function createInterpretedBranchSc(heapPtr: usize, parentId: ScId): ScId {
+    return createInterpretedScWithType(heapPtr, parentId, 0, ScType.branch)
 }
 
 function createInterpretedPoolSc(
@@ -764,9 +1301,105 @@ function benchAddRemove(iter: number, heap: usize, localFrom: Handle, localTo: H
     removeEdge(heap, localFrom, localTo)
 }
 
+const condenseBenchFanout = accountingCapacity
+const condenseBenchLeafCapacity = accountingCapacity
+
+function condenseBenchScCount(leaves: u32): u32 {
+    let level = leaves
+    let total = leaves
+    while (level > condenseBenchFanout) {
+        level = Math.ceil(level / condenseBenchFanout)
+        total += level
+    }
+    return total
+}
+
+function makeCondenseBenchLeaves(
+    heap: usize,
+    parent: ScId,
+    count: u32,
+    depth: u32,
+    leaves: ScId[],
+): void {
+    if (depth === 1) {
+        for (let i: u32 = 0; i < count; i++) {
+            leaves.push(createInterpretedSc(heap, parent, 0))
+        }
+        return
+    }
+    let childCapacity: u32 = 1
+    for (let i: u32 = 1; i < depth; i++) childCapacity *= condenseBenchFanout
+    let remaining = count
+    while (remaining !== 0) {
+        const childLeaves = Math.min(remaining, childCapacity)
+        const child = createInterpretedBranchSc(heap, parent)
+        makeCondenseBenchLeaves(heap, child, childLeaves, depth - 1, leaves)
+        remaining -= childLeaves
+    }
+}
+
+function makeCondenseBenchHeap(allocations: u32): [usize, ScId] {
+    const leafCount = Math.ceil(allocations / condenseBenchLeafCapacity)
+    let depth: u32 = 1
+    let capacity: u32 = condenseBenchFanout
+    while (leafCount > capacity) {
+        capacity *= condenseBenchFanout
+        depth++
+    }
+    const maxScs = (condenseBenchScCount(leafCount) + 3) as ScId
+    const heap = createInterpretedHeap(maxScs, 0)
+    const root = rootSc(heap)
+    const leaves: ScId[] = []
+    makeCondenseBenchLeaves(heap, root, leafCount, depth, leaves)
+    leaves.reverse()
+    let leaf = leaves.pop()!
+    let used: u32 = 0
+    let previous = 0 as Handle
+    for (let i: u32 = 0; i < allocations; i++) {
+        if (used === condenseBenchLeafCapacity) {
+            leaf = leaves.pop()!
+            used = 0
+        }
+        const cell = allocCell(heap, leaf, 8)
+        if (previous !== 0) addEdge(heap, cell, previous)
+        previous = cell
+        used++
+    }
+    return [heap, root]
+}
+
+export function benchCondenseAllocations(samples: u32): void {
+    const counts = [32, 256, 1024, 4096, 8192]
+    for (let i = 0; i < 10; i++) {
+        const [heap, root] = makeCondenseBenchHeap(32)
+        condense(heap, root, true)
+        intrinsics.Intrinsics.free(heap)
+    }
+    for (const allocations of counts) {
+        const leaves = Math.ceil(allocations / condenseBenchLeafCapacity)
+        const scs = condenseBenchScCount(leaves)
+        let elapsed = 0
+        for (let i: u32 = 0; i < samples; i++) {
+            const [heap, root] = makeCondenseBenchHeap(allocations)
+            const start = performance.now()
+            intrinsics.assert(condense(heap, root, true).length === 1)
+            elapsed += performance.now() - start
+            intrinsics.Intrinsics.free(heap)
+        }
+        console.log(
+            `benchCondense (allocations: ${allocations}, leaf SCs: ${leaves}, SCs: ${scs}, samples: ${samples})`,
+            (elapsed / samples).toFixed(6), 'ms/op',
+        )
+    }
+}
+
 function enumerateSingleEdge(ptr: usize, index: u32): Handle {
-    if (index !== 0) return 0
+    if (index !== 0) return 0 as Handle
     return intrinsics.Intrinsics.load(ptr, 0, Types.u32) as Handle
+}
+
+function setSingleEdgeRaw(heapPtr: usize, source: Handle, target: Handle): void {
+    intrinsics.Intrinsics.store(resolve(heapPtr, source), 0, target, Types.u32)
 }
 
 function setSingleEdge(heapPtr: usize, source: Handle, target: Handle): void {
@@ -796,6 +1429,7 @@ export function selfTest(select: (apis: any) => any): void {
         destroyCellWith,
         enumerateSingleEdge,
         setSingleEdge,
+        setSingleEdgeRaw,
         rootSc,
         scOwner,
         refSc,
@@ -812,11 +1446,17 @@ export function selfTest(select: (apis: any) => any): void {
         benchAddRemove,
     }
     const api = select({
-        native: { createHeap, createSc, createPoolSc, ...shared },
+        native: { createHeap, createSc, createBranchSc, createPoolSc, ...shared },
         interpreted: {
             createHeap: createInterpretedHeap,
             createSc: createInterpretedSc,
+            createBranchSc: createInterpretedBranchSc,
             createPoolSc: createInterpretedPoolSc,
+            mergeGroup,
+            condense,
+            initBuild,
+            beginBuild,
+            finishBuild,
             ...shared,
         },
     })
@@ -883,6 +1523,22 @@ export function selfTest(select: (apis: any) => any): void {
     intrinsics.assert(api.localRefCount(heap, siblingOwner) === 0)
     intrinsics.assert(api.supportState(heap, remoteTo) === supportPending)
     intrinsics.assert(api.supportState(heap, siblingOwner) === supportPending)
+
+    {
+        const source = api.allocCell(heap, child, 8)
+        const targetA = api.allocCell(heap, sibling, 8)
+        const targetB = api.allocCell(heap, sibling, 8)
+        api.addEdge(heap, source, targetA)
+        api.addEdge(heap, source, targetB)
+        intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 2)
+        intrinsics.assert(api.localRefCount(heap, siblingOwner) === 1)
+        api.removeEdgeDeferred(heap, source, targetA)
+        intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 1)
+        intrinsics.assert(api.localRefCount(heap, siblingOwner) === 1)
+        api.removeEdgeDeferred(heap, source, targetB)
+        intrinsics.assert(api.peerRefCount(heap, root, childOwner, siblingOwner) === 0)
+        intrinsics.assert(api.localRefCount(heap, siblingOwner) === 0)
+    }
 
     const grandFrom = api.allocCell(heap, grandchild, 8)
     const grandTo = api.allocCell(heap, grandchild, 8)
@@ -1003,9 +1659,110 @@ export function selfTest(select: (apis: any) => any): void {
         intrinsics.assert(api.supportCount(heap, owner) === 0)
         intrinsics.assert(api.supportState(heap, owner) === supportDestroyed)
     }
+
+    if (api.createBranchSc) {
+        const branch = api.createBranchSc(heap, root)
+        const left = api.createSc(heap, branch, 0)
+        const right = api.createSc(heap, branch, 0)
+        const leftCell = api.allocCell(heap, left, 8)
+        const rightA = api.allocCell(heap, right, 8)
+        const rightB = api.allocCell(heap, right, 8)
+        const rightOwner = api.scOwner(heap, right)
+        api.addEdge(heap, leftCell, rightA)
+        api.addEdge(heap, leftCell, rightB)
+        intrinsics.assert(api.localRefCount(heap, rightOwner) === 1)
+        for (let i = 0; i < 301; i++) api.refSc(heap, right)
+        intrinsics.assert(api.inboundRefCount(heap, rightOwner) === 301)
+        for (let i = 0; i < 301; i++) api.unrefSc(heap, right)
+        intrinsics.assert(api.inboundRefCount(heap, rightOwner) === 0)
+        api.removeEdgeDeferred(heap, leftCell, rightA)
+        intrinsics.assert(api.localRefCount(heap, rightOwner) === 1)
+        api.removeEdgeDeferred(heap, leftCell, rightB)
+        intrinsics.assert(api.localRefCount(heap, rightOwner) === 0)
+    }
+
+    if (api.beginBuild) {
+        const build = intrinsics.Intrinsics.alloc(buildContextSize)
+        defer { intrinsics.Intrinsics.free(build) }
+        api.initBuild(build)
+        const buildSc = api.createPoolSc(heap, root, StaticEnumerator.singleEdge, 16)
+        const existing = api.allocCell(heap, buildSc, 16)
+
+        const parent = api.beginBuild(heap, build, buildSc, 16)
+        const child = api.beginBuild(heap, build, buildSc, 16)
+        api.finishBuild(heap, build, child)
+        api.setSingleEdgeRaw(heap, parent, child)
+        api.finishBuild(heap, build, parent)
+        intrinsics.assert(api.localRefCount(heap, child) === 1)
+        intrinsics.assert(api.supportCount(heap, child) === 1)
+
+        const holder = api.beginBuild(heap, build, buildSc, 16)
+        api.setSingleEdgeRaw(heap, holder, existing)
+        api.finishBuild(heap, build, holder)
+        intrinsics.assert(api.localRefCount(heap, existing) === 1)
+
+        const owner = api.beginBuild(heap, build, buildSc, 16)
+        const ephemeral = api.beginBuild(heap, build, buildSc, 16)
+        api.finishBuild(heap, build, ephemeral)
+        intrinsics.assert(api.localRefCount(heap, ephemeral) === 1)
+        api.finishBuild(heap, build, owner)
+        intrinsics.assert(api.localRefCount(heap, ephemeral) === 0)
+        intrinsics.assert(api.supportState(heap, ephemeral) === supportDestroyed)
+    }
+
+    if (api.condense) {
+        const mergedHeap = api.createHeap(16, 0)
+        const mergedRoot = api.rootSc(mergedHeap)
+        const aSc = api.createSc(mergedHeap, mergedRoot, 0)
+        const bSc = api.createSc(mergedHeap, mergedRoot, 0)
+        const cSc = api.createSc(mergedHeap, mergedRoot, 0)
+        const a = api.allocCell(mergedHeap, aSc, 8)
+        const b = api.allocCell(mergedHeap, bSc, 8)
+        const c = api.allocCell(mergedHeap, cSc, 8)
+        api.addEdge(mergedHeap, a, b)
+        api.addEdge(mergedHeap, b, a)
+        api.addEdge(mergedHeap, a, c)
+        api.addEdge(mergedHeap, b, c)
+        intrinsics.assert(api.supportCount(mergedHeap, c) === 2)
+        const wrappers = api.condense(mergedHeap, mergedRoot, false)
+        intrinsics.assert(wrappers.length === 1)
+        const wrapper = wrappers[0]
+        const wrapperOwner = api.scOwner(mergedHeap, wrapper)
+        const aOwner = api.scOwner(mergedHeap, aSc)
+        const bOwner = api.scOwner(mergedHeap, bSc)
+        const cOwner = api.scOwner(mergedHeap, cSc)
+        intrinsics.assert(api.handleSc(aOwner) === wrapper)
+        intrinsics.assert(api.handleSc(bOwner) === wrapper)
+        intrinsics.assert(api.scDepth(mergedHeap, aSc) === 2)
+        intrinsics.assert(api.peerRefCount(mergedHeap, wrapper, aOwner, bOwner) === 1)
+        intrinsics.assert(api.peerRefCount(mergedHeap, mergedRoot, wrapperOwner, cOwner) === 1)
+        intrinsics.assert(api.supportCount(mergedHeap, b) === 1)
+        intrinsics.assert(api.supportCount(mergedHeap, c) === 1)
+        api.removeEdgeDeferred(mergedHeap, a, b)
+        api.removeEdgeDeferred(mergedHeap, b, a)
+        api.removeEdgeDeferred(mergedHeap, a, c)
+        intrinsics.assert(api.supportCount(mergedHeap, c) === 1)
+        api.removeEdgeDeferred(mergedHeap, b, c)
+        intrinsics.assert(api.supportCount(mergedHeap, b) === 0)
+        intrinsics.assert(api.supportCount(mergedHeap, c) === 0)
+
+        const bucketHeap = api.createHeap(16, 0)
+        const bucketRoot = api.rootSc(bucketHeap)
+        const heldSc = api.createSc(bucketHeap, bucketRoot, 0)
+        const looseA = api.createSc(bucketHeap, bucketRoot, 0)
+        const looseB = api.createSc(bucketHeap, bucketRoot, 0)
+        api.refSc(bucketHeap, heldSc)
+        const bucketWrappers = api.condense(bucketHeap, bucketRoot, false)
+        intrinsics.assert(bucketWrappers.length === 1)
+        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, heldSc)) === bucketRoot)
+        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, looseA)) === bucketWrappers[0])
+        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, looseB)) === bucketWrappers[0])
+        api.unrefSc(bucketHeap, heldSc)
+    }
 }
 
 if (intrinsics.argv()[0] === 'cg') {
     selfTest(apis => apis.interpreted)
     console.log('cg interpreted self-test passed')
+    if (intrinsics.argv().includes('condense-bench')) benchCondenseAllocations(20)
 }

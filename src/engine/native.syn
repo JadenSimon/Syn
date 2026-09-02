@@ -4,6 +4,7 @@
 
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
+import * as heap from './heap'
 import * as syscalls from './syscalls'
 import {
     Graph, GraphNode, LowerGraphResult, analyzeValueGraph, lowerValueGraph, normalizeValueGraph,
@@ -33,8 +34,18 @@ let nativeCopier: any
 let nativeSealer: any
 let nativeInvoker: any
 const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64'
-const sys_icache_invalidate = darwinArm64
-    ? (ts as any).lookupNativeSymbol('sys_icache_invalidate') : undefined
+function declareNative(ptr: any, args: number[], returns: number): any {
+    if (ptr === undefined) return undefined
+    const f: any = (..._: any[]) => { throw new Error('unlinked native symbol') }
+    f.__native = typeof ptr === 'bigint' ? Number(ptr) : ptr
+    f.__args = args
+    f.__returns = returns
+    return f
+}
+const sys_icache_invalidate = declareNative(
+    darwinArm64 ? (ts as any).lookupNativeSymbol('sys_icache_invalidate') : undefined,
+    [Types.u64, Types.u64], Types.u64,
+)
 const pthread_jit_write_protect_np = darwinArm64
     ? (ts as any).lookupNativeSymbol('pthread_jit_write_protect_np') : undefined
 
@@ -158,18 +169,103 @@ interface NativeUnit {
     code: LowerGraphResult
 }
 
-function marker(kind: number, id: number): number {
-    return Number.MAX_SAFE_INTEGER - (kind << 20) - id
-}
-
 function nativeStub(fn: Function, symbol: number): Function {
     const names: string[] = []
     for (let i = 0; i < fn.length; i++) names.push(`arg${i}`)
     const stub: any = new Function(...names, `throw new Error('Unlinked local function')`)
-    stub.__native = marker(1, symbol)
+    stub.__localTarget = symbol
     stub.__args = Array.from({ length: fn.length }, () => Types.u64)
     stub.__returns = Types.u64
     return stub
+}
+
+function isLocalStub(f: any): boolean {
+    return Number.isSafeInteger(f?.__localTarget)
+}
+
+const toComputation = Symbol.for('toComputation')
+const addressKey = heap.fromJsString('__address')
+
+function inlineComputation(source: string, captures: any[], arity: number): Function {
+    const names: string[] = []
+    for (let i = 0; i < arity; i++) names.push(`arg${i}`)
+    const fn: any = new Function(...names, `throw new Error('Untraced synthetic function')`)
+    fn.shouldInline = true
+    fn[toComputation] = () => [source, captures]
+    return fn
+}
+
+function makeHeapWrapper(proto: intrinsics.Handle): Function {
+    return inlineComputation(
+        'function heapWrapper(value) { return Object.setPrototypeOf({ __address: value }, $0) }',
+        [heap.createHeapHandle(proto)],
+        1,
+    )
+}
+
+function wrapCall(stub: Function, wrapper: Function, arity: number): Function {
+    const names: string[] = []
+    for (let i = 0; i < arity; i++) names.push(`arg${i}`)
+    return inlineComputation(
+        `function wrappedCall(${names.join(', ')}) { return $0($1(${names.join(', ')})) }`,
+        [wrapper, stub],
+        arity,
+    )
+}
+
+function liftReturnedHeapValues(graph: Graph): { graph: Graph, wrapper?: Function } {
+    const nodes = new Map<number, GraphNode>(graph.nodes)
+    const params = new Set<number>(graph.params)
+    let prototype: intrinsics.Handle | undefined
+    let lifted = false
+
+    function replacement(handle: intrinsics.Handle): [number, number] | undefined {
+        if (heap.ownPropertyCount(handle) !== 1) return
+        const descriptor = heap.getOwnProperty(handle, addressKey)
+        if (!descriptor) return
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
+        const boxed = d.slot0 as intrinsics.Handle
+        if (!heap.isBoxedF64(boxed)) return
+        const proto = heap.getPrototypeOf(handle)
+        if (prototype !== undefined && prototype !== proto) return
+        prototype = proto
+        const value = heap.unboxF64(boxed)
+        const id = intrinsics.getNanId(value)
+        if (id && !nodes.has(id) && !params.has(id)) return
+        lifted = true
+        return id ? [id, 0] : [0, value]
+    }
+
+    function visit(id: number, constant: number): [number, number] | undefined {
+        if (!id) return
+        const n = nodes.get(id)
+        if (!n) return
+        if (n.op === 'heap-handle' && !n.argIds[0]) {
+            return replacement(n.argConsts[0] as intrinsics.Handle)
+        }
+        const indices = n.op === 'after' ? [1]
+            : n.op === 'select' ? Array.from({ length: n.argIds.length - 1 }, (_, i) => i + 1)
+            : undefined
+        if (!indices) return
+        const argIds = n.argIds.slice()
+        const argConsts = n.argConsts.slice()
+        for (const i of indices) {
+            const next = visit(argIds[i], argConsts[i])
+            if (!next) return
+            argIds[i] = next[0]
+            argConsts[i] = next[1]
+        }
+        nodes.set(id, { ...n, argIds, argConsts })
+        return [id, constant]
+    }
+
+    const entry = graph.blocks[0]
+    const root = visit(entry.bodyId, entry.bodyConst)
+    if (!root || !lifted || prototype === undefined) return { graph }
+    const blocks = graph.blocks.slice()
+    blocks[0] = { ...entry, bodyId: root[0], bodyConst: root[1] }
+    return { graph: { ...graph, nodes, blocks }, wrapper: makeHeapWrapper(prototype) }
 }
 
 interface InlineScore {
@@ -245,69 +341,29 @@ function obviousInline(graph: Graph): InlineScore | undefined {
 
 function rewriteTargets(
     graph: Graph,
-    locals: Map<number, number>,
-    pooled: Map<number, number>,
-    heapHandles: Map<number, number>,
+    functionHandles: Map<number, number>,
+    dataHandles: Map<number, number>,
 ): Graph {
     const nodes = new Map<number, GraphNode>()
-    const localNodes = new Map<number, number>()
-    const poolNodes = new Map<number, number>()
-    let nextId = graph.maxId
-    function valueNode(op: string, value: number, cache: Map<number, number>): number {
-        const known = cache.get(value)
-        if (known !== undefined) return known
-        const id = nextId++
-        nodes.set(id, {
-            op, argIds: [0], argConsts: new Float64Array([value]),
-            T: Types.usize, U: Types.usize, offset: 0,
-        })
-        cache.set(value, id)
-        return id
-    }
     for (const [id, n] of graph.nodes) {
-        if (n.op === 'heap-handle') {
-            const handle = n.argConsts[0]
-            const slot = heapHandles.get(handle)
-            if (n.argIds[0] || slot === undefined) {
-                throw `native: unresolved heap handle ${handle} in ${graph.name ?? 'anonymous graph'} at %${id}`
-            }
-            nodes.set(id, {
-                op: 'pool-entry', argIds: [0], argConsts: new Float64Array([slot]),
-                T: Types.fnptr, U: Types.fnptr, offset: 0,
-            })
+        if (n.op !== 'heap-handle') {
+            nodes.set(id, n)
             continue
         }
-        const ids = n.argIds.slice()
-        const consts = n.argConsts.slice()
-        let changed = false
-        for (let i = 0; i < ids.length; i++) {
-            if (ids[i]) continue
-            const local = locals.get(consts[i])
-            if (local !== undefined && n.op === 'call' && i === 1) {
-                ids[i] = valueNode('local-target', local, localNodes)
-                consts[i] = 0
-                changed = true
-                continue
-            }
-            const slot = pooled.get(consts[i])
-            if (slot !== undefined) {
-                ids[i] = valueNode('pool-entry', slot, poolNodes)
-                consts[i] = 0
-                changed = true
-            }
+        const handle = n.argConsts[0]
+        const functionSlot = functionHandles.get(handle)
+        const slot = functionSlot ?? dataHandles.get(handle)
+        if (n.argIds[0] || slot === undefined) {
+            throw `native: unresolved heap handle ${handle} in ${graph.name ?? 'anonymous graph'} at %${id}`
         }
-        nodes.set(id, changed ? { ...n, argIds: ids, argConsts: consts } : n)
+        nodes.set(id, {
+            op: 'pool-entry', argIds: [0], argConsts: new Float64Array([slot]),
+            T: functionSlot !== undefined ? Types.fnptr : Types.handle,
+            U: functionSlot !== undefined ? Types.fnptr : Types.handle,
+            offset: 0,
+        })
     }
-    const blocks = graph.blocks.map(block => {
-        if (block.bodyId) return block
-        const slot = pooled.get(block.bodyConst)
-        if (slot === undefined) return block
-        return { ...block, bodyId: valueNode('pool-entry', slot, poolNodes), bodyConst: 0 }
-    })
-    for (const [id, n] of nodes) {
-        if (n.op === 'heap-handle') throw `native: heap handle survived target rewriting at %${id}`
-    }
-    return { ...graph, maxId: nextId, nodes, params: graph.params, blocks }
+    return { ...graph, nodes }
 }
 
 function align(value: number, amount: number): number {
@@ -335,7 +391,7 @@ function patchImage(
     for (let i = 0; i < units.length; i++) {
         const unit = units[i]
         for (const relocation of unit.code.relocations) {
-            const offset = offsets[i] + relocation.offset
+            const offset = offsets[unit.symbol] + relocation.offset
             const pc = imageBase + BigInt(offset)
             let word = view.getUint32(offset, true)
             if (relocation.kind === 'aarch64-pool') {
@@ -409,44 +465,7 @@ export function createNatives(fns: Record<string, Function>) {
     const localPoolTargets = new Map<number, number>()
     const session = createTraceSession()
     const inlineScores = new Map<Function, InlineScore | false>()
-    let inlineMarker = 0
-    function analyzeInline(fn: Function): boolean {
-        const known = inlineScores.get(fn)
-        if (known !== undefined) return known !== false
-        inlineScores.set(fn, false)
-        try {
-            const computation = intrinsics.getComputation(fn)
-            const candidate = trace2(computation[0], {
-                captures: computation[1],
-                session: createTraceSession(),
-                mapCapture(capture: any) {
-                    if (typeof capture !== 'function') return capture
-                    const linked: any = capture
-                    if (Number.isSafeInteger(linked.__syscall)
-                        || Number.isSafeInteger(linked.__native)
-                        || linked.shouldInline) return capture
-                    try {
-                        intrinsics.getComputation(capture)
-                    } catch {
-                        return capture
-                    }
-                    return nativeStub(capture, inlineMarker++)
-                },
-            })
-            const score = obviousInline(normalizeValueGraph(candidate.graph))
-            if (!score) return false
-            inlineScores.set(fn, score)
-            if (intrinsics.argv().includes('native-inline')) {
-                console.log('native inline', fn.name, score)
-            }
-            return true
-        } catch (e) {
-            if (intrinsics.argv().includes('native-inline')) {
-                console.log('native no-inline', fn.name, e)
-            }
-            return false
-        }
-    }
+    const returnWrappers = new Map<Function, Function>()
     function shouldInline(fn: Function): boolean {
         return inlineScores.get(fn) !== false && inlineScores.has(fn)
     }
@@ -480,38 +499,70 @@ export function createNatives(fns: Record<string, Function>) {
         roots.set(name, intern(fn))
     }
     intrinsics.assert(roots.size > 0)
-    const discovered = new Set<Function>()
-    const pending = [...functions]
-    while (pending.length) {
-        const fn = pending.pop()!
-        if (discovered.has(fn)) continue
-        discovered.add(fn)
-        let computation: [string, any[]]
-        try {
-            computation = intrinsics.getComputation(fn)
-        } catch {
-            continue
-        }
+    const dependencies = new Map<Function, Function[]>()
+    function discover(fn: Function): void {
+        if (dependencies.has(fn)) return
+        intern(fn)
+        const deps: Function[] = []
+        dependencies.set(fn, deps)
+        const computation = intrinsics.getComputation(fn)
+        const inlined: any[] = []
         for (const capture of computation[1]) {
             if (typeof capture !== 'function') continue
             const linked: any = capture
-            if (Number.isSafeInteger(linked.__syscall) || Number.isSafeInteger(linked.__native)) continue
-            if (!discovered.has(capture)) pending.push(capture)
+            if (linked.shouldInline) {
+                inlined.push(capture)
+                continue
+            }
+            if (Number.isSafeInteger(linked.__syscall)
+                || Number.isSafeInteger(linked.__native)) continue
+            deps.push(capture)
+            discover(capture)
+        }
+        if (!inlined.length) return
+        const seen = new Set<any>(deps)
+        while (inlined.length) {
+            const f = inlined.pop()
+            seen.add(f)
+            const c = intrinsics.getComputation(f)
+            for (const x of c[1]) {
+                if (typeof x !== 'function') continue
+                if (Number.isSafeInteger(x.__syscall)
+                    || Number.isSafeInteger(x.__native)) continue
+                if (seen.has(x)) continue
+                seen.add(x)
+                if (x.shouldInline) {
+                    inlined.push(x)
+                    continue
+                }
+                deps.push(x)
+                discover(x)
+            }
         }
     }
-    for (const fn of discovered) {
-        const linked: any = fn
-        if (!linked.shouldInline) analyzeInline(fn)
+    for (const fn of fns ? Object.values(fns) : []) discover(fn)
+    const order: Function[] = []
+    const visiting = new Set<Function>()
+    const visited = new Set<Function>()
+    function schedule(fn: Function): void {
+        if (visited.has(fn)) return
+        if (visiting.has(fn)) return
+        visiting.add(fn)
+        for (const dep of dependencies.get(fn) ?? []) schedule(dep)
+        visiting.delete(fn)
+        visited.add(fn)
+        order.push(fn)
     }
-    for (let symbol = 0; symbol < functions.length; symbol++) {
-        const current = functions[symbol]
+    for (const fn of fns ? Object.values(fns) : []) schedule(fn)
+    session.enterTrace()
+    defer session.leaveTrace()
+    for (const current of order) {
+        const symbol = symbols.get(current)!
         if (intrinsics.argv().includes('native-symbols')) console.log('native symbol', symbol, current.name)
         const traceDebug = intrinsics.argv().includes('trace-debug')
             || intrinsics.argv().includes(`trace-debug:${current.name}`)
         if (traceDebug) console.log('trace native', current.name)
         const computation = intrinsics.getComputation(current)
-        const localMarkers = new Map<number, number>()
-        const poolMarkers = new Map<number, number>()
         const mapCapture = (capture: any) => {
             if (isPoolValue(capture)) {
                 let slot = poolSlots.get(capture)
@@ -520,14 +571,13 @@ export function createNatives(fns: Record<string, Function>) {
                     poolSlots.set(capture, slot)
                     poolValues.push(capture.value)
                 }
-                const value = marker(2, slot)
-                poolMarkers.set(value, slot)
-                return value
+                return session.mk('pool-entry', new Float64Array([slot]), '', [Types.usize])
             }
             if (typeof capture !== 'function') return capture
             const linked: any = capture
             if (Number.isSafeInteger(linked.__syscall)
                 || Number.isSafeInteger(linked.__native)
+                || isLocalStub(linked)
                 || linked.shouldInline
                 || shouldInline(capture)) return capture
             try {
@@ -537,33 +587,51 @@ export function createNatives(fns: Record<string, Function>) {
             }
             const target = intern(capture)
             const stub: any = nativeStub(capture, target)
-            localMarkers.set(stub.__native, target)
-            return stub
+            const wrapper = returnWrappers.get(capture)
+            if (traceDebug) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
+            return wrapper ? wrapCall(stub, wrapper, capture.length) : stub
         }
         const traced = trace2(computation[0], {
             captures: computation[1], session, mapCapture, shouldInline, verbose: traceDebug,
         })
-        traced.graph.name = current.name
+        const lifted = liftReturnedHeapValues(traced.graph)
+        const tracedGraph = lifted.graph
+        tracedGraph.name = current.name
         if (traceDebug) console.log(traced.text)
-        const heapHandleSlots = new Map<number, number>()
-        for (const n of traced.graph.nodes.values()) {
+        if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
+        if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
+        if (!(current as any).shouldInline) {
+            const graph = normalizeValueGraph(tracedGraph)
+            const score = graph.nodes.size <= 50 ? obviousInline(graph) : undefined
+            inlineScores.set(current, score ?? false)
+            if (score && intrinsics.argv().includes('native-inline')) {
+                console.log('native inline', current.name, score)
+            }
+        }
+        const functionHandleSlots = new Map<number, number>()
+        const dataHandleSlots = new Map<number, number>()
+        for (const n of tracedGraph.nodes.values()) {
             if (n.op !== 'heap-handle') continue
             const handle = n.argConsts[0]
+            if (!heap.isCallable(handle as intrinsics.Handle)) {
+                dataHandleSlots.set(handle, pointerSlot(handle))
+                continue
+            }
             const linked = session.stubFunctions.get(handle) as any
             if (!linked) throw `native: heap handle ${handle} is not a linked function`
-            const marker = linked.__native
-            const local = localMarkers.get(marker)
-            if (local !== undefined) {
-                heapHandleSlots.set(handle, localFunctionSlot(local))
+            if (isLocalStub(linked)) {
+                functionHandleSlots.set(handle, localFunctionSlot(linked.__localTarget))
                 continue
             }
-            if (Number.isSafeInteger(marker)) {
-                heapHandleSlots.set(handle, pointerSlot(marker))
+            if (Number.isSafeInteger(linked.__native)) {
+                functionHandleSlots.set(handle, pointerSlot(linked.__native))
                 continue
             }
-            heapHandleSlots.set(handle, localFunctionSlot(intern(linked)))
+            functionHandleSlots.set(handle, localFunctionSlot(intern(linked)))
         }
-        const graph = rewriteTargets(traced.graph, localMarkers, poolMarkers, heapHandleSlots)
+        const graph = rewriteTargets(
+            tracedGraph, functionHandleSlots, dataHandleSlots,
+        )
         intrinsics.assert(graph.params.length <= 5)
         const debug = intrinsics.argv().includes('lower-debug')
             || intrinsics.argv().includes(`lower-debug:${current.name}`)
