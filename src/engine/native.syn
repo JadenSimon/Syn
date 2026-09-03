@@ -7,7 +7,7 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as syscalls from './syscalls'
 import {
-    Graph, GraphNode, LowerGraphResult, analyzeValueGraph, lowerValueGraph, normalizeValueGraph,
+    Graph, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, lowerValueGraph, normalizeValueGraph,
 } from './lowering2'
 
 type usize = u32
@@ -298,9 +298,12 @@ function obviousInline(graph: Graph): InlineScore | undefined {
     }
     visit(root)
 
+    const targets = new Set(['syscall-target', 'local-target', 'pool-entry', 'heap-handle'])
+    const effects = new Set(['nil-effect', 'after', 'call', 'panic', 'load', 'store'])
     const free = new Set<number>()
     for (const id of reachable) {
         const n = graph.nodes.get(id)
+        if (n && targets.has(n.op)) { free.add(id); continue }
         if (n?.op !== 'load' || !n.argIds[1]) continue
         const offset = graph.nodes.get(n.argIds[1])
         if (offset?.op === 'shl' && !offset.argIds[1]
@@ -310,18 +313,21 @@ function obviousInline(graph: Graph): InlineScore | undefined {
 
     let cost = 0
     const cheap = new Set([
+        'load', 'store', 'select', 'ne', 'eq', 'gt', 'lt', 'le',
         'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'shr', 'ushr',
-        'neg', 'not', 'convert', 'bitconvert', 'load',
+        'neg', 'not', 'convert', 'bitconvert', 'void'
     ])
     for (const id of reachable) {
         const n = graph.nodes.get(id)
         if (!n || n.op === 'nil-effect' || free.has(id)) continue
-        if (n.op === 'after') {
-            if (graph.nodes.get(n.argIds[0])?.op !== 'nil-effect') return
+        if (n.op === 'after' || n.op === 'call') {
+            const effect = graph.nodes.get(n.argIds[0])
+            if (effect && !effects.has(effect.op)) return
+            if (n.op === 'call') cost += 2
             continue
         }
         if (!cheap.has(n.op)) return
-        cost += n.op === 'load' ? 1 : n.op === 'mul' ? 2 : 1
+        cost += n.op === 'mul' || n.op === 'div' ? 2 : 1
     }
     if (cost > 4) return
 
@@ -350,9 +356,14 @@ function rewriteTargets(
     graph: Graph,
     functionHandles: Map<number, number>,
     dataHandles: Map<number, number>,
+    targetRefs: Map<number, number>,
 ): Graph {
     const nodes = new Map<number, GraphNode>()
     for (const [id, n] of graph.nodes) {
+        if (n.op === 'local-target') {
+            const symbol = n.argConsts[0]
+            targetRefs.set(symbol, (targetRefs.get(symbol) ?? 0) + 1)
+        }
         if (n.op !== 'heap-handle') {
             nodes.set(id, n)
             continue
@@ -472,6 +483,7 @@ export function createNatives(fns: Record<string, Function>) {
     const localPoolTargets = new Map<number, number>()
     const session = createTraceSession()
     const inlineScores = new Map<Function, InlineScore | false>()
+    const targetRefs = new Map<number, number>()
     const returnWrappers = new Map<Function, Function>()
     function shouldInline(fn: Function): boolean {
         return inlineScores.get(fn) !== false && inlineScores.has(fn)
@@ -609,7 +621,8 @@ export function createNatives(fns: Record<string, Function>) {
         if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
         if (!(current as any).shouldInline) {
             const graph = normalizeValueGraph(tracedGraph)
-            const score = graph.nodes.size <= 50 ? obviousInline(graph) : undefined
+            const score = (current as any).shouldNotInline || graph.nodes.size > 50
+                ? undefined : obviousInline(graph)
             inlineScores.set(current, score ?? false)
             if (score && intrinsics.argv().includes('native-inline')) {
                 console.log('native inline', current.name, score)
@@ -637,7 +650,7 @@ export function createNatives(fns: Record<string, Function>) {
             functionHandleSlots.set(handle, localFunctionSlot(intern(linked)))
         }
         const graph = rewriteTargets(
-            tracedGraph, functionHandleSlots, dataHandleSlots,
+            tracedGraph, functionHandleSlots, dataHandleSlots, targetRefs,
         )
         intrinsics.assert(graph.params.length <= 5)
         const debug = intrinsics.argv().includes('lower-debug')
@@ -647,7 +660,17 @@ export function createNatives(fns: Record<string, Function>) {
         if (debug) console.log(`--- ${current.name} listing ---\n`, code.listing)
         units.push({ fn: current, symbol, code })
     }
-    const installed = installImage(units, poolValues, localPoolTargets)
+    const rootSymbols = new Set<number>(roots.values())
+    const pooledSymbols = new Set<number>(localPoolTargets.values())
+    const emitted = units.filter(u =>
+        rootSymbols.has(u.symbol)
+        || pooledSymbols.has(u.symbol)
+        || (targetRefs.get(u.symbol) ?? 0) > 0)
+    let unitInst = 0
+    for (const u of emitted) unitInst += u.code.words.length
+    console.log('native unit', emitted.length, 'fns', unitInst, 'instructions',
+        units.length === emitted.length ? '' : `(${units.length - emitted.length} inlined away)`)
+    const installed = installImage(emitted, poolValues, localPoolTargets)
     const result: Record<string, any> = {}
     for (const [name, symbol] of roots) {
         const ptr = installed.entries[symbol]
