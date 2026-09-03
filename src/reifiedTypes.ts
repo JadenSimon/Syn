@@ -750,52 +750,71 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         const m = new vm.SourceTextModule(text, {
             identifier: fileName,
             context: ctx,
+            importModuleDynamically: async (spec, from) => evaluated(await link(spec, from)),
         })
         const modules = new Map<string, any>()
         modules.set(fileName, m)
         modules.set(fileName.replace('.syn', '.js'), m)
         const namesToSource = new Map<string, string>()
         namesToSource.set(fileName, text)
-        return (async function() {
-            await m.link(async (spec: string, m: vm.Module) => {
-                if (spec === 'typescript') {
-                    const cached = modules.get(spec)
-                    if (cached) return cached
-                    const exports = Object.keys(ts)
-                    if (!exports.includes('default')) exports.push('default')
-                    const mod = new vm.SyntheticModule(exports, function() {
-                        for (const k of exports) {
-                            this.setExport(k, ts[k])
-                        }
-                        this.setExport('default', ts)
-                    }, { context: ctx })
-                    modules.set(spec, mod)
-                    return mod
-                }
+        const evaluating = new Set<any>()
+        function dependsOnEvaluating(m: any, seen = new Set<any>()): boolean {
+            if (!m || seen.has(m)) return false
+            seen.add(m)
+            if (m.status === 'evaluating' || evaluating.has(m)) return true
+            for (const spec of m.dependencySpecifiers ?? []) {
                 const p = resolve?.(m.identifier, spec)
-                if (!p) return
-                const cached = modules.get(p[0])
+                if (!p) continue
+                if (dependsOnEvaluating(modules.get(p[0]), seen)) return true
+            }
+            return false
+        }
+        async function evaluated(m: any) {
+            if (!m) return m
+            if (m.status === 'unlinked') await m.link(link)
+            if (m.status !== 'linked') return m
+            const cyclic = dependsOnEvaluating(m)
+            evaluating.add(m)
+            const done = m.evaluate().finally(() => evaluating.delete(m))
+            if (cyclic) done.catch(() => {})
+            else await done
+            return m
+        }
+        async function link(spec: string, m: vm.Module) {
+            if (spec === 'typescript') {
+                const cached = modules.get(spec)
                 if (cached) return cached
-                const src = `let __filename = import.meta.filename\n` + p[1]
-                namesToSource.set(p[0], src)
-                const m2 = new vm.SourceTextModule(src, {
-                    identifier: p[0],
-                    context: ctx,
-                    importModuleDynamically: (spec, from) => {
-                        const p2 = resolve?.(from.identifier.replace('.js', '.syn'), spec)
-                        if (!p2) return
-                        const cached = modules.get(p2[0])
-                        if (cached) return cached
-                        throw `todo: dynamic import ${spec}`
-                    },
-                    initializeImportMeta: (meta, m) => {
-                        meta.filename = m.identifier.replace('.js', '.syn')
-                    },
-                    lineOffset: -1,
-                })
-                modules.set(p[0], m2)
-                return m2
+                const exports = Object.keys(ts)
+                if (!exports.includes('default')) exports.push('default')
+                const mod = new vm.SyntheticModule(exports, function() {
+                    for (const k of exports) {
+                        this.setExport(k, ts[k])
+                    }
+                    this.setExport('default', ts)
+                }, { context: ctx })
+                modules.set(spec, mod)
+                return mod
+            }
+            const p = resolve?.(m.identifier, spec)
+            if (!p) return
+            const cached = modules.get(p[0])
+            if (cached) return cached
+            const src = `let __filename = import.meta.filename\n` + p[1]
+            namesToSource.set(p[0], src)
+            const m2 = new vm.SourceTextModule(src, {
+                identifier: p[0],
+                context: ctx,
+                importModuleDynamically: async (spec, from) => evaluated(await link(spec, from)),
+                initializeImportMeta: (meta, m) => {
+                    meta.filename = m.identifier.replace('.js', '.syn')
+                },
+                lineOffset: -1,
             })
+            modules.set(p[0], m2)
+            return m2
+        }
+        return (async function() {
+            await m.link(link)
             return await m.evaluate().catch(err => {
                 applySourceMaps(namesToSource, err)
                 throw err

@@ -128,6 +128,7 @@ interface TraceRuntime {
     blocks: Map<number, SessionBlock>
     frames: TraceFrame[]
     nilEffect?: any
+    memoryLoad?: (ptr: number, offset: number, T: number) => any
     depth: number
 }
 
@@ -153,7 +154,7 @@ function deriveBlocks(
         return CallOpcodes.has(opcode) || LoadOpcodes.has(opcode) || StoreOpcodes.has(opcode)
     }
     function writesToken(opcode: number): boolean {
-        return CallOpcodes.has(opcode) || StoreOpcodes.has(opcode)
+        return readsToken(opcode)
     }
     function readsOf(inst: bytecode.CodeInstruction): number[] {
         const out: number[] = []
@@ -560,11 +561,7 @@ export function createTraceSession(): TraceSession {
             tracer = intrinsics.createIntrinsicsTracer(Intrinsics, {
                 load: (ptr, offset, T) => {
                     if (symbolicMemory.has(ptr)) {
-                        const args = new Float64Array(3)
-                        args[0] = ptr
-                        args[1] = offset
-                        args[2] = T
-                        const result = tracer.traceOp('load', args, T)
+                        const result = runtime!.memoryLoad!(ptr, offset, T)
                         tracer.markHandled()
                         return result
                     }
@@ -581,6 +578,7 @@ export function createTraceSession(): TraceSession {
                 },
                 store: (ptr, offset, val, T) => {
                     if (symbolicMemory.has(ptr)) {
+                        throw "???"
                         const args = new Float64Array(4)
                         args[0] = ptr
                         args[1] = offset
@@ -727,38 +725,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     const mk = session.mk
 
-    function after(v: any, token: any, refreshLoad?: boolean): any {
+    function after(v: any, token: any): any {
         const tokenId = tracer.getNanId(token)
         if (!tokenId || tokenId === tracer.getNanId(nilEffect)) return v
         if (tracer.getNanId(v) === tokenId) return v
-        if (refreshLoad) {
-            const u = tracer.getTraceFromUnknown(v)
-            if (u?.op === 'load') {
-                const parts: string[] = ['after-load']
-                for (let i = 0; i < 2; i++) {
-                    const id = u.argIds[i]
-                    parts.push(id ? `v${id}` : `c${u.args[i]}`)
-                }
-                parts.push(`t${u.T}`, `e${tokenId}`)
-                const key = parts.join('|')
-                if (const hit = nodeCache.get(key)) return intrinsics.getNanFromId(hit) as any
-                const copy = tracer.createUniqueNan()
-                const copyId = tracer.getNanId(copy)
-                const argIds: number[] = []
-                const argConsts = new Float64Array(2)
-                for (let i = 0; i < 2; i++) {
-                    argIds.push(u.argIds[i])
-                    argConsts[i] = u.args[i]
-                }
-                nodes.set(copyId, { ...u, op: 'load', argIds, argConsts, types: [u.T] })
-                const args = new Float64Array(2)
-                args[0] = token
-                args[1] = copy
-                const res = mk('after', args)
-                nodeCache.set(key, tracer.getNanId(res))
-                return res
-            }
-        }
         const a = new Float64Array(2)
         a[0] = token
         a[1] = v
@@ -795,6 +765,36 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const regsBase = frameRegs(frame)
     const thisArg = opts.inputs ? opts.inputs.thisArg : 0
     function slotAddr(r: number): number { return regsBase + r * 4 }
+
+    function operand(n: Node, i: number): any {
+        return n.argIds[i] ? intrinsics.getNanFromId(n.argIds[i]) : n.argConsts![i]
+    }
+
+    function lastWrite(token: any): any {
+        const n = nodes.get(tracer.getNanId(token))
+        if (!n) return token
+        if (n.op === 'after' || n.op === 'load') return lastWrite(operand(n, 0))
+        if (n.op !== 'select') return token
+        const a = lastWrite(operand(n, 1))
+        const b = lastWrite(operand(n, 2))
+        const ai = tracer.getNanId(a)
+        const bi = tracer.getNanId(b)
+        if (nodes.get(ai)?.op === 'panic') return b
+        if (nodes.get(bi)?.op === 'panic') return a
+        return ai && ai === bi ? a : token
+    }
+
+    function memoryLoad(ptr: any, offset: any, T: number): any {
+        const token = mem[slotAddr(TOKEN)]
+        const args = new Float64Array(3)
+        args[0] = lastWrite(token)
+        args[1] = ptr
+        args[2] = offset
+        const loaded = mk('load', args, '', [T as intrinsics.Types])
+        mem[slotAddr(TOKEN)] = after(loaded, token)
+        return loaded
+    }
+    runtime.memoryLoad = memoryLoad
 
     interface Reified {
         header: number
@@ -1118,13 +1118,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     return tagCallResult(mk('call-context', new Float64Array(0), '', [Types.usize]))
                 }
                 if (intrinsicName === 'load' && iargs[2] === Types.fnptr) {
-                    const loadArgs = new Float64Array(2)
-                    loadArgs[0] = iargs[0]
-                    loadArgs[1] = iargs[1]
-                    const loaded = after(
-                        mk('load', loadArgs, '', [Types.fnptr]),
-                        mem[slotAddr(TOKEN)],
-                    )
+                    const loaded = memoryLoad(iargs[0], iargs[1], Types.fnptr)
                     let context = iargs[0]
                     if (tracer.getNanId(iargs[1]) || iargs[1] !== 0) {
                         const addressArgs = new Float64Array(2)
@@ -1149,13 +1143,14 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     tracer.markHandled()
                     return tagCallResult(0)
                 }
-                const result = (Intrinsics as any)[intrinsicName](...iargs)
-                tracer.markHandled()
-                if (intrinsicName === 'load' && tracer.getTraceFromUnknown(result)?.op === 'load') {
-                    const loaded = mem[slotAddr(TOKEN)] = after(result, mem[slotAddr(TOKEN)], true)
+                if (intrinsicName === 'load') {
+                    const loaded = memoryLoad(iargs[0], iargs[1], iargs[2])
+                    tracer.markHandled()
                     return tagCallResult(loaded, iargs[2] === Types.fnptr)
                 }
-                return tagCallResult(result, intrinsicName === 'load' && iargs[2] === Types.fnptr)
+                const result = (Intrinsics as any)[intrinsicName](...iargs)
+                tracer.markHandled()
+                return tagCallResult(result)
             }
             if (linked) {
                 const result = callLinked(linked, thisArg, regStart, nargs)
@@ -1866,7 +1861,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             return r
         }
         if (t.op === 'select') return [0, 1, 2]
-        if (t.op === 'load') return [0, 1]
+        if (t.op === 'load') return [0, 1, 2]
         if (t.b !== undefined) return [0, 1]
         if (t.a !== undefined) return [0]
         return []
@@ -1940,8 +1935,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     label: n.label,
                     T: (n as any).T ?? n.types?.[0] ?? Types.u64,
                     U: (n as any).U ?? n.types?.[1] ?? Types.u64,
-                    offset: n.op === 'load' && !argIds[1]
-                        ? argConsts[1] : (n as any).offset ?? 0,
                     types: n.types,
                 })
                 return id
@@ -1959,8 +1952,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 op: t.op, argIds, argConsts,
                 T: (t as any).T ?? Types.u64,
                 U: (t as any).U ?? (t as any).T ?? Types.u64,
-                offset: t.op === 'load' && !argIds[1]
-                    ? argConsts[1] : (t as any).offset ?? 0,
             })
             return id
         }
