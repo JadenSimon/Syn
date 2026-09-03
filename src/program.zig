@@ -17248,9 +17248,11 @@ pub const Analyzer = struct {
                 }
             }
 
-            debugPrint("TODO (intersectType): ", .{});
-            this.printTypeInfo(lhs);
-            this.printTypeInfo(rhs);
+            if (!comptime suppress_gaps) {
+                debugPrint("TODO (intersectType): ", .{});
+                this.printTypeInfo(lhs);
+                this.printTypeInfo(rhs);
+            }
             return lhs; // TODO
         }
 

@@ -18,12 +18,13 @@ const slotScale = 8
 const slotMask = 0xffff
 const scIdMask = 0xffff
 const scChunkBytes = 4 * 1024
-const accountingCapacity = 16 as u16
-const refCountMask = 0x3fffffff
-const supportStateMask = 0xc0000000
-const supportPending = 0x40000000
-const supportDestroying = 0x80000000
-const supportDestroyed = 0xc0000000
+const supportStateMask = 3
+const refUnit = 4
+const supportPending = 1
+const supportDestroying = 2
+const supportDestroyed = 3
+const condenseChunkBytes = 3800
+const condenseAccountingBytes = 256
 
 enum StaticEnumerator {
     none,
@@ -104,6 +105,7 @@ const scCellBaseSize = ScCellBase.sizeof
 const supportSize = Support.sizeof
 const branchScCellSize = (scCellSize + supportSize + 7) & ~7
 const internalScCellSize = (scCellBaseSize + 7) & ~7
+const condenseSpareCells = Math.floor((scChunkBytes - condenseChunkBytes) / branchScCellSize) as u32
 const buildMaxDepth = 32
 const buildMaxChildren = 256
 const buildFramesOffset = (Build.sizeof + 7) & ~7
@@ -160,45 +162,22 @@ function setNextSibling(heapPtr: usize, id: ScId, sibling: ScId): void {
     ScCellBase(scCellPtr(heapPtr, getScRaw(heapPtr, id))).nextSibling = sibling
 }
 
-function accountingPtr(heapPtr: usize, handle: Handle): usize {
-    return resolve(heapPtr, handle)
-}
-intrinsics.tagInline(accountingPtr)
-
-function allocAccounting(heapPtr: usize, bytes: usize): Handle {
-    const handle = allocInternal(heapPtr, Heap(heapPtr).internalSc, bytes)
-    memsetByte(accountingPtr(heapPtr, handle), bytes, 0)
-    return handle
-}
-
-function localRefs(heapPtr: usize, ptr: usize): usize {
-    return accountingPtr(heapPtr, Sc(ptr).localRefs)
+function localRefs(ptr: usize): usize {
+    return ptr + scLocalRefsOffset
 }
 intrinsics.tagInline(localRefs)
 
+function peerRefs(ptr: usize): usize {
+    return ptr + scPeerRefsOffset
+}
+intrinsics.tagInline(peerRefs)
+
 function inboundRefs(heapPtr: usize, ptr: usize): usize {
-    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).inboundRefs)
+    return scCellPtr(heapPtr, ptr) + cellInboundRefsOffset
 }
 
 function outboundRefs(heapPtr: usize, ptr: usize): usize {
-    return accountingPtr(heapPtr, ScCell(scCellPtr(heapPtr, ptr)).outboundRefs)
-}
-
-function peerRefs(heapPtr: usize, ptr: usize): usize {
-    const handle = Sc(ptr).peerRefs
-    intrinsics.assert(handle !== 0)
-    return accountingPtr(heapPtr, handle)
-}
-
-function peerEntries(heapPtr: usize, ptr: usize): [u32, u32][] {
-    const handle = Sc(ptr).peerRefs
-    return handle === 0 ? [] : sparseEntries(accountingPtr(heapPtr, handle))
-}
-
-function ensurePeerRefs(heapPtr: usize, ptr: usize): void {
-    const sc = Sc(ptr)
-    if (sc.peerRefs !== 0) return
-    sc.peerRefs = allocAccounting(heapPtr, accountingCapacity * 8)
+    return scCellPtr(heapPtr, ptr) + cellOutboundRefsOffset
 }
 
 function hasDenseSupport(heapPtr: usize, handle: Handle): boolean {
@@ -222,10 +201,10 @@ function denseSupport(heapPtr: usize, handle: Handle) {
 
 function supportStateAt(heapPtr: usize, handle: Handle): u32 {
     if (hasDenseSupport(heapPtr, handle)) {
-        return (((denseSupport(heapPtr, handle).supportFlags as u32) << 30) >>> 0) as u32
+        return denseSupport(heapPtr, handle).supportFlags as u32
     }
     const ptr = getScRaw(heapPtr, handleSc(handle))
-    return ((sparseCount(inboundRefs(heapPtr, ptr), accountingCapacity, handleSlot(handle)) & supportStateMask) >>> 0) as u32
+    return sparseGet(heapPtr, inboundRefs(heapPtr, ptr), handleSlot(handle)) & supportStateMask
 }
 
 export function supportCount(heapPtr: usize, handle: Handle): u32 {
@@ -235,7 +214,8 @@ export function supportCount(heapPtr: usize, handle: Handle): u32 {
     }
     const ptr = getScRaw(heapPtr, handleSc(handle))
     const slot = handleSlot(handle)
-    return refCount(localRefs(heapPtr, ptr), slot) + refCount(inboundRefs(heapPtr, ptr), slot)
+    return refCount(heapPtr, localRefs(ptr), slot)
+        + refCount(heapPtr, inboundRefs(heapPtr, ptr), slot)
 }
 
 export function supportState(heapPtr: usize, handle: Handle): u32 {
@@ -244,14 +224,14 @@ export function supportState(heapPtr: usize, handle: Handle): u32 {
 
 function setSupportState(heapPtr: usize, handle: Handle, state: u32): void {
     if (hasDenseSupport(heapPtr, handle)) {
-        denseSupport(heapPtr, handle).supportFlags = state >>> 30
+        denseSupport(heapPtr, handle).supportFlags = state as u8
         return
     }
     const ptr = getScRaw(heapPtr, handleSc(handle))
     const refs = inboundRefs(heapPtr, ptr)
     const slot = handleSlot(handle)
-    const count = sparseCount(refs, accountingCapacity, slot) & refCountMask
-    putSparse(refs, accountingCapacity, slot, count + state)
+    const raw = sparseGet(heapPtr, refs, slot)
+    sparseSet(heapPtr, refs, slot, (raw - (raw & supportStateMask)) + state)
 }
 
 function supportAdded(heapPtr: usize, handle: Handle): void {
@@ -421,17 +401,10 @@ function initSc(ptr: usize, owner: Handle, enumerateEdges: u64, depth: u8, type:
 }
 
 function initScAccounting(heapPtr: usize, ptr: usize, cellHandle: Handle): void {
-    const sc = Sc(ptr)
     const data = ScCell(resolve(heapPtr, cellHandle))
     data.header = ptr
-    const bytes = accountingCapacity * 8
-    if (sc.type !== ScType.branch && sc.type !== ScType.pool) {
-        sc.localRefs = allocAccounting(heapPtr, bytes)
-    }
-    data.inboundRefs = sc.type === ScType.branch || sc.type === ScType.pool
-        ? 0 as Handle
-        : allocAccounting(heapPtr, bytes)
-    data.outboundRefs = allocAccounting(heapPtr, bytes)
+    data.inboundRefs = 0 as Handle
+    data.outboundRefs = 0 as Handle
 }
 
 function allocBump(scId: ScId, ptr: usize, slots: u16): Handle {
@@ -689,7 +662,7 @@ function configurePool(heapPtr: usize, id: ScId, cellBytes: usize): ScId {
     const availableBytes = (scCapacity + 1 - sc.nextSlot) * slotScale
     const cells = Math.floor(availableBytes / (slots * slotScale)) as u32
     intrinsics.assert(cells > 0)
-    Sc(getScRaw(heapPtr, id)).localRefs = allocAccounting(heapPtr, cells * supportSize)
+    Sc(getScRaw(heapPtr, id)).localRefs = allocZeroed(heapPtr, cells * supportSize)
     sc.freeSlot = 0
     return id
 }
@@ -742,8 +715,8 @@ export function allocInto(
     }
 
     if (childCount > 1
-        && (childCount >= accountingCapacity
-            || availableBranchCells(heapPtr, parentId, 2) < 2)) {
+        && (availableBranchCells(heapPtr, parentId, condenseSpareCells + 1) <= condenseSpareCells
+            || sparseWouldGrow(heapPtr, peerRefs(getScRaw(heapPtr, parentId)), condenseAccountingBytes))) {
         intrinsics.assert(condense(heapPtr, parentId, false).length !== 0)
     }
     const leaf = createPoolSc(heapPtr, parentId, enumerateEdges, bytes)
@@ -798,46 +771,38 @@ export function scCellHeader(heapPtr: usize, handle: Handle): usize {
     return ScCell(resolve(heapPtr, handle)).header as usize
 }
 
-function refCount(ptr: usize, slot: u16): u32 {
-    return sparseCount(ptr, accountingCapacity, slot) & refCountMask
+function refCount(heapPtr: usize, fieldPtr: usize, slot: u16): u32 {
+    return sparseGet(heapPtr, fieldPtr, slot) >>> 2
 }
 
-function addRef(ptr: usize, slot: u16): u32 {
-    const raw = sparseCount(ptr, accountingCapacity, slot)
-    const count = raw & refCountMask
-    intrinsics.assert(count < refCountMask)
-    putSparse(ptr, accountingCapacity, slot, ((raw & supportStateMask) >>> 0) + count + 1)
-    return count + 1
+function addRef(heapPtr: usize, fieldPtr: usize, slot: u16): u32 {
+    return sparseAdd(heapPtr, fieldPtr, slot, refUnit) >>> 2
 }
 
-function removeRef(ptr: usize, slot: u16): u32 {
-    const raw = sparseCount(ptr, accountingCapacity, slot)
-    const count = raw & refCountMask
-    intrinsics.assert(count > 0)
-    putSparse(ptr, accountingCapacity, slot, ((raw & supportStateMask) >>> 0) + count - 1)
-    return count - 1
+function removeRef(heapPtr: usize, fieldPtr: usize, slot: u16): u32 {
+    return sparseSub(heapPtr, fieldPtr, slot, refUnit) >>> 2
 }
 
-function addSupportRef(heapPtr: usize, ptr: usize, handle: Handle): u32 {
-    const count = addRef(ptr, handleSlot(handle))
+function addSupportRef(heapPtr: usize, fieldPtr: usize, handle: Handle): u32 {
+    const count = addRef(heapPtr, fieldPtr, handleSlot(handle))
     supportAdded(heapPtr, handle)
     return count
 }
 
-function removeSupportRef(heapPtr: usize, ptr: usize, handle: Handle, eager: boolean): u32 {
-    const count = removeRef(ptr, handleSlot(handle))
+function removeSupportRef(heapPtr: usize, fieldPtr: usize, handle: Handle, eager: boolean): u32 {
+    const count = removeRef(heapPtr, fieldPtr, handleSlot(handle))
     if (count === 0) supportRemoved(heapPtr, handle, eager)
     return count
 }
 
 function localCount(heapPtr: usize, ptr: usize, handle: Handle): u32 {
     if (Sc(ptr).type === ScType.branch || Sc(ptr).type === ScType.pool) return denseSupport(heapPtr, handle).localSupport
-    return refCount(localRefs(heapPtr, ptr), handleSlot(handle))
+    return refCount(heapPtr, localRefs(ptr), handleSlot(handle))
 }
 
 function inboundCount(heapPtr: usize, ptr: usize, handle: Handle): u32 {
     if (Sc(ptr).type === ScType.branch || Sc(ptr).type === ScType.pool) return denseSupport(heapPtr, handle).inboundVertical
-    return refCount(inboundRefs(heapPtr, ptr), handleSlot(handle))
+    return refCount(heapPtr, inboundRefs(heapPtr, ptr), handleSlot(handle))
 }
 
 function setLocalCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
@@ -846,7 +811,7 @@ function setLocalCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): 
         denseSupport(heapPtr, handle).localSupport = count as u8
         return
     }
-    setRefCount(localRefs(heapPtr, ptr), handleSlot(handle), count)
+    setRefCount(heapPtr, localRefs(ptr), handleSlot(handle), count)
 }
 
 function setInboundCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
@@ -855,7 +820,7 @@ function setInboundCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32)
         denseSupport(heapPtr, handle).inboundVertical = count as u16
         return
     }
-    setRefCount(inboundRefs(heapPtr, ptr), handleSlot(handle), count)
+    setRefCount(heapPtr, inboundRefs(heapPtr, ptr), handleSlot(handle), count)
 }
 
 function addLocalCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32): void {
@@ -867,7 +832,7 @@ function addInboundCount(heapPtr: usize, ptr: usize, handle: Handle, count: u32)
 }
 
 function addLocalSupport(heapPtr: usize, ptr: usize, handle: Handle): u32 {
-    if (Sc(ptr).type !== ScType.branch && Sc(ptr).type !== ScType.pool) return addSupportRef(heapPtr, localRefs(heapPtr, ptr), handle)
+    if (Sc(ptr).type !== ScType.branch && Sc(ptr).type !== ScType.pool) return addSupportRef(heapPtr, localRefs(ptr), handle)
     const cell = denseSupport(heapPtr, handle)
     intrinsics.assert(cell.localSupport < 0xff)
     cell.localSupport = cell.localSupport + 1
@@ -876,7 +841,7 @@ function addLocalSupport(heapPtr: usize, ptr: usize, handle: Handle): u32 {
 }
 
 function removeLocalSupport(heapPtr: usize, ptr: usize, handle: Handle, eager: boolean): u32 {
-    if (Sc(ptr).type !== ScType.branch && Sc(ptr).type !== ScType.pool) return removeSupportRef(heapPtr, localRefs(heapPtr, ptr), handle, eager)
+    if (Sc(ptr).type !== ScType.branch && Sc(ptr).type !== ScType.pool) return removeSupportRef(heapPtr, localRefs(ptr), handle, eager)
     const cell = denseSupport(heapPtr, handle)
     intrinsics.assert(cell.localSupport > 0)
     cell.localSupport = cell.localSupport - 1
@@ -902,108 +867,255 @@ function removeInboundSupport(heapPtr: usize, ptr: usize, handle: Handle, eager:
     return cell.inboundVertical
 }
 
-function sparseCount(ptr: usize, capacity: u16, key: u32): u32 {
-    for (let i: u32 = 0; i < capacity; i++) {
-        const offset = i * 8
-        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
-        if (entry === key) return intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
-        if (entry === 0) return 0
+interface SparseHeader {
+    count: u16
+    live: u16
+    capacity: u16
+    widthLog: u8
+    reservedByte: u8
+}
+
+const SparseMap = intrinsics.DefineStructView(reify SparseHeader)
+const sparseHeaderSize = SparseMap.sizeof
+const sparseMinBytes = 32
+const sparseMaxBytes = 2048
+
+const scLocalRefsOffset = intrinsics.offsetof(reify ScHeader, 'localRefs')
+const scPeerRefsOffset = intrinsics.offsetof(reify ScHeader, 'peerRefs')
+const cellInboundRefsOffset = intrinsics.offsetof(reify ScCellData, 'inboundRefs')
+const cellOutboundRefsOffset = intrinsics.offsetof(reify ScCellData, 'outboundRefs')
+
+function sparseWidthLog(value: u32): u8 {
+    if (value <= 0xff) return 0
+    if (value <= 0xffff) return 1
+    return 2
+}
+
+function sparseMaxValue(widthLog: u8): u32 {
+    if (widthLog === 0) return 0xff
+    if (widthLog === 1) return 0xffff
+    return 0xffffffff
+}
+
+function sparseCapacityFor(bytes: u32, widthLog: u8): u16 {
+    return ((bytes - sparseHeaderSize) >>> (widthLog + 1)) as u16
+}
+
+function sparseEntryOffset(widthLog: u8, index: u32): u32 {
+    return sparseHeaderSize + (index << (widthLog + 1))
+}
+
+function sparseLoad(ptr: usize, offset: u32, widthLog: u8): u32 {
+    if (widthLog === 0) return intrinsics.Intrinsics.load(ptr, offset, Types.u8)
+    if (widthLog === 1) return intrinsics.Intrinsics.load(ptr, offset, Types.u16)
+    return intrinsics.Intrinsics.load(ptr, offset, Types.u32)
+}
+
+function sparseStore(ptr: usize, offset: u32, widthLog: u8, value: u32): void {
+    if (widthLog === 0) {
+        intrinsics.Intrinsics.store(ptr, offset, value as u8, Types.u8)
+        return
+    }
+    if (widthLog === 1) {
+        intrinsics.Intrinsics.store(ptr, offset, value as u16, Types.u16)
+        return
+    }
+    intrinsics.Intrinsics.store(ptr, offset, value, Types.u32)
+}
+
+function sparseHandle(fieldPtr: usize): Handle {
+    return intrinsics.Intrinsics.load(fieldPtr, 0, Types.u32) as Handle
+}
+
+function allocZeroed(heapPtr: usize, bytes: usize): Handle {
+    const handle = allocInternal(heapPtr, Heap(heapPtr).internalSc, bytes)
+    memsetByte(resolve(heapPtr, handle), bytes, 0)
+    return handle
+}
+
+function sparseInit(heapPtr: usize, fieldPtr: usize, bytes: u32, widthLog: u8): usize {
+    const handle = allocZeroed(heapPtr, bytes)
+    const ptr = resolve(heapPtr, handle)
+    const map = SparseMap(ptr)
+    map.capacity = sparseCapacityFor(bytes, widthLog)
+    map.widthLog = widthLog
+    intrinsics.Intrinsics.store(fieldPtr, 0, handle, Types.u32)
+    return ptr
+}
+
+function sparseResize(heapPtr: usize, fieldPtr: usize, widthLog: u8): usize {
+    const oldHandle = sparseHandle(fieldPtr)
+    const oldPtr = resolve(heapPtr, oldHandle)
+    const oldMap = SparseMap(oldPtr)
+    const oldWidthLog = oldMap.widthLog
+    const oldCount = oldMap.count as u32
+    const oldWidth = (1 << oldWidthLog) as u32
+    const oldBytes = sparseHeaderSize + ((oldMap.capacity as u32) << (oldWidthLog + 1))
+
+    const live = oldMap.live as u32
+    let bytes = sparseMinBytes as u32
+    while (bytes < sparseMaxBytes && sparseCapacityFor(bytes, widthLog) <= live) bytes <<= 1
+    if (widthLog === oldWidthLog && bytes <= oldBytes) bytes = oldBytes << 1
+    intrinsics.assert(bytes <= sparseMaxBytes)
+
+    const ptr = sparseInit(heapPtr, fieldPtr, bytes, widthLog)
+    const width = (1 << widthLog) as u32
+    let next: u32 = 0
+    for (let i: u32 = 0; i < oldCount; i++) {
+        const from = sparseEntryOffset(oldWidthLog, i)
+        const value = sparseLoad(oldPtr, from + oldWidth, oldWidthLog)
+        if (value === 0) continue
+        const to = sparseEntryOffset(widthLog, next)
+        sparseStore(ptr, to, widthLog, sparseLoad(oldPtr, from, oldWidthLog))
+        sparseStore(ptr, to + width, widthLog, value)
+        next++
+    }
+    SparseMap(ptr).count = next as u16
+    SparseMap(ptr).live = next as u16
+    freeCell(heapPtr, oldHandle)
+    return ptr
+}
+
+function sparsePlace(heapPtr: usize, fieldPtr: usize, ptr: usize, key: u32, value: u32): void {
+    const map = SparseMap(ptr)
+    const widthLog = map.widthLog
+    const width = (1 << widthLog) as u32
+    const count = map.count as u32
+    let vacant = count
+    for (let i: u32 = 0; i < count; i++) {
+        const offset = sparseEntryOffset(widthLog, i)
+        if (sparseLoad(ptr, offset, widthLog) === key) {
+            const previous = sparseLoad(ptr, offset + width, widthLog)
+            sparseStore(ptr, offset + width, widthLog, value)
+            if (previous === 0 && value !== 0) map.live = map.live + 1
+            else if (previous !== 0 && value === 0) map.live = map.live - 1
+            return
+        }
+        if (vacant === count && sparseLoad(ptr, offset + width, widthLog) === 0) vacant = i
+    }
+    if (value === 0) return
+    if (vacant === count && count === (map.capacity as u32)) {
+        sparsePlace(heapPtr, fieldPtr, sparseResize(heapPtr, fieldPtr, widthLog), key, value)
+        return
+    }
+    const offset = sparseEntryOffset(widthLog, vacant)
+    sparseStore(ptr, offset, widthLog, key)
+    sparseStore(ptr, offset + width, widthLog, value)
+    map.live = map.live + 1
+    if (vacant === count) map.count = (count + 1) as u16
+}
+
+function sparseSet(heapPtr: usize, fieldPtr: usize, key: u32, value: u32): void {
+    intrinsics.assert(key > 0 && value <= 0xffffffff)
+    const needed = sparseWidthLog(key > value ? key : value)
+    let ptr: usize = 0
+    if (sparseHandle(fieldPtr) === 0) {
+        if (value === 0) return
+        ptr = sparseInit(heapPtr, fieldPtr, sparseMinBytes, needed)
+    } else {
+        ptr = resolve(heapPtr, sparseHandle(fieldPtr))
+        if (needed > SparseMap(ptr).widthLog) ptr = sparseResize(heapPtr, fieldPtr, needed)
+    }
+    sparsePlace(heapPtr, fieldPtr, ptr, key, value)
+}
+
+function sparseGet(heapPtr: usize, fieldPtr: usize, key: u32): u32 {
+    const handle = sparseHandle(fieldPtr)
+    if (handle === 0) return 0
+    const ptr = resolve(heapPtr, handle)
+    const map = SparseMap(ptr)
+    const widthLog = map.widthLog
+    const width = (1 << widthLog) as u32
+    const count = map.count as u32
+    let offset = sparseHeaderSize as u32
+    for (let i: u32 = 0; i < count; i++) {
+        if (sparseLoad(ptr, offset, widthLog) === key) {
+            return sparseLoad(ptr, offset + width, widthLog)
+        }
+        offset += width << 1
     }
     return 0
 }
 
-function putSparse(ptr: usize, capacity: u16, key: u32, value: u32): void {
-    intrinsics.assert(key > 0)
-    let vacant = 0
-    for (let i: u32 = 0; i < capacity; i++) {
-        const offset = i * 8
-        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
-        if (entry === key) {
-            intrinsics.Intrinsics.store(ptr, offset + 4, value, Types.u32)
-            return
+function sparseAdd(heapPtr: usize, fieldPtr: usize, key: u32, delta: u32): u32 {
+    const handle = sparseHandle(fieldPtr)
+    if (handle !== 0) {
+        const ptr = resolve(heapPtr, handle)
+        const map = SparseMap(ptr)
+        const widthLog = map.widthLog
+        const width = (1 << widthLog) as u32
+        const count = map.count as u32
+        let offset = sparseHeaderSize as u32
+        for (let i: u32 = 0; i < count; i++) {
+            if (sparseLoad(ptr, offset, widthLog) === key) {
+                const previous = sparseLoad(ptr, offset + width, widthLog)
+                const value = previous + delta
+                if (value <= sparseMaxValue(widthLog)) {
+                    sparseStore(ptr, offset + width, widthLog, value)
+                    if (previous === 0 && value !== 0) map.live = map.live + 1
+                } else {
+                    sparseSet(heapPtr, fieldPtr, key, value)
+                }
+                return value
+            }
+            offset += width << 1
         }
-        if (entry === 0) {
-            if (value === 0) return
-            const target = (vacant === 0 ? offset : vacant - 1) as u32
-            intrinsics.Intrinsics.store(ptr, target, key, Types.u32)
-            intrinsics.Intrinsics.store(ptr, target + 4, value, Types.u32)
-            return
-        }
-        if (vacant === 0
-            && intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32) === 0) vacant = offset + 1
     }
-    if (vacant !== 0) {
-        if (value === 0) return
-        const target = (vacant - 1) as u32
-        intrinsics.Intrinsics.store(ptr, target, key, Types.u32)
-        intrinsics.Intrinsics.store(ptr, target + 4, value, Types.u32)
-        return
+    sparseSet(heapPtr, fieldPtr, key, delta)
+    return delta
+}
+
+function sparseSub(heapPtr: usize, fieldPtr: usize, key: u32, delta: u32): u32 {
+    const handle = sparseHandle(fieldPtr)
+    intrinsics.assert(handle !== 0)
+    const ptr = resolve(heapPtr, handle)
+    const map = SparseMap(ptr)
+    const widthLog = map.widthLog
+    const width = (1 << widthLog) as u32
+    const count = map.count as u32
+    let offset = sparseHeaderSize as u32
+    for (let i: u32 = 0; i < count; i++) {
+        if (sparseLoad(ptr, offset, widthLog) === key) {
+            const value = sparseLoad(ptr, offset + width, widthLog)
+            intrinsics.assert(value >= delta)
+            sparseStore(ptr, offset + width, widthLog, value - delta)
+            if (value === delta) map.live = map.live - 1
+            return value - delta
+        }
+        offset += width << 1
     }
     intrinsics.assert(false)
 }
 
-function addSparse(ptr: usize, capacity: u16, key: u32): u32 {
-    let vacant = 0
-    for (let i: u32 = 0; i < capacity; i++) {
-        const offset = i * 8
-        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
-        if (entry === key) {
-            const count = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32) + 1
-            intrinsics.Intrinsics.store(ptr, offset + 4, count, Types.u32)
-            return count
-        }
-        if (entry === 0) {
-            const target = (vacant === 0 ? offset : vacant - 1) as u32
-            intrinsics.Intrinsics.store(ptr, target, key, Types.u32)
-            intrinsics.Intrinsics.store(ptr, target + 4, 1, Types.u32)
-            return 1
-        }
-        if (vacant === 0
-            && intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32) === 0) vacant = offset + 1
-    }
-    if (vacant !== 0) {
-        const target = (vacant - 1) as u32
-        intrinsics.Intrinsics.store(ptr, target, key, Types.u32)
-        intrinsics.Intrinsics.store(ptr, target + 4, 1, Types.u32)
-        return 1
-    }
-    intrinsics.assert(false)
+function sparseWouldGrow(heapPtr: usize, fieldPtr: usize, minBytes: u32): boolean {
+    const handle = sparseHandle(fieldPtr)
+    if (handle === 0) return false
+    const map = SparseMap(resolve(heapPtr, handle))
+    const capacity = map.capacity as u32
+    if ((map.live as u32) !== capacity) return false
+    return sparseHeaderSize + (capacity << (map.widthLog + 1)) >= minBytes
 }
 
-function removeSparse(ptr: usize, capacity: u16, key: u32): u32 {
-    for (let i: u32 = 0; i < capacity; i++) {
-        const offset = i * 8
-        const entry = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
-        if (entry === 0) break
-        if (entry !== key) continue
-        const count = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
-        intrinsics.assert(count > 0)
-        intrinsics.Intrinsics.store(ptr, offset + 4, count - 1, Types.u32)
-        return count - 1
-    }
-    intrinsics.assert(false)
-}
-
-function sparseEntries(ptr: usize): [u32, u32][] {
+function sparseEntries(heapPtr: usize, fieldPtr: usize): [u32, u32][] {
     const result: [u32, u32][] = []
-    for (let i: u32 = 0; i < accountingCapacity; i++) {
-        const offset = i * 8
-        const key = intrinsics.Intrinsics.load(ptr, offset, Types.u32)
-        if (key === 0) break
-        const value = intrinsics.Intrinsics.load(ptr, offset + 4, Types.u32)
-        if (value !== 0) result.push([key, value])
+    const handle = sparseHandle(fieldPtr)
+    if (handle === 0) return result
+    const ptr = resolve(heapPtr, handle)
+    const map = SparseMap(ptr)
+    const widthLog = map.widthLog
+    const width = (1 << widthLog) as u32
+    const count = map.count as u32
+    for (let i: u32 = 0; i < count; i++) {
+        const offset = sparseEntryOffset(widthLog, i)
+        const value = sparseLoad(ptr, offset + width, widthLog)
+        if (value !== 0) result.push([sparseLoad(ptr, offset, widthLog), value])
     }
     return result
 }
 
-function addSparseCount(ptr: usize, key: u32, count: u32): void {
-    const current = sparseCount(ptr, accountingCapacity, key)
-    putSparse(ptr, accountingCapacity, key, current + count)
-}
-
-function setRefCount(ptr: usize, slot: u16, count: u32): void {
-    const raw = sparseCount(ptr, accountingCapacity, slot)
-    putSparse(ptr, accountingCapacity, slot, ((raw & supportStateMask) >>> 0) + count)
+function setRefCount(heapPtr: usize, fieldPtr: usize, slot: u16, count: u32): void {
+    const raw = sparseGet(heapPtr, fieldPtr, slot)
+    sparseSet(heapPtr, fieldPtr, slot, (raw & supportStateMask) + count * refUnit)
 }
 
 function peerKey(from: u16, to: u16): u32 {
@@ -1043,7 +1155,7 @@ function addOutboundPath(heapPtr: usize, sourceId: ScId, boundary: u32, target: 
     for (;;) {
         const ptr = getScRaw(heapPtr, current)
         const sc = Sc(ptr)
-        if (addSparse(outboundRefs(heapPtr, ptr), accountingCapacity, target) !== 1) return false
+        if (sparseAdd(heapPtr, outboundRefs(heapPtr, ptr), target, 1) !== 1) return false
         if (current === end) return true
         current = parentSc(sc)
     }
@@ -1055,7 +1167,7 @@ function removeOutboundPath(heapPtr: usize, sourceId: ScId, boundary: u32, targe
     for (;;) {
         const ptr = getScRaw(heapPtr, current)
         const sc = Sc(ptr)
-        if (removeSparse(outboundRefs(heapPtr, ptr), accountingCapacity, target) !== 0) return false
+        if (sparseSub(heapPtr, outboundRefs(heapPtr, ptr), target, 1) !== 0) return false
         if (current === end) return true
         current = parentSc(sc)
     }
@@ -1124,10 +1236,9 @@ export function addEdge(heapPtr: usize, from: Handle, to: Handle): void {
     const parentId = parentSc(left)
     intrinsics.assert(parentId > 0 && parentId === parentSc(right))
     const parentPtr = getScRaw(heapPtr, parentId)
-    ensurePeerRefs(heapPtr, parentPtr)
     const fromSlot = handleSlot(left.owner)
     const toSlot = handleSlot(right.owner)
-    const peers = addSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    const peers = sparseAdd(heapPtr, peerRefs(parentPtr), peerKey(fromSlot, toSlot), 1)
     if (peers === 1) addLocalSupport(heapPtr, parentPtr, right.owner)
 }
 
@@ -1164,7 +1275,7 @@ function removeEdgeWith(heapPtr: usize, from: Handle, to: Handle, eager: boolean
     const parentPtr = getScRaw(heapPtr, parentId)
     const fromSlot = handleSlot(left.owner)
     const toSlot = handleSlot(right.owner)
-    const peers = removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity, peerKey(fromSlot, toSlot))
+    const peers = sparseSub(heapPtr, peerRefs(parentPtr), peerKey(fromSlot, toSlot), 1)
     if (peers === 0) removeLocalSupport(heapPtr, parentPtr, right.owner, eager)
 }
 
@@ -1188,18 +1299,12 @@ export function inboundRefCount(heapPtr: usize, handle: Handle): u32 {
 
 export function outboundRefCount(heapPtr: usize, from: Handle, to: Handle): u32 {
     const ptr = getScRaw(heapPtr, handleSc(from))
-    return sparseCount(outboundRefs(heapPtr, ptr), accountingCapacity, to)
+    return sparseGet(heapPtr, outboundRefs(heapPtr, ptr), to)
 }
 
 export function peerRefCount(heapPtr: usize, parentId: ScId, fromOwner: Handle, toOwner: Handle): u32 {
     const ptr = getScRaw(heapPtr, parentId)
-    const handle = Sc(ptr).peerRefs
-    if (handle === 0) return 0
-    return sparseCount(
-        accountingPtr(heapPtr, handle),
-        accountingCapacity,
-        peerKey(handleSlot(fromOwner), handleSlot(toOwner)),
-    )
+    return sparseGet(heapPtr, peerRefs(ptr), peerKey(handleSlot(fromOwner), handleSlot(toOwner)))
 }
 
 function isBelow(heapPtr: usize, id: ScId, ancestor: ScId): boolean {
@@ -1252,8 +1357,8 @@ function removeBoundarySupport(heapPtr: usize, sourceId: ScId, target: Handle): 
     const right = Sc(getScRaw(heapPtr, boundaryTo))
     const parentId = parentSc(left)
     const parentPtr = getScRaw(heapPtr, parentId)
-    const peers = removeSparse(peerRefs(heapPtr, parentPtr), accountingCapacity,
-        peerKey(handleSlot(left.owner), handleSlot(right.owner)))
+    const peers = sparseSub(heapPtr, peerRefs(parentPtr),
+        peerKey(handleSlot(left.owner), handleSlot(right.owner)), 1)
     if (peers === 0) removeLocalSupport(heapPtr, parentPtr, right.owner, false)
 }
 
@@ -1275,9 +1380,9 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         oldSlots.set(id, slot)
         oldLocal.set(id, localCount(heapPtr, parentPtr, sc.owner))
         oldInbound.set(id, inboundCount(heapPtr, parentPtr, sc.owner))
-        outboundByChild.set(id, sparseEntries(outboundRefs(heapPtr, getScRaw(heapPtr, id))))
+        outboundByChild.set(id, sparseEntries(heapPtr, outboundRefs(heapPtr, getScRaw(heapPtr, id))))
     }
-    const parentPeers = peerEntries(heapPtr, parentPtr)
+    const parentPeers = sparseEntries(heapPtr, peerRefs(parentPtr))
     const wrapperId = createBranchSc(heapPtr, parentId)
     const wrapperPtr = getScRaw(heapPtr, wrapperId)
     const wrapper = Sc(wrapperPtr)
@@ -1320,8 +1425,8 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         bumpDepth(heapPtr, id)
     }
 
-    const parentPeerPtr = parentPeers.length === 0 ? 0 : peerRefs(heapPtr, parentPtr)
-    let wrapperPeerPtr: usize = 0
+    const parentPeerRefs = peerRefs(parentPtr)
+    const wrapperPeerRefs = peerRefs(wrapperPtr)
     let wrapperSupport: u32 = 0
     const incomingPeer = new Map<number, u32>()
     for (const [key, count] of parentPeers) {
@@ -1330,25 +1435,21 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         const fromId = oldSlotToId.get(fromSlot)
         const toId = oldSlotToId.get(toSlot)
         if (!fromId && !toId) continue
-        putSparse(parentPeerPtr, accountingCapacity, key, 0)
+        sparseSet(heapPtr, parentPeerRefs, key, 0)
         if (fromId && toId) {
-            if (wrapperPeerPtr === 0) {
-                ensurePeerRefs(heapPtr, wrapperPtr)
-                wrapperPeerPtr = peerRefs(heapPtr, wrapperPtr)
-            }
-            addSparseCount(wrapperPeerPtr,
+            sparseAdd(heapPtr, wrapperPeerRefs,
                 peerKey(handleSlot(newOwners.get(fromId)!), handleSlot(newOwners.get(toId)!)), count)
             addLocalCount(heapPtr, wrapperPtr, newOwners.get(toId)!, 1)
             incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
         } else if (toId) {
             const key = peerKey(fromSlot, wrapperSlot)
-            const existing = sparseCount(parentPeerPtr, accountingCapacity, key)
-            addSparseCount(parentPeerPtr, key, count)
+            const existing = sparseGet(heapPtr, parentPeerRefs, key)
+            sparseAdd(heapPtr, parentPeerRefs, key, count)
             addInboundCount(heapPtr, wrapperPtr, newOwners.get(toId)!, count)
             if (existing === 0) wrapperSupport++
             incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
         } else {
-            addSparseCount(parentPeerPtr, peerKey(wrapperSlot, toSlot), count)
+            sparseAdd(heapPtr, parentPeerRefs, peerKey(wrapperSlot, toSlot), count)
         }
     }
 
@@ -1369,7 +1470,7 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
     if (wrapperSupport) addLocalCount(heapPtr, parentPtr, wrapper.owner, wrapperSupport)
 
     const targetSources = new Map<number, number>()
-    const wrapperOutboundPtr = outboundRefs(heapPtr, wrapperPtr)
+    const wrapperOutboundRefs = outboundRefs(heapPtr, wrapperPtr)
     for (const id of group) {
         for (const [target, count] of outboundByChild.get(id)!) {
             if (!count) continue
@@ -1379,7 +1480,7 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
                 if (isBelow(heapPtr, targetId, member)) { internal = true; break }
             }
             if (internal) continue
-            addSparseCount(wrapperOutboundPtr, target, 1)
+            sparseAdd(heapPtr, wrapperOutboundRefs, target, 1)
             targetSources.set(target, (targetSources.get(target) ?? 0) + 1)
         }
     }
@@ -1441,7 +1542,7 @@ export function condense(heapPtr: usize, parentId: ScId, useAll: boolean): ScId[
     for (const id of selected) slotToChild.set(handleSlot(Sc(getScRaw(heapPtr, id)).owner), id)
     const neighbors = new Map<number, ScId[]>()
     for (const id of selected) neighbors.set(id, [])
-    for (const [key, count] of peerEntries(heapPtr, parentPtr)) {
+    for (const [key, count] of sparseEntries(heapPtr, peerRefs(parentPtr))) {
         if (!count) continue
         const from = slotToChild.get(key >>> 16)
         const to = slotToChild.get(key & slotMask)
@@ -1701,6 +1802,54 @@ export function selfTest(select: (apis: any) => any): void {
         intrinsics.assert(api.tryAllocCell(heap, api.handleSc(a), 32) === 0)
         api.freeCell(heap, a)
         intrinsics.assert(api.allocInternal(heap, internal, 24) === a)
+    }
+
+    if (api.finishBuild) {
+        const sparseHeap = api.createHeap(16, 0)
+        const field = intrinsics.Intrinsics.alloc(8)
+        defer { intrinsics.Intrinsics.free(field) }
+        intrinsics.Intrinsics.store(field, 0, 0, Types.u32)
+        intrinsics.assert(sparseHeaderSize === 8)
+
+        intrinsics.assert(sparseGet(sparseHeap, field, 7) === 0)
+        intrinsics.assert(sparseHandle(field) === 0)
+
+        sparseSet(sparseHeap, field, 7, 3)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).widthLog === 0)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).capacity === 12)
+        intrinsics.assert(sparseGet(sparseHeap, field, 7) === 3)
+
+        for (let i: u32 = 1; i <= 13; i++) sparseSet(sparseHeap, field, i, i)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).widthLog === 0)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).capacity === 28)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 13)
+        for (let i: u32 = 1; i <= 13; i++) intrinsics.assert(sparseGet(sparseHeap, field, i) === i)
+
+        sparseSet(sparseHeap, field, 0x1234, 5)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).widthLog === 1)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 14)
+        intrinsics.assert(sparseGet(sparseHeap, field, 0x1234) === 5)
+        for (let i: u32 = 1; i <= 13; i++) intrinsics.assert(sparseGet(sparseHeap, field, i) === i)
+
+        sparseSet(sparseHeap, field, 4, 0x12345)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).widthLog === 2)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 14)
+        intrinsics.assert(sparseGet(sparseHeap, field, 4) === 0x12345)
+        intrinsics.assert(sparseGet(sparseHeap, field, 0x1234) === 5)
+
+        const count = SparseMap(resolve(sparseHeap, sparseHandle(field))).count
+        sparseSet(sparseHeap, field, 4, 0)
+        intrinsics.assert(sparseGet(sparseHeap, field, 4) === 0)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).count === count)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 13)
+        sparseSet(sparseHeap, field, 0x777, 9)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).count === count)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 14)
+        intrinsics.assert(sparseEntries(sparseHeap, field).length === 14)
+
+        intrinsics.assert(sparseAdd(sparseHeap, field, 3, 2) === 5)
+        intrinsics.assert(sparseSub(sparseHeap, field, 3, 5) === 0)
+        intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 13)
     }
 
     const child = api.createSc(heap, root, 11)
