@@ -137,22 +137,34 @@ const CallOpcodes = new Set<number>([
     Op.Call, Op.CallConst, Op.Construct, Op.ConstructConst,
 ])
 
+const LoadOpcodes = new Set<number>([
+    Op.GetProperty, Op.GetPropertyConst, Op.GetPropertyImm,
+])
+
+const StoreOpcodes = new Set<number>([
+    Op.SetProperty, Op.SetPropertyConst, Op.SetPropertyImm,
+])
+
 function deriveBlocks(
     code: readonly u8[], codeLen: number, paramCount: number,
     accSlot: number, tokenSlot: number,
 ): Blocks {
-    // TODO: certain intrinsics are effectful too, though those can be 
-    // represented as calls anyway
+    function readsToken(opcode: number): boolean {
+        return CallOpcodes.has(opcode) || LoadOpcodes.has(opcode) || StoreOpcodes.has(opcode)
+    }
+    function writesToken(opcode: number): boolean {
+        return CallOpcodes.has(opcode) || StoreOpcodes.has(opcode)
+    }
     function readsOf(inst: bytecode.CodeInstruction): number[] {
         const out: number[] = []
         for (const r of bytecode.getRegReads(inst)) out.push(r === -1 ? accSlot : r)
-        if (CallOpcodes.has(inst.opcode)) out.push(tokenSlot)
+        if (readsToken(inst.opcode)) out.push(tokenSlot)
         return out
     }
     function writesOf(inst: bytecode.CodeInstruction): number[] {
         const out: number[] = []
         for (const r of bytecode.getRegWrites(inst)) out.push(r === -1 ? accSlot : r)
-        if (CallOpcodes.has(inst.opcode)) out.push(tokenSlot)
+        if (writesToken(inst.opcode)) out.push(tokenSlot)
         return out
     }
 
@@ -738,7 +750,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     argIds.push(u.argIds[i])
                     argConsts[i] = u.args[i]
                 }
-                nodes.set(copyId, { op: 'load', argIds, argConsts, label: '', types: [u.T] })
+                nodes.set(copyId, { ...u, op: 'load', argIds, argConsts, types: [u.T] })
                 const args = new Float64Array(2)
                 args[0] = token
                 args[1] = copy
@@ -792,6 +804,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         paramIds: number[]
         members: Set<number>
         terminals: Map<string, { key: string, block: number, returns: boolean }>
+        unified?: Map<number, u32>
     }
     const reified = new Map<number, Reified>()
     const built = new Set<number>()
@@ -1242,6 +1255,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             let symbolic = false
             for (const member of B.cycles[b]) if (B.symPred[member]) { symbolic = true; break }
             if (!symbolic) continue
+            const regionReads = new Set<number>()
+            for (const member of B.cycles[b]) {
+                for (const slot of B.readSlots[member]) regionReads.add(slot)
+            }
             const outputs: number[] = []
             const outputSet = new Set<number>()
             for (const exit of B.exits[b]) {
@@ -1251,13 +1268,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     outputs.push(slot)
                 }
             }
-            if (B.cycleWrites[b].has(TOKEN) && !outputSet.has(TOKEN)) {
+            if ((B.cycleWrites[b].has(TOKEN) || regionReads.has(TOKEN)) && !outputSet.has(TOKEN)) {
                 outputSet.add(TOKEN)
                 outputs.push(TOKEN)
-            }
-            const regionReads = new Set<number>()
-            for (const member of B.cycles[b]) {
-                for (const slot of B.readSlots[member]) regionReads.add(slot)
             }
             const inputSet = new Set<number>()
             for (const slot of B.liveIn[b]) {
@@ -1287,13 +1300,56 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function application(R: Reified, ins: Float64Array): any {
         const args = new Float64Array(R.params.length + 1)
         args[0] = intrinsics.getNanFromId(R.selfId) as any
-        for (let i = 0; i < R.params.length; i++) args[i + 1] = ins[R.params[i]]
+        for (let i = 0; i < R.params.length; i++) {
+            const slot = R.params[i]
+            const key = R.unified?.get(slot)
+            args[i + 1] = key === undefined ? ins[slot] : gutValue(ins[slot], key)
+        }
         return mk('apply', args)
     }
 
     function explicitHeapHandle(value: any): boolean {
         const n = nodes.get(tracer.getNanId(value))
         return !!n && n.op === 'heap-handle' && !n.argIds[0]
+    }
+
+    function heapHandleOf(value: any): u32 {
+        const n = nodes.get(tracer.getNanId(value))
+        if (!n || n.op !== 'heap-handle' || n.argIds[0]) return 0
+        return n.argConsts[0] as u32
+    }
+
+    function symbolicGutKey(handle: u32): u32 {
+        let found: u32 = 0
+        const count = heap.ownPropertyCount(handle)
+        for (let i: u32 = 0; i < count; i++) {
+            const key = heap.ownPropertyKeyAt(handle, i)
+            if (!key) return 0
+            const descriptor = heap.getOwnProperty(handle, key)
+            if (!descriptor) return 0
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return 0
+            const boxed = d.slot0 as u32
+            if (!heap.isBoxedF64(boxed)) continue
+            if (!tracer.getNanId(heap.unboxF64(boxed))) continue
+            if (found) return 0
+            found = key
+        }
+        return found
+    }
+
+    function gutValue(value: any, key: u32): any {
+        const descriptor = heap.getOwnProperty(heapHandleOf(value), key)
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+        return heap.unboxF64(d.slot0 as u32)
+    }
+
+    function refineHeapHandle(handle: u32, key: u32, gut: any): any {
+        const clone = heap.shallowClone(handle)
+        heap.setProperty(clone, key, heap.boxF64(gut))
+        const args = new Float64Array(1)
+        args[0] = clone
+        return mk('heap-handle', args, '', [Types.handle])
     }
 
     function terminal(R: Reified, ins: Float64Array, key: string, block: number, value?: any): any {
@@ -1310,18 +1366,30 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         built.add(R.header)
         const params: number[] = []
         const paramIds: number[] = []
+        const unified = new Map<number, u32>()
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
-            if (!B.cycleWrites[R.header].has(slot) && explicitHeapHandle(ins[slot])) continue
+            if (!B.cycleWrites[R.header].has(slot) && explicitHeapHandle(ins[slot])) {
+                const key = symbolicGutKey(heapHandleOf(ins[slot]))
+                if (!key) continue
+                unified.set(slot, key)
+            }
             params.push(slot)
             paramIds.push(R.paramIds[i])
         }
         R.params = params
         R.paramIds = paramIds
+        R.unified = unified
         const bodyIns = new Float64Array(slotCount)
         for (let i = 0; i < ins.length; i++) bodyIns[i] = ins[i]
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
+            const key = unified.get(slot)
+            if (key !== undefined) {
+                bodyIns[slot] = refineHeapHandle(
+                    heapHandleOf(ins[slot]), key, intrinsics.getNanFromId(R.paramIds[i]))
+                continue
+            }
             if (B.preds[R.header].length <= 1
                 || (!B.cycleWrites[R.header].has(slot)
                     && !B.symIn[R.header].has(slot))) continue
