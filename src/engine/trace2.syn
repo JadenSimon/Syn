@@ -514,7 +514,7 @@ export function createTraceSession(): TraceSession {
     function fromJsValue(v: any): u32 {
         if (!isSymbolicMemory(v)) return convertJsValue(v)
         symbolicMemory.add(v.ptr)
-        return heap.boxF64(v.ptr)
+        return heap.boxF64(v.ptr as f64)
     }
 
     function mk(op: string, args: Float64Array, label: string = '', types?: intrinsics.Types[]): any {
@@ -593,14 +593,6 @@ export function createTraceSession(): TraceSession {
                 store: (ptr, offset, val, T) => {
                     if (symbolicMemory.has(ptr)) {
                         throw "???"
-                        const args = new Float64Array(4)
-                        args[0] = ptr
-                        args[1] = offset
-                        args[2] = val
-                        args[3] = T
-                        tracer.traceOp('store', args, Types.void)
-                        tracer.markHandled()
-                        return
                     }
                     if (ptr <= intrinsics.heapMaxAddress) {
                         const addr = ptr + offset
@@ -673,6 +665,7 @@ export interface TraceOptions {
     shouldInline?: (fn: Function) => boolean
     session?: TraceSession
     inputs?: { thisArg: any, args: Float64Array, effect: any }
+    name?: string
 }
 
 let logTraceCalls = intrinsics.argv().includes('trace-calls')
@@ -688,6 +681,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         code = input
     }
     if (captures && opts.mapCapture) captures = captures.map(opts.mapCapture)
+    const traceName = opts.name ?? (typeof input === 'function' ? input.name : '')
     const session = opts.session ?? createTraceSession()
     const debugTrace = typeof input === 'function'
         && intrinsics.argv().includes(`trace-debug:${input.name}`)
@@ -822,7 +816,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         paramIds: number[]
         members: Set<number>
         terminals: Map<string, { key: string, block: number, returns: boolean }>
-        unified?: Map<number, u32>
+        leafKeys?: u32[]
     }
     const reified = new Map<number, Reified>()
     const built = new Set<number>()
@@ -854,7 +848,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const handle = vmHandle(tagged)
             if (!heap.isBoxedF64(handle)) {
                 const args = new Float64Array(1)
-                args[0] = handle
+                args[0] = handle as f64
                 return mk('heap-handle', args, '', [Types.handle])
             }
         }
@@ -1106,7 +1100,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             const callee = target
             const intrinsicName = session.intrinsicFns.get(callee)
-            const linked = session.stubFunctions.get(callee)
+            const linked = session.stubFunctions.get(callee) as any
             if (logTraceCalls) {
                 const nanId = tracer.getNanId(callee)
                 const bytecodeFn = !nanId && !intrinsicName && !linked
@@ -1319,54 +1313,94 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         args[0] = intrinsics.getNanFromId(R.selfId) as any
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
-            const key = R.unified?.get(slot)
-            args[i + 1] = key === undefined ? ins[slot] : gutValue(ins[slot], key)
+            const key = R.leafKeys?.[i] ?? 0
+            args[i + 1] = key === 0 ? ins[slot]
+                : heap.unboxF64(slotOf(heapHandleOf(ins[slot]), key))
         }
         return mk('apply', args)
     }
 
-    function explicitHeapHandle(value: any): boolean {
-        const n = nodes.get(tracer.getNanId(value))
-        return !!n && n.op === 'heap-handle' && !n.argIds[0]
-    }
 
     function heapHandleOf(value: any): u32 {
         const n = nodes.get(tracer.getNanId(value))
         if (!n || n.op !== 'heap-handle' || n.argIds[0]) return 0
-        return n.argConsts[0] as u32
+        return n.argConsts![0] as u32
     }
 
-    function symbolicGutKey(handle: u32): u32 {
-        let found: u32 = 0
+
+    function dataKeys(handle: u32): u32[] {
+        const out: u32[] = []
         const count = heap.ownPropertyCount(handle)
         for (let i: u32 = 0; i < count; i++) {
             const key = heap.ownPropertyKeyAt(handle, i)
-            if (!key) return 0
+            if (!key) continue
             const descriptor = heap.getOwnProperty(handle, key)
-            if (!descriptor) return 0
+            if (!descriptor) continue
             const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
-            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return 0
-            const boxed = d.slot0 as u32
-            if (!heap.isBoxedF64(boxed)) continue
-            if (!tracer.getNanId(heap.unboxF64(boxed))) continue
-            if (found) return 0
-            found = key
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+            out.push(key)
         }
-        return found
+        return out
     }
 
-    function gutValue(value: any, key: u32): any {
-        const descriptor = heap.getOwnProperty(heapHandleOf(value), key)
-        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
-        return heap.unboxF64(d.slot0 as u32)
+    function slotOf(handle: u32, key: u32): u32 {
+        const descriptor = heap.getOwnProperty(handle, key)
+        if (!descriptor) return 0
+        return heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).slot0 as u32
     }
 
-    function refineHeapHandle(handle: u32, key: u32, gut: any): any {
-        const clone = heap.shallowClone(handle)
-        heap.setProperty(clone, key, heap.boxF64(gut))
-        const args = new Float64Array(1)
-        args[0] = clone
-        return mk('heap-handle', args, '', [Types.handle])
+    interface LeafSnapshot { slot: number, handle: u32, keys: u32[], slots: u32[] }
+
+    const noLeaves: LeafSnapshot[] = []
+    const mutatesProperties = (() => {
+        for (const block of B.insts) {
+            for (const inst of block) {
+                if (inst.opcode === Op.SetProperty || inst.opcode === Op.SetPropertyConst
+                    || inst.opcode === Op.SetPropertyImm) return true
+            }
+        }
+        return false
+    })()
+
+    function snapshotLeaves(st: Float64Array): LeafSnapshot[] {
+        if (!mutatesProperties) return noLeaves
+        const out: LeafSnapshot[] = []
+        for (let i = 0; i < st.length; i++) {
+            const handle = heapHandleOf(st[i])
+            if (!handle) continue
+            const keys = dataKeys(handle)
+            if (!keys.length) continue
+            const slots: u32[] = []
+            for (const key of keys) slots.push(slotOf(handle, key))
+            out.push({ slot: i, handle, keys, slots })
+        }
+        return out
+    }
+
+    function restoreLeaves(snap: LeafSnapshot[]): void {
+        for (const e of snap) {
+            for (let k = 0; k < e.keys.length; k++) {
+                if (slotOf(e.handle, e.keys[k]) === e.slots[k]) continue
+                heap.setProperty(e.handle, e.keys[k], e.slots[k] as any)
+            }
+        }
+    }
+
+    function detachLeaves(st: Float64Array, snap: LeafSnapshot[]): void {
+        for (const e of snap) {
+            let changed = false
+            for (let k = 0; k < e.keys.length; k++) {
+                if (slotOf(e.handle, e.keys[k]) !== e.slots[k]) { changed = true; break }
+            }
+            if (changed && heapHandleOf(st[e.slot]) === e.handle) {
+                const args = new Float64Array(1)
+                args[0] = heap.shallowClone(e.handle) as f64
+                st[e.slot] = mk('heap-handle', args, '', [Types.handle])
+            }
+            for (let k = 0; k < e.keys.length; k++) {
+                heap.setProperty(e.handle, e.keys[k], e.slots[k] as any)
+            }
+        }
     }
 
     function terminal(R: Reified, ins: Float64Array, key: string, block: number, value?: any): any {
@@ -1378,39 +1412,89 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return mk('state', args, key)
     }
 
+
+    function constKey(slot: number): u32 {
+        const fn = heap.FunctionBytecode(heap.resolveHeapCell(finalized))
+        if (slot >= fn.constantsLen) return 0
+        const tagged = Intrinsics.load(
+            heap.resolveHeapCell(fn.constants), slot * 8 as u32, Types.u64) as u32
+        return isVmHandle(tagged) ? vmHandle(tagged) : 0
+    }
+
+    function freshParamId(slot: number, key: u32): number {
+        const id = tracer.getNanId(tracer.createUniqueNan())
+        const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
+        names.set(id, `${name}.k${key}`)
+        nodes.set(id, {
+            op: 'param', argIds: [], argConsts: new Float64Array(0), label: `${name}.k${key}`,
+        })
+        return id
+    }
+
+    function shapeStable(R: Reified, handle: u32, ins: Float64Array): boolean {
+        for (const member of R.members) {
+            for (const inst of B.insts[member]) {
+                if (inst.opcode === Op.SetProperty || inst.opcode === Op.SetPropertyImm) return false
+                if (inst.opcode !== Op.SetPropertyConst) continue
+                if (inst.constSlot === undefined) return false
+                const key = constKey(inst.constSlot)
+                if (!key) return false
+                if (heap.getOwnProperty(handle, key)) continue
+                const recv = inst.regs.length ? inst.regs[0] : -1
+                const slot = recv === -1 ? ACC : recv
+                if (heapHandleOf(ins[slot]) === handle) return false
+            }
+        }
+        return true
+    }
+
     function ensureBuilt(R: Reified, ins: Float64Array): void {
         if (built.has(R.header)) return
         built.add(R.header)
         const params: number[] = []
         const paramIds: number[] = []
-        const unified = new Map<number, u32>()
+        const leafKeys: u32[] = []
+        const refined = new Map<number, u32[]>()
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
-            if (!B.cycleWrites[R.header].has(slot) && explicitHeapHandle(ins[slot])) {
-                const key = symbolicGutKey(heapHandleOf(ins[slot]))
-                if (!key) continue
-                unified.set(slot, key)
+            const handle = B.cycleWrites[R.header].has(slot) ? 0 : heapHandleOf(ins[slot])
+            const keys = handle && shapeStable(R, handle, ins) ? dataKeys(handle) : []
+            if (keys.length) {
+                refined.set(slot, keys)
+                for (const key of keys) {
+                    params.push(slot)
+                    leafKeys.push(key)
+                    paramIds.push(freshParamId(slot, key))
+                }
+                continue
             }
             params.push(slot)
+            leafKeys.push(0 as u32)
             paramIds.push(R.paramIds[i])
         }
         R.params = params
         R.paramIds = paramIds
-        R.unified = unified
+        R.leafKeys = leafKeys
         const bodyIns = new Float64Array(slotCount)
         for (let i = 0; i < ins.length; i++) bodyIns[i] = ins[i]
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
-            const key = unified.get(slot)
-            if (key !== undefined) {
-                bodyIns[slot] = refineHeapHandle(
-                    heapHandleOf(ins[slot]), key, intrinsics.getNanFromId(R.paramIds[i]))
+            const key = leafKeys[i]
+            if (key !== 0) {
+                const base = heapHandleOf(bodyIns[slot])
+                const clone = refined.get(slot)![0] === key ? heap.shallowClone(base) : base
+                heap.setProperty(clone, key, heap.boxF64(intrinsics.getNanFromId(paramIds[i])))
+                if (clone !== base) {
+                    const hargs = new Float64Array(1)
+                    hargs[0] = clone as f64
+                    bodyIns[slot] = mk('heap-handle', hargs, '', [Types.handle])
+                }
                 continue
             }
             if (B.preds[R.header].length <= 1
                 || (!B.cycleWrites[R.header].has(slot)
                     && !B.symIn[R.header].has(slot))) continue
-            bodyIns[slot] = intrinsics.getNanFromId(R.paramIds[i])
+            bodyIns[slot] = intrinsics.getNanFromId(paramIds[i])
         }
         const body = continueRegion(runBlock(R.header, bodyIns, R), R)
         loops.set(R.selfId, { block: R.header, params: R.params, body })
@@ -1439,6 +1523,35 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const args = new Float64Array(1)
         args[0] = app
         return mk('is-state', args, key)
+    }
+
+    function mergeHandles(cond: any, x: any, y: any): any | undefined {
+        const hx = heapHandleOf(x)
+        const hy = heapHandleOf(y)
+        if (!hx || !hy || hx === hy) return
+        if (heap.getPrototypeOf(hx) !== heap.getPrototypeOf(hy)) return
+        const keys = dataKeys(hx)
+        const other = dataKeys(hy)
+        if (keys.length !== other.length) return
+        for (let i = 0; i < keys.length; i++) if (keys[i] !== other[i]) return
+        const merged = new Float64Array(keys.length)
+        const differs: boolean[] = []
+        for (let i = 0; i < keys.length; i++) {
+            const sx = slotOf(hx, keys[i])
+            const sy = slotOf(hy, keys[i])
+            if (sx === sy) { differs.push(false); continue }
+            if (!heap.isBoxedF64(sx) || !heap.isBoxedF64(sy)) return
+            differs.push(true)
+            merged[i] = selectValues(cond, heap.unboxF64(sx), heap.unboxF64(sy))
+        }
+        const clone = heap.shallowClone(hx)
+        for (let i = 0; i < keys.length; i++) {
+            if (!differs[i]) continue
+            heap.setProperty(clone, keys[i], heap.boxF64(merged[i]))
+        }
+        const args = new Float64Array(1)
+        args[0] = clone as f64
+        return mk('heap-handle', args, '', [Types.handle])
     }
 
     function selectValues(cond: any, a: any, b: any): any {
@@ -1474,6 +1587,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         for (let i = 0; i < slotCount; i++) {
             const union = unionValues(a.state[i], b.state[i])
             if (union !== undefined) { out[i] = union; continue }
+            const handles = mergeHandles(cond, a.state[i], b.state[i])
+            if (handles !== undefined) { out[i] = handles; continue }
             args[1] = a.state[i]
             args[2] = b.state[i]
             out[i] = mk('select', args)
@@ -1548,8 +1663,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const branch = branchInputs(r)
         const args = new Float64Array(3)
         args[0] = intrinsics.getNanFromId(r.condId)
+        const snap = snapshotLeaves(r.outs)
         args[1] = regionFrom(blockOf.get(r.thenPc)!, branch[0], R)
+        restoreLeaves(snap)
         args[2] = regionFrom(blockOf.get(r.elsePc)!, branch[1], R)
+        restoreLeaves(snap)
         return mk('select', args)
     }
 
@@ -1577,8 +1695,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (r.kind === 'goto') return evalFrom(blockOf.get(r.target)!, r.outs)
 
         const branch = branchInputs(r)
+        const snap = snapshotLeaves(r.outs)
         const a = evalFrom(blockOf.get(r.thenPc)!, branch[0])
+        detachLeaves(a.state, snap)
         const c = evalFrom(blockOf.get(r.elsePc)!, branch[1])
+        detachLeaves(c.state, snap)
 
         if (debugTrace) {
             console.log('trace branch', {
@@ -1982,7 +2103,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         blocks.unshift({ id: 0, params: paramIds.slice(), bodyId: er[0], bodyConst: er[1] })
         for (const b of blocks) for (const id of b.params) visit(id)
         const maxId = tracer.getNanCount() + 1
-        const name = typeof input === 'function' ? input.name : undefined
+        const name = opts.name ?? (typeof input === 'function' ? input.name : undefined)
         return { maxId, nodes: out, params: paramIds, blocks, name }
     }
 
@@ -2729,6 +2850,84 @@ if (intrinsics.argv()[0] === 'trace2') {
         else x = a
         return x
     }, [[1, 5], [0, 5], [4, 9]])
+
+    if (intrinsics.argv().includes('shape-tests')) {
+        function shapeCase(fn: Function, inputs: number[][]) {
+            let c: any
+            try {
+                c = createNative(fn)
+            } catch (e: any) {
+                console.log(`  SHAPE ${fn.name.padEnd(18)} NOCOMPILE  ${`${e}`.split('\n')[0]}`)
+                return
+            }
+            const bad: string[] = []
+            for (const args of inputs) {
+                const want = fn(...args)
+                const got = c.native(...args)
+                if (got !== want) bad.push(`(${args.join(',')}) want ${want} got ${got}`)
+            }
+            console.log(`  SHAPE ${fn.name.padEnd(18)} ${bad.length ? 'WRONG      ' + bad.join('  ') : 'ok'}`)
+        }
+
+        console.log('=== shape analysis cases ===')
+        if (intrinsics.argv().includes('shape-dis')) {
+            show(function sObjBranchNoLoop(n: number) {
+                const o = { a: n }
+                if (n > 2) o.a = o.a + 8
+                return o.a
+            }, true)
+        }
+
+        shapeCase(function sObjReadLoop(n: number) {
+            const o = { a: n }
+            let total = 0
+            for (let i = 0; i < n; i++) total += o.a
+            return total
+        }, [[0], [1], [5]])
+
+        shapeCase(function sObjLeafLoop(n: number) {
+            const o = { a: n }
+            let total = 0
+            for (let i = 0; i < n; i++) {
+                o.a = o.a + 1
+                total += o.a
+            }
+            return total
+        }, [[0], [1], [5]])
+
+        shapeCase(function sObjLeafBranch(n: number) {
+            const o = { a: n }
+            let total = 0
+            for (let i = 0; i < n; i++) {
+                if ((i & 1) !== 0) o.a = o.a + 8
+                total += o.a
+            }
+            return total
+        }, [[0], [1], [5], [6]])
+
+        shapeCase(function sObjTwoLeaves(n: number) {
+            const o = { a: n, b: 1 }
+            let total = 0
+            for (let i = 0; i < n; i++) {
+                o.a = o.a + i
+                o.b = o.b + 1
+                total += o.a + o.b
+            }
+            return total
+        }, [[0], [1], [5]])
+
+        shapeCase(function sObjLeafNoLoop(n: number) {
+            const o = { a: n }
+            o.a = o.a + 1
+            return o.a
+        }, [[0], [3]])
+
+        shapeCase(function sObjBranchNoLoop(n: number) {
+            const o = { a: n }
+            if (n > 2) o.a = o.a + 8
+            return o.a
+        }, [[0], [3]])
+    }
 
     testNativeCompile(function cSymbolicLoop(n: number) {
         let s = 0
