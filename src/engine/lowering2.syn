@@ -21,6 +21,7 @@ export interface GraphBlock {
     params: number[]
     inputs?: number[]
     slots?: number[]
+    effectSlot?: number
     bodyId: number
     bodyConst: number
     consumesEffectToken?: boolean
@@ -57,7 +58,7 @@ const PureOps = new Set<string>([
     'add', 'sub', 'mul', 'div', 'rem', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
     'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'select', 'convert', 'bitconvert',
     'syscall-target', 'local-target', 'indirect-target', 'call-context', 'pool-entry', 'void',
-    'param',
+    'param', 'heap-handle', 'nil-effect'
 ])
 const Commutative = new Set<string>(['add', 'mul', 'and', 'or', 'xor'])
 const SwappedCmp: Record<string, string> = {
@@ -93,10 +94,6 @@ export function liftCommonApplications(g: Graph): Graph {
     const blockOf = new Map<number, GraphBlock>()
     for (const b of g.blocks) blockOf.set(b.id, b)
     let nextId = g.maxId
-    let tokenSlot = -1
-    for (const n of g.nodes.values()) {
-        if (n.op === 'proj' && n.label?.endsWith('.token')) tokenSlot = n.argConsts[1]
-    }
     function sameValue(a: GraphNode, b: GraphNode, i: number): boolean {
         return a.argIds[i] === b.argIds[i]
             && (a.argIds[i] !== 0 || Object.is(a.argConsts[i], b.argConsts[i]))
@@ -117,7 +114,7 @@ export function liftCommonApplications(g: Graph): Graph {
             if (!sameValue(yes, no, i)) different.push(i)
         }
         if (different.length > 1) return
-        if (different.length && tokenSlot >= 0 && block.inputs?.[different[0] - 1] === tokenSlot) return
+        if (different.length && block.consumesEffectToken && different[0] === block.params.length) return
         const args = yes.argIds.slice()
         const constants = yes.argConsts.slice()
         for (const i of different) {
@@ -2418,6 +2415,7 @@ export function normalizeValueGraph(g: Graph): Graph {
         console.log('graph transform cost', g.name || '<anonymous>', name,
             `${elapsed.toFixed(3)}ms`, `${beforeNodes}->${g.nodes.size}`)
     }
+    run(specializeBlockApplications)
     run(simplifyCountedLoop)
     run(liftCommonEffects)
     run(liftCommonApplications)
@@ -2427,16 +2425,17 @@ export function normalizeValueGraph(g: Graph): Graph {
     run(pruneBlockParams)
     run(graph => { optimizeValueGraph(graph); return graph }, 'optimizeValueGraph')
     run(simplifyBitOperations)
+
+        // if (n.op === 'heap-handle') {
+        //     const handle = !n.argIds[0] ? n.argConsts[0] : '?'
+        //     console.log(dumpGraph(g))
+        //     throw `lowering2: unresolved heap handle ${handle} at %${id}`
+        // }
+
     return g
 }
 
 export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
-    for (const [id, n] of g.nodes) {
-        if (n.op !== 'heap-handle') continue
-        const handle = !n.argIds[0] ? n.argConsts[0] : '?'
-        console.log(dumpGraph(g))
-        throw `lowering2: unresolved heap handle ${handle} at %${id}`
-    }
     g = normalizeValueGraph(g)
     const target = opts.target ?? lowering.aarch64
     const asm = target.createAssembler()
@@ -3806,6 +3805,7 @@ export function packageBlocks(g: Graph): Graph {
             if (!calls?.length) continue
             const replacements = new Map<number, number>()
             for (let i = 0; i < block.params.length; i++) {
+                if (block.consumesEffectToken && i === block.params.length - 1) continue
                 const param = block.params[i]
                 let source = 0
                 let same = true
@@ -3859,8 +3859,9 @@ export function packageBlocks(g: Graph): Graph {
                         throw `lowering2: inconsistent state '${n.label}'`
                     }
                     terminals.set(n.label!, n.argIds.length)
-                    if (block.consumesEffectToken) {
-                        const tokenSlot = block.inputs![block.params.length - 1]
+                    const tokenSlot = block.effectSlot
+                        ?? (block.consumesEffectToken ? block.inputs![block.params.length - 1] : undefined)
+                    if (tokenSlot !== undefined) {
                         const tokenAt = block.slots!.indexOf(tokenSlot)
                         if (tokenAt < 0) throw `lowering2: state '${n.label}' is missing its effect token`
                         terminalTokens.set(n.label!, tokenAt)
@@ -3982,7 +3983,7 @@ export function packageBlocks(g: Graph): Graph {
             if (isParam(nodes, id)) return [capture(id), 0]
             const n = nodes.get(id)!
             if (n.op === 'syscall-target' || n.op === 'local-target'
-                || n.op === 'pool-entry' || n.op === 'nil-effect' || n.op === 'panic') return [id, 0]
+                || n.op === 'pool-entry' || n.op === 'nil-effect' || n.op === 'panic' || n.op === 'heap-handle') return [id, 0]
             if (!depends(id) && !usesRegionParam(id)
                 && n.op !== 'state' && n.op !== 'apply'
                 && n.op !== 'select' && n.op !== 'after') return [capture(id), 0]
@@ -4211,6 +4212,141 @@ export function packageBlocks(g: Graph): Graph {
     }
 }
 
+function specializeBlockApplications(g: Graph): Graph {
+    const applications = new Map<number, number>()
+    for (const n of g.nodes.values()) {
+        if (n.op === 'apply') applications.set(n.argIds[0], (applications.get(n.argIds[0]) ?? 0) + 1)
+    }
+    const candidates = new Map<number, GraphBlock>()
+    for (const b of g.blocks) {
+        const body = g.nodes.get(b.bodyId)
+        if (body?.op === 'apply' || (body?.op === 'state'
+            && body.label === 'return' && body.argIds.length === 2 && b.slots?.length === 1)) candidates.set(b.id, b)
+    }
+    const pure = pureValues(g)
+    const nodes = new Map(g.nodes)
+    let nextId = g.maxId
+    type Value = { id: number, value: number }
+    const interned = new Map<string, number>()
+    function key(n: GraphNode): string {
+        return [n.op, n.label ?? '', n.T, n.U, ...(n.types ?? []),
+            ...n.argIds.map((id, i) => id ? `v${id}` : `c${Object.is(n.argConsts[i], -0) ? '-0' : n.argConsts[i]}`)].join(',')
+    }
+    for (const [id, n] of nodes) if (n.op !== 'param' && n.op !== 'block') interned.set(key(n), id)
+    function intern(n: GraphNode): Value {
+        const k = key(n)
+        let id = interned.get(k)
+        if (id === undefined) {
+            id = nextId++
+            nodes.set(id, n)
+            interned.set(k, id)
+        }
+        return { id, value: 0 }
+    }
+    const active = new Set<number>()
+    function rewrite(id: number, value: number, env: Map<number, Value>, memo: Map<number, Value>): Value {
+        if (!id) return { id, value }
+        const replacement = env.get(id) ?? memo.get(id)
+        if (replacement) return replacement
+        const n = nodes.get(id)
+        if (!n || n.op === 'param' || n.op === 'block') return { id, value: 0 }
+        const args = n.argIds.map((a, i) => rewrite(a, n.argConsts[i], env, memo))
+        let result: Value | undefined
+        const block = n.op === 'apply' ? candidates.get(n.argIds[0]) : undefined
+        if (block && !active.has(block.id) && (nodes.get(block.bodyId)?.op === 'apply'
+            || applications.get(block.id) === 1 || args.slice(1).some(arg => !arg.id))) {
+            const bindings = new Map(env)
+            for (let i = 0; i < block.params.length; i++) bindings.set(block.params[i], args[i + 1])
+            active.add(block.id)
+            result = rewrite(block.bodyId, block.bodyConst, bindings, new Map())
+            active.delete(block.id)
+        } else if (n.op === 'proj') {
+            const state = nodes.get(args[0].id)
+            if (state?.op === 'state' && state.label === 'return') {
+                const at = n.label === 'return.return' ? state.argIds.length - 1
+                    : n.label === 'return.token' ? 0 : -1
+                if (at >= 0) result = { id: state.argIds[at], value: state.argConsts[at] }
+            }
+        } else if (n.op === 'select') {
+            if (!args[0].id) result = args[0].value ? args[1] : args[2]
+            else if (args[1].id === args[2].id && (args[1].id || Object.is(args[1].value, args[2].value))) {
+                result = pure.has(args[0].id) ? args[1] : intern({ ...n, op: 'after', label: undefined,
+                    argIds: [args[0].id, args[1].id], argConsts: new Float64Array([0, args[1].value]) })
+            }
+        } else if (n.op === 'after') {
+            if (!args[0].id || nodes.get(args[0].id)?.op === 'nil-effect' || args[0].id === args[1].id) result = args[1]
+        } else if (args.length === 2 && args.every(arg => !arg.id)
+            && Number.isSafeInteger(args[0].value) && Number.isSafeInteger(args[1].value)
+            && args[0].value >= 0 && args[1].value >= 0) {
+            const a = args[0].value, b = args[1].value
+            let folded: number | undefined
+            if (n.op === 'add') folded = a + b
+            else if (n.op === 'sub' && a >= b) folded = a - b
+            else if (n.op === 'mul') folded = a * b
+            else if (n.op === 'lt') folded = a < b ? 1 : 0
+            else if (n.op === 'le') folded = a <= b ? 1 : 0
+            else if (n.op === 'gt') folded = a > b ? 1 : 0
+            else if (n.op === 'ge') folded = a >= b ? 1 : 0
+            else if (n.op === 'eq') folded = a === b ? 1 : 0
+            else if (n.op === 'ne') folded = a !== b ? 1 : 0
+            if (folded !== undefined && Number.isSafeInteger(folded)
+                && (n.T === Types.u64 || n.T === Types.u32) && n.U === n.T
+                && (n.T !== Types.u32 || (a <= 0xFFFFFFFF && b <= 0xFFFFFFFF && folded <= 0xFFFFFFFF))) {
+                result = { id: 0, value: folded }
+            }
+        }
+        if (!result && args.length === 2 && n.T <= Types.i64 && n.U <= Types.i64) {
+            // Keep the operand itself, including any effects it carries.
+            // Integer arithmetic uses full-width values here; narrowing is
+            // represented by explicit conversions, which remain untouched.
+            const left = (value: number) => !args[0].id && args[0].value === value
+            const right = (value: number) => !args[1].id && args[1].value === value
+            if (n.op === 'add' || n.op === 'or' || n.op === 'xor') {
+                if (right(0)) result = args[0]
+                else if (left(0)) result = args[1]
+            } else if (n.op === 'sub' || n.op === 'shl' || n.op === 'shr' || n.op === 'ushr') {
+                if (right(0)) result = args[0]
+            } else if (n.op === 'mul') {
+                if (right(1)) result = args[0]
+                else if (left(1)) result = args[1]
+            } else if (n.op === 'div' && right(1)) result = args[0]
+        }
+        if (!result) {
+            result = intern({ ...n, argIds: args.map(a => a.id), argConsts: new Float64Array(args.map(a => a.value)) })
+        }
+        memo.set(id, result)
+        return result
+    }
+    const memo = new Map<number, Value>()
+    const env = new Map<number, Value>()
+    const blocks = g.blocks.map(b => {
+        active.add(b.id)
+        const body = rewrite(b.bodyId, b.bodyConst, env, memo)
+        active.delete(b.id)
+        return { ...b, bodyId: body.id, bodyConst: body.value }
+    })
+    const blockOf = new Map(blocks.map(b => [b.id, b]))
+    const reachable = new Set<number>()
+    const liveNodes = new Map<number, GraphNode>()
+    function visit(id: number): void {
+        if (!id || liveNodes.has(id)) return
+        const n = nodes.get(id)
+        if (!n) return
+        liveNodes.set(id, n)
+        if (n.op === 'apply') visitBlock(n.argIds[0])
+        for (const arg of n.argIds) visit(arg)
+    }
+    function visitBlock(id: number): void {
+        if (reachable.has(id)) return
+        reachable.add(id)
+        const b = blockOf.get(id)!
+        for (const param of b.params) visit(param)
+        visit(b.bodyId)
+    }
+    visitBlock(0)
+    return { ...g, maxId: nextId, nodes: liveNodes, blocks: blocks.filter(b => reachable.has(b.id)) }
+}
+
 export function simplifyCountedLoop(g: Graph): Graph | undefined {
     if (g.blocks.length !== 2) return
     const entry = g.blocks[0]
@@ -4229,11 +4365,24 @@ export function simplifyCountedLoop(g: Graph): Graph | undefined {
     const iv = loop.params.indexOf(cond.argIds[0])
     let acc = loop.params.indexOf(select.argIds[2])
     if (root?.op === 'proj') {
-        const slot = root.argConsts[1]
-        acc = loop.inputs?.indexOf(slot) ?? -1
         const state = g.nodes.get(select.argIds[2])
-        const field = loop.slots?.indexOf(slot) ?? -1
-        if (!state || state.op !== 'state' || field < 0 || state.argIds[field] !== loop.params[acc]) return
+        if (!state || state.op !== 'state') return
+        if (root.label === 'return.return' && state.label === 'return') {
+            const token = loop.consumesEffectToken ? loop.params.length - 1 : -1
+            if (token >= 0) {
+                if (state.argIds[0] !== loop.params[token]
+                    || g.nodes.get(start.argIds[1 + token])?.op !== 'nil-effect') return
+            } else if (g.nodes.get(state.argIds[0])?.op !== 'nil-effect') return
+            let value = state.argIds[state.argIds.length - 1]
+            const after = g.nodes.get(value)
+            if (after?.op === 'after' && after.argIds[0] === loop.params[token]) value = after.argIds[1]
+            acc = loop.params.indexOf(value)
+        } else {
+            const slot = root.argConsts[1]
+            acc = loop.inputs?.indexOf(slot) ?? -1
+            const field = loop.slots?.indexOf(slot) ?? -1
+            if (field < 0 || state.argIds[field] !== loop.params[acc]) return
+        }
     }
     if (iv < 0 || acc < 0 || iv === acc) return
     if (!isZero(start, 1 + iv) || !isZero(start, 1 + acc)) return

@@ -72,6 +72,7 @@ interface Blocks {
     insts: bytecode.CodeInstruction[][]
     inCycle: boolean[]
     symPred: boolean[]
+    symbolicJoins: Set<number>
     symIn: Set<number>[]
     writes: Set<number>[]
     cycleWrites: Set<number>[]
@@ -242,8 +243,51 @@ function deriveBlocks(
     }
     for (let i = 0; i < paramCount; i++) symIn[0].add(i)
 
+    const readSlots: number[][] = []
+    for (let i = 0; i < n; i++) {
+        const rs = new Set<number>()
+        const defined = new Set<number>()
+        for (const inst of insts[i]) {
+            for (const r of readsOf(inst)) if (!defined.has(r)) rs.add(r)
+            for (const r of writesOf(inst)) defined.add(r)
+        }
+        readSlots.push([...rs])
+    }
+
     const symPred: boolean[] = []
     for (let i = 0; i < n; i++) symPred.push(false)
+    const symbolicJoins = new Set<number>()
+    const joins: { source: number, block: number, writes: Set<number> }[] = []
+    for (let source = 0; source < n; source++) {
+        if (succs[source].length < 2) continue
+        const arms = succs[source].map(start => {
+            const reach = new Set<number>()
+            const pending = [start]
+            while (pending.length) {
+                const b = pending.pop()!
+                if (b === source || reach.has(b)) continue
+                reach.add(b)
+                for (const next of succs[b]) pending.push(next)
+            }
+            return reach
+        })
+        const count = (b: number) => arms.filter(arm => arm.has(b)).length
+        for (let block = 0; block < n; block++) {
+            if (preds[block].length < 2 || count(block) < 2
+                || !preds[block].some(pred => count(pred) < 2)) continue
+            const written = new Set<number>()
+            const seen = new Set<number>()
+            const pending = succs[source].slice()
+            while (pending.length) {
+                const b = pending.pop()!
+                if (b === source || b === block || seen.has(b)) continue
+                seen.add(b)
+                for (const slot of writes[b]) written.add(slot)
+                for (const next of succs[b]) pending.push(next)
+            }
+            joins.push({ source, block, writes: written })
+        }
+    }
     const symOut: Set<number>[] = []
     for (let i = 0; i < n; i++) symOut.push(new Set<number>())
 
@@ -295,11 +339,23 @@ function deriveBlocks(
                 }
             }
         }
+        for (const join of joins) {
+            if (!symPred[join.source]) continue
+            symbolicJoins.add(join.block)
+            for (const slot of join.writes) {
+                if (symIn[join.block].has(slot)) continue
+                symIn[join.block].add(slot)
+                changed = true
+            }
+        }
         if (changed) continue
         // TODO: some writes are always known despite being in a symbolic block
         for (let i = 0; i < n; i++) {
-            if (!inCycle[i] || !symPred[i]) continue
-            for (const x of cycleRegion(i)) {
+            if (!inCycle[i]) continue
+            const region = cycleRegion(i)
+            if (![...region].some(block => symPred[block]
+                || readSlots[block].some(slot => symIn[block].has(slot)))) continue
+            for (const x of region) {
                 for (const w of writes[x]) {
                     if (symIn[i].has(w)) continue
                     symIn[i].add(w)
@@ -352,15 +408,6 @@ function deriveBlocks(
         cycleWrites.push(w)
     }
 
-    const readSlots: number[][] = []
-    for (let i = 0; i < n; i++) {
-        const rs = new Set<number>()
-        for (const inst of insts[i]) {
-            for (const r of readsOf(inst)) rs.add(r)
-        }
-        readSlots.push([...rs])
-    }
-
     const cycles: Set<number>[] = []
     const exits: number[][] = []
     for (let i = 0; i < n; i++) {
@@ -374,7 +421,7 @@ function deriveBlocks(
     }
 
     return {
-        leaders, succs, preds, insts, inCycle, symPred, symIn, writes, cycleWrites,
+        leaders, succs, preds, insts, inCycle, symPred, symbolicJoins, symIn, writes, cycleWrites,
         liveIn, readSlots, cycles, exits,
     }
 }
@@ -749,6 +796,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const o = nodes.get(id) ?? tracer.getTraceById(id)
             if (!o) return names.get(id) ?? `p@${id}`
             const parts: string[] = [`[s@${id}] ${o.op}`]
+            if (o.op === 'heap-handle' && o.argConsts[0]) {
+                parts.push(`${o.argConsts[0]} : snapshot ${showShapeHandle(o.argConsts[1])}`)
+                return `(${parts.join(', ')})`
+            }
             for (let i = 0; i < o.argIds.length; i++) {
                 const u = o.argIds[i]
                 if (u) parts.push(valToString(intrinsics.getNanFromId(u)))
@@ -810,16 +861,27 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     interface Reified {
         header: number
+        inputs: number[]
         params: number[]
         outputs: number[]
         selfId: number
         paramIds: number[]
+        inputParamIds: number[]
+        incoming?: Float64Array
+        varying: Set<number>
+        applications: Set<number>
+        constants: Set<number>
+        queued: boolean
+        finalized: boolean
         members: Set<number>
+        loopWrites: Set<number>
+        cyclic: boolean
         terminals: Map<string, { key: string, block: number, returns: boolean }>
-        leafKeys?: u32[]
     }
     const reified = new Map<number, Reified>()
+    const regionalParams = new Set<number>()
     const built = new Set<number>()
+    const buildQueue: Reified[] = []
 
     function watch(b: number): boolean {
         for (const r of B.readSlots[b]) {
@@ -834,6 +896,19 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     let injectedRet = false
     let stopNext = false
     let activeRegion: Reified | undefined
+    const checkBlocks = intrinsics.argv().includes('check-blocks')
+    const tracedBlocks = new Map<number, string>()
+    const enteredBlocks = new Set<number>()
+
+    function noteTracedBlock(block: number, pc: number, owner: string): void {
+        enteredBlocks.add(block)
+        if (!checkBlocks) return
+        const first = tracedBlocks.get(block)
+        if (first !== undefined) {
+            throw `trace2: bytecode block B${block} @${pc} traced twice (${first}; ${owner})`
+        }
+        tracedBlocks.set(block, owner)
+    }
     const emptyState = new Float64Array(0)
     let step: Step = { kind: '', from: 0, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
 
@@ -846,6 +921,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const tagged = value as u32
         if (isVmHandle(tagged)) {
             const handle = vmHandle(tagged)
+            if (handle <= 1) return handle
             if (!heap.isBoxedF64(handle)) return handleValue(intern(handle))
         }
         return vmValue(tagged)
@@ -1046,7 +1122,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 return SYN_RET
             }
             if (!reified.has(blockOf.get(pc)!)) {
-                tracer.setActive(watch(blockOf.get(pc)!))
+                const block = blockOf.get(pc)!
+                enteredBlocks.add(block)
+                const symbolic = watch(block)
+                if (tracer.getActive() || symbolic) {
+                    noteTracedBlock(block, pc, `dispatch from B${step.from} in ${activeRegion ? `B${activeRegion.header}` : 'root'}`)
+                }
+                tracer.setActive(symbolic)
                 return pc
             }
             injectedRet = true
@@ -1194,7 +1276,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (n.op === 'heap-handle' && !n.argIds[0]) return showShapeHandle(n.argConsts![0] as u32)
         const args: string[] = []
         for (let i = 0; i < n.argIds.length; i++) args.push(showShapeValue(operand(n, i)))
-        return args.length ? `(${n.op} ${args.join(' ')})` : n.op
+        return args.length ? `([s@${id}] ${n.op} ${args.join(' ')})` : `${n.op}@${id}`
     }
 
     function showShapeHandle(h: u32): string {
@@ -1223,6 +1305,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function runBlock(b: number, ins: Float64Array, region?: Reified): Step {
+        noteTracedBlock(b, leaders[b], `run in ${region ? `B${region.header}` : 'root'}`)
         if (shapeTrace) dumpShapes(`B${b} in `, ins)
         for (let r = 0; r <= ACC; r++) mem[slotAddr(r)] = fromGraphValue(ins[r]) as any
         writeToken(ins[TOKEN])
@@ -1244,7 +1327,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         step = { kind: '', from: b, outs: emptyState, target: 0, condId: 0, condConst: 0, thenPc: 0, elsePc: 0, valueId: 0, valueConst: 0 }
         let concrete = !tracer.getNanId(thisArg) && runtime.heapOverlay.size === 0
         if (concrete) {
-            for (const r of B.liveIn[b]) {
+            for (const r of B.readSlots[b]) {
                 if (tracer.getNanId(ins[r])) { concrete = false; break }
             }
         }
@@ -1290,37 +1373,44 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const loops = new Map<number, { block: number, params: number[], body: any }>()
 
     function reifyBlocks(): void {
+        const regions = new Map<number, Set<number>>()
         for (let b = 0; b < leaders.length; b++) {
-            if (!B.inCycle[b]) continue
-            let loopsBack = false
-            for (const s of B.succs[b]) if (s <= b) { loopsBack = true; break }
-            if (!loopsBack) continue
-            let symbolic = false
-            for (const member of B.cycles[b]) if (B.symPred[member]) { symbolic = true; break }
-            if (!symbolic) continue
-            const regionReads = new Set<number>()
-            for (const member of B.cycles[b]) {
-                for (const slot of B.readSlots[member]) regionReads.add(slot)
-            }
-            const outputs: number[] = []
-            const outputSet = new Set<number>()
-            for (const exit of B.exits[b]) {
-                for (const slot of B.liveIn[exit]) {
-                    if (!B.cycleWrites[b].has(slot) || outputSet.has(slot)) continue
-                    outputSet.add(slot)
-                    outputs.push(slot)
+            if (b === 0 && !B.inCycle[b]) continue
+            if (B.preds[b].length < 2 && b !== 0) continue
+            let symbolic = B.symPred[b] || B.symbolicJoins.has(b)
+            if (!symbolic) {
+                for (const member of B.cycles[b]) {
+                    if (!B.symPred[member]) continue
+                    symbolic = true
+                    break
                 }
             }
-            if ((B.cycleWrites[b].has(TOKEN) || regionReads.has(TOKEN)) && !outputSet.has(TOKEN)) {
-                outputSet.add(TOKEN)
-                outputs.push(TOKEN)
+            if (symbolic) regions.set(b, new Set<number>([b]))
+        }
+
+        for (const [header, members] of regions) {
+            const pending = [header]
+            while (pending.length) {
+                const from = pending.pop()!
+                for (const target of B.succs[from]) {
+                    if (members.has(target) || regions.has(target)) continue
+                    members.add(target)
+                    pending.push(target)
+                }
             }
-            const inputSet = new Set<number>()
-            for (const slot of B.liveIn[b]) {
-                if (regionReads.has(slot) || outputSet.has(slot)) inputSet.add(slot)
+        }
+
+        for (const [b, members] of regions) {
+            const loopWrites = new Set<number>()
+            for (let h = 0; h < leaders.length; h++) {
+                if (!B.cycles[h].has(b)) continue
+                for (const slot of B.cycleWrites[h]) loopWrites.add(slot)
             }
-            const params = [...inputSet]
-            params.sort((x, y) => x - y)
+            const outputs = [TOKEN]
+            const inputSet = new Set<number>(B.liveIn[b])
+            inputSet.add(TOKEN)
+            const inputs = [...inputSet]
+            inputs.sort((x, y) => x - y)
             outputs.sort((x, y) => x - y)
 
             const selfId = tracer.getNanId(tracer.createUniqueNan())
@@ -1328,30 +1418,66 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 op: 'block', argIds: [], argConsts: new Float64Array(0), label: `B${b}`,
             })
             const paramIds: number[] = []
-            for (const slot of params) {
+            for (const slot of inputs) {
                 const id = tracer.getNanId(tracer.createUniqueNan())
                 const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
                 names.set(id, name)
                 nodes.set(id, {
                     op: 'param', argIds: [], argConsts: new Float64Array(0), label: name,
                 })
+                regionalParams.add(id)
                 paramIds.push(id)
             }
             reified.set(b, {
-                header: b, params, outputs, selfId, paramIds, members: B.cycles[b],
+                header: b, inputs, params: inputs.slice(), outputs, selfId,
+                paramIds: paramIds.slice(), inputParamIds: paramIds,
+                varying: new Set(), applications: new Set(), constants: new Set(),
+                queued: false, finalized: false, members,
+                loopWrites, cyclic: B.inCycle[b],
                 terminals: new Map(),
             })
+        }
+        if (intrinsics.argv().includes(`trace-blocks:${traceName}`)) {
+            for (const [header, members] of regions) {
+                console.log(`region B${header}${B.inCycle[header] ? ' cyclic' : ''}:`, [...members].map(x => `B${x}`).join(','))
+            }
         }
     }
 
     function application(R: Reified, ins: Float64Array): any {
+        if (!R.incoming) {
+            R.incoming = new Float64Array(slotCount)
+            for (let i = 0; i < ins.length; i++) R.incoming[i] = ins[i]
+        } else {
+            for (const slot of R.inputs) {
+                if (R.varying.has(slot)) continue
+                const a = R.incoming[slot]
+                const b = ins[slot]
+                if (sameValue(a, b)) continue
+                const ah = heapHandleOf(a)
+                const bh = heapHandleOf(b)
+                if (ah && ah === bh) continue
+                R.varying.add(slot)
+                if (R.finalized && R.constants.has(slot)) {
+                    console.log('a', valToString(a))
+                    console.log('b', valToString(b))
+                    throw `trace2: constant input s${slot} of B${R.header} in ${traceName || '<anonymous>'} changed after the block was built`
+                }
+            }
+        }
+        if (!R.queued && !built.has(R.header)) {
+            R.queued = true
+            buildQueue.push(R)
+        }
         const args = new Float64Array(R.params.length + 1)
         args[0] = intrinsics.getNanFromId(R.selfId) as any
         for (let i = 0; i < R.params.length; i++) {
             const slot = R.params[i]
             args[i + 1] = ins[slot]
         }
-        return mk('apply', args)
+        const app = mk('apply', args)
+        if (!R.finalized) R.applications.add(tracer.getNanId(app))
+        return app
     }
 
     function cellOf(value: any): u32 {
@@ -1369,11 +1495,53 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return h && heap.isIndirect(h) ? heap.indirectTarget(h) : h
     }
 
+    const snapshots = new Map<u32, u32[]>()
+
+    function sameSnapshot(a: u32, b: u32): boolean {
+        if (a === b) return true
+        if (!heap.isOrdinaryObject(a) || !heap.isOrdinaryObject(b)) return false
+        if (heap.getPrototypeOf(a) !== heap.getPrototypeOf(b)) return false
+        const td = heap.typeDescriptorOf(a)
+        if (td !== heap.typeDescriptorOf(b)) return false
+        const count = heap.ownPropertyCount(a)
+        if (count !== heap.ownPropertyCount(b)) return false
+        for (let i: u32 = 0; i < count; i++) {
+            const key = heap.ownPropertyKeyAt(a, i)
+            if (key !== heap.ownPropertyKeyAt(b, i)) return false
+            const x = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(a, key)))
+            const y = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(b, key)))
+            if (x.flags !== y.flags) return false
+            if (x.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) {
+                if (x.slot0 !== y.slot0 || x.slot1 !== y.slot1) return false
+            } else if (x.slot0 !== y.slot0) {
+                if (!heap.isBoxedF64(x.slot0) || !heap.isBoxedF64(y.slot0)) return false
+                const vx = heap.unboxF64(x.slot0), vy = heap.unboxF64(y.slot0)
+                const ix = tracer.getNanId(vx), iy = tracer.getNanId(vy)
+                if (ix || iy) {
+                    if (ix !== iy) return false
+                } else if (!Object.is(vx, vy)) return false
+            }
+        }
+        return true
+    }
+
+    function canonicalSnapshot(cell: u32): u32 {
+        const target = heap.indirectTarget(cell)
+        const previous = snapshots.get(cell)
+        if (!previous) {
+            snapshots.set(cell, [target])
+            return target
+        }
+        for (const snapshot of previous) if (sameSnapshot(snapshot, target)) return snapshot
+        previous.push(target)
+        return target
+    }
+
     function handleValue(handle: u32): any {
         const cell = heap.isIndirect(handle) ? handle : 0
         const args = new Float64Array(cell ? 2 : 1)
         args[0] = handle as f64
-        if (cell) args[1] = heap.indirectTarget(cell) as f64
+        if (cell) args[1] = canonicalSnapshot(cell) as f64
         return mk('heap-handle', args, '', [Types.handle])
     }
 
@@ -1464,95 +1632,70 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function terminal(R: Reified, ins: Float64Array, key: string, block: number, value?: any): any {
         const returns = value !== undefined
         if (!R.terminals.has(key)) R.terminals.set(key, { key, block, returns })
-        const args = new Float64Array(R.outputs.length + (returns ? 1 : 0))
-        for (let i = 0; i < R.outputs.length; i++) args[i] = ins[R.outputs[i]]
-        if (returns) args[R.outputs.length] = value
+        const args = new Float64Array(returns ? 2 : 1)
+        args[0] = nilEffect // ins[TOKEN]
+        if (returns) args[1] = value
         return mk('state', args, key)
     }
 
 
-    function constKey(slot: number): u32 {
-        const fn = heap.FunctionBytecode(heap.resolveHeapCell(finalized))
-        if (slot >= fn.constantsLen) return 0
-        const tagged = Intrinsics.load(
-            heap.resolveHeapCell(fn.constants), slot * 8 as u32, Types.u64) as u32
-        return isVmHandle(tagged) ? vmHandle(tagged) : 0
-    }
 
-    function freshParamId(slot: number, key: u32): number {
-        const id = tracer.getNanId(tracer.createUniqueNan())
-        const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
-        names.set(id, `${name}.k${key}`)
-        nodes.set(id, {
-            op: 'param', argIds: [], argConsts: new Float64Array(0), label: `${name}.k${key}`,
-        })
-        return id
-    }
-
-    function shapeStable(R: Reified, handle: u32, ins: Float64Array): boolean {
-        for (const member of R.members) {
-            for (const inst of B.insts[member]) {
-                if (inst.opcode === Op.SetProperty || inst.opcode === Op.SetPropertyImm) return false
-                if (inst.opcode !== Op.SetPropertyConst) continue
-                if (inst.constSlot === undefined) return false
-                const key = constKey(inst.constSlot)
-                if (!key) return false
-                if (heap.getOwnProperty(handle, key)) continue
-                const recv = inst.regs.length ? inst.regs[0] : -1
-                const slot = recv === -1 ? ACC : recv
-                if (heapHandleOf(ins[slot]) === handle) return false
-            }
+    function regionalValue(id: number, seen = new Set<number>()): boolean {
+        if (!id || seen.has(id)) return false
+        seen.add(id)
+        const n = nodes.get(id) ?? tracer.getTraceById(id)
+        if (!n) return false
+        if (n.op === 'param') return regionalParams.has(id)
+        if (n.op === 'heap-handle') return false
+        for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
+            if (regionalValue(n.argIds[i], seen)) return true
         }
-        return true
+        return false
     }
 
-    function ensureBuilt(R: Reified, ins: Float64Array): void {
+    function ensureBuilt(R: Reified): void {
         if (built.has(R.header)) return
+        if (!R.incoming) throw `trace2: B${R.header} has no incoming state`
         built.add(R.header)
+        R.queued = false
+
         const params: number[] = []
         const paramIds: number[] = []
-        const leafKeys: u32[] = []
-        const refined = new Map<number, u32[]>()
-        for (let i = 0; i < R.params.length; i++) {
-            const slot = R.params[i]
-            const handle = B.cycleWrites[R.header].has(slot) ? 0 : heapHandleOf(ins[slot])
-            const keys = handle && shapeStable(R, handle, ins) ? dataKeys(handle) : []
-            if (keys.length) {
-                refined.set(slot, keys)
-                for (const key of keys) {
-                    params.push(slot)
-                    leafKeys.push(key)
-                    paramIds.push(freshParamId(slot, key))
-                }
-                continue
+        for (let i = 0; i < R.inputs.length; i++) {
+            const slot = R.inputs[i]
+            if (R.varying.has(slot) || R.loopWrites.has(slot)
+                || (slot === TOKEN && !sameValue(R.incoming[slot], nilEffect))
+                || regionalValue(tracer.getNanId(R.incoming[slot]))) {
+                params.push(slot)
+                paramIds.push(R.inputParamIds[i])
+            } else {
+                R.constants.add(slot)
             }
-            params.push(slot)
-            leafKeys.push(0 as u32)
-            paramIds.push(R.paramIds[i])
         }
         R.params = params
         R.paramIds = paramIds
-        R.leafKeys = leafKeys
-        const bodyIns = new Float64Array(slotCount)
-        for (let i = 0; i < ins.length; i++) bodyIns[i] = ins[i]
-        for (let i = 0; i < R.params.length; i++) {
-            const slot = R.params[i]
-            const key = leafKeys[i]
-            if (key !== 0) {
-                const base = heapHandleOf(bodyIns[slot])
-                const clone = refined.get(slot)![0] === key ? heap.shallowClone(base) : base
-                heap.setProperty(clone, key, heap.boxF64(intrinsics.getNanFromId(paramIds[i])))
-                if (clone !== base) {
-                    const hargs = new Float64Array(1)
-                    hargs[0] = clone as f64
-                    bodyIns[slot] = mk('heap-handle', hargs, '', [Types.handle])
+
+        if (R.constants.size) {
+            for (const id of R.applications) {
+                const n = nodes.get(id)
+                if (!n || n.op !== 'apply') continue
+                const ids = [n.argIds[0]]
+                const consts = [n.argConsts![0]]
+                for (let i = 0; i < R.inputs.length; i++) {
+                    if (R.constants.has(R.inputs[i])) continue
+                    ids.push(n.argIds[i + 1])
+                    consts.push(n.argConsts![i + 1])
                 }
-                continue
+                n.argIds = ids
+                n.argConsts = new Float64Array(consts)
             }
-            if (B.preds[R.header].length <= 1
-                || (!B.cycleWrites[R.header].has(slot)
-                    && !B.symIn[R.header].has(slot))) continue
-            bodyIns[slot] = intrinsics.getNanFromId(paramIds[i])
+        }
+        R.finalized = true
+
+        const bodyIns = new Float64Array(slotCount)
+        for (let i = 0; i < R.incoming.length; i++) bodyIns[i] = R.incoming[i]
+        for (let i = 0; i < R.params.length; i++) {
+            bodyIns[R.params[i]] = intrinsics.getNanFromId(R.paramIds[i])
         }
         const body = continueRegion(runBlock(R.header, bodyIns, R), R)
         loops.set(R.selfId, { block: R.header, params: R.params, body })
@@ -1609,9 +1752,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (hasY && !heap.isBoxedF64(sy)) return
             const vx = hasX ? heap.unboxF64(sx) : mk('void', emptyState, '', [Types.u32])
             const vy = hasY ? heap.unboxF64(sy) : mk('void', emptyState, '', [Types.u32])
+            if (sameValue(vx, vy)) { differs.push(false); continue }
             differs.push(true)
             merged[i] = selectValues(cond, vx, vy)
         }
+        if (!differs.some(x => x)) return
         const clone = heap.shallowClone(hx)
         for (let i = 0; i < keys.length; i++) {
             if (!differs[i]) continue
@@ -1667,44 +1812,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function resumeApplication(R: Reified, app: any, ins: Float64Array): EvalResult {
-        const terminals = [...R.terminals.values()]
-        if (!terminals.length) throw `trace2: cyclic region B${R.header} has no terminal states`
-        const outcomes: EvalResult[] = []
-        for (const t of terminals) {
-            const state = projectedState(R, app, ins, t.key)
-            outcomes.push(t.returns
-                ? { value: returnedValue(R, app, t.key), state }
-                : evalFrom(t.block, state))
-        }
-        let result = outcomes[outcomes.length - 1]
-        for (let i = outcomes.length - 2; i >= 0; i--) {
-            result = selectResults(isState(app, terminals[i].key), outcomes[i], result)
-        }
-        return result
-    }
-
-    function resumeRegionApplication(R: Reified, app: any, ins: Float64Array, owner: Reified): any {
-        const terminals = [...R.terminals.values()]
-        if (!terminals.length) throw `trace2: cyclic region B${R.header} has no terminal states`
-        const outcomes = new Float64Array(terminals.length)
-        for (let i = 0; i < terminals.length; i++) {
-            const t = terminals[i]
-            const state = projectedState(R, app, ins, t.key)
-            outcomes[i] = t.returns
-                ? terminal(owner, state, 'return', -1, returnedValue(R, app, t.key))
-                : regionFrom(t.block, state, owner)
-        }
-        let result = outcomes[outcomes.length - 1]
-        for (let i = outcomes.length - 2; i >= 0; i--) {
-            result = selectValues(isState(app, terminals[i].key), outcomes[i], result)
-        }
-        return result
+        const state = projectedState(R, app, ins, 'return')
+        return { value: returnedValue(R, app, 'return'), state }
     }
 
     function evalFrom(b: number, ins: Float64Array): EvalResult {
         const R = reified.get(b)
         if (R) {
-            ensureBuilt(R, ins)
             const app = application(R, ins)
             return resumeApplication(R, app, ins)
         }
@@ -1743,13 +1857,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function regionFrom(block: number, ins: Float64Array, R: Reified): f64 {
         if (block === R.header) return application(R, ins)
         if (!R.members.has(block)) {
-            return terminal(R, ins, `B${block}`, block)
+            const next = reified.get(block)
+            if (!next) throw `trace2: region B${R.header} exits to unreified B${block}`
+            return application(next, ins)
         }
         const nested = reified.get(block)
         if (nested) {
-            ensureBuilt(nested, ins)
-            const app = application(nested, ins)
-            return resumeRegionApplication(nested, app, ins, R)
+            return application(nested, ins)
         }
         return continueRegion(runBlock(block, ins, R), R)
     }
@@ -1823,7 +1937,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (ia && !ib) return knownValue(st, ia, t.args[1])
         if (ib && !ia) return knownValue(st, ib, t.args[0])
         // XXX: only valid after equality check
-        if (ia && ib) return knownValue(st, ib, intrinsics.getNanFromId(ia) as any)
+        if (ia && ib) {
+            if (regionalValue(ia) && !regionalValue(ib)) {
+                return knownValue(st, ia, intrinsics.getNanFromId(ib) as any)
+            }
+            return knownValue(st, ib, intrinsics.getNanFromId(ia) as any)
+        }
         return st
     }
 
@@ -1858,10 +1977,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function sameValue(a: any, b: any): boolean {
+        if (a === b) return true
         const ia = tracer.getNanId(a)
-        const ib = tracer.getNanId(b)
-        if (ia || ib) return ia === ib
-        return a === b
+        return ia && ia === tracer.getNanId(b)
     }
 
     const paramIds: number[] = []
@@ -1906,9 +2024,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             console.log('\n--- --------- ---\n')
             console.log(bytecode.disassemble(compiled.code as any, compiled.paramCount, compiled.registerCount))
-            const referencedSymbol = e.message.match(/symbolic property receiver (\d+)/)?.[1]
+            const referencedSymbol = e.message.match(/symbolic property (?:store )?receiver (\d+)/)?.[1]
             if (referencedSymbol) {
                 const id = Number(referencedSymbol)
+                console.log(valToString(intrinsics.getNanFromId(id)))
                 console.log(`\n  symbolic ${id} -->\n`, nodes.get(id) ?? tracer.getTraceById(id) ?? 'param')
             }
             throw e
@@ -1916,6 +2035,38 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     const finalState = doTrace()
+    while (true) {
+        const reachable = new Set<number>()
+        const work: number[] = []
+        for (const R of buildQueue) if (!built.has(R.header)) work.push(R.header)
+        while (work.length) {
+            const b = work.pop()!
+            if (reachable.has(b) || built.has(b)) continue
+            reachable.add(b)
+            for (const next of B.succs[b]) work.push(next)
+        }
+        let pending: Reified | undefined
+        for (const R of buildQueue) {
+            if (built.has(R.header)) continue
+            let ready = true
+            for (const pred of B.preds[R.header]) {
+                if (R.members.has(pred) || B.cycles[R.header].has(pred)) continue
+                if (!enteredBlocks.has(pred) && reachable.has(pred)) { ready = false; break }
+            }
+            if (ready) { pending = R; break }
+        }
+        if (!pending) {
+            for (const R of buildQueue) {
+                if (!built.has(R.header) && R.cyclic) { pending = R; break }
+            }
+        }
+        if (!pending) {
+            const waiting = buildQueue.filter(R => !built.has(R.header))
+            if (waiting.length) throw `trace2: unresolved predecessors for ${waiting.map(R => `B${R.header}`).join(', ')}`
+            break
+        }
+        ensureBuilt(pending)
+    }
     const result = finalState.value
     for (const e of loops) {
         const l = e[1]
@@ -2127,6 +2278,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                         const r = tail(block.body)
                         blocks.push({
                             id, params: block.params.slice(), inputs: block.inputs.slice(), slots: block.slots.slice(),
+                            effectSlot: block.slots[0],
                             bodyId: r[0], bodyConst: r[1], consumesEffectToken: block.consumesEffectToken,
                         })
                     }
@@ -2141,6 +2293,15 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     argConsts[0] = (argConsts.length > 1 && argConsts[1]
                         ? argConsts[1]
                         : heap.indirectTarget(argConsts[0] as u32)) as f64
+                    const base = argConsts[0] as u32
+                    for (const key of dataKeys(base)) {
+                        const slot = slotOf(base, key)
+                        if (heap.isBoxedF64(slot)) {
+                            if (const id = tracer.getNanId(heap.unboxF64(slot))) {
+                                visit(id)
+                            }
+                        }
+                    }
                 }
                 out.set(id, {
                     op: n.op, argIds, argConsts,
@@ -2178,6 +2339,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         for (const id of extraRoots) visit(id)
         blocks.unshift({ id: 0, params: paramIds.slice(), bodyId: er[0], bodyConst: er[1] })
         for (const b of blocks) for (const id of b.params) visit(id)
+        if (intrinsics.argv().includes(`trace-blocks:${traceName}`)) {
+            for (const b of blocks) {
+                console.log('graph block', b.id, {
+                    params: b.params,
+                    inputs: b.inputs,
+                    bodyId: b.bodyId,
+                    body: out.get(b.bodyId),
+                })
+            }
+        }
         const maxId = tracer.getNanCount() + 1
         const name = opts.name ?? (typeof input === 'function' ? input.name : undefined)
         return { maxId, nodes: out, params: paramIds, blocks, name }
@@ -2199,7 +2370,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 if (intrinsics.argv()[0] === 'trace2') {
     function show(fn: Function, verbose = false, listing = false) {
         console.log(`--- ${fn.name} ---`)
-        const r = trace2(fn, { verbose })
+        const r = trace2(fn, {
+            verbose: verbose || intrinsics.argv().includes(`trace-blocks:${fn.name}`),
+        })
         console.log(r.text)
         if (listing) {
             console.log(lowerValueGraph(r.graph, { debug: true }).listing)
@@ -2460,6 +2633,7 @@ if (intrinsics.argv()[0] === 'trace2') {
             const z = ((x * x)+1)*x
             return (x + x) % z
         }
+        intrinsics.tagNoInline(expensive)
         function viewHelper(ptr: usize) {
             if (expensive(ptr) > 99999) return View(0)
             return View(ptr)
@@ -2477,8 +2651,79 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(result.f(ptr) === 38)
         cell[0] = 0
         assert(result.f(ptr) === 99)
+        function viewHelperInline(ptr: usize) {
+            if (expensive(ptr) > 99999) return View(0)
+            return View(ptr)
+        }
+        function f2(ptr: usize) {
+            if (View(ptr).x === 0) return 99
+            const v = viewHelperInline(ptr)
+            v.x = v.x + 1
+            return v.x
+        }
+        const result2: any = native.createNatives({ f2 })
+        const cell2 = new Uint32Array([37])
+        const ptr2 = (ts as any).getArrayBufferPtr(cell2.buffer)
+        assert(result2.f2(ptr2) === 38)
+        cell2[0] = 0
+        assert(result2.f2(ptr2) === 99)
     }
     testStructViewAcrossBranch()
+
+    function testTraceConvergence() {
+        function constantArmLoop(flag: u32): u32 {
+            let value = 2
+            if (flag) value = 5
+            for (let i = 0; i < 3; i++) value = (value + i) % 7
+            return value as u32
+        }
+        const loop = createNative(constantArmLoop).native
+        assert(loop(0) === 5)
+        assert(loop(1) === 1)
+
+        function prunedJoin(flag: u32, value: u32): u32 {
+            const fixed = 2
+            let result = 0
+            if (flag) result = value + 1
+            else if (fixed + 5 !== 9) result = value + 2
+            else if (value > 0) result = 6
+            else result = 7
+            return result * 3 as u32
+        }
+        const join = createNative(prunedJoin).native
+        assert(join(1, 4) === 15)
+        assert(join(0, 4) === 18)
+
+        function writeLoop(ptr: usize, count: u32): void {
+            for (let i = 0; i < count; i++) Intrinsics.store(ptr, 0, i + 1, Types.u32)
+        }
+        intrinsics.tagInline(writeLoop)
+        function readAfterLoop(ptr: usize, count: u32): u32 {
+            writeLoop(ptr, count)
+            return Intrinsics.load(ptr, 0, Types.u32)
+        }
+        const read = createNative(readAfterLoop).native
+        const cell = new Uint32Array([91])
+        const ptr = (ts as any).getArrayBufferPtr(cell.buffer)
+        assert(read(ptr, 0) === 91)
+        assert(read(ptr, 4) === 4)
+
+        function reserve(ptr: usize, count: u32): u32 {
+            const start = Intrinsics.load(ptr, 0, Types.u32)
+            if (count === 0 || start + count > 16) return 0
+            Intrinsics.store(ptr, 0, start + count, Types.u32)
+            return start
+        }
+        const alloc = createNative(reserve).native
+        assert(alloc(ptr, 2) === 4)
+        assert(cell[0] === 6)
+        assert(alloc(ptr, 0) === 0)
+        assert(alloc(ptr, 20) === 0)
+        assert(cell[0] === 6)
+        assert(alloc(ptr, 10) === 6)
+        assert(cell[0] === 16)
+    }
+    testTraceConvergence()
 
     let totalInst = 0
     process.on('beforeExit', () => console.log('TOTAL INST COUNT', totalInst))
@@ -2486,6 +2731,7 @@ if (intrinsics.argv()[0] === 'trace2') {
         console.log(`=== compile ${name} ===`)
         const c = createNative(fn, regBudget)
         console.log(c.trace.text)
+        if (intrinsics.argv().includes(`lower-debug:${name}`)) console.log(c.code.listing)
         const native = c.native
         console.log(`  ${c.code.words.length} instructions`)
         totalInst += c.code.words.length
@@ -3336,7 +3582,9 @@ if (intrinsics.argv()[0] === 'trace2') {
                 inputs.push(args)
             }
             let r: any
-            try { r = trace2(src) } catch (e) { console.log(src); throw e }
+            try {
+                r = trace2(src, { name: fn.name, verbose: intrinsics.argv().includes(`trace-blocks:${fn.name}`) })
+            } catch (e) { console.log(src); throw e }
             for (const budget of [0, 1, 2, 3, 4]) {
                 let l: any
                 try {
