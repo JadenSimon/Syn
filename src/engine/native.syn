@@ -7,8 +7,7 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as syscalls from './syscalls'
 import {
-    Graph, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, isParam, lowerValueGraph, normalizeValueGraph,
-    packageBlocks,
+    Graph, GraphBlock, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, isParam, lowerValueGraph, normalizeValueGraph,
 } from './lowering2'
 
 type usize = u32
@@ -187,6 +186,8 @@ function isLocalStub(f: any): boolean {
 
 const toComputation = Symbol.for('toComputation')
 const addressKey = heap.fromJsString('__address')
+const resultTerminal = 'return'
+const resultProjection = 'return.return'
 
 function inlineComputation(source: string, captures: any[], arity: number): Function {
     const names: string[] = []
@@ -225,9 +226,14 @@ function liftReturnedHeapValues(
     graph: Graph,
 ): { graph: Graph, wrapper?: Function } {
     let nodes = new Map<number, GraphNode>(graph.nodes)
+    const blocks = graph.blocks.map(b => ({ ...b }))
+    const blockOf = new Map<number, GraphBlock>(blocks.map(b => [b.id, b]))
+    const applications = new Map<number, number>()
+    for (const n of nodes.values()) {
+        if (n.op === 'apply') applications.set(n.argIds[0], (applications.get(n.argIds[0]) ?? 0) + 1)
+    }
     let prototype: intrinsics.Handle | undefined
     let lifted = false
-    const roots: number[] = []
 
     function replacement(raw: intrinsics.Handle): [number, number] | undefined {
         const handle = unwrapCell(raw) as intrinsics.Handle
@@ -243,42 +249,85 @@ function liftReturnedHeapValues(
         prototype = proto
         const value = heap.unboxF64(boxed)
         const id = intrinsics.getNanId(value)
-        if (id && (!nodes.has(id) || isParam(nodes, id))) roots.push(id)
         lifted = true
         return id ? [id, 0] : [0, value]
     }
 
-    function visit(id: number, constant: number, rewrite: boolean): [number, number] | undefined {
-        if (!id) return
+    const replacements = new Map<number, [number, number]>()
+    const walked = new Map<number, boolean>()
+    const entered = new Map<number, Set<number>>()
+    function visit(id: number): boolean {
+        if (!id) return false
+        const known = walked.get(id)
+        if (known !== undefined) return known
+        walked.set(id, false)
         const n = nodes.get(id)
-        if (!n || isParam(nodes, id)) return
+        if (!n || isParam(nodes, id)) return false
+        let ok = false
         if (n.op === 'heap-handle' && !n.argIds[0]) {
-            return replacement(n.argConsts[0] as intrinsics.Handle)
+            const next = replacement(n.argConsts[0] as intrinsics.Handle)
+            if (next) { replacements.set(id, next); ok = true }
+        } else if (n.op === 'after') {
+            ok = visit(n.argIds[1])
+        } else if (n.op === 'select') {
+            ok = true
+            for (let i = 1; i < n.argIds.length; i++) if (!visit(n.argIds[i])) { ok = false; break }
+        } else if (n.op === 'proj') {
+            if (n.label === resultProjection) ok = visit(n.argIds[0])
+        } else if (n.op === 'state') {
+            if (n.label === resultTerminal) ok = visit(n.argIds[n.argIds.length - 1])
+        } else if (n.op === 'apply') {
+            const target = blockOf.get(n.argIds[0])
+            if (target) {
+                let users = entered.get(target.id)
+                if (!users) entered.set(target.id, users = new Set())
+                users.add(id)
+                ok = visit(target.bodyId)
+            }
         }
-        const indices = n.op === 'after' ? [1]
-            : n.op === 'select' ? Array.from({ length: n.argIds.length - 1 }, (_, i) => i + 1)
-            : undefined
-        if (!indices) return
-        const argIds = n.argIds.slice()
-        const argConsts = n.argConsts.slice()
-        for (const i of indices) {
-            const next = visit(argIds[i], argConsts[i], rewrite)
-            if (!next) return
-            argIds[i] = next[0]
-            argConsts[i] = next[1]
-        }
-        if (rewrite) nodes.set(id, { ...n, argIds, argConsts })
-        return [id, constant]
+        walked.set(id, ok)
+        return ok
     }
 
-    const entry = graph.blocks[0]
-    const compatible = visit(entry.bodyId, entry.bodyConst, false)
-    if (!compatible || !lifted || prototype === undefined) return { graph }
-    const root = visit(entry.bodyId, entry.bodyConst, true)
-    if (!root || !lifted || prototype === undefined) return { graph }
-    const blocks = graph.blocks.slice()
-    blocks[0] = { ...entry, bodyId: root[0], bodyConst: root[1] }
-    return { graph: { ...graph, nodes, blocks }, wrapper: makeHeapWrapper(prototype) }
+    let nextId = graph.maxId
+    const rewritten = new Map<number, [number, number]>()
+    function replaceAll(id: number): [number, number] {
+        if (!id) return [id, 0]
+        const replacement = replacements.get(id) ?? rewritten.get(id)
+        if (replacement) return replacement
+        const n = nodes.get(id)
+        if (!n || isParam(nodes, id)) return [id, 0]
+        const ids = n.argIds
+        const edits: [idx: number, id: number, value: number][] = []
+        for (let i = n.op === 'apply' ? 1 : 0; i < ids.length; i++) {
+            const next = replaceAll(ids[i])
+            if (next[0] !== ids[i]) edits.push([i, next[0], next[1]])
+        }
+        if (!edits.length) return [id, 0]
+        const argIds = ids.slice()
+        const argConsts = n.argConsts.slice()
+        for (const edit of edits) {
+            argIds[edit[0]] = edit[1]
+            argConsts[edit[0]] = edit[2] as f64
+        }
+        const copy = nextId++
+        nodes.set(copy, { ...n, argIds, argConsts })
+        rewritten.set(id, [copy, 0])
+        return [copy, 0]
+    }
+
+    const entry = blocks[0]
+    if (!visit(entry.bodyId) || !lifted || prototype === undefined) return { graph }
+    for (const [block, callers] of entered) {
+        if ((applications.get(block) ?? 0) !== callers.size) return { graph }
+    }
+    for (const b of blocks) {
+        const next = replaceAll(b.bodyId)
+        if (next[0] === b.bodyId) continue
+        b.bodyId = next[0]
+        b.bodyConst = next[1] as f64
+    }
+    return { graph: { ...graph, maxId: nextId, nodes, blocks }, wrapper: makeHeapWrapper(prototype) }
 }
 
 interface InlineScore {
@@ -625,7 +674,7 @@ export function createNatives(fns: Record<string, Function>) {
             const traceOps = (session.runtime?.tracer.getOpCount() ?? traceOpsBefore) - traceOpsBefore
             console.log('native trace cost', current.name || '<anonymous>', traceOps)
         }
-        const lifted = liftReturnedHeapValues(packageBlocks(traced.graph))
+        const lifted = liftReturnedHeapValues(traced.graph)
         let tracedGraph = lifted.graph
         tracedGraph.name = current.name
         if (traceDebug) console.log(traced.text)
