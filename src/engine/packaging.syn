@@ -1,0 +1,289 @@
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import type { Graph, GraphBlock, GraphNode } from './lowering2'
+
+interface Value {
+    id: number
+    konst: number
+    state?: { label: string, fields: Value[], slots: number[] }
+}
+interface Context {
+    block: GraphBlock
+    values: Map<number, Value>
+    token: Value
+    branches: Map<number, boolean>
+}
+type Continuation = (value: Value, context: Context) => Value
+interface Region {
+    blocks: Map<number, GraphBlock>
+    finish: Continuation
+    slots: number[]
+    branches: Map<number, boolean>
+}
+
+export function packageBlocks2(graph: Graph): Graph {
+    const source = graph.nodes
+    const sourceBlocks = new Map(graph.blocks.map(b => [b.id, b]))
+    const nodes = new Map<number, GraphNode>()
+    const blocks: GraphBlock[] = []
+    const owner = new Map<number, number>()
+    let nextId = graph.maxId
+    const literal = (konst: number): Value => ({ id: 0, konst })
+    function node(op: string, args: Value[], context: Context, from?: GraphNode): Value {
+        const id = nextId++
+        nodes.set(id, {
+            op, argIds: args.map(a => a.id), argConsts: new Float64Array(args.map(a => a.konst)),
+            T: from?.T ?? intrinsics.Types.u64, U: from?.U ?? intrinsics.Types.u64,
+            types: from?.types, label: from?.label,
+        })
+        if (!['local-target', 'syscall-target', 'pool-entry', 'heap-handle', 'nil-effect', 'void'].includes(op)) {
+            owner.set(id, context.block.id)
+        }
+        return { id, konst: 0 }
+    }
+    function parameter(block: GraphBlock): Value {
+        const id = nextId++
+        nodes.set(id, { op: 'param', argIds: [], argConsts: new Float64Array(0),
+            T: intrinsics.Types.u64, U: intrinsics.Types.u64 })
+        owner.set(id, block.id)
+        block.params.push(id)
+        return { id, konst: 0 }
+    }
+    function newBlock(id = nextId++): GraphBlock {
+        const b: GraphBlock = { id, params: [], bodyId: 0, bodyConst: 0, consumesEffectToken: true }
+        nodes.set(id, { op: 'block', argIds: [], argConsts: new Float64Array(0),
+            T: intrinsics.Types.u64, U: intrinsics.Types.u64 })
+        blocks.push(b)
+        return b
+    }
+    function body(b: GraphBlock, value: Value): void {
+        if (value.state) throw 'packaging2: state escaped its continuation'
+        b.bodyId = value.id
+        b.bodyConst = value.konst
+    }
+    function ordered(value: Value, context: Context): Value {
+        if (!context.token.id || context.token.id === value.id) return value
+        return node('after', [context.token, value], context)
+    }
+    function fork(context: Context): Context {
+        return { ...context, values: new Map(context.values), branches: new Map(context.branches) }
+    }
+    function operands(n: GraphNode, context: Context, region: Region,
+        done: (args: Value[], context: Context) => Value, start = 0): Value {
+        const args: Value[] = []
+        function next(i: number, c: Context): Value {
+            if (i === n.argIds.length) return done(args, c)
+            return evaluate(n.argIds[i], n.argConsts[i], c, region, (v, c) => {
+                // A continuation can be entered through several branches.
+                const previous = args.slice()
+                args[i - start] = v
+                const result = next(i + 1, c)
+                args.splice(0, args.length, ...previous)
+                return result
+            })
+        }
+        return next(start, context)
+    }
+    function enter(target: number, args: Value[], context: Context, region: Region): Value {
+        const original = sourceBlocks.get(target)
+        if (!original) throw `packaging2: missing block ${target}`
+        let b = region.blocks.get(target)
+        if (!b) {
+            b = newBlock()
+            region.blocks.set(target, b)
+            const c: Context = { block: b, values: new Map(context.values), token: literal(0), branches: new Map(region.branches) }
+            const rebound = new Set(original.params)
+            const depends = new Map<number, boolean>()
+            function varies(id: number): boolean {
+                if (rebound.has(id)) return true
+                const known = depends.get(id)
+                if (known !== undefined) return known
+                depends.set(id, false)
+                const n = source.get(id)
+                if (!n || n.op === 'param') return false
+                for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
+                    if (varies(n.argIds[i])) { depends.set(id, true); return true }
+                }
+                return false
+            }
+            for (const id of c.values.keys()) if (!rebound.has(id) && varies(id)) c.values.delete(id)
+            for (let i = 0; i < original.params.length; i++) {
+                if (original.consumesEffectToken && i === original.params.length - 1) continue
+                c.values.set(original.params[i], parameter(b))
+            }
+            c.token = parameter(b)
+            if (original.consumesEffectToken) c.values.set(original.params[original.params.length - 1], c.token)
+            body(b, evaluate(original.bodyId, original.bodyConst, c, region, region.finish, true))
+        }
+        const data = original.consumesEffectToken ? args.slice(0, -1) : args.slice()
+        return node('apply', [{ id: b.id, konst: 0 }, ...data, context.token], context)
+    }
+    function evaluate(id: number, konst: number, context: Context, region: Region,
+        done: Continuation, tail = false): Value {
+        if (!id) return done(literal(konst), context)
+        const known = context.values.get(id)
+        if (known) return done(known, context)
+        const n = source.get(id)
+        if (!n) throw `packaging2: unbound source value ${id}`
+        const remember: Continuation = (v, c) => { c.values.set(id, v); return done(v, c) }
+        if (n.op === 'param') throw `packaging2: unbound source parameter ${id} in ${graph.name}`
+        if (n.op === 'select') {
+            const selected = context.branches.get(n.argIds[0])
+            if (selected !== undefined) {
+                const i = selected ? 1 : 2
+                return evaluate(n.argIds[i], n.argConsts[i], context, region, remember, tail)
+            }
+            return evaluate(n.argIds[0], n.argConsts[0], context, region, (condition, c) => {
+                if (!condition.id) {
+                    const i = condition.konst ? 1 : 2
+                    return evaluate(n.argIds[i], n.argConsts[i], c, region, remember, tail)
+                }
+                const arm = (i: number) => {
+                    const branch = fork(c)
+                    branch.branches.set(n.argIds[0], i === 1)
+                    return evaluate(n.argIds[i], n.argConsts[i], branch, region, remember, tail)
+                }
+                return node('select', [condition, arm(1), arm(2)], c, n)
+            })
+        }
+        if (n.op === 'after') {
+            return evaluate(n.argIds[0], n.argConsts[0], context, region, (_, c) =>
+                evaluate(n.argIds[1], n.argConsts[1], c, region, remember, tail))
+        }
+        if (n.op === 'apply') {
+            return operands(n, context, region, (args, c) => {
+                if (tail) return enter(n.argIds[0], args, c, region)
+                const nested: Region = {
+                    blocks: new Map(), slots: sourceBlocks.get(n.argIds[0])?.slots ?? [],
+                    branches: new Map(c.branches),
+                    finish: (v, exit) => remember(v, {
+                        block: exit.block, values: new Map(c.values), token: exit.token, branches: new Map(exit.branches),
+                    }),
+                }
+                return enter(n.argIds[0], args, c, nested)
+            }, 1)
+        }
+        if (n.op === 'state') {
+            return operands(n, context, region, (fields, c) => remember({ id: 0, konst: 0,
+                state: { label: n.label!, fields: fields.slice(), slots: region.slots } }, c))
+        }
+        if (n.op === 'proj' || n.op === 'is-state') {
+            return evaluate(n.argIds[0], n.argConsts[0], context, region, (v, c) => {
+                if (!v.state) throw `packaging2: ${n.op} of a scalar at ${id}`
+                if (n.op === 'is-state') return remember(literal(v.state.label === n.label ? 1 : 0), c)
+                const prefix = v.state.label + '.'
+                if (!n.label?.startsWith(prefix)) return remember(literal(0), c)
+                const suffix = n.label.slice(prefix.length)
+                const at = suffix === 'return' ? v.state.slots.length : v.state.slots.indexOf(n.argConsts[1])
+                if (at < 0 || at >= v.state.fields.length) throw `packaging2: invalid projection ${n.label}`
+                return remember(v.state.fields[at], c)
+            })
+        }
+        return operands(n, context, region, (args, c) => {
+            if (args.some(a => a.state)) throw `packaging2: state operand of ${n.op}`
+            const effectful = n.op === 'call' || n.op === 'store' || n.op === 'load'
+            if (effectful) args[0] = c.token
+            const value = node(n.op, args, c, n)
+            if (effectful) c.token = value
+            if (n.op === 'panic') return ordered(value, c)
+            return remember(value, c)
+        })
+    }
+
+    const entry = newBlock(graph.blocks[0].id)
+    entry.consumesEffectToken = false
+    const context: Context = { block: entry, values: new Map(), token: literal(0), branches: new Map() }
+    for (const id of graph.params) context.values.set(id, parameter(entry))
+    const region: Region = { blocks: new Map(), slots: graph.blocks[0].slots ?? [],
+        branches: new Map(),
+        finish: (value, c) => {
+            if (value.state) throw 'packaging2: entry returned an unprojected state'
+            return ordered(value, c)
+        } }
+    body(entry, evaluate(graph.blocks[0].bodyId, graph.blocks[0].bodyConst, context, region, region.finish, true))
+
+    const free = new Map<number, Set<number>>()
+    const calls = new Map<number, GraphNode[]>()
+    for (const b of blocks) {
+        const needed = new Set<number>()
+        free.set(b.id, needed)
+        const seen = new Set<number>()
+        function walk(id: number): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            if (!owner.has(id)) return
+            if (owner.get(id) !== b.id) { needed.add(id); return }
+            const n = nodes.get(id)!
+            if (n.op === 'apply') {
+                let list = calls.get(b.id)
+                if (!list) calls.set(b.id, list = [])
+                list.push(n)
+            }
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) walk(n.argIds[i])
+        }
+        walk(b.bodyId)
+    }
+    let changed = true
+    while (changed) {
+        changed = false
+        for (const b of blocks) for (const call of calls.get(b.id) ?? []) {
+            for (const id of free.get(call.argIds[0])!) {
+                if (owner.get(id) === b.id || free.get(b.id)!.has(id)) continue
+                free.get(b.id)!.add(id)
+                changed = true
+            }
+        }
+    }
+    if (free.get(entry.id)!.size) throw `packaging2: entry has unavailable captures ${[...free.get(entry.id)!]}`
+    for (const b of blocks) {
+        const replacements = new Map<number, number>()
+        const token = b.consumesEffectToken ? b.params.pop() : undefined
+        for (const id of free.get(b.id)!) replacements.set(id, parameter(b).id)
+        if (token !== undefined) b.params.push(token)
+        for (const call of calls.get(b.id) ?? []) {
+            const at = call.argIds.length - 1
+            const captures = [...free.get(call.argIds[0])!]
+            call.argIds.splice(at, 0, ...captures)
+            const constants = new Float64Array(call.argIds.length)
+            constants.set(call.argConsts.slice(0, at))
+            constants[constants.length - 1] = call.argConsts[at]
+            call.argConsts = constants
+        }
+        const seen = new Set<number>()
+        function rewrite(id: number): number {
+            const replacement = replacements.get(id)
+            if (replacement !== undefined) return replacement
+            if (!id || seen.has(id)) return id
+            seen.add(id)
+            if (!owner.has(id)) return id
+            const n = nodes.get(id)!
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) n.argIds[i] = rewrite(n.argIds[i])
+            return id
+        }
+        b.bodyId = rewrite(b.bodyId)
+    }
+    const blockOf = new Map(blocks.map(b => [b.id, b]))
+    for (const b of blocks) {
+        const seen = new Set<number>()
+        function validate(id: number, tail: boolean): void {
+            if (!id) return
+            const n = nodes.get(id)!
+            if (n.op === 'apply') {
+                if (!tail) throw 'packaging2: application outside tail position'
+                if (n.argIds.length !== blockOf.get(n.argIds[0])!.params.length + 1) {
+                    throw 'packaging2: application arity mismatch'
+                }
+            }
+            if (owner.has(id) && owner.get(id) !== b.id) throw 'packaging2: implicit capture'
+            if (n.op === 'state' || n.op === 'proj' || n.op === 'is-state') throw 'packaging2: unlowered state'
+            if (seen.has(id)) return
+            seen.add(id)
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) {
+                validate(n.argIds[i], tail && (n.op === 'select' && i > 0 || n.op === 'after' && i === 1))
+            }
+        }
+        validate(b.bodyId, true)
+    }
+    return { ...graph, maxId: nextId, nodes, blocks, params: entry.params.slice() }
+}
