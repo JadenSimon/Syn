@@ -379,10 +379,14 @@ export function pureValues(g: Graph): Set<number> {
 export function pruneBlockParams(g: Graph): Graph {
     const applied = new Map<number, GraphNode[]>()
     const escaped = new Set<number>()
+    const sequenced = new Set<number>()
     for (const n of g.nodes.values()) {
         for (let i = 0; i < n.argIds.length; i++) {
             if (n.op === 'apply' && i === 0) continue
             if (n.argIds[i]) escaped.add(n.argIds[i])
+        }
+        if (n.op === 'after' || n.op === 'call' || n.op === 'store' || n.op === 'load') {
+            sequenced.add(n.argIds[0])
         }
         if (n.op !== 'apply') continue
         const list = applied.get(n.argIds[0]) ?? []
@@ -390,13 +394,43 @@ export function pruneBlockParams(g: Graph): Graph {
         applied.set(n.argIds[0], list)
     }
 
-    const inert = pureValues(g)
     const params = new Set<number>()
     const blockById = new Map<number, GraphBlock>()
     const flows = new Map<number, number[]>()
     for (const b of g.blocks) {
         blockById.set(b.id, b)
         for (const param of b.params) params.add(param)
+    }
+    for (const [blockId, calls] of applied) {
+        const block = blockById.get(blockId)
+        if (!block?.consumesEffectToken) continue
+        for (const call of calls) sequenced.add(call.argIds[call.argIds.length - 1])
+    }
+
+    const inert = new Set<number>([0])
+    {
+        const checked = new Set<number>([0])
+        function walk(id: number): boolean {
+            if (checked.has(id)) return inert.has(id)
+            checked.add(id)
+            inert.add(id)
+            const n = g.nodes.get(id)
+            let ok = true
+            if (n) {
+                ok = PureOps.has(n.op) || (n.op === 'load' && !sequenced.has(id))
+                if (ok) for (const a of n.argIds) if (!walk(a)) { ok = false; break }
+            }
+            if (!ok) inert.delete(id)
+            return ok
+        }
+        for (const [id, n] of g.nodes) {
+            walk(id)
+            for (const a of n.argIds) walk(a)
+        }
+        for (const b of g.blocks) {
+            for (const p of b.params) walk(p)
+            walk(b.bodyId)
+        }
     }
     for (const [blockId, calls] of applied) {
         const block = blockById.get(blockId)
@@ -1251,6 +1285,221 @@ function optimizeValueGraph(g: Graph) {
         return true
     }
 
+    function strengthReduceAddresses(target: GraphBlock) {
+        const inbound = findInboundApplies(target)
+        const self = inbound.filter(x => x[0] === target.id)
+        const entries = inbound.filter(x => x[0] !== target.id)
+        if (self.length !== 1 || !entries.length) return
+        const back = g.nodes.get(self[0][1])!
+        const params = target.params
+        const invariants = new Set<number>()
+        for (let i = 0; i < params.length; i++) {
+            if (back.argIds[i + 1] === params[i]) invariants.add(params[i])
+        }
+
+        for (let ivAt = 0; ivAt < params.length; ivAt++) {
+            const iv = params[ivAt]
+            if (invariants.has(iv)) continue
+            const stepId = back.argIds[ivAt + 1]
+            const step = g.nodes.get(stepId)
+            if (!step || step.op !== 'add') continue
+            const strideAt = step.argIds[0] === iv ? 1 : step.argIds[1] === iv ? 0 : -1
+            if (strideAt < 0 || step.argIds[strideAt]) continue
+            const stride = step.argConsts[strideAt]
+            if (!Number.isSafeInteger(stride) || stride <= 0) continue
+
+            const uses = dependents.get(iv)
+            if (!uses || uses.size !== 2) continue
+            let scaledId = 0
+            for (const u of uses) if (u !== stepId) scaledId = u
+            const scaled = g.nodes.get(scaledId)
+            if (!scaled) continue
+            let scale = 0
+            if (scaled.op === 'mul') {
+                const constAt = scaled.argIds[0] === iv ? 1 : 0
+                if (scaled.argIds[constAt]) continue
+                scale = scaled.argConsts[constAt]
+            } else if (scaled.op === 'shl' && scaled.argIds[0] === iv && !scaled.argIds[1]) {
+                scale = 2 ** scaled.argConsts[1]
+            } else continue
+            if (!Number.isSafeInteger(scale * stride) || scale <= 0) continue
+
+            const scaledUses = dependents.get(scaledId)
+            if (!scaledUses || scaledUses.size !== 1) continue
+            let addressId = 0
+            for (const u of scaledUses) addressId = u
+            const address = g.nodes.get(addressId)
+            if (!address || address.op !== 'add') continue
+            const baseAt = address.argIds[0] === scaledId ? 1 : 0
+            const baseId = address.argIds[baseAt]
+            const baseParamAt = baseId ? params.indexOf(baseId) : -1
+            if (baseId && (baseParamAt < 0 || !invariants.has(baseId))) continue
+
+            for (const [blockId, appId] of entries) {
+                const app = g.nodes.get(appId)!
+                const initId = app.argIds[ivAt + 1]
+                let offsetId = 0
+                let offsetConst = 0
+                if (initId) {
+                    offsetId = addNode('mul', [initId, 0], new Float64Array([0, scale]), scaled)
+                } else {
+                    offsetConst = app.argConsts[ivAt + 1] * scale
+                }
+                const fromId = baseId ? app.argIds[baseParamAt + 1] : 0
+                const fromConst = baseId ? app.argConsts[baseParamAt + 1] : address.argConsts[baseAt]
+                let startId = fromId
+                let startConst = fromConst
+                if (offsetId || offsetConst) {
+                    if (!fromId && !offsetId) {
+                        startConst = fromConst + offsetConst
+                    } else {
+                        startId = addNode('add', [fromId, offsetId],
+                            new Float64Array([fromConst, offsetConst]), address)
+                        startConst = 0
+                    }
+                }
+                const argIds = app.argIds.slice()
+                const argConsts = app.argConsts.slice()
+                argIds[ivAt + 1] = startId
+                argConsts[ivAt + 1] = startConst as f64
+                const caller = getGraphBlock(blockId)
+                caller.bodyId = replaceAll(caller.bodyId,
+                    new Map([[appId, addNode('apply', argIds, argConsts, app)]]))
+                revisitBlock(caller)
+            }
+
+            const advance = addNode('add', [iv, 0], new Float64Array([0, stride * scale]), address)
+            target.bodyId = replaceAll(target.bodyId,
+                new Map([[addressId, iv], [stepId, advance]]))
+            revisitBlock(target)
+            return true
+        }
+    }
+
+    function rotateLoop(target: GraphBlock) {
+        const tail = g.nodes.get(target.bodyId)
+        if (!tail || tail.op !== 'select') return
+        const back = g.nodes.get(tail.argIds[1])
+        if (!back || back.op !== 'apply' || back.argIds[0] !== target.id) return
+
+        const tokenAt = target.consumesEffectToken ? back.argIds.length - 1 : -1
+        const backToken = tokenAt > 0 ? back.argIds[tokenAt] : 0
+        if (tokenAt > 0 && !backToken) return
+
+        function gather(id: number, out: Set<number>): Set<number> {
+            if (!id || out.has(id)) return out
+            const n = g.nodes.get(id)
+            if (!n || n.op === 'block') return out
+            out.add(id)
+            for (let i = n.op === 'apply' ? 1 : 0; i < n.argIds.length; i++) gather(n.argIds[i], out)
+            return out
+        }
+        const inCond = gather(tail.argIds[0], new Set())
+        const inBack = new Set<number>()
+        for (let i = 1; i < back.argIds.length; i++) gather(back.argIds[i], inBack)
+        const inExit = gather(tail.argIds[2], new Set())
+
+        let shared = false
+        for (let i = 1; i < back.argIds.length; i++) {
+            const arg = back.argIds[i]
+            if (arg && g.nodes.has(arg) && !isParam(g.nodes, arg) && inCond.has(arg)) { shared = true; break }
+        }
+        if (!shared) return
+
+        const unconditional = new Set(inCond)
+        for (const id of inBack) if (inExit.has(id)) unconditional.add(id)
+        function speculatable(id: number): boolean {
+            if (!id || unconditional.has(id)) return true
+            const n = g.nodes.get(id)
+            if (!n || isParam(g.nodes, id)) return true
+            if (n.op !== 'after' && !PureOps.has(n.op)) return false
+            for (const arg of n.argIds) if (!speculatable(arg)) return false
+            return true
+        }
+        for (let i = 1; i < back.argIds.length; i++) {
+            if (!speculatable(back.argIds[i])) return
+        }
+
+        const params: number[] = []
+        const args: number[] = []
+        const lowered = new Map<number, [id: number, konst: number]>()
+        let token = 0
+        if (tokenAt > 0) {
+            token = addParam()
+            lowered.set(backToken, [token, 0])
+        }
+        function drag(id: number, konst: number): [id: number, konst: number] {
+            if (!id) return [0, konst]
+            const known = lowered.get(id)
+            if (known) return known
+            const p = addParam()
+            const out: [id: number, konst: number] = [p, 0]
+            lowered.set(id, out)
+            params.push(p)
+            args.push(id)
+            return out
+        }
+        function lower(id: number, konst: number): [id: number, konst: number] | undefined {
+            if (!id) return [0, konst]
+            const known = lowered.get(id)
+            if (known) return known
+            const n = g.nodes.get(id)
+            if (!n || isParam(g.nodes, id) || inBack.has(id)) return drag(id, konst)
+            if (n.op !== 'after' && !PureOps.has(n.op)) return
+            const ids = n.argIds.slice()
+            const consts = n.argConsts.slice()
+            for (let i = 0; i < ids.length; i++) {
+                const arg = lower(ids[i], consts[i])
+                if (!arg) return
+                ids[i] = arg[0]
+                consts[i] = arg[1] as f64
+            }
+            const out: [id: number, konst: number] = [addNode(n.op, ids, consts, n), 0]
+            lowered.set(id, out)
+            return out
+        }
+
+        const backIds = [target.id]
+        const backConsts = [0]
+        for (let i = 1; i < back.argIds.length; i++) {
+            if (i === tokenAt) { backIds.push(token); backConsts.push(0); continue }
+            const [id, konst] = drag(back.argIds[i], back.argConsts[i])
+            backIds.push(id)
+            backConsts.push(konst)
+        }
+
+        const cond = lower(tail.argIds[0], tail.argConsts[0])
+        if (!cond) return
+
+        let exit: [id: number, konst: number] | undefined
+        const exitNode = g.nodes.get(tail.argIds[2])
+        if (exitNode?.op === 'apply') {
+            const ids = [exitNode.argIds[0]]
+            const consts = [0]
+            for (let i = 1; i < exitNode.argIds.length; i++) {
+                const arg = lower(exitNode.argIds[i], exitNode.argConsts[i])
+                if (!arg) return
+                ids.push(arg[0])
+                consts.push(arg[1])
+            }
+            exit = [addNode('apply', ids, Float64Array.from(consts), exitNode), 0]
+        } else {
+            exit = lower(tail.argIds[2], tail.argConsts[2])
+        }
+        if (!exit) return
+
+        const backApply = addNode('apply', backIds, Float64Array.from(backConsts), back)
+        const body = addNode('select', [cond[0], backApply, exit[0]],
+            Float64Array.from([cond[1], 0, exit[1]]), tail)
+        if (token) params.push(token)
+        const blockId = addBlock(params, body, target.consumesEffectToken)
+        const entryIds = [blockId, ...args]
+        if (token) entryIds.push(backToken)
+        target.bodyId = addNode('apply', entryIds, new Float64Array(entryIds.length), back)
+        revisitBlock(target)
+        return true
+    }
+
     function reachableBlocks() {
         const live = new Set<number>()
         const seen = new Set<number>()
@@ -1269,6 +1518,41 @@ function optimizeValueGraph(g: Graph) {
         }
         reach(g.blocks[0].id)
         return g.blocks.filter(b => live.has(b.id))
+    }
+
+    function eliminatePassthru(b: GraphBlock) {
+        if (b.params.length > 1) return false
+        const isVoid = b.params.length === 0 && g.nodes.get(b.bodyId)?.op === 'void'
+        if (!isVoid && !b.params.includes(b.bodyId)) return false
+
+        const applies = findInboundApplies(b)
+        const byBlock = new Map<number, number[]>()
+        for (const x of applies) {
+            let arr = byBlock.get(x[0])
+            if (!arr) byBlock.set(x[0], arr = [])
+            arr.push(x[1])
+        }
+        for (const [k, v] of byBlock) {
+            const r = new Map<number, number>()
+            for (const x of v) {
+                const a = g.nodes.get(x)!
+                if (isVoid) {
+                    r.set(x, b.bodyId)
+                    continue
+                }
+                const arg = a.argIds[1]
+                if (arg) {
+                    r.set(x, arg)
+                    continue
+                }
+                const c = a.argConsts[1]
+                r.set(x, addNode('literal', [0], new Float64Array([c])))
+            }
+            const t = blocks.get(k)!
+            t.bodyId = replaceAll(t.bodyId, r)
+            revisitBlock(t)
+        }
+        return true
     }
 
     function canonicalizeBlocks() {
@@ -1374,8 +1658,31 @@ function optimizeValueGraph(g: Graph) {
         if (hoistInvariants(g.blocks[i])) {
             revisitBlock(g.blocks[i])
         }
+        strengthReduceAddresses(g.blocks[i])
     }
-    return { ...g, maxId: nextId, blocks: reachableBlocks() }
+    for (let i = 0; i < g.blocks.length; i++) {
+        rotateLoop(g.blocks[i])
+        eliminatePassthru(g.blocks[i])
+    }
+    const result = reachableBlocks()
+    for (const b of result) {
+        if (const literals = findValues(b.id, 'literal')) {
+            for (const id of literals) {
+                const uses = dependents.get(id) ?? []
+                for (const x of uses) {
+                    const n = g.nodes.get(x)!
+                    let slot = n.argIds.indexOf(id)
+                    assert(slot !== -1)
+                    do {
+                        n.argIds[slot] = 0
+                        n.argConsts[slot] = g.nodes.get(id)!.argConsts[0]
+                        slot = n.argIds.indexOf(id)
+                    } while (slot !== -1)
+                }
+            }
+        }
+    }
+    return { ...g, maxId: nextId, blocks: result }
 }
 
 export function simplifyBitOperations(g: Graph): Graph | undefined {
@@ -1872,7 +2179,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         for (let i = 1; i < back.argIds.length; i++) {
             const arg = back.argIds[i]
             if (arg && g.nodes.has(arg) && !isParam(g.nodes, arg) && underCondition.has(arg)) {
-                rotatedSelects.add(b.bodyId)
+                //rotatedSelects.add(b.bodyId)
                 break
             }
         }
@@ -2637,11 +2944,13 @@ export function normalizeValueGraph(g: Graph): Graph {
             `${elapsed.toFixed(3)}ms`, `${beforeNodes}->${g.nodes.size}`)
     }
     run(intrinsics.argv().includes('package2') ? packageBlocks2 : packageBlocks)
+    run(pruneBlockParams)
+    run(reduceEffectDependencies)
     run(specializeBlockApplications)
     run(strengthReduceLoops)
-    run(reduceEffectDependencies)
     run(pruneBlockParams)
     run(optimizeValueGraph)
+    run(pruneBlockParams)
     run(simplifyBitOperations)
 
         // if (n.op === 'heap-handle') {
