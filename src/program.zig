@@ -14319,6 +14319,9 @@ pub const Analyzer = struct {
                     }
                     return false;
                 }
+                if (comptime suppress_gaps) {
+                    return false;
+                }
                 this.printTypeInfo(subject);
                 debugPrint("{any}\n", .{n.getKind()});
                 return error.TODO4;
@@ -23500,6 +23503,7 @@ pub const Analyzer = struct {
                                 }
                             },
                             else => {
+                                if (comptime suppress_gaps) return @intFromEnum(Kind.error_any);
                                 debugPrint("unhandled spread type\n", .{});
                                 this._debug(t);
                                 return notSupported(n.getKind()); // TODO
@@ -24595,7 +24599,7 @@ pub const Analyzer = struct {
                     });
                 },
                 else => {
-                    debugPrint("TODO {any}\n", .{n.kind});
+                    debugPrint("TODO copyNodeFromRef {any}\n", .{n.kind});
                     return error.TODO;
                 },
             };
