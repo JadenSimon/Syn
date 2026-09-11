@@ -1,0 +1,223 @@
+"use wrapped";
+
+import * as heap from './heap'
+import * as intrinsics from './intrinsics'
+
+const assert = intrinsics.assert
+const Types = intrinsics.Types
+type Handle = intrinsics.Handle
+
+interface ValueNode {
+    op: string
+    argIds: number[]
+    argConsts?: Float64Array
+    label: string
+}
+
+interface Shape {
+    type: Handle
+    keys: Handle[]
+    fields: Handle[]
+    flags: number[]
+    fixed: Handle[]
+    second: Handle[]
+    targets: Map<number, Handle>
+}
+
+export type HeapState = Map<Handle, number>
+type CellMarks = Map<Handle, Handle>
+type CellChanges = Map<Handle, Handle>
+export type HeapRecords = ReturnType<typeof createHeapRecords>
+
+export function createHeapRecords(
+    tracer: any,
+    mk: (op: string, args: Float64Array, label?: string, types?: intrinsics.Types[]) => any,
+    nodes: Map<number, ValueNode>,
+) {
+    const identities = new Map<Handle, Handle>()
+    const managed = new Set<Handle>()
+    const shapes = new Map<Handle, Shape>()
+    const children = new Map<Handle, Handle[]>()
+    const records = new Map<Handle, number>()
+
+    function intern(handle: Handle): Handle {
+        if (handle <= 1 || tracer.getNanId(handle)) return handle
+        if (heap.isIndirect(handle)) {
+            managed.add(handle)
+            return handle
+        }
+        if (!heap.isOrdinaryObject(handle)) return handle
+        const previous = identities.get(handle)
+        if (previous !== undefined) return previous
+        const cell = heap.makeIndirect(handle)
+        identities.set(handle, cell)
+        managed.add(cell)
+        const refs: Handle[] = []
+        children.set(cell, refs)
+        for (const key of keysOf(handle)) {
+            const d = descriptor(handle, key)
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+            const value = d.slot0 as Handle
+            if (!value || heap.isBoxedF64(value)) continue
+            const child = intern(value)
+            if (child !== value) d.slot0 = child
+            if (heap.isIndirect(child)) refs.push(child)
+        }
+        return cell
+    }
+
+    function keysOf(target: Handle): Handle[] {
+        const keys: Handle[] = []
+        for (let i: u32 = 0; i < heap.ownPropertyCount(target); i++) keys.push(heap.ownPropertyKeyAt(target, i))
+        return keys
+    }
+
+    function descriptor(target: Handle, key: Handle) {
+        return heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, key)))
+    }
+
+    function shapeOf(cell: Handle, target: Handle): Shape {
+        const known = shapes.get(cell)
+        if (known) {
+            assert(heap.typeDescriptorOf(target) === known.type, 'heap record: prototype or type changed')
+            const keys = keysOf(target)
+            assert(keys.length === known.keys.length && keys.every((k, i) => k === known.keys[i]), 'heap record: property shape changed')
+            for (let i = 0; i < keys.length; i++) {
+                const d = descriptor(target, keys[i])
+                assert(d.flags === known.flags[i], 'heap record: property descriptor changed')
+                if (known.fields.includes(keys[i])) {
+                    assert(heap.isBoxedF64(d.slot0), 'heap record: scalar field changed representation')
+                } else {
+                    assert(d.slot0 === known.fixed[i] && d.slot1 === known.second[i], 'heap record: structural field changed')
+                }
+            }
+            return known
+        }
+        const keys = keysOf(target)
+        const fields: Handle[] = []
+        const flags: number[] = []
+        const fixed: Handle[] = []
+        const second: Handle[] = []
+        for (const key of keys) {
+            const d = descriptor(target, key)
+            flags.push(d.flags)
+            fixed.push(d.slot0 as Handle)
+            second.push(d.slot1 as Handle)
+            if (!(d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) && heap.isBoxedF64(d.slot0)) fields.push(key)
+        }
+        const shape = { type: heap.typeDescriptorOf(target), keys, fields, flags, fixed, second, targets: new Map<number, Handle>() }
+        shapes.set(cell, shape)
+        return shape
+    }
+
+    function record(cell: Handle, target: Handle): number {
+        const previous = records.get(target)
+        if (previous !== undefined) return previous
+        const shape = shapeOf(cell, target)
+        const values = new Float64Array(shape.fields.length * 2)
+        for (let i = 0; i < shape.fields.length; i++) {
+            values[i * 2] = shape.fields[i]
+            values[i * 2 + 1] = heap.unboxF64(descriptor(target, shape.fields[i]).slot0)
+        }
+        const value = mk('record', values)
+        records.set(target, value)
+        shape.targets.set(tracer.getNanId(value), target)
+        return value
+    }
+
+    function get(value: number, key: Handle): number {
+        const n = nodes.get(tracer.getNanId(value))!
+        if (n.op === 'record') {
+            for (let i = 0; i < n.argIds.length; i += 2) {
+                if (n.argConsts![i] !== key) continue
+                return n.argIds[i + 1] ? intrinsics.getNanFromId(n.argIds[i + 1]) : n.argConsts![i + 1]
+            }
+            throw 'heap record: missing field'
+        }
+        const args = new Float64Array(2)
+        args[0] = value
+        args[1] = key as number
+        return mk('get', args, '', [Types.u64])
+    }
+
+    function install(cell: Handle, value: number): void {
+        const shape = shapes.get(cell)!
+        const id = tracer.getNanId(value)
+        const known = shape.targets.get(id)
+        if (known !== undefined) {
+            heap.setIndirectTarget(cell, known)
+            heap.markIndirect(cell)
+            return
+        }
+        const target = heap.prepareWrite(cell)
+        for (const key of shape.fields) descriptor(target, key).slot0 = heap.boxF64(get(value, key))
+        records.set(target, value)
+        shape.targets.set(id, target)
+        heap.markIndirect(cell)
+    }
+
+    function mark(): CellMarks {
+        const state: CellMarks = new Map()
+        for (const cell of managed) {
+            state.set(cell, heap.indirectTarget(cell))
+            heap.markIndirect(cell)
+        }
+        return state
+    }
+
+    function take(before: CellMarks): CellChanges {
+        const changes: CellChanges = new Map()
+        for (const [cell, target] of before) {
+            heap.setIndirectStash(cell, target)
+            const clone = heap.restoreIndirect(cell)
+            if (clone !== target) changes.set(cell, clone)
+            heap.markIndirect(cell)
+        }
+        return changes
+    }
+
+    function capture(roots: Handle[]): HeapState {
+        const state: HeapState = new Map()
+        function visit(handle: Handle): void {
+            const cell = intern(handle)
+            if (!managed.has(cell) || state.has(cell)) return
+            heap.markIndirect(cell)
+            state.set(cell, record(cell, heap.indirectTarget(cell)))
+            for (const child of children.get(cell) ?? []) visit(child)
+        }
+        for (const root of roots) visit(root)
+        return state
+    }
+
+    function parameter(cell: Handle, label: string): number {
+        const id = tracer.getNanId(tracer.createUniqueNan())
+        const keys = shapes.get(cell)!.fields
+        nodes.set(id, {
+            op: 'param', argIds: new Array(keys.length + 1).fill(0),
+            argConsts: new Float64Array([keys.length, ...keys]), label,
+        })
+        return id
+    }
+
+    function merge(cond: number, before: CellMarks, a: CellChanges, b: CellChanges): void {
+        for (const cell of new Set([...a.keys(), ...b.keys()])) {
+            const at = a.get(cell) ?? before.get(cell)!
+            const bt = b.get(cell) ?? before.get(cell)!
+            if (at === bt) {
+                heap.setIndirectTarget(cell, at)
+                heap.markIndirect(cell)
+                continue
+            }
+            const av = record(cell, at), bv = record(cell, bt)
+            if (tracer.getNanId(av) === tracer.getNanId(bv)) { install(cell, av); continue }
+            const args = new Float64Array(3)
+            args[0] = cond
+            args[1] = av
+            args[2] = bv
+            const value = mk('select', args)
+            install(cell, value)
+        }
+    }
+
+    return { intern, capture, mark, take, parameter, install, merge }
+}

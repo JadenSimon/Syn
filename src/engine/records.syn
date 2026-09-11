@@ -1,0 +1,129 @@
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import type { Graph, GraphNode } from './lowering2'
+
+const assert = intrinsics.assert
+interface Value { id: number, constant: number }
+
+export function flattenRecords(g: Graph): Graph {
+    const nodes = new Map<number, GraphNode>()
+    const parts = new Map<number, number[]>()
+    let nextId = g.maxId
+
+    let seenRecord = false
+    for (const b of g.blocks) {
+        for (const id of b.params) {
+            const n = g.nodes.get(id)!
+            if (!n.argIds.length) continue
+            seenRecord = true
+            const keys = Array.from(n.argConsts.slice(1))
+            const fields: number[] = []
+            for (const key of keys) {
+                const field = nextId++
+                fields.push(field)
+                nodes.set(field, {
+                    op: 'param', argIds: [], argConsts: new Float64Array(0),
+                    label: `${n.label ?? 'record'}.${key}`, T: n.T, U: n.U,
+                })
+            }
+            parts.set(id, fields)
+        }
+    }
+    if (!seenRecord) return g
+
+    function operand(n: GraphNode, i: number): Value {
+        return { id: n.argIds[i], constant: n.argConsts[i] }
+    }
+
+    function make(n: GraphNode, args: Value[]): Value {
+        const id = nextId++
+        nodes.set(id, {
+            ...n,
+            argIds: args.map(a => a.id),
+            argConsts: new Float64Array(args.map(a => a.constant)),
+        })
+        return { id, constant: 0 }
+    }
+
+    const projections = new Map<string, Value>()
+    function project(record: number, key: number): Value {
+        const cacheKey = `${record}:${key}`
+        const hit = projections.get(cacheKey)
+        if (hit) return hit
+        const n = g.nodes.get(record)!
+        let result: Value
+        if (n.op === 'record') {
+            let index = -1
+            for (let i = 0; i < n.argIds.length; i += 2) {
+                if (n.argConsts[i] === key) { index = i + 1; break }
+            }
+            assert(index !== -1, 'record: projection does not match shape')
+            result = visit(operand(n, index))
+        } else if (n.op === 'param') {
+            const index = n.argConsts.indexOf(key, 1) - 1
+            assert(index >= 0, 'record: projection does not match parameter shape')
+            const fields = parts.get(record)
+            assert(fields, 'record: parameter has no owning block')
+            result = { id: fields[index], constant: 0 }
+        } else if (n.op === 'select') {
+            result = make(n, [visit(operand(n, 0)), project(n.argIds[1], key), project(n.argIds[2], key)])
+        } else if (n.op === 'after') {
+            result = make(n, [visit(operand(n, 0)), project(n.argIds[1], key)])
+        } else {
+            throw `record: cannot project '${n.op}'`
+        }
+        projections.set(cacheKey, result)
+        return result
+    }
+
+    const blocksById = new Map(g.blocks.map(b => [b.id, b]))
+    const rewritten = new Map<number, Value>()
+    function visit(value: Value): Value {
+        if (!value.id) return value
+        const hit = rewritten.get(value.id)
+        if (hit) return hit
+        const n = g.nodes.get(value.id)
+        assert(n, `record: missing value ${value.id}`)
+        if (n.op === 'get') {
+            assert(!n.argIds[1], 'record: dynamic projection key')
+            const result = project(n.argIds[0], n.argConsts[1])
+            rewritten.set(value.id, result)
+            return result
+        }
+        assert(n.op !== 'record' && !(n.op === 'param' && n.argIds.length), `record: aggregate escapes through '${n.op}'`)
+        const args: Value[] = []
+        if (n.op === 'apply') {
+            args.push(visit(operand(n, 0)))
+            const target = blocksById.get(n.argIds[0])!
+            assert(target.params.length + 1 === n.argIds.length, 'record: application arity mismatch')
+            for (let i = 0; i < target.params.length; i++) {
+                const param = g.nodes.get(target.params[i])!
+                if (!param.argIds.length) { args.push(visit(operand(n, i + 1))); continue }
+                const keys = param.argConsts.slice(1)
+                for (const key of keys) args.push(project(n.argIds[i + 1], key))
+            }
+        } else {
+            for (let i = 0; i < n.argIds.length; i++) args.push(visit(operand(n, i)))
+        }
+        nodes.set(value.id, { ...n, argIds: args.map(a => a.id), argConsts: new Float64Array(args.map(a => a.constant)) })
+        rewritten.set(value.id, value)
+        return value
+    }
+
+    const blocks = g.blocks.map(b => {
+        const body = visit({ id: b.bodyId, constant: b.bodyConst })
+        const params: number[] = []
+        const inputs: number[] = []
+        for (let i = 0; i < b.params.length; i++) {
+            const fields = parts.get(b.params[i])
+            for (const id of fields ?? [b.params[i]]) {
+                params.push(id)
+                if (b.inputs) inputs.push(b.inputs[i])
+                if (!fields) visit({ id, constant: 0 })
+            }
+        }
+        return { ...b, params, inputs: b.inputs ? inputs : undefined, bodyId: body.id, bodyConst: body.constant }
+    })
+    return { ...g, nodes, blocks, maxId: nextId, params: blocks[0].params.slice() }
+}
