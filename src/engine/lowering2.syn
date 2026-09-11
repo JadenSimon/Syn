@@ -141,7 +141,7 @@ export function reduceEffectDependencies(g: Graph): Graph {
         let out = false
         if (n) {
             if (n.op === 'panic' || n.op === 'unreachable') out = true
-            else if (n.op === 'after') out = diverges(n.argIds[0]) || diverges(n.argIds[1])
+            else if (n.op === 'after') out = n.argIds.some(diverges)
             else if (n.op === 'select') out = diverges(n.argIds[1]) && diverges(n.argIds[2])
             else if (n.op === 'apply') {
                 for (let i = 1; !out && i < n.argIds.length; i++) out = diverges(n.argIds[i])
@@ -233,9 +233,9 @@ export function reduceEffectDependencies(g: Graph): Graph {
                     if (isUsed) send(arm, dataCtx, mark, true)
                 }
             } else if (n.op === 'after') {
-                send(n.argIds[0], evalCtx, 0, false)
-                send(n.argIds[1], evalCtx, 0, false)
-                if (isUsed) send(n.argIds[1], dataCtx, 0, true)
+                const last = n.argIds.length - 1
+                for (let i = 0; i <= last; i++) send(n.argIds[i], evalCtx, 0, false)
+                if (isUsed) send(n.argIds[last], dataCtx, 0, true)
             } else if (n.op === 'call' || n.op === 'store' || n.op === 'load') {
                 send(n.argIds[0], evalCtx, 0, false)
                 for (let i = 1; i < n.argIds.length; i++) {
@@ -281,6 +281,25 @@ export function reduceEffectDependencies(g: Graph): Graph {
         })
         return id
     }
+    let empty = 0
+    function parallel(order: number[], tail: number, source: GraphNode): number {
+        const parts = [...new Set(order)].filter(x => x && x !== tail && nodes.get(x)?.op !== 'nil-effect')
+        if (!parts.length) return tail
+        if (!tail && parts.length === 1) return parts[0]
+        if (!tail) {
+            if (!empty) for (const [id, n] of nodes) if (n.op === 'void') { empty = id; break }
+            if (!empty) {
+                empty = nextId++
+                nodes.set(empty, { op: 'void', argIds: [], argConsts: new Float64Array(0), T: Types.u64, U: Types.u64 })
+            }
+            tail = empty
+        }
+        const id = nextId++
+        nodes.set(id, {
+            ...source, op: 'after', argIds: [...parts, tail], argConsts: new Float64Array(parts.length + 1),
+        })
+        return id
+    }
     // `ordered` reductions are for writers
     function effects(id: number, ordered: boolean, forceParam = false): number {
         if (!id) return 0
@@ -294,14 +313,13 @@ export function reduceEffectDependencies(g: Graph): Graph {
         if (!n) out = tokenParams.has(id) || forceParam ? id : 0
         else if (n.op === 'nil-effect') out = 0
         else if (n.op === 'after') {
-            const a = effects(n.argIds[0], ordered, true)
-            const b = effects(n.argIds[1], ordered)
-            out = a === n.argIds[0] && b === n.argIds[1] ? id : sequence(a, b, n)
+            const last = n.argIds.length - 1
+            const parts = n.argIds.map((arg, i) => effects(arg, ordered, i < last))
+            out = parts.every((p, i) => p === n.argIds[i]) ? id : parallel(parts.slice(0, last), parts[last], n)
         } else if (n.op === 'load' && ordered && demanded.has(id)) {
             out = id
         } else if (n.op === 'load' || n.op === 'is-state' || PureOps.has(n.op)) {
-            out = 0
-            for (const arg of n.argIds) out = sequence(out, effects(arg, ordered), n)
+            out = parallel(n.argIds.map(arg => effects(arg, ordered)), 0, n)
         }
         active.delete(id)
         memo.set(id, out)
@@ -309,6 +327,7 @@ export function reduceEffectDependencies(g: Graph): Graph {
     }
 
     function isOperand(n: GraphNode, id: number): boolean {
+        if (n.op === 'after') return n.argIds[n.argIds.length - 1] === id
         for (let i = 1; i < n.argIds.length; i++) if (n.argIds[i] === id) return true
         return false
     }
@@ -316,8 +335,7 @@ export function reduceEffectDependencies(g: Graph): Graph {
     function flatten(id: number, out: number[]): void {
         const n = nodes.get(id)
         if (n?.op === 'after') {
-            flatten(n.argIds[0], out)
-            flatten(n.argIds[1], out)
+            for (const arg of n.argIds) flatten(arg, out)
             return
         }
         if (id) out.push(id)
@@ -337,28 +355,42 @@ export function reduceEffectDependencies(g: Graph): Graph {
         return out
     }
 
-    const reduced: [id: number, n: GraphNode, effect: number][] = []
-    for (const [id, n] of [...nodes]) {
-        if (n.op !== 'after' && n.op !== 'call' && n.op !== 'store' && n.op !== 'load') continue
-        let effect = effects(n.argIds[0], n.op !== 'after' && n.op !== 'load', true)
-        if (n.op !== 'after') effect = dropReleased(effect, id, n)
-        for (;;) {
-            const e = nodes.get(effect)
-            if (!e) break
-            if (e.op === 'load' && isOperand(n, effect)) { effect = 0; break }
-            if (e.op !== 'after') break
-            const tail = e.argIds[e.argIds.length-1]
-            if (nodes.get(tail)?.op !== 'load' || !isOperand(n, tail)) break
-            effect = e.argIds[0] // FIXME: handle multiple
-        }
-        if (effect === n.argIds[0]) continue
-        reduced.push([id, n, effect])
+    function strip(effect: number, n: GraphNode): number {
+        const e = nodes.get(effect)
+        if (!e) return effect
+        if (e.op === 'load' && isOperand(n, effect)) return 0
+        if (e.op !== 'after') return effect
+        const last = e.argIds.length - 1
+        const tail = e.argIds[last]
+        if (nodes.get(tail)?.op !== 'load' || !isOperand(n, tail)) return effect
+        return parallel(e.argIds.slice(0, last).map(x => strip(x, n)), 0, e)
     }
-    for (const [id, n, effect] of reduced) {
+
+    const reduced: [id: number, n: GraphNode][] = []
+    for (const [id, n] of [...nodes]) {
+        if (n.op === 'after') {
+            const last = n.argIds.length - 1
+            const tail = n.argIds[last]
+            const parts = n.argIds.slice(0, last).map(arg => strip(effects(arg, false, true), n))
+            const kept = [...new Set(parts)].filter(x => x && x !== tail && nodes.get(x)?.op !== 'nil-effect')
+            const argIds = [...(kept.length ? kept : [nilEffect()]), tail]
+            if (argIds.length === n.argIds.length && argIds.every((x, i) => x === n.argIds[i])) continue
+            const argConsts = new Float64Array(argIds.length)
+            argConsts[argIds.length - 1] = n.argConsts[last]
+            reduced.push([id, { ...n, argIds, argConsts }])
+            continue
+        }
+        if (n.op !== 'call' && n.op !== 'store' && n.op !== 'load') continue
+        let effect = strip(dropReleased(effects(n.argIds[0], n.op !== 'load', true), id, n), n)
+        if (effect === n.argIds[0]) continue
+        if (!effect) effect = nilEffect()
+        if (effect === n.argIds[0]) continue
         const argIds = n.argIds.slice()
-        argIds[0] = effect || nilEffect()
-        if (argIds[0] === n.argIds[0]) continue
-        nodes.set(id, { ...n, argIds })
+        argIds[0] = effect
+        reduced.push([id, { ...n, argIds }])
+    }
+    for (const [id, n] of reduced) {
+        nodes.set(id, n)
         changed = true
     }
     if (!changed) return g
@@ -394,159 +426,17 @@ export function pureValues(g: Graph): Set<number> {
     return pure
 }
 
-export function pruneBlockParams(g: Graph): Graph {
-    const applied = new Map<number, GraphNode[]>()
-    const sequenced = new Set<number>()
-    for (const n of g.nodes.values()) {
-        if (n.op === 'after' || n.op === 'call' || n.op === 'store' || n.op === 'load') {
-            sequenced.add(n.argIds[0])
-        }
-        if (n.op !== 'apply') continue
-        const list = applied.get(n.argIds[0]) ?? []
-        list.push(n)
-        applied.set(n.argIds[0], list)
-    }
-
-    const params = new Set<number>()
-    const blockById = new Map<number, GraphBlock>()
-    const flows = new Map<number, number[]>()
-    for (const b of g.blocks) {
-        blockById.set(b.id, b)
-        for (const param of b.params) params.add(param)
-    }
-    for (const [blockId, calls] of applied) {
-        const block = blockById.get(blockId)
-        if (!block?.consumesEffectToken) continue
-        for (const call of calls) sequenced.add(call.argIds[call.argIds.length - 1])
-    }
-
-    const inert = new Set<number>([0])
-    {
-        const checked = new Set<number>([0])
-        function walk(id: number): boolean {
-            if (checked.has(id)) return inert.has(id)
-            checked.add(id)
-            inert.add(id)
-            const n = g.nodes.get(id)
-            let ok = true
-            if (n) {
-                ok = PureOps.has(n.op) || (n.op === 'load' && !sequenced.has(id))
-                if (ok) for (const a of n.argIds) if (!walk(a)) { ok = false; break }
-            }
-            if (!ok) inert.delete(id)
-            return ok
-        }
-        for (const [id, n] of g.nodes) {
-            walk(id)
-            for (const a of n.argIds) walk(a)
-        }
-        for (const b of g.blocks) {
-            for (const p of b.params) walk(p)
-            walk(b.bodyId)
-        }
-    }
-    for (const [blockId, calls] of applied) {
-        const block = blockById.get(blockId)
-        if (!block) continue
-        for (let i = 0; i < block.params.length; i++) {
-            const args: number[] = []
-            for (const call of calls) args.push(call.argIds[i + 1])
-            flows.set(block.params[i], args)
-        }
-    }
-
-    const live = new Set<number>()
-    const walked = new Set<number>()
-    function mark(id: number): void {
-        if (!id) return
-        if (params.has(id)) {
-            if (live.has(id)) return
-            live.add(id)
-            for (const arg of flows.get(id) ?? []) mark(arg)
-            return
-        }
-        if (walked.has(id)) return
-        walked.add(id)
-        const n = g.nodes.get(id)
-        if (!n) return
-        if (n.op === 'apply') return
-        for (const arg of n.argIds) mark(arg)
-    }
-    for (const b of g.blocks) {
-        mark(b.bodyId)
-        if (b.consumesEffectToken) mark(b.params[b.params.length - 1])
-    }
-
-    const rename = new Map<number, number>()
-    const dropped = new Map<number, Set<number>>()
-    for (const b of g.blocks) {
-        const calls = applied.get(b.id)
-        if (!calls) continue
-        const pinned = b.consumesEffectToken ? b.params.length - 1 : -1
-        const keep: number[] = []
-        const drop = new Set<number>()
-        for (let j = 0; j < b.params.length; j++) {
-            if (j !== pinned && !live.has(b.params[j])) {
-                let inertEverywhere = true
-                for (const c of calls) if (!inert.has(c.argIds[j + 1])) { inertEverywhere = false; break }
-                if (inertEverywhere) { drop.add(j); continue }
-            }
-            let dup = -1
-            for (const i of j === pinned ? [] : keep) {
-                let every = true
-                for (const c of calls) {
-                    if (c.argIds[i + 1] !== c.argIds[j + 1]) { every = false; break }
-                    if (!c.argIds[j + 1] && !Object.is(c.argConsts[i + 1], c.argConsts[j + 1])) { every = false; break }
-                }
-                if (every) { dup = i; break }
-            }
-            if (dup < 0) { keep.push(j); continue }
-            rename.set(b.params[j], b.params[dup])
-            drop.add(j)
-        }
-        if (drop.size) dropped.set(b.id, drop)
-    }
-    if (!rename.size && !dropped.size) return g
-
-    const nodes = new Map<number, GraphNode>()
-    for (const [id, n] of g.nodes) {
-        const argIds = n.argIds.slice()
-        for (let i = 0; i < argIds.length; i++) {
-            const to = rename.get(argIds[i])
-            if (to !== undefined) argIds[i] = to
-        }
-        const drop = n.op === 'apply' ? dropped.get(n.argIds[0]) : undefined
-        if (!drop) { nodes.set(id, { ...n, argIds, argConsts: n.argConsts.slice() }); continue }
-        const ids = [argIds[0]]
-        const consts = [n.argConsts[0]]
-        for (let i = 1; i < argIds.length; i++) {
-            if (drop.has(i - 1)) continue
-            ids.push(argIds[i])
-            consts.push(n.argConsts[i])
-        }
-        nodes.set(id, { ...n, argIds: ids, argConsts: new Float64Array(consts) })
-    }
-
-    const blocks: GraphBlock[] = []
-    for (const b of g.blocks) {
-        const drop = dropped.get(b.id)
-        if (!drop) { blocks.push(b); continue }
-        const params: number[] = []
-        const inputs: number[] = []
-        for (let i = 0; i < b.params.length; i++) {
-            if (drop.has(i)) continue
-            params.push(b.params[i])
-            if (b.inputs) inputs.push(b.inputs[i])
-        }
-        blocks.push({ ...b, params, inputs: b.inputs ? inputs : undefined })
-    }
-    return { ...g, nodes, params: g.params, blocks }
-}
-
 function literalValue(u: GraphNode) {
     const l = (u as any).literal
     if (l !== undefined) return l
     return u.argConsts[0]
+}
+
+function scalarOperand(nodes: Map<number, GraphNode>, n: GraphNode, i: number): number | undefined {
+    const id = n.argIds[i]
+    if (!id) return n.argConsts[i]
+    const u = nodes.get(id)
+    return u?.op === 'literal' ? literalValue(u) : undefined
 }
 
 function createNode(g: Graph, op: string, operands: (number | GraphNode)[], original?: GraphNode): number {
@@ -1567,7 +1457,13 @@ function optimizeValueGraph(g: Graph) {
 
         indexValue(id, n.op, currentBlockId)
 
-        if (n.op === 'after' || n.op === 'call' || n.op === 'store' || n.op === 'load') {
+        if (n.op === 'after') {
+            const last = n.argIds.length - 1
+            for (let i = 0; i < last; i++) visit(n.argIds[i], false)
+            visit(n.argIds[last], true)
+            return
+        }
+        if (n.op === 'call' || n.op === 'store' || n.op === 'load') {
             visit(n.argIds[0], false)
             for (let i = 1; i < n.argIds.length; i++) {
                 if (n.op === 'call' && i === 1) {
@@ -1836,17 +1732,22 @@ function optimizeValueGraph(g: Graph) {
             for (let i = 0; i < n.argIds.length; i++) visit(n.argIds[i])
 
             if (n.op !== 'after' && n.op !== 'call' && n.op !== 'load' && n.op !== 'store') return
-            const ordering = simplifyOrdering(n.argIds[0], unordered, n)
-            if (ordering === n.argIds[0]) return
-            if (ordering !== undefined && g.nodes.get(ordering)?.op === 'unreachable') {
-                replacements.set(id, ordering)
-                return
+            const end = n.op === 'after' ? n.argIds.length - 1 : 1
+            let argIds: number[] | undefined
+            let argConsts: Float64Array | undefined
+            for (let i = 0; i < end; i++) {
+                const ordering = simplifyOrdering(n.argIds[i], unordered, n)
+                if (ordering === n.argIds[i]) continue
+                if (ordering !== undefined && g.nodes.get(ordering)?.op === 'unreachable') {
+                    replacements.set(id, ordering)
+                    return
+                }
+                if (!argIds) argIds = n.argIds.slice()
+                if (!argConsts) argConsts = n.argConsts.slice()
+                argIds[i] = ordering ?? createNode(g, 'nil-effect', [])
+                argConsts[i] = 0
             }
-            const argIds = n.argIds.slice()
-            const argConsts = n.argConsts.slice()
-            argIds[0] = ordering ?? createNode(g, 'nil-effect', [])
-            argConsts[0] = 0
-            replacements.set(id, cloneNode(n, argIds, argConsts))
+            if (argIds && argConsts) replacements.set(id, cloneNode(n, argIds, argConsts))
         }
         visit(target.bodyId)
         if (!replacements.size) return false
@@ -2147,10 +2048,7 @@ function optimizeValueGraph(g: Graph) {
                 }
             }
             let app = createNode(g, 'apply', o, u)
-            while (const x = rem.pop()) {
-                // FIXME: this should put all ordered vals in 1 `after`
-                app = createNode(g, 'after', [x, app])
-            }
+            if (rem.length) app = createNode(g, 'after', [...rem, app])
             replacements.set(x[1], app)
         }
         for (const bid of changedBlocks) {
@@ -2789,7 +2687,54 @@ export function simplifyBitOperations(g: Graph): Graph | undefined {
         if (!nodes) nodes = new Map(g.nodes)
         return nodes
     }
+    const addresses = new Map<string, number>()
+    function address(from: GraphNode, term: number): number {
+        const key = `${from.argIds[1]}:${from.argConsts[1]}:${term}`
+        let id = addresses.get(key)
+        if (id === undefined) {
+            id = g.maxId++
+            writable().set(id, {
+                ...from, op: 'add', T: Types.u64, U: Types.u64,
+                argIds: [from.argIds[1], term], argConsts: new Float64Array([from.argConsts[1], 0]),
+            })
+            addresses.set(key, id)
+        }
+        return id
+    }
     for (const [id, n] of g.nodes) {
+        if (n.op === 'load' || n.op === 'store') {
+            const current = nodes ?? g.nodes
+            const scalar = scalarOperand(current, n, 2)
+            let term = scalar === undefined ? n.argIds[2] : 0
+            let offset = scalar ?? 0
+            for (;;) {
+                const t = current.get(term)
+                if (!t || (t.op !== 'add' && t.op !== 'sub')) break
+                const right = scalarOperand(current, t, 1)
+                const left = t.op === 'add' ? scalarOperand(current, t, 0) : undefined
+                if (right !== undefined && left === undefined) {
+                    offset += t.op === 'add' ? right : -right
+                    term = t.argIds[0]
+                } else if (left !== undefined && right === undefined) {
+                    offset += left
+                    term = t.argIds[1]
+                } else break
+            }
+            if (term === n.argIds[2] || !Number.isSafeInteger(offset)) continue
+            const argIds = n.argIds.slice()
+            const argConsts = n.argConsts.slice()
+            if (term && offset) {
+                argIds[1] = address(n, term)
+                argConsts[1] = 0
+                argIds[2] = 0
+                argConsts[2] = offset as f64
+            } else {
+                argIds[2] = term
+                argConsts[2] = (term ? 0 : offset) as f64
+            }
+            writable().set(id, { ...n, argIds, argConsts })
+            continue
+        }
         if (n.op === 'mul') {
             const valueAt = n.argIds[0] && !n.argIds[1] ? 0
                 : n.argIds[1] && !n.argIds[0] ? 1 : -1
@@ -2981,9 +2926,8 @@ function strengthReduceLoops(g: Graph): Graph | undefined {
         const applications = applicationsByTarget.get(block.id) ?? []
         const entries = applications.filter(([id]) => !inside.has(id))
         const backs = applications.filter(([id]) => inside.has(id))
-        if (entries.length !== 1 || !backs.length) continue
-        const entry = entries[0][1]
-        if (entry.argIds[1 + ivAt] || entry.argConsts[1 + ivAt] !== 0) continue
+        if (!entries.length || !backs.length) continue
+        if (entries.some(([, entry]) => entry.argIds[1 + ivAt] || entry.argConsts[1 + ivAt] !== 0)) continue
 
         let valid = true
         const increments = new Set<number>()
@@ -3028,23 +2972,27 @@ function strengthReduceLoops(g: Graph): Graph | undefined {
         writableBlocks()[bi] = updatedBlock
 
         const address = (nodes ?? g.nodes).get(addressId || multiplyId)!
-        const scaledBound = addNode('mul', [
-            entry.argIds[1 + boundAt], 0,
-        ], [entry.argConsts[1 + boundAt], stride], address)
-        const endValue = addNode('add', [
-            entry.argIds[1 + baseAt], scaledBound,
-        ], [entry.argConsts[1 + baseAt], 0], address)
         const nextAddress = addNode('add', [current, 0], [0, stride], address)
         const nextCond = addNode('lt', [current, end], [0, 0], cond)
 
         for (const [id, app] of applications) {
             const at = 1 + tokenAt
             const isBack = inside.has(id)
-            const ids = insert(app.argIds, at,
-                isBack ? nextAddress : entry.argIds[1 + baseAt],
-                isBack ? end : endValue)
-            const constants = insert([...app.argConsts], at,
-                isBack ? 0 : entry.argConsts[1 + baseAt], 0)
+            let startId = nextAddress
+            let startConst = 0
+            let endId = end
+            if (!isBack) {
+                const scaledBound = addNode('mul', [
+                    app.argIds[1 + boundAt], 0,
+                ], [app.argConsts[1 + boundAt], stride], address)
+                endId = addNode('add', [
+                    app.argIds[1 + baseAt], scaledBound,
+                ], [app.argConsts[1 + baseAt], 0], address)
+                startId = app.argIds[1 + baseAt]
+                startConst = app.argConsts[1 + baseAt]
+            }
+            const ids = insert(app.argIds, at, startId, endId)
+            const constants = insert([...app.argConsts], at, startConst, 0)
             writableNodes().set(id, {
                 ...app,
                 argIds: omit(ids, 1 + ivAt),
@@ -3246,7 +3194,6 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
     const shouldSpillUntil = new Map<number, number>()
     const visitOrder = new Map<number, number>()
     const operandOrder = new Map<number, number[]>()
-    const rotatedSelects = new Set<number>()
     {
         const tmp = new Set<number>()
         interface ClaimState {
@@ -3364,16 +3311,14 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
 
         function findSchedule(n: GraphNode) {
             const args = n.argIds
-            if (n.op === 'after') {
-                if (n.argIds.length !== 2) return n.argIds.map((_, i) => i)
-                return [0, 1]
-            }
             if (n.op === 'store') {
                 return [0, 1, 2, 3]
             }
+            const pinned = n.op === 'after' ? args.length - 1 : -1
             const calls = new Array(n.argIds.length) as boolean[]
             for (let i = 0; i < n.argIds.length; i++) calls[i] = false
             const baggage = args.map((x, i) => {
+                if (i === pinned) return 0
                 const b = getBaggage(x)
                 for (const id of tmp) {
                     if (!hasCallEffects.has(id)) continue
@@ -3382,12 +3327,14 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
                 }
                 return b
             })
-            return args.map((_, i) => i).sort((a, b) => {
+            const order = args.map((_, i) => i).filter(i => i !== pinned).sort((a, b) => {
                 if (calls[a] === calls[b]) {
                     return baggage[a] - baggage[b]
                 }
                 return calls[a] ? -1 : 1
             })
+            if (pinned >= 0) order.push(pinned)
+            return order
         }
         function updateLiveAfter(id: number, partial?: number) {
             if (const d = demands.get(id)) {
@@ -4271,31 +4218,11 @@ export function normalizeValueGraph(g: Graph): Graph {
     }
     run(flattenRecords)
     run(packageBlocksFINAL)
-    const tokenBlocks = new Set<number>()
     for (const b of g.blocks) {
         if (!b.consumesEffectToken) continue
-        tokenBlocks.add(b.id)
         const nil = createNode(g, 'nil-effect', [])
         b.bodyId = replaceAll(g, b.bodyId, new Map([[b.params[b.params.length - 1], nil]]))
         b.consumesEffectToken = false
-    }
-    for (const b of g.blocks) {
-        const sequenced = new Map<number, number>()
-        const seen = new Set<number>()
-        function walk(id: number): void {
-            if (!id || seen.has(id)) return
-            seen.add(id)
-            const n = g.nodes.get(id)
-            if (!n) return
-            const token = n.argIds[n.argIds.length - 1]
-            if (n.op === 'apply' && token && tokenBlocks.has(n.argIds[0])
-                && g.nodes.get(token)?.op !== 'nil-effect') {
-                sequenced.set(id, createNode(g, 'after', [token, id]))
-            }
-            for (const x of n.argIds) walk(x)
-        }
-        walk(b.bodyId)
-        if (sequenced.size) b.bodyId = replaceAll(g, b.bodyId, sequenced)
     }
     run(reduceEffectDependencies)
     run(specializeBlockApplications)
@@ -4724,6 +4651,10 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         return out
     }
 
+    function orderingOperands(site: number, n: GraphNode): number[] {
+        return orderedOperands(site, n.argIds.slice(0, -1).map((_, i) => i))
+    }
+
     function build(id: number, want = -1): void {
         const outer = materializing
         if (opts.debug) console.log('build', id, 'from', outer)
@@ -4831,13 +4762,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
     function buildAfter(id: number, n: GraphNode, want: number): void {
         const result = n.argIds.length - 1
         assert(result >= 0)
-        if (result === 1) {
-            effect(n.argIds[0])
-        } else {
-            for (const i of orderedOperands(id, n.argIds.slice(0, -1).map((_, i) => i))) {
-                effect(n.argIds[i])
-            }
-        }
+        for (const i of orderingOperands(id, n)) effect(n.argIds[i])
         const value = demand(n.argIds[result], n.argConsts[result], want)
         if (!value) { finish(id); return }
         const src = at(value, NOTHING)
@@ -4991,7 +4916,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             if (!done.has(id) && !homeOf.has(id)) build(id)
         } else if (n.op === 'after') {
             if (done.has(id)) return
-            for (let i = 0; i < n.argIds.length - 1; i++) effect(n.argIds[i])
+            for (const i of orderingOperands(id, n)) effect(n.argIds[i])
         } else if (n.op === 'store') {
             if (!done.has(id)) buildStore(id, n)
         } else if (n.op === 'load') {
@@ -5032,13 +4957,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             put(() => asm.store(base, offset, rv, T))
             return
         }
-        const addr = freeReg(volatiles, guard)
-        if (addr < 0) throw 'lowering3: out of registers'
-        const sum = ro
-        put(() => {
-            asm.binary('add', addr, base, sum, false)
-            asm.store(addr, 0, rv, T)
-        })
+        put(() => asm.storeIndexed(base, ro, rv, T))
     }
 
     function buildLoad(id: number, n: GraphNode, want: number) {
@@ -5068,10 +4987,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         const ro = at(o, guard)
         finish()
         const dst = regFor(id, want)
-        put(() => {
-            asm.binary('add', dst, rb, ro, false)
-            asm.load(dst, dst, 0, T)
-        })
+        put(() => asm.loadIndexed(dst, rb, ro, T))
     }
 
     function condition(site: number, id: number, konst: number, otherwise: number): void {
@@ -5249,7 +5165,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         if (n.op === 'after') {
             const result = n.argIds.length - 1
             if (hasStructuredTail(g, n.argIds[result])) {
-                for (let i = 0; i < result; i++) effect(n.argIds[i])
+                for (const i of orderingOperands(id, n)) effect(n.argIds[i])
                 emitTail(n.argIds[result], n.argConsts[result])
                 return
             }
@@ -5443,6 +5359,23 @@ function specializeBlockApplications(g: Graph): Graph {
         return { id, value: 0 }
     }
     const active = new Set<number>()
+    const paramUses = new Map<number, Set<number>>()
+    function referencedParams(block: GraphBlock): Set<number> {
+        const known = paramUses.get(block.id)
+        if (known) return known
+        const uses = new Set<number>()
+        const params = new Set(block.params)
+        const seen = new Set<number>()
+        function walk(id: number): void {
+            if (!id || seen.has(id)) return
+            seen.add(id)
+            if (params.has(id)) { uses.add(id); return }
+            for (const x of nodes.get(id)?.argIds ?? []) walk(x)
+        }
+        walk(block.bodyId)
+        paramUses.set(block.id, uses)
+        return uses
+    }
     function rewrite(id: number, value: number, env: Map<number, Value>, memo: Map<number, Value>): Value {
         if (!id) return { id, value }
         const replacement = env.get(id) ?? memo.get(id)
@@ -5459,6 +5392,17 @@ function specializeBlockApplications(g: Graph): Graph {
             active.add(block.id)
             result = rewrite(block.bodyId, block.bodyConst, bindings, new Map())
             active.delete(block.id)
+            const uses = referencedParams(block)
+            const dropped: number[] = []
+            for (let i = 0; i < block.params.length; i++) {
+                const arg = args[i + 1]
+                if (!arg.id || pure.has(arg.id) || uses.has(block.params[i]) || dropped.includes(arg.id)) continue
+                dropped.push(arg.id)
+            }
+            if (dropped.length) {
+                result = intern({ ...n, op: 'after', label: undefined, argIds: [...dropped, result.id],
+                    argConsts: new Float64Array([...dropped.map(() => 0), result.value]) })
+            }
         } else if (n.op === 'select') {
             if (!args[0].id) result = args[0].value ? args[1] : args[2]
             else if (args[1].id === args[2].id && (args[1].id || Object.is(args[1].value, args[2].value))) {
@@ -5466,7 +5410,14 @@ function specializeBlockApplications(g: Graph): Graph {
                     argIds: [args[0].id, args[1].id], argConsts: new Float64Array([0, args[1].value]) })
             }
         } else if (n.op === 'after') {
-            if (!args[0].id || nodes.get(args[0].id)?.op === 'nil-effect' || args[0].id === args[1].id) result = args[1]
+            const last = args[args.length - 1]
+            const ids = [...new Set(args.slice(0, -1).map(a => a.id))]
+            const order = ids.filter(x => x && x !== last.id && nodes.get(x)?.op !== 'nil-effect').map(id => ({ id, value: 0 }))
+            if (!order.length) result = last
+            else if (order.length < args.length - 1) {
+                result = intern({ ...n, argIds: [...order.map(a => a.id), last.id],
+                    argConsts: new Float64Array([...order.map(() => 0), last.value]) })
+            }
         } else if (args.length === 2 && args.every(arg => !arg.id)
             && args[0].value >= 0 && args[1].value >= 0) {
             const a = args[0].value, b = args[1].value

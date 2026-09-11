@@ -3,11 +3,8 @@
 import * as intrinsics from './intrinsics'
 
 const Types = intrinsics.Types
-const Intrinsics = intrinsics.Intrinsics
-const getNanId = intrinsics.getNanId
 const assert = intrinsics.assert
 
-type OpTrace = intrinsics.OpTrace
 type Ty = intrinsics.Types
 
 export interface Target {
@@ -53,6 +50,8 @@ export interface Assembler {
     select(dst: number, cond: number, a: number, b: number): void
     load(dst: number, base: number, offset: number, T: Ty): void
     store(base: number, offset: number, src: number, T: Ty): void
+    loadIndexed(dst: number, base: number, index: number, T: Ty): void
+    storeIndexed(base: number, index: number, src: number, T: Ty): void
     spAdjust(bytes: number): void
     spRead(dst: number): void
     bindLabel(id: number): void
@@ -124,6 +123,11 @@ interface AsmItem {
     loadBase?: number
     loadOffset?: number
     loadBytes?: number
+    indexBase?: number
+    indexReg?: number
+    indexBytes?: number
+    indexLoad?: boolean
+    indexSigned?: boolean
     cmpZeroReg?: number
     setsFlags?: boolean  // a compare; the only thing that writes the condition flags
     cselCond?: number    // for csel, whose condition a peephole can rewrite
@@ -1120,6 +1124,32 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         ldrUnsigned(dst, scratchA, 0, bytes, signed)
     }
 
+    function encodeIndexed(item: AsmItem, shifted: boolean): void {
+        const bytes = item.indexBytes!
+        const size = bytes === 1 ? 0 : bytes === 2 ? 1 : bytes === 4 ? 2 : 3
+        const load = item.indexLoad!
+        const signed = load && item.indexSigned!
+        const opc = !load ? 0 : signed && bytes < 8 ? 2 : 1
+        const name = !load ? `str${bytes === 1 ? 'b' : bytes === 2 ? 'h' : ''}`
+            : signed ? (bytes === 1 ? 'ldrsb' : bytes === 2 ? 'ldrsh' : bytes === 4 ? 'ldrsw' : 'ldr')
+            : bytes === 1 ? 'ldrb' : bytes === 2 ? 'ldrh' : 'ldr'
+        const t = item.reg
+        const n = item.indexBase!
+        const m = item.indexReg!
+        item.word = (0x38206800 | (size << 30) | (opc << 22) | (m << 16) | ((shifted ? 1 : 0) << 12)
+            | (n << 5) | t) >>> 0
+        item.text = `${name} ${bytes === 8 || signed ? x(t) : w(t)}, [${base(n)}, ${x(m)}${shifted ? `, lsl #${size}` : ''}]`
+    }
+
+    function indexed(load: boolean, t: number, n: number, m: number, T: Ty): void {
+        const item: AsmItem = {
+            kind: 'insn', word: 0, text: '', label: -1, reg: t, cond: -1,
+            indexBase: n, indexReg: m, indexBytes: accessBytes(T), indexLoad: load, indexSigned: isSignedType(T),
+        }
+        encodeIndexed(item, false)
+        items.push(item)
+    }
+
     function store(base: number, offset: number, src: number, T: Ty): void {
         const bytes = accessBytes(T)
         if (fitsScaled(offset, bytes)) {
@@ -1145,6 +1175,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.convertDst !== undefined) { out.push(item.convertDst); return true }
         if (item.extractDst !== undefined) { out.push(item.extractDst); return true }
         if (item.zeroReg !== undefined) { out.push(item.zeroReg); return true }
+        if (item.indexBase !== undefined) { if (item.indexLoad) out.push(item.reg); return true }
         if (item.loadBase !== undefined) { out.push(item.word & 0x1F); return true }
         if (item.storeBase !== undefined) return true
         if (item.cmpLeft !== undefined) return true
@@ -1164,6 +1195,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.convertSrc !== undefined) { out.push(item.convertSrc); return true }
         if (item.extractSrc !== undefined) { out.push(item.extractSrc); return true }
         if (item.zeroReg !== undefined) return true
+        if (item.indexBase !== undefined) {
+            out.push(item.indexBase, item.indexReg!)
+            if (!item.indexLoad) out.push(item.reg)
+            return true
+        }
         if (item.loadBase !== undefined) { out.push(item.loadBase); return true }
         if (item.storeBase !== undefined) {
             out.push(item.storeBase)
@@ -1193,26 +1229,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
-    function collapseIndexedLoad(addAt: number): boolean {
-        const add = items[addAt]
-        const load = items[addAt + 1]
-        if (!add || !load || add.kind !== 'insn' || load.kind !== 'insn') return false
-        if (add.addDst === undefined || add.addLeft === undefined
-            || add.addShiftReg === undefined || add.addShiftAmount !== 3) return false
-        if (load.loadBytes !== 8 || load.loadOffset !== 0) return false
-        if (load.loadBase !== add.addDst || load.reg !== add.addDst) return false
-        const index = add.addShiftReg
-        const baseReg = add.addLeft
-        if (baseReg === index) return false
-        load.word = (0xF8607800 | (index << 16) | (baseReg << 5) | load.reg) >>> 0
-        load.text = `ldr ${x(load.reg)}, [${x(baseReg)}, ${x(index)}, lsl #3]`
-        load.loadBase = undefined
-        load.loadOffset = undefined
-        load.loadBytes = undefined
-        items.splice(addAt, 1)
-        return true
-    }
-
     function retargetDef(item: AsmItem, from: number, dst: number): boolean {
         if (item.kind !== 'insn' || item.adjustReg !== undefined) return false
         if (item.addDst === from) item.addDst = dst
@@ -1221,6 +1237,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         else if (item.convertDst === from) item.convertDst = dst
         else if (item.extractDst === from) item.extractDst = dst
         else if (item.loadBase !== undefined && (item.word & 0x1F) === from) { if (item.reg === from) item.reg = dst }
+        else if (item.indexLoad && item.reg === from) item.reg = dst
         else return false
         item.word = ((item.word & ~0x1F) | dst) >>> 0
         item.text = item.text.replace(/^(\S+) ([xw])\d+,/, (_, op, width) => `${op} ${width === 'w' ? w(dst) : x(dst)},`)
@@ -1244,6 +1261,29 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 removedWrites.push(move.moveSrc)
                 items.pop()
                 return
+            }
+        }
+
+        if (items.length >= 2) {
+            const mem = items[items.length - 1]
+            const index = mem.indexReg
+            const bytes = mem.indexBytes ?? 1
+            const scale = bytes === 2 ? 1 : bytes === 4 ? 2 : bytes === 8 ? 3 : 0
+            if (mem.kind === 'insn' && index !== undefined && scale && dead.has(index)
+                && mem.indexBase !== index && (mem.indexLoad || mem.reg !== index)) {
+                for (let at = items.length - 2; at >= 0; at--) {
+                    const shift = items[at]
+                    if (shift.kind !== 'insn') break
+                    if (shift.shiftKind === 'lsl' && shift.shiftDst === index
+                        && shift.shiftSrc !== undefined && shift.shiftAmount === scale) {
+                        if (!noInterference(at + 1, items.length - 1, index, shift.shiftSrc)) break
+                        mem.indexReg = shift.shiftSrc
+                        encodeIndexed(mem, true)
+                        items.splice(at, 1)
+                        return
+                    }
+                    if (!canReorderOver(shift)) break
+                }
             }
         }
 
@@ -1373,7 +1413,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             add.addShiftReg = source
             add.addShiftAmount = shift.shiftAmount
             items.splice(at, 1)
-            collapseIndexedLoad(addAt - 1)
             return
         }
 
@@ -1445,6 +1484,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         select,
         load,
         store,
+        loadIndexed: (dst, baseReg, index, T) => indexed(true, dst, baseReg, index, T),
+        storeIndexed: (baseReg, index, src, T) => indexed(false, src, baseReg, index, T),
         spAdjust: (bytes) => {
             if (bytes === 0) return
             if (bytes > 0) subImmRaw(SP, SP, bytes, true, true)
@@ -1558,23 +1599,6 @@ export const aarch64Linux: Target = {
     createAssembler: () => createAarch64Assembler(aarch64LinuxSyscall),
 }
 
-export interface LowerOptions {
-    params?: number[]       // incoming argument values, in order
-    paramIds?: number[]     // their value ids, if the caller captured them
-    regBudget?: number      // shrink the allocation pool, to exercise spilling
-    target?: Target
-    argRegCount?: number    // how many args arrive in registers 
-}
-
-export interface LowerResult {
-    target: Target
-    words: number[]
-    bytes: number[]
-    listing: string
-    regOf: Map<number, number>
-}
-
-// which entries of `args` are "real" inputs, i.e. dropping the trailing type tags
 export function operandIndices(t: intrinsics.OpTrace): number[] {
     if (t.op === 'call') {
         const r: number[] = []
@@ -1591,39 +1615,3 @@ export function operandIndices(t: intrinsics.OpTrace): number[] {
     return []
 }
 
-// lowerResidual - blocks with parameters, edge arguments, and predicates
-
-export interface ResidualEdge {
-    target: number       // node index this bundle arrives at, -1 if it returns
-    args: number[]       // value ids, in the target's parameter order
-    argConsts: number[]  // the literal, where the corresponding id is 0
-    // the calls made while travelling this bundle, in order. They are already
-    // in the value graph and this changes nothing about it -- an edge is just
-    // the stretch of straight-line work between two nodes, so it is where the
-    // question "what may not be held in a temporary here" gets asked
-    calls: number[]
-}
-
-export interface ResidualNode {
-    label: number        // for the listing only
-    idom: number         // for placing shared values
-    params: number[]
-    term: string         // 'branch' | 'ret' | 'goto'
-    condId: number
-    thenEdge: number
-    elseEdge: number
-    gotoEdge: number
-    retId: number
-    retConst: number
-    // the last call on the way out. Its value is discarded, but it and the
-    // chain behind it still have to be emitted: the exit is what keeps them
-    retTokenId: number
-}
-
-export interface Residual {
-    entryEdge: number
-    nodes: ResidualNode[]
-    edges: ResidualEdge[]
-    paramIds: number[]
-    traces: readonly OpTrace[]
-}
