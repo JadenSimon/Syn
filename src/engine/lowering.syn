@@ -304,13 +304,19 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function peephole(): void {
         const values: number[] = []
+        let fresh = 32
         function resetMoves(): void {
             for (let r = 0; r < 32; r++) values[r] = r
         }
         resetMoves()
+        const defs: number[] = []
         for (let i = 0; i < items.length; i++) {
             const it = items[i]
             if (it.moveDst === undefined) {
+                defs.length = 0
+                if (it.kind === 'cbz' || it.kind === 'cbnz' || it.kind === 'bcond') continue
+                if (it.kind === 'cset') { values[it.reg] = fresh++; continue }
+                if (itemDefs(it, defs)) { for (const d of defs) values[d] = fresh++; continue }
                 resetMoves()
                 continue
             }
@@ -578,6 +584,83 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
             if (!used) items.splice(first, i - first + 1)
         }
+        for (let i = items.length - 1; i >= 0; i--) {
+            if (items[i].kind === 'b' && fallsThroughTo(i, items[i].label)) items.splice(i, 1)
+        }
+    }
+
+    function mergeTails(): void {
+        const RET = 0xD65F03C0
+        let nextLabel = 0
+        for (const it of items) if (it.label >= nextLabel) nextLabel = it.label + 1
+        const isRet = (it: AsmItem) => it.kind === 'insn' && it.word === RET
+        const stops = (it: AsmItem) => it.kind === 'label' || isBranch(it.kind) || isRet(it)
+        const same = (a: AsmItem, b: AsmItem) => a.kind === b.kind && a.word === b.word
+            && a.relocationKind === b.relocationKind && a.relocationTarget === b.relocationTarget
+        interface TailEnd { start: number, end: number, explicit: boolean, ret: boolean }
+
+        for (;;) {
+            const entry = new Map<number, number>()
+            for (let i = items.length - 1, next = items.length; i >= 0; i--) {
+                if (items[i].kind === 'label') entry.set(items[i].label, next)
+                else next = i
+            }
+            const ends = new Map<number, TailEnd[]>()
+            function add(key: number, end: number, explicit: boolean, ret: boolean): void {
+                let start = ret ? end - 1 : end
+                while (start > 0 && !stops(items[start - 1])) start--
+                let list = ends.get(key)
+                if (!list) ends.set(key, list = [])
+                list.push({ start, end, explicit, ret })
+            }
+            for (let i = 0; i < items.length; i++) {
+                const it = items[i]
+                if (it.kind === 'b') add(entry.get(it.label)!, i, entry.get(it.label)! > i, false)
+                else if (isRet(it)) add(-1, i + 1, true, true)
+                else if (it.kind === 'label' && i > 0 && items[i - 1].kind !== 'label'
+                    && items[i - 1].kind !== 'b' && !isRet(items[i - 1])) {
+                    add(entry.get(it.label)!, i, false, false)
+                }
+            }
+
+            let best: { from: TailEnd, into: TailEnd, n: number } | undefined
+            let bestGain = 0
+            for (const [, list] of ends) {
+                for (const from of list) {
+                    if (!from.explicit) continue
+                    for (const into of list) {
+                        if (into === from) continue
+                        let n = 0
+                        while (from.end - n > from.start && into.end - n > into.start
+                            && same(items[from.end - 1 - n], items[into.end - 1 - n])) n++
+                        while (n > 0 && (items[from.end - n - 1]?.relocationKind === 'aarch64-pool'
+                            || items[into.end - n - 1]?.relocationKind === 'aarch64-pool')) n--
+                        const gain = from.ret ? n - 1 : n
+                        if (gain > bestGain) { best = { from, into, n }; bestGain = gain }
+                    }
+                }
+            }
+            if (!best) return
+
+            const { from, into, n } = best
+            const label = nextLabel++
+            const mark: AsmItem = { kind: 'label', word: 0, text: '', label, reg: -1, cond: -1 }
+            const cut = () => {
+                if (from.ret) {
+                    items.splice(from.end - n, n, { kind: 'b', word: 0, text: `b L${label}`, label, reg: -1, cond: -1 })
+                } else {
+                    items[from.end].label = label
+                    items.splice(from.end - n, n)
+                }
+            }
+            if (into.end - n > from.end - n) {
+                items.splice(into.end - n, 0, mark)
+                cut()
+            } else {
+                cut()
+                items.splice(into.end - n, 0, mark)
+            }
+        }
     }
 
     // assign word addresses and encode the displacements
@@ -585,6 +668,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (finished) return
         finished = true
         peephole()
+        mergeTails()
         threadBranches()
 
         const addrOf = new Map<number, number>()
@@ -1129,6 +1213,20 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
+    function retargetDef(item: AsmItem, from: number, dst: number): boolean {
+        if (item.kind !== 'insn' || item.adjustReg !== undefined) return false
+        if (item.addDst === from) item.addDst = dst
+        else if (item.shiftDst === from) item.shiftDst = dst
+        else if (item.logicalDst === from) item.logicalDst = dst
+        else if (item.convertDst === from) item.convertDst = dst
+        else if (item.extractDst === from) item.extractDst = dst
+        else if (item.loadBase !== undefined && (item.word & 0x1F) === from) { if (item.reg === from) item.reg = dst }
+        else return false
+        item.word = ((item.word & ~0x1F) | dst) >>> 0
+        item.text = item.text.replace(/^(\S+) ([xw])\d+,/, (_, op, width) => `${op} ${width === 'w' ? w(dst) : x(dst)},`)
+        return true
+    }
+
     function released(values: { value: number, home: number }[]): void {
         const dead = new Set<number>()
         for (const value of values) if (value.home >= 0) dead.add(value.home)
@@ -1140,13 +1238,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
         if (items.length >= 2) {
             const move = items[items.length - 1]
-            const add = items[items.length - 2]
-            if (move.moveSrc !== undefined && move.moveDst !== undefined
-                && add.addDst === move.moveSrc && dead.has(move.moveSrc)) {
-                const dst = move.moveDst
-                add.word = ((add.word & ~0x1F) | dst) >>> 0
-                add.addDst = dst
-                add.text = add.text.replace(/^add x\d+,/, `add ${x(dst)},`)
+            const def = items[items.length - 2]
+            if (move.moveSrc !== undefined && move.moveDst !== undefined && dead.has(move.moveSrc)
+                && retargetDef(def, move.moveSrc, move.moveDst)) {
                 removedWrites.push(move.moveSrc)
                 items.pop()
                 return
