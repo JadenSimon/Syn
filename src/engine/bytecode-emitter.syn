@@ -394,10 +394,13 @@ function emitFunction(
         return reg
     }
 
-    type LoopLabels = { breaks: number[], continues: number[], continueTarget: number, canContinue: boolean }
+    type IteratorScope = { iterator: number, open: number }
+    const iterators: IteratorScope[] = []
+    type LoopLabels = { breaks: number[], continues: number[], continueTarget: number, canContinue: boolean, iterator?: IteratorScope }
     let labels: LoopLabels | undefined = undefined
     function emitBreak() {
         if (!labels) throw "`break` outside of a loop"
+        if (labels.iterator) emitIteratorClose(labels.iterator)
         labels.breaks.push(emitJumpPlaceholder(Op.Jump))
     }
     function emitContinue() {
@@ -566,8 +569,10 @@ function emitFunction(
                             continue
                         }
                         if (ts.isPropertyAssignment(x)) {
-                            // FIXME: computed names
                             inner = Math.max(inner, 1 + visit(x.initializer, true))
+                            if (ts.isComputedPropertyName(x.name)) {
+                                inner = Math.max(inner, visit(x.name.expression, true), 2 + visit(x.initializer, true))
+                            }
                             continue
                         }
                         throw `Unhandled property kind: ${ts.SyntaxKind[x.kind]}`
@@ -1214,6 +1219,14 @@ function emitFunction(
         star(robj)
         defer freeReg()
         for (const p of node.properties) {
+            if (ts.isPropertyAssignment(p) && ts.isComputedPropertyName(p.name)) {
+                emitExpr(p.name.expression)
+                const key = allocReg(); star(key)
+                emitExpr(p.initializer)
+                emit3(Op.SetProperty, robj, key)
+                freeReg()
+                continue
+            }
             let name: string
             let value: ts.Expression
             if (ts.isShorthandPropertyAssignment(p)) {
@@ -1546,6 +1559,117 @@ function emitFunction(
         for (const p of ctx.breaks) patchJump(p) // break -> after loop
     }
 
+    function emitIteratorClose(scope: IteratorScope) {
+        ldar(scope.open)
+        const closed = emitJumpPlaceholder(Op.JumpIfToBooleanFalse)
+        emit1(Op.LdaFalse)
+        star(scope.open)
+        ldar(scope.iterator)
+        emit2(Op.GetPropertyConst, internString('return'))
+        const missing = emitJumpPlaceholder(Op.JumpIfNullish)
+        const method = allocReg()
+        star(method)
+        emitCallArgs('Call', method, [], scope.iterator)
+        freeReg()
+        patchJump(missing)
+        patchJump(closed)
+    }
+
+    function emitForOf(node: ts.ForOfStatement) {
+        if (node.awaitModifier) throw 'for await...of is not supported'
+        const savedReg = nextReg
+        const savedLabels = labels
+        defer { nextReg = savedReg; labels = savedLabels }
+
+        emitExpr(node.expression)
+        const iterator = allocReg(); star(iterator)
+        emitLoadConst(lateBoundSlot(-1, 'Symbol'))
+        emit2(Op.GetPropertyConst, internString('iterator'))
+        const method = allocReg(); star(method)
+        ldar(iterator)
+        emit2(Op.GetProperty, method)
+        star(method)
+        emitCallArgs('Call', method, [], iterator)
+        star(iterator)
+        emit2(Op.GetPropertyConst, internString('next'))
+        star(method)
+        const step = allocReg()
+        const open = allocReg()
+        const scope = { iterator, open }
+
+        function bind(name: ts.BindingName): void {
+            if (ts.isIdentifier(name)) {
+                const reg = allocReg()
+                symToReg.set(getSymbolId(name), reg)
+                return
+            }
+            for (const element of name.elements) {
+                if (ts.isOmittedExpression(element)) continue
+                if (element.dotDotDotToken || element.initializer) throw 'for...of rest and default bindings are not supported'
+                bind(element.name)
+            }
+        }
+        function assign(name: ts.BindingName): void {
+            if (ts.isIdentifier(name)) { star(symToReg.get(getSymbolId(name))!); return }
+            const value = allocReg(); star(value)
+            for (let i = 0; i < name.elements.length; i++) {
+                const element = name.elements[i]
+                if (ts.isOmittedExpression(element)) continue
+                ldar(value)
+                if (ts.isArrayBindingPattern(name)) emit2(Op.GetPropertyImm, i)
+                else {
+                    const key = element.propertyName ?? element.name
+                    if (!ts.isIdentifier(key) && !ts.isStringLiteral(key)) throw 'unsupported for...of binding key'
+                    emit2(Op.GetPropertyConst, internString(key.text))
+                }
+                assign(element.name)
+            }
+            freeReg()
+        }
+        const binding = ts.isVariableDeclarationList(node.initializer) ? node.initializer.declarations[0].name : undefined
+        if (binding) bind(binding)
+
+        skipNextLookbehind = true
+        const top = code.length
+        emit1(Op.LdaFalse); star(open)
+        emitCallArgs('Call', method, [], iterator)
+        star(step)
+        emit2(Op.GetPropertyConst, internString('done'))
+        const end = emitJumpPlaceholder(Op.JumpIfToBooleanTrue)
+        ldar(step)
+        emit2(Op.GetPropertyConst, internString('value'))
+        star(step)
+        emit1(Op.LdaTrue); star(open)
+        const range: EhRange = { start: code.length, end: 0, handler: 0 }
+        ldar(step)
+        if (binding) assign(binding)
+        else if (ts.isIdentifier(node.initializer)) star(symToReg.get(getSymbolId(node.initializer))!)
+        else throw 'for...of assignment target must be an identifier'
+
+        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget: top, canContinue: true, iterator: scope }
+        labels = ctx
+        iterators.push(scope)
+        emitStatement(node.statement)
+        iterators.pop()
+        range.end = code.length
+        emitJumpTo(Op.Jump, top)
+
+        range.handler = code.length
+        skipNextLookbehind = true
+        const error = allocReg(); star(error)
+        const closeRange: EhRange = { start: code.length, end: 0, handler: 0 }
+        emitIteratorClose(scope)
+        closeRange.end = code.length
+        closeRange.handler = code.length
+        ldar(error)
+        emit1(Op.ReThrow)
+        freeReg()
+        const extras = getExtraLabels()
+        extras.eh.push(closeRange, range)
+        patchJump(end)
+        for (const at of ctx.breaks) patchJump(at)
+    }
+
     // TODO: `finally` which requires swapping out subsequent control flow labels w/ jumps
     function emitTryStatement(node: ts.TryStatement) {
         if (node.finallyBlock) throw "TODO: finally block"
@@ -1719,8 +1843,15 @@ function emitFunction(
         currentNode = node
   
         if (ts.isReturnStatement(node)) {
-            if (!node.expression) { emit1(Op.ReturnVoid); return }
-            emitExpr(node.expression)
+            if (!node.expression && !iterators.length) { emit1(Op.ReturnVoid); return }
+            if (node.expression) emitExpr(node.expression)
+            else emit1(Op.LdaUndefined)
+            if (iterators.length) {
+                const value = allocReg(); star(value)
+                for (let i = iterators.length - 1; i >= 0; i--) emitIteratorClose(iterators[i])
+                ldar(value)
+                freeReg()
+            }
             emit1(Op.Return)
             return
         }
@@ -1731,6 +1862,7 @@ function emitFunction(
         if (ts.isWhileStatement(node)) { emitWhile(node); return }
         if (ts.isDoStatement(node)) { emitDo(node); return }
         if (ts.isForStatement(node)) { emitFor(node); return }
+        if (ts.isForOfStatement(node)) { emitForOf(node); return }
         if (ts.isSwitchStatement(node)) { emitSwitch(node); return }
         if (ts.isBreakStatement(node)) {
             if (node.label) throw "labeled break is not supported"
@@ -2292,7 +2424,7 @@ interface Ctx {
     [key: string]: any
 }
 export function createCtx(o: Record<string, any> = {}): Ctx {
-    return Object.assign({ [ctxSym]: Symbol('ctx brand') }, o) as any
+    return Object.assign({ [ctxSym]: Symbol('ctx brand'), Symbol: heap.symbolConstants }, o) as any
 }
 export function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
@@ -2596,6 +2728,33 @@ function runTest() {
     // try/catch
     e2eTest('function eh() { try { throw 1 } catch (e) { return e + 1 } }', [1])
     e2eTest('function nothrow(x) { try { x += 1 } catch (e) { return e + 1 } return x }', [1])
+
+    function iterable() {
+        return {
+            index: 0, closed: 0,
+            [Symbol.iterator]: function iterator() { this.index = 0; return this },
+            next: function next() {
+                const value = this.index
+                this.index = value + 1
+                return { value, done: value >= 4 }
+            },
+            return: function close() { this.closed = this.closed + 1; return { done: true, value: 0 } },
+        }
+    }
+    e2eTest('function iteration(o) { let sum = 0; for (const x of o) sum += x; return sum * 10 + o.closed }', [iterable()])
+    e2eTest('function iterationBreak(o) { let sum = 0; for (const x of o) { if (x === 1) continue; if (x === 3) break; sum += x } return sum * 10 + o.closed }', [iterable()])
+    e2eTest('function iterationReturn(o) { function inner() { for (const x of o) { if (x === 2) return x + 10 } return 0 } const value = inner(); return value * 10 + o.closed }', [iterable()])
+    e2eTest('function iterationThrow(o) { try { for (const x of o) { if (x === 2) throw 7 } } catch (e) { return e * 10 + o.closed } return 0 }', [iterable()])
+    e2eTest('function iterationAssign(o) { let x = 0; for (x of o) {} return x }', [iterable()])
+    e2eTest('function iterationSwitch(o) { let sum = 0; for (const x of o) { switch (x) { case 1: break; default: sum += x } } return sum * 10 + o.closed }', [iterable()])
+    const pairs = iterable()
+    pairs.next = function next() {
+        const index = this.index
+        this.index = index + 1
+        return { done: index >= 4, value: [index, index + 1] }
+    } as any
+    e2eTest('function iterationEntries(o) { let sum = 0; for (const [key, value] of o) sum += key + value; return sum }', [pairs])
+    e2eTest('function symbolProperty(key, n) { const o = { [key]: n, value: 5 }; return o[key] + o.value }', [Symbol('value'), 7])
 
     {
         function shortcircuit(x: number, y: (o: any) => number) {

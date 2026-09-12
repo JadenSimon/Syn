@@ -24060,6 +24060,7 @@ pub const Analyzer = struct {
     }
 
     fn notSupported(n: anytype) !u32 {
+        if (comptime suppress_gaps) return @intFromEnum(Kind.error_any);
         debugPrint("  not supported: {any}\n\n", .{n});
         return error.Unsupported;
     }
