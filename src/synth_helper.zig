@@ -427,7 +427,7 @@ pub const SynthInstrumenter = struct {
             defer self.rebindings = save_rebindings;
             self.rebindings = .{};
             try forEachChild(self.nodes, node, self);
-            try self.drainRebindings(funcBodyRef(node));
+            try self.drainRebindings(funcBodyRef(node), 0);
             const captures = self.fns.get(ref) orelse unreachable; // set before transform
 
             if (node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor or node.kind == .constructor) {
@@ -537,16 +537,17 @@ pub const SynthInstrumenter = struct {
         return self.replacements.get(ref) orelse ref;
     }
 
-    fn drainRebindings(self: *@This(), _ref: NodeRef) !void {
+    fn drainRebindings(self: *@This(), _ref: NodeRef, start: usize) !void {
         std.debug.assert(_ref != 0);
-        if (self.rebindings.items.len == 0) return; 
+        if (self.rebindings.items.len == start) return;
+        const pending = self.rebindings.items[start..];
         const ref = self.resolveRef(_ref);
         switch (self.nodes.at(ref).kind) {
             .variable_statement => {
                 const clone = try self.factory.cloneNodeRef(ref);
                 try self.replacements.put(ref, clone);
                 var t = clone;
-                for (self.rebindings.items) |x| {
+                for (pending) |x| {
                     self.nodes.at(t).next = x;
                     t = x;
                 }
@@ -556,7 +557,7 @@ pub const SynthInstrumenter = struct {
                 const first = maybeUnwrapRef(self.nodes.at(ref)) orelse 0;
                 var head: NodeRef = 0;
                 var tail: NodeRef = 0;
-                for (self.rebindings.items) |x| {
+                for (pending) |x| {
                     if (tail != 0) self.nodes.at(tail).next = x;
                     if (head == 0) head = x;
                     tail = x;
@@ -566,7 +567,7 @@ pub const SynthInstrumenter = struct {
                     self.nodes.at(clone).data = head;
                     try self.replacements.put(_ref, clone);
                 } else {
-                    const clone = try self.factory.cloneNodeRef(first);
+                    const clone = self.replacements.get(first) orelse try self.factory.cloneNodeRef(first);
                     self.nodes.at(tail).next = clone;
                     try self.replacements.put(first, head);
                 }
@@ -576,7 +577,7 @@ pub const SynthInstrumenter = struct {
                 const ret = try self.factory.createReturnStatement(try self.factory.cloneNodeRef(ref));
                 var head: NodeRef = 0;
                 var tail = head;
-                for (self.rebindings.items) |x| {
+                for (pending) |x| {
                     if (tail != 0) self.nodes.at(tail).next = x;
                     if (head == 0) head = x;
                     tail = x;
@@ -587,7 +588,7 @@ pub const SynthInstrumenter = struct {
             },
         }
 
-        self.rebindings.clearRetainingCapacity();
+        self.rebindings.shrinkRetainingCapacity(start);
     }
 
     fn maybeRecordDollarName(self: *@This(), sym: SymbolRef, n: *const AstNode) !void {
@@ -714,15 +715,16 @@ pub const SynthInstrumenter = struct {
         if (ref == 0) return;
         if (self.emitting) {
             if (node.kind == .variable_statement) {
+                const start = self.rebindings.items.len;
                 try forEachChild(self.nodes, node, self);
-                return try self.drainRebindings(ref);
+                return try self.drainRebindings(ref, start);
             }
             if (node.kind == .arrow_function or node.kind == .function_expression or node.kind == .function_declaration or node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor) {
                 const save_rebindings = self.rebindings;
                 defer self.rebindings = save_rebindings;
                 self.rebindings = .{};
                 try forEachChild(self.nodes, node, self);
-                return try self.drainRebindings(funcBodyRef(node));
+                return try self.drainRebindings(funcBodyRef(node), 0);
             }
             if (node.kind == .shorthand_property_assignment) {
                 const inner_ref = parser.unwrapRef(node);
@@ -812,8 +814,9 @@ pub const SynthInstrumenter = struct {
             },
 
             .variable_statement => {
+                const start = self.rebindings.items.len;
                 try forEachChild(self.nodes, node, self);
-                try self.drainRebindings(ref);
+                try self.drainRebindings(ref, start);
             },
 
             .shorthand_property_assignment => {
