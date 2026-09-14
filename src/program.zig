@@ -22928,13 +22928,19 @@ pub const Analyzer = struct {
         if (_lhs == @intFromEnum(Kind.number)) {
             return @intFromEnum(Kind.number);
         }
-        const lhs = this.maybeGetInt32FromType(_lhs) orelse return error.NotIn32;
+        const lhs = this.maybeGetInt32FromType(_lhs) orelse {
+            if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+            return error.NotInt32;
+        };
 
         const _rhs = try this.getType(file, d.right);
         if (_rhs == @intFromEnum(Kind.number)) {
             return @intFromEnum(Kind.number);
         }
-        const rhs = this.maybeGetInt32FromType(_rhs) orelse return error.NotIn32;
+        const rhs = this.maybeGetInt32FromType(_rhs)  orelse {
+            if (comptime suppress_gaps) return @intFromEnum(Kind.any);
+            return error.NotInt32;
+        };
 
         const op: SyntaxKind = @enumFromInt(exp.len);
         const v: i32 = switch (op) {
