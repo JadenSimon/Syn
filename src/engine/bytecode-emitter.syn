@@ -83,7 +83,6 @@ function isShortLoad(opcode: number) {
 
 function emitFunction(
     fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration,
-    constContext?: Record<string, any>,
     outerSymbols: Map<number, OuterSymbol> = new Map<number, OuterSymbol>(),
 ): EmitResult {
     const code: number[] = []
@@ -915,13 +914,13 @@ function emitFunction(
         emit3(setOp, robj, keySlot)
     }
 
-    function emitPropertyAccessAssignment(
-        node: ts.BinaryExpression, 
-        target: ts.PropertyAccessExpression | ts.ElementAccessExpression
+    function emitPropertyTarget(
+        target: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+        finish: (getOp: number, setOp: number, robj: number, keySlot: number) => void,
     ) {
         if (target.questionDotToken) throw `optional chaining assignment is not supported`
-        const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression        
-        
+        const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression
+
         emitExpr(target.expression) // acc = object
         const robj = allocReg(); star(robj)
         defer freeReg()
@@ -930,7 +929,7 @@ function emitFunction(
             const key = tryFoldExp(target.argumentExpression)
             if (key?.[0] === 'value' && typeof key[1] === 'number') {
                 if (!Number.isInteger(key[1]) || key[1] < 0 || key[1] > 0xFF) throw 'array index does not fit in bytecode'
-                finishPropertyAccessAssignment(node, Op.GetPropertyImm, Op.SetPropertyImm, robj, key[1])
+                finish(Op.GetPropertyImm, Op.SetPropertyImm, robj, key[1])
                 return
             }
         }
@@ -941,26 +940,28 @@ function emitFunction(
         if (!isConstName) {
             if (const val = tryFoldExp(target.argumentExpression)) {
                 if (val[0] === 'value' && typeof val[1] === 'string') {
-                    return finishPropertyAccessAssignment(
-                        node,
-                        Op.GetPropertyConst,
-                        Op.SetPropertyConst,
-                        robj,
-                        internValue(val[1]),
-                    )
+                    return finish(Op.GetPropertyConst, Op.SetPropertyConst, robj, internValue(val[1]))
                 }
             }
             emitExpr(target.argumentExpression)
             star(keySlot)
         }
 
-        finishPropertyAccessAssignment(
-            node,
+        finish(
             isConstName ? Op.GetPropertyConst : Op.GetProperty,
             isConstName ? Op.SetPropertyConst : Op.SetProperty,
             robj,
             keySlot,
         )
+    }
+
+    function emitPropertyAccessAssignment(
+        node: ts.BinaryExpression,
+        target: ts.PropertyAccessExpression | ts.ElementAccessExpression
+    ) {
+        emitPropertyTarget(target, (getOp, setOp, robj, keySlot) => {
+            finishPropertyAccessAssignment(node, getOp, setOp, robj, keySlot)
+        })
     }
 
     function emitAssignment(node: ts.BinaryExpression) {
@@ -1127,6 +1128,20 @@ function emitFunction(
         return op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken
     }
 
+    function emitUpdateAcc(isPrefix: boolean, increment: boolean, store: () => void) {
+        const op = increment ? Op.Inc : Op.Dec
+        if (isPrefix) {
+            emit1(op)
+            store()
+            return
+        }
+        const old = allocReg(); star(old)
+        emit1(op)
+        store()
+        ldar(old)
+        freeReg()
+    }
+
     function emitUnaryAssignment(node: ts.PrefixUnaryExpression | ts.PostfixUnaryExpression) {
         assert(isAssignmentUnary(node.operator))
         const isPrefix = node.kind === ts.SyntaxKind.PrefixUnaryExpression
@@ -1134,10 +1149,22 @@ function emitFunction(
             ? (isPrefix ? Op.Inc : Op.IncPost) 
             : (isPrefix ? Op.Dec : Op.DecPost) 
         const operand = node.operand
+        const increment = node.operator === ts.SyntaxKind.PlusPlusToken
+        if (ts.isPropertyAccessExpression(operand) || ts.isElementAccessExpression(operand)) {
+            return emitPropertyTarget(operand, (getOp, setOp, robj, keySlot) => {
+                ldar(robj)
+                emit2(getOp, keySlot)
+                emitUpdateAcc(isPrefix, increment, () => emit3(setOp, robj, keySlot))
+            })
+        }
         const symId = getSymbolId(operand)
         if (symId === 0) throw `non-lexical identifier: ${operand.getText()}`
+        if (const scoped = scopedSymbol(symId)) {
+            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            return emitUpdateAcc(isPrefix, increment, () => emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg))
+        }
         const dst = symToReg.get(symId)
-        assert(dst !== undefined) // FIXME: this emit only works on local bindings
+        assert(dst !== undefined)
         if (!isPrefix) return emit2(op, dst)
 
         ldar(dst)
@@ -1929,7 +1956,7 @@ function emitFunction(
             const scoped = scopedSymbol(sym)
             if (scoped) childOuter.set(sym, scoped)
         }
-        emitNested(emitFunction(node, constContext, childOuter))
+        emitNested(emitFunction(node, childOuter))
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
@@ -2059,7 +2086,7 @@ function fixupMethodLikeDecl(src: string) {
     src = src.trim()
     if (src.startsWith('export default ')) src = src.slice(15).trimStart()
     else if (src.startsWith('export ')) src = src.slice(7).trimStart()
-    if (src.startsWith('get ') || src.startsWith('set ')) src = src.slice(4)
+    else if (src.startsWith('get ') || src.startsWith('set ')) src = src.slice(4)
     if (src.startsWith('function')) return src
     if (src.startsWith('(')) return src
     if (src.startsWith('async')) return src // todo: async method fixup
@@ -2761,6 +2788,13 @@ function runTest() {
     e2eTest('function arrayLiteral(a, b) { const x = [a, b]; return x[0] + x[1] + x.length }', [4, 7])
     e2eTest('function arrayStore(a) { const x = [1, 2]; x[1] = a; return x[1] }', [9])
     e2eTest('function nestedCapture(a) { let x = 2; function add(b) { x = x + b; return x + a } return add(3) }', [7])
+    e2eTest('function capturedPostfix() { let n = 5; function take() { const i = n++; return i } const a = take(); return a * 10 + n }', [])
+    e2eTest('function capturedPrefix() { let n = 5; function take() { return ++n } const a = take(); return a * 10 + n }', [])
+    e2eTest('function capturedDecrement() { let n = 5; function take() { return n-- } const a = take(); return a * 10 + n }', [])
+    e2eTest('function propertyPostfix(o) { const a = o.x++; return a * 10 + o.x }', [{ x: 3 }])
+    e2eTest('function propertyPrefix(o) { const a = ++o.x; return a * 10 + o.x }', [{ x: 3 }])
+    e2eTest('function elementPostfix(o, k) { const a = o[k]++; return a * 10 + o[k] }', [{ x: 3 }, 'x'])
+    e2eTest('function indexPostfix(a) { const b = a[0]++; return b * 10 + a[0] }', [[7]])
 
     // compound property assignment
     e2eTest('function compoundProp(o) { o.x += 5; return o.x }', [{ x: 10 }])
@@ -2815,7 +2849,7 @@ function runTest() {
     e2eTest('function iterationAssign(o) { let x = 0; for (x of o) {} return x }', [iterable()])
     e2eTest('function iterationSwitch(o) { let sum = 0; for (const x of o) { switch (x) { case 1: break; default: sum += x } } return sum * 10 + o.closed }', [iterable()])
     const pairs = iterable()
-    pairs.next = function next() {
+    pairs.next = function next(this: { index: number }) {
         const index = this.index
         this.index = index + 1
         return { done: index >= 4, value: [index, index + 1] }

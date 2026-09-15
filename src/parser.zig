@@ -1970,6 +1970,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             var prev_token: ?js_lexer.T = null;
             while (depth > 0) {
                 switch (this.lexer.token) {
+                    .t_end_of_file => return false,
                     // Many operators are invalid in this context
                     .t_plus, .t_tilde, .t_slash => return false,
                     .t_ampersand_ampersand, .t_bar_bar => return false,

@@ -35,6 +35,8 @@ const supportDestroying = 2
 const supportDestroyed = 3
 const condenseChunkBytes = 3800
 const condenseAccountingBytes = 256
+const heapStackBytes = 1 << 20
+const depthBias = 256
 
 enum StaticEnumerator {
     none,
@@ -62,6 +64,8 @@ interface HeapState {
     maxScs: ScId
     rootSc: ScId
     internalSc: ScId
+    stackTop: u64
+    stackEnd: u64
 }
 
 interface BuildState {
@@ -126,21 +130,31 @@ const heapTableOffset = (heapSize + 7) & ~7
 const scHeaderSize = (Sc.sizeof + 7) & ~7
 const scCapacity = (((scChunkBytes - scHeaderSize) / slotScale) - 1) as u16
 const poolStart = 1 as u16
+const maxChildren = ((scCapacity + 1) >> 1) as u32
 
-function tempU32Array(capacity: u32): usize {
-    const ptr = Intrinsics.alloc(u32ArrayBytes(capacity))
+function stackAlloc(heapPtr: usize, bytes: usize): usize {
+    const heap = Heap(heapPtr)
+    const ptr = heap.stackTop as usize
+    const next = ptr + ((bytes + 7) & ~7)
+    intrinsics.assert(next <= (heap.stackEnd as usize))
+    heap.stackTop = next
+    return ptr
+}
+
+function tempU32Array(heapPtr: usize, capacity: u32): usize {
+    const ptr = stackAlloc(heapPtr, u32ArrayBytes(capacity))
     initU32Array(ptr, capacity)
     return ptr
 }
 
-function tempU32Set(capacity: u32): usize {
-    const ptr = Intrinsics.alloc(u32SetBytes(capacity))
+function tempU32Set(heapPtr: usize, capacity: u32): usize {
+    const ptr = stackAlloc(heapPtr, u32SetBytes(capacity))
     initU32Set(ptr, capacity)
     return ptr
 }
 
-function tempU32Map(capacity: u32): usize {
-    const ptr = Intrinsics.alloc(u32MapBytes(capacity))
+function tempU32Map(heapPtr: usize, capacity: u32): usize {
+    const ptr = stackAlloc(heapPtr, u32MapBytes(capacity))
     initU32Map(ptr, capacity)
     return ptr
 }
@@ -559,11 +573,13 @@ export function createHeap(
     intrinsics.assert(maxScs > 1 && (maxScs as any) <= scIdMask)
     const tableBytes = maxScs * 8
     const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
-    const heapPtr = allocate(slabStartOffset + maxScs * scChunkBytes)
+    const heapPtr = allocate(slabStartOffset + maxScs * scChunkBytes + heapStackBytes)
     const heap = Heap(heapPtr)
     heap.scTable = heapPtr + heapTableOffset
     heap.slabNext = heapPtr + slabStartOffset
     heap.slabEnd = heap.slabNext as usize + maxScs * scChunkBytes
+    heap.stackTop = heap.slabEnd
+    heap.stackEnd = heap.slabEnd as usize + heapStackBytes
     heap.nextScId = 2
     heap.maxScs = maxScs
     heap.rootSc = 1
@@ -756,7 +772,7 @@ export function allocInto(
     if (childCount > 1
         && (availableBranchCells(heapPtr, parentId, condenseSpareCells + 1) <= condenseSpareCells
             || sparseWouldGrow(heapPtr, peerRefs(getScRaw(heapPtr, parentId)), condenseAccountingBytes))) {
-        intrinsics.assert(condense(heapPtr, parentId, false).length !== 0)
+        intrinsics.assert(condense(heapPtr, parentId, false) !== 0)
     }
     const leaf = createPoolSc(heapPtr, parentId, enumerateEdges, bytes)
     return allocCell(heapPtr, leaf, bytes)
@@ -1143,21 +1159,21 @@ function sparseWouldGrow(heapPtr: usize, fieldPtr: usize, minBytes: u32): boolea
     return sparseHeaderSize + (capacity << (map.widthLog + 1)) >= minBytes
 }
 
-function sparseEntries(heapPtr: usize, fieldPtr: usize): [u32, u32][] {
-    const result: [u32, u32][] = []
+function sparseEntries(heapPtr: usize, fieldPtr: usize): usize {
     const handle = sparseHandle(fieldPtr)
-    if (handle === 0) return result
+    if (handle === 0) return tempU32Map(heapPtr, 0)
     const ptr = resolve(heapPtr, handle)
     const map = SparseMap(ptr)
     const widthLog = map.widthLog
     const width = (1 << widthLog) as u32
     const count = map.count as u32
+    const result = U32Map(tempU32Map(heapPtr, count))
     for (let i: u32 = 0; i < count; i++) {
         const offset = sparseEntryOffset(widthLog, i)
         const value = sparseLoad(ptr, offset + width, widthLog)
-        if (value !== 0) result.push([sparseLoad(ptr, offset, widthLog), value])
+        if (value !== 0) result.append(sparseLoad(ptr, offset, widthLog), value)
     }
-    return result
+    return result.__address
 }
 
 function setRefCount(heapPtr: usize, fieldPtr: usize, slot: u16, count: u32): void {
@@ -1375,11 +1391,13 @@ export function releaseArena(heapPtr: usize, arenaId: ScId): void {
     const sc = Sc(ptr)
     intrinsics.assert(sc.type === ScType.arena && !isArena(heapPtr, parentSc(sc)))
     const source = makeHandle(arenaId, 1)
-    for (const [target, count] of sparseEntries(heapPtr, outboundRefs(heapPtr, ptr))) {
+    const mark = Heap(heapPtr).stackTop
+    for (const [target, count] of U32Map(sparseEntries(heapPtr, outboundRefs(heapPtr, ptr)))) {
         for (let i: u32 = 0; i < count; i++) {
             removeEdgeWith(heapPtr, source, target as Handle, true)
         }
     }
+    Heap(heapPtr).stackTop = mark
     const owner = sc.owner
     unlinkChild(heapPtr, handleSc(owner), arenaId)
     releaseCell(heapPtr, owner)
@@ -1389,6 +1407,7 @@ export function convertArena(heapPtr: usize, arenaId: ScId): void {
     const ptr = getScRaw(heapPtr, arenaId)
     const sc = Sc(ptr)
     intrinsics.assert(sc.type === ScType.arena && !isArena(heapPtr, parentSc(sc)))
+    const mark = Heap(heapPtr).stackTop
     const members = arenaSubtree(heapPtr, arenaId)
     const memberIds = new Set<number>(members)
     for (const id of members) {
@@ -1402,7 +1421,7 @@ export function convertArena(heapPtr: usize, arenaId: ScId): void {
     const pending: Handle[] = []
     for (const id of members) {
         const memberPtr = getScRaw(heapPtr, id)
-        for (const [slot, raw] of sparseEntries(heapPtr, inboundRefs(heapPtr, memberPtr))) {
+        for (const [slot, raw] of U32Map(sparseEntries(heapPtr, inboundRefs(heapPtr, memberPtr)))) {
             if ((raw >>> 2) === 0) continue
             const handle = makeHandle(id, slot as u16)
             if (seen.has(handle)) continue
@@ -1410,6 +1429,7 @@ export function convertArena(heapPtr: usize, arenaId: ScId): void {
             pending.push(handle)
         }
     }
+    Heap(heapPtr).stackTop = mark
 
     while (pending.length !== 0) {
         const cell = pending.pop()!
@@ -1458,14 +1478,14 @@ function isBelow(heapPtr: usize, id: ScId, ancestor: ScId): boolean {
     return false
 }
 
-function childScs(heapPtr: usize, parentId: ScId): ScId[] {
-    const children: ScId[] = []
+function childScs(heapPtr: usize, parentId: ScId): usize {
+    const children = U32Array(tempU32Array(heapPtr, maxChildren))
     let child = Sc(getScRaw(heapPtr, parentId)).firstChild
     while (child !== 0) {
         children.push(child)
         child = nextSibling(heapPtr, child)
     }
-    return children
+    return children.__address
 }
 
 function bumpDepth(heapPtr: usize, id: ScId): void {
@@ -1502,27 +1522,34 @@ function removeBoundarySupport(heapPtr: usize, sourceId: ScId, target: Handle): 
     if (peers === 0) removeLocalSupport(heapPtr, parentPtr, right.owner, false)
 }
 
-export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId {
+export function mergeGroup(heapPtr: usize, parentId: ScId, groupPtr: usize): ScId {
+    const group = U32Array(groupPtr)
     intrinsics.assert(group.length > 1)
+    const mark = Heap(heapPtr).stackTop
     const parentPtr = getScRaw(heapPtr, parentId)
     const parent = Sc(parentPtr)
-    const groupIds = new Set<number>(group)
-    const oldOwners = new Map<number, Handle>()
-    const oldSlots = new Map<number, u16>()
-    const oldLocal = new Map<number, u32>()
-    const oldInbound = new Map<number, u32>()
-    const outboundByChild = new Map<number, [u32, u32][]>()
+    const groupIds = U32Set(tempU32Set(heapPtr, group.length))
+    const oldOwners = U32Map(tempU32Map(heapPtr, group.length))
+    const oldSlots = U32Map(tempU32Map(heapPtr, group.length))
+    const oldLocal = U32Map(tempU32Map(heapPtr, group.length))
+    const oldInbound = U32Map(tempU32Map(heapPtr, group.length))
+    const outboundByChild = U32Map(tempU32Map(heapPtr, group.length))
+    let outboundTotal: u32 = 0
     for (const id of group) {
-        const sc = Sc(getScRaw(heapPtr, id))
+        groupIds.add(id)
+        const sc = Sc(getScRaw(heapPtr, id as ScId))
         intrinsics.assert(parentSc(sc) === parentId)
         oldOwners.set(id, sc.owner)
         const slot = handleSlot(sc.owner)
         oldSlots.set(id, slot)
         oldLocal.set(id, localCount(heapPtr, parentPtr, sc.owner))
         oldInbound.set(id, inboundCount(heapPtr, parentPtr, sc.owner))
-        outboundByChild.set(id, sparseEntries(heapPtr, outboundRefs(heapPtr, getScRaw(heapPtr, id))))
+        const outbound = sparseEntries(heapPtr, outboundRefs(heapPtr, getScRaw(heapPtr, id as ScId)))
+        outboundByChild.set(id, outbound - heapPtr)
+        outboundTotal += U32Map(outbound).size
     }
-    const parentPeers = sparseEntries(heapPtr, peerRefs(parentPtr))
+
+    const parentPeers = U32Map(sparseEntries(heapPtr, peerRefs(parentPtr)))
     const wrapperId = createBranchSc(heapPtr, parentId)
     const wrapperPtr = getScRaw(heapPtr, wrapperId)
     const wrapper = Sc(wrapperPtr)
@@ -1542,13 +1569,13 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         }
         child = next
     }
-    const newOwners = new Map<number, Handle>()
-    const oldSlotToId = new Map<number, number>()
-    for (const id of group) oldSlotToId.set(oldSlots.get(id)!, id)
+    const newOwners = U32Map(tempU32Map(heapPtr, group.length))
+    const oldSlotToId = U32Map(tempU32Map(heapPtr, group.length))
+    for (const id of group) oldSlotToId.set(oldSlots.get(id), id)
 
     for (const id of group) {
-        const sc = Sc(getScRaw(heapPtr, id))
-        const oldOwner = oldOwners.get(id)!
+        const sc = Sc(getScRaw(heapPtr, id as ScId))
+        const oldOwner = oldOwners.get(id) as Handle
         const oldData = ScCell(resolve(heapPtr, oldOwner))
         const newOwner = allocCell(heapPtr, wrapperId, branchScCellSize)
         const data = ScCell(resolve(heapPtr, newOwner))
@@ -1562,13 +1589,13 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         support.inboundVertical = 0
         sc.owner = newOwner
         newOwners.set(id, newOwner)
-        bumpDepth(heapPtr, id)
+        bumpDepth(heapPtr, id as ScId)
     }
 
     const parentPeerRefs = peerRefs(parentPtr)
     const wrapperPeerRefs = peerRefs(wrapperPtr)
     let wrapperSupport: u32 = 0
-    const incomingPeer = new Map<number, u32>()
+    const incomingPeer = U32Map(tempU32Map(heapPtr, group.length))
     for (const [key, count] of parentPeers) {
         const fromSlot = (key >>> 16) as u16
         const toSlot = (key & slotMask) as u16
@@ -1578,50 +1605,50 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
         sparseSet(heapPtr, parentPeerRefs, key, 0)
         if (fromId && toId) {
             sparseAdd(heapPtr, wrapperPeerRefs,
-                peerKey(handleSlot(newOwners.get(fromId)!), handleSlot(newOwners.get(toId)!)), count)
-            addLocalCount(heapPtr, wrapperPtr, newOwners.get(toId)!, 1)
-            incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
+                peerKey(handleSlot(newOwners.get(fromId) as Handle), handleSlot(newOwners.get(toId) as Handle)), count)
+            addLocalCount(heapPtr, wrapperPtr, newOwners.get(toId) as Handle, 1)
+            incomingPeer.set(toId, incomingPeer.get(toId) + 1)
         } else if (toId) {
             const key = peerKey(fromSlot, wrapperSlot)
             const existing = sparseGet(heapPtr, parentPeerRefs, key)
             sparseAdd(heapPtr, parentPeerRefs, key, count)
-            addInboundCount(heapPtr, wrapperPtr, newOwners.get(toId)!, count)
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(toId) as Handle, count)
             if (existing === 0) wrapperSupport++
-            incomingPeer.set(toId, (incomingPeer.get(toId) ?? 0) + 1)
+            incomingPeer.set(toId, incomingPeer.get(toId) + 1)
         } else {
             sparseAdd(heapPtr, parentPeerRefs, peerKey(wrapperSlot, toSlot), count)
         }
     }
 
     for (const id of group) {
-        const vertical = oldInbound.get(id)!
-        const remainder = oldLocal.get(id)! - (incomingPeer.get(id) ?? 0)
-        setLocalCount(heapPtr, parentPtr, oldOwners.get(id)!, 0)
-        setInboundCount(heapPtr, parentPtr, oldOwners.get(id)!, 0)
+        const vertical = oldInbound.get(id)
+        const remainder = oldLocal.get(id) - incomingPeer.get(id)
+        setLocalCount(heapPtr, parentPtr, oldOwners.get(id) as Handle, 0)
+        setInboundCount(heapPtr, parentPtr, oldOwners.get(id) as Handle, 0)
         if (vertical) {
-            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id)!, vertical)
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id) as Handle, vertical)
             addInboundCount(heapPtr, parentPtr, wrapper.owner, vertical)
         }
         if (remainder) {
-            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id)!, remainder)
+            addInboundCount(heapPtr, wrapperPtr, newOwners.get(id) as Handle, remainder)
             wrapperSupport += remainder
         }
     }
     if (wrapperSupport) addLocalCount(heapPtr, parentPtr, wrapper.owner, wrapperSupport)
 
-    const targetSources = new Map<number, number>()
+    const targetSources = U32Map(tempU32Map(heapPtr, outboundTotal))
     const wrapperOutboundRefs = outboundRefs(heapPtr, wrapperPtr)
     for (const id of group) {
-        for (const [target, count] of outboundByChild.get(id)!) {
+        for (const [target, count] of U32Map(heapPtr + outboundByChild.get(id))) {
             if (!count) continue
             let internal = false
             const targetId = handleSc(target as Handle)
             for (const member of group) {
-                if (isBelow(heapPtr, targetId, member)) { internal = true; break }
+                if (isBelow(heapPtr, targetId, member as ScId)) { internal = true; break }
             }
             if (internal) continue
             sparseAdd(heapPtr, wrapperOutboundRefs, target, 1)
-            targetSources.set(target, (targetSources.get(target) ?? 0) + 1)
+            targetSources.set(target, targetSources.get(target) + 1)
         }
     }
     for (const [target, sources] of targetSources) {
@@ -1632,135 +1659,150 @@ export function mergeGroup(heapPtr: usize, parentId: ScId, group: ScId[]): ScId 
 
     let extent: u8 = 0
     for (const id of group) {
-        const child = Sc(getScRaw(heapPtr, id))
+        const child = Sc(getScRaw(heapPtr, id as ScId))
         const value = child.depthExtent + 1
         if (value > extent) extent = value
     }
     wrapper.depthExtent = extent
     if (wrapper.depthExtent + 1 > parent.depthExtent) parent.depthExtent = wrapper.depthExtent + 1
-    for (const id of group) releaseCell(heapPtr, oldOwners.get(id)!)
+    for (const id of group) releaseCell(heapPtr, oldOwners.get(id) as Handle)
+    Heap(heapPtr).stackTop = mark
     return wrapperId
 }
 
-export function condense(heapPtr: usize, parentId: ScId, useAll: boolean): ScId[] {
+export function condense(heapPtr: usize, parentId: ScId, useAll: boolean): u32 {
+    const mark = Heap(heapPtr).stackTop
     const parentPtr = getScRaw(heapPtr, parentId)
     const parent = Sc(parentPtr)
-    const children = childScs(heapPtr, parentId)
-    const buckets = new Map<number, ScId[]>()
+    const children = U32Array(childScs(heapPtr, parentId))
+    const depths = U32Array(tempU32Array(heapPtr, children.length))
+    const buckets = U32Map(tempU32Map(heapPtr, children.length))
     for (const id of children) {
-        const child = Sc(getScRaw(heapPtr, id))
+        const child = Sc(getScRaw(heapPtr, id as ScId))
         if (useAll) continue
         const vertical = inboundCount(heapPtr, parentPtr, child.owner) !== 0
         const depth = vertical
             ? (child.depthExtent as number) - (parent.depthExtent as number)
             : child.depthExtent as number
-        const bucket = buckets.get(depth) ?? []
-        bucket.push(id)
-        buckets.set(depth, bucket)
+        const key = (depth + depthBias) as u32
+        depths.push(key)
+        buckets.set(key, buckets.get(key) + 1)
     }
     let selected = children
     if (!useAll) {
-        selected = []
-        let bestDepth = 0
-        for (const [depth, bucket] of buckets) {
-            if (selected.length === 0 || bucket.length > selected.length
-                || (bucket.length === selected.length && depth < bestDepth)) {
-                selected = bucket.slice()
-                bestDepth = depth
+        selected = U32Array(tempU32Array(heapPtr, children.length))
+        let bestKey: u32 = 0
+        let bestCount: u32 = 0
+        for (const [key, count] of buckets) {
+            if (bestCount === 0 || count > bestCount || (count === bestCount && key < bestKey)) {
+                bestKey = key
+                bestCount = count
             }
         }
-        for (const [depth, bucket] of buckets) {
-            if (depth === bestDepth) continue
-            if (bestDepth >= 0 && depth < 0) continue
-            if (depth < bestDepth) selected.push(...bucket)
+        for (let i: u32 = 0; i < children.length; i++) {
+            if (depths.get(i) === bestKey) selected.push(children.get(i))
+        }
+        for (const key of buckets.keys()) {
+            if (key === bestKey) continue
+            if (bestKey >= depthBias && key < depthBias) continue
+            if (key > bestKey) continue
+            for (let i: u32 = 0; i < children.length; i++) {
+                if (depths.get(i) === key) selected.push(children.get(i))
+            }
         }
     }
-    if (selected.length < 2) return []
+    if (selected.length < 2) {
+        Heap(heapPtr).stackTop = mark
+        return 0
+    }
 
-    const selectedSetPtr = tempU32Set(selected.length as u32)
-    defer Intrinsics.free(selectedSetPtr)
-    const selectedSet = U32Set(selectedSetPtr)
-    const slotToChildPtr = tempU32Map(selected.length as u32)
-    defer Intrinsics.free(slotToChildPtr)
-    const slotToChild = U32Map(slotToChildPtr)
-    const neighborsPtr = tempU32Map(selected.length as u32)
-    defer Intrinsics.free(neighborsPtr)
-    const neighbors = U32Map(neighborsPtr)
-    const neighborStoragePtr = tempU32Array(selected.length as u32)
-    defer {
-        const storage = U32Array(neighborStoragePtr)
-        while (storage.length !== 0) Intrinsics.free(storage.pop())
-        Intrinsics.free(neighborStoragePtr)
-    }
-    const neighborStorage = U32Array(neighborStoragePtr)
+    const selectedSet = U32Set(tempU32Set(heapPtr, selected.length))
+    const slotToChild = U32Map(tempU32Map(heapPtr, selected.length))
+    const neighbors = U32Map(tempU32Map(heapPtr, selected.length))
     for (let i: u32 = 0; i < selected.length; i++) {
-        const id = selected[i]
+        const id = selected.get(i)
         selectedSet.add(id)
-        slotToChild.set(handleSlot(Sc(getScRaw(heapPtr, id)).owner), id)
-        const list = tempU32Array(selected.length as u32)
-        neighborStorage.push(list)
-        neighbors.set(id, list)
+        slotToChild.set(handleSlot(Sc(getScRaw(heapPtr, id as ScId)).owner), id)
+        neighbors.set(id, tempU32Array(heapPtr, selected.length) - heapPtr)
     }
-    for (const [key, count] of sparseEntries(heapPtr, peerRefs(parentPtr))) {
+    for (const [key, count] of U32Map(sparseEntries(heapPtr, peerRefs(parentPtr)))) {
         if (!count) continue
         const from = slotToChild.get(key >>> 16)
         const to = slotToChild.get(key & slotMask)
         if (from && to && selectedSet.has(from) && selectedSet.has(to)) {
-            U32Array(neighbors.get(from)).push(to)
+            U32Array(heapPtr + neighbors.get(from)).push(to)
         }
     }
 
-    let nextIndex = 0
-    const indicesPtr = tempU32Map(selected.length as u32)
-    defer Intrinsics.free(indicesPtr)
-    const indices = U32Map(indicesPtr)
-    const lowlinksPtr = tempU32Map(selected.length as u32)
-    defer Intrinsics.free(lowlinksPtr)
-    const lowlinks = U32Map(lowlinksPtr)
-    const stackPtr = tempU32Array(selected.length as u32)
-    defer Intrinsics.free(stackPtr)
-    const stack = U32Array(stackPtr)
-    const onStackPtr = tempU32Set(selected.length as u32)
-    defer Intrinsics.free(onStackPtr)
-    const onStack = U32Set(onStackPtr)
-    const components: ScId[][] = []
-    function connect(id: ScId): void {
-        const index = nextIndex++
-        indices.set(id, index)
-        lowlinks.set(id, index)
-        stack.push(id)
-        onStack.add(id)
-        const adjacent = U32Array(neighbors.get(id))
-        for (let i: u32 = 0; i < adjacent.length; i++) {
-            const target = adjacent.get(i) as ScId
-            if (!indices.has(target)) {
-                connect(target)
-                lowlinks.set(id, Math.min(lowlinks.get(id)!, lowlinks.get(target)!))
-            } else if (onStack.has(target)) {
-                lowlinks.set(id, Math.min(lowlinks.get(id)!, indices.get(target)!))
+    const indices = U32Map(tempU32Map(heapPtr, selected.length))
+    const lowlinks = U32Map(tempU32Map(heapPtr, selected.length))
+    const stack = U32Array(tempU32Array(heapPtr, selected.length))
+    const onStack = U32Set(tempU32Set(heapPtr, selected.length))
+    const members = U32Array(tempU32Array(heapPtr, selected.length))
+    const ends = U32Array(tempU32Array(heapPtr, selected.length))
+    const work = U32Array(tempU32Array(heapPtr, selected.length))
+    const cursors = U32Map(tempU32Map(heapPtr, selected.length))
+    for (const root of selected) {
+        if (indices.has(root)) continue
+        work.push(root)
+        while (work.length !== 0) {
+            const id = work.get(work.length - 1)
+            if (!indices.has(id)) {
+                const index = indices.size
+                indices.set(id, index)
+                lowlinks.set(id, index)
+                stack.push(id)
+                onStack.add(id)
             }
+            const adjacent = U32Array(heapPtr + neighbors.get(id))
+            const at = cursors.get(id)
+            if (at < adjacent.length) {
+                cursors.set(id, at + 1)
+                const target = adjacent.get(at)
+                if (!indices.has(target)) {
+                    work.push(target)
+                    continue
+                }
+                if (onStack.has(target)) lowlinks.set(id, Math.min(lowlinks.get(id), indices.get(target)) as u32)
+                continue
+            }
+            work.pop()
+            if (work.length !== 0) {
+                const parent = work.get(work.length - 1)
+                lowlinks.set(parent, Math.min(lowlinks.get(parent), lowlinks.get(id)) as u32)
+            }
+            if (lowlinks.get(id) !== indices.get(id)) continue
+            for (;;) {
+                const child = stack.pop()
+                onStack.delete(child)
+                members.push(child)
+                if (child === id) break
+            }
+            ends.push(members.length)
         }
-        if (lowlinks.get(id) !== indices.get(id)) return
-        const component: ScId[] = []
-        for (;;) {
-            const child = stack.pop()!
-            onStack.delete(child)
-            component.push(child)
-            if (child === id) break
-        }
-        components.push(component)
     }
-    for (const id of selected) if (!indices.has(id)) connect(id)
 
-    const groups: ScId[][] = []
-    const remainder: ScId[] = []
-    for (const component of components) {
-        if (component.length > 1) groups.push(component)
-        else remainder.push(component[0])
+    const remainder = U32Array(tempU32Array(heapPtr, ends.length))
+    let wrappers: u32 = 0
+    let start: u32 = 0
+    for (let c: u32 = 0; c < ends.length; c++) {
+        const end = ends.get(c)
+        if (end - start === 1) {
+            remainder.push(members.get(start))
+            start = end
+            continue
+        }
+        const group = U32Array(tempU32Array(heapPtr, end - start))
+        for (let i = start; i < end; i++) group.push(members.get(i))
+        mergeGroup(heapPtr, parentId, group.__address)
+        wrappers++
+        start = end
     }
-    if (remainder.length > 1) groups.push(remainder)
-    const wrappers: ScId[] = []
-    for (const group of groups) wrappers.push(mergeGroup(heapPtr, parentId, group))
+    if (remainder.length > 1) {
+        mergeGroup(heapPtr, parentId, remainder.__address)
+        wrappers++
+    }
+    Heap(heapPtr).stackTop = mark
     return wrappers
 }
 
@@ -1768,11 +1810,13 @@ function createInterpretedHeap(maxScs: ScId, enumerateEdges: u64): usize {
     intrinsics.assert(maxScs > 1 && (maxScs as any) <= scIdMask)
     const tableBytes = maxScs * 8
     const slabStartOffset = (heapTableOffset + tableBytes + 7) & ~7
-    const heapPtr = intrinsics.Intrinsics.alloc(slabStartOffset + maxScs * scChunkBytes)
+    const heapPtr = intrinsics.Intrinsics.alloc(slabStartOffset + maxScs * scChunkBytes + heapStackBytes)
     const heap = Heap(heapPtr)
     heap.scTable = heapPtr + heapTableOffset
     heap.slabNext = heapPtr + slabStartOffset
     heap.slabEnd = heap.slabNext as usize + maxScs * scChunkBytes
+    heap.stackTop = heap.slabEnd
+    heap.stackEnd = heap.slabEnd as usize + heapStackBytes
     heap.nextScId = 2
     heap.maxScs = maxScs
     heap.rootSc = 1
@@ -1849,39 +1893,69 @@ function benchAddRemove(iter: number, heap: usize, localFrom: Handle, localTo: H
 const condenseBenchCellBytes = 8
 const condenseBenchMaxScs = 512 as ScId
 
-function makeCondenseBenchHeap(allocations: u32): [usize, ScId, u32] {
-    const heap = createInterpretedHeap(condenseBenchMaxScs, 0)
-    const root = rootSc(heap)
-    const target = createInterpretedBranchSc(heap, root)
+function fillCondenseBenchHeap(heap: usize, target: ScId, allocations: u32): u32 {
     let previous = 0 as Handle
     for (let i: u32 = 0; i < allocations; i++) {
         const cell = allocInto(heap, target, condenseBenchCellBytes, 0)
         if (previous !== 0) addEdge(heap, cell, previous)
         previous = cell
     }
-    return [heap, target, Heap(heap).nextScId - 1]
+    return Heap(heap).nextScId - 1
 }
 
-export function benchCondenseAllocations(samples: u32): void {
+function freeCondenseBenchHeap(heap: usize): void {
+    syscalls.munmap(heap, (Heap(heap).stackEnd as usize) - heap)
+}
+
+interface CondenseBenchApi {
+    createHeap: typeof createHeap
+    rootSc: typeof rootSc
+    createBranchSc: typeof createBranchSc
+    fillCondenseBenchHeap: typeof fillCondenseBenchHeap
+    condense: typeof condense
+    freeHeap: (heap: usize) => void
+}
+
+const interpretedCondenseBenchApi: CondenseBenchApi = {
+    createHeap: createInterpretedHeap,
+    rootSc,
+    createBranchSc: createInterpretedBranchSc,
+    fillCondenseBenchHeap,
+    condense,
+    freeHeap: Intrinsics.free,
+}
+
+function makeCondenseBenchHeap(allocations: u32, api: CondenseBenchApi): [usize, ScId, u32] {
+    const heap = api.createHeap(condenseBenchMaxScs, 0)
+    const target = api.createBranchSc(heap, api.rootSc(heap))
+    const count = api.fillCondenseBenchHeap(heap, target, allocations)
+    return [heap, target, count]
+}
+
+export function benchCondenseAllocations(
+    samples: u32,
+    api: CondenseBenchApi = interpretedCondenseBenchApi,
+    mode = 'interpreted',
+): void {
     const counts = [32, 256, 1024, 4096, 16384, 65536] as u32[]
     for (let i = 0; i < 10; i++) {
-        const [heap, target] = makeCondenseBenchHeap(32)
-        condense(heap, target, true)
-        intrinsics.Intrinsics.free(heap)
+        const [heap, target] = makeCondenseBenchHeap(32, api)
+        defer api.freeHeap(heap)
+        api.condense(heap, target, true)
     }
     for (const allocations of counts) {
         let elapsed = 0
         let scs: u32 = 0
         for (let i: u32 = 0; i < samples; i++) {
-            const [heap, target, count] = makeCondenseBenchHeap(allocations)
+            const [heap, target, count] = makeCondenseBenchHeap(allocations, api)
+            defer api.freeHeap(heap)
             scs = count
             const start = performance.now()
-            condense(heap, target, true)
+            api.condense(heap, target, true)
             elapsed += performance.now() - start
-            intrinsics.Intrinsics.free(heap)
         }
         console.log(
-            `benchCondense (allocations: ${allocations}, SCs: ${scs}, samples: ${samples})`,
+            `benchCondense ${mode} (allocations: ${allocations}, SCs: ${scs}, samples: ${samples})`,
             (elapsed / samples).toFixed(6), 'ms/op',
         )
     }
@@ -1946,7 +2020,7 @@ export function selfTest(select: (apis: any) => any): void {
         benchAddRemove,
     }
     const api = select({
-        native: { createHeap, createSc, createBranchSc, createPoolSc, createArenaSc, createInternalAllocator, ...shared },
+        native: { createHeap, createSc, createBranchSc, createPoolSc, createArenaSc, createInternalAllocator, mergeGroup, condense, allocInto, ...shared },
         interpreted: {
             createHeap: createInterpretedHeap,
             createSc: createInterpretedSc,
@@ -2026,7 +2100,7 @@ export function selfTest(select: (apis: any) => any): void {
         sparseSet(sparseHeap, field, 0x777, 9)
         intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).count === count)
         intrinsics.assert(SparseMap(resolve(sparseHeap, sparseHandle(field))).live === 14)
-        intrinsics.assert(sparseEntries(sparseHeap, field).length === 14)
+        intrinsics.assert(U32Map(sparseEntries(sparseHeap, field)).size === 14)
 
         intrinsics.assert(sparseAdd(sparseHeap, field, 3, 2) === 5)
         intrinsics.assert(sparseSub(sparseHeap, field, 3, 5) === 0)
@@ -2281,6 +2355,42 @@ export function selfTest(select: (apis: any) => any): void {
         intrinsics.assert(api.supportState(heap, ephemeral) === supportDestroyed)
     }
 
+    if (api.mergeGroup) {
+        const heap = api.createHeap(16, 0)
+        const root = api.rootSc(heap)
+        const aSc = api.createSc(heap, root, 0)
+        const bSc = api.createSc(heap, root, 0)
+        const cSc = api.createSc(heap, root, 0)
+        const a = api.allocCell(heap, aSc, 8)
+        const b = api.allocCell(heap, bSc, 8)
+        const c = api.allocCell(heap, cSc, 8)
+        api.addEdge(heap, a, b)
+        api.addEdge(heap, b, a)
+        api.addEdge(heap, a, c)
+        api.addEdge(heap, b, c)
+        const ids = new Uint32Array([2, 2, aSc, bSc])
+        let groupPtr: usize
+        if (api.finishBuild) {
+            groupPtr = intrinsics.Intrinsics.alloc(u32ArrayBytes(2))
+            initU32Array(groupPtr, 2)
+            U32Array(groupPtr).push(aSc)
+            U32Array(groupPtr).push(bSc)
+        } else {
+            groupPtr = (globalThis as any).ts.getArrayBufferPtr(ids.buffer)
+        }
+        const wrapper = api.mergeGroup(heap, root, groupPtr)
+        const aOwner = api.scOwner(heap, aSc)
+        const bOwner = api.scOwner(heap, bSc)
+        const cOwner = api.scOwner(heap, cSc)
+        intrinsics.assert(api.handleSc(aOwner) === wrapper)
+        intrinsics.assert(api.handleSc(bOwner) === wrapper)
+        intrinsics.assert(api.scDepth(heap, aSc) === 2)
+        intrinsics.assert(api.peerRefCount(heap, wrapper, aOwner, bOwner) === 1)
+        intrinsics.assert(api.peerRefCount(heap, root, api.scOwner(heap, wrapper), cOwner) === 1)
+        intrinsics.assert(api.supportCount(heap, b) === 1)
+        intrinsics.assert(api.supportCount(heap, c) === 1)
+    }
+
     if (api.condense) {
         const mergedHeap = api.createHeap(16, 0)
         const mergedRoot = api.rootSc(mergedHeap)
@@ -2295,14 +2405,13 @@ export function selfTest(select: (apis: any) => any): void {
         api.addEdge(mergedHeap, a, c)
         api.addEdge(mergedHeap, b, c)
         intrinsics.assert(api.supportCount(mergedHeap, c) === 2)
-        const wrappers = api.condense(mergedHeap, mergedRoot, false)
-        intrinsics.assert(wrappers.length === 1)
-        const wrapper = wrappers[0]
-        const wrapperOwner = api.scOwner(mergedHeap, wrapper)
+        intrinsics.assert(api.condense(mergedHeap, mergedRoot, 0) === 1)
         const aOwner = api.scOwner(mergedHeap, aSc)
         const bOwner = api.scOwner(mergedHeap, bSc)
         const cOwner = api.scOwner(mergedHeap, cSc)
-        intrinsics.assert(api.handleSc(aOwner) === wrapper)
+        const wrapper = api.handleSc(aOwner)
+        const wrapperOwner = api.scOwner(mergedHeap, wrapper)
+        intrinsics.assert(wrapper !== mergedRoot)
         intrinsics.assert(api.handleSc(bOwner) === wrapper)
         intrinsics.assert(api.scDepth(mergedHeap, aSc) === 2)
         intrinsics.assert(api.peerRefCount(mergedHeap, wrapper, aOwner, bOwner) === 1)
@@ -2323,11 +2432,11 @@ export function selfTest(select: (apis: any) => any): void {
         const looseA = api.createSc(bucketHeap, bucketRoot, 0)
         const looseB = api.createSc(bucketHeap, bucketRoot, 0)
         api.refSc(bucketHeap, heldSc)
-        const bucketWrappers = api.condense(bucketHeap, bucketRoot, false)
-        intrinsics.assert(bucketWrappers.length === 1)
+        intrinsics.assert(api.condense(bucketHeap, bucketRoot, 0) === 1)
+        const bucketWrapper = api.handleSc(api.scOwner(bucketHeap, looseA))
         intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, heldSc)) === bucketRoot)
-        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, looseA)) === bucketWrappers[0])
-        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, looseB)) === bucketWrappers[0])
+        intrinsics.assert(bucketWrapper !== bucketRoot)
+        intrinsics.assert(api.handleSc(api.scOwner(bucketHeap, looseB)) === bucketWrapper)
         api.unrefSc(bucketHeap, heldSc)
 
         const allocationHeap = api.createHeap(512, 0)
@@ -2406,7 +2515,7 @@ export function selfTest(select: (apis: any) => any): void {
 if (intrinsics.argv()[0] === 'cg') {
     selfTest(apis => apis.interpreted)
     console.log('cg interpreted self-test passed')
-    if (intrinsics.argv().includes('condense-bench')) benchCondenseAllocations(10)
+    if (intrinsics.argv().includes('condense-bench') && !intrinsics.argv().includes('native')) benchCondenseAllocations(10)
     if (intrinsics.argv().includes('native')) {
         const native = await import('./native')
         selfTest(apis => {
@@ -2424,5 +2533,12 @@ if (intrinsics.argv()[0] === 'cg') {
             }))
         })
         console.log('cg native self-test passed')
+        if (intrinsics.argv().includes('condense-bench')) {
+            const api = native.createNatives({
+                createHeap, rootSc, createBranchSc, fillCondenseBenchHeap, condense,
+                freeHeap: freeCondenseBenchHeap,
+            })
+            benchCondenseAllocations(10, api, 'native')
+        }
     }
 }

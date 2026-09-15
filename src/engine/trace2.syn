@@ -556,6 +556,7 @@ export function createTraceSession(): TraceSession {
     const objectBuiltins = { setPrototypeOf: Object.setPrototypeOf }
     const math = {
         floor: intrinsics.tagInline((v: number) => v),
+        min: intrinsics.tagInline((a: number, b: number) => a < b ? a : b),
     }
     const intrinsicFns = getCachedIntrinsics().stubs
     const functionStubs = new Map<Function, number>()
@@ -699,7 +700,7 @@ export function createTraceSession(): TraceSession {
             })
             runtime = {
                 tracer, mem, heapOverlay, nodes, nodeCache, blocks, frames,
-                objects: createHeapRecords(tracer, mk, nodes),
+                objects: createHeapRecords(tracer, mk, nodes, blocks),
                 opaque: new Map(),
                 groupObjects: new Map(),
                 proxied: new Map(),
@@ -755,6 +756,7 @@ export interface TraceOptions {
     inputs?: { thisArg: any, args: Float64Array, effect: any }
     shapes?: (intrinsics.Handle | undefined)[]
     name?: string
+    self?: Function
 }
 
 let logTraceCalls = intrinsics.argv().includes('trace-calls')
@@ -876,18 +878,23 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return n.argIds[i] ? intrinsics.getNanFromId(n.argIds[i]) : n.argConsts![i]
     }
 
+    const lastWrites = new Map<number, number>()
     function lastWrite(token: any): any {
-        const n = nodes.get(tracer.getNanId(token))
+        const id = tracer.getNanId(token)
+        const n = nodes.get(id)
         if (!n) return token
         if (n.op === 'after' || n.op === 'load') return lastWrite(operand(n, 0))
         if (n.op !== 'select') return token
+        const known = lastWrites.get(id)
+        if (known !== undefined) return intrinsics.getNanFromId(known)
         const a = lastWrite(operand(n, 1))
         const b = lastWrite(operand(n, 2))
         const ai = tracer.getNanId(a)
         const bi = tracer.getNanId(b)
-        if (isTerminalValue(a)) return b
-        if (isTerminalValue(b)) return a
-        return ai && ai === bi ? a : token
+        const result = isTerminalValue(a) ? b : isTerminalValue(b) ? a : ai && ai === bi ? a : token
+        const resultId = tracer.getNanId(result)
+        if (resultId) lastWrites.set(id, resultId)
+        return result
     }
 
     function memoryLoad(ptr: any, offset: any, T: number): any {
@@ -922,6 +929,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (B.inCycle[b] || joined.has(b)) return R
     }
     const regionalParams = new Set<number>()
+    const refinements: number[] = []
 
     function watch(b: number): boolean {
         for (const r of B.readSlots[b]) {
@@ -1123,7 +1131,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
             const value = inlined(nested.result)
             const unified = objects.unify(value)
-            writeToken(getOrderingFromInlined(unified ? unified.result : value))
+            writeToken(getOrderingFromInlined(unified ? unified.result : value, effect))
             tracer.markHandled()
             return { value: unified ? unified.value : value }
         }
@@ -1206,9 +1214,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 if (step.kind !== 'branch') step.kind = 'goto'
                 mem[slotAddr(ACC)] = acc as any
             } else {
+                const returned = returnedValue(value)
                 step.kind = 'ret'
-                step.valueId = tracer.getNanId(value)
-                step.valueConst = step.valueId ? 0 : value
+                step.valueId = tracer.getNanId(returned)
+                step.valueConst = step.valueId ? 0 : returned
             }
             return true
         },
@@ -1235,7 +1244,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             const callee = target
             const intrinsicName = session.intrinsicFns.get(callee)
-            const linked = session.stubFunctions.get(callee) as any
+            let linked = session.stubFunctions.get(callee) as any
+            if (!linked && callee === finalized) {
+                const self = typeof input === 'function' ? input : opts.self
+                if (self) linked = opts.mapCapture ? opts.mapCapture(self) : self
+            }
             if (logTraceCalls) {
                 const nanId = tracer.getNanId(callee)
                 const bytecodeFn = !nanId && !intrinsicName && !linked
@@ -1470,7 +1483,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return order
     }
 
-    function application(R: Reified, ins: Float64Array): any {
+    function application(R: Reified, edge: Float64Array): any {
+        const ins = unrefine(edge, R.inputs)
         const heapState = captureHeap(ins, R.inputs)
         if (!R.incoming) {
             R.incoming = ins.slice()
@@ -1484,19 +1498,19 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 if (sameValue(R.incoming[slot], ins[slot])) continue
                 const joins = R.heap.has(cellOf(R.incoming[slot])) && heapState.has(cellOf(ins[slot]))
                 if (joins) continue
-                assert(!cellOf(R.incoming[slot]) && !cellOf(ins[slot]), 'heap record: block input changes identity')
+                if (cellOf(R.incoming[slot]) || cellOf(ins[slot])) throw `heap record: input s${slot} of B${R.header} changes identity`
                 if (R.symbolic.has(slot)) continue
-                assert(!R.traced, `trace2: input s${slot} of B${R.header} changed after tracing`)
+                if (R.traced) throw `trace2: input s${slot} of B${R.header} changed after tracing`
                 R.symbolic.add(slot)
             }
-            assert(heapState.size === R.heap.size, 'heap record: block input changes object graph')
+            if (heapState.size !== R.heap.size) throw `heap record: B${R.header} input changes object graph (${R.heap.size} -> ${heapState.size} cells)`
             const edge = [...heapState]
             let at = 0
             for (const [cell, binding] of R.heap) {
                 const [other, value] = edge[at++]
-                assert(objects.sameShape(cell, other), 'heap record: block input changes object graph')
+                if (!objects.sameShape(cell, other)) throw `heap record: B${R.header} input changes object shape`
                 if (binding.symbolic || sameValue(value, binding.incoming)) continue
-                assert(!R.traced, 'heap record: entry contents changed after tracing')
+                if (R.traced) throw `heap record: B${R.header} entry contents changed after tracing`
                 binding.symbolic = true
             }
         }
@@ -1521,6 +1535,18 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const n = nodes.get(tracer.getNanId(value))
         if (!n || n.op !== 'heap-handle' || n.argIds[0]) return 0
         return n.argConsts![0] as u32
+    }
+
+    function returnedValue(value: any): any {
+        if (!opts.inputs || !traceOrder.length) return value
+        const cell = cellOf(value)
+        if (!cell) return value
+        const state = objects.snapshot(cell as intrinsics.Handle)
+        if (!state) return value
+        const args = new Float64Array(2)
+        args[0] = cell as f64
+        args[1] = state as f64
+        return mk('heap-handle', args, '', [Types.handle])
     }
 
     function makeProxy(proto: u32): u32 {
@@ -1557,7 +1583,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const id = tracer.getNanId(value)
         const n = nodes.get(id)
         if (n?.op === 'param' && !n.argIds.length && !regionalParams.has(id)) return opaqueObject(value)
-        if (n?.op === 'inlined') return opaqueObject(value)
         throw `trace2: no shape for symbolic receiver ${id} (${n?.op ?? tracer.getTraceById(id)?.op ?? 'unknown'})`
     }
 
@@ -1746,9 +1771,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return mk('unreachable', new Float64Array(0))
     }
 
-    function getOrderingFromInlined(val: any): any {
+    function getOrderingFromInlined(val: any, incoming: any): any {
         const id = tracer.getNanId(val)
         if (!id) return nilEffect
+        if (sameValue(val, incoming)) return val
         const n = nodes.get(id) ?? tracer.getTraceById(id)
         if (!n) return nilEffect
         if (n.op === 'select') {
@@ -1756,27 +1782,28 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             rem[0] = operand(n, 0)
             let changed = false
             for (let i = 1; i < n.argIds.length; i++) {
-                const nv = getOrderingFromInlined(operand(n, i))
+                const nv = getOrderingFromInlined(operand(n, i), incoming)
                 rem[i] = nv
                 if (!changed && tracer.getNanId(nv) !== n.argIds[i]) {
                     changed = true
                 }
             }
             if (!changed) return val
+            if (rem.length === 3 && sameValue(rem[1], rem[2])) return rem[1]
             return mk('select', rem)
         }
         if (n.op === 'ret') {
-            const x = getOrderingFromInlined(operand(n, 0))
+            const x = getOrderingFromInlined(operand(n, 0), incoming)
             if (sameValue(x, nilEffect) || nodes.get(tracer.getNanId(x))?.op === 'panic' || isUnreachable(x)) return x
             return ret(x, n.argConsts?.[1])
         }
         if (n.op === 'inlined') {
-            const x = getOrderingFromInlined(operand(n, 0))
+            const x = getOrderingFromInlined(operand(n, 0), incoming)
             if (sameValue(x, nilEffect) || nodes.get(tracer.getNanId(x))?.op === 'panic' || isUnreachable(x)) return x
             return val // must preserve
         }
         if (n.op === 'after') {
-            return getOrderingFromInlined(operand(n, 0))
+            return getOrderingFromInlined(operand(n, 0), incoming)
         }
         if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
             return val
@@ -1810,9 +1837,14 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
         const branch = branchInputs(r)
         const marks = objects.mark()
+        const depth = refinements.length
+        refine(r.outs, branch[0])
         const a = evalFrom(blockOf.get(r.thenPc)!, branch[0])
+        refinements.length = depth
         const thenChanges = objects.take(marks)
+        refine(r.outs, branch[1])
         const c = evalFrom(blockOf.get(r.elsePc)!, branch[1])
+        refinements.length = depth
         const elseChanges = objects.take(marks)
         objects.merge(intrinsics.getNanFromId(r.condId), marks, thenChanges, elseChanges)
 
@@ -1829,6 +1861,39 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             value: selectValues(cond, a.value, c.value),
             ordering: selectValues(cond, a.ordering, c.ordering),
         }
+    }
+
+    function refine(before: Float64Array, after: Float64Array): void {
+        if (before === after) return
+        for (let i = 0; i < TOKEN; i++) {
+            const id = tracer.getNanId(before[i])
+            if (!id || sameValue(before[i], after[i])) continue
+            if (CompareOps.has((nodes.get(id) ?? tracer.getTraceById(id))?.op)) continue
+            const valueId = tracer.getNanId(after[i])
+            refinements.push(i, id, valueId, valueId ? 0 : after[i])
+        }
+    }
+
+    function unrefine(ins: Float64Array, slots: number[]): Float64Array {
+        if (!refinements.length) return ins
+        let out = ins
+        for (const slot of slots) {
+            const values = new Float64Array(1)
+            values[0] = ins[slot]
+            for (let i = refinements.length - 4; i >= 0; i -= 4) {
+                if (refinements[i] !== slot) continue
+                const valueId = tracer.getNanId(values[0])
+                const matches = valueId
+                    ? refinements[i + 2] === valueId
+                    : refinements[i + 2] === 0 && refinements[i + 3] === values[0]
+                if (!matches) continue
+                values[0] = intrinsics.getNanFromId(refinements[i + 1])
+            }
+            if (sameValue(values[0], ins[slot])) continue
+            if (out === ins) out = ins.slice()
+            out[slot] = values[0]
+        }
+        return out
     }
 
     function branchInputs(r: Step): [Float64Array, Float64Array] {
@@ -2554,14 +2619,12 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(result.capturedTernary(10) === 11)
         assert(result.capturedTernary(0) === 1)
 
-        // FIXME: unify heap handles needs to deal with `apply`
         const Box2 = defineBox(0 as any)
         function capturedTernary2(n: u32): u32 {
             const b = Box2(n)
             b.value = b.value + 1
             return b.value
         }
-        intrinsics.tagNoInline(capturedTernary2)
         const result2: any = native.createNatives({ capturedTernary2 })
         assert(result2.capturedTernary2(10) === 11)
         assert(result2.capturedTernary2(0) === 2)
@@ -2655,6 +2718,44 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(accessor.callsReadTwice(5) === 11)
     }
     testShapedCall()
+
+    // function testNestedFunctionCapture() {
+    //     function countUp(n: u32): u32 {
+    //         let next: u32 = 0
+    //         function take(): u32 {
+    //             const index = next++
+    //             return index
+    //         }
+    //         let total: u32 = 0
+    //         for (let i: u32 = 0; i < n; i++) total += take()
+    //         return total * 10 + next
+    //     }
+    //     const compiled: any = native.createNatives({ countUp })
+    //     assert(compiled.countUp(4) === 64)
+    // }
+    // testNestedFunctionCapture()
+
+    function testTokenAfterLoop() {
+        const Cell = intrinsics.DefineStructView(reify { value: u32 })
+        function bump(ptr: usize): void {
+            Cell(ptr).value = Cell(ptr).value + 1
+        }
+        intrinsics.tagNoInline(bump)
+        const step = intrinsics.tagInline(function(i: u32): u32 { return i + 1 })
+        function resetAfterLoop(ptr: usize, n: u32): u32 {
+            const mark = Cell(ptr).value
+            for (let i: u32 = 0; i < n; i = step(i)) bump(ptr)
+            Cell(ptr).value = mark
+            return Cell(ptr).value
+        }
+        const result: any = native.createNatives({ resetAfterLoop })
+        const cell = new Uint32Array([5])
+        const ptr = (ts as any).getArrayBufferPtr(cell.buffer)
+        const value = result.resetAfterLoop(ptr, 3)
+        assert(value === 5)
+        assert(cell[0] === 5)
+    }
+    testTokenAfterLoop()
 
     if (intrinsics.argv().includes('opaque-shapes')) {
         function readY(o: { y: u32 }): u32 {
@@ -3698,6 +3799,21 @@ if (intrinsics.argv()[0] === 'trace2') {
         return s
     }, [[0], [1], [9], [40]], 'cSpillLoop @1 reg', 1)
 
+    testNativeCompile(function cSpillRotate(n: number, a: number, b: number, c: number) {
+        let d = a + 7
+        let e = b + 11
+        const f = c + 13
+        for (let i = 0; i < n; i++) {
+            const saved = a
+            a = b
+            b = c
+            c = d
+            d = e
+            e = saved
+        }
+        return a + b * 3 + c * 5 + d * 7 + e * 11 + f * 13
+    }, [[0, 2, 3, 5], [1, 2, 3, 5], [2, 2, 3, 5], [5, 7, 11, 17], [6, 7, 11, 17], [19, 2, 3, 5]], 'cSpillRotate @2 regs', 2)
+
     testNativeCompile(function cSpillNested(n: number) {
         let s = 0
         for (let i = 0; i < n; i = i + 1) {
@@ -4148,6 +4264,21 @@ if (intrinsics.argv()[0] === 'trace2') {
             for (let i = 0; i < n; i++) s = f(s, i)
             return s
         }, [[addr, 0, 100], [addr, 1, 100], [addr, 5, 90]], 1, 'cSpillCallInLoop @1 reg', 1)
+
+        function cSpillAcrossBranches(f: any, n: number, a: number, b: number, c: number) {
+            let d = a + b
+            let e = b + c
+            for (let i = 0; i < n; i++) {
+                if (i & 1) d = f(d, i)
+                else e = f(e, i)
+                a = f(a, 1)
+            }
+            return a + b * 3 + c * 5 + d * 7 + e * 11
+        }
+        const spillCases = [[0, 2, 3, 5], [1, 2, 3, 5], [4, 20, 7, 11], [9, 30, 13, 17]]
+        const spillExpected = spillCases.map(args => [addr, ...args,
+            cSpillAcrossBranches((a: number, b: number) => a - b, ...args)])
+        testNative(cSpillAcrossBranches, spillExpected, -1, 'cSpillAcrossBranches @2 regs', 2)
 
         const callInLoop = testNative(function cCallInLoop(f: any, n: number) {
             let s = 100

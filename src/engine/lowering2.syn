@@ -201,9 +201,9 @@ function scalarOperand(nodes: Map<number, GraphNode>, n: GraphNode, i: number): 
     return u?.op === 'literal' ? literalValue(u) : undefined
 }
 
-function nodeKey(n: GraphNode, argIds = n.argIds): string {
-    return [n.op, n.label ?? '', n.T, n.U, (n as any).literal ?? '', ...(n.types ?? []),
-        ...argIds.map((id, i) => id ? `v${id}` : `c${Object.is(n.argConsts[i], -0) ? '-0' : n.argConsts[i]}`)].join(',')
+function nodeKey(n: GraphNode, argIds = n.argIds, argConsts = n.argConsts): string {
+    return [n.op, n.T, n.U, (n as any).literal ?? '', ...(n.types ?? []),
+        ...argIds.map((id, i) => id ? `v${id}` : `c${Object.is(argConsts[i], -0) ? '-0' : argConsts[i]}`)].join(',')
 }
 
 function createNode(g: Graph, op: string, operands: (number | GraphNode)[], original?: GraphNode): number {
@@ -911,6 +911,7 @@ export function packageBlocksFINAL(g: Graph) {
                         pinTail(u.argIds[i], false)
                     }
                 } else if (u.op === 'select') {
+                    if (!tail) return
                     pinned.set(vid, bid)
                     for (let i = 1; i < u.argIds.length; i++) {
                         pinTail(u.argIds[i], true)
@@ -3722,6 +3723,84 @@ function optimizeValueGraph(g: Graph) {
         if (changed) touch(b)
     }
 
+    function deduplicateParams(): boolean {
+        let canonicalParams = new Map<number, number>()
+        const applies = new Map<GraphBlock, number[]>()
+        let candidates = false
+        for (const b of reachableBlocks) {
+            if (b === g.blocks[0] || b.params.length < 2) continue
+            const inbound = findInboundApplies(b)
+            if (!inbound.length) continue
+            applies.set(b, inbound.map(x => x[1]))
+            const representatives = new Map<string, number>()
+            for (const p of b.params) {
+                const key = nodeKey(g.nodes.get(p)!)
+                const rep = representatives.get(key)
+                if (rep === undefined) representatives.set(key, p)
+                else candidates = true
+                canonicalParams.set(p, rep ?? p)
+            }
+        }
+        if (!candidates) return false
+
+        while (true) {
+            let changed = false
+            const representatives = new Map<string, number>()
+            const canonical = new Map<number, number>()
+            function visit(id: number): number {
+                if (!id) return 0
+                const known = canonical.get(id)
+                if (known !== undefined) return known
+                const n = g.nodes.get(id)
+                let rep = canonicalParams.get(id) ?? id
+                if (n && n.op !== 'param' && n.op !== 'block') {
+                    const key = nodeKey(n, n.argIds.map(visit))
+                    rep = representatives.get(key) ?? id
+                    representatives.set(key, rep)
+                }
+                canonical.set(id, rep)
+                return rep
+            }
+            const next = new Map<number, number>()
+            for (const [b, ids] of applies) {
+                for (let i = 0; i < b.params.length; i++) {
+                    const p = b.params[i]
+                    const argIds = [canonicalParams.get(p)!]
+                    const argConsts = new Float64Array(ids.length + 1)
+                    for (let j = 0; j < ids.length; j++) {
+                        const u = g.nodes.get(ids[j])!
+                        argIds.push(visit(u.argIds[i + 1]))
+                        argConsts[j + 1] = u.argConsts[i + 1]
+                    }
+                    const key = nodeKey(g.nodes.get(p)!, argIds, argConsts)
+                    const rep = representatives.get(key) ?? p
+                    representatives.set(key, rep)
+                    if (rep !== canonicalParams.get(p)) changed = true
+                    next.set(p, rep)
+                }
+            }
+            canonicalParams = next
+            if (!changed) break
+        }
+
+        const replacements = new Map<number, number>()
+        for (const [p, rep] of canonicalParams) {
+            if (p !== rep) replacements.set(p, rep)
+        }
+        if (!replacements.size) return false
+        const changedBlocks: GraphBlock[] = []
+        for (const b of reachableBlocks) {
+            const bodyId = replaceAll(b.bodyId, replacements)
+            if (bodyId === b.bodyId) continue
+            b.bodyId = bodyId
+            changedBlocks.push(b)
+        }
+        for (const b of changedBlocks) {
+            revisitBlock(b)
+        }
+        return true
+    }
+
     const exempt = new Set<(b: GraphBlock) => unknown>([
         mergeBlocks, absorbConditions, threadConstantBranches, deriveIncrementor,
         closeCountedLoop, reverseLoop, hoistInvariants, pruneUnusedParams,
@@ -3753,6 +3832,7 @@ function optimizeValueGraph(g: Graph) {
             step(reduceBlockOrdering, b)
             step(interchangeSelects, b)
         }
+        deduplicateParams()
         for (const b of reachableBlocks) {
             step(pruneUnusedParams, b)
         }
@@ -5494,6 +5574,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
 
     interface Move { dst: number, src: number }
     function shuffle(moves: Move[]): void {
+        const scratch = moves.some(m => isSlot(m.dst)) ? CALLEE : SWAP
         const pending: Move[] = []
         for (const m of moves) if (m.dst !== m.src) pending.push(m)
         while (pending.length) {
@@ -5507,8 +5588,8 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             }
             if (ready < 0) {
                 const stuck = pending[0].src
-                transfer(SWAP, stuck)
-                for (const m of pending) if (m.src === stuck) m.src = SWAP
+                transfer(scratch, stuck)
+                for (const m of pending) if (m.src === stuck) m.src = scratch
                 continue
             }
             const m = pending.splice(ready, 1)[0]
@@ -5595,7 +5676,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
                     break
                 }
                 const home = sig.get(n.argIds[0])?.[at[1]]
-                if (home !== undefined && !isSlot(home) && home !== OPEN) { fixed.set(i, home); break }
+                if (home !== undefined && home !== OPEN) { fixed.set(i, home); break }
             }
         }
         const homes: number[] = []
@@ -5605,7 +5686,13 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             if (i === tokenAt) { homes.push(0); continue }
             const safe = acrossCall.has(p)
             let r = -1
-            const wanted = fixed.get(i) ?? -1
+            const fixedHome = fixed.get(i)
+            if (fixedHome !== undefined && isSlot(fixedHome) && !taken.has(fixedHome)) {
+                homes.push(fixedHome)
+                taken.add(fixedHome)
+                continue
+            }
+            const wanted = fixedHome ?? -1
             if (wanted >= 0 && (!safe || isPreserved(wanted)) && !taken.has(wanted)) r = wanted
             if (r < 0 && !safe && !inherits.has(i)) { homes.push(OPEN); continue }
             if (r < 0) {
