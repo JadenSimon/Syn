@@ -11,6 +11,7 @@ import {
 } from './vm'
 import * as lowering from './lowering'
 import * as lowering2 from './lowering2'
+import { makeNode } from './graph-node'
 import * as heap from './heap'
 import { createHeapRecords, type Group, type HeapRecords, type HeapState, type Joined } from './heap-records'
 import * as native from './native'
@@ -98,13 +99,7 @@ interface Step {
     valueConst: number
 }
 
-interface Node {
-    op: string
-    argIds: number[]
-    argConsts?: Float64Array
-    label: string
-    types?: intrinsics.Types[]
-}
+type Node = lowering2.GraphNode
 
 interface TraceFrame {
     dispatch(pc: number): number
@@ -461,7 +456,6 @@ export interface TraceSession {
     intrinsicFns: Map<number, string>
     functionStubs: Map<Function, number>
     stubFunctions: Map<number, Function>
-    compiledFunctions: Map<Function, number>
     symbolicMemory: Set<number>
     symbolicDispatch: Function
     symbolicJmp: Function
@@ -474,9 +468,16 @@ export interface TraceSession {
     mk(op: string, args: Float64Array, label?: string, types?: intrinsics.Types[]): any
     fromJsValue(v: any): u32
     linkFunction(f: Function): u32
+    compileSource(code: string): CompiledSource
     finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
     enterTrace(): TraceRuntime
     leaveTrace(): void
+}
+
+export interface CompiledSource {
+    compiled: bytecode.EmitResult
+    codeLen: number
+    blocks: Blocks
 }
 
 const symbolicMemoryTag = Symbol('trace.symbolicMemory')
@@ -561,7 +562,8 @@ export function createTraceSession(): TraceSession {
     const intrinsicFns = getCachedIntrinsics().stubs
     const functionStubs = new Map<Function, number>()
     const stubFunctions = new Map<number, Function>()
-    const compiledFunctions = new Map<Function, number>()
+    const compiledSources = new Map<string, CompiledSource>()
+    const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
     const symbolicMemory = new Set<number>()
     let runtime: TraceRuntime | undefined
 
@@ -619,17 +621,54 @@ export function createTraceSession(): TraceSession {
         const v = tracer.createUniqueNan()
         const id = tracer.getNanId(v)
         r.nodeCache.set(key, id)
-        r.nodes.set(id, { op, argIds, argConsts, label, types })
+        r.nodes.set(id, makeNode(op, argIds, argConsts, types?.[0], types?.[1], types, label))
         return v
     }
 
+    function compileSource(code: string): CompiledSource {
+        const known = compiledSources.get(code)
+        if (known) return known
+        traceStats.compileMisses++
+        const compiled = bytecode.compile(code)
+        const codeLen = compiled.code.length
+        const ACC = compiled.registerCount
+        ;(compiled.code as u8[]).push(Op.Return as u8, Op.Ldar as u8, ACC as u8)
+        const blocks = deriveBlocks(compiled.code as u8[], codeLen, compiled.paramCount, ACC, ACC + 1)
+        const source = { compiled, codeLen, blocks }
+        compiledSources.set(code, source)
+        return source
+    }
+
+    const captureBits = new Float64Array(2)
+    const captureWords = new Uint32Array(captureBits.buffer)
+    function sameCaptures(a: any[] | undefined, b: any[] | undefined): boolean {
+        if (a === b) return true
+        if (!a || !b || a.length !== b.length) return false
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] === b[i]) continue
+            if (typeof a[i] !== 'number' || typeof b[i] !== 'number') return false
+            captureBits[0] = a[i]
+            captureBits[1] = b[i]
+            if (captureWords[0] !== captureWords[2] || captureWords[1] !== captureWords[3]) return false
+        }
+        return true
+    }
+
     function finalize(compiled: bytecode.EmitResult, captures?: any[]): u32 {
-        return bytecode.finalize(
+        let known = finalizedFunctions.get(compiled)
+        if (!known) finalizedFunctions.set(compiled, known = [])
+        for (const entry of known) {
+            if (sameCaptures(entry.captures, captures)) return entry.fn
+        }
+        traceStats.finalizeMisses++
+        const fn = bytecode.finalize(
             compiled,
             bytecode.createCtx(context(captures)),
             linkFunction,
             fromJsValue,
         )
+        known.push({ captures, fn })
+        return fn
     }
 
     function enterTrace(): TraceRuntime {
@@ -718,6 +757,7 @@ export function createTraceSession(): TraceSession {
         r.tracer.dispose()
         runtime = undefined
         session.runtime = undefined
+        finalizedFunctions.clear()
     }
 
     const session: TraceSession = {
@@ -727,7 +767,6 @@ export function createTraceSession(): TraceSession {
         intrinsicFns,
         functionStubs,
         stubFunctions,
-        compiledFunctions,
         symbolicMemory,
         symbolicBranch,
         symbolicDispatch,
@@ -740,6 +779,7 @@ export function createTraceSession(): TraceSession {
         runtime,
         fromJsValue,
         linkFunction,
+        compileSource,
         finalize,
         enterTrace,
         leaveTrace,
@@ -760,6 +800,10 @@ export interface TraceOptions {
 }
 
 let logTraceCalls = intrinsics.argv().includes('trace-calls')
+export const traceStats = {
+    calls: 0, nested: 0, compileMisses: 0, finalizeMisses: 0,
+    bySource: new Map<string, { name: string, count: number }>(),
+}
 
 export function trace2(input: string | Function, opts: TraceOptions = {}) {
     let code: string
@@ -776,16 +820,20 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const session = opts.session ?? createTraceSession()
     const debugTrace = typeof input === 'function'
         && intrinsics.argv().includes(`trace-debug:${input.name}`)
-    const compiled = bytecode.compile(code)
-    const codeLen = compiled.code.length
+    traceStats.calls++
+    if (opts.inputs) traceStats.nested++
+    let statEntry = traceStats.bySource.get(code)
+    if (!statEntry) traceStats.bySource.set(code, statEntry = { name: traceName || code.slice(0, 60), count: 0 })
+    statEntry.count++
+    const source = session.compileSource(code)
+    const compiled = source.compiled
+    const codeLen = source.codeLen
     const ACC = compiled.registerCount
     const TOKEN = ACC + 1
     const slotCount = ACC + 2
     const SYN_RET = codeLen
     const SYN_LDAR = codeLen + 1
-    ;(compiled.code as u8[]).push(Op.Return as u8, Op.Ldar as u8, ACC as u8)
-
-    const B = deriveBlocks(compiled.code as u8[], codeLen, compiled.paramCount, ACC, TOKEN)
+    const B = source.blocks
     const leaders = B.leaders
     const isLeader = new Set<number>(leaders)
     const blockOf = new Map<number, number>()
@@ -814,10 +862,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             bytecode: bytecode.disassemble(compiled.code as any, compiled.paramCount, compiled.registerCount),
         })
     }
-    const interpret = createInterpreter(true, 3)
     const runtime = session.enterTrace()
     defer session.leaveTrace()
     const tracer = runtime.tracer
+    const interpret = createInterpreter(true, 3, tracer.saved)
     const mem = runtime.mem
     const nodes = runtime.nodes
     const objects = runtime.objects
@@ -1333,6 +1381,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     tracer.setActive(true)
     defer {
         assert(runtime.frames.pop() === traceFrame)
+        if (!runtime.frames.length) objects.release()
     }
 
 
@@ -1380,9 +1429,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         noteTracedBlock(b, leaders[b], 'entry')
         current = b
         if (shapeTrace) dumpShapes(`B${b} in `, ins)
-        for (let r = 0; r <= ACC; r++) mem[slotAddr(r)] = fromGraphValue(ins[r]) as any
-        writeToken(ins[TOKEN])
-        for (let i = 0; i < compiled.paramCount; i++) mem[args + i * 4] = fromGraphValue(ins[i]) as any
+        tracer.inactive(() => {
+            for (let r = 0; r <= ACC; r++) mem[slotAddr(r)] = fromGraphValue(ins[r]) as any
+            writeToken(ins[TOKEN])
+            for (let i = 0; i < compiled.paramCount; i++) mem[args + i * 4] = fromGraphValue(ins[i]) as any
+        })
         if (debugTrace && b === 0) {
             console.log('trace frame input', {
                 sp: sp(), args, frame, regsBase, memLength: mem.length,
@@ -1409,7 +1460,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         tracer.setActive(true)
         sp(saved)
         const outs = new Float64Array(slotCount)
-        for (let r = 0; r <= ACC; r++) outs[r] = toGraphValue(mem[slotAddr(r)])
+        tracer.inactive(() => {
+            for (let r = 0; r <= ACC; r++) outs[r] = toGraphValue(mem[slotAddr(r)])
+        })
         outs[TOKEN] = readToken()
         if (shapeTrace) dumpShapes(`B${b} out`, outs)
         if (debugTrace) {
@@ -1456,17 +1509,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             inputs.sort((x, y) => x - y)
 
             const selfId = tracer.getNanId(tracer.createUniqueNan())
-            nodes.set(selfId, {
-                op: 'block', argIds: [], argConsts: new Float64Array(0), label: `B${b}`,
-            })
+            nodes.set(selfId, makeNode('block', [], new Float64Array(0), Types.u64, Types.u64, undefined, `B${b}`))
             const paramIds: number[] = []
             for (const slot of inputs) {
                 const id = tracer.getNanId(tracer.createUniqueNan())
                 const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
                 names.set(id, name)
-                nodes.set(id, {
-                    op: 'param', argIds: [], argConsts: new Float64Array(0), label: name,
-                })
+                nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64, undefined, name))
                 regionalParams.add(id)
                 paramIds.push(id)
             }
@@ -1836,17 +1885,17 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (r.kind === 'goto') return evalFrom(blockOf.get(r.target)!, r.outs)
 
         const branch = branchInputs(r)
-        const marks = objects.mark()
+        const marks = tracer.inactive(() => objects.mark())
         const depth = refinements.length
         refine(r.outs, branch[0])
         const a = evalFrom(blockOf.get(r.thenPc)!, branch[0])
         refinements.length = depth
-        const thenChanges = objects.take(marks)
+        const thenChanges = tracer.inactive(() => objects.take(marks))
         refine(r.outs, branch[1])
         const c = evalFrom(blockOf.get(r.elsePc)!, branch[1])
         refinements.length = depth
-        const elseChanges = objects.take(marks)
-        objects.merge(intrinsics.getNanFromId(r.condId), marks, thenChanges, elseChanges)
+        const elseChanges = tracer.inactive(() => objects.take(marks))
+        tracer.inactive(() => objects.merge(intrinsics.getNanFromId(r.condId), marks, thenChanges, elseChanges))
 
         if (debugTrace) {
             console.log('trace branch', {
@@ -1998,9 +2047,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 const label = `p${i}.${heap.stringToJs(key as intrinsics.Handle)}`
                 paramIds.push(id)
                 names.set(id, label)
-                nodes.set(id, {
-                    op: 'param', argIds: [], argConsts: new Float64Array(0), label,
-                })
+                nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64, undefined, label))
                 descriptor.slot0 = heap.boxF64(v)
             }
             ins[i] = handleValue(standIn)
@@ -2009,9 +2056,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const id = tracer.getNanId(v)
             paramIds.push(id)
             names.set(id, `p${i}`)
-            nodes.set(id, {
-                op: 'param', argIds: [], argConsts: new Float64Array(0), label: `p${i}`,
-            })
+            nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64, undefined, `p${i}`))
             ins[i] = v
         }
     }
@@ -2226,13 +2271,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                         }
                     }
                 }
-                out.set(id, {
-                    op: n.op, argIds, argConsts,
-                    label: n.label,
-                    T: (n as any).T ?? n.types?.[0] ?? Types.u64,
-                    U: (n as any).U ?? n.types?.[1] ?? Types.u64,
-                    types: n.types,
-                })
+                out.set(id, makeNode(n.op, argIds, argConsts, n.T, n.U, n.types, n.label))
                 return id
             }
             const t = tracer.getTraceById(id)
@@ -2244,11 +2283,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 argIds.push(visit(t.argIds[idx[k]] ?? 0))
                 argConsts[k] = t.args[idx[k]]
             }
-            out.set(id, {
-                op: t.op, argIds, argConsts,
-                T: (t as any).T ?? Types.u64,
-                U: (t as any).U ?? (t as any).T ?? Types.u64,
-            })
+            out.set(id, makeNode(t.op, argIds, argConsts, (t as any).T ?? Types.u64, (t as any).U ?? (t as any).T ?? Types.u64))
             return id
         }
 
@@ -2869,7 +2904,7 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(alloc(ptr, 20) === 0)
         assert(cell[0] === 6)
         assert(alloc(ptr, 10) === 6)
-        assert(cell[0] === 16)
+        assert(cell[0] === 16 as any)
     }
     testTraceBindings()
 
@@ -4277,7 +4312,7 @@ if (intrinsics.argv()[0] === 'trace2') {
         }
         const spillCases = [[0, 2, 3, 5], [1, 2, 3, 5], [4, 20, 7, 11], [9, 30, 13, 17]]
         const spillExpected = spillCases.map(args => [addr, ...args,
-            cSpillAcrossBranches((a: number, b: number) => a - b, ...args)])
+            cSpillAcrossBranches((a: number, b: number) => a - b, ...(args as [number, number, number, number]))])
         testNative(cSpillAcrossBranches, spillExpected, -1, 'cSpillAcrossBranches @2 regs', 2)
 
         const callInLoop = testNative(function cCallInLoop(f: any, n: number) {

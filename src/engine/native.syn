@@ -8,7 +8,9 @@ import * as heap from './heap'
 import * as syscalls from './syscalls'
 import {
     Graph, GraphBlock, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, isParam, lowerValueGraph, normalizeValueGraph,
+    printOptimizeStats,
 } from './lowering2'
+import { copyNode, makeNode } from './graph-node'
 
 type usize = u32
 
@@ -160,7 +162,8 @@ export function installNative(bytes: number[]) {
     if (!nativeCopier(ptr, src, code.byteLength)) throw 'failed to copy native code'
     return Object.assign((...args: any[]) => {
         sealCode(page)
-        const values = new BigInt64Array(Math.max(args.length, 1))
+        if (!args.length) return nativeInvoker(ptr, 0, args.length)
+        const values = new BigInt64Array(args.length)
         for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
         const argsPtr = (ts as any).getArrayBufferPtr(values.buffer)
         return nativeInvoker(ptr, argsPtr, args.length)
@@ -311,7 +314,7 @@ function liftReturnedHeapValues(
             argConsts[edit[0]] = edit[2] as f64
         }
         const copy = nextId++
-        nodes.set(copy, { ...n, argIds, argConsts })
+        nodes.set(copy, copyNode(n, argIds, argConsts))
         rewritten.set(id, [copy, 0])
         return [copy, 0]
     }
@@ -498,11 +501,8 @@ function rewriteTargets(
         if (n.argIds[0] || slot === undefined) {
             throw `native: unresolved heap handle ${handle} in ${graph.name ?? 'anonymous graph'} at %${id}`
         }
-        nodes.set(id, {
-            op: 'pool-entry', argIds: [0], argConsts: new Float64Array([slot]),
-            T: functionSlot !== undefined ? Types.fnptr : Types.handle,
-            U: functionSlot !== undefined ? Types.fnptr : Types.handle,
-        })
+        const slotType = functionSlot !== undefined ? Types.fnptr : Types.handle
+        nodes.set(id, makeNode('pool-entry', [0], new Float64Array([slot]), slotType, slotType))
     }
     return { ...graph, nodes }
 }
@@ -699,6 +699,8 @@ export function createNatives(fns: Record<string, Function>) {
         order.push(fn)
     }
     for (const fn of Object.values(fns)) schedule(fn)
+    const phaseStart = performance.now()
+    const phases = { trace: 0, normalize: 0, reconcile: 0, lower: 0 }
     session.enterTrace()
     defer session.leaveTrace()
     for (const current of order) {
@@ -742,10 +744,12 @@ export function createNatives(fns: Record<string, Function>) {
             if (traceDebug) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
             return wrapper ? wrapCall(stub, wrapper, capture.length) : stub
         }
+        let phaseMark = performance.now()
         const traced = trace2(computation[0], {
             captures: computation[1], session, mapCapture, shouldInline, verbose: traceDebug,
             name: current.name, self: current,
         })
+        phases.trace += performance.now() - phaseMark
         const opaque = [...traced.graph.nodes.values()].some(n => n.op === 'property')
         if (opaque) {
             if ([...roots.values()].includes(symbol)) throw `native: ${current.name} reads properties of an opaque argument`
@@ -760,7 +764,9 @@ export function createNatives(fns: Record<string, Function>) {
         if (traceDebug) console.log(traced.text)
         if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
         if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
+        phaseMark = performance.now()
         tracedGraph = normalizeValueGraph(tracedGraph)
+        phases.normalize += performance.now() - phaseMark
         const score = (current as any).shouldNotInline || tracedGraph.nodes.size > 50 || lifted.wrapper
             ? undefined : obviousInline(tracedGraph)
         inlineScores.set(current, score ?? false)
@@ -777,7 +783,9 @@ export function createNatives(fns: Record<string, Function>) {
         }
         pending.push({ fn: current, symbol, graph: tracedGraph, ...handleSlots(tracedGraph) })
     }
+    const reconcileStart = performance.now()
     for (const shaped of shapedCallees) reconcileShapes(shaped)
+    phases.reconcile = performance.now() - reconcileStart
 
     function handleSlots(graph: Graph) {
         const functionHandleSlots = new Map<number, number>()
@@ -855,7 +863,7 @@ export function createNatives(fns: Record<string, Function>) {
                     argConsts.push(arg.argConsts[2 + k])
                 }
             }
-            graph.nodes.set(id, { ...call, argIds, argConsts: new Float64Array(argConsts) })
+            graph.nodes.set(id, copyNode(call, argIds, new Float64Array(argConsts)))
         }
         const lifted = liftReturnedHeapValues(traced.graph)
         const normalized = normalizeValueGraph({ ...lifted.graph, name: shaped.fn.name })
@@ -866,6 +874,7 @@ export function createNatives(fns: Record<string, Function>) {
         dumpCallShapes(pending, functions, opaqueGraphs)
         throw 'native: call shapes dumped'
     }
+    const lowerStart = performance.now()
     for (const unit of pending) {
         const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs)
         intrinsics.assert(graph.params.length <= 7)
@@ -875,6 +884,17 @@ export function createNatives(fns: Record<string, Function>) {
         const code = lowerValueGraph(graph, { debug, skipNormalized: true })
         if (debug || intrinsics.argv().includes('listings')) console.log(`--- ${unit.fn.name} listing ---\n`, code.listing)
         units.push({ fn: unit.fn, symbol: unit.symbol, code })
+    }
+    phases.lower = performance.now() - lowerStart
+    printOptimizeStats()
+    if (intrinsics.argv().includes('trace-stats')) {
+        console.log('native phases', { total: performance.now() - phaseStart, ...phases })
+        const { bySource, ...totals } = traceModule.traceStats
+        console.log('heap records', session.runtime?.objects.stats)
+        const repeated = [...bySource.values()].filter(x => x.count > 1).sort((a, b) => b.count - a.count)
+        console.log('trace2 stats', totals, 'distinct sources', bySource.size,
+            'repeat traces', repeated.reduce((s, x) => s + x.count - 1, 0))
+        for (const x of repeated.slice(0, 25)) console.log('  ', x.count, x.name)
     }
     const rootSymbols = new Set<number>(roots.values())
     const pooledSymbols = new Set<number>(localPoolTargets.values())
