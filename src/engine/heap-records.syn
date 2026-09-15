@@ -238,5 +238,122 @@ export function createHeapRecords(
         }
     }
 
-    return { intern, capture, mark, take, parameter, install, merge }
+    function sameShape(a: Handle, b: Handle): boolean {
+        const x = shapes.get(a)!
+        const y = shapes.get(b)!
+        if (x.type !== y.type || x.keys.length !== y.keys.length) return false
+        for (let i = 0; i < x.keys.length; i++) {
+            if (x.keys[i] !== y.keys[i] || x.flags[i] !== y.flags[i]) return false
+            const field = x.fields.includes(x.keys[i])
+            if (field !== y.fields.includes(y.keys[i])) return false
+            if (field || x.fixed[i] === y.fixed[i]) continue
+            if (!managed.has(x.fixed[i]) || !managed.has(y.fixed[i])) return false
+        }
+        return true
+    }
+
+    function operand(n: ValueNode, i: number): number {
+        return n.argIds[i] ? intrinsics.getNanFromId(n.argIds[i]) : n.argConsts![i]
+    }
+
+    function rebuild(id: number, leaf: (id: number) => number, memo: Map<number, number>): number {
+        const known = memo.get(id)
+        if (known !== undefined) return known
+        const n = nodes.get(id)!
+        let out: number
+        if (n.op === 'heap-handle') {
+            out = leaf(id)
+        } else {
+            const args = new Float64Array(n.argIds.length)
+            for (let i = 0; i < n.argIds.length; i++) {
+                const spine = n.op === 'after' ? i === 1 : n.op === 'select' ? i > 0 : i === 0
+                args[i] = (spine ? rebuild(n.argIds[i], leaf, memo) : operand(n, i)) as f64
+            }
+            out = mk(n.op, args)
+        }
+        memo.set(id, out)
+        return out
+    }
+
+    function unify(value: number): { value: number, result: number } | undefined {
+        const root = tracer.getNanId(value)
+        if (!root || nodes.get(root)?.op === 'heap-handle') return
+        const leaves: number[] = []
+        const visited = new Set<number>()
+        function collect(id: number): boolean {
+            if (visited.has(id)) return true
+            visited.add(id)
+            const n = nodes.get(id)
+            if (!n) return false
+            if (n.op === 'heap-handle') {
+                if (n.argIds[0]) return false
+                leaves.push(id)
+                return true
+            }
+            if (n.op === 'after') return !!n.argIds[1] && collect(n.argIds[1])
+            if (n.op === 'ret' || n.op === 'inlined') return !!n.argIds[0] && collect(n.argIds[0])
+            if (n.op !== 'select' || n.argIds.length < 2) return false
+            for (let i = 1; i < n.argIds.length; i++) {
+                if (!n.argIds[i] || !collect(n.argIds[i])) return false
+            }
+            return true
+        }
+        if (!collect(root)) return
+
+        const cells = leaves.map(id => nodes.get(id)!.argConsts![0] as Handle)
+        const first = intrinsics.getNanFromId(leaves[0])
+        if (cells.every(c => c === cells[0])) {
+            const empty = mk('void', new Float64Array(0), '', [Types.u32])
+            return { value: first, result: rebuild(root, () => empty, new Map()) }
+        }
+        for (const cell of cells) {
+            if (!managed.has(cell)) return
+        }
+
+        const groups: Handle[][] = []
+        function join(members: Handle[]): void {
+            if (members.every(c => c === members[0])) return
+            for (const c of members) shapeOf(c, heap.indirectTarget(c))
+            for (const c of members) assert(sameShape(members[0], c), 'heap record: cannot unify objects with different shapes')
+            groups.push(members)
+            const shape = shapes.get(members[0])!
+            for (let i = 0; i < shape.keys.length; i++) {
+                if (shape.fields.includes(shape.keys[i])) continue
+                join(members.map(c => shapes.get(c)!.fixed[i]))
+            }
+        }
+        join(cells)
+
+        const offset = 0x100000000
+        let width = 0
+        for (const members of groups) width += shapes.get(members[0])!.fields.length * 2
+        function leafRecord(id: number): number {
+            const index = leaves.indexOf(id)
+            const fields = new Float64Array(width)
+            let at = 0
+            for (let g = 0; g < groups.length; g++) {
+                const cell = groups[g][index]
+                const own = record(cell, heap.indirectTarget(cell))
+                for (const key of shapes.get(cell)!.fields) {
+                    fields[at++] = (g * offset + key) as f64
+                    fields[at++] = get(own, key) as f64
+                }
+            }
+            return mk('record', fields)
+        }
+        const result = rebuild(root, leafRecord, new Map())
+        for (let g = 0; g < groups.length; g++) {
+            const keys = shapes.get(groups[g][0])!.fields
+            const fields = new Float64Array(keys.length * 2)
+            for (let i = 0; i < keys.length; i++) {
+                fields[i * 2] = keys[i] as f64
+                fields[i * 2 + 1] = get(result, (g * offset + keys[i]) as Handle) as f64
+            }
+            const joined = mk('record', fields)
+            for (const cell of new Set(groups[g])) install(cell, joined)
+        }
+        return { value: first, result }
+    }
+
+    return { intern, capture, mark, take, parameter, install, merge, sameShape, unify }
 }

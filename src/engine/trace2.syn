@@ -452,7 +452,6 @@ export interface TraceSession {
     stubFunctions: Map<number, Function>
     compiledFunctions: Map<Function, number>
     symbolicMemory: Set<number>
-    traceHandles: Set<u32>
     symbolicDispatch: Function
     symbolicJmp: Function
     symbolicBranch: Function
@@ -701,8 +700,6 @@ export function createTraceSession(): TraceSession {
         session.runtime = undefined
     }
 
-    const traceHandles = new Set<u32>()
-
     const session: TraceSession = {
         intrinsicContext,
         moduleContext,
@@ -712,7 +709,6 @@ export function createTraceSession(): TraceSession {
         stubFunctions,
         compiledFunctions,
         symbolicMemory,
-        traceHandles,
         symbolicBranch,
         symbolicDispatch,
         symbolicJmp,
@@ -848,7 +844,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const frame = sp() - frameSize(compiled.registerCount as u32, 3)
     noteTraceMemLow(frame)
     const regsBase = frameRegs(frame)
-    const thisArg = opts.inputs ? objects.intern(opts.inputs.thisArg) : 0
+    const thisValue = opts.inputs ? opts.inputs.thisArg : 0
+    const thisArg = cellOf(thisValue) || thisValue
     function slotAddr(r: number): number { return regsBase + r * 4 }
     function readToken(): any { return vmValue(mem[slotAddr(TOKEN)] as u32) }
     function writeToken(v: any): void { mem[slotAddr(TOKEN)] = tagVmValue(v) as any }
@@ -958,230 +955,17 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return toGraphValue(mem[regStart + index * 4])
     }
 
-    function tagCallResult(value: any, handle: boolean = false): u32 {
-        const tagged = handle ? fromGraphValue(value) : tagVmValue(value)
+    function graphReceiver(value: any): any {
+        return tracer.getNanId(value) ? value : toGraphValue(tagVmHandle(value))
+    }
+
+    function tagCallResult(value: any): u32 {
+        const tagged = fromGraphValue(value)
         tracer.markHandled()
         return tagged
     }
 
-    function isHeapValue(value: any, seen: Set<number> = new Set()): boolean {
-        const id = tracer.getNanId(value)
-        if (!id || seen.has(id)) return false
-        seen.add(id)
-        const n = nodes.get(id)
-        if (!n) return false
-        if (n.op === 'heap-handle') return true
-        if (n.op === 'ret' || n.op === 'inlined') {
-            const inner = n.argIds[0]
-            return inner ? isHeapValue(intrinsics.getNanFromId(inner), seen) : false
-        }
-        if (n.op === 'after') {
-            const inner = n.argIds[1]
-            return inner ? isHeapValue(intrinsics.getNanFromId(inner), seen) : false
-        }
-        if (n.op !== 'select' || n.argIds.length < 2) return false
-        for (let i = 1; i < n.argIds.length; i++) {
-            if (!n.argIds[i] || !isHeapValue(intrinsics.getNanFromId(n.argIds[i]), new Set(seen))) return false
-        }
-        return true
-    }
-
-    function unifyHeapHandles(value: any): { value: any, result: any } | undefined {
-        const rootId = tracer.getNanId(value)
-        if (!rootId || nodes.get(rootId)?.op === 'heap-handle') return
-
-        const leafOf = new Map<number, u32>()
-        const spine = new Map<number, boolean>()
-        function collect(id: number): boolean {
-            if (!id) return false
-            const known = spine.get(id)
-            if (known !== undefined) return known
-            spine.set(id, false)
-            const n = nodes.get(id)
-            let ok = false
-            if (!n) {
-                // fall through
-            } else if (n.op === 'heap-handle') {
-                const handle = heapHandleOf(intrinsics.getNanFromId(id))
-                if (handle && traceHandles.has(handle)) { leafOf.set(id, handle); ok = true }
-            } else if (n.op === 'after') {
-                ok = collect(n.argIds[1])
-            } else if (n.op === 'ret' || n.op === 'inlined') {
-                ok = collect(n.argIds[0])
-            } else if (n.op === 'select' && n.argIds.length > 1) {
-                ok = true
-                for (let i = 1; i < n.argIds.length; i++) if (!collect(n.argIds[i])) { ok = false; break }
-            }
-            spine.set(id, ok)
-            return ok
-        }
-        if (!collect(rootId) || leafOf.size < 1) return
-        const members = new Set<number>()
-        function mark(id: number): void {
-            if (members.has(id)) return
-            members.add(id)
-            if (leafOf.has(id)) return
-            const n = nodes.get(id)!
-            if (n.op === 'after') { 
-                mark(n.argIds[1])
-                return 
-            }
-            if (n.op === 'ret' || n.op === 'inlined') {
-                mark(n.argIds[0])
-                return
-            }
-            for (let i = 1; i < n.argIds.length; i++) mark(n.argIds[i])
-        }
-        mark(rootId)
-
-        for (const [id, n] of nodes) {
-            if (members.has(id)) continue
-            for (const arg of n.argIds) if (leafOf.has(arg)) return
-        }
-
-        function dataSlot(target: u32, key: u32): u32 | undefined {
-            const descriptor = heap.getOwnProperty(target, key)
-            if (!descriptor) return
-            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
-            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
-            return d.slot0
-        }
-        function targetOf(handle: u32): u32 {
-            return heap.isIndirect(handle) ? heap.indirectTarget(handle) : handle
-        }
-        function isScalar(handle: u32): boolean {
-            return handle > 1 && heap.isBoxedF64(handle)
-        }
-
-        interface Layout { index: number, objects: u32[], scalars: u32[], children: Map<u32, Layout> }
-        const nested = new Set<u32>()
-        let objectCount = 0
-        function layoutOf(objects: u32[], depth: number): Layout | undefined {
-            for (const o of objects) {
-                if (o <= 1 || heap.isBoxedF64(o) || !heap.isOrdinaryObject(o)) return
-            }
-            const first = objects[0]
-            const proto = heap.getPrototypeOf(first)
-            const descriptor = heap.typeDescriptorOf(first)
-            const count = heap.ownPropertyCount(first)
-            const keys: u32[] = []
-            for (let i: u32 = 0; i < count; i++) keys.push(heap.ownPropertyKeyAt(first, i))
-            for (const o of objects) {
-                if (heap.getPrototypeOf(o) !== proto) return
-                if (heap.typeDescriptorOf(o) !== descriptor) return
-                if (heap.ownPropertyCount(o) !== count) return
-                for (let i = 0; i < keys.length; i++) {
-                    if (heap.ownPropertyKeyAt(o, i as u32) !== keys[i]) return
-                    if (dataSlot(o, keys[i]) === undefined) return
-                }
-                if (depth) nested.add(o)
-            }
-            const layout: Layout = { index: objectCount++, objects, scalars: [], children: new Map() }
-            for (const key of keys) {
-                const slots = objects.map(o => dataSlot(o, key)!)
-                if (slots.every(isScalar)) {
-                    layout.scalars.push(key)
-                    continue
-                }
-                if (slots.every(s => s === slots[0])) continue
-                const child = layoutOf(slots.map(targetOf), depth + 1)
-                if (!child) return
-                layout.children.set(key, child)
-            }
-            return layout
-        }
-        function fieldKey(layout: Layout, key: u32): f64 {
-            return (layout.index * 0x100000000 + key) as f64
-        }
-        function fieldCount(layout: Layout): number {
-            let count = layout.scalars.length
-            for (const child of layout.children.values()) count += fieldCount(child)
-            return count
-        }
-
-        const leaves = [...leafOf.keys()]
-        const root = layoutOf([...leafOf.values()], 0)
-        if (!root) return
-        if (nested.size) {
-            const nestedIds = new Set<number>()
-            for (const [id, n] of nodes) {
-                if (n.op !== 'heap-handle' || n.argIds[0]) continue
-                const handle = n.argConsts![0] as u32
-                if (handle > 1 && nested.has(targetOf(handle))) nestedIds.add(id)
-            }
-            for (const [id, n] of nodes) {
-                if (members.has(id)) continue
-                for (const arg of n.argIds) if (nestedIds.has(arg)) return
-            }
-        }
-
-        const recordSize = fieldCount(root) * 2
-        function recordOf(id: number): any {
-            const leaf = leaves.indexOf(id)
-            const fields = new Float64Array(recordSize)
-            let at = 0
-            function fill(layout: Layout): void {
-                for (const key of layout.scalars) {
-                    fields[at++] = fieldKey(layout, key)
-                    fields[at++] = heap.unboxF64(dataSlot(layout.objects[leaf], key)!)
-                }
-                for (const child of layout.children.values()) fill(child)
-            }
-            fill(root!)
-            return mk('record', fields)
-        }
-
-        function rebuild(id: number, memo: Map<number, any>): any {
-            const prev = memo.get(id)
-            if (prev !== undefined) return prev
-            const n = nodes.get(id)!
-            let out: any
-            if (leafOf.has(id)) {
-                out = recordOf(id)
-            } else if (n.op === 'after') {
-                out = after(rebuild(n.argIds[1], memo), intrinsics.getNanFromId(n.argIds[0]))
-            } else if (n.op === 'ret') {
-                out = ret(rebuild(n.argIds[0], memo), n.argConsts![1])
-            } else if (n.op === 'inlined') {
-                out = inlined(rebuild(n.argIds[0], memo))
-            } else {
-                const args = new Float64Array(n.argIds.length)
-                args[0] = n.argIds[0] ? intrinsics.getNanFromId(n.argIds[0]) : n.argConsts![0]
-                for (let i = 1; i < n.argIds.length; i++) args[i] = rebuild(n.argIds[i], memo)
-                out = mk('select', args)
-            }
-            memo.set(id, out)
-            return out
-        }
-        const result = rebuild(rootId, new Map<number, any>())
-
-        function field(key: f64): any {
-            const n = nodes.get(tracer.getNanId(result))
-            if (n?.op === 'record') {
-                for (let i = 0; i < n.argIds.length; i += 2) {
-                    if (n.argConsts![i] !== key) continue
-                    return n.argIds[i + 1] ? intrinsics.getNanFromId(n.argIds[i + 1]) : n.argConsts![i + 1]
-                }
-            }
-            const args = new Float64Array(2)
-            args[0] = result
-            args[1] = key
-            return mk('get', args, '', [Types.u64])
-        }
-        function build(layout: Layout): u32 {
-            const unified = heap.shallowClone(layout.objects[0] as intrinsics.Handle) as u32
-            for (const key of layout.scalars) {
-                heap.setProperty(unified as intrinsics.Handle, key as intrinsics.Handle, heap.boxF64(field(fieldKey(layout, key))))
-            }
-            for (const [key, child] of layout.children) {
-                heap.setProperty(unified as intrinsics.Handle, key as intrinsics.Handle, build(child) as intrinsics.Handle)
-            }
-            return unified
-        }
-        return { value: handleValue(build(root)), result }
-    }
-
-    function callLinked(linked: Function, thisArg: any, regStart: number, nargs: number): { value: any, handle?: boolean } | undefined {
+    function callLinked(linked: Function, thisArg: any, regStart: number, nargs: number): { value: any } | undefined {
         const native = linked as any
         const isLocal = !!native.__localTarget
         if ((isLocal || native.__native)
@@ -1252,12 +1036,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const obj = callArg(regStart, 0)
             heap.setPrototypeOf(heap.isIndirect(obj) ? heap.prepareWrite(obj) : obj as u32, callArg(regStart, 1) as u32)
             tracer.markHandled()
-            return { value: handleValue(obj), handle: true }
+            return { value: handleValue(obj) }
         }
         if (((linked as any).shouldInline || opts.shouldInline?.(linked))
             && typeof (linked as any)[Symbol.for('toComputation')] === 'function') {
             const args = new Float64Array(nargs)
-            for (let i = 0; i < nargs; i++) args[i] = callArg(regStart, i)
+            for (let i = 0; i < nargs; i++) args[i] = graphCallArg(regStart, i)
             const effect = readToken()
             let nested: any
             tracer.setActive(false)
@@ -1267,7 +1051,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                         session,
                         mapCapture: opts.mapCapture,
                         shouldInline: opts.shouldInline,
-                        inputs: { thisArg, args, effect },
+                        inputs: { thisArg: graphReceiver(thisArg), args, effect },
                     })
                 } catch (e) {
                     console.log(linked.toString(), e)
@@ -1285,13 +1069,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
 
             const value = inlined(nested.result)
-            const heapValue = isHeapValue(value)
-            const unified = heapValue ? unifyHeapHandles(value) : undefined
+            const unified = objects.unify(value)
             writeToken(getOrderingFromInlined(unified ? unified.result : value))
             tracer.markHandled()
-
-            if (unified) return { value: unified.value, handle: true }
-            return { value, handle: heapValue }
+            return { value: unified ? unified.value : value }
         }
         const syscall = linked as any
         if (Number.isSafeInteger(syscall.__syscall)
@@ -1438,7 +1219,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     targetArgs[0] = loaded
                     targetArgs[1] = context
                     tracer.markHandled()
-                    return tagCallResult(mk('indirect-target', targetArgs, '', [Types.fnptr]), true)
+                    return tagCallResult(mk('indirect-target', targetArgs, '', [Types.fnptr]))
                 }
                 if (intrinsicName === 'store') {
                     const sargs = new Float64Array(4)
@@ -1454,7 +1235,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 if (intrinsicName === 'load') {
                     const loaded = memoryLoad(iargs[0], iargs[1], iargs[2])
                     tracer.markHandled()
-                    return tagCallResult(loaded, iargs[2] === Types.fnptr)
+                    return tagCallResult(loaded)
                 }
                 const result = (Intrinsics as any)[intrinsicName](...iargs)
                 tracer.markHandled()
@@ -1462,7 +1243,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             if (linked) {
                 const result = callLinked(linked, thisArg, regStart, nargs)
-                if (result) return tagCallResult(result.value, result.handle)
+                if (result) return tagCallResult(result.value)
             }
             const cargs = new Float64Array(3 + nargs)
             cargs[0] = readToken()
@@ -1643,15 +1424,19 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         } else {
             for (const slot of R.inputs) {
                 if (sameValue(R.incoming[slot], ins[slot])) continue
+                const joins = R.heap.has(cellOf(R.incoming[slot])) && heapState.has(cellOf(ins[slot]))
+                if (joins) continue
                 assert(!cellOf(R.incoming[slot]) && !cellOf(ins[slot]), 'heap record: block input changes identity')
                 if (R.symbolic.has(slot)) continue
                 assert(!R.traced, `trace2: input s${slot} of B${R.header} changed after tracing`)
                 R.symbolic.add(slot)
             }
             assert(heapState.size === R.heap.size, 'heap record: block input changes object graph')
+            const edge = [...heapState]
+            let at = 0
             for (const [cell, binding] of R.heap) {
-                const value = heapState.get(cell)
-                assert(value !== undefined, 'heap record: block input changes object graph')
+                const [other, value] = edge[at++]
+                assert(objects.sameShape(cell, other), 'heap record: block input changes object graph')
                 if (binding.symbolic || sameValue(value, binding.incoming)) continue
                 assert(!R.traced, 'heap record: entry contents changed after tracing')
                 binding.symbolic = true
@@ -1661,7 +1446,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         args[0] = intrinsics.getNanFromId(R.selfId) as any
         for (let i = 0; i < R.inputs.length; i++) args[i + 1] = ins[R.inputs[i]]
         let i = R.inputs.length + 1
-        for (const [cell] of R.heap) args[i++] = heapState.get(cell)!
+        for (const value of heapState.values()) args[i++] = value as f64
         return mk('apply', args)
     }
 
@@ -1680,18 +1465,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return n.argConsts![0] as u32
     }
 
-    function heapHandleOf(value: any): u32 {
-        const n = nodes.get(tracer.getNanId(value))
-        if (!n || n.op !== 'heap-handle' || n.argIds[0]) return 0
-        const h = n.argConsts![0] as u32
-        return h && heap.isIndirect(h) ? heap.indirectTarget(h) : h
-    }
-
-    const traceHandles = session.traceHandles
-
     function handleValue(handle: u32): any {
         handle = objects.intern(handle)
-        if (heap.isIndirect(handle)) traceHandles.add(heap.indirectTarget(handle))
         const args = new Float64Array(1)
         args[0] = handle as f64
         return mk('heap-handle', args, '', [Types.handle])
@@ -2035,7 +1810,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
     if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', new Float64Array(0))
     nilEffect = runtime.nilEffect
-    ins[ACC] = thisArg
+    ins[ACC] = thisValue
     ins[TOKEN] = opts.inputs?.effect ?? nilEffect
 
     const traceOrder = reifyBlocks()
@@ -2650,6 +2425,31 @@ if (intrinsics.argv()[0] === 'trace2') {
     }
     testCapturedTernaryObject()
 
+    function testObjectJoins() {
+        function joinedObject(flag: u32, value: u32): u32 {
+            let o: { y: u32 }
+            if (flag) o = { y: value + 1 }
+            else o = { y: value + 2 }
+            return o.y
+        }
+        const joined = createNative(joinedObject).native
+        assert(joined(1, 4) === 5)
+        assert(joined(0, 4) === 6)
+
+        function joinedObjectLoop(flag: u32, n: u32): u32 {
+            let o: { y: u32 }
+            if (flag) o = { y: 1 as u32 }
+            else o = { y: 2 as u32 }
+            for (let i: u32 = 0; i < n; i++) o.y = o.y + i
+            return o.y
+        }
+        const loop = createNative(joinedObjectLoop).native
+        assert(loop(1, 3) === 4)
+        assert(loop(0, 3) === 5)
+        assert(loop(1, 0) === 1)
+    }
+    testObjectJoins()
+
     function testTraceBindings() {
         function constantArmLoop(flag: u32): u32 {
             let value = 2
@@ -2685,8 +2485,6 @@ if (intrinsics.argv()[0] === 'trace2') {
             return (factor === 3 ? value : 0) as u32
         }
         const identical = trace2(identicalComputedInputs)
-        // The join must see both computed 3s before tracing its comparison.
-        // This checks specialization in the trace, before lowering optimizes it.
         for (const b of identical.graph.blocks) if (b.id) assert(b.params.length === 0)
         for (const n of identical.graph.nodes.values()) assert(n.op !== 'eq')
         const specialized = createNative(identicalComputedInputs).native
