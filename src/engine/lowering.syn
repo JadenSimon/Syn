@@ -187,37 +187,94 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     const removedWrites: number[] = []
     let finished = false
 
-    function emit(word: number, asm: string): void {
-        items.push({ kind: 'insn', word: word >>> 0, text: asm, label: -1, reg: -1, cond: -1 })
+    const writebacks = new Map<number, AsmItem>()
+
+    function push(item: AsmItem): void {
+        items.push(item)
+        emitted(item)
+    }
+
+    function emitted(item: AsmItem): void {
+        if (item.kind !== 'insn') {
+            writebacks.clear()
+            return
+        }
+        if (item.adjustReg !== undefined && foldWriteback(item)) return
+        const defs: number[] = []
+        const uses: number[] = []
+        if (!itemDefs(item, defs) || !itemUses(item, uses)) {
+            writebacks.clear()
+            return
+        }
+        for (const r of defs) writebacks.delete(r)
+        for (const r of uses) writebacks.delete(r)
+        if (item.loadBase !== undefined && item.loadBytes && item.reg !== item.loadBase) writebacks.set(item.loadBase, item)
+    }
+
+    function foldWriteback(add: AsmItem): boolean {
+        const rn = add.adjustReg!
+        const k = add.adjustDelta!
+        const load = writebacks.get(rn)
+        writebacks.delete(rn)
+        if (!load) return false
+        const at = items.lastIndexOf(load)
+        const bytes = load.loadBytes
+        if (at < 0 || load.loadBase !== rn || load.reg === rn || !bytes) return false
+        const prev = items[at - 1]
+        const paired = prev?.kind === 'insn' && prev.loadBase === rn && prev.loadBytes === bytes
+            && (bytes === 4 || bytes === 8) && prev.reg !== rn && prev.reg !== load.reg
+            && Math.abs(prev.loadOffset! - load.loadOffset!) === bytes
+        if (paired) {
+            const [lo, hi] = prev.loadOffset! < load.loadOffset! ? [prev, load] : [load, prev]
+            if (lo.loadOffset !== k || k % bytes !== 0 || k < -64 * bytes || k > 63 * bytes) return false
+            const reg = bytes === 8 ? x : w
+            prev.word = ((bytes === 8 ? 0xA9C00000 : 0x29C00000) | (((k / bytes) & 0x7F) << 15) | (hi.reg << 10)
+                | (rn << 5) | lo.reg) >>> 0
+            prev.text = `ldp ${reg(lo.reg)}, ${reg(hi.reg)}, [${base(rn)}, #${k}]!`
+            prev.reg = lo.reg
+            prev.loadBase = undefined; prev.loadOffset = undefined; prev.loadBytes = undefined
+            items.pop()
+            items.splice(at, 1)
+            return true
+        }
+        if (load.loadOffset !== k || !fitsIndexedImm(k, bytes)) return false
+        writeback(load, rn, k, true)
+        load.loadBase = undefined; load.loadOffset = undefined; load.loadBytes = undefined
+        items.pop()
+        return true
+    }
+
+    function emit(word: number, asm: string, meta?: Partial<AsmItem>): void {
+        push({ kind: 'insn', word: word >>> 0, text: asm, label: -1, reg: -1, cond: -1, ...meta })
     }
 
     // tagged so the peephole can fuse it with a following branch instead of
     // decoding the encoding back out
     function emitCset(word: number, asm: string, dst: number, cond: number): void {
-        items.push({ kind: 'cset', word: word >>> 0, text: asm, label: -1, reg: dst, cond })
+        push({ kind: 'cset', word: word >>> 0, text: asm, label: -1, reg: dst, cond })
     }
 
     function emitCmpZero(reg: number): void {
-        items.push({
+        push({
             kind: 'insn', word: (0xF1000000 | (reg << 5) | XZR) >>> 0,
             text: `cmp ${x(reg)}, #0`, label: -1, reg: -1, cond: -1, cmpZeroReg: reg,
             setsFlags: true,
         })
     }
 
-    function emitCmp(word: number, asm: string): void {
-        items.push({ kind: 'insn', word: word >>> 0, text: asm, label: -1, reg: -1, cond: -1, setsFlags: true })
+    function emitCmp(word: number, asm: string, meta?: Partial<AsmItem>): void {
+        push({ kind: 'insn', word: word >>> 0, text: asm, label: -1, reg: -1, cond: -1, setsFlags: true, ...meta })
     }
 
     function emitStore(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
-        items.push({
+        push({
             kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
             storeBase: base, storeOffset: offset, storeBytes: bytes,
         })
     }
 
     function emitLoad(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
-        items.push({
+        push({
             kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
             loadBase: base, loadOffset: offset, loadBytes: bytes,
         })
@@ -362,17 +419,22 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             for (let i = 0; i < items.length; i++) {
                 const it = items[i]
 
-                if (it.loadBytes === 8 && i + 1 < items.length) {
+                if ((it.loadBytes === 8 || it.loadBytes === 4) && i + 1 < items.length) {
                     const next = items[i + 1]
-                    const offset = it.loadOffset!
-                    if (next.loadBytes === 8 && next.loadBase === it.loadBase
-                        && next.loadOffset === offset + 8 && it.reg !== it.loadBase
-                        && it.reg !== next.reg && offset >= -512 && offset <= 504) {
-                        const imm = offset / 8
-                        it.word = (0xA9400000 | ((imm & 0x7F) << 15) | (next.reg << 10)
-                            | (it.loadBase! << 5) | it.reg) >>> 0
-                        it.text = `ldp ${x(it.reg)}, ${x(next.reg)}, [${base(it.loadBase!)}, #${offset}]`
-                        it.loadBytes = undefined
+                    const bytes = it.loadBytes
+                    const [lo, hi] = next.loadOffset! < it.loadOffset! ? [next, it] : [it, next]
+                    const offset = lo.loadOffset!
+                    if (next.loadBytes === bytes && next.loadBase === it.loadBase
+                        && hi.loadOffset === offset + bytes && it.reg !== it.loadBase && it.reg !== next.reg
+                        && offset % bytes === 0 && offset >= -64 * bytes && offset <= 63 * bytes) {
+                        const imm = offset / bytes
+                        const reg = bytes === 8 ? x : w
+                        it.word = ((bytes === 8 ? 0xA9400000 : 0x29400000) | ((imm & 0x7F) << 15) | (hi.reg << 10)
+                            | (it.loadBase! << 5) | lo.reg) >>> 0
+                        it.text = `ldp ${reg(lo.reg)}, ${reg(hi.reg)}, [${base(it.loadBase!)}, #${offset}]`
+                        it.reg = lo.reg
+                        it.loadOffset = offset
+                        it.loadBytes = bytes === 8 ? undefined : 0
                         items.splice(i + 1, 1)
                         changed = true
                         break
@@ -888,8 +950,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     // --- raw encoders ------------------------------------------------------
-    function shiftedReg(base: number, name: string, d: number, n: number, m: number): void {
-        emit(base | (m << 16) | (n << 5) | d, `${name} ${x(d)}, ${x(n)}, ${x(m)}`)
+    function shiftedReg(base: number, name: string, d: number, n: number, m: number, meta?: Partial<AsmItem>): void {
+        emit(base | (m << 16) | (n << 5) | d, `${name} ${x(d)}, ${x(n)}, ${x(m)}`, meta)
     }
     function dataProc2(base: number, name: string, d: number, n: number, m: number): void {
         emit(base | (m << 16) | (n << 5) | d, `${name} ${x(d)}, ${x(n)}, ${x(m)}`)
@@ -897,12 +959,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function lsrImm(dst: number, src: number, amount: number): void {
         emit(0xD3400000 | (amount << 16) | (63 << 10) | (src << 5) | dst,
-            `lsr ${x(dst)}, ${x(src)}, #${amount}`)
-        const item = items[items.length - 1]
-        item.shiftDst = dst
-        item.shiftSrc = src
-        item.shiftAmount = amount
-        item.shiftKind = 'lsr'
+            `lsr ${x(dst)}, ${x(src)}, #${amount}`,
+            { shiftDst: dst, shiftSrc: src, shiftAmount: amount, shiftKind: 'lsr' })
     }
 
     function logicalImmediate(value: number): number | undefined {
@@ -932,8 +990,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function movz(d: number, imm16: number, hw: number): void {
         emit(0xD2800000 | (hw << 21) | (imm16 << 5) | d,
-            `movz ${x(d)}, #${imm16}${hw ? `, lsl #${hw * 16}` : ''}`)
-        if (imm16 === 0 && hw === 0) items[items.length - 1].zeroReg = d
+            `movz ${x(d)}, #${imm16}${hw ? `, lsl #${hw * 16}` : ''}`,
+            imm16 === 0 && hw === 0 ? { zeroReg: d } : undefined)
     }
     function movk(d: number, imm16: number, hw: number): void {
         emit(0xF2800000 | (hw << 21) | (imm16 << 5) | d,
@@ -950,9 +1008,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const dd = dIsSp ? `sp` : x(d)
         const word = (0x91000000 | (imm << 10) | (n << 5) | d) >>> 0
         const text = `add ${dd}, ${nn}, #${imm}`
-        if (d === n) items.push({ kind: 'insn', word, text, label: -1, reg: -1, cond: -1, adjustReg: d, adjustDelta: imm })
+        if (d === n) push({ kind: 'insn', word, text, label: -1, reg: -1, cond: -1, adjustReg: d, adjustDelta: imm })
         else {
-            items.push({
+            push({
                 kind: 'insn', word, text, label: -1, reg: -1, cond: -1,
                 addDst: d, addLeft: n, addImmediate: imm,
             })
@@ -964,7 +1022,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const dd = dIsSp ? `sp` : x(d)
         const word = (0xD1000000 | (imm << 10) | (n << 5) | d) >>> 0
         const text = `sub ${dd}, ${nn}, #${imm}`
-        if (d === n) items.push({ kind: 'insn', word, text, label: -1, reg: -1, cond: -1, adjustReg: d, adjustDelta: -imm })
+        if (d === n) push({ kind: 'insn', word, text, label: -1, reg: -1, cond: -1, adjustReg: d, adjustDelta: -imm })
         else emit(word, text)
     }
 
@@ -1068,7 +1126,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function mov(dst: number, src: number): void {
         if (dst === src) return
-        items.push({
+        push({
             kind: 'insn', word: (0xAA0003E0 | (src << 16) | dst) >>> 0,
             text: `mov ${x(dst)}, ${x(src)}`, label: -1, reg: -1, cond: -1,
             moveDst: dst, moveSrc: src,
@@ -1077,11 +1135,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function binary(op: string, dst: number, a: number, b: number, signed: boolean): void {
         if (op === 'add') {
-            shiftedReg(0x8B000000, 'add', dst, a, b)
-            const item = items[items.length - 1]
-            item.addDst = dst
-            item.addLeft = a
-            item.addRight = b
+            shiftedReg(0x8B000000, 'add', dst, a, b, { addDst: dst, addLeft: a, addRight: b })
             return
         }
         if (op === 'sub') return shiftedReg(0xCB000000, 'sub', dst, a, b)
@@ -1133,12 +1187,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 const immr = (64 - imm) & 63
                 const imms = 63 - imm
                 emit(0xD3400000 | (immr << 16) | (imms << 10) | (a << 5) | dst,
-                    `lsl ${x(dst)}, ${x(a)}, #${imm}`)
-                const item = items[items.length - 1]
-                item.shiftDst = dst
-                item.shiftSrc = a
-                item.shiftAmount = imm
-                item.shiftKind = 'lsl'
+                    `lsl ${x(dst)}, ${x(a)}, #${imm}`,
+                    { shiftDst: dst, shiftSrc: a, shiftAmount: imm, shiftKind: 'lsl' })
             } else {
                 if (op === 'ushr') lsrImm(dst, a, imm)
                 else emit(0x93400000 | (imm << 16) | (63 << 10) | (a << 5) | dst,
@@ -1154,12 +1204,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 const immr = (encoded >>> 6) & 0x3F
                 const imms = encoded & 0x3F
                 emit(base | (N << 22) | (immr << 16) | (imms << 10) | (a << 5) | dst,
-                    `${op === 'or' ? 'orr' : op === 'xor' ? 'eor' : 'and'} ${x(dst)}, ${x(a)}, #${imm}`)
-                const item = items[items.length - 1]
-                item.logicalDst = dst
-                item.logicalSrc = a
-                item.logicalImmediate = imm
-                item.logicalOp = op
+                    `${op === 'or' ? 'orr' : op === 'xor' ? 'eor' : 'and'} ${x(dst)}, ${x(a)}, #${imm}`,
+                    { logicalDst: dst, logicalSrc: a, logicalImmediate: imm, logicalOp: op })
                 return
             }
         }
@@ -1191,13 +1237,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (when) {
             const prior = condFor(when[0], when[1])
             emitCmp(0xFA400000 | (b << 16) | (prior << 12) | (a << 5) | FalseFlags[cond],
-                `ccmp ${x(a)}, ${x(b)}, #${FalseFlags[cond]}, ${CondNames[prior]}`)
-            items[items.length - 1].cond = prior
+                `ccmp ${x(a)}, ${x(b)}, #${FalseFlags[cond]}, ${CondNames[prior]}`, { cond: prior })
         } else {
-            emitCmp(0xEB000000 | (b << 16) | (a << 5) | XZR, `cmp ${x(a)}, ${x(b)}`)  // subs xzr, a, b
-            const item = items[items.length - 1]
-            item.cmpLeft = a
-            item.cmpRight = b
+            emitCmp(0xEB000000 | (b << 16) | (a << 5) | XZR, `cmp ${x(a)}, ${x(b)}`, { cmpLeft: a, cmpRight: b })  // subs xzr, a, b
         }
         if (dst >= 0) cset(dst, cond)
     }
@@ -1208,8 +1250,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (imm < 0 || imm > 31) throw `aarch64: ccmp immediate out of range: ${imm}`
             const prior = condFor(when[0], when[1])
             emitCmp(0xFA400800 | (imm << 16) | (prior << 12) | (a << 5) | FalseFlags[cond],
-                `ccmp ${x(a)}, #${imm}, #${FalseFlags[cond]}, ${CondNames[prior]}`)
-            items[items.length - 1].cond = prior
+                `ccmp ${x(a)}, #${imm}, #${FalseFlags[cond]}, ${CondNames[prior]}`, { cond: prior })
         } else {
             if (imm < 0 || imm > 0xFFF) throw `aarch64: cmp immediate out of range: ${imm}`
             if (imm === 0) emitCmpZero(a)
@@ -1234,32 +1275,27 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const bytes = accessBytes(to)
         const signed = isSignedType(to)
         if (bytes === 8) return mov(dst, src)
+        const meta = { convertDst: dst, convertSrc: src, convertWidth: bytes * 8, convertSigned: signed, convertFrom: from }
         if (bytes === 4) {
             if (signed) {
-                emit(0x93407C00 | (src << 5) | dst, `sxtw ${x(dst)}, ${w(src)}`)
+                emit(0x93407C00 | (src << 5) | dst, `sxtw ${x(dst)}, ${w(src)}`, meta)
             } else {
-                emit(0x2A0003E0 | (src << 16) | dst, `mov ${w(dst)}, ${w(src)}`)
+                emit(0x2A0003E0 | (src << 16) | dst, `mov ${w(dst)}, ${w(src)}`, meta)
             }
         } else if (bytes === 2) {
-            if (signed) emit(0x93403C00 | (src << 5) | dst, `sxth ${x(dst)}, ${w(src)}`)
-            else emit(0x53003C00 | (src << 5) | dst, `uxth ${w(dst)}, ${w(src)}`)
+            if (signed) emit(0x93403C00 | (src << 5) | dst, `sxth ${x(dst)}, ${w(src)}`, meta)
+            else emit(0x53003C00 | (src << 5) | dst, `uxth ${w(dst)}, ${w(src)}`, meta)
         } else {
-            if (signed) emit(0x93401C00 | (src << 5) | dst, `sxtb ${x(dst)}, ${w(src)}`)
-            else emit(0x53001C00 | (src << 5) | dst, `uxtb ${w(dst)}, ${w(src)}`)
+            if (signed) emit(0x93401C00 | (src << 5) | dst, `sxtb ${x(dst)}, ${w(src)}`, meta)
+            else emit(0x53001C00 | (src << 5) | dst, `uxtb ${w(dst)}, ${w(src)}`, meta)
         }
-        const item = items[items.length - 1]
-        item.convertDst = dst
-        item.convertSrc = src
-        item.convertWidth = bytes * 8
-        item.convertSigned = signed
-        item.convertFrom = from
     }
 
     function select(dst: number, cond: number, a: number, b: number): void {
         emitCmpZero(cond)
         // tagged so the peephole can retarget the condition instead of decoding it
         // back out of the encoding
-        items.push({
+        push({
             kind: 'insn', word: (0x9A800000 | (b << 16) | (COND_NE << 12) | (a << 5) | dst) >>> 0,
             text: `csel ${x(dst)}, ${x(a)}, ${x(b)}, ne`, label: -1, reg: dst, cond: -1,
             cselCond: COND_NE, cselRegs: [dst, a, b],
@@ -1305,7 +1341,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             indexBase: n, indexReg: m, indexBytes: accessBytes(T), indexLoad: load, indexSigned: isSignedType(T),
         }
         encodeIndexed(item, false)
-        items.push(item)
+        push(item)
     }
 
     function store(base: number, offset: number, src: number, T: Ty): void {
@@ -1334,7 +1370,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.extractDst !== undefined) { out.push(item.extractDst); return true }
         if (item.zeroReg !== undefined) { out.push(item.zeroReg); return true }
         if (item.indexBase !== undefined) { if (item.indexLoad) out.push(item.reg); return true }
-        if (item.loadBase !== undefined) { out.push(item.word & 0x1F); return true }
+        if (item.loadBase !== undefined) {
+            out.push(item.word & 0x1F)
+            if (!item.loadBytes) out.push(pairSecondReg(item))
+            return true
+        }
         if (item.storeBase !== undefined) return true
         if (item.cmpLeft !== undefined) return true
         return false
@@ -1405,6 +1445,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     function released(values: { value: number, home: number }[]): void {
         const dead = new Set<number>()
         for (const value of values) if (value.home >= 0) dead.add(value.home)
+        for (const reg of dead) writebacks.delete(reg)
         if (items.length) {
             const item = items[items.length - 1]
             if (!item.deadAfter) item.deadAfter = new Set<number>()
@@ -1651,21 +1692,21 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         },
         spRead: (dst) => addImmRaw(dst, SP, 0, true, false),
         bindLabel: (id) => {
-            items.push({ kind: 'label', word: 0, text: '', label: id, reg: -1, cond: -1 })
+            push({ kind: 'label', word: 0, text: '', label: id, reg: -1, cond: -1 })
         },
         jump: (id) => {
-            items.push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
+            push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
         },
         jumpIfNonZero: (reg, id) => {
-            items.push({ kind: 'cbnz', word: 0, text: '', label: id, reg, cond: -1 })
+            push({ kind: 'cbnz', word: 0, text: '', label: id, reg, cond: -1 })
         },
         jumpIfZero: (reg, id) => {
-            items.push({ kind: 'cbz', word: 0, text: '', label: id, reg, cond: -1 })
+            push({ kind: 'cbz', word: 0, text: '', label: id, reg, cond: -1 })
         },
         br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`),
         blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
         loadPool: (dst: number, slot: number) => {
-            items.push({
+            push({
                 kind: 'insn', word: (0x90000000 | dst) >>> 0,
                 text: `adrp ${x(dst)}, pool[${slot}]`, label: -1, reg: dst, cond: -1,
                 relocationKind: 'aarch64-pool', relocationTarget: slot,
@@ -1673,14 +1714,14 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             emit(0xF9400000 | (dst << 5) | dst, `ldr ${x(dst)}, [${x(dst)}, pool[${slot}]]`)
         },
         callLocal: (target: number, debugName) => {
-            items.push({
+            push({
                 kind: 'insn', word: 0x94000000, text: `bl fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
                 relocationKind: 'aarch64-call', relocationTarget: target,
             })
         },
         jumpLocal: (target: number, debugName) => {
-            items.push({
+            push({
                 kind: 'insn', word: 0x14000000, text: `b fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
                 relocationKind: 'aarch64-jump', relocationTarget: target,

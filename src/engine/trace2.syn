@@ -986,18 +986,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return true
     }
 
-    function boxedSlot(handle: u32, key: u32): f64 | undefined {
-        const descriptor = heap.getOwnProperty(handle, key)
-        if (!descriptor) return
-        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
-        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
-        if (!heap.isBoxedF64(d.slot0)) return
-        return heap.unboxF64(d.slot0)
-    }
-
-    function unifyHeapHandles(value: any): any {
+    function unifyHeapHandles(value: any): { value: any, result: any } | undefined {
         const rootId = tracer.getNanId(value)
-        if (!rootId || nodes.get(rootId)?.op === 'heap-handle') return value
+        if (!rootId || nodes.get(rootId)?.op === 'heap-handle') return
 
         const leafOf = new Map<number, u32>()
         const spine = new Map<number, boolean>()
@@ -1024,7 +1015,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             spine.set(id, ok)
             return ok
         }
-        if (!collect(rootId) || leafOf.size < 1) return value
+        if (!collect(rootId) || leafOf.size < 1) return
         const members = new Set<number>()
         function mark(id: number): void {
             if (members.has(id)) return
@@ -1045,80 +1036,149 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
         for (const [id, n] of nodes) {
             if (members.has(id)) continue
-            for (const arg of n.argIds) if (leafOf.has(arg)) return value
+            for (const arg of n.argIds) if (leafOf.has(arg)) return
         }
 
-        const leaves = [...leafOf.values()]
-        const first = leaves[0]
-        if (!heap.isOrdinaryObject(first)) return value
-        const proto = heap.getPrototypeOf(first)
-        const descriptor = heap.typeDescriptorOf(first)
-        const count = heap.ownPropertyCount(first)
-        const keys: u32[] = []
-        for (let i: u32 = 0; i < count; i++) keys.push(heap.ownPropertyKeyAt(first, i))
-        for (const leaf of leaves) {
-            if (!heap.isOrdinaryObject(leaf)) return value
-            if (heap.getPrototypeOf(leaf) !== proto) return value
-            if (heap.typeDescriptorOf(leaf) !== descriptor) return value
-            if (heap.ownPropertyCount(leaf) !== count) return value
-            for (let i = 0; i < keys.length; i++) {
-                if (heap.ownPropertyKeyAt(leaf, i as u32) !== keys[i]) return value
-                if (boxedSlot(leaf, keys[i]) === undefined) return value
+        function dataSlot(target: u32, key: u32): u32 | undefined {
+            const descriptor = heap.getOwnProperty(target, key)
+            if (!descriptor) return
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
+            return d.slot0
+        }
+        function targetOf(handle: u32): u32 {
+            return heap.isIndirect(handle) ? heap.indirectTarget(handle) : handle
+        }
+        function isScalar(handle: u32): boolean {
+            return handle > 1 && heap.isBoxedF64(handle)
+        }
+
+        interface Layout { index: number, objects: u32[], scalars: u32[], children: Map<u32, Layout> }
+        const nested = new Set<u32>()
+        let objectCount = 0
+        function layoutOf(objects: u32[], depth: number): Layout | undefined {
+            for (const o of objects) {
+                if (o <= 1 || heap.isBoxedF64(o) || !heap.isOrdinaryObject(o)) return
+            }
+            const first = objects[0]
+            const proto = heap.getPrototypeOf(first)
+            const descriptor = heap.typeDescriptorOf(first)
+            const count = heap.ownPropertyCount(first)
+            const keys: u32[] = []
+            for (let i: u32 = 0; i < count; i++) keys.push(heap.ownPropertyKeyAt(first, i))
+            for (const o of objects) {
+                if (heap.getPrototypeOf(o) !== proto) return
+                if (heap.typeDescriptorOf(o) !== descriptor) return
+                if (heap.ownPropertyCount(o) !== count) return
+                for (let i = 0; i < keys.length; i++) {
+                    if (heap.ownPropertyKeyAt(o, i as u32) !== keys[i]) return
+                    if (dataSlot(o, keys[i]) === undefined) return
+                }
+                if (depth) nested.add(o)
+            }
+            const layout: Layout = { index: objectCount++, objects, scalars: [], children: new Map() }
+            for (const key of keys) {
+                const slots = objects.map(o => dataSlot(o, key)!)
+                if (slots.every(isScalar)) {
+                    layout.scalars.push(key)
+                    continue
+                }
+                if (slots.every(s => s === slots[0])) continue
+                const child = layoutOf(slots.map(targetOf), depth + 1)
+                if (!child) return
+                layout.children.set(key, child)
+            }
+            return layout
+        }
+        function fieldKey(layout: Layout, key: u32): f64 {
+            return (layout.index * 0x100000000 + key) as f64
+        }
+        function fieldCount(layout: Layout): number {
+            let count = layout.scalars.length
+            for (const child of layout.children.values()) count += fieldCount(child)
+            return count
+        }
+
+        const leaves = [...leafOf.keys()]
+        const root = layoutOf([...leafOf.values()], 0)
+        if (!root) return
+        if (nested.size) {
+            const nestedIds = new Set<number>()
+            for (const [id, n] of nodes) {
+                if (n.op !== 'heap-handle' || n.argIds[0]) continue
+                const handle = n.argConsts![0] as u32
+                if (handle > 1 && nested.has(targetOf(handle))) nestedIds.add(id)
+            }
+            for (const [id, n] of nodes) {
+                if (members.has(id)) continue
+                for (const arg of n.argIds) if (nestedIds.has(arg)) return
             }
         }
 
-        function rebuild(id: number, key: u32, memo: Map<number, any>): any {
+        const recordSize = fieldCount(root) * 2
+        function recordOf(id: number): any {
+            const leaf = leaves.indexOf(id)
+            const fields = new Float64Array(recordSize)
+            let at = 0
+            function fill(layout: Layout): void {
+                for (const key of layout.scalars) {
+                    fields[at++] = fieldKey(layout, key)
+                    fields[at++] = heap.unboxF64(dataSlot(layout.objects[leaf], key)!)
+                }
+                for (const child of layout.children.values()) fill(child)
+            }
+            fill(root!)
+            return mk('record', fields)
+        }
+
+        function rebuild(id: number, memo: Map<number, any>): any {
             const prev = memo.get(id)
             if (prev !== undefined) return prev
             const n = nodes.get(id)!
             let out: any
-            const leaf = leafOf.get(id)
-            if (leaf !== undefined) {
-                out = boxedSlot(leaf, key)!
+            if (leafOf.has(id)) {
+                out = recordOf(id)
             } else if (n.op === 'after') {
-                out = after(rebuild(n.argIds[1], key, memo),
-                    intrinsics.getNanFromId(n.argIds[0]))
+                out = after(rebuild(n.argIds[1], memo), intrinsics.getNanFromId(n.argIds[0]))
             } else if (n.op === 'ret') {
-                out = ret(rebuild(n.argIds[0], key, memo), n.argConsts![1])
+                out = ret(rebuild(n.argIds[0], memo), n.argConsts![1])
             } else if (n.op === 'inlined') {
-                out = inlined(rebuild(n.argIds[0], key, memo))
+                out = inlined(rebuild(n.argIds[0], memo))
             } else {
-                const shared: number[] = []
-                let arms = n.argIds.slice(1)
-                for (;;) {
-                    const head = nodes.get(arms[0])
-                    if (!head || head.op !== 'after') break
-                    const effect = head.argIds[0]
-                    let common = true
-                    for (const arm of arms) {
-                        const a = nodes.get(arm)
-                        if (!a || a.op !== 'after' || a.argIds[0] !== effect) { common = false; break }
-                    }
-                    if (!common) break
-                    shared.push(effect)
-                    arms = arms.map(arm => nodes.get(arm)!.argIds[1])
-                }
-                const args = new Float64Array(1 + arms.length)
+                const args = new Float64Array(n.argIds.length)
                 args[0] = n.argIds[0] ? intrinsics.getNanFromId(n.argIds[0]) : n.argConsts![0]
-                for (let i = 0; i < arms.length; i++) args[i + 1] = rebuild(arms[i], key, memo)
+                for (let i = 1; i < n.argIds.length; i++) args[i] = rebuild(n.argIds[i], memo)
                 out = mk('select', args)
-                for (let i = shared.length - 1; i >= 0; i--) {
-                    out = after(out, intrinsics.getNanFromId(shared[i]))
-                }
             }
             memo.set(id, out)
             return out
         }
+        const result = rebuild(rootId, new Map<number, any>())
 
-        const unified = heap.shallowClone(first as intrinsics.Handle) as u32
-        for (const key of keys) {
-            const merged = rebuild(rootId, key, new Map<number, any>())
-            heap.setProperty(unified as intrinsics.Handle, key as intrinsics.Handle,
-                heap.boxF64(merged))
+        function field(key: f64): any {
+            const n = nodes.get(tracer.getNanId(result))
+            if (n?.op === 'record') {
+                for (let i = 0; i < n.argIds.length; i += 2) {
+                    if (n.argConsts![i] !== key) continue
+                    return n.argIds[i + 1] ? intrinsics.getNanFromId(n.argIds[i + 1]) : n.argConsts![i + 1]
+                }
+            }
+            const args = new Float64Array(2)
+            args[0] = result
+            args[1] = key
+            return mk('get', args, '', [Types.u64])
         }
-        const cell = heap.makeIndirect(unified as intrinsics.Handle) as u32
-        traceHandles.add(unified)
-        return handleValue(cell)
+        function build(layout: Layout): u32 {
+            const unified = heap.shallowClone(layout.objects[0] as intrinsics.Handle) as u32
+            for (const key of layout.scalars) {
+                heap.setProperty(unified as intrinsics.Handle, key as intrinsics.Handle, heap.boxF64(field(fieldKey(layout, key))))
+            }
+            for (const [key, child] of layout.children) {
+                heap.setProperty(unified as intrinsics.Handle, key as intrinsics.Handle, build(child) as intrinsics.Handle)
+            }
+            return unified
+        }
+        return { value: handleValue(build(root)), result }
     }
 
     function callLinked(linked: Function, thisArg: any, regStart: number, nargs: number): { value: any, handle?: boolean } | undefined {
@@ -1225,14 +1285,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
 
             const value = inlined(nested.result)
-            writeToken(getOrderingFromInlined(value))
+            const heapValue = isHeapValue(value)
+            const unified = heapValue ? unifyHeapHandles(value) : undefined
+            writeToken(getOrderingFromInlined(unified ? unified.result : value))
             tracer.markHandled()
 
-            if (isHeapValue(value)) {
-                return { value: unifyHeapHandles(value), handle: true }
-            }
-
-            return { value, handle: false }
+            if (unified) return { value: unified.value, handle: true }
+            return { value, handle: heapValue }
         }
         const syscall = linked as any
         if (Number.isSafeInteger(syscall.__syscall)
@@ -2577,6 +2636,17 @@ if (intrinsics.argv()[0] === 'trace2') {
         const result: any = native.createNatives({ capturedTernary })
         assert(result.capturedTernary(10) === 11)
         assert(result.capturedTernary(0) === 1)
+
+        // FIXME: unify heap handles needs to deal with `apply`
+        // const Box2 = defineBox(0 as any)
+        // function capturedTernary2(n: u32): u32 {
+        //     const b = Box2(n)
+        //     b.value = b.value + 1
+        //     return b.value
+        // }
+        // const result2: any = native.createNatives({ capturedTernary2 })
+        // assert(result2.capturedTernary2(10) === 11)
+        // assert(result2.capturedTernary2(0) === 2)
     }
     testCapturedTernaryObject()
 
