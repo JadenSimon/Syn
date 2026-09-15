@@ -24,6 +24,17 @@ interface Shape {
     targets: Map<number, Handle>
 }
 
+export interface Group {
+    members: Handle[]
+    children: [key: Handle, group: number][]
+    base: Float64Array
+}
+
+export interface Joined {
+    result: number
+    groups: Group[]
+}
+
 export type HeapState = Map<Handle, number>
 type CellChanges = Map<Handle, Handle>
 interface CellMarks {
@@ -42,6 +53,9 @@ export function createHeapRecords(
     const shapes = new Map<Handle, Shape>()
     const children = new Map<Handle, Handle[]>()
     const records = new Map<Handle, number>()
+    const joins = new Map<number, Joined>()
+    const offset = 0x100000000
+    const armKey = -1
     let saved: Map<Handle, Handle> | undefined
 
     function intern(handle: Handle): Handle {
@@ -310,30 +324,35 @@ export function createHeapRecords(
             if (!managed.has(cell)) return
         }
 
-        const groups: Handle[][] = []
-        function join(members: Handle[]): void {
-            if (members.every(c => c === members[0])) return
+        const groups: Group[] = []
+        function join(members: Handle[]): number {
             for (const c of members) shapeOf(c, heap.indirectTarget(c))
             for (const c of members) assert(sameShape(members[0], c), 'heap record: cannot unify objects with different shapes')
-            groups.push(members)
+            const group: Group = { members, children: [], base: new Float64Array(members.length) }
+            const index = groups.push(group) - 1
             const shape = shapes.get(members[0])!
             for (let i = 0; i < shape.keys.length; i++) {
                 if (shape.fields.includes(shape.keys[i])) continue
-                join(members.map(c => shapes.get(c)!.fixed[i]))
+                const children = members.map(c => shapes.get(c)!.fixed[i])
+                if (children.every(c => c === children[0])) continue
+                group.children.push([shape.keys[i], join(children)])
             }
+            return index
         }
         join(cells)
 
-        const offset = 0x100000000
-        let width = 0
-        for (const members of groups) width += shapes.get(members[0])!.fields.length * 2
+        let width = 2
+        for (const group of groups) width += shapes.get(group.members[0])!.fields.length * 2
         function leafRecord(id: number): number {
             const index = leaves.indexOf(id)
             const fields = new Float64Array(width)
-            let at = 0
+            fields[0] = armKey as f64
+            fields[1] = index as f64
+            let at = 2
             for (let g = 0; g < groups.length; g++) {
-                const cell = groups[g][index]
+                const cell = groups[g].members[index]
                 const own = record(cell, heap.indirectTarget(cell))
+                groups[g].base[index] = own as f64
                 for (const key of shapes.get(cell)!.fields) {
                     fields[at++] = (g * offset + key) as f64
                     fields[at++] = get(own, key) as f64
@@ -342,18 +361,85 @@ export function createHeapRecords(
             return mk('record', fields)
         }
         const result = rebuild(root, leafRecord, new Map())
-        for (let g = 0; g < groups.length; g++) {
-            const keys = shapes.get(groups[g][0])!.fields
+        joins.set(root, { result, groups })
+        return { value, result }
+    }
+
+    function snapshot(cell: Handle): Handle | undefined {
+        if (!managed.has(cell)) return
+        freeze(cell)
+        return heap.indirectTarget(cell)
+    }
+
+    function joinOf(value: number): Joined | undefined {
+        const id = tracer.getNanId(value)
+        return id ? joins.get(id) : undefined
+    }
+
+    function same(a: number, b: number): boolean {
+        const id = tracer.getNanId(a)
+        return id ? id === tracer.getNanId(b) : a === b
+    }
+
+    function guard(arm: number, index: number): number {
+        const args = new Float64Array(2)
+        args[0] = arm as f64
+        args[1] = index as f64
+        return mk('eq', args, '', [Types.u64, Types.u64])
+    }
+
+    function select(cond: number, a: number, b: number): number {
+        const args = new Float64Array(3)
+        args[0] = cond as f64
+        args[1] = a as f64
+        args[2] = b as f64
+        return mk('select', args)
+    }
+
+    function readJoined(joined: Joined, g: number, key: Handle): { value?: number, group?: number, handle?: Handle } {
+        const group = joined.groups[g]
+        const shape = shapes.get(group.members[0])!
+        const at = shape.keys.indexOf(key)
+        if (at < 0) return { handle: 0 as Handle }
+        if (shape.fields.includes(key)) {
+            const arm = get(joined.result, armKey as Handle)
+            let value = get(joined.result, (g * offset + key) as Handle)
+            for (let i = 0; i < group.members.length; i++) {
+                const cell = group.members[i]
+                const current = get(record(cell, heap.indirectTarget(cell)), key)
+                if (same(current, get(group.base[i], key))) continue
+                value = select(guard(arm, i), current, value)
+            }
+            return { value }
+        }
+        for (const [k, child] of group.children) {
+            if (k === key) return { group: child }
+        }
+        assert(!(shape.flags[at] & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)), 'heap record: accessor on a joined object')
+        return { handle: shape.fixed[at] }
+    }
+
+    function writeJoined(joined: Joined, g: number, key: Handle, value: number): void {
+        const group = joined.groups[g]
+        assert(shapes.get(group.members[0])!.fields.includes(key), 'heap record: structural write through a joined object')
+        const arm = get(joined.result, armKey as Handle)
+        const updates = new Map<Handle, number>()
+        for (let i = 0; i < group.members.length; i++) {
+            const cell = group.members[i]
+            const prior = updates.get(cell) ?? get(record(cell, heap.indirectTarget(cell)), key)
+            updates.set(cell, select(guard(arm, i), value, prior))
+        }
+        for (const [cell, field] of updates) {
+            const own = record(cell, heap.indirectTarget(cell))
+            const keys = shapes.get(cell)!.fields
             const fields = new Float64Array(keys.length * 2)
             for (let i = 0; i < keys.length; i++) {
                 fields[i * 2] = keys[i] as f64
-                fields[i * 2 + 1] = get(result, (g * offset + keys[i]) as Handle) as f64
+                fields[i * 2 + 1] = (keys[i] === key ? field : get(own, keys[i])) as f64
             }
-            const joined = mk('record', fields)
-            for (const cell of new Set(groups[g])) install(cell, joined)
+            install(cell, mk('record', fields))
         }
-        return { value: first, result }
     }
 
-    return { intern, capture, mark, take, parameter, install, merge, sameShape, unify }
+    return { intern, capture, mark, take, parameter, install, merge, sameShape, unify, snapshot, joinOf, readJoined, writeJoined }
 }

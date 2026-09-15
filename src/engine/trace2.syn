@@ -12,7 +12,7 @@ import {
 import * as lowering from './lowering'
 import * as lowering2 from './lowering2'
 import * as heap from './heap'
-import { createHeapRecords, type HeapRecords, type HeapState } from './heap-records'
+import { createHeapRecords, type Group, type HeapRecords, type HeapState, type Joined } from './heap-records'
 import * as native from './native'
 import * as syscalls from './syscalls'
 
@@ -111,6 +111,7 @@ interface TraceFrame {
     branch(cond: any, v1: number, v2: number): number
     canexit(acc: any): boolean
     voidvalue(): any
+    shapeof(value: any): any
     panic(acc: any): void
     call(target: any, thisArg: any, regStart: number, nargs: number, cb: any): any
 }
@@ -123,6 +124,13 @@ interface SessionBlock {
     body: any
 }
 
+interface Proxied {
+    param?: any
+    cell?: u32
+    joined?: Joined
+    group?: number
+}
+
 interface TraceRuntime {
     tracer: any
     mem: Float64Array
@@ -132,6 +140,9 @@ interface TraceRuntime {
     blocks: Map<number, SessionBlock>
     frames: TraceFrame[]
     objects: HeapRecords
+    opaque: Map<number, u32>
+    groupObjects: Map<Group, u32>
+    proxied: Map<u32, Proxied>
     nilEffect?: any
     memoryLoad?: (ptr: number, offset: number, T: number) => any
     depth: number
@@ -456,6 +467,8 @@ export interface TraceSession {
     symbolicJmp: Function
     symbolicBranch: Function
     symbolicPanic: Function
+    symbolicProxyGet: Function
+    symbolicProxySet: Function
     symbolicError: Function
     runtime?: TraceRuntime
     mk(op: string, args: Float64Array, label?: string, types?: intrinsics.Types[]): any
@@ -523,6 +536,8 @@ export function createTraceSession(): TraceSession {
         return cond ? v1 : v2
     }
     function symbolicPanic(err: any, T: any) {}
+    function symbolicProxyGet(target: any, key: any) {}
+    function symbolicProxySet(target: any, key: any, value: any) {}
     function symbolicError(message: any) {}
     const intrinsicContext: Record<string, any> = { ...Intrinsics }
     for (const [name, value] of Object.entries(Intrinsics)) {
@@ -679,11 +694,15 @@ export function createTraceSession(): TraceSession {
                 branch: (cond, v1, v2) => frame().branch(cond, v1, v2),
                 canexit: acc => frame().canexit(acc),
                 voidvalue: () => frame().voidvalue(),
+                shapeof: value => frame().shapeof(value),
                 call: (target, thisArg, regStart, nargs, cb) => frame().call(target, thisArg, regStart, nargs, cb),
             })
             runtime = {
                 tracer, mem, heapOverlay, nodes, nodeCache, blocks, frames,
                 objects: createHeapRecords(tracer, mk, nodes),
+                opaque: new Map(),
+                groupObjects: new Map(),
+                proxied: new Map(),
                 depth: 0,
             }
             session.runtime = runtime
@@ -713,6 +732,8 @@ export function createTraceSession(): TraceSession {
         symbolicDispatch,
         symbolicJmp,
         symbolicPanic,
+        symbolicProxyGet,
+        symbolicProxySet,
         mk,
         symbolicError,
         runtime,
@@ -732,6 +753,7 @@ export interface TraceOptions {
     shouldInline?: (fn: Function) => boolean
     session?: TraceSession
     inputs?: { thisArg: any, args: Float64Array, effect: any }
+    shapes?: (intrinsics.Handle | undefined)[]
     name?: string
 }
 
@@ -955,6 +977,23 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return toGraphValue(mem[regStart + index * 4])
     }
 
+    function escapedArg(regStart: number, index: number): any {
+        const value = graphCallArg(regStart, index)
+        const cell = cellOf(value)
+        if (!cell) return value
+        const state = objects.snapshot(cell as intrinsics.Handle)
+        if (!state) return value
+        const keys = dataKeys(state as u32)
+        const args = new Float64Array(2 + keys.length)
+        args[0] = cell as f64
+        args[1] = state as f64
+        for (let i = 0; i < keys.length; i++) {
+            const slot = slotOf(state as u32, keys[i])
+            args[2 + i] = (heap.isBoxedF64(slot as intrinsics.Handle) ? heap.unboxF64(slot as intrinsics.Handle) : slot) as f64
+        }
+        return mk('heap-handle', args, '', [Types.handle])
+    }
+
     function graphReceiver(value: any): any {
         return tracer.getNanId(value) ? value : toGraphValue(tagVmHandle(value))
     }
@@ -982,11 +1021,25 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 ? mk('local-target', lt!, native.__name ?? '', [Types.fnptr])
                 : native.__native
             args[2] = 0
-            for (let i = 0; i < nargs; i++) args[i + 3] = graphCallArg(regStart, i)
+            for (let i = 0; i < nargs; i++) args[i + 3] = escapedArg(regStart, i)
             const value = tracer.traceOp('call', args, native.__returns)
             writeToken(value)
             tracer.markHandled()
             return { value }
+        }
+        if (linked === session.symbolicProxyGet) {
+            const receiver = callArg(regStart, 0) as intrinsics.Handle
+            const target = runtime.proxied.get(heap.getPropertyProxy(receiver) as u32)!
+            const value = proxyRead(target, heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle))
+            tracer.markHandled()
+            return { value }
+        }
+        if (linked === session.symbolicProxySet) {
+            const receiver = callArg(regStart, 0) as intrinsics.Handle
+            const target = runtime.proxied.get(heap.getPropertyProxy(receiver) as u32)!
+            proxyWrite(target, heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle), vmHandle(mem[regStart + 8] as u32))
+            tracer.markHandled()
+            return { value: 0 }
         }
         if (linked === session.symbolicPanic) {
             traceFrame.panic(callArg(regStart, 0))
@@ -1163,6 +1216,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             tracer.markHandled()
             return mk('void', emptyState, '', [Types.u32])
         },
+        shapeof: (value) => {
+            const shape = shapeOfValue(tracer.getNanId(value) ? value : heap.unboxF64(value))
+            tracer.markHandled()
+            return shape
+        },
         panic: (acc): void => {
             tracer.markHandled()
             step.kind = 'panic'
@@ -1251,7 +1309,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             a[0] = callee
             cargs[1] = tracer.getNanId(callee) ? callee : mk('heap-handle', a, '', [Types.handle])
             cargs[2] = thisArg
-            for (let i = 0; i < nargs; i++) cargs[3+i] = graphCallArg(regStart, i)
+            for (let i = 0; i < nargs; i++) cargs[3+i] = escapedArg(regStart, i)
             const v = tracer.traceOp('call', cargs, Types.u32)
             writeToken(v)
             tracer.markHandled()
@@ -1465,8 +1523,76 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return n.argConsts![0] as u32
     }
 
+    function makeProxy(proto: u32): u32 {
+        const getter = session.linkFunction(session.symbolicProxyGet) as intrinsics.Handle
+        const setter = session.linkFunction(session.symbolicProxySet) as intrinsics.Handle
+        return heap.makeProxy(getter, setter, proto as intrinsics.Handle) as u32
+    }
+
+    function opaqueObject(value: any): u32 {
+        const id = tracer.getNanId(value)
+        const known = runtime.opaque.get(id)
+        if (known !== undefined) return known
+        const proxy = makeProxy(0 as u32)
+        const cell = objects.intern(heap.makeObject(proxy as intrinsics.Handle)) as u32
+        runtime.opaque.set(id, cell)
+        runtime.proxied.set(proxy, { param: value, cell })
+        return cell
+    }
+
+    function joinedObject(joined: Joined, g: number): u32 {
+        const group = joined.groups[g]
+        const known = runtime.groupObjects.get(group)
+        if (known !== undefined) return known
+        const proxy = makeProxy(heap.getPrototypeOf(heap.indirectTarget(group.members[0])) as u32)
+        const obj = heap.makeObject(proxy as intrinsics.Handle) as u32
+        runtime.groupObjects.set(group, obj)
+        runtime.proxied.set(proxy, { joined, group: g })
+        return obj
+    }
+
+    function shapeOfValue(value: any): u32 {
+        const joined = objects.joinOf(value)
+        if (joined) return joinedObject(joined, 0)
+        const id = tracer.getNanId(value)
+        const n = nodes.get(id)
+        if (n?.op === 'param' && !n.argIds.length && !regionalParams.has(id)) return opaqueObject(value)
+        if (n?.op === 'inlined') return opaqueObject(value)
+        throw `trace2: no shape for symbolic receiver ${id} (${n?.op ?? tracer.getTraceById(id)?.op ?? 'unknown'})`
+    }
+
+    function proxyRead(target: Proxied, key: intrinsics.Handle): any {
+        if (!target.joined) {
+            const args = new Float64Array(2)
+            args[0] = target.param
+            args[1] = key as f64
+            return mk('property', args, '', [Types.u64])
+        }
+        const read = objects.readJoined(target.joined, target.group!, key)
+        if (read.group !== undefined) return handleValue(joinedObject(target.joined, read.group))
+        if (read.handle !== undefined) return handleValue(read.handle as u32)
+        if (tracer.getNanId(read.value)) return read.value
+        return handleValue(heap.boxF64(read.value as f64) as u32)
+    }
+
+    function proxyWrite(target: Proxied, key: intrinsics.Handle, value: intrinsics.Handle): void {
+        if (!target.joined) {
+            heap.setProperty(heap.prepareWrite(target.cell as intrinsics.Handle), key, value)
+            return
+        }
+        assert(heap.isBoxedF64(value), 'trace2: structural write through a joined object')
+        objects.writeJoined(target.joined, target.group!, key, heap.unboxF64(value))
+    }
+
     function handleValue(handle: u32): any {
-        handle = objects.intern(handle)
+        const cell = objects.intern(handle) as u32
+        if (cell !== handle) {
+            const raw = tagVmHandle(handle)
+            for (let r = 0; r <= ACC; r++) {
+                if (mem[slotAddr(r)] === raw) mem[slotAddr(r)] = tagVmHandle(cell) as any
+            }
+        }
+        handle = cell
         const args = new Float64Array(1)
         args[0] = handle as f64
         return mk('heap-handle', args, '', [Types.handle])
@@ -1797,6 +1923,22 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     for (let i = 0; i < compiled.paramCount; i++) {
         if (opts.inputs) {
             ins[i] = i < opts.inputs.args.length ? opts.inputs.args[i] : 0
+        } else if (opts.shapes?.[i]) {
+            const standIn = heap.shallowClone(opts.shapes[i]!) as u32
+            for (const key of dataKeys(standIn)) {
+                const descriptor = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(standIn as intrinsics.Handle, key as intrinsics.Handle)))
+                if (!heap.isBoxedF64(descriptor.slot0 as intrinsics.Handle)) continue
+                const v = tracer.createUniqueNan()
+                const id = tracer.getNanId(v)
+                const label = `p${i}.${heap.stringToJs(key as intrinsics.Handle)}`
+                paramIds.push(id)
+                names.set(id, label)
+                nodes.set(id, {
+                    op: 'param', argIds: [], argConsts: new Float64Array(0), label,
+                })
+                descriptor.slot0 = heap.boxF64(v)
+            }
+            ins[i] = handleValue(standIn)
         } else {
             const v = tracer.createUniqueNan()
             const id = tracer.getNanId(v)
@@ -2413,15 +2555,16 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(result.capturedTernary(0) === 1)
 
         // FIXME: unify heap handles needs to deal with `apply`
-        // const Box2 = defineBox(0 as any)
-        // function capturedTernary2(n: u32): u32 {
-        //     const b = Box2(n)
-        //     b.value = b.value + 1
-        //     return b.value
-        // }
-        // const result2: any = native.createNatives({ capturedTernary2 })
-        // assert(result2.capturedTernary2(10) === 11)
-        // assert(result2.capturedTernary2(0) === 2)
+        const Box2 = defineBox(0 as any)
+        function capturedTernary2(n: u32): u32 {
+            const b = Box2(n)
+            b.value = b.value + 1
+            return b.value
+        }
+        intrinsics.tagNoInline(capturedTernary2)
+        const result2: any = native.createNatives({ capturedTernary2 })
+        assert(result2.capturedTernary2(10) === 11)
+        assert(result2.capturedTernary2(0) === 2)
     }
     testCapturedTernaryObject()
 
@@ -2447,8 +2590,93 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(loop(1, 3) === 4)
         assert(loop(0, 3) === 5)
         assert(loop(1, 0) === 1)
+
+        const pick = function(flag: u32, value: u32) {
+            if (flag) return { y: value }
+            return { y: value + 10 }
+        }
+        pick.shouldInline = true
+        function joinedWrite(flag: u32, value: u32): u32 {
+            const o = pick(flag, value)
+            o.y = o.y + 1
+            return o.y
+        }
+        const write = createNative(joinedWrite).native
+        assert(write(1, 4) === 5)
+        assert(write(0, 4) === 15)
+
+        const choose = function(flag: u32, base: { y: u32 }) {
+            if (flag) return base
+            return { y: 100 as u32 }
+        }
+        choose.shouldInline = true
+        function joinedAlias(flag: u32, value: u32): u32 {
+            const base = { y: value }
+            const o = choose(flag, base)
+            o.y = o.y + 1
+            return base.y
+        }
+        const alias = createNative(joinedAlias).native
+        assert(alias(1, 4) === 5)
+        assert(alias(0, 4) === 4)
     }
     testObjectJoins()
+
+    function testShapedCall() {
+        function readY(o: { y: u32 }): u32 {
+            return o.y + 1
+        }
+        (readY as any).shouldNotInline = true
+        function callsReadY(flag: u32, value: u32): u32 {
+            const o = { y: value }
+            if (flag) o.y = value + 2
+            return readY(o)
+        }
+        const shaped: any = native.createNatives({ callsReadY })
+        assert(shaped.callsReadY(1, 4) === 7)
+        assert(shaped.callsReadY(0, 4) === 5)
+
+        const doubled = Object.defineProperties({}, {
+            twice: {
+                get: intrinsics.tagInline(function(this: { v: u32 }): u32 { return this.v * 2 }),
+                enumerable: true,
+                configurable: true,
+            },
+        })
+        function readTwice(o: { twice: u32 }): u32 {
+            return o.twice + 1
+        }
+        (readTwice as any).shouldNotInline = true
+        function callsReadTwice(value: u32): u32 {
+            const o = Object.setPrototypeOf({ v: value }, doubled) as { twice: u32 }
+            return readTwice(o)
+        }
+        const accessor: any = native.createNatives({ callsReadTwice })
+        assert(accessor.callsReadTwice(5) === 11)
+    }
+    testShapedCall()
+
+    if (intrinsics.argv().includes('opaque-shapes')) {
+        function readY(o: { y: u32 }): u32 {
+            return o.y + 1
+        }
+        function callsReadY(flag: u32, value: u32): u32 {
+            const o = { y: value }
+            if (flag) o.y = value + 2
+            return readY(o)
+        }
+        console.log('--- readY ---')
+        console.log(trace2(readY).text)
+        console.log('--- callsReadY ---')
+        console.log(trace2(callsReadY).text)
+        function callsReadYDirect(value: u32): u32 {
+            const o = { y: value + 1 }
+            o.y = o.y * 2
+            return readY(o)
+        }
+        console.log('--- callsReadYDirect ---')
+        console.log(trace2(callsReadYDirect).text)
+    }
 
     function testTraceBindings() {
         function constantArmLoop(flag: u32): u32 {

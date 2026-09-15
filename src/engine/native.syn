@@ -386,6 +386,90 @@ function obviousInline(graph: Graph): InlineScore | undefined {
     return { cost, pressure: 0 }
 }
 
+interface ShapedCallee {
+    fn: Function
+    symbol: number
+    computation: [source: string, captures: any[]]
+    mapCapture: (capture: any) => any
+}
+
+function snapshotOf(graph: Graph, argId: number): intrinsics.Handle | undefined {
+    const arg = graph.nodes.get(argId)
+    if (!arg || arg.op !== 'heap-handle') return
+    if (arg.argConsts.length < 2) return
+    return arg.argConsts[1] as intrinsics.Handle
+}
+
+function snapshotFields(snapshot: intrinsics.Handle): { key: intrinsics.Handle, scalar: boolean, slot: intrinsics.Handle }[] {
+    const fields: { key: intrinsics.Handle, scalar: boolean, slot: intrinsics.Handle }[] = []
+    for (let k: u32 = 0; k < heap.ownPropertyCount(snapshot); k++) {
+        const key = heap.ownPropertyKeyAt(snapshot, k)
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(snapshot, key)))
+        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+        const slot = d.slot0 as intrinsics.Handle
+        fields.push({ key, scalar: heap.isBoxedF64(slot), slot })
+    }
+    return fields
+}
+
+function sameSnapshotShape(a: intrinsics.Handle | undefined, b: intrinsics.Handle | undefined): boolean {
+    if (!a || !b) return a === b
+    if (heap.typeDescriptorOf(a) !== heap.typeDescriptorOf(b)) return false
+    const x = snapshotFields(a)
+    const y = snapshotFields(b)
+    if (x.length !== y.length) return false
+    for (let i = 0; i < x.length; i++) {
+        if (x[i].key !== y[i].key || x[i].scalar !== y[i].scalar) return false
+        if (!x[i].scalar && x[i].slot !== y[i].slot) return false
+    }
+    return true
+}
+
+interface PendingUnit {
+    fn: Function
+    symbol: number
+    graph: Graph
+    functionHandleSlots: Map<number, number>
+    dataHandleSlots: Map<number, number>
+}
+
+function dumpCallShapes(pending: PendingUnit[], functions: Function[], opaque: Map<number, Graph>): void {
+    for (const unit of pending) {
+        for (const n of unit.graph.nodes.values()) {
+            if (n.op !== 'call') continue
+            const target = unit.graph.nodes.get(n.argIds[1])
+            if (!target || target.op !== 'local-target') continue
+            const callee = functions[target.argConsts[0]]?.name
+            for (let i = 3; i < n.argIds.length; i++) {
+                const arg = unit.graph.nodes.get(n.argIds[i])
+                if (!arg || arg.op !== 'heap-handle') continue
+                if (arg.argConsts.length < 2) continue
+                const snapshot = arg.argConsts[1] as intrinsics.Handle
+                const fields: string[] = []
+                let operand = 2
+                for (let k: u32 = 0; k < heap.ownPropertyCount(snapshot); k++) {
+                    const key = heap.ownPropertyKeyAt(snapshot, k)
+                    const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(snapshot, key)))
+                    if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+                    const id = arg.argIds[operand++]
+                    const mark = !id ? '' : unit.graph.nodes.has(id) ? '*' : '!'
+                    fields.push(`${heap.stringToJs(key)}${mark}`)
+                }
+                const proto = heap.getPrototypeOf(snapshot)
+                console.log('native shape', unit.fn.name, '->', callee, `p${i - 3}`, `proto ${proto}`, `{ ${fields.join(', ')} }`)
+            }
+        }
+    }
+    for (const [symbol, graph] of opaque) {
+        const reads = new Set<string>()
+        for (const n of graph.nodes.values()) {
+            if (n.op !== 'property') continue
+            reads.add(`p${graph.params.indexOf(n.argIds[0])}.${heap.stringToJs(n.argConsts[1] as intrinsics.Handle)}`)
+        }
+        console.log('native reads', functions[symbol]?.name, [...reads].join(', '))
+    }
+}
+
 function rewriteTargets(
     graph: Graph,
     functionHandles: Map<number, number>,
@@ -509,6 +593,9 @@ export function createNatives(fns: Record<string, Function>) {
     const functions: Function[] = []
     const roots = new Map<string, number>()
     const units: NativeUnit[] = []
+    const pending: PendingUnit[] = []
+    const opaqueGraphs = new Map<number, Graph>()
+    const shapedCallees: ShapedCallee[] = []
     const poolValues: (number | bigint)[] = []
     const poolSlots = new Map<PoolValue, number>()
     const nativePointerSlots = new Map<number, number>()
@@ -653,6 +740,11 @@ export function createNatives(fns: Record<string, Function>) {
             captures: computation[1], session, mapCapture, shouldInline, verbose: traceDebug,
             name: current.name,
         })
+        const opaque = [...traced.graph.nodes.values()].some(n => n.op === 'property')
+        if (opaque) {
+            console.log(dumpGraph(traced.graph))
+            // if ([...roots.values()].includes(symbol)) throw `native: ${current.name} reads properties of an opaque argument`
+        }
         if (intrinsics.argv().includes('native-trace-cost')) {
             const traceOps = (session.runtime?.tracer.getOpCount() ?? traceOpsBefore) - traceOpsBefore
             console.log('native trace cost', current.name || '<anonymous>', traceOps)
@@ -667,12 +759,25 @@ export function createNatives(fns: Record<string, Function>) {
         const score = (current as any).shouldNotInline || tracedGraph.nodes.size > 50 || lifted.wrapper
             ? undefined : obviousInline(tracedGraph)
         inlineScores.set(current, score ?? false)
+        if (opaque) {
+            const inspect = intrinsics.argv().includes('native-shapes')
+            const shaped = !!(current as any).shouldNotInline
+            inlineScores.set(current, inspect || shaped ? false : { cost: 0, pressure: 0 })
+            if (inspect) opaqueGraphs.set(symbol, tracedGraph)
+            if (shaped) shapedCallees.push({ fn: current, symbol, computation, mapCapture })
+            continue
+        }
         if (score && intrinsics.argv().includes('native-inline')) {
             console.log('native inline', current.name, score)
         }
+        pending.push({ fn: current, symbol, graph: tracedGraph, ...handleSlots(tracedGraph) })
+    }
+    for (const shaped of shapedCallees) reconcileShapes(shaped)
+
+    function handleSlots(graph: Graph) {
         const functionHandleSlots = new Map<number, number>()
         const dataHandleSlots = new Map<number, number>()
-        for (const n of tracedGraph.nodes.values()) {
+        for (const n of graph.nodes.values()) {
             if (n.op !== 'heap-handle') continue
             const handle = unwrapCell(n.argConsts[0])
             if (!heap.isCallable(handle as intrinsics.Handle)) {
@@ -696,16 +801,75 @@ export function createNatives(fns: Record<string, Function>) {
             }
             functionHandleSlots.set(handle, localFunctionSlot(target))
         }
-        const graph = rewriteTargets(
-            tracedGraph, functionHandleSlots, dataHandleSlots, targetRefs,
-        )
+        return { functionHandleSlots, dataHandleSlots }
+    }
+
+    function reconcileShapes(shaped: ShapedCallee): void {
+        const sites: [graph: Graph, id: number, call: GraphNode][] = []
+        for (const unit of pending) {
+            for (const [id, n] of unit.graph.nodes) {
+                if (n.op !== 'call') continue
+                const target = unit.graph.nodes.get(n.argIds[1])
+                if (!target || target.op !== 'local-target') continue
+                if (target.argConsts[0] !== shaped.symbol) continue
+                sites.push([unit.graph, id, n])
+            }
+        }
+        if (!sites.length) throw `native: ${shaped.fn.name} has no call sites to reconcile`
+        const arity = sites[0][2].argIds.length - 3
+        const shapes: (intrinsics.Handle | undefined)[] = []
+        for (let i = 0; i < arity; i++) shapes.push(snapshotOf(sites[0][0], sites[0][2].argIds[3 + i]))
+        for (const [graph, , call] of sites) {
+            for (let i = 0; i < arity; i++) {
+                if (sameSnapshotShape(shapes[i], snapshotOf(graph, call.argIds[3 + i]))) continue
+                throw `native: call sites of ${shaped.fn.name} disagree on the shape of p${i}`
+            }
+        }
+        const traced = trace2(shaped.computation[0], {
+            captures: shaped.computation[1], session, mapCapture: shaped.mapCapture, shouldInline,
+            name: shaped.fn.name, shapes,
+        })
+        if ([...traced.graph.nodes.values()].some(n => n.op === 'property')) {
+            throw `native: ${shaped.fn.name} still reads unshaped properties after reconciliation`
+        }
+        for (const [graph, id, call] of sites) {
+            const argIds = call.argIds.slice(0, 3)
+            const argConsts = Array.from(call.argConsts.slice(0, 3))
+            for (let i = 0; i < arity; i++) {
+                const shape = shapes[i]
+                if (!shape) {
+                    argIds.push(call.argIds[3 + i])
+                    argConsts.push(call.argConsts[3 + i])
+                    continue
+                }
+                const arg = graph.nodes.get(call.argIds[3 + i])!
+                const fields = snapshotFields(shape)
+                for (let k = 0; k < fields.length; k++) {
+                    if (!fields[k].scalar) continue
+                    argIds.push(arg.argIds[2 + k])
+                    argConsts.push(arg.argConsts[2 + k])
+                }
+            }
+            graph.nodes.set(id, { ...call, argIds, argConsts: new Float64Array(argConsts) })
+        }
+        const lifted = liftReturnedHeapValues(traced.graph)
+        const normalized = normalizeValueGraph({ ...lifted.graph, name: shaped.fn.name })
+        pending.push({ fn: shaped.fn, symbol: shaped.symbol, graph: normalized, ...handleSlots(normalized) })
+    }
+
+    if (intrinsics.argv().includes('native-shapes')) {
+        dumpCallShapes(pending, functions, opaqueGraphs)
+        throw 'native: call shapes dumped'
+    }
+    for (const unit of pending) {
+        const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs)
         intrinsics.assert(graph.params.length <= 7)
         const debug = intrinsics.argv().includes('lower-debug')
-            || intrinsics.argv().includes(`lower-debug:${current.name}`)
-        if (debug) console.log('lower native', current.name)
+            || intrinsics.argv().includes(`lower-debug:${unit.fn.name}`)
+        if (debug) console.log('lower native', unit.fn.name)
         const code = lowerValueGraph(graph, { debug, skipNormalized: true })
-        if (debug || intrinsics.argv().includes('listings')) console.log(`--- ${current.name} listing ---\n`, code.listing)
-        units.push({ fn: current, symbol, code })
+        if (debug || intrinsics.argv().includes('listings')) console.log(`--- ${unit.fn.name} listing ---\n`, code.listing)
+        units.push({ fn: unit.fn, symbol: unit.symbol, code })
     }
     const rootSymbols = new Set<number>(roots.values())
     const pooledSymbols = new Set<number>(localPoolTargets.values())
