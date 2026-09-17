@@ -14287,6 +14287,7 @@ pub const Analyzer = struct {
                 // It's possible for two string types to not have the same reference due to flags
                 const s = this.maybeGetTypeFromRef(subject) orelse return false;
                 if (s.getKind() != .string_literal) {
+                    if (comptime suppress_gaps) return false;
                     this.printTypeInfo(subject);
                     return false; //error.TODO_string_literal_and_other;
                 }
@@ -19604,10 +19605,10 @@ pub const Analyzer = struct {
             if (resolved == @intFromEnum(Kind.void)) return resolved; // TODO error
 
             if (comptime is_debug) {
+                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
                 this.printTypeInfo(source_ref);
                 this.printTypeInfo(resolved);
                 // two booleans apparently getting passed thru here?
-                if (comptime suppress_gaps) return @intFromEnum(Kind.any);
             }
         }
 

@@ -453,7 +453,21 @@ async function gatherTestCases() {
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
-    if (filter === '--engine') return testEngine(args[1], args.slice(1))
+    if (filter === '--engine') {
+        if (args[1] === 'all') {
+            const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm']
+            const hasNativeOption = new Set(['cg', 'containers'])
+            for (const x of allTestableFiles) {
+                const a = args.slice(2)
+                if (hasNativeOption.has(x)) a.unshift('native')
+                a.unshift(x)
+                console.log(`--- running ${a.join(' ')} ---`)
+                await testEngine(x, a) // let it fail fast
+            }
+            return
+        }
+        return testEngine(args[1], args.slice(1))
+    }
 
     const shouldExecute = args[1] === '--reify'
 
