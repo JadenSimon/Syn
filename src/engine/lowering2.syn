@@ -285,8 +285,10 @@ function sweepBlocks(g: Graph, andNodes = true) {
         }
         if (n.op === 'block') {
             const b = getBlock(g, id)!
-            for (const p of b.params) seen.add(p)
-            seen.add(b.bodyId)
+            if (andNodes) {
+                for (const p of b.params) seen.add(p)
+                seen.add(b.bodyId)
+            }
             forEachOperand(g, b.bodyId, visit)
         } else {
             forEachOperand(g, id, visit)
@@ -296,9 +298,11 @@ function sweepBlocks(g: Graph, andNodes = true) {
     if (seen.size === (andNodes ? g.nodes.size : g.blocks.length)) {
         return g
     }
-    for (const k of g.nodes.keys()) {
-        if (!seen.has(k)) {
-            g.nodes.delete(k)
+    if (andNodes) {
+        for (const k of g.nodes.keys()) {
+            if (!seen.has(k)) {
+                g.nodes.delete(k)
+            }
         }
     }
     const result = g.blocks.filter(x => seen.has(x.id))
@@ -581,8 +585,7 @@ function stripJoins(g: Graph): Graph {
         if (x !== vid) replacements.set(vid, x)
         return x
     }
-    const rootBlock = g.blocks[0]
-    rootBlock.bodyId = forEachOperand(g, rootBlock.bodyId, visit)
+    for (const block of g.blocks) block.bodyId = forEachOperand(g, block.bodyId, visit)
     return g
 }
 
@@ -604,7 +607,7 @@ export function inlineBlocks(g: Graph) {
                     refs.push(id)
                     return 0
                 }
-                if (n.op === 'inlined') return id
+                if (n.op === 'inlined') return find(getRef(n, 0)) || id
                 for (let i = countIds(n) - 1; i >= 0; i--) {
                     const found = find(getRef(n, i))
                     if (found) return found
@@ -943,7 +946,7 @@ export function packageBlocksFINAL(g: Graph) {
                 }
             }
         }
-        assert(res.includes(m))
+        assert(res.includes(m), `package: ${g.name ?? '<anonymous>'} placement for %${vid} misses B${m} (uses B${[...s].join(',B')}, lca B${l})`)
         placements.set(vid, res.map(placeBlock))
     }
     function pinBlock(bid: number) {
@@ -3005,6 +3008,80 @@ function optimizeValueGraph(g: Graph) {
         return true
     }
 
+    function reduceSelects(b: GraphBlock) {
+        const selects = findValues(b.id, 'select')
+        if (!selects?.length) return false
+
+        function sameOperand(a: GraphNode, ai: number, c: GraphNode, ci: number) {
+            const aId = getRef(a, ai)
+            const cId = getRef(c, ci)
+            return aId === cId && (aId || Object.is(getLiteral(a, ai), getLiteral(c, ci)))
+        }
+
+        const nested = new Map<number, number>()
+        for (const id of selects) {
+            const outer = g.nodes.get(id)!
+            if (countIds(outer) !== 3) continue
+            for (const innerAt of [1, 2]) {
+                const inner = g.nodes.get(getRef(outer, innerAt))
+                if (!inner || inner.op !== 'select' || countIds(inner) !== 3
+                    || !sameOperand(outer, 0, inner, 0)) continue
+                const argIds = [getRef(outer, 0),
+                    innerAt === 1 ? getRef(inner, 1) : getRef(outer, 1),
+                    innerAt === 1 ? getRef(outer, 2) : getRef(inner, 2)]
+                const argConsts = new Float64Array([
+                    getLiteral(outer, 0),
+                    innerAt === 1 ? getLiteral(inner, 1) : getLiteral(outer, 1),
+                    innerAt === 1 ? getLiteral(outer, 2) : getLiteral(inner, 2),
+                ])
+                nested.set(id, addNode('select', argIds, argConsts, outer))
+                break
+            }
+        }
+        if (nested.size) {
+            b.bodyId = replaceAll(b.bodyId, nested)
+            revisitBlock(b)
+            return true
+        }
+
+        const filtered = selects.filter(x => {
+            const n = g.nodes.get(x)!
+            const arm1 = getLiteral(n, 1)
+            if (arm1 !== 0) return false
+            if (getRef(n, 1) !== 0) return false
+            const arm2 = getLiteral(n, 2)
+            if (arm2 !== 1) return false
+            return true
+        })
+        if (filtered.length === 0) return false
+        const r = new Map<number, number>()
+        for (const x of filtered) {
+            const usages = dependents.get(x) ?? []
+            for (const d of usages) {
+                const u = g.nodes.get(d)!
+                if (!CompareOps.has(u.op)) continue
+                const selectAt = getRef(u, 0) === x ? 0 : getRef(u, 1) === x ? 1 : -1
+                if (selectAt !== 0) continue
+                if (getRef(u, 1) !== 0) continue
+                const rhs = getLiteral(u, 1)
+                if ((rhs === 1 || rhs === 0) && (u.op === 'eq' || u.op === 'ne')) {
+                    const q = copyNode(u, undefined, undefined, u.op === 'eq' ? 'ne' : 'eq')
+                    setRef(q, 0, getRef(g.nodes.get(x)!, 0))
+                    setLiteral(q, 1, 0)
+                    const qId = g.maxId++
+                    g.nodes.set(qId, q)
+                    r.set(d, qId)
+                    continue
+                }
+            }
+        }
+
+        if (!r.size) return false
+        b.bodyId = replaceAll(b.bodyId, r)
+        revisitBlock(b)
+        return true
+    }
+
     function applicationPaths(from: GraphBlock, to: number): number[][] {
         const paths: number[][] = []
         function tails(id: number, path: number[]): void {
@@ -3703,6 +3780,174 @@ function optimizeValueGraph(g: Graph) {
         if (changed) touch(target)
     }
 
+    function foldValues(target: GraphBlock) {
+        type Value = { id: number, value: number }
+        const memo = new Map<number, Value>()
+        const active = new Set<number>()
+
+        function fold(id: number): Value {
+            if (!id) return { id: 0, value: 0 }
+            const known = memo.get(id)
+            if (known) return known
+            const n = g.nodes.get(id)
+            if (!n || n.op === 'param' || n.op === 'block' || n.op === 'nil-effect') {
+                const value = { id, value: 0 }
+                memo.set(id, value)
+                return value
+            }
+            if (n.op === 'literal') {
+                const value = { id: 0, value: literalValue(n) }
+                memo.set(id, value)
+                return value
+            }
+            if (active.has(id)) return { id, value: 0 }
+            active.add(id)
+            const _id = id
+            defer active.delete(_id)
+
+            const args: Value[] = []
+            for (let i = 0; i < countIds(n); i++) {
+                const arg = getRef(n, i)
+                args.push(arg ? fold(arg) : { id: 0, value: getLiteral(n, i) })
+            }
+
+            let result: Value | undefined
+            if (args.length === 2 && args.every(arg => !arg.id)
+                && args[0].value >= 0 && args[1].value >= 0) {
+                const a = args[0].value, b = args[1].value
+                let folded: number | undefined
+                if (n.op === 'add') folded = a + b
+                else if (n.op === 'sub' && a >= b) folded = a - b
+                else if (n.op === 'mul') folded = a * b
+                else if (n.op === 'lt') folded = a < b ? 1 : 0
+                else if (n.op === 'le') folded = a <= b ? 1 : 0
+                else if (n.op === 'gt') folded = a > b ? 1 : 0
+                else if (n.op === 'ge') folded = a >= b ? 1 : 0
+                else if (n.op === 'eq') folded = a === b ? 1 : 0
+                else if (n.op === 'ne') folded = a !== b ? 1 : 0
+                const T = getTypeT(n)
+                if (folded !== undefined
+                    && (T === Types.u64 || T === Types.u32) && getTypeU(n) === T
+                    && (T !== Types.u32 || (a <= 0xFFFFFFFF && b <= 0xFFFFFFFF && folded <= 0xFFFFFFFF))) {
+                    result = { id: 0, value: folded }
+                }
+            }
+            if (!result && args.length === 2 && getTypeT(n) <= Types.i64 && getTypeU(n) <= Types.i64) {
+                const left = (value: number) => !args[0].id && args[0].value === value
+                const right = (value: number) => !args[1].id && args[1].value === value
+                if (n.op === 'add' || n.op === 'or' || n.op === 'xor') {
+                    if (right(0)) result = args[0]
+                    else if (left(0)) result = args[1]
+                } else if (n.op === 'sub' || n.op === 'shl' || n.op === 'shr' || n.op === 'ushr') {
+                    if (right(0)) result = args[0]
+                } else if (n.op === 'mul') {
+                    if (right(1)) result = args[0]
+                    else if (left(1)) result = args[1]
+                } else if (n.op === 'div' && right(1)) result = args[0]
+            }
+            if (!result) {
+                let unchanged = args.length === countIds(n)
+                for (let i = 0; unchanged && i < args.length; i++) {
+                    const prior = getRef(n, i)
+                    if (args[i].id !== prior || (!prior && !Object.is(args[i].value, getLiteral(n, i)))) {
+                        unchanged = false
+                    }
+                }
+                result = unchanged ? { id, value: 0 }
+                    : { id: addNode(n.op, args.map(arg => arg.id),
+                        new Float64Array(args.map(arg => arg.value)), n), value: 0 }
+            }
+            memo.set(id, result)
+            return result
+        }
+
+        const body = fold(target.bodyId)
+        if (body.id === target.bodyId && Object.is(body.value, target.bodyConst)) return false
+        target.bodyId = body.id
+        target.bodyConst = body.value
+        revisitBlock(target)
+        return true
+    }
+
+    function specializeBlockParameters(target: GraphBlock) {
+        if (target === g.blocks[0] || !target.params.length) return false
+        const inbound = findInboundApplies(target)
+        if (!inbound.length) return false
+        const specialized = new Map<number, number>()
+        const literals = new Map<number, number>()
+
+        function literalFor(value: number) {
+            const key = Object.is(value, -0) ? -0 : value
+            const known = literals.get(key)
+            if (known !== undefined) return known
+            const id = addNode('literal', [0], new Float64Array([value]))
+            literals.set(key, id)
+            return id
+        }
+
+        for (let i = 0; i < target.params.length; i++) {
+            const values: ({ id: number, value: number, constant: boolean })[] = []
+            let valid = true
+            for (const [, appId] of inbound) {
+                const app = g.nodes.get(appId)!
+                if (countIds(app) !== target.params.length + 1) {
+                    valid = false
+                    break
+                }
+                const constant = constantOf(app, i + 1)
+                if (constant !== undefined) values.push({ id: 0, value: constant, constant: true })
+                else values.push({ id: getRef(app, i + 1), value: getLiteral(app, i + 1), constant: false })
+            }
+            if (!valid || !values.length) continue
+            const first = values[0]
+            if (first.constant) {
+                if (!values.every(value => value.constant && Object.is(value.value, first.value))) continue
+                specialized.set(target.params[i], literalFor(first.value))
+                continue
+            }
+            // if (!first.id || !values.every(value => !value.constant && value.id === first.id)
+            //     || target.params.includes(first.id) || !isUnordered(first.id)) continue
+            // specialized.set(target.params[i], first.id)
+        }
+        if (!specialized.size) return false
+
+        const removed = new Set(specialized.keys())
+        for (const [param, replacement] of specialized) {
+            if (removed.has(replacement)) specialized.delete(param)
+        }
+        if (!specialized.size) return false
+
+        const edits = new Map<GraphBlock, Map<number, number>>()
+        const newParams = target.params.filter(param => !specialized.has(param))
+        for (const [blockId, appId] of inbound) {
+            const app = g.nodes.get(appId)!
+            const argIds = new Array<number>(newParams.length + 1)
+            const argConsts = new Float64Array(newParams.length + 1)
+            argIds[0] = getRef(app, 0)
+            let out = 1
+            for (let i = 0; i < target.params.length; i++) {
+                if (specialized.has(target.params[i])) continue
+                argIds[out] = getRef(app, i + 1)
+                argConsts[out] = getLiteral(app, i + 1)
+                out++
+            }
+            let replacements = edits.get(getGraphBlock(blockId))
+            if (!replacements) edits.set(getGraphBlock(blockId), replacements = new Map())
+            replacements.set(appId, addNode('apply', argIds, argConsts, app))
+        }
+
+        const changed = new Set<GraphBlock>()
+        for (const [block, replacements] of edits) {
+            block.bodyId = replaceAll(block.bodyId, replacements)
+            changed.add(block)
+        }
+        target.params = newParams
+        target.bodyId = replaceAll(target.bodyId, specialized)
+        changed.add(target)
+        for (const block of changed) revisitBlock(block)
+        return true
+    }
+
     function foldLiterals(b: GraphBlock) {
         const literals = findValues(b.id, 'literal')
         if (!literals) return
@@ -3829,6 +4074,7 @@ function optimizeValueGraph(g: Graph) {
             step(absorbConditions, b)
             step(threadConstantBranches, b)
             step(foldKnownConditions, b)
+            step(reduceSelects, b)
             step(forwardMemory, b)
             step(liftCommonEffects, b)
             step(liftCommonApplications, b)
@@ -3854,6 +4100,8 @@ function optimizeValueGraph(g: Graph) {
         }
         for (const b of reachableBlocks) {
             step(foldLiterals, b)
+            step(foldValues, b)
+            step(specializeBlockParameters, b)
             step(simplifyBitOperations, b)
             step(deduplicateValues, b)
         }
@@ -5411,7 +5659,7 @@ export function normalizeValueGraph(g: Graph): Graph {
     run(removeOrderingParams)
     run(flattenRecords)
     run(packageBlocksFINAL)
-    run(specializeBlockApplications)
+    //run(specializeBlockApplications)
     run(optimizeValueGraph)
     run(outlineBlocks)
     run(cloneExits)
