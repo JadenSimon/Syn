@@ -12,7 +12,7 @@ import {
 } from './lowering2'
 import {
     cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getLiteral,
-    getRef, makeNode, setGraphBlocks,
+    getRef, makeNode, setGraphBlocks, setRef,
 } from './graph-node'
 
 type usize = u32
@@ -338,6 +338,133 @@ function liftReturnedHeapValues(
     return { graph: out, wrapper: makeHeapWrapper(prototype) }
 }
 
+interface ReturnedShape {
+    value: number
+    consumer: number
+    at: number
+    keys: intrinsics.Handle[]
+    fields: Map<number, [id: number, konst: number]>
+}
+
+interface ReturnedRecord extends ReturnedShape {
+    fn: Function
+    symbol: number
+    graph: Graph
+}
+
+interface ReturnCaller {
+    fn: Function
+    symbol: number
+    graph: Graph
+}
+
+function returnedShape(graph: Graph): ReturnedShape | undefined {
+    const entry = graph.blocks[0]
+    const body = graph.nodes.get(entry.bodyId)
+    if (!body || body.op !== 'ret') return
+    for (const [id, n] of graph.nodes) {
+        if (n.op === 'ret' && id !== entry.bodyId) return
+    }
+    let consumer = entry.bodyId
+    let at = 0
+    let value = getRef(body, 0)
+    while (const n = graph.nodes.get(value)) {
+        if (n.op !== 'after') break
+        consumer = value
+        at = countIds(n) - 1
+        value = getRef(n, at)
+    }
+    const n = graph.nodes.get(value)
+    if (!n || n.op !== 'heap-handle' || getRef(n, 0)) return
+    let uses = 0
+    for (const u of graph.nodes.values()) {
+        for (let i = 0; i < countIds(u); i++) if (getRef(u, i) === value) uses++
+    }
+    if (uses !== 1) return
+    const handle = unwrapCell(getLiteral(n, 0)) as intrinsics.Handle
+    if (!heap.isOrdinaryObject(handle)) return
+    const keys: intrinsics.Handle[] = []
+    const fields = new Map<number, [id: number, konst: number]>()
+    for (let k: u32 = 0; k < heap.ownPropertyCount(handle); k++) {
+        const key = heap.ownPropertyKeyAt(handle, k)
+        const descriptor = heap.getOwnProperty(handle, key)
+        if (!descriptor) return
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
+        const boxed = d.slot0 as intrinsics.Handle
+        if (!heap.isBoxedF64(boxed)) return
+        const unboxed = heap.unboxF64(boxed)
+        const id = intrinsics.getNanId(unboxed)
+        if (id && !graph.nodes.has(id)) return
+        keys.push(key)
+        fields.set(key, id ? [id, 0] : [0, unboxed])
+    }
+    if (!keys.length) return
+    return { value, consumer, at, keys, fields }
+}
+
+function installReturnRecord(shape: ReturnedRecord, layout: intrinsics.Handle[]): void {
+    const graph = shape.graph
+    const argIds: number[] = []
+    const argConsts: number[] = []
+    for (let i = 0; i < layout.length; i++) {
+        const field = shape.fields.get(layout[i])!
+        argIds.push(0)
+        argConsts.push(i)
+        argIds.push(field[0])
+        argConsts.push(field[1])
+    }
+    const id = graph.maxId++
+    graph.nodes.set(id, makeNode('record', argIds, new Float64Array(argConsts)))
+    setRef(graph.nodes.get(shape.consumer)!, shape.at, id)
+    graph.nodes.delete(shape.value)
+}
+
+function calleeSymbol(graph: Graph, call: number): number | undefined {
+    const n = graph.nodes.get(call)
+    if (!n || n.op !== 'call') return
+    const target = graph.nodes.get(getRef(n, 1))
+    if (!target || target.op !== 'local-target' || getRef(target, 0)) return
+    return getLiteral(target, 0)
+}
+
+function readsCallResult(graph: Graph, id: number): boolean {
+    const n = graph.nodes.get(id)!
+    if (n.op !== 'property' || getRef(n, 1)) return false
+    return calleeSymbol(graph, getRef(n, 0)) !== undefined
+}
+
+function projectsCallResults(graph: Graph): boolean {
+    let found = false
+    for (const [id, n] of graph.nodes) {
+        if (n.op !== 'property') continue
+        if (!readsCallResult(graph, id)) return false
+        found = true
+    }
+    return found
+}
+
+function callSitesOf(graph: Graph, symbol: number): number[] {
+    const out: number[] = []
+    for (const [id, n] of graph.nodes) {
+        if (n.op === 'call' && calleeSymbol(graph, id) === symbol) out.push(id)
+    }
+    return out
+}
+
+function callResultEscapes(graph: Graph, call: number): boolean {
+    for (const n of graph.nodes.values()) {
+        for (let i = 0; i < countIds(n); i++) {
+            if (getRef(n, i) !== call) continue
+            if (i === 0 && (n.op === 'property' || n.op === 'get')) continue
+            if (i === 0 && (n.op === 'load' || n.op === 'store' || n.op === 'call')) continue
+            if (n.op === 'after' && i < countIds(n) - 1) continue
+            return true
+        }
+    }
+    return false
+}
+
 interface InlineScore {
     cost: number
     pressure: number
@@ -607,6 +734,8 @@ export function createNatives(fns: Record<string, Function>) {
     const pending: PendingUnit[] = []
     const opaqueGraphs = new Map<number, Graph>()
     const shapedCallees: ShapedCallee[] = []
+    const returnRecords = new Map<number, ReturnedRecord>()
+    const returnCallers: ReturnCaller[] = []
     const poolValues: (number | bigint)[] = []
     const poolSlots = new Map<PoolValue, number>()
     const nativePointerSlots = new Map<number, number>()
@@ -757,9 +886,13 @@ export function createNatives(fns: Record<string, Function>) {
             name: current.name, self: current,
         })
         phases.trace += performance.now() - phaseMark
-        const opaque = [...traced.graph.nodes.values()].some(n => n.op === 'property')
+        const projected = projectsCallResults(traced.graph)
+        const opaque = !projected && [...traced.graph.nodes.values()].some(n => n.op === 'property')
         if (opaque) {
-            if ([...roots.values()].includes(symbol)) throw `native: ${current.name} reads properties of an opaque argument`
+            if ([...roots.values()].includes(symbol)) {
+                console.log(dumpGraph(traced.graph))
+                throw `native: ${current.name} reads properties of an opaque argument`
+            }
         }
         if (intrinsics.argv().includes('native-trace-cost')) {
             const traceOps = (session.runtime?.tracer.getOpCount() ?? traceOpsBefore) - traceOpsBefore
@@ -771,6 +904,20 @@ export function createNatives(fns: Record<string, Function>) {
         if (traceDebug) console.log(traced.text)
         if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
         if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
+        if (projected) {
+            inlineScores.set(current, false)
+            returnCallers.push({ fn: current, symbol, graph: tracedGraph })
+            continue
+        }
+        const shouldNotInline = (current as any).shouldNotInline || lifted.wrapper || tracedGraph.nodes.size > 150 || !obviousInline(tracedGraph)
+        const shape = shouldNotInline && !lifted.wrapper ? returnedShape(tracedGraph) : undefined
+        if (shape) {
+            if (shouldNotInline || tracedGraph.nodes.size > 50 || !obviousInline(tracedGraph)) {
+                inlineScores.set(current, false)
+                returnRecords.set(symbol, { fn: current, symbol, graph: tracedGraph, ...shape })
+                continue
+            }
+        }
         phaseMark = performance.now()
         tracedGraph = normalizeValueGraph(tracedGraph)
         phases.normalize += performance.now() - phaseMark
@@ -792,6 +939,7 @@ export function createNatives(fns: Record<string, Function>) {
     }
     const reconcileStart = performance.now()
     for (const shaped of shapedCallees) reconcileShapes(shaped)
+    reconcileReturns()
     phases.reconcile = performance.now() - reconcileStart
 
     function handleSlots(graph: Graph) {
@@ -875,6 +1023,52 @@ export function createNatives(fns: Record<string, Function>) {
         const lifted = liftReturnedHeapValues(traced.graph)
         const normalized = normalizeValueGraph({ ...lifted.graph, name: shaped.fn.name })
         pending.push({ fn: shaped.fn, symbol: shaped.symbol, graph: normalized, ...handleSlots(normalized) })
+    }
+
+    function reconcileReturns(): void {
+        const wanted = new Map<number, Set<number>>()
+        for (const caller of returnCallers) {
+            for (const n of caller.graph.nodes.values()) {
+                if (n.op !== 'property') continue
+                const symbol = calleeSymbol(caller.graph, getRef(n, 0))!
+                let keys = wanted.get(symbol)
+                if (!keys) wanted.set(symbol, keys = new Set())
+                keys.add(getLiteral(n, 1))
+            }
+        }
+        const layouts = new Map<number, Map<number, number>>()
+        for (const [symbol, keys] of wanted) {
+            const shape = returnRecords.get(symbol)
+            const name = functions[symbol]?.name || `symbol ${symbol}`
+            if (!shape) throw `native: ${name} does not return a record of its own`
+            const layout = shape.keys.filter(k => keys.has(k as number))
+            if (layout.length !== keys.size) throw `native: ${name} does not own every projected key`
+            if (layout.length > 7) throw `native: ${name} returns ${layout.length} projected fields`
+            for (const graph of [...pending.map(u => u.graph), ...returnCallers.map(c => c.graph)]) {
+                for (const call of callSitesOf(graph, symbol)) {
+                    if (!callResultEscapes(graph, call)) continue
+                    throw `native: the result of ${name} escapes in ${graph.name ?? 'anonymous graph'}`
+                }
+            }
+            const at = new Map<number, number>()
+            for (let i = 0; i < layout.length; i++) at.set(layout[i] as number, i)
+            layouts.set(symbol, at)
+            installReturnRecord(shape, layout)
+        }
+        for (const shape of returnRecords.values()) {
+            const graph = normalizeValueGraph(shape.graph)
+            pending.push({ fn: shape.fn, symbol: shape.symbol, graph, ...handleSlots(graph) })
+        }
+        for (const caller of returnCallers) {
+            for (const [id, n] of caller.graph.nodes) {
+                if (n.op !== 'property') continue
+                const base = getRef(n, 0)
+                const at = layouts.get(calleeSymbol(caller.graph, base)!)!.get(getLiteral(n, 1))!
+                caller.graph.nodes.set(id, makeNode('get', [base, 0], new Float64Array([0, at])))
+            }
+            const graph = normalizeValueGraph(caller.graph)
+            pending.push({ fn: caller.fn, symbol: caller.symbol, graph, ...handleSlots(graph) })
+        }
     }
 
     if (intrinsics.argv().includes('native-shapes')) {

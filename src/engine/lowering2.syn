@@ -457,24 +457,51 @@ function replaceLiterals(g: Graph) {
     }
 }
 
+function returnedRecord(g: Graph, ret: GraphNode): GraphNode | undefined {
+    const n = g.nodes.get(getRef(ret, 0))
+    return n?.op === 'record' ? n : undefined
+}
+
 function outlineReturns(g: Graph): Graph {
     const blockId = createNode(g, 'block', [])
     let replaced = false
     let hasLiterals = false
+    let fields = 0
+    for (const n of g.nodes.values()) {
+        if (n.op !== 'ret') continue
+        const record = returnedRecord(g, n)
+        const width = record ? countIds(record) / 2 : 0
+        assert(!replaced || fields === width, 'lowering: returns disagree on shape')
+        replaced = true
+        fields = width
+    }
+    replaced = false
     for (const [id, n] of g.nodes) {
         if (n.op !== 'ret') continue
         replaced = true
-        const v = operand(n, 0)
-        if (!getRef(n, 0)) hasLiterals = true
-        g.nodes.set(id, g.nodes.get(createNode(g, 'apply', [blockId, v], n))!)
+        const operands: (number | GraphNode)[] = [blockId]
+        const record = returnedRecord(g, n)
+        if (record) {
+            for (let i = 0; i < fields; i++) {
+                assert(getLiteral(record, i * 2) === i, 'lowering: returned record is not in slot order')
+                operands.push(operand(record, i * 2 + 1))
+            }
+        } else {
+            operands.push(operand(n, 0))
+            if (!getRef(n, 0)) hasLiterals = true
+        }
+        g.nodes.set(id, g.nodes.get(createNode(g, 'apply', operands, n))!)
     }
     if (!replaced) {
         g.nodes.delete(blockId)
         return g
     }
-    const parameter = createNode(g, 'param', [])
-    const bodyId = createNode(g, 'ret', [parameter])
-    addGraphBlock(g, { id: blockId, params: [parameter], bodyId, bodyConst: 0 })
+    const params: number[] = []
+    for (let i = 0; i < Math.max(fields, 1); i++) params.push(createNode(g, 'param', []))
+    const values: (number | GraphNode)[] = []
+    for (let i = 0; i < fields; i++) values.push(literal(i), params[i])
+    const bodyId = createNode(g, 'ret', [fields ? createNode(g, 'record', values) : params[0]])
+    addGraphBlock(g, { id: blockId, params, bodyId, bodyConst: 0 })
     if (hasLiterals) replaceLiterals(g)
     return g
 }
@@ -3915,6 +3942,13 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             loopsOf.delete(k)
         }
     }
+    
+    const callProjections = new Map<number, number[]>()
+    function addCallProj(target: number, consumer: number) {
+        let arr = callProjections.get(target)
+        if (!arr) callProjections.set(target, arr = [])
+        arr.push(consumer)
+    }
 
     const stack: number[] = []
     const blockStack: GraphBlock[] = []
@@ -3938,9 +3972,9 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
     }
     function visit(id: number, used: boolean, param?: boolean): void {
         if (!id) return
-        const n = g.nodes.get(id)
-        if (n?.op === 'nil-effect') return
-        if (n?.op === 'void') return
+        const n = g.nodes.get(id)!
+        if (n.op === 'nil-effect') return
+        if (n.op === 'void') return
         if (stack.length && !param) {
             recordEdge(stack[stack.length-1], id, used)
         }
@@ -3960,7 +3994,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             }
         }
 
-        if (!n || !countIds(n)) return
+        if (!countIds(n)) return
 
         if (n.op === 'after') {
             const result = countIds(n) - 1
@@ -4001,6 +4035,12 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             if (visited.has(b.id)) return
             enterBlock(b)
             return
+        }
+        if (n.op === 'get') {
+            const t = getRef(n, 0)
+            if (t !== 0 && g.nodes.get(t)!.op === 'call') {
+                addCallProj(t, id)
+            }
         }
         for (const x of getArgIds(n)) {
             if (!x) continue
@@ -4416,6 +4456,10 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             }
             if (t.op === 'after') { tails(getRef(t, countIds(t)-1)); return }
             if (t.op === 'ret') { tails(getRef(t, 0)); return }
+            if (t.op === 'record') {
+                for (let i = 1; i < countIds(t); i += 2) tails(getRef(t, i))
+                return
+            }
             if (t.op === 'apply') return
             notePos(inStatePos, at, b.id, -1)
         }
@@ -4588,6 +4632,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         reverseOrder,
         callsUnderValue: callsUnderCache,
         rotated,
+        callProjections,
     }
 }
 
@@ -6101,7 +6146,27 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
             }
         }
         const retReg = syscall ? target.syscall.retReg : target.retReg
+        if (const projections = analysis.callProjections.get(id)) {
+            for (const p of projections) {
+                buildCallProjection(p, retReg)
+            }
+            return
+        }
         transfer(regFor(id, retReg), retReg)
+    }
+
+    function buildCallProjection(id: number, baseReg: number) {
+        const outer = materializing
+        materializing = id
+        defer materializing = outer
+        defer finish()
+        assert(!done.has(id), `Value is already done: ${id}`)
+        const n = g.nodes.get(id)!
+        assert(n.op === 'get', `Invalid proj op: ${n.op}`)
+        const key = getLiteral(n, 1)
+        assert(key >= 0 && key <= 6, `Unhandled proj key: ${key}`)
+        const target = baseReg + key
+        transfer(regFor(id, target), target)
     }
 
     function effect(id: number): void {
@@ -6294,6 +6359,20 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         throw `lowering3: select ${id} branches in value position`
     }
 
+    function returnRecord(site: number, n: GraphNode): void {
+        const outer = materializing
+        materializing = site
+        defer materializing = outer
+        const slots: Handover[] = []
+        for (let i = 0; i < countIds(n); i += 2) {
+            const at = getLiteral(n, i)
+            assert(at >= 0 && at <= 6, `Unhandled return slot: ${at}`)
+            slots.push({ dst: target.retReg + at, id: getRef(n, i + 1), konst: getLiteral(n, i + 1) })
+        }
+        handOver(site, slots, [-1, () => {}])
+        jumpToExit()
+    }
+
     function returnValue(site: number, id: number, konst: number): void {
         if (!id) put(() => asm.movImm(target.retReg, konst))
         else {
@@ -6428,6 +6507,7 @@ export function lowerValueGraph(g: Graph, opts: LowerGraphOptions = {}): LowerGr
         if (n.op === 'ret') {
             return emitTail(getRef(n!, 0), getLiteral(n!, 0))
         }
+        if (n.op === 'record') { returnRecord(id, n); return }
         returnValue(id, id, konst)
     }
 
