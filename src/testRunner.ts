@@ -401,7 +401,7 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
 
     await Promise.all(promises)
 
-    const f = results.find(x => x.name.includes(entrypoint))!
+    const f = results.find(x => x.name.endsWith(`${entrypoint}.js`))!
     const reifier = (prog as any).getReifier()
     ;(reifier as any).__argv = argv // XXX
     return runSynModule(f.text, path.resolve(`src/engine/${entrypoint}.syn`), reifier, false, (from, name) => {
