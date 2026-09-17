@@ -2082,7 +2082,15 @@ pub const Program = struct {
             const Kind = Analyzer.Kind;
             const TypeRef = Analyzer.TypeRef;
 
-            const Helper = enum { style, template, set_attribute, spread_attributes, update_symbol, spread_comp, splice_at, replace, set_slot, set_slot_spread, swap_tree };
+            const Helper = enum { style, template, set_attribute, spread_attributes, update_symbol, spread_comp, splice_at, replace, set_slot, set_slot_spread, swap_tree, run_defers };
+
+            const DeferScope = struct {
+                defers_name: []const u8 = &.{},
+                fdefers_name: []const u8 = &.{},
+                ret_name: []const u8 = &.{},
+                ret_used: bool = false,
+            };
+
             const helper_code = struct {
                 const style = "var __style = (c => s => c[s]||=(document.head.insertAdjacentHTML('beforeend', `<style>${s}</style>`),1))({})";
                 const sheet =
@@ -2171,6 +2179,7 @@ pub const Program = struct {
                     \\  v.length = 0
                     \\}
                 ;
+                const run_defers = "var __runDefers = d => { while (d.length) d.pop()() }";
             };
 
             // empty string = no property exists, always use DOM attr
@@ -2400,6 +2409,10 @@ pub const Program = struct {
             proxied_symbol_replacements: std.AutoHashMapUnmanaged(u32, NodeRef) = .{},
             jsx_emit_state: ?*InlineEmitState = null,
 
+            defer_scopes: std.ArrayListUnmanaged(DeferScope) = .{},
+            defer_scope_floor: u32 = 0,
+            defer_counter: u32 = 0,
+
             style_visitor: StyleVisitor = .{},
 
             helpers: std.EnumSet(Helper) = std.EnumSet(Helper).initEmpty(),
@@ -2427,6 +2440,7 @@ pub const Program = struct {
                     .set_slot => "__slot",
                     .set_slot_spread => "__slot_s",
                     .swap_tree => "__swap_tree",
+                    .run_defers => "__runDefers",
                 };
             }
 
@@ -3454,6 +3468,399 @@ pub const Program = struct {
                     try self.addReplacement(last_stmt_ref, last_copy);
                 }
                 return self.factory.createBlock(stmts_head);
+            }
+
+            const Chain = struct {
+                head: NodeRef = 0,
+                tail: NodeRef = 0,
+
+                fn push(c: *@This(), nodes: *BumpAllocator(AstNode), ref: NodeRef) void {
+                    if (c.tail != 0) {
+                        nodes.at(c.tail).next = ref;
+                    } else {
+                        c.head = ref;
+                    }
+                    var t = ref;
+                    while (nodes.at(t).next != 0) t = nodes.at(t).next;
+                    c.tail = t;
+                }
+            };
+
+            fn isTerminalStatement(kind: parser.SyntaxKind) bool {
+                return switch (kind) {
+                    .return_statement, .throw_statement, .break_statement, .continue_statement => true,
+                    else => false,
+                };
+            }
+
+            fn insertChainAfter(self: *@This(), ref: NodeRef, chain: Chain) !void {
+                const successor = self.nodes.at(ref).next;
+                self.nodes.at(chain.tail).next = successor;
+
+                if (self.replacements.get(ref)) |resolved| {
+                    var tail = resolved;
+                    while (self.nodes.at(tail).next != successor) tail = self.nodes.at(tail).next;
+                    self.nodes.at(tail).next = chain.head;
+                    return;
+                }
+
+                const clone = try self.factory.cloneNodeRef(ref);
+                self.nodes.at(clone).next = chain.head;
+                try self.replacements.put(ref, clone);
+            }
+
+            fn deferIdent(self: *@This(), name: []const u8) !NodeRef {
+                return self.factory.createIdentifierAllocated(name);
+            }
+
+            fn runDefersStatement(self: *@This(), name: []const u8) !NodeRef {
+                return self.factory.createExpressionStatement(try self.runDefersCall(name));
+            }
+
+            fn runDefersCall(self: *@This(), name: []const u8) !NodeRef {
+                const helper = try self.factory.createIdentifier(self.requireHelper(.run_defers));
+                return self.factory.createCallExpression(helper, try self.deferIdent(name));
+            }
+
+            fn emptyArrayDecl(self: *@This(), name: []const u8) !NodeRef {
+                const decl = try self.factory.createVariableDeclarationSimple(
+                    try self.deferIdent(name),
+                    try self.factory.createArrayLiteralExpression(&.{}),
+                );
+                return self.factory.createVariableStatement(decl, @intFromEnum(parser.NodeFlags.@"const"));
+            }
+
+            fn commaExp(self: *@This(), left: NodeRef, right: NodeRef) !NodeRef {
+                return self.factory.createBinaryExpression(left, .comma_token, right);
+            }
+
+            fn deferPayloadArrow(self: *@This(), n: *const AstNode) !NodeRef {
+                const payload_ref = unwrapRef(n);
+                const payload = self.nodes.at(payload_ref);
+
+                const body = if (payload.kind == .expression_statement)
+                    unwrapRef(payload)
+                else if (payload.kind == .block)
+                    payload_ref
+                else
+                    try self.factory.createBlock(payload_ref);
+
+                return self.factory.createArrowFunction(0, body, 0);
+            }
+
+            fn collectBindingNames(self: *@This(), binding_ref: NodeRef, out: *std.ArrayList(NodeRef)) anyerror!void {
+                const binding = self.nodes.at(binding_ref);
+
+                switch (binding.kind) {
+                    .identifier => try out.append(binding_ref),
+                    .binding_element => try self.collectBindingNames(getPackedData(binding).left, out),
+                    .object_binding_pattern, .array_binding_pattern => {
+                        var iter = NodeIterator.init(self.nodes, maybeUnwrapRef(binding) orelse return);
+                        while (iter.nextPair()) |pair| {
+                            if (pair[0].kind != .binding_element) continue;
+                            try self.collectBindingNames(pair[1], out);
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            fn bindingToAssignmentTarget(self: *@This(), binding_ref: NodeRef) anyerror!NodeRef {
+                const binding = self.nodes.at(binding_ref);
+
+                switch (binding.kind) {
+                    .object_binding_pattern => {
+                        var props = std.ArrayList(NodeRef).init(getAllocator());
+                        var iter = NodeIterator.init(self.nodes, maybeUnwrapRef(binding) orelse 0);
+                        while (iter.nextPair()) |pair| {
+                            if (pair[0].kind != .binding_element) continue;
+                            const d = getPackedData(pair[0]);
+                            var target = try self.bindingToAssignmentTarget(d.left);
+                            if (pair[0].hasFlag(.generator)) {
+                                try props.append(try self.factory.createSpreadAssignment(target));
+                                continue;
+                            }
+                            if (d.right != 0) {
+                                target = try self.factory.createBinaryExpression(target, .equals_token, d.right);
+                            }
+                            const key = if (pair[0].len != 0) pair[0].len else try self.factory.cloneNodeRef(d.left);
+                            try props.append(try self.factory.createPropertyAssignment(key, target));
+                        }
+                        return self.factory.createObjectLiteralExpression(props.items);
+                    },
+                    .array_binding_pattern => {
+                        var elements = std.ArrayList(NodeRef).init(getAllocator());
+                        var iter = NodeIterator.init(self.nodes, maybeUnwrapRef(binding) orelse 0);
+                        while (iter.nextPair()) |pair| {
+                            if (pair[0].kind != .binding_element) {
+                                try elements.append(try self.factory.nodes.push(.{ .kind = .omitted_expression }));
+                                continue;
+                            }
+                            const d = getPackedData(pair[0]);
+                            var target = try self.bindingToAssignmentTarget(d.left);
+                            if (pair[0].hasFlag(.generator)) {
+                                try elements.append(try self.factory.createSpreadElement(target));
+                                continue;
+                            }
+                            if (d.right != 0) {
+                                target = try self.factory.createBinaryExpression(target, .equals_token, d.right);
+                            }
+                            try elements.append(target);
+                        }
+                        return self.factory.createArrayLiteralExpression(elements.items);
+                    },
+                    else => return self.factory.cloneNodeRef(binding_ref),
+                }
+            }
+
+            fn hoistDeclaration(self: *@This(), stmt_ref: NodeRef) !Chain {
+                const resolved = self.replacements.get(stmt_ref) orelse stmt_ref;
+                const rn = self.nodes.at(resolved);
+                const successor = rn.next;
+
+                switch (rn.kind) {
+                    .function_declaration => {
+                        const hoisted = try self.factory.cloneNodeRef(resolved);
+                        self.nodes.at(hoisted).next = 0;
+                        try self.replacements.put(stmt_ref, try self.factory.nodes.push(.{
+                            .kind = .empty_statement,
+                            .next = successor,
+                        }));
+                        return .{ .head = hoisted, .tail = hoisted };
+                    },
+                    .class_declaration => {
+                        const name_ref = getPackedData(rn).left;
+                        if (name_ref == 0) return .{};
+
+                        const cls = try self.factory.cloneNodeRef(resolved);
+                        self.nodes.at(cls).kind = .class_expression;
+                        self.nodes.at(cls).next = 0;
+                        self.nodes.at(cls).flags &= ~@as(u22, @intFromEnum(parser.NodeFlags.@"export"));
+
+                        const assign = try self.factory.createAssignmentStatement(try self.factory.cloneNodeRef(name_ref), cls);
+                        self.nodes.at(assign).next = successor;
+                        try self.replacements.put(stmt_ref, assign);
+
+                        const decl = try self.factory.createVariableDeclaration(try self.factory.cloneNodeRef(name_ref), 0, 0);
+                        const hoisted = try self.factory.createVariableStatement(decl, @intFromEnum(parser.NodeFlags.let));
+                        return .{ .head = hoisted, .tail = hoisted };
+                    },
+                    .variable_statement => {
+                        const decls_head = maybeUnwrapRef(rn) orelse return .{};
+
+                        const hoist_flags: u22 = if (rn.hasFlag(.let) or rn.hasFlag(.@"const"))
+                            @intFromEnum(parser.NodeFlags.let)
+                        else
+                            0;
+
+                        var names = std.ArrayList(NodeRef).init(getAllocator());
+                        defer names.deinit();
+
+                        var assignments = Chain{};
+                        var iter = NodeIterator.init(self.nodes, decls_head);
+                        while (iter.next()) |decl| {
+                            const d = getPackedData(decl);
+                            try self.collectBindingNames(d.left, &names);
+                            if (d.right == 0) continue;
+
+                            const target = try self.bindingToAssignmentTarget(d.left);
+                            const assign = try self.factory.createBinaryExpression(target, .equals_token, d.right);
+                            const exp = if (self.nodes.at(target).kind == .object_literal_expression)
+                                try self.factory.createParenthesizedExpression(assign)
+                            else
+                                assign;
+                            assignments.push(self.nodes, try self.factory.createExpressionStatement(exp));
+                        }
+
+                        if (names.items.len == 0) return .{};
+
+                        var hoisted_decls = Chain{};
+                        for (names.items) |name_ref| {
+                            hoisted_decls.push(self.nodes, try self.factory.createVariableDeclaration(try self.factory.cloneNodeRef(name_ref), 0, 0));
+                        }
+                        const hoisted = try self.factory.createVariableStatement(hoisted_decls.head, hoist_flags);
+
+                        if (assignments.head != 0) {
+                            self.nodes.at(assignments.tail).next = successor;
+                            try self.replacements.put(stmt_ref, assignments.head);
+                        } else {
+                            try self.replacements.put(stmt_ref, try self.factory.nodes.push(.{
+                                .kind = .empty_statement,
+                                .next = successor,
+                            }));
+                        }
+
+                        return .{ .head = hoisted, .tail = hoisted };
+                    },
+                    else => return .{},
+                }
+            }
+
+            fn transformDeferScope(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                const head = maybeUnwrapRef(n) orelse return parser.forEachChild(self.nodes, n, self);
+
+                var first_plain: NodeRef = 0;
+                var first_finally: NodeRef = 0;
+                var last_ref: NodeRef = 0;
+                {
+                    var iter = NodeIterator.init(self.nodes, head);
+                    while (iter.nextPair()) |pair| {
+                        last_ref = pair[1];
+                        if (pair[0].kind != .defer_statement) continue;
+                        if (pair[0].extra_data == 1) {
+                            if (first_finally == 0) first_finally = pair[1];
+                        } else if (first_plain == 0) {
+                            first_plain = pair[1];
+                        }
+                    }
+                }
+
+                if (first_plain == 0 and first_finally == 0) {
+                    return parser.forEachChild(self.nodes, n, self);
+                }
+
+                const id = self.defer_counter;
+                self.defer_counter += 1;
+
+                var scope = DeferScope{};
+                if (first_plain != 0) {
+                    scope.defers_name = try std.fmt.allocPrint(getAllocator(), "__defers{d}", .{id});
+                    scope.ret_name = try std.fmt.allocPrint(getAllocator(), "__dret{d}", .{id});
+                }
+                if (first_finally != 0) {
+                    scope.fdefers_name = try std.fmt.allocPrint(getAllocator(), "__fdefers{d}", .{id});
+                }
+
+                try self.defer_scopes.append(getAllocator(), scope);
+                const depth = self.defer_scopes.items.len;
+
+                try parser.forEachChild(self.nodes, n, self);
+
+                const finished = self.defer_scopes.items[depth - 1];
+                self.defer_scopes.items.len = depth - 1;
+
+                var pre = Chain{};
+                if (finished.defers_name.len > 0) {
+                    if (finished.ret_used) {
+                        const d = try self.factory.createVariableDeclaration(try self.deferIdent(finished.ret_name), 0, 0);
+                        pre.push(self.nodes, try self.factory.createVariableStatement(d, @intFromEnum(parser.NodeFlags.let)));
+                    }
+                    pre.push(self.nodes, try self.emptyArrayDecl(finished.defers_name));
+
+                    if (!isTerminalStatement(self.nodes.at(last_ref).kind)) {
+                        var trailing = Chain{};
+                        trailing.push(self.nodes, try self.runDefersStatement(finished.defers_name));
+                        try self.insertChainAfter(last_ref, trailing);
+                    }
+                }
+
+                var fin = Chain{};
+                if (finished.fdefers_name.len > 0) {
+                    var iter = NodeIterator.init(self.nodes, first_finally);
+                    while (iter.nextRef()) |stmt_ref| {
+                        const hoisted = try self.hoistDeclaration(stmt_ref);
+                        if (hoisted.head != 0) fin.push(self.nodes, hoisted.head);
+                    }
+
+                    fin.push(self.nodes, try self.emptyArrayDecl(finished.fdefers_name));
+                    fin.push(self.nodes, try self.factory.createTryStatement(
+                        try self.factory.createBlock(first_finally),
+                        0,
+                        try self.factory.createBlock(try self.runDefersStatement(finished.fdefers_name)),
+                    ));
+                    self.nodes.at(fin.tail).next = 0;
+                }
+
+                var new_head: NodeRef = 0;
+                if (fin.head != 0 and first_finally == head) {
+                    if (pre.head != 0) {
+                        pre.push(self.nodes, fin.head);
+                        new_head = pre.head;
+                    } else {
+                        new_head = fin.head;
+                    }
+                } else {
+                    if (fin.head != 0) {
+                        var prev = head;
+                        while (self.nodes.at(prev).next != first_finally) prev = self.nodes.at(prev).next;
+
+                        if (self.replacements.get(prev)) |resolved| {
+                            var t = resolved;
+                            while (self.nodes.at(t).next != first_finally) t = self.nodes.at(t).next;
+                            self.nodes.at(t).next = fin.head;
+                        } else {
+                            const clone = try self.factory.cloneNodeRef(prev);
+                            self.nodes.at(clone).next = fin.head;
+                            try self.replacements.put(prev, clone);
+                        }
+                    }
+
+                    if (pre.head != 0) {
+                        self.nodes.at(pre.tail).next = head;
+                        new_head = pre.head;
+                    }
+                }
+
+                if (new_head != 0) {
+                    const clone = try self.factory.cloneNode(n);
+                    self.nodes.at(clone).data = new_head;
+                    try self.replacements.put(ref, clone);
+                }
+            }
+
+            fn transformDeferStatement(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                const payload_ref = unwrapRef(n);
+                try self.visit(self.nodes.at(payload_ref), payload_ref);
+
+                if (self.defer_scopes.items.len == 0) return;
+
+                const scope = &self.defer_scopes.items[self.defer_scopes.items.len - 1];
+                const name = if (n.extra_data == 1) scope.fdefers_name else scope.defers_name;
+                if (name.len == 0) return;
+
+                const push = try self.factory.createPropertyAccessExpression(try self.deferIdent(name), "push");
+                const call = try self.factory.createCallExpression(push, try self.deferPayloadArrow(n));
+                const stmt = try self.factory.createExpressionStatement(call);
+                self.nodes.at(stmt).next = n.next;
+
+                try self.replacements.put(ref, stmt);
+            }
+
+            fn maybeRunDefersOnReturn(self: *@This(), n: *const AstNode) !?NodeRef {
+                var i = self.defer_scopes.items.len;
+                var innermost: ?*DeferScope = null;
+                while (i > self.defer_scope_floor) {
+                    i -= 1;
+                    if (self.defer_scopes.items[i].defers_name.len > 0) {
+                        innermost = &self.defer_scopes.items[i];
+                        break;
+                    }
+                }
+
+                const inner = innermost orelse return null;
+                const exp_ref = maybeUnwrapRef(n) orelse 0;
+
+                // innermost scope first
+                var seq: NodeRef = 0;
+                var j = self.defer_scopes.items.len;
+                while (j > self.defer_scope_floor) {
+                    j -= 1;
+                    const name = self.defer_scopes.items[j].defers_name;
+                    if (name.len == 0) continue;
+                    const call = try self.runDefersCall(name);
+                    seq = if (seq == 0) call else try self.commaExp(seq, call);
+                }
+
+                var full: NodeRef = undefined;
+                if (exp_ref != 0) {
+                    inner.ret_used = true;
+                    const spill = try self.factory.createBinaryExpression(try self.deferIdent(inner.ret_name), .equals_token, exp_ref);
+                    full = try self.commaExp(try self.commaExp(spill, seq), try self.deferIdent(inner.ret_name));
+                } else {
+                    full = try self.commaExp(seq, try self.factory.createUndefined());
+                }
+
+                return try self.factory.createReturnStatement(try self.factory.createParenthesizedExpression(full));
             }
 
             fn unwrapSubject(self: *@This(), ref: NodeRef) NodeRef {
@@ -10009,6 +10416,10 @@ pub const Program = struct {
                         defer self.is_async_ctx = is_async;
                         self.is_async_ctx = false;
 
+                        const floor = self.defer_scope_floor;
+                        defer self.defer_scope_floor = floor;
+                        self.defer_scope_floor = @intCast(self.defer_scopes.items.len);
+
                         try parser.forEachChild(self.nodes, n, self);
                     },
                     .function_declaration, .function_expression, .method_declaration, .arrow_function => {
@@ -10016,8 +10427,13 @@ pub const Program = struct {
                         defer self.is_async_ctx = is_async;
                         self.is_async_ctx = n.hasFlag(.@"async");
 
+                        const floor = self.defer_scope_floor;
+                        defer self.defer_scope_floor = floor;
+                        self.defer_scope_floor = @intCast(self.defer_scopes.items.len);
+
                         try parser.forEachChild(self.nodes, n, self);
                     },
+                    .defer_statement => try self.transformDeferStatement(n, ref),
                     .for_of_statement => {
                         const r = getPackedData(n).right;
                         const ty = try self.analyzer.evaluateType(try self.analyzer.getType(self.file, r), 1 << 0 | 1 << 30);
@@ -10081,8 +10497,14 @@ pub const Program = struct {
                     .return_statement => {
                         if (try self.maybeInlineExpTransform(n)) |new_ref| {
                             try self.replacements.put(ref, new_ref);
-                        } else {
-                            try parser.forEachChild(self.nodes, n, self);
+                            return;
+                        }
+
+                        try parser.forEachChild(self.nodes, n, self);
+
+                        if (try self.maybeRunDefersOnReturn(n)) |new_ref| {
+                            self.nodes.at(new_ref).next = n.next;
+                            try self.replacements.put(ref, new_ref);
                         }
                     },
                     .catch_clause => {
@@ -10665,7 +11087,7 @@ pub const Program = struct {
                             }
                         }
                     },
-                    .source_file, .block => {
+                    .source_file => {
                         // const saved = self.checked_mode;
                         // defer self.checked_mode = saved;
                         // if (self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0)) |mode| {
@@ -10673,6 +11095,7 @@ pub const Program = struct {
                         // }
                         try parser.forEachChild(self.nodes, n, self);
                     },
+                    .block => try self.transformDeferScope(n, ref),
                     .enum_declaration => try self.lowerEnumDeclaration(n, ref),
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
@@ -10754,6 +11177,9 @@ pub const Program = struct {
             }
             if (v.helpers.contains(.swap_tree)) {
                 try pushHelper.run(&f.ast.nodes, Visitor.helper_code.swap_tree, &helper_head, &helper_tail);
+            }
+            if (v.helpers.contains(.run_defers)) {
+                try pushHelper.run(&f.ast.nodes, Visitor.helper_code.run_defers, &helper_head, &helper_tail);
             }
             {
                 var it = v.machine_helpers.iterator();

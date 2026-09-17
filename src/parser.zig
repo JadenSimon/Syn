@@ -8552,7 +8552,7 @@ pub fn forEachChild(
         .block, .variable_statement, .object_literal_expression, .array_literal_expression, .template_expression, .class_static_block_declaration => {
             try visitList(nodes, maybeUnwrapRef(node) orelse 0, visitor);
         },
-        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .typeof_expression, .spread_element, .throw_statement => {
+        .expression_statement, .await_expression, .delete_expression, .parenthesized_expression, .typeof_expression, .spread_element, .throw_statement, .defer_statement => {
             const ref = unwrapRef(node);
             try visitor.visit(nodes.at(ref), ref);
         },
