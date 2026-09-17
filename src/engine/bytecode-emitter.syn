@@ -1071,6 +1071,106 @@ function emitFunction(
         emit2(isConstName ? Op.GetPropertyConst : Op.GetProperty, keySlot)
     }
 
+    function emitChainedPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number) {
+        if (node.kind === ts.SyntaxKind.ElementAccessExpression) {
+            const key = tryFoldExp(node.argumentExpression)
+            if (key?.[0] === 'value' && typeof key[1] === 'number') {
+                if (!Number.isInteger(key[1]) || key[1] < 0 || key[1] > 0xFF) throw 'array index does not fit in bytecode'
+                emit2(Op.GetPropertyImm, key[1])
+                return
+            }
+        }
+
+        if (node.kind === ts.SyntaxKind.PropertyAccessExpression) {
+            emit2(Op.GetPropertyConst, internString(node.name.text))
+            return
+        }
+
+        if (const key = tryFoldExp(node.argumentExpression)) {
+            if (key[0] === 'value' && typeof key[1] === 'string') {
+                emit2(Op.GetPropertyConst, internValue(key[1]))
+                return
+            }
+        }
+        if (isLexicalIdent(node.argumentExpression)) {
+            emit2(Op.GetProperty, symToReg.get(getSymbolId(node.argumentExpression))!)
+            return
+        }
+
+        let savedReceiver = receiverReg
+        if (savedReceiver === undefined) {
+            savedReceiver = allocReg()
+            star(savedReceiver)
+        }
+        defer if (receiverReg === undefined) freeReg()
+        const keyReg = allocReg()
+        defer freeReg()
+        emitExpr(node.argumentExpression)
+        star(keyReg)
+        ldar(savedReceiver)
+        emit2(Op.GetProperty, keyReg)
+    }
+
+    function isOptionalChainExpression(node: ts.Expression): boolean {
+        if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)) {
+            return !!node.questionDotToken || isOptionalChainExpression(node.expression)
+        }
+        return false
+    }
+
+    function emitOptionalChain(node: ts.Expression): void {
+        const nullish: number[] = []
+
+        function emitOptionalOperand(exp: ts.Expression): void {
+            if (isOptionalChainExpression(exp)) emitOptionalPart(exp)
+            else emitExpr(exp)
+        }
+
+        function checkNullish(): void {
+            nullish.push(emitJumpPlaceholder(Op.JumpIfNullish))
+        }
+
+        function emitOptionalPart(exp: ts.Expression): void {
+            if (ts.isPropertyAccessExpression(exp) || ts.isElementAccessExpression(exp)) {
+                emitOptionalOperand(exp.expression)
+                if (exp.questionDotToken) checkNullish()
+                emitChainedPropertyAccess(exp)
+                return
+            }
+            if (ts.isCallExpression(exp)) {
+                const callee = exp.expression
+                if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+                    emitOptionalOperand(callee.expression)
+                    if (callee.questionDotToken) checkNullish()
+                    const receiverReg = allocReg()
+                    defer freeReg()
+                    star(receiverReg)
+                    emitChainedPropertyAccess(callee, receiverReg)
+                    if (exp.questionDotToken) checkNullish()
+                    const calleeReg = allocReg()
+                    defer freeReg()
+                    star(calleeReg)
+                    emitCallArgs('Call', calleeReg, exp.arguments, receiverReg)
+                    return
+                }
+                emitOptionalOperand(callee)
+                if (exp.questionDotToken) checkNullish()
+                const calleeReg = allocReg()
+                defer freeReg()
+                star(calleeReg)
+                emitCallArgs('Call', calleeReg, exp.arguments)
+                return
+            }
+            throw `unsupported optional chain: ${ts.SyntaxKind[exp.kind]}`
+        }
+
+        emitOptionalPart(node)
+        const done = emitJumpPlaceholder(Op.Jump)
+        for (const jump of nullish) patchJump(jump)
+        emit1(Op.LdaUndefined)
+        patchJump(done)
+    }
+
     function emitLogicalOp(node: ts.BinaryExpression) {
         const kind = node.operatorToken.kind
         emitExpr(node.left) // acc = left
@@ -1342,6 +1442,7 @@ function emitFunction(
             }
             return emitExpr(r[1]) // residual
         }
+        if (isOptionalChainExpression(node)) { emitOptionalChain(node); return }
         if (ts.isParenthesizedExpression(node)) { emitExpr(node.expression); return }
         if (node.kind === ts.SyntaxKind.ThisKeyword) {
             if (thisReg !== undefined) { ldar(thisReg); return }
@@ -1396,7 +1497,6 @@ function emitFunction(
 
     function emitCallOrConstruct(node: ts.CallExpression | ts.NewExpression) {
         const isConstruct = node.kind === ts.SyntaxKind.NewExpression
-        if (!isConstruct && (node as ts.CallExpression).questionDotToken) throw "optional call is not supported"
         const isTailCall = node.parent.kind === ts.SyntaxKind.ReturnStatement
         // if (const slot = findConstPoolSlot(node.expression)) {
         //     return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
@@ -2574,15 +2674,13 @@ function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx
     }
     const args = Intrinsics.stackalloc(framesize)
     defer Intrinsics.stackfree(framesize)
-    const zerodArgs = _args.slice()
-    while (zerodArgs.length < m) zerodArgs.push(0)
-    zerodArgs.length = m
+    const suppliedArgs = _args.slice(0, m)
 
-    for (let i = 0; i < zerodArgs.length; i++) {
-        Intrinsics.store(args, 4*i as u32, tagVmHandle(fromJsValue(zerodArgs[i])), Types.u32)
+    for (let i = 0; i < suppliedArgs.length; i++) {
+        Intrinsics.store(args, 4*i as u32, tagVmHandle(fromJsValue(suppliedArgs[i])), Types.u32)
     }
     const compiledThisArg = fromJsValue(thisArg)
-    const r = vmValue(interpret(fn, compiledThisArg, args, zerodArgs.length as u32))
+    const r = vmValue(interpret(fn, compiledThisArg, args, suppliedArgs.length as u32))
 
     const realResult = r & (2**32)-1 // TODO: the intrinsics should be truncating to `nt`
     function disasmIfBad(expected: any): void {
@@ -2810,6 +2908,22 @@ function runTest() {
     // property read
     e2eTest('function read(o) { return o.x }', [{ x: 5 }])
 
+    // optional chains
+    e2eTest('function optionalProperty(o) { return o?.x || 7 }', [{ x: 5 }])
+    e2eTest('function optionalProperty(o) { return o?.x || 7 }', [undefined])
+    e2eTest('function optionalNested(o) { return o?.inner.x || 7 }', [{ inner: { x: 5 } }])
+    e2eTest('function optionalNested(o) { return o?.inner.x || 7 }', [undefined])
+    e2eTest('function optionalElement(o) { let i = 0; const x = o?.[(i++, "x")]; return i * 10 + (x || 0) }', [{ x: 5 }])
+    e2eTest('function optionalElement(o) { let i = 0; const x = o?.[(i++, "x")]; return i * 10 + (x || 0) }', [undefined])
+    e2eTest('function optionalCall(f, a) { return f?.(a) || 7 }', [(a: number) => a + 1, 4])
+    e2eTest('function optionalCall(f, a) { return f?.(a) || 7 }', [undefined, 4])
+    e2eTest('function optionalCallArgs(f) { let i = 0; f?.(i++); return i }', [() => 0])
+    e2eTest('function optionalCallArgs(f) { let i = 0; f?.(i++); return i }', [undefined])
+    e2eTest('function optionalMethod(o) { return o?.m() || 7 }', [{ x: 5, m() { return this.x } }])
+    e2eTest('function optionalMethod(o) { return o?.m() || 7 }', [undefined])
+    e2eTest('function optionalMethodCall(o) { return o.m?.() || 7 }', [{ x: 5, m() { return this.x } }])
+    e2eTest('function optionalMethodCall(o) { return o.m?.() || 7 }', [{}])
+
     // read after write
     e2eTest('function assignThenRead(o, y) { o.x = y; return o.x }', [{}, 7])
 
@@ -2850,6 +2964,7 @@ function runTest() {
 
     // default init
     e2eTest('function init(x, y = 1) { return x + y }', [1])
+    e2eTest('function initZero(x, y = 1) { return x + y }', [1, 0])
     e2eTestPrint('function init2(x, _ = 1) { return x }', [1])
     e2eTest('function init3(x, f, _ = f(x++)) { return x }', [1, () => 2])
     e2eTest('function init4(x, f, y = f()) { return x + y }', [1, () => 2, 3])
