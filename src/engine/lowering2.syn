@@ -516,6 +516,44 @@ function outlinePanics(g: Graph): Graph {
     return g
 }
 
+function stripJoins(g: Graph): Graph {
+    let hasJoin = false
+    for (const [id, n] of g.nodes) {
+        if (n.op !== 'join') continue
+        hasJoin = true
+        break
+    }
+    if (!hasJoin) return g
+
+    const blocks = new Map<number, GraphBlock>()
+    for (const b of g.blocks) blocks.set(b.id, b)
+    const epoch = nextEpoch(g)
+    const replacements = new Map<number, number>()
+    const visit = (n: GraphNode, vid: number) => {
+        if (!markVisited(n, epoch)) {
+            if (const x = replacements.get(vid)) return x
+            return
+        }
+        if (n.op === 'block') {
+            const b = blocks.get(vid)!
+            b.bodyId = forEachOperand(g, b.bodyId, visit)
+            return
+        }
+        if (n.op === 'join' && n.argIds.slice(0, -1).every(x => !x || g.nodes.get(x)?.op === 'heap-handle')) {
+            const x = forEachOperand(g, n.argIds[n.argIds.length-1], visit)
+            replacements.set(vid, x)
+            return x
+        }
+        const x = forEachOperand(g, vid, visit)
+        if (x !== vid) replacements.set(vid, x)
+        return x
+    }
+    const rootBlock = g.blocks[0]
+    rootBlock.bodyId = forEachOperand(g, rootBlock.bodyId, visit)
+    return g
+}
+
+
 export function inlineBlocks(g: Graph) {
     makeTailsUnique(g)
     transformVoids(g)
@@ -679,6 +717,7 @@ export function inlineBlocks(g: Graph) {
 export function packageBlocksFINAL(g: Graph) {
     g = outlineReturns(g)
     g = outlinePanics(g)
+    // g = stripJoins(g)
     const blocks = new Map<number, GraphBlock>()
     const successors = new Map<number, Set<number>>()
     const preds = new Map<number, Set<number>>()
@@ -956,7 +995,10 @@ export function packageBlocksFINAL(g: Graph) {
         }
     }
     if (solved.parameters.has(0)) {
+        console.log(solved)
+        console.log(dumpBlockGraph(g))
         console.log(dumpGraph(g))
+        console.log('placements', [...solved.parameters.get(0)!].map(x => solved.placements.get(x)))
         throw `found block 0 capturing a value: ${[...solved.parameters.get(0)!].join(', ')}`
     }
     const order: number[] = []
@@ -1406,9 +1448,20 @@ function optimizeValueGraph(g: Graph) {
             const n = g.nodes.get(skipAfter(id) ?? 0)
             return n?.op === 'apply' && n.argIds[0] === target.id
         }
+        const diverges = (id: number) => isUnreachable(skipAfter(id) ?? 0)
         const r = new Map<number, number>()
         for (const id of findValues(target.id, 'select') ?? []) {
             const n = g.nodes.get(id)!
+            if (diverges(n.argIds[2])) {
+                const x = createNode(g, 'after', [n.argIds[0], operand(n, 1)])
+                r.set(id, x)
+                continue
+            }
+            if (diverges(n.argIds[1])) {
+                const x = createNode(g, 'after', [n.argIds[0], operand(n, 2)])
+                r.set(id, x)
+                continue
+            }
             if (n.argIds.length !== 3 || loops(n.argIds[1]) || !loops(n.argIds[2])) continue
             const cond = g.nodes.get(n.argIds[0])
             if (!cond || !CompareOps.has(cond.op)) continue
@@ -1419,6 +1472,7 @@ function optimizeValueGraph(g: Graph) {
         if (!r.size) return false
         target.bodyId = replaceAll(target.bodyId, r)
         revisitBlock(target)
+        simplifySelect(target)
         return true
     }
 
@@ -1678,12 +1732,6 @@ function optimizeValueGraph(g: Graph) {
         return vid
     }
 
-    function cloneNode(n: GraphNode, argIds: number[], argConsts: Float64Array): number {
-        const id = g.maxId++
-        g.nodes.set(id, copyNode(n, argIds, argConsts))
-        return id
-    }
-
     function reduceOrdering(target: GraphBlock, unordered?: Set<number>) {
         const seen = new Set<number>()
         const replacements = new Map<number, number>()
@@ -1704,6 +1752,7 @@ function optimizeValueGraph(g: Graph) {
     }
 
     function reduceBlockOrdering(target: GraphBlock, unordered?: Set<number>): boolean {
+        let changed = false
         const epoch = nextEpoch(g)
         const replacements = new Map<number, number>()
         function visit(id: number): void {
@@ -1719,7 +1768,9 @@ function optimizeValueGraph(g: Graph) {
             for (let i = 0; i < end; i++) {
                 const q = replacements.get(n.argIds[i]) ?? n.argIds[i]
                 const ordering = simplifyOrdering(q, unordered, n)
-                if (ordering === q || (isNilOrVoid(ordering) && isNilOrVoid(q))) continue
+                if (ordering === q || (isNilOrVoid(ordering) && isNilOrVoid(q))) {
+                    continue
+                }
                 if (!argIds) argIds = n.argIds.slice()
                 if (!argConsts) argConsts = n.argConsts.slice()
                 argIds[i] = ordering ?? createNode(g, 'nil-effect', [])
@@ -1735,10 +1786,11 @@ function optimizeValueGraph(g: Graph) {
                 const q = argIds[i]
                 if (q) argIds[i] = replacements.get(q) ?? q
             }
-            replacements.set(id, cloneNode(n, argIds, argConsts))
+            g.nodes.set(id, copyNode(n, argIds, argConsts))
+            changed = true
         }
         visit(target.bodyId)
-        if (!replacements.size) return false
+        if (!changed && !replacements.size) return false
         target.bodyId = replaceAll(target.bodyId, replacements)
         revisitBlock(target)
         return true
@@ -2781,7 +2833,8 @@ function optimizeValueGraph(g: Graph) {
             return false
         }
         const isVoid = body.op === 'void'
-        if (!isVoid && !b.params.includes(bodyId)) return false
+        const isUnreachable = body.op === 'unreachable'
+        if (!isVoid && !isUnreachable && !b.params.includes(bodyId)) return false
 
         const applies = findInboundApplies(b)
         const byBlock = new Map<number, number[]>()
@@ -2794,9 +2847,12 @@ function optimizeValueGraph(g: Graph) {
             const r = new Map<number, number>()
             for (const x of v) {
                 const a = g.nodes.get(x)!
-                if (isVoid && !b.params.length) {
+                if ((isVoid || isUnreachable) && !b.params.length) {
                     r.set(x, b.bodyId)
                     continue
+                }
+                if (isUnreachable) {
+                    throw `todo: unreachable in a block with params`
                 }
                 const arg = a.argIds[1]
                 if (arg) {
@@ -3771,9 +3827,9 @@ function optimizeValueGraph(g: Graph) {
             if (step(closeCountedLoop, b)) continue
             step(reverseLoop, b)
             step(hoistInvariants, b)
+            if (step(eliminatePassthru, b)) continue
         }
         for (const b of reachableBlocks) {
-            if (step(eliminatePassthru, b)) continue
             step(rotateLoop, b)
             step(simplifySelect, b)
             step(reduceBlockOrdering, b)
@@ -5206,6 +5262,94 @@ function removeOrderingParams(g: Graph): Graph {
     return g
 }
 
+function checkCaptures(g: Graph) {
+    if (!intrinsics.argv().includes('check-captures')) return
+    const owners = new Map<number, number>()
+    for (const b of g.blocks) for (const p of b.params) owners.set(p, b.id)
+
+    const succs = new Map<number, Set<number>>()
+    const used = new Map<number, Set<number>>()
+    let targets = new Set<number>()
+    let params = new Set<number>()
+    let epoch = 0
+    function scan(n: GraphNode, id: number) {
+        if (!markVisited(n, epoch)) return
+        if (n.op === 'block') {
+            targets.add(id)
+            return
+        }
+        if (n.op === 'param') {
+            params.add(id)
+            return
+        }
+        forEachOperand(g, id, scan)
+    }
+    for (const b of g.blocks) {
+        targets = new Set<number>()
+        params = new Set<number>()
+        epoch = nextEpoch(g)
+        succs.set(b.id, targets)
+        used.set(b.id, params)
+        if (const body = g.nodes.get(b.bodyId)) scan(body, b.bodyId)
+    }
+
+    const entry = g.blocks[0].id
+    const order: number[] = []
+    const seen = new Set<number>([entry])
+    const pending = [entry]
+    while (pending.length) {
+        const id = pending.pop()!
+        order.push(id)
+        for (const s of succs.get(id) ?? []) {
+            if (seen.has(s)) continue
+            seen.add(s)
+            pending.push(s)
+        }
+    }
+    const preds = new Map<number, number[]>()
+    for (const id of order) preds.set(id, [])
+    for (const id of order) {
+        for (const s of succs.get(id) ?? []) {
+            if (seen.has(s)) preds.get(s)!.push(id)
+        }
+    }
+    const dominators = new Map<number, Set<number>>()
+    for (const id of order) dominators.set(id, new Set<number>(id === entry ? [entry] : order))
+    let changed = true
+    while (changed) {
+        changed = false
+        for (const id of order) {
+            if (id === entry) continue
+            const incoming = preds.get(id)!
+            if (!incoming.length) continue
+            const next = new Set<number>()
+            for (const x of dominators.get(incoming[0])!) {
+                let all = true
+                for (let i = 1; i < incoming.length; i++) {
+                    if (dominators.get(incoming[i])!.has(x)) continue
+                    all = false
+                    break
+                }
+                if (all) next.add(x)
+            }
+            next.add(id)
+            if (next.size === dominators.get(id)!.size) continue
+            dominators.set(id, next)
+            changed = true
+        }
+    }
+
+    for (const id of order) {
+        for (const p of used.get(id) ?? []) {
+            const owner = owners.get(p)
+            if (owner === undefined || owner === id) continue
+            if (dominators.get(id)!.has(owner)) continue
+            console.log(dumpGraph(g))
+            throw `lowering2: ${g.name || '<anonymous>'} impossible capture of %${p} owned by B${owner} used in B${id}`
+        }
+    }
+}
+
 export function normalizeValueGraph(g: Graph): Graph {
     const profile = intrinsics.argv().includes('graph-transform-cost')
     const profileThresh = 1 // ms, only affects display
@@ -5223,6 +5367,7 @@ export function normalizeValueGraph(g: Graph): Graph {
             g = transform(g) ?? g
             if (optimizeTimers) optimizeTimers.set(`normalize:${name}`, (optimizeTimers.get(`normalize:${name}`) ?? 0) + performance.now() - start)
             checkOrder(name)
+            checkCaptures(g)
             return
         }
         const beforeNodes = g.nodes.size
@@ -5240,7 +5385,7 @@ export function normalizeValueGraph(g: Graph): Graph {
     function checkOrder(stage: string) {
         if (orderViolations) checkCreationOrder(g, stage, orderViolations)
     }
-
+    checkCaptures(g)
     const normalizeStart = performance.now()
     checkOrder('trace')
     run(inlineBlocks)
@@ -5255,11 +5400,10 @@ export function normalizeValueGraph(g: Graph): Graph {
     // validate
     {
         const blocks = new Map<number, GraphBlock>()
-        const seen = new Set<number>()
+        const epoch = nextEpoch(g)
         function visit(n: GraphNode, id: number) {
             if (n.op === 'block') {
-                if (seen.has(id)) return
-                seen.add(id)
+                if (!markVisited(n, epoch)) return
                 forEachOperand(g, blocks.get(id)!.bodyId, visit)
                 return
             }
@@ -6472,7 +6616,11 @@ function specializeBlockApplications(g: Graph): Graph {
     let nextId = g.maxId
     type Value = { id: number, value: number }
     const interned = new Map<string, number>()
-    for (const [id, n] of nodes) if (n.op !== 'param' && n.op !== 'block') interned.set(nodeKey(n), id)
+    for (const [id, n] of nodes) {
+        if (n.op === 'param' || n.op === 'block' || n.op === 'nil-effect') continue
+        const key = nodeKey(n)
+        interned.set(key, id)
+    }
     function intern(n: GraphNode): Value {
         const k = nodeKey(n)
         let id = interned.get(k)
@@ -6480,55 +6628,81 @@ function specializeBlockApplications(g: Graph): Graph {
             id = nextId++
             nodes.set(id, n)
             interned.set(k, id)
+            if ((PureOps.has(n.op) || n.op === 'after') && n.argIds.every(a => pure.has(a))) pure.add(id)
         }
         return { id, value: 0 }
     }
+    function ordering(values: Value[]): Value {
+        const frontier = new Set<number>()
+        const seen = new Set<number>()
+        function collect(id: number): void {
+            if (!id || pure.has(id) || seen.has(id)) return
+            seen.add(id)
+            const n = nodes.get(id)!
+            if (n.op === 'select' || (n.op !== 'after' && !PureOps.has(n.op))) frontier.add(id)
+            else for (const a of n.argIds) collect(a)
+        }
+        for (const v of values) collect(v.id)
+        const implied = new Set<number>()
+        function dependencies(id: number): void {
+            if (!id || pure.has(id) || implied.has(id)) return
+            implied.add(id)
+            const n = nodes.get(id)!
+            if (n.op === 'select') dependencies(n.argIds[0])
+            else for (const a of n.argIds) dependencies(a)
+        }
+        if (frontier.size > 1) {
+            for (const id of frontier) for (const a of nodes.get(id)!.argIds) dependencies(a)
+        }
+        const ids = [...frontier].filter(id => !implied.has(id))
+        if (!ids.length) return { id: 0, value: 0 }
+        if (ids.length === 1) return { id: ids[0], value: 0 }
+        const empty = intern(makeNode('void', [], new Float64Array(0)))
+        return intern(makeNode('after', [...ids, empty.id], new Float64Array(ids.length + 1)))
+    }
     const active = new Set<number>()
-    const paramUses = new Map<number, Set<number>>()
-    function referencedParams(block: GraphBlock): Set<number> {
-        const known = paramUses.get(block.id)
+    const entryTokens = new Map<number, number[]>()
+    function tokensOf(block: GraphBlock): number[] {
+        const known = entryTokens.get(block.id)
         if (known) return known
-        const uses = new Set<number>()
-        const params = new Set(block.params)
+        const tokens: number[] = []
         const epoch = nextEpoch(g)
         function walk(id: number): void {
             if (!id) return
             const n = nodes.get(id)
-            if (!n || !markVisited(n, epoch)) return
-            if (params.has(id)) { uses.add(id); return }
+            if (!n || !markVisited(n, epoch) || n.op === 'param' || n.op === 'block') return
+            if (n.op === 'nil-effect') { tokens.push(id); return }
             for (const x of n.argIds) walk(x)
         }
         walk(block.bodyId)
-        paramUses.set(block.id, uses)
-        return uses
+        entryTokens.set(block.id, tokens)
+        return tokens
     }
-    function rewrite(id: number, value: number, env: Map<number, Value>, memo: Map<number, Value>): Value {
+    function rewrite(id: number, value: number, env: Map<number, Value>, memo: Map<number, Value>, before: Value = { id: 0, value: 0 }): Value {
         if (!id) return { id, value }
         const replacement = env.get(id) ?? memo.get(id)
         if (replacement) return replacement
         const n = nodes.get(id)
-        if (!n || n.op === 'param' || n.op === 'block') return { id, value: 0 }
-        const args = n.argIds.map((a, i) => rewrite(a, n.argConsts[i], env, memo))
+        if (!n || n.op === 'param' || n.op === 'block' || n.op === 'nil-effect') return { id, value: 0 }
+        const args: Value[] = []
+        for (let i = 0; i < n.argIds.length; i++) {
+            const prior = n.op === 'after' && i === n.argIds.length - 1 ? ordering([before, ...args])
+                : n.op === 'select' && i > 0 ? ordering([before, args[0]]) : before
+            args.push(rewrite(n.argIds[i], n.argConsts[i], env, memo, prior))
+        }
         let result: Value | undefined
         const block = n.op === 'apply' ? candidates.get(n.argIds[0]) : undefined
         if (block && !active.has(block.id) && (nodes.get(block.bodyId)?.op === 'apply'
             || applications.get(block.id) === 1 || args.slice(1).some(arg => !arg.id))) {
             const bindings = new Map(env)
             for (let i = 0; i < block.params.length; i++) bindings.set(block.params[i], args[i + 1])
+            const o = ordering([before, ...args.slice(1)])
+            if (o.id) for (const token of tokensOf(block)) bindings.set(token, o)
             active.add(block.id)
-            result = rewrite(block.bodyId, block.bodyConst, bindings, new Map())
+            result = rewrite(block.bodyId, block.bodyConst, bindings, new Map(), o)
             active.delete(block.id)
-            const uses = referencedParams(block)
-            const dropped: number[] = []
-            for (let i = 0; i < block.params.length; i++) {
-                const arg = args[i + 1]
-                if (!arg.id || pure.has(arg.id) || uses.has(block.params[i]) || dropped.includes(arg.id)) continue
-                dropped.push(arg.id)
-            }
-            if (dropped.length) {
-                result = intern(makeNode('after', [...dropped, result.id],
-                    new Float64Array([...dropped.map(() => 0), result.value]), n.T, n.U))
-            }
+            if (o.id) result = intern(makeNode('after', [o.id, result.id],
+                new Float64Array([0, result.value]), n.T, n.U))
         } else if (n.op === 'select') {
             if (!args[0].id) result = args[0].value ? args[1] : args[2]
             else if (args[1].id === args[2].id && (args[1].id || Object.is(args[1].value, args[2].value))) {
