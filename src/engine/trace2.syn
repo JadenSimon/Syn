@@ -3,10 +3,11 @@
 "use wrapped";
 
 import ts from 'typescript' // XXX: used for `api.zig`
+import * as gn from './graph-node'
 import * as intrinsics from './intrinsics'
 import * as bytecode from './bytecode-emitter'
 import {
-    Op, createInterpreter, frameSize, frameRegs, isVmHandle, rawArgs, rawValue,
+    Op, createInterpreter, frameSize, frameRegs, isVmHandle, rawValue,
     symbolOf, symbolValue, tagVmHandle, traceCell, traceValue, vmHandle, vmValue,
 } from './vm'
 import * as lowering2 from './lowering2'
@@ -337,7 +338,7 @@ export interface TraceSession {
     symbolicProxySet: Function
     symbolicError: Function
     runtime?: TraceRuntime
-    mk(op: string, args: Float64Array, label?: string, types?: intrinsics.Types[]): any
+    mk(op: string, args: number[], label?: string, types?: intrinsics.Types[]): any
     fromJsValue(v: any): u32
     linkFunction(f: Function): u32
     compileSource(code: string): CompiledSource
@@ -441,7 +442,7 @@ export function createTraceSession(): TraceSession {
     const compiledSources = new Map<string, CompiledSource>()
     const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
     let runtime: TraceRuntime | undefined
-    let nodeCache: Map<string, number> | undefined
+    let nodeCache: Map<string | number, number> | undefined
 
     const ctx: Record<string, any> = {
         Intrinsics: intrinsicContext, Math: math, Object: objectBuiltins, Error: symbolicError,
@@ -479,27 +480,32 @@ export function createTraceSession(): TraceSession {
         return heap.boxF64(v.ptr as f64)
     }
 
-    function mk(op: string, args: Float64Array, label: string = '', types?: intrinsics.Types[]): any {
+    function mk(op: string, args: number[], label: string = '', types?: intrinsics.Types[]): any {
         const r = runtime
         if (!r) throw 'trace: mk requires an open trace'
+        const typeSlots = gn.typeSlots(op)
+        const slots = new Uint32Array(args.length + typeSlots)
         const tracer = r.tracer
-        const argIds: number[] = []
-        const argConsts = new Float64Array(args.length)
         const parts: string[] = [op, label]
-        if (types) for (const T of types) parts.push(`t${T}`)
+        if (types && typeSlots) for (const T of types) parts.push(`t${T}`)
         for (let i = 0; i < args.length; i++) {
             const id = symbolOf(args[i])
             const k = id ? 0 : vmValue(args[i] as u32)
-            argIds.push(id)
-            argConsts[i] = k
+            slots[i] = gn.encodeSlot(id, k) as u32
             parts.push(id ? `v${id}` : `c${k}`)
         }
         const key = parts.join('|')
         if (const hit = nodeCache!.get(key)) return hit
+        if (typeSlots === 1) {
+            slots[args.length] = gn.encodeSlot(0, types?.[0] ?? Types.u64) as u32
+        }
+        if (typeSlots === 2) {
+            slots[args.length + 1] = gn.encodeSlot(0, types?.[1] ?? Types.u64) as u32
+        }
         const id = newNodeId(tracer)
         const handle = symbolValue(id)
         nodeCache!.set(key, handle)
-        r.nodes.set(id, makeNode(op, argIds, argConsts, types?.[0], types?.[1]))
+        r.nodes.set(id, gn.makeNodeFromSlots(op, slots))
         if (label) setDebugLabel(r, id, label)
         return handle
     }
@@ -652,7 +658,7 @@ export interface TraceOptions {
     mapCapture?: (capture: any) => any
     shouldInline?: (fn: Function) => boolean
     session?: TraceSession
-    inputs?: { thisArg: any, args: Float64Array, effect: any }
+    inputs?: { thisArg: any, args: number[], effect: any }
     shapes?: (intrinsics.Handle | undefined)[]
     name?: string
     self?: Function
@@ -739,10 +745,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const tokenId = symbolOf(token)
         if (!tokenId || tokenId === symbolOf(nilEffect)) return v
         if (symbolOf(v) === tokenId) return v
-        const a = new Float64Array(2)
-        a[0] = token
-        a[1] = v
-        return mk('after', a)
+        return mk('after', [token, v])
     }
 
    function valToString(v: any) {
@@ -812,11 +815,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function memoryLoad(ptr: any, offset: any, T: number): f64 {
         const token = readToken()
-        const args = new Float64Array(3)
-        args[0] = lastWrite(token)
-        args[1] = ptr
-        args[2] = offset
-        const loaded = mk('load', args, '', [T as intrinsics.Types])
+        const loaded = mk('load', [lastWrite(token), ptr, offset], '', [T as intrinsics.Types])
         writeToken(after(loaded, token))
         return loaded
     }
@@ -894,13 +893,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const state = objects.snapshot(cell as intrinsics.Handle)
         if (!state) return value
         const keys = dataKeys(state as u32)
-        const args = new Float64Array(2 + keys.length)
-        args[0] = traceValue(cell)
-        args[1] = traceValue(state)
-        for (let i = 0; i < keys.length; i++) {
-            const slot = slotOf(state as u32, keys[i])
-            args[2 + i] = traceValue(heap.isBoxedF64(slot as intrinsics.Handle)
-                ? heap.unboxF64(slot as intrinsics.Handle) : slot)
+        const args = [traceValue(cell), traceValue(state)]
+        for (const key of keys) {
+            const slot = slotOf(state as u32, key) as intrinsics.Handle
+            args.push(traceValue(heap.isBoxedF64(slot) ? heap.unboxF64(slot) : slot))
         }
         return mk('heap-handle', args, '', [Types.handle])
     }
@@ -935,16 +931,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (nargs !== native.__args.length) {
                 throw `trace2: native fn expected ${native.__args.length} args, got ${nargs}`
             }
-            const args = new Float64Array(3 + nargs)
-            args[0] = readToken()
-            const lt = isLocal ? new Float64Array(1) : undefined
-            if (lt) lt[0] = traceValue(native.__localTarget)
-            args[1] = isLocal
-                ? mk('local-target', lt!, native.__name ?? '', [Types.fnptr])
+            const target = isLocal
+                ? mk('local-target', [traceValue(native.__localTarget)], native.__name ?? '', [Types.fnptr])
                 : traceValue(native.__native)
-            args[2] = 0
-            for (let i = 0; i < nargs; i++) args[i + 3] = escapedArg(regStart, i)
-            const value = traceValue(tracer.traceOp('call', rawArgs(args), native.__returns))
+            const args = [readToken(), target, 0]
+            for (let i = 0; i < nargs; i++) args.push(escapedArg(regStart, i))
+            const value = mk('call', args, '', [native.__returns])
             writeToken(value)
             tracer.markHandled()
             return { value }
@@ -996,9 +988,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const pc = callArg(regStart, 0)
             tracer.markHandled()
             if (intrinsics.getNanId(pc)) return { value: traceValue(pc) }
-            const args = new Float64Array(1)
-            args[0] = traceValue(pc)
-            return { value: mk('dispatch', args) }
+            return { value: mk('dispatch', [traceValue(pc)]) }
         }
         if (linked === session.objectBuiltins.assign) {
             const target = cellOf(mem[regStart]) || callArg(regStart, 0) as u32
@@ -1015,8 +1005,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         }
         if (((linked as any).shouldInline || opts.shouldInline?.(linked))
             && typeof (linked as any)[Symbol.for('toComputation')] === 'function') {
-            const args = new Float64Array(nargs)
-            for (let i = 0; i < nargs; i++) args[i] = graphCallArg(regStart, i)
+            const args: number[] = []
+            for (let i = 0; i < nargs; i++) args.push(graphCallArg(regStart, i))
             const effect = readToken()
             let nested: ReturnType<typeof trace2> | undefined
             tracer.setActive(false)
@@ -1049,15 +1039,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (nargs !== syscall.__args.length) {
                 throw `trace2: syscall ${syscall.__syscall} expected ${syscall.__args.length} args, got ${nargs}`
             }
-            const signatureArgs = new Float64Array(1)
-            signatureArgs[0] = traceValue(syscall.__syscall)
-            const target = mk('syscall-target', signatureArgs, '', [syscall.__returns, ...syscall.__args])
-            const args = new Float64Array(3 + nargs)
-            args[0] = readToken()
-            args[1] = target
-            args[2] = 0
-            for (let i = 0; i < nargs; i++) args[i + 3] = graphCallArg(regStart, i)
-            const value = traceValue(tracer.traceOp('call', rawArgs(args), syscall.__returns))
+            const target = mk('syscall-target', [traceValue(syscall.__syscall)], '',
+                [syscall.__returns, ...syscall.__args])
+            const args = [readToken(), target, 0]
+            for (let i = 0; i < nargs; i++) args.push(graphCallArg(regStart, i))
+            const value = mk('call', args, '', [syscall.__returns])
             writeToken(value)
             tracer.markHandled()
             return { value }
@@ -1126,7 +1112,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         },
         voidvalue: () => {
             tracer.markHandled()
-            return rawValue(mk('void', emptyState, '', [Types.u32]))
+            return rawValue(mk('void', [], '', [Types.u32]))
         },
         shapeof: (value) => {
             const shape = shapeOfValue(traceValue(intrinsics.getNanId(value) ? value : heap.unboxF64(value)))
@@ -1174,34 +1160,24 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 })
             }
             if (intrinsicName) {
-                const iargs = new Float64Array(nargs)
-                for (let i = 0; i < nargs; i++) iargs[i] = mem[regStart + i * 4]
+                const iargs: number[] = []
+                for (let i = 0; i < nargs; i++) iargs.push(mem[regStart + i * 4])
                 if (intrinsicName === 'callcontext') {
                     tracer.markHandled()
-                    return tagCallResult(mk('call-context', new Float64Array(0), '', [Types.usize]))
+                    return tagCallResult(mk('call-context', [], '', [Types.usize]))
                 }
                 if (intrinsicName === 'load' && vmValue(iargs[2] as u32) === Types.fnptr) {
                     const loaded = memoryLoad(iargs[0], iargs[1], Types.fnptr)
                     let context = iargs[0]
                     if (symbolOf(iargs[1]) || vmValue(iargs[1] as u32) !== 0) {
-                        const addressArgs = new Float64Array(2)
-                        addressArgs[0] = iargs[0]
-                        addressArgs[1] = iargs[1]
-                        context = mk('add', addressArgs, '', [Types.usize, Types.usize])
+                        context = mk('add', [iargs[0], iargs[1]], '', [Types.usize, Types.usize])
                     }
-                    const targetArgs = new Float64Array(2)
-                    targetArgs[0] = loaded
-                    targetArgs[1] = context
                     tracer.markHandled()
-                    return tagCallResult(mk('indirect-target', targetArgs, '', [Types.fnptr]))
+                    return tagCallResult(mk('indirect-target', [loaded, context], '', [Types.fnptr]))
                 }
                 if (intrinsicName === 'store') {
-                    const sargs = new Float64Array(4)
-                    sargs[0] = readToken()
-                    sargs[1] = iargs[0]
-                    sargs[2] = iargs[1]
-                    sargs[3] = iargs[2]
-                    const v = mk('store', sargs, '', [vmValue(iargs[3] as u32) as intrinsics.Types])
+                    const v = mk('store', [readToken(), iargs[0], iargs[1], iargs[2]], '',
+                        [vmValue(iargs[3] as u32) as intrinsics.Types])
                     writeToken(v)
                     tracer.markHandled()
                     return tagCallResult(0)
@@ -1211,7 +1187,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                     tracer.markHandled()
                     return tagCallResult(loaded)
                 }
-                const result = (Intrinsics as any)[intrinsicName](...rawArgs(iargs))
+                const result = (Intrinsics as any)[intrinsicName](...iargs.map(rawValue))
                 tracer.markHandled()
                 return tagCallResult(traceValue(result))
             }
@@ -1219,14 +1195,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 const result = callLinked(linked, thisArg, regStart, nargs)
                 if (result) return tagCallResult(result.value)
             }
-            const cargs = new Float64Array(3 + nargs)
-            cargs[0] = readToken()
-            const a = new Float64Array(1)
-            a[0] = traceValue(callee)
-            cargs[1] = intrinsics.getNanId(callee) ? traceValue(callee) : mk('heap-handle', a, '', [Types.handle])
-            cargs[2] = traceValue(thisArg)
-            for (let i = 0; i < nargs; i++) cargs[3+i] = escapedArg(regStart, i)
-            const v = traceValue(tracer.traceOp('call', rawArgs(cargs), Types.u32))
+            const calleeValue = intrinsics.getNanId(callee)
+                ? traceValue(callee)
+                : mk('heap-handle', [traceValue(callee)], '', [Types.handle])
+            const cargs = [readToken(), calleeValue, traceValue(thisArg)]
+            for (let i = 0; i < nargs; i++) cargs.push(escapedArg(regStart, i))
+            const v = mk('call', cargs, '', [Types.u32])
             writeToken(v)
             tracer.markHandled()
             return tagCallResult(v)
@@ -1374,11 +1348,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 throw `heap record: input s${slot} of B${R.header} changes identity across the back edge from B${from}`
             }
         }
-        const args = new Float64Array(R.inputs.length + heapState.size + 1)
-        args[0] = symbolValue(R.selfId) as any
-        for (let i = 0; i < R.inputs.length; i++) args[i + 1] = ins[R.inputs[i]]
-        let i = R.inputs.length + 1
-        for (const value of heapState.values()) args[i++] = value as f64
+        const args = [symbolValue(R.selfId)]
+        for (const slot of R.inputs) args.push(ins[slot])
+        for (const value of heapState.values()) args.push(value)
         return mk('apply', args)
     }
 
@@ -1403,10 +1375,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (!cell) return value
         const state = objects.snapshot(cell as intrinsics.Handle)
         if (!state) return value
-        const args = new Float64Array(2)
-        args[0] = traceValue(cell)
-        args[1] = traceValue(state)
-        return mk('heap-handle', args, '', [Types.handle])
+        return mk('heap-handle', [traceValue(cell), traceValue(state)], '', [Types.handle])
     }
 
     function makeProxy(proto: u32): u32 {
@@ -1445,16 +1414,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const id = symbolOf(value)
         const n = nodes.get(id)
         if (n?.op === 'param' && !countIds(n) && !regionalParams.has(id)) return opaqueObject(value)
-        if (tracer.getTraceById(id)?.op === 'call') return opaqueObject(value)
-        throw `trace2: no shape for symbolic receiver ${id} (${n?.op ?? tracer.getTraceById(id)?.op ?? 'unknown'})`
+        if (nodeOf(id)?.op === 'call') return opaqueObject(value)
+        throw `trace2: no shape for symbolic receiver ${id} (${nodeOf(id)?.op ?? 'unknown'})`
     }
 
     function proxyRead(target: Proxied, key: intrinsics.Handle): any {
         if (!target.joined) {
-            const args = new Float64Array(2)
-            args[0] = target.param
-            args[1] = traceValue(key)
-            return mk('property', args, '', [Types.u64])
+            return mk('property', [target.param, traceValue(key)], '', [Types.u64])
         }
         const read = objects.readJoined(target.joined, target.group!, key)
         if (read.group !== undefined) return handleValue(joinedObject(target.joined, read.group))
@@ -1481,9 +1447,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
         }
         handle = cell
-        const args = new Float64Array(1)
-        args[0] = traceValue(handle)
-        return mk('heap-handle', args, '', [Types.handle])
+        return mk('heap-handle', [traceValue(handle)], '', [Types.handle])
     }
 
     function dataKeys(handle: u32): u32[] {
@@ -1596,9 +1560,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function panic(v: any, token: any) {
         if (isTerminalValue(v)) return v
-        const args = new Float64Array(1)
-        args[0] = after(v, token)
-        return mk('panic', args)
+        return mk('panic', [after(v, token)])
     }
 
     function ret(v: any, tag = fnId) {
@@ -1612,10 +1574,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 return ret(after(operand(u, 0), symbolValue(getRef(n, 0))), tag)
             }
         }
-        const args = new Float64Array(2)
-        args[0] = v
-        args[1] = traceValue(tag)
-        return mk('ret', args)
+        return mk('ret', [v, traceValue(tag)])
     }
 
     function inlined(v: any): any {
@@ -1642,19 +1601,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (simple) return operand(n, 0)
         }
         if (n?.op === 'panic') return v
-        const args = new Float64Array(1)
-        args[0] = v
-        return mk('inlined', args)
+        return mk('inlined', [v])
     }
 
     function selectValues(cond: any, a: any, b: any): any {
         const union = unionValues(a, b)
         if (union !== undefined) return union
-        const args = new Float64Array(3)
-        args[0] = cond
-        args[1] = a
-        args[2] = b
-        return mk('select', args)
+        return mk('select', [cond, a, b])
     }
 
     function isTerminalValue(val: any) {
@@ -1664,7 +1617,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function unreachable() {
-        return mk('unreachable', new Float64Array(0))
+        return mk('unreachable', [])
     }
 
     function getOrderingFromInlined(val: any, incoming: any): any {
@@ -1674,12 +1627,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const n = nodeOf(id)
         if (!n) return nilEffect
         if (n.op === 'select') {
-            const rem = new Float64Array(countIds(n))
-            rem[0] = operand(n, 0)
+            const rem: number[] = [operand(n, 0)]
             let changed = false
             for (let i = 1; i < countIds(n); i++) {
                 const nv = getOrderingFromInlined(operand(n, i), incoming)
-                rem[i] = nv
+                rem.push(nv)
                 if (!changed && symbolOf(nv) !== getRef(n, i)) {
                     changed = true
                 }
@@ -1844,9 +1796,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function nonzeroOf(id: number): any {
-        const one = new Float64Array(1)
-        one[0] = symbolValue(id) as any
-        return mk('nonzero', one)
+        return mk('nonzero', [symbolValue(id)])
     }
 
     function againstZero(t: Node): number {
@@ -1884,7 +1834,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const ins = new Float64Array(slotCount)
     for (let i = 0; i < compiled.paramCount; i++) {
         if (opts.inputs) {
-            ins[i] = i < opts.inputs.args.length ? opts.inputs.args[i] : 0
+            ins[i] = i < opts.inputs.args.length ? opts.inputs.args[i] as f64 : 0
         } else if (opts.shapes?.[i]) {
             const standIn = heap.shallowClone(opts.shapes[i]!) as u32
             for (const key of dataKeys(standIn)) {
@@ -1906,7 +1856,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             ins[i] = symbolValue(id)
         }
     }
-    if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', new Float64Array(0))
+    if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', [])
     nilEffect = runtime.nilEffect
     ins[ACC] = thisValue
     ins[TOKEN] = opts.inputs?.effect ?? nilEffect
