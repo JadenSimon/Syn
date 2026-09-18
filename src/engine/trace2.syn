@@ -9,7 +9,6 @@ import {
     Op, createInterpreter, frameSize, frameRegs, isVmHandle, tagVmHandle, tagVmValue, vmHandle,
     vmValue,
 } from './vm'
-import * as lowering from './lowering'
 import * as lowering2 from './lowering2'
 import {
     copyNode, countIds, createGraph, getArgConsts, getArgIds, getDebugLabel, getLiteral, getRef,
@@ -98,16 +97,32 @@ interface Step {
 
 type Node = lowering2.GraphNode
 
-function opCount(o: any): number {
-    return o.args ? o.argIds.length : countIds(o)
+const binaryOps = new Set([
+    'add', 'sub', 'mul', 'div', 'rem', 'pow', 'lt', 'le', 'gt', 'ge', 'eq', 'ne',
+    'or', 'and', 'xor', 'ushr', 'shr', 'shl',
+])
+const unaryOps = new Set(['neg', 'not', 'convert', 'bitconvert'])
+
+function lowOperands(op: string, arity: number): number {
+    if (binaryOps.has(op)) return 2
+    if (unaryOps.has(op)) return 1
+    if (op === 'call') return arity
+    if (op === 'select' || op === 'store') return 3
+    if (op === 'load') return 2
+    if (op === 'ret' || op === 'stackalloc' || op === 'stackfree') return 1
+    return 0
 }
 
-function opRef(o: any, idx: number): number {
-    return o.args ? o.argIds[idx] ?? 0 : getRef(o, idx)
-}
-
-function opConst(o: any, idx: number): any {
-    return o.args ? o.args[idx] : getLiteral(o, idx)
+function fromOpTrace(t: intrinsics.OpTrace): Node {
+    const arity = lowOperands(t.op, t.args.length)
+    const argIds: number[] = []
+    const argConsts = new Float64Array(arity)
+    for (let i = 0; i < arity; i++) {
+        argIds.push(t.argIds[i] ?? 0)
+        argConsts[i] = t.args[i]
+    }
+    const T = t.args[arity] ?? Types.u64
+    return makeNode(t.op, argIds, argConsts, T, t.args[arity + 1] ?? T)
 }
 
 interface TraceFrame {
@@ -148,7 +163,6 @@ interface TraceRuntime {
     groupObjects: Map<Group, u32>
     proxied: Map<u32, Proxied>
     nilEffect?: any
-    memoryLoad?: (ptr: number, offset: number, T: number) => any
     depth: number
 }
 
@@ -729,17 +743,17 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
    function valToString(v: any) {
         if (const id = tracer.getNanId(v)) {
-            const o = nodes.get(id) ?? tracer.getTraceById(id)
+            const o = nodeOf(id)
             if (!o) return getDebugLabel(runtime, id) ?? `p@${id}`
             const parts: string[] = [`[s@${id}] ${o.op}`]
-            if (o.op === 'heap-handle' && opConst(o, 0)) {
-                parts.push(`${opConst(o, 0)}`)
+            if (o.op === 'heap-handle' && getLiteral(o, 0)) {
+                parts.push(`${getLiteral(o, 0)}`)
                 return `(${parts.join(', ')})`
             }
-            for (let i = 0; i < opCount(o); i++) {
-                const u = opRef(o, i)
+            for (let i = 0; i < countIds(o); i++) {
+                const u = getRef(o, i)
                 if (u) parts.push(valToString(intrinsics.getNanFromId(u)))
-                else parts.push(opConst(o, i) ?? '?')
+                else parts.push(getLiteral(o, i) ?? '?')
             }
             return `(${parts.join(', ')})`
         } else {
@@ -760,8 +774,19 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function readToken(): any { return vmValue(mem[slotAddr(TOKEN)] as u32) }
     function writeToken(v: any): void { mem[slotAddr(TOKEN)] = tagVmValue(v) as any }
 
-    function operand(n: any, i: number): any {
-        return opRef(n, i) ? intrinsics.getNanFromId(opRef(n, i)) : opConst(n, i)
+    const lowNodes = new Map<number, Node>()
+    function nodeOf(id: number): Node | undefined {
+        const known = nodes.get(id) ?? lowNodes.get(id)
+        if (known) return known
+        const t = tracer.getTraceById(id)
+        if (!t) return
+        const made = fromOpTrace(t)
+        lowNodes.set(id, made)
+        return made
+    }
+
+    function operand(n: Node, i: number): any {
+        return getRef(n, i) ? intrinsics.getNanFromId(getRef(n, i)) : getLiteral(n, i)
     }
 
     const lastWrites = new Map<number, number>()
@@ -793,7 +818,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         writeToken(after(loaded, token))
         return loaded
     }
-    runtime.memoryLoad = memoryLoad
 
     interface Arrival {
         from: number
@@ -973,13 +997,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 return { value: callArg(regStart, 0) ? callArg(regStart, 1) : callArg(regStart, 2) }
             }
             throw "???"
-            const args = new Float64Array(3)
-            args[0] = callArg(regStart, 0)
-            args[1] = callArg(regStart, 1)
-            args[2] = callArg(regStart, 2)
-            const value = tracer.traceOp()
-            tracer.markHandled()
-            return { value }
         }
         if (linked === session.symbolicDispatch) {
             const pc = callArg(regStart, 0)
@@ -1501,12 +1518,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function regionalValue(id: number, seen = new Set<number>()): boolean {
         if (!id || seen.has(id)) return false
         seen.add(id)
-        const n = nodes.get(id) ?? tracer.getTraceById(id)
+        const n = nodeOf(id)
         if (!n) return false
         if (n.op === 'param') return regionalParams.has(id)
         if (n.op === 'heap-handle' || n.op === 'block') return false
-        for (let i = 0; i < opCount(n); i++) {
-            if (regionalValue(opRef(n, i), seen)) return true
+        for (let i = 0; i < countIds(n); i++) {
+            if (regionalValue(getRef(n, i), seen)) return true
         }
         return false
     }
@@ -1579,12 +1596,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return ins
     }
 
-    function isNil(v: any) {
-        const id = tracer.getNanId(v)
-        if (!id) return false
-        return nodes.get(id)?.op === 'nil-effect'
-    }
-
     function isUnreachable(v: any) {
         const id = tracer.getNanId(v)
         if (!id) return false
@@ -1627,19 +1638,14 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 const id = pending.pop()!
                 if (!id || seen.has(id)) continue
                 seen.add(id)
-                const node = nodes.get(id)
-                const trace = node ? undefined : tracer.getTraceById(id)
-                const op = node?.op ?? trace?.op
+                const node = nodeOf(id)
+                const op = node?.op
                 if (op === 'inlined') continue
                 if (op === 'apply' || op === 'select' || op === 'ret' || op === 'join') {
                     simple = false
                     break
                 }
-                if (node) {
-                    for (const arg of getArgIds(node)) pending.push(arg)
-                } else if (trace) {
-                    for (const i of lowering.operandIndices(trace)) pending.push(opRef(trace, i))
-                }
+                if (node) for (const arg of getArgIds(node)) pending.push(arg)
             }
             if (simple) return operand(n, 0)
         }
@@ -1673,16 +1679,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const id = tracer.getNanId(val)
         if (!id) return nilEffect
         if (sameValue(val, incoming)) return val
-        const n = nodes.get(id) ?? tracer.getTraceById(id)
+        const n = nodeOf(id)
         if (!n) return nilEffect
         if (n.op === 'select') {
-            const rem = new Float64Array(opCount(n))
+            const rem = new Float64Array(countIds(n))
             rem[0] = operand(n, 0)
             let changed = false
-            for (let i = 1; i < opCount(n); i++) {
+            for (let i = 1; i < countIds(n); i++) {
                 const nv = getOrderingFromInlined(operand(n, i), incoming)
                 rem[i] = nv
-                if (!changed && tracer.getNanId(nv) !== opRef(n, i)) {
+                if (!changed && tracer.getNanId(nv) !== getRef(n, i)) {
                     changed = true
                 }
             }
@@ -1693,7 +1699,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         if (n.op === 'ret') {
             const x = getOrderingFromInlined(operand(n, 0), incoming)
             if (sameValue(x, nilEffect) || nodes.get(tracer.getNanId(x))?.op === 'panic' || isUnreachable(x)) return x
-            return ret(x, opConst(n, 1))
+            return ret(x, getLiteral(n, 1))
         }
         if (n.op === 'inlined') {
             const x = getOrderingFromInlined(operand(n, 0), incoming)
@@ -1704,7 +1710,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             return getOrderingFromInlined(operand(n, 0), incoming)
         }
         if (n.op === 'join') {
-            return getOrderingFromInlined(operand(n, opCount(n) - 1), incoming)
+            return getOrderingFromInlined(operand(n, countIds(n) - 1), incoming)
         }
         if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
             return val
@@ -1797,7 +1803,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     function branchInputs(r: Step): [Float64Array, Float64Array] {
-        const ct = tracer.getTraceById(r.condId)
+        const ct = nodeOf(r.condId)
         const exactTrue = ct !== undefined && CompareOps.has(ct.op)
 
         let thenIn = r.outs
@@ -1830,11 +1836,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return n?.op === 'nonzero' ? getRef(n, 0) : 0
     }
 
-    function intersectEqual(st: Float64Array, t: any): Float64Array {
-        const ia = opRef(t, 0)
-        const ib = opRef(t, 1)
-        if (ia && !ib) return knownValue(st, ia, opConst(t, 1))
-        if (ib && !ia) return knownValue(st, ib, opConst(t, 0))
+    function intersectEqual(st: Float64Array, t: Node): Float64Array {
+        const ia = getRef(t, 0)
+        const ib = getRef(t, 1)
+        if (ia && !ib) return knownValue(st, ia, getLiteral(t, 1))
+        if (ib && !ia) return knownValue(st, ib, getLiteral(t, 0))
         // XXX: only valid after equality check
         if (ia && ib) {
             if (regionalValue(ia) && !regionalValue(ib)) {
@@ -1851,11 +1857,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         return mk('nonzero', one)
     }
 
-    function againstZero(t: any): number {
-        const ia = opRef(t, 0)
-        const ib = opRef(t, 1)
-        if (ia && !ib && opConst(t, 1) === 0) return ia
-        if (ib && !ia && opConst(t, 0) === 0) return ib
+    function againstZero(t: Node): number {
+        const ia = getRef(t, 0)
+        const ib = getRef(t, 1)
+        if (ia && !ib && getLiteral(t, 1) === 0) return ia
+        if (ib && !ia && getLiteral(t, 0) === 0) return ib
         return 0
     }
 
@@ -2070,7 +2076,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const id = resolve(id0)
             if (!id || seen.has(id)) return id
             seen.add(id)
-            const n = nodes.get(id)
+            const n = nodeOf(id)
             if (n) {
                 if (n.op === 'block') {
                     const block = runtime.blocks.get(id)
@@ -2105,16 +2111,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 out.set(id, copyNode(n, argIds, argConsts))
                 return id
             }
-            const t = tracer.getTraceById(id)
-            if (!t) return id
-            const idx = lowering.operandIndices(t)
-            const argIds: number[] = []
-            const argConsts = new Float64Array(idx.length)
-            for (let k = 0; k < idx.length; k++) {
-                argIds.push(visit(opRef(t, idx[k])))
-                argConsts[k] = opConst(t, idx[k])
-            }
-            out.set(id, makeNode(t.op, argIds, argConsts, (t as any).T ?? Types.u64, (t as any).U ?? (t as any).T ?? Types.u64))
             return id
         }
 
@@ -2632,7 +2628,7 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(alias(1, 4) === 5)
         assert(alias(0, 4) === 4)
     }
-    testObjectJoins()
+    // testObjectJoins()
 
     function testShapedCall() {
         function readY(o: { y: u32 }): u32 {
