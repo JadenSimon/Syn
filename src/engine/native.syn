@@ -266,13 +266,36 @@ function liftReturnedHeapValues(
     const replacements = new Map<number, [number, number]>()
     const walked = new Map<number, boolean>()
     const entered = new Map<number, Set<number>>()
+    const incoming = new Map<number, number[]>()
+    for (const b of blocks.slice(1)) {
+        for (let i = 0; i < b.params.length; i++) {
+            const args: number[] = []
+            for (const n of nodes.values()) {
+                if (n.op === 'apply' && getRef(n, 0) === b.id) args.push(getRef(n, i + 1))
+            }
+            incoming.set(b.params[i], args)
+        }
+    }
+    const walking = new Set<number>()
     function visit(id: number): boolean {
         if (!id) return false
         const known = walked.get(id)
         if (known !== undefined) return known
-        walked.set(id, false)
+        if (walking.has(id)) return true
+        walking.add(id)
+        defer walking.delete(id)
         const n = nodes.get(id)
-        if (!n || isParam(nodes, id)) return false
+        if (!n) return false
+        if (intrinsics.argv().includes(`lift-why:${graph.name}`)) {
+            console.log(`  LIFT visit %${id} ${n.op}`)
+        }
+        if (isParam(nodes, id)) {
+            const args = incoming.get(id)
+            if (!args || !args.length) return false
+            const ok = args.every(arg => visit(arg))
+            walked.set(id, ok)
+            return ok
+        }
         let ok = false
         if (n.op === 'heap-handle' && !getRef(n, 0)) {
             const next = replacement(getLiteral(n, 0) as intrinsics.Handle)
@@ -282,6 +305,8 @@ function liftReturnedHeapValues(
         } else if (n.op === 'select') {
             ok = true
             for (let i = 1; i < countIds(n); i++) if (!visit(getRef(n, i))) { ok = false; break }
+        } else if (n.op === 'panic' || n.op === 'unreachable') {
+            ok = true
         } else if (n.op === 'ret' || n.op === 'inlined') {
             ok = visit(getRef(n, 0))
         } else if (n.op === 'apply') {
@@ -325,9 +350,16 @@ function liftReturnedHeapValues(
     }
 
     const entry = blocks[0]
-    if (!visit(entry.bodyId) || !lifted || prototype === undefined) return { graph }
+    const probe = intrinsics.argv().includes(`lift-why:${graph.name}`)
+    if (!visit(entry.bodyId) || !lifted || prototype === undefined) {
+        if (probe) console.log(`LIFT-WHY ${graph.name}: spine visit=${visit(entry.bodyId)} lifted=${lifted} proto=${prototype !== undefined}`)
+        return { graph }
+    }
     for (const [block, callers] of entered) {
-        if ((applications.get(block) ?? 0) !== callers.size) return { graph }
+        if ((applications.get(block) ?? 0) !== callers.size) {
+            if (probe) console.log(`LIFT-WHY ${graph.name}: block %${block} applied ${applications.get(block) ?? 0}x but spine entered ${callers.size}x`)
+            return { graph }
+        }
     }
     for (const b of blocks) {
         const next = replaceAll(b.bodyId)
@@ -360,11 +392,16 @@ interface ReturnCaller {
 }
 
 function returnedShape(graph: Graph): ReturnedShape | undefined {
+    const probe = intrinsics.argv().includes(`shape-why:${graph.name}`)
+    function why(reason: string): undefined {
+        if (probe) console.log(`SHAPE-WHY ${graph.name}: ${reason}`)
+        return undefined
+    }
     const entry = graph.blocks[0]
     const body = graph.nodes.get(entry.bodyId)
-    if (!body || body.op !== 'ret') return
+    if (!body || body.op !== 'ret') return why(`entry body is ${body?.op ?? 'missing'}, not ret`)
     for (const [id, n] of graph.nodes) {
-        if (n.op === 'ret' && id !== entry.bodyId) return
+        if (n.op === 'ret' && id !== entry.bodyId) return why(`extra ret %${id}`)
     }
     let consumer = entry.bodyId
     let at = 0
@@ -376,12 +413,12 @@ function returnedShape(graph: Graph): ReturnedShape | undefined {
         value = getRef(n, at)
     }
     const n = graph.nodes.get(value)
-    if (!n || n.op !== 'heap-handle' || getRef(n, 0)) return
+    if (!n || n.op !== 'heap-handle' || getRef(n, 0)) return why(`returned value %${value} is ${n?.op ?? 'missing'}, not a plain heap-handle`)
     let uses = 0
     for (const u of graph.nodes.values()) {
         for (let i = 0; i < countIds(u); i++) if (getRef(u, i) === value) uses++
     }
-    if (uses !== 1) return
+    if (uses !== 1) return why(`returned heap-handle %${value} has ${uses} uses`)
     const handle = unwrapCell(getLiteral(n, 0)) as intrinsics.Handle
     if (!heap.isOrdinaryObject(handle)) return
     const keys: intrinsics.Handle[] = []
@@ -748,7 +785,12 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const inlineScores = new Map<Function, InlineScore | false>()
     const targetRefs = new Map<number, number>()
     const returnWrappers = new Map<Function, Function>()
+    const inlineDenylist = new Set(intrinsics.argv()
+        .filter(x => x.startsWith('no-inline:'))
+        .map(x => x.slice('no-inline:'.length)))
+    const noInlineAll = intrinsics.argv().includes('no-inline-all')
     function shouldInline(fn: Function): boolean {
+        if (noInlineAll || inlineDenylist.has(fn.name)) return false
         return inlineScores.get(fn) !== false && inlineScores.has(fn)
     }
     function intern(f: Function): number {
@@ -908,12 +950,20 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
         if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
         if (projected) {
+            if (intrinsics.argv().includes('native-decisions')) {
+                console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size} projected=true`)
+            }
             inlineScores.set(current, false)
             returnCallers.push({ fn: current, symbol, graph: tracedGraph })
             continue
         }
         const shouldNotInline = (current as any).shouldNotInline || lifted.wrapper || (tracedGraph.nodes.size > 150 && !obviousInline(tracedGraph))
         const shape = shouldNotInline && !lifted.wrapper ? returnedShape(tracedGraph) : undefined
+        if (intrinsics.argv().includes('native-decisions')) {
+            console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size}`
+                + ` projected=false shouldNotInline=${!!shouldNotInline} wrapper=${!!lifted.wrapper}`
+                + ` tagged=${!!(current as any).shouldNotInline} shape=${!!shape}`)
+        }
         if (shape) {
             if (shouldNotInline || (tracedGraph.nodes.size > 50 && !obviousInline(tracedGraph))) {
                 inlineScores.set(current, false)
@@ -1039,11 +1089,22 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 keys.add(getLiteral(n, 1))
             }
         }
+        if (intrinsics.argv().includes('native-decisions')) {
+            console.log(`WANTED ${[...wanted].map(([sym, keys]) => `${functions[sym]?.name || sym}:${keys.size}`).join(' ')}`)
+            console.log(`RECORDS ${[...returnRecords.keys()].map(k => functions[k]?.name || k).join(' ')}`)
+            console.log(`CALLERS ${returnCallers.map(c => c.fn.name || '<anon>').join(' ')}`)
+        }
         const layouts = new Map<number, Map<number, number>>()
         for (const [symbol, keys] of wanted) {
             const shape = returnRecords.get(symbol)
             const name = functions[symbol]?.name || `symbol ${symbol}`
-            if (!shape) throw `native: ${name} does not return a record of its own`
+            if (!shape) {
+                const callers = returnCallers.filter(c => [...c.graph.nodes.values()].some(n =>
+                    n.op === 'property' && calleeSymbol(c.graph, getRef(n, 0)) === symbol))
+                throw `native: ${name} does not return a record of its own`
+                    + ` (wanted [${[...keys].join(', ')}] by ${callers.map(c => c.fn.name || '<anon>').join(', ')};`
+                    + ` registered records: ${[...returnRecords.keys()].map(k => functions[k]?.name || k).join(', ')})`
+            }
             const layout = shape.keys.filter(k => keys.has(k as number))
             if (layout.length !== keys.size) throw `native: ${name} does not own every projected key`
             if (layout.length > 7) throw `native: ${name} returns ${layout.length} projected fields`

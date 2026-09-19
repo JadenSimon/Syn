@@ -613,29 +613,98 @@ export function inlineBlocks(g: Graph) {
     function reduceInlined() {
         const refs: number[] = []
         const jumped = new Set<number>()
-        function findSite(root: number): number {
+        const jumpedBy = new Map<number, number>()
+        function logInlinedBlocks() {
+            const sites = new Map<number, Set<number>>()
+            for (const b of g.blocks) {
+                const epoch = nextEpoch(g)
+                function walk(id: number): void {
+                    if (!id) return
+                    const n = g.nodes.get(id)
+                    if (!n || !markVisited(n, epoch)) return
+                    if (n.op === 'block') return
+                    if (n.op === 'inlined') {
+                        let s = sites.get(id)
+                        if (!s) sites.set(id, s = new Set())
+                        s.add(b.id)
+                    }
+                    for (let i = 0; i < countIds(n); i++) walk(getRef(n, i))
+                }
+                walk(b.bodyId)
+            }
+            const succ = new Map<number, Set<number>>()
+            for (const b of g.blocks) {
+                const epoch = nextEpoch(g)
+                const out = new Set<number>()
+                succ.set(b.id, out)
+                function edges(id: number): void {
+                    if (!id) return
+                    const n = g.nodes.get(id)
+                    if (!n || !markVisited(n, epoch)) return
+                    if (n.op === 'block') { out.add(id); return }
+                    for (let i = 0; i < countIds(n); i++) edges(getRef(n, i))
+                }
+                edges(b.bodyId)
+            }
+            function reaches(from: number, to: number): boolean {
+                const seen = new Set<number>([from])
+                const queue = [from]
+                while (const cur = queue.pop()) {
+                    if (cur === to) return true
+                    for (const nx of succ.get(cur) ?? []) {
+                        if (seen.has(nx)) continue
+                        seen.add(nx)
+                        queue.push(nx)
+                    }
+                }
+                return false
+            }
+            for (const [id, blocks] of sites) {
+                if (blocks.size < 2) continue
+                const arr = [...blocks]
+                const head = arr.filter(a => arr.every(b => a === b || reaches(a, b)))
+                const pairs: string[] = []
+                for (let i = 0; i < arr.length; i++) {
+                    for (let j = i + 1; j < arr.length; j++) {
+                        if (!reaches(arr[i], arr[j]) && !reaches(arr[j], arr[i])) pairs.push(`B${arr[i]}/B${arr[j]}`)
+                    }
+                }
+                console.log(`inlined ${id} in ${arr.map(x => `B${x}`).join(', ')}`)
+                console.log(`    reaches-all: ${head.length ? head.map(x => `B${x}`).join(', ') : 'NONE'}`
+                    + (pairs.length ? `   divergent: ${pairs.join(' ')}` : '   (total order)'))
+            }
+            return sites
+        }
+        const siteBlocks = intrinsics.argv().includes('inline-debug') ? logInlinedBlocks() : undefined
+        function findSite(root: number): number | undefined {
             refs.length = 0
             const epoch = nextEpoch(g)
-            function find(id: number): number {
-                if (!id) return 0
+            function find(id: number): number | undefined {
+                if (!id) return
                 const n = g.nodes.get(id)
-                if (!n || !markVisited(n, epoch)) return 0
+                if (!n || !markVisited(n, epoch)) return
                 if (n.op === 'block') {
                     refs.push(id)
-                    return 0
+                    return
                 }
                 if (n.op === 'inlined') return find(getRef(n, 0)) || id
                 for (let i = countIds(n) - 1; i >= 0; i--) {
                     const found = find(getRef(n, i))
                     if (found) return found
                 }
-                return 0
+                return
             }
             return find(root)
         }
 
         function convert(block: GraphBlock, site: number) {
             const source = g.nodes.get(site)!
+            if (siteBlocks) {
+                const seen = siteBlocks.get(site)
+                const where = seen ? [...seen].map(x => `B${x}`).join(', ') : '<none>'
+                const picked = seen?.has(block.id) ? '' : ' NOT-IN-SET'
+                console.log(`convert site=${site} at B${block.id} of ${seen?.size ?? 0}: ${where}${picked}`)
+            }
             const memo = new Map<number, boolean>()
             function reaches(id: number): boolean {
                 if (id === site) return true
@@ -701,21 +770,65 @@ export function inlineBlocks(g: Graph) {
                 if (!id) return
                 const n = g.nodes.get(id)
                 if (!n || !markVisited(n, epoch)) return
-                assert(!jumped.has(id), `inlined ${site}: ret ${id} already exits another inlined value`)
-                if (n.op === 'ret') jumps.push(id)
+                if (n.op === 'ret') {
+                    assert(!jumped.has(id), `inlined ${site}: ret ${id} already exits another inlined value`)
+                    jumps.push(id)
+                }
                 else if (n.op === 'after') collect(getRef(n, countIds(n) - 1))
                 else if (n.op === 'select') for (let i = 1; i < countIds(n); i++) collect(getRef(n, i))
                 else if (n.op === 'apply') collect(getBlock(g, getRef(n, 0))?.bodyId ?? 0)
             }
             collect(getRef(source, 0))
             const shape = jumps.length ? recordKeys(g, getRef(g.nodes.get(jumps[0])!, 0)) : undefined
+            // the outbound `ret-slot` wrappers are what create the continuation's params
+            const outbound = new Map<number, Map<number, number>>() // jump -> slot -> wrapper
+            const slots = new Set<number>()
+            for (const id of jumps) {
+                const n = g.nodes.get(id)!
+                const mine = new Map<number, number>()
+                for (let i = 2; i < countIds(n); i++) {
+                    const w = getRef(n, i)
+                    const wn = w ? g.nodes.get(w) : undefined
+                    if (wn?.op !== 'ret-slot') continue
+                    const k = getLiteral(wn, 1)
+                    mine.set(k, w)
+                    slots.add(k)
+                }
+                outbound.set(id, mine)
+            }
+            const slotOrder = [...slots].sort((a, b) => a - b)
+            const heapParams: number[] = []
+            const heapRepl = new Map<number, number>()
+            for (const k of slotOrder) {
+                const pid = g.maxId++
+                g.nodes.set(pid, makeNode('param', [], new Float64Array(0)))
+                setDebugLabel(g, pid, `inlineh${k}`)
+                heapParams.push(pid)
+            }
+            if (slotOrder.length) {
+                for (const [id, n] of g.nodes) {
+                    if (n.op !== 'inlined-slot' || getRef(n, 0) !== site) continue
+                    const at = slotOrder.indexOf(getLiteral(n, 1))
+                    if (at >= 0) heapRepl.set(id, heapParams[at])
+                }
+            }
 
             const blockId = g.maxId++
             g.nodes.set(blockId, makeNode('block', [], new Float64Array(0)))
             for (const id of jumps) {
                 const n = g.nodes.get(id)!
                 jumped.add(id)
-                g.nodes.set(id, makeNode('apply', [blockId, getRef(n, 0)], new Float64Array([0, getLiteral(n, 0)])))
+                jumpedBy.set(id, site)
+                const argIds = [blockId, getRef(n, 0)]
+                const consts = [0, getLiteral(n, 0)]
+                const mine = outbound.get(id)!
+                for (const k of slotOrder) {
+                    const w = mine.get(k)
+                    const wn = w ? g.nodes.get(w) : undefined
+                    argIds.push(wn ? getRef(wn, 0) : 0)
+                    consts.push(wn ? getLiteral(wn, 0) : 0)
+                }
+                g.nodes.set(id, makeNode('apply', argIds, new Float64Array(consts)))
             }
             if (bodyParent) {
                 const p = g.nodes.get(bodyParent)!
@@ -731,7 +844,11 @@ export function inlineBlocks(g: Graph) {
             const param = shape ? createRecordParam(shape) : makeNode('param', [], new Float64Array(0))
             g.nodes.set(site, param)
             setDebugLabel(g, site, `inline${site}`)
-            const continuation: GraphBlock = { id: blockId, params: [site], bodyId: body, bodyConst: 0 }
+            const contBody = heapRepl.size ? replaceAll(g, body, heapRepl) : body
+            if (heapRepl.size) {
+                for (const blk of g.blocks) blk.bodyId = replaceAll(g, blk.bodyId, heapRepl)
+            }
+            const continuation: GraphBlock = { id: blockId, params: [site, ...heapParams], bodyId: contBody, bodyConst: 0 }
             addGraphBlock(g, continuation)
         }
 
@@ -739,9 +856,7 @@ export function inlineBlocks(g: Graph) {
         const queued = new Set<number>([g.blocks[0].id])
         for (let i = 0; i < queue.length; i++) {
             const block = queue[i]
-            for (let site = findSite(block.bodyId); site; site = findSite(block.bodyId)) {
-                convert(block, site)
-            }
+            while (const site = findSite(block.bodyId)) convert(block, site)
             for (const ref of refs) {
                 if (queued.has(ref) || !getBlock(g, ref)) continue
                 queued.add(ref)
@@ -5169,12 +5284,6 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
 
         function findSchedule(n: GraphNode) {
             const args = getArgIds(n)
-            if (n.op === 'store') {
-                return [0, 1, 2, 3]
-            }
-            if (n.op === 'load') {
-                return [0, 1, 2]
-            }
             const pinned = n.op === 'after' ? args.length - 1 : -1
             const calls = new Array(countIds(n)) as boolean[]
             for (let i = 0; i < countIds(n); i++) calls[i] = false
@@ -7124,11 +7233,19 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         done.add(id)
         effect(getRef(n, 0))
         const T = getTypeT(n)
-        const b = demand(getRef(n, 1), getLiteral(n, 1))
-        let o = 0
-        if (getRef(n, 2)) o = demand(getRef(n, 2), getLiteral(n, 2))
         const zero = !getRef(n, 3) && getLiteral(n, 3) === 0
-        const v = zero ? 0 : demand(getRef(n, 3), getLiteral(n, 3))
+        const wanted = [1]
+        if (getRef(n, 2)) wanted.push(2)
+        if (!zero) wanted.push(3)
+        let b = 0
+        let o = 0
+        let v = 0
+        for (const i of orderedOperands(id, wanted)) {
+            const d = demand(getRef(n, i), getLiteral(n, i))
+            if (i === 1) b = d
+            else if (i === 2) o = d
+            else v = d
+        }
         const guard = new Set<number>()
         const base = at(b, guard)
         guard.add(base)
@@ -7181,13 +7298,18 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         defer materializing = outer
         const branch = (r: number) => whenTrue ? asm.jumpIfNonZero(r, target) : asm.jumpIfZero(r, target)
         const n = id ? g.nodes.get(id) : undefined
-        function operands(c: GraphNode, limit: number) {
+        function operands(cid: number, c: GraphNode, limit: number) {
             const flip = !getRef(c, 0) && getRef(c, 1) !== 0 && SwappedCmp[c.op] !== undefined
             const li = flip ? 1 : 0
             const ri = flip ? 0 : 1
             const imm = !getRef(c, ri) && getLiteral(c, ri) >= 0 && getLiteral(c, ri) <= limit ? getLiteral(c, ri) : -1
-            const a = demand(getRef(c, li), getLiteral(c, li))
-            const b = imm < 0 ? demand(getRef(c, ri), getLiteral(c, ri)) : 0
+            let a = 0
+            let b = 0
+            for (const i of orderedOperands(cid, imm < 0 ? [li, ri] : [li])) {
+                const v = demand(getRef(c, i), getLiteral(c, i))
+                if (i === li) a = v
+                else b = v
+            }
             return { op: flip ? SwappedCmp[c.op] : c.op, signed: lowering.isSignedType(getTypeT(c)) || lowering.isSignedType(getTypeU(c)), imm, a, b }
         }
         function compareWith(o: { op: string, signed: boolean, imm: number, a: number, b: number }, guard: Set<number>) {
@@ -7200,7 +7322,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
                 : asm.compareImm(o.op, dst, ra, o.imm, o.signed, when)
         }
         if (n && CompareOps.has(n.op) && !homeOf.has(id) && releaseAt.get(site)?.has(id)) {
-            const emit = compareWith(operands(n, 0xFFF), new Set())
+            const emit = compareWith(operands(id, n, 0xFFF), new Set())
             finish(id)
             const flag = freeReg(volatiles, NOTHING)
             if (flag < 0) throw 'lowering: out of registers'
@@ -7215,8 +7337,8 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         const right = n?.op === 'and' ? g.nodes.get(getRef(n, 1)) : undefined
         if (n && left && right && CompareOps.has(left.op) && CompareOps.has(right.op) && !homeOf.has(getRef(n, 0)) && !homeOf.has(getRef(n, 1))
             && !homeOf.has(id) && releaseAt.get(site)?.has(id)) {
-            const first = operands(left, 0xFFF)
-            const second = operands(right, 31)
+            const first = operands(getRef(n, 0), left, 0xFFF)
+            const second = operands(getRef(n, 1), right, 31)
             const guard = new Set<number>()
             const one = compareWith(first, guard)
             const two = compareWith(second, guard)

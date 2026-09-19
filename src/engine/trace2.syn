@@ -23,6 +23,8 @@ import * as syscalls from './syscalls'
 type usize = u32
 
 const dumpEveryListing = intrinsics.argv().includes('lower-debug')
+const contBlocks = intrinsics.argv().includes('cont-blocks')
+const splitOnly = intrinsics.argv().includes('cont-split-only')
 let anonymousGraphs = 0
 function lowerValueGraph(
     g: lowering2.Graph,
@@ -60,7 +62,9 @@ function findLeaders(code: readonly u8[], codeLen: number) {
         if (inst.jumpTarget !== undefined) {
             set.add(inst.jumpTarget)
             set.add(after)
+            continue
         }
+        if (contBlocks && CallLikeOpcodes.has(inst.opcode)) set.add(after)
     }
     const out: number[] = []
     for (const l of set) {
@@ -82,6 +86,7 @@ interface Blocks {
     cycles: Set<number>[] // loop header -> members, empty for other blocks
     cycleWrites: Set<number>[]
     cycleReads: Set<number>[]
+    retCount: number
 }
 
 interface Step {
@@ -184,6 +189,11 @@ const StoreOpcodes = new Set<number>([
     Op.SetProperty, Op.SetPropertyConst, Op.SetPropertyImm,
 ])
 
+const splitProps = !intrinsics.argv().includes('cont-calls-only')
+const CallLikeOpcodes = new Set<number>(splitProps
+    ? [...CallOpcodes, ...LoadOpcodes, ...StoreOpcodes]
+    : [...CallOpcodes])
+
 function deriveBlocks(
     code: readonly u8[], codeLen: number,
     accSlot: number, tokenSlot: number,
@@ -227,6 +237,7 @@ function deriveBlocks(
         }
     }
 
+    let retCount = 0
     const succs: number[][] = []
     for (let i = 0; i < n; i++) {
         const own = insts[i]
@@ -242,6 +253,8 @@ function deriveBlocks(
                 if (CondJumpOpcodes.has(last.opcode)) to(after)
                 to(last.jumpTarget)
             } else if (after < codeLen) to(after)
+        } else if (last.opcode === Op.Return || last.opcode === Op.ReturnVoid) {
+            retCount += 1
         }
         succs.push(s)
     }
@@ -333,7 +346,7 @@ function deriveBlocks(
         }
     }
 
-    return { leaders, order: loopOrder, succs, preds, insts, backPreds, readSlots, liveIn, cycles, cycleWrites, cycleReads }
+    return { leaders, order: loopOrder, succs, preds, insts, backPreds, readSlots, liveIn, cycles, cycleWrites, cycleReads, retCount }
 }
 
 export interface TraceSession {
@@ -666,6 +679,13 @@ export function createTraceSession(): TraceSession {
     return session
 }
 
+export interface Continuation {
+    (value: any, token: any): any
+    target: number
+    multi: boolean
+    used: boolean
+}
+
 export interface TraceOptions {
     verbose?: boolean
     captures?: any[]
@@ -673,6 +693,7 @@ export interface TraceOptions {
     shouldInline?: (fn: Function) => boolean
     session?: TraceSession
     inputs?: { thisArg: any, args: number[], effect: any }
+    continuation?: Continuation
     shapes?: (intrinsics.Handle | undefined)[]
     name?: string
     self?: Function
@@ -762,7 +783,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function after(v: any, token: any): any {
         const tokenId = symbolOf(token)
         if (!tokenId || tokenId === symbolOf(nilEffect)) return v
-        if (symbolOf(v) === tokenId) return v
+        const vid = symbolOf(v)
+        if (vid === tokenId) return v
         return mk('after', [token, v])
     }
 
@@ -788,6 +810,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
 
     let nilEffect: f64
+    let returned = false
+    const continuation = contBlocks ? opts.continuation : undefined
+    if (continuation) {
+        if (B.retCount > 1) continuation.multi = true
+    }
 
     const spBefore = sp()
     const args = Intrinsics.stackalloc(Math.max(compiled.paramCount, 1) * 4 as u32)
@@ -856,8 +883,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         heap: Map<u32, { incoming: number, param: number, symbolic: boolean }>
     }
     const reified = new Map<number, Reified>()
+    let entryCells: intrinsics.Handle[] = []
     const regionalParams = new Set<number>()
     const paramOwner = new Map<number, number>()
+    const outParams = new Set<number>()
     const rootBlockOrder = intrinsics.argv().includes(`block-order:${traceName}`)
     if (rootBlockOrder) {
         blockOrderOn = true
@@ -903,8 +932,15 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function toGraphValue(value: any): any {
         if (!isVmHandle(value)) return value
         const handle = vmHandle(value)
-        if (handle <= 1) return traceValue(handle)
+        if (!handle) return nullishValue()
+        if (handle === 1) return traceValue(handle)
         return heap.isBoxedF64(handle) ? value : handleValue(handle)
+    }
+
+    let nullish: any
+    function nullishValue(): any {
+        if (nullish === undefined) nullish = mk('heap-handle', [traceValue(0)], '', [Types.handle])
+        return nullish
     }
 
     function fromGraphValue(value: any): u32 {
@@ -1039,6 +1075,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const args: number[] = []
             for (let i = 0; i < nargs; i++) args.push(graphCallArg(regStart, i))
             const effect = readToken()
+            const cont = continuationFor()
             let nested: ReturnType<typeof trace2> | undefined
             tracer.setActive(false)
             try {
@@ -1048,6 +1085,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                         mapCapture: opts.mapCapture,
                         shouldInline: opts.shouldInline,
                         inputs: { thisArg: graphReceiver(thisArg), args, effect },
+                        continuation: cont,
                     })
                 } catch (e) {
                     console.log(linked.toString(), e)
@@ -1057,7 +1095,30 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 tracer.setActive(true)
             }
 
+            if (!nested.returned) {
+                step.kind = 'panic'
+                stopNext = true
+                tracer.markHandled()
+                return { value: nested.result }
+            }
+
+            if (cont && cont.multi) {
+                assert(cont.used, `trace2: multi-ret callee never applied continuation B${cont.target}`)
+                const result = nested.result
+                step.kind = 'inline-cont'
+                step.valueId = symbolOf(result)
+                step.valueConst = step.valueId ? 0 : result
+                stopNext = true
+                tracer.markHandled()
+                return { value: 0 }
+            }
+
             const value = inlined(nested.result)
+            if (intrinsics.argv().includes('ret-heap')
+                && nodes.get(symbolOf(value))?.op === 'inlined') {
+                tracer.inactive(() => objects.rerootFields(nested!.entryCells,
+                    (k) => mk('inlined-slot', [value, traceValue(k)])))
+            }
             const unified = objects.unify(value)
             writeToken(getOrderingFromInlined(unified ? unified.result : value, effect))
             tracer.markHandled()
@@ -1124,6 +1185,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         },
         canexit: (acc) => {
             tracer.markHandled()
+            if (step.kind === 'inline-cont') return true
             const value = toGraphValue(acc)
             if (step.kind === 'panic') {
                 step.valueId = symbolOf(value)
@@ -1163,6 +1225,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 throw `trace: invalid call arg count ${nargs} (nan ${intrinsics.getNanId(nargs)})`
             }
             const callee = target
+            if (intrinsics.argv().includes(`calls:${traceName}`)) {
+                const l = session.stubFunctions.get(callee) as any
+                console.log(`CALL ${traceName} -> ${l?.name || session.intrinsicFns.get(callee) || '<anon>'}`)
+            }
             const intrinsicName = session.intrinsicFns.get(callee)
             let linked = session.stubFunctions.get(callee) as any
             if (!linked && callee === finalized) {
@@ -1346,24 +1412,69 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const exitsLoop = B.preds[b].some(p =>
                 B.backPreds[p].length > 0 && !B.cycles[p].has(b) && deferredInterior(p))
             if (B.preds[b].length < 2 && !B.backPreds[b].length && !exitsLoop) continue
-            const inputs = [...B.liveIn[b]].sort((x, y) => x - y)
-            const selfId = newNodeId(tracer)
-            nodes.set(selfId, makeNode('block', [], new Float64Array(0), Types.u64, Types.u64))
-            setDebugLabel(runtime, selfId, `B${b}`)
-            const paramIds: number[] = []
-            for (const slot of inputs) {
-                const id = newNodeId(tracer)
-                const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
-                setDebugLabel(runtime, id, name)
-                nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64))
-                regionalParams.add(id)
-                paramIds.push(id)
-            }
-            reified.set(b, {
-                header: b, inputs, selfId, paramIds, arrivals: [],
-                symbolic: new Set(), heap: new Map(),
-            })
+            reifyBlock(b)
         }
+    }
+
+    function reifyBlock(b: number): Reified {
+        const known = reified.get(b)
+        if (known) return known
+        const inputs = [...B.liveIn[b]].sort((x, y) => x - y)
+        const selfId = newNodeId(tracer)
+        nodes.set(selfId, makeNode('block', [], new Float64Array(0), Types.u64, Types.u64))
+        setDebugLabel(runtime, selfId, `B${b}`)
+        const paramIds: number[] = []
+        for (const slot of inputs) {
+            const id = newNodeId(tracer)
+            const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
+            setDebugLabel(runtime, id, name)
+            nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64))
+            regionalParams.add(id)
+            paramIds.push(id)
+        }
+        const R: Reified = {
+            header: b, inputs, selfId, paramIds, arrivals: [],
+            symbolic: new Set(), heap: new Map(),
+        }
+        reified.set(b, R)
+        return R
+    }
+
+    function continuationFor(): Continuation | undefined {
+        if (!contBlocks || splitOnly) return undefined
+        assert(folding === undefined, `trace2: continuation for a call inside concrete loop B${current}`)
+        const own = B.insts[current]
+        const last = own[own.length - 1]
+        assert(CallLikeOpcodes.has(last.opcode),
+            `trace2: call in B${current} but the block ends in ${last.opname}`)
+        const writesAcc = !!last.writesAcc
+        const succs = B.succs[current]
+        assert(succs.length === 1, `trace2: call block B${current} has ${succs.length} successors`)
+        const target = succs[0]
+        const back = B.backPreds[target].includes(current)
+        assert(back || (!tracedBlocks.has(target) && !settled.has(target)),
+            `trace2: continuation B${target} of B${current} was already traced`
+            + ` (traced=${tracedBlocks.get(target)} settled=${settled.has(target)}`
+            + ` preds=[${B.preds[target].join(',')}] [${traceName || '?'}])`)
+        const from = current
+        const saved = new Float64Array(slotCount)
+        tracer.inactive(() => {
+            for (let r = 0; r <= ACC; r++) saved[r] = toGraphValue(mem[slotAddr(r)])
+        })
+        const cont = ((value: any, token: any) => {
+            assert(cont.multi || !cont.used,
+                `trace2: single-use continuation B${target} of B${from} applied twice [${traceName || '?'}]`)
+            cont.used = true
+            if (cont.multi) reifyBlock(target)
+            const ins = saved.slice()
+            if (writesAcc) ins[ACC] = toGraphValue(value)
+            ins[TOKEN] = token
+            return arrive(target, ins, from)
+        }) as Continuation
+        cont.target = target
+        cont.multi = false
+        cont.used = false
+        return cont
     }
 
     function application(R: Reified, edge: Float64Array, from: number): any {
@@ -1548,7 +1659,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
             setDebugLabel(runtime, param, `h${R.heap.size}`)
             regionalParams.add(param)
-            R.heap.set(cell, { incoming: value, param, symbolic: B.backPreds[R.header].length > 0 })
+            R.heap.set(cell, { incoming: value, param, symbolic: intrinsics.argv().includes('loose-heap') ? false : B.backPreds[R.header].length > 0 })
         }
         for (const arrival of R.arrivals.slice(1)) {
             if (arrival.heap.size !== R.heap.size) throw `heap record: B${R.header} input changes object graph`
@@ -1642,7 +1753,23 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 return ret(after(operand(u, 0), symbolValue(getRef(n, 0))), tag)
             }
         }
-        return mk('ret', [v, traceValue(tag)])
+        if (!intrinsics.argv().includes('ret-heap')) return mk('ret', [v, traceValue(tag)])
+        const cells = tracer.inactive(() => objects.fieldsFor(entryCells,
+            (value, k) => mk('ret-slot', [value, traceValue(k)])))
+        for (const c of cells) {
+            const seen = new Set<number>()
+            const queue = [symbolOf(c)]
+            while (const at = queue.pop()) {
+                if (!at || seen.has(at)) continue
+                seen.add(at)
+                const u = nodes.get(at)
+                if (!u) continue
+                if (u.op === 'param') { outParams.add(at); continue }
+                if (u.op === 'block' || u.op === 'apply' || u.op === 'inlined') continue
+                for (let i = 0; i < countIds(u); i++) queue.push(getRef(u, i))
+            }
+        }
+        return mk('ret', [v, traceValue(tag), ...cells])
     }
 
     function inlined(v: any): any {
@@ -1738,8 +1865,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function arrive(b: number, ins: Float64Array, from: number): f64 {
         const R = reified.get(b)
+        if (!R) assert(!tracedBlocks.has(b))
         if (blockOrderOn) {
-            const kind = R ? (tracedBlocks.has(b) ? 'revisit' : 'arrive ') : 'trace  '
+            const kind = R ? (tracedBlocks.has(b) ? 'back edge' : 'first arrival ') : 'trace  '
             const self = R ? `%${R.selfId}` : '%?'
             const src = reified.get(from)
             console.log(`${`${blockOrderStep++}`.padStart(3)} ${'  '.repeat(blockOrderDepth)}${kind} B${b} ${self} from B${from} ${src ? `%${src.selfId}` : '%?'}  [${traceName || '?'}]`)
@@ -1759,8 +1887,13 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             const v = r.valueId ? symbolValue(r.valueId) : r.valueConst
             return panic(v, r.outs[TOKEN])
         }
+        if (r.kind === 'inline-cont') {
+            return r.valueId ? symbolValue(r.valueId) : r.valueConst
+        }
         if (r.kind === 'ret') {
+            returned = true
             const v = r.valueId ? symbolValue(r.valueId) : r.valueConst
+            if (continuation?.multi) return continuation(v, r.outs[TOKEN])
             // if (objects.shouldJoin()) return ret(objects.joinChanges(v, r.outs[TOKEN]))
             return ret(after(v, r.outs[TOKEN]))
         }
@@ -1952,6 +2085,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function doTrace() {
         try {
             if (debugBlocks) console.log('forward order:', B.order.map(b => `B${b}`).join(', '))
+            if (intrinsics.argv().includes('ret-heap')) {
+                entryCells = tracer.inactive(() => {
+                    const roots: intrinsics.Handle[] = [thisArg as intrinsics.Handle]
+                    for (let slot = 0; slot < slotCount; slot++) {
+                        const cell = cellOf(ins[slot])
+                        if (cell) roots.push(cell as intrinsics.Handle)
+                    }
+                    return [...objects.capture(roots).keys()]
+                })
+            }
             const entry = arrive(0, ins, -1)
             for (const b of B.order) {
                 settled.add(b)
@@ -2167,6 +2310,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         get graph() { return _graph ??= buildGraph() },
         get text() { return printLines() },
         result,
+        returned,
+        entryCells,
+        get outParams() { return [...outParams] },
         dispatches,
         session,
     }
@@ -3261,6 +3407,28 @@ if (intrinsics.argv()[0] === 'trace2') {
         for (const flag of [0, 1]) assert(earlyReturn(flag, 4) === earlyReturnWrite(flag as u32, 4))
     }
     testHeapCellCycles()
+
+    function testInlinedHeapCellMutation() {
+        function repro(box: { p: usize }, key: u32): void {
+            if (key === 7) return
+            if (key >= 256) box.p = (box.p + 8) as usize
+            Intrinsics.store(box.p, 8, key, Types.u32)
+        }
+        intrinsics.tagInline(repro)
+
+        function twoBoxes(ptr: usize, n: u32): u32 {
+            const a = { p: ptr }
+            const b = { p: ptr }
+            repro(a, n)
+            repro(b, n + 1)
+            return (Intrinsics.load(a.p, 0, Types.u32) + Intrinsics.load(b.p, 0, Types.u32)) as u32
+        }
+        const cases = native.createNatives({ twoBoxes })
+        const cell = new Uint32Array([1,3,3,4,5,6,7,8])
+        const ptr = (ts as any).getArrayBufferPtr(cell.buffer)
+        assert(cases.twoBoxes(ptr, 5) === 2)
+    }
+    testInlinedHeapCellMutation()
 
     let totalInst = 0
     process.on('beforeExit', () => console.log('TOTAL INST COUNT', totalInst))
@@ -4511,11 +4679,13 @@ if (intrinsics.argv()[0] === 'trace2') {
         const strength = createNative(cStrengthReduce)
         const strengthData = new Uint32Array([2, 20, 7, 70, 9, 90])
         const strengthPtr = (ts as any).getArrayBufferPtr(strengthData.buffer)
-        assert(strength.native(strengthPtr, 3, 7) === 70)
-        assert(strength.native(strengthPtr, 3, 9) === 90)
-        assert(!strength.code.listing.includes('mul'))
-        assert(!strength.code.listing.includes('lsl'))
-        assert(strength.code.listing.includes('#8'))
+        assertOn(strength.code.listing, () => {
+            assert(strength.native(strengthPtr, 3, 7) === 70)
+            assert(strength.native(strengthPtr, 3, 9) === 90)
+            assert(!strength.code.listing.includes('mul'))
+            assert(!strength.code.listing.includes('lsl'))
+            assert(strength.code.listing.includes('#8'))
+        })
 
         function cPointerInduction(ptr: usize, n: u32): u32 {
             let sum: u32 = 0
