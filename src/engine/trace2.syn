@@ -319,7 +319,21 @@ function deriveBlocks(
         }
     }
 
-    return { leaders, order, succs, preds, insts, backPreds, readSlots, liveIn, cycles, cycleWrites, cycleReads }
+    const loopOrder: number[] = []
+    const placed = new Set<number>()
+    for (const b of order) {
+        if (placed.has(b)) continue
+        loopOrder.push(b)
+        placed.add(b)
+        if (!backPreds[b].length) continue
+        for (const member of order) {
+            if (placed.has(member) || !cycles[b].has(member)) continue
+            loopOrder.push(member)
+            placed.add(member)
+        }
+    }
+
+    return { leaders, order: loopOrder, succs, preds, insts, backPreds, readSlots, liveIn, cycles, cycleWrites, cycleReads }
 }
 
 export interface TraceSession {
@@ -670,6 +684,10 @@ export const traceStats = {
     bySource: new Map<string, { name: string, count: number }>(),
 }
 
+let blockOrderOn = false
+let blockOrderStep = 0
+let blockOrderDepth = 0
+
 export function trace2(input: string | Function, opts: TraceOptions = {}) {
     let code: string
     let captures = opts.captures
@@ -758,6 +776,9 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             parts.push(`${getLiteral(o, 0)}`)
             return `(${parts.join(', ')})`
         }
+        if (o.op === 'inlined' && gn.getLiteral(o, 1) !== id) {
+            parts.push(`COPY OF ${gn.getLiteral(o, 1)}`)
+        }
         for (let i = 0; i < countIds(o); i++) {
             const u = getRef(o, i)
             if (u) parts.push(valToString(symbolValue(u)))
@@ -836,6 +857,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     }
     const reified = new Map<number, Reified>()
     const regionalParams = new Set<number>()
+    const paramOwner = new Map<number, number>()
+    const rootBlockOrder = intrinsics.argv().includes(`block-order:${traceName}`)
+    if (rootBlockOrder) {
+        blockOrderOn = true
+        blockOrderStep = 0
+        blockOrderDepth = 0
+    }
+    defer if (rootBlockOrder) blockOrderOn = false
+    if (blockOrderOn && !rootBlockOrder) blockOrderDepth++
+    defer if (blockOrderOn && !rootBlockOrder) blockOrderDepth--
     const refinements: number[] = []
     let current = 0
     let folding: Set<number> | undefined
@@ -1310,7 +1341,11 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function reifyBlocks(): void {
         for (const b of B.order) {
-            if (B.preds[b].length < 2 && !B.backPreds[b].length) continue
+            const deferredInterior = (h: number) => [...B.cycles[h]].some(m =>
+                m !== h && (B.preds[m].length >= 2 || B.backPreds[m].length > 0))
+            const exitsLoop = B.preds[b].some(p =>
+                B.backPreds[p].length > 0 && !B.cycles[p].has(b) && deferredInterior(p))
+            if (B.preds[b].length < 2 && !B.backPreds[b].length && !exitsLoop) continue
             const inputs = [...B.liveIn[b]].sort((x, y) => x - y)
             const selfId = newNodeId(tracer)
             nodes.set(selfId, makeNode('block', [], new Float64Array(0), Types.u64, Types.u64))
@@ -1333,6 +1368,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function application(R: Reified, edge: Float64Array, from: number): any {
         const ins = unrefine(edge, R.inputs)
+        if (intrinsics.argv().includes('probe-heap')) {
+            for (const slot of R.inputs) {
+                if (sameValue(ins[slot], edge[slot])) continue
+                const before = cellOf(edge[slot])
+                const after = cellOf(ins[slot])
+                if (before !== after) {
+                    console.log(`PROBE unrefine -> B${R.header} from B${from} s${slot}: cell ${before} -> ${after}`)
+                }
+            }
+        }
         const heapState = captureHeap(ins, R.inputs)
         const back = B.backPreds[R.header].includes(from)
         if (!back) {
@@ -1351,7 +1396,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const args = [symbolValue(R.selfId)]
         for (const slot of R.inputs) args.push(ins[slot])
         for (const value of heapState.values()) args.push(value)
-        return mk('apply', args)
+        const applied = mk('apply', args)
+        if (intrinsics.argv().includes('probe-heap')) {
+            const shown = args.map(a => {
+                const sid = symbolOf(a)
+                const owner = paramOwner.get(sid)
+                return owner === undefined ? `%${sid}` : `%${sid}@B${owner}`
+            })
+            console.log(`PROBE apply %${symbolOf(applied)} -> B${R.header} from B${from}: ${shown.join(' ')}`)
+        }
+        return applied
     }
 
     function captureHeap(ins: Float64Array, slots: number[]): HeapState {
@@ -1409,8 +1463,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function shapeOfValue(value: any): u32 {
         const joined = objects.joinOf(value)
         if (joined) return joinedObject(joined, 0)
-        // const unified = objects.unifyInlined(value)
-        // if (unified) return unified as u32
         const id = symbolOf(value)
         const n = nodes.get(id)
         if (n?.op === 'param' && !countIds(n) && !regionalParams.has(id)) return opaqueObject(value)
@@ -1490,6 +1542,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const ins = first.values.slice()
         for (const [cell, value] of first.heap) {
             const param = objects.parameter(cell)
+            paramOwner.set(param, R.header)
+            if (intrinsics.argv().includes('probe-heap')) {
+                console.log(`PROBE param %${param} created for B${R.header} cell=${cell}`)
+            }
             setDebugLabel(runtime, param, `h${R.heap.size}`)
             regionalParams.add(param)
             R.heap.set(cell, { incoming: value, param, symbolic: B.backPreds[R.header].length > 0 })
@@ -1529,6 +1585,18 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             }
         }
 
+        if (intrinsics.argv().includes(`bind-debug:${traceName}`)) {
+            for (const [cell, binding] of R.heap) {
+                const arrivals = R.arrivals.map(a => {
+                    const v = [...a.heap.values()][[...R.heap.keys()].indexOf(cell)]
+                    return `B${a.from}=%${symbolOf(v)}`
+                })
+                console.log(`BIND B${R.header} cell=${cell} symbolic=${binding.symbolic}`
+                    + ` param=%${binding.param} incoming=%${symbolOf(binding.incoming)} arrivals=[${arrivals.join(' ')}]`
+                    + ` backPreds=[${B.backPreds[R.header].join(',')}]`)
+            }
+            console.log(`BIND B${R.header} regs symbolic=[${[...R.symbolic].join(',')}] inputs=[${R.inputs.join(',')}]`)
+        }
         if (R.inputs.includes(TOKEN) && !sameValue(ins[TOKEN], nilEffect)) R.symbolic.add(TOKEN)
         for (let i = 0; i < R.inputs.length; i++) {
             const slot = R.inputs[i]
@@ -1601,7 +1669,10 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
             if (simple) return operand(n, 0)
         }
         if (n?.op === 'panic') return v
-        return mk('inlined', [v])
+        const handle = mk('inlined', [v, 0])
+        const self = symbolOf(handle)
+        gn.setLiteral(nodes.get(self)!, 1, self)
+        return handle
     }
 
     function selectValues(cond: any, a: any, b: any): any {
@@ -1667,6 +1738,12 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
 
     function arrive(b: number, ins: Float64Array, from: number): f64 {
         const R = reified.get(b)
+        if (blockOrderOn) {
+            const kind = R ? (tracedBlocks.has(b) ? 'revisit' : 'arrive ') : 'trace  '
+            const self = R ? `%${R.selfId}` : '%?'
+            const src = reified.get(from)
+            console.log(`${`${blockOrderStep++}`.padStart(3)} ${'  '.repeat(blockOrderDepth)}${kind} B${b} ${self} from B${from} ${src ? `%${src.selfId}` : '%?'}  [${traceName || '?'}]`)
+        }
         return R ? application(R, ins, from) : tracePath(b, ins)
     }
 
@@ -1700,6 +1777,16 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const c = arrive(blockOf.get(r.elsePc)!, branch[1], r.from)
         refinements.length = depth
         const elseChanges = tracer.inactive(() => objects.take(marks))
+        if (intrinsics.argv().includes('probe-merge') && (thenChanges.size || elseChanges.size)) {
+            const aDead = isTerminalValue(a) || isUnreachable(a)
+            const cDead = isTerminalValue(c) || isUnreachable(c)
+            if (aDead || cDead) {
+                const which = aDead && cDead ? 'both arms' : aDead ? 'then arm' : 'else arm'
+                const n = nodes.get(symbolOf(aDead ? a : c))
+                console.log(`PROBE merge with dead ${which} (${n?.op}) [${traceName || '?'}]`
+                    + ` thenChanges=${thenChanges.size} elseChanges=${elseChanges.size}`)
+            }
+        }
         tracer.inactive(() => objects.merge(symbolValue(r.condId), marks, thenChanges, elseChanges))
 
         if (debugTrace) {
@@ -2075,7 +2162,6 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         const name = opts.name ?? (typeof input === 'function' ? input.name : undefined)
         return createGraph({ maxId, nodes: out, blocks, debugLabels: runtime.debugLabels, name })
     }
-
     let _graph: lowering2.Graph
     return {
         get graph() { return _graph ??= buildGraph() },
@@ -2162,6 +2248,52 @@ if (intrinsics.argv()[0] === 'trace2') {
     }
     testMmapSyscall()
 
+    function testSpecializedFactoryFn() {
+        function factory(o?: { fn: (a: number) => number }) {
+            function res(n: number) {
+                let i = 0
+                for (let j = 0; j < n; j++) i += n
+                if (o !== undefined) {
+                    return n + o.fn(2)
+                }
+                return n + i
+            }
+            return res
+        }
+        const f1 = factory()
+        const f2 = factory({ fn: (a: number) => a+a })
+        function caller(a: number, b: number) {
+            return f1(a) + f2(b)
+        }
+        const fns = native.createNatives({ caller })
+        assert(fns.caller(1, 2) === caller(1, 2))
+        assert(fns.caller(2, 5) === caller(2, 5))
+
+        function factoryWithAssert(o?: { fn: (a: number) => number }) {
+            function test(n: number) {
+                intrinsics.assert(o !== undefined)
+                return o.fn(n)
+            }
+            intrinsics.tagNoInline(test)
+            function res(n: number) {
+                if (o) return test(n)
+                return n + 1
+            }
+            return res
+        }
+        {
+            const f1 = factoryWithAssert()
+            const f2 = factoryWithAssert({ fn: (a: number) => a+a })
+            function caller(a: number, b: number) {
+                return f1(a) + f2(b)
+            }
+            const fns = native.createNatives({ caller })
+            assert(fns.caller(1, 2) === caller(1, 2))
+            assert(fns.caller(2, 5) === caller(2, 5))
+        }
+    }
+    testSpecializedFactoryFn()
+    
     function testStaticMemory() {
         function allocate(): usize {
             return syscalls.mmap(
@@ -2197,7 +2329,6 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert([...reader.graph.nodes.values()].some(n => n.op === 'load'))
         assert(reader.native() === 3)
         assert(free() === 0)
-        console.log('good')
     }
     testStaticMemory()
 
@@ -2515,6 +2646,35 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(result.distinguishMaybeZero(0) === 22)
     }
 
+    function testMutatedHeapCellAfterLoop() {
+        function v(x: number) {
+            return x
+        }
+        intrinsics.tagNoInline(v)
+        function mutate(c: { x: number }) {
+            c.x += 1
+        }
+        intrinsics.tagInline(mutate)
+        function withLoop(c: { x: number }, n: number) {
+            let sum = 0
+            for (let i = 0; i < n; i++) {
+                sum += c.x
+            }
+            mutate(c)
+            mutate(c)
+            return sum + c.x + v(c.x)
+        }
+        intrinsics.tagInline(withLoop)
+        function cellWithLoop(x: number, n: number) {
+            const c = { x }
+            if (n) withLoop(c, n)
+            return c.x
+        }
+        const res = native.createNatives({ cellWithLoop })
+        assert(res.cellWithLoop(2, 3) === cellWithLoop(2, 3))
+    }
+    testMutatedHeapCellAfterLoop()
+
     function testObjectJoins() {
         function joinedObject(flag: u32, value: u32): u32 {
             let o: { y: u32 }
@@ -2754,6 +2914,62 @@ if (intrinsics.argv()[0] === 'trace2') {
         const agreedHeapNative = createNative(agreedHeapInputs).native
         assert(agreedHeapNative(0, 7) === 8)
         assert(agreedHeapNative(1, 19) === 20)
+
+        function nestedJoinHeapWrite(cond: u32, cond2: u32, value: u32): u32 {
+            const box = { x: 0 as u32 }
+            if (cond) {
+                const baz = value + 1
+                const v = cond2 ? value * 2 : value * 3
+                box.x = (v + baz) as u32
+            }
+            return box.x
+        }
+        const nestedJoin = createNative(nestedJoinHeapWrite).native
+        for (const c of [0, 1]) {
+            for (const c2 of [0, 1]) {
+                for (const v of [0, 3, 7]) {
+                    const got = nestedJoin(c, c2, v)
+                    const want = nestedJoinHeapWrite(c as u32, c2 as u32, v as u32)
+                    if (got !== want) console.log(`nestedJoinHeapWrite(${c}, ${c2}, ${v}) got=${got} want=${want}`)
+                    assert(got === want)
+                }
+            }
+        }
+
+        function singleJoinHeapWrite(cond: u32, value: u32): u32 {
+            const box = { x: 0 as u32 }
+            if (cond) box.x = (value + 1) as u32
+            return box.x
+        }
+        const singleJoin = createNative(singleJoinHeapWrite).native
+        for (const c of [0, 1]) {
+            for (const v of [0, 3]) assert(singleJoin(c, v) === singleJoinHeapWrite(c as u32, v as u32))
+        }
+
+        function hoistedSelectHeapWrite(cond: u32, cond2: u32, value: u32): u32 {
+            const box = { x: 0 as u32 }
+            const v = cond2 ? value * 2 : value * 3
+            if (cond) box.x = (v + value + 1) as u32
+            return box.x
+        }
+        const hoistedSelect = createNative(hoistedSelectHeapWrite).native
+        for (const c of [0, 1]) {
+            for (const c2 of [0, 1]) assert(hoistedSelect(c, c2, 3) === hoistedSelectHeapWrite(c as u32, c2 as u32, 3 as u32))
+        }
+
+        function loopJoinHeapWrite(cond: u32, n: u32): u32 {
+            const box = { x: 0 as u32 }
+            if (cond) {
+                let sum: u32 = 0
+                for (let i: u32 = 0; i < n; i++) sum += i
+                box.x = sum
+            }
+            return box.x
+        }
+        const loopJoin = createNative(loopJoinHeapWrite).native
+        for (const c of [0, 1]) {
+            for (const n of [0, 1, 4]) assert(loopJoin(c, n) === loopJoinHeapWrite(c as u32, n as u32))
+        }
 
         function writeLoop(ptr: usize, count: u32): void {
             for (let i = 0; i < count; i++) Intrinsics.store(ptr, 0, i + 1, Types.u32)

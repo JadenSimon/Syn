@@ -615,7 +615,8 @@ pub const SynthInstrumenter = struct {
         const s = self.binder.symbols.at(sym);
         if (s.hasFlag(.type)) return;
         if (s.hasFlag(.late_bound) or s.hasFlag(.imported) or s.hasFlag(.exported)) return;
-        if (self.nodes.at(s.declaration).hasFlag(.declare)) return;
+        const decl_node = self.nodes.at(s.declaration);
+        if (decl_node.hasFlag(.declare)) return;
 
         if (self.transforming) {
             if (!self.needsCell(sym)) return;

@@ -8561,6 +8561,10 @@ pub fn forEachChild(
                 try visitor.visit(nodes.at(ref), ref);
             }
         },
+        .labeled_statement => {
+            const ref = getRight(node);
+            try visitor.visit(nodes.at(ref), ref);
+        },
         .for_statement => {
             const d = getPackedData(node);
             if (d.left != 0) {
