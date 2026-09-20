@@ -13,7 +13,7 @@ import {
 } from './lowering2'
 import {
     cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getLiteral,
-    getRef, makeNode, setGraphBlocks, setRef,
+    getRef, makeNode, setGraphBlocks, setLiteral, setRef,
 } from './graph-node'
 
 type usize = u32
@@ -508,7 +508,7 @@ interface InlineScore {
     pressure: number
 }
 
-const interpreted = new Set(['ret', 'panic', 'unreachable', 'record', 'get', 'block', 'void', 'apply', 'after'])
+const interpreted = new Set(['ret', 'panic', 'unreachable', 'record', 'get', 'block', 'void', 'apply', 'after', 'inlined'])
 const targets = new Set(['syscall-target', 'local-target', 'pool-entry', 'heap-handle'])
 
 function obviousInline(g: Graph): InlineScore | undefined {
@@ -536,7 +536,7 @@ function obviousInline(g: Graph): InlineScore | undefined {
  
     let cost = 0
     const cheap = new Set([
-        'load', 'store', 'select', 'ne', 'eq', 'gt', 'lt', 'le',
+        'load', 'store', 'select', 'ne', 'eq', 'gt', 'lt', 'le', 'ge',
         'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'shr', 'ushr',
         'neg', 'not', 'convert', 'bitconvert', 'literal', 'void'
     ])
@@ -604,6 +604,60 @@ interface PendingUnit {
     graph: Graph
     functionHandleSlots: Map<number, number>
     dataHandleSlots: Map<number, number>
+}
+
+const EffectNone = 0
+const EffectRead = 1
+const EffectWrite = 2
+const EffectNames = ['readnone', 'readonly', 'writes']
+
+function classifyEffects(pending: PendingUnit[]): Map<number, number> {
+    const classes = new Map<number, number>()
+    const callees = new Map<number, number[]>()
+    const callers = new Map<number, Set<number>>()
+    for (const unit of pending) {
+        let self = EffectNone
+        const out: number[] = []
+        for (const n of unit.graph.nodes.values()) {
+            if (n.op === 'store') {
+                self = EffectWrite
+                continue
+            }
+            if (n.op === 'load') {
+                if (self < EffectRead) self = EffectRead
+                continue
+            }
+            if (n.op !== 'call') continue
+            const target = unit.graph.nodes.get(getRef(n, 1))
+            if (target && target.op === 'local-target' && !getRef(target, 0)) {
+                out.push(getLiteral(target, 0))
+                continue
+            }
+            self = EffectWrite
+        }
+        classes.set(unit.symbol, self)
+        callees.set(unit.symbol, out)
+    }
+    for (const [symbol, out] of callees) {
+        for (const callee of out) {
+            let set = callers.get(callee)
+            if (!set) callers.set(callee, set = new Set())
+            set.add(symbol)
+        }
+    }
+    const work = [...classes.keys()]
+    while (work.length) {
+        const symbol = work.pop()!
+        let want = classes.get(symbol)!
+        for (const callee of callees.get(symbol) ?? []) {
+            const c = classes.get(callee)
+            want = Math.max(want, c === undefined ? EffectWrite : c)
+        }
+        if (want === classes.get(symbol)) continue
+        classes.set(symbol, want)
+        for (const caller of callers.get(symbol) ?? []) work.push(caller)
+    }
+    return classes
 }
 
 function dumpCallShapes(pending: PendingUnit[], functions: Function[], opaque: Map<number, Graph>): void {
@@ -1139,6 +1193,29 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         dumpCallShapes(pending, functions, opaqueGraphs)
         throw 'native: call shapes dumped'
     }
+    const effectClasses = classifyEffects(pending)
+    if (intrinsics.argv().includes('native-effects')) {
+        const counts = [0, 0, 0]
+        for (const [symbol, c] of effectClasses) {
+            counts[c]++
+            if (c === EffectWrite) continue
+            console.log('native effects', EffectNames[c], functions[symbol]?.name || `symbol ${symbol}`)
+        }
+        console.log('native effects total', EffectNames.map((n, i) => `${n}=${counts[i]}`).join(' '))
+    }
+    if (!intrinsics.argv().includes('no-call-effects')) {
+        for (const unit of pending) {
+            let refined = false
+            for (const n of unit.graph.nodes.values()) {
+                if (n.op !== 'local-target' || getRef(n, 0) || countIds(n) < 2) continue
+                const c = effectClasses.get(getLiteral(n, 0)) ?? EffectWrite
+                if (c === getLiteral(n, 1)) continue
+                setLiteral(n, 1, c)
+                refined = true
+            }
+            if (refined) unit.graph = normalizeValueGraph(unit.graph)
+        }
+    }
     const lowerStart = performance.now()
     for (const unit of pending) {
         const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs)
@@ -1160,7 +1237,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const repeated = [...bySource.values()].filter(x => x.count > 1).sort((a, b) => b.count - a.count)
         console.log('trace2 stats', totals, 'distinct sources', bySource.size,
             'repeat traces', repeated.reduce((s, x) => s + x.count - 1, 0))
-        for (const x of repeated.slice(0, 25)) console.log('  ', x.count, x.name)
+        for (const x of repeated.slice(0, 15)) console.log('  ', x.count, x.name)
+        const bySelf = [...bySource.values()].sort((a, b) => b.self - a.self)
+        for (const x of bySelf.slice(0, 20)) {
+            console.log('  self', x.self.toFixed(1), 'x', x.count, x.name.replace(/\n\s*/g, ' ').slice(0, 70))
+        }
     }
     const rootSymbols = new Set<number>(roots.values())
     const pooledSymbols = new Set<number>(localPoolTargets.values())

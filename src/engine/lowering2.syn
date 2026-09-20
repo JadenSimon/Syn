@@ -144,6 +144,25 @@ const PureOps = new Set<string>([
     ...TargetingValues
 ])
 const Commutative = new Set<string>(['add', 'mul', 'and', 'or', 'xor', 'ne', 'eq'])
+
+const LiftableSlots: Record<string, number[]> = {
+    load: [1, 2],
+    store: [1, 2, 3],
+    select: [1, 2],
+    ret: [0],
+}
+
+const maxInlineLiteral = 0x10000
+
+function inlineableLiteral(v: f64): boolean {
+    return !Number.isSafeInteger(v) || (v > -maxInlineLiteral && v < maxInlineLiteral)
+}
+
+function liftableSlot(op: string, slot: number): boolean {
+    if (BinaryOps.has(op) || CompareOps.has(op)) return slot < 2
+    if (UnaryOps.has(op) || op === 'convert' || op === 'bitconvert') return slot === 0
+    return LiftableSlots[op]?.includes(slot) ?? false
+}
 const SwappedCmp: Record<string, string> = {
     lt: 'gt', gt: 'lt', le: 'ge', ge: 'le', eq: 'eq', ne: 'ne',
 }
@@ -213,6 +232,9 @@ function nodeKey(n: GraphNode, argIds = getArgIds(n), argConsts = getArgConsts(n
     const parts = [n.op]
     for (let i = 0; i < argIds.length; i++) {
         parts.push(argIds[i] ? `v${argIds[i]}` : `c${Object.is(argConsts[i], -0) ? '-0' : argConsts[i]}`)
+    }
+    for (let i = argIds.length; i < argConsts.length; i++) {
+        parts.push(`c${Object.is(argConsts[i], -0) ? '-0' : argConsts[i]}`)
     }
     const slots = typeSlots(n.op)
     // XXX: graph arithmetic can carry u32/u64 decoration that lowering treats identically.
@@ -1507,6 +1529,11 @@ function optimizeValueGraph(g: Graph) {
             return runWithInboundChecks(pass, b)
         }
         const changed = !!pass(b)
+        if (changed) {
+        if (g.name === 'createHeap') {
+            console.log('after', pass.name, dumpGraph(g))
+        }
+        }
         seen.set(b.id, versions.get(b.id) ?? 0)
         return changed
     }
@@ -1807,6 +1834,12 @@ function optimizeValueGraph(g: Graph) {
         return createNode(g, 'after', rem)
     }
 
+    function callEffect(n: GraphNode): number {
+        const target = g.nodes.get(getRef(n, 1))
+        if (!target || target.op !== 'local-target' || getRef(target, 0)) return 2
+        return countIds(target) > 1 ? getLiteral(target, 1) : 2
+    }
+
     function simplifyOrdering(
         vid: number,
         unordered = new Set<number>(),
@@ -1865,7 +1898,8 @@ function optimizeValueGraph(g: Graph) {
             return effectsJoin(arr, r)
         }
         if (u.op === 'call' || u.op === 'load' || u.op === 'store') {
-            if (u.op === 'load' && (from?.op === 'load' || from?.op === 'after')) {
+            const clobbers = u.op === 'store' || (u.op === 'call' && callEffect(u) > 1)
+            if (!clobbers && (from?.op === 'load' || from?.op === 'after')) {
                 return simplifyOrdering(getRef(u, 0), unordered, from)
             }
             return vid
@@ -1903,16 +1937,15 @@ function optimizeValueGraph(g: Graph) {
                 }
                 if (!argIds) argIds = cloneRefs(n)
                 if (!argConsts) argConsts = cloneLiterals(n)
-                argIds[i] = ordering ?? createNode(g, 'nil-effect', [])
+                argIds[i] = ordering ?? nil()
                 argConsts[i] = 0
             }
             const orderings = (argIds ?? getArgIds(n)).slice(0, end)
             const isPointlessAfter = n.op === 'after' && orderings.every(isNilOrVoid)
-            if (isPointlessAfter && getRef(n, end)) {
+            if (isPointlessAfter) {
                 if (getRef(n, end)) {
                     replacements.set(id, replacements.get(getRef(n, end)) ?? getRef(n, end))
                 } else {
-                    // TODO: turn this on. it regresses `cg native` atm
                     const nextId = g.maxId++
                     g.nodes.set(nextId, literal(getLiteral(n, end)))
                     replacements.set(id, nextId)
@@ -1920,7 +1953,7 @@ function optimizeValueGraph(g: Graph) {
                 return
             }
             if (!argIds || !argConsts) return
-            for (let i = end; i < countIds(n); i++) {
+            for (let i = end; i < argIds.length; i++) {
                 const q = argIds[i]
                 if (q) argIds[i] = replacements.get(q) ?? q
             }
@@ -3177,24 +3210,6 @@ function optimizeValueGraph(g: Graph) {
         return true
     }
 
-    function foldPanics(b: GraphBlock) {
-        const r = new Map<number, number>()
-        const panics = findValues(b.id, 'panic') ?? []
-        for (const v of panics) {
-            const uses = dependents.get(v) ?? []
-            for (const u of uses) {
-                const n = g.nodes.get(u)!
-                if (n.op === 'select' && getRef(n, 0) !== v) continue
-                r.set(u, v)
-            }
-        }
-        if (!r.size) return false
-        b.bodyId = replaceAll(b.bodyId, r)
-        revisitBlock(b)
-        foldPanics(b)
-        return true
-    }
-
     function mergeBlocks(target: GraphBlock): boolean {
         const next = successors.get(target.id)
         if (!next || next.size !== 1) return false
@@ -3217,9 +3232,7 @@ function optimizeValueGraph(g: Graph) {
 
         removeBlock(b)
         target.bodyId = replaceAll(target.bodyId, new Map([[site, merged]]))
-        internBody(target)
         revisitBlock(target)
-        mergeBlocks(target)
         return true
     }
 
@@ -3383,28 +3396,16 @@ function optimizeValueGraph(g: Graph) {
 
     function inlineApplication(path: number[], b: GraphBlock, bodyId: number): number | undefined {
         const app = g.nodes.get(path[path.length - 1])!
-        const orderedness = new Map<number, boolean>()
-        function ordered(id: number): boolean {
-            const n = g.nodes.get(id)
-            if (!n || n.op === 'nil-effect' || n.op === 'param' || n.op === 'block' || n.op === 'void') return false
-            if (n.op === 'load' || n.op === 'store' || n.op === 'call') return true
-            let known = orderedness.get(id)
-            if (known === undefined) {
-                orderedness.set(id, false)
-                known = getArgIds(n).some(x => ordered(x))
-                orderedness.set(id, known)
-            }
-            return known
-        }
         let conditional = false
         function frontier(id: number, into: Set<number>): void {
-            if (!id || into.has(id) || !ordered(id)) return
+            if (conditional) return
+            if (!id || into.has(id) || isUnordered(id)) return
             const n = g.nodes.get(id)!
             if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
                 into.add(id)
             } else if (n.op === 'select') {
                 frontier(getRef(n, 0), into)
-                if (cloneRefs(n, 1).some(x => ordered(x))) conditional = true
+                if (cloneRefs(n, 1).some(x => !isUnordered(x))) conditional = true
             } else {
                 for (const x of getArgIds(n)) frontier(x, into)
             }
@@ -3414,6 +3415,7 @@ function optimizeValueGraph(g: Graph) {
             const n = g.nodes.get(id)!
             const end = n.op === 'after' ? countIds(n) - 1 : 1
             for (let i = 0; i < end; i++) frontier(getRef(n, i), order)
+            if (conditional) return
         }
         const context = new Set(order)
         for (let i = 1; i < countIds(app); i++) frontier(getRef(app, i), order)
@@ -3446,28 +3448,6 @@ function optimizeValueGraph(g: Graph) {
         const dropped = kept.filter(id => !context.has(id))
         if (dropped.length) merged = addNode('after', [...dropped, merged], new Float64Array(dropped.length + 1))
         return merged
-    }
-
-    function internBody(target: GraphBlock) {
-        const interned = new Map<string, number>()
-        const canonical = new Map<number, number>()
-        function intern(id: number): number {
-            if (!id) return id
-            const known = canonical.get(id)
-            if (known !== undefined) return known
-            const n = g.nodes.get(id)
-            if (!n || n.op === 'param' || n.op === 'block') return id
-            const argIds = getArgIds(n).map(x => intern(x))
-            const key = nodeKey(n, argIds)
-            let result = interned.get(key)
-            if (result === undefined) {
-                result = argIds.some((x, i) => x !== getRef(n, i)) ? addNode(n.op, argIds, cloneLiterals(n), n) : id
-                interned.set(key, result)
-            }
-            canonical.set(id, result)
-            return result
-        }
-        target.bodyId = intern(target.bodyId)
     }
 
     function constantOf(n: GraphNode, i: number): number | undefined {
@@ -3536,7 +3516,6 @@ function optimizeValueGraph(g: Graph) {
         removeBlock(target)
         for (const [from, r] of edits) {
             from.bodyId = replaceAll(from.bodyId, r)
-            internBody(from)
             revisitBlock(from)
         }
         return true
@@ -4080,7 +4059,8 @@ function optimizeValueGraph(g: Graph) {
                 return value
             }
             if (n.op === 'literal') {
-                const value = { id: 0, value: literalValue(n) }
+                const k = literalValue(n)
+                const value = inlineableLiteral(k) ? { id: 0, value: k } : { id, value: 0 }
                 memo.set(id, value)
                 return value
             }
@@ -4244,18 +4224,55 @@ function optimizeValueGraph(g: Graph) {
         let changed = false
         for (const id of literals) {
             const u = g.nodes.get(id)!
+            const value = literalValue(u)
+            const wide = !inlineableLiteral(value)
             const uses = dependents.get(id) ?? []
             for (const x of uses) {
                 const n = g.nodes.get(x)!
-                let slot = getArgIds(n).indexOf(id)
-                while (slot !== -1) {
-                    setLiteral(n, slot, literalValue(u))
-                    slot = getArgIds(n).indexOf(id)
+                const ids = getArgIds(n)
+                for (let slot = 0; slot < ids.length; slot++) {
+                    if (ids[slot] !== id) continue
+                    if (wide && liftableSlot(n.op, slot)) continue
+                    setLiteral(n, slot, value)
                     changed = true
                 }
             }
         }
         if (changed) revisitBlock(b)
+    }
+
+    function liftLiterals(b: GraphBlock) {
+        const ops = byOp.get(b.id)
+        if (!ops) return false
+        const counts = new Map<number, number>()
+        const visit = (fn: (n: GraphNode, op: string, slot: number, value: f64) => void) => {
+            for (const [op, ids] of ops) {
+                if (op === 'literal') continue
+                for (const id of ids) {
+                    const n = g.nodes.get(id)!
+                    const arity = countIds(n)
+                    for (let slot = 0; slot < arity; slot++) {
+                        if (getRef(n, slot)) continue
+                        const value = getLiteral(n, slot)
+                        if (inlineableLiteral(value) || !liftableSlot(op, slot)) continue
+                        fn(n, op, slot, value)
+                    }
+                }
+            }
+        }
+        visit((n, op, slot, value) => counts.set(value, (counts.get(value) ?? 0) + 1))
+        const made = new Map<number, number>()
+        visit((n, op, slot, value) => {
+            if ((counts.get(value) ?? 0) < 2) return
+            let lifted = made.get(value)
+            if (lifted === undefined) {
+                made.set(value, lifted = addNode('literal', [0], new Float64Array([value])))
+            }
+            setRef(n, slot, lifted)
+        })
+        if (made.size === 0) return false
+        revisitBlock(b)
+        return true
     }
 
     interface ClosureTerm {
@@ -4890,6 +4907,7 @@ function optimizeValueGraph(g: Graph) {
         }
         for (const b of reachableBlocks) {
             step(foldLiterals, b)
+            step(liftLiterals, b)
             step(foldValues, b)
             step(specializeBlockParameters, b)
             step(simplifyBitOperations, b)
@@ -4912,11 +4930,28 @@ function optimizeValueGraph(g: Graph) {
         }
     }
 
+    function reduceConstantMultiplies() {
+        for (const b of reachableBlocks) {
+            for (const id of findValues(b.id, 'mul') ?? []) {
+                const n = g.nodes.get(id)!
+                const valueAt = getRef(n, 0) && !getRef(n, 1) ? 0
+                    : getRef(n, 1) && !getRef(n, 0) ? 1 : -1
+                if (valueAt < 0) continue
+                const carried = Math.log2(getLiteral(n, valueAt ^ 1) - 1)
+                if (!Number.isSafeInteger(carried) || carried <= 0 || carried >= 32) continue
+                const value = getRef(n, valueAt)
+                const shifted = addNode('shl', [value, 0], new Float64Array([0, carried]), n)
+                g.nodes.set(id, copyNode(n, [value, shifted], new Float64Array(2), 'add'))
+            }
+        }
+    }
+
     const maxRounds = g.nodes.size < 50 ? 3 : 2
     for (let round = 0; round < maxRounds; round++) {
         optimize()
         if (!didAnyChange) break
     }
+    reduceConstantMultiplies()
     if (!reachableBlocks.size) {
         reachableBlocks.add(g.blocks[0])
         g.blocks[0].bodyId = unreachable()
@@ -7185,16 +7220,19 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         materializing = id
         defer materializing = outer
         done.add(id)
-        effect(getRef(n, 0))
         const T = getTypeT(n)
         const zero = !getRef(n, 3) && getLiteral(n, 3) === 0
-        const wanted = [1]
+        const wanted = [0, 1]
         if (getRef(n, 2)) wanted.push(2)
         if (!zero) wanted.push(3)
         let b = 0
         let o = 0
         let v = 0
         for (const i of orderedOperands(id, wanted)) {
+            if (i === 0) {
+                effect(getRef(n, 0))
+                continue
+            }
             const d = demand(getRef(n, i), getLiteral(n, i))
             if (i === 1) b = d
             else if (i === 2) o = d
@@ -7221,10 +7259,13 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         materializing = id
         defer materializing = outer
         done.add(id)
-        effect(getRef(n, 0))
         const T = getTypeT(n)
         if (!getRef(n, 2)) {
-            const b0 = demand(getRef(n, 1), getLiteral(n, 1))
+            let b0 = 0
+            for (const i of orderedOperands(id, [0, 1])) {
+                if (i === 0) effect(getRef(n, 0))
+                else b0 = demand(getRef(n, 1), getLiteral(n, 1))
+            }
             const base0 = at(b0, NOTHING)
             finish()
             const dst = regFor(id, want)
@@ -7232,7 +7273,11 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             return
         }
         let b = 0, o = 0
-        for (const i of orderedOperands(id, [1, 2])) {
+        for (const i of orderedOperands(id, [0, 1, 2])) {
+            if (i === 0) {
+                effect(getRef(n, 0))
+                continue
+            }
             const v = demand(getRef(n, i), getLiteral(n, i))
             if (i === 1) b = v
             else o = v
