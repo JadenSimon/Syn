@@ -55,6 +55,7 @@ export interface Assembler {
     spAdjust(bytes: number): void
     spRead(dst: number): void
     bindLabel(id: number): void
+    releaseLabel(id: number): void
     jump(id: number): void
     jumpIfNonZero(reg: number, id: number): void
     jumpIfZero(reg: number, id: number): void
@@ -138,6 +139,7 @@ interface AsmItem {
     adjustDelta?: number // signed: +imm for add, -imm for sub
     relocationKind?: Relocation['kind']
     relocationTarget?: number
+    clobbers?: boolean
     moveDst?: number
     moveSrc?: number
     shiftDst?: number
@@ -158,6 +160,8 @@ interface AsmItem {
     logicalOp?: 'and' | 'or' | 'xor'
     cmpLeft?: number
     cmpRight?: number
+    cmpImmediate?: number
+    constReg?: number
     convertDst?: number
     convertSrc?: number
     convertWidth?: number
@@ -184,14 +188,21 @@ export const aarch64LinuxSyscall: SyscallConvention = {
     trap: 0,
 }
 
+
 export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall): Assembler {
     const items: AsmItem[] = []
     const removedWrites: number[] = []
+    const labelRefs = new Map<number, number>()
+    const closedLabels = new Set<number>()
     let finished = false
 
     const writebacks = new Map<number, AsmItem>()
+    const NO_REGS: Set<number> = new Set()
 
     function push(item: AsmItem): void {
+        if (item.label >= 0 && isBranch(item.kind)) {
+            labelRefs.set(item.label, (labelRefs.get(item.label) ?? 0) + 1)
+        }
         items.push(item)
         emitted(item)
     }
@@ -1256,7 +1267,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         } else {
             if (imm < 0 || imm > 0xFFF) throw `aarch64: cmp immediate out of range: ${imm}`
             if (imm === 0) emitCmpZero(a)
-            else emitCmp(0xF1000000 | (imm << 10) | (a << 5) | XZR, `cmp ${x(a)}, #${imm}`) // subs xzr, a, #imm
+            else emitCmp(0xF1000000 | (imm << 10) | (a << 5) | XZR, `cmp ${x(a)}, #${imm}`,
+                { cmpLeft: a, cmpImmediate: imm }) // subs xzr, a, #imm
         }
         if (dst >= 0) cset(dst, cond)
     }
@@ -1371,6 +1383,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.convertDst !== undefined) { out.push(item.convertDst); return true }
         if (item.extractDst !== undefined) { out.push(item.extractDst); return true }
         if (item.zeroReg !== undefined) { out.push(item.zeroReg); return true }
+        if (item.constReg !== undefined) { out.push(item.constReg); return true }
         if (item.indexBase !== undefined) { if (item.indexLoad) out.push(item.reg); return true }
         if (item.loadBase !== undefined) {
             out.push(item.word & 0x1F)
@@ -1395,6 +1408,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.convertSrc !== undefined) { out.push(item.convertSrc); return true }
         if (item.extractSrc !== undefined) { out.push(item.extractSrc); return true }
         if (item.zeroReg !== undefined) return true
+        if (item.constReg !== undefined) return true
         if (item.indexBase !== undefined) {
             out.push(item.indexBase, item.indexReg!)
             if (!item.indexLoad) out.push(item.reg)
@@ -1444,6 +1458,256 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
+    function plainCompare(cmp: AsmItem): [left: number, right: number, imm: number] | undefined {
+        const left = cmp.cmpLeft ?? cmp.cmpZeroReg
+        if (!cmp.setsFlags || left === undefined) return
+        if (cmp.cmpRight !== undefined) {
+            return cmp.word === ((0xEB000000 | (cmp.cmpRight << 16) | (left << 5) | XZR) >>> 0)
+                ? [left, cmp.cmpRight, -1] : undefined
+        }
+        const imm = cmp.cmpZeroReg !== undefined ? 0 : cmp.cmpImmediate
+        if (imm === undefined || imm < 0 || imm > 0xFFF) return
+        return cmp.word === ((0xF1000000 | (imm << 10) | (left << 5) | XZR) >>> 0)
+            ? [left, -1, imm] : undefined
+    }
+
+    function toCcmp(cmp: AsmItem, cond: number, prior: number): AsmItem | undefined {
+        const [left, right, imm] = plainCompare(cmp)!
+        const nzcv = FalseFlags[cond]
+        let setup: AsmItem | undefined
+        let rhs = right
+        if (imm >= 0 && imm <= 31) {
+            cmp.word = (0xFA400800 | (imm << 16) | (prior << 12) | (left << 5) | nzcv) >>> 0
+            cmp.text = `ccmp ${x(left)}, #${imm}, #${nzcv}, ${CondNames[prior]}`
+        } else {
+            if (imm >= 0) {
+                rhs = scratchA
+                setup = {
+                    kind: 'insn', word: (0xD2800000 | (imm << 5) | scratchA) >>> 0,
+                    text: `movz ${x(scratchA)}, #${imm}`, label: -1, reg: -1, cond: -1,
+                    constReg: scratchA,
+                }
+            }
+            cmp.word = (0xFA400000 | (rhs << 16) | (prior << 12) | (left << 5) | nzcv) >>> 0
+            cmp.text = `ccmp ${x(left)}, ${x(rhs)}, #${nzcv}, ${CondNames[prior]}`
+        }
+        cmp.cmpLeft = undefined
+        cmp.cmpRight = undefined
+        cmp.cmpZeroReg = undefined
+        cmp.cmpImmediate = undefined
+        cmp.cond = prior
+        return setup
+    }
+
+    function fuseConjunction(dead: Set<number>): boolean {
+        const len = items.length
+        if (len < 6) return false
+        const branch = items[len - 1]
+        const conj = items[len - 2]
+        const late = items[len - 3]
+        const lateCmp = items[len - 4]
+        if (branch.kind !== 'cbnz' && branch.kind !== 'cbz') return false
+        if (!dead.has(branch.reg)) return false
+        if (conj.aluName !== 'and' || conj.addDst !== branch.reg) return false
+        if (late.kind !== 'cset' || !lateCmp.setsFlags) return false
+
+        const floor = Math.max(1, len - 12)
+        let at = len - 5
+        while (at >= floor && items[at].kind !== 'cset') {
+            const it = items[at]
+            if (it.kind === 'label' || isBranch(it.kind) || it.setsFlags) return false
+            at--
+        }
+        if (at < floor) return false
+        const early = items[at]
+        const earlyCmp = items[at - 1]
+        if (!earlyCmp.setsFlags || early.reg === late.reg) return false
+        if ((conj.addLeft !== early.reg || conj.addRight !== late.reg)
+            && (conj.addLeft !== late.reg || conj.addRight !== early.reg)) return false
+        if (FalseFlags[early.cond] === undefined || FalseFlags[late.cond] === undefined) return false
+        for (let k = at + 1; k < len - 3; k++) {
+            const defs: number[] = []
+            if (!itemDefs(items[k], defs)) return false
+            for (const r of defs) if (r === early.reg) return false
+        }
+
+        const spent = (r: number) => r === conj.addDst || !!conj.deadAfter?.has(r)
+        let swap = false
+        if (spent(late.reg) && plainCompare(lateCmp)) swap = false
+        else if (at === len - 5 && spent(early.reg) && plainCompare(earlyCmp)) swap = true
+        else return false
+        if (swap) {
+            const uses: number[] = []
+            if (!itemUses(earlyCmp, uses)) return false
+            for (const r of uses) if (r === late.reg) return false
+        }
+        const head = swap ? late : early
+        const tail = swap ? early : late
+        const keep: AsmItem[] = [swap ? lateCmp : earlyCmp]
+        if (!spent(head.reg)) keep.push(head)
+        if (!swap) for (let k = at + 1; k < len - 4; k++) keep.push(items[k])
+        const setup = toCcmp(swap ? earlyCmp : lateCmp, tail.cond, head.cond)
+        if (setup) keep.push(setup)
+        keep.push(swap ? earlyCmp : lateCmp)
+        branch.cond = branch.kind === 'cbz' ? tail.cond ^ 1 : tail.cond
+        branch.kind = 'bcond'
+        keep.push(branch)
+        items.splice(at - 1, len - at + 1, ...keep)
+        removedWrites.push(conj.addDst!, tail.reg)
+        if (spent(head.reg)) removedWrites.push(head.reg)
+        return true
+    }
+
+    function usesReg(it: AsmItem, r: number): boolean {
+        if (it.kind === 'b' || it.kind === 'label' || it.kind === 'bcond' || it.kind === 'cset') return false
+        if (it.kind === 'cbz' || it.kind === 'cbnz') return it.reg === r
+        const uses: number[] = []
+        if (!itemUses(it, uses)) return true
+        return uses.includes(r)
+    }
+
+    function terminates(it: AsmItem | undefined): boolean {
+        return !!it && (it.kind === 'b' || (it.kind === 'insn' && it.word === 0xD65F03C0))
+    }
+
+    function recoverPrior(dead: Set<number>): boolean {
+        const len = items.length
+        if (len < 4) return false
+        const reader = items[len - 1]
+        let probe = len - 1
+        let taken = false
+        if (reader.kind === 'cbz' || reader.kind === 'cbnz') {
+            taken = reader.kind === 'cbnz'
+        } else if (reader.cselCond === COND_NE || reader.cselCond === COND_EQ) {
+            probe = len - 2
+            taken = reader.cselCond === COND_NE
+        } else return false
+        const reg = probe === len - 1 ? reader.reg : (items[probe]?.cmpZeroReg ?? -1)
+        if (reg < 0 || !dead.has(reg)) return false
+
+        let j = probe - 1
+        let crossed = false
+        while (j >= 0 && items[j].kind !== 'bcond') {
+            const it = items[j]
+            if (it.kind === 'label') {
+                if (crossed || !closedLabels.has(it.label) || labelRefs.get(it.label) !== 1) return false
+                if (!terminates(items[j - 1])) return false
+                let k = j - 1
+                while (k >= 0 && !(items[k].kind === 'bcond' && items[k].label === it.label)) {
+                    if (items[k].kind === 'label' || usesReg(items[k], reg)) return false
+                    k--
+                }
+                if (k < 0) return false
+                crossed = true
+                j = k
+                break
+            }
+            if (isBranch(it.kind) || it.setsFlags || it.kind === 'cset') return false
+            const defs: number[] = []
+            if (!itemDefs(it, defs) || usesReg(it, reg)) return false
+            for (const r of defs) if (r === reg) return false
+            j--
+        }
+        if (j < 2) return false
+        const guard = items[j]
+        const ccmp = items[j - 1]
+        if (guard.kind !== 'bcond') return false
+        if (ccmp.kind !== 'insn' || (ccmp.word >>> 21) !== 0x7D2) return false
+        let c = j - 2
+        const bottom = Math.max(0, j - 8)
+        while (c >= bottom && !(items[c].kind === 'cset' && items[c].reg === reg)) {
+            const it = items[c]
+            if (it.kind === 'label' || isBranch(it.kind) || it.setsFlags) return false
+            const defs: number[] = []
+            if (!itemDefs(it, defs)) return false
+            for (const r of defs) if (r === reg) return false
+            c--
+        }
+        if (c < bottom) return false
+        const set = items[c]
+        const prior = (ccmp.word >>> 12) & 0xF
+        if (set.cond !== prior) return false
+        const fallback = ccmp.word & 0xF
+
+        if (holds(guard.cond, fallback) !== crossed) {
+            if (probe !== len - 1) return false
+            if (taken) {
+                reader.kind = 'b'
+                reader.text = `b L${reader.label}`
+                reader.reg = -1
+            } else {
+                labelRefs.set(reader.label, (labelRefs.get(reader.label) ?? 1) - 1)
+                items.splice(len - 1, 1)
+            }
+            items.splice(c, 1)
+            removedWrites.push(reg)
+            return true
+        }
+        if ((crossed ? guard.cond : guard.cond ^ 1) !== COND_EQ) return false
+        let t = 0
+        while (t < 14 && !(holds(t, 0b0110) && !holds(t, fallback))) t++
+        if (t === 14) return false
+        const cond = taken ? t : t ^ 1
+        if (probe === len - 1) {
+            reader.cond = cond
+            reader.kind = 'bcond'
+        } else {
+            const regs = reader.cselRegs!
+            reader.word = ((reader.word & ~(0xF << 12)) | (cond << 12)) >>> 0
+            reader.text = `csel ${x(regs[0])}, ${x(regs[1])}, ${x(regs[2])}, ${CondNames[cond]}`
+            reader.cselCond = cond
+            items.splice(probe, 1)
+        }
+        items.splice(c, 1)
+        removedWrites.push(reg)
+        return true
+    }
+
+    function sinkIntoMove(dead: Set<number>): boolean {
+        const len = items.length
+        if (len < 3) return false
+        const move = items[len - 1]
+        if (move.moveSrc === undefined || move.moveDst === undefined) return false
+        const src = move.moveSrc
+        const dst = move.moveDst
+        if (!dead.has(src)) return false
+        const floor = Math.max(0, len - 8)
+        let at = len - 2
+        while (at >= floor) {
+            const it = items[at]
+            const defs: number[] = []
+            const uses: number[] = []
+            if (it.kind !== 'insn' || !itemDefs(it, defs) || !itemUses(it, uses)) return false
+            if (defs.includes(src)) { if (defs.length !== 1) return false; break }
+            if (uses.includes(src)) return false
+            at--
+        }
+        if (at < floor) return false
+        const def = items[at]
+        if (def.setsFlags || def.relocationKind !== undefined) return false
+        const feeds: number[] = []
+        if (!itemUses(def, feeds)) return false
+        for (let k = at + 1; k < len - 1; k++) {
+            const it = items[k]
+            const defs: number[] = []
+            if (it.setsFlags || it.clobbers || !itemDefs(it, defs)) return false
+            for (const r of defs) if (r === dst || feeds.includes(r)) return false
+        }
+        if (!retargetDef(def, src, dst)) return false
+        const notices = def.deadAfter ?? new Set<number>()
+        for (let k = at + 1; k < len - 1; k++) {
+            const seen = items[k].deadAfter
+            if (!seen) continue
+            for (const r of feeds) if (seen.delete(r)) notices.add(r)
+        }
+        for (const r of move.deadAfter ?? NO_REGS) notices.add(r)
+        def.deadAfter = notices.size ? notices : undefined
+        items.splice(at, 1)
+        items.splice(items.length - 1, 1, def)
+        removedWrites.push(src)
+        return true
+    }
+
     function released(values: { value: number, home: number }[]): void {
         const dead = new Set<number>()
         for (const value of values) if (value.home >= 0) dead.add(value.home)
@@ -1453,6 +1717,10 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (!item.deadAfter) item.deadAfter = new Set<number>()
             for (const reg of dead) item.deadAfter.add(reg)
         }
+
+        if (fuseConjunction(dead)) return
+        if (recoverPrior(dead)) return
+        if (sinkIntoMove(dead)) return
 
         if (items.length >= 2) {
             const move = items[items.length - 1]
@@ -1700,6 +1968,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         bindLabel: (id) => {
             push({ kind: 'label', word: 0, text: '', label: id, reg: -1, cond: -1 })
         },
+        releaseLabel: (id) => {
+            closedLabels.add(id)
+        },
         jump: (id) => {
             push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
         },
@@ -1709,8 +1980,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         jumpIfZero: (reg, id) => {
             push({ kind: 'cbz', word: 0, text: '', label: id, reg, cond: -1 })
         },
-        br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`),
-        blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`),
+        br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`, { clobbers: true }),
+        blr: (reg: number) => emit(0xD63F0000 | (reg << 5), `blr x${reg}`, { clobbers: true }),
         loadPool: (dst: number, slot: number) => {
             push({
                 kind: 'insn', word: (0x90000000 | dst) >>> 0,
@@ -1723,14 +1994,14 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             push({
                 kind: 'insn', word: 0x94000000, text: `bl fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
-                relocationKind: 'aarch64-call', relocationTarget: target,
+                relocationKind: 'aarch64-call', relocationTarget: target, clobbers: true,
             })
         },
         jumpLocal: (target: number, debugName) => {
             push({
                 kind: 'insn', word: 0x14000000, text: `b fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
-                relocationKind: 'aarch64-jump', relocationTarget: target,
+                relocationKind: 'aarch64-jump', relocationTarget: target, clobbers: true,
             })
         },
         syscall: (id: number) => {
@@ -1739,7 +2010,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (!Number.isInteger(trap) || trap < 0 || trap > 0xFFFF) {
                 throw `aarch64: invalid syscall trap ${trap}`
             }
-            emit(0xD4000001 | (trap << 5), `svc #${trap}`)
+            emit(0xD4000001 | (trap << 5), `svc #${trap}`, { clobbers: true })
         },
         ret: () => emit(0xD65F03C0, 'ret'),
         released,
