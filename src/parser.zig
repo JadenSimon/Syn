@@ -10601,6 +10601,9 @@ pub const Binder = struct {
                 this.default_export = inner;
                 try this.visitRef(inner);
             },
+            .export_specifier => {
+                try this.visitRef(getLeft(node));
+            },
             .import_equals_declaration => {
                 const d = getPackedData(node);
                 const rhs = this.nodes.at(d.right);

@@ -69,6 +69,7 @@ pub const SynthInstrumenter = struct {
     dollar_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
 
     fns: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, void)) = .{},
+    instrumented: std.AutoArrayHashMapUnmanaged(NodeRef, void) = .{},
 
     ignored: ?*const std.AutoArrayHashMapUnmanaged(SymbolRef, void) = null,
 
@@ -90,6 +91,7 @@ pub const SynthInstrumenter = struct {
         defer v.deinit();
 
         try v.visit(ast.nodes.at(ast.start), ast.start);
+        try v.selectInstrumentation();
         v.transforming = true;
         try v.visit(ast.nodes.at(ast.start), ast.start);
         if (v.tmp_binding != 0) {
@@ -109,6 +111,108 @@ pub const SynthInstrumenter = struct {
 
     fn deinit(self: *@This()) void {
         self.frames.deinit(self.alloc);
+        for (self.fns.values()) |*captures| captures.deinit(self.alloc);
+        self.fns.deinit(self.alloc);
+        self.instrumented.deinit(self.alloc);
+        self.escapes.deinit(self.alloc);
+        self.assigned.deinit(self.alloc);
+        self.captured.deinit(self.alloc);
+        self.this_symbols.deinit(self.alloc);
+        self.dollar_symbols.deinit(self.alloc);
+    }
+
+    fn escapeSymbol(self: *@This(), sym_ref: SymbolRef) anyerror!void {
+        if (sym_ref == 0) return;
+        const sym = self.binder.symbols.at(sym_ref);
+        if (sym.hasFlag(.late_bound) or sym.hasFlag(.imported) or sym.hasFlag(.type) or sym.declaration == 0) return;
+        const entry = try self.escapes.getOrPut(self.alloc, sym_ref);
+        if (entry.found_existing) return;
+        try self.escapeValue(sym.declaration);
+    }
+
+    fn escapeValue(self: *@This(), ref: NodeRef) anyerror!void {
+        if (ref == 0) return;
+        const node = self.nodes.at(ref);
+        if (isFunctionLike(node.kind) or node.kind == .class_declaration or node.kind == .class_expression) {
+            try self.instrumented.put(self.alloc, ref, {});
+            return;
+        }
+        switch (node.kind) {
+            .identifier => if (self.binder.getSymbol(ref)) |sym| {
+                try self.escapeSymbol(sym);
+            },
+            .variable_declaration, .property_assignment, .property_declaration => try self.escapeValue(parser.getRight(node)),
+            .parameter, .binding_element => try self.escapeValue(parser.getRight(node)),
+            .expression_statement, .parenthesized_expression, .await_expression, .spread_element, .shorthand_property_assignment => try self.escapeValue(parser.unwrapRef(node)),
+            .as_expression, .satisfies_expression => try self.escapeValue(parser.getLeft(node)),
+            .conditional_expression => {
+                try self.escapeValue(parser.getRight(node));
+                try self.escapeValue(node.len);
+            },
+            .binary_expression => {
+                const op: SyntaxKind = @enumFromInt(node.len);
+                if (op == .ampersand_ampersand_token or op == .bar_bar_token or op == .question_question_token) {
+                    try self.escapeValue(parser.getLeft(node));
+                    try self.escapeValue(parser.getRight(node));
+                } else if (op == .comma_token or parser.isAssignmentOp(op)) {
+                    try self.escapeValue(parser.getRight(node));
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn collectEscapes(self: *@This(), node: *const AstNode, ref: NodeRef) !void {
+        switch (node.kind) {
+            .function_declaration, .function_expression, .arrow_function => {
+                if (node.hasFlag(.@"export")) try self.escapeValue(ref);
+                if (node.kind == .arrow_function) {
+                    const body = funcBodyRef(node);
+                    if (body != 0 and self.nodes.at(body).kind != .block) try self.escapeValue(body);
+                }
+            },
+            .method_declaration, .get_accessor, .set_accessor, .constructor,
+            .class_declaration, .class_expression => try self.escapeValue(ref),
+            .call_expression, .new_expression, .array_literal_expression => {
+                const head = if (node.kind == .array_literal_expression) parser.maybeUnwrapRef(node) orelse 0 else parser.getRight(node);
+                var iter = NodeIterator.init(self.nodes, head);
+                while (iter.nextRef()) |arg| try self.escapeValue(arg);
+            },
+            .property_assignment, .property_declaration => try self.escapeValue(parser.getRight(node)),
+            .parameter, .binding_element => try self.escapeValue(parser.getRight(node)),
+            .shorthand_property_assignment, .return_statement, .yield_expression, .throw_statement, .export_assignment => try self.escapeValue(parser.maybeUnwrapRef(node) orelse 0),
+            .binary_expression => {
+                if (parser.isAssignmentOp(@enumFromInt(node.len))) try self.escapeValue(parser.getRight(node));
+            },
+            .variable_statement => {
+                if (node.hasFlag(.@"export")) {
+                    var iter = NodeIterator.init(self.nodes, parser.maybeUnwrapRef(node) orelse 0);
+                    while (iter.nextRef()) |decl| try self.escapeValue(decl);
+                }
+            },
+            .export_declaration => {
+                if (node.hasFlag(.declare) or parser.getRight(node) != 0) return;
+                const clause = parser.getLeft(node);
+                if (clause == 0 or self.nodes.at(clause).kind != .named_exports) return;
+                var iter = NodeIterator.init(self.nodes, parser.maybeUnwrapRef(self.nodes.at(clause)) orelse 0);
+                while (iter.next()) |spec| {
+                    if (!spec.hasFlag(.declare)) try self.escapeValue(parser.getLeft(spec));
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn selectInstrumentation(self: *@This()) !void {
+        var i: usize = 0;
+        while (i < self.instrumented.count()) : (i += 1) {
+            const ref = self.instrumented.keys()[i];
+            const captures = self.fns.get(ref) orelse continue;
+            for (captures.keys()) |sym| {
+                try self.captured.put(self.alloc, sym, ref);
+                try self.escapeSymbol(sym);
+            }
+        }
     }
 
     fn isFungiblePrimitiveExp(self: *@This(), exp_ref: NodeRef) bool {
@@ -419,15 +523,16 @@ pub const SynthInstrumenter = struct {
     fn visitFunction(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
         if (funcBodyRef(node) == 0) return;
         if (self.transforming) {
-            const move_key = try self.factory.createCallExpression(
-                try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
-                &.{try self.factory.createStringLiteral("toComputation")},// &.{try self.factory.createStringLiteral("__moveable__")},
-            );
             const save_rebindings = self.rebindings;
             defer self.rebindings = save_rebindings;
             self.rebindings = .{};
             try forEachChild(self.nodes, node, self);
             try self.drainRebindings(funcBodyRef(node), 0);
+            if (!self.instrumented.contains(ref)) return;
+            const move_key = try self.factory.createCallExpression(
+                try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
+                &.{try self.factory.createStringLiteral("toComputation")},
+            );
             const captures = self.fns.get(ref) orelse unreachable; // set before transform
 
             if (node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor or node.kind == .constructor) {
@@ -652,7 +757,6 @@ pub const SynthInstrumenter = struct {
                     }
                 }
                 try frame.captures.put(self.alloc, sym, {});
-                try self.captured.put(self.alloc, sym, frame.decl_ref);
                 if (is_this) {
                     try self.this_symbols.put(self.alloc, sym, {});
                 }
@@ -764,6 +868,8 @@ pub const SynthInstrumenter = struct {
             return;
         }
 
+        if (!self.transforming) try self.collectEscapes(node, ref);
+
         switch (node.kind) {
             .function_declaration,
             .function_expression,
@@ -858,6 +964,10 @@ pub const SynthInstrumenter = struct {
 
             .identifier, .this_keyword => try self.classifyReference(ref),
             .super_keyword => {},
+            .export_assignment => {
+                const inner = parser.unwrapRef(node);
+                try self.visit(self.nodes.at(inner), inner);
+            },
 
             .object_literal_expression,
             .class_declaration, .class_expression => try self.visitClassLike(node, ref),
