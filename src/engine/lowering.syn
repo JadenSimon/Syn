@@ -65,6 +65,7 @@ export interface Assembler {
     callLocal(target: number, debugName?: string): void
     jumpLocal(target: number, debugName?: string): void
     syscall(id: number): void
+    trap(code: number): void
     ret(): void
     released(values: { value: number, home: number }[]): void
     elidedWrites(): number[]
@@ -133,6 +134,7 @@ interface AsmItem {
     setsFlags?: boolean  // a compare; the only thing that writes the condition flags
     cselCond?: number    // for csel, whose condition a peephole can rewrite
     cselRegs?: number[]  // dst, a, b -- to re-render the text when it does
+    cselIncrements?: boolean // csinc: the false arm is b + 1
     deadAfter?: Set<number>
     zeroReg?: number
     adjustReg?: number   // for self-modifying `add/sub rn, rn, #imm`
@@ -597,18 +599,16 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 }
 
                 if (it.cmpZeroReg !== undefined && i + 1 < items.length
-                    && items[i + 1].cselCond === COND_NE) {
+                    && (items[i + 1].cselCond === COND_NE || items[i + 1].cselCond === COND_EQ)) {
                     const reg = it.cmpZeroReg
                     let k = i - 1
                     while (k >= 0 && items[k].kind === 'insn' && !items[k].setsFlags
                         && (items[k].word & 31) !== reg) k--
                     if (k >= 0 && items[k].kind === 'cset' && items[k].reg === reg) {
                         const sel = items[i + 1]
-                        const cc = items[k].cond
+                        const cc = sel.cselCond === COND_NE ? items[k].cond : items[k].cond ^ 1
                         const regs = sel.cselRegs!
-                        sel.word = ((sel.word & ~(0xF << 12)) | (cc << 12)) >>> 0
-                        sel.text = `csel ${x(regs[0])}, ${x(regs[1])}, ${x(regs[2])}, ${CondNames[cc]}`
-                        sel.cselCond = cc
+                        retargetSelect(sel, cc)
                         items.splice(i, 1)
                         if ((sel.deadAfter?.has(reg) || regs[0] === reg)
                             && regs[1] !== reg && regs[2] !== reg) {
@@ -694,10 +694,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (reader.kind === 'bcond') {
             reader.cond = t
         } else {
-            const regs = reader.cselRegs!
-            reader.word = ((reader.word & ~(0xF << 12)) | (t << 12)) >>> 0
-            reader.text = `csel ${x(regs[0])}, ${x(regs[1])}, ${x(regs[2])}, ${CondNames[t]}`
-            reader.cselCond = t
+            retargetSelect(reader, t)
         }
         items.splice(i, 1)
         return true
@@ -1305,6 +1302,39 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
     }
 
+    function retargetSelect(sel: AsmItem, cond: number): void {
+        const [d, a, b] = sel.cselRegs!
+        sel.word = ((sel.word & ~(0xF << 12)) | (cond << 12)) >>> 0
+        sel.cselCond = cond
+        if (!sel.cselIncrements) sel.text = `csel ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
+        else if (a === b) sel.text = `cinc ${x(d)}, ${x(a)}, ${CondNames[cond ^ 1]}`
+        else sel.text = `csinc ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
+    }
+
+    function incrementSelect(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const sel = items[last]
+        if (!sel?.cselRegs || sel.cselIncrements) return false
+        const [d, a, b] = sel.cselRegs
+        for (let at = last - 1; at >= 0 && items[at].kind === 'insn'; at--) {
+            const add = items[at]
+            const t = add.addDst
+            const r = add.addLeft
+            if (add.addImmediate !== 1 || t === undefined || r === undefined || !dead.has(t)) continue
+            if ((a !== t || b !== r) && (a !== r || b !== t)) continue
+            if (!noInterference(at + 1, last, t, r)) return false
+            sel.word = (0x9A800400 | (r << 16) | (r << 5) | d) >>> 0
+            sel.cselRegs = [d, r, r]
+            sel.cselIncrements = true
+            retargetSelect(sel, a === t ? sel.cselCond! ^ 1 : sel.cselCond!)
+            for (const reg of add.deadAfter ?? NO_REGS) (sel.deadAfter ??= new Set()).add(reg)
+            items.splice(at, 1)
+            removedWrites.push(t)
+            return true
+        }
+        return false
+    }
+
     function select(dst: number, cond: number, a: number, b: number): void {
         emitCmpZero(cond)
         // tagged so the peephole can retarget the condition instead of decoding it
@@ -1391,7 +1421,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             return true
         }
         if (item.storeBase !== undefined) return true
-        if (item.cmpLeft !== undefined) return true
+        if (item.cmpLeft !== undefined || item.cmpZeroReg !== undefined) return true
         return false
     }
     function itemUses(item: AsmItem, out: number[]): boolean {
@@ -1425,6 +1455,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (item.cmpRight !== undefined) out.push(item.cmpRight)
             return true
         }
+        if (item.cmpZeroReg !== undefined) { out.push(item.cmpZeroReg); return true }
         return false
     }
     function canReorderOver(item: AsmItem): boolean {
@@ -1652,10 +1683,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             reader.cond = cond
             reader.kind = 'bcond'
         } else {
-            const regs = reader.cselRegs!
-            reader.word = ((reader.word & ~(0xF << 12)) | (cond << 12)) >>> 0
-            reader.text = `csel ${x(regs[0])}, ${x(regs[1])}, ${x(regs[2])}, ${CondNames[cond]}`
-            reader.cselCond = cond
+            retargetSelect(reader, cond)
             items.splice(probe, 1)
         }
         items.splice(c, 1)
@@ -1718,6 +1746,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             for (const reg of dead) item.deadAfter.add(reg)
         }
 
+        incrementSelect(dead)
         if (fuseConjunction(dead)) return
         if (recoverPrior(dead)) return
         if (sinkIntoMove(dead)) return
@@ -2011,6 +2040,10 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 throw `aarch64: invalid syscall trap ${trap}`
             }
             emit(0xD4000001 | (trap << 5), `svc #${trap}`, { clobbers: true })
+        },
+        trap: (code: number) => {
+            if (!Number.isInteger(code) || code < 0 || code > 0xFFFF) throw `aarch64: invalid trap code ${code}`
+            emit(0xD4200000 | (code << 5), `brk #${code}`, { clobbers: true })
         },
         ret: () => emit(0xD65F03C0, 'ret'),
         released,
