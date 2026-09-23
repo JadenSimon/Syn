@@ -37,6 +37,7 @@ const Frame = struct {
     kind: SyntaxKind,
     threshold: u16,
     captures: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
+    ambient: std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = .{},
 };
 
 // this expects a fresh parsed file (for simplicity)
@@ -69,6 +70,7 @@ pub const SynthInstrumenter = struct {
     dollar_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
 
     fns: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, void)) = .{},
+    ambients: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef)) = .{},
     instrumented: std.AutoArrayHashMapUnmanaged(NodeRef, void) = .{},
 
     ignored: ?*const std.AutoArrayHashMapUnmanaged(SymbolRef, void) = null,
@@ -113,6 +115,8 @@ pub const SynthInstrumenter = struct {
         self.frames.deinit(self.alloc);
         for (self.fns.values()) |*captures| captures.deinit(self.alloc);
         self.fns.deinit(self.alloc);
+        for (self.ambients.values()) |*ambient| ambient.deinit(self.alloc);
+        self.ambients.deinit(self.alloc);
         self.instrumented.deinit(self.alloc);
         self.escapes.deinit(self.alloc);
         self.assigned.deinit(self.alloc);
@@ -368,7 +372,15 @@ pub const SynthInstrumenter = struct {
         }
         const subj = try self.getMicroProgramStr(decl_ref, captured);
         const cap_arr = try self.factory.createArrayLiteralExpression(cap.items);
-        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
+        const ambient = self.ambients.get(decl_ref) orelse return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
+        if (ambient.count() == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
+        var names = std.ArrayListUnmanaged(NodeRef){};
+        defer names.deinit(self.alloc);
+        for (ambient.values()) |ref| {
+            try names.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
+        }
+        const names_arr = try self.factory.createArrayLiteralExpression(names.items);
+        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr});
     }
 
     fn buildSynthDataFn(
@@ -635,6 +647,7 @@ pub const SynthInstrumenter = struct {
         }
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
+        try self.ambients.put(self.alloc, ref, frame.ambient);
     }
 
     // takes into account replacements
@@ -719,7 +732,15 @@ pub const SynthInstrumenter = struct {
         if (sym == 0) return;
         const s = self.binder.symbols.at(sym);
         if (s.hasFlag(.type)) return;
-        if (s.hasFlag(.late_bound) or s.hasFlag(.imported) or s.hasFlag(.exported)) return;
+        if (s.hasFlag(.late_bound)) {
+            if (self.transforming or self.nodes.at(ref).kind != .identifier) return;
+            for (self.frames.items) |*frame| {
+                const entry = try frame.ambient.getOrPut(self.alloc, sym);
+                if (!entry.found_existing) entry.value_ptr.* = ref;
+            }
+            return;
+        }
+        if (s.hasFlag(.exported)) return;
         const decl_node = self.nodes.at(s.declaration);
         if (decl_node.hasFlag(.declare)) return;
 
@@ -814,6 +835,7 @@ pub const SynthInstrumenter = struct {
 
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
+        try self.ambients.put(self.alloc, ref, frame.ambient);
     }
 
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
