@@ -906,6 +906,7 @@ export function packageBlocksFINAL(g: Graph) {
         if (bid === 0) return r
         const l = [...preds.get(bid)!]
         while (const x = l.pop()) {
+            if (r.has(x)) continue
             r.add(x)
             for (const q of ancestorsOf(x)) {
                 if (r.has(q)) continue
@@ -2398,27 +2399,48 @@ function optimizeValueGraph(g: Graph) {
         return false
     }
 
-    function pruneUnusedParams(b: GraphBlock) {
-        if (b === g.blocks[0]) return false
-        function used(p: number, owner: GraphBlock, epoch = nextEpoch(g)): boolean {
-            if (owner.bodyId === p) return true
-            if (!markVisited(g.nodes.get(p)!, epoch)) return false
-            const uses = dependents.get(p)
-            if (!uses) return false
-            for (const id of uses) {
-                const u = g.nodes.get(id)!
-                if (u.op !== 'apply') return true
-            }
-            for (const id of uses) {
-                const u = g.nodes.get(id)!
-                const target = getGraphBlock(getRef(u, 0))
-                for (let i = 1; i < countIds(u); i++) {
-                    if (getRef(u, i) === p && used(target.params[i - 1], target, epoch)) return true
+    let liveParams: Set<number> | undefined
+    function liveParameters(): Set<number> {
+        if (liveParams) return liveParams
+        const live = new Set<number>()
+        const forwarded = new Map<number, number[]>()
+        const pending: number[] = []
+        function mark(p: number) {
+            if (live.has(p)) return
+            live.add(p)
+            pending.push(p)
+        }
+        for (const b of reachableBlocks) {
+            for (const p of b.params) {
+                if (b.bodyId === p) mark(p)
+                for (const id of dependents.get(p) ?? []) {
+                    const n = g.nodes.get(id)!
+                    if (n.op !== 'apply') { mark(p); break }
                 }
             }
-            return false
+            for (const id of findValues(b.id, 'apply') ?? []) {
+                const n = g.nodes.get(id)!
+                const target = getGraphBlock(getRef(n, 0))
+                for (let i = 1; i < countIds(n); i++) {
+                    const p = getRef(n, i)
+                    if (!p || g.nodes.get(p)!.op !== 'param') continue
+                    const to = target.params[i - 1]
+                    let from = forwarded.get(to)
+                    if (!from) forwarded.set(to, from = [])
+                    from.push(p)
+                }
+            }
         }
-        const safe = new Set(b.params.filter(p => used(p, b)))
+        while (pending.length) {
+            for (const from of forwarded.get(pending.pop()!) ?? []) mark(from)
+        }
+        return liveParams = live
+    }
+
+    function pruneUnusedParams(b: GraphBlock) {
+        if (b === g.blocks[0]) return false
+        const live = liveParameters()
+        const safe = new Set(b.params.filter(p => live.has(p)))
         if (safe.size === b.params.length) return false
         const inbound = findInboundApplies(b)
         const newParams = [...safe]
@@ -4494,90 +4516,107 @@ function optimizeValueGraph(g: Graph) {
             return addConstant([addNode('add', [base[0], rest], new Float64Array([base[1], 0])), 0], constant)
         }
 
-        for (let i = 0; i < params.length; i++) {
-            for (let j = 0; j < params.length; j++) {
-                if (i === j) continue
-                const pa = params[j]
-                const pt = params[i]
-                const shape = rebaseShape(target, pa, pt)
-                if (!shape) continue
-                const gain = shape.pairs.length + shape.offsets.length
-                if (!gain) continue
-                let cost = 0
-                for (const u of shape.outbound) {
-                    const n = g.nodes.get(u)!
-                    const into = getRef(n, 0)
-                    const b = into === target.id ? target : getBlock(g, into)
-                    for (let k = 1; k < countIds(n); k++) {
-                        if (getRef(n, k) !== pt) continue
-                        if (b === target) {
-                            if (k !== i + 1 || getRef(n, j + 1) !== pa) cost += 2
-                            continue
-                        }
-                        let l = 1
-                        while (l < countIds(n) && getRef(n, l) !== pa) l++
-                        if (!b || l === countIds(n) || !rebaseShape(b, b.params[l - 1], b.params[k - 1])) cost++
-                    }
+        const candidates = new Map<string, [base: number, offset: number]>()
+        const consider = (base: number, offset: number) => {
+            const j = params.indexOf(base)
+            const i = params.indexOf(offset)
+            if (i >= 0 && j >= 0 && i !== j) candidates.set(`${j}:${i}`, [j, i])
+        }
+        for (const u of findValues(target.id, 'add') ?? []) {
+            const n = g.nodes.get(u)!
+            const a = getRef(n, 0)
+            const b = getRef(n, 1)
+            consider(a, b)
+            consider(b, a)
+            for (const w of dependents.get(u) ?? []) {
+                const m = g.nodes.get(w)
+                if ((m?.op === 'load' || m?.op === 'store') && getRef(m, 2) === u) {
+                    consider(getRef(m, 1), a)
+                    consider(getRef(m, 1), b)
                 }
-                for (const [from, app] of inbound) {
-                    if (from === target.id) continue
-                    const base = applyArg(app, j)
-                    const offset = applyArg(app, i)
-                    if (cancels(base, offset)) continue
-                    const p = getGraphBlock(from)
-                    if (base[0] && offset[0] && p.params.includes(base[0]) && p.params.includes(offset[0])
-                        && rebaseShape(p, base[0], offset[0])) continue
-                    cost++
-                }
-                if (cost > gain) continue
-
-                const np = addParam()
-                const back = addNode('sub', [np, pa], new Float64Array(2))
-                const byBlock = new Map<number, Map<number, number>>()
-                for (const [from, app] of inbound) {
-                    if (from === target.id) continue
-                    let replacements = byBlock.get(from)
-                    if (!replacements) byBlock.set(from, replacements = new Map())
-                    replacements.set(app, withArg(app, i, combine(applyArg(app, j), applyArg(app, i))))
-                }
-                for (const [from, replacements] of byBlock) {
-                    const p = getGraphBlock(from)
-                    p.bodyId = replaceAll(p.bodyId, replacements)
-                    revisitBlock(p)
-                }
-                function readdress(id: number, offset: [number, number]) {
-                    const m = g.nodes.get(id)!
-                    const ids = cloneRefs(m)
-                    const consts = cloneLiterals(m)
-                    ids[1] = np
-                    ids[2] = offset[0]
-                    consts[2] = offset[1] as f64
-                    g.nodes.set(id, copyNode(m, ids, Float64Array.from(consts)))
-                }
-                for (const u of shape.offsets) {
-                    const n = g.nodes.get(u)!
-                    const at = getRef(n, 0) === pt ? 1 : 0
-                    for (const w of dependents.get(u)!) readdress(w, [getRef(n, at), getLiteral(n, at)])
-                }
-                for (const u of shape.direct) readdress(u, [0, 0])
-                for (const [from, app] of inbound) {
-                    if (from !== target.id) continue
-                    const n = g.nodes.get(app)!
-                    const ids = cloneRefs(n)
-                    const consts = cloneLiterals(n)
-                    const sum = getRef(n, i + 1) === pt && getRef(n, j + 1) === pa ? [np, 0]
-                        : combine(applyArg(app, j), applyArg(app, i))
-                    ids[i + 1] = sum[0]
-                    consts[i + 1] = sum[1] as f64
-                    g.nodes.set(app, copyNode(n, ids, Float64Array.from(consts)))
-                }
-                const replacements = new Map<number, number>([[pt, back]])
-                for (const u of shape.pairs) replacements.set(u, np)
-                params[i] = np
-                target.bodyId = replaceAll(target.bodyId, replacements)
-                revisitBlock(target)
-                return true
             }
+        }
+        for (const [j, i] of candidates.values()) {
+            const pa = params[j]
+            const pt = params[i]
+            const shape = rebaseShape(target, pa, pt)
+            if (!shape) continue
+            const gain = shape.pairs.length + shape.offsets.length
+            if (!gain) continue
+            let cost = 0
+            for (const u of shape.outbound) {
+                const n = g.nodes.get(u)!
+                const into = getRef(n, 0)
+                const b = into === target.id ? target : getBlock(g, into)
+                for (let k = 1; k < countIds(n); k++) {
+                    if (getRef(n, k) !== pt) continue
+                    if (b === target) {
+                        if (k !== i + 1 || getRef(n, j + 1) !== pa) cost += 2
+                        continue
+                    }
+                    let l = 1
+                    while (l < countIds(n) && getRef(n, l) !== pa) l++
+                    if (!b || l === countIds(n) || !rebaseShape(b, b.params[l - 1], b.params[k - 1])) cost++
+                }
+            }
+            for (const [from, app] of inbound) {
+                if (from === target.id) continue
+                const base = applyArg(app, j)
+                const offset = applyArg(app, i)
+                if (cancels(base, offset)) continue
+                const p = getGraphBlock(from)
+                if (base[0] && offset[0] && p.params.includes(base[0]) && p.params.includes(offset[0])
+                    && rebaseShape(p, base[0], offset[0])) continue
+                cost++
+            }
+            if (cost > gain) continue
+
+            const np = addParam()
+            const back = addNode('sub', [np, pa], new Float64Array(2))
+            const byBlock = new Map<number, Map<number, number>>()
+            for (const [from, app] of inbound) {
+                if (from === target.id) continue
+                let replacements = byBlock.get(from)
+                if (!replacements) byBlock.set(from, replacements = new Map())
+                replacements.set(app, withArg(app, i, combine(applyArg(app, j), applyArg(app, i))))
+            }
+            for (const [from, replacements] of byBlock) {
+                const p = getGraphBlock(from)
+                p.bodyId = replaceAll(p.bodyId, replacements)
+                revisitBlock(p)
+            }
+            function readdress(id: number, offset: [number, number]) {
+                const m = g.nodes.get(id)!
+                const ids = cloneRefs(m)
+                const consts = cloneLiterals(m)
+                ids[1] = np
+                ids[2] = offset[0]
+                consts[2] = offset[1] as f64
+                g.nodes.set(id, copyNode(m, ids, Float64Array.from(consts)))
+            }
+            for (const u of shape.offsets) {
+                const n = g.nodes.get(u)!
+                const at = getRef(n, 0) === pt ? 1 : 0
+                for (const w of dependents.get(u)!) readdress(w, [getRef(n, at), getLiteral(n, at)])
+            }
+            for (const u of shape.direct) readdress(u, [0, 0])
+            for (const [from, app] of inbound) {
+                if (from !== target.id) continue
+                const n = g.nodes.get(app)!
+                const ids = cloneRefs(n)
+                const consts = cloneLiterals(n)
+                const sum = getRef(n, i + 1) === pt && getRef(n, j + 1) === pa ? [np, 0]
+                    : combine(applyArg(app, j), applyArg(app, i))
+                ids[i + 1] = sum[0]
+                consts[i + 1] = sum[1] as f64
+                g.nodes.set(app, copyNode(n, ids, Float64Array.from(consts)))
+            }
+            const replacements = new Map<number, number>([[pt, back]])
+            for (const u of shape.pairs) replacements.set(u, np)
+            params[i] = np
+            target.bodyId = replaceAll(target.bodyId, replacements)
+            revisitBlock(target)
+            return true
         }
         return false
     }
@@ -5483,7 +5522,7 @@ function optimizeValueGraph(g: Graph) {
     }
 
     function deduplicateParams(): boolean {
-        let canonicalParams = new Map<number, number>()
+        const canonicalParams = new Map<number, number>()
         const applies = new Map<GraphBlock, number[]>()
         let candidates = false
         for (const b of reachableBlocks) {
@@ -5509,28 +5548,28 @@ function optimizeValueGraph(g: Graph) {
             let changed = false
             const sizes = new Map<number, number>()
             for (const rep of canonicalParams.values()) sizes.set(rep, (sizes.get(rep) ?? 0) + 1)
-            const representatives = new Map<string, number>()
-            const canonical = new Map<number, number>()
-            function visit(id: number): number {
-                if (!id) return 0
-                const known = canonical.get(id)
-                if (known !== undefined) return known
-                const n = g.nodes.get(id)
-                let rep = canonicalParams.get(id) ?? id
-                if (n && n.op !== 'param' && n.op !== 'block') {
-                    const key = nodeKey(n, getArgIds(n).map(visit))
-                    rep = representatives.get(key) ?? id
-                    representatives.set(key, rep)
-                }
-                canonical.set(id, rep)
-                return rep
-            }
-            const next = new Map<number, number>()
             for (const [b, ids] of applies) {
                 if (b.params.every(p => sizes.get(canonicalParams.get(p)!) === 1)) {
                     applies.delete(b)
                     continue
                 }
+                const representatives = new Map<string, number>()
+                const canonical = new Map<number, number>()
+                function visit(id: number): number {
+                    if (!id) return 0
+                    const known = canonical.get(id)
+                    if (known !== undefined) return known
+                    const n = g.nodes.get(id)
+                    let rep = canonicalParams.get(id) ?? id
+                    if (n && n.op !== 'param' && n.op !== 'block') {
+                        const key = nodeKey(n, getArgIds(n).map(visit))
+                        rep = representatives.get(key) ?? id
+                        representatives.set(key, rep)
+                    }
+                    canonical.set(id, rep)
+                    return rep
+                }
+                const next = new Map<number, number>()
                 for (let i = 0; i < b.params.length; i++) {
                     const p = b.params[i]
                     if (sizes.get(canonicalParams.get(p)!) === 1) {
@@ -5550,8 +5589,8 @@ function optimizeValueGraph(g: Graph) {
                     if (rep !== canonicalParams.get(p)) changed = true
                     next.set(p, rep)
                 }
+                for (const [p, rep] of next) canonicalParams.set(p, rep)
             }
-            canonicalParams = next
             if (!changed) break
         }
 
@@ -5615,6 +5654,7 @@ function optimizeValueGraph(g: Graph) {
         const dedupeStart = performance.now()
         deduplicateParams()
         if (optimizeTimers) time('deduplicateParams', performance.now() - dedupeStart)
+        liveParams = undefined
         for (const b of reachableBlocks) {
             step(pruneUnusedParams, b)
         }
