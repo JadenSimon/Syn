@@ -518,7 +518,7 @@ interface InlineScore {
     pressure: number
 }
 
-const interpreted = new Set(['ret', 'panic', 'unreachable', 'record', 'get', 'block', 'void', 'apply', 'after', 'inlined'])
+const interpreted = new Set(['ret', 'panic', 'unreachable', 'record', 'get', 'block', 'void', 'apply', 'after', 'inlined', 'trap'])
 const targets = new Set(['syscall-target', 'local-target', 'pool-entry', 'heap-handle'])
 
 function obviousInline(g: Graph): InlineScore | undefined {
@@ -579,14 +579,20 @@ function snapshotOf(graph: Graph, argId: number): intrinsics.Handle | undefined 
     return getLiteral(arg, 1) as intrinsics.Handle
 }
 
-function snapshotFields(snapshot: intrinsics.Handle): { key: intrinsics.Handle, scalar: boolean, slot: intrinsics.Handle }[] {
-    const fields: { key: intrinsics.Handle, scalar: boolean, slot: intrinsics.Handle }[] = []
+export function fieldShape(slot: intrinsics.Handle): intrinsics.Types {
+    if (heap.isBoxedF64(slot)) return Types.f64
+    if (heap.isString(slot)) return Types.usize
+    return Types.handle
+}
+
+function snapshotFields(snapshot: intrinsics.Handle): { key: intrinsics.Handle, shape: intrinsics.Types, slot: intrinsics.Handle }[] {
+    const fields: { key: intrinsics.Handle, shape: intrinsics.Types, slot: intrinsics.Handle }[] = []
     for (let k: u32 = 0; k < heap.ownPropertyCount(snapshot); k++) {
         const key = heap.ownPropertyKeyAt(snapshot, k)
         const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(snapshot, key)))
         if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
         const slot = d.slot0 as intrinsics.Handle
-        fields.push({ key, scalar: heap.isBoxedF64(slot), slot })
+        fields.push({ key, shape: fieldShape(slot), slot })
     }
     return fields
 }
@@ -598,8 +604,8 @@ function sameSnapshotShape(a: intrinsics.Handle | undefined, b: intrinsics.Handl
     const y = snapshotFields(b)
     if (x.length !== y.length) return false
     for (let i = 0; i < x.length; i++) {
-        if (x[i].key !== y[i].key || x[i].scalar !== y[i].scalar) return false
-        if (!x[i].scalar && x[i].slot !== y[i].slot) return false
+        if (x[i].key !== y[i].key || x[i].shape !== y[i].shape) return false
+        if (x[i].shape === Types.handle && x[i].slot !== y[i].slot) return false
     }
     return true
 }
@@ -615,6 +621,14 @@ interface PendingUnit {
     functionHandleSlots: Map<number, number>
     dataHandleSlots: Map<number, number>
 }
+
+const panicTrap = intrinsics.argv().includes('panic-trap')
+
+function reportPanic(err: any): void {
+    syscalls.write(2, err.message, 1)
+    Intrinsics.trap(0)
+}
+intrinsics.tagNoInline(reportPanic)
 
 const EffectNone = 0
 const EffectRead = 1
@@ -968,6 +982,42 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         order.push(fn)
     }
     for (const fn of Object.values(fns)) schedule(fn)
+    let panicSymbol = 0
+    function lowerPanics(graph: Graph): boolean {
+        let nextId = graph.maxId
+        let changed = false
+        for (const [id, n] of graph.nodes) {
+            if (n.op !== 'panic') continue
+            if (!panicTrap) {
+                if (!countIds(n)) continue
+                graph.nodes.set(id, makeNode('panic', [], new Float64Array(0)))
+                changed = true
+                continue
+            }
+            if (!panicSymbol) {
+                panicSymbol = intern(reportPanic)
+                discover(reportPanic)
+                schedule(reportPanic)
+            }
+            const arg = getRef(n, 0)
+            const chained = arg ? graph.nodes.get(arg) : undefined
+            const after = chained?.op === 'after'
+            const token = after ? getRef(chained!, 0) : 0
+            const err = after ? getRef(chained!, countIds(chained!) - 1) : arg
+            const target = nextId++
+            graph.nodes.set(target, makeNode('local-target', [0, 0], new Float64Array([panicSymbol, EffectWrite])))
+            const call = nextId++
+            graph.nodes.set(call, makeNode('call', [token, target, 0, err], new Float64Array(4)))
+            const dead = nextId++
+            graph.nodes.set(dead, makeNode('unreachable', [], new Float64Array(0)))
+            graph.nodes.set(id, makeNode('after', [call, dead], new Float64Array(2)))
+            changed = true
+        }
+        if (!changed) return false
+        graph.maxId = nextId
+        return true
+    }
+
     const phaseStart = performance.now()
     const phases = { trace: 0, normalize: 0, reconcile: 0, lower: 0 }
     session.enterTrace()
@@ -1021,6 +1071,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             name: current.name, self: current,
         })
         phases.trace += performance.now() - phaseMark
+        lowerPanics(traced.graph)
         const projected = projectsCallResults(traced.graph)
         const opaque = !projected && [...traced.graph.nodes.values()].some(n => n.op === 'property')
         if (opaque) {
@@ -1142,6 +1193,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             captures: shaped.computation[1], session, mapCapture: shaped.mapCapture, shouldInline,
             name: shaped.fn.name, shapes, self: shaped.fn,
         })
+        lowerPanics(traced.graph)
         if ([...traced.graph.nodes.values()].some(n => n.op === 'property')) {
             throw `native: ${shaped.fn.name} still reads unshaped properties after reconciliation`
         }
@@ -1158,7 +1210,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 const arg = graph.nodes.get(getRef(call, 3 + i))!
                 const fields = snapshotFields(shape)
                 for (let k = 0; k < fields.length; k++) {
-                    if (!fields[k].scalar) continue
+                    if (fields[k].shape === Types.handle) continue
                     argIds.push(getRef(arg, 2 + k))
                     argConsts.push(getLiteral(arg, 2 + k))
                 }
@@ -1287,6 +1339,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         rootSymbols.has(u.symbol)
         || pooledSymbols.has(u.symbol)
         || (targetRefs.get(u.symbol) ?? 0) > 0)
+    if (intrinsics.argv().includes('emit-debug')) {
+        console.log('EMITTED', units.map(u => `${u.fn.name}:${u.symbol}${emitted.includes(u) ? '' : '(dropped)'}`).join(' '),
+            'refs', [...targetRefs].map(([k, v]) => `${k}=${v}`).join(' '))
+    }
     let unitInst = 0
     for (const u of emitted) unitInst += u.code.words.length
     console.log('native unit', emitted.length, 'fns', unitInst, 'instructions',

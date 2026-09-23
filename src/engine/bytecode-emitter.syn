@@ -60,6 +60,8 @@ interface Labels {
     jump: number[]
 }
 
+export type Expandos = Map<string, EmitResult | Expandos>
+
 export type EmitResult = {
     code: number[]           // opcodes + byte operands
     constants: any[]
@@ -71,6 +73,14 @@ export type EmitResult = {
     labels?: Labels
     scopeBindings: ScopeBinding[]
     sourceMapping: [pc: number, pos: number][] // uses encoded line/col
+    expandos?: Expandos
+}
+
+function defaultConstructorResult(): EmitResult {
+    return {
+        code: [Op.Return], constants: [], constantKinds: [], paramCount: 0, registerCount: 0,
+        lateBound: new Map(), scopeBindings: [], sourceMapping: [],
+    }
 }
 
 function isShortStore(opcode: number) {
@@ -162,6 +172,7 @@ function emitFunction(
     let nextReg = 0
     let maxReg = 0
     let thisReg: number | undefined = undefined
+    const isConstructor = ts.isConstructorDeclaration(fn)
     let prevOpOffset: number = -1
     let prevStoreOffset: number = -1
     let skipNextLookbehind = false
@@ -2010,8 +2021,13 @@ function emitFunction(
         currentNode = node
   
         if (ts.isReturnStatement(node)) {
-            if (!node.expression && !iterators.length) { emit1(Op.ReturnVoid); return }
+            if (!node.expression && !iterators.length) {
+                if (isConstructor) ldar(thisReg!)
+                emit1(isConstructor ? Op.Return : Op.ReturnVoid)
+                return
+            }
             if (node.expression) emitExpr(node.expression)
+            else if (isConstructor) ldar(thisReg!)
             else emit1(Op.LdaUndefined)
             if (iterators.length) {
                 const value = allocReg(); star(value)
@@ -2089,10 +2105,7 @@ function emitFunction(
         if (ctor) {
             emitClosure(ctor)
         } else {
-            emitNested({
-                code: [Op.ReturnVoid], constants: [], constantKinds: [], paramCount: 0, registerCount: 0,
-                lateBound: new Map(), scopeBindings: [], sourceMapping: [],
-            })
+            emitNested(defaultConstructorResult())
         }
         star(rctor)
         emit1(Op.CreateEmptyObject)
@@ -2150,7 +2163,7 @@ function emitFunction(
         freeReg()
     }
 
-    if (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || ts.isConstructorDeclaration(fn)) {
+    if (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || isConstructor) {
         skipNextLookbehind = true
         thisReg = allocReg()
         star(thisReg)
@@ -2175,7 +2188,8 @@ function emitFunction(
 
     const closed = code.at(-1) === Op.Return || code.at(-1) === Op.ReturnVoid || code.at(-1) === Op.Throw || code.at(-1) === Op.ReThrow
     if (!closed || maxJumpTarget >= code.length) {
-        emit1(ts.isBlock(fn.body) ? Op.ReturnVoid : Op.Return)
+        if (isConstructor) ldar(thisReg!)
+        emit1(isConstructor || !ts.isBlock(fn.body) ? Op.Return : Op.ReturnVoid)
     }
 
     assert(constants.length === constantKinds.length)
@@ -2215,7 +2229,27 @@ function fixupMethodLikeDecl(src: string) {
         const idx = src.indexOf('>')
         return `(${src.slice(0, idx-1)})=${src.slice(idx)}`
     }
+    if (src.startsWith('class')) return src
     return `function ${src}`
+}
+
+function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
+    if (node.heritageClauses?.length) throw 'class heritage is not supported'
+    const ctor = node.members.find(ts.isConstructorDeclaration)
+    const result = ctor ? emitFunction(ctor) : defaultConstructorResult()
+    const prototype: Expandos = new Map()
+    for (const member of node.members) {
+        if (member === ctor) continue
+        if (!ts.isMethodDeclaration(member) || !ts.isIdentifier(member.name)) {
+            throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
+        }
+        if (member.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword)) throw 'static class members are not supported'
+        prototype.set(member.name.text, emitFunction(member))
+    }
+    const expandos: Expandos = new Map()
+    expandos.set('prototype', prototype)
+    result.expandos = expandos
+    return result
 }
 
 export function compile(src: string): EmitResult {
@@ -2225,6 +2259,9 @@ export function compile(src: string): EmitResult {
     const exp = unwrapParensOrExpStatement(fn)
     if (ts.isArrowFunction(exp) || ts.isFunctionExpression(exp)) {
         return emitFunction(exp)
+    }
+    if (ts.isClassDeclaration(exp) || ts.isClassExpression(exp)) {
+        return emitClassDeclaration(exp)
     }
     if (!ts.isFunctionDeclaration(fn)) 
         throw "expected the source to be a single function declaration/expression"
@@ -2535,6 +2572,8 @@ function emitTest() {
     testBytecodeEmit('function f(a) { return a <= 1 ? a : a+f(a-1) }', 'recursive2')
 
     testBytecodeEmit('function objectSpread(a, b) { return { x: 1, ...a, y: 2, ...b } }', 'objectSpread')
+
+    testBytecodeEmit('class Error {\n  constructor(message) {\n    this.message = message;\n  }\n}', 'classDecl')
 }
 if (intrinsics.argv()[0] === 'bytecode-emitter') {
     emitTest()
@@ -2638,7 +2677,26 @@ export function finalize(
         heap.finishHeapCell(labelsHandle)
     }
     heap.finishHeapCell(res)
-    return res
+    if (!result.expandos) return res
+    const fn = heap.makeFunction(res)
+    for (const [key, value] of result.expandos) {
+        heap.setProperty(fn, fromJsValue(key), materializeExpando(value, ctx, compileFn, fromJsValue))
+    }
+    return fn
+}
+
+function materializeExpando(
+    value: EmitResult | Expandos,
+    ctx: Ctx | undefined,
+    compileFn: ((f: Function) => Handle) | undefined,
+    fromJsValue: (v: any) => Handle,
+): Handle {
+    if (!(value instanceof Map)) return finalize(value, ctx, compileFn, fromJsValue)
+    const obj = heap.makeObject(0 as Handle)
+    for (const [key, nested] of value) {
+        heap.setProperty(obj, fromJsValue(key), materializeExpando(nested, ctx, compileFn, fromJsValue))
+    }
+    return obj
 }
 
 // this _will_ tag the fn to dedupe compilations
@@ -2654,11 +2712,17 @@ export function createCtx(o: Record<string, any> = {}): Ctx {
         Symbol: heap.symbolConstants,
     }, o) as any
 }
+const toComputation = Symbol.for('toComputation')
+function sourceOf(f: Function): string {
+    const computation = (f as any)[toComputation]
+    return computation ? computation()[0] : f.toString()
+}
+
 export function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
     const _f = f as any
     if (const prev = _f[key]) return prev
-    const compiled = compile(_f.toString()) // TODO: use computations
+    const compiled = compile(sourceOf(f))
     // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
     _f[key] = compiled
     return _f[key] = finalize(compiled, ctx)
@@ -3012,6 +3076,9 @@ function runTest() {
     e2eTest('function classChain(a) { class Counter { constructor(n) { this.n = n } add(x) { this.n = this.n + x; return this } } return new Counter(a).add(2).add(3).n }', [1])
     e2eTest('function classExpression(a) { const K = class { constructor(x) { this.x = x } }; return new K(a).x }', [5])
     e2eTest('function classCapture(a) { let base = 10; class A { get() { return base + a } } return new A().get() }', [3])
+    e2eTest('function classFromCtx(a) { return new Point(a).value() }', [4], null, createCtx({
+        Point: class Point { constructor(public x: number) {} value() { return this.x + 1 } },
+    }))
     e2eTest('function destructureArray(a) { const [x, , y] = [a, 0, a + 1]; return x * y }', [3])
     e2eTest('function destructureObject(a) { const { x, y: z } = { x: a, y: 2 }; return x + z }', [3])
     e2eTest('function destructureDefault(a) { let { x, y = 7 } = { x: a }; const [p = 1, q = 2] = [a]; return x + y + p + q }', [3])
