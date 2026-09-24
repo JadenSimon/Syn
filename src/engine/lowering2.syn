@@ -141,7 +141,7 @@ const PureOps = new Set<string>([
     'add', 'sub', 'mul', 'div', 'rem', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
     'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'select', 'convert', 'bitconvert',
     'call-context', 'pool-entry', 'void', 'param', 'heap-handle', 'nil-effect', 'block', 
-    'literal', 'get', 'record', 'unreachable',
+    'literal', 'get', 'record', 'unreachable', 'alloca', 'frame-address',
     ...TargetingValues
 ])
 const Commutative = new Set<string>(['add', 'mul', 'and', 'or', 'xor', 'ne', 'eq'])
@@ -1551,11 +1551,14 @@ function optimizeValueGraph(g: Graph) {
     function time(name: string, dur: number) {
         optimizeTimers!.set(name, (optimizeTimers!.get(name) ?? 0) + dur)
     }
+    const passDebug = intrinsics.argv().includes('pass-debug')
+        || (g.name !== undefined && intrinsics.argv().includes(`pass-debug:${g.name}`))
     function step(pass: (b: GraphBlock) => unknown, b: GraphBlock): boolean {
-        if (!optimizeTimers) return runStep(pass, b)
+        if (!optimizeTimers && !passDebug) return runStep(pass, b)
         const s = performance.now()
         const changed = runStep(pass, b)
-        time(pass.name, performance.now() - s)
+        if (optimizeTimers) time(pass.name, performance.now() - s)
+        if (passDebug && changed) console.log(`--- ${pass.name} changed B${b.id} ---\n${dumpGraph(g)}`)
         return changed
     }
     function runStep(pass: (b: GraphBlock) => unknown, b: GraphBlock): boolean {
@@ -3966,7 +3969,15 @@ function optimizeValueGraph(g: Graph) {
                 for (const user of dependents.get(id) ?? []) {
                     const n = g.nodes.get(user)
                     if (!n) continue
-                    if (n.op === 'after' && getRef(n, countIds(n) - 1) !== id) continue
+                    if (n.op === 'after' && getRef(n, countIds(n) - 1) !== id) {
+                        let sequenced = getRef(n, countIds(n) - 1)
+                        for (let m = g.nodes.get(sequenced); m?.op === 'after'; m = g.nodes.get(sequenced)) {
+                            sequenced = getRef(m, countIds(m) - 1)
+                        }
+                        if (isUnordered(sequenced)) continue
+                        dead = false
+                        break
+                    }
                     if ((n.op === 'load' || n.op === 'store') && getRef(n, 0) === id) {
                         if (!sameLocation(n, store)) continue
                         if (n.op === 'store' && bits(n) >= bits(store)) { 
@@ -3984,6 +3995,223 @@ function optimizeValueGraph(g: Graph) {
         target.bodyId = replaceAll(target.bodyId, r)
         revisitBlock(target)
         forwardMemory(target)
+        return true
+    }
+
+    const unpromotable = new Set<string>()
+    function promoteAllocas(target: GraphBlock): boolean {
+        const found = findValues(target.id, 'alloca')
+        if (!found?.length) return false
+        const keys = new Map<number, string | undefined>()
+        function keyOf(id: number): string | undefined {
+            if (keys.has(id)) return keys.get(id)
+            const n = g.nodes.get(id)
+            let key: string | undefined
+            if (n?.op === 'alloca' && !getRef(n, 1) && !getRef(n, 2)) {
+                const prev = getRef(n, 0) ? keyOf(getRef(n, 0)) : ''
+                if (prev !== undefined) key = `${prev}/${getLiteral(n, 1)}:${getLiteral(n, 2)}`
+            }
+            keys.set(id, key)
+            return key
+        }
+        let changed = false
+        for (const id of found) {
+            const key = keyOf(id)
+            if (key === undefined || unpromotable.has(key)) continue
+            if (promoteAlloca(key, keyOf)) changed = true
+            else unpromotable.add(key)
+        }
+        return changed
+    }
+
+    function promoteAlloca(key: string, keyOf: (id: number) => string | undefined): boolean {
+        const ids = new Set<number>()
+        for (const b of reachableBlocks) {
+            for (const a of findValues(b.id, 'alloca') ?? []) if (keyOf(a) === key) ids.add(a)
+        }
+        for (const a of ids) {
+            for (const u of dependents.get(a) ?? []) {
+                const n = g.nodes.get(u)!
+                if (n.op === 'alloca' && getRef(n, 0) === a) continue
+                if (n.op !== 'load' && n.op !== 'store') return false
+                if (getRef(n, 1) !== a || getRef(n, 2) || getTypeT(n) !== Types.u64) return false
+                if (n.op === 'store' && getRef(n, 3) === a) return false
+            }
+        }
+        const loads: [GraphBlock, number][] = []
+        const stores = new Set<number>()
+        const touched = new Set<GraphBlock>()
+        for (const b of reachableBlocks) {
+            for (const id of findValues(b.id, 'load') ?? []) {
+                if (!ids.has(getRef(g.nodes.get(id)!, 1))) continue
+                loads.push([b, id])
+                touched.add(b)
+            }
+            for (const id of findValues(b.id, 'store') ?? []) {
+                if (!ids.has(getRef(g.nodes.get(id)!, 1))) continue
+                stores.add(id)
+                touched.add(b)
+            }
+        }
+
+        function tailApplies(b: GraphBlock, visit: (app: number, token: number) => boolean): boolean {
+            function walk(id: number, token: number): boolean {
+                const n = g.nodes.get(id)
+                if (!n) return true
+                if (n.op === 'after') {
+                    const last = countIds(n) - 1
+                    return walk(getRef(n, last), last === 1 ? getRef(n, 0) : -1)
+                }
+                if (n.op === 'select') return walk(getRef(n, 1), token) && walk(getRef(n, 2), token)
+                if (n.op === 'apply') return visit(id, token)
+                return true
+            }
+            return walk(b.bodyId, 0)
+        }
+
+        const entries = new Map<string, number>()
+        const added = new Map<number, number[]>()
+        function entryValue(b: GraphBlock, offset: number): [number, number] | undefined {
+            if (b === g.blocks[0]) return
+            const at = `${b.id}:${offset}`
+            const known = entries.get(at)
+            if (known !== undefined) return [known, 0]
+            const param = addParam()
+            entries.set(at, param)
+            const list = added.get(b.id)
+            if (list) list.push(offset)
+            else added.set(b.id, [offset])
+            for (const from of preds.get(b.id) ?? []) {
+                const pred = getGraphBlock(from)
+                const seen = new Set<number>()
+                const ok = tailApplies(pred, (app, token) => {
+                    const n = g.nodes.get(app)!
+                    if (getRef(n, 0) !== b.id) return true
+                    seen.add(app)
+                    for (let i = 1; i < countIds(n); i++) if (carriesStore(getRef(n, i))) return false
+                    return !!valueFrom(pred, token, offset)
+                })
+                if (!ok) return
+                for (const app of findValues(pred.id, 'apply') ?? []) {
+                    if (getRef(g.nodes.get(app)!, 0) === b.id && !seen.has(app)) return
+                }
+            }
+            return [param, 0]
+        }
+
+        function carriesStore(id: number): boolean {
+            const n = g.nodes.get(id)
+            if (!n) return false
+            if (n.op === 'store') return ids.has(getRef(n, 1))
+            if (n.op !== 'after') return false
+            for (let i = 0; i < countIds(n); i++) if (carriesStore(getRef(n, i))) return true
+            return false
+        }
+
+        const memo = new Map<string, [number, number] | undefined>()
+        function valueFrom(b: GraphBlock, token: number, offset: number): [number, number] | undefined {
+            const at = `${b.id}:${token}:${offset}`
+            if (memo.has(at)) return memo.get(at)
+            const result = findValue(b, token, offset)
+            memo.set(at, result)
+            return result
+        }
+        function findValue(b: GraphBlock, token: number, offset: number): [number, number] | undefined {
+            for (;;) {
+                if (token < 0) return
+                if (!token) return entryValue(b, offset)
+                const n = g.nodes.get(token)
+                if (!n) return
+                if (n.op === 'nil-effect') return entryValue(b, offset)
+                if (n.op === 'store' && ids.has(getRef(n, 1)) && getLiteral(n, 2) === offset) {
+                    return [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+                }
+                if (n.op === 'store' || n.op === 'load' || n.op === 'call') {
+                    token = getRef(n, 0)
+                    continue
+                }
+                if (n.op !== 'after') return
+                let result: [number, number] | undefined
+                for (let i = 0; i < countIds(n); i++) {
+                    const ref = getRef(n, i)
+                    if (!ref || isUnordered(ref)) continue
+                    const value = valueFrom(b, ref, offset)
+                    if (!value || (result && (result[0] !== value[0] || result[1] !== value[1]))) return
+                    result = value
+                }
+                return result ?? entryValue(b, offset)
+            }
+        }
+
+        const values = new Map<number, [number, number]>()
+        for (const [b, id] of loads) {
+            const value = valueFrom(b, getRef(g.nodes.get(id)!, 0), getLiteral(g.nodes.get(id)!, 2))
+            if (!value) return false
+            values.set(id, value)
+        }
+
+        for (const [block, offsets] of added) {
+            const b = getGraphBlock(block)
+            for (const offset of offsets) b.params.push(entries.get(`${block}:${offset}`)!)
+            touched.add(b)
+            for (const from of preds.get(block) ?? []) touched.add(getGraphBlock(from))
+        }
+        const replaced = new Map<number, number>()
+        function replacement(id: number): number {
+            const known = replaced.get(id)
+            if (known !== undefined) return known
+            const n = g.nodes.get(id)
+            if (!n) return id
+            let result = id
+            if (stores.has(id)) {
+                result = getRef(n, 0) ? replacement(getRef(n, 0)) : addNode('nil-effect', [], new Float64Array())
+            } else if (values.has(id)) {
+                const [ref, literal] = values.get(id)!
+                result = addNode('after', [replacement(getRef(n, 0)), ref ? replacement(ref) : 0], new Float64Array([0, literal]))
+            }
+            replaced.set(id, result)
+            return result
+        }
+        for (const id of stores) replacement(id)
+        for (const id of values.keys()) replacement(id)
+
+        function rewriteTail(b: GraphBlock): number {
+            function walk(id: number, token: number): number {
+                const n = g.nodes.get(id)
+                if (!n) return id
+                if (n.op === 'after') {
+                    const last = countIds(n) - 1
+                    const inner = walk(getRef(n, last), last === 1 ? getRef(n, 0) : -1)
+                    if (inner === getRef(n, last)) return id
+                    const argIds = cloneRefs(n)
+                    argIds[last] = inner
+                    return addNode('after', argIds, cloneLiterals(n), n)
+                }
+                if (n.op === 'select') {
+                    const yes = walk(getRef(n, 1), token)
+                    const no = walk(getRef(n, 2), token)
+                    if (yes === getRef(n, 1) && no === getRef(n, 2)) return id
+                    const argIds = cloneRefs(n)
+                    argIds[1] = yes
+                    argIds[2] = no
+                    return addNode('select', argIds, cloneLiterals(n), n)
+                }
+                if (n.op !== 'apply') return id
+                const offsets = added.get(getRef(n, 0))
+                if (!offsets) return id
+                const argIds = cloneRefs(n)
+                const argConsts = Array.from(cloneLiterals(n))
+                for (const offset of offsets) {
+                    const [ref, literal] = valueFrom(b, token, offset)!
+                    argIds.push(ref)
+                    argConsts.push(literal)
+                }
+                return addNode('apply', argIds, new Float64Array(argConsts), n)
+            }
+            return walk(b.bodyId, 0)
+        }
+        for (const b of touched) b.bodyId = replaceAll(rewriteTail(b), replaced)
+        for (const b of touched) revisitBlock(b)
         return true
     }
 
@@ -5668,6 +5896,7 @@ function optimizeValueGraph(g: Graph) {
             step(simplifyBitOperations, b)
             step(rebaseAddresses, b)
             step(hoistLoopStep, b)
+            step(promoteAllocas, b)
             step(deduplicateValues, b)
         }
         if (intrinsics.argv().includes('closure-debug')
@@ -5960,6 +6189,76 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
     findLoops(g.blocks[0].id)
     const loopDepth = new Map<number, number>()
     for (const [k, v] of loopsOf) loopDepth.set(k, v.length)
+    const frameAllocas = layoutAllocas()
+
+    function layoutAllocas(): number {
+        const allocas: number[] = []
+        for (const [id, n] of g.nodes) if (n.op === 'alloca') allocas.push(id)
+        if (!allocas.length) return framed()
+        const paramAt = new Map<number, [block: number, index: number]>()
+        for (const b of g.blocks) b.params.forEach((p, i) => paramAt.set(p, [b.id, i]))
+        function loopCarried(id: number): boolean {
+            for (;;) {
+                const n = g.nodes.get(id)
+                if (!n) return false
+                if (n.op === 'param') return !!loopDepth.get(paramAt.get(id)?.[0] ?? -1)
+                if (n.op !== 'alloca') return false
+                id = getRef(n, 0)
+            }
+        }
+        for (const b of g.blocks) {
+            if (!loopDepth.get(b.id)) continue
+            const seen = new Set<number>()
+            const pending = [b.bodyId]
+            while (pending.length) {
+                const id = pending.pop()!
+                if (!id || seen.has(id)) continue
+                seen.add(id)
+                const n = g.nodes.get(id)
+                if (!n || n.op === 'block' || n.op === 'param') continue
+                if (n.op === 'alloca' && loopCarried(getRef(n, 0))) throw `lowering: alloca %${id} is evaluated inside the loop at B${b.id}`
+                for (let i = 0; i < countIds(n); i++) pending.push(getRef(n, i))
+            }
+        }
+        const ends = new Map<number, number>()
+        const offsets = new Map<number, number>()
+        function end(id: number): number {
+            if (!id) return 0
+            const known = ends.get(id)
+            if (known !== undefined) return known
+            const n = g.nodes.get(id)!
+            if (n.op === 'param') {
+                ends.set(id, 0)
+                const [block, index] = paramAt.get(id)!
+                let furthest = 0
+                for (const m of g.nodes.values()) {
+                    if (m.op !== 'apply' || getRef(m, 0) !== block) continue
+                    furthest = Math.max(furthest, end(getRef(m, index + 1)))
+                }
+                ends.set(id, furthest)
+                return furthest
+            }
+            const align = getLiteral(n, 2)
+            const at = (end(getRef(n, 0)) + align - 1) & ~(align - 1)
+            offsets.set(id, at)
+            ends.set(id, at + getLiteral(n, 1))
+            return at + getLiteral(n, 1)
+        }
+        for (const id of allocas) end(id)
+        for (const id of allocas) {
+            const size = getLiteral(g.nodes.get(id)!, 1)
+            g.nodes.set(id, makeNode('frame-address', [0, 0], new Float64Array([offsets.get(id)!, size])))
+        }
+        return framed()
+    }
+
+    function framed(): number {
+        let bytes = 0
+        for (const n of g.nodes.values()) {
+            if (n.op === 'frame-address') bytes = Math.max(bytes, getLiteral(n, 0) + getLiteral(n, 1))
+        }
+        return (bytes + 15) & ~15
+    }
     
     const callProjections = new Map<number, number[]>()
     function addCallProj(target: number, consumer: number) {
@@ -6606,6 +6905,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         rotated,
         callProjections,
         effectivelyLinearBlocks,
+        frameAllocas,
     }
 }
 
@@ -7563,6 +7863,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     const reusableSlots = new Set<number>()
     let frameBase = 0
     function slotOffset(h: number): number { return frameBase + (-h - 1) * 8 }
+    function allocaBase(): number { return (frameBase + slotCount * 8 + 15) & ~15 }
     function takeSlot(): number {
         const reused = reusableSlots.values().next()
         if (!reused.done) {
@@ -7947,6 +8248,13 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         }
         if (n.op === 'call-context') {
             throw `lowering3: indirect call context ${id} was not bound at entry`
+        }
+        if (n.op === 'frame-address') {
+            const offset = getLiteral(n, 0)
+            finish()
+            const dst = regFor(id, want)
+            put(() => asm.spRead(dst, allocaBase() + offset))
+            return
         }
         if (BinaryOps.has(n.op) || CompareOps.has(n.op)) { buildArith(id, n, signed, want); return }
         if (UnaryOps.has(n.op)) {
@@ -8675,12 +8983,12 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     promoteCommonRegionWrites(rootRegion)
     assignRegionRegisters(rootRegion, new Set())
 
-    tailCalls = !usedPreserved.size && !slotCount && !callsOut
+    tailCalls = !usedPreserved.size && !slotCount && !callsOut && !analysis.frameAllocas
     if (!tailCalls && tails.size) callsOut = true
     const saved = target.calleeSaved.filter(r => usedPreserved.has(r))
     for (let i = 0; i < saved.length; i++) savedIndex.set(saved[i], i)
     frameBase = (saved.length + (callsOut ? 1 : 0)) * 8
-    const frameBytes = (frameBase + slotCount * 8 + 15) & ~15
+    const frameBytes = allocaBase() + analysis.frameAllocas
     if (frameBytes) asm.spAdjust(frameBytes)
     for (const r of rootRegion.owned) asm.store(SP, savedIndex.get(r)! * 8, r, Types.u64)
     if (callsOut) asm.store(SP, saved.length * 8, LR, Types.u64)
