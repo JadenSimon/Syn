@@ -4,6 +4,8 @@ import * as heap from './heap'
 import * as intrinsics from './intrinsics'
 import { Op, createInterpreter, makeFunctionFromBytes, tagVmHandle, vmValue } from './vm'
 import ts from 'typescript'
+import { Array as ArrayBuiltin } from './builtin/Array'
+import { Map as MapBuiltin } from './builtin/Map'
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -48,6 +50,11 @@ export enum ConstantKind {
 
 type ScopeBinding = { slot: number, parentSlot: number }
 type OuterSymbol = { scopeSlot: number, reg: number }
+type FoldResultValue = string | number | boolean | undefined | null
+type EmitCtx = {
+    outerSymbols: Map<number, OuterSymbol>
+    outerFolded: Map<number, [FoldResultValue]>
+}
 const thisSymbol = -3
 
 interface EhRange {
@@ -61,7 +68,24 @@ interface Labels {
     jump: number[]
 }
 
-export type Expandos = Map<string, EmitResult | Expandos>
+export type Expandos = Map<string | symbol, EmitResult | Expandos>
+
+function wellKnownSymbol(name: ts.PropertyName): symbol | undefined {
+    if (!ts.isComputedPropertyName(name)) return
+    const e = name.expression
+    if (!ts.isPropertyAccessExpression(e) || !ts.isIdentifier(e.expression) || e.expression.text !== 'Symbol') return
+    const symbol = (Symbol as any)[e.name.text]
+    return typeof symbol === 'symbol' ? symbol : undefined
+}
+
+function classMemberKey(member: ts.ClassElement): string | symbol {
+    if (!ts.isMethodDeclaration(member)) throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
+    if (member.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword)) throw 'static class members are not supported'
+    if (ts.isIdentifier(member.name)) return member.name.text
+    const symbol = wellKnownSymbol(member.name)
+    if (symbol === undefined) throw `unsupported class member name: ${member.name.getText()}`
+    return symbol
+}
 
 export type EmitResult = {
     code: number[]           // opcodes + byte operands
@@ -75,6 +99,7 @@ export type EmitResult = {
     scopeBindings: ScopeBinding[]
     sourceMapping: [pc: number, pos: number][] // uses encoded line/col
     expandos?: Expandos
+    name?: string
 }
 
 function defaultConstructorResult(): EmitResult {
@@ -94,8 +119,9 @@ function isShortLoad(opcode: number) {
 
 function emitFunction(
     fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration,
-    outerSymbols: Map<number, OuterSymbol> = new Map<number, OuterSymbol>(),
+    emitCtx: EmitCtx = { outerSymbols: new Map(), outerFolded: new Map() },
 ): EmitResult {
+    const outerSymbols = emitCtx.outerSymbols
     const code: number[] = []
     const constants: any[] = []
     const constantKinds: ConstantKind[] = []
@@ -477,7 +503,7 @@ function emitFunction(
         return symToReg.has(getSymbolId(node))
     }
 
-    const foldedVariables = new Map<number, [FoldResultValue]>()
+    const foldedVariables = new Map<number, [FoldResultValue]>(emitCtx.outerFolded)
     function tryFoldVariableDecl(node: ts.VariableDeclaration) {
         if (!node.initializer) return false
         if (!ts.isIdentifier(node.name)) return false
@@ -555,12 +581,14 @@ function emitFunction(
 
                 case ts.SyntaxKind.ArrayLiteralExpression:
                     const elements = (n as ts.ArrayLiteralExpression).elements
+                    const spreads = elements.some(ts.isSpreadElement)
                     let inner = 0
                     for (const x of elements) {
-                        if (ts.isSpreadAssignment(x)) {
-                            throw `Unhandled array element kind: ${ts.SyntaxKind[x.kind]}`
+                        if (ts.isSpreadElement(x)) {
+                            inner = Math.max(inner, 5 + visit(x.expression, true))
+                            continue
                         }
-                        inner = Math.max(inner, 1 + visit(x, true))
+                        inner = Math.max(inner, (spreads ? 2 : 1) + visit(x, true))
                     }
                     return (isAcc ? 0 : 1) + inner
 
@@ -575,7 +603,7 @@ function emitFunction(
                     const properties = (n as ts.ObjectLiteralExpression).properties
                     let inner = 0
                     for (const x of properties) {
-                        if (ts.isSpreadElement(x)) {
+                        if (ts.isSpreadAssignment(x)) {
                             inner = Math.max(inner, 4 + visit(x.expression, true))
                             continue
                         }
@@ -628,6 +656,8 @@ function emitFunction(
                     return 1 + args.length + Math.max(l, argMax) + (isAcc ? 0 : 1)
                 case ts.SyntaxKind.TypeOfExpression:
                     return visit((n as ts.TypeOfExpression).expression, isAcc)
+                case ts.SyntaxKind.SpreadElement:
+                    return 5 + visit((n as ts.SpreadElement).expression, true)
                 case ts.SyntaxKind.ArrowFunction:
                 case ts.SyntaxKind.FunctionExpression:
                     return isAcc ? 0 : 1
@@ -730,7 +760,6 @@ function emitFunction(
     let foldDepth = 0 // so we can cache intermediate failures on the way back up
     let foldMaxDepth = 0
     const foldedResults = new Map<ts.Expression, FoldResult | false>()
-    type FoldResultValue = string | number | boolean | undefined | null
     type FoldResult = 
         | [kind: 'value', value: FoldResultValue]
         | [kind: 'residual', node: ts.Expression]
@@ -901,6 +930,23 @@ function emitFunction(
         }
     }
 
+    function logicalAssignmentJump(kind: ts.SyntaxKind): number | undefined {
+        switch (kind) {
+            case ts.SyntaxKind.QuestionQuestionEqualsToken: return Op.JumpIfNotNullish
+            case ts.SyntaxKind.BarBarEqualsToken: return Op.JumpIfToBooleanTrue
+            case ts.SyntaxKind.AmpersandAmpersandEqualsToken: return Op.JumpIfToBooleanFalse
+        }
+    }
+
+    function emitLogicalAssignment(jumpOp: number, load: () => void, right: ts.Expression, store: () => void): void {
+        load()
+        const end = emitJumpPlaceholder(jumpOp)
+        skipNextLookbehind = true
+        emitExpr(right)
+        store()
+        patchJump(end)
+    }
+
     function isAssignmentOp(kind: ts.SyntaxKind): boolean {
         return kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment
     }
@@ -919,6 +965,11 @@ function emitFunction(
             return
         }
 
+        const jump = logicalAssignmentJump(kind)
+        if (jump !== undefined) {
+            emitLogicalAssignment(jump, () => { ldar(robj); emit2(getOp, keySlot) }, node.right, () => emit3(setOp, robj, keySlot))
+            return
+        }
         const op = compoundBinaryOp(kind)
         if (isLexicalIdent(node.right)) {
             ldar(robj)
@@ -1002,6 +1053,12 @@ function emitFunction(
                 emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
                 return
             }
+            const jump = logicalAssignmentJump(kind)
+            if (jump !== undefined) {
+                const load = () => emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+                emitLogicalAssignment(jump, load, node.right, () => emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg))
+                return
+            }
             const op = compoundBinaryOp(kind)
             emitExpr(node.right)
             const rhs = allocReg(); star(rhs)
@@ -1025,6 +1082,11 @@ function emitFunction(
             return
         }
 
+        const jump = logicalAssignmentJump(kind)
+        if (jump !== undefined) {
+            emitLogicalAssignment(jump, () => ldar(reg), node.right, () => star(reg))
+            return
+        }
         const op = compoundBinaryOp(kind)
         if (isLexicalIdent(node.right)) {
             ldar(reg)
@@ -1302,6 +1364,7 @@ function emitFunction(
             case ts.SyntaxKind.MinusToken: return Op.Negate
             case ts.SyntaxKind.TildeToken: return Op.BitNot
             case ts.SyntaxKind.ExclamationToken: return Op.LogicalNot
+            case ts.SyntaxKind.PlusToken: return Op.ToNumber
             default: throw `Unhandled unary operator: ${ts.SyntaxKind[token]}`
         }
     }
@@ -1413,19 +1476,78 @@ function emitFunction(
     }
 
     function emitArrayLiteral(node: ts.ArrayLiteralExpression): void {
-        if (node.elements.length > 0x100) throw 'array literals larger than 256 elements are not supported'
-        emit1(Op.CreateEmptyArray)
+        emitArrayOf(node.elements)
+    }
+
+    function emitArrayOf(elements: ReadonlyArray<ts.Expression>): void {
+        if (elements.length > 0x100) throw 'array literals larger than 256 elements are not supported'
+        const savedReg = nextReg
+        defer nextReg = savedReg
+        emit2(Op.CreateEmptyArray, lateBoundSlot(-4, 'Array'))
         const rarray = allocReg()
         star(rarray)
-        defer freeReg()
-        for (let i = 0; i < node.elements.length; i++) {
-            const element = node.elements[i]
-            if (ts.isSpreadElement(element)) throw 'spread array elements are not supported'
+        let index: number | undefined
+        for (let i = 0; i < elements.length; i++) {
+            const element = elements[i]
+            if (ts.isSpreadElement(element)) {
+                if (index === undefined) {
+                    index = allocReg()
+                    emitNumber(i)
+                    star(index)
+                }
+                emitSpreadInto(rarray, index, element.expression)
+                continue
+            }
             if (ts.isOmittedExpression(element)) emit1(Op.LdaUndefined)
             else emitExpr(element)
-            emit3(Op.SetPropertyImm, rarray, i)
+            if (index === undefined) {
+                emit3(Op.SetPropertyImm, rarray, i)
+                continue
+            }
+            emitAppend(rarray, index)
         }
         ldar(rarray)
+    }
+
+    function emitAppend(rarray: number, index: number): void {
+        emit3(Op.SetProperty, rarray, index)
+        ldar(index)
+        emit1(Op.Inc)
+        star(index)
+    }
+
+    function emitOpenIterator(exp: ts.Expression): { iterator: number, method: number } {
+        emitExpr(exp)
+        const iterator = allocReg(); star(iterator)
+        emitLoadConst(lateBoundSlot(-1, 'Symbol'))
+        emit2(Op.GetPropertyConst, internString('iterator'))
+        const method = allocReg(); star(method)
+        ldar(iterator)
+        emit2(Op.GetProperty, method)
+        star(method)
+        emitCallArgs('Call', method, [], iterator)
+        star(iterator)
+        emit2(Op.GetPropertyConst, internString('next'))
+        star(method)
+        return { iterator, method }
+    }
+
+    function emitSpreadInto(rarray: number, index: number, exp: ts.Expression): void {
+        const savedReg = nextReg
+        defer nextReg = savedReg
+        const { iterator, method } = emitOpenIterator(exp)
+        const step = allocReg()
+        skipNextLookbehind = true
+        const top = code.length
+        emitCallArgs('Call', method, [], iterator)
+        star(step)
+        emit2(Op.GetPropertyConst, internString('done'))
+        const end = emitJumpPlaceholder(Op.JumpIfToBooleanTrue)
+        ldar(step)
+        emit2(Op.GetPropertyConst, internString('value'))
+        emitAppend(rarray, index)
+        emitJumpTo(Op.Jump, top)
+        patchJump(end)
     }
 
     function emitTemplateExpression(node: ts.TemplateExpression): void {
@@ -1503,13 +1625,19 @@ function emitFunction(
         const saveNextReg = nextReg
         defer nextReg = saveNextReg
 
+        if (args.some(ts.isSpreadElement)) {
+            if (callOp !== 'Call') throw `spread arguments are not supported for ${callOp}`
+            emitArrayOf(args)
+            const rarray = allocReg(); star(rarray)
+            if (thisReg !== undefined) ldar(thisReg)
+            else emit1(Op.LdaUndefined)
+            emit3(Op.CallArray, callee, rarray)
+            return
+        }
+
         const nargs = args.length
         const allocated = new Array(nargs)
-        for (let i = 0; i < args.length; i++) {
-            const arg = args[i]
-            if (ts.isSpreadElement(arg)) throw "spread arguments are not supported"
-            allocated[i] = allocReg()
-        }
+        for (let i = 0; i < args.length; i++) allocated[i] = allocReg()
         for (let i = 0; i < args.length; i++) {
             emitExpr(args[i])
             star(allocated[i])
@@ -1613,10 +1741,9 @@ function emitFunction(
         }
         const reg = allocReg()
         symToReg.set(symId, reg)
-        if (decl.initializer) { 
-            emitExpr(decl.initializer)
-            star(reg)
-        }
+        if (decl.initializer) emitExpr(decl.initializer)
+        else emit1(Op.LdaUndefined)
+        star(reg)
     }
 
     function emitVariableStatement(node: ts.VariableStatement) {
@@ -1634,7 +1761,9 @@ function emitFunction(
 
     function emitBlock(node: ts.Block) {
         const savedReg = nextReg
-        for (const s of node.statements) emitStatement(s)
+        const hoisted = hoistFunctions(node.statements)
+        for (const s of node.statements) if (!ts.isFunctionDeclaration(s)) emitStatement(s)
+        for (const [slot, decl] of hoisted) constants[slot] = emitFunction(decl, closureCtx(decl))
         nextReg = savedReg
     }
 
@@ -1800,18 +1929,7 @@ function emitFunction(
         const savedLabels = labels
         defer { nextReg = savedReg; labels = savedLabels }
 
-        emitExpr(node.expression)
-        const iterator = allocReg(); star(iterator)
-        emitLoadConst(lateBoundSlot(-1, 'Symbol'))
-        emit2(Op.GetPropertyConst, internString('iterator'))
-        const method = allocReg(); star(method)
-        ldar(iterator)
-        emit2(Op.GetProperty, method)
-        star(method)
-        emitCallArgs('Call', method, [], iterator)
-        star(iterator)
-        emit2(Op.GetPropertyConst, internString('next'))
-        star(method)
+        const { iterator, method } = emitOpenIterator(node.expression)
         const step = allocReg()
         const open = allocReg()
         const scope = { iterator, open }
@@ -1883,10 +2001,13 @@ function emitFunction(
             prevStoreOffset = -1 // acc was clobbered
             range.handler = code.length
             const decl = node.catchClause.variableDeclaration
-            if (decl) {
-                emitVariableDecl(decl)
-                if (ts.isIdentifier(decl.name)) star(symToReg.get(getSymbolId(decl.name))!)
-                else assignPattern(decl.name)
+            if (decl && ts.isIdentifier(decl.name)) {
+                const reg = allocReg()
+                symToReg.set(getSymbolId(decl.name), reg)
+                star(reg)
+            } else if (decl) {
+                bindPattern(decl.name)
+                assignPattern(decl.name)
             }
             emitBlock(node.catchClause.block)
             extras.jump[handleEnd] = code.length
@@ -2099,6 +2220,27 @@ function emitFunction(
     }
 
     function emitClosure(node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.ArrowFunction | ts.FunctionExpression): void {
+        emitNested(emitFunction(node, closureCtx(node)))
+    }
+
+    function hoistFunctions(statements: readonly ts.Statement[]): [slot: number, decl: ts.FunctionDeclaration][] {
+        const hoisted: [number, ts.FunctionDeclaration][] = []
+        for (const s of statements) {
+            if (!ts.isFunctionDeclaration(s) || !s.body) continue
+            if (!s.name) throw 'nested function declaration has no name'
+            const reg = allocReg()
+            symToReg.set(getSymbolId(s.name), reg)
+            const slot = constants.length
+            constants.push(undefined)
+            constantKinds.push(ConstantKind.nested_function)
+            emit2(Op.CreateClosure, slot)
+            star(reg)
+            hoisted.push([slot, s])
+        }
+        return hoisted
+    }
+
+    function closureCtx(node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitCtx {
         const childOuter = new Map<number, OuterSymbol>()
         for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
         for (const [sym] of outerSymbols) {
@@ -2110,7 +2252,7 @@ function emitFunction(
             if (thisReg !== undefined) childOuter.set(thisSymbol, { scopeSlot: -1, reg: thisReg })
             else if (outerSymbols.has(thisSymbol)) childOuter.set(thisSymbol, scopedSymbol(thisSymbol)!)
         }
-        emitNested(emitFunction(node, childOuter))
+        return { outerSymbols: childOuter, outerFolded: foldedVariables }
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
@@ -2130,12 +2272,20 @@ function emitFunction(
         star(rproto)
         for (const member of node.members) {
             if (member === ctor) continue
-            if (!ts.isMethodDeclaration(member) || !ts.isIdentifier(member.name)) {
-                throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
+            const key = classMemberKey(member)
+            const method = member as ts.MethodDeclaration
+            if (typeof key === 'string') {
+                emitClosure(method)
+                emit3(Op.SetPropertyConst, rproto, internString(key))
+                continue
             }
-            if (member.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword)) throw 'static class members are not supported'
-            emitClosure(member)
-            emit3(Op.SetPropertyConst, rproto, internString(member.name.text))
+            const name = (method.name as ts.ComputedPropertyName).expression as ts.PropertyAccessExpression
+            emitLoadConst(lateBoundSlot(-1, 'Symbol'))
+            emit2(Op.GetPropertyConst, internString(name.name.text))
+            const rkey = allocReg(); star(rkey)
+            emitClosure(method)
+            emit3(Op.SetProperty, rproto, rkey)
+            freeReg()
         }
         ldar(rproto)
         emit3(Op.SetPropertyConst, rctor, internString('prototype'))
@@ -2150,35 +2300,36 @@ function emitFunction(
         patchJump(ph)
     }
 
-    let defaultInitIndex = -1
+    const paramRegs: number[] = []
     for (let i = 0; i < fn.parameters.length; i++) {
         const p = fn.parameters[i]
-        if (!ts.isIdentifier(p.name)) throw "destructuring parameters are not supported"
         if (p.dotDotDotToken) throw "rest parameters are not supported"
-        if (p.initializer && defaultInitIndex === -1) defaultInitIndex = i
         // we have to assign it even if unused
         const reg = allocReg()
-        symToReg.set(getSymbolId(p.name), reg)
+        paramRegs.push(reg)
+        if (ts.isIdentifier(p.name)) symToReg.set(getSymbolId(p.name), reg)
     }
-    if (defaultInitIndex !== -1) {
-        for (let i = defaultInitIndex; i < fn.parameters.length; i++) {
-            const p = fn.parameters[i]
-            assert(p.initializer)
-            const name = p.name as ts.Identifier
-            const reg = symToReg.get(getSymbolId(name))!
-            if (!isReferencedSymbol(name)) {
-                if (hasEffects(p.initializer)) {
-                    emitDefaultInit(p.initializer, reg, true)
-                }
-                continue
-            }
-            emitDefaultInit(p.initializer, reg)
+    for (let i = 0; i < fn.parameters.length; i++) {
+        const p = fn.parameters[i]
+        if (!p.initializer) continue
+        if (ts.isIdentifier(p.name) && !isReferencedSymbol(p.name)) {
+            if (hasEffects(p.initializer)) emitDefaultInit(p.initializer, paramRegs[i], true)
+            continue
         }
+        emitDefaultInit(p.initializer, paramRegs[i])
     }
     // `freeReg` pops, so only a run of unused parameters at the end can be given back
     for (let i = fn.parameters.length-1; i >= 0; i--) {
-        if (isReferencedSymbol(fn.parameters[i].name as any)) break
+        const name = fn.parameters[i].name
+        if (!ts.isIdentifier(name) || isReferencedSymbol(name)) break
         freeReg()
+    }
+    for (let i = 0; i < fn.parameters.length; i++) {
+        const name = fn.parameters[i].name
+        if (ts.isIdentifier(name)) continue
+        bindPattern(name)
+        ldar(paramRegs[i])
+        assignPattern(name)
     }
 
     const lexicalThis = ts.isArrowFunction(fn) && outerSymbols.has(thisSymbol)
@@ -2189,7 +2340,7 @@ function emitFunction(
     }
 
     let selfSlot: number | undefined
-    if ((ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn)) && fn.name && isReferencedSymbol(fn.name)) {
+    if ((ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn)) && fn.name && isReferencedSymbol(fn.name) && !outerSymbols.has(getSymbolId(fn.name))) {
         const slot = lateBoundSlot(getSymbolId(fn.name), (fn.name as ts.Identifier).text, ConstantKind.function_)
         selfSlot = slot
         const reg = allocReg()
@@ -2224,6 +2375,7 @@ function emitFunction(
         labels: extraLabels,
         scopeBindings,
         sourceMapping,
+        name: fn.name && ts.isIdentifier(fn.name) ? fn.name.text : undefined,
     }
 }
 
@@ -2259,11 +2411,7 @@ function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): E
     const prototype: Expandos = new Map()
     for (const member of node.members) {
         if (member === ctor) continue
-        if (!ts.isMethodDeclaration(member) || !ts.isIdentifier(member.name)) {
-            throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
-        }
-        if (member.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword)) throw 'static class members are not supported'
-        prototype.set(member.name.text, emitFunction(member))
+        prototype.set(classMemberKey(member), emitFunction(member as ts.MethodDeclaration))
     }
     const expandos: Expandos = new Map()
     expandos.set('prototype', prototype)
@@ -2291,7 +2439,7 @@ const OpNames: Record<number, string> = {}
 for (const [name, val] of Object.entries(Op)) OpNames[val as number] = name
 
 const ImmOps = new Set([Op.LdaImm])
-const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst, Op.CreateClosure])
+const ConstOps = new Set([Op.LdaConst, Op.GetPropertyConst, Op.SetPropertyConst, Op.CreateClosure, Op.CreateEmptyArray])
 export const ConditionalJumpOps = new Set([Op.JumpIfNull, Op.JumpIfUndefined, Op.JumpIfNullish, Op.JumpIfNotUndefined, Op.JumpIfNotNull, Op.JumpIfNotNullish, Op.JumpIfToBooleanTrue, Op.JumpIfToBooleanFalse])
 const JumpOps = new Set([Op.Jump, ...ConditionalJumpOps])
 
@@ -2405,7 +2553,7 @@ export function createCodeIterator(bytes: readonly u8[]) {
         if (inst.opname.startsWith('Lda')) {
             inst.writesAcc = true
         }
-        if (opcode >= Op.Add && opcode <= Op.LogicalNotNot) {
+        if (opcode >= Op.Add && opcode <= Op.ToNumber) {
             inst.readsAcc = inst.writesAcc = true
         }
         if (opcode === Op.Return || opcode === Op.Throw || opcode === Op.ReThrow) {
@@ -2470,6 +2618,11 @@ export function createCodeIterator(bytes: readonly u8[]) {
             } else {
                 inst.regs[2] += inst.regs[1]-1
             }
+            return inst
+        }
+        if (opcode === Op.CallArray) {
+            inst.readsAcc = inst.writesAcc = true
+            inst.regs.push(readByte(), readByte()) // callee, array
             return inst
         }
         if (opcode === Op.CallConst || opcode === Op.ConstructConst) {
@@ -2539,6 +2692,7 @@ export function getRegReads(inst: CodeInstruction): number[] {
     if (inst.opcode >= Op.GetProperty && inst.opcode <= Op.SetPropertyImm) {
         regs.push(...inst.regs)
     }
+    if (inst.opcode === Op.CallArray) regs.push(...inst.regs)
     if (inst.opcode === Op.Call || inst.opcode === Op.Construct) {
         regs.push(inst.regs[0])
         if (inst.regs.length === 3) {
@@ -2758,6 +2912,8 @@ export function createCtx(o: Record<string, any> = {}): Ctx {
         [ctxSym]: Symbol('ctx brand'),
         Object: { assign: Object.assign },
         Symbol: heap.symbolConstants,
+        Array: ArrayBuiltin,
+        Map: MapBuiltin,
     }, o) as any
 }
 const toComputation = Symbol.for('toComputation')
@@ -3069,6 +3225,45 @@ function runTest() {
     e2eTest('function nestedArrow(a) { const outer = (x) => { const inner = (y) => x + y + a; return inner(1) }; return outer(2) }', [3])
     e2eTest('function objectMethod(a) { const o = { get() { return a }, add: function(x) { return x + a } }; return o.get() + o.add(1) }', [2])
     e2eTest('function arrowThis() { const f = () => this.x; return f() }', [], { x: 7 })
+    e2eTest('function hoistedCall() { return later(3); function later(x) { return x + 1 } }', [])
+    e2eTest('function hoistedCapture(a) { const f = (x) => g(x) + 1; function g(y) { return y * a } return f(2) }', [5])
+    e2eTest('function hoistedLaterConst(a) { function g() { return k + a } const k = a * 2; return g() }', [5])
+    e2eTest('function recursiveCapture(a) { function sum(k) { return k ? a + sum(k - 1) : 0 } return sum(3) }', [5])
+    e2eTest('function spreadOnly(o) { const x = [...o]; return x[0] + x[1] * 10 + x[2] * 100 + x[3] * 1000 + x.length * 10000 }', [iterable()])
+    e2eTest('function spreadMiddle(o, a) { const x = [a, ...o, a + 1]; return x[0] + x[2] * 10 + x[5] * 100 + x.length * 1000 }', [iterable(), 7])
+    e2eTest('function spreadTwice(o) { const x = [...o, ...o]; return x[3] + x[4] * 10 + x[7] * 100 + x.length * 1000 }', [iterable()])
+    e2eTest('function foldedCapture(a) { const k = 3; function g() { return k + a } return g() }', [5])
+    e2eTest('function foldedArrow(a) { const k = 3; const f = () => k * a; return f() }', [5])
+    e2eTest('function foldedNested(a) { const k = 3; const j = k * 2; function g() { function h() { return j + k + a } return h() } return g() }', [5])
+    e2eTest('function defaultThenPlain(a = 1, b) { return a * 10 + (b ?? 7) }', [])
+    e2eTest('function logicalLocal(a) { let x; x ??= a; x ||= 9; x &&= x + 1; return x }', [5])
+    e2eTest('function logicalFalsy(a) { let x = 0; x ||= a; let y = 0; y &&= a; return x * 10 + y }', [5])
+    e2eTest('function logicalScoped(a) { let x; function set() { x ??= a } set(); set(); return x }', [5])
+    e2eTest('function logicalProperty(o, a) { o.x ??= a; o.y ??= a; return o.x * 10 + o.y }', [{ x: 3 }, 5])
+    e2eTest('function logicalValue(a) { let x; const v = (x ??= a); const w = (x ??= 9); return v * 10 + w }', [5])
+    function counted(n: number) {
+        const o: any = iterable()
+        o.limit = n
+        o.next = function next(this: { index: number, limit: number }) {
+            const value = this.index
+            this.index = value + 1
+            return { value: value + 1, done: value >= this.limit }
+        }
+        return o
+    }
+    e2eTest('function spreadCall(two, one, a) { function f(x, y, z, w) { return x + y * 10 + z * 100 + w * 1000 } return f(...two, a, ...one) }', [counted(2), counted(1), 5])
+    e2eTest('function spreadMethod(o, two) { return o.add(...two) }', [{ base: 10, add(x: number, y: number) { return (this as any).base + x + y } }, counted(2)])
+    e2eTest('function spreadIterable(o) { function f(a, b, c, d) { return a + b * 10 + c * 100 + d * 1000 } return f(...o) }', [iterable()])
+    e2eTest('function destructureParam(o) { function f([a, b], c) { return a + b * 10 + c * 100 } return f(o, 3) }', [[1, 2]])
+    e2eTest('function destructureSkip(o) { const g = ([, id]) => id; return g(o) * 2 }', [[4, 9]])
+    e2eTest('function destructureParamDefault() { function f([a, b] = [5, 6]) { return a * 10 + b } return f() }', [])
+    e2eTest('function unaryPlus(a) { return +(a > 3) + +a }', [5])
+    e2eTest('function arrayIterate() { let s = 0; for (const x of [1, 2, 3]) s += x; return s }', [])
+    e2eTest('function arraySpreadReal(a) { const x = [a, 2]; const y = [...x, ...x]; return y.length * 100 + y[2] * 10 + y[3] }', [5])
+    e2eTest('function arrayPush() { const x = []; x.push(4); x.push(5); return x.length * 10 + x[1] }', [])
+    e2eTest('function arraySpreadCall(a) { function f(x, y, z, w) { return x + y * 10 + z * 100 + w * 1000 } return f(...[1, 2], a, ...[3]) }', [5])
+    e2eTest('function arrayIndexLoop(o) { const x = [7, 8, 9]; let s = 0; for (let i = 0; i < x.length; i++) s = s * 10 + x[i]; return s }', [0])
+    e2eTest('function mapBasics() { const m = new Map(); m.set(1, 10); m.set(2, 20); m.set(1, 30); return m.get(1) + m.get(2) + m.size * 1000 + (m.has(3) ? 100 : 0) }', [])
     e2eTest('function sharedFrame() { let n = 1; function bump() { n = n * 3 } function read() { return n } bump(); n = n + 1; return read() }', [])
     try {
         e2eTest('function outlived() { function make() { let n = 5; function get() { return n } return get } const g = make(); return g() }', [])

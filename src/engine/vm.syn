@@ -100,7 +100,7 @@ export const Op = {
     IncPost: 0x42, DecPost: 0x43, // some specializations
 
     Inc: 0x4A, Dec: 0x4B, Negate: 0x4C, BitNot: 0x4D, LogicalNot: 0x4E, TypeOf: 0x4F,
-    LogicalNotNot: 0x50,
+    LogicalNotNot: 0x50, ToNumber: 0x51,
 
     // FIXME: we need jumps that can read from a separate label table so we can have known-sized emits
     
@@ -114,6 +114,7 @@ export const Op = {
     CallConst: 0x68,
     Construct: 0x69,
     ConstructConst: 0x6A,
+    CallArray: 0x6B,
 
     Throw: 0x77, ReThrow: 0x78, // ReThrow won't contribute to the stack trace
     Return: 0x79, ReturnVoid: 0x7A,
@@ -148,6 +149,20 @@ export function frameSize(registerCount: u32, extraSlots: u32 = 0): u32 {
 export function frameFunction(frame: usize): usize { return frame }
 export function frameArg(frame: usize, index: u32): usize { return frame + (1 + index) * 4 }
 export function frameRegs(frame: usize): usize { return frameArg(frame, 1) }
+
+const frameGetter = heap.makeHostFunction((_thisArg, args, _argc) => {
+    const proxy = vmHandle(Intrinsics.load(args, 0, Types.u32))
+    const reg = vmValue(Intrinsics.load(args, 4, Types.u32))
+    const value = Intrinsics.load(frameRegs(heap.frameProxyFrame(proxy)), reg * 4 as u32, Types.u32)
+    return isVmHandle(value) ? value : tagVmHandle(heap.boxF64(vmValue(value)))
+})
+
+const frameSetter = heap.makeHostFunction((_thisArg, args, _argc) => {
+    const proxy = vmHandle(Intrinsics.load(args, 0, Types.u32))
+    const reg = vmValue(Intrinsics.load(args, 4, Types.u32))
+    Intrinsics.store(frameRegs(heap.frameProxyFrame(proxy)), reg * 4 as u32, Intrinsics.load(args, 8, Types.u32), Types.u32)
+    return tagVmHandle(0)
+})
 
 export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0, internal: typeof Intrinsics = Intrinsics, ownsFrames = true) {
     const constantBytes = nativeMode ? 8 : 4
@@ -193,6 +208,7 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
         }
     }
     function interpret(callee: Handle, thisArg: Handle, args: usize, argCount: u32): u32 {
+        if (const host = heap.hostCallbackOf(callee)) return host(thisArg, args, argCount)
         const nt = Types.u32
         const fn = heap.functionBytecode(callee)
         const bc = heap.FunctionBytecode(heap.resolveHeapCell(fn))
@@ -319,10 +335,27 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
         }
 
         function doCall(target: Handle, rargStart: u32, nargs: u32) {
+            invoke(target, regs + rargStart * 4, nargs)
+        }
+
+        function doCallArray(target: Handle, array: Handle) {
+            let obj = array
+            if (intrinsics.getNanId(obj)) obj = Intrinsics.shapeof(obj)
+            const count = heap.arrayLength(obj) as u32
+            const bytes = (count > 0 ? count : 1) * 4 as u32
+            const argv = Intrinsics.stackalloc(bytes)
+            for (let i: u32 = 0; i < count; i++) {
+                Intrinsics.store(argv, i * 4, tagVmHandle(getProperty(obj, heap.indexKey(i))), Types.u32)
+            }
+            invoke(target, argv, count)
+            Intrinsics.stackfree(bytes)
+        }
+
+        function invoke(target: Handle, argv: usize, nargs: u32) {
             assert(target !== 0, 'vm: nullish call target')
             frames.push([pc, frame])
             const callee = intrinsics.getNanId(target) ? target : heap.functionBytecode(target)
-            const result = Intrinsics.call(callee, scalar(), regs + rargStart * 4, nargs, interpret)
+            const result = Intrinsics.call(callee, scalar(), argv, nargs, interpret)
             frames.pop()
             setTagged(result)
         }
@@ -360,6 +393,29 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
             if (!(desc.flags & heap.PropFlags.has_getter)) return desc.slot0
             assertSym(desc.slot0)
             return vmHandle(Intrinsics.call(desc.slot0, obj, regs, 0, interpret))
+        }
+
+        function propertyKey(key: u32): Handle {
+            if (!isVmHandle(key)) return heap.indexKey(vmPayload(key))
+            const index = boxedIndex(key)
+            return index === undefined ? vmValue(key) : heap.indexKey(index)
+        }
+
+        function boxedIndex(key: u32): u32 | undefined {
+            const handle = vmHandle(key)
+            if (!handle || !heap.isBoxedF64(handle)) return
+            const value = heap.unboxF64(handle)
+            if (intrinsics.getNanId(value)) return
+            return value as u32
+        }
+
+        function setIndexed(target: Handle, index: u32, value: Handle): void {
+            let obj = target
+            if (intrinsics.getNanId(obj)) obj = Intrinsics.shapeof(obj)
+            setProperty(obj, heap.indexKey(index), value)
+            if (heap.isArray(obj) && index >= heap.arrayLength(obj)) {
+                setProperty(obj, heap.arrayLengthKey, heap.boxF64((index + 1) as f64))
+            }
         }
 
         function proxyKeyArg(key: Handle): u32 {
@@ -452,18 +508,14 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
                 case Op.MovPacked: const r = nextByte(); regStoreTagged(regs, r & 0xF, regLoadTagged(regs, r >> 4))
                 case Op.StoreFrame:
                     const scope = loadConstantHandle(nextByte())
-                    const reg = nextByte()
-                    if (heap.isFrameProxy(scope)) regStoreTagged(frameRegs(heap.frameProxyFrame(scope)), reg, acc)
-                    else setProperty(scope, heap.indexKey(reg), heapAcc())
+                    setProperty(scope, heap.indexKey(nextByte()), heapAcc())
 
                 case Op.LdaZero: setScalar(0)
                 case Op.LdaImm: const n = nextByte(); setScalar(Intrinsics.convert(n, Types.i8, Types.u32)) // sign-extend the signed byte
                 case Op.LdaConst: setTagged(loadConst1Wide())
                 case Op.LoadFrame:
                     const scope = loadConstantHandle(nextByte())
-                    const reg = nextByte()
-                    if (heap.isFrameProxy(scope)) setTagged(regLoadTagged(frameRegs(heap.frameProxyFrame(scope)), reg))
-                    else setHandle(getProperty(scope, heap.indexKey(reg)))
+                    setHandle(getProperty(scope, heap.indexKey(nextByte())))
                 case Op.LdaUndefined: setHandle(0)
                 case Op.LdaNull: setHandle(0)
                 case Op.LdaTrue: setScalar(fromBool(true))
@@ -513,6 +565,7 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
                 case Op.BitNot: setValue(Intrinsics.not(scalar(), nt))
                 case Op.LogicalNot: setScalar(Intrinsics.eq(scalar(), 0, nt, nt) as any)
                 case Op.TypeOf: setHandle(typeOf(acc))
+                case Op.ToNumber: continue
                 case Op.LogicalNotNot: setScalar(Intrinsics.ne(scalar(), 0, nt, nt) as any)
 
                 case Op.Jump: const off = Intrinsics.convert(nextByte(), Types.i8, Types.u32); pc = Intrinsics.jmp(pc, off)
@@ -533,6 +586,10 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
 
                 case Op.CallConst:
                     doCall(vmValue(loadConst1Wide()), nextByte(), nextByte())
+
+                case Op.CallArray:
+                    const callee = regLoad(regs, nextByte())
+                    doCallArray(callee, regLoad(regs, nextByte()))
 
                 case Op.Construct:
                     const callee = regLoad(regs, nextByte())
@@ -576,18 +633,20 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
                     return Intrinsics.ret(taggedVoid, nt)
 
                 case Op.CreateEmptyObject: setHandle(heap.makeObject(0))
-                case Op.CreateEmptyArray: setHandle(heap.makeArray())
+                case Op.CreateEmptyArray: setHandle(heap.makeArray(heap.getPrototypeProperty(vmHandle(loadConst1Wide()))))
                 case Op.CreateClosure:
                     madeFrameProxy = ownsFrames
-                    setHandle(heap.makeFunction(heap.makeClosure(vmHandle(loadConst1Wide()), fn, heap.frameProxyOf(frame))))
+                    setHandle(heap.makeFunction(heap.makeClosure(vmHandle(loadConst1Wide()), fn, heap.frameProxyOf(frame, frameGetter, frameSetter))))
                 // TODO: will create an obj w/ owned properties already set
                 // case Op.CreateObjectConst: acc = heap.makeObject(0)
 
-                case Op.GetProperty: setHandle(getProperty(vmHandle(acc), regLoad(regs, nextByte())))
+                case Op.GetProperty: setHandle(getProperty(vmHandle(acc), propertyKey(regLoadTagged(regs, nextByte()))))
                 case Op.SetProperty:
                     const robj = nextByte()
-                    const rkey = nextByte()
-                    setProperty(regLoad(regs, robj), regLoad(regs, rkey), heapAcc())
+                    const key = regLoadTagged(regs, nextByte())
+                    const index = isVmHandle(key) ? boxedIndex(key) : vmPayload(key)
+                    if (index === undefined) setProperty(regLoad(regs, robj), vmValue(key), heapAcc())
+                    else setIndexed(regLoad(regs, robj), index, heapAcc())
 
                 case Op.GetPropertyConst: setHandle(getProperty(vmHandle(acc), vmHandle(loadConst1Wide())))
                 case Op.SetPropertyConst:
@@ -596,13 +655,8 @@ export function createInterpreter(nativeMode: boolean, extraFrameSlots: u32 = 0,
 
                 case Op.GetPropertyImm: setHandle(getProperty(vmHandle(acc), heap.indexKey(nextByte())))
                 case Op.SetPropertyImm:
-                    let obj = regLoad(regs, nextByte())
-                    if (intrinsics.getNanId(obj)) obj = Intrinsics.shapeof(obj)
-                    const index = nextByte()
-                    setProperty(obj, heap.indexKey(index), heapAcc())
-                    if (heap.isArray(obj) && index >= heap.arrayLength(obj)) {
-                        setProperty(obj, heap.arrayLengthKey, heap.boxF64((index + 1) as f64))
-                    }
+                    const obj = regLoad(regs, nextByte())
+                    setIndexed(obj, nextByte(), heapAcc())
 
                 case Op.Width2:
                     const w2 = nextByte()
