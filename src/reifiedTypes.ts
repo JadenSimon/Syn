@@ -747,37 +747,58 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         origin: fileName,
     })
     if (!cjs) {
-        const m = new vm.SourceTextModule(text, {
+        const finished = new Set<any>()
+        const pending = new Map<any, Promise<unknown>>()
+        const linking = new Map<any, Promise<void>>()
+        const readyMarker = 'await import.meta.ready();'
+        const finishedMarker = '\nimport.meta.finished()\n'
+        function initializeMeta(meta: any, m: any) {
+            meta.finished = () => finished.add(m)
+            meta.ready = () => {
+                const waits = [...pending].filter(([p]) => !dependsOn(p, x => x === m)).map(([, done]) => done)
+                if (waits.length) return Promise.all(waits)
+            }
+        }
+        const m = new vm.SourceTextModule(readyMarker + '\n' + text + finishedMarker, {
             identifier: fileName,
             context: ctx,
             importModuleDynamically: async (spec, from) => evaluated(await link(spec, from)),
+            initializeImportMeta: initializeMeta,
+            lineOffset: -1,
         })
         const modules = new Map<string, any>()
         modules.set(fileName, m)
         modules.set(fileName.replace('.syn', '.js'), m)
         const namesToSource = new Map<string, string>()
         namesToSource.set(fileName, text)
-        const evaluating = new Set<any>()
-        function dependsOnEvaluating(m: any, seen = new Set<any>()): boolean {
+        function dependsOn(m: any, matches: (m: any) => boolean, seen = new Set<any>()): boolean {
             if (!m || seen.has(m)) return false
             seen.add(m)
-            if (m.status === 'evaluating' || evaluating.has(m)) return true
+            if (matches(m)) return true
             for (const spec of m.dependencySpecifiers ?? []) {
                 const p = resolve?.(m.identifier, spec)
                 if (!p) continue
-                if (dependsOnEvaluating(modules.get(p[0]), seen)) return true
+                if (dependsOn(modules.get(p[0]), matches, seen)) return true
             }
             return false
         }
+        function isEvaluating(m: any) {
+            if (m.status === 'evaluating') return true
+            return m instanceof vm.SourceTextModule && m.status === 'evaluated' && !finished.has(m)
+        }
         async function evaluated(m: any) {
             if (!m) return m
-            if (m.status === 'unlinked') await m.link(link)
+            if (m.status === 'unlinked' && !linking.has(m)) linking.set(m, m.link(link))
+            await linking.get(m)
             if (m.status !== 'linked') return m
-            const cyclic = dependsOnEvaluating(m)
-            evaluating.add(m)
-            const done = m.evaluate().finally(() => evaluating.delete(m))
-            if (cyclic) done.catch(() => {})
-            else await done
+            const cyclic = dependsOn(m, isEvaluating)
+            const done = m.evaluate()
+            if (!cyclic) {
+                await done
+                return m
+            }
+            pending.set(m, done)
+            done.then(() => pending.delete(m), () => pending.delete(m))
             return m
         }
         async function link(spec: string, m: vm.Module) {
@@ -799,7 +820,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
             if (!p) return
             const cached = modules.get(p[0])
             if (cached) return cached
-            const src = `let __filename = import.meta.filename\n` + p[1]
+            const src = `let __filename = import.meta.filename; ${readyMarker}\n` + p[1] + finishedMarker
             namesToSource.set(p[0], src)
             const m2 = new vm.SourceTextModule(src, {
                 identifier: p[0],
@@ -807,6 +828,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
                 importModuleDynamically: async (spec, from) => evaluated(await link(spec, from)),
                 initializeImportMeta: (meta, m) => {
                     meta.filename = m.identifier.replace('.js', '.syn')
+                    initializeMeta(meta, m)
                 },
                 lineOffset: -1,
             })

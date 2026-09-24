@@ -191,9 +191,12 @@ const StoreOpcodes = new Set<number>([
 
 const CallLikeOpcodes = new Set<number>([...CallOpcodes, ...LoadOpcodes, ...StoreOpcodes])
 
+const FrameSyncOpcodes = new Set<number>([...CallLikeOpcodes, Op.LoadFrame, Op.StoreFrame])
+
 function deriveBlocks(
     code: readonly u8[], codeLen: number,
     accSlot: number, tokenSlot: number,
+    captured: bytecode.FrameCaptures,
 ): Blocks {
     function readsToken(opcode: number): boolean {
         if (TerminalOpcodes.has(opcode)) return true
@@ -206,12 +209,14 @@ function deriveBlocks(
         const out: number[] = []
         for (const r of bytecode.getRegReads(inst)) out.push(r === -1 ? accSlot : r)
         if (readsToken(inst.opcode)) out.push(tokenSlot)
+        if (FrameSyncOpcodes.has(inst.opcode)) for (const r of captured.reads) out.push(r)
         return out
     }
     function writesOf(inst: bytecode.CodeInstruction): number[] {
         const out: number[] = []
         for (const r of bytecode.getRegWrites(inst)) out.push(r === -1 ? accSlot : r)
         if (writesToken(inst.opcode)) out.push(tokenSlot)
+        if (FrameSyncOpcodes.has(inst.opcode)) for (const r of captured.writes) out.push(r)
         return out
     }
 
@@ -380,15 +385,23 @@ export interface TraceSession {
     fromJsValue(v: any): u32
     linkFunction(f: Function): u32
     compileSource(code: string): CompiledSource
+    compileTemplate(compiled: bytecode.EmitResult): CompiledSource
+    templateOf(closure: u32): Template | undefined
     finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
     enterTrace(): TraceRuntime
     leaveTrace(): void
+}
+
+export interface Template {
+    compiled: bytecode.EmitResult
+    captures?: any[]
 }
 
 export interface CompiledSource {
     compiled: bytecode.EmitResult
     codeLen: number
     blocks: Blocks
+    captured: bytecode.FrameCaptures
 }
 
 const symbolicMemoryTag = Symbol('trace.symbolicMemory')
@@ -481,6 +494,8 @@ export function createTraceSession(): TraceSession {
     const functionStubs = new Map<Function, number>()
     const stubFunctions = new Map<number, Function>()
     const compiledSources = new Map<string, CompiledSource>()
+    const compiledTemplates = new Map<bytecode.EmitResult, CompiledSource>()
+    const templates = new Map<u32, Template>()
     const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
     let runtime: TraceRuntime | undefined
     let nodeCache: Map<string | number, number> | undefined
@@ -555,14 +570,42 @@ export function createTraceSession(): TraceSession {
         const known = compiledSources.get(code)
         if (known) return known
         traceStats.compileMisses++
-        const compiled = bytecode.compile(code)
+        const source = prepareSource(bytecode.compile(code))
+        compiledSources.set(code, source)
+        return source
+    }
+
+    function compileTemplate(template: bytecode.EmitResult): CompiledSource {
+        const known = compiledTemplates.get(template)
+        if (known) return known
+        const source = prepareSource({ ...template, code: template.code.slice() })
+        compiledTemplates.set(template, source)
+        return source
+    }
+
+    function noteTemplates(compiled: bytecode.EmitResult, fn: u32, captures?: any[]): void {
+        const bc = heap.functionBytecode(fn as intrinsics.Handle)
+        for (let i = 0; i < compiled.constants.length; i++) {
+            if (compiled.constantKinds[i] !== bytecode.ConstantKind.nested_function) continue
+            const nested = vmHandle(heap.constantAt(bc, i as u32))
+            const nestedBytecode = heap.FunctionBytecode(heap.resolveHeapCell(heap.functionBytecode(nested))).bytecode
+            templates.set(nestedBytecode as u32, { compiled: compiled.constants[i], captures })
+            noteTemplates(compiled.constants[i], nested as u32, captures)
+        }
+    }
+
+    function templateOf(closure: u32): Template | undefined {
+        const bc = heap.functionBytecode(closure as intrinsics.Handle)
+        return templates.get(heap.FunctionBytecode(heap.resolveHeapCell(bc)).bytecode as u32)
+    }
+
+    function prepareSource(compiled: bytecode.EmitResult): CompiledSource {
         const codeLen = compiled.code.length
         const ACC = compiled.registerCount
         ;(compiled.code as u8[]).push(Op.Return as u8, Op.Ldar as u8, ACC as u8)
-        const blocks = deriveBlocks(compiled.code as u8[], codeLen, ACC, ACC + 1)
-        const source = { compiled, codeLen, blocks }
-        compiledSources.set(code, source)
-        return source
+        const captured = bytecode.frameCaptures(compiled)
+        const blocks = deriveBlocks(compiled.code as u8[], codeLen, ACC, ACC + 1, captured)
+        return { compiled, codeLen, blocks, captured }
     }
 
     const captureBits = new Float64Array(2)
@@ -594,6 +637,7 @@ export function createTraceSession(): TraceSession {
             fromJsValue,
         )
         known.push({ captures, fn })
+        noteTemplates(compiled, fn, captures)
         return fn
     }
 
@@ -686,6 +730,8 @@ export function createTraceSession(): TraceSession {
         fromJsValue,
         linkFunction,
         compileSource,
+        compileTemplate,
+        templateOf,
         finalize,
         enterTrace,
         leaveTrace,
@@ -711,6 +757,7 @@ export interface TraceOptions {
     shapes?: (intrinsics.Handle | undefined)[]
     name?: string
     self?: Function
+    env?: boolean
 }
 
 let nestedElapsed = 0
@@ -724,15 +771,19 @@ let blockOrderOn = false
 let blockOrderStep = 0
 let blockOrderDepth = 0
 
-export function trace2(input: string | Function, opts: TraceOptions = {}) {
+export function trace2(input: string | Function | bytecode.EmitResult, opts: TraceOptions = {}) {
     let code: string
     let captures = opts.captures
+    let template: bytecode.EmitResult | undefined
     if (typeof input === 'function') {
         const computation = intrinsics.getComputation(input)
         code = computation[0]
         captures = computation[1]
-    } else {
+    } else if (typeof input === 'string') {
         code = input
+    } else {
+        template = input
+        code = `<template ${opts.name ?? ''}>`
     }
     if (captures && opts.mapCapture) captures = captures.map(opts.mapCapture)
     const traceName = opts.name ?? (typeof input === 'function' ? input.name : '')
@@ -748,7 +799,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     const selfStart = performance.now()
     const outerNested = nestedElapsed
     nestedElapsed = 0
-    const source = session.compileSource(code)
+    const source = template ? session.compileTemplate(template) : session.compileSource(code)
     const compiled = source.compiled
     const codeLen = source.codeLen
     const ACC = compiled.registerCount
@@ -790,7 +841,7 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
         session.leaveTrace()
     }
     const tracer = runtime.tracer
-    const interpret = createInterpreter(true, 3, tracer.saved)
+    const interpret = createInterpreter(true, 3, tracer.saved, false)
     const mem = runtime.mem
     const nodes = runtime.nodes
     const objects = runtime.objects
@@ -847,6 +898,49 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     function slotAddr(r: number): number { return regsBase + r * 4 }
     function readToken(): any { return mem[slotAddr(TOKEN)] }
     function writeToken(v: any): void { mem[slotAddr(TOKEN)] = v as any }
+
+    defer heap.releaseFrameProxy(frame)
+    function frameEnvironment(): any {
+        const proxy = heap.liveFrameProxy(frame)
+        if (proxy === undefined) return
+        return mk('heap-handle', [traceValue(proxy)], '', [Types.handle])
+    }
+    const captured = source.captured
+    const vmStubs = new Set<Function>([
+        session.symbolicPanic, session.symbolicJmp, session.symbolicBranch, session.symbolicDispatch,
+        ...Object.values(session.objectBuiltins),
+    ])
+    function syncsFrame(linked: any): boolean {
+        if (!linked) return true
+        if (linked.concrete) return false
+        return !vmStubs.has(linked)
+    }
+    function syncOut(env: any): void {
+        for (const r of captured.reads) {
+            writeToken(mk('set-prop', [readToken(), env, traceValue(heap.indexKey(r as u32)), toGraphValue(mem[slotAddr(r)])], '', [Types.u64]))
+        }
+    }
+    function syncIn(env: any): void {
+        if (!captured.writes.size) return
+        if (step.kind === 'inline-cont') throw `trace2: ${traceName} inlines a callee that continues past a closure write-back`
+        for (const r of captured.writes) {
+            const value = mk('get-prop', [readToken(), env, traceValue(heap.indexKey(r as u32))], '', [Types.u64])
+            writeToken(value)
+            mem[slotAddr(r)] = fromGraphValue(value) as any
+        }
+    }
+    const envs: number[] = []
+    if (opts.env) {
+        const bindings = compiled.scopeBindings
+        const context = mk('call-context', [], '', [Types.usize])
+        runtime.nilEffect ??= mk('nil-effect', [])
+        const bc = heap.functionBytecode(finalized as intrinsics.Handle)
+        for (let i = 0; i < bindings.length; i++) {
+            const env = mk('get-prop', [runtime.nilEffect, context, traceValue(heap.closureScopeKey(i as u32))], '', [Types.u64])
+            envs.push(symbolOf(env))
+            heap.setConstant(bc, bindings[i].slot as u32, tagVmHandle(opaqueObject(env) as intrinsics.Handle))
+        }
+    }
 
     const lowNodes = new Map<number, Node>()
     function nodeOf(id: number): Node | undefined {
@@ -1312,19 +1406,22 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
                 tracer.markHandled()
                 return tagCallResult(traceValue(result))
             }
-            if (linked) {
-                const result = callLinked(linked, thisArg, regStart, nargs)
-                if (result) return tagCallResult(result.value)
+            const env = syncsFrame(linked) ? frameEnvironment() : undefined
+            if (env) syncOut(env)
+            const result = linked ? callLinked(linked, thisArg, regStart, nargs) : undefined
+            let value = result?.value
+            if (!result) {
+                const calleeValue = intrinsics.getNanId(callee)
+                    ? traceValue(callee)
+                    : mk('heap-handle', [traceValue(callee)], '', [Types.handle])
+                const cargs = [readToken(), calleeValue, traceValue(thisArg)]
+                for (let i = 0; i < nargs; i++) cargs.push(escapedArg(regStart, i))
+                value = mk('call', cargs, '', [Types.u32])
+                writeToken(value)
+                tracer.markHandled()
             }
-            const calleeValue = intrinsics.getNanId(callee)
-                ? traceValue(callee)
-                : mk('heap-handle', [traceValue(callee)], '', [Types.handle])
-            const cargs = [readToken(), calleeValue, traceValue(thisArg)]
-            for (let i = 0; i < nargs; i++) cargs.push(escapedArg(regStart, i))
-            const v = mk('call', cargs, '', [Types.u32])
-            writeToken(v)
-            tracer.markHandled()
-            return tagCallResult(v)
+            if (env) syncIn(env)
+            return tagCallResult(value)
         },
     }
     runtime.frames.push(traceFrame)
@@ -2321,6 +2418,8 @@ export function trace2(input: string | Function, opts: TraceOptions = {}) {
     return {
         get graph() { return _graph ??= buildGraph() },
         get text() { return printLines() },
+        frameProxy: heap.liveFrameProxy(frame) as u32 | undefined,
+        envs,
         result,
         returned,
         dispatches,

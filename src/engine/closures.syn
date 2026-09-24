@@ -1,0 +1,327 @@
+/// @synth
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as heap from './heap'
+import * as bytecode from './bytecode-emitter'
+import { trace2, createTraceSession, type Template } from './trace2'
+import { resolveProperties } from './property-eval'
+import { dumpGraph, lowerValueGraph, normalizeValueGraph, type Graph } from './lowering2'
+import { copyNode, countIds, getLiteral, getRef, makeNode } from './graph-node'
+import * as native from './native'
+
+type Handle = intrinsics.Handle
+const Types = intrinsics.Types
+
+if (intrinsics.argv()[0] === 'closures') {
+    function readCapture(n: u32): u32 {
+        function add(x: u32): u32 {
+            return x + n
+        }
+        return add(1)
+    }
+    function writeCapture(n: u32): u32 {
+        let c: u32 = 0
+        function bump(): void {
+            c = c + n
+        }
+        bump()
+        bump()
+        return c
+    }
+    function loopCall(n: u32): u32 {
+        let s: u32 = 0
+        function step(i: u32): void {
+            s = s + i
+        }
+        for (let i: u32 = 0; i < n; i++) step(i)
+        return s
+    }
+    function nestedCapture(n: u32): u32 {
+        function outer(a: u32): u32 {
+            function inner(b: u32): u32 {
+                return a + b + n
+            }
+            return inner(2)
+        }
+        return outer(1)
+    }
+    function skipLevel(n: u32): u32 {
+        function outer(a: u32): u32 {
+            function inner(b: u32): u32 {
+                return b + n
+            }
+            return inner(a) + 1
+        }
+        return outer(2)
+    }
+    function threeLevels(n: u32): u32 {
+        let total: u32 = 0
+        function outer(a: u32): u32 {
+            function middle(b: u32): u32 {
+                function inner(c: u32): void {
+                    total = total + a + b + c + n
+                }
+                inner(3)
+                return total
+            }
+            return middle(2)
+        }
+        return outer(1) + total
+    }
+    function applyTwice(f: (x: u32) => u32, x: u32): u32 {
+        return f(f(x))
+    }
+    function passedDown(n: u32): u32 {
+        function add(x: u32): u32 {
+            return x + n
+        }
+        return applyTwice(add, 1)
+    }
+    function returned(n: u32): u32 {
+        function makeAdder(k: u32) {
+            function add(x: u32): u32 {
+                return x + k
+            }
+            return add
+        }
+        const f = makeAdder(n)
+        return f(1)
+    }
+    function arrow(n: u32): u32 {
+        const add = (x: u32): u32 => x + n
+        return add(1)
+    }
+    function expression(n: u32): u32 {
+        const add = function(x: u32): u32 { return x + n }
+        return add(1)
+    }
+    function method(n: u32): u32 {
+        const o = { get: function(): u32 { return n } }
+        return o.get() + 1
+    }
+
+    const session = createTraceSession()
+    const dump = (name: string, g: Graph) => {
+        if (intrinsics.argv().includes(`closure-dump:${name}`)) console.log(`=== ${name} ===\n${dumpGraph(g)}`)
+    }
+
+    function envShape(size: number): Handle {
+        const shape = heap.makeObject(0 as Handle)
+        for (let r = 0; r < size; r++) heap.setProperty(shape, heap.indexKey(r as u32), 0 as Handle)
+        return shape
+    }
+
+    function findNode(g: Graph, match: (op: string, id: number) => boolean): number {
+        for (const [id, n] of g.nodes) if (match(n.op, id)) return id
+        return 0
+    }
+
+    interface Unit {
+        name: string
+        graph: Graph
+        callees: { call: number, unit: Unit }[]
+        installed?: number
+    }
+
+    interface Scope {
+        bindings: { slot: number, parentSlot: number }[]
+        envs: number[]
+        shape: Handle
+    }
+
+    const pointerShape = envShape(256)
+    const closureUnits = new Map<u32, Unit>()
+
+    function scopeShape(template: Template): Handle {
+        const shape = heap.makeObject(0 as Handle)
+        for (let i = 0; i < template.compiled.scopeBindings.length; i++) heap.setReadonlyProperty(shape, heap.closureScopeKey(i as u32), 0 as Handle)
+        return shape
+    }
+
+    function envSize(compiled: bytecode.EmitResult): number {
+        const captured = bytecode.frameCaptures(compiled)
+        return Math.max(0, ...captured.reads, ...captured.writes) + 1
+    }
+
+    function ensureNode(graph: Graph, id: number): void {
+        if (!id || graph.nodes.has(id)) return
+        const n = session.runtime!.nodes.get(id)
+        if (!n) throw `closures: %${id} is not a traced node`
+        graph.nodes.set(id, copyNode(n))
+        for (let i = 0; i < countIds(n); i++) ensureNode(graph, getRef(n, i))
+    }
+
+    function withRef(graph: Graph, id: number, index: number, ref: number, literal = 0): void {
+        const n = graph.nodes.get(id)!
+        const ids = Array.from({ length: countIds(n) }, (_, j) => getRef(n, j))
+        const literals = Array.from({ length: countIds(n) }, (_, j) => getRef(n, j) ? 0 : getLiteral(n, j))
+        ids[index] = ref
+        literals[index] = literal
+        graph.nodes.set(id, copyNode(n, ids, literals))
+    }
+
+    function closureOf(graph: Graph, id: number): u32 | undefined {
+        const n = graph.nodes.get(id)
+        if (!n || n.op !== 'heap-handle' || getRef(n, 0)) return
+        const handle = getLiteral(n, 0) as u32
+        return session.templateOf(handle) ? handle : undefined
+    }
+
+    function closureUnit(handle: u32, name: string): void {
+        if (closureUnits.has(handle)) return
+        const template = session.templateOf(handle)!
+        const closureName = `${name}/closure`
+        const body = trace2(template.compiled, { session, captures: template.captures, env: true, name: closureName })
+        const scope = { bindings: template.compiled.scopeBindings, envs: body.envs, shape: scopeShape(template) }
+        closureUnits.set(handle, resolveUnit(closureName, body, template.compiled, scope))
+    }
+
+    function resolveUnit(name: string, traced: ReturnType<typeof trace2>, compiled: bytecode.EmitResult, scope?: Scope, params?: Map<number, Handle>): Unit {
+        const graph = traced.graph
+        dump(`${name}:traced`, graph)
+        const proxy = traced.frameProxy
+        let envNode = proxy === undefined ? 0 : findNode(graph, (op, id) => op === 'heap-handle' && !getRef(graph.nodes.get(id)!, 0) && getLiteral(graph.nodes.get(id)!, 0) === proxy)
+        if (proxy !== undefined && !envNode) {
+            envNode = graph.maxId++
+            graph.nodes.set(envNode, makeNode('heap-handle', [0], new Float64Array([proxy])))
+        }
+        const frameShape = envShape(envSize(compiled))
+        const objects = new Map<number, Handle>()
+        if (envNode) objects.set(envNode, frameShape)
+        const pointers = new Map<number, Handle>()
+        if (scope) {
+            for (const env of scope.envs) {
+                ensureNode(graph, env)
+                pointers.set(env, pointerShape)
+            }
+            const context = findNode(graph, op => op === 'call-context')
+            if (context) pointers.set(context, scope.shape)
+        }
+        for (const [i, shape] of params ?? []) pointers.set(graph.blocks[0].params[i], shape)
+
+        function envValue(parentSlot: number): Handle {
+            if (parentSlot === -1) return frameShape
+            const at = scope?.bindings.findIndex(b => b.slot === parentSlot) ?? -1
+            if (at < 0) throw `closures: ${name} has no scope slot ${parentSlot}`
+            return heap.boxF64(intrinsics.getNanFromId(scope!.envs[at])) as Handle
+        }
+        const shapes = new Map<u32, Handle>()
+        function closureShape(handle: u32): Handle {
+            const known = shapes.get(handle)
+            if (known !== undefined) return known
+            const template = session.templateOf(handle)!
+            const proto = heap.makeObject(0 as Handle)
+            heap.setProperty(proto, heap.closureCallKey, handle as Handle)
+            heap.setProperty(proto, heap.fromJsString('name'), heap.fromJsString(`${name}/closure`))
+            heap.setProperty(proto, heap.fromJsString('length'), heap.boxF64(template.compiled.paramCount as f64) as Handle)
+            const shape = heap.makeObject(proto)
+            const bindings = template.compiled.scopeBindings
+            for (let i = 0; i < bindings.length; i++) heap.setReadonlyProperty(shape, heap.closureScopeKey(i as u32), envValue(bindings[i].parentSlot))
+            shapes.set(handle, shape)
+            return shape
+        }
+
+        const pendingCallees: { call: number, fn: Function, params: Map<number, Handle> }[] = []
+        for (const [id, n] of graph.nodes) {
+            const closure = closureOf(graph, id)
+            if (closure !== undefined) {
+                objects.set(id, closureShape(closure))
+                continue
+            }
+            if (n.op !== 'call') continue
+            const target = graph.nodes.get(getRef(n, 1))
+            if (!target || target.op !== 'heap-handle' || getRef(target, 0)) continue
+            const fn = session.stubFunctions.get(getLiteral(target, 0) as u32)
+            if (!fn) continue
+            const calleeParams = new Map<number, Handle>()
+            for (let i = 3; i < countIds(n); i++) {
+                const closure = closureOf(graph, getRef(n, i))
+                if (closure !== undefined) calleeParams.set(i - 3, closureShape(closure))
+            }
+            pendingCallees.push({ call: id, fn, params: calleeParams })
+        }
+        const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers })
+        const unit: Unit = { name, graph: resolved.graph, callees: [] }
+        for (const handle of shapes.keys()) closureUnit(handle, name)
+        for (const { call, fn, params } of pendingCallees) {
+            const calleeCompiled = session.compileSource(intrinsics.getComputation(fn)[0]).compiled
+            unit.callees.push({ call, unit: resolveUnit(fn.name, trace2(fn, { session }), calleeCompiled, undefined, params) })
+        }
+        dump(`${name}:resolved`, unit.graph)
+        return unit
+    }
+
+    let lastRun: any
+    function install(name: string, graph: Graph): { run: any, ptr: number } {
+        const normalized = normalizeValueGraph(graph)
+        dump(name, normalized)
+        const text = dumpGraph(normalized)
+        if (text.includes('get-prop') || text.includes('set-prop')) {
+            console.log(text)
+            throw `closures: ${name} still has property values`
+        }
+        let lowered: ReturnType<typeof lowerValueGraph>
+        try {
+            lowered = lowerValueGraph(normalized)
+        } catch (e) {
+            throw `${name}: ${e}`
+        }
+        if (intrinsics.argv().includes(`closure-listing:${name}`)) console.log(lowered.listing)
+        const run = native.installNative(lowered.bytes)
+        lastRun = run
+        return { run, ptr: Number(run.ptr) }
+    }
+
+    function installUnit(unit: Unit): number {
+        if (unit.installed !== undefined) return unit.installed
+        const graph = unit.graph
+        for (const c of unit.callees) withRef(graph, c.call, 1, 0, installUnit(c.unit))
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op !== 'indirect-target') continue
+            const closure = closureOf(graph, getRef(n, 0))
+            if (closure === undefined) continue
+            withRef(graph, id, 0, 0, installUnit(closureUnits.get(closure)!))
+        }
+        return unit.installed = install(unit.name, graph).ptr
+    }
+
+    function compile(fn: Function): any {
+        const compiled = session.compileSource(intrinsics.getComputation(fn)[0]).compiled
+        let unit: Unit
+        {
+            session.enterTrace()
+            defer session.leaveTrace()
+            unit = resolveUnit(fn.name, trace2(fn, { session }), compiled)
+        }
+        installUnit(unit)
+        return lastRun
+    }
+
+    const cases: [fn: Function, args: number[]][] = [
+        [readCapture, [4]],
+        [writeCapture, [3]],
+        [loopCall, [5]],
+        [nestedCapture, [3]],
+        [skipLevel, [3]],
+        [threeLevels, [3]],
+        [passedDown, [3]],
+        [returned, [3]],
+        [arrow, [3]],
+        [expression, [3]],
+        [method, [3]],
+    ]
+    const only = intrinsics.argv().find(a => a.startsWith('only:'))?.slice(5)
+    for (const [fn, args] of cases) {
+        if (only && fn.name !== only) continue
+        const expected = (fn as any)(...args)
+        try {
+            const actual = compile(fn)(...args)
+            if (Number(actual) === expected) console.log(`closures ${fn.name} ok`)
+            else console.log(`closures ${fn.name} WRONG: ${actual}, expected ${expected}`)
+        } catch (e) {
+            console.log(`closures ${fn.name} FAILED: ${String(e).split('\n')[0].slice(0, 300)}`)
+        }
+    }
+}

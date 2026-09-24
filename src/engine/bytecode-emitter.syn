@@ -37,7 +37,7 @@ function getDecodedLocation(loc: number): { line: number; col: number } {
     return (ts as any).decodeLocation(loc)
 }
 
-enum ConstantKind {
+export enum ConstantKind {
     number,
     string,
     function_, // ??? FIXME: this breaks if you try to use "function" because it gets treated as a keyword :/
@@ -48,6 +48,7 @@ enum ConstantKind {
 
 type ScopeBinding = { slot: number, parentSlot: number }
 type OuterSymbol = { scopeSlot: number, reg: number }
+const thisSymbol = -3
 
 interface EhRange {
     start: number
@@ -627,6 +628,9 @@ function emitFunction(
                     return 1 + args.length + Math.max(l, argMax) + (isAcc ? 0 : 1)
                 case ts.SyntaxKind.TypeOfExpression:
                     return visit((n as ts.TypeOfExpression).expression, isAcc)
+                case ts.SyntaxKind.ArrowFunction:
+                case ts.SyntaxKind.FunctionExpression:
+                    return isAcc ? 0 : 1
                 case ts.SyntaxKind.ConditionalExpression:
                     const x = n as ts.ConditionalExpression
                     return Math.max(visit(x.condition, isAcc), visit(x.whenTrue, isAcc), visit(x.whenFalse, isAcc))
@@ -1395,6 +1399,10 @@ function emitFunction(
             } else if (ts.isPropertyAssignment(p) && !ts.isComputedPropertyName(p.name)) {
                 name = p.name.getText().replace(/^['"]|['"]$/g, '')
                 value = p.initializer
+            } else if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) {
+                emitClosure(p)
+                emit3(Op.SetPropertyConst, robj, internString(p.name.text))
+                continue
             } else {
                 throw `unsupported object property: ${ts.SyntaxKind[p.kind]}`
             }
@@ -1459,6 +1467,7 @@ function emitFunction(
         if (ts.isParenthesizedExpression(node)) { emitExpr(node.expression); return }
         if (node.kind === ts.SyntaxKind.ThisKeyword) {
             if (thisReg !== undefined) { ldar(thisReg); return }
+            if (const scoped = scopedSymbol(thisSymbol)) { emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg); return }
             // generally should not happen?
             emitLoadConst(lateBoundSlot(getSymbolId(node), "this"))
             return
@@ -1470,6 +1479,7 @@ function emitFunction(
         if (ts.isPrefixUnaryExpression(node)) { emitPrefixUnary(node); return }
         if (ts.isPostfixUnaryExpression(node)) { emitPostfixUnary(node); return }
         if (ts.isTypeOfExpression(node)) { emitExpr(node.expression); emit1(Op.TypeOf); return }
+        if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) { emitClosure(node); return }
         if (ts.isConditionalExpression(node)) { emitConditionalExp(node); return }
         if (ts.isTemplateExpression(node)) { emitTemplateExpression(node); return }
         if (ts.isArrayLiteralExpression(node)) { emitArrayLiteral(node); return }
@@ -2088,12 +2098,17 @@ function emitFunction(
         emit2(Op.CreateClosure, slot)
     }
 
-    function emitClosure(node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration): void {
+    function emitClosure(node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.ArrowFunction | ts.FunctionExpression): void {
         const childOuter = new Map<number, OuterSymbol>()
         for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
         for (const [sym] of outerSymbols) {
+            if (sym === thisSymbol) continue
             const scoped = scopedSymbol(sym)
             if (scoped) childOuter.set(sym, scoped)
+        }
+        if (ts.isArrowFunction(node)) {
+            if (thisReg !== undefined) childOuter.set(thisSymbol, { scopeSlot: -1, reg: thisReg })
+            else if (outerSymbols.has(thisSymbol)) childOuter.set(thisSymbol, scopedSymbol(thisSymbol)!)
         }
         emitNested(emitFunction(node, childOuter))
     }
@@ -2166,7 +2181,8 @@ function emitFunction(
         freeReg()
     }
 
-    if (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || isConstructor) {
+    const lexicalThis = ts.isArrowFunction(fn) && outerSymbols.has(thisSymbol)
+    if (!lexicalThis && (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || isConstructor)) {
         skipNextLookbehind = true
         thisReg = allocReg()
         star(thisReg)
@@ -2308,6 +2324,7 @@ export type CodeInstruction = {
     jumpTarget?: usize      // absolute byte offset the jump lands on
     jumpLabel?: number      // slots into the labeled jump table
     copyTo?: number
+    frameReg?: number
     readsAcc?: boolean
     writesAcc?: boolean
 }
@@ -2379,7 +2396,7 @@ export function createCodeIterator(bytes: readonly u8[]) {
             inst.readsAcc = opcode === Op.StoreFrame
             inst.writesAcc = opcode === Op.LoadFrame
             inst.constSlot = readByte()
-            readByte()
+            inst.frameReg = readByte()
             return inst
         }
         if (inst.opname.endsWith('Const')) {
@@ -2473,6 +2490,34 @@ export function createCodeIterator(bytes: readonly u8[]) {
     }
 
     return { next }
+}
+
+export interface FrameCaptures {
+    reads: Set<number>
+    writes: Set<number>
+}
+
+export function frameCaptures(result: EmitResult): FrameCaptures {
+    const captures: FrameCaptures = { reads: new Set(), writes: new Set() }
+    function visit(fn: EmitResult, frameSlots: Set<number>): void {
+        for (let i = 0; i < fn.constants.length; i++) {
+            if (fn.constantKinds[i] !== ConstantKind.nested_function) continue
+            const nested: EmitResult = fn.constants[i]
+            const slots = new Set<number>()
+            for (const b of nested.scopeBindings) if (frameSlots.has(b.parentSlot)) slots.add(b.slot)
+            if (!slots.size) continue
+            const it = createCodeIterator(nested.code as u8[])
+            while (const inst = it.next()) {
+                if (inst.opcode !== Op.LoadFrame && inst.opcode !== Op.StoreFrame) continue
+                if (!slots.has(inst.constSlot!)) continue
+                if (inst.opcode === Op.LoadFrame) captures.reads.add(inst.frameReg!)
+                else captures.writes.add(inst.frameReg!)
+            }
+            visit(nested, slots)
+        }
+    }
+    visit(result, new Set([-1]))
+    return captures
 }
 
 // -1 is considered the acc
@@ -3018,6 +3063,20 @@ function runTest() {
     e2eTest('function capturedPostfix() { let n = 5; function take() { const i = n++; return i } const a = take(); return a * 10 + n }', [])
     e2eTest('function capturedPrefix() { let n = 5; function take() { return ++n } const a = take(); return a * 10 + n }', [])
     e2eTest('function capturedDecrement() { let n = 5; function take() { return n-- } const a = take(); return a * 10 + n }', [])
+    e2eTest('function arrowCapture(a) { const add = (x) => x + a; return add(2) }', [5])
+    e2eTest('function arrowBlock(a) { let s = 0; const bump = (x) => { s = s + x + a }; bump(1); bump(2); return s }', [1])
+    e2eTest('function fnExpression(a) { const f = function(x) { return x * a }; return f(3) }', [4])
+    e2eTest('function nestedArrow(a) { const outer = (x) => { const inner = (y) => x + y + a; return inner(1) }; return outer(2) }', [3])
+    e2eTest('function objectMethod(a) { const o = { get() { return a }, add: function(x) { return x + a } }; return o.get() + o.add(1) }', [2])
+    e2eTest('function arrowThis() { const f = () => this.x; return f() }', [], { x: 7 })
+    e2eTest('function sharedFrame() { let n = 1; function bump() { n = n * 3 } function read() { return n } bump(); n = n + 1; return read() }', [])
+    try {
+        e2eTest('function outlived() { function make() { let n = 5; function get() { return n } return get } const g = make(); return g() }', [])
+        throw 'vm: outlived closure was expected to throw'
+    } catch (e) {
+        if (!String(e).includes('outlived its frame')) throw e
+        console.log('outlived closure refused ok')
+    }
     e2eTest('function propertyPostfix(o) { const a = o.x++; return a * 10 + o.x }', [{ x: 3 }])
     e2eTest('function propertyPrefix(o) { const a = ++o.x; return a * 10 + o.x }', [{ x: 3 }])
     e2eTest('function elementPostfix(o, k) { const a = o[k]++; return a * 10 + o[k] }', [{ x: 3 }, 'x'])

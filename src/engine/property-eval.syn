@@ -1,0 +1,758 @@
+/// @synth
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as heap from './heap'
+import { trace2, createTraceSession, type TraceSession } from './trace2'
+import { dumpGraph, lowerValueGraph, normalizeValueGraph, type Graph, type GraphNode } from './lowering2'
+import { copyNode, countIds, createGraph, getLiteral, getRef, makeNode, setGraphBlocks } from './graph-node'
+import type { HeapState } from './heap-records'
+import { symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmValue } from './vm'
+import * as native from './native'
+import ts from 'typescript'
+
+type Handle = intrinsics.Handle
+const Types = intrinsics.Types
+
+export interface PropertyEvalOptions {
+    mapCapture?: (capture: any) => any
+    shouldInline?: (fn: Function) => boolean
+    accessors?: 'inline' | 'call'
+    representation?: 'auto' | 'values' | 'memory'
+    pointers?: Map<number, Handle>
+}
+
+export interface AccessorCall {
+    fn: Function
+    keys: Handle[]
+    proto: Handle
+    pointer: boolean
+}
+
+interface Memory {
+    ptr: number
+    shape: Handle
+    keys: Handle[]
+    reduced: boolean
+    pointer: boolean
+    address?: [ref: number, literal: number]
+}
+
+export interface Resolved {
+    graph: Graph
+    calls: Map<number, AccessorCall>
+    addresses: Map<number, number>
+}
+
+const orderedOps = new Set(['load', 'store', 'call'])
+
+export function resolveProperties(
+    graph: Graph,
+    session: TraceSession,
+    objects: Map<number, Handle>,
+    opts: PropertyEvalOptions = {},
+): Resolved {
+    const runtime = session.runtime
+    if (!runtime) throw 'property-eval: the session must stay entered from tracing through resolution'
+    const records = runtime.objects
+    const tracer = runtime.tracer
+    const source = graph.nodes
+    const nodes = new Map<number, GraphNode>()
+    for (const [id, n] of source) nodes.set(id, copyNode(n))
+    const out = createGraph({
+        maxId: graph.maxId, nodes, blocks: graph.blocks.map(b => ({ ...b, params: b.params.slice() })),
+        debugLabels: graph.debugLabels, name: graph.name,
+    })
+
+    const cells = new Map<number, Handle>()
+    const memory = new Map<number, Memory>()
+    const forward = new Map<number, number>()
+    const written = new Set<number>()
+    for (const n of source.values()) if (n.op === 'set-prop') written.add(getRef(n, 1))
+    for (const [id, shape] of opts.pointers ?? []) {
+        const keys = dataKeys(shape)
+        memory.set(id, { ptr: id, shape, keys, reduced: keys.length === 1 && readonlyKeys(shape, keys), pointer: true, address: [id, 0] })
+    }
+    const representation = opts.representation ?? 'auto'
+    const byHandle = new Map<Handle, Memory>()
+    let initToken = 0
+    let lastAlloca = 0
+    for (const [id, handle] of objects) {
+        if (representation === 'values' || (representation === 'auto' && !written.has(id))) {
+            cells.set(id, records.intern(handle))
+            continue
+        }
+        const keys = dataKeys(handle)
+        const reduced = keys.length <= 1 && readonlyKeys(handle, keys)
+        let ptr = 0
+        if (!reduced) {
+            ptr = newId()
+            nodes.set(ptr, makeNode('alloca', [lastAlloca, 0, 0], new Float64Array([0, Math.max(keys.length, 1) * 8, 8])))
+            lastAlloca = ptr
+        }
+        const mem: Memory = { ptr, shape: handle, keys, reduced, pointer: false }
+        memory.set(id, mem)
+        byHandle.set(handle, mem)
+    }
+    for (const mem of byHandle.values()) {
+        if (mem.reduced) continue
+        for (let i = 0; i < mem.keys.length; i++) {
+            const [ref, literal] = operandOf(slotAt(mem.shape, mem.keys[i]))
+            if (!initToken) {
+                initToken = newId()
+                nodes.set(initToken, makeNode('nil-effect', [], new Float64Array(0)))
+            }
+            const store = newId()
+            nodes.set(store, makeNode('store', [initToken, mem.ptr, 0, ref], new Float64Array([0, 0, i * 8, literal]), Types.u64))
+            initToken = store
+        }
+    }
+    if (initToken) {
+        for (const [id, n] of source) if (n.op === 'nil-effect') forward.set(id, initToken)
+    }
+    const roots = [...cells.values()]
+    const start = records.capture(roots)
+
+    const tokenParams = new Map<number, { block: number, index: number }>()
+    for (const b of graph.blocks) b.params.forEach((p, index) => tokenParams.set(p, { block: b.id, index }))
+    const inbound = new Map<number, number[]>()
+    for (const [id, n] of source) {
+        if (n.op !== 'apply') continue
+        const list = inbound.get(getRef(n, 0))
+        if (list) list.push(id)
+        else inbound.set(getRef(n, 0), [id])
+    }
+
+    const after = new Map<number, HeapState>()
+    const entries = new Map<number, HeapState>()
+    const pending = new Set<number>()
+    const calls = new Map<number, AccessorCall>()
+
+    function newId(): number {
+        return tracer.getNanId(tracer.createUniqueNan())
+    }
+
+    function sameState(a: HeapState, b: HeapState): boolean {
+        if (a.size !== b.size) return false
+        for (const [cell, value] of a) if (b.get(cell) !== value) return false
+        return true
+    }
+
+    function stateAt(token: number): HeapState | undefined {
+        for (;;) {
+            const n = source.get(token)
+            if (!n) throw `property-eval: token %${token} is not in the graph`
+            if (n.op === 'get-prop' || n.op === 'set-prop') return evaluate(token)
+            if (n.op === 'nil-effect') return start
+            if (n.op === 'param') return entryOf(token)
+            if (!orderedOps.has(n.op)) throw `property-eval: cannot follow the token through ${n.op} %${token}`
+            token = getRef(n, 0)
+        }
+    }
+
+    function entryOf(param: number): HeapState | undefined {
+        const known = entries.get(param)
+        if (known) return known
+        if (pending.has(param)) return
+        const at = tokenParams.get(param)
+        if (!at || !at.block) throw `property-eval: token param %${param} has no block`
+        pending.add(param)
+        const _param = param
+        defer pending.delete(_param)
+        let state: HeapState | undefined
+        for (const apply of inbound.get(at.block) ?? []) {
+            const arrival = stateAt(getRef(source.get(apply)!, at.index + 1))
+            if (!arrival) continue
+            if (state && !sameState(state, arrival)) throw `property-eval: B${at.block} joins different object states`
+            state = arrival
+        }
+        if (!state) throw `property-eval: B${at.block} is only reached through itself`
+        entries.set(param, state)
+        return state
+    }
+
+    function objectOf(id: number): Handle {
+        const known = cells.get(id)
+        if (known !== undefined) return known
+        const n = source.get(id)
+        if (n?.op === 'heap-handle' && !getRef(n, 0)) {
+            if (heap.isFrameProxy(getLiteral(n, 0) as Handle)) throw `property-eval: frame proxy %${id} has no environment`
+            return records.intern(getLiteral(n, 0) as Handle)
+        }
+        throw `property-eval: no object for %${id} (${n?.op ?? 'missing'})`
+    }
+
+    function addressOf(mem: Memory): [ref: number, literal: number] {
+        if (mem.address) return mem.address
+        if (!mem.reduced) return mem.address = [mem.ptr, 0]
+        mem.address = [0, 0]
+        if (mem.keys.length) mem.address = operandOf(slotAt(mem.shape, mem.keys[0]))
+        return mem.address
+    }
+
+    function operandOf(slot: Handle): [ref: number, literal: number] {
+        if (!slot) return [0, 0]
+        const mem = byHandle.get(slot)
+        if (mem) return addressOf(mem)
+        if (heap.isBoxedF64(slot)) {
+            const value = heap.unboxF64(slot)
+            const id = intrinsics.getNanId(value)
+            return id ? [id, 0] : [0, value]
+        }
+        const id = newId()
+        nodes.set(id, makeNode('heap-handle', [0], new Float64Array([slot])))
+        cells.set(id, records.intern(slot))
+        return [id, 0]
+    }
+
+    function slotOf(n: GraphNode, i: number): Handle {
+        const ref = getRef(n, i)
+        if (!ref) return heap.boxF64(getLiteral(n, i)) as Handle
+        const cell = cells.get(ref)
+        if (cell !== undefined) return cell
+        const target = source.get(ref)
+        if (target?.op === 'heap-handle' && !getRef(target, 0)) return getLiteral(target, 0) as Handle
+        return heap.boxF64(intrinsics.getNanFromId(ref)) as Handle
+    }
+
+    function keyArg(key: Handle): u32 {
+        const index = heap.keyIndex(key)
+        return index === undefined ? tagVmHandle(key) : tagVmScalar(index)
+    }
+
+    function inline(id: number, fn: Handle, thisArg: Handle, args: u32[], token: number): void {
+        const linked = session.stubFunctions.get(fn)
+        if (!linked) throw `property-eval: accessor ${fn} for %${id} is not a linked function`
+        const nested = trace2(linked, {
+            session, mapCapture: opts.mapCapture, shouldInline: opts.shouldInline,
+            inputs: { thisArg: thisArg ? tagVmHandle(thisArg) : 0, args, effect: symbolValue(token) },
+        })
+        const traced = nested.graph
+        for (const [nid, n] of traced.nodes) if (!nodes.has(nid)) nodes.set(nid, n)
+        for (const b of traced.blocks) if (b.id && !out.blockIndex.has(b.id)) out.blocks.push(b)
+        setGraphBlocks(out, out.blocks)
+        const result = symbolOf(nested.result)
+        if (result) {
+            nodes.set(id, makeNode('inlined', [result, 0], new Float64Array([0, id])))
+            return
+        }
+        nodes.set(id, makeNode('after', [token, 0], new Float64Array([0, vmValue(nested.result as u32)])))
+    }
+
+    function callAccessor(id: number, fn: Handle, cell: Handle, token: number): void {
+        const linked = session.stubFunctions.get(fn)
+        if (!linked) throw `property-eval: accessor ${fn} for %${id} is not a linked function`
+        const target = heap.indirectTarget(cell)
+        const keys = dataKeys(target)
+        const callee = newId()
+        nodes.set(callee, makeNode('heap-handle', [0], new Float64Array([fn])))
+        const refs = [token, callee, 0]
+        const literals = [0, 0, 0]
+        for (const key of keys) {
+            const [ref, literal] = operandOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, key))).slot0 as Handle)
+            refs.push(ref)
+            literals.push(literal)
+        }
+        nodes.set(id, makeNode('call', refs, new Float64Array(literals)))
+        calls.set(id, { fn: linked, keys, proto: heap.getPrototypeOf(target), pointer: false })
+    }
+
+    function callWithPointer(id: number, fn: Handle, mem: Memory, token: number, value?: [ref: number, literal: number]): void {
+        const linked = session.stubFunctions.get(fn)
+        if (!linked) throw `property-eval: accessor ${fn} for %${id} is not a linked function`
+        const callee = newId()
+        nodes.set(callee, makeNode('heap-handle', [0], new Float64Array([fn])))
+        const refs = [token, callee, 0, mem.ptr]
+        const literals = [0, 0, 0, 0]
+        if (value) {
+            refs.push(value[0])
+            literals.push(value[1])
+        }
+        nodes.set(id, makeNode('call', refs, new Float64Array(literals)))
+        calls.set(id, { fn: linked, keys: mem.keys, proto: heap.getPrototypeOf(mem.shape), pointer: true })
+    }
+
+    function resolveMemory(id: number, n: GraphNode, mem: Memory): void {
+        let token = getRef(n, 0)
+        if (mem.pointer && source.get(token)?.op === 'nil-effect') {
+            token = newId()
+            nodes.set(token, makeNode('nil-effect', [], new Float64Array(0)))
+        }
+        const key = getLiteral(n, 2) as Handle
+        const value: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+        if (mem.reduced && n.op === 'set-prop') throw `property-eval: %${id} writes a reduced object`
+        if (mem.reduced && key === mem.keys[0]) {
+            const [ref, literal] = addressOf(mem)
+            nodes.set(id, makeNode('after', [token, ref], new Float64Array([0, literal])))
+            return
+        }
+        const addr = heap.getPropertyDescriptor(mem.shape, key)
+        if (!addr) {
+            if (heap.getPropertyProxy(mem.shape)) throw `property-eval: %${id} goes through a proxy on a memory object`
+            if (n.op === 'set-prop') throw `property-eval: %${id} adds a key to a memory object`
+            nodes.set(id, makeNode('after', [token, 0], new Float64Array(2)))
+            return
+        }
+        const desc = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
+        if (desc.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) {
+            if (n.op === 'get-prop' && desc.flags & heap.PropFlags.has_getter) return callWithPointer(id, desc.slot0 as Handle, mem, token)
+            if (n.op === 'set-prop' && desc.flags & heap.PropFlags.has_setter) return callWithPointer(id, desc.slot1 as Handle, mem, token, value)
+            throw `property-eval: %${id} uses an accessor without the matching half`
+        }
+        const offset = mem.keys.indexOf(key) * 8
+        if (offset < 0) {
+            if (n.op === 'set-prop') throw `property-eval: %${id} shadows a prototype key on a memory object`
+            const [ref, literal] = operandOf(desc.slot0 as Handle)
+            nodes.set(id, makeNode('after', [token, ref], new Float64Array([0, literal])))
+            return
+        }
+        if (n.op === 'get-prop') {
+            const load = newId()
+            nodes.set(load, makeNode('load', [token, mem.ptr, 0], new Float64Array([0, 0, offset]), Types.u64))
+            nodes.set(id, makeNode('after', [token, load], new Float64Array(2)))
+            return
+        }
+        nodes.set(id, makeNode('store', [token, mem.ptr, 0, value[0]], new Float64Array([0, 0, offset, value[1]]), Types.u64))
+    }
+
+    function write(cell: Handle, key: Handle, slot: Handle): void {
+        heap.setProperty(heap.prepareWrite(cell), key, slot)
+    }
+
+    function resolve(id: number, n: GraphNode): void {
+        const mem = memory.get(getRef(n, 1))
+        if (mem) return resolveMemory(id, n, mem)
+        const token = getRef(n, 0)
+        const cell = objectOf(getRef(n, 1))
+        const key = getLiteral(n, 2) as Handle
+        const addr = heap.getPropertyDescriptor(heap.indirectTarget(cell), key)
+        if (!addr) {
+            const proxy = heap.getPropertyProxy(heap.indirectTarget(cell))
+            if (!proxy) {
+                if (n.op === 'get-prop') {
+                    nodes.set(id, makeNode('after', [token, 0], new Float64Array(2)))
+                    return
+                }
+                write(cell, key, slotOf(n, 3))
+                forward.set(id, token)
+                return
+            }
+            if (n.op === 'get-prop') return inline(id, heap.getProxyGetter(proxy), 0, [tagVmHandle(cell), keyArg(key)], token)
+            return inline(id, heap.getProxySetter(proxy), 0, [tagVmHandle(cell), keyArg(key), tagVmHandle(slotOf(n, 3))], token)
+        }
+        const desc = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
+        const accessor = desc.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)
+        if (n.op === 'get-prop') {
+            if (desc.flags & heap.PropFlags.has_getter) {
+                if (opts.accessors === 'call') return callAccessor(id, desc.slot0 as Handle, cell, token)
+                return inline(id, desc.slot0 as Handle, cell, [], token)
+            }
+            if (accessor) throw `property-eval: %${id} reads a property with only a setter`
+            const [ref, literal] = operandOf(desc.slot0 as Handle)
+            nodes.set(id, makeNode('after', [token, ref], new Float64Array([0, literal])))
+            return
+        }
+        if (desc.flags & heap.PropFlags.has_setter) return inline(id, desc.slot1 as Handle, cell, [tagVmHandle(slotOf(n, 3))], token)
+        if (accessor) throw `property-eval: %${id} writes a property with only a getter`
+        write(cell, key, slotOf(n, 3))
+        forward.set(id, token)
+    }
+
+    function evaluate(id: number): HeapState | undefined {
+        const known = after.get(id)
+        if (known) return known
+        const n = source.get(id)!
+        const prior = stateAt(getRef(n, 0))
+        if (!prior) return
+        for (const [cell, value] of prior) records.install(cell, value)
+        resolve(id, n)
+        const state = records.capture(roots)
+        after.set(id, state)
+        return state
+    }
+
+    for (const [id, n] of source) {
+        if (n.op !== 'get-prop' && n.op !== 'set-prop') continue
+        if (!evaluate(id)) throw `property-eval: %${id} depends on its own loop`
+    }
+    for (const [param, state] of entries) {
+        const at = tokenParams.get(param)!
+        for (const apply of inbound.get(at.block) ?? []) {
+            const arrival = stateAt(getRef(source.get(apply)!, at.index + 1))!
+            if (!sameState(state, arrival)) throw `property-eval: B${at.block} changes object state around its loop`
+        }
+    }
+    for (const [id, n] of source) {
+        if (n.op !== 'call') continue
+        const mem = memory.get(getRef(n, 1))
+        if (!mem) continue
+        const current = nodes.get(id)!
+        const fnptr = newId()
+        const at = mem.keys.indexOf(heap.closureCallKey)
+        if (at >= 0 && !mem.reduced) {
+            nodes.set(fnptr, makeNode('load', [getRef(current, 0), mem.ptr, 0], new Float64Array([0, 0, at * 8]), Types.fnptr))
+        } else {
+            const addr = heap.getPropertyDescriptor(mem.shape, heap.closureCallKey)
+            if (!addr) throw `property-eval: %${id} calls an object without a call slot`
+            nodes.set(fnptr, makeNode('heap-handle', [0], new Float64Array([heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0])))
+        }
+        const [context, contextLiteral] = addressOf(mem)
+        const target = newId()
+        nodes.set(target, makeNode('indirect-target', [fnptr, context], new Float64Array([0, contextLiteral]), Types.fnptr))
+        const ids = Array.from({ length: countIds(current) }, (_, j) => getRef(current, j))
+        const literals = Array.from({ length: countIds(current) }, (_, j) => getRef(current, j) ? 0 : getLiteral(current, j))
+        ids[1] = target
+        nodes.set(id, copyNode(current, ids, literals))
+    }
+    out.maxId = Math.max(out.maxId, tracer.getNanCount() + 1)
+    const addresses = new Map<number, number>()
+    const replaced = new Map<number, [number, number]>()
+    for (const [id, mem] of memory) {
+        addresses.set(id, mem.ptr)
+        if (!mem.pointer) replaced.set(id, addressOf(mem))
+    }
+
+    function target(id: number): number {
+        while (forward.has(id)) id = forward.get(id)!
+        return id
+    }
+    for (const [id, n] of nodes) {
+        let ids: number[] | undefined
+        let literals: number[] | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!ref || (!forward.has(ref) && !replaced.has(ref))) continue
+            ids ??= Array.from({ length: countIds(n) }, (_, j) => getRef(n, j))
+            literals ??= Array.from({ length: countIds(n) }, (_, j) => getRef(n, j) ? 0 : getLiteral(n, j))
+            if (forward.has(ref)) {
+                ids[i] = target(ref)
+                continue
+            }
+            const [to, literal] = replaced.get(ref)!
+            ids[i] = to
+            literals[i] = literal
+        }
+        if (!ids) continue
+        nodes.set(id, copyNode(n, ids, literals))
+    }
+    for (const id of forward.keys()) nodes.delete(id)
+    for (const b of out.blocks) b.bodyId = target(b.bodyId)
+    return { graph: out, calls, addresses }
+}
+
+function slotAt(target: Handle, key: Handle): Handle {
+    return heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, key))).slot0 as Handle
+}
+
+function readonlyKeys(target: Handle, keys: Handle[]): boolean {
+    for (const key of keys) {
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, key)))
+        if (d.flags & heap.PropFlags.writable) return false
+    }
+    return true
+}
+
+function dataKeys(target: Handle): Handle[] {
+    const keys: Handle[] = []
+    for (let i: u32 = 0; i < heap.ownPropertyCount(target); i++) {
+        const key = heap.ownPropertyKeyAt(target, i)
+        if (!key) continue
+        const descriptor = heap.getOwnProperty(target, key)
+        if (!descriptor) continue
+        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+        keys.push(key)
+    }
+    return keys
+}
+
+export function resolveAccessor(session: TraceSession, call: AccessorCall, opts: PropertyEvalOptions = {}): Resolved {
+    const runtime = session.runtime
+    if (!runtime) throw 'property-eval: the session must stay entered while resolving accessors'
+    const tracer = runtime.tracer
+    const newId = (): number => tracer.getNanId(tracer.createUniqueNan())
+    const param = (): number => {
+        const id = newId()
+        runtime.nodes.set(id, makeNode('param', [], new Float64Array(0)))
+        return id
+    }
+    const self = param()
+    const args = Array.from({ length: call.fn.length }, param)
+    const traced = trace2(call.fn, {
+        session, mapCapture: opts.mapCapture, shouldInline: opts.shouldInline,
+        inputs: { thisArg: symbolValue(self), args: args.map(a => symbolValue(a)), effect: undefined },
+    }).graph
+    for (const id of [self, ...args]) traced.nodes.set(id, makeNode('param', [], new Float64Array(0)))
+    if (call.pointer) {
+        const shape = heap.makeObject(call.proto)
+        for (const key of call.keys) heap.setProperty(shape, key, heap.boxF64(0) as Handle)
+        traced.blocks[0].params = [self, ...args]
+        return resolveProperties(traced, session, new Map(), { ...opts, pointers: new Map([[self, shape]]) })
+    }
+    for (const n of traced.nodes.values()) {
+        if (n.op === 'set-prop' && getRef(n, 1) === self) throw `property-eval: accessor ${call.fn.name || '<anonymous>'} writes to this`
+    }
+    traced.blocks[0].params = [self]
+    const standIn = heap.makeObject(call.proto)
+    const params = call.keys.map(key => {
+        const field = newId()
+        traced.nodes.set(field, makeNode('param', [], new Float64Array(0)))
+        heap.setProperty(standIn, key, heap.boxF64(intrinsics.getNanFromId(field)) as Handle)
+        return field
+    })
+    const resolved = resolveProperties(traced, session, new Map([[self, standIn]]), opts)
+    for (const n of resolved.graph.nodes.values()) {
+        for (let i = 0; i < countIds(n); i++) {
+            if (getRef(n, i) === self) throw `property-eval: accessor ${call.fn.name || '<anonymous>'} uses this as a value`
+        }
+    }
+    resolved.graph.nodes.delete(self)
+    resolved.graph.blocks[0].params = [...params, ...args]
+    return resolved
+}
+
+if (intrinsics.argv()[0] === 'property-eval') {
+    function readY(o: { y: u32 }): u32 {
+        return o.y + 1
+    }
+    function writeThenRead(o: { y: u32 }, v: u32): u32 {
+        o.y = v
+        return o.y * 2
+    }
+    function readSum(o: { y: u32 }, a: u32): u32 {
+        return o.y + a
+    }
+    function readTwice(o: { twice: u32 }): u32 {
+        return o.twice + 1
+    }
+    function armsDiverge(o: { y: u32 }, c: u32): u32 {
+        if (c) {
+            o.y = 1
+            return o.y
+        }
+        o.y = 2
+        return o.y + 1
+    }
+    function joinSame(o: { y: u32 }, c: u32): u32 {
+        let r: u32 = 0
+        if (c) r = 1
+        return o.y + r
+    }
+    function joinRead(o: { y: u32 }, c: u32): u32 {
+        if (c) o.y = 3
+        return o.y
+    }
+    function loopRead(o: { y: u32 }, n: u32): u32 {
+        let s: u32 = 0
+        for (let i: u32 = 0; i < n; i++) s += o.y
+        return s
+    }
+    function bumpLoop(o: { y: u32 }, n: u32): u32 {
+        for (let i: u32 = 0; i < n; i++) o.y = o.y + 1
+        return o.y
+    }
+    function readNext(o: { next: u32 }): u32 {
+        return o.next + o.next
+    }
+    function writeY(o: { x: u32, y: u32 }, v: u32): void {
+        o.y = v + 1
+    }
+    const counting = Object.defineProperties({}, {
+        next: {
+            get: intrinsics.tagInline(function(this: { v: u32 }): u32 {
+                this.v = this.v + 1
+                return this.v
+            }),
+            enumerable: true,
+            configurable: true,
+        },
+    })
+    function readQuad(o: { quad: u32 }, _v: u32): u32 {
+        return o.quad + 1
+    }
+    const quadded = Object.defineProperties({}, {
+        twice: {
+            get: intrinsics.tagInline(function(this: { v: u32 }): u32 { return this.v * 2 }),
+            enumerable: true,
+            configurable: true,
+        },
+        quad: {
+            get: intrinsics.tagInline(function(this: { twice: u32 }): u32 { return this.twice * 2 }),
+            enumerable: true,
+            configurable: true,
+        },
+    })
+    const doubled = Object.defineProperties({}, {
+        twice: {
+            get: intrinsics.tagInline(function(this: { v: u32 }): u32 { return this.v * 2 }),
+            enumerable: true,
+            configurable: true,
+        },
+    })
+
+    const session = createTraceSession()
+    type Objects = (g: Graph) => Map<number, Handle>
+    interface Unit {
+        graph: Graph
+        calls: [id: number, callee: Unit][]
+    }
+    function unitOf(resolved: Resolved, opts: PropertyEvalOptions): Unit {
+        const calls: [number, Unit][] = []
+        for (const [id, call] of resolved.calls) calls.push([id, unitOf(resolveAccessor(session, call, opts), opts)])
+        return { graph: resolved.graph, calls }
+    }
+    function traceResolved(fn: Function, objects: Objects, opts: PropertyEvalOptions, pointers?: Objects): Unit {
+        session.enterTrace()
+        defer session.leaveTrace()
+        const traced = trace2(fn, { session }).graph
+        const resolved = resolveProperties(traced, session, objects(traced), { ...opts, pointers: pointers?.(traced) })
+        return unitOf(resolved, opts)
+    }
+    function install(name: string, unit: Unit): { run: any, text: string, listing: string } {
+        for (const [id, callee] of unit.calls) {
+            const ptr = Number(install(`${name} callee`, callee).run.ptr)
+            const n = unit.graph.nodes.get(id)!
+            const ids = Array.from({ length: countIds(n) }, (_, j) => getRef(n, j))
+            const literals = Array.from({ length: countIds(n) }, (_, j) => getRef(n, j) ? 0 : getLiteral(n, j))
+            ids[1] = 0
+            literals[1] = ptr
+            unit.graph.nodes.set(id, copyNode(n, ids, literals))
+        }
+        const graph = normalizeValueGraph(unit.graph)
+        const text = dumpGraph(graph)
+        if (intrinsics.argv().includes(`pe-dump:${name}`)) console.log(`=== ${name} ===\n${text}`)
+        if (text.includes('get-prop') || text.includes('set-prop')) {
+            console.log(text)
+            throw `property-eval: ${name} still has property values`
+        }
+        const lowered = lowerValueGraph(graph)
+        return { run: native.installNative(lowered.bytes), text, listing: lowered.listing }
+    }
+    function check(fn: Function, objects: Objects, cases: [args: number[], expected: number][], opts: PropertyEvalOptions = {}) {
+        const unit = traceResolved(fn, objects, opts)
+        const inlined = unit.calls.length === 0 && opts.accessors === 'call'
+        const { run, text, listing } = install(fn.name, unit)
+        if (opts.accessors === 'call' && text.includes('inlined')) {
+            console.log(text)
+            throw `property-eval: ${fn.name} inlined an accessor in call mode`
+        }
+        for (const [args, expected] of cases) {
+            const actual = run(...args)
+            if (Number(actual) === expected) continue
+            console.log(text)
+            console.log(listing)
+            throw `property-eval: ${fn.name}(${args.join(', ')}) returned ${actual}, expected ${expected}`
+        }
+        const mode = opts.accessors === 'call' ? ` (${unit.calls.length} accessor calls${inlined ? ', none expected?' : ''})` : ''
+        console.log(`property-eval ${fn.name} ok${mode}`)
+    }
+    function refuses(fn: Function, objects: Objects, reason: string, opts: PropertyEvalOptions = {}) {
+        try {
+            traceResolved(fn, objects, opts)
+        } catch (e) {
+            if (String(e).includes(reason)) {
+                console.log(`property-eval ${fn.name} refused ok`)
+                return
+            }
+            throw e
+        }
+        throw `property-eval: ${fn.name} was expected to be refused (${reason})`
+    }
+    const param = (g: Graph, i: number) => g.blocks[0].params[i]
+    const withY = (y: number): Objects => g => new Map([[param(g, 0), session.fromJsValue({ y }) as Handle]])
+    check(readY, withY(5), [[[0], 6]])
+    check(writeThenRead, withY(5), [[[0, 7], 14]])
+    check(readSum, g => {
+        const standIn = session.fromJsValue({ y: 0 }) as Handle
+        heap.setProperty(standIn, heap.fromJsString('y'), heap.boxF64(intrinsics.getNanFromId(param(g, 1))) as Handle)
+        return new Map([[param(g, 0), standIn]])
+    }, [[[0, 4], 8]])
+    const withV = (proto: object, v: (g: Graph) => number): Objects => g => {
+        const standIn = heap.makeObject(session.fromJsValue(proto) as Handle)
+        heap.setProperty(standIn, heap.fromJsString('v'), heap.boxF64(v(g)) as Handle)
+        return new Map([[param(g, 0), standIn]])
+    }
+    check(readTwice, withV(doubled, () => 5), [[[0], 11]])
+    check(readTwice, withV(doubled, () => 5), [[[0], 11]], { accessors: 'call' })
+    check(readQuad, withV(quadded, () => 5), [[[0], 21]])
+    check(readQuad, withV(quadded, () => 5), [[[0], 21]], { accessors: 'call' })
+    check(readQuad, withV(quadded, g => intrinsics.getNanFromId(param(g, 1))), [[[0, 3], 13], [[0, 7], 29]], { accessors: 'call' })
+    check(armsDiverge, withY(5), [[[0, 1], 1], [[0, 0], 3]])
+    check(joinSame, withY(5), [[[0, 1], 6], [[0, 0], 5]])
+    check(loopRead, withY(5), [[[0, 3], 15], [[0, 0], 0]])
+    check(joinRead, withY(5), [[[0, 1], 3], [[0, 0], 5]])
+    refuses(joinRead, withY(5), 'joins different object states', { representation: 'values' })
+    check(bumpLoop, withY(5), [[[0, 3], 8], [[0, 0], 5]])
+    check(readNext, withV(counting, () => 5), [[[0], 13]], { representation: 'memory' })
+
+    {
+        const unit = traceResolved(writeY, () => new Map(), {}, g => new Map([[param(g, 0), session.fromJsValue({ x: 0, y: 0 }) as Handle]]))
+        const { run, text, listing } = install('writeY', unit)
+        const cell = new BigUint64Array(2)
+        cell[0] = BigInt(7)
+        run(Number((ts as any).getArrayBufferPtr(cell.buffer)), 41)
+        if (Number(cell[0]) !== 7 || Number(cell[1]) !== 42) {
+            console.log(text)
+            console.log(listing)
+            throw `property-eval: writeY left [${cell[0]}, ${cell[1]}], expected [7, 42]`
+        }
+        console.log('property-eval writeY ok (caller sees the write)')
+    }
+
+    function testAlloca() {
+        const u64 = intrinsics.Types.u64
+        const nodes = new Map<number, GraphNode>([
+            [1, makeNode('param', [], new Float64Array(0))],
+            [2, makeNode('param', [], new Float64Array(0))],
+            [3, makeNode('nil-effect', [], new Float64Array(0))],
+            [4, makeNode('alloca', [0, 0, 0], new Float64Array([0, 8, 8]))],
+            [5, makeNode('alloca', [4, 0, 0], new Float64Array([0, 8, 8]))],
+            [6, makeNode('store', [3, 4, 0, 1], new Float64Array(4), u64)],
+            [7, makeNode('store', [6, 5, 0, 2], new Float64Array(4), u64)],
+            [8, makeNode('load', [7, 4, 0], new Float64Array(3), u64)],
+            [9, makeNode('load', [8, 5, 0], new Float64Array(3), u64)],
+            [10, makeNode('sub', [8, 9], new Float64Array(2), u64, u64)],
+            [11, makeNode('after', [9, 10], new Float64Array(2))],
+            [12, makeNode('ret', [11, 0], new Float64Array([0, 1]))],
+        ])
+        const g = createGraph({ maxId: 13, nodes, blocks: [{ id: 0, params: [1, 2], bodyId: 12, bodyConst: 0 }], name: 'allocaPair' })
+        const lowered = lowerValueGraph(g)
+        const run = native.installNative(lowered.bytes)
+        if (Number(run(30, 12)) !== 18) {
+            console.log(lowered.listing)
+            throw `property-eval: allocaPair returned ${run(30, 12)}`
+        }
+        console.log('property-eval allocaPair ok')
+
+        const loop = new Map<number, GraphNode>([
+            [1, makeNode('param', [], new Float64Array(0))],
+            [2, makeNode('block', [], new Float64Array(0))],
+            [15, makeNode('alloca', [0, 0, 0], new Float64Array([0, 8, 8]))],
+            [3, makeNode('apply', [2, 0, 1, 15], new Float64Array(4))],
+            [4, makeNode('param', [], new Float64Array(0))],
+            [5, makeNode('param', [], new Float64Array(0))],
+            [6, makeNode('param', [], new Float64Array(0))],
+            [7, makeNode('alloca', [6, 0, 0], new Float64Array([0, 8, 8]))],
+            [8, makeNode('sub', [7, 6], new Float64Array(2), u64, u64)],
+            [10, makeNode('add', [4, 0], new Float64Array([0, 1]), u64, u64)],
+            [11, makeNode('apply', [2, 10, 5, 7], new Float64Array(4))],
+            [12, makeNode('ret', [8, 0], new Float64Array([0, 1]))],
+            [13, makeNode('lt', [4, 5], new Float64Array(2), u64, u64)],
+            [14, makeNode('select', [13, 11, 12], new Float64Array(3))],
+        ])
+        const looped = createGraph({
+            maxId: 16, nodes: loop, name: 'allocaLoop',
+            blocks: [{ id: 0, params: [1], bodyId: 3, bodyConst: 0 }, { id: 2, params: [4, 5, 6], bodyId: 14, bodyConst: 0 }],
+        })
+        try {
+            const code = lowerValueGraph(looped)
+            console.log(code.listing)
+            throw 'property-eval: allocaLoop was expected to be refused'
+        } catch (e) {
+            if (!String(e).includes('inside the loop')) throw e
+            console.log('property-eval allocaLoop refused ok')
+        }
+    }
+    testAlloca()
+}
