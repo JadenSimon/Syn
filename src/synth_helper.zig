@@ -462,7 +462,7 @@ pub const SynthInstrumenter = struct {
             .symbol_replacements = &symbol_replacements,
         });
         const s = try self.factory.createStringLiteralAllocated(res.contents);
-        self.factory.nodes.at(s).flags |= @intFromEnum(parser.StringFlags.synthetic);
+        self.factory.nodes.at(s).flags |= @intFromEnum(parser.StringFlags.cooked);
         return s;
     }
 
@@ -875,13 +875,8 @@ pub const SynthInstrumenter = struct {
                 const sym = self.binder.symbols.at(sym_ref);
                 if (sym.hasFlag(.late_bound) or sym.hasFlag(.imported) or sym.hasFlag(.exported)) return;
                 if (self.needsCell(sym_ref)) {
-                    if (parser.getIdentFromSymbol(self.binder, sym_ref) == node) {
-                        var buf: [256]u8 = undefined;
-                        const name = try std.fmt.bufPrint(&buf, "c__{s}", .{getSlice(self.nodes.at(ref), u8)});
-                        const new_ident = try self.factory.createIdentifier(name);
-                        try self.rebindings.append(self.alloc, try self.factory.createConstVariable(new_ident, try self.factory.createArrayLiteralExpression(&.{try self.factory.createIdentifier(getSlice(self.nodes.at(ref), u8))})));
-                        return;
-                    }
+                    const captured = self.symbol_replacements != null and self.symbol_replacements.?.contains(sym_ref);
+                    if (!captured) return;
                     const access = try self.factory.createElementAccessExpression(try self.getCellOrSymbol(sym_ref), @as(i64, 0));
                     self.nodes.at(access).next = node.next;
                     try self.replacements.put(ref, access);

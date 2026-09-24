@@ -534,6 +534,7 @@ pub const StringFlags = enum(u20) {
     non_ascii = 1 << 5, // contains multibyte codepoints
 
     synthetic = 1 << 6, // Implies escaping may be needed
+    cooked = 1 << 7, // `data` is the string's value, so every backslash is escaped when printed
     emits_verbatim = 1 << 12,
     needs_decode = 1 << 14,
 };
@@ -11672,12 +11673,18 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
             try this.visitRef(d.right);
         }
 
-        fn printEscapedString(this: *@This(), s: []const u8, comptime quote_char: u8) void {
+        fn printEscapedString(this: *@This(), s: []const u8, comptime quote_char: u8, comptime cooked: bool) void {
             var i: usize = 0;
             var j: usize = 0;
             while (i < s.len) : (i += 1) {
                 switch (s[i]) {
                     '\\' => {
+                        if (cooked) {
+                            this.print(s[j..i]);
+                            this.print("\\\\");
+                            j = i + 1;
+                            continue;
+                        }
                         i += 1;
                         // TODO: skip over unicode escape
                     },
@@ -11706,11 +11713,17 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
             const quote_char = if (hasStringFlag(n, .double_quote)) "\"" else "'";
             this.print(quote_char);
 
-            if (hasStringFlag(n, .synthetic)) {
+            if (hasStringFlag(n, .cooked)) {
                 if (hasStringFlag(n, .double_quote)) {
-                    this.printEscapedString(getSlice(n, u8), '"');
+                    this.printEscapedString(getSlice(n, u8), '"', true);
                 } else {
-                    this.printEscapedString(getSlice(n, u8), '\'');
+                    this.printEscapedString(getSlice(n, u8), '\'', true);
+                }
+            } else if (hasStringFlag(n, .synthetic)) {
+                if (hasStringFlag(n, .double_quote)) {
+                    this.printEscapedString(getSlice(n, u8), '"', false);
+                } else {
+                    this.printEscapedString(getSlice(n, u8), '\'', false);
                 }
             } else {
                 this.print(getSlice(n, u8));
