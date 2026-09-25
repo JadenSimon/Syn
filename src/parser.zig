@@ -5342,7 +5342,9 @@ fn Parser_(comptime skip_trivia: bool) type {
                         }
                     },
                     .t_identifier => {
-                        if (this.lexer.isContextualKeyword("constructor")) {
+                        if (this.lexer.isContextualKeyword("declare")) {
+                            try parseModifierOrMember(this, &flags, &members, .declare);
+                        } else if (this.lexer.isContextualKeyword("constructor")) {
                             try this.lexer.next();
                             const n = try this.parseConstructor();
                             try members.append(n);
@@ -11579,6 +11581,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                     this.print("static ");
                 }
                 return;
+            }
+
+            if (hasFlag(n, .declare)) {
+                this.print("declare ");
             }
 
             if (hasFlag(n, .public)) {
