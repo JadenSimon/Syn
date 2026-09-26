@@ -6,7 +6,7 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { trace2, createTraceSession, type TraceSession } from './trace2'
 import { dumpGraph, lowerValueGraph, normalizeValueGraph, type Graph, type GraphNode } from './lowering2'
-import { copyNode, countIds, createGraph, getLiteral, getRef, makeNode, setGraphBlocks } from './graph-node'
+import { cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, createGraph, getLiteral, getRef, makeNode, setGraphBlocks } from './graph-node'
 import type { HeapState } from './heap-records'
 import { symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmValue } from './vm'
 import * as native from './native'
@@ -21,6 +21,32 @@ export interface PropertyEvalOptions {
     accessors?: 'inline' | 'call'
     representation?: 'auto' | 'values' | 'memory'
     pointers?: Map<number, Handle>
+    partial?: boolean
+    constructed?: Constructed
+    calls?: (site: CallSite) => CallBinding | undefined
+}
+
+export interface CallSite {
+    call: number
+    target: GraphNode
+    receiver: Handle | undefined
+    args: (Handle | undefined)[]
+    demanded: boolean
+}
+
+export interface CallBinding {
+    paramCount: number
+    receiver: boolean
+    receiverShape?: Handle
+    result?: Handle
+    returnSlot?: { at: number, size: number }
+}
+
+export interface Constructed {
+    refinements: Map<Handle, Map<Handle, Handle>>
+    embedded?: Map<number, { parent: number, key: Handle }>
+    fixed?: Map<Handle, Map<Handle, Handle>>
+    pointees?: Map<Handle, Map<Handle, Handle>>
 }
 
 export interface AccessorCall {
@@ -30,10 +56,17 @@ export interface AccessorCall {
     pointer: boolean
 }
 
-interface Memory {
-    ptr: number
-    shape: Handle
+interface Layout {
     keys: Handle[]
+    offsets: number[]
+    nested: (Handle | undefined)[]
+    size: number
+}
+
+interface Memory extends Layout {
+    ptr: number
+    base: number
+    shape: Handle
     reduced: boolean
     pointer: boolean
     address?: [ref: number, literal: number]
@@ -43,9 +76,18 @@ export interface Resolved {
     graph: Graph
     calls: Map<number, AccessorCall>
     addresses: Map<number, number>
+    shapes: Map<number, Handle>
 }
 
-const orderedOps = new Set(['load', 'store', 'call'])
+const orderedOps = new Set(['load', 'store', 'call', 'pstack'])
+
+export function allocaTail(nodes: Map<number, GraphNode>): number {
+    const chained = new Set<number>()
+    let tail = 0
+    for (const n of nodes.values()) if (n.op === 'alloca') chained.add(getRef(n, 0))
+    for (const [id, n] of nodes) if (n.op === 'alloca' && !chained.has(id)) tail = Math.max(tail, id)
+    return tail
+}
 
 export function resolveProperties(
     graph: Graph,
@@ -67,46 +109,146 @@ export function resolveProperties(
 
     const cells = new Map<number, Handle>()
     const memory = new Map<number, Memory>()
+    const addressed = new Map<number, Memory>()
     const forward = new Map<number, number>()
     const written = new Set<number>()
     for (const n of source.values()) if (n.op === 'set-prop') written.add(getRef(n, 1))
-    for (const [id, shape] of opts.pointers ?? []) {
+    function layout(shape: Handle): Layout {
         const keys = dataKeys(shape)
-        memory.set(id, { ptr: id, shape, keys, reduced: keys.length === 1 && readonlyKeys(shape, keys), pointer: true, address: [id, 0] })
+        const fields = opts.constructed?.refinements.get(shape)
+        const offsets: number[] = []
+        const nested: (Handle | undefined)[] = []
+        let size = 0
+        for (const key of keys) {
+            offsets.push(size)
+            const inner = fields?.get(key)
+            nested.push(inner)
+            size += inner !== undefined ? layout(inner).size : 8
+        }
+        return { keys, offsets, nested, size }
+    }
+    for (const [id, shape] of opts.pointers ?? []) {
+        const fields = layout(shape)
+        memory.set(id, { ...fields, ptr: id, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [id, 0] })
     }
     const representation = opts.representation ?? 'auto'
     const byHandle = new Map<Handle, Memory>()
     let initToken = 0
-    let lastAlloca = 0
+    let lastAlloca = allocaTail(source)
+    function snapshotNode(id: number): GraphNode | undefined {
+        const n = source.get(id)
+        if (!n || n.op !== 'heap-handle' || getRef(n, 0) || getRef(n, 1) || countLiterals(n) < 2) return
+        return n
+    }
+    const homes = new Map<Handle, Memory>()
+    function materialize(id: number, handle: Handle): Memory {
+        const known = memory.get(id)
+        if (known) return known
+        const n = snapshotNode(id)
+        const cell = n ? getLiteral(n, 0) as Handle : undefined
+        const fields = layout(handle)
+        const keys = fields.keys
+        let mem = cell !== undefined ? homes.get(cell) : undefined
+        if (mem && (mem.keys.length !== keys.length || mem.keys.some((k, i) => k !== keys[i]))) {
+            throw `property-eval: %${id} changes the shape of an object that lives in memory`
+        }
+        if (!mem) {
+            const reduced = keys.length <= 1 && readonlyKeys(handle, keys)
+            let ptr = 0
+            if (!reduced) {
+                ptr = newId()
+                nodes.set(ptr, makeNode('alloca', [lastAlloca, 0, 0], new Float64Array([0, Math.max(fields.size, 8), 8])))
+                lastAlloca = ptr
+            }
+            mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false }
+            if (cell !== undefined) homes.set(cell, mem)
+        }
+        memory.set(id, mem)
+        byHandle.set(handle, mem)
+        if (!n) return mem
+        for (let i = 0; i < keys.length; i++) {
+            const nested = snapshotNode(getRef(n, 2 + i))
+            if (nested) materialize(getRef(n, 2 + i), getLiteral(nested, 1) as Handle)
+        }
+        return mem
+    }
     for (const [id, handle] of objects) {
         if (representation === 'values' || (representation === 'auto' && !written.has(id))) {
             cells.set(id, records.intern(handle))
             continue
         }
-        const keys = dataKeys(handle)
-        const reduced = keys.length <= 1 && readonlyKeys(handle, keys)
-        let ptr = 0
-        if (!reduced) {
-            ptr = newId()
-            nodes.set(ptr, makeNode('alloca', [lastAlloca, 0, 0], new Float64Array([0, Math.max(keys.length, 1) * 8, 8])))
-            lastAlloca = ptr
-        }
-        const mem: Memory = { ptr, shape: handle, keys, reduced, pointer: false }
-        memory.set(id, mem)
-        byHandle.set(handle, mem)
+        materialize(id, handle)
     }
-    for (const mem of byHandle.values()) {
-        if (mem.reduced) continue
+    for (const [id, { parent, key }] of opts.constructed?.embedded ?? []) {
+        const owner = memory.get(parent)
+        if (!owner) throw `property-eval: %${id} is embedded in %${parent}, which has no memory`
+        const at = owner.keys.indexOf(key)
+        const inner = at < 0 ? undefined : owner.nested[at]
+        if (inner === undefined) throw `property-eval: %${id} is embedded in a field of %${parent} that holds no object`
+        const op = source.get(id)?.op
+        const pointer = op === 'call'
+        memory.set(id, { ...layout(inner), ptr: owner.ptr, base: owner.base + owner.offsets[at], shape: inner, reduced: false, pointer, address: pointer ? [id, 0] : undefined })
+    }
+    function nestedMemory(id: number, i: number): [number, Memory] | undefined {
+        const n = snapshotNode(id)
+        const ref = n ? getRef(n, 2 + i) : 0
+        const nested = ref ? memory.get(ref) : undefined
+        return nested && !nested.pointer ? [ref, nested] : undefined
+    }
+    const initialized = new Set<Memory>()
+    function initChain(id: number, mem: Memory, token: number, visited = new Set<Memory>()): number {
+        initialized.add(mem)
+        visited.add(mem)
+        if (mem.reduced) return token
+        const state = snapshotNode(id) ? getLiteral(snapshotNode(id)!, 1) as Handle : mem.shape
         for (let i = 0; i < mem.keys.length; i++) {
-            const [ref, literal] = operandOf(slotAt(mem.shape, mem.keys[i]))
-            if (!initToken) {
-                initToken = newId()
-                nodes.set(initToken, makeNode('nil-effect', [], new Float64Array(0)))
-            }
+            if (mem.nested[i] !== undefined) continue
+            const nested = nestedMemory(id, i)
+            if (!nested && !heap.getOwnProperty(state, mem.keys[i])) continue
+            const [ref, literal] = nested ? addressOf(nested[1]) : operandOf(slotAt(state, mem.keys[i]))
+            if (!nested && holdsAlready(mem, i, ref)) continue
             const store = newId()
-            nodes.set(store, makeNode('store', [initToken, mem.ptr, 0, ref], new Float64Array([0, 0, i * 8, literal]), Types.u64))
-            initToken = store
+            nodes.set(store, makeNode('store', [token, mem.ptr, 0, ref], new Float64Array([0, 0, mem.base + mem.offsets[i], literal]), Types.u64))
+            token = store
+            if (nested && !visited.has(nested[1])) token = initChain(nested[0], nested[1], token, visited)
         }
+        return token
+    }
+    function holdsAlready(mem: Memory, i: number, ref: number): boolean {
+        const read = ref ? source.get(ref) : undefined
+        if (read?.op !== 'get-prop' || getRef(read, 2)) return false
+        return memory.get(getRef(read, 1)) === mem && getLiteral(read, 2) === mem.keys[i]
+    }
+    const consumers = new Map<number, number[]>()
+    for (const [id, n] of source) {
+        if (n.op !== 'call') continue
+        for (let i = 1; i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!memory.has(ref)) continue
+            const list = consumers.get(ref)
+            if (!list) consumers.set(ref, [id])
+            else if (!list.includes(id)) list.push(id)
+        }
+    }
+    for (const [id, mem] of memory) {
+        if (mem.pointer) continue
+        for (const consumer of consumers.get(id) ?? []) {
+            const call = nodes.get(consumer)!
+            const token = initChain(id, mem, getRef(call, 0))
+            const ids = Array.from({ length: countIds(call) }, (_, j) => getRef(call, j))
+            const literals = Array.from({ length: countIds(call) }, (_, j) => getRef(call, j) ? 0 : getLiteral(call, j))
+            ids[0] = token
+            literals[0] = 0
+            nodes.set(consumer, copyNode(call, ids, literals))
+        }
+    }
+    for (const [id, mem] of memory) {
+        if (mem.pointer || mem.reduced || initialized.has(mem)) continue
+        if (!initToken) {
+            initToken = newId()
+            nodes.set(initToken, makeNode('nil-effect', [], new Float64Array(0)))
+        }
+        initToken = initChain(id, mem, initToken)
     }
     if (initToken) {
         for (const [id, n] of source) if (n.op === 'nil-effect') forward.set(id, initToken)
@@ -146,6 +288,10 @@ export function resolveProperties(
             if (n.op === 'get-prop' || n.op === 'set-prop') return evaluate(token)
             if (n.op === 'nil-effect') return start
             if (n.op === 'param') return entryOf(token)
+            if (n.op === 'after' && countIds(n) === 2) {
+                token = getRef(n, 0)
+                continue
+            }
             if (!orderedOps.has(n.op)) throw `property-eval: cannot follow the token through ${n.op} %${token}`
             token = getRef(n, 0)
         }
@@ -167,6 +313,7 @@ export function resolveProperties(
             if (state && !sameState(state, arrival)) throw `property-eval: B${at.block} joins different object states`
             state = arrival
         }
+        if (!state && pending.size > 1) return
         if (!state) throw `property-eval: B${at.block} is only reached through itself`
         entries.set(param, state)
         return state
@@ -176,16 +323,23 @@ export function resolveProperties(
         const known = cells.get(id)
         if (known !== undefined) return known
         const n = source.get(id)
-        if (n?.op === 'heap-handle' && !getRef(n, 0)) {
-            if (heap.isFrameProxy(getLiteral(n, 0) as Handle)) throw `property-eval: frame proxy %${id} has no environment`
-            return records.intern(getLiteral(n, 0) as Handle)
-        }
+        if (n?.op === 'heap-handle' && !getRef(n, 0)) return records.intern(getLiteral(n, 0) as Handle)
         throw `property-eval: no object for %${id} (${n?.op ?? 'missing'})`
     }
 
     function addressOf(mem: Memory): [ref: number, literal: number] {
+        const address = computeAddress(mem)
+        if (address[0] && !mem.reduced) addressed.set(address[0], mem)
+        return address
+    }
+    function computeAddress(mem: Memory): [ref: number, literal: number] {
         if (mem.address) return mem.address
-        if (!mem.reduced) return mem.address = [mem.ptr, 0]
+        if (!mem.reduced && !mem.base) return mem.address = [mem.ptr, 0]
+        if (!mem.reduced) {
+            const at = newId()
+            nodes.set(at, makeNode('add', [mem.ptr, 0], new Float64Array([0, mem.base])))
+            return mem.address = [at, 0]
+        }
         mem.address = [0, 0]
         if (mem.keys.length) mem.address = operandOf(slotAt(mem.shape, mem.keys[0]))
         return mem.address
@@ -256,6 +410,21 @@ export function resolveProperties(
         }
         nodes.set(id, makeNode('call', refs, new Float64Array(literals)))
         calls.set(id, { fn: linked, keys, proto: heap.getPrototypeOf(target), pointer: false })
+        bindCall(id, accessed.has(id), true)
+    }
+
+    function callTrap(id: number, fn: Handle, mem: Memory, token: number, key: [ref: number, literal: number], value?: [ref: number, literal: number]): void {
+        const callee = newId()
+        nodes.set(callee, makeNode('heap-handle', [0], new Float64Array([fn])))
+        const [ptr, ptrLiteral] = addressOf(mem)
+        const refs = [token, callee, 0, ptr, key[0]]
+        const literals = [0, 0, 0, ptrLiteral, key[1]]
+        if (value) {
+            refs.push(value[0])
+            literals.push(value[1])
+        }
+        nodes.set(id, makeNode('call', refs, new Float64Array(literals)))
+        bindCall(id, accessed.has(id), true)
     }
 
     function callWithPointer(id: number, fn: Handle, mem: Memory, token: number, value?: [ref: number, literal: number]): void {
@@ -269,8 +438,10 @@ export function resolveProperties(
             refs.push(value[0])
             literals.push(value[1])
         }
+        if (!mem.base) addressed.set(mem.ptr, mem)
         nodes.set(id, makeNode('call', refs, new Float64Array(literals)))
         calls.set(id, { fn: linked, keys: mem.keys, proto: heap.getPrototypeOf(mem.shape), pointer: true })
+        bindCall(id, accessed.has(id), true)
     }
 
     function resolveMemory(id: number, n: GraphNode, mem: Memory): void {
@@ -281,6 +452,13 @@ export function resolveProperties(
         }
         const key = getLiteral(n, 2) as Handle
         const value: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+        const keyRef = getRef(n, 2)
+        const index = keyRef ? undefined : heap.keyIndex(key)
+        if (keyRef || index !== undefined) {
+            const proxy = heap.getPropertyProxy(mem.shape, keyRef ? intrinsics.getNanFromId(keyRef) as Handle : key)
+            if (proxy) return callTrap(id, n.op === 'get-prop' ? heap.getProxyGetter(proxy) : heap.getProxySetter(proxy), mem, token, [keyRef, keyRef ? 0 : index!], n.op === 'set-prop' ? value : undefined)
+            if (keyRef) throw `property-eval: %${id} uses a computed key on a memory object without an index trap`
+        }
         if (mem.reduced && n.op === 'set-prop') throw `property-eval: %${id} writes a reduced object`
         if (mem.reduced && key === mem.keys[0]) {
             const [ref, literal] = addressOf(mem)
@@ -289,7 +467,7 @@ export function resolveProperties(
         }
         const addr = heap.getPropertyDescriptor(mem.shape, key)
         if (!addr) {
-            if (heap.getPropertyProxy(mem.shape)) throw `property-eval: %${id} goes through a proxy on a memory object`
+            if (heap.getPropertyProxy(mem.shape, key)) throw `property-eval: %${id} goes through a proxy on a memory object`
             if (n.op === 'set-prop') throw `property-eval: %${id} adds a key to a memory object`
             nodes.set(id, makeNode('after', [token, 0], new Float64Array(2)))
             return
@@ -300,20 +478,53 @@ export function resolveProperties(
             if (n.op === 'set-prop' && desc.flags & heap.PropFlags.has_setter) return callWithPointer(id, desc.slot1 as Handle, mem, token, value)
             throw `property-eval: %${id} uses an accessor without the matching half`
         }
-        const offset = mem.keys.indexOf(key) * 8
-        if (offset < 0) {
+        const at = mem.keys.indexOf(key)
+        if (at < 0) {
             if (n.op === 'set-prop') throw `property-eval: %${id} shadows a prototype key on a memory object`
             const [ref, literal] = operandOf(desc.slot0 as Handle)
             nodes.set(id, makeNode('after', [token, ref], new Float64Array([0, literal])))
             return
         }
+        const fixed = opts.constructed?.fixed?.get(mem.shape)?.get(key)
+        if (fixed !== undefined && n.op === 'set-prop') throw `property-eval: %${id} writes a field that every construction fixes`
+        if (fixed !== undefined) {
+            const [ref, literal] = operandOf(fixed)
+            nodes.set(id, makeNode('after', [token, ref], new Float64Array([0, literal])))
+            return
+        }
+        const offset = mem.base + mem.offsets[at]
+        const inner = mem.nested[at]
+        if (inner !== undefined) return resolveEmbedded(id, n, mem, token, offset, inner, value)
         if (n.op === 'get-prop') {
             const load = newId()
             nodes.set(load, makeNode('load', [token, mem.ptr, 0], new Float64Array([0, 0, offset]), Types.u64))
             nodes.set(id, makeNode('after', [token, load], new Float64Array(2)))
+            const slot = desc.slot0 as Handle
+            const pointee = opts.constructed?.pointees?.get(mem.shape)?.get(key)
+            if (pointee !== undefined) {
+                memory.set(id, { ...layout(pointee), ptr: load, base: 0, shape: pointee, reduced: false, pointer: true, address: [load, 0] })
+                return
+            }
+            if (isObjectSlot(slot)) {
+                const shape = heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot
+                memory.set(id, { ...layout(shape), ptr: load, base: 0, shape, reduced: false, pointer: true, address: [load, 0] })
+            }
             return
         }
         nodes.set(id, makeNode('store', [token, mem.ptr, 0, value[0]], new Float64Array([0, 0, offset, value[1]]), Types.u64))
+    }
+
+    function resolveEmbedded(id: number, n: GraphNode, mem: Memory, token: number, offset: number, inner: Handle, value: [number, number]): void {
+        if (n.op === 'set-prop') {
+            const stored = value[0] ? memory.get(value[0]) : undefined
+            if (!stored || stored.ptr !== mem.ptr || stored.base !== offset) throw `property-eval: %${id} reassigns an embedded field`
+            forward.set(id, token)
+            return
+        }
+        const address = newId()
+        nodes.set(address, makeNode('add', [mem.ptr, 0], new Float64Array([0, offset])))
+        nodes.set(id, makeNode('after', [token, address], new Float64Array(2)))
+        memory.set(id, { ...layout(inner), ptr: mem.ptr, base: offset, shape: inner, reduced: false, pointer: true, address: [id, 0] })
     }
 
     function write(cell: Handle, key: Handle, slot: Handle): void {
@@ -328,7 +539,7 @@ export function resolveProperties(
         const key = getLiteral(n, 2) as Handle
         const addr = heap.getPropertyDescriptor(heap.indirectTarget(cell), key)
         if (!addr) {
-            const proxy = heap.getPropertyProxy(heap.indirectTarget(cell))
+            const proxy = heap.getPropertyProxy(heap.indirectTarget(cell), key)
             if (!proxy) {
                 if (n.op === 'get-prop') {
                     nodes.set(id, makeNode('after', [token, 0], new Float64Array(2)))
@@ -359,12 +570,184 @@ export function resolveProperties(
         forward.set(id, token)
     }
 
+    const deriving = new Set<number>()
+    function arrivals(param: number): number[] {
+        const at = tokenParams.get(param)
+        if (!at) return []
+        return (inbound.get(at.block) ?? []).map(apply => getRef(source.get(apply)!, at.index + 1))
+    }
+    function agree(shapes: (Handle | null | undefined)[]): Handle | null | undefined {
+        let found: Handle | undefined
+        for (const shape of shapes) {
+            if (shape === null) continue
+            if (shape === undefined || (found !== undefined && found !== shape)) return
+            found = shape
+        }
+        return found ?? null
+    }
+    function pointerLayout(id: number): Handle | null | undefined {
+        const mem = memory.get(id)
+        if (mem) return mem.shape
+        if (deriving.has(id)) return null
+        const n = source.get(id)
+        if (!n) return
+        deriving.add(id)
+        let shape: Handle | null | undefined
+        if (n.op === 'get' && !getRef(n, 1)) shape = fieldLayout(getRef(n, 0), getLiteral(n, 1) as Handle)
+        else if (n.op === 'param') shape = agree(arrivals(id).map(pointerLayout))
+        else if (n.op === 'after') shape = pointerLayout(getRef(n, countIds(n) - 1))
+        else if (n.op === 'call') {
+            bindCall(id, true)
+            shape = memory.get(id)?.shape
+        }
+        deriving.delete(id)
+        return shape
+    }
+    function fieldLayout(id: number, key: Handle): Handle | null | undefined {
+        const n = source.get(id)
+        if (n?.op === 'record') {
+            for (let i = 0; i + 1 < countIds(n); i += 2) {
+                if (getLiteral(n, i) === key) return getRef(n, i + 1) ? pointerLayout(getRef(n, i + 1)) : undefined
+            }
+            return
+        }
+        if (n?.op === 'after') return fieldLayout(getRef(n, countIds(n) - 1), key)
+        if (n?.op !== 'param') return
+        if (deriving.has(id)) return null
+        deriving.add(id)
+        const shape = agree(arrivals(id).map(arg => fieldLayout(arg, key)))
+        deriving.delete(id)
+        return shape
+    }
+    const accessed = new Set<number>()
+    for (const n of source.values()) if (n.op === 'get-prop' || n.op === 'set-prop') accessed.add(getRef(n, 1))
+    const boundCalls = new Set<number>()
+    const lazy = new Set<number>()
+    function sameConstant(a: number, b: number): boolean {
+        const x = nodes.get(a)!
+        const y = nodes.get(b)!
+        return x.op === y.op && getLiteral(x, 0) === getLiteral(y, 0)
+    }
+    function constantTarget(id: number, seen = new Set<number>()): number | null | undefined {
+        if (!id || seen.has(id)) return id ? null : undefined
+        if (source.get(id)?.op === 'get-prop') evaluate(id)
+        const n = nodes.get(target(id))
+        if (!n) return
+        if (n.op === 'after') return constantTarget(getRef(n, countIds(n) - 1), seen)
+        if ((n.op === 'heap-handle' || n.op === 'local-target') && !getRef(n, 0)) return target(id)
+        if (n.op !== 'param') return
+        seen.add(id)
+        let found: number | undefined
+        for (const arrival of arrivals(id)) {
+            const at = constantTarget(arrival, seen)
+            if (at === null) continue
+            if (at === undefined || (found !== undefined && !sameConstant(found, at))) return
+            found = at
+        }
+        seen.delete(id)
+        return found ?? null
+    }
+    function directTarget(id: number): boolean {
+        let n = nodes.get(target(id))
+        while (n?.op === 'after') n = nodes.get(target(getRef(n, countIds(n) - 1)))
+        return n?.op === 'heap-handle' || n?.op === 'local-target'
+    }
+    function shapeOf(id: number): Handle | undefined {
+        if (!id) return
+        const n = source.get(id)
+        if (n?.op === 'get-prop') evaluate(id)
+        if (n?.op === 'call') bindCall(id, accessed.has(id))
+        adopt(id)
+        const mem = memory.get(id) ?? addressed.get(id)
+        if (mem) return mem.shape
+        const snapshot = snapshotNode(id)
+        return snapshot ? getLiteral(snapshot, 1) as Handle : undefined
+    }
+    function bindCall(id: number, demanded: boolean, created = false): void {
+        if (!opts.calls || boundCalls.has(id)) return
+        boundCalls.add(id)
+        const n = created ? nodes.get(id)! : source.get(id)!
+        if (memory.has(getRef(n, 1))) return
+        const callee = constantTarget(getRef(n, 1))
+        if (!callee) return
+        const receiver = getRef(n, 2)
+        const args: (Handle | undefined)[] = []
+        for (let i = 3; i < countIds(n); i++) args.push(shapeOf(getRef(n, i)))
+        const binding = opts.calls({ call: id, target: nodes.get(callee)!, receiver: shapeOf(receiver), args, demanded })
+        if (!binding) return
+        const current = nodes.get(id)!
+        const ids = cloneRefs(current)
+        const literals = Array.from(cloneLiterals(current))
+        let token = ids[0]
+        function prepare(value: number, shape: Handle | undefined): void {
+            if (!value) return
+            if (!memory.has(value) && shape !== undefined && snapshotNode(value)) {
+                materialize(value, shape)
+                lazy.add(value)
+            }
+            const mem = memory.get(value)
+            if (mem && !mem.pointer && lazy.has(value)) token = initChain(value, mem, token)
+        }
+        for (let i = 0; i < binding.paramCount && i < args.length; i++) prepare(getRef(n, 3 + i), args[i])
+        if (binding.receiver) prepare(receiver, binding.receiverShape ?? shapeOf(receiver))
+        if (binding.result !== undefined && !memory.has(id)) {
+            const fields = layout(binding.result)
+            memory.set(id, { ...fields, ptr: id, base: 0, shape: binding.result, reduced: fields.keys.length === 1 && readonlyKeys(binding.result, fields.keys), pointer: true, address: [id, 0] })
+        }
+        const retarget = !directTarget(getRef(n, 1))
+        if (!binding.receiver && !binding.returnSlot && !retarget && token === ids[0]) return
+        ids[0] = token
+        if (retarget) ids[1] = callee
+        ids[2] = 0
+        literals[2] = 0
+        if (binding.receiver) {
+            while (ids.length < 3 + binding.paramCount) {
+                ids.push(0)
+                literals.push(0)
+            }
+            ids.push(receiver)
+            literals.push(0)
+        }
+        if (binding.returnSlot) {
+            while (ids.length < 3 + binding.returnSlot.at) {
+                ids.push(0)
+                literals.push(0)
+            }
+            const slot = newId()
+            nodes.set(slot, makeNode('alloca', [lastAlloca, 0, 0], new Float64Array([0, Math.max(binding.returnSlot.size, 8), 8])))
+            lastAlloca = slot
+            ids.push(slot)
+            literals.push(0)
+        }
+        nodes.set(id, copyNode(current, ids, new Float64Array(literals)))
+    }
+    function adopt(id: number): void {
+        if (memory.has(id) || cells.has(id)) return
+        const n = source.get(id)
+        if (n?.op === 'call') {
+            bindCall(id, true)
+            return
+        }
+        if (n?.op !== 'get' && n?.op !== 'param') return
+        const shape = pointerLayout(id)
+        if (!shape) return
+        const fields = layout(shape)
+        memory.set(id, { ...fields, ptr: id, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [id, 0] })
+    }
+
     function evaluate(id: number): HeapState | undefined {
         const known = after.get(id)
         if (known) return known
         const n = source.get(id)!
-        const prior = stateAt(getRef(n, 0))
+        const object = getRef(n, 1)
+        if (source.get(object)?.op === 'get-prop') evaluate(object)
+        adopt(object)
+        const prior = cells.size ? stateAt(getRef(n, 0)) : start
         if (!prior) return
+        if (opts.partial && !memory.has(getRef(n, 1)) && !cells.has(getRef(n, 1))) {
+            after.set(id, prior)
+            return prior
+        }
         for (const [cell, value] of prior) records.install(cell, value)
         resolve(id, n)
         const state = records.capture(roots)
@@ -376,6 +759,7 @@ export function resolveProperties(
         if (n.op !== 'get-prop' && n.op !== 'set-prop') continue
         if (!evaluate(id)) throw `property-eval: %${id} depends on its own loop`
     }
+    for (const [id, n] of source) if (n.op === 'call') bindCall(id, accessed.has(id))
     for (const [param, state] of entries) {
         const at = tokenParams.get(param)!
         for (const apply of inbound.get(at.block) ?? []) {
@@ -391,7 +775,7 @@ export function resolveProperties(
         const fnptr = newId()
         const at = mem.keys.indexOf(heap.closureCallKey)
         if (at >= 0 && !mem.reduced) {
-            nodes.set(fnptr, makeNode('load', [getRef(current, 0), mem.ptr, 0], new Float64Array([0, 0, at * 8]), Types.fnptr))
+            nodes.set(fnptr, makeNode('load', [getRef(current, 0), mem.ptr, 0], new Float64Array([0, 0, mem.base + mem.offsets[at]]), Types.fnptr))
         } else {
             const addr = heap.getPropertyDescriptor(mem.shape, heap.closureCallKey)
             if (!addr) throw `property-eval: %${id} calls an object without a call slot`
@@ -438,7 +822,134 @@ export function resolveProperties(
     }
     for (const id of forward.keys()) nodes.delete(id)
     for (const b of out.blocks) b.bodyId = target(b.bodyId)
-    return { graph: out, calls, addresses }
+    const shapes = new Map<number, Handle>()
+    for (const [id, mem] of memory) {
+        shapes.set(id, mem.shape)
+        const [ptr] = addressOf(mem)
+        if (ptr) shapes.set(ptr, mem.shape)
+    }
+    return { graph: out, calls, addresses, shapes }
+}
+
+export interface ClosureScope {
+    bindings: { slot: number, parentSlot: number }[]
+    envs: number[]
+}
+
+export interface ResolvedClosures {
+    graph: Graph
+    memoryShapes: Map<number, Handle>
+    closures: u32[]
+    passed: { call: number, index: number, closure: u32, shape: Handle }[]
+}
+
+export function frameShape(size: number): Handle {
+    const shape = heap.makeObject(0 as Handle)
+    for (let r = 0; r < size; r++) heap.setProperty(shape, heap.indexKey(r as u32), 0 as Handle)
+    return shape
+}
+
+export function scopeShape(count: number): Handle {
+    const shape = heap.makeObject(0 as Handle)
+    for (let i = 0; i < count; i++) heap.setReadonlyProperty(shape, heap.closureScopeKey(i as u32), 0 as Handle)
+    return shape
+}
+
+let envPointerShape: Handle | undefined
+
+export function resolveClosures(
+    graph: Graph,
+    session: TraceSession,
+    name: string,
+    frameProxy: u32 | undefined,
+    frameSize: number,
+    scope?: ClosureScope,
+    params?: Map<number, Handle>,
+    constructed?: Constructed,
+    calls?: PropertyEvalOptions['calls'],
+): ResolvedClosures {
+    const runtime = session.runtime
+    if (!runtime) throw 'property-eval: closures resolve inside an entered trace'
+    const nodes = graph.nodes
+    function ensureNode(id: number): void {
+        if (!id || nodes.has(id)) return
+        const n = runtime!.nodes.get(id)
+        if (!n) throw `property-eval: %${id} is not a traced node`
+        nodes.set(id, copyNode(n))
+        for (let i = 0; i < countIds(n); i++) ensureNode(getRef(n, i))
+    }
+    function closureOf(id: number): u32 | undefined {
+        const n = nodes.get(id)
+        if (!n || n.op !== 'heap-handle' || getRef(n, 0)) return
+        const handle = getLiteral(n, 0) as u32
+        return session.templateOf(handle) ? handle : undefined
+    }
+
+    const objects = new Map<number, Handle>()
+    const pointers = new Map<number, Handle>()
+    for (const [i, shape] of params ?? []) pointers.set(graph.blocks[0].params[i], shape)
+    const frame = frameShape(frameSize)
+    let envNode = 0
+    if (frameProxy !== undefined) {
+        for (const [id, n] of nodes) if (n.op === 'heap-handle' && !getRef(n, 0) && getLiteral(n, 0) === frameProxy) envNode = id
+        if (!envNode) {
+            envNode = graph.maxId++
+            nodes.set(envNode, makeNode('heap-handle', [0], new Float64Array([frameProxy])))
+        }
+        objects.set(envNode, frame)
+    }
+    if (scope) {
+        envPointerShape ??= frameShape(256)
+        for (const env of scope.envs) {
+            ensureNode(env)
+            pointers.set(env, envPointerShape)
+        }
+        for (const [id, n] of nodes) if (n.op === 'call-context') pointers.set(id, scopeShape(scope.bindings.length))
+    }
+
+    function envValue(parentSlot: number): Handle {
+        if (parentSlot === -1) return frame
+        const at = scope?.bindings.findIndex(b => b.slot === parentSlot) ?? -1
+        if (at < 0) throw `property-eval: ${name} has no scope slot ${parentSlot}`
+        return heap.boxF64(intrinsics.getNanFromId(scope!.envs[at])) as Handle
+    }
+    const shapes = new Map<u32, Handle>()
+    function closureShape(handle: u32): Handle {
+        const known = shapes.get(handle)
+        if (known !== undefined) return known
+        const template = session.templateOf(handle)!
+        const proto = heap.makeObject(0 as Handle)
+        heap.setProperty(proto, heap.closureCallKey, handle as Handle)
+        heap.setProperty(proto, heap.fromJsString('name'), heap.fromJsString(`${name}/closure`))
+        heap.setProperty(proto, heap.fromJsString('length'), heap.boxF64(template.compiled.paramCount as f64) as Handle)
+        const shape = heap.makeObject(proto)
+        const bindings = template.compiled.scopeBindings
+        for (let i = 0; i < bindings.length; i++) heap.setReadonlyProperty(shape, heap.closureScopeKey(i as u32), envValue(bindings[i].parentSlot))
+        shapes.set(handle, shape)
+        return shape
+    }
+
+    const passed: ResolvedClosures['passed'] = []
+    for (const [id, n] of [...nodes]) {
+        const closure = closureOf(id)
+        if (closure !== undefined) {
+            objects.set(id, closureShape(closure))
+            continue
+        }
+        if (n.op !== 'call' || closureOf(getRef(n, 1)) !== undefined) continue
+        for (let i = 3; i < countIds(n); i++) {
+            const arg = closureOf(getRef(n, i))
+            if (arg !== undefined) passed.push({ call: id, index: i, closure: arg, shape: closureShape(arg) })
+        }
+    }
+    if (!objects.size && !pointers.size && !calls) return { graph, memoryShapes: new Map(), closures: [], passed }
+    const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, partial: true, constructed, calls })
+    return { graph: resolved.graph, memoryShapes: resolved.shapes, closures: [...shapes.keys()], passed }
+}
+
+function isObjectSlot(slot: Handle): boolean {
+    if (!slot || heap.isBoxedF64(slot) || heap.isString(slot) || heap.isCallable(slot)) return false
+    return heap.isOrdinaryObject(heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot)
 }
 
 function slotAt(target: Handle, key: Handle): Handle {

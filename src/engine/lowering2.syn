@@ -111,7 +111,7 @@ function detachRecordOrdering(g: Graph, tokenBlocks: Set<number>) {
     for (const n of [...g.nodes.values()]) {
         if (n.op === 'after') {
             for (let i = 0; i < countIds(n) - 1; i++) detach(n, i)
-        } else if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
+        } else if (OrderedValues.has(n.op)) {
             detach(n, 0)
         } else if (n.op === 'apply' && tokenBlocks.has(getRef(n, 0))) {
             detach(n, countIds(n) - 1)
@@ -135,7 +135,7 @@ const TargetingValues = new Set([
     'syscall-target', 'local-target', 'indirect-target'
 ])
 const OrderedValues = new Set([
-    'load', 'store', 'call'
+    'load', 'store', 'call', 'pstack'
 ])
 const PureOps = new Set<string>([
     'add', 'sub', 'mul', 'div', 'rem', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
@@ -1411,7 +1411,7 @@ function optimizeValueGraph(g: Graph) {
             visit(getRef(n, last), true)
             return
         }
-        if (n.op === 'call' || n.op === 'store' || n.op === 'load') {
+        if (OrderedValues.has(n.op)) {
             visit(getRef(n, 0), false)
             for (let i = 1; i < countIds(n); i++) {
                 visit(getRef(n, i), true)
@@ -1653,6 +1653,11 @@ function optimizeValueGraph(g: Graph) {
         const r = new Map<number, number>()
         for (const id of findValues(target.id, 'select') ?? []) {
             const n = g.nodes.get(id)!
+            if (countIds(n) === 3 && !getRef(n, 0)) {
+                const arm = getLiteral(n, 0) ? 1 : 2
+                r.set(id, getRef(n, arm) || addNode('literal', [0], new Float64Array([getLiteral(n, arm)])))
+                continue
+            }
             if (diverges(getRef(n, 2))) {
                 const x = createNode(g, 'after', [getRef(n, 0), operand(n, 1)])
                 r.set(id, x)
@@ -1932,8 +1937,8 @@ function optimizeValueGraph(g: Graph) {
             if (!changed) return vid
             return effectsJoin(arr, r)
         }
-        if (u.op === 'call' || u.op === 'load' || u.op === 'store') {
-            const clobbers = u.op === 'store' || (u.op === 'call' && callEffect(u) > 1)
+        if (OrderedValues.has(u.op)) {
+            const clobbers = u.op === 'store' || u.op === 'pstack' || (u.op === 'call' && callEffect(u) > 1)
             if (!clobbers && (from?.op === 'load' || from?.op === 'after')) {
                 return simplifyOrdering(getRef(u, 0), unordered, from)
             }
@@ -2378,6 +2383,123 @@ function optimizeValueGraph(g: Graph) {
         return true
     }
 
+    function sinkReloadedStores(target: GraphBlock): boolean {
+        if (target === g.blocks[0]) return false
+        const members = loopMembers(target)
+        const inbound = findInboundApplies(target)
+        const entries = inbound.filter(x => !members.has(x[0]))
+        const backs = inbound.filter(x => members.has(x[0]))
+        if (entries.length !== 1 || !backs.length) return false
+        const bodyId = backs[0][0]
+        if (backs.some(x => x[0] !== bodyId)) return false
+        const body = getGraphBlock(bodyId)
+        let relay: number[] | undefined
+        if (body !== target) {
+            if (findValues(target.id, 'store')?.length || findValues(target.id, 'call')?.length) return false
+            const into = findInboundApplies(body)
+            if (into.length !== 1 || into[0][0] !== target.id) return false
+            relay = cloneRefs(g.nodes.get(into[0][1])!).slice(1)
+        }
+        const [entryBlock, entryApp] = entries[0]
+        const entry = g.nodes.get(entryApp)!
+
+        function headerSlot(ref: number): number {
+            const i = body.params.indexOf(ref)
+            if (i < 0) return -1
+            return relay ? target.params.indexOf(relay[i]) : i
+        }
+        function entryPointer(ref: number): number | undefined {
+            const i = body.params.indexOf(ref)
+            if (i < 0) return
+            const outer = relay ? relay[i] : ref
+            const at = target.params.indexOf(outer)
+            if (at < 0) {
+                const op = g.nodes.get(outer)?.op
+                return op === 'alloca' || op === 'frame-address' ? outer : undefined
+            }
+            if (!relayChain(target, at, members) || !getRef(entry, at + 1)) return
+            return getRef(entry, at + 1)
+        }
+        function wrapper(block: number, app: number): number | undefined {
+            for (const u of dependents.get(app) ?? []) {
+                const n = g.nodes.get(u)!
+                if (n.op === 'after' && countIds(n) === 2 && getRef(n, 1) === app) return u
+            }
+        }
+        function reloads(store: GraphNode, slot: number): boolean {
+            for (const [block, app] of backs) {
+                const loaded = g.nodes.get(skipAfter(getRef(g.nodes.get(app)!, slot + 1)) ?? 0)
+                if (!loaded || loaded.op !== 'load') return false
+                if (getRef(loaded, 1) !== getRef(store, 1) || getRef(loaded, 2)) return false
+                if (getLiteral(loaded, 2) !== getLiteral(store, 2) || getTypeT(loaded) !== getTypeT(store)) return false
+                if (applyWriter(block, app) !== lastWriter(getRef(loaded, 0))) return false
+            }
+            return true
+        }
+        function applyWriter(block: number, app: number): number | undefined {
+            const after = wrapper(block, app)
+            if (after !== undefined) return lastWriter(getRef(g.nodes.get(after)!, 0))
+            let writer: number | undefined
+            const n = g.nodes.get(app)!
+            for (let i = 1; i < countIds(n); i++) {
+                const arg = g.nodes.get(getRef(n, i))
+                if (!arg || (arg.op !== 'after' && !OrderedValues.has(arg.op))) continue
+                const w = lastWriter(getRef(n, i))
+                if (writer !== undefined && writer !== w) return
+                writer = w
+            }
+            return writer
+        }
+        function lastWriter(token: number): number {
+            for (;;) {
+                const n = g.nodes.get(token)
+                if (!n || (n.op !== 'load' && n.op !== 'after')) return token
+                token = getRef(n, 0)
+            }
+        }
+        function firstWrite(store: GraphNode): boolean {
+            const bytes = intrinsics.intrinsicBitWidth(getTypeT(store)) / 8
+            for (let t = getRef(store, 0); t;) {
+                const n = g.nodes.get(t)!
+                if (n.op === 'nil-effect') return true
+                if (n.op === 'load') {
+                    t = getRef(n, 0)
+                    continue
+                }
+                if (n.op !== 'store' || getRef(n, 1) !== getRef(store, 1) || getRef(n, 2)) return false
+                const at = getLiteral(n, 2)
+                const width = intrinsics.intrinsicBitWidth(getTypeT(n)) / 8
+                if (at < getLiteral(store, 2) + bytes && getLiteral(store, 2) < at + width) return false
+                t = getRef(n, 0)
+            }
+            return true
+        }
+
+        for (const id of findValues(body.id, 'store') ?? []) {
+            const store = g.nodes.get(id)!
+            if (!getRef(store, 1) || getRef(store, 2)) continue
+            const slot = headerSlot(getRef(store, 3))
+            if (slot < 0 || !getRef(entry, slot + 1) && getLiteral(entry, slot + 1) === undefined) continue
+            const ptr = entryPointer(getRef(store, 1))
+            if (ptr === undefined || !firstWrite(store) || !reloads(store, slot)) continue
+
+            const from = getGraphBlock(entryBlock)
+            const outer = wrapper(entryBlock, entryApp)
+            const token = outer !== undefined ? getRef(g.nodes.get(outer)!, 0) : 0
+            const value = getRef(entry, slot + 1)
+            const sunk = addNode('store', [token, ptr, 0, value],
+                new Float64Array([0, 0, getLiteral(store, 2), value ? 0 : getLiteral(entry, slot + 1)]), store)
+            const sequenced = addNode('after', [sunk, entryApp], new Float64Array(2))
+            from.bodyId = replaceAll(from.bodyId, new Map([[outer ?? entryApp, sequenced]]))
+            const removed = getRef(store, 0) || addNode('nil-effect', [], new Float64Array())
+            body.bodyId = replaceAll(body.bodyId, new Map([[id, removed]]))
+            revisitBlock(from)
+            revisitBlock(body)
+            return true
+        }
+        return false
+    }
+
     function rootsOf(sg: Set<number>) {
         const res = new Set<number>(sg)
         for (const x of sg) {
@@ -2559,7 +2681,7 @@ function optimizeValueGraph(g: Graph) {
             for (let i = 0; i < end; i++) {
                 for (const effect of guaranteed(getRef(n, i))) out.add(effect)
             }
-            if (n.op === 'call' || n.op === 'store' || n.op === 'load') out.add(id)
+            if (OrderedValues.has(n.op)) out.add(id)
         }
         return out
     }
@@ -3705,7 +3827,7 @@ function optimizeValueGraph(g: Graph) {
             if (conditional) return
             if (!id || into.has(id) || isUnordered(id)) return
             const n = g.nodes.get(id)!
-            if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
+            if (OrderedValues.has(n.op)) {
                 into.add(id)
             } else if (n.op === 'select') {
                 frontier(getRef(n, 0), into)
@@ -3999,14 +4121,19 @@ function optimizeValueGraph(g: Graph) {
     }
 
     const unpromotable = new Set<string>()
+    function allocations(block: number): number[] {
+        return [...(findValues(block, 'alloca') ?? []), ...(findValues(block, 'pstack') ?? [])]
+    }
+
     function promoteAllocas(target: GraphBlock): boolean {
-        const found = findValues(target.id, 'alloca')
-        if (!found?.length) return false
+        const found = allocations(target.id)
+        if (!found.length) return false
         const keys = new Map<number, string | undefined>()
         function keyOf(id: number): string | undefined {
             if (keys.has(id)) return keys.get(id)
             const n = g.nodes.get(id)
             let key: string | undefined
+            if (n?.op === 'pstack' && !getRef(n, 2) && !getLiteral(n, 2)) key = `pstack:${id}`
             if (n?.op === 'alloca' && !getRef(n, 1) && !getRef(n, 2)) {
                 const prev = getRef(n, 0) ? keyOf(getRef(n, 0)) : ''
                 if (prev !== undefined) key = `${prev}/${getLiteral(n, 1)}:${getLiteral(n, 2)}`
@@ -4026,21 +4153,44 @@ function optimizeValueGraph(g: Graph) {
 
     function promoteAlloca(key: string, keyOf: (id: number) => string | undefined): boolean {
         const ids = new Set<number>()
+        const touched = new Set<GraphBlock>()
         for (const b of reachableBlocks) {
-            for (const a of findValues(b.id, 'alloca') ?? []) if (keyOf(a) === key) ids.add(a)
+            for (const a of allocations(b.id)) {
+                if (keyOf(a) !== key) continue
+                ids.add(a)
+                touched.add(b)
+            }
         }
+        function tokenUse(n: GraphNode, a: number): boolean {
+            if (g.nodes.get(a)!.op !== 'pstack') return false
+            if (n.op === 'after') return getRef(n, countIds(n) - 1) !== a
+            if (!OrderedValues.has(n.op) || getRef(n, 0) !== a) return false
+            for (let i = 1; i < countIds(n); i++) {
+                if (getRef(n, i) === a && !(i === 1 && (n.op === 'load' || n.op === 'store'))) return false
+            }
+            return true
+        }
+        const slotTypes = new Map<number, (typeof Types)[keyof typeof Types]>()
         for (const a of ids) {
             for (const u of dependents.get(a) ?? []) {
                 const n = g.nodes.get(u)!
                 if (n.op === 'alloca' && getRef(n, 0) === a) continue
-                if (n.op !== 'load' && n.op !== 'store') return false
-                if (getRef(n, 1) !== a || getRef(n, 2) || getTypeT(n) !== Types.u64) return false
+                const pointer = (n.op === 'load' || n.op === 'store') && getRef(n, 1) === a
+                if (!pointer && tokenUse(n, a)) continue
+                if (!pointer || getRef(n, 2)) return false
                 if (n.op === 'store' && getRef(n, 3) === a) return false
+                const offset = getLiteral(n, 2)
+                const known = slotTypes.get(offset)
+                if (known !== undefined && known !== getTypeT(n)) return false
+                slotTypes.set(offset, getTypeT(n))
             }
+        }
+        const slots = [...slotTypes].sort((x, y) => x[0] - y[0])
+        for (let i = 1; i < slots.length; i++) {
+            if (slots[i - 1][0] + intrinsics.intrinsicBitWidth(slots[i - 1][1]) / 8 > slots[i][0]) return false
         }
         const loads: [GraphBlock, number][] = []
         const stores = new Set<number>()
-        const touched = new Set<GraphBlock>()
         for (const b of reachableBlocks) {
             for (const id of findValues(b.id, 'load') ?? []) {
                 if (!ids.has(getRef(g.nodes.get(id)!, 1))) continue
@@ -4108,6 +4258,14 @@ function optimizeValueGraph(g: Graph) {
             return false
         }
 
+        function storedValue(store: GraphNode): [number, number] {
+            const T = getTypeT(store)
+            const ref = getRef(store, 3)
+            const literal = ref ? 0 : getLiteral(store, 3)
+            if (intrinsics.intrinsicBitWidth(T) === 64) return [ref, literal]
+            return [insert(createConvert('convert', [ref], new Float64Array([literal]), Types.u64, T)), 0]
+        }
+
         const memo = new Map<string, [number, number] | undefined>()
         function valueFrom(b: GraphBlock, token: number, offset: number): [number, number] | undefined {
             const at = `${b.id}:${token}:${offset}`
@@ -4124,9 +4282,9 @@ function optimizeValueGraph(g: Graph) {
                 if (!n) return
                 if (n.op === 'nil-effect') return entryValue(b, offset)
                 if (n.op === 'store' && ids.has(getRef(n, 1)) && getLiteral(n, 2) === offset) {
-                    return [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+                    return storedValue(n)
                 }
-                if (n.op === 'store' || n.op === 'load' || n.op === 'call') {
+                if (OrderedValues.has(n.op)) {
                     token = getRef(n, 0)
                     continue
                 }
@@ -4163,7 +4321,7 @@ function optimizeValueGraph(g: Graph) {
             const n = g.nodes.get(id)
             if (!n) return id
             let result = id
-            if (stores.has(id)) {
+            if (stores.has(id) || (ids.has(id) && n.op === 'pstack')) {
                 result = getRef(n, 0) ? replacement(getRef(n, 0)) : addNode('nil-effect', [], new Float64Array())
             } else if (values.has(id)) {
                 const [ref, literal] = values.get(id)!
@@ -4174,6 +4332,7 @@ function optimizeValueGraph(g: Graph) {
         }
         for (const id of stores) replacement(id)
         for (const id of values.keys()) replacement(id)
+        for (const id of ids) replacement(id)
 
         function rewriteTail(b: GraphBlock): number {
             function walk(id: number, token: number): number {
@@ -4339,7 +4498,7 @@ function optimizeValueGraph(g: Graph) {
                     const last = countIds(n) - 1
                     for (let i = 0; i <= last; i++) send(getRef(n, i), evalCtx, 0, false)
                     if (isUsed) send(getRef(n, last), dataCtx, 0, true)
-                } else if (n.op === 'call' || n.op === 'store' || n.op === 'load') {
+                } else if (OrderedValues.has(n.op)) {
                     send(getRef(n, 0), evalCtx, 0, false)
                     for (let i = 1; i < countIds(n); i++) {
                         send(getRef(n, i), evalCtx, 0, false)
@@ -5861,6 +6020,7 @@ function optimizeValueGraph(g: Graph) {
             step(reverseLoop, b)
             step(hoistInvariants, b)
             step(hoistLoopInvariants, b)
+            step(sinkReloadedStores, b)
             step(hoistSharedSelectValues, b)
             if (step(eliminatePassthru, b)) continue
         }
@@ -6113,7 +6273,51 @@ export function assignBlockSignatures(
     return out
 }
 
+function expandPstacks(g: Graph): void {
+    function add(a: [number, number], b: [number, number]): [number, number] {
+        if (!a[0] && !b[0]) return [0, a[1] + b[1]]
+        if (!a[0] && !a[1]) return b
+        if (!b[0] && !b[1]) return a
+        const id = g.maxId++
+        g.nodes.set(id, makeNode('add', [a[0], b[0]], new Float64Array([a[1], b[1]])))
+        return [id, 0]
+    }
+    function sub(a: [number, number], b: [number, number]): [number, number] {
+        if (!a[0] && !b[0]) return [0, a[1] - b[1]]
+        const id = g.maxId++
+        g.nodes.set(id, makeNode('sub', [a[0], b[0]], new Float64Array([a[1], b[1]])))
+        return [id, 0]
+    }
+    for (const [id, n] of [...g.nodes]) {
+        if (n.op !== 'pstack') continue
+        if (getRef(n, 1)) throw `lowering: pstack %${id} names its stack dynamically`
+        const token = getRef(n, 0)
+        const cell = getLiteral(n, 1)
+        const region: [number, number] = [0, cell + 8]
+        const size: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+        const mark: [number, number] = [getRef(n, 2), getRef(n, 2) ? 0 : getLiteral(n, 2)]
+        let base = mark
+        let top: [number, number]
+        if (!mark[0] && !mark[1]) {
+            const used = g.maxId++
+            g.nodes.set(used, makeNode('load', [token, 0, 0], new Float64Array([0, cell, 0]), Types.u64))
+            base = add([used, 0], region)
+            if (!size[0] && !size[1]) {
+                g.nodes.set(id, copyNode(n, [used, base[0]], new Float64Array([0, base[1]]), 'after'))
+                continue
+            }
+            top = add([used, 0], size)
+        } else {
+            top = add(sub(mark, region), size)
+        }
+        const store = g.maxId++
+        g.nodes.set(store, makeNode('store', [token, 0, 0, top[0]], new Float64Array([0, cell, 0, top[1]]), Types.u64))
+        g.nodes.set(id, copyNode(n, [store, base[0]], new Float64Array([0, base[1]]), 'after'))
+    }
+}
+
 export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
+    expandPstacks(g)
     const implicitParams: number[] = []
     for (const [id, n] of g.nodes) if (n.op === 'call-context') implicitParams.push(id)
     const usedBy = new Map<number, number[]>()
@@ -6687,11 +6891,11 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         const select = tailOf(g, getGraphBlock(header).bodyId)
         const n = g.nodes.get(select)
         if (n?.op !== 'select') continue
-        const stays = g.nodes.get(tailOf(g, getRef(n, 1)))
-        if (stays?.op !== 'apply' || !members.has(getRef(stays, 0))) continue
-        if (!rotateAnyLoop && (getRef(stays, 0) !== header || cycleChildren.has(header))) continue
+        const stays = g.nodes.get(tailOf(g, getRef(n!, 1)))
+        if (stays?.op !== 'apply' || !members.has(getRef(stays!, 0))) continue
+        if (!rotateAnyLoop && (getRef(stays!, 0) !== header || cycleChildren.has(header))) continue
         const exits: number[] = []
-        collectTargets(getRef(n, 2), exits)
+        collectTargets(getRef(n!, 2), exits)
         if (exits.some(t => members.has(t))) continue
         rotated.set(select, header)
     }
@@ -7397,7 +7601,7 @@ function outlineArm(g: Graph, uses: Map<number, number>, arm: number, exits = ne
     for (const id of inside) {
         const n = g.nodes.get(id)!
         const effects = n.op === 'after' ? cloneRefs(n, 0, -1)
-            : n.op === 'load' || n.op === 'store' || n.op === 'call' ? cloneRefs(n, 0, 1) : []
+            : OrderedValues.has(n.op) ? cloneRefs(n, 0, 1) : []
         if (effects.some(x => x && !inside.has(x) && !isArgless(g.nodes.get(x)!))) return 0
     }
     const params: number[] = []
@@ -8299,6 +8503,13 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             const dst = regFor(id, want)
             const k = literalValue(n)
             put(() => asm.movImm(dst, k))
+            return
+        }
+        if (n.op === 'heap-handle' && !getRef(n, 0) && getLiteral(n, 0) === 0) {
+            // undefined/null
+            finish()
+            const dst = regFor(id, want)
+            put(() => asm.movImm(dst, 0))
             return
         }
         throw `lowering3: cannot produce '${n.op}' @ %${id}\n${dumpGraph(g)}`

@@ -2,10 +2,11 @@
 
 import * as heap from './heap'
 import * as intrinsics from './intrinsics'
-import { Op, createInterpreter, makeFunctionFromBytes, tagVmHandle, vmValue } from './vm'
+import { Op, createInterpreter, makeFunctionFromBytes, tagVmHandle, vmValue, hostIntrinsics } from './vm'
 import ts from 'typescript'
 import { Array as ArrayBuiltin } from './builtin/Array'
 import { Map as MapBuiltin } from './builtin/Map'
+import { Set as SetBuiltin } from './builtin/Set'
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -1107,7 +1108,7 @@ function emitFunction(
         emitExpr(node.expression) // acc = object
 
         if (receiverReg === undefined && isLexicalIdent(node.expression)) {
-            receiverReg = symToReg.get(getSymbolId(node))!
+            receiverReg = symToReg.get(getSymbolId(node.expression))!
             shouldSpillRecv = false
         }
 
@@ -1146,7 +1147,7 @@ function emitFunction(
             star(keySlot)
         }
 
-        if (!isConstName && shouldSpillRecv) ldar(spilledRecv ?? receiverReg!)
+        if (!isConstName) ldar(spilledRecv ?? receiverReg!)
         emit2(isConstName ? Op.GetPropertyConst : Op.GetProperty, keySlot)
     }
 
@@ -2388,6 +2389,15 @@ function unwrapParensOrExpStatement(node: ts.Node) {
 
 // very hacky but good enough
 const arrowFnPattern = /\w+\s*=>/
+function computedKeyEnd(src: string): number {
+    let depth = 0
+    for (let i = 0; i < src.length; i++) {
+        if (src[i] === '[') depth++
+        else if (src[i] === ']' && --depth === 0) return i + 1
+    }
+    throw `unterminated computed key: ${src.slice(0, 40)}`
+}
+
 function fixupMethodLikeDecl(src: string) {
     src = src.trim()
     if (src.startsWith('export default ')) src = src.slice(15).trimStart()
@@ -2395,6 +2405,7 @@ function fixupMethodLikeDecl(src: string) {
     else if (src.startsWith('get ') || src.startsWith('set ')) src = src.slice(4)
     if (src.startsWith('function')) return src
     if (src.startsWith('(')) return src
+    if (src.startsWith('[')) return `function ${src.slice(computedKeyEnd(src))}`
     if (src.startsWith('async')) return src // todo: async method fixup
     if (arrowFnPattern.test(src)) {
         const idx = src.indexOf('>')
@@ -2903,33 +2914,55 @@ function materializeExpando(
 
 // this _will_ tag the fn to dedupe compilations
 const ctxSym = Symbol('ctx')
+const substitutesSym = Symbol('substitutes')
 interface Ctx {
     readonly [ctxSym]: unique symbol
+    readonly [substitutesSym]: Map<any, any>
     [key: string]: any
 }
 export function createCtx(o: Record<string, any> = {}): Ctx {
     return Object.assign({
         [ctxSym]: Symbol('ctx brand'),
+        [substitutesSym]: new Map<any, any>([[intrinsics.Intrinsics, heap.createHeapHandle(hostIntrinsics)]]),
         Object: { assign: Object.assign },
         Symbol: heap.symbolConstants,
         Array: ArrayBuiltin,
         Map: MapBuiltin,
+        Set: SetBuiltin,
     }, o) as any
 }
 const toComputation = Symbol.for('toComputation')
-function sourceOf(f: Function): string {
+function computationOf(f: Function): [string, any[]] {
     const computation = (f as any)[toComputation]
-    return computation ? computation()[0] : f.toString()
+    return computation ? computation() : [f.toString(), []]
+}
+
+function withCaptures(ctx: Ctx, captures: any[] | undefined): Ctx {
+    if (!captures?.length) return ctx
+    const scoped = Object.create(ctx)
+    const substitutes = ctx[substitutesSym]
+    for (let i = 0; i < captures.length; i++) {
+        const capture = captures[i]
+        scoped[`$${i}`] = substitutes.has(capture) ? substitutes.get(capture) : capture
+    }
+    return scoped
 }
 
 export function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
     const _f = f as any
     if (const prev = _f[key]) return prev
-    const compiled = compile(sourceOf(f))
+    const [source, captures] = computationOf(f)
+    const compiled = compile(source)
     // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
     _f[key] = compiled
-    return _f[key] = finalize(compiled, ctx)
+    const scoped = withCaptures(ctx, captures)
+    const proto = _f.prototype
+    if (proto === null || typeof proto !== 'object') return _f[key] = finalize(compiled, scoped)
+    const finalized = finalize(compiled, scoped)
+    const fn = _f[key] = compiled.expandos ? finalized : heap.makeFunction(finalized)
+    heap.setProperty(fn, heap.prototypeKey, heap.createJsValueConverter(f => compileJsFn(f, ctx))(proto))
+    return fn
 }
 
 function e2eTest(code: string | Function, _args: any[], thisArg: any = null, ctx: Ctx = createCtx()): any {
@@ -3262,6 +3295,7 @@ function runTest() {
     e2eTest('function arraySpreadReal(a) { const x = [a, 2]; const y = [...x, ...x]; return y.length * 100 + y[2] * 10 + y[3] }', [5])
     e2eTest('function arrayPush() { const x = []; x.push(4); x.push(5); return x.length * 10 + x[1] }', [])
     e2eTest('function arraySpreadCall(a) { function f(x, y, z, w) { return x + y * 10 + z * 100 + w * 1000 } return f(...[1, 2], a, ...[3]) }', [5])
+    e2eTest('function elementKeyExpression(n) { const a = [5, 6, 7]; return a[n - 1] }', [3])
     e2eTest('function arrayIndexLoop(o) { const x = [7, 8, 9]; let s = 0; for (let i = 0; i < x.length; i++) s = s * 10 + x[i]; return s }', [0])
     e2eTest('function mapBasics() { const m = new Map(); m.set(1, 10); m.set(2, 20); m.set(1, 30); return m.get(1) + m.get(2) + m.size * 1000 + (m.has(3) ? 100 : 0) }', [])
     e2eTest('function sharedFrame() { let n = 1; function bump() { n = n * 3 } function read() { return n } bump(); n = n + 1; return read() }', [])

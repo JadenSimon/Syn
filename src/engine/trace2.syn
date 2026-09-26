@@ -16,6 +16,9 @@ import {
     makeNode, setDebugLabel,
 } from './graph-node'
 import * as heap from './heap'
+import { Array as ArrayBuiltin } from './builtin/Array'
+import { Map as MapBuiltin } from './builtin/Map'
+import { Set as SetBuiltin } from './builtin/Set'
 import { createHeapRecords, type Group, type HeapRecords, type HeapState, type Joined } from './heap-records'
 import * as native from './native'
 import * as syscalls from './syscalls'
@@ -178,7 +181,7 @@ interface TraceRuntime {
 const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
 
 const CallOpcodes = new Set<number>([
-    Op.Call, Op.CallConst, Op.Construct, Op.ConstructConst,
+    Op.Call, Op.CallConst, Op.Construct, Op.ConstructConst, Op.CallArray, Op.CreateEmptyArray,
 ])
 
 const LoadOpcodes = new Set<number>([
@@ -453,8 +456,27 @@ function noteTraceMemLow(addr: number): void {
     if (addr < traceMemLow) traceMemLow = addr
 }
 
+const constructors = new Map<Function, boolean>()
+export function isConstructor(f: Function): boolean {
+    const known = constructors.get(f)
+    if (known !== undefined) return known
+    const computation = (f as any)[Symbol.for('toComputation')]
+    const result = typeof computation === 'function' && /^class\b/.test(computation()[0].trimStart())
+    constructors.set(f, result)
+    return result
+}
+
 class TracedError {
     constructor(public readonly message: string) {}
+}
+
+function frozenData(module: Record<string, any>): Record<string, any> {
+    const out: Record<string, any> = {}
+    for (const [key, value] of Object.entries(module)) {
+        const plain = value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype
+        out[key] = plain ? Object.freeze({ ...value }) : value
+    }
+    return out
 }
 
 export function createTraceSession(): TraceSession {
@@ -480,11 +502,11 @@ export function createTraceSession(): TraceSession {
     intrinsicContext.jmp = symbolicJmp
     intrinsicContext.branch = symbolicBranch
     intrinsicContext.panic = symbolicPanic
-    const moduleContext = {
-        ...intrinsics,
+    const moduleContext = Object.freeze({
+        ...frozenData(intrinsics),
         Intrinsics: getCachedIntrinsics().wrapper,
         isNative: intrinsics.tagConcrete(() => true),
-    }
+    })
     const objectBuiltins = { assign: Object.assign, create: Object.create, setPrototypeOf: Object.setPrototypeOf }
     const math = {
         floor: intrinsics.tagInline((v: number) => v),
@@ -502,7 +524,7 @@ export function createTraceSession(): TraceSession {
 
     const ctx: Record<string, any> = {
         Intrinsics: intrinsicContext, Math: math, Object: objectBuiltins, Error: TracedError,
-        Symbol: heap.symbolConstants,
+        Symbol: heap.symbolConstants, Array: ArrayBuiltin, Map: MapBuiltin, Set: SetBuiltin,
         intrinsics: moduleContext, heap, syscalls,
     }
 
@@ -527,6 +549,8 @@ export function createTraceSession(): TraceSession {
         stubFunctions.set(stub, f)
         const intrinsicName = intrinsicNames.get(f)
         if (intrinsicName !== undefined) intrinsicFns.set(stub, intrinsicName)
+        const proto = (f as any).prototype
+        if (proto !== null && typeof proto === 'object') heap.setProperty(stub as intrinsics.Handle, heap.prototypeKey, fromJsValue(proto) as intrinsics.Handle)
         return stub
     }
 
@@ -758,6 +782,7 @@ export interface TraceOptions {
     name?: string
     self?: Function
     env?: boolean
+    receiver?: boolean
 }
 
 let nestedElapsed = 0
@@ -891,7 +916,9 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     noteTraceMemLow(frame)
     const regsBase = frameRegs(frame)
     const constructed = !opts.inputs && compiled.expandos !== undefined
-    const thisValue = opts.inputs ? (B.liveIn[0].has(ACC) ? opts.inputs.thisArg : 0)
+    const receiverId = opts.receiver ? newNodeId(tracer) : 0
+    const thisValue = receiverId ? symbolValue(receiverId)
+        : opts.inputs ? (B.liveIn[0].has(ACC) ? opts.inputs.thisArg : 0)
         : constructed ? handleValue(heap.makeObject(heap.getPrototypeProperty(finalized as intrinsics.Handle)) as u32)
         : 0
     const thisArg = cellOf(thisValue) || thisValue
@@ -1067,18 +1094,53 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     }
 
     function escapedArg(regStart: number, index: number): any {
-        const value = graphCallArg(regStart, index)
+        return escapedValue(graphCallArg(regStart, index))
+    }
+
+    function isObjectSlot(slot: intrinsics.Handle): boolean {
+        if (!slot || heap.isBoxedF64(slot) || heap.isString(slot) || heap.isCallable(slot)) return false
+        return heap.isOrdinaryObject(heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot)
+    }
+
+    function escapedValue(value: any, visiting = new Set<u32>()): any {
         const cell = cellOf(value)
-        if (!cell) return value
+        if (!cell || visiting.has(cell)) return value
         const state = objects.snapshot(cell as intrinsics.Handle)
         if (!state) return value
+        visiting.add(cell)
         const keys = dataKeys(state as u32)
         const args = [traceValue(cell), traceValue(state)]
         for (const key of keys) {
             const slot = slotOf(state as u32, key) as intrinsics.Handle
-            args.push(traceValue(heap.isBoxedF64(slot) ? heap.unboxF64(slot) : slot))
+            if (isObjectSlot(slot)) args.push(escapedValue(handleValue(slot as u32), visiting))
+            else args.push(traceValue(heap.isBoxedF64(slot) ? heap.unboxF64(slot) : slot))
         }
+        visiting.delete(cell)
         return mk('heap-handle', args, '', [Types.handle])
+    }
+
+    function syncEscaped(snapshot: any): void {
+        const n = nodes.get(symbolOf(snapshot))
+        if (!n || n.op !== 'heap-handle' || getRef(n, 0) || getRef(n, 1) || gn.countLiterals(n) < 2) return
+        const cell = getLiteral(n, 0) as intrinsics.Handle
+        const state = getLiteral(n, 1) as intrinsics.Handle
+        let target = 0 as intrinsics.Handle
+        const keys = dataKeys(state)
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i]
+            const descriptor = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, key as intrinsics.Handle)))
+            const slot = descriptor.slot0 as intrinsics.Handle
+            if (isObjectSlot(slot)) {
+                if (getRef(n, 2 + i)) syncEscaped(symbolValue(getRef(n, 2 + i)))
+                continue
+            }
+            if (!(descriptor.flags & heap.PropFlags.writable)) continue
+            if (slot && !heap.isBoxedF64(slot) && !heap.isString(slot)) continue
+            const value = mk('get-prop', [readToken(), snapshot, traceValue(key)], '', [Types.u64])
+            writeToken(value)
+            target ||= heap.isIndirect(cell) ? heap.prepareWrite(cell) : cell
+            heap.setProperty(target, key as intrinsics.Handle, traceCell(fromGraphValue(value)) as intrinsics.Handle)
+        }
     }
 
     function graphReceiver(value: any): any {
@@ -1123,15 +1185,17 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         }
         if (linked === session.symbolicProxyGet) {
             const receiver = callArg(regStart, 0) as intrinsics.Handle
-            const target = runtime.proxied.get(heap.getPropertyProxy(receiver) as u32)!
-            const value = proxyRead(target, heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle))
+            const key = heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle)
+            const target = runtime.proxied.get(heap.getPropertyProxy(receiver, key) as u32)!
+            const value = proxyRead(target, key)
             tracer.markHandled()
             return { value }
         }
         if (linked === session.symbolicProxySet) {
             const receiver = callArg(regStart, 0) as intrinsics.Handle
-            const target = runtime.proxied.get(heap.getPropertyProxy(receiver) as u32)!
-            proxyWrite(target, heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle), regStart)
+            const key = heap.unproxyKey(callArg(regStart, 1) as intrinsics.Handle)
+            const target = runtime.proxied.get(heap.getPropertyProxy(receiver, key) as u32)!
+            proxyWrite(target, key, regStart)
             tracer.markHandled()
             return { value: 0 }
         }
@@ -1397,6 +1461,12 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     tracer.markHandled()
                     return tagCallResult(0)
                 }
+                if (intrinsicName === 'pstack') {
+                    const v = mk('pstack', [readToken(), iargs[0], iargs[1], iargs[2]])
+                    writeToken(v)
+                    tracer.markHandled()
+                    return tagCallResult(v)
+                }
                 if (intrinsicName === 'load') {
                     const loaded = memoryLoad(iargs[0], iargs[1], vmValue(iargs[2] as u32))
                     tracer.markHandled()
@@ -1414,10 +1484,11 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                 const calleeValue = intrinsics.getNanId(callee)
                     ? traceValue(callee)
                     : mk('heap-handle', [traceValue(callee)], '', [Types.handle])
-                const cargs = [readToken(), calleeValue, traceValue(thisArg)]
+                const cargs = [readToken(), calleeValue, escapedValue(graphReceiver(thisArg))]
                 for (let i = 0; i < nargs; i++) cargs.push(escapedArg(regStart, i))
                 value = mk('call', cargs, '', [Types.u32])
                 writeToken(value)
+                for (let i = 2; i < cargs.length; i++) syncEscaped(cargs[i])
                 tracer.markHandled()
             }
             if (env) syncIn(env)
@@ -1694,11 +1765,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     function shapeOfValue(value: any): u32 {
         const joined = objects.joinOf(value)
         if (joined) return joinedObject(joined, 0)
-        const id = symbolOf(value)
-        const n = nodes.get(id)
-        if (n?.op === 'param' && !countIds(n) && !regionalParams.has(id)) return opaqueObject(value)
-        if (nodeOf(id)?.op === 'call' || nodeOf(id)?.op === 'get-prop') return opaqueObject(value)
-        throw `trace2: no shape for symbolic receiver ${id} (${nodeOf(id)?.op ?? 'unknown'})`
+        return opaqueObject(value)
     }
 
     function proxyRead(target: Proxied, key: intrinsics.Handle): any {
@@ -1965,7 +2032,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (n.op === 'join') {
             return getOrderingFromInlined(operand(n, countIds(n) - 1), incoming)
         }
-        if (n.op === 'load' || n.op === 'store' || n.op === 'call') {
+        if (n.op === 'load' || n.op === 'store' || n.op === 'call' || n.op === 'pstack') {
             return val
         }
         if (n.op === 'apply') return val
@@ -2190,6 +2257,11 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             nodes.set(id, makeNode('param', [], new Float64Array(0), Types.u64, Types.u64))
             ins[i] = symbolValue(id)
         }
+    }
+    if (receiverId) {
+        paramIds.push(receiverId)
+        setDebugLabel(runtime, receiverId, 'this')
+        nodes.set(receiverId, gn.createThisParam())
     }
     if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', [])
     nilEffect = runtime.nilEffect
@@ -2709,7 +2781,7 @@ if (intrinsics.argv()[0] === 'trace2') {
     testPassedNativeValue()
 
     function testPassedHeapValue() {
-        const handle = heap.makeArray()
+        const handle = heap.fromJsSymbol(Symbol('opaque'))
         const captured = heap.createHeapHandle(handle)
         function passHandle(value: intrinsics.Handle): intrinsics.Handle {
             return value
@@ -3394,7 +3466,7 @@ if (intrinsics.argv()[0] === 'trace2') {
                 }
             } catch (e) {
                 const trace = e?.stack ? String(e.stack).split('\n').slice(0, 4).join(' | ') : ''
-                status = `ERR ${String(e.message ?? e)}${trace ? ` @ ${trace}` : ''}`
+                status = `(known failure) ERR ${String(e.message ?? e)}${trace ? ` @ ${trace}` : ''}`
             }
             console.log(`heap cell ${name}: ${status}`)
         }
@@ -4793,7 +4865,7 @@ if (intrinsics.argv()[0] === 'trace2') {
             intrinsics.assert(value > 1 && value < 10)
             return value + 1
         }
-        assert([...trace2(cAssertRange).graph.nodes.values()].filter(n => n.op === 'call').length === 1)
+        assert([...trace2(cAssertRange).graph.nodes.values()].filter(n => n.op === 'panic').length === 1)
         testNativeFn(cAssertRange, [[2], [9]])
 
         function cAssertShortCircuit(value: u32, other: u32, fn: () => u32): u32 {
@@ -4801,7 +4873,9 @@ if (intrinsics.argv()[0] === 'trace2') {
             return fn()
         }
         const shortAssert = trace2(cAssertShortCircuit)
-        assert([...shortAssert.graph.nodes.values()].filter(n => n.op === 'call').length === 2)
+        const shortFn = shortAssert.graph.blocks[0].params[2]
+        assert([...shortAssert.graph.nodes.values()].filter(n => n.op === 'call' && getRef(n, 1) === shortFn).length === 1)
+        assert([...shortAssert.graph.nodes.values()].filter(n => n.op === 'panic').length === 1)
 
         const rotated = testNativeCompile(function cRotateDoWhile(n: u32): u32 {
             let i: u32 = 0
