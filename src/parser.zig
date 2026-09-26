@@ -4765,7 +4765,7 @@ fn Parser_(comptime skip_trivia: bool) type {
 
         fn parseFnDecl(this: *@This(), full_start: u32, flags_init: u22, comptime kind: SyntaxKind) !AstNode_ {
             if (comptime kind != .jsx_component) {
-                try this.lexer.expect(.t_function);
+                try this.lexer.expectNoKeywords(.t_function);
             }
 
             var flags = flags_init;

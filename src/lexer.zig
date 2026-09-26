@@ -799,6 +799,12 @@ fn NewLexer_(
             try self.next();
         }
 
+        pub inline fn expectNoKeywords(self: *LexerType, comptime token: T) !void {
+            if (self.token != token) try self.expected(token);
+
+            try self.nextNoKeywords();
+        }
+
         pub inline fn expectInClassScope(self: *LexerType, comptime token: T) !void {
             if (self.token != token) try self.expected(token);
 
