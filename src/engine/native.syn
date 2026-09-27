@@ -13,8 +13,9 @@ import {
 } from './lowering2'
 import {
     cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getLiteral,
-    getRef, isThisParam, makeNode, setGraphBlocks, setLiteral, setRef,
+    getRef, isThisParam, makeNode, operandType, setGraphBlocks, setLiteral, setRef,
 } from './graph-node'
+import { isSignedType } from './lowering'
 
 import type { CompiledSource } from './trace2'
 import type { EmitResult } from './bytecode-emitter'
@@ -1292,8 +1293,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     }
     function freshId(graph: Graph): number {
         const tracer = session.runtime!.tracer
-        const id = tracer.getNanId(tracer.createUniqueNan())
-        graph.maxId = Math.max(graph.maxId, id + 1)
+        const id = Math.max(graph.maxId, tracer.getNanId(tracer.createUniqueNan()))
+        graph.maxId = id + 1
         return id
     }
     function returnedObjects(graph: Graph, calls?: number[]): number[] | undefined {
@@ -1774,8 +1775,212 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const reconcileStart = performance.now()
     for (const shaped of shapedCallees) reconcileShapes(shaped)
     reconcileReturns()
+    tagReturns()
     phases.reconcile = performance.now() - reconcileStart
 
+    interface TaggedReturn {
+        sentinel: number
+        rets: { select: number, tag: number, payload: number }[]
+    }
+    function tokenSlot(n: GraphNode, i: number): boolean {
+        if (n.op === 'after') return i < countIds(n) - 1
+        if (n.op === 'get') return i === 0
+        return i === 0 && (n.op === 'load' || n.op === 'store' || n.op === 'call' || n.op === 'pstack')
+    }
+    function reachableRets(graph: Graph): number[] {
+        const applied = new Set<number>([graph.blocks[0].id])
+        const seen = new Set<number>()
+        const work = [graph.blocks[0].bodyId]
+        while (work.length) {
+            const id = work.pop()!
+            const n = id ? graph.nodes.get(id) : undefined
+            if (!n || seen.has(id) || n.op === 'block') continue
+            seen.add(id)
+            if (n.op === 'apply' && !applied.has(getRef(n, 0))) {
+                applied.add(getRef(n, 0))
+                work.push(getBlock(graph, getRef(n, 0))!.bodyId)
+            }
+            for (let i = n.op === 'apply' ? 1 : 0; i < countIds(n); i++) work.push(getRef(n, i))
+        }
+        const rets: number[] = []
+        function walk(id: number): void {
+            const n = id ? graph.nodes.get(id) : undefined
+            if (n?.op === 'ret') rets.push(id)
+            if (n?.op === 'after') walk(getRef(n, countIds(n) - 1))
+            if (n?.op === 'select') {
+                walk(getRef(n, 1))
+                walk(getRef(n, 2))
+            }
+        }
+        for (const b of graph.blocks) if (applied.has(b.id)) walk(b.bodyId)
+        return rets
+    }
+    function excludes(graph: Graph, cond: number, value: number, k: number): boolean {
+        const c = cond ? graph.nodes.get(cond) : undefined
+        if (!c) return false
+        if (c.op === 'param') {
+            const block = graph.blocks.find(b => b.params.includes(cond))
+            const at = block?.params.indexOf(value) ?? -1
+            if (!block || at < 0) return false
+            const of = block.params.indexOf(cond)
+            let arrived = false
+            for (const n of graph.nodes.values()) {
+                if (n.op !== 'apply' || getRef(n, 0) !== block.id) continue
+                if (!excludes(graph, getRef(n, of + 1), getRef(n, at + 1), k)) return false
+                arrived = true
+            }
+            return arrived
+        }
+        if (c.op === 'and') return excludes(graph, getRef(c, 0), value, k) || excludes(graph, getRef(c, 1), value, k)
+        if (k !== -1 || (c.op !== 'lt' && c.op !== 'gt')) return false
+        if (isSignedType(operandType(graph, c, 0)) || isSignedType(operandType(graph, c, 1))) return false
+        return getRef(c, c.op === 'lt' ? 0 : 1) === value
+    }
+    function taggedReturn(graph: Graph): TaggedReturn | undefined {
+        const rets = reachableRets(graph)
+        if (!rets.length) return
+        let sentinel: number | undefined
+        const out: TaggedReturn['rets'] = []
+        for (const ret of rets) {
+            let value = getRef(graph.nodes.get(ret)!, 0)
+            for (let m = graph.nodes.get(value); m?.op === 'after'; m = graph.nodes.get(value)) value = getRef(m, countIds(m) - 1)
+            const n = value ? graph.nodes.get(value) : undefined
+            if (n?.op !== 'select' || countIds(n) !== 3 || !getRef(n, 0) || !getRef(n, 1) || getRef(n, 2)) return
+            const k = getLiteral(n, 2)
+            if (sentinel !== undefined && sentinel !== k) return
+            sentinel = k
+            if (!excludes(graph, getRef(n, 0), getRef(n, 1), k)) return
+            out.push({ select: value, tag: getRef(n, 0), payload: getRef(n, 1) })
+        }
+        return { sentinel: sentinel!, rets: out }
+    }
+    function names(graph: Graph, n: GraphNode, fn: Function, symbol: number): boolean {
+        if (getRef(n, 0)) return false
+        if (n.op === 'local-target') return getLiteral(n, 0) === symbol
+        return n.op === 'heap-handle' && session.stubFunctions.get(getLiteral(n, 0) as u32) === fn
+    }
+    function escapes(graph: Graph, id: number): boolean {
+        for (const [uid, u] of graph.nodes) {
+            for (let i = 0; i < countIds(u); i++) {
+                if (getRef(u, i) !== id) continue
+                if (u.op === 'call' && i === 1) continue
+                if (u.op === 'after' && i === countIds(u) - 1 && !escapes(graph, uid)) continue
+                return true
+            }
+        }
+        return false
+    }
+    function substitute(graph: Graph, id: number, from: number, to: number, memo: Map<number, number>): number {
+        if (id === from) return to
+        const known = memo.get(id)
+        if (known !== undefined) return known
+        const n = id ? graph.nodes.get(id) : undefined
+        memo.set(id, id)
+        if (!n || n.op === 'block' || n.op === 'param' || n.op === 'call') return id
+        const ids = cloneRefs(n)
+        let changed = false
+        for (let i = 0; i < ids.length; i++) {
+            if (!ids[i] || (n.op === 'apply' && i === 0) || tokenSlot(n, i)) continue
+            const next = substitute(graph, ids[i], from, to, memo)
+            if (next === ids[i]) continue
+            ids[i] = next
+            changed = true
+        }
+        if (!changed) return id
+        const copy = freshId(graph)
+        graph.nodes.set(copy, copyNode(n, ids, cloneLiterals(n)))
+        memo.set(id, copy)
+        return copy
+    }
+    function tagCallSite(graph: Graph, call: number, sentinel: number): void {
+        const tag = freshId(graph)
+        graph.nodes.set(tag, makeNode('get', [call, 0], new Float64Array([0, 1])))
+        const payload = freshId(graph)
+        graph.nodes.set(payload, makeNode('get', [call, 0], new Float64Array([0, 0])))
+        const tests = new Map<number, number>()
+        for (const [id, n] of [...graph.nodes]) {
+            if ((n.op !== 'eq' && n.op !== 'ne') || countIds(n) !== 2) continue
+            const at = getRef(n, 0) === call ? 1 : getRef(n, 1) === call ? 0 : -1
+            if (at < 0 || getRef(n, at) || getLiteral(n, at) !== sentinel) continue
+            graph.nodes.set(id, makeNode(n.op, [tag, 0], new Float64Array(2), intrinsics.Types.bool))
+            tests.set(id, n.op === 'eq' ? 2 : 1)
+        }
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op !== 'select' || countIds(n) !== 3) continue
+            const arm = tests.get(getRef(n, 0))
+            if (arm === undefined) continue
+            const replaced = substitute(graph, getRef(n, arm), call, payload, new Map())
+            if (replaced === getRef(n, arm)) continue
+            const ids = cloneRefs(n)
+            ids[arm] = replaced
+            graph.nodes.set(id, copyNode(n, ids, cloneLiterals(n)))
+        }
+        let rebuilt = 0
+        for (const [id, n] of [...graph.nodes]) {
+            if (id === tag || id === payload) continue
+            let ids: number[] | undefined
+            for (let i = 0; i < countIds(n); i++) {
+                if (getRef(n, i) !== call || tokenSlot(n, i)) continue
+                if (!rebuilt) {
+                    rebuilt = freshId(graph)
+                    graph.nodes.set(rebuilt, makeNode('select', [tag, payload, 0], new Float64Array([0, 0, sentinel])))
+                }
+                ids ??= cloneRefs(n)
+                ids[i] = rebuilt
+            }
+            if (ids) graph.nodes.set(id, copyNode(n, ids, cloneLiterals(n)))
+        }
+    }
+    function tagReturns(): void {
+        const rootSymbols = new Set<number>(roots.values())
+        for (const unit of pending) {
+            if (rootSymbols.has(unit.symbol)) continue
+            const summary = taggedReturn(unit.graph)
+            if (!summary) continue
+            const sites: [PendingUnit, number][] = []
+            let escaped = false
+            for (const other of pending) {
+                for (const [id, n] of other.graph.nodes) {
+                    if (!names(other.graph, n, unit.fn, unit.symbol)) continue
+                    if (escapes(other.graph, id)) escaped = true
+                }
+                for (const [id, n] of other.graph.nodes) {
+                    if (n.op === 'call' && calledFunction(other.graph, n) === unit.fn) sites.push([other, id])
+                }
+            }
+            if (escaped || !sites.length) continue
+            const tested = sites.some(([other, call]) => [...other.graph.nodes.values()].some(n =>
+                (n.op === 'eq' || n.op === 'ne') && countIds(n) === 2
+                && ((getRef(n, 0) === call && !getRef(n, 1) && getLiteral(n, 1) === summary.sentinel)
+                    || (getRef(n, 1) === call && !getRef(n, 0) && getLiteral(n, 0) === summary.sentinel))))
+            if (!tested) continue
+            const replace = new Map<number, number>()
+            for (const r of summary.rets) {
+                const record = freshId(unit.graph)
+                unit.graph.nodes.set(record, makeNode('record', [0, r.payload, 0, r.tag], new Float64Array([0, 0, 1, 0])))
+                replace.set(r.select, record)
+            }
+            for (const [id, n] of [...unit.graph.nodes]) {
+                if (n.op !== 'ret' && n.op !== 'after') continue
+                const at = n.op === 'ret' ? 0 : countIds(n) - 1
+                const to = replace.get(getRef(n, at))
+                if (to === undefined) continue
+                const ids = cloneRefs(n)
+                ids[at] = to
+                unit.graph.nodes.set(id, copyNode(n, ids, cloneLiterals(n)))
+            }
+            const touched = new Set<PendingUnit>([unit])
+            for (const [other, call] of sites) {
+                tagCallSite(other.graph, call, summary.sentinel)
+                touched.add(other)
+            }
+            for (const u of touched) {
+                u.graph = normalizeValueGraph({ ...u.graph, name: u.fn.name })
+                Object.assign(u, handleSlots(u.graph))
+            }
+            if (intrinsics.argv().includes('native-decisions')) console.log(`TAGGED ${unit.fn.name} sentinel=${summary.sentinel} sites=${sites.length}`)
+        }
+    }
     function handleSlots(graph: Graph) {
         const functionHandleSlots = new Map<number, number>()
         const dataHandleSlots = new Map<number, number>()
