@@ -733,6 +733,8 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         Type: reifier.types,
         __reify: reifier.__reify,
         __argv: (reifier as any).__argv,
+        __readFile: (reifier as any).__readFile,
+        __writeFile: (reifier as any).__writeFile,
         console: console,
         performance,
         process,
