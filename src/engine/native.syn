@@ -13,7 +13,7 @@ import {
 } from './lowering2'
 import {
     cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getLiteral,
-    getRef, isThisParam, makeNode, operandType, setGraphBlocks, setLiteral, setRef,
+    getRef, isThisParam, makeNode, operandType, setGraphBlocks, setLiteral, setRef, typeOf,
 } from './graph-node'
 import { isSignedType } from './lowering'
 
@@ -129,7 +129,7 @@ function pstackCell(stack: number): number {
     return cell
 }
 
-function seedPstacks(graph: Graph): void {
+export function seedPstacks(graph: Graph): void {
     for (const [id, n] of graph.nodes) {
         if (n.op !== 'pstack') continue
         if (getRef(n, 1)) throw `native: pstack %${id} names its stack dynamically`
@@ -627,7 +627,7 @@ function snapshotFields(snapshot: intrinsics.Handle): { key: intrinsics.Handle, 
     return fields
 }
 
-function sameSnapshotShape(a: intrinsics.Handle | undefined, b: intrinsics.Handle | undefined): boolean {
+export function sameSnapshotShape(a: intrinsics.Handle | undefined, b: intrinsics.Handle | undefined): boolean {
     if (!a || !b) return a === b
     if (heap.typeDescriptorOf(a) !== heap.typeDescriptorOf(b)) return false
     const x = snapshotFields(a)
@@ -921,7 +921,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         .map(x => x.slice('no-inline:'.length)))
     const noInlineAll = intrinsics.argv().includes('no-inline-all')
     function constructsOutOfLine(fn: Function): boolean {
-        return traceModule.isConstructor(fn)
+        return traceModule.isConstructor(specializedFrom.get(fn) ?? fn)
     }
     function shouldInline(fn: Function): boolean {
         if (noInlineAll || inlineDenylist.has(fn.name) || constructsOutOfLine(fn)) return false
@@ -981,6 +981,13 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         scope?: EmitResult['scopeBindings']
     }
     const codes = new Map<Function, Code>()
+    const frames = new Map<Function, intrinsics.Handle>()
+    const localStubs = new Set<Function>()
+    function encodesReturns(fn: Function): boolean {
+        return !constructsOutOfLine(fn) && !localStubs.has(specializedFrom.get(fn) ?? fn) && !returnLayout(fn)
+    }
+    const closureShapes = new Map<u32, intrinsics.Handle>()
+    const closureHandles = new Map<Function, u32>()
     const templateFunctions = new Map<EmitResult, Function>()
     function codeOf(fn: Function): Code | undefined {
         const known = codes.get(fn)
@@ -997,6 +1004,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     }
     function closureFunction(handle: u32, name: string): Function {
         const template = session.templateOf(handle)!
+        defer if (templateFunctions.has(template.compiled)) closureHandles.set(templateFunctions.get(template.compiled)!, handle)
         let fn = templateFunctions.get(template.compiled)
         if (!fn) {
             fn = Object.defineProperty(function closureBody() {}, 'name', { value: template.compiled.name || `${name}/closure` })
@@ -1110,18 +1118,26 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         return Math.max(0, ...source.captured.reads, ...source.captured.writes) + 1
     }
     function closeOver(
-        name: string,
+        fn: Function,
         traced: ReturnType<typeof trace2>,
         source: CompiledSource,
         mapCapture: (capture: any) => any,
         scope?: ClosureScope,
         params?: Map<number, intrinsics.Handle>,
         constructed?: Constructed,
-    ): { graph: Graph, closures: boolean, shapes: Map<number, intrinsics.Handle> } {
-        const resolved = propertyEval.resolveClosures(traced.graph, session, name, traced.frameProxy, frameSize(source), scope, params, constructed, callsFor(name))
+    ): { graph: Graph, closures: boolean, shapes: Map<number, intrinsics.Handle>, encoded: Set<number> } {
+        const name = fn.name
+        if (intrinsics.argv().includes(`pe-input:${name}`)) console.log(dumpGraph(traced.graph))
+        let frame = frames.get(fn)
+        if (frame === undefined) frames.set(fn, frame = propertyEval.frameShape(frameSize(source)))
+        const handle = closureHandles.get(fn)
+        const resolved = propertyEval.resolveClosures(traced.graph, session, name, traced.frameProxy, frameSize(source), scope, params, constructed, callsFor(fn), {
+            locate, stored: (shape, path, value) => setFact(name, shape, path, { shape: value, encoded: false }),
+            frame, closureShapes, contextShape: handle !== undefined ? closureShapes.get(handle) : undefined,
+        })
         if (resolved.passed.length) throw `native: ${name} passes a closure to another function`
         for (const handle of resolved.closures) closureFunction(handle, name)
-        return { graph: resolved.graph, closures: traced.frameProxy !== undefined || resolved.closures.length > 0, shapes: resolved.memoryShapes }
+        return { graph: resolved.graph, closures: traced.frameProxy !== undefined || resolved.closures.length > 0, shapes: resolved.memoryShapes, encoded: resolved.encoded ?? new Set() }
     }
     function scopeOf(fn: Function, traced: ReturnType<typeof trace2>): ClosureScope | undefined {
         const scope = codeOf(fn)?.scope
@@ -1212,6 +1228,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             discover(capture)
             schedule(capture)
         }
+        localStubs.add(capture)
         const stub: any = nativeStub(capture, target)
         const wrapper = returnWrappers.get(capture)
         if (intrinsics.argv().includes('trace-debug')) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
@@ -1256,8 +1273,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         const graph = { ...traced, nodes, blocks: traced.blocks.map(b => ({ ...b, params: b.params.slice() })) }
         const name = unit.fn.name
-        const closed = closeOver(name, { ...entry.traced, graph }, entry.source, mapCapture, scopeOf(unit.fn, entry.traced), paramShapes.get(unit.fn), constructedFor(layout, graph))
+        const closed = closeOver(unit.fn, { ...entry.traced, graph }, entry.source, mapCapture, scopeOf(unit.fn, entry.traced), paramShapes.get(unit.fn), constructedFor(layout, graph))
         entry.closed = snapshotGraph(closed.graph)
+        entry.closedShapes = closed.shapes
+        encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(unit.fn))
         const lifted = liftReturnedHeapValues(closed.graph)
         const normalized = normalizeValueGraph({ ...lifted.graph, name })
         if ([...normalized.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')) {
@@ -1277,6 +1296,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         layout?: ConstructorLayout | null
         returns?: ReturnLayout | null
         closed?: Graph
+        closedShapes?: Map<number, intrinsics.Handle>
         unit?: Graph
     }
     interface ReturnLayout {
@@ -1359,8 +1379,15 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     function resolvedOf(fn: Function): Graph {
         const entry = graphsOf(fn)
         if (entry.closed) return entry.closed
-        const closed = closeOver(fn.name, entry.traced, entry.source, mapCapture, scopeOf(fn, entry.traced), paramShapes.get(fn), constructedFor(undefined, entry.traced.graph))
+        const layout = constructsOutOfLine(fn) ? constructorLayout(fn) : undefined
+        if (layout) {
+            let shapes = paramShapes.get(fn)
+            if (!shapes) paramShapes.set(fn, shapes = new Map())
+            shapes.set(entry.source.compiled.paramCount, layout.shape)
+        }
+        const closed = closeOver(fn, entry.traced, entry.source, mapCapture, scopeOf(fn, entry.traced), paramShapes.get(fn), constructedFor(layout, entry.traced.graph))
         entry.closed = snapshotGraph(closed.graph)
+        entry.closedShapes = closed.shapes
         return entry.closed
     }
     function forwardedReturns(fn: Function): ReturnLayout | undefined {
@@ -1572,7 +1599,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (value !== self) return
         }
         writes.sort((a, b) => a[0] - b[0])
-        const shape = heap.makeObject(heap.getPrototypeProperty(session.linkFunction(fn) as intrinsics.Handle))
+        const shape = heap.makeObject(heap.getPrototypeProperty(session.linkFunction(specializedFrom.get(fn) ?? fn) as intrinsics.Handle))
         const fields = new Map<intrinsics.Handle, intrinsics.Handle>()
         const sites = new Map<intrinsics.Handle, { call: number, receiver: number }>()
         for (const [, n] of writes) {
@@ -1580,8 +1607,9 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const key = getLiteral(n, 2) as intrinsics.Handle
             if (heap.keyIndex(key) !== undefined) return
             const value = graph.nodes.get(getRef(n, 3))
-            const callee = value?.op === 'call' ? linkedCallee(graph, value) : undefined
-            const nested = callee && constructsOutOfLine(callee) ? constructorLayout(callee, mapCapture) : undefined
+            const linked = value?.op === 'call' ? linkedCallee(graph, value) : undefined
+            const callee = linked && constructsOutOfLine(linked) ? constructionFor(fn, linked, getRef(n, 3)) : undefined
+            const nested = callee ? constructorLayout(callee, mapCapture) : undefined
             if (heap.getOwnProperty(shape, key)) {
                 if (nested || fields.has(key)) return
                 continue
@@ -1621,9 +1649,380 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const fn = closureFunction(handle as u32, 'closure')
         return codeOf(fn)!.scope?.length ? undefined : fn
     }
-    function callsFor(name: string): (site: propertyEval.CallSite) => propertyEval.CallBinding | undefined {
+    function describe(shape: intrinsics.Handle | undefined): string {
+        if (shape === undefined) return '?'
+        const keys: string[] = [`@${shape}`]
+        for (let k: u32 = 0; k < heap.ownPropertyCount(shape); k++) {
+            const key = heap.ownPropertyKeyAt(shape, k)
+            keys.push(heap.isString(key) ? heap.stringToJs(key) : `#${key}`)
+        }
+        return `{${keys.join(',')}}`
+    }
+    const instances = new Map<Function, Map<number, intrinsics.Handle>>()
+    function instanceShape(caller: Function, shape: intrinsics.Handle, site: number): intrinsics.Handle {
+        let bySite = instances.get(caller)
+        if (!bySite) instances.set(caller, bySite = new Map())
+        const known = bySite.get(site)
+        if (known !== undefined) return known
+        const instance = heap.shallowClone(shape)
+        for (const facts of [refinements, fixed, pointees]) {
+            const entry = facts.get(shape)
+            if (entry) facts.set(instance, new Map(entry))
+        }
+        bySite.set(site, instance)
+        return instance
+    }
+    const constructions = new Map<Function, Map<number, Function>>()
+    function constructionFor(caller: Function, fn: Function, site: number): Function {
+        let bySite = constructions.get(caller)
+        if (!bySite) constructions.set(caller, bySite = new Map())
+        const known = bySite.get(site)
+        if (known) return known
+        const origin = specializedFrom.get(fn) ?? fn
+        const constructed = Object.defineProperty(function constructed() {}, 'name', { value: `${origin.name}@${caller.name}:${site}` })
+        codes.set(constructed, codeOf(origin)!)
+        specializedFrom.set(constructed, origin)
+        bySite.set(site, constructed)
+        return constructed
+    }
+    const specializedFrom = new Map<Function, Function>()
+    const specializations = new Map<Function, Function[]>()
+    const used = new Set<Function>()
+    function specializationFor(fn: Function, wanted: Map<number, intrinsics.Handle>): Function {
+        const origin = specializedFrom.get(fn) ?? fn
+        let family = specializations.get(origin)
+        if (!family) specializations.set(origin, family = [origin])
+        for (const candidate of family) {
+            const shapes = paramShapes.get(candidate)
+            if (!shapes?.size && !used.has(candidate)) {
+                used.add(candidate)
+                return candidate
+            }
+            let fits = (shapes?.size ?? 0) === wanted.size
+            for (const [index, shape] of wanted) {
+                const prior = shapes?.get(index)
+                if (prior === undefined || !sameSnapshotShape(prior, shape)) {
+                    fits = false
+                    break
+                }
+            }
+            if (fits) return candidate
+        }
+        const specialized = Object.defineProperty(function specialized() {}, 'name', { value: `${origin.name}#${family.length}` })
+        codes.set(specialized, codeOf(origin)!)
+        specializedFrom.set(specialized, origin)
+        family.push(specialized)
+        if (intrinsics.argv().includes('call-sites')) console.log('SPECIALIZE', specialized.name, [...wanted].map(([i, s]) => `p${i}=${describe(s)}`).join(' '))
+        return specialized
+    }
+    interface Loc {
+        param: number
+        path: string
+        base?: number
+    }
+    type Stored = Loc | intrinsics.Handle
+    interface Content {
+        value: Stored
+        encoded: boolean
+    }
+    interface Summary {
+        effects: { target: Loc, value: Stored, encoded: boolean }[]
+        rets: Content[]
+        fields: Map<intrinsics.Handle, Content>
+    }
+    interface Fact {
+        shape: intrinsics.Handle
+        encoded: boolean
+    }
+    const summaries = new Map<Function, Summary>()
+    const summarizing = new Set<Function>()
+    const locationFacts = new Map<intrinsics.Handle, Map<string, Fact>>()
+    const readLocations = new Map<intrinsics.Handle, Set<string>>()
+    function isLoc(x: Stored): x is Loc {
+        return typeof x === 'object'
+    }
+    function joinPath(a: string, b: string): string {
+        return a && b ? `${a}/${b}` : a || b
+    }
+    const provisional = new Map<Function, Summary>()
+    const recursed = new Set<Function>()
+    function summaryKey(summary: Summary): string {
+        const show = (x: Stored) => isLoc(x) ? `p${x.param}:[${x.path}]${x.base ? `+${x.base}` : ''}` : describe(x).replace(/@\d+,?/, '')
+        return JSON.stringify({
+            effects: summary.effects.map(e => `${show(e.target)}<-${show(e.value)}${e.encoded ? '!' : ''}`).sort(),
+            rets: summary.rets.map(r => `${show(r.value)}${r.encoded ? '!' : ''}`).sort(),
+            fields: [...summary.fields].map(([k, c]) => `${k}:${show(c.value)}${c.encoded ? '!' : ''}`).sort(),
+        })
+    }
+    function summaryOf(fn: Function): Summary {
+        const known = summaries.get(fn)
+        if (known) return known
+        if (summarizing.has(fn)) {
+            recursed.add(fn)
+            return provisional.get(fn) ?? { effects: [], rets: [], fields: new Map() }
+        }
+        summarizing.add(fn)
+        const first = computeSummary(fn)
+        if (!recursed.has(fn)) {
+            summarizing.delete(fn)
+            return first
+        }
+        provisional.set(fn, first)
+        const entry = graphsOf(fn)
+        entry.closed = undefined
+        entry.closedShapes = undefined
+        summaries.delete(fn)
+        const second = computeSummary(fn)
+        summarizing.delete(fn)
+        provisional.delete(fn)
+        if (summaryKey(first) !== summaryKey(second)) throw `native: ${fn.name}'s recursive summary does not settle: ${summaryKey(first)} vs ${summaryKey(second)}`
+        return second
+    }
+    function computeSummary(fn: Function): Summary {
+        const graph = resolvedOf(fn)
+        const shapes = graphsOf(fn).closedShapes ?? new Map<number, intrinsics.Handle>()
+        if (intrinsics.argv().includes(`summary-debug:${fn.name}`)) console.log(dumpGraph(graph))
+        const params = graph.blocks[0].params
+        function strip(id: number): number {
+            for (let n = graph.nodes.get(id); n?.op === 'after'; n = graph.nodes.get(id)) id = getRef(n, countIds(n) - 1)
+            return id
+        }
+        function step(n: GraphNode, i: number, base = 0): string {
+            return getRef(n, i) ? '*' : String(getLiteral(n, i) + base)
+        }
+        function shifted(path: string, base = 0): string {
+            if (!base || !path) return path
+            const [first, ...rest] = path.split('/')
+            return [first === '*' ? first : String(Number(first) + base), ...rest].join('/')
+        }
+        function locOf(id: number, pointer = false): Loc | undefined {
+            id = strip(id)
+            const n = graph.nodes.get(id)
+            if (!n) return
+            if (n.op === 'param') {
+                const at = params.indexOf(id)
+                return at < 0 ? undefined : { param: at, path: '' }
+            }
+            if (n.op === 'call-context') return { param: -1, path: '' }
+            if (pointer && n.op === 'add' && getRef(n, 0) && !getRef(n, 1)) {
+                const inner = locOf(getRef(n, 0), true)
+                return inner && { param: inner.param, path: inner.path, base: (inner.base ?? 0) + getLiteral(n, 1) }
+            }
+            if (n.op !== 'load') return
+            const base = locOf(getRef(n, 1), true)
+            return base && { param: base.param, path: joinPath(base.path, step(n, 2, base.base)) }
+        }
+        function storedOf(id: number): Stored | undefined {
+            return locOf(id) ?? shapes.get(strip(id))
+        }
+        function contentOf(id: number): Content | undefined {
+            const stripped = strip(id)
+            const n = graph.nodes.get(stripped)
+            if (n?.op === 'call') {
+                const callee = calledFunction(graph, n)
+                const inner = callee ? summaryOf(callee).rets : []
+                const value = inner.length === 1 ? through(n, inner[0].value) : undefined
+                return value !== undefined ? { value, encoded: inner[0].encoded } : undefined
+            }
+            const value = storedOf(id)
+            return value !== undefined ? { value, encoded: n?.op === 'load' && typeOf(n) === intrinsics.Types.vm_value } : undefined
+        }
+        function returnedContent(id: number): Content | undefined {
+            const content = contentOf(id)
+            return content && { value: content.value, encoded: encodesReturns(fn) || content.encoded }
+        }
+        function through(call: GraphNode, value: Stored): Stored | undefined {
+            if (!isLoc(value)) return value
+            const arg = getRef(call, 3 + value.param)
+            if (!value.path) return storedOf(arg)
+            const loc = locOf(arg, true)
+            return loc && { param: loc.param, path: joinPath(loc.path, shifted(value.path, loc.base)) }
+        }
+        const effects: Summary['effects'] = []
+        const rets: Content[] = []
+        const fields = new Map<intrinsics.Handle, Content>()
+        function returnedCell(id: number): intrinsics.Handle | undefined {
+            const n = graph.nodes.get(strip(id))
+            if (n?.op !== 'heap-handle' || getRef(n, 0)) return
+            const cell = unwrapCell(getLiteral(n, 0)) as intrinsics.Handle
+            return cell && heap.isOrdinaryObject(cell) ? cell : undefined
+        }
+        for (const n of graph.nodes.values()) {
+            if (n.op === 'store') {
+                const base = locOf(getRef(n, 1), true)
+                const value = storedOf(getRef(n, 3))
+                if (base && value !== undefined) effects.push({ target: { param: base.param, path: joinPath(base.path, step(n, 2, base.base)) }, value, encoded: typeOf(n) === intrinsics.Types.vm_value })
+            } else if (n.op === 'ret') {
+                if (!getRef(n, 0)) continue
+                const cell = returnedCell(getRef(n, 0))
+                if (cell !== undefined) {
+                    for (let k: u32 = 0; k < heap.ownPropertyCount(cell); k++) {
+                        const key = heap.ownPropertyKeyAt(cell, k)
+                        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(cell, key)))
+                        if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) continue
+                        const slot = d.slot0 as intrinsics.Handle
+                        const symbol = heap.isBoxedF64(slot) ? intrinsics.getNanId(heap.unboxF64(slot)) : 0
+                        const content = symbol ? contentOf(symbol) : undefined
+                        if (content === undefined) continue
+                        const prior = fields.get(key)
+                        if (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(content)) throw `native: ${fn.name} returns different contents for ${heap.stringToJs(key)}`
+                        fields.set(key, content)
+                    }
+                    continue
+                }
+                const value = returnedContent(getRef(n, 0))
+                if (value === undefined) continue
+                if (!rets.some(r => JSON.stringify(r) === JSON.stringify(value))) rets.push(value)
+            } else if (n.op === 'call') {
+                const callee = calledFunction(graph, n)
+                if (!callee) continue
+                for (const e of summaryOf(callee).effects) {
+                    const target = through(n, e.target)
+                    const value = through(n, e.value)
+                    if (target !== undefined && isLoc(target) && value !== undefined) effects.push({ target, value, encoded: e.encoded })
+                }
+            }
+        }
+        const summary = { effects, rets, fields }
+        summaries.set(fn, summary)
+        if (intrinsics.argv().includes('call-sites')) {
+            const show = (x: Stored) => isLoc(x) ? `p${x.param}:[${x.path}]` : describe(x)
+            console.log('SUMMARY', fn.name, summary.effects.map(e => `${show(e.target)} <- ${show(e.value)}`).join(', '),
+                summary.rets.map(r => `ret ${show(r.value)}${r.encoded ? ' encoded' : ''}`).join(' '),
+                [...fields].map(([k, c]) => `.${heap.stringToJs(k)} ${show(c.value)}${c.encoded ? ' encoded' : ''}`).join(' '))
+        }
+        return summary
+    }
+    function owner(shape: intrinsics.Handle, path: string): { shape: intrinsics.Handle, path: string } {
+        const segments = path.split('/')
+        for (let i = 1; i < segments.length; i++) {
+            const inner = locationFacts.get(shape)?.get(segments.slice(0, i).join('/'))
+            if (inner !== undefined) return owner(inner.shape, segments.slice(i).join('/'))
+        }
+        return { shape, path }
+    }
+    function factAt(shape: intrinsics.Handle | undefined, path: string): Fact | undefined {
+        if (shape === undefined) return
+        if (!path) return { shape, encoded: false }
+        const at = owner(shape, path)
+        const fact = locationFacts.get(at.shape)?.get(at.path)
+        if (fact === undefined) return
+        let reads = readLocations.get(at.shape)
+        if (!reads) readLocations.set(at.shape, reads = new Set())
+        reads.add(at.path)
+        return fact
+    }
+    function setFact(name: string, shape: intrinsics.Handle, path: string, fact: Fact): void {
+        const at = owner(shape, path)
+        let facts = locationFacts.get(at.shape)
+        if (!facts) locationFacts.set(at.shape, facts = new Map())
+        const prior = facts.get(at.path)
+        if (prior !== undefined) {
+            if (!sameSnapshotShape(prior.shape, fact.shape) || prior.encoded !== fact.encoded) throw `native: ${name} stores ${describe(fact.shape)} into [${at.path}] of ${describe(at.shape)}, which holds ${describe(prior.shape)}`
+            return
+        }
+        if (readLocations.get(at.shape)?.has(at.path)) throw `native: ${name} widens [${at.path}] of ${describe(at.shape)} after it was read`
+        facts.set(at.path, fact)
+        if (intrinsics.argv().includes('call-sites')) console.log('FACT', name, describe(at.shape), `[${at.path}]`, '<-', describe(fact.shape), fact.encoded ? 'encoded' : '')
+    }
+    function locate(shape: intrinsics.Handle, path: string): { shape: intrinsics.Handle, decode?: number } | undefined {
+        const fact = factAt(shape, path)
+        if (fact === undefined) return
+        return { shape: fact.shape, decode: fact.encoded ? heapBase() : undefined }
+    }
+    function applySummary(callee: Function, name: string, argShape: (i: number) => intrinsics.Handle | undefined, result: intrinsics.Handle | undefined): { result?: intrinsics.Handle, heap: number[], decode: boolean, reads: intrinsics.Handle[], stores: [number, number][] } {
+        const summary = summaryOf(callee)
+        const resolve = (x: Stored) => isLoc(x) ? factAt(argShape(x.param), x.path)?.shape : x
+        for (const e of summary.effects) {
+            const target = argShape(e.target.param)
+            const value = resolve(e.value)
+            if (target === undefined || value === undefined) continue
+            setFact(name, target, e.target.path, { shape: value, encoded: e.encoded })
+        }
+        if (result !== undefined) {
+            for (const [key, content] of summary.fields) {
+                const value = resolve(content.value)
+                const offset = propertyEval.fieldOffset(result, key, refinements)
+                if (value === undefined || offset === undefined) continue
+                setFact(name, result, String(offset), { shape: value, encoded: content.encoded })
+            }
+        }
+        const heap: number[] = []
+        for (const e of summary.effects) if (e.encoded && isLoc(e.value) && !e.value.path && !heap.includes(e.value.param)) heap.push(e.value.param)
+        const shapes = summary.rets.map(r => resolve(r.value))
+        let resolved: intrinsics.Handle | undefined = shapes.length && shapes.every(x => x !== undefined) ? shapes[0] : undefined
+        if (resolved !== undefined && shapes.some(x => !sameSnapshotShape(x, resolved))) throw `native: ${callee.name} returns ${shapes.map(describe).join(' or ')}`
+        if (summary.rets.some(r => r.encoded !== summary.rets[0].encoded)) throw `native: ${callee.name} returns both encoded and unencoded values`
+        const reads: intrinsics.Handle[] = []
+        for (const r of summary.rets) {
+            const read = resolved === undefined && isLoc(r.value) && r.value.path ? argShape(r.value.param) : undefined
+            if (read !== undefined && !reads.includes(read)) reads.push(read)
+        }
+        const stores: [number, number][] = []
+        for (const e of summary.effects) if (isLoc(e.value) && !e.value.path && e.value.param !== e.target.param) stores.push([e.value.param, e.target.param])
+        return { result: resolved, heap, decode: summary.rets[0]?.encoded ?? false, reads, stores }
+    }
+    let heapBaseAddress: number | undefined
+    function heapBase(): number {
+        heapBaseAddress ??= pstackCell(0) + 8
+        return heapBaseAddress
+    }
+    function encodeHandles(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, returns: () => boolean): void {
+        function encode(value: number): number {
+            const offset = freshId(graph)
+            graph.nodes.set(offset, makeNode('sub', [value, 0], new Float64Array([0, heapBase()])))
+            const shifted = freshId(graph)
+            graph.nodes.set(shifted, makeNode('shl', [offset, 0], new Float64Array([0, 1])))
+            const tagged = freshId(graph)
+            graph.nodes.set(tagged, makeNode('or', [shifted, 0], new Float64Array([0, 1])))
+            const chosen = freshId(graph)
+            graph.nodes.set(chosen, makeNode('select', [value, tagged, 0], new Float64Array(3)))
+            return chosen
+        }
+        function objectValue(ref: number): boolean {
+            let value = ref
+            for (let m = graph.nodes.get(value); m?.op === 'after'; m = graph.nodes.get(value)) value = getRef(m, countIds(m) - 1)
+            if (!value || !shapes.has(value) || encoded.has(value)) return false
+            if (graph.nodes.get(value)?.op === 'alloca') throw `native: ${graph.name} lets stack object %${value} escape as a vm_value`
+            return true
+        }
+        for (const [id, n] of [...graph.nodes]) {
+            const at = n.op === 'store' && typeOf(n) === intrinsics.Types.vm_value ? 3 : n.op === 'ret' && getRef(n, 0) ? 0 : -1
+            if (at < 0 || !objectValue(getRef(n, at)) || (at === 0 && !returns())) continue
+            const ids = cloneRefs(n)
+            ids[at] = encode(getRef(n, at))
+            graph.nodes.set(id, copyNode(n, ids, cloneLiterals(n)))
+        }
+    }
+    function callsFor(caller: Function): (site: propertyEval.CallSite) => propertyEval.CallBinding | undefined {
+        const name = caller.name
         return site => {
+            if (site.context !== undefined) {
+                const slot = heap.getPropertyDescriptor(site.context, heap.closureCallKey)
+                const handle = slot ? heap.FullPropertyDescriptor(heap.resolveHeapCell(slot)).slot0 as u32 : site.target.op === 'heap-handle' && !getRef(site.target, 0) ? getLiteral(site.target, 0) as u32 : undefined
+                const closure = handle !== undefined && session.templateOf(handle) ? closureFunction(handle, name) : undefined
+                if (intrinsics.argv().includes('call-sites')) console.log('CLOSURE-SITE', name, '->', closure?.name ?? '?', `%${site.call}`, 'context', describe(site.context), 'args', site.args.map(describe).join(' '))
+                if (!closure) return
+                let shapes = paramShapes.get(closure)
+                if (!shapes) paramShapes.set(closure, shapes = new Map())
+                const first = !used.has(closure)
+                used.add(closure)
+                for (let i = 0; i < site.args.length; i++) {
+                    const shape = site.args[i]
+                    const prior = shapes.get(i)
+                    if (!first && (prior === undefined) !== (shape === undefined)) throw `native: call sites of ${closure.name} disagree on whether parameter ${i} is an object`
+                    if (shape === undefined) continue
+                    if (prior !== undefined && !sameSnapshotShape(prior, shape)) throw `native: call sites of ${closure.name} disagree on the shape of parameter ${i}`
+                    shapes.set(i, shape)
+                }
+                const context = propertyEval.representedBy(site.context)
+                const located = applySummary(closure, name, i => i < 0 ? context : site.args[i], undefined)
+                return { paramCount: site.args.length, receiver: false, result: located.result, decode: located.result !== undefined && located.decode ? heapBase() : undefined, reads: located.reads, stores: located.stores.map(([from, into]) => [from < 0 ? 1 : 3 + from, into < 0 ? 1 : 3 + into]) }
+            }
             const fn = calleeOf(site.target)
+            if (intrinsics.argv().includes('call-sites')) {
+                console.log('CALL-SITE', name, '->', fn?.name ?? '?', site.target.op, `%${site.call}`, 'recv', describe(site.receiver), 'args', site.args.map(describe).join(' '), site.demanded ? 'demanded' : '')
+            }
             if (!fn) return
             const source = sourceOfLinked(fn)
             if (!source) return
@@ -1634,24 +2033,33 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 return { paramCount, receiver: false, result: returns.shape, returnSlot: { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } }
             }
             const receiver = source.blocks.liveIn[0].has(source.compiled.registerCount)
-            const layout = constructsOutOfLine(fn) ? constructorLayout(fn) : undefined
-            let shapes = paramShapes.get(fn)
-            function record(shape: intrinsics.Handle | undefined, index: number): boolean {
-                if (shape === undefined) return false
-                if (!shapes) paramShapes.set(fn!, shapes = new Map())
-                const prior = shapes.get(index)
-                if (prior && !sameSnapshotShape(prior, shape)) throw `native: call sites of ${fn!.name} disagree on the shape of parameter ${index}`
-                shapes.set(index, shape)
-                return true
-            }
-            for (let i = 0; i < paramCount && i < site.args.length; i++) record(site.args[i], i)
-            if (receiver && !record(layout?.shape ?? site.receiver, paramCount)) throw `native: ${name} calls ${fn.name} without a known receiver shape`
-            const returns = !layout && site.demanded ? returnLayout(fn) : undefined
-            const known = fnGraphs.get(fn)?.returns
-            if (known) recordPointees(known, fn)
+            const construction = constructsOutOfLine(fn) ? constructionFor(caller, fn, site.call) : undefined
+            const layout = construction ? constructorLayout(construction) : undefined
+            const wanted = new Map<number, intrinsics.Handle>()
+            for (let i = 0; i < paramCount && i < site.args.length; i++) if (site.args[i] !== undefined) wanted.set(i, site.args[i]!)
+            const instance = layout?.shape
+            const receiverShape = instance ?? site.receiver
+            if (receiver && receiverShape === undefined) throw `native: ${name} calls ${fn.name} without a known receiver shape`
+            if (receiver) wanted.set(paramCount, receiverShape!)
+            const callee = construction ?? specializationFor(fn, wanted)
+            let shapes = paramShapes.get(callee)
+            if (!shapes) paramShapes.set(callee, shapes = new Map())
+            for (const [index, shape] of wanted) shapes.set(index, shape)
+            const returns = !layout && site.demanded ? returnLayout(callee) : undefined
+            const known = fnGraphs.get(callee)?.returns
+            if (known) recordPointees(known, callee)
+            const returned = returns ? instanceShape(caller, returns.shape, site.call) : undefined
+            if (intrinsics.argv().includes('bind-debug')) console.log('BIND', name, '->', callee.name, `%${site.call}`, 'returns', !!returns, 'fields', [...summaryOf(callee).fields.keys()].map(k => heap.stringToJs(k)).join(','))
+            const located = layout ? undefined : applySummary(callee, name, i => wanted.get(i), returned)
+            const fromLocation = !instance && !returns ? located?.result : undefined
             return {
-                paramCount, receiver, receiverShape: layout?.shape, result: layout?.shape ?? returns?.shape,
+                paramCount, receiver, receiverShape: instance, result: instance ?? returned ?? fromLocation,
+                heap: located?.heap.length ? located.heap : undefined,
+                decode: fromLocation !== undefined && located!.decode ? heapBase() : undefined,
+                reads: !instance && !returns ? located?.reads : undefined,
+                stores: located?.stores.map(([from, into]) => [receiver && from === paramCount ? 2 : 3 + from, receiver && into === paramCount ? 2 : 3 + into]),
                 returnSlot: returns ? { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } : undefined,
+                target: callee === fn ? undefined : session.linkFunction(callee),
             }
         }
     }
@@ -1687,8 +2095,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 if (!shapes) paramShapes.set(current, shapes = new Map())
                 shapes.set(unitSource.compiled.paramCount, layout.shape)
             }
-            const closed = closeOver(current.name, traced, unitSource, mapCapture, scopeOf(current, traced), paramShapes.get(current), constructedFor(layout, traced.graph))
+            const closed = closeOver(current, traced, unitSource, mapCapture, scopeOf(current, traced), paramShapes.get(current), constructedFor(layout, traced.graph))
             entry.closed = snapshotGraph(closed.graph)
+            entry.closedShapes = closed.shapes
+            encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(current))
             if (intrinsics.argv().includes(`closed-debug:${current.name}`)) console.log(dumpGraph(closed.graph))
             const projected = projectsCallResults(closed.graph)
             const opaque = !projected && [...closed.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')
@@ -1764,14 +2174,33 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             }
         }
     }
+    function referenced(unit: DeferredUnit): boolean {
+        if (localFunctionSlots.has(unit.symbol)) return true
+        for (const graph of [...pending.map(u => u.graph), ...returnCallers.map(c => c.graph), ...[...returnRecords.values()].map(r => r.graph)]) {
+            for (const n of graph.nodes.values()) {
+                if (n.op !== 'call') continue
+                if (linkedCallee(graph, n) === unit.fn) return true
+                const target = graph.nodes.get(getRef(n, 1))
+                if (target?.op === 'local-target' && !getRef(target, 0) && getLiteral(target, 0) === unit.symbol) return true
+            }
+        }
+        return false
+    }
+    const unreferenced: DeferredUnit[] = []
     do {
         traceUnits()
         while (deferredUnits.length) {
-            specializeDeferred(deferredUnits.pop()!)
+            const unit = deferredUnits.pop()!
+            if (!referenced(unit)) {
+                unreferenced.push(unit)
+                continue
+            }
+            specializeDeferred(unit)
             traceUnits()
         }
         installReturnSlots()
     } while (tracedUnits < order.length)
+    for (const unit of unreferenced) if (referenced(unit)) throw `native: ${unit.fn.name} was deferred as unreferenced but is called`
     const reconcileStart = performance.now()
     for (const shaped of shapedCallees) reconcileShapes(shaped)
     reconcileReturns()

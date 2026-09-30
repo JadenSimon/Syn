@@ -24,6 +24,8 @@ export interface PropertyEvalOptions {
     partial?: boolean
     constructed?: Constructed
     calls?: (site: CallSite) => CallBinding | undefined
+    locate?: (shape: Handle, path: string) => { shape: Handle, decode?: number } | undefined
+    stored?: (shape: Handle, path: string, value: Handle) => void
 }
 
 export interface CallSite {
@@ -32,6 +34,7 @@ export interface CallSite {
     receiver: Handle | undefined
     args: (Handle | undefined)[]
     demanded: boolean
+    context?: Handle
 }
 
 export interface CallBinding {
@@ -40,6 +43,11 @@ export interface CallBinding {
     receiverShape?: Handle
     result?: Handle
     returnSlot?: { at: number, size: number }
+    target?: number
+    heap?: number[]
+    decode?: number
+    reads?: Handle[]
+    stores?: [from: number, into: number][]
 }
 
 export interface Constructed {
@@ -70,6 +78,7 @@ interface Memory extends Layout {
     reduced: boolean
     pointer: boolean
     address?: [ref: number, literal: number]
+    decoded?: boolean
 }
 
 export interface Resolved {
@@ -77,6 +86,7 @@ export interface Resolved {
     calls: Map<number, AccessorCall>
     addresses: Map<number, number>
     shapes: Map<number, Handle>
+    encoded: Set<number>
 }
 
 const orderedOps = new Set(['load', 'store', 'call', 'pstack'])
@@ -134,6 +144,22 @@ export function resolveProperties(
     const representation = opts.representation ?? 'auto'
     const byHandle = new Map<Handle, Memory>()
     let initToken = 0
+    let allocToken: number | undefined
+    function heapAllocate(size: number): number {
+        let token = allocToken
+        if (token === undefined) {
+            if (!initToken) {
+                initToken = newId()
+                nodes.set(initToken, makeNode('nil-effect', [], new Float64Array(0)))
+            }
+            token = initToken
+        }
+        const ptr = newId()
+        nodes.set(ptr, makeNode('pstack', [token, 0, 0, 0], new Float64Array([0, 0, 0, size])))
+        if (allocToken !== undefined) allocToken = ptr
+        else initToken = ptr
+        return ptr
+    }
     let lastAlloca = allocaTail(source)
     function snapshotNode(id: number): GraphNode | undefined {
         const n = source.get(id)
@@ -155,11 +181,7 @@ export function resolveProperties(
         if (!mem) {
             const reduced = keys.length <= 1 && readonlyKeys(handle, keys)
             let ptr = 0
-            if (!reduced) {
-                ptr = newId()
-                nodes.set(ptr, makeNode('alloca', [lastAlloca, 0, 0], new Float64Array([0, Math.max(fields.size, 8), 8])))
-                lastAlloca = ptr
-            }
+            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8))
             mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false }
             if (cell !== undefined) homes.set(cell, mem)
         }
@@ -210,6 +232,8 @@ export function resolveProperties(
             const store = newId()
             nodes.set(store, makeNode('store', [token, mem.ptr, 0, ref], new Float64Array([0, 0, mem.base + mem.offsets[i], literal]), Types.u64))
             token = store
+            const storedShape = nested ? nested[1].shape : ref ? memory.get(ref)?.shape : undefined
+            if (storedShape !== undefined) opts.stored?.(mem.shape, String(mem.offsets[i]), storedShape)
             if (nested && !visited.has(nested[1])) token = initChain(nested[0], nested[1], token, visited)
         }
         return token
@@ -500,6 +524,12 @@ export function resolveProperties(
             nodes.set(load, makeNode('load', [token, mem.ptr, 0], new Float64Array([0, 0, offset]), Types.u64))
             nodes.set(id, makeNode('after', [token, load], new Float64Array(2)))
             const slot = desc.slot0 as Handle
+            const located = opts.locate?.(mem.shape, String(offset))
+            if (located !== undefined) {
+                const ptr = located.decode !== undefined ? decodeHandle(load, located.decode) : load
+                memory.set(id, { ...layout(located.shape), ptr, base: 0, shape: located.shape, reduced: false, pointer: true, address: [ptr, 0], decoded: located.decode !== undefined })
+                return
+            }
             const pointee = opts.constructed?.pointees?.get(mem.shape)?.get(key)
             if (pointee !== undefined) {
                 memory.set(id, { ...layout(pointee), ptr: load, base: 0, shape: pointee, reduced: false, pointer: true, address: [load, 0] })
@@ -512,6 +542,8 @@ export function resolveProperties(
             return
         }
         nodes.set(id, makeNode('store', [token, mem.ptr, 0, value[0]], new Float64Array([0, 0, offset, value[1]]), Types.u64))
+        const storedShape = value[0] ? shapeOf(value[0]) : undefined
+        if (storedShape !== undefined) opts.stored?.(mem.shape, String(mem.offsets[at]), storedShape)
     }
 
     function resolveEmbedded(id: number, n: GraphNode, mem: Memory, token: number, offset: number, inner: Handle, value: [number, number]): void {
@@ -532,6 +564,8 @@ export function resolveProperties(
     }
 
     function resolve(id: number, n: GraphNode): void {
+        const union = unions.get(getRef(n, 1))
+        if (union && n.op === 'get-prop') return resolveUnion(id, n, union)
         const mem = memory.get(getRef(n, 1))
         if (mem) return resolveMemory(id, n, mem)
         const token = getRef(n, 0)
@@ -570,58 +604,367 @@ export function resolveProperties(
         forward.set(id, token)
     }
 
-    const deriving = new Set<number>()
     function arrivals(param: number): number[] {
         const at = tokenParams.get(param)
         if (!at) return []
         return (inbound.get(at.block) ?? []).map(apply => getRef(source.get(apply)!, at.index + 1))
     }
+    const pendingShape = 0xFFFFFFFF as Handle
     function agree(shapes: (Handle | null | undefined)[]): Handle | null | undefined {
         let found: Handle | undefined
+        let waiting = false
         for (const shape of shapes) {
             if (shape === null) continue
-            if (shape === undefined || (found !== undefined && found !== shape)) return
+            if (shape === pendingShape) {
+                waiting = true
+                continue
+            }
+            if (shape === undefined || (found !== undefined && !native.sameSnapshotShape(found, shape))) return
             found = shape
         }
-        return found ?? null
+        return found ?? (waiting ? pendingShape : null)
     }
-    function pointerLayout(id: number): Handle | null | undefined {
-        const mem = memory.get(id)
+    interface Union {
+        tag: number
+        members: Handle[]
+    }
+    const unions = new Map<number, Union>()
+    const unionTargets = new Map<number, { tag: number, arms: number[] }>()
+    let armOverride: { id: number, shape: Handle } | undefined
+    function memberIndex(members: Handle[], shape: Handle): number {
+        return members.findIndex(m => native.sameSnapshotShape(m, shape))
+    }
+    function unionOf(param: number, shapes: (Handle | null | undefined)[]): void {
+        if (unions.has(param)) return
+        if (shapes.some(s => s === undefined || s === pendingShape)) return
+        const members: Handle[] = []
+        for (const s of shapes) if (s !== null && memberIndex(members, s!) < 0) members.push(s!)
+        if (members.length < 2) return
+        const at = tokenParams.get(param)
+        if (!at) return
+        const tag = newId()
+        nodes.set(tag, makeNode('param', [], new Float64Array(0)))
+        const block = out.blocks.find(b => b.id === at.block)!
+        const position = block.consumesEffectToken ? block.params.length - 1 : block.params.length
+        block.params.splice(position, 0, tag)
+        unions.set(param, { tag, members })
+        const incoming = inbound.get(at.block) ?? []
+        for (let k = 0; k < incoming.length; k++) {
+            const apply = incoming[k]
+            const current = nodes.get(apply)!
+            let value = getRef(source.get(apply)!, at.index + 1)
+            while (source.get(value)?.op === 'after') value = getRef(source.get(value)!, countIds(source.get(value)!) - 1)
+            const ids = cloneRefs(current)
+            const literals = Array.from(cloneLiterals(current))
+            const carried = unions.get(value)
+            const index = carried ? -1 : shapes[k] ? memberIndex(members, shapes[k]!) : -1
+            if (!carried && index < 0) throw `property-eval: %${apply} brings an unknown shape into the union at %${param}`
+            ids.splice(position + 1, 0, carried ? carried.tag : 0)
+            literals.splice(position + 1, 0, carried ? 0 : index)
+            nodes.set(apply, copyNode(current, ids, new Float64Array(literals)))
+        }
+    }
+    function tagSelect(tag: number, arms: number[]): number {
+        let chosen = arms[arms.length - 1]
+        for (let i = arms.length - 2; i >= 0; i--) {
+            const test = newId()
+            nodes.set(test, makeNode('eq', [tag, 0], new Float64Array([0, i]), Types.bool))
+            const select = newId()
+            nodes.set(select, makeNode('select', [test, arms[i], chosen], new Float64Array(3)))
+            chosen = select
+        }
+        return chosen
+    }
+    function resolveUnion(id: number, n: GraphNode, union: Union): void {
+        const arms: number[] = []
+        const shapes: (Handle | undefined)[] = []
+        let constants = true
+        for (const shape of union.members) {
+            const fields = layout(shape)
+            const member: Memory = { ...fields, ptr: getRef(n, 1), base: 0, shape, reduced: false, pointer: true, address: [getRef(n, 1), 0] }
+            const arm = newId()
+            resolveMemory(arm, n, member)
+            arms.push(arm)
+            shapes.push(memory.get(arm)?.shape)
+            const resolved = nodes.get(arm)!
+            const value = resolved.op === 'after' ? getRef(resolved, countIds(resolved) - 1) : 0
+            const valueNode = value ? nodes.get(value) : undefined
+            if (!valueNode || valueNode.op !== 'heap-handle' || getRef(valueNode, 0)) constants = false
+        }
+        const chosen = tagSelect(union.tag, arms)
+        nodes.set(id, makeNode('after', [getRef(n, 0), chosen], new Float64Array(2)))
+        if (constants) unionTargets.set(id, { tag: union.tag, arms: arms.map(a => getRef(nodes.get(a)!, countIds(nodes.get(a)!) - 1)) })
+        if (shapes.every(s => s !== undefined)) joinResult(id, union.tag, shapes as Handle[])
+    }
+    function joinResult(id: number, tag: number, shapes: Handle[]): void {
+        const members: Handle[] = []
+        for (const s of shapes) if (memberIndex(members, s) < 0) members.push(s)
+        if (members.length === 1) {
+            const fields = layout(members[0])
+            memory.set(id, { ...fields, ptr: id, base: 0, shape: members[0], reduced: false, pointer: true, address: [id, 0] })
+            return
+        }
+        unions.set(id, { tag, members })
+    }
+    const frames: { low: number, cyclic: boolean }[] = []
+    const active = new Map<string, number>()
+    function query<T>(key: string, compute: () => T, bottom: T): T {
+        const at = active.get(key)
+        if (at !== undefined) {
+            frames[at].cyclic = true
+            observe(at)
+            return bottom
+        }
+        const frame = { low: frames.length, cyclic: false }
+        active.set(key, frames.length)
+        frames.push(frame)
+        try {
+            return compute()
+        } finally {
+            frames.pop()
+            active.delete(key)
+            observe(frame.low)
+        }
+    }
+    function observe(index: number): void {
+        const top = frames[frames.length - 1]
+        if (top) top.low = Math.min(top.low, index)
+    }
+    function settled(): boolean {
+        const top = frames[frames.length - 1]
+        return !top || top.low >= frames.length - 1
+    }
+    function pointerMemory(id: number, shape: Handle): Memory {
+        const fields = layout(shape)
+        return { ...fields, ptr: id, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [id, 0] }
+    }
+    const derived = new Map<number, Handle | null | undefined>()
+    const adoptable = new Set(['param', 'get', 'select', 'after'])
+    const assumed: number[] = []
+    function commit(id: number, value: Handle | null | undefined): void {
+        if (value && adoptable.has(source.get(id)?.op ?? '')) memory.set(id, pointerMemory(id, value))
+        else derived.set(id, value)
+    }
+    function pin(id: number, value: Handle | null | undefined): void {
+        if (!id || armOverride?.id === id || memory.has(id) || addressed.has(id) || derived.has(id)) return
+        commit(id, value)
+        assumed.push(id)
+    }
+    function shape(id: number): Handle | null | undefined {
+        if (!id) return
+        if (armOverride?.id === id) return armOverride.shape
+        const mem = memory.get(id) ?? addressed.get(id)
         if (mem) return mem.shape
-        if (deriving.has(id)) return null
+        if (derived.has(id)) return derived.get(id)
+        return query(`s${id}`, () => {
+            const result = deriveShape(id)
+            if (result === pendingShape || !settled()) return result
+            commit(id, result)
+            if (frames[frames.length - 1].cyclic) assumed.push(id)
+            return result
+        }, pendingShape)
+    }
+    function pointerShape(id: number): Handle | null | undefined {
+        return snapshotNode(id) && !memory.has(id) ? undefined : shape(id)
+    }
+    function deriveShape(id: number): Handle | null | undefined {
         const n = source.get(id)
         if (!n) return
-        deriving.add(id)
-        let shape: Handle | null | undefined
-        if (n.op === 'get' && !getRef(n, 1)) shape = fieldLayout(getRef(n, 0), getLiteral(n, 1) as Handle)
-        else if (n.op === 'param') shape = agree(arrivals(id).map(pointerLayout))
-        else if (n.op === 'after') shape = pointerLayout(getRef(n, countIds(n) - 1))
-        else if (n.op === 'call') {
-            bindCall(id, true)
-            shape = memory.get(id)?.shape
+        if (n.op === 'after') return pointerShape(getRef(n, countIds(n) - 1))
+        if (n.op === 'select') return agree([1, 2].map(i => getRef(n, i) ? pointerShape(getRef(n, i)) : null))
+        if (n.op === 'param') {
+            const shapes = arrivals(id).map(pointerShape)
+            const joined = agree(shapes)
+            if (joined === undefined && settled()) unionOf(id, shapes)
+            return joined
         }
-        deriving.delete(id)
-        return shape
+        if (n.op === 'get' && !getRef(n, 1)) return fieldShape(getRef(n, 0), getLiteral(n, 1) as Handle)
+        if (n.op === 'heap-handle' && !getRef(n, 0)) {
+            if (!getLiteral(n, 0)) return null
+            return snapshotNode(id) ? getLiteral(n, 1) as Handle : undefined
+        }
+        if (n.op === 'get-prop' && !evaluate(id)) return pendingShape
+        if (n.op === 'call' && opts.calls) {
+            bindCall(id, true)
+            if (!boundCalls.has(id)) return pendingShape
+        }
+        if (n.op !== 'get-prop' && n.op !== 'call') return
+        resolvePending(id)
+        return waitingResults.has(id) ? pendingShape : memory.get(id)?.shape
     }
-    function fieldLayout(id: number, key: Handle): Handle | null | undefined {
+    function fieldShape(id: number, key: Handle): Handle | null | undefined {
         const n = source.get(id)
         if (n?.op === 'record') {
             for (let i = 0; i + 1 < countIds(n); i += 2) {
-                if (getLiteral(n, i) === key) return getRef(n, i + 1) ? pointerLayout(getRef(n, i + 1)) : undefined
+                if (getLiteral(n, i) === key) return getRef(n, i + 1) ? pointerShape(getRef(n, i + 1)) : undefined
             }
             return
         }
-        if (n?.op === 'after') return fieldLayout(getRef(n, countIds(n) - 1), key)
+        if (n?.op === 'after') return fieldShape(getRef(n, countIds(n) - 1), key)
         if (n?.op !== 'param') return
-        if (deriving.has(id)) return null
-        deriving.add(id)
-        const shape = agree(arrivals(id).map(arg => fieldLayout(arg, key)))
-        deriving.delete(id)
-        return shape
+        return query(`f${id}/${key}`, () => agree(arrivals(id).map(arg => fieldShape(arg, key))), pendingShape)
+    }
+    const parents = new Map<Handle, Handle>()
+    for (const [outer, fields] of opts.constructed?.refinements ?? []) for (const inner of fields.values()) parents.set(inner, outer)
+    function rootOf(of: Handle): Handle {
+        for (let up = parents.get(of); up !== undefined; up = parents.get(of)) of = up
+        return of
+    }
+    const uses = new Map<number, [user: number, slot: number][]>()
+    for (const [id, n] of source) {
+        for (let i = 0; i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!ref) continue
+            const list = uses.get(ref)
+            if (list) list.push([id, i])
+            else uses.set(ref, [[id, i]])
+        }
+    }
+    const paramsOf = new Map<number, number[]>()
+    for (const b of graph.blocks) paramsOf.set(b.id, b.params)
+    const holderSets = new Map<Handle, Set<number>>()
+    const writerSets = new Map<Handle, Set<number>>()
+    const storedIn = new Map<Handle, Set<Handle>>()
+    const holding: [root: Handle, id: number][] = []
+    function setOf<K, V>(map: Map<K, Set<V>>, key: K): Set<V> {
+        let set = map.get(key)
+        if (!set) map.set(key, set = new Set())
+        return set
+    }
+    function hold(root: Handle, id: number): void {
+        if (!id || setOf(holderSets, root).has(id)) return
+        setOf(holderSets, root).add(id)
+        holding.push([root, id])
+    }
+    function candidate(root: Handle, id: number): void {
+        setOf(writerSets, root).add(id)
+        if (source.get(id)!.op === 'call') for (const inner of storedIn.get(root) ?? []) setOf(writerSets, inner).add(id)
+    }
+    function drain(): void {
+        while (holding.length) {
+            const [root, id] = holding.pop()!
+            for (const [user, slot] of uses.get(id) ?? []) {
+                const n = source.get(user)!
+                if (n.op === 'after' && slot === countIds(n) - 1) hold(root, user)
+                else if (n.op === 'select' && slot > 0) hold(root, user)
+                else if (n.op === 'apply' && slot > 0) hold(root, paramsOf.get(getRef(n, 0))?.[slot - 1] ?? 0)
+                else if (n.op === 'set-prop' && slot === 1) candidate(root, user)
+                else if (n.op === 'set-prop' && slot === 3) storeInto(root, getRef(n, 1))
+                else if (n.op === 'get-prop' && slot === 1) for (const inner of storedIn.get(root) ?? []) hold(inner, user)
+                else if (n.op === 'call' && slot > 0) candidate(root, user)
+            }
+        }
+    }
+    function storeInto(root: Handle, object: number): void {
+        const into = shape(object)
+        if (!into || into === pendingShape) return
+        const owner = rootOf(into)
+        seed(owner, [object])
+        const inner = setOf(storedIn, owner)
+        if (inner.has(root)) return
+        inner.add(root)
+        for (const id of holderSets.get(owner) ?? []) for (const [user, slot] of uses.get(id) ?? []) if (source.get(user)!.op === 'get-prop' && slot === 1) hold(root, user)
+        for (const id of writerSets.get(owner) ?? []) if (source.get(id)!.op === 'call') setOf(writerSets, root).add(id)
+    }
+    function producers(id: number, found: Set<number>, seen = new Set<number>()): void {
+        if (!id || seen.has(id)) return
+        seen.add(id)
+        const n = source.get(id)
+        if (n?.op === 'after') return producers(getRef(n, countIds(n) - 1), found, seen)
+        if (n?.op === 'select') {
+            producers(getRef(n, 1), found, seen)
+            producers(getRef(n, 2), found, seen)
+            return
+        }
+        if (n?.op === 'param' && arrivals(id).length) {
+            for (const arrival of arrivals(id)) producers(arrival, found, seen)
+            return
+        }
+        found.add(id)
+    }
+    const seeded = new Set<Handle>()
+    function seed(root: Handle, from: number[]): void {
+        if (!seeded.has(root)) {
+            seeded.add(root)
+            for (const [id, mem] of memory) if (rootOf(mem.shape) === root) hold(root, id)
+        }
+        const found = new Set<number>()
+        for (const id of from) producers(id, found)
+        for (const id of found) {
+            const of = shape(id)
+            if (of && of !== pendingShape && rootOf(of) === root) hold(root, id)
+        }
+    }
+    function learn(call: number): void {
+        const mem = memory.get(call)
+        if (mem) hold(rootOf(mem.shape), call)
+        const n = source.get(call) ?? nodes.get(call)!
+        for (const [from, into] of bindings.get(call)?.stores ?? []) {
+            const value = shape(getRef(n, from))
+            if (value && value !== pendingShape) storeInto(rootOf(value), getRef(n, into))
+        }
+        for (const read of waitingResults.get(call)?.reads ?? []) for (const inner of storedIn.get(rootOf(read)) ?? []) hold(inner, call)
+    }
+    const writersKnown = new Set<Handle>()
+    function demandWriters(target: Handle, from: number[]): void {
+        const root = rootOf(target)
+        seed(root, from)
+        if (writersKnown.has(root)) return
+        query(`w${root}`, () => {
+            const tried = new Set<number>()
+            for (;;) {
+                drain()
+                const next = [...writerSets.get(root) ?? []].filter(id => !tried.has(id))
+                if (!next.length) break
+                for (const id of next) {
+                    tried.add(id)
+                    if (source.get(id)!.op === 'set-prop') evaluate(id)
+                    else bindCall(id, accessed.has(id))
+                }
+            }
+            if (settled()) writersKnown.add(root)
+        }, undefined)
+    }
+    function readsState(n: GraphNode, of: Handle): boolean {
+        if (getRef(n, 2)) return true
+        const key = getLiteral(n, 2) as Handle
+        const addr = heap.getPropertyDescriptor(of, key)
+        if (!addr || heap.getOwnProperty(of, key)) return true
+        return !!(heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter))
+    }
+    const bindings = new Map<number, CallBinding>()
+    const waitingResults = new Map<number, { site: CallSite, reads: Handle[] }>()
+    function resolvePending(id: number): void {
+        const waiting = waitingResults.get(id)
+        if (!waiting) return
+        const n = source.get(id) ?? nodes.get(id)!
+        const operands: number[] = []
+        for (let i = 1; i < countIds(n); i++) operands.push(getRef(n, i))
+        for (const read of waiting.reads) demandWriters(read, operands)
+        if (!settled() && !waiting.reads.every(read => writersKnown.has(rootOf(read)))) return
+        waitingResults.delete(id)
+        const binding = opts.calls!(waiting.site)
+        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode)
+        learn(id)
+    }
+    function settleResult(id: number, site: CallSite, binding: CallBinding | undefined): void {
+        if (binding) bindings.set(id, binding)
+        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode)
+        else if (binding?.result === undefined && binding?.reads?.length) waitingResults.set(id, { site, reads: binding.reads })
+        learn(id)
     }
     const accessed = new Set<number>()
     for (const n of source.values()) if (n.op === 'get-prop' || n.op === 'set-prop') accessed.add(getRef(n, 1))
     const boundCalls = new Set<number>()
+    const callUses = new Map<number, number[]>()
+    for (const [id, n] of source) {
+        if (n.op !== 'call') continue
+        for (let i = 2; i < countIds(n); i++) {
+            const uses = callUses.get(getRef(n, i))
+            if (!uses) callUses.set(getRef(n, i), [id])
+            else if (!uses.includes(id)) uses.push(id)
+        }
+    }
     const lazy = new Set<number>()
     function sameConstant(a: number, b: number): boolean {
         const x = nodes.get(a)!
@@ -653,27 +996,66 @@ export function resolveProperties(
         return n?.op === 'heap-handle' || n?.op === 'local-target'
     }
     function shapeOf(id: number): Handle | undefined {
-        if (!id) return
-        const n = source.get(id)
-        if (n?.op === 'get-prop') evaluate(id)
-        if (n?.op === 'call') bindCall(id, accessed.has(id))
-        adopt(id)
-        const mem = memory.get(id) ?? addressed.get(id)
-        if (mem) return mem.shape
-        const snapshot = snapshotNode(id)
-        return snapshot ? getLiteral(snapshot, 1) as Handle : undefined
+        return shape(id) ?? undefined
+    }
+    function inputsOf(n: GraphNode): number[] {
+        const inputs: number[] = []
+        for (let i = 1; i < countIds(n); i++) if (getRef(n, i)) inputs.push(getRef(n, i))
+        return inputs
     }
     function bindCall(id: number, demanded: boolean, created = false): void {
         if (!opts.calls || boundCalls.has(id)) return
-        boundCalls.add(id)
+        if (created) return bindNow(id, demanded, created)
+        query(`b${id}`, () => bindNow(id, demanded, created), undefined)
+    }
+    function bindNow(id: number, demanded: boolean, created: boolean): void {
         const n = created ? nodes.get(id)! : source.get(id)!
-        if (memory.has(getRef(n, 1))) return
-        const callee = constantTarget(getRef(n, 1))
-        if (!callee) return
-        const receiver = getRef(n, 2)
+        const inputs = inputsOf(n)
+        const values = inputs.map(shape)
+        if (values.includes(pendingShape)) {
+            if (created) throw `property-eval: %${id} was created before its inputs settled`
+            return
+        }
+        if (!settled()) inputs.forEach((input, i) => pin(input, values[i]))
+        boundCalls.add(id)
+        const closure = memory.get(getRef(n, 1))
         const args: (Handle | undefined)[] = []
         for (let i = 3; i < countIds(n); i++) args.push(shapeOf(getRef(n, i)))
-        const binding = opts.calls({ call: id, target: nodes.get(callee)!, receiver: shapeOf(receiver), args, demanded })
+        if (closure) {
+            const site: CallSite = { call: id, target: nodes.get(getRef(n, 1))!, receiver: undefined, args, demanded, context: closure.shape }
+            settleResult(id, site, opts.calls!(site))
+            return
+        }
+        const callee = constantTarget(getRef(n, 1))
+        const receiver = getRef(n, 2)
+        const receiverShape = shapeOf(receiver)
+        const split = callee ? undefined : unionTargets.get(getRef(n, 1))
+        if (split) {
+            const union = unions.get(getRef(n, 2))
+            const arms: number[] = []
+            const shapes: (Handle | undefined)[] = []
+            for (let i = 0; i < split.arms.length; i++) {
+                const arm = newId()
+                const ids = cloneRefs(n)
+                ids[1] = split.arms[i]
+                nodes.set(arm, copyNode(n, ids, cloneLiterals(n)))
+                const saved = armOverride
+                armOverride = union ? { id: getRef(n, 2), shape: union.members[i] } : undefined
+                try {
+                    bindCall(arm, demanded, true)
+                } finally {
+                    armOverride = saved
+                }
+                arms.push(arm)
+                shapes.push(memory.get(arm)?.shape)
+            }
+            nodes.set(id, makeNode('after', [getRef(n, 0), tagSelect(split.tag, arms)], new Float64Array(2)))
+            if (shapes.every(s => s !== undefined)) joinResult(id, split.tag, shapes as Handle[])
+            return
+        }
+        if (!callee) return
+        const site: CallSite = { call: id, target: nodes.get(callee)!, receiver: receiverShape, args, demanded }
+        const binding = opts.calls!(site)
         if (!binding) return
         const current = nodes.get(id)!
         const ids = cloneRefs(current)
@@ -682,7 +1064,13 @@ export function resolveProperties(
         function prepare(value: number, shape: Handle | undefined): void {
             if (!value) return
             if (!memory.has(value) && shape !== undefined && snapshotNode(value)) {
-                materialize(value, shape)
+                allocToken = token
+                try {
+                    materialize(value, shape)
+                    token = allocToken
+                } finally {
+                    allocToken = undefined
+                }
                 lazy.add(value)
             }
             const mem = memory.get(value)
@@ -690,14 +1078,16 @@ export function resolveProperties(
         }
         for (let i = 0; i < binding.paramCount && i < args.length; i++) prepare(getRef(n, 3 + i), args[i])
         if (binding.receiver) prepare(receiver, binding.receiverShape ?? shapeOf(receiver))
-        if (binding.result !== undefined && !memory.has(id)) {
-            const fields = layout(binding.result)
-            memory.set(id, { ...fields, ptr: id, base: 0, shape: binding.result, reduced: fields.keys.length === 1 && readonlyKeys(binding.result, fields.keys), pointer: true, address: [id, 0] })
-        }
+        settleResult(id, site, binding)
         const retarget = !directTarget(getRef(n, 1))
-        if (!binding.receiver && !binding.returnSlot && !retarget && token === ids[0]) return
+        if (!binding.receiver && !binding.returnSlot && !retarget && binding.target === undefined && token === ids[0]) return
         ids[0] = token
         if (retarget) ids[1] = callee
+        if (binding.target !== undefined) {
+            const specialized = newId()
+            nodes.set(specialized, makeNode('heap-handle', [0], new Float64Array([binding.target])))
+            ids[1] = specialized
+        }
         ids[2] = 0
         literals[2] = 0
         if (binding.receiver) {
@@ -721,30 +1111,45 @@ export function resolveProperties(
         }
         nodes.set(id, copyNode(current, ids, new Float64Array(literals)))
     }
-    function adopt(id: number): void {
-        if (memory.has(id) || cells.has(id)) return
-        const n = source.get(id)
-        if (n?.op === 'call') {
-            bindCall(id, true)
-            return
-        }
-        if (n?.op !== 'get' && n?.op !== 'param') return
-        const shape = pointerLayout(id)
-        if (!shape) return
-        const fields = layout(shape)
-        memory.set(id, { ...fields, ptr: id, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [id, 0] })
+    const decodeInputs = new Set<number>()
+    function decodeHandle(raw: number, base: number): number {
+        const offset = newId()
+        nodes.set(offset, makeNode('ushr', [raw, 0], new Float64Array([0, 1])))
+        const address = newId()
+        nodes.set(address, makeNode('add', [offset, 0], new Float64Array([0, base])))
+        const ptr = newId()
+        nodes.set(ptr, makeNode('select', [raw, address, 0], new Float64Array(3)))
+        decodeInputs.add(offset)
+        decodeInputs.add(ptr)
+        return ptr
     }
-
+    function bindResult(id: number, shape: Handle, decode: number | undefined): void {
+        const fields = layout(shape)
+        const ptr = decode !== undefined ? decodeHandle(id, decode) : id
+        memory.set(id, { ...fields, ptr, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [ptr, 0], decoded: decode !== undefined })
+    }
     function evaluate(id: number): HeapState | undefined {
         const known = after.get(id)
         if (known) return known
+        return query(`e${id}`, () => evaluateNow(id), undefined)
+    }
+    function evaluateNow(id: number): HeapState | undefined {
         const n = source.get(id)!
         const object = getRef(n, 1)
-        if (source.get(object)?.op === 'get-prop') evaluate(object)
-        adopt(object)
-        const prior = cells.size ? stateAt(getRef(n, 0)) : start
+        const inputs = inputsOf(n)
+        const values = inputs.map(shape)
+        if (values.includes(pendingShape)) return
+        if (snapshotNode(object) && !memory.has(object)) for (const call of callUses.get(object) ?? []) bindCall(call, accessed.has(call))
+        if (n.op === 'get-prop') {
+            const objectShape = shape(object)
+            const reads = cells.has(object) || snapshotNode(object) ? [] : objectShape ? readsState(n, objectShape) ? [objectShape] : [] : unions.get(object)?.members ?? []
+            for (const read of reads) demandWriters(read, [object])
+            if (!settled() && !reads.every(read => writersKnown.has(rootOf(read)))) return
+        }
+        const prior = roots.length ? stateAt(getRef(n, 0)) : start
         if (!prior) return
-        if (opts.partial && !memory.has(getRef(n, 1)) && !cells.has(getRef(n, 1))) {
+        if (!settled()) inputs.forEach((input, i) => pin(input, values[i]))
+        if (opts.partial && !memory.has(object) && !cells.has(object) && !unions.has(object)) {
             after.set(id, prior)
             return prior
         }
@@ -752,6 +1157,8 @@ export function resolveProperties(
         resolve(id, n)
         const state = records.capture(roots)
         after.set(id, state)
+        const result = memory.get(id)
+        if (result) hold(rootOf(result.shape), id)
         return state
     }
 
@@ -759,7 +1166,18 @@ export function resolveProperties(
         if (n.op !== 'get-prop' && n.op !== 'set-prop') continue
         if (!evaluate(id)) throw `property-eval: %${id} depends on its own loop`
     }
-    for (const [id, n] of source) if (n.op === 'call') bindCall(id, accessed.has(id))
+    for (const [id, n] of source) {
+        if (n.op !== 'call') continue
+        bindCall(id, accessed.has(id))
+        resolvePending(id)
+    }
+    for (let i = 0; i < assumed.length; i++) {
+        const id = assumed[i]
+        const settledShape = shape(id)
+        const again = deriveShape(id)
+        if (again === settledShape || (again && settledShape && native.sameSnapshotShape(again, settledShape))) continue
+        throw `property-eval: %${id} was assumed to be ${settledShape} but settles as ${again}`
+    }
     for (const [param, state] of entries) {
         const at = tokenParams.get(param)!
         for (const apply of inbound.get(at.block) ?? []) {
@@ -794,7 +1212,18 @@ export function resolveProperties(
     const replaced = new Map<number, [number, number]>()
     for (const [id, mem] of memory) {
         addresses.set(id, mem.ptr)
-        if (!mem.pointer) replaced.set(id, addressOf(mem))
+        if (!mem.pointer || mem.decoded) replaced.set(id, addressOf(mem))
+    }
+    for (const [id, n] of nodes) {
+        if (n.op !== 'heap-handle' || getRef(n, 0) || countLiterals(n) !== 1 || memory.has(id) || replaced.has(id)) continue
+        const home = homes.get(getLiteral(n, 0) as Handle)
+        if (home && home.ptr) replaced.set(id, addressOf(home))
+    }
+    const returning = new Set<number>()
+    for (const [id, n] of nodes) {
+        if (n.op !== 'ret') continue
+        returning.add(id)
+        for (let m = nodes.get(getRef(n, 0)), at = getRef(n, 0); m?.op === 'after'; at = getRef(m, countIds(m) - 1), m = nodes.get(at)) returning.add(at)
     }
 
     function target(id: number): number {
@@ -807,6 +1236,9 @@ export function resolveProperties(
         for (let i = 0; i < countIds(n); i++) {
             const ref = getRef(n, i)
             if (!ref || (!forward.has(ref) && !replaced.has(ref))) continue
+            if (decodeInputs.has(id) && !forward.has(ref)) continue
+            const tail = nodes.get(id)!.op === 'ret' ? 0 : countIds(n) - 1
+            if (returning.has(id) && i === tail && memory.get(ref)?.decoded && !forward.has(ref)) continue
             ids ??= Array.from({ length: countIds(n) }, (_, j) => getRef(n, j))
             literals ??= Array.from({ length: countIds(n) }, (_, j) => getRef(n, j) ? 0 : getLiteral(n, j))
             if (forward.has(ref)) {
@@ -828,7 +1260,9 @@ export function resolveProperties(
         const [ptr] = addressOf(mem)
         if (ptr) shapes.set(ptr, mem.shape)
     }
-    return { graph: out, calls, addresses, shapes }
+    const encoded = new Set<number>()
+    for (const [id, mem] of memory) if (mem.decoded) encoded.add(id)
+    return { graph: out, calls, addresses, shapes, encoded }
 }
 
 export interface ClosureScope {
@@ -836,9 +1270,18 @@ export interface ClosureScope {
     envs: number[]
 }
 
+export interface ClosureOptions {
+    locate?: PropertyEvalOptions['locate']
+    stored?: PropertyEvalOptions['stored']
+    frame?: Handle
+    contextShape?: Handle
+    closureShapes?: Map<u32, Handle>
+}
+
 export interface ResolvedClosures {
     graph: Graph
     memoryShapes: Map<number, Handle>
+    encoded?: Set<number>
     closures: u32[]
     passed: { call: number, index: number, closure: u32, shape: Handle }[]
 }
@@ -867,6 +1310,7 @@ export function resolveClosures(
     params?: Map<number, Handle>,
     constructed?: Constructed,
     calls?: PropertyEvalOptions['calls'],
+    extra: ClosureOptions = {},
 ): ResolvedClosures {
     const runtime = session.runtime
     if (!runtime) throw 'property-eval: closures resolve inside an entered trace'
@@ -888,7 +1332,7 @@ export function resolveClosures(
     const objects = new Map<number, Handle>()
     const pointers = new Map<number, Handle>()
     for (const [i, shape] of params ?? []) pointers.set(graph.blocks[0].params[i], shape)
-    const frame = frameShape(frameSize)
+    const frame = extra.frame ?? frameShape(frameSize)
     let envNode = 0
     if (frameProxy !== undefined) {
         for (const [id, n] of nodes) if (n.op === 'heap-handle' && !getRef(n, 0) && getLiteral(n, 0) === frameProxy) envNode = id
@@ -900,9 +1344,11 @@ export function resolveClosures(
     }
     if (scope) {
         envPointerShape ??= frameShape(256)
-        for (const env of scope.envs) {
+        for (let i = 0; i < scope.envs.length; i++) {
+            const env = scope.envs[i]
             ensureNode(env)
-            pointers.set(env, envPointerShape)
+            const slot = extra.contextShape !== undefined ? slotAt(extra.contextShape, heap.closureScopeKey(i as u32)) : undefined
+            pointers.set(env, slot !== undefined && isObjectSlot(slot) ? slot : envPointerShape)
         }
         for (const [id, n] of nodes) if (n.op === 'call-context') pointers.set(id, scopeShape(scope.bindings.length))
     }
@@ -915,8 +1361,11 @@ export function resolveClosures(
     }
     const shapes = new Map<u32, Handle>()
     function closureShape(handle: u32): Handle {
-        const known = shapes.get(handle)
-        if (known !== undefined) return known
+        const known = shapes.get(handle) ?? extra.closureShapes?.get(handle)
+        if (known !== undefined) {
+            shapes.set(handle, known)
+            return known
+        }
         const template = session.templateOf(handle)!
         const proto = heap.makeObject(0 as Handle)
         heap.setProperty(proto, heap.closureCallKey, handle as Handle)
@@ -926,6 +1375,7 @@ export function resolveClosures(
         const bindings = template.compiled.scopeBindings
         for (let i = 0; i < bindings.length; i++) heap.setReadonlyProperty(shape, heap.closureScopeKey(i as u32), envValue(bindings[i].parentSlot))
         shapes.set(handle, shape)
+        extra.closureShapes?.set(handle, shape)
         return shape
     }
 
@@ -943,8 +1393,8 @@ export function resolveClosures(
         }
     }
     if (!objects.size && !pointers.size && !calls) return { graph, memoryShapes: new Map(), closures: [], passed }
-    const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, partial: true, constructed, calls })
-    return { graph: resolved.graph, memoryShapes: resolved.shapes, closures: [...shapes.keys()], passed }
+    const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, partial: true, constructed, calls, locate: extra.locate, stored: extra.stored })
+    return { graph: resolved.graph, memoryShapes: resolved.shapes, encoded: resolved.encoded, closures: [...shapes.keys()], passed }
 }
 
 function isObjectSlot(slot: Handle): boolean {
@@ -962,6 +1412,31 @@ function readonlyKeys(target: Handle, keys: Handle[]): boolean {
         if (d.flags & heap.PropFlags.writable) return false
     }
     return true
+}
+
+export function fieldOffset(shape: Handle, key: Handle, refinements?: Map<Handle, Map<Handle, Handle>>): number | undefined {
+    function size(of: Handle): number {
+        let total = 0
+        for (const k of dataKeys(of)) {
+            const inner = refinements?.get(of)?.get(k)
+            total += inner !== undefined ? size(inner) : 8
+        }
+        return total
+    }
+    let offset = 0
+    for (const k of dataKeys(shape)) {
+        if (k === key) return offset
+        const inner = refinements?.get(shape)?.get(k)
+        offset += inner !== undefined ? size(inner) : 8
+    }
+    return undefined
+}
+
+export function representedBy(shape: Handle): Handle {
+    const keys = dataKeys(shape)
+    if (keys.length !== 1 || !readonlyKeys(shape, keys)) return shape
+    const slot = slotAt(shape, keys[0])
+    return isObjectSlot(slot) ? slot : shape
 }
 
 function dataKeys(target: Handle): Handle[] {
@@ -1117,7 +1592,9 @@ if (intrinsics.argv()[0] === 'property-eval') {
         session.enterTrace()
         defer session.leaveTrace()
         const traced = trace2(fn, { session }).graph
+        if (intrinsics.argv().includes(`pe-dump:${fn.name}`)) console.log('--- traced', dumpGraph(traced))
         const resolved = resolveProperties(traced, session, objects(traced), { ...opts, pointers: pointers?.(traced) })
+        if (intrinsics.argv().includes(`pe-dump:${fn.name}`)) console.log('--- resolved', dumpGraph(resolved.graph))
         return unitOf(resolved, opts)
     }
     function install(name: string, unit: Unit): { run: any, text: string, listing: string } {
@@ -1137,6 +1614,7 @@ if (intrinsics.argv()[0] === 'property-eval') {
             console.log(text)
             throw `property-eval: ${name} still has property values`
         }
+        native.seedPstacks(graph)
         const lowered = lowerValueGraph(graph)
         return { run: native.installNative(lowered.bytes), text, listing: lowered.listing }
     }
