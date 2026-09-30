@@ -1261,10 +1261,18 @@ export function packageBlocksFINAL(g: Graph) {
 }
 
 const optimizeTimers = intrinsics.argv().includes('optimize-stats') ? new Map<string, number>() : undefined
+const optimizeChanges = new Map<string, [calls: number, changes: number]>()
+const optimizeRounds = Number(intrinsics.argv().find(a => a.startsWith('optimize-rounds:'))?.slice(16) ?? 0)
+const disabledPasses = new Set(intrinsics.argv().filter(a => a.startsWith('no-pass:')).map(a => a.slice(8)))
 
 export function printOptimizeStats(): void {
     if (!optimizeTimers) return
-    for (const [name, ms] of [...optimizeTimers].sort((a, b) => b[1] - a[1])) console.log('optimize step', ms.toFixed(1), name)
+    for (const [name, ms] of [...optimizeTimers].sort((a, b) => b[1] - a[1])) {
+        const counts = optimizeChanges.get(name)
+        console.log('optimize step', ms.toFixed(1), name, counts ? `${counts[1]}/${counts[0]}` : '')
+    }
+    optimizeTimers.clear()
+    optimizeChanges.clear()
 }
 
 function optimizeValueGraph(g: Graph) {
@@ -1432,7 +1440,9 @@ function optimizeValueGraph(g: Graph) {
             for (let i = 1; i < countIds(n); i++) {
                 visit(getRef(n, i), true)
             }
+            const outer = stack.splice(0)
             visitBlock(b)
+            stack.push(...outer)
             return
         }
         for (const x of gn.enumerateRefs(n)) {
@@ -1557,10 +1567,17 @@ function optimizeValueGraph(g: Graph) {
     const passDebug = intrinsics.argv().includes('pass-debug')
         || (g.name !== undefined && intrinsics.argv().includes(`pass-debug:${g.name}`))
     function step(pass: (b: GraphBlock) => unknown, b: GraphBlock): boolean {
+        if (disabledPasses.has(pass.name)) return false
         if (!optimizeTimers && !passDebug) return runStep(pass, b)
         const s = performance.now()
         const changed = runStep(pass, b)
-        if (optimizeTimers) time(pass.name, performance.now() - s)
+        if (optimizeTimers) {
+            time(pass.name, performance.now() - s)
+            const counts = optimizeChanges.get(pass.name) ?? [0, 0]
+            counts[0]++
+            if (changed) counts[1]++
+            optimizeChanges.set(pass.name, counts)
+        }
         if (passDebug && changed) console.log(`--- ${pass.name} changed B${b.id} ---\n${dumpGraph(g)}`)
         return changed
     }
@@ -1802,7 +1819,7 @@ function optimizeValueGraph(g: Graph) {
         let result = false
         for (let i = 0; i < lb; i++) {
             const q = getRef(nb, i)
-            if (precedes(a, q, true)) {
+            if (q === a || precedes(a, q, true)) {
                 result = true
                 break
             }
@@ -1860,18 +1877,39 @@ function optimizeValueGraph(g: Graph) {
             return u
         }
         const sink = into && !isNilOrVoid(into) ? into : undefined
-        const pruned = values.filter(x => !isNilOrVoid(x))
+        const pruned: number[] = []
+        function add(x: number): void {
+            if (isNilOrVoid(x)) return
+            const n = g.nodes.get(x)!
+            const last = countIds(n) - 1
+            if (n.op !== 'after' || !isNilOrVoid(getRef(n, last))) {
+                pruned.push(x)
+                return
+            }
+            for (let i = 0; i < last; i++) add(getRef(n, i))
+        }
+        for (const x of values) add(x)
+        outer: for (let i = 0; i < pruned.length; i++) {
+            for (let j = 0; j < pruned.length; j++) {
+                if (i === j) continue
+                if (pruned[i] === pruned[j] || precedes(pruned[j], pruned[i])) {
+                    pruned.splice(j, 1)
+                    i = -1
+                    continue outer
+                }
+            }
+        }
         if (!pruned.length) return into ?? nil()
         if (pruned.length === 1) {
             const v = pruned[0]
             if (!sink) return v
-            return precedes(v, sink) ? sink : createNode(g, 'after', [v, sink])
+            return v === sink || precedes(v, sink) ? sink : createNode(g, 'after', [v, sink])
         }
         if (!sink) {
             pruned.push(Void())
             return createNode(g, 'after', pruned)
         }
-        const rem = pruned.filter(x => !precedes(x, sink))
+        const rem = pruned.filter(x => x !== sink && !precedes(x, sink))
         if (!rem.length) return sink
         rem.push(sink)
         return createNode(g, 'after', rem)
@@ -1885,16 +1923,12 @@ function optimizeValueGraph(g: Graph) {
 
     function simplifyOrdering(
         vid: number,
-        unordered = new Set<number>(),
         from?: GraphNode,
     ): number | undefined {
-        if (!vid || unordered.has(vid)) return
+        if (!vid) return
         const u = g.nodes.get(vid)
         if (!u) return
-        if (u.op === 'param') {
-            if (from && OrderedValues.has(from.op)) return
-            return vid
-        }
+        if (u.op === 'param') return
         if (u.op === 'nil-effect') return vid
         if (u.op === 'unreachable') return vid
         if (u.op === 'ret' || u.op === 'panic') {
@@ -1908,7 +1942,7 @@ function optimizeValueGraph(g: Graph) {
             let changed = false
             const arr: number[] = []
             for (let i = 1; i < countIds(u); i++) {
-                const q = simplifyOrdering(getRef(u, i), unordered, from)
+                const q = simplifyOrdering(getRef(u, i), from)
                 if (q !== getRef(u, i)) changed = true
                 arr.push(q ?? nil())
             }
@@ -1920,7 +1954,7 @@ function optimizeValueGraph(g: Graph) {
         }
         if (u.op === 'after') {
             const end = countIds(u)-1
-            const r = simplifyOrdering(getRef(u, end), unordered, from)
+            const r = simplifyOrdering(getRef(u, end), from)
             // if (r && (!isUnordered(r) || isParam(g.nodes, r))) {
             //     return vid
             // }
@@ -1928,19 +1962,28 @@ function optimizeValueGraph(g: Graph) {
             let changed = r !== getRef(u, end)
             const arr: number[] = []
             for (let i = 0; i < end; i++) {
-                const q = simplifyOrdering(getRef(u, i), unordered, u)
+                const q = simplifyOrdering(getRef(u, i), from)
                 if (q !== getRef(u, i)) changed = true
                 if (!q) continue
                 if (isUnreachable(q)) return q
                 arr.push(q)
             }
-            if (!changed) return vid
-            return effectsJoin(arr, r)
+            if (r) arr.push(r)
+            if (changed) return effectsJoin(arr)
+            const fresh = g.maxId
+            const joined = effectsJoin(arr)
+            if (joined < fresh || countIds(g.nodes.get(joined)!) - 1 < arr.length || !isNilOrVoid(getRef(u, end))) return joined
+            g.nodes.delete(joined)
+            return vid
         }
         if (OrderedValues.has(u.op)) {
             const clobbers = u.op === 'store' || (u.op === 'call' && callEffect(u) > 1)
-            if (!clobbers && (from?.op === 'load' || from?.op === 'after')) {
-                return simplifyOrdering(getRef(u, 0), unordered, from)
+            const pure = u.op === 'load' || (u.op === 'call' && !clobbers)
+            if (pure && (from?.op === 'apply' || from?.op === 'ret')) {
+                return simplifyOrdering(getRef(u, 0), from)
+            }
+            if (!clobbers && from?.op === 'load') {
+                return simplifyOrdering(getRef(u, 0), from)
             }
             return vid
         }
@@ -1949,7 +1992,7 @@ function optimizeValueGraph(g: Graph) {
             const arr: number[] = []
             let changed = false
             for (let i = 0; i < countIds(u); i++) {
-                const q = simplifyOrdering(getRef(u, i), unordered, from)
+                const q = simplifyOrdering(getRef(u, i), from)
                 if (q !== getRef(u, i)) changed = true
                 if (!q) continue
                 if (isUnreachable(q)) return q
@@ -1967,23 +2010,46 @@ function optimizeValueGraph(g: Graph) {
         return op === 'nil-effect' || op === 'void'
     }
 
-    function reduceBlockOrdering(target: GraphBlock, unordered?: Set<number>): boolean {
+    function reduceBlockOrdering(target: GraphBlock): boolean {
         let changed = false
         const epoch = nextEpoch(g)
         const replacements = new Map<number, number>()
         function visit(id: number): void {
             if (!id) return
-            const n = g.nodes.get(id)
+            let n = g.nodes.get(id)
             if (!n || !markVisited(n, epoch)) return
             for (let i = 0; i < countIds(n); i++) visit(getRef(n, i))
 
+            let resolved: number[] | undefined
+            for (let i = 0; i < countIds(n); i++) {
+                const r = replacements.get(getRef(n, i))
+                if (r === undefined) continue
+                if (!resolved) resolved = cloneRefs(n)
+                resolved[i] = r
+            }
+            if (resolved) {
+                n = copyNode(n, resolved, cloneLiterals(n))
+                markVisited(n, epoch)
+                g.nodes.set(id, n)
+                changed = true
+            }
+
             if (n.op !== 'after' && !OrderedValues.has(n.op)) return
             const end = n.op === 'after' ? countIds(n) - 1 : 1
+            const tail = n.op === 'after' ? g.nodes.get(replacements.get(getRef(n, end)) ?? getRef(n, end)) : undefined
+            const from = tail?.op === 'apply' || tail?.op === 'ret' ? tail : n
             let argIds: number[] | undefined
             let argConsts: Float64Array | undefined
             for (let i = 0; i < end; i++) {
                 const q = replacements.get(getRef(n, i)) ?? getRef(n, i)
-                const ordering = simplifyOrdering(q, unordered, n)
+                if (g.nodes.get(q)?.op === 'void') {
+                    if (!argIds) argIds = cloneRefs(n)
+                    if (!argConsts) argConsts = cloneLiterals(n)
+                    argIds[i] = nil()
+                    argConsts[i] = 0
+                    continue
+                }
+                const ordering = simplifyOrdering(q, from)
                 if (ordering === q || (isNilOrVoid(ordering) && isNilOrVoid(q))) {
                     continue
                 }
@@ -2004,6 +2070,34 @@ function optimizeValueGraph(g: Graph) {
                 }
                 return
             }
+            if (n.op === 'after' && !isNilOrVoid(getRef(n, end))) {
+                const fresh = g.maxId
+                const joined = effectsJoin(orderings, replacements.get(getRef(n, end)) ?? getRef(n, end))
+                if (joined < fresh) {
+                    replacements.set(id, joined)
+                    return
+                }
+                const j = g.nodes.get(joined)!
+                g.nodes.delete(joined)
+                if (countIds(j) === countIds(n) && getArgIds(j).every((x, i) => x === getRef(n, i))) return
+                g.nodes.set(id, j)
+                changed = true
+                return
+            }
+            if (OrderedValues.has(n.op)) {
+                const ordering = (argIds ?? getArgIds(n))[0]
+                const o = g.nodes.get(ordering)
+                const parallel = o?.op === 'after' && isNilOrVoid(getRef(o, countIds(o) - 1))
+                const parts = (parallel ? cloneRefs(o!, 0, countIds(o!) - 1) : [ordering]).filter(p => !isNilOrVoid(p))
+                const operands = cloneRefs(n, 1).filter(x => x)
+                const kept = parts.filter(p => !operands.some(x => x === p || precedes(p, x)))
+                if (kept.length < parts.length) {
+                    if (!argIds) argIds = cloneRefs(n)
+                    if (!argConsts) argConsts = cloneLiterals(n)
+                    argIds[0] = effectsJoin(kept)
+                    argConsts[0] = 0
+                }
+            }
             if (!argIds || !argConsts) return
             for (let i = end; i < argIds.length; i++) {
                 const q = argIds[i]
@@ -2015,6 +2109,80 @@ function optimizeValueGraph(g: Graph) {
         visit(target.bodyId)
         if (!changed && !replacements.size) return false
         for (const [id, value] of replacements) replacements.set(id, replaceAll(value, replacements))
+        target.bodyId = replaceAll(target.bodyId, replacements)
+        revisitBlock(target)
+        return true
+    }
+
+    function liftAfters(target: GraphBlock): boolean {
+        const members = new Set<number>()
+        const users = new Set<number>()
+        for (const a of findValues(target.id, 'after') ?? []) {
+            const n = g.nodes.get(a)
+            if (!n || isNilOrVoid(getRef(n, countIds(n) - 1))) continue
+            for (const u of usedBy.get(a) ?? []) users.add(u)
+        }
+        if (!users.size) return false
+        for (const ids of byOp.get(target.id)!.values()) for (const id of ids) members.add(id)
+        let changed = false
+        for (const id of users) {
+            let n = g.nodes.get(id)
+            if (!n || !members.has(id)) continue
+            const first = OrderedValues.has(n.op) || n.op === 'apply' ? 1 : n.op === 'ret' ? 0 : countIds(n)
+            let lifted: number[] | undefined
+            const parts: number[] = []
+            for (let i = first; i < countIds(n); i++) {
+                const a = g.nodes.get(getRef(n, i))
+                if (a?.op !== 'after') continue
+                const last = countIds(a) - 1
+                if (isNilOrVoid(getRef(a, last))) continue
+                const v = getRef(a, last)
+                const value = g.nodes.get(v)!
+                if (OrderedValues.has(value.op) && cloneRefs(a, 0, last).every(p => {
+                    const q = simplifyOrdering(p, value)
+                    return isNilOrVoid(q) || q === v || precedes(q!, v)
+                })) {
+                    if (!lifted) lifted = cloneRefs(n)
+                    lifted[i] = v
+                    continue
+                }
+                if (!OrderedValues.has(n.op) && !isUnordered(getRef(a, last))) continue
+                if (!lifted) lifted = cloneRefs(n)
+                lifted[i] = getRef(a, last)
+                for (let j = 0; j < last; j++) parts.push(getRef(a, j))
+            }
+            if (!lifted) continue
+            if (OrderedValues.has(n.op)) {
+                lifted[0] = effectsJoin([getRef(n, 0), ...parts])
+                n = copyNode(n, lifted, cloneLiterals(n))
+            } else {
+                const inner = g.maxId++
+                g.nodes.set(inner, copyNode(n, lifted, cloneLiterals(n)))
+                n = copyNode(n, [...parts, inner], new Float64Array(parts.length + 1), 'after')
+            }
+            g.nodes.set(id, n)
+            changed = true
+        }
+        if (changed) revisitBlock(target)
+        return changed
+    }
+
+    function eliminateUnusedPureValues(target: GraphBlock): boolean {
+        const replacements = new Map<number, number>()
+        for (const id of findValues(target.id, 'load') ?? []) {
+            if (usedBy.get(id)?.length) continue
+            replacements.set(id, getRef(g.nodes.get(id)!, 0))
+        }
+        for (const id of findValues(target.id, 'call') ?? []) {
+            if (usedBy.get(id)?.length) continue
+            const n = g.nodes.get(id)!
+            if (callEffect(n) > 1) continue
+            replacements.set(id, getRef(n, 0))
+        }
+        if (!replacements.size) return false
+        for (const id of [...replacements.keys()].sort((a, b) => a - b)) {
+            replacements.set(id, replaceAll(replacements.get(id)!, replacements))
+        }
         target.bodyId = replaceAll(target.bodyId, replacements)
         revisitBlock(target)
         return true
@@ -2589,7 +2757,7 @@ function optimizeValueGraph(g: Graph) {
                     if (a) o.push(a)
                     else o.push(literal(getLiteral(u, i)))
                 } else if (a && !isParam(g.nodes, a)) {
-                    const q = simplifyOrdering(a, undefined, orderingSink)
+                    const q = simplifyOrdering(a, orderingSink)
                     if (q && !isNilOrVoid(q) && !rem.includes(q)) rem.push(q)
                 }
             }
@@ -3870,7 +4038,7 @@ function optimizeValueGraph(g: Graph) {
                 if (!id) return
                 const n = g.nodes.get(id)
                 if (!n || !markVisited(n, epoch)) return
-                if (n?.op === 'nil-effect' || n?.op === 'void') r.set(id, join)
+                if (n?.op === 'nil-effect') r.set(id, join)
                 else for (const x of getArgIds(n)) nils(x)
             }
             nils(bodyId)
@@ -4097,9 +4265,31 @@ function optimizeValueGraph(g: Graph) {
             for (let i = 0; i < countIds(n); i++) if (!quietSince(getRef(n, i), load)) return false
             return true
         }
+        function restores(store: GraphNode): boolean {
+            const bytes = bits(store) / 8
+            let prior = getRef(store, 0)
+            for (;;) {
+                const n = g.nodes.get(prior)
+                if (!n) return false
+                if (n.op === 'load') {
+                    prior = getRef(n, 0)
+                    continue
+                }
+                if (n.op !== 'store') return false
+                if (sameLocation(n, store)) return bits(n) === bits(store) && sameOperand(n, store, 3)
+                if (!getRef(n, 1) || getRef(n, 1) !== getRef(store, 1) || getRef(n, 2) || getRef(store, 2)) return false
+                const at = getLiteral(n, 2)
+                if (at < getLiteral(store, 2) + bytes && getLiteral(store, 2) < at + bits(n) / 8) return false
+                prior = getRef(n, 0)
+            }
+        }
         if (!r.size) {
             for (const id of findValues(target.id, 'store') ?? []) {
                 const store = g.nodes.get(id)!
+                if (restores(store)) {
+                    r.set(id, getRef(store, 0) || addNode('nil-effect', [], new Float64Array()))
+                    break
+                }
                 let value = getRef(store, 3)
                 for (let m = g.nodes.get(value); m?.op === 'after'; m = g.nodes.get(value)) value = getRef(m, countIds(m) - 1)
                 const loaded = g.nodes.get(value)
@@ -4398,283 +4588,6 @@ function optimizeValueGraph(g: Graph) {
         for (const b of touched) b.bodyId = replaceAll(rewriteTail(b), replaced)
         for (const b of touched) revisitBlock(b)
         return true
-    }
-
-    function reduceEffectDependencies(target: GraphBlock) {
-        const selects = findValues(target.id, 'select') ?? []
-        const afters = findValues(target.id, 'after') ?? []
-        const calls = findValues(target.id, 'call') ?? []
-        const stores = findValues(target.id, 'store') ?? []
-        const loads = findValues(target.id, 'load') ?? []
-        if (!selects.length && !afters.length && !calls.length && !stores.length && !loads.length) return
-
-        const divergesMemo = new Map<number, boolean>()
-        function diverges(id: number): boolean {
-            if (!id) return false
-            const known = divergesMemo.get(id)
-            if (known !== undefined) return known
-            const n = g.nodes.get(id)
-            let out = false
-            if (n) {
-                if (n.op === 'panic' || n.op === 'unreachable' || n.op === 'trap') out = true
-                else if (n.op === 'after') out = getArgIds(n).some(diverges)
-                else if (n.op === 'select') out = diverges(getRef(n, 1)) && diverges(getRef(n, 2))
-                else if (n.op === 'apply') {
-                    for (let i = 1; !out && i < countIds(n); i++) out = diverges(getRef(n, i))
-                }
-            }
-            divergesMemo.set(id, out)
-            return out
-        }
-
-        let changed = false
-        for (const id of selects) {
-            const n = g.nodes.get(id)!
-            if (n.op !== 'select') continue
-            let survivor = -1
-            for (let i = 1; i < countIds(n); i++) {
-                if (diverges(getRef(n, i))) continue
-                if (survivor >= 0) { survivor = -2; break }
-                survivor = i
-            }
-            if (survivor < 0) continue
-            const args = new Float64Array(2)
-            args[0] = getLiteral(n, 0)
-            args[1] = getLiteral(n, survivor)
-            g.nodes.set(id, copyNode(n, [getRef(n, 0), getRef(n, survivor)], args, 'after'))
-            changed = true
-        }
-
-        const siblingOf = new Map<number, number>()
-        const ambiguous = new Set<number>()
-        for (const id of selects) {
-            const n = g.nodes.get(id)!
-            if (n.op !== 'select') continue
-            const a = getRef(n, 1)
-            const b = getRef(n, 2)
-            if (!a || !b || a === b) {
-                if (a) ambiguous.add(a)
-                if (b) ambiguous.add(b)
-                continue
-            }
-            const prevA = siblingOf.get(a)
-            if (prevA !== undefined && prevA !== b) ambiguous.add(a)
-            else siblingOf.set(a, b)
-            const prevB = siblingOf.get(b)
-            if (prevB !== undefined && prevB !== a) ambiguous.add(b)
-            else siblingOf.set(b, a)
-        }
-
-        const members = new Set<number>()
-        for (const arr of byOp.get(target.id)!.values()) for (const id of arr) members.add(id)
-        function escapes(users?: Iterable<number>): boolean {
-            if (users) for (const u of users) if (!members.has(u)) return true
-            return false
-        }
-
-        const evalArms = new Map<number, Set<number>>()
-        const dataArms = new Map<number, Set<number>>()
-        const demanded = new Set<number>()
-        const checked = new Set<number>()
-        if (calls.length || stores.length) {
-            const queue: [id: number, arms: Set<number>, used: boolean][] = []
-            const none = new Set<number>()
-            function send(id: number, arms: Set<number>, mark: number, used: boolean): void {
-                if (!id) return
-                const next = new Set<number>(arms)
-                if (mark) next.add(mark)
-                queue.push([id, next, used])
-            }
-            function narrow(map: Map<number, Set<number>>, id: number, arms: Set<number>): boolean {
-                const prev = map.get(id)
-                if (!prev) { map.set(id, new Set<number>(arms)); return true }
-                const drop: number[] = []
-                for (const a of prev) if (!arms.has(a)) drop.push(a)
-                for (const a of drop) prev.delete(a)
-                return drop.length > 0
-            }
-            send(target.bodyId, none, 0, false)
-            send(target.bodyId, none, 0, true)
-            while (queue.length) {
-                const [id, arms, used] = queue.pop()!
-                if (!checked.has(id)) {
-                    checked.add(id)
-                    if (escapes(dependents.get(id))) queue.push([id, none, false])
-                    if (escapes(usedBy.get(id))) queue.push([id, none, true])
-                }
-                if (used) demanded.add(id)
-                if (!narrow(used ? dataArms : evalArms, id, arms)) continue
-                if (!members.has(id)) continue
-                const n = g.nodes.get(id)
-                if (!n) continue
-                const evalCtx = evalArms.get(id) ?? arms
-                const dataCtx = dataArms.get(id) ?? evalCtx
-                const isUsed = demanded.has(id)
-                if (n.op === 'select') {
-                    send(getRef(n, 0), evalCtx, 0, false)
-                    if (isUsed) send(getRef(n, 0), dataCtx, 0, true)
-                    for (let i = 1; i < countIds(n); i++) {
-                        const arm = getRef(n, i)
-                        if (!arm) continue
-                        const mark = ambiguous.has(arm) ? 0 : arm
-                        send(arm, evalCtx, mark, false)
-                        if (isUsed) send(arm, dataCtx, mark, true)
-                    }
-                } else if (n.op === 'after') {
-                    const last = countIds(n) - 1
-                    for (let i = 0; i <= last; i++) send(getRef(n, i), evalCtx, 0, false)
-                    if (isUsed) send(getRef(n, last), dataCtx, 0, true)
-                } else if (OrderedValues.has(n.op)) {
-                    send(getRef(n, 0), evalCtx, 0, false)
-                    for (let i = 1; i < countIds(n); i++) {
-                        send(getRef(n, i), evalCtx, 0, false)
-                        send(getRef(n, i), evalCtx, 0, true)
-                    }
-                } else if (n.op === 'apply') {
-                    for (let i = 1; i < countIds(n); i++) {
-                        send(getRef(n, i), evalCtx, 0, false)
-                        send(getRef(n, i), evalCtx, 0, true)
-                    }
-                } else {
-                    for (const a of getArgIds(n)) {
-                        send(a, evalCtx, 0, false)
-                        if (isUsed) send(a, dataCtx, 0, true)
-                    }
-                }
-            }
-        }
-
-        function released(load: number, at: number): boolean {
-            const reads = dataArms.get(load)
-            const runs = evalArms.get(at)
-            if (!reads || !runs) return false
-            for (const arm of reads) {
-                const other = siblingOf.get(arm)
-                if (other !== undefined && runs.has(other)) return true
-            }
-            return false
-        }
-
-        let nil = 0
-        function nilFor(current: number): number {
-            if (g.nodes.get(current)?.op === 'nil-effect') return current
-            if (!nil) nil = addNode('nil-effect', [], new Float64Array(0))
-            return nil
-        }
-        function join(source: GraphNode, argIds: number[]): number {
-            const id = g.maxId++
-            g.nodes.set(id, copyNode(source, argIds, new Float64Array(argIds.length), 'after'))
-            return id
-        }
-        function sequence(a: number, b: number, source: GraphNode): number {
-            if (!a) return b
-            if (!b || a === b) return a
-            return join(source, [a, b])
-        }
-        let empty = 0
-        function parallel(order: number[], tail: number, source: GraphNode): number {
-            const parts = [...new Set(order)].filter(x => x && x !== tail && g.nodes.get(x)?.op !== 'nil-effect' && g.nodes.get(x)?.op !== 'void')
-            if (!parts.length) return tail
-            if (!tail && parts.length === 1) return parts[0]
-            if (!tail) {
-                if (!empty) empty = addNode('void', [], new Float64Array(0))
-                tail = empty
-            }
-            return join(source, [...parts, tail])
-        }
-
-        const memos = [new Map<number, number>(), new Map<number, number>()]
-        const active = new Set<number>()
-        function effects(id: number, ordered: boolean, forceParam = false): number {
-            if (!id) return 0
-            const memo = memos[ordered ? 1 : 0]
-            const known = memo.get(id)
-            if (known !== undefined) return known
-            if (active.has(id)) return id
-            active.add(id)
-            const n = isParam(g.nodes, id) ? undefined : g.nodes.get(id)
-            let out = id
-            if (!n) out = forceParam ? id : 0
-            else if (n.op === 'nil-effect' || n.op === 'void') out = 0
-            else if (n.op === 'after') {
-                const last = countIds(n) - 1
-                const parts = getArgIds(n).map((arg, i) => effects(arg, ordered, i < last))
-                out = parts.every((p, i) => p === getRef(n, i)) ? id : parallel(parts.slice(0, last), parts[last], n)
-            } else if (n.op === 'load' && ordered && (demanded.has(id) || !checked.has(id))) {
-                out = id
-            } else if (n.op === 'load'  || PureOps.has(n.op)) {
-                out = parallel(getArgIds(n).map(arg => effects(arg, ordered)), 0, n)
-            }
-            active.delete(id)
-            memo.set(id, out)
-            return out
-        }
-
-        function isOperand(n: GraphNode, id: number): boolean {
-            if (n.op === 'after') return getRef(n, countIds(n) - 1) === id
-            for (let i = 1; i < countIds(n); i++) if (getRef(n, i) === id) return true
-            return false
-        }
-
-        function flatten(id: number, out: number[]): void {
-            const n = g.nodes.get(id)
-                if (n?.op === 'after') {
-                for (const arg of getArgIds(n)) flatten(arg, out)
-                return
-                }
-            if (id) out.push(id)
-        }
-
-        function dropReleased(effect: number, at: number, source: GraphNode): number {
-            const parts: number[] = []
-            flatten(effect, parts)
-            let drops = 0
-            for (const p of parts) if (g.nodes.get(p)?.op === 'load' && released(p, at)) drops++
-            if (!drops) return effect
-            let out = 0
-            for (const p of parts) {
-                if (g.nodes.get(p)?.op === 'load' && released(p, at)) continue
-                out = sequence(out, p, source)
-            }
-            return out
-        }
-
-        function strip(effect: number, n: GraphNode): number {
-            const e = g.nodes.get(effect)
-            if (!e) return effect
-            if (e.op === 'load' && isOperand(n, effect)) return 0
-            if (e.op !== 'after') return effect
-            const last = countIds(e) - 1
-            const tail = getRef(e, last)
-            if (g.nodes.get(tail)?.op !== 'load' || !isOperand(n, tail)) return effect
-            return parallel(cloneRefs(e, 0, last).map(x => strip(x, n)), 0, e)
-        }
-
-        const reduced: [id: number, n: GraphNode][] = []
-        for (const id of [...afters, ...selects]) {
-            const n = g.nodes.get(id)!
-            if (n.op !== 'after') continue
-            const last = countIds(n) - 1
-            const tail = getRef(n, last)
-            const parts = cloneRefs(n, 0, last).map(arg => strip(effects(arg, false, true), n))
-            const kept = [...new Set(parts)].filter(x => x && x !== tail && g.nodes.get(x)?.op !== 'nil-effect' && g.nodes.get(x)?.op !== 'void')
-            const argIds = [...(kept.length ? kept : [nilFor(getRef(n, 0))]), tail]
-            if (argIds.length === countIds(n) && argIds.every((x, i) => x === getRef(n, i))) continue
-            const argConsts = new Float64Array(argIds.length)
-            argConsts[argIds.length - 1] = getLiteral(n, last)
-            reduced.push([id, copyNode(n, argIds, argConsts)])
-        }
-        for (const id of [...calls, ...stores, ...loads]) {
-            const n = g.nodes.get(id)!
-            let effect = strip(dropReleased(effects(getRef(n, 0), n.op !== 'load', true), id, n), n)
-            if (!effect) effect = nilFor(getRef(n, 0))
-            if (effect === getRef(n, 0)) continue
-            const argIds = cloneRefs(n)
-            argIds[0] = effect
-            reduced.push([id, copyNode(n, argIds)])
-        }
-        for (const [id, n] of reduced) g.nodes.set(id, n)
-        if (changed || reduced.length) revisitBlock(target)
     }
 
     function splitConstant(term: number): [term: number, offset: number] {
@@ -6076,7 +5989,7 @@ function optimizeValueGraph(g: Graph) {
 
     function optimize() {
         for (const b of reachableBlocks) {
-            step(reduceEffectDependencies, b)
+            step(eliminateUnusedPureValues, b)
         }
         for (const b of reachableBlocks) {
             step(mergeBlocks, b)
@@ -6104,18 +6017,19 @@ function optimizeValueGraph(g: Graph) {
             step(advanceLoopLoads, b)
             step(simplifySelect, b)
             step(reduceBlockOrdering, b)
+            step(liftAfters, b)
             step(interchangeSelects, b)
         }
         const forwardingStart = performance.now()
         if (intrinsics.argv().includes('closure-forward')) {
             for (const b of reachableBlocks) forwardEquivalentClosure(b)
-        } else {
+        } else if (!disabledPasses.has('forwardEquivalentValue')) {
             forwardEquivalentValue()
         }
         if (optimizeTimers) time(intrinsics.argv().includes('closure-forward')
             ? 'forwardEquivalentClosure' : 'forwardEquivalentValue', performance.now() - forwardingStart)
         const dedupeStart = performance.now()
-        deduplicateParams()
+        if (!disabledPasses.has('deduplicateParams')) deduplicateParams()
         if (optimizeTimers) time('deduplicateParams', performance.now() - dedupeStart)
         liveParams = undefined
         for (const b of reachableBlocks) {
@@ -6167,9 +6081,13 @@ function optimizeValueGraph(g: Graph) {
         }
     }
 
-    const maxRounds = g.nodes.size < 50 ? 3 : 2
+    const maxRounds = optimizeRounds || (g.nodes.size < 50 ? 3 : 2)
+    if (optimizeTimers) time('(setup)', performance.now() - optimizeStart)
     for (let round = 0; round < maxRounds; round++) {
+        const roundStart = performance.now()
+        didAnyChange = false
         optimize()
+        if (optimizeTimers) time(`(round ${round})`, performance.now() - roundStart)
         if (!didAnyChange) break
     }
     reduceConstantMultiplies()
@@ -7998,19 +7916,29 @@ function isolateSelectArms(g: Graph): Graph {
         const epoch = nextEpoch(g)
         const order: number[] = [arm]
         const stack: number[] = [arm]
+        const targets: number[] = []
         markVisited(g.nodes.get(arm)!, epoch)
         while (const next = stack.pop()) {
             const u = g.nodes.get(next)!
             for (const r of gn.enumerateRefs(u)) {
                 const t = g.nodes.get(r)!
                 if (t.op === 'block' || t.op === 'param' || t.op === 'nil-effect') continue
-                if (TargetingValues.has(t.op)) continue
+                if (TargetingValues.has(t.op)) {
+                    targets.push(r)
+                    continue
+                }
                 if (!markVisited(t, epoch)) continue
                 if (shared.has(r)) continue
                 order.push(r)
                 stack.push(r)
             }
         }
+        function share(id: number): void {
+            if (shared.has(id)) return
+            shared.add(id)
+            for (const r of gn.enumerateRefs(g.nodes.get(id)!)) share(r)
+        }
+        for (const t of targets) share(t)
         const r = new Map<number, number>()
         function visit(vid: number) {
             if (!vid) return vid
@@ -8018,13 +7946,13 @@ function isolateSelectArms(g: Graph): Graph {
             if (shared.has(vid)) return vid
             const u = g.nodes.get(vid)!
             if (u.epoch !== epoch) return vid
-            const id = g.maxId++
             const slots = u.slots.slice()
             for (let i = 0; i < gn.countIds(u); i++) {
                 const s = gn.getRef(u, i)
                 if (!s) continue
                 slots[i] = gn.encodeSlot(visit(s), 0) as u32
             }
+            const id = g.maxId++
             g.nodes.set(id, gn.makeNodeFromSlots(u.op, slots))
             r.set(vid, id)
             return id
@@ -8269,6 +8197,7 @@ export function normalizeValueGraph(g: Graph, opts: { packaged?: boolean } = {})
     }
     const debugTransform = intrinsics.argv().includes(`graph-debug:${g.name}`)
     function run(transform: (g: Graph) => Graph | undefined, name = transform.name): void {
+        if (disabledPasses.has(name)) return
         if (debugTransform) {
             console.log(`before transform: ${name}\n`, dumpGraph(g))
         }
