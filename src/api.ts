@@ -454,6 +454,52 @@ interface AstNode {
     _types?: AstNode[]
 }
 
+function cookString(raw: string): string {
+    if (!raw.includes('\\')) return raw
+    let out = ''
+    for (let i = 0; i < raw.length; i++) {
+        const c = raw[i]
+        if (c !== '\\') {
+            out += c
+            continue
+        }
+        const e = raw[++i]
+        switch (e) {
+            case 'n': out += '\n'; break
+            case 'r': out += '\r'; break
+            case 't': out += '\t'; break
+            case 'b': out += '\b'; break
+            case 'f': out += '\f'; break
+            case 'v': out += '\v'; break
+            case '0': out += '\0'; break
+            case 'x':
+                out += String.fromCharCode(parseInt(raw.slice(i + 1, i + 3), 16))
+                i += 2
+                break
+            case 'u':
+                if (raw[i + 1] === '{') {
+                    const end = raw.indexOf('}', i)
+                    out += String.fromCodePoint(parseInt(raw.slice(i + 2, end), 16))
+                    i = end
+                } else {
+                    out += String.fromCharCode(parseInt(raw.slice(i + 1, i + 5), 16))
+                    i += 4
+                }
+                break
+            case '\r':
+                if (raw[i + 1] === '\n') i++
+                break
+            case '\n':
+            case '\u2028':
+            case '\u2029':
+                break
+            default:
+                out += e
+        }
+    }
+    return out
+}
+
 class AstNode {
     public readonly kind: SyntaxKind
 
@@ -515,16 +561,21 @@ class AstNode {
             case SyntaxKind.RegularExpressionLiteral:
             case SyntaxKind.Identifier:
             case SyntaxKind.PrivateIdentifier:
+                return this._text = this.rawText
+
             case SyntaxKind.StringLiteral:
             case SyntaxKind.TemplateHead:
             case SyntaxKind.TemplateMiddle:
             case SyntaxKind.TemplateTail:
-            case SyntaxKind.NoSubstitutionTemplateLiteral: {
-                const offset = api.ptrOffset(this.l, this.r, this.source)
-
-                return this._text = (this.source.subarray(offset, offset + this.len) as Buffer).toString('utf-8')
-            }
+            case SyntaxKind.NoSubstitutionTemplateLiteral:
+                return this._text = cookString(this.rawText)
         }
+    }
+
+    get rawText() {
+        const offset = api.ptrOffset(this.l, this.r, this.source)
+
+        return (this.source.subarray(offset, offset + this.len) as Buffer).toString('utf-8')
     }
 
     getText(sourceFile?: ts.SourceFile) {
@@ -2782,7 +2833,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
             flags |= node.isSingleQuote ? (1 << 0) : (1 << 1)
             flags |= (1 << 6) // synthetic
         }
-        const r = writeString(node.text)
+        const r = writeString(node instanceof AstNode ? node.rawText : node.text)
         buf[offset + 0] = (flags << 10) | node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = r.pointer
@@ -2792,7 +2843,7 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
     }
 
     function serializeStringLike(node: ts.Identifier | ts.StringLiteral | ts.PrivateIdentifier, offset: number) {
-        const r = writeString(node.text)
+        const r = writeString(node instanceof AstNode ? node.rawText : node.text)
         buf[offset + 0] = node.kind
         // buf[offset + 1] = next
         buf[offset + 2] = r.pointer

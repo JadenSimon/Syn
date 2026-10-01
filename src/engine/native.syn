@@ -21,6 +21,7 @@ import { isSignedType } from './lowering'
 import type { CompiledSource } from './trace2'
 import type { EmitResult } from './bytecode-emitter'
 import * as propertyEval from './property-eval'
+import * as rt from './rt'
 import type { ClosureScope, Constructed } from './property-eval'
 
 type usize = u32
@@ -117,6 +118,50 @@ function invokeNative(target: any, args: usize, nargs: usize): usize {
     const a6 = Intrinsics.load(args, 48, Types.u64)
     if (nargs === 7) return target(a0, a1, a2, a3, a4, a5, a6)
     return 0
+}
+let runtimeHeapAddress: number | undefined
+function runtimeHeapBase(): number {
+    if (runtimeHeapAddress !== undefined) return runtimeHeapAddress
+    getNativeBootstraps()
+    const base = Number(nativeMapper(intrinsics.heapMaxAddress))
+    if (!base || base === -1) throw 'native: failed to map the runtime heap'
+    runtimeHeapAddress = base
+    return base
+}
+const mirroredCells = new Set<number>()
+function vmBytes(ptr: number, size: number): Uint8Array {
+    const bytes = new Uint8Array(size)
+    for (let i = 0; i < size; i++) bytes[i] = Intrinsics.load(ptr, i, Types.u8)
+    return bytes
+}
+function writeRuntimeHeap(at: number, bytes: Uint8Array): void {
+    const src = (ts as any).getArrayBufferPtr(bytes.buffer)
+    if (!nativeCopier(runtimeHeapBase() + at, src, bytes.byteLength)) throw 'native: failed to copy into the runtime heap'
+}
+function mirrorRaw(ptr: number): void {
+    if (!ptr || mirroredCells.has(ptr)) return
+    mirroredCells.add(ptr)
+    writeRuntimeHeap(ptr, vmBytes(ptr, intrinsics.allocationSize(ptr)))
+}
+function mirrorCell(handle: number): void {
+    if (!handle || mirroredCells.has(handle)) return
+    mirroredCells.add(handle)
+    const view = heap.cellViewOf(heap.typeDescriptorOf(handle as intrinsics.Handle))
+    if (!view) throw `native: heap cell ${handle} has no view for its type descriptor`
+    const bytes = vmBytes(heap.resolveHeapCell(handle as intrinsics.Handle), view.sizeof)
+    const data = new DataView(bytes.buffer)
+    for (const offset of view.handleOffsets) {
+        const child = data.getUint32(offset, true)
+        if (offset === 0) mirrorRaw(child)
+        else mirrorCell(child)
+    }
+    for (const offset of view.rawOffsets) {
+        const raw = Number(data.getBigUint64(offset, true))
+        if (!raw) continue
+        mirrorRaw(raw)
+        data.setBigUint64(offset, BigInt(runtimeHeapBase() + raw), true)
+    }
+    writeRuntimeHeap(handle, bytes)
 }
 const pstackRegionBytes = 1 << 24
 const pstackCells = new Map<number, number>()
@@ -778,11 +823,19 @@ function rewriteTargets(
                 throw `native: ${g.name ?? 'anonymous graph'} calls heap handle ${unwrapCell(getLiteral(target, 0))} at %${id}, which has no native target`
             }
         }
+        if (n.op === 'rt') {
+            nodes.set(id, rt.lowerNative(n, { runtimeHeapBase }))
+            continue
+        }
         if (n.op !== 'heap-handle') {
             nodes.set(id, n)
             continue
         }
         const handle = unwrapCell(getLiteral(n, 0))
+        if (!getRef(n, 0) && mirroredCells.has(handle)) {
+            nodes.set(id, makeNode('literal', [{ literal: handle }], Types.u32))
+            continue
+        }
         const functionSlot = functionHandles.get(handle)
         const slot = functionSlot ?? dataHandles.get(handle)
         if (getRef(n, 0) || slot === undefined) {
@@ -841,7 +894,7 @@ function patchImage(
                 continue
             }
             const targetOffset = offsets[relocation.target]
-            if (targetOffset === undefined) throw `native: unknown local function ${relocation.target}`
+            if (targetOffset === undefined) throw `native: unknown local function ${relocation.target} called from ${unit.fn.name}`
             const delta = (imageBase + BigInt(targetOffset) - pc) >> callShift
             if (delta < -(one << BigInt(25)) || delta >= (one << BigInt(25))) throw 'native: local call is out of range'
             const imm = Number(BigInt.asUintN(26, delta))
@@ -2009,7 +2062,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     function locate(shape: intrinsics.Handle, path: string): { shape: intrinsics.Handle, decode?: number } | undefined {
         const fact = factAt(shape, path)
         if (fact === undefined) return
-        return { shape: fact.shape, decode: fact.encoded ? heapBase() : undefined }
+        return { shape: fact.shape, decode: fact.encoded ? pstack0Base() : undefined }
     }
     function applySummary(callee: Function, name: string, argShape: (i: number) => intrinsics.Handle | undefined, result: intrinsics.Handle | undefined): { result?: intrinsics.Handle, heap: number[], decode: boolean, reads: intrinsics.Handle[], stores: [number, number][] } {
         const summary = summaryOf(callee)
@@ -2043,15 +2096,15 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         for (const e of summary.effects) if (isLoc(e.value) && !e.value.path && e.value.param !== e.target.param) stores.push([e.value.param, e.target.param])
         return { result: resolved, heap, decode: summary.rets[0]?.encoded ?? false, reads, stores }
     }
-    let heapBaseAddress: number | undefined
-    function heapBase(): number {
-        heapBaseAddress ??= pstackCell(0) + 8
-        return heapBaseAddress
+    let pstack0BaseAddress: number | undefined
+    function pstack0Base(): number {
+        pstack0BaseAddress ??= pstackCell(0) + 8
+        return pstack0BaseAddress
     }
     function encodeHandles(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, returns: () => boolean): void {
         function encode(value: number): number {
             const encoded = freshId(graph)
-            graph.nodes.set(encoded, makeNode('encode', [value, { literal: heapBase() }]))
+            graph.nodes.set(encoded, makeNode('encode', [value, { literal: pstack0Base() }]))
             return encoded
         }
         function objectValue(ref: number): boolean {
@@ -2092,7 +2145,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 }
                 const context = propertyEval.representedBy(site.context)
                 const located = applySummary(closure, name, i => i < 0 ? context : site.args[i], undefined)
-                return { paramCount: site.args.length, receiver: false, result: located.result, decode: located.result !== undefined && located.decode ? heapBase() : undefined, reads: located.reads, stores: located.stores.map(([from, into]) => [from < 0 ? 1 : 3 + from, into < 0 ? 1 : 3 + into]) }
+                return { paramCount: site.args.length, receiver: false, result: located.result, decode: located.result !== undefined && located.decode ? pstack0Base() : undefined, reads: located.reads, stores: located.stores.map(([from, into]) => [from < 0 ? 1 : 3 + from, into < 0 ? 1 : 3 + into]) }
             }
             const fn = calleeOf(site.target)
             if (intrinsics.argv().includes('call-sites')) {
@@ -2130,7 +2183,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             return {
                 paramCount, receiver, receiverShape: instance, result: instance ?? returned ?? fromLocation,
                 heap: located?.heap.length ? located.heap : undefined,
-                decode: fromLocation !== undefined && located!.decode ? heapBase() : undefined,
+                decode: fromLocation !== undefined && located!.decode ? pstack0Base() : undefined,
                 reads: !instance && !returns ? located?.reads : undefined,
                 stores: located?.stores.map(([from, into]) => [receiver && from === paramCount ? 2 : 3 + from, receiver && into === paramCount ? 2 : 3 + into]),
                 returnSlot: returns ? { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } : undefined,
@@ -2490,6 +2543,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const closure = closureSymbols.get(handle as u32) ?? (session.templateOf(handle as u32) ? symbols.get(closureFunction(handle as u32, 'closure')) : undefined)
             if (closure !== undefined) {
                 functionHandleSlots.set(handle, localFunctionSlot(closure))
+                continue
+            }
+            if (handle && heap.cellViewOf(heap.typeDescriptorOf(handle as intrinsics.Handle))) {
+                mirrorCell(handle)
                 continue
             }
             if (!heap.isCallable(handle as intrinsics.Handle)) {

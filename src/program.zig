@@ -24040,6 +24040,7 @@ pub const Analyzer = struct {
                                 const t = try this.getType(file, unwrapRef(name));
                                 if (t >= @intFromEnum(Kind.false)) {
                                     if (t >= @intFromEnum(Kind.zero)) {
+                                        if (comptime suppress_gaps) return @intFromEnum(Kind.any);
                                         return error.TODO_Numeric_literal;
                                     }
 
