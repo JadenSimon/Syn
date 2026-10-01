@@ -412,6 +412,7 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
     ;(reifier as any).__argv = argv // XXX
     ;(reifier as any).__readFile = (file: string) => fs.readFileSync(file, 'utf8')
     ;(reifier as any).__writeFile = (file: string, text: string) => fs.writeFileSync(file, text)
+    ;(reifier as any).__readDir = (dir: string) => fs.readdirSync(dir)
     return runSynModule(f.text, path.resolve(`src/engine/${entrypoint}.syn`), reifier, false, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
         let sourceName = r

@@ -1,5 +1,6 @@
 import * as vm from 'node:vm'
 import * as v8 from 'node:v8'
+import * as path from 'node:path'
 
 const any = Symbol.for('Type.any')
 const never = Symbol.for('Type.never')
@@ -735,6 +736,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         __argv: (reifier as any).__argv,
         __readFile: (reifier as any).__readFile,
         __writeFile: (reifier as any).__writeFile,
+        __readDir: (reifier as any).__readDir,
         console: console,
         performance,
         process,
@@ -757,7 +759,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
         function initializeMeta(meta: any, m: any) {
             meta.finished = () => finished.add(m)
             meta.ready = () => {
-                const waits = [...pending].filter(([p]) => !dependsOn(p, x => x === m)).map(([, done]) => done)
+                const waits = [...pending].filter(([p]) => dependsOn(m, x => x === p) && !dependsOn(p, x => x === m)).map(([, done]) => done)
                 if (waits.length) return Promise.all(waits)
             }
         }
@@ -830,6 +832,7 @@ export function runSynModule(text: string, fileName: string, reifier: { types: a
                 importModuleDynamically: async (spec, from) => evaluated(await link(spec, from)),
                 initializeImportMeta: (meta, m) => {
                     meta.filename = m.identifier.replace('.js', '.syn')
+                    meta.dirname = path.dirname(meta.filename)
                     initializeMeta(meta, m)
                 },
                 lineOffset: -1,
