@@ -10,9 +10,9 @@ import { flattenRecords } from './records'
 import * as rt from './rt'
 import {
     addGraphBlock, clearOperands, cloneLiterals, cloneRefs, copyNode, countIds, countLiterals,
-    createRecordParam, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
+    createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, makeNode, type Operand, operandType, pushRefs, setDebugLabel, setGraphBlocks, setLiteral,
-    setOperand, setRef, typeOf, typeSlots, withRefs,
+    recordFields, setOperand, setRef, setType, typeOf, typeRefOf, typeSlots, withRefs,
 } from './graph-node'
 
 const Types = intrinsics.Types
@@ -89,7 +89,8 @@ function recordKeys(g: Graph, id: number): number[] | undefined {
         for (let i = 0; i < countLiterals(n); i += 2) keys.push(getLiteral(n, i))
         return keys
     }
-    if (n.op === 'param' && countIds(n)) return Array.from(cloneLiterals(n, 1))
+    const type = n.op === 'param' ? g.nodes.get(typeRefOf(n)) : undefined
+    if (type?.op === 'record-type') return recordFields(type).map(field => field.key)
     if (n.op === 'select') return recordKeys(g, getRef(n, 1))
 }
 
@@ -98,7 +99,7 @@ function detachRecordOrdering(g: Graph, tokenBlocks: Set<number>) {
     for (const b of g.blocks) {
         for (const p of b.params) {
             const u = g.nodes.get(p)
-            if (u && countIds(u)) owners.set(p, b.id)
+            if (u && recordKeys(g, p)) owners.set(p, b.id)
         }
     }
     if (!owners.size) return
@@ -156,6 +157,52 @@ export function isNumeric(g: Graph, id: number, entry: (param: number) => boolea
     }
     return arrived
 }
+const FloatArith = new Set(['add', 'sub', 'mul', 'div', 'neg'])
+
+export function floatValues(g: Graph): Set<number> {
+    const floats = new Set<number>()
+    const flows = new Map<number, number[]>()
+    const pending: number[] = []
+    function mark(id: number): void {
+        if (!id || floats.has(id)) return
+        floats.add(id)
+        pending.push(id)
+    }
+    function flow(from: number, to: number, literal: number): void {
+        if (!from) {
+            if (!Number.isInteger(literal)) mark(to)
+            return
+        }
+        const list = flows.get(from)
+        if (list) list.push(to)
+        else flows.set(from, [to])
+    }
+    for (const [id, n] of g.nodes) {
+        if (n.op !== 'store' && typeSlots(n.op) && typeOf(n) === Types.f64) mark(id)
+        if (n.op === 'literal' && !Number.isInteger(literalValue(n))) mark(id)
+        if (FloatArith.has(n.op)) {
+            for (let i = 0; i < countIds(n); i++) flow(getRef(n, i), id, getLiteral(n, i))
+        } else if (n.op === 'select') {
+            for (let i = 1; i < countIds(n); i++) flow(getRef(n, i), id, getLiteral(n, i))
+        } else if (n.op === 'after') {
+            flow(getRef(n, countIds(n) - 1), id, getLiteral(n, countIds(n) - 1))
+        } else if (n.op === 'apply') {
+            const block = getBlock(g, getRef(n, 0))
+            if (!block) continue
+            block.params.forEach((p, i) => flow(getRef(n, i + 1), p, getLiteral(n, i + 1)))
+        }
+    }
+    while (pending.length) for (const to of flows.get(pending.pop()!) ?? []) mark(to)
+    return floats
+}
+
+function comparesFloats(g: Graph, c: GraphNode): boolean {
+    for (let i = 0; i < 2; i++) {
+        if (getRef(c, i) ? operandType(g, c, i) === Types.f64 : !Number.isInteger(getLiteral(c, i))) return true
+    }
+    return false
+}
+
 const TargetingValues = new Set([
     'syscall-target', 'local-target', 'indirect-target'
 ])
@@ -265,7 +312,7 @@ function nodeKey(n: GraphNode, argIds = getArgIds(n), argConsts = getArgConsts(n
     // XXX: graph arithmetic can carry u32/u64 decoration that lowering treats identically.
     const word = (type: number) => type === Types.u32 || type === Types.u64
     const eraseWidth = ignoreWordWidth && BinaryOps.has(n.op) && word(typeOf(n))
-    if (slots) parts.push(eraseWidth ? 'tuword' : `t${typeOf(n)}`)
+    if (slots) parts.push(eraseWidth ? 'tuword' : typeRefOf(n) ? `t%${typeRefOf(n)}` : `t${typeOf(n)}`)
     return parts.join(',')
 }
 
@@ -867,7 +914,12 @@ export function inlineBlocks(g: Graph) {
                 block.bodyId = getRef(source, 0)
                 block.bodyConst = getLiteral(source, 0)
             }
-            const param = shape ? createRecordParam(shape) : makeNode('param', [])
+            let param = makeNode('param', [])
+            if (shape) {
+                const type = g.maxId++
+                g.nodes.set(type, createRecordType(shape.map(key => ({ key, type: Types.u64 }))))
+                param = makeNode('param', [], { ref: type })
+            }
             g.nodes.set(site, param)
             setDebugLabel(g, site, `inline${site}`)
             addGraphBlock(g, { id: blockId, params: [site], bodyId: body, bodyConst: 0 })
@@ -1749,6 +1801,7 @@ function optimizeValueGraph(g: Graph) {
             if (countIds(n) !== 3 || loops(getRef(n, 1)) || !loops(getRef(n, 2))) continue
             const cond = g.nodes.get(getRef(n, 0))
             if (!cond || !CompareOps.has(cond.op)) continue
+            if (comparesFloats(g, cond)) continue
             const inverted = addNode(InverseCompare[cond.op], getOperands(cond), cond)
             r.set(id, addNode('select', [inverted, getOperand(n, 2), getOperand(n, 1)], n))
         }
@@ -1818,6 +1871,7 @@ function optimizeValueGraph(g: Graph) {
             const c1 = g.nodes.get(getRef(outer, 0))
             const c2 = g.nodes.get(getRef(inner, 0))
             if (!c1 || !c2 || !CompareOps.has(c1.op) || !CompareOps.has(c2.op)) continue
+            if (comparesFloats(g, c1) || comparesFloats(g, c2)) continue
             const guarded = collect(getRef(outer, 0), new Set())
             let extra = 0
             let speculatable = true
@@ -3920,7 +3974,7 @@ function optimizeValueGraph(g: Graph) {
             if (key === undefined) return next
             next.set(key, value)
             const n = g.nodes.get(cond)!
-            if (CompareOps.has(n.op)) next.set(nodeKey(copyNode(n, getOperands(n), InverseCompare[n.op])), value ? 0 : 1)
+            if (CompareOps.has(n.op) && !comparesFloats(g, n)) next.set(nodeKey(copyNode(n, getOperands(n), InverseCompare[n.op])), value ? 0 : 1)
             return next
         }
         function lookup(known: Map<string, number>, cond: number): number | undefined {
@@ -4651,6 +4705,7 @@ function optimizeValueGraph(g: Graph) {
     function splitConstant(term: number): [term: number, offset: number] {
         const t = g.nodes.get(term)
         if (!t) return [term, 0]
+        if (typeOf(t) === Types.f64) return [term, 0]
         if (t.op === 'add' || t.op === 'sub') {
             const right = scalarOperand(g.nodes, t, 1)
             const left = t.op === 'add' ? scalarOperand(g.nodes, t, 0) : undefined
@@ -4729,6 +4784,7 @@ function optimizeValueGraph(g: Graph) {
             foldTest(getRef(n, valueAt))
             const inner = g.nodes.get(getRef(n, valueAt))
             if (!inner || !CompareOps.has(inner.op)) return
+            if (n.op === 'eq' && comparesFloats(g, inner)) return
             const op = n.op === 'eq' ? InverseCompare[inner.op] : inner.op
             g.nodes.set(id, copyNode(inner, getOperands(inner), op))
             changed = true
@@ -4739,6 +4795,7 @@ function optimizeValueGraph(g: Graph) {
         for (const id of findValues(target.id, 'ne') ?? []) foldTest(id)
         for (const id of findValues(target.id, 'mul') ?? []) {
             const n = g.nodes.get(id)!
+            if (typeOf(n) === Types.f64) continue
             const valueAt = getRef(n, 0) && !getRef(n, 1) ? 0
                 : getRef(n, 1) && !getRef(n, 0) ? 1 : -1
             if (valueAt < 0) continue
@@ -5047,13 +5104,14 @@ function optimizeValueGraph(g: Graph) {
                     result = { id: 0, value: folded }
                 }
             }
-            if (!result && args.length === 2 && args[0].id && args[0].id === args[1].id) {
+            const floating = typeOf(n) === Types.f64 || comparesFloats(g, n)
+            if (!result && !floating && args.length === 2 && args[0].id && args[0].id === args[1].id) {
                 if (n.op === 'sub' || n.op === 'xor') result = { id: 0, value: 0 }
                 else if (n.op === 'and' || n.op === 'or') result = args[0]
                 else if (n.op === 'eq' || n.op === 'le' || n.op === 'ge') result = { id: 0, value: 1 }
                 else if (n.op === 'ne' || n.op === 'lt' || n.op === 'gt') result = { id: 0, value: 0 }
             }
-            if (!result && args.length === 2 && (n.op === 'add' || n.op === 'sub')) result = linear(n, args)
+            if (!result && !floating && args.length === 2 && (n.op === 'add' || n.op === 'sub')) result = linear(n, args)
             if (!result && args.length === 2 && operandType(g, n, 0) <= Types.i64 && operandType(g, n, 1) <= Types.i64) {
                 const left = (value: number) => !args[0].id && args[0].value === value
                 const right = (value: number) => !args[1].id && args[1].value === value
@@ -8222,6 +8280,19 @@ function checkCaptures(g: Graph) {
     }
 }
 
+function resolveNumberTypes(g: Graph) {
+    const floats = floatValues(g)
+    for (const [id, n] of g.nodes) {
+        if (!typeSlots(n.op)) continue
+        const T = floats.has(id) ? Types.f64 : typeOf(n) === Types.unknown_number ? Types.u64 : typeOf(n)
+        if (typeOf(n) === T) continue
+        const copy = copyNode(n)
+        setType(copy, T)
+        g.nodes.set(id, copy)
+    }
+    return g
+}
+
 export function normalizeValueGraph(g: Graph, opts: { packaged?: boolean } = {}): Graph {
     const profile = intrinsics.argv().includes('graph-transform-cost')
     const profileThresh = intrinsics.argv().find(x => x.startsWith('perf-thresh:'))
@@ -8268,6 +8339,7 @@ export function normalizeValueGraph(g: Graph, opts: { packaged?: boolean } = {})
     checkCaptures(g)
     const normalizeStart = performance.now()
     checkOrder('trace')
+    run(resolveNumberTypes)
     if (!opts.packaged) {
         run(bindCallContext)
         run(inlineBlocks)
@@ -8329,7 +8401,7 @@ function zeroExtendedBits(T: Types): number {
     return 64
 }
 
-function narrowTypes(g: Graph): void {
+function narrowTypes(g: Graph, floats: Set<number>): void {
     const uses = new Map<number, [user: number, slot: number][]>()
     for (const [id, n] of g.nodes) {
         for (let i = 0; i < countIds(n); i++) {
@@ -8427,6 +8499,7 @@ function narrowTypes(g: Graph): void {
     }
     const typed = new Map<number, Types>()
     for (const [id, n] of g.nodes) {
+        if (floats.has(id)) continue
         if (n.op === 'literal') {
             if (fits(id, 0) || lowDemand(id)) typed.set(id, Types.u32)
             continue
@@ -8452,7 +8525,7 @@ function narrowTypes(g: Graph): void {
         const n = g.nodes.get(id)!
         if (typeOf(n) === T) continue
         const copy = copyNode(n)
-        setLiteral(copy, countIds(copy), T)
+        setType(copy, T)
         g.nodes.set(id, copy)
     }
     if (!redundant.size) return
@@ -8477,7 +8550,8 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     //     opts.debug = true
     // }
     const g = opts.skipNormalized ? _g : normalizeValueGraph(_g)
-    if (!intrinsics.argv().includes('no-narrow')) narrowTypes(g)
+    const floats = floatValues(g)
+    if (!intrinsics.argv().includes('no-narrow')) narrowTypes(g, floats)
     const target = opts.target ?? lowering.aarch64
 
     const rootBlock = g.blocks[0]
@@ -8858,7 +8932,15 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     }
 
 
-    function demand(id: number, konst: number, want = -1, narrow = false): number {
+    function floatOperand(n: GraphNode, i: number): boolean {
+        return getRef(n, i) ? floats.has(getRef(n, i)) : !Number.isInteger(getLiteral(n, i))
+    }
+
+    function floatSource(n: GraphNode, i: number): Types {
+        return !getRef(n, i) || floats.has(getRef(n, i)) ? Types.f64 : operandType(g, n, i)
+    }
+
+    function demand(id: number, konst: number, want = -1, narrow = false, float = false): number {
         if (!id) {
             const k = --synth
             let temps = temporariesAt.get(materializing)
@@ -8868,7 +8950,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             if (r < 0) r = freeReg(preserved, NOTHING)
             if (r < 0) throw 'lowering3: out of registers'
             bind(k, r)
-            put(() => asm.movImm(r, konst, narrow))
+            put(() => float ? asm.movF64(r, konst) : asm.movImm(r, konst, narrow))
             return k
         }
         const n = g.nodes.get(id)
@@ -8950,15 +9032,16 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (BinaryOps.has(n.op) || CompareOps.has(n.op)) { buildArith(id, n, signed, want); return }
         if (UnaryOps.has(n.op)) {
             const op = n.op
-            const a = demand(getRef(n, 0), getLiteral(n, 0))
+            const float = floatOperand(n, 0)
+            const a = demand(getRef(n, 0), getLiteral(n, 0), -1, false, float)
             const ra = at(a, NOTHING)
             finish()
             const dst = regFor(id, want)
-            put(() => asm.unary(op, dst, ra))
+            put(() => float ? asm.floatNeg(dst, ra) : asm.unary(op, dst, ra))
             return
         }
         if (n.op === 'convert' || n.op === 'bitconvert') {
-            const T = operandType(g, n, 0)
+            const T = floatOperand(n, 0) ? Types.f64 : operandType(g, n, 0)
             const U = typeOf(n)
             const converts = n.op === 'convert'
             const a = demand(getRef(n, 0), getLiteral(n, 0))
@@ -8993,7 +9076,27 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         throw `lowering: cannot produce '${n.op}' @ %${id} [unit: ${g.name ?? '<anonymous'}]\n${errorDump(g)}`
     }
 
+    function buildFloatArith(id: number, n: GraphNode, want: number): void {
+        const cmp = CompareOps.has(n.op)
+        let a = 0
+        let b = 0
+        for (const i of orderedOperands(id, [0, 1])) {
+            const v = demand(getRef(n, i), getLiteral(n, i), -1, false, true)
+            if (i === 0) a = v
+            else b = v
+        }
+        const guard = new Set<number>()
+        const ra = at(a, guard)
+        guard.add(ra)
+        const rb = at(b, guard)
+        finish(id)
+        const dst = regFor(id, want)
+        const from: [Types, Types] = [floatSource(n, 0), floatSource(n, 1)]
+        put(() => cmp ? asm.floatCompare(n.op, dst, ra, rb, from) : asm.floatBinary(n.op, dst, ra, rb, from))
+    }
+
     function buildArith(id: number, n: GraphNode, signed: boolean, want: number): void {
+        if (floatOperand(n, 0) || floatOperand(n, 1)) return buildFloatArith(id, n, want)
         const swap = !getRef(n, 0) && getRef(n, 1) !== 0
             && (Commutative.has(n.op) || SwappedCmp[n.op] !== undefined)
         const op = swap ? SwappedCmp[n.op] ?? n.op : n.op
@@ -9307,7 +9410,10 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
                 effect(getRef(n, 0))
                 continue
             }
-            const d = demand(getRef(n, i), getLiteral(n, i), -1, i === 3 && intrinsics.intrinsicBitWidth(T) <= 32)
+            if (i === 3 && T === Types.f64 && getRef(n, 3) && !floats.has(getRef(n, 3))) {
+                throw `lowering: f64 store of the non-f64 value %${getRef(n, 3)} [unit: ${g.name ?? '<anonymous>'}]`
+            }
+            const d = demand(getRef(n, i), getLiteral(n, i), -1, i === 3 && intrinsics.intrinsicBitWidth(T) <= 32, i === 3 && T === Types.f64)
             if (i === 1) b = d
             else if (i === 2) o = d
             else v = d
