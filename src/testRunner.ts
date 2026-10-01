@@ -403,6 +403,11 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
 
     const f = results.find(x => x.name.endsWith(`${entrypoint}.js`))
     if (!f) throw `entrypoint "${entrypoint}" not found`
+    const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:'))?.replace(/^(cpu|heap)-prof:/, '')
+    if (prof) {
+        fs.mkdirSync(`${prof}.src`, { recursive: true })
+        for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
+    }
     const reifier = (prog as any).getReifier()
     ;(reifier as any).__argv = argv // XXX
     ;(reifier as any).__readFile = (file: string) => fs.readFileSync(file, 'utf8')
@@ -453,9 +458,49 @@ async function gatherTestCases() {
     return files.filter(x => x.isFile()).map(x => path.resolve(x.parentPath, x.name))
 }
 
+async function profiled<T>(file: string | undefined, heapFile: string | undefined, run: () => Promise<T>): Promise<T> {
+    if (!file && !heapFile) return run()
+    const inspector = await import('node:inspector')
+    const session = new inspector.Session()
+    session.connect()
+    const post = (method: string, params?: object) => new Promise<any>((resolve, reject) => {
+        session.post(method, params ?? {}, (err: any, res: any) => err ? reject(err) : resolve(res))
+    })
+    if (file) {
+        await post('Profiler.enable')
+        await post('Profiler.setSamplingInterval', { interval: 100 })
+        await post('Profiler.start')
+    }
+    if (heapFile) {
+        await post('HeapProfiler.enable')
+        await post('HeapProfiler.startSampling', {
+            samplingInterval: 4096,
+            includeObjectsCollectedByMajorGC: true,
+            includeObjectsCollectedByMinorGC: true,
+        })
+    }
+    try {
+        return await run()
+    } finally {
+        if (file) {
+            const { profile } = await post('Profiler.stop')
+            fs.writeFileSync(file, JSON.stringify(profile))
+        }
+        if (heapFile) {
+            const { profile } = await post('HeapProfiler.stopSampling')
+            fs.writeFileSync(heapFile, JSON.stringify(profile))
+        }
+    }
+}
+
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
+    if (filter === '--engine' && args[1] !== 'all') {
+        const prof = args.find(a => a.startsWith('cpu-prof:'))?.slice('cpu-prof:'.length)
+        const heapProf = args.find(a => a.startsWith('heap-prof:'))?.slice('heap-prof:'.length)
+        if (prof || heapProf) return profiled(prof, heapProf, () => testEngine(args[1], args.slice(1)))
+    }
     if (filter === '--engine') {
         if (args[1] === 'all') {
             const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm']
