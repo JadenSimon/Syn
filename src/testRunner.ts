@@ -504,7 +504,7 @@ export async function main(...args: string[]) {
     }
     if (filter === '--engine') {
         if (args[1] === 'all') {
-            const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm']
+            const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures']
             const hasNativeOption = new Set(['cg', 'containers'])
             for (const x of allTestableFiles) {
                 const a = args.slice(2)
