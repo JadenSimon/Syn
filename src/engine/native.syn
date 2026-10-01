@@ -13,8 +13,8 @@ import {
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, getArgIds, getBlock, getDebugLabel, getLiteral,
-    getOperand, getOperands, getRef, isContextParam, isThisParam, makeNode, type Operand, operandType, setDebugLabel, setGraphBlocks,
-    setLiteral, setRef, typeOf,
+    getOperand, getOperands, getRef, isContextParam, isThisParam, makeNode, type Operand, operandType, resultType, setDebugLabel, setGraphBlocks,
+    setLiteral, setRef, setType, typeOf, typeRefOf,
 } from './graph-node'
 import { isSignedType } from './lowering'
 
@@ -278,13 +278,13 @@ function floatBits(raw: any): number {
     return new Float64Array(new BigInt64Array([BigInt(raw)]).buffer)[0]
 }
 
-function nativeStub(fn: Function, symbol: number): Function {
+function nativeStub(fn: Function, symbol: number, returns: intrinsics.Types): Function {
     const names: string[] = []
     for (let i = 0; i < fn.length; i++) names.push(`arg${i}`)
     const stub: any = new Function(...names, `throw new Error('Unlinked local function')`)
     stub.__localTarget = symbol
     stub.__args = Array.from({ length: fn.length }, () => Types.u64)
-    stub.__returns = Types.u64
+    stub.__returns = returns
     stub.__name = fn.name
     return stub
 }
@@ -658,7 +658,7 @@ interface ShapedCallee {
 function snapshotOf(graph: Graph, argId: number): intrinsics.Handle | undefined {
     const arg = graph.nodes.get(argId)
     if (!arg || arg.op !== 'heap-handle') return
-    if (countLiterals(arg) < 2) return
+    if (countIds(arg) < 2) return
     return getLiteral(arg, 1) as intrinsics.Handle
 }
 
@@ -790,7 +790,7 @@ function dumpCallShapes(pending: PendingUnit[], functions: Function[], opaque: M
             for (let i = 3; i < countIds(n); i++) {
                 const arg = unit.graph.nodes.get(getRef(n, i))
                 if (!arg || arg.op !== 'heap-handle') continue
-                if (countLiterals(arg) < 2) continue
+                if (countIds(arg) < 2) continue
                 const snapshot = getLiteral(arg, 1) as intrinsics.Handle
                 const fields: string[] = []
                 let operand = 2
@@ -1336,7 +1336,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             schedule(capture)
         }
         localStubs.add(capture)
-        const stub: any = nativeStub(capture, target)
+        const stub: any = nativeStub(capture, target, returnTypeOf(capture))
         const wrapper = returnWrappers.get(capture)
         if (intrinsics.argv().includes('trace-debug')) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
         return wrapper ? wrapCall(stub, wrapper, capture.length) : stub
@@ -1688,15 +1688,31 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
     }
     const fnGraphs = new Map<Function, FnGraphs>()
+    const tracing = new Set<Function>()
+    const processed = new Set<Function>()
+    const returnTypes = new Map<Function, intrinsics.Types>()
+    function returnTypeOf(fn: Function): intrinsics.Types {
+        const known = returnTypes.get(fn)
+        if (known !== undefined) return known
+        if (tracing.has(fn)) return Types.u64
+        if (!codeOf(fn)) return Types.u64
+        const T = returnsFloat(graphsOf(fn).traced.graph) ? Types.f64 : Types.u64
+        returnTypes.set(fn, T)
+        return T
+    }
     function graphsOf(fn: Function): FnGraphs {
         const known = fnGraphs.get(fn)
         if (known) return known
+        intrinsics.assert(!tracing.has(fn), `native: ${fn.name} is already being traced`)
+        tracing.add(fn)
+        defer tracing.delete(fn)
+        for (const dep of dependencies.get(fn) ?? []) processUnit(dep)
         const code = codeOf(fn)
         if (!code) throw `native: ${fn.name} has no code to trace`
         const verbose = intrinsics.argv().includes('trace-debug') || intrinsics.argv().includes(`trace-debug:${fn.name}`)
         const outer = enterPhase('trace')
         const traced = trace2(code.input, {
-            captures: code.captures, session, mapCapture, shouldInline, verbose, name: fn.name,
+            captures: code.captures, session, mapCapture, shouldInline, returnTypeOf, verbose, name: fn.name,
             self: code.scope ? undefined : fn, env: !!code.scope, receiver: constructsOutOfLine(fn) || usesReceiver(fn),
         })
         lowerPanics(traced.graph)
@@ -2213,102 +2229,104 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     }
     let tracedUnits = 0
     function traceUnits(): void {
-        for (; tracedUnits < order.length; tracedUnits++) {
-            const current = order[tracedUnits]
-            if ((current as any).shouldInline) continue
-            const symbol = symbols.get(current)!
-            const traceOpsBefore = session.runtime?.tracer.getOpCount() ?? 0
-            if (intrinsics.argv().includes('native-symbols')) console.log('native symbol', symbol, current.name || current.toString().slice(0, 80))
-            const traceDebug = intrinsics.argv().includes('trace-debug')
-                || intrinsics.argv().includes(`trace-debug:${current.name}`)
-            if (traceDebug) console.log('trace native', current.name)
-            const constructing = constructsOutOfLine(current)
-            const entry = graphsOf(current)
-            const traced = entry.traced
-            const unitSource = entry.source
-            const layout = constructing ? constructorLayout(current) : undefined
-            if (constructing && !layout) throw `native: cannot prove the layout ${current.name} constructs`
-            if (layout) {
-                let shapes = paramShapes.get(current)
-                if (!shapes) paramShapes.set(current, shapes = new Map())
-                shapes.set(unitSource.compiled.paramCount, layout.shape)
+        for (; tracedUnits < order.length; tracedUnits++) processUnit(order[tracedUnits])
+    }
+    function processUnit(current: Function): void {
+        if (processed.has(current)) return
+        processed.add(current)
+        if ((current as any).shouldInline) return
+        const symbol = symbols.get(current)!
+        const traceOpsBefore = session.runtime?.tracer.getOpCount() ?? 0
+        if (intrinsics.argv().includes('native-symbols')) console.log('native symbol', symbol, current.name || current.toString().slice(0, 80))
+        const traceDebug = intrinsics.argv().includes('trace-debug')
+            || intrinsics.argv().includes(`trace-debug:${current.name}`)
+        if (traceDebug) console.log('trace native', current.name)
+        const constructing = constructsOutOfLine(current)
+        const entry = graphsOf(current)
+        const traced = entry.traced
+        const unitSource = entry.source
+        const layout = constructing ? constructorLayout(current) : undefined
+        if (constructing && !layout) throw `native: cannot prove the layout ${current.name} constructs`
+        if (layout) {
+            let shapes = paramShapes.get(current)
+            if (!shapes) paramShapes.set(current, shapes = new Map())
+            shapes.set(unitSource.compiled.paramCount, layout.shape)
+        }
+        const closed = timed('close', () => closeOver(current, traced, unitSource, mapCapture, scopeOf(current, traced), closeParams(current, unitSource.compiled.paramCount), constructedFor(layout, traced.graph)))
+        entry.closed = snapshotGraph(closed.graph)
+        entry.closedShapes = closed.shapes
+        encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(current))
+        if (intrinsics.argv().includes(`closed-debug:${current.name}`)) console.log(dumpGraph(closed.graph))
+        const projected = projectsCallResults(closed.graph)
+        const opaque = !projected && [...closed.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')
+        if (opaque) {
+            if ([...roots.values()].includes(symbol)) {
+                console.log(dumpGraph(closed.graph))
+                throw `native: ${current.name} reads properties of an opaque argument`
             }
-            const closed = timed('close', () => closeOver(current, traced, unitSource, mapCapture, scopeOf(current, traced), closeParams(current, unitSource.compiled.paramCount), constructedFor(layout, traced.graph)))
-            entry.closed = snapshotGraph(closed.graph)
-            entry.closedShapes = closed.shapes
-            encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(current))
-            if (intrinsics.argv().includes(`closed-debug:${current.name}`)) console.log(dumpGraph(closed.graph))
-            const projected = projectsCallResults(closed.graph)
-            const opaque = !projected && [...closed.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')
-            if (opaque) {
-                if ([...roots.values()].includes(symbol)) {
-                    console.log(dumpGraph(closed.graph))
-                    throw `native: ${current.name} reads properties of an opaque argument`
-                }
-            }
-            if (opaque && (constructing || entry.returns || codeOf(current)!.scope)) {
-                inlineScores.set(current, false)
-                deferredUnits.push({ fn: current, symbol })
-                continue
-            }
-            if (intrinsics.argv().includes('native-trace-cost')) {
-                const traceOps = (session.runtime?.tracer.getOpCount() ?? traceOpsBefore) - traceOpsBefore
-                console.log('native trace cost', current.name || '<anonymous>', traceOps)
-            }
-            const lifted = entry.returns ? { graph: closed.graph } as ReturnType<typeof liftReturnedHeapValues> : liftReturnedHeapValues(closed.graph)
-            let tracedGraph = lifted.graph
-            tracedGraph.name = current.name
-            if (traceDebug) console.log(traced.text)
-            if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
-            if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
-            if (projected) {
-                if (intrinsics.argv().includes('native-decisions')) {
-                    console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size} projected=true`)
-                }
-                inlineScores.set(current, false)
-                returnCallers.push({ fn: current, symbol, graph: tracedGraph })
-                continue
-            }
-            const shouldNotInline = closed.closures || (current as any).shouldNotInline || lifted.wrapper || (tracedGraph.nodes.size <= 150 && !obviousInline(tracedGraph))
-            const shape = shouldNotInline && !lifted.wrapper && !entry.returns ? returnedShape(tracedGraph) : undefined
+        }
+        if (opaque && (constructing || entry.returns || codeOf(current)!.scope)) {
+            inlineScores.set(current, false)
+            deferredUnits.push({ fn: current, symbol })
+            return
+        }
+        if (intrinsics.argv().includes('native-trace-cost')) {
+            const traceOps = (session.runtime?.tracer.getOpCount() ?? traceOpsBefore) - traceOpsBefore
+            console.log('native trace cost', current.name || '<anonymous>', traceOps)
+        }
+        const lifted = entry.returns ? { graph: closed.graph } as ReturnType<typeof liftReturnedHeapValues> : liftReturnedHeapValues(closed.graph)
+        let tracedGraph = lifted.graph
+        tracedGraph.name = current.name
+        if (traceDebug) console.log(traced.text)
+        if (traceDebug) console.log('native summary', { wrapper: !!lifted.wrapper })
+        if (lifted.wrapper) returnWrappers.set(current, lifted.wrapper)
+        if (projected) {
             if (intrinsics.argv().includes('native-decisions')) {
-                console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size}`
-                    + ` projected=false shouldNotInline=${!!shouldNotInline} wrapper=${!!lifted.wrapper}`
-                    + ` tagged=${!!(current as any).shouldNotInline} shape=${!!shape}`)
+                console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size} projected=true`)
             }
-            if (shape) {
-                if (shouldNotInline || (tracedGraph.nodes.size <= 50 && !obviousInline(tracedGraph))) {
-                    inlineScores.set(current, false)
-                    returnRecords.set(symbol, { fn: current, symbol, graph: tracedGraph, ...shape })
-                    continue
-                }
+            inlineScores.set(current, false)
+            returnCallers.push({ fn: current, symbol, graph: tracedGraph })
+            return
+        }
+        const shouldNotInline = closed.closures || (current as any).shouldNotInline || lifted.wrapper || (tracedGraph.nodes.size <= 150 && !obviousInline(tracedGraph))
+        const shape = shouldNotInline && !lifted.wrapper && !entry.returns ? returnedShape(tracedGraph) : undefined
+        if (intrinsics.argv().includes('native-decisions')) {
+            console.log(`DECIDE ${current.name || '<anon>'} sym=${symbol} nodes=${tracedGraph.nodes.size}`
+                + ` projected=false shouldNotInline=${!!shouldNotInline} wrapper=${!!lifted.wrapper}`
+                + ` tagged=${!!(current as any).shouldNotInline} shape=${!!shape}`)
+        }
+        if (shape) {
+            if (shouldNotInline || (tracedGraph.nodes.size <= 50 && !obviousInline(tracedGraph))) {
+                inlineScores.set(current, false)
+                returnRecords.set(symbol, { fn: current, symbol, graph: tracedGraph, ...shape })
+                return
             }
-            if (opaque) {
-                if (intrinsics.argv().includes('native-opaque')) console.log(`opaque ${current.name || '<anon>'} sym=${symbol}\n${dumpGraph(tracedGraph)}`)
-                const inspect = intrinsics.argv().includes('native-shapes')
-                const shaped = !!(current as any).shouldNotInline
-                inlineScores.set(current, inspect || shaped ? false : { cost: 0, pressure: 0 })
-                if (inspect) opaqueGraphs.set(symbol, tracedGraph)
-                if (shaped) shapedCallees.push({ fn: current, symbol, computation: intrinsics.getComputation(current), mapCapture })
-                continue
-            }
-            if (callEffects) refineCallEffects(tracedGraph, completedEffects)
-            const tracedSource = snapshotGraph(tracedGraph)
-            tracedGraph = normalize(tracedGraph)
-            const score = closed.closures || (current as any).shouldNotInline || tracedGraph.nodes.size > 50 || lifted.wrapper
-                ? undefined : obviousInline(tracedGraph)
-            inlineScores.set(current, score ?? false)
-            if (score && intrinsics.argv().includes('native-inline')) {
-                console.log('native inline', current.name, score)
-            }
-            entry.unit = tracedGraph
-            pending.push({ fn: current, symbol, graph: tracedGraph, source: tracedSource, ...handleSlots(tracedGraph) })
-            if (callEffects) {
-                const effects = graphEffects(tracedGraph)
-                let effect = effects.self
-                for (const callee of effects.callees) effect = Math.max(effect, completedEffects.get(callee) ?? EffectWrite)
-                completedEffects.set(symbol, effect)
-            }
+        }
+        if (opaque) {
+            if (intrinsics.argv().includes('native-opaque')) console.log(`opaque ${current.name || '<anon>'} sym=${symbol}\n${dumpGraph(tracedGraph)}`)
+            const inspect = intrinsics.argv().includes('native-shapes')
+            const shaped = !!(current as any).shouldNotInline
+            inlineScores.set(current, inspect || shaped ? false : { cost: 0, pressure: 0 })
+            if (inspect) opaqueGraphs.set(symbol, tracedGraph)
+            if (shaped) shapedCallees.push({ fn: current, symbol, computation: intrinsics.getComputation(current), mapCapture })
+            return
+        }
+        if (callEffects) refineCallEffects(tracedGraph, completedEffects)
+        const tracedSource = snapshotGraph(tracedGraph)
+        tracedGraph = normalize(tracedGraph)
+        const score = closed.closures || (current as any).shouldNotInline || tracedGraph.nodes.size > 50 || lifted.wrapper
+            ? undefined : obviousInline(tracedGraph)
+        inlineScores.set(current, score ?? false)
+        if (score && intrinsics.argv().includes('native-inline')) {
+            console.log('native inline', current.name, score)
+        }
+        entry.unit = tracedGraph
+        pending.push({ fn: current, symbol, graph: tracedGraph, source: tracedSource, ...handleSlots(tracedGraph) })
+        if (callEffects) {
+            const effects = graphEffects(tracedGraph)
+            let effect = effects.self
+            for (const callee of effects.callees) effect = Math.max(effect, completedEffects.get(callee) ?? EffectWrite)
+            completedEffects.set(symbol, effect)
         }
     }
     function referenced(unit: DeferredUnit): boolean {
@@ -2612,7 +2630,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         const outer = enterPhase('trace')
         const traced = trace2(shaped.computation[0], {
-            captures: shaped.computation[1], session, mapCapture: shaped.mapCapture, shouldInline,
+            captures: shaped.computation[1], session, mapCapture: shaped.mapCapture, shouldInline, returnTypeOf,
             name: shaped.fn.name, shapes, self: shaped.fn,
         })
         lowerPanics(traced.graph)
@@ -2719,7 +2737,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const symbol = slot === undefined ? undefined : localPoolTargets.get(slot)
             if (symbol === undefined) continue
             const local = freshId(graph)
-            graph.nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: 2 }]))
+            graph.nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: 2 }], resultType(graph, n)))
             const copy = copyNode(n)
             setRef(copy, 1, local)
             graph.nodes.set(id, copy)
@@ -2779,6 +2797,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 fresh = freshId(graph)
                 const copied = copyNode(m, getOperands(m).map(x => typeof x === 'number' ? copy(x) : x))
                 if (m.op === 'nil-effect' && countLiterals(m)) setLiteral(copied, 0, blocks.get(getLiteral(m, 0)) ?? getLiteral(m, 0))
+                if (typeRefOf(m)) setType(copied, { ref: copy(typeRefOf(m)) })
                 graph.nodes.set(fresh, copied)
             }
             copies.set(id, fresh)
@@ -2912,6 +2931,13 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const emitted = units
     if (intrinsics.argv().includes('emit-debug')) {
         console.log('EMITTED', pending.map(u => `${u.fn.name}:${u.symbol}${reached.has(u.symbol) ? '' : '(dropped)'}`).join(' '))
+    }
+    const floatReturns = new Set(emitted.filter(u => u.returnsFloat).map(u => u.symbol))
+    for (const p of pending) {
+        for (const n of p.graph.nodes.values()) {
+            if (n.op !== 'local-target' || getRef(n, 0) || !floatReturns.has(getLiteral(n, 0))) continue
+            intrinsics.assert(typeOf(n) === Types.f64, `native: ${p.fn.name || 'anonymous'} calls ${functions[getLiteral(n, 0)]?.name || 'anonymous'}, which returns f64, through an untyped target`)
+        }
     }
     let unitInst = 0
     for (const u of emitted) unitInst += u.code.words.length
