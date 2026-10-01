@@ -722,6 +722,10 @@ class AstNode {
         switch (this.kind) {
             case SyntaxKind.LabeledStatement:
                 return this.left
+
+            case SyntaxKind.BreakStatement:
+            case SyntaxKind.ContinueStatement:
+                return this.l ? this.left : undefined
         }
     }
 

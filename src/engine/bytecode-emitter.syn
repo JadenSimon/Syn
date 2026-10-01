@@ -435,17 +435,54 @@ function emitFunction(
 
     type IteratorScope = { iterator: number, open: number }
     const iterators: IteratorScope[] = []
-    type LoopLabels = { breaks: number[], continues: number[], continueTarget: number, canContinue: boolean, iterator?: IteratorScope }
-    let labels: LoopLabels | undefined = undefined
-    function emitBreak() {
-        if (!labels) throw "`break` outside of a loop"
-        if (labels.iterator) emitIteratorClose(labels.iterator)
-        labels.breaks.push(emitJumpPlaceholder(Op.Jump))
+    type LoopLabels = {
+        breaks: number[]
+        continues: number[]
+        continueTarget: number
+        canContinue: boolean
+        iterator?: IteratorScope
+        outer?: LoopLabels
+        names: string[]
+        labeledOnly?: boolean
     }
-    function emitContinue() {
-        if (!labels?.canContinue) throw "`continue` outside of a loop"
-        if (labels.continueTarget >= 0) { emitJumpTo(Op.Jump, labels.continueTarget); return }
-        labels.continues.push(emitJumpPlaceholder(Op.Jump))
+    let labels: LoopLabels | undefined = undefined
+    let pendingLabels: string[] = []
+    function enterLabels(continueTarget: number, canContinue: boolean, iterator?: IteratorScope): LoopLabels {
+        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget, canContinue, iterator, outer: labels, names: pendingLabels }
+        pendingLabels = []
+        labels = ctx
+        return ctx
+    }
+    function jumpTarget(label: string | undefined, continuing: boolean): LoopLabels {
+        for (let ctx = labels; ctx; ctx = ctx.outer) {
+            if (label === undefined) {
+                if (continuing ? ctx.canContinue : !ctx.labeledOnly) return ctx
+                continue
+            }
+            if (!ctx.names.includes(label)) continue
+            if (continuing && !ctx.canContinue) throw `\`continue ${label}\` does not target a loop`
+            return ctx
+        }
+        if (label !== undefined) throw `unknown label: ${label}`
+        throw continuing ? "`continue` outside of a loop" : "`break` outside of a loop"
+    }
+    function closeIterators(target: LoopLabels, inclusive: boolean): void {
+        for (let ctx = labels; ctx; ctx = ctx.outer) {
+            if (ctx === target && !inclusive) return
+            if (ctx.iterator) emitIteratorClose(ctx.iterator)
+            if (ctx === target) return
+        }
+    }
+    function emitBreak(label?: string) {
+        const target = jumpTarget(label, false)
+        closeIterators(target, true)
+        target.breaks.push(emitJumpPlaceholder(Op.Jump))
+    }
+    function emitContinue(label?: string) {
+        const target = jumpTarget(label, true)
+        closeIterators(target, false)
+        if (target.continueTarget >= 0) { emitJumpTo(Op.Jump, target.continueTarget); return }
+        target.continues.push(emitJumpPlaceholder(Op.Jump))
     }
 
     function internString(s: string): number {
@@ -1813,8 +1850,7 @@ function emitFunction(
 
         const saveLabels = labels
         defer labels = saveLabels
-        const ctx = { breaks: [], continues: [], continueTarget: -1, canContinue: true }
-        labels = ctx
+        const ctx = enterLabels(-1, true)
         skipNextLookbehind = true
 
         if (c && c[0] === 'value') {
@@ -1840,8 +1876,7 @@ function emitFunction(
     function emitDo(node: ts.DoStatement) {
         const saveLabels = labels
         defer labels = saveLabels
-        const ctx = { breaks: [], continues: [], continueTarget: -1, canContinue: true }
-        labels = ctx
+        const ctx = enterLabels(-1, true)
         skipNextLookbehind = true
 
         const bodyTop = code.length
@@ -1888,8 +1923,7 @@ function emitFunction(
 
         const saveLabels = labels
         defer labels = saveLabels
-        const ctx = { breaks: [], continues: [], continueTarget: -1, canContinue: true }
-        labels = ctx
+        const ctx = enterLabels(-1, true)
         skipNextLookbehind = true
 
         if (condAlwaysTrue) {
@@ -1960,8 +1994,7 @@ function emitFunction(
         else if (ts.isIdentifier(node.initializer)) star(symToReg.get(getSymbolId(node.initializer))!)
         else throw 'for...of assignment target must be an identifier'
 
-        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget: top, canContinue: true, iterator: scope }
-        labels = ctx
+        const ctx = enterLabels(top, true, scope)
         iterators.push(scope)
         emitStatement(node.statement)
         iterators.pop()
@@ -2135,13 +2168,7 @@ function emitFunction(
 
         const savedLabels = labels
         defer labels = savedLabels
-        const ctx: LoopLabels = {
-            breaks: [],
-            continues: savedLabels?.continues ?? [],
-            continueTarget: savedLabels?.continueTarget ?? -1,
-            canContinue: savedLabels?.canContinue ?? false,
-        }
-        labels = ctx
+        const ctx = enterLabels(-1, false)
         freeReg()
         for (let i = 0; i < clauses.length; i++) {
             for (const at of targets[i]) patchJump(at)
@@ -2150,6 +2177,23 @@ function emitFunction(
             for (const statement of clauses[i].statements) emitStatement(statement)
         }
         if (defaultClause < 0) for (const at of defaults) patchJump(at)
+        for (const at of ctx.breaks) patchJump(at)
+    }
+
+    function emitLabeled(node: ts.LabeledStatement) {
+        const statement = node.statement
+        pendingLabels.push(node.label.text)
+        defer pendingLabels = []
+        if (ts.isWhileStatement(statement) || ts.isDoStatement(statement) || ts.isForStatement(statement)
+            || ts.isForOfStatement(statement) || ts.isSwitchStatement(statement) || ts.isLabeledStatement(statement)) {
+            emitStatement(statement)
+            return
+        }
+        const saveLabels = labels
+        defer labels = saveLabels
+        const ctx = enterLabels(-1, false)
+        ctx.labeledOnly = true
+        emitStatement(statement)
         for (const at of ctx.breaks) patchJump(at)
     }
 
@@ -2187,12 +2231,11 @@ function emitFunction(
         if (ts.isForStatement(node)) { emitFor(node); return }
         if (ts.isForOfStatement(node)) { emitForOf(node); return }
         if (ts.isSwitchStatement(node)) { emitSwitch(node); return }
+        if (ts.isLabeledStatement(node)) { emitLabeled(node); return }
         if (ts.isBreakStatement(node)) {
-            if (node.label) throw "labeled break is not supported"
-            emitBreak(); return
+            emitBreak(node.label?.text); return
         } else if (ts.isContinueStatement(node)) {
-            if (node.label) throw "labeled continue is not supported"
-            emitContinue(); return
+            emitContinue(node.label?.text); return
         } else if (ts.isTryStatement(node)) {
             return void emitTryStatement(node)
         } else if (ts.isThrowStatement(node)) {
@@ -3399,6 +3442,13 @@ function runTest() {
     e2eTest('function iterationThrow(o) { try { for (const x of o) { if (x === 2) throw 7 } } catch (e) { return e * 10 + o.closed } return 0 }', [iterable()])
     e2eTest('function iterationAssign(o) { let x = 0; for (x of o) {} return x }', [iterable()])
     e2eTest('function iterationSwitch(o) { let sum = 0; for (const x of o) { switch (x) { case 1: break; default: sum += x } } return sum * 10 + o.closed }', [iterable()])
+    e2eTest('function labeledFor(n) { let s = 0; outer: for (let i = 0; i < n; i += 1) { for (let j = 0; j < n; j += 1) { if (j === 3) continue outer; if (i === 4) break outer; s += i * 10 + j } } return s }', [6])
+    e2eTest('function labeledBlock(x) { let s = 1; block: { if (x > 2) break block; s = 5 } return s }', [3])
+    e2eTest('function labeledBlock(x) { let s = 1; block: { if (x > 2) break block; s = 5 } return s }', [1])
+    e2eTest('function blockInLoop(n) { let s = 0; for (let i = 0; i < n; i += 1) { b: { if (i === 2) break b; if (i === 4) break; s += i } } return s }', [10])
+    e2eTest('function labeledSwitch(n) { let s = 0; loop: for (let i = 0; i < n; i += 1) { switch (i) { case 1: continue loop; case 3: break loop; default: s += i } s += 100 } return s }', [6])
+    e2eTest('function labeledWhile(n) { let i = 0; let s = 0; top: while (i < n) { i += 1; let j = 0; do { j += 1; if (j === 2) continue top; s += j } while (j < 5) } return s }', [4])
+    e2eTest('function labeledIteration(o, p) { let sum = 0; outer: for (const x of o) { for (const y of p) { if (y === 2) continue outer; if (x === 3) break outer; sum += x * 10 + y } } return sum * 100 + o.closed * 10 + p.closed }', [iterable(), iterable()])
     const pairs = iterable()
     pairs.next = function next(this: { index: number }) {
         const index = this.index
