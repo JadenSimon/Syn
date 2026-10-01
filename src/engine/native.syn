@@ -8,12 +8,12 @@ import * as heap from './heap'
 import * as syscalls from './syscalls'
 import { rawValue, traceValue } from './vm'
 import {
-    Graph, GraphBlock, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, isParam, lowerValueGraph, normalizeValueGraph,
+    Graph, GraphBlock, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, isNumeric, isParam, lowerValueGraph, normalizeValueGraph,
     printOptimizeStats,
 } from './lowering2'
 import {
-    addGraphBlock, cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getLiteral,
-    getRef, isContextParam, isThisParam, makeNode, operandType, setGraphBlocks, setLiteral, setRef, typeOf,
+    addGraphBlock, cloneLiterals, cloneRefs, copyNode, countIds, countLiterals, getArgIds, getBlock, getDebugLabel, getLiteral,
+    getRef, isContextParam, isThisParam, makeNode, operandType, setDebugLabel, setGraphBlocks, setLiteral, setRef, typeOf,
 } from './graph-node'
 import { isSignedType } from './lowering'
 
@@ -958,12 +958,14 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         functions.push(f)
         return id
     }
-    function pointerSlot(ptr: number): number {
+    const poolLabels = new Map<number, string>()
+    function pointerSlot(ptr: number, label?: string): number {
         const known = nativePointerSlots.get(ptr)
         if (known !== undefined) return known
         const slot = poolValues.length
         poolValues.push(ptr)
         nativePointerSlots.set(ptr, slot)
+        if (label) poolLabels.set(slot, label)
         return slot
     }
     const imageStringBytes: number[] = []
@@ -977,6 +979,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         imageStringBytes.push(0)
         const slot = poolValues.length
         poolValues.push(0)
+        poolLabels.set(slot, JSON.stringify(text.length > 24 ? `${text.slice(0, 24)}...` : text))
         imageStringSlots.set(text, slot)
         stringPoolTargets.set(slot, at)
         return slot
@@ -986,6 +989,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         if (known !== undefined) return known
         const slot = poolValues.length
         poolValues.push(0)
+        poolLabels.set(slot, `fn ${functions[symbol]?.name || symbol}`)
         localFunctionSlots.set(symbol, slot)
         localPoolTargets.set(slot, symbol)
         return slot
@@ -1167,6 +1171,25 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         return scope ? { bindings: scope, envs: traced.envs } : undefined
     }
     const paramShapes = new Map<Function, Map<number, intrinsics.Handle>>()
+    const numberParams = new Map<Function, Set<number>>()
+    function isRoot(fn: Function): boolean {
+        for (const symbol of roots.values()) if (functions[symbol] === fn) return true
+        return false
+    }
+    function isNumberParam(fn: Function, index: number): boolean {
+        if (paramShapes.get(fn)?.has(index)) return false
+        return isRoot(fn) || !!numberParams.get(fn)?.has(index)
+    }
+    function closeParams(fn: Function, paramCount: number): Map<number, intrinsics.Handle> | undefined {
+        const shapes = paramShapes.get(fn)
+        let out: Map<number, intrinsics.Handle> | undefined
+        for (let i = 0; i < paramCount; i++) {
+            if (!isNumberParam(fn, i)) continue
+            out ??= new Map(shapes ?? [])
+            out.set(i, propertyEval.numberShape)
+        }
+        return out ?? shapes
+    }
     function sourceOfLinked(fn: Function): CompiledSource | undefined {
         return codeOf(fn)?.source
     }
@@ -1230,6 +1253,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 slot = poolValues.length
                 poolSlots.set(capture, slot)
                 poolValues.push(capture.value)
+                poolLabels.set(slot, `0x${capture.value.toString(16)}`)
             }
             return rawValue(session.mk('pool-entry', [traceValue(slot)]))
         }
@@ -1262,9 +1286,26 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         symbol: number
     }
     const deferredUnits: DeferredUnit[] = []
+    function callers(): { fn: Function, graph: Graph }[] {
+        return [...pending, ...returnCallers, ...returnRecords.values()]
+    }
+    function agreedNumeric(fn: Function, index: number): boolean {
+        let called = false
+        for (const caller of callers()) {
+            const graph = caller.graph
+            const entry = (param: number) => isNumberParam(caller.fn, graph.blocks[0].params.indexOf(param))
+            for (const n of graph.nodes.values()) {
+                if (n.op !== 'call' || linkedCallee(graph, n) !== fn) continue
+                const at = 3 + index
+                if (at >= countIds(n) || !isNumeric(graph, getRef(n, at), entry)) return false
+                called = true
+            }
+        }
+        return called
+    }
     function agreedLiteral(fn: Function, index: number): number | undefined {
         let agreed: number | undefined
-        for (const graph of [...pending.map(u => u.graph), ...returnCallers.map(c => c.graph), ...[...returnRecords.values()].map(r => r.graph)]) {
+        for (const { graph } of callers()) {
             for (const n of graph.nodes.values()) {
                 if (n.op !== 'call' || linkedCallee(graph, n) !== fn) continue
                 const at = 3 + index
@@ -1284,6 +1325,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         for (let i = 0; i < entry.source.compiled.paramCount; i++) {
             const value = agreedLiteral(unit.fn, i)
             if (value !== undefined) literals.set(traced.blocks[0].params[i], value)
+            else if (agreedNumeric(unit.fn, i)) {
+                let numbers = numberParams.get(unit.fn)
+                if (!numbers) numberParams.set(unit.fn, numbers = new Set())
+                numbers.add(i)
+            }
         }
         const nodes = new Map<number, GraphNode>()
         for (const [id, n] of traced.nodes) {
@@ -1296,7 +1342,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         const graph = { ...traced, nodes, blocks: traced.blocks.map(b => ({ ...b, params: b.params.slice() })) }
         const name = unit.fn.name
-        const closed = timed('close', () => closeOver(unit.fn, { ...entry.traced, graph }, entry.source, mapCapture, scopeOf(unit.fn, entry.traced), paramShapes.get(unit.fn), constructedFor(layout, graph)))
+        const closed = timed('close', () => closeOver(unit.fn, { ...entry.traced, graph }, entry.source, mapCapture, scopeOf(unit.fn, entry.traced), closeParams(unit.fn, entry.source.compiled.paramCount), constructedFor(layout, graph)))
         entry.closed = snapshotGraph(closed.graph)
         entry.closedShapes = closed.shapes
         encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(unit.fn))
@@ -1409,7 +1455,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (!shapes) paramShapes.set(fn, shapes = new Map())
             shapes.set(entry.source.compiled.paramCount, layout.shape)
         }
-        const closed = timed('close', () => closeOver(fn, entry.traced, entry.source, mapCapture, scopeOf(fn, entry.traced), paramShapes.get(fn), constructedFor(layout, entry.traced.graph)))
+        const closed = timed('close', () => closeOver(fn, entry.traced, entry.source, mapCapture, scopeOf(fn, entry.traced), closeParams(fn, entry.source.compiled.paramCount), constructedFor(layout, entry.traced.graph)))
         entry.closed = snapshotGraph(closed.graph)
         entry.closedShapes = closed.shapes
         return entry.closed
@@ -1786,10 +1832,16 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     }
     const provisional = new Map<Function, Summary>()
     const recursed = new Set<Function>()
+    function showStored(x: Stored): string {
+        return isLoc(x) ? `p${x.param}:[${x.path}]${x.base ? `+${x.base}` : ''}` : describe(x).replace(/@\d+,?/, '')
+    }
+    function effectKey(e: Summary['effects'][number]): string {
+        return `${showStored(e.target)}<-${showStored(e.value)}${e.encoded ? '!' : ''}`
+    }
     function summaryKey(summary: Summary): string {
-        const show = (x: Stored) => isLoc(x) ? `p${x.param}:[${x.path}]${x.base ? `+${x.base}` : ''}` : describe(x).replace(/@\d+,?/, '')
+        const show = showStored
         return JSON.stringify({
-            effects: summary.effects.map(e => `${show(e.target)}<-${show(e.value)}${e.encoded ? '!' : ''}`).sort(),
+            effects: summary.effects.map(effectKey).sort(),
             rets: summary.rets.map(r => `${show(r.value)}${r.encoded ? '!' : ''}`).sort(),
             fields: [...summary.fields].map(([k, c]) => `${k}:${show(c.value)}${c.encoded ? '!' : ''}`).sort(),
         })
@@ -1923,7 +1975,9 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 }
             }
         }
-        const summary = { effects, rets, fields }
+        const distinct = new Map<string, Summary['effects'][number]>()
+        for (const e of effects) distinct.set(effectKey(e), e)
+        const summary = { effects: [...distinct.values()], rets, fields }
         summaries.set(fn, summary)
         if (intrinsics.argv().includes('call-sites')) {
             const show = (x: Stored) => isLoc(x) ? `p${x.param}:[${x.path}]` : describe(x)
@@ -2125,7 +2179,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 if (!shapes) paramShapes.set(current, shapes = new Map())
                 shapes.set(unitSource.compiled.paramCount, layout.shape)
             }
-            const closed = timed('close', () => closeOver(current, traced, unitSource, mapCapture, scopeOf(current, traced), paramShapes.get(current), constructedFor(layout, traced.graph)))
+            const closed = timed('close', () => closeOver(current, traced, unitSource, mapCapture, scopeOf(current, traced), closeParams(current, unitSource.compiled.paramCount), constructedFor(layout, traced.graph)))
             entry.closed = snapshotGraph(closed.graph)
             entry.closedShapes = closed.shapes
             encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(current))
@@ -2454,7 +2508,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (!heap.isCallable(handle as intrinsics.Handle)) {
                 dataHandleSlots.set(handle, heap.isString(handle as intrinsics.Handle)
                     ? stringSlot(heap.stringToJs(handle as intrinsics.Handle))
-                    : pointerSlot(handle))
+                    : pointerSlot(handle, !handle ? 'nullish' : heap.isOrdinaryObject(handle as intrinsics.Handle) ? describe(handle as intrinsics.Handle) : `@${handle}`))
                 continue
             }
             const linked = session.stubFunctions.get(handle) as any
@@ -2464,7 +2518,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 continue
             }
             if (Number.isSafeInteger(linked.__native)) {
-                functionHandleSlots.set(handle, pointerSlot(linked.__native))
+                functionHandleSlots.set(handle, pointerSlot(linked.__native, `native ${linked.name || linked.__native}`))
                 continue
             }
             const target = intern(linked)
@@ -2620,7 +2674,6 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         localizeCalls(unit, unit.graph)
         if (unit.source) localizeCalls(unit, unit.source)
     }
-    const inlineLimit = 16
     const unitsBySymbol = new Map<number, PendingUnit>()
     for (const unit of pending) unitsBySymbol.set(unit.symbol, unit)
     function reachable(graph: Graph): GraphNode[] | undefined {
@@ -2658,7 +2711,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             blocks.set(b.id, id)
             for (const p of b.params) {
                 const fresh = freshId(graph)
-                graph.nodes.set(fresh, makeNode('param', [], new Float64Array(0)))
+                graph.nodes.set(fresh, copyNode(callee.nodes.get(p)!))
                 copies.set(p, fresh)
             }
         }
@@ -2680,24 +2733,37 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         graph.nodes.set(call, makeNode('inlined', [copy(callee.blocks[0].bodyId), 0], new Float64Array([0, call])))
     }
     const inlining = new Map<number, boolean>()
+    const callSites = new Map<number, number>()
+    function calledSymbol(source: Graph, n: GraphNode): number | undefined {
+        if (n.op !== 'call') return
+        const target = source.nodes.get(getRef(n, 1))
+        if (target?.op !== 'local-target' || getRef(target, 0)) return
+        return getLiteral(target, 0)
+    }
+    for (const unit of pending) {
+        for (const n of unit.source?.nodes.values() ?? []) {
+            const symbol = calledSymbol(unit.source!, n)
+            if (symbol !== undefined) callSites.set(symbol, (callSites.get(symbol) ?? 0) + 1)
+        }
+    }
     function inlineCallees(unit: PendingUnit): void {
         if (inlining.has(unit.symbol)) return
         inlining.set(unit.symbol, false)
         const source = unit.source
         let changed = false
         for (const [id, n] of source ? [...source.nodes] : []) {
-            if (n.op !== 'call') continue
-            const target = source!.nodes.get(getRef(n, 1))
-            if (target?.op !== 'local-target' || getRef(target, 0)) continue
-            const callee = unitsBySymbol.get(getLiteral(target, 0))
+            const symbol = calledSymbol(source!, n)
+            if (symbol === undefined) continue
+            const callee = unitsBySymbol.get(symbol)
             if (!callee || callee === unit || (callee.fn as any).shouldNotInline) continue
             inlineCallees(callee)
             if (!inlining.get(callee.symbol) || !callee.source) continue
-            const size = reachable(callee.graph)?.length
-            if (size === undefined || size > inlineLimit) continue
+            if (!reachable(callee.graph)) continue
+            const score = obviousInline(callee.graph)
+            if (!score && (callSites.get(symbol) !== 1 || isRoot(callee.fn))) continue
             const only = intrinsics.argv().filter(a => a.startsWith('inline-only:')).map(a => a.slice(12))
             if (only.length && !only.includes(callee.fn.name)) continue
-            if (intrinsics.argv().includes('inline-debug')) console.log('INLINE', unit.fn.name, '<-', callee.fn.name, `%${id}`, size)
+            if (intrinsics.argv().includes('inline-debug')) console.log('INLINE', unit.fn.name, '<-', callee.fn.name, `%${id}`, score?.cost ?? 'sole')
             splice(source!, id, callee.source)
             changed = true
         }
@@ -2758,6 +2824,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     for (const unit of pending) {
         if (!reached.has(unit.symbol)) continue
         const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs)
+        for (const [id, n] of graph.nodes) {
+            if (n.op !== 'pool-entry' || getDebugLabel(graph, id)) continue
+            const label = poolLabels.get(getLiteral(n, 0))
+            if (label) setDebugLabel(graph, id, label)
+        }
         const rootBlock = graph.blocks[0]
         intrinsics.assert(rootBlock.params.filter(p => !isContextParam(graph.nodes.get(p)!)).length <= 7)
         const debug = intrinsics.argv().includes('lower-debug')

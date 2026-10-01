@@ -132,6 +132,29 @@ const InverseCompare: Record<string, string> = {
     eq: 'ne', ne: 'eq', lt: 'ge', ge: 'lt', le: 'gt', gt: 'le',
 }
 const UnaryOps = new Set<string>(['neg', 'not'])
+export const NumericOps = new Set<string>([...BinaryOps, ...CompareOps, ...UnaryOps])
+
+export function isNumeric(g: Graph, id: number, entry: (param: number) => boolean, visiting = new Set<number>()): boolean {
+    if (!id) return true
+    const n = g.nodes.get(id)
+    if (!n) return false
+    if (n.op === 'literal' || NumericOps.has(n.op)) return true
+    if (n.op === 'select') return isNumeric(g, getRef(n, 1), entry, visiting) && isNumeric(g, getRef(n, 2), entry, visiting)
+    if (n.op !== 'param') return false
+    if (visiting.has(id)) return true
+    const block = g.blocks.find(b => b.params.includes(id))
+    if (!block) return false
+    if (!block.id) return entry(id)
+    visiting.add(id)
+    const at = block.params.indexOf(id) + 1
+    let arrived = false
+    for (const m of g.nodes.values()) {
+        if (m.op !== 'apply' || getRef(m, 0) !== block.id) continue
+        if (!isNumeric(g, getRef(m, at), entry, visiting)) return false
+        arrived = true
+    }
+    return arrived
+}
 const TargetingValues = new Set([
     'syscall-target', 'local-target', 'indirect-target'
 ])
@@ -2135,8 +2158,12 @@ function optimizeValueGraph(g: Graph) {
                 const o = g.nodes.get(ordering)
                 const parallel = o?.op === 'after' && isNilOrVoid(getRef(o, countIds(o) - 1))
                 const parts = (parallel ? cloneRefs(o!, 0, countIds(o!) - 1) : [ordering]).filter(p => !isNilOrVoid(p))
-                const operands = cloneRefs(n, 1).filter(x => x)
-                const kept = parts.filter(p => !operands.some(x => x === p || precedes(p, x)))
+                const operands = cloneRefs(n, 1).filter(x => x && g.nodes.get(x)?.op !== 'after')
+                const kept = parts.filter(p => {
+                    const part = g.nodes.get(p)
+                    const pure = part?.op === 'load' || (part?.op === 'call' && callEffect(part) <= 1)
+                    return !operands.some(x => x === p || (!pure && precedes(p, x)))
+                })
                 if (kept.length < parts.length) {
                     if (!argIds) argIds = cloneRefs(n)
                     if (!argConsts) argConsts = cloneLiterals(n)
@@ -2185,7 +2212,7 @@ function optimizeValueGraph(g: Graph) {
                 const v = getRef(a, last)
                 const value = g.nodes.get(v)!
                 if (OrderedValues.has(value.op) && cloneRefs(a, 0, last).every(p => {
-                    const q = simplifyOrdering(p, value)
+                    const q = simplifyOrdering(p, n)
                     return isNilOrVoid(q) || q === v || precedes(q!, v)
                 })) {
                     if (!lifted) lifted = cloneRefs(n)
@@ -2213,6 +2240,57 @@ function optimizeValueGraph(g: Graph) {
         return changed
     }
 
+    function relaxStoreOrdering(target: GraphBlock): boolean {
+        const fences = findValues(target.id, 'noalias')
+        if (!fences?.length) return false
+        function flatten(x: number, out: number[] = []): number[] {
+            if (isNilOrVoid(x)) return out
+            const n = g.nodes.get(x)!
+            if (n.op !== 'after') {
+                out.push(x)
+                return out
+            }
+            for (let i = 0; i < countIds(n); i++) flatten(getRef(n, i), out)
+            return out
+        }
+        function fencedBy(fence: number, load: number) {
+            const f = g.nodes.get(fence)
+            const n = g.nodes.get(load)
+            return f?.op === 'noalias' && n?.op === 'load' && getRef(n, 1) === getRef(f, 1)
+        }
+        for (const id of findValues(target.id, 'store') ?? []) {
+            const n = g.nodes.get(id)!
+            const ptr = getRef(n, 1)
+            const parts = flatten(getRef(n, 0))
+            const kept = parts.filter(p => !fencedBy(ptr, p) && !fencedBy(getRef(g.nodes.get(p)!, 1), id))
+            if (kept.length === parts.length) continue
+            const relaxed = cloneRefs(n)
+            relaxed[0] = effectsJoin(kept)
+            g.nodes.set(id, copyNode(n, relaxed, cloneLiterals(n)))
+        }
+        const replacements = new Map<number, number>()
+        for (const id of fences) {
+            const fence = g.nodes.get(id)!
+            const ptr = getRef(fence, 0)
+            if (!ptr) {
+                replacements.set(id, createNode(g, 'literal', [literal(getLiteral(fence, 0))]))
+                continue
+            }
+            const a = g.nodes.get(ptr)!
+            if (a.op !== 'after') {
+                replacements.set(id, ptr)
+                continue
+            }
+            const last = countIds(a) - 1
+            const kept: number[] = []
+            for (let i = 0; i < last; i++) for (const p of flatten(getRef(a, i))) if (!fencedBy(id, p)) kept.push(p)
+            replacements.set(id, effectsJoin(kept, getRef(a, last)))
+        }
+        target.bodyId = replaceAll(target.bodyId, replacements)
+        revisitBlock(target)
+        return true
+    }
+
     function eliminateUnusedPureValues(target: GraphBlock): boolean {
         const replacements = new Map<number, number>()
         for (const id of findValues(target.id, 'load') ?? []) {
@@ -2233,6 +2311,8 @@ function optimizeValueGraph(g: Graph) {
         revisitBlock(target, true)
         return true
     }
+
+    const maxLoopParams = 6
 
     // finds values that never differ across applications and moves them to a pred
     function hoistInvariants(target: GraphBlock) {
@@ -2323,15 +2403,24 @@ function optimizeValueGraph(g: Graph) {
                 covered.add(next)
             }
         }
-        const maxLoopParams = 6
         const headroom = Math.max(0, maxLoopParams - target.params.length)
-        for (const idx of obvious) {
-            const p = target.params[idx]
-            if (!covered.has(p) && !headroom) {
-                invariants.delete(p)
-                const s = dependents.get(p)
-                if (!s) continue
-                for (const u of s) invariants.delete(u)
+        if (!headroom) {
+            const dropping = obvious.map(i => target.params[i]).filter(p => !covered.has(p))
+            while (dropping.length) {
+                const stack = [dropping.pop()!]
+                while (stack.length) {
+                    const x = stack.pop()!
+                    if (!invariants.delete(x)) continue
+                    for (const u of dependents.get(x) ?? []) stack.push(u)
+                }
+                for (const p of covered) {
+                    for (const u of dependents.get(p) ?? []) {
+                        if (invariants.has(u) || inbound.some(x => x[1] === u)) continue
+                        covered.delete(p)
+                        dropping.push(p)
+                        break
+                    }
+                }
             }
         }
         const roots = new Map<number, [dependent: number, pos: number][]>()
@@ -2564,6 +2653,9 @@ function optimizeValueGraph(g: Graph) {
                 else if (worthHoisting(x) && !roots.includes(x)) roots.push(x)
             }
         }
+        let fullest = 0
+        for (const id of carrier.keys()) fullest = Math.max(fullest, getGraphBlock(id).params.length)
+        roots.splice(Math.max(0, maxLoopParams - fullest))
         if (!roots.length) return false
 
         const epoch = nextEpoch(g)
@@ -6064,6 +6156,7 @@ function optimizeValueGraph(g: Graph) {
             step(simplifySelect, b)
             step(reduceBlockOrdering, b)
             step(liftAfters, b)
+            step(relaxStoreOrdering, b)
             step(interchangeSelects, b)
         }
         const forwardingStart = performance.now()
@@ -8952,7 +9045,8 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             assert(!getRef(n, 0) && Number.isSafeInteger(slot) && slot >= 0)
             finish()
             const dst = regFor(id, want)
-            put(() => asm.loadPool(dst, slot))
+            const name = getDebugLabel(g, id)
+            put(() => asm.loadPool(dst, slot, name))
             return
         }
         if (n.op === 'call-context') {
