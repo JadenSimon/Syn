@@ -8,7 +8,8 @@ import * as heap from './heap'
 import * as syscalls from './syscalls'
 import { rawValue, traceValue } from './vm'
 import {
-    Graph, GraphBlock, GraphNode, LowerGraphResult, analyzeValueGraph, dumpGraph, floatValues, isNumeric, isParam, lowerValueGraph, normalizeValueGraph,
+    Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
+    isJumbo, isNumeric, isParam, lowerValueGraph, normalizeValueGraph,
     printOptimizeStats,
 } from './lowering2'
 import {
@@ -873,6 +874,7 @@ function patchImage(
     localPoolTargets: Map<number, number>,
     stringPoolTargets: Map<number, number>,
     dataOffset: number,
+    dataRelocations: [at: number, target: number][],
 ): void {
     const view = new DataView(image.buffer, image.byteOffset, image.byteLength)
     const imageBase = BigInt(base)
@@ -886,6 +888,9 @@ function patchImage(
     }
     for (const [slot, at] of stringPoolTargets) {
         view.setBigUint64(poolOffset + slot * 8, imageBase + BigInt(dataOffset + at), true)
+    }
+    for (const [at, target] of dataRelocations) {
+        view.setBigUint64(dataOffset + at, imageBase + BigInt(dataOffset + target), true)
     }
     for (let i = 0; i < units.length; i++) {
         const unit = units[i]
@@ -924,6 +929,7 @@ function installImage(
     localPoolTargets: Map<number, number>,
     stringPoolTargets: Map<number, number>,
     stringBytes: Uint8Array,
+    dataRelocations: [at: number, target: number][],
 ) {
     const offsets: number[] = []
     let length = 0
@@ -945,7 +951,7 @@ function installImage(
     }
     const reserved = reserveCode(image.byteLength)
     patchImage(image, reserved.ptr, units, offsets, poolOffset, localPoolTargets,
-        stringPoolTargets, dataOffset)
+        stringPoolTargets, dataOffset, dataRelocations)
     const src = (ts as any).getArrayBufferPtr(image.buffer)
     if (!nativeCopier(reserved.ptr, src, image.byteLength)) throw 'failed to copy native image'
     const entries = offsets.map(offset => addPtr(reserved.ptr, offset))
@@ -977,7 +983,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         enterPhase(outer)
         return result
     }
-    function normalize(graph: Graph, opts?: { packaged?: boolean }): Graph {
+    function normalize(graph: Graph, opts?: { packaged?: boolean, firstPass?: boolean }): Graph {
         return timed('normalize', () => normalizeValueGraph(graph, opts))
     }
     const symbols = new Map<Function, number>()
@@ -1043,6 +1049,102 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         imageStringSlots.set(text, slot)
         stringPoolTargets.set(slot, at)
         return slot
+    }
+    const dataRelocations: [at: number, target: number][] = []
+    const constructionSlots = new Map<number, number>()
+    function dataBlock(bytes: Uint8Array): number {
+        while (imageStringBytes.length % 8) imageStringBytes.push(0)
+        const at = imageStringBytes.length
+        for (const byte of bytes) imageStringBytes.push(byte)
+        return at
+    }
+    function constructionSlot(cell: number): number {
+        const known = constructionSlots.get(cell)
+        if (known !== undefined) return known
+        const at = placeConstruction(cell, session.constructions.get(cell as u32)!.graph)
+        const slot = poolValues.length
+        poolValues.push(0)
+        poolLabels.set(slot, `construction @${cell}`)
+        stringPoolTargets.set(slot, at)
+        constructionSlots.set(cell, slot)
+        return slot
+    }
+    function placeConstruction(cell: number, graph: Graph): number {
+        const fail = (why: string): never => { throw `native: construction @${cell} cannot be placed in read-only memory: ${why}` }
+        if (graph.blocks.length !== 1) fail(`its graph has ${graph.blocks.length} blocks`)
+        function allocation(id: number): number {
+            let n = graph.nodes.get(id)
+            while (n?.op === 'after') {
+                id = getRef(n, countIds(n) - 1)
+                n = graph.nodes.get(id)
+            }
+            return n?.op === 'pstack' ? id : 0
+        }
+        const buffers = new Map<number, Uint8Array>()
+        const stores: number[] = []
+        for (const [id, n] of graph.nodes) {
+            if (n.op === 'pstack') {
+                if (getRef(n, 2) || getLiteral(n, 2) || getRef(n, 3)) fail(`%${id} is not a fixed-size allocation`)
+                buffers.set(id, new Uint8Array(getLiteral(n, 3)))
+            } else if (n.op === 'store') stores.push(id)
+            else if (n.op === 'call' || n.op === 'load' || n.op === 'set-prop' || n.op === 'get-prop') fail(`it performs ${n.op} %${id}`)
+        }
+        const pointers: [buffer: number, offset: number, target: number][] = []
+        for (const id of stores.sort((a, b) => a - b)) {
+            const n = graph.nodes.get(id)!
+            const buffer = allocation(getRef(n, 1))
+            if (!buffer || getRef(n, 2)) fail(`store %${id} has no fixed address`)
+            const width = intrinsics.intrinsicBitWidth(typeOf(n)) / 8
+            const offset = getLiteral(n, 2)
+            if (getRef(n, 3)) {
+                const target = allocation(getRef(n, 3))
+                if (!target || width !== 8) fail(`store %${id} writes a value that is not a 64-bit pointer to an allocation`)
+                pointers.push([buffer, offset, target])
+                continue
+            }
+            const view = new DataView(buffers.get(buffer)!.buffer)
+            const value = getLiteral(n, 3)
+            if (typeOf(n) === Types.f64) view.setFloat64(offset, value, true)
+            else if (!Number.isInteger(value)) fail(`store %${id} writes ${value}, which is not an integer`)
+            else for (let i = 0; i < width; i++) view.setUint8(offset + i, Number(BigInt.asUintN(8, BigInt(value) >> BigInt(i * 8))))
+        }
+        const buffersAt = new Map<number, number>()
+        for (const [id, bytes] of buffers) buffersAt.set(id, dataBlock(bytes))
+        for (const [buffer, offset, target] of pointers) dataRelocations.push([buffersAt.get(buffer)! + offset, buffersAt.get(target)!])
+        const placed = new Map<number, number>()
+        const placing = new Set<number>()
+        function placeObject(handle: intrinsics.Handle): number {
+            const known = placed.get(handle)
+            if (known !== undefined) return known
+            if (placing.has(handle)) fail(`object @${handle} contains itself`)
+            placing.add(handle)
+            const target = heap.isIndirect(handle) ? heap.indirectTarget(handle) : handle
+            const keys = propertyEval.dataKeys(target)
+            const bytes = new Uint8Array(keys.length * 8)
+            const view = new DataView(bytes.buffer)
+            const fields: [offset: number, target: number][] = []
+            for (let i = 0; i < keys.length; i++) {
+                const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, keys[i]))).slot0 as intrinsics.Handle
+                if (heap.isBoxedF64(slot)) {
+                    const raw = heap.unboxF64(slot)
+                    const id = intrinsics.getNanId(raw)
+                    if (id) {
+                        const allocated = allocation(id)
+                        if (!allocated) fail(`field ${heap.stringToJs(keys[i])} holds %${id}, which is not an allocation`)
+                        fields.push([i * 8, buffersAt.get(allocated)!])
+                    } else if (Number.isInteger(raw)) view.setBigUint64(i * 8, BigInt.asUintN(64, BigInt(raw)), true)
+                    else fail(`field ${heap.stringToJs(keys[i])} holds ${raw}, which is not an integer`)
+                } else if (slot && heap.isOrdinaryObject(heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot)) {
+                    fields.push([i * 8, placeObject(slot)])
+                } else fail(`field ${heap.stringToJs(keys[i])} holds an unsupported value`)
+            }
+            placing.delete(handle)
+            const at = dataBlock(bytes)
+            for (const [offset, into] of fields) dataRelocations.push([at + offset, into])
+            placed.set(handle, at)
+            return at
+        }
+        return placeObject(cell as intrinsics.Handle)
     }
     function localFunctionSlot(symbol: number): number {
         const known = localFunctionSlots.get(symbol)
@@ -1408,7 +1510,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(unit.fn))
         const lifted = liftReturnedHeapValues(closed.graph)
         const source = snapshotGraph({ ...lifted.graph, name })
-        const normalized = normalize({ ...lifted.graph, name })
+        const normalized = normalize({ ...lifted.graph, name }, { firstPass: true })
         if ([...normalized.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')) {
             console.log(dumpGraph(normalized))
             throw `native: ${name} reads properties of an opaque argument after specializing to its call sites`
@@ -1679,7 +1781,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (!entry.closed) throw `native: ${entry.fn.name} returns into a caller slot but was never resolved`
             const stored = { ...storeReturns(entry.fn.name, entry.closed, entry.returns), name: entry.fn.name }
             const source = snapshotGraph(stored)
-            const graph = normalize(stored)
+            const graph = normalize(stored, { firstPass: true })
             entry.unit = graph
             const symbol = symbols.get(entry.fn)!
             const unit = pending.find(u => u.fn === entry.fn)
@@ -2313,7 +2415,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         if (callEffects) refineCallEffects(tracedGraph, completedEffects)
         const tracedSource = snapshotGraph(tracedGraph)
-        tracedGraph = normalize(tracedGraph)
+        tracedGraph = normalize(tracedGraph, { firstPass: true })
         const score = closed.closures || (current as any).shouldNotInline || tracedGraph.nodes.size > 50 || lifted.wrapper
             ? undefined : obviousInline(tracedGraph)
         inlineScores.set(current, score ?? false)
@@ -2559,7 +2661,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 touched.add(other)
             }
             for (const u of touched) {
-                u.graph = normalize({ ...u.graph, name: u.fn.name })
+                u.graph = normalize({ ...u.graph, name: u.fn.name }, { firstPass: true })
                 u.source = undefined
                 Object.assign(u, handleSlots(u.graph))
             }
@@ -2572,6 +2674,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         for (const n of graph.nodes.values()) {
             if (n.op !== 'heap-handle') continue
             const handle = unwrapCell(getLiteral(n, 0))
+            if (session.constructions.has(getLiteral(n, 0) as u32)) {
+                dataHandleSlots.set(handle, constructionSlot(getLiteral(n, 0)))
+                continue
+            }
             const closure = closureSymbols.get(handle as u32) ?? (session.templateOf(handle as u32) ? symbols.get(closureFunction(handle as u32, 'closure')) : undefined)
             if (closure !== undefined) {
                 functionHandleSlots.set(handle, localFunctionSlot(closure))
@@ -2657,7 +2763,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         const lifted = liftReturnedHeapValues(traced.graph)
         const source = snapshotGraph({ ...lifted.graph, name: shaped.fn.name })
-        const normalized = normalize({ ...lifted.graph, name: shaped.fn.name })
+        const normalized = normalize({ ...lifted.graph, name: shaped.fn.name }, { firstPass: true })
         pending.push({ fn: shaped.fn, symbol: shaped.symbol, graph: normalized, source, ...handleSlots(normalized) })
     }
 
@@ -2704,7 +2810,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         for (const shape of returnRecords.values()) {
             const source = snapshotGraph(shape.graph)
-            const graph = normalize(shape.graph)
+            const graph = normalize(shape.graph, { firstPass: true })
             pending.push({ fn: shape.fn, symbol: shape.symbol, graph, source, ...handleSlots(graph) })
         }
         for (const caller of returnCallers) {
@@ -2719,7 +2825,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             }
             caller.graph.maxId = nextId
             const source = snapshotGraph(caller.graph)
-            const graph = normalize(caller.graph)
+            const graph = normalize(caller.graph, { firstPass: true })
             pending.push({ fn: caller.fn, symbol: caller.symbol, graph, source, ...handleSlots(graph) })
         }
     }
@@ -2731,7 +2837,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     function localizeCalls(unit: PendingUnit, graph: Graph): void {
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== 'call') continue
-            const target = graph.nodes.get(getRef(n, 1))
+            let target = graph.nodes.get(getRef(n, 1))
+            while (target?.op === 'after') target = graph.nodes.get(getRef(target, countIds(target) - 1))
             if (target?.op !== 'heap-handle' || getRef(target, 0)) continue
             const slot = unit.functionHandleSlots.get(unwrapCell(getLiteral(target, 0)))
             const symbol = slot === undefined ? undefined : localPoolTargets.get(slot)
@@ -2782,11 +2889,6 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const id = freshId(graph)
             graph.nodes.set(id, makeNode('block', []))
             blocks.set(b.id, id)
-            for (const p of b.params) {
-                const fresh = freshId(graph)
-                graph.nodes.set(fresh, copyNode(callee.nodes.get(p)!))
-                copies.set(p, fresh)
-            }
         }
         function copy(id: number): number {
             const known = copies.get(id) ?? blocks.get(id)
@@ -2803,7 +2905,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             copies.set(id, fresh)
             return fresh
         }
-        for (const b of callee.blocks.slice(1)) addGraphBlock(graph, { ...b, id: blocks.get(b.id)!, params: b.params.map(p => copies.get(p)!), bodyId: copy(b.bodyId) })
+        for (const b of callee.blocks.slice(1)) addGraphBlock(graph, { ...b, id: blocks.get(b.id)!, params: b.params.map(copy), bodyId: copy(b.bodyId) })
         graph.nodes.set(call, makeNode('inlined', [copy(callee.blocks[0].bodyId), { literal: call }]))
     }
     const inlining = new Map<number, boolean>()
@@ -2842,13 +2944,13 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             changed = true
         }
         if (changed) {
-            unit.graph = normalize(snapshotGraph(source!))
+            unit.graph = normalize(snapshotGraph(source!), { firstPass: true })
             Object.assign(unit, handleSlots(unit.graph))
         }
         inlining.set(unit.symbol, true)
     }
     enterPhase('inline')
-    if (intrinsics.argv().includes('graph-inline')) for (const unit of pending) inlineCallees(unit)
+    for (const unit of pending) inlineCallees(unit)
     enterPhase('effects')
     const effectClasses = classifyEffects(pending)
     if (intrinsics.argv().includes('native-effects')) {
@@ -2860,10 +2962,9 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         console.log('native effects total', EffectNames.map((n, i) => `${n}=${counts[i]}`).join(' '))
     }
-    if (callEffects) {
-        for (const unit of pending) {
-            if (refineCallEffects(unit.graph, effectClasses)) unit.graph = normalize(unit.graph, { packaged: true })
-        }
+    for (const unit of pending) {
+        const refined = callEffects && refineCallEffects(unit.graph, effectClasses)
+        if (refined || isJumbo(unit.graph)) unit.graph = normalize(unit.graph, { packaged: true })
     }
     enterPhase('other')
     const reached = new Set<number>()
@@ -2947,7 +3048,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const pooled = new Map<number, number>()
     for (const [slot, symbol] of localPoolTargets) if (reached.has(symbol)) pooled.set(slot, symbol)
     const installed = installImage(emitted, poolValues, pooled,
-        stringPoolTargets, new Uint8Array(imageStringBytes))
+        stringPoolTargets, new Uint8Array(imageStringBytes), dataRelocations)
     const result: Record<string, any> = {}
     for (const [name, symbol] of roots) {
         const ptr = installed.entries[symbol]
