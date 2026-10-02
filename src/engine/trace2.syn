@@ -156,6 +156,16 @@ interface Proxied {
     cell?: u32
     joined?: Joined
     group?: number
+    union?: Union
+}
+
+interface Union {
+    param: any
+    arm: any
+    record: any
+    shape: u32
+    fields: u32[]
+    object?: u32
 }
 
 interface TraceRuntime {
@@ -168,6 +178,7 @@ interface TraceRuntime {
     opaque: Map<number, u32>
     groupObjects: Map<Group, u32>
     proxied: Map<u32, Proxied>
+    unions: Map<number, Union>
     memory: Map<number, MemoryFacts>
     applications: Map<number, number[]>
     nilEffect?: any
@@ -752,6 +763,7 @@ export function createTraceSession(): TraceSession {
                 opaque: new Map(),
                 groupObjects: new Map(),
                 proxied: new Map(),
+                unions: new Map(),
                 memory: new Map(),
                 applications: new Map(),
                 depth: 0,
@@ -1115,6 +1127,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         from: number
         values: Float64Array
         heap: HeapState
+        apply: number
     }
     interface Reified {
         header: number
@@ -1124,6 +1137,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         arrivals: Arrival[]
         symbolic: Set<number>
         heap: Map<u32, { incoming: number, param: number, symbolic: boolean }>
+        extras: number[]
         direct: boolean
     }
     const reified = new Map<number, Reified>()
@@ -1748,7 +1762,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         }
         const R: Reified = {
             header: b, inputs, selfId, paramIds, arrivals: [],
-            symbolic: new Set(), heap: new Map(), direct: false,
+            symbolic: new Set(), heap: new Map(), extras: [], direct: false,
         }
         reified.set(b, R)
         runtime.applications.set(selfId, [])
@@ -1811,6 +1825,14 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (!applies.includes(id)) applies.push(id)
     }
 
+    function applyArgs(R: Reified, values: Float64Array, heapState: HeapState): any[] {
+        const args = [symbolValue(R.selfId)]
+        for (const slot of R.inputs) args.push(values[slot])
+        for (const value of heapState.values()) args.push(value)
+        if (!R.inputs.includes(TOKEN)) args.push(values[TOKEN])
+        return args
+    }
+
     function application(R: Reified, edge: Float64Array, from: number): any {
         const ins = edge // unrefine(edge, R.inputs)
         if (intrinsics.argv().includes('probe-heap')) {
@@ -1825,10 +1847,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         }
         const heapState = captureHeap(ins, R.inputs)
         const back = B.backPreds[R.header].includes(from)
-        if (!back) {
-            assert(!tracedBlocks.has(R.header), `trace2: B${from} arrived after B${R.header} was traced`)
-            R.arrivals.push({ from, values: ins.slice(), heap: heapState })
-        }
+        if (!back) assert(!tracedBlocks.has(R.header), `trace2: B${from} arrived after B${R.header} was traced`)
         if (back && R.arrivals.length) {
             const entry = R.arrivals[0]
             for (const slot of R.inputs) {
@@ -1842,11 +1861,10 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                 if (incoming !== undefined && !objects.sameShape(incoming, value)) throw `heap record: B${R.header} changes object shape across the back edge from B${from}`
             }
         }
-        const args = [symbolValue(R.selfId)]
-        for (const slot of R.inputs) args.push(ins[slot])
-        for (const value of heapState.values()) args.push(value)
-        if (!R.inputs.includes(TOKEN)) args.push(ins[TOKEN])
-        const applied = after(mk('apply', args), ins[TOKEN])
+        const args = applyArgs(R, ins, heapState)
+        const apply = mk('apply', args)
+        const applied = after(apply, ins[TOKEN])
+        if (!back) R.arrivals.push({ from, values: ins.slice(), heap: heapState, apply: symbolOf(apply) })
         addApplication(R.selfId, symbolOf(applied))
         if (intrinsics.argv().includes('probe-heap')) {
             const shown = args.map(a => {
@@ -1911,13 +1929,34 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return obj
     }
 
+    function unionObject(union: Union): u32 {
+        if (union.object !== undefined) return union.object
+        const proxy = makeProxy(0 as u32)
+        union.object = heap.makeObject(proxy as intrinsics.Handle) as u32
+        runtime.proxied.set(proxy, { union })
+        return union.object
+    }
+
+    function unionRead(union: Union, key: intrinsics.Handle): any {
+        const own = dataKeys(union.shape).includes(key as u32)
+        if (own && !union.fields.includes(key as u32)) throw `trace2: reads object field ${heap.stringToJs(key)} through an object joined with an unknown value`
+        if (!own && heap.getPropertyDescriptor(union.shape as intrinsics.Handle, key)) throw `trace2: reads inherited ${heap.stringToJs(key)} through an object joined with an unknown value`
+        const unknown = mk('get-prop', [readToken(), union.param, traceValue(key)])
+        writeToken(unknown)
+        const known = union.fields.includes(key as u32) ? mk('get', [union.record, traceValue(key)]) : handleValue(0)
+        return mk('select', [mk('eq', [union.arm, traceValue(0)], '', Types.bool), known, unknown])
+    }
+
     function shapeOfValue(value: any): u32 {
+        const union = runtime.unions.get(symbolOf(value))
+        if (union) return unionObject(union)
         const joined = objects.joinOf(value)
         if (joined) return joinedObject(joined, 0)
         return opaqueObject(value)
     }
 
     function proxyRead(target: Proxied, key: intrinsics.Handle): any {
+        if (target.union) return unionRead(target.union, key)
         if (!target.joined) {
             const value = mk('get-prop', [readToken(), target.param, traceValue(key)])
             writeToken(value)
@@ -1931,6 +1970,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     }
 
     function proxyWrite(target: Proxied, key: intrinsics.Handle, regStart: number): void {
+        if (target.union) throw `trace2: writes ${heap.stringToJs(key)} through an object joined with an unknown value`
         if (!target.joined) {
             writeToken(mk('set-prop', [readToken(), target.param, traceValue(key), escapedArg(regStart, 2)]))
             return
@@ -2004,10 +2044,71 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return lines.join('\n')
     }
 
+    function joinUnknownObjects(R: Reified): Map<number, u32> {
+        const found = new Map<number, u32>()
+        for (const slot of R.inputs) {
+            if (slot === TOKEN) continue
+            const cells = R.arrivals.map(a => cellOf(a.values[slot]))
+            if (cells.every(c => c) || !cells.some(c => c)) continue
+            if (R.arrivals.some((a, i) => !cells[i] && !symbolOf(a.values[slot]))) continue
+            const cell = cells.find(c => c)!
+            if (cells.some(c => c && c !== cell)) throw `trace2: s${slot} of B${R.header} joins several objects with an unknown value\n${describeArrivals(R)}`
+            found.set(slot, cell)
+        }
+        if (!found.size) return found
+        if (B.backPreds[R.header].length) throw `trace2: B${R.header} joins an object with an unknown value around a loop\n${describeArrivals(R)}`
+        const held = new Set(found.values())
+        for (const a of R.arrivals) {
+            for (const slot of R.inputs) {
+                if (!found.has(slot) && held.has(cellOf(a.values[slot]))) throw `trace2: s${slot} of B${R.header} also holds an object that joins with an unknown value\n${describeArrivals(R)}`
+            }
+        }
+        const records = new Map<number, number>()
+        for (const a of R.arrivals) {
+            for (const [slot, cell] of found) if (cellOf(a.values[slot]) === cell) records.set(slot, a.heap.get(cell)!)
+        }
+        for (const a of R.arrivals) {
+            const extras: any[] = []
+            for (const [slot, cell] of found) {
+                const own = cellOf(a.values[slot]) === cell
+                if (own) a.heap.delete(cell)
+                const record = own ? records.get(slot)! : mk('record', fieldKeys(heap.indirectTarget(cell as intrinsics.Handle) as u32).flatMap(key => [traceValue(key), traceValue(0)]))
+                extras.push(traceValue(own ? 0 : 1), record)
+            }
+            nodes.set(a.apply, copyNode(nodeOf(symbolOf(mk('apply', [...applyArgs(R, a.values, a.heap), ...extras], '', undefined, true)))!))
+        }
+        for (const [slot, cell] of found) {
+            const arm = newNodeId(tracer)
+            nodes.set(arm, makeNode('param', []))
+            setDebugLabel(runtime, arm, `arm${slot}`)
+            const record = objects.parameter(records.get(slot)!)
+            R.extras.push(arm, record)
+            const param = R.paramIds[R.inputs.indexOf(slot)]
+            const shape = heap.indirectTarget(cell as intrinsics.Handle) as u32
+            runtime.unions.set(param, {
+                param: symbolValue(param),
+                arm: symbolValue(arm),
+                record: symbolValue(record),
+                shape,
+                fields: fieldKeys(shape),
+            })
+        }
+        return found
+    }
+
+    function fieldKeys(target: u32): u32[] {
+        return dataKeys(target).filter(key => heap.isBoxedF64(slotOf(target, key)))
+    }
+
     function bindInputs(R: Reified): Float64Array {
         assert(!tracedBlocks.has(R.header) && R.arrivals.length > 0)
         const first = R.arrivals[0]
         const ins = first.values.slice()
+        const unions = joinUnknownObjects(R)
+        for (const [slot] of unions) {
+            R.symbolic.add(slot)
+            ins[slot] = symbolValue(R.paramIds[R.inputs.indexOf(slot)])
+        }
         for (const [cell, value] of first.heap) {
             const param = objects.parameter(value)
             paramOwner.set(param, R.header)
@@ -2025,7 +2126,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             let at = 0
             for (const [cell] of R.heap) joined.set(cell, edge[at++][0])
             for (const slot of R.inputs) {
-                if (sameValue(ins[slot], arrival.values[slot])) continue
+                if (unions.has(slot) || sameValue(ins[slot], arrival.values[slot])) continue
                 const incoming = cellOf(ins[slot])
                 const other = cellOf(arrival.values[slot])
                 if (incoming && other) {
@@ -2492,6 +2593,12 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     }
                     i++
                 }
+                const extrasAt = 1 + R.inputs.length + R.heap.size + (R.inputs.includes(TOKEN) ? 0 : 1)
+                R.extras.forEach((param, k) => {
+                    argumentIndices.push(extrasAt + k)
+                    inputs.push(-1)
+                    params.push(param)
+                })
                 runtime.blocks.set(R.selfId, { params, inputs, argumentIndices, body })
             }
             for (const R of reified.values()) assert(!R.arrivals.length || tracedBlocks.has(R.header), `trace2: missed B${R.header} in trace order`)

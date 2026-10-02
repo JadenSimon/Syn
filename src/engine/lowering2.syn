@@ -2357,6 +2357,17 @@ function optimizeValueGraph(g: Graph) {
     }
 
     const maxLoopParams = 8
+    function workingParams(block: GraphBlock): number {
+        let count = 0
+        for (const p of block.params) {
+            for (const user of dependents.get(p) ?? []) {
+                if (g.nodes.get(user)?.op === 'apply') continue
+                count++
+                break
+            }
+        }
+        return count
+    }
 
     // finds values that never differ across applications and moves them to a pred
     function hoistInvariants(target: GraphBlock) {
@@ -2419,6 +2430,7 @@ function optimizeValueGraph(g: Graph) {
             if (n.op === 'ret') return false
             if (n.op === 'select') return false
             if (n.op === 'after' || n.op === 'store' || n.op === 'call' || n.op === 'pstack') return false
+            if (TargetingValues.has(n.op)) return false
             if (n.op === 'load') {
                 if (writes) return false
                 if (!isNilOrVoid(getRef(n, 0))) return false
@@ -2447,7 +2459,7 @@ function optimizeValueGraph(g: Graph) {
                 covered.add(next)
             }
         }
-        const headroom = Math.max(0, maxLoopParams - target.params.length)
+        const headroom = Math.max(0, maxLoopParams - workingParams(target))
         if (!headroom) {
             const dropping = obvious.map(i => target.params[i]).filter(p => !covered.has(p))
             while (dropping.length) {
@@ -2701,7 +2713,7 @@ function optimizeValueGraph(g: Graph) {
             }
         }
         let fullest = 0
-        for (const id of carrier.keys()) fullest = Math.max(fullest, getGraphBlock(id).params.length)
+        for (const id of carrier.keys()) fullest = Math.max(fullest, workingParams(getGraphBlock(id)))
         roots.splice(Math.max(0, maxLoopParams - fullest))
         if (!roots.length) return false
 
@@ -4359,6 +4371,17 @@ function optimizeValueGraph(g: Graph) {
         return false
     }
 
+    let paramOwners: Map<number, GraphBlock> | undefined
+    function ownerOfParam(param: number): GraphBlock | undefined {
+        let owner = paramOwners?.get(param)
+        if (!owner || !owner.params.includes(param) || getBlock(g, owner.id) !== owner) {
+            paramOwners = new Map()
+            for (const b of g.blocks) for (const p of b.params) paramOwners.set(p, b)
+            owner = paramOwners.get(param)
+        }
+        return owner
+    }
+
     function forwardMemory(target: GraphBlock): boolean {
         function sameOperand(a: GraphNode, b: GraphNode, i: number): boolean {
             if (getRef(a, i) && getRef(a, i) === getRef(b, i)) return true
@@ -4445,34 +4468,158 @@ function optimizeValueGraph(g: Graph) {
                 }
             }
         }
+        const arrivals = new Map<number, GraphNode | undefined>()
+        function soleArrival(block: GraphBlock): GraphNode | undefined {
+            if (block === g.blocks[0]) return
+            if (!arrivals.has(block.id)) {
+                const inbound = findInboundApplies(block)
+                arrivals.set(block.id, inbound.length === 1 ? g.nodes.get(inbound[0][1]) : undefined)
+            }
+            return arrivals.get(block.id)
+        }
+        function addressOf(n: GraphNode): [root: number, offset: number] | undefined {
+            if (getRef(n, 2)) return
+            let at = getRef(n, 1)
+            let offset = getLiteral(n, 2)
+            for (let depth = 0; depth < 32; depth++) {
+                const m = g.nodes.get(at)
+                if (m?.op === 'after') {
+                    at = getRef(m, countIds(m) - 1)
+                    continue
+                }
+                if (m?.op === 'add' && getRef(m, 0) && !getRef(m, 1)) {
+                    offset += getLiteral(m, 1)
+                    at = getRef(m, 0)
+                    continue
+                }
+                const owner = m?.op === 'param' ? ownerOfParam(at) : undefined
+                const arrival = owner ? soleArrival(owner) : undefined
+                const arg = arrival ? getRef(arrival, owner!.params.indexOf(at) + 1) : 0
+                if (arg) {
+                    at = arg
+                    continue
+                }
+                return [at, offset]
+            }
+        }
+        function fresh(id: number): boolean {
+            const op = g.nodes.get(id)?.op
+            return op === 'pstack' || op === 'alloca'
+        }
+        function fixed(id: number): boolean {
+            const op = g.nodes.get(id)?.op
+            return !id || op === 'literal' || op === 'pool-entry'
+        }
+        function mayAlias(n: GraphNode, store: GraphNode): boolean {
+            const a = addressOf(n)
+            const b = addressOf(store)
+            if (!a || !b) return true
+            if (a[0] === b[0]) return a[1] < b[1] + bits(store) / 8 && b[1] < a[1] + bits(n) / 8
+            return !((fresh(a[0]) || fixed(a[0])) && (fresh(b[0]) || fixed(b[0])) && (fresh(a[0]) || fresh(b[0])))
+        }
+        function covers(n: GraphNode, store: GraphNode): boolean {
+            const a = addressOf(n)
+            const b = addressOf(store)
+            return !!a && !!b && a[0] === b[0] && a[1] <= b[1] && b[1] + bits(store) / 8 <= a[1] + bits(n) / 8
+        }
+        function overwritten(id: number, store: GraphNode): boolean {
+            const kills = new Set<number>()
+            let budget = 512
+            const seen = new Set<number>([id])
+            const pending: [node: number, from: number][] = []
+            function reach(node: number, from: number): void {
+                if (seen.has(node)) return
+                seen.add(node)
+                pending.push([node, from])
+            }
+            function afterKill(node: number): boolean {
+                if (!kills.size) return false
+                const stack = [node]
+                const visited = new Set<number>()
+                let steps = 128
+                while (stack.length) {
+                    const at = stack.pop()!
+                    if (kills.has(at)) return true
+                    if (at <= id || visited.has(at) || --steps < 0) continue
+                    visited.add(at)
+                    const n = g.nodes.get(at)
+                    if (n) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
+                }
+                return false
+            }
+            function users(node: number): void {
+                for (const user of dependents.get(node) ?? []) reach(user, node)
+            }
+            function enter(apply: GraphNode): boolean {
+                const block = getBlock(g, getRef(apply, 0))
+                if (!block || soleArrival(block) !== apply) return false
+                for (let i = 1; i < countIds(apply); i++) if (seen.has(getRef(apply, i))) reach(block.params[i - 1], 0)
+                for (const op of ['load', 'store', 'call', 'pstack', 'alloca', 'after']) {
+                    for (const entry of findValues(block.id, op) ?? []) {
+                        if (g.nodes.get(getRef(g.nodes.get(entry)!, 0))?.op === 'nil-effect') reach(entry, 0)
+                    }
+                }
+                return true
+            }
+            users(id)
+            while (pending.length) {
+                let next = 0
+                for (let i = 1; i < pending.length; i++) if (pending[i][0] < pending[next][0]) next = i
+                const [node, from] = pending[next]
+                pending[next] = pending[pending.length - 1]
+                pending.pop()
+                if (--budget < 0) return false
+                const n = g.nodes.get(node)
+                if (!n || afterKill(node)) continue
+                if (n.op === 'store') {
+                    if (covers(n, store)) {
+                        kills.add(node)
+                        continue
+                    }
+                    users(node)
+                    continue
+                }
+                if (n.op === 'load') {
+                    if (mayAlias(n, store)) return false
+                    users(node)
+                    continue
+                }
+                if (n.op === 'after') {
+                    let sequenced = getRef(n, countIds(n) - 1)
+                    for (let m = g.nodes.get(sequenced); m?.op === 'after'; m = g.nodes.get(sequenced)) sequenced = getRef(m, countIds(m) - 1)
+                    const value = g.nodes.get(sequenced)
+                    if (sequenced !== from && value && !isUnordered(sequenced)) {
+                        if (value.op === 'load') {
+                            if (mayAlias(value, store)) return false
+                        } else if (value.op === 'apply') {
+                            if (!enter(value)) return false
+                        } else if (value.op !== 'pstack' && value.op !== 'alloca' && !PureOps.has(value.op)) {
+                            return false
+                        }
+                    }
+                    users(node)
+                    continue
+                }
+                if (n.op === 'apply') {
+                    if (!enter(n)) return false
+                    continue
+                }
+                if (n.op === 'select') {
+                    if (getRef(n, 0) === from) return false
+                    continue
+                }
+                if (n.op === 'param' || n.op === 'pstack' || n.op === 'alloca' || PureOps.has(n.op)) {
+                    users(node)
+                    continue
+                }
+                return false
+            }
+            return kills.size > 0
+        }
         if (!r.size) {
             for (const id of findValues(target.id, 'store') ?? []) {
                 const store = g.nodes.get(id)!
-                let overwritten = false
-                let dead = true
-                for (const user of dependents.get(id) ?? []) {
-                    const n = g.nodes.get(user)
-                    if (!n) continue
-                    if (n.op === 'after' && getRef(n, countIds(n) - 1) !== id) {
-                        let sequenced = getRef(n, countIds(n) - 1)
-                        for (let m = g.nodes.get(sequenced); m?.op === 'after'; m = g.nodes.get(sequenced)) {
-                            sequenced = getRef(m, countIds(m) - 1)
-                        }
-                        if (isUnordered(sequenced)) continue
-                        dead = false
-                        break
-                    }
-                    if ((n.op === 'load' || n.op === 'store') && getRef(n, 0) === id) {
-                        if (!sameLocation(n, store)) continue
-                        if (n.op === 'store' && bits(n) >= bits(store)) { 
-                            overwritten = true 
-                            continue 
-                        }
-                    }
-                    dead = false
-                    break
-                }
-                if (overwritten && dead) r.set(id, getRef(store, 0) || addNode('nil-effect', []))
+                if (overwritten(id, store)) r.set(id, getRef(store, 0) || addNode('nil-effect', []))
             }
         }
         if (!r.size) return false
@@ -6458,13 +6605,128 @@ function expandPstacks(g: Graph): void {
         g.nodes.set(id, makeNode('sub', [a[0] || { literal: a[1] }, b[0] || { literal: b[1] }]))
         return [id, 0]
     }
+    const bumps = (n: GraphNode) => !getRef(n, 2) && !getLiteral(n, 2) && !getRef(n, 3) && getLiteral(n, 3) > 0
+    const blockOf = new Map<number, number>()
+    const inbound = new Map<number, number[]>()
+    const wrappers = new Map<number, number[]>()
+    for (const b of g.blocks) {
+        const stack = [b.bodyId]
+        const seen = new Set<number>()
+        while (stack.length) {
+            const at = stack.pop()!
+            if (!at || seen.has(at)) continue
+            seen.add(at)
+            const n = g.nodes.get(at)
+            if (!n || n.op === 'block') continue
+            if (!blockOf.has(at)) blockOf.set(at, b.id)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    for (const [id, n] of g.nodes) {
+        if (n.op === 'apply') {
+            const list = inbound.get(getRef(n, 0))
+            if (list) list.push(id)
+            else inbound.set(getRef(n, 0), [id])
+        }
+        if (n.op === 'after' && g.nodes.get(getRef(n, countIds(n) - 1))?.op === 'apply') {
+            const apply = getRef(n, countIds(n) - 1)
+            const list = wrappers.get(apply)
+            if (list) list.push(id)
+            else wrappers.set(apply, [id])
+        }
+    }
+    function search(starts: number[], cell: number): { found: number, visited: number[] } | undefined {
+        const seen = new Set<number>()
+        const visited: number[] = []
+        const stack = starts.slice()
+        let found = 0
+        while (stack.length) {
+            const at = stack.pop()!
+            if (!at || seen.has(at)) continue
+            if (seen.size >= 256) return
+            seen.add(at)
+            const n = g.nodes.get(at)
+            if (!n) continue
+            visited.push(at)
+            if (n.op === 'pstack' && getLiteral(n, 1) === cell) {
+                if (bumps(n) && at > found) found = at
+                continue
+            }
+            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
+        }
+        return { found, visited }
+    }
+    function clear(visited: number[], after: number, cell: number): boolean {
+        for (const at of visited) {
+            if (at <= after) continue
+            const n = g.nodes.get(at)!
+            if (n.op === 'call' || n.op === 'rt' || n.op === 'apply') return false
+            if (n.op === 'pstack' && getLiteral(n, 1) === cell && at !== after) return false
+            if ((n.op === 'load' || n.op === 'store') && !getRef(n, 1) && getLiteral(n, 1) === cell) return false
+        }
+        return true
+    }
+    function previous(id: number, cell: number): { found: number, hops: number[] } | undefined {
+        let starts = [getRef(g.nodes.get(id)!, 0)]
+        let block = blockOf.get(id)
+        const hops: number[] = []
+        for (let depth = 0; depth <= 4 && block !== undefined; depth++) {
+            const result = search(starts, cell)
+            if (!result) return
+            if (result.found) return clear(result.visited, result.found, cell) ? { found: result.found, hops } : undefined
+            if (!clear(result.visited, 0, cell)) return
+            if (block === g.blocks[0].id) return
+            const arrivals = inbound.get(block) ?? []
+            if (arrivals.length !== 1) return
+            hops.push(block)
+            const apply = g.nodes.get(arrivals[0])!
+            starts = cloneRefs(apply, 1)
+            for (const wrapper of wrappers.get(arrivals[0]) ?? []) starts.push(...cloneRefs(g.nodes.get(wrapper)!, 0, countIds(g.nodes.get(wrapper)!) - 1))
+            block = blockOf.get(arrivals[0])
+        }
+    }
+    const groups = new Map<number, { leader: number, offset: number, hops: number[] }>()
+    const totals = new Map<number, number>()
+    const planned = new Map<number, Set<number>>()
+    function fits(leader: number, hops: number[]): boolean {
+        for (const block of hops) {
+            const carried = planned.get(block)
+            if (carried?.has(leader)) continue
+            if (getBlock(g, block)!.params.length + (carried?.size ?? 0) >= 8) return false
+        }
+        return true
+    }
+    const decided = new Set<number>()
+    function decide(id: number): void {
+        if (decided.has(id)) return
+        decided.add(id)
+        const n = g.nodes.get(id)!
+        if (getRef(n, 1) || !bumps(n)) return
+        const prior = previous(id, getLiteral(n, 1))
+        if (!prior) return
+        decide(prior.found)
+        const group = groups.get(prior.found)
+        const leader = group?.leader ?? prior.found
+        const hops = [...prior.hops, ...(group?.hops ?? [])]
+        if (!fits(leader, hops)) return
+        for (const block of hops) {
+            let carried = planned.get(block)
+            if (!carried) planned.set(block, carried = new Set())
+            carried.add(leader)
+        }
+        const offset = totals.get(leader) ?? getLiteral(g.nodes.get(leader)!, 3)
+        groups.set(id, { leader, offset, hops })
+        totals.set(leader, offset + getLiteral(n, 3))
+    }
+    for (const [id, n] of [...g.nodes]) if (n.op === 'pstack') decide(id)
+    const bases = new Map<number, [number, number]>()
     for (const [id, n] of [...g.nodes]) {
-        if (n.op !== 'pstack') continue
+        if (n.op !== 'pstack' || groups.has(id)) continue
         if (getRef(n, 1)) throw `lowering: pstack %${id} names its stack dynamically`
         const token = getRef(n, 0)
         const cell = getLiteral(n, 1)
         const region: [number, number] = [0, cell + 8]
-        const size: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(n, 3)]
+        const size: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : totals.get(id) ?? getLiteral(n, 3)]
         const mark: [number, number] = [getRef(n, 2), getRef(n, 2) ? 0 : getLiteral(n, 2)]
         let base = mark
         let top: [number, number]
@@ -6483,6 +6745,31 @@ function expandPstacks(g: Graph): void {
         const store = g.maxId++
         g.nodes.set(store, makeNode('store', [token, { literal: cell }, 0, top[0] || { literal: top[1] }], Types.u64))
         g.nodes.set(id, copyNode(n, [store, base[0] || { literal: base[1] }], 'after'))
+        bases.set(id, base)
+    }
+    const threaded = new Map<string, number>()
+    function carry(leader: number, hops: number[]): [number, number] {
+        let value = bases.get(leader)!
+        for (let i = hops.length - 1; i >= 0; i--) {
+            const key = `${leader}:${hops[i]}`
+            let param = threaded.get(key)
+            if (param === undefined) {
+                param = g.maxId++
+                g.nodes.set(param, makeNode('param', []))
+                getBlock(g, hops[i])!.params.push(param)
+                const apply = inbound.get(hops[i])![0]
+                const n = g.nodes.get(apply)!
+                g.nodes.set(apply, copyNode(n, [...getOperands(n), value[0] || { literal: value[1] }]))
+                threaded.set(key, param)
+            }
+            value = [param, 0]
+        }
+        return value
+    }
+    for (const [id, { leader, offset, hops }] of groups) {
+        const n = g.nodes.get(id)!
+        const base = add(carry(leader, hops), [0, offset])
+        g.nodes.set(id, copyNode(n, [getOperand(n, 0), base[0] || { literal: base[1] }], 'after'))
     }
 }
 
