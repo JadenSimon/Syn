@@ -1,7 +1,7 @@
 import * as api from './api'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { runSynModule } from './reifiedTypes'
+import { createModuleLoader, runSynScript } from './synModules'
 
 const filenameMarker = '// @filename:'
 
@@ -292,7 +292,7 @@ async function runTestCase(name: string, opt?: { testOnly?: boolean; shouldExecu
         if ((opt?.shouldExecute || parsed.compilerOptions.run) && k === '.js') {
             const f = v[0]
             const reifier = (prog as any).getReifier()
-            runSynModule(f.text, f.absPath, reifier)
+            runSynScript(f.text, f.absPath, reifier)
         }
 
         if (existingSnapshot === undefined) {
@@ -369,7 +369,7 @@ async function runVsonTestCase(name: string) {
     await writeFile(snapshotPath, output)
 }
 
-async function testEngine(entrypoint = 'heap', argv: string[] = []) {
+async function compileEngine() {
     const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
 
     const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
@@ -379,7 +379,6 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
         inlineSourceMap: true,
     })
 
-    const results: ({ name: string, text: string })[] = []
     const emitted = new Map<string, string>()
     const sourceFiles = prog.getSourceFiles().filter(sf => sf.fileName.endsWith('.syn'))
     const promises = []
@@ -387,7 +386,6 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
         const p = new Promise<void>((resolve, reject) => {
             const expected = new Set<string>()
             const x = prog.emit(sf, (name, text) => {
-                results.push({ name, text })
                 emitted.set(name, text)
                 expected.delete(name)
                 if (expected.size === 0) {
@@ -401,29 +399,31 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
 
     await Promise.all(promises)
 
-    const f = results.find(x => x.name.endsWith(`${entrypoint}.js`))
-    if (!f) throw `entrypoint "${entrypoint}" not found`
+    const reifier = (prog as any).getReifier()
+    reifier.__readFile = (file: string) => fs.readFileSync(file, 'utf8')
+    reifier.__writeFile = (file: string, text: string) => fs.writeFileSync(file, text)
+    reifier.__readDir = (dir: string) => fs.readdirSync(dir)
+    const loader = createModuleLoader(reifier, (from, name) => {
+        let r = path.resolve(path.dirname(from), name)
+        if (!path.extname(r)) r = `${r}.js`
+        return [r, emitted.get(r)]
+    }, api)
+    return { emitted, loader }
+}
+
+let engine: ReturnType<typeof compileEngine> | undefined
+
+async function testEngine(entrypoint = 'heap', argv: string[] = []) {
+    const { emitted, loader } = await (engine ??= compileEngine())
+    const entry = path.resolve(`src/engine/${entrypoint}.js`)
+    const text = emitted.get(entry)
+    if (!text) throw `entrypoint "${entrypoint}" not found`
     const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:'))?.replace(/^(cpu|heap)-prof:/, '')
     if (prof) {
         fs.mkdirSync(`${prof}.src`, { recursive: true })
         for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
     }
-    const reifier = (prog as any).getReifier()
-    ;(reifier as any).__argv = argv // XXX
-    ;(reifier as any).__readFile = (file: string) => fs.readFileSync(file, 'utf8')
-    ;(reifier as any).__writeFile = (file: string, text: string) => fs.writeFileSync(file, text)
-    ;(reifier as any).__readDir = (dir: string) => fs.readdirSync(dir)
-    return runSynModule(f.text, path.resolve(`src/engine/${entrypoint}.syn`), reifier, false, (from, name) => {
-        let r = path.resolve(path.dirname(from), name)
-        let sourceName = r
-        const extname = path.extname(r)
-        if (!extname) {
-            sourceName = `${r}.syn`
-            r = `${r}.js`
-        }
-        const text = emitted.get(r)
-        return [r, text]
-    }, api)
+    return loader.run(entry, text, argv)
 }
 
 function lineDiff(a: string, b: string) {
