@@ -11,6 +11,7 @@ import {
     symbolOf, symbolValue, tagVmHandle, traceCell, traceValue, vmHandle, vmValue,
 } from './vm'
 import * as lowering2 from './lowering2'
+import { recordSnapshots } from './records'
 import {
     copyNode, countIds, createGraph, getArgIds, getDebugLabel, getLiteral, getRef,
     makeNode, setDebugLabel, type Operand, typeRefOf,
@@ -146,7 +147,6 @@ interface SessionBlock {
     params: number[]
     inputs: number[]
     argumentIndices: number[]
-    consumesEffectToken: boolean
     body: any
 }
 
@@ -167,9 +167,18 @@ interface TraceRuntime {
     opaque: Map<number, u32>
     groupObjects: Map<Group, u32>
     proxied: Map<u32, Proxied>
+    memory: Map<number, MemoryFacts>
+    applications: Map<number, number[]>
     nilEffect?: any
     depth: number
 }
+
+interface KnownMemory {
+    value: any
+    T: number
+}
+
+type MemoryFacts = Map<number, Map<number, KnownMemory>>
 
 const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
 
@@ -386,6 +395,12 @@ export interface TraceSession {
     finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
     enterTrace(): TraceRuntime
     leaveTrace(): void
+    constructions: Map<u32, Construction>
+}
+
+export interface Construction {
+    rebuild: Function
+    graph: lowering2.Graph
 }
 
 export interface Template {
@@ -566,7 +581,18 @@ export function createTraceSession(): TraceSession {
         return stub
     }
 
-    const convertJsValue = heap.createJsValueConverter(linkFunction)
+    const constructions = new Map<u32, Construction>()
+    function construct(rebuild: Function): heap.Handle {
+        const traced = trace2(rebuild, { session, shouldInline: () => true })
+        const result = traced.returns[0]
+        const returned = runtime!.nodes.get(symbolOf(result))
+        assert(traced.returns.every(r => r === result) && returned?.op === 'heap-handle' && !getRef(returned, 0),
+            `trace2: the construction ${rebuild.name || '<anonymous>'} did not return a single heap value`)
+        const handle = getLiteral(returned!, 0) as heap.Handle
+        constructions.set(handle, { rebuild, graph: traced.graph })
+        return handle
+    }
+    const convertJsValue = heap.createJsValueConverter(linkFunction, construct)
     function fromJsValue(v: any): u32 {
         if (!isSymbolicMemory(v)) return convertJsValue(v)
         return heap.boxF64(v.ptr as f64)
@@ -716,6 +742,8 @@ export function createTraceSession(): TraceSession {
                 opaque: new Map(),
                 groupObjects: new Map(),
                 proxied: new Map(),
+                memory: new Map(),
+                applications: new Map(),
                 depth: 0,
             }
             session.runtime = runtime
@@ -757,6 +785,7 @@ export function createTraceSession(): TraceSession {
         finalize,
         enterTrace,
         leaveTrace,
+        constructions,
     }
     return session
 }
@@ -874,7 +903,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     function after(v: any, token: any): any {
         const tokenId = symbolOf(token)
-        if (!tokenId || tokenId === symbolOf(nilEffect)) return v
+        if (!tokenId || nodes.get(tokenId)?.op === 'nil-effect') return v
         const vid = symbolOf(v)
         if (vid === tokenId) return v
         return mk('after', [token, v])
@@ -903,6 +932,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     let nilEffect: f64
     let returned = false
+    const returns: any[] = []
     const continuation = opts.continuation
     if (continuation) {
         if (B.retCount > 1) continuation.multi = true
@@ -989,11 +1019,84 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return { ref: symbolOf(mk('fn-type', [traceValue(T)])) }
     }
 
+    function stackPointer(v: any): number {
+        let id = symbolOf(v)
+        while (id && nodes.get(id)?.op === 'after') id = getRef(nodes.get(id)!, 1)
+        return id && nodes.get(id)?.op === 'pstack' ? id : 0
+    }
+
+    function allocationOf(ptr: any): number {
+        const id = stackPointer(ptr)
+        if (!id) return 0
+        const n = nodes.get(id)!
+        if (getRef(n, 2) || getLiteral(n, 2)) return 0
+        return getRef(n, 3) || getLiteral(n, 3) ? id : 0
+    }
+
+    function factsOf(token: any): MemoryFacts | undefined {
+        return runtime.memory.get(symbolOf(token))
+    }
+
+    function setFacts(token: any, facts: MemoryFacts | undefined): void {
+        const id = symbolOf(token)
+        assert(id, 'trace2: memory token is concrete')
+        if (facts) runtime.memory.set(id, facts)
+    }
+
+    function forwardable(value: any, T: number): boolean {
+        if (T === Types.vm_value) return true
+        if (T >= Types.f16 && T <= Types.f64) return false
+        const id = symbolOf(value)
+        if (id) return nodes.get(id) !== undefined && gn.typeOf(nodes.get(id)!) === T
+        const raw = vmValue(value as u32)
+        return Number.isInteger(raw) && intrinsics.inRange(T as intrinsics.Types, raw)
+    }
+
+    function withContent(facts: MemoryFacts | undefined, allocation: number, offset: number, T: number, value?: any): MemoryFacts {
+        const next = new Map(facts)
+        const contents = new Map(next.get(allocation))
+        const end = offset + Math.ceil(intrinsics.intrinsicBitWidth(T as intrinsics.Types) / 8)
+        for (const [at, known] of contents) {
+            if (at < end && offset < at + Math.ceil(intrinsics.intrinsicBitWidth(known.T as intrinsics.Types) / 8)) contents.delete(at)
+        }
+        if (value !== undefined && forwardable(value, T)) contents.set(offset, { value, T })
+        next.set(allocation, contents)
+        return next
+    }
+
     function memoryLoad(ptr: any, offset: any, T: number): f64 {
         const token = readToken()
+        const allocation = symbolOf(offset) ? 0 : allocationOf(ptr)
+        const at = vmValue(offset as u32)
+        const facts = factsOf(token)
+        const known = allocation ? facts?.get(allocation)?.get(at) : undefined
+        if (known && known.T === T) return known.value
         const loaded = mk('load', [token, ptr, offset], '', T as intrinsics.Types)
-        writeToken(after(loaded, token))
+        const next = after(loaded, token)
+        writeToken(next)
+        setFacts(next, allocation ? withContent(facts, allocation, at, T, loaded) : facts)
         return loaded
+    }
+
+    function memoryStore(ptr: any, offset: any, value: any, T: number): void {
+        const token = readToken()
+        const stored = mk('store', [token, ptr, offset, value], '', T as intrinsics.Types)
+        writeToken(stored)
+        const allocation = allocationOf(ptr)
+        if (!allocation) return
+        const facts = factsOf(token)
+        if (!symbolOf(offset)) return setFacts(stored, withContent(facts, allocation, vmValue(offset as u32), T, value))
+        const next = new Map(facts)
+        next.delete(allocation)
+        setFacts(stored, next)
+    }
+
+    function stackOperation(stack: any, mark: any, size: any): any {
+        const token = readToken()
+        const v = mk('pstack', [token, stack, mark, size])
+        writeToken(v)
+        if (!symbolOf(mark) && !vmValue(mark as u32)) setFacts(v, factsOf(token))
+        return v
     }
 
     interface Arrival {
@@ -1009,6 +1112,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         arrivals: Arrival[]
         symbolic: Set<number>
         heap: Map<u32, { incoming: number, param: number, symbolic: boolean }>
+        direct: boolean
     }
     const reified = new Map<number, Reified>()
     const regionalParams = new Set<number>()
@@ -1239,7 +1343,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             const args: number[] = []
             for (let i = 0; i < nargs; i++) args.push(graphCallArg(regStart, i))
             const effect = readToken()
-            const cont = continuationFor()
+            const cont = folding ? undefined : continuationFor()
             let nested: ReturnType<typeof trace2> | undefined
             tracer.setActive(false)
             try {
@@ -1269,7 +1373,9 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                 return { value: nested.result }
             }
 
-            if (cont.multi) {
+            assert(cont || nested.returns.length === 1,
+                `trace2: ${linked.name || '<anonymous>'} returns from ${nested.returns.length} paths inside concrete loop B${current}`)
+            if (cont?.multi) {
                 assert(cont.used, `trace2: multi-ret callee never applied continuation B${cont.target}`)
                 const result = nested.result
                 step.kind = 'inline-cont'
@@ -1284,7 +1390,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             const unified = objects.unify(value)
             writeToken(getOrderingFromInlined(unified ? unified.result : value, effect))
             tracer.markHandled()
-            return { value: unified ? unified.value : value }
+            return { value: unified ? unified.value : orderedValue(value) }
         }
         const syscall = linked as any
         if (Number.isSafeInteger(syscall.__syscall)
@@ -1335,8 +1441,11 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             const id = intrinsics.getNanId(cond as any)
             if (debugTrace) console.log('trace branch intrinsic', { cond, id, v1, v2 })
             if (!id) return cond ? v1 : v2
-            const kn = nodes.get(id)
-            if (kn && kn.op === 'nonzero') return v1
+            if (knownNonzero(id)) return v1
+            const kn = nodeOf(id)
+            const zero = kn && (kn.op === 'eq' || kn.op === 'ne') ? againstZero(kn) : 0
+            if (zero && knownNonzero(zero)) return kn!.op === 'ne' ? v1 : v2
+            assert(folding === undefined, `trace2: symbolic branch inside concrete loop B${current} [${traceName || '?'}] %${id}`)
             step.kind = 'branch'
             step.condId = id
             step.thenPc = v1
@@ -1448,9 +1557,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     return tagCallResult(mk('indirect-target', [loaded, context]))
                 }
                 if (intrinsicName === 'store') {
-                    const v = mk('store', [readToken(), iargs[0], iargs[1], iargs[2]], '',
-                        vmValue(iargs[3] as u32) as intrinsics.Types)
-                    writeToken(v)
+                    memoryStore(iargs[0], iargs[1], iargs[2], vmValue(iargs[3] as u32))
                     tracer.markHandled()
                     return tagCallResult(0)
                 }
@@ -1461,8 +1568,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     return tagCallResult(mk('rt', operands))
                 }
                 if (intrinsicName === 'pstack') {
-                    const v = mk('pstack', [readToken(), iargs[0], iargs[1], iargs[2]])
-                    writeToken(v)
+                    const v = stackOperation(iargs[0], iargs[1], iargs[2])
                     tracer.markHandled()
                     return tagCallResult(v)
                 }
@@ -1504,6 +1610,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     const shapeTrace = intrinsics.argv().includes(`shape-trace:${traceName}`)
     const fnId = tracer.getNanCount()
+    let currentBlockId = fnId
 
     function showShapeValue(v: any): string {
         const id = symbolOf(v)
@@ -1616,18 +1723,22 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         setDebugLabel(runtime, selfId, `B${b}`)
         const paramIds: number[] = []
         for (const slot of inputs) {
+            if (slot === TOKEN) {
+                paramIds.push(0)
+                continue
+            }
             const id = newNodeId(tracer)
-            const name = slot === ACC ? 'acc' : slot === TOKEN ? 'token' : `s${slot}`
-            setDebugLabel(runtime, id, name)
+            setDebugLabel(runtime, id, slot === ACC ? 'acc' : `s${slot}`)
             nodes.set(id, makeNode('param', []))
             regionalParams.add(id)
             paramIds.push(id)
         }
         const R: Reified = {
             header: b, inputs, selfId, paramIds, arrivals: [],
-            symbolic: new Set(), heap: new Map(),
+            symbolic: new Set(), heap: new Map(), direct: false,
         }
         reified.set(b, R)
+        runtime.applications.set(selfId, [])
         return R
     }
 
@@ -1667,6 +1778,26 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return cont
     }
 
+    function settleApplication(id: number, value: any): void {
+        const target = symbolOf(value)
+        assert(target, `trace2: application %${id} settles to a concrete value`)
+        const n = copyNode(nodeOf(target)!)
+        nodes.set(id, n)
+        const block = appliedBlock(n)
+        if (block) addApplication(block, id)
+    }
+
+    function appliedBlock(n: Node): number {
+        const tail = n.op === 'after' ? nodes.get(getRef(n, countIds(n) - 1)) : n
+        return tail?.op === 'apply' ? getRef(tail, 0) : 0
+    }
+
+    function addApplication(block: number, id: number): void {
+        const applies = runtime.applications.get(block)
+        assert(applies, `trace2: %${id} applies %${block}, which is not a reified block`)
+        if (!applies.includes(id)) applies.push(id)
+    }
+
     function application(R: Reified, edge: Float64Array, from: number): any {
         const ins = edge // unrefine(edge, R.inputs)
         if (intrinsics.argv().includes('probe-heap')) {
@@ -1697,7 +1828,9 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         const args = [symbolValue(R.selfId)]
         for (const slot of R.inputs) args.push(ins[slot])
         for (const value of heapState.values()) args.push(value)
-        const applied = mk('apply', args)
+        if (!R.inputs.includes(TOKEN)) args.push(ins[TOKEN])
+        const applied = after(mk('apply', args), ins[TOKEN])
+        addApplication(R.selfId, symbolOf(applied))
         if (intrinsics.argv().includes('probe-heap')) {
             const shown = args.map(a => {
                 const sid = symbolOf(a)
@@ -1875,12 +2008,17 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             }
         }
 
+        let folds = false
         if (B.backPreds[R.header].length) {
             const reads = B.cycleReads[R.header]
-            const concrete = !B.cycleWrites[R.header].has(TOKEN)
-                && [...reads].every(slot => slot === TOKEN || (!R.symbolic.has(slot) && !symbolOf(ins[slot])))
-            if (concrete) folding = B.cycles[R.header]
-            else {
+            const effects = intrinsics.argv().includes('fold-effects')
+            const concrete = (effects || !B.cycleWrites[R.header].has(TOKEN))
+                && [...reads].every(slot => slot === TOKEN || (effects && (cellOf(ins[slot]) || stackPointer(ins[slot]))) || (!R.symbolic.has(slot) && !symbolOf(ins[slot])))
+            if (concrete) {
+                folds = true
+                folding = B.cycles[R.header]
+                if (effects) for (const [, binding] of R.heap) binding.symbolic = false
+            } else {
                 for (const slot of B.cycleWrites[R.header]) R.symbolic.add(slot)
             }
         }
@@ -1897,7 +2035,15 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             }
             console.log(`BIND B${R.header} regs symbolic=[${[...R.symbolic].join(',')}] inputs=[${R.inputs.join(',')}]`)
         }
-        if (R.inputs.includes(TOKEN) && !sameValue(ins[TOKEN], nilEffect)) R.symbolic.add(TOKEN)
+        const parameterized = R.inputs.some(slot => slot !== TOKEN && R.symbolic.has(slot) && !cellOf(ins[slot]))
+            || [...R.heap.values()].some(binding => binding.symbolic)
+        R.direct = R.arrivals.length === 1 && (folds || !B.backPreds[R.header].length) && !parameterized
+        if (!R.direct) {
+            const entry = mk('nil-effect', [traceValue(R.selfId)])
+            if (!R.symbolic.has(TOKEN)) setFacts(entry, factsOf(ins[TOKEN]))
+            ins[TOKEN] = entry
+        }
+        R.symbolic.delete(TOKEN)
         for (let i = 0; i < R.inputs.length; i++) {
             const slot = R.inputs[i]
             if (cellOf(ins[slot])) R.symbolic.delete(slot)
@@ -1935,7 +2081,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return mk('trap', [token, traceValue(code)])
     }
 
-    function ret(v: any, tag = fnId) {
+    function ret(v: any, tag = currentBlockId) {
         const id = symbolOf(v)
         const n = id ? nodes.get(id) : undefined
         if (n?.op === 'ret') return v
@@ -1979,6 +2125,11 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return handle
     }
 
+    function orderedValue(v: any): any {
+        const n = nodes.get(symbolOf(v))
+        return n?.op === 'after' && !getRef(n, 1) ? operand(n, 1) : v
+    }
+
     function selectValues(cond: any, a: any, b: any): any {
         const union = unionValues(a, b)
         if (union !== undefined) return union
@@ -1997,10 +2148,10 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     function getOrderingFromInlined(val: any, incoming: any): any {
         const id = symbolOf(val)
-        if (!id) return nilEffect
+        if (!id) return incoming
         if (sameValue(val, incoming)) return val
         const n = nodeOf(id)
-        if (!n) return nilEffect
+        if (!n) return incoming
         if (n.op === 'select') {
             const rem: number[] = [operand(n, 0)]
             let changed = false
@@ -2026,6 +2177,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             return val // must preserve
         }
         if (n.op === 'after') {
+            if (appliedBlock(n)) return val
             return getOrderingFromInlined(operand(n, 0), incoming)
         }
         if (n.op === 'join') {
@@ -2037,7 +2189,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (n.op === 'apply') return val
         if (n.op === 'unreachable') return val
         if (n.op === 'panic' || n.op === 'trap') return unreachable()
-        return nilEffect
+        return incoming
     }
 
     function arrive(b: number, ins: Float64Array, from: number): f64 {
@@ -2073,6 +2225,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (r.kind === 'ret') {
             returned = true
             const v = r.valueId ? symbolValue(r.valueId) : r.valueConst
+            returns.push(v)
             if (continuation && continuation.multi) return continuation(v, r.outs[TOKEN])
             // if (objects.shouldJoin()) return ret(objects.joinChanges(v, r.outs[TOKEN]))
             return ret(after(v, r.outs[TOKEN]))
@@ -2173,6 +2326,10 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (an && (b === 0 || symbolOf(b) === an)) return symbolValue(an)
         const bn = nonzeroInput(b)
         if (bn && (a === 0 || symbolOf(a) === bn)) return symbolValue(bn)
+    }
+
+    function knownNonzero(id: number): boolean {
+        return nodeOf(id)?.op === 'nonzero' || stackPointer(symbolValue(id)) !== 0
     }
 
     function nonzeroInput(v: any): number {
@@ -2276,12 +2433,17 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                 settled.add(b)
                 const R = reified.get(b)
                 if (!R || !R.arrivals.length) continue
+                currentBlockId = R.selfId
                 const body = tracePath(R.header, bindInputs(R))
+                if (R.direct) {
+                    for (const id of runtime.applications.get(R.selfId)!) settleApplication(id, body)
+                    continue
+                }
                 const argumentIndices: number[] = []
                 const inputs: number[] = []
                 const params: number[] = []
                 for (let i = 0; i < R.inputs.length; i++) {
-                    if (R.inputs[i] === TOKEN || !R.symbolic.has(R.inputs[i])) continue
+                    if (!R.symbolic.has(R.inputs[i])) continue
                     argumentIndices.push(i + 1)
                     inputs.push(R.inputs[i])
                     params.push(R.paramIds[i])
@@ -2295,16 +2457,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     }
                     i++
                 }
-                if (R.symbolic.has(TOKEN)) {
-                    const index = R.inputs.indexOf(TOKEN)
-                    argumentIndices.push(index + 1)
-                    inputs.push(TOKEN)
-                    params.push(R.paramIds[index])
-                }
-                runtime.blocks.set(R.selfId, {
-                    params, inputs, argumentIndices, body,
-                    consumesEffectToken: R.symbolic.has(TOKEN),
-                })
+                runtime.blocks.set(R.selfId, { params, inputs, argumentIndices, body })
             }
             for (const R of reified.values()) assert(!R.arrivals.length || tracedBlocks.has(R.header), `trace2: missed B${R.header} in trace order`)
             return entry
@@ -2430,7 +2583,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                         const r = tail(block.body)
                         blocks.push({
                             id, params: block.params.slice(),
-                            bodyId: r[0], bodyConst: r[1], consumesEffectToken: block.consumesEffectToken,
+                            bodyId: r[0], bodyConst: r[1],
                         })
                     }
                 }
@@ -2476,7 +2629,9 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         }
         const maxId = tracer.getNanCount() + 1
         const name = opts.name ?? (typeof input === 'function' ? input.name : undefined)
-        return createGraph({ maxId, nodes: out, blocks, debugLabels: runtime.debugLabels, name })
+        const graph = createGraph({ maxId, nodes: out, blocks, debugLabels: runtime.debugLabels, name })
+        recordSnapshots(graph)
+        return graph
     }
     const selfTotal = performance.now() - selfStart
     statEntry.self += selfTotal - nestedElapsed
@@ -2490,6 +2645,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         envs,
         result,
         returned,
+        returns,
         dispatches,
         session,
     }

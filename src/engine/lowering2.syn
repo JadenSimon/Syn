@@ -7,6 +7,7 @@ import * as intrinsics from './intrinsics'
 import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
+import { snapshotKeys } from './heap-records'
 import * as rt from './rt'
 import {
     addGraphBlock, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
@@ -31,7 +32,6 @@ export interface GraphBlock {
     params: number[]
     bodyId: number
     bodyConst: number
-    consumesEffectToken?: boolean // DO NOT USE THIS
 }
 
 export interface Graph {
@@ -91,10 +91,11 @@ function recordKeys(g: Graph, id: number): number[] | undefined {
     }
     const type = n.op === 'param' ? g.nodes.get(typeRefOf(n)) : undefined
     if (type?.op === 'record-type') return recordFields(type).map(field => field.key)
+    if (n.op === 'heap-handle' && !getRef(n, 0) && countIds(n) > 1) return snapshotKeys(getLiteral(n, 1) as intrinsics.Handle)
     if (n.op === 'select') return recordKeys(g, getRef(n, 1))
 }
 
-function detachRecordOrdering(g: Graph, tokenBlocks: Set<number>) {
+function detachRecordOrdering(g: Graph): Graph {
     const owners = new Map<number, number>()
     for (const b of g.blocks) {
         for (const p of b.params) {
@@ -102,7 +103,7 @@ function detachRecordOrdering(g: Graph, tokenBlocks: Set<number>) {
             if (u && recordKeys(g, p)) owners.set(p, b.id)
         }
     }
-    if (!owners.size) return
+    if (!owners.size) return g
     const nils = new Map<number, number>()
     function detach(n: GraphNode, i: number) {
         const owner = owners.get(getRef(n, i))
@@ -116,10 +117,9 @@ function detachRecordOrdering(g: Graph, tokenBlocks: Set<number>) {
             for (let i = 0; i < countIds(n) - 1; i++) detach(n, i)
         } else if (OrderedValues.has(n.op)) {
             detach(n, 0)
-        } else if (n.op === 'apply' && tokenBlocks.has(getRef(n, 0))) {
-            detach(n, countIds(n) - 1)
         }
     }
+    return g
 }
 
 function paramNode(): GraphNode {
@@ -3063,8 +3063,19 @@ function optimizeValueGraph(g: Graph) {
     function liftCommonApplication(id: number) {
         const n = g.nodes.get(id)
         if (!n || n.op !== 'select') return false
-        const yes = g.nodes.get(getRef(n, 1))
-        const no = g.nodes.get(getRef(n, 2))
+        let yes = g.nodes.get(getRef(n, 1))
+        let no = g.nodes.get(getRef(n, 2))
+        const orderings: Operand[] = []
+        if (yes?.op === 'after' && no?.op === 'after') {
+            const end = countIds(yes) - 1
+            if (countIds(no) - 1 !== end) return false
+            for (let i = 0; i < end; i++) {
+                if (!getRef(yes, i) || getRef(yes, i) !== getRef(no, i)) return false
+                orderings.push(getRef(yes, i))
+            }
+            yes = g.nodes.get(getRef(yes, end))
+            no = g.nodes.get(getRef(no, end))
+        }
         if (!yes || yes.op !== 'apply' || !no || no.op !== 'apply') return false
         if (getRef(yes, 0) !== getRef(no, 0) || countIds(yes) !== countIds(no)) return false
 
@@ -3080,7 +3091,11 @@ function optimizeValueGraph(g: Graph) {
 
         const operands = getOperands(yes)
         for (const at of differ) operands[at] = addNode('select', [getOperand(n, 0), getOperand(yes, at), getOperand(no, at)], n)
-        g.nodes.set(id, copyNode(yes, operands))
+        if (!orderings.length) {
+            g.nodes.set(id, copyNode(yes, operands))
+            return true
+        }
+        g.nodes.set(id, makeNode('after', [...orderings, addNode('apply', operands, yes)]))
         return true
     }
 
@@ -6409,7 +6424,7 @@ function bindCallContext(g: Graph) {
     g.nodes.set(context, gn.createContextParam())
     if (merged.size) for (const b of g.blocks) b.bodyId = replaceAll(g, b.bodyId, merged)
     const entry = g.blocks[0]
-    entry.params.splice(entry.consumesEffectToken ? entry.params.length - 1 : entry.params.length, 0, context)
+    entry.params.push(context)
     return g
 }
 
@@ -7326,7 +7341,7 @@ export function dumpGraph(g: Graph): string {
         out.push(`--- vgraph for ${g.name} ---`)
     }
     for (const b of g.blocks) {
-        out.push(`B${b.id}(${b.params.join(', ')})${b.consumesEffectToken ? ' [tok]' : ''} -> ${b.bodyId || b.bodyConst}`)
+        out.push(`B${b.id}(${b.params.join(', ')}) -> ${b.bodyId || b.bodyConst}`)
         const seen = new Set<number>()
         function walk(id: number): void {
             if (!id || seen.has(id)) return
@@ -7819,7 +7834,7 @@ function hoistSharedArms(g: Graph): Graph {
     if (only && g.name !== only) return g
     const hoistable = (n: GraphNode) => n.op === 'load' || n.op === 'convert' || n.op === 'bitconvert'
         || BinaryOps.has(n.op) || UnaryOps.has(n.op) || CompareOps.has(n.op)
-    const outer = (n: GraphNode | undefined) => !n || n.op === 'block' || TargetingValues.has(n.op) || isArgless(n)
+    const outer = (n: GraphNode | undefined) => !n || n.op === 'block' || isArgless(n)
     function reach(root: number, into: Set<number>, stop?: Set<number>): void {
         const stack = [root]
         while (stack.length) {
@@ -8175,22 +8190,6 @@ function checkCreationOrder(g: Graph, stage: string, known: Set<string>) {
     console.log(`creation order: ${g.name || '<anonymous>'} after ${stage}: ${found.length} new\n  ${found.slice(0, 8).join('\n  ')}`)
 }
 
-function removeOrderingParams(g: Graph): Graph {
-    const tokens = new Map<number, number>()
-    const tokenBlocks = new Set<number>()
-    for (const b of g.blocks) {
-        if (!b.consumesEffectToken) continue
-        tokens.set(b.params[b.params.length - 1], createNode(g, 'nil-effect', [literal(b.id)]))
-        tokenBlocks.add(b.id)
-        b.consumesEffectToken = false
-    }
-    if (tokens.size) {
-        for (const b of g.blocks) b.bodyId = replaceAll(g, b.bodyId, tokens)
-    }
-    detachRecordOrdering(g, tokenBlocks)
-    return g
-}
-
 function errorDump(g: Graph): string {
     return dumpGraph(g)
 }
@@ -8346,7 +8345,7 @@ export function normalizeValueGraph(g: Graph, opts: { packaged?: boolean } = {})
     if (!opts.packaged) {
         run(bindCallContext)
         run(inlineBlocks)
-        run(removeOrderingParams)
+        run(detachRecordOrdering)
         run(flattenRecords)
         run(packageBlocksFINAL)
     }
@@ -8623,6 +8622,10 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     function isSlot(h: number): boolean { return h < 0 }
     let slotCount = 0
     const reusableSlots = new Set<number>()
+    const spillStats = intrinsics.argv().includes('spill-stats') ? { total: 0, again: 0 } : undefined
+    const spilledOnce = new Set<number>()
+    const evictedOps = new Map<string, number>()
+    const handoverKinds = new Map<string, number>()
     let frameBase = 0
     function slotOffset(h: number): number { return frameBase + (-h - 1) * 8 }
     function allocaBase(): number { return (frameBase + slotCount * 8 + 15) & ~15 }
@@ -8672,6 +8675,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     }
 
     const homeOf = new Map<number, number>()
+    const copyOf = new Map<number, number>()
     const heldBy = new Map<number, number>()
     const done = new Set<number>()
     const temporariesAt = new Map<number, number[]>()
@@ -8703,6 +8707,11 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (home === undefined) return
         if (opts.debug) console.log('home -', v, home, 'at', site)
         homeOf.delete(v)
+        const copy = copyOf.get(v)
+        if (copy !== undefined) {
+            copyOf.delete(v)
+            reusableSlots.add(copy)
+        }
         freedAt.set(v, site)
         if (!isSlot(home) && heldBy.get(home) === v) heldBy.delete(home)
         code.push({ released: [{ value: v, home }] })
@@ -8730,9 +8739,19 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         for (const r of pool) if (!heldBy.has(r) && !avoid.has(r)) return r
         for (const r of pool) {
             const v = heldBy.get(r)
+            const copy = v === undefined ? undefined : copyOf.get(v)
+            if (copy === undefined || avoid.has(r)) continue
+            homeOf.set(v!, copy)
+            copyOf.delete(v!)
+            heldBy.delete(r)
+            return r
+        }
+        for (const r of pool) {
+            const v = heldBy.get(r)
             if (v === undefined || avoid.has(r)) continue
             const slot = takeSlot()
             transfer(slot, r)
+            if (spillStats) { spillStats.total++; if (spilledOnce.has(v)) spillStats.again++; spilledOnce.add(v); const op = g.nodes.get(v)?.op ?? '?'; evictedOps.set(op, (evictedOps.get(op) ?? 0) + 1) }
             homeOf.set(v, slot)
             heldBy.delete(r)
             return r
@@ -8786,25 +8805,30 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (r < 0) r = freeReg(second, avoid)
         if (r < 0) throw 'lowering: out of registers'
         transfer(r, home)
-        reusableSlots.add(home)
+        copyOf.set(v, home)
         return bind(v, r)
     }
-    interface Snapshot { homes: number[][], held: number[][], ran: number[] }
+    interface Snapshot { homes: number[][], copies: number[][], held: number[][], ran: number[] }
     function snapshot(): Snapshot {
         const homes: number[][] = []
         for (const [k, v] of homeOf) homes.push([k, v])
+        const copies: number[][] = []
+        for (const [k, v] of copyOf) copies.push([k, v])
         const held: number[][] = []
         for (const [k, v] of heldBy) held.push([k, v])
-        return { homes, held, ran: [...done] }
+        return { homes, copies, held, ran: [...done] }
     }
     function restore(s: Snapshot): void {
         homeOf.clear()
         for (const e of s.homes) homeOf.set(e[0], e[1])
+        copyOf.clear()
+        for (const e of s.copies) copyOf.set(e[0], e[1])
         heldBy.clear()
         for (const e of s.held) heldBy.set(e[0], e[1])
         reusableSlots.clear()
         const occupied = new Set<number>()
         for (const h of homeOf.values()) if (isSlot(h)) occupied.add(h)
+        for (const h of copyOf.values()) occupied.add(h)
         for (let i = 1; i <= slotCount; i++) if (!occupied.has(-i)) reusableSlots.add(-i)
         done.clear()
         for (const v of s.ran) done.add(v)
@@ -9182,6 +9206,14 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
                 sequenced = true
             }
             if (!s.id) continue
+            if (spillStats && paramAt.has(s.id) && s.dst !== OPEN) {
+                const at = paramAt.get(s.id)!
+                const own = sig.get(at[0])?.[at[1]]
+                const now = homeOf.get(s.id)
+                const kind = own !== s.dst ? 'other-ordinal' : now === s.dst ? 'kept' : now === undefined ? 'not-live' : isSlot(now) ? 'evicted-to-slot' : 'moved-to-reg'
+                const key = `${kind}${isSlot(s.dst) ? ' (dst slot)' : ''}`
+                handoverKinds.set(key, (handoverKinds.get(key) ?? 0) + 1)
+            }
             const want = s.dst === OPEN || isSlot(s.dst) ? -1 : s.dst
             pendingHomes = new Set(landing)
             if (want >= 0) pendingHomes.delete(want)
@@ -9192,7 +9224,12 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (!sequenced) sequence[1]()
         slots = slots.filter(s => !s.id || feeds.has(s))
         const settled = new Map<number, number>()
-        for (const v of feeds.values()) settled.set(v, homeOf.get(v)!)
+        const copied = new Map<number, number>()
+        for (const v of feeds.values()) {
+            settled.set(v, homeOf.get(v)!)
+            const copy = copyOf.get(v)
+            if (copy !== undefined) copied.set(v, copy)
+        }
         const claimed = new Set<number>()
         for (const s of slots) if (s.dst !== OPEN) claimed.add(s.dst)
         const open = slots.filter(s => s.dst === OPEN)
@@ -9241,6 +9278,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         let landed = elide
         const moves: Move[] = []
         for (const a of args) {
+            if (copied.get(a.src) === a.dst) continue
             const src = settled.get(a.src)
             if (src === undefined) {
                 const t = slots.find(x => x.dst === a.dst)?.id
@@ -9744,6 +9782,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         currentRegion = rootRegion
         armStart = -1
         homeOf.clear()
+        copyOf.clear()
         heldBy.clear()
         done.clear()
         reusableSlots.clear()
@@ -9874,6 +9913,9 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     if (reachesExit || !tailCalls) asm.ret()
 
     const listing = asm.listing()
+    if (spillStats && spillStats.total) console.log(`SPILLS ${g.name} total=${spillStats.total} again=${spillStats.again}`)
+    if (spillStats && evictedOps.size) console.log(`EVICTED ${g.name} ${[...evictedOps].map(([op, n]) => `${op}=${n}`).join(' ')}`)
+    if (spillStats && handoverKinds.size) console.log(`HANDOVER ${g.name} ${[...handoverKinds].map(([k, n]) => `${k}=${n}`).join(', ')}`)
     if (branchWasteProbe || intrinsics.argv().includes(`branch-waste:${g.name}`)) {
         reportBranchWaste(g.name ?? '<anonymous>', listing)
     }
