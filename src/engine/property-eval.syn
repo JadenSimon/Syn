@@ -5,9 +5,9 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { trace2, createTraceSession, type TraceSession } from './trace2'
-import { NumericOps, dumpGraph, lowerValueGraph, normalizeValueGraph, type Graph, type GraphNode } from './lowering2'
+import { NumericOps, dumpGraph, floatValues, lowerValueGraph, normalizeValueGraph, type Graph, type GraphNode } from './lowering2'
 import {
-    copyNode, countIds, countLiterals, createGraph, getLiteral, getOperands, getRef, makeNode, type Operand, setGraphBlocks, setLiteral,
+    cloneRefs, copyNode, countIds, countLiterals, createGraph, getLiteral, getOperands, getRef, makeNode, type Operand, setGraphBlocks, setLiteral,
     setOperand, setRef,
 } from './graph-node'
 import type { HeapState } from './heap-records'
@@ -39,6 +39,8 @@ export interface CallSite {
     target: GraphNode
     receiver: Handle | undefined
     args: (Handle | undefined)[]
+    numbers: boolean[]
+    floats: boolean[]
     demanded: boolean
     context?: Handle
 }
@@ -318,7 +320,7 @@ export function resolveProperties(
     }
 
     const after = new Map<number, HeapState>()
-    const entries = new Map<number, HeapState>()
+    const entries = new Map<number, { state: HeapState, block: number, arrivalState: (apply: number) => HeapState | undefined }>()
     const pending = new Set<number>()
     const calls = new Map<number, AccessorCall>()
 
@@ -387,7 +389,7 @@ export function resolveProperties(
 
     function joinArrivals(key: number, block: number, arrivalState: (apply: number) => HeapState | undefined): HeapState | undefined {
         const known = entries.get(key)
-        if (known) return known
+        if (known) return known.state
         if (pending.has(key)) return
         pending.add(key)
         const _key = key
@@ -401,7 +403,7 @@ export function resolveProperties(
         }
         if (!state && pending.size > 1) return
         if (!state) throw `property-eval: B${block} is only reached through itself`
-        entries.set(key, state)
+        entries.set(key, { state, block, arrivalState })
         return state
     }
 
@@ -709,6 +711,7 @@ export function resolveProperties(
         const tag = newId()
         nodes.set(tag, makeNode('param', []))
         const block = out.blocks.find(b => b.id === at.block)!
+        const position = block.params.length
         block.params.push(tag)
         unions.set(param, { tag, members })
         const incoming = inbound.get(at.block) ?? []
@@ -1069,6 +1072,7 @@ export function resolveProperties(
         for (let i = 1; i < countIds(n); i++) if (getRef(n, i)) inputs.push(getRef(n, i))
         return inputs
     }
+    let floating: Set<number> | undefined
     function bindCall(id: number, demanded: boolean, created = false): void {
         if (!opts.calls || boundCalls.has(id)) return
         if (created) return bindNow(id, demanded, created)
@@ -1086,9 +1090,16 @@ export function resolveProperties(
         boundCalls.add(id)
         const closure = memory.get(getRef(n, 1))
         const args: (Handle | undefined)[] = []
-        for (let i = 3; i < countIds(n); i++) args.push(shapeOf(getRef(n, i)))
+        const numbers: boolean[] = []
+        const floats: boolean[] = []
+        for (let i = 3; i < countIds(n); i++) {
+            const arg = getRef(n, i)
+            args.push(shapeOf(arg))
+            numbers.push(!arg || shape(arg) === numberShape)
+            floats.push(arg ? (floating ??= floatValues(graph)).has(arg) : !Number.isInteger(getLiteral(n, i)))
+        }
         if (closure) {
-            const site: CallSite = { call: id, target: nodes.get(getRef(n, 1))!, receiver: undefined, args, demanded, context: closure.shape }
+            const site: CallSite = { call: id, target: nodes.get(getRef(n, 1))!, receiver: undefined, args, numbers, floats, demanded, context: closure.shape }
             settleResult(id, site, opts.calls!(site))
             return
         }
@@ -1120,7 +1131,7 @@ export function resolveProperties(
             return
         }
         if (!callee) return
-        const site: CallSite = { call: id, target: nodes.get(callee)!, receiver: receiverShape, args, demanded }
+        const site: CallSite = { call: id, target: nodes.get(callee)!, receiver: receiverShape, args, numbers, floats, demanded }
         const binding = opts.calls!(site)
         if (!binding) return
         const current = nodes.get(id)!
@@ -1237,11 +1248,9 @@ export function resolveProperties(
         if (again === settledShape || (again && settledShape && again !== numberShape && settledShape !== numberShape && native.sameSnapshotShape(again, settledShape))) continue
         throw `property-eval: %${id} was assumed to be ${settledShape} but settles as ${again}`
     }
-    for (const [param, state] of entries) {
-        const at = tokenParams.get(param)!
-        for (const apply of inbound.get(at.block) ?? []) {
-            const arrival = stateAt(getRef(source.get(apply)!, at.index + 1))!
-            if (!sameState(state, arrival)) throw `property-eval: B${at.block} changes object state around its loop`
+    for (const { state, block, arrivalState } of entries.values()) {
+        for (const apply of inbound.get(block) ?? []) {
+            if (!sameState(state, arrivalState(apply)!)) throw `property-eval: B${block} changes object state around its loop`
         }
     }
     for (const [id, n] of source) {
@@ -1309,6 +1318,27 @@ export function resolveProperties(
     }
     for (const id of forward.keys()) nodes.delete(id)
     for (const b of out.blocks) b.bodyId = target(b.bodyId)
+    if (initToken) {
+        const initialized = target(initToken)
+        function sequence(id: number): number {
+            const n = nodes.get(id)
+            if (n?.op === 'apply') {
+                const sequenced = newId()
+                nodes.set(sequenced, makeNode('after', [initialized, id]))
+                return sequenced
+            }
+            if (n?.op !== 'select') return id
+            const arms = cloneRefs(n, 1).map(sequence)
+            if (arms.every((arm, i) => arm === getRef(n, i + 1))) return id
+            const copy = copyNode(n)
+            arms.forEach((arm, i) => setRef(copy, i + 1, arm))
+            const rebuilt = newId()
+            nodes.set(rebuilt, copy)
+            return rebuilt
+        }
+        const root = out.blocks.find(b => b.id === graph.blocks[0].id)!
+        root.bodyId = sequence(root.bodyId)
+    }
     const shapes = new Map<number, Handle>()
     for (const [id, mem] of memory) {
         shapes.set(id, mem.shape)
