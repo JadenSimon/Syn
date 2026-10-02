@@ -17601,6 +17601,11 @@ pub const Analyzer = struct {
     }
 
     fn intersectType(this: *@This(), lhs: TypeRef, rhs: TypeRef) anyerror!u32 {
+        if (lhs == @intFromEnum(Kind.any) or rhs == @intFromEnum(Kind.any)) {
+            if (lhs == @intFromEnum(Kind.never) or rhs == @intFromEnum(Kind.never)) return @intFromEnum(Kind.never);
+            return @intFromEnum(Kind.any);
+        }
+
         if (this.isParameterizedRef(lhs) or this.isParameterizedRef(rhs)) {
             if (lhs == rhs) return lhs;
 

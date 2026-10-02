@@ -5546,7 +5546,7 @@ fn Parser_(comptime skip_trivia: bool) type {
             while (this.lexer.token != .t_close_brace) {
                 var name: NodeRef = 0;
                 // Only ident/string literals allowed
-                if (this.lexer.token == .t_identifier) {
+                if (this.lexer.isIdentifierOrKeyword()) {
                     name = try this.parseIdentifier();
                 } else if (this.lexer.token == .t_string_literal) {
                     name = try this.pushNode(try this.parseStringLiteralLike());
