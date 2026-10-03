@@ -24,6 +24,7 @@ export interface GraphNode {
     op: string
     slots: Uint32Array
     flags: u8
+    scratchFlags: u8
     epoch: number
 }
 
@@ -1372,23 +1373,33 @@ export function printOptimizeStats(): void {
     optimizeIdle.clear()
 }
 
+const ResultUsedFlag = 1
+const FoldableOps = new Set(['add', 'sub', 'mul', 'div', 'and', 'or', 'xor', 'shl', 'shr', 'ushr', 'lt', 'le', 'gt', 'ge', 'eq', 'ne'])
+
 function optimizeValueGraph(g: Graph) {
     const optimizeStart = performance.now()
-    const usedBy = new Map<number, Set<number>>()
     const dependents = new Map<number, Set<number>>()
-    const dependencies = new Map<number, Set<number>>()
     function recordEdge(from: number, to: number, used: boolean) {
-        if (used) {
-            let users = usedBy.get(to)
-            if (!users) usedBy.set(to, users = new Set())
-            users.add(from)
-        }
-        let set = dependencies.get(from)
-        if (!set) dependencies.set(from, set = new Set())
-        set.add(to)
+        if (used) g.nodes.get(to)!.scratchFlags |= ResultUsedFlag
         let d = dependents.get(to)
         if (!d) dependents.set(to, d = new Set())
         d.add(from)
+    }
+
+    function isResultUsed(id: number): boolean {
+        return (g.nodes.get(id)!.scratchFlags & ResultUsedFlag) !== 0
+    }
+
+    function usesForResult(user: number, id: number): boolean {
+        const u = g.nodes.get(user)!
+        const first = u.op === 'after' ? countIds(u) - 1 : OrderedValues.has(u.op) ? 1 : 0
+        for (let i = first; i < countIds(u); i++) if (getRef(u, i) === id) return true
+        return false
+    }
+
+    function usedForResult(id: number): boolean {
+        for (const u of dependents.get(id) ?? []) if (usesForResult(u, id)) return true
+        return false
     }
 
     function getGraphBlock(id: number) {
@@ -1435,10 +1446,18 @@ function optimizeValueGraph(g: Graph) {
     }
     const blockClosureInfo = new Map<number, BlockClosureInfo>()
 
+    function operandEdge(n: GraphNode, i: number): number {
+        if (i === 0 && n.op === 'apply') return 0
+        const ref = getRef(n, i)
+        return isNilOrVoid(ref) ? 0 : ref
+    }
+
     function reaches(from: number, to: number) {
-        const deps = dependencies.get(from)
-        if (!deps) return false
-        for (const u of deps) {
+        const n = g.nodes.get(from)
+        if (!n) return false
+        for (let i = 0; i < countIds(n); i++) {
+            const u = operandEdge(n, i)
+            if (!u) continue
             if (u === to) return true
             if (reaches(u, to)) return true
         }
@@ -1446,9 +1465,11 @@ function optimizeValueGraph(g: Graph) {
     }
 
     function reachesAnyOf(from: number, to: Set<number>) {
-        const deps = dependencies.get(from)
-        if (!deps) return false
-        for (const u of deps) {
+        const n = g.nodes.get(from)
+        if (!n) return false
+        for (let i = 0; i < countIds(n); i++) {
+            const u = operandEdge(n, i)
+            if (!u) continue
             if (to.has(u)) return true
             if (reachesAnyOf(u, to)) return true
         }
@@ -1456,11 +1477,12 @@ function optimizeValueGraph(g: Graph) {
     }
 
     function collectSubgraph(from: number, dst: Set<number> = new Set()) {
-        const deps = dependencies.get(from)
         dst.add(from)
-        if (!deps) return dst
-        for (const u of deps) {
-            if (dst.has(u)) continue
+        const n = g.nodes.get(from)
+        if (!n) return dst
+        for (let i = 0; i < countIds(n); i++) {
+            const u = operandEdge(n, i)
+            if (!u || dst.has(u)) continue
             collectSubgraph(u, dst)
         }
         return dst
@@ -1491,10 +1513,12 @@ function optimizeValueGraph(g: Graph) {
         if (!id) return
         const n = g.nodes.get(id)!
         if (n.op === 'nil-effect' || n.op === 'void') return
+        const seen = visited.has(id)
+        if (!seen) n.scratchFlags &= ~ResultUsedFlag
         if (stack.length && !param) {
             recordEdge(stack[stack.length-1], id, used)
         }
-        if (visited.has(id)) return
+        if (seen) return
         visited.set(id, visited.size)
 
         const currentBlockId = blockStack[blockStack.length-1].id
@@ -1515,13 +1539,6 @@ function optimizeValueGraph(g: Graph) {
             visit(getRef(n, last), true)
             return
         }
-        if (OrderedValues.has(n.op)) {
-            visit(getRef(n, 0), false)
-            for (let i = 1; i < countIds(n); i++) {
-                visit(getRef(n, i), true)
-            }
-            return
-        }
         if (n.op === 'apply') {
             let s = successors.get(currentBlockId)
             if (!s) successors.set(currentBlockId, s = new Set())
@@ -1538,15 +1555,20 @@ function optimizeValueGraph(g: Graph) {
             stack.push(...outer)
             return
         }
+        if (OrderedValues.has(n.op)) {
+            visit(getRef(n, 0), false)
+            for (let i = 1; i < countIds(n); i++) {
+                visit(getRef(n, i), true)
+            }
+            return
+        }
         for (const x of gn.enumerateRefs(n)) {
             visit(x, true)
         }
     }
 
     function indexGraph() {
-        usedBy.clear()
         dependents.clear()
-        dependencies.clear()
         byOp.clear()
         successors.clear()
         preds.clear()
@@ -1606,9 +1628,7 @@ function optimizeValueGraph(g: Graph) {
                 for (const id of arr) cleanEdges(id)
             }
             function cleanEdges(id: number) {
-                dependencies.delete(id)
                 dependents.delete(id)
-                usedBy.delete(id)
                 visited.delete(id)
             }
         }
@@ -1689,22 +1709,19 @@ function optimizeValueGraph(g: Graph) {
             if (dropped.has(id) || id === b.bodyId || !members.has(id) || dependents.get(id)?.size) return
             if (g.nodes.get(id)?.op === 'param') return
             dropped.add(id)
-            const deps = dependencies.get(id)
-            dependencies.delete(id)
             dependents.delete(id)
-            usedBy.delete(id)
             visited.delete(id)
-            for (const d of deps ?? []) {
+            const n = g.nodes.get(id)
+            for (let i = 0; n && i < countIds(n); i++) {
+                const d = operandEdge(n, i)
+                if (!d) continue
                 const users = dependents.get(d)
                 if (users) {
                     users.delete(id)
                     if (!users.size) dependents.delete(d)
                 }
-                const used = usedBy.get(d)
-                if (used) {
-                    used.delete(id)
-                    if (!used.size) usedBy.delete(d)
-                }
+                const node = g.nodes.get(d)
+                if (node && node.scratchFlags & ResultUsedFlag && !usedForResult(d)) node.scratchFlags &= ~ResultUsedFlag
                 drop(d)
             }
         }
@@ -1956,7 +1973,7 @@ function optimizeValueGraph(g: Graph) {
         return result
     }
 
-    function isRead(n: GraphNode | undefined): boolean {
+    function isRead(n: GraphNode | undefined) {
         return n?.op === 'load' || (n?.op === 'call' && callEffect(n) <= 1)
     }
 
@@ -2264,7 +2281,7 @@ function optimizeValueGraph(g: Graph) {
         for (const a of findValues(target.id, 'after') ?? []) {
             const n = g.nodes.get(a)
             if (!n || isNilOrVoid(getRef(n, countIds(n) - 1))) continue
-            for (const u of usedBy.get(a) ?? []) users.add(u)
+            for (const u of dependents.get(a) ?? []) if (usesForResult(u, a)) users.add(u)
         }
         if (!users.size) return false
         for (const ids of byOp.get(target.id)!.values()) for (const id of ids) members.add(id)
@@ -2365,11 +2382,11 @@ function optimizeValueGraph(g: Graph) {
     function eliminateUnusedPureValues(target: GraphBlock): boolean {
         const replacements = new Map<number, number>()
         for (const id of findValues(target.id, 'load') ?? []) {
-            if (usedBy.get(id)?.size) continue
+            if (isResultUsed(id)) continue
             replacements.set(id, getRef(g.nodes.get(id)!, 0))
         }
         for (const id of findValues(target.id, 'call') ?? []) {
-            if (usedBy.get(id)?.size) continue
+            if (isResultUsed(id)) continue
             const n = g.nodes.get(id)!
             if (callEffect(n) > 1) continue
             replacements.set(id, getRef(n, 0))
@@ -2514,9 +2531,8 @@ function optimizeValueGraph(g: Graph) {
         }
         for (const x of invariants) {
             if (target.params.includes(x)) continue
-            const uses = usedBy.get(x)!
-            for (const y of uses) {
-                if (invariants.has(y)) continue
+            for (const y of dependents.get(x) ?? []) {
+                if (invariants.has(y) || !usesForResult(y, x)) continue
                 const u = g.nodes.get(y)!
                 for (let i = 0; i < countIds(u); i++) {
                     if (getRef(u, i) === x) {
@@ -2898,9 +2914,8 @@ function optimizeValueGraph(g: Graph) {
     function rootsOf(sg: Set<number>) {
         const res = new Set<number>(sg)
         for (const x of sg) {
-            const deps = dependencies.get(x)
-            if (!deps) continue
-            for (const y of deps) res.delete(y)
+            const n = g.nodes.get(x)
+            for (let i = 0; n && i < countIds(n); i++) res.delete(operandEdge(n, i))
         }
         return res
     }
@@ -5262,35 +5277,25 @@ function optimizeValueGraph(g: Graph) {
 
     function foldValues(target: GraphBlock) {
         type Value = { id: number, value: number }
-        const memo = new Map<number, Value>()
-        const active = new Set<number>()
+        const folded = new Map<number, Value>()
+        const epoch = nextEpoch(g)
 
-        function fold(id: number): Value {
-            if (!id) return { id: 0, value: 0 }
-            const known = memo.get(id)
+        function operand(n: GraphNode, i: number): Value {
+            const ref = getRef(n, i)
+            if (!ref) return { id: 0, value: getLiteral(n, i) }
+            const m = g.nodes.get(ref)
+            if (m && FoldableOps.has(m.op)) return fold(ref, m)
+            if (m?.op === 'literal' && inlineableLiteral(literalValue(m))) return { id: 0, value: literalValue(m) }
+            return { id: ref, value: 0 }
+        }
+
+        function fold(id: number, n: GraphNode): Value {
+            const known = folded.get(id)
             if (known) return known
-            const n = g.nodes.get(id)
-            if (!n || n.op === 'param' || n.op === 'block' || n.op === 'nil-effect') {
-                const value = { id, value: 0 }
-                memo.set(id, value)
-                return value
-            }
-            if (n.op === 'literal') {
-                const k = literalValue(n)
-                const value = inlineableLiteral(k) ? { id: 0, value: k } : { id, value: 0 }
-                memo.set(id, value)
-                return value
-            }
-            if (active.has(id)) return { id, value: 0 }
-            active.add(id)
-            const _id = id
-            defer active.delete(_id)
+            if (!markVisited(n, epoch)) return { id, value: 0 }
 
             const args: Value[] = []
-            for (let i = 0; i < countIds(n); i++) {
-                const arg = getRef(n, i)
-                args.push(arg ? fold(arg) : { id: 0, value: getLiteral(n, i) })
-            }
+            for (let i = 0; i < countIds(n); i++) args.push(operand(n, i))
 
             let result: Value | undefined
             if (args.length === 2 && args.every(arg => !arg.id)
@@ -5320,7 +5325,7 @@ function optimizeValueGraph(g: Graph) {
                 else if (n.op === 'eq' || n.op === 'le' || n.op === 'ge') result = { id: 0, value: 1 }
                 else if (n.op === 'ne' || n.op === 'lt' || n.op === 'gt') result = { id: 0, value: 0 }
             }
-            if (!result && !floating && args.length === 2 && (n.op === 'add' || n.op === 'sub')) result = linear(n, args)
+            if (!result && !floating && args.length === 2 && (n.op === 'add' || n.op === 'sub') && (chained(args[0]) || chained(args[1]))) result = linear(n, args)
             if (!result && args.length === 2 && operandType(g, n, 0) <= Types.i64 && operandType(g, n, 1) <= Types.i64) {
                 const left = (value: number) => !args[0].id && args[0].value === value
                 const right = (value: number) => !args[1].id && args[1].value === value
@@ -5345,8 +5350,13 @@ function optimizeValueGraph(g: Graph) {
                 result = unchanged ? { id, value: 0 }
                     : { id: addNode(n.op, args.map(arg => arg.id || { literal: arg.value }), n), value: 0 }
             }
-            memo.set(id, result)
+            if (result.id !== id) folded.set(id, result)
             return result
+        }
+
+        function chained(v: Value): boolean {
+            const m = v.id ? g.nodes.get(v.id) : undefined
+            return !!m && (m.op === 'add' || m.op === 'sub') && countIds(m) === 2
         }
 
         function linear(n: GraphNode, args: Value[]): Value | undefined {
@@ -5391,10 +5401,16 @@ function optimizeValueGraph(g: Graph) {
             return acc
         }
 
-        const body = fold(target.bodyId)
-        if (body.id === target.bodyId && Object.is(body.value, target.bodyConst)) return false
-        target.bodyId = body.id
-        target.bodyConst = body.value
+        const replacements = new Map<number, number>()
+        for (const op of FoldableOps) {
+            for (const id of findValues(target.id, op) ?? []) {
+                const result = fold(id, g.nodes.get(id)!)
+                if (result.id === id) continue
+                replacements.set(id, result.id || insert(literal(result.value)))
+            }
+        }
+        if (!replacements.size) return false
+        target.bodyId = replaceAll(target.bodyId, replacements)
         revisitBlock(target)
         return true
     }
@@ -6388,10 +6404,10 @@ function optimizeValueGraph(g: Graph) {
             step(pruneUnusedParams, b)
         }
         for (const b of reachableBlocks) {
+            step(foldValues, b)
             step(foldLiterals, b)
             step(liftLiterals, b)
             step(normalizeCommutative, b)
-            step(foldValues, b)
             step(specializeBlockParameters, b)
             step(substituteEqualArguments, b)
             step(specializeApplySite, b)
