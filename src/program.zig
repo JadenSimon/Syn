@@ -20863,6 +20863,21 @@ pub const Analyzer = struct {
                 return inner;
             },
             .method_declaration => return try this.getSignature(file, ref),
+            .get_accessor => {
+                if (n.extra_data != 0) return this.getType(file, n.extra_data);
+                if (n.len != 0) return this.analyzeBody(file, ref, unwrapRef(file.ast.nodes.at(n.len)), true);
+
+                return @intFromEnum(Kind.empty_element);
+            },
+            .set_accessor => {
+                const d = getPackedData(n);
+                if (d.right == 0) return error.MissingParameter;
+
+                const param = file.ast.nodes.at(d.right);
+                if (param.len == 0) return @intFromEnum(Kind.any);
+
+                return this.getType(file, param.len);
+            },
             else => {
                 return error.TODO_getMemberType;
             },
@@ -21134,6 +21149,30 @@ pub const Analyzer = struct {
 
                     const name = try this.propertyNameToType(file, name_ref);
                     try members.append(ObjectLiteralMember.initLazy(.method, name, file.id, pair[1], member_flags));
+                },
+                .get_accessor, .set_accessor => {
+                    const name_ref = (getPackedData(pair[0])).left;
+                    var member_flags: u24 = pair[0].flags;
+                    if (file.ast.nodes.at(name_ref).kind == .private_identifier) {
+                        member_flags |= ObjectLiteralMember.private_ident_flag;
+                    }
+
+                    const is_getter = pair[0].kind == .get_accessor;
+                    const accessor_flag: u24 = @intFromEnum(if (is_getter) parser.SyntheticMemberFlags.getter else parser.SyntheticMemberFlags.setter);
+                    const name = try this.propertyNameToType(file, name_ref);
+
+                    const paired = for (members.items) |*m| {
+                        if (m.name == name and (m.hasSyntheticFlag(.getter) or m.hasSyntheticFlag(.setter))) break m;
+                    } else null;
+
+                    if (paired) |m| {
+                        m.flags |= accessor_flag;
+                        m.flags &= ~@as(u24, @intFromEnum(NodeFlags.readonly));
+                        if (is_getter) m.type = pair[1];
+                    } else {
+                        if (is_getter) member_flags |= @intFromEnum(NodeFlags.readonly);
+                        try members.append(ObjectLiteralMember.initLazy(.property, name, file.id, pair[1], member_flags | accessor_flag));
+                    }
                 },
                 .index_signature => {
                     if (comptime suppress_gaps) continue;

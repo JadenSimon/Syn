@@ -6,7 +6,7 @@ import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as syscalls from './syscalls'
-import { rawValue, traceValue } from './vm'
+import { Op, rawValue, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged,
@@ -23,6 +23,7 @@ import type { CompiledSource } from './trace2'
 import type { EmitResult } from './bytecode-emitter'
 import * as propertyEval from './property-eval'
 import * as rt from './rt'
+import * as typer from './typer'
 import type { Constructed } from './property-eval'
 
 type usize = u32
@@ -124,9 +125,10 @@ let runtimeHeapAddress: number | undefined
 function runtimeHeapBase(): number {
     if (runtimeHeapAddress !== undefined) return runtimeHeapAddress
     getNativeBootstraps()
-    const base = Number(nativeMapper(intrinsics.heapMaxAddress))
+    const base = Number(nativeMapper(heap.runtimeCells + (1 << 24)))
     if (!base || base === -1) throw 'native: failed to map the runtime heap'
     runtimeHeapAddress = base
+    writeRuntimeHeap(heap.runtimeCells, new Uint8Array(new Uint32Array([heap.runtimeCells + 8]).buffer))
     return base
 }
 const mirroredCells = new Set<number>()
@@ -842,8 +844,10 @@ function rewriteTargets(
     functionHandles: Map<number, number>,
     dataHandles: Map<number, number>,
     targetRefs: Map<number, number>,
+    runtimeTargets: Map<number, number>,
 ): Graph {
     const nodes = new Map<number, GraphNode>()
+    let maxId = g.maxId
     for (const [id, n] of g.nodes) {
         if (n.op === 'local-target') {
             const symbol = getLiteral(n, 0)
@@ -855,6 +859,14 @@ function rewriteTargets(
                 console.log(dumpGraph(g))
                 throw `native: ${g.name ?? 'anonymous graph'} calls heap handle ${heap.deref(getLiteral(target, 0) as intrinsics.Handle)} at %${id}, which has no native target`
             }
+        }
+        if (n.op === 'rt' && runtimeTargets.has(getLiteral(n, 0))) {
+            const token = maxId++
+            nodes.set(token, makeNode('nil-effect', []))
+            const target = maxId++
+            nodes.set(target, makeNode('local-target', [{ literal: runtimeTargets.get(getLiteral(n, 0))! }, { literal: EffectWrite }], Types.u32))
+            nodes.set(id, makeNode('call', [token, target, 0, ...getOperands(n).slice(1)]))
+            continue
         }
         if (n.op === 'rt') {
             nodes.set(id, rt.lowerNative(n, { runtimeHeapBase }))
@@ -876,7 +888,7 @@ function rewriteTargets(
         }
         nodes.set(id, makeNode('pool-entry', [{ literal: slot }]))
     }
-    return { ...g, nodes }
+    return { ...g, nodes, maxId }
 }
 
 function align(value: number, amount: number): number {
@@ -1285,6 +1297,20 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         order.push(fn)
     }
     for (const fn of Object.values(fns)) schedule(fn)
+    function link(fn: Function): number {
+        const symbol = intern(fn)
+        discover(fn)
+        schedule(fn)
+        return symbol
+    }
+    const runtimeTargets = new Map<number, number>()
+    function linkRuntimeCalls(graph: Graph): void {
+        for (const n of graph.nodes.values()) {
+            if (n.op !== 'rt' || runtimeTargets.has(getLiteral(n, 0))) continue
+            const binding = rt.nativeBinding(getLiteral(n, 0))
+            if (binding) runtimeTargets.set(getLiteral(n, 0), link(binding))
+        }
+    }
     let panicSymbol = 0
     function lowerPanics(graph: Graph): boolean {
         let nextId = graph.maxId
@@ -1297,11 +1323,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 changed = true
                 continue
             }
-            if (!panicSymbol) {
-                panicSymbol = intern(reportPanic)
-                discover(reportPanic)
-                schedule(reportPanic)
-            }
+            if (!panicSymbol) panicSymbol = link(reportPanic)
             const arg = getRef(n, 0)
             const chained = arg ? graph.nodes.get(arg) : undefined
             const after = chained?.op === 'after'
@@ -1842,6 +1864,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             self: code.scope ? undefined : fn, env: !!code.scope, receiver: constructsOutOfLine(fn) || usesReceiver(fn),
         })
         lowerPanics(traced.graph)
+        linkRuntimeCalls(traced.graph)
         enterPhase(outer)
         const entry: FnGraphs = { fn, source: code.source, traced }
         fnGraphs.set(fn, entry)
@@ -2527,6 +2550,31 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         return false
     }
+    const typerStats = intrinsics.argv().includes('typer-stats')
+    const typerStart = performance.now()
+    const typed = typer.createTyper(session)
+    for (const symbol of roots.values()) typed.root(functions[symbol])
+    if (typed.run()) {
+        const agreed = new Map<CompiledSource, Map<number, string>>()
+        for (const unit of typed.units) {
+            let sites = agreed.get(unit.source)
+            if (!sites) agreed.set(unit.source, sites = new Map())
+            for (const site of unit.sites.values()) {
+                const prior = sites.get(site.pc)
+                sites.set(site.pc, prior === undefined || prior === site.result ? site.result : 'unknown')
+            }
+        }
+        for (const [source, sites] of agreed) {
+            const code = source.compiled.code
+            for (const [pc, result] of sites) {
+                if (result === 'unknown') continue
+                const at = code[pc] === Op.Width2 || code[pc] === Op.Width4 || code[pc] === Op.Width8 ? pc + 1 : pc
+                intrinsics.assert(code[at] === Op.AddOrConcat, `native: typer site @${pc} is not an AddOrConcat`)
+                code[at] = result === 'numeric' ? Op.Add : Op.Concat
+            }
+        }
+    }
+    const typerMs = performance.now() - typerStart
     const unreferenced: DeferredUnit[] = []
     do {
         traceUnits()
@@ -2542,6 +2590,23 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         installReturnSlots()
     } while (tracedUnits < order.length)
     for (const unit of unreferenced) if (referenced(unit)) throw `native: ${unit.fn.name} was deferred as unreferenced but is called`
+    if (typerStats) {
+        const counts = { numeric: 0, string: 0, unknown: 0 }
+        const typedSources = new Set<CompiledSource>()
+        for (const unit of typed.units) {
+            typedSources.add(unit.source)
+            for (const site of unit.sites.values()) counts[site.result]++
+        }
+        let untypedFns = 0
+        let untypedSites = 0
+        for (const fn of fnGraphs.keys()) {
+            const code = codeOf(fn)
+            if (!code || typedSources.has(code.source)) continue
+            untypedFns++
+            untypedSites += typer.countAddSites(code.source.compiled)
+        }
+        console.log(`typer [${[...roots.keys()].join(',')}] ${typerMs.toFixed(1)}ms units=${typed.units.length} numeric=${counts.numeric} string=${counts.string} unknown=${counts.unknown} | traced-untyped fns=${untypedFns} sites=${untypedSites}`)
+    }
     enterPhase('reconcile')
     for (const shaped of shapedCallees) reconcileShapes(shaped)
     reconcileReturns()
@@ -2824,6 +2889,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             name: shaped.fn.name, shapes, self: shaped.fn,
         })
         lowerPanics(traced.graph)
+        linkRuntimeCalls(traced.graph)
         enterPhase(outer)
         if ([...traced.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')) {
             throw `native: ${shaped.fn.name} still reads unshaped properties after reconciliation`
@@ -3091,6 +3157,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 continue
             }
             if (n.op === 'local-target' && !getRef(n, 0)) reaching.push(getLiteral(n, 0))
+            if (n.op === 'rt' && runtimeTargets.has(getLiteral(n, 0))) reaching.push(runtimeTargets.get(getLiteral(n, 0))!)
             if (n.op === 'heap-handle' && !getRef(n, 0)) {
                 const slot = unit.functionHandleSlots.get(heap.deref(getLiteral(n, 0) as intrinsics.Handle))
                 const target = slot === undefined ? undefined : localPoolTargets.get(slot)
@@ -3102,7 +3169,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     enterPhase('lower')
     for (const unit of pending) {
         if (!reached.has(unit.symbol)) continue
-        const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs)
+        const graph = rewriteTargets(unit.graph, unit.functionHandleSlots, unit.dataHandleSlots, targetRefs, runtimeTargets)
         for (const [id, n] of graph.nodes) {
             if (n.op !== 'pool-entry' || getDebugLabel(graph, id)) continue
             const label = poolLabels.get(getLiteral(n, 0))

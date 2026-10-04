@@ -1,0 +1,1003 @@
+/// @synth
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as bytecode from './bytecode-emitter'
+import { Op } from './vm'
+import type { CompiledSource } from './trace2'
+
+const Types = intrinsics.Types
+
+export const KindNumber = 1
+export const KindString = 2
+export const KindObject = 4
+export const KindAny = 7
+
+interface ObjectSite {
+    id: string
+    fields: Map<PropertyKey, Fact>
+}
+
+type Known =
+    | { tag: 'value', value: any }
+    | { tag: 'unit', unit: TypedUnit }
+    | { tag: 'instance', of: Function }
+    | { tag: 'object', site: ObjectSite }
+    | { tag: 'struct' }
+
+interface Fact {
+    kind: number
+    known: Known | undefined | null
+    readers: Set<TypedUnit>
+}
+
+interface Value {
+    kind: number
+    known?: Known
+    why?: string
+    key?: PropertyKey
+}
+
+export interface AddSite {
+    pc: number
+    result: 'numeric' | 'string' | 'unknown'
+    why?: string
+}
+
+export interface TypedUnit {
+    id: number
+    name: string
+    compiled: bytecode.EmitResult
+    source: CompiledSource
+    captures: any[]
+    params: number[]
+    paramKnown: (Known | undefined | null)[]
+    thisKind: number
+    thisKnown: Known | undefined | null
+    methodOf?: Function
+    returns: number
+    returnKnown: Known | undefined | null
+    open: boolean
+    callers: Set<TypedUnit>
+    sites: Map<number, AddSite>
+    analyses: number
+    parent?: TypedUnit
+}
+
+export interface TyperInput {
+    compileSource(code: string): CompiledSource
+    compileTemplate(compiled: bytecode.EmitResult): CompiledSource
+    globals: Record<string, any>
+}
+
+const intrinsicNames = new Map<Function, string>()
+const intrinsicFunctions = new Map<PropertyKey, Function>()
+for (const [name, value] of Object.entries(intrinsics.Intrinsics)) {
+    if (typeof value !== 'function') continue
+    intrinsicNames.set(value, name)
+    intrinsicFunctions.set(name, value)
+}
+
+const FrameSyncOps = new Set<number>([
+    Op.Call, Op.CallConst, Op.Construct, Op.ConstructConst, Op.CallArray, Op.CreateEmptyArray,
+    Op.GetProperty, Op.GetPropertyConst, Op.GetPropertyImm, Op.SetProperty, Op.SetPropertyConst, Op.SetPropertyImm,
+])
+
+const indexGetKey = Symbol('index get')
+const indexSetKey = Symbol('index set')
+
+function kindOfValue(v: any): number {
+    const t = typeof v
+    if (t === 'string') return KindString
+    if (t === 'function' || t === 'symbol' || (t === 'object' && v !== null)) return KindObject
+    return KindNumber
+}
+
+function isStructViewFactory(v: any): boolean {
+    return typeof v === 'function' && 'sizeof' in v && 'handleOffsets' in v
+}
+
+function isMachineFunction(v: any): boolean {
+    return typeof v === 'function' && (Number.isSafeInteger(v.__syscall) || Number.isSafeInteger(v.__native))
+}
+
+function isObjectLike(v: any): boolean {
+    return (typeof v === 'object' && v !== null) || typeof v === 'function'
+}
+
+function isIndexKey(key: PropertyKey): boolean {
+    if (typeof key === 'number') return true
+    if (typeof key !== 'string' || key === '') return false
+    const n = Number(key)
+    return Number.isSafeInteger(n) && n >= 0 && String(n) === key
+}
+
+function sameKnown(a: Known | undefined, b: Known | undefined): boolean {
+    if (a === b) return true
+    if (!a || !b || a.tag !== b.tag) return false
+    if (a.tag === 'value') return Object.is(a.value, (b as any).value)
+    if (a.tag === 'unit') return a.unit === (b as any).unit
+    if (a.tag === 'instance') return a.of === (b as any).of
+    if (a.tag === 'struct') return true
+    return a.site === (b as any).site
+}
+
+function joinKnown(a: Known | undefined | null, b: Known | undefined): Known | undefined | null {
+    if (a === null) return b
+    if (a === undefined) return undefined
+    return sameKnown(a, b) ? a : undefined
+}
+
+function lookup(target: any, key: PropertyKey): { value: any } | undefined {
+    let cur = target
+    while (cur !== null && cur !== undefined) {
+        const d = Object.getOwnPropertyDescriptor(cur, key)
+        if (d) return 'value' in d ? { value: d.value } : undefined
+        cur = Object.getPrototypeOf(cur)
+    }
+    return { value: undefined }
+}
+
+function newFact(): Fact {
+    return { kind: 0, known: null, readers: new Set() }
+}
+
+function factOf(map: Map<PropertyKey, Fact>, key: PropertyKey): Fact {
+    let f = map.get(key)
+    if (!f) map.set(key, f = newFact())
+    return f
+}
+
+export function createTyper(input: TyperInput) {
+    const stats = { analyses: 0, reanalyses: 0, firstMs: 0, reMs: 0, discoverMs: 0, compileMs: 0 }
+    const byFunction = new Map<Function, TypedUnit | null>()
+    const byTemplate = new Map<bytecode.EmitResult, TypedUnit>()
+    const units: TypedUnit[] = []
+    const dirty: TypedUnit[] = []
+    const queued = new Set<TypedUnit>()
+
+    const allWrites = new Map<PropertyKey, Fact>()
+    const looseWrites = new Map<PropertyKey, Fact>()
+    const classFields = new Map<Function, Map<PropertyKey, Fact>>()
+    const objectSites = new Map<string, ObjectSite>()
+    const wildcard = newFact()
+    const vmMemory = newFact()
+    let currentUnit: TypedUnit | undefined
+    const takenUnits = new Set<TypedUnit>()
+    const anyTargetCallers = new Set<TypedUnit>()
+    const anyTarget = { thisKind: 0, args: [] as number[], used: false }
+    const elementWrites = newFact()
+    let hostFunctionEscaped = false
+    const frameFacts = new Map<TypedUnit, Map<PropertyKey, Fact>>()
+
+    function frameFact(owner: TypedUnit, reg: number): Fact {
+        let facts = frameFacts.get(owner)
+        if (!facts) frameFacts.set(owner, facts = new Map())
+        return factOf(facts, reg)
+    }
+
+    function frameOwner(u: TypedUnit, slot: number): TypedUnit | undefined {
+        const binding = u.compiled.scopeBindings.find(b => b.slot === slot)
+        if (!binding || !u.parent) return
+        if (binding.parentSlot === -1) return u.parent
+        return frameOwner(u.parent, binding.parentSlot)
+    }
+    const callables = new Map<PropertyKey, Set<TypedUnit>>()
+    const keyCalls = new Map<PropertyKey, { thisKind: number, args: number[] }>()
+    const keyCallers = new Map<PropertyKey, Set<TypedUnit>>()
+    const escapedHosts = new WeakSet<object>()
+
+    function schedule(unit: TypedUnit): void {
+        if (queued.has(unit)) return
+        queued.add(unit)
+        dirty.push(unit)
+    }
+
+    function makeUnit(name: string, compiled: bytecode.EmitResult, source: CompiledSource, captures: any[], methodOf?: Function): TypedUnit {
+        const unit: TypedUnit = {
+            id: units.length, name, compiled, source, captures,
+            params: compiled.paramCount ? new Array(compiled.paramCount).fill(0) : [],
+            paramKnown: compiled.paramCount ? new Array(compiled.paramCount).fill(null) : [],
+            thisKind: methodOf ? KindObject : 0,
+            thisKnown: methodOf ? { tag: 'instance', of: methodOf } : null,
+            methodOf, returns: 0, returnKnown: null, open: false,
+            callers: new Set(), sites: new Map(), analyses: 0,
+        }
+        units.push(unit)
+        return unit
+    }
+
+    function unitOfFunction(fn: Function, methodOf?: Function): TypedUnit | undefined {
+        if (byFunction.has(fn)) {
+            const known = byFunction.get(fn) ?? undefined
+            if (known && methodOf && !known.methodOf) {
+                known.methodOf = methodOf
+                known.thisKind = KindObject
+                known.thisKnown = { tag: 'instance', of: methodOf }
+                schedule(known)
+            }
+            return known
+        }
+        let computation: any
+        try {
+            computation = intrinsics.getComputation(fn)
+        } catch {
+            byFunction.set(fn, null)
+            return
+        }
+        if (!computation || typeof computation[0] !== 'string') {
+            byFunction.set(fn, null)
+            return
+        }
+        let source: CompiledSource
+        const compileStart = performance.now()
+        try {
+            source = input.compileSource(computation[0])
+        } catch {
+            byFunction.set(fn, null)
+            return
+        } finally {
+            stats.compileMs += performance.now() - compileStart
+        }
+        const unit = makeUnit(fn.name || '<anonymous>', source.compiled, source, computation[1] ?? [], methodOf)
+        byFunction.set(fn, unit)
+        return unit
+    }
+
+    function unitOfTemplate(compiled: bytecode.EmitResult, parent: TypedUnit): TypedUnit {
+        const known = byTemplate.get(compiled)
+        if (known) return known
+        const compileStart = performance.now()
+        const source = input.compileTemplate(compiled)
+        stats.compileMs += performance.now() - compileStart
+        const unit = makeUnit(compiled.name || `${parent.name}/closure`, compiled, source, parent.captures)
+        unit.parent = parent
+        byTemplate.set(compiled, unit)
+        return unit
+    }
+
+    function addressTaken(unit: TypedUnit): void {
+        if (takenUnits.has(unit)) return
+        takenUnits.add(unit)
+        if (anyTarget.used) enter(unit, anyTarget.thisKind, undefined, anyTarget.args, [])
+        for (const caller of anyTargetCallers) {
+            unit.callers.add(caller)
+            schedule(caller)
+        }
+    }
+
+    function open(unit: TypedUnit): void {
+        addressTaken(unit)
+        if (unit.open) return
+        unit.open = true
+        unit.params.fill(KindAny)
+        unit.paramKnown.fill(undefined)
+        if (!unit.methodOf) {
+            unit.thisKind = KindAny
+            unit.thisKnown = undefined
+        }
+        schedule(unit)
+    }
+
+    function enter(unit: TypedUnit, thisKind: number, thisKnown: Known | undefined, args: number[], argKnown: (Known | undefined)[]): void {
+        let changed = !unit.analyses
+        if (!unit.methodOf) {
+            if ((unit.thisKind | thisKind) !== unit.thisKind) {
+                unit.thisKind |= thisKind
+                changed = true
+            }
+            const nextThis = joinKnown(unit.thisKnown, thisKnown)
+            if (nextThis !== unit.thisKnown) {
+                unit.thisKnown = nextThis
+                changed = true
+            }
+        }
+        for (let i = 0; i < unit.params.length; i++) {
+            const kind = i < args.length ? args[i] : KindNumber
+            const known: Known | undefined = i < args.length ? argKnown[i] : { tag: 'value', value: undefined }
+            if ((unit.params[i] | kind) !== unit.params[i]) {
+                unit.params[i] |= kind
+                changed = true
+            }
+            const next = joinKnown(unit.paramKnown[i], known)
+            if (next !== unit.paramKnown[i]) {
+                unit.paramKnown[i] = next
+                changed = true
+            }
+        }
+        if (changed) schedule(unit)
+    }
+
+    function joinFact(f: Fact, kind: number, known: Known | undefined): void {
+        const nextKind = f.kind | kind
+        const nextKnown = joinKnown(f.known, known)
+        if (nextKind === f.kind && nextKnown === f.known) return
+        f.kind = nextKind
+        f.known = nextKnown
+        for (const r of f.readers) schedule(r)
+    }
+
+    function registerCallable(key: PropertyKey, unit: TypedUnit): void {
+        let set = callables.get(key)
+        if (!set) callables.set(key, set = new Set())
+        if (set.has(unit)) return
+        set.add(unit)
+        const pending = keyCalls.get(key)
+        if (pending) enter(unit, pending.thisKind, undefined, pending.args, [])
+        for (const caller of keyCallers.get(key) ?? []) {
+            unit.callers.add(caller)
+            schedule(caller)
+        }
+    }
+
+    function keyCall(caller: TypedUnit, key: PropertyKey, thisKind: number, args: number[]): Value {
+        let pending = keyCalls.get(key)
+        let changed = false
+        if (!pending) {
+            keyCalls.set(key, pending = { thisKind: 0, args: [] })
+            changed = true
+        }
+        if ((pending.thisKind | thisKind) !== pending.thisKind) {
+            pending.thisKind |= thisKind
+            changed = true
+        }
+        for (let i = 0; i < args.length; i++) {
+            const prior = pending.args[i] ?? 0
+            if ((prior | args[i]) === prior && i < pending.args.length) continue
+            pending.args[i] = prior | args[i]
+            changed = true
+        }
+        let callers = keyCallers.get(key)
+        if (!callers) keyCallers.set(key, callers = new Set())
+        callers.add(caller)
+        const targets = callables.get(key)
+        let kind = 0
+        for (const unit of targets ?? []) {
+            if (changed) enter(unit, pending.thisKind, undefined, pending.args, [])
+            unit.callers.add(caller)
+            kind |= unit.returns
+        }
+        if (!targets?.size) return { kind: KindAny, why: `call .${String(key)}` }
+        return { kind, why: `returns of .${String(key)}` }
+    }
+
+
+    function hostEscape(value: any): void {
+        if (!isObjectLike(value) || escapedHosts.has(value)) return
+        escapedHosts.add(value)
+        const array = Array.isArray(value) || ArrayBuffer.isView(value)
+        if (array) for (const element of value as any) joinFact(elementWrites, kindOfValue(element), { tag: 'value', value: element })
+        for (const key of Reflect.ownKeys(value)) {
+            if (array && isIndexKey(key)) continue
+            const d = Object.getOwnPropertyDescriptor(value, key)
+            if (!d || !('value' in d)) continue
+            const known: Known = { tag: 'value', value: d.value }
+            joinFact(factOf(allWrites, key), kindOfValue(d.value), known)
+            joinFact(factOf(looseWrites, key), kindOfValue(d.value), known)
+            if (typeof d.value === 'function') {
+                const unit = unitOfFunction(d.value)
+                if (unit) registerCallable(key, unit)
+            }
+        }
+    }
+
+    function escapeOpaque(known: Known | undefined): void {
+        if (known?.tag === 'unit') open(known.unit)
+        else if (known?.tag === 'value' && typeof known.value === 'function') {
+            const unit = unitOfFunction(known.value)
+            if (unit) open(unit)
+        }
+        escape(known)
+    }
+
+    function escape(known: Known | undefined): void {
+        if (known?.tag === 'unit') addressTaken(known.unit)
+        else if (known?.tag === 'value') {
+            if (typeof known.value === 'function') {
+                const unit = unitOfFunction(known.value)
+                if (unit) addressTaken(unit)
+                else if (!hostFunctionEscaped) {
+                    hostFunctionEscaped = true
+                    for (const caller of anyTargetCallers) schedule(caller)
+                }
+            }
+            hostEscape(known.value)
+        }
+    }
+
+    function anyTargetCall(caller: TypedUnit, thisKind: number, args: number[]): Value {
+        anyTargetCallers.add(caller)
+        let changed = !anyTarget.used
+        anyTarget.used = true
+        if ((anyTarget.thisKind | thisKind) !== anyTarget.thisKind) {
+            anyTarget.thisKind |= thisKind
+            changed = true
+        }
+        for (let i = 0; i < args.length; i++) {
+            const prior = anyTarget.args[i] ?? 0
+            if ((prior | args[i]) === prior && i < anyTarget.args.length) continue
+            anyTarget.args[i] = prior | args[i]
+            changed = true
+        }
+        if (changed) for (const unit of takenUnits) enter(unit, anyTarget.thisKind, undefined, anyTarget.args, [])
+        if (hostFunctionEscaped) return { kind: KindAny, why: 'call of escaped host fn' }
+        let kind = 0
+        let known: Known | undefined | null = null
+        for (const unit of takenUnits) {
+            unit.callers.add(caller)
+            if (!unit.analyses) continue
+            kind |= unit.returns
+            known = joinKnown(known, unit.returnKnown ?? undefined)
+        }
+        return { kind, known: known ?? undefined, why: 'returns of escaped fns' }
+    }
+
+    function hasTrap(cls: Function): boolean {
+        const proto = cls.prototype
+        return !!proto && typeof proto === 'object' && '__proxy' in proto
+    }
+
+    function classFieldsOf(cls: Function): Map<PropertyKey, Fact> {
+        let fields = classFields.get(cls)
+        if (!fields) classFields.set(cls, fields = new Map())
+        return fields
+    }
+
+    function analyze(unit: TypedUnit): void {
+        currentUnit = unit
+        unit.analyses++
+        const { compiled, source } = unit
+        const blocks = source.blocks
+        const slots = compiled.registerCount + 1
+        const ACC = compiled.registerCount
+        const count = blocks.leaders.length
+        const blockAt = new Map<number, number>()
+        for (let b = 0; b < count; b++) blockAt.set(blocks.leaders[b], b)
+        const entryKinds: (Uint8Array | undefined)[] = new Array(count)
+        const entryKnown: (Known | undefined)[][] = new Array(count)
+        const entryWhy: (string | undefined)[][] = new Array(count)
+        const entryKey: (PropertyKey | undefined)[][] = new Array(count)
+        const pending: number[] = []
+        const inPending = new Set<number>()
+        let returns = unit.returns
+        let returnKnown = unit.returnKnown
+        const captured = source.captured
+
+        function seed(b: number, kinds: Uint8Array, known: (Known | undefined)[], why: (string | undefined)[], keys: (PropertyKey | undefined)[]): void {
+            const at = entryKinds[b]
+            if (!at) {
+                entryKinds[b] = kinds.slice()
+                entryKnown[b] = known.slice()
+                entryWhy[b] = why.slice()
+                entryKey[b] = keys.slice()
+            } else {
+                let changed = false
+                const k = entryKnown[b]
+                const w = entryWhy[b]
+                const m = entryKey[b]
+                for (let i = 0; i < slots; i++) {
+                    if ((at[i] | kinds[i]) !== at[i]) {
+                        at[i] |= kinds[i]
+                        changed = true
+                    }
+                    if (w[i] === undefined && why[i] !== undefined) w[i] = why[i]
+                    if (k[i] && !sameKnown(k[i], known[i])) {
+                        k[i] = undefined
+                        changed = true
+                    }
+                    if (m[i] !== undefined && m[i] !== keys[i]) {
+                        m[i] = undefined
+                        changed = true
+                    }
+                }
+                if (!changed) return
+            }
+            if (inPending.has(b)) return
+            inPending.add(b)
+            pending.push(b)
+        }
+
+        {
+            const kinds = new Uint8Array(slots)
+            const known: (Known | undefined)[] = new Array(slots)
+            const why: (string | undefined)[] = new Array(slots)
+            for (let i = 0; i < unit.params.length; i++) {
+                kinds[i] = unit.params[i]
+                known[i] = unit.paramKnown[i] ?? undefined
+                if (unit.params[i] & KindString) why[i] = `param ${i}`
+            }
+            kinds[ACC] = unit.thisKind
+            known[ACC] = unit.thisKnown ?? undefined
+            if (unit.thisKind & KindString) why[ACC] = 'this'
+            for (const r of captured.reads) if (r < unit.params.length) joinFact(frameFact(unit, r), kinds[r], known[r])
+            seed(0, kinds, known, why, new Array(slots))
+        }
+        for (const range of compiled.labels?.eh ?? []) {
+            const b = blockAt.get(range.handler)
+            if (b !== undefined) seed(b, new Uint8Array(slots).fill(KindAny), new Array(slots), new Array(slots).fill('handler'), new Array(slots))
+        }
+
+        function constantValue(slot: number): Value {
+            const kind = compiled.constantKinds[slot]
+            const value = compiled.constants[slot]
+            if (kind === bytecode.ConstantKind.number) return { kind: KindNumber, known: { tag: 'value', value } }
+            if (kind === bytecode.ConstantKind.string) return { kind: KindString, known: { tag: 'value', value } }
+            if (kind === bytecode.ConstantKind.function_) return { kind: KindObject, known: { tag: 'unit', unit } }
+            if (kind === bytecode.ConstantKind.nested_function) return { kind: KindObject, known: { tag: 'unit', unit: unitOfTemplate(value, unit) } }
+            if (kind === bytecode.ConstantKind.late_bound) {
+                const name = value as string
+                let resolved: { value: any } | undefined
+                if (name.startsWith('$')) {
+                    const index = Number(name.slice(1))
+                    if (index < unit.captures.length) resolved = { value: unit.captures[index] }
+                } else if (name in input.globals) {
+                    resolved = { value: input.globals[name] }
+                }
+                if (!resolved) return { kind: KindAny, why: `free ${name}` }
+                return { kind: kindOfValue(resolved.value), known: { tag: 'value', value: resolved.value } }
+            }
+            return { kind: KindObject }
+        }
+
+        function readFacts(facts: Fact[], why: string, key: PropertyKey | undefined): Value {
+            let kind = 0
+            let known: Known | undefined | null = null
+            for (const f of facts) {
+                f.readers.add(unit)
+                if (!f.kind) continue
+                kind |= f.kind
+                known = joinKnown(known, f.known ?? undefined)
+            }
+            return { kind, known: known ?? undefined, why, key }
+        }
+
+        function trapCall(key: symbol, recv: Known | undefined, args: number[], argKnown: (Known | undefined)[]): Value {
+            if (recv?.tag === 'instance') {
+                const proto = recv.of.prototype
+                const fn = proto && '__proxy' in proto ? (key === indexGetKey ? proto.__proxyGet : proto.__proxySet) : undefined
+                const trap = fn ? unitOfFunction(fn) : undefined
+                if (trap) {
+                    enter(trap, KindNumber, undefined, args, argKnown)
+                    trap.callers.add(unit)
+                    return { kind: trap.returns, known: trap.returnKnown ?? undefined, why: `returns of ${trap.name}` }
+                }
+                if (key === indexGetKey) return { kind: KindAny, why: 'element' }
+                return { kind: 0 }
+            }
+            const r = keyCall(unit, key, KindNumber, args)
+            if (key === indexGetKey) return { kind: KindAny, why: 'element' }
+            return r
+        }
+
+        function readProperty(recvKind: number, recv: Known | undefined, key: PropertyKey | undefined, keyKind: number, label: string): Value {
+            if (key === undefined || isIndexKey(key)) {
+                if (keyKind & ~KindNumber) return { kind: KindAny, why: `get ${label}` }
+                if (recv?.tag === 'value' && isObjectLike(recv.value)) {
+                    if (key !== undefined) {
+                        const found = lookup(recv.value, key)
+                        if (found) return { kind: kindOfValue(found.value), known: { tag: 'value', value: found.value } }
+                    }
+                    hostEscape(recv.value)
+                    return readFacts([elementWrites], 'element', undefined)
+                }
+                if (recv?.tag === 'instance' && hasTrap(recv.of)) return trapCall(indexGetKey, recv, [recvKind, KindNumber], [recv, undefined])
+                const elements = readFacts([elementWrites], 'element', undefined)
+                if (recv?.tag === 'instance' || recv?.tag === 'object') return elements
+                const traps = callables.get(indexGetKey)
+                if (!traps?.size) return elements
+                const viaTraps = keyCall(unit, indexGetKey, KindNumber, [recvKind, KindNumber])
+                return { kind: viaTraps.kind | elements.kind, why: 'element' }
+            }
+            if (recv?.tag === 'value' && recv.value === intrinsics.Intrinsics) {
+                const fn = intrinsicFunctions.get(key)
+                if (fn) return { kind: KindObject, known: { tag: 'value', value: fn } }
+            }
+            if (recv?.tag === 'value' && isObjectLike(recv.value)) {
+                const found = lookup(recv.value, key)
+                if (!found) return { kind: KindAny, why: `getter ${label}` }
+                return { kind: kindOfValue(found.value), known: { tag: 'value', value: found.value } }
+            }
+            if (recvKind === KindString && key === 'length') return { kind: KindNumber }
+            if (recv?.tag === 'struct') return { kind: KindNumber }
+            if (recv?.tag === 'instance') {
+                const found = lookup(recv.of.prototype, key)
+                if (!found) return { kind: KindAny, why: `getter ${label}` }
+                if (found.value !== undefined) return { kind: kindOfValue(found.value), known: { tag: 'value', value: found.value } }
+                return readFacts([factOf(classFieldsOf(recv.of), key), factOf(looseWrites, key), wildcard], `get ${label}`, key)
+            }
+            if (recv?.tag === 'object') {
+                return readFacts([factOf(recv.site.fields, key), factOf(looseWrites, key), wildcard], `get ${label}`, key)
+            }
+            return readFacts([factOf(allWrites, key), wildcard], `get ${label}`, key)
+        }
+
+        function writeProperty(recv: Known | undefined, key: PropertyKey | undefined, keyKind: number, recvKind: number, value: Value): void {
+            if (key === undefined || isIndexKey(key)) {
+                if (!(keyKind & ~KindNumber)) {
+                    escape(value.known)
+                    if (recv?.tag === 'instance' && hasTrap(recv.of)) {
+                        trapCall(indexSetKey, recv, [recvKind, KindNumber, value.kind], [recv, undefined, value.known])
+                        return
+                    }
+                    joinFact(elementWrites, value.kind, value.known)
+                    if (recv?.tag !== 'instance' && recv?.tag !== 'object' && callables.get(indexSetKey)?.size) keyCall(unit, indexSetKey, KindNumber, [recvKind, KindNumber, value.kind])
+                    return
+                }
+                escape(value.known)
+                joinFact(wildcard, value.kind, value.known)
+                return
+            }
+            if (recv?.tag === 'struct') return
+            if (value.known?.tag === 'unit') registerCallable(key, value.known.unit)
+            else escape(value.known)
+            joinFact(factOf(allWrites, key), value.kind, value.known)
+            if (recv?.tag === 'instance') joinFact(factOf(classFieldsOf(recv.of), key), value.kind, value.known)
+            else if (recv?.tag === 'object') joinFact(factOf(recv.site.fields, key), value.kind, value.known)
+            else joinFact(factOf(looseWrites, key), value.kind, value.known)
+        }
+
+        function objectSite(pc: number): ObjectSite {
+            const id = `${unit.id}:${pc}`
+            let site = objectSites.get(id)
+            if (!site) objectSites.set(id, site = { id, fields: new Map() })
+            return site
+        }
+
+        function callTarget(target: Known | undefined): TypedUnit | string | undefined {
+            if (!target) return
+            if (target.tag === 'unit') return target.unit
+            if (target.tag !== 'value' || typeof target.value !== 'function') return
+            const intrinsic = intrinsicNames.get(target.value)
+            if (intrinsic !== undefined) return intrinsic
+            return unitOfFunction(target.value)
+        }
+
+        while (pending.length) {
+            let next = 0
+            for (let i = 1; i < pending.length; i++) if (pending[i] < pending[next]) next = i
+            const b = pending[next]
+            pending[next] = pending[pending.length - 1]
+            pending.pop()
+            inPending.delete(b)
+            const kinds = entryKinds[b]!.slice()
+            const known = entryKnown[b].slice()
+            const why = entryWhy[b].slice()
+            const keys = entryKey[b].slice()
+
+            function set(slot: number, v: Value): void {
+                kinds[slot] = v.kind
+                known[slot] = v.known
+                why[slot] = v.kind & KindString ? v.why : undefined
+                keys[slot] = v.key
+                if (captured.reads.has(slot)) joinFact(frameFact(unit, slot), v.kind, v.known)
+            }
+            function copy(to: number, from: number): void {
+                kinds[to] = kinds[from]
+                known[to] = known[from]
+                why[to] = why[from]
+                keys[to] = keys[from]
+                if (captured.reads.has(to)) joinFact(frameFact(unit, to), kinds[to], known[to])
+            }
+            function syncFrame(): void {
+                for (const r of captured.writes) {
+                    const f = frameFact(unit, r)
+                    f.readers.add(unit)
+                    if ((kinds[r] | f.kind) !== kinds[r]) {
+                        kinds[r] |= f.kind
+                        if (f.kind & KindString) why[r] = 'frame'
+                    }
+                    if (f.kind && !sameKnown(known[r], f.known ?? undefined)) known[r] = undefined
+                }
+            }
+            function valueAt(slot: number): Value {
+                return { kind: kinds[slot], known: known[slot], why: why[slot] }
+            }
+            function keyAt(slot: number): PropertyKey | undefined {
+                const k = known[slot]
+                if (k?.tag !== 'value') return
+                const t = typeof k.value
+                return t === 'string' || t === 'number' || t === 'symbol' ? k.value : undefined
+            }
+
+            const insts = blocks.insts[b]
+            let jumpsAnywhere = false
+            for (const inst of insts) {
+                const op = inst.opcode
+                if (op >= Op.Star0 && op <= Op.Star15 || op === Op.Star) { copy(inst.regs[0], ACC); continue }
+                if (op >= Op.Ldar0 && op <= Op.Ldar3 || op === Op.Ldar) { copy(ACC, inst.regs[0]); continue }
+                if (op === Op.Mov || op === Op.MovPacked) { copy(inst.regs[0], inst.regs[1]); continue }
+                switch (op) {
+                    case Op.LdaZero: set(ACC, { kind: KindNumber, known: { tag: 'value', value: 0 } })
+                    case Op.LdaImm: set(ACC, { kind: KindNumber, known: { tag: 'value', value: inst.imm } })
+                    case Op.LdaTrue: set(ACC, { kind: KindNumber, known: { tag: 'value', value: true } })
+                    case Op.LdaFalse: set(ACC, { kind: KindNumber, known: { tag: 'value', value: false } })
+                    case Op.LdaUndefined: set(ACC, { kind: KindNumber, known: { tag: 'value', value: undefined } })
+                    case Op.LdaNull: set(ACC, { kind: KindNumber, known: { tag: 'value', value: null } })
+                    case Op.LdaConst: set(ACC, constantValue(inst.constSlot!))
+                    case Op.LoadFrame: {
+                        const owner = frameOwner(unit, inst.constSlot!)
+                        set(ACC, owner ? readFacts([frameFact(owner, inst.frameReg!)], 'frame', undefined) : { kind: KindAny, why: 'frame' })
+                    }
+                    case Op.StoreFrame: {
+                        if (known[ACC]?.tag === 'unit') escape(known[ACC])
+                        const owner = frameOwner(unit, inst.constSlot!)
+                        if (owner) joinFact(frameFact(owner, inst.frameReg!), kinds[ACC], known[ACC])
+                        else escape(known[ACC])
+                    }
+                    case Op.TypeOf: set(ACC, { kind: KindString, why: 'typeof' })
+                    case Op.ToNumber: break
+                    case Op.IncPost:
+                    case Op.DecPost:
+                        set(inst.regs[0], { kind: KindNumber })
+                        set(ACC, { kind: KindNumber })
+                    case Op.AddOrConcat: {
+                        const lhs = kinds[ACC]
+                        const rhs = kinds[inst.regs[0]]
+                        let site: AddSite
+                        if (!((lhs | rhs) & KindString)) site = { pc: inst.pos, result: 'numeric' }
+                        else if (lhs === KindString || rhs === KindString) site = { pc: inst.pos, result: 'string' }
+                        else site = { pc: inst.pos, result: 'unknown', why: (lhs & KindString ? why[ACC] : why[inst.regs[0]]) ?? '?' }
+                        unit.sites.set(inst.pos, site)
+                        if (site.result === 'numeric') set(ACC, { kind: KindNumber })
+                        else if (site.result === 'string') set(ACC, { kind: KindString, why: 'concat' })
+                        else set(ACC, { kind: KindNumber | KindString, why: site.why })
+                    }
+                    case Op.GetProperty: {
+                        const key = keyAt(inst.regs[0])
+                        set(ACC, readProperty(kinds[ACC], known[ACC], key, kinds[inst.regs[0]], key === undefined ? '[]' : `[${String(key)}]`))
+                    }
+                    case Op.GetPropertyConst: {
+                        const key = compiled.constants[inst.constSlot!]
+                        set(ACC, readProperty(kinds[ACC], known[ACC], key, KindString, `.${String(key)}`))
+                    }
+                    case Op.GetPropertyImm: set(ACC, readProperty(kinds[ACC], known[ACC], inst.imm, KindNumber, `[${inst.imm}]`))
+                    case Op.SetProperty: writeProperty(known[inst.regs[0]], keyAt(inst.regs[1]), kinds[inst.regs[1]], kinds[inst.regs[0]], valueAt(ACC))
+                    case Op.SetPropertyConst: writeProperty(known[inst.regs[0]], compiled.constants[inst.constSlot!], KindString, kinds[inst.regs[0]], valueAt(ACC))
+                    case Op.SetPropertyImm: writeProperty(known[inst.regs[0]], inst.imm, KindNumber, kinds[inst.regs[0]], valueAt(ACC))
+                    case Op.CreateEmptyObject:
+                    case Op.CreateObjectConst:
+                        set(ACC, { kind: KindObject, known: { tag: 'object', site: objectSite(inst.pos) } })
+                    case Op.CreateEmptyArray: {
+                        const c = constantValue(inst.constSlot!)
+                        const cls = c.known?.tag === 'value' && typeof c.known.value === 'function' ? c.known.value : undefined
+                        const ctor = cls ? unitOfFunction(cls) : undefined
+                        if (ctor) {
+                            enter(ctor, KindObject, { tag: 'instance', of: cls! }, [], [])
+                            ctor.callers.add(unit)
+                        }
+                        set(ACC, { kind: KindObject, known: cls ? { tag: 'instance', of: cls } : undefined })
+                    }
+                    case Op.CreateClosure: set(ACC, { kind: KindObject, known: constantValue(inst.constSlot!).known })
+                    case Op.Call:
+                    case Op.CallConst:
+                    case Op.Construct:
+                    case Op.ConstructConst:
+                    case Op.CallArray: {
+                        const construct = op === Op.Construct || op === Op.ConstructConst
+                        const spread = op === Op.CallArray
+                        let target: Known | undefined
+                        let targetKey: PropertyKey | undefined
+                        const argRegs: number[] = []
+                        if (op === Op.Call || op === Op.Construct) {
+                            target = known[inst.regs[0]]
+                            targetKey = keys[inst.regs[0]]
+                            if (inst.regs.length === 3) for (let r = inst.regs[1]; r <= inst.regs[2]; r++) argRegs.push(r)
+                        } else if (op === Op.CallConst || op === Op.ConstructConst) {
+                            target = constantValue(inst.constSlot!).known
+                            if (inst.regs.length === 2) for (let r = inst.regs[0]; r <= inst.regs[1]; r++) argRegs.push(r)
+                        } else {
+                            target = known[inst.regs[0]]
+                            targetKey = keys[inst.regs[0]]
+                        }
+                        const args = argRegs.map(r => kinds[r])
+                        const argKnown = argRegs.map(r => known[r])
+                        const resolved = callTarget(target)
+                        const cls = construct && target?.tag === 'value' && typeof target.value === 'function' ? target.value : undefined
+                        const thisKind = construct ? KindObject : kinds[ACC]
+                        const thisKnown: Known | undefined = cls ? { tag: 'instance', of: cls } : construct ? undefined : known[ACC]
+                        if (target?.tag === 'value' && isMachineFunction(target.value)) {
+                            for (const k of argKnown) escapeOpaque(k)
+                            set(ACC, { kind: KindNumber })
+                        } else if (target?.tag === 'value' && isStructViewFactory(target.value)) {
+                            set(ACC, { kind: KindObject, known: { tag: 'struct' } })
+                        } else if (typeof resolved === 'string') {
+                            for (const k of argKnown) escapeOpaque(k)
+                            if (resolved === 'load') {
+                                const T = known[argRegs[2]]
+                                const numeric = T?.tag === 'value' && typeof T.value === 'number' && T.value !== Types.vm_value
+                                set(ACC, numeric ? { kind: KindNumber } : readFacts([vmMemory], 'load vm_value', undefined))
+                            } else if (resolved === 'store') {
+                                const T = known[argRegs[3]]
+                                const numeric = T?.tag === 'value' && typeof T.value === 'number' && T.value !== Types.vm_value
+                                if (!numeric) joinFact(vmMemory, kinds[argRegs[2]], known[argRegs[2]])
+                                set(ACC, { kind: KindNumber })
+                            } else if (resolved === 'call' || resolved === 'shapeof' || resolved === 'voidvalue' || resolved === 'literal' || resolved === 'rt') {
+                                set(ACC, { kind: KindAny, why: `Intrinsics.${resolved}` })
+                            } else {
+                                set(ACC, { kind: KindNumber })
+                            }
+                        } else if (resolved) {
+                            for (const k of argKnown) if (k?.tag === 'unit' || spread) escape(k)
+                            if (spread) escape(known[inst.regs[1]])
+                            if (spread) enter(resolved, thisKind, thisKnown, resolved.params.map(() => KindAny), [])
+                            else enter(resolved, thisKind, thisKnown, args, argKnown)
+                            resolved.callers.add(unit)
+                            if (construct) set(ACC, { kind: KindObject, known: thisKnown })
+                            else set(ACC, { kind: resolved.returns, known: resolved.returnKnown ?? undefined, why: `returns of ${resolved.name}` })
+                        } else {
+                            for (const k of argKnown) target ? escapeOpaque(k) : escape(k)
+                            if (construct) set(ACC, { kind: KindObject, known: thisKnown })
+                            else if (targetKey !== undefined) set(ACC, keyCall(unit, targetKey, kinds[ACC], spread ? [KindAny, KindAny, KindAny, KindAny] : args))
+                            else if (target) set(ACC, { kind: KindAny, why: 'call of unknown fn' })
+                            else set(ACC, anyTargetCall(unit, kinds[ACC], spread ? [KindAny, KindAny, KindAny, KindAny] : args))
+                        }
+                    }
+                    case Op.Return:
+                        if (known[ACC]?.tag === 'unit') escape(known[ACC])
+                        returns |= kinds[ACC]
+                        returnKnown = joinKnown(returnKnown, known[ACC])
+                    case Op.ReturnVoid:
+                        returns |= KindNumber
+                        returnKnown = joinKnown(returnKnown, { tag: 'value', value: undefined })
+                    case Op.JumpAcc:
+                    case Op.JumpLabel:
+                        jumpsAnywhere = true
+                    default:
+                        if (op >= Op.Add && op <= Op.ToNumber) set(ACC, { kind: KindNumber })
+                }
+                if (captured.writes.size && FrameSyncOps.has(op)) syncFrame()
+            }
+            const succs = jumpsAnywhere ? blocks.leaders.map((_, i) => i) : blocks.succs[b]
+            for (const s of succs) seed(s, kinds, known, why, keys)
+        }
+        if (returns !== unit.returns || returnKnown !== unit.returnKnown) {
+            unit.returns = returns
+            unit.returnKnown = returnKnown
+            for (const caller of unit.callers) schedule(caller)
+        }
+    }
+
+    function run(reanalysesPerUnit = 2): boolean {
+        while (dirty.length) {
+            const unit = dirty.shift()!
+            queued.delete(unit)
+            const again = unit.analyses > 0
+            if (again && stats.reanalyses >= reanalysesPerUnit * units.length) return false
+            const start = performance.now()
+            analyze(unit)
+            const elapsed = performance.now() - start
+            stats.analyses++
+            if (again) {
+                stats.reanalyses++
+                stats.reMs += elapsed
+            } else {
+                stats.firstMs += elapsed
+            }
+        }
+        return true
+    }
+
+    const discoveredUnits = new Set<TypedUnit>()
+    const discoveredObjects: object[] = []
+    const seenObjects = new Set<object>()
+    const objectOwners = new Map<object, Function>()
+    const readKeys = new Set<PropertyKey>()
+    const scanQueue: TypedUnit[] = []
+
+    function discoverUnit(unit: TypedUnit): void {
+        if (discoveredUnits.has(unit)) return
+        discoveredUnits.add(unit)
+        scanQueue.push(unit)
+        schedule(unit)
+    }
+
+    function discoverValue(v: any, viaData: boolean, key?: PropertyKey, owner?: Function): void {
+        if (typeof v === 'function') {
+            const unit = unitOfFunction(v, owner)
+            if (unit) {
+                discoverUnit(unit)
+                if (viaData) open(unit)
+                if (key !== undefined) registerCallable(key, unit)
+            }
+            discoverObject(v)
+            const proto = v.prototype
+            if (proto && typeof proto === 'object') discoverObject(proto, v)
+            return
+        }
+        if (isObjectLike(v)) discoverObject(v)
+    }
+
+    function discoverMember(o: object, key: PropertyKey): void {
+        let cur: any = o
+        while (cur !== null && cur !== undefined) {
+            const d = Object.getOwnPropertyDescriptor(cur, key)
+            if (d) {
+                const owner = objectOwners.get(cur)
+                if ('value' in d) discoverValue(d.value, false, key, owner)
+                if (d.get) discoverValue(d.get, false, undefined, owner)
+                if (d.set) discoverValue(d.set, false, undefined, owner)
+                return
+            }
+            cur = Object.getPrototypeOf(cur)
+        }
+    }
+
+    function discoverObject(o: object, owner?: Function): void {
+        if (owner && !objectOwners.has(o)) objectOwners.set(o, owner)
+        if (seenObjects.has(o) || o === intrinsics.Intrinsics || o === Object.prototype || o === Function.prototype) return
+        seenObjects.add(o)
+        discoveredObjects.push(o)
+        if ('__proxy' in o) {
+            discoverValue((o as any).__proxyGet, false, indexGetKey)
+            discoverValue((o as any).__proxySet, false, indexSetKey)
+        }
+        if (o instanceof Map) for (const [k, v] of o) { discoverValue(k, true); discoverValue(v, true) }
+        else if (o instanceof Set) for (const v of o) discoverValue(v, true)
+        else if (Array.isArray(o)) for (const v of o) discoverValue(v, true)
+        for (const key of Reflect.ownKeys(o)) if (typeof key === 'symbol') discoverMember(o, key)
+        for (const key of readKeys) discoverMember(o, key)
+        const proto = Object.getPrototypeOf(o)
+        if (proto) discoverObject(proto, objectOwners.get(o))
+    }
+
+    function readKey(key: PropertyKey): void {
+        if (readKeys.has(key)) return
+        readKeys.add(key)
+        for (let i = 0; i < discoveredObjects.length; i++) discoverMember(discoveredObjects[i], key)
+    }
+
+    function scan(unit: TypedUnit): void {
+        const { compiled } = unit
+        function constant(slot: number): void {
+            const kind = compiled.constantKinds[slot]
+            const value = compiled.constants[slot]
+            if (kind === bytecode.ConstantKind.nested_function) {
+                discoverUnit(unitOfTemplate(value, unit))
+                return
+            }
+            if (kind !== bytecode.ConstantKind.late_bound) return
+            const name = value as string
+            if (name.startsWith('$')) {
+                const index = Number(name.slice(1))
+                if (index < unit.captures.length) discoverValue(unit.captures[index], false)
+            } else if (name in input.globals) {
+                discoverValue(input.globals[name], false)
+            }
+        }
+        const it = bytecode.createCodeIterator(compiled.code as u8[])
+        while (const inst = it.next()) {
+            if (inst.constSlot === undefined) continue
+            if (inst.opcode === Op.GetPropertyConst || inst.opcode === Op.SetPropertyConst) {
+                const key = compiled.constants[inst.constSlot]
+                if (inst.opcode === Op.GetPropertyConst) readKey(key)
+                continue
+            }
+            if (inst.opcode === Op.LoadFrame || inst.opcode === Op.StoreFrame) continue
+            constant(inst.constSlot)
+        }
+    }
+
+    function root(fn: Function): void {
+        const unit = unitOfFunction(fn)
+        if (!unit) return
+        const start = performance.now()
+        discoverUnit(unit)
+        enter(unit, KindNumber, undefined, unit.params.map(() => KindNumber), [])
+        while (scanQueue.length) scan(scanQueue.pop()!)
+        stats.discoverMs += performance.now() - start
+    }
+
+    function unitOf(fn: Function): TypedUnit | undefined {
+        return byFunction.get(fn) ?? undefined
+    }
+
+    return { root, run, units, unitOf, discovered: discoveredUnits, stats }
+}
+
+export function countAddSites(compiled: bytecode.EmitResult): number {
+    let count = 0
+    const it = bytecode.createCodeIterator(compiled.code as u8[])
+    while (const inst = it.next()) if (inst.opcode === Op.AddOrConcat) count++
+    return count
+}
