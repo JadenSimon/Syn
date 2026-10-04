@@ -305,13 +305,14 @@ function floatBits(raw: any): number {
     return new Float64Array(new BigInt64Array([BigInt(raw)]).buffer)[0]
 }
 
-function nativeStub(fn: Function, symbol: number, returns: intrinsics.Types): Function {
+function nativeStub(fn: Function, symbol: number, returns: intrinsics.Types, paramCount: number, rest: number): Function {
     const names: string[] = []
-    for (let i = 0; i < fn.length; i++) names.push(`arg${i}`)
+    for (let i = 0; i < paramCount; i++) names.push(`arg${i}`)
     const stub: any = new Function(...names, `throw new Error('Unlinked local function')`)
     stub.__localTarget = symbol
-    stub.__args = Array.from({ length: fn.length }, () => Types.u64)
+    stub.__args = Array.from({ length: paramCount }, () => Types.u64)
     stub.__returns = returns
+    stub.__rest = rest
     stub.__name = fn.name
     return stub
 }
@@ -1311,6 +1312,24 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (binding) runtimeTargets.set(getLiteral(n, 0), link(binding))
         }
     }
+    function closeRootDefaults(fn: Function, graph: Graph): void {
+        const compiled = codeOf(fn)?.source.compiled
+        if (!compiled?.defaults || !isRoot(fn)) return
+        const params = graph.blocks[0].params
+        intrinsics.assert(params.length === compiled.paramCount + (usesReceiver(fn) ? 1 : 0) + 1, `native: ${fn.name} has no trailing presence param`)
+        const present = params[params.length - 1]
+        for (const [id, n] of graph.nodes) {
+            let copy: GraphNode | undefined
+            for (let i = 0; i < countIds(n); i++) {
+                if (getRef(n, i) !== present) continue
+                copy ??= copyNode(n)
+                setLiteral(copy, i, (1 << compiled.paramCount) - 1)
+            }
+            if (copy) graph.nodes.set(id, copy)
+        }
+        graph.nodes.delete(present)
+        setGraphBlocks(graph, [{ ...graph.blocks[0], params: params.slice(0, -1) }, ...graph.blocks.slice(1)])
+    }
     let panicSymbol = 0
     function lowerPanics(graph: Graph): boolean {
         let nextId = graph.maxId
@@ -1398,6 +1417,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         return out ?? shapes
     }
+    function defaultsOf(fn: Function): number | undefined {
+        const compiled = codeOf(fn)?.source.compiled
+        return compiled?.defaults ? compiled.paramCount : undefined
+    }
     function sourceOfLinked(fn: Function): CompiledSource | undefined {
         return codeOf(fn)?.source
     }
@@ -1484,7 +1507,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             schedule(capture)
         }
         localStubs.add(capture)
-        const stub: any = nativeStub(capture, target, returnTypeOf(capture))
+        const compiled = codeOf(capture)?.source.compiled
+        const stub: any = nativeStub(capture, target, returnTypeOf(capture), compiled?.paramCount ?? capture.length, compiled?.rest ? compiled.paramCount - 1 : -1)
         const wrapper = returnWrappers.get(capture)
         if (intrinsics.argv().includes('trace-debug')) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
         return wrapper ? wrapCall(stub, wrapper, capture.length) : stub
@@ -1865,6 +1889,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         })
         lowerPanics(traced.graph)
         linkRuntimeCalls(traced.graph)
+        closeRootDefaults(fn, traced.graph)
         enterPhase(outer)
         const entry: FnGraphs = { fn, source: code.source, traced }
         fnGraphs.set(fn, entry)
@@ -2366,16 +2391,26 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                     if (prior !== undefined && !sameSnapshotShape(prior, shape)) throw `native: call sites of ${closure.name} disagree on the shape of parameter ${i}`
                     shapes.set(i, shape)
                 }
+                const paramCount = sourceOfLinked(closure)!.compiled.paramCount
+                const receiver = usesReceiver(closure) && site.receiver !== undefined
+                if (receiver) {
+                    const prior = shapes.get(paramCount)
+                    if (prior !== undefined && !sameSnapshotShape(prior, site.receiver!)) throw `native: call sites of ${closure.name} disagree on the shape of its receiver`
+                    shapes.set(paramCount, site.receiver!)
+                }
+                const argShape = (i: number) => i < 0 ? site.context : receiver && i === paramCount ? site.receiver : site.args[i]
+                const slotOf = (i: number) => i < 0 ? 1 : receiver && i === paramCount ? 2 : 3 + i
                 const returns = site.demanded ? returnLayout(closure) : undefined
                 const returned = returns ? instanceShape(caller, returns.shape, site.call) : undefined
-                const located = applySummary(closure, name, i => i < 0 ? site.context : site.args[i], returned)
+                const located = applySummary(closure, name, argShape, returned)
                 const fromLocation = returns ? undefined : located.result
                 return {
-                    paramCount: site.args.length, receiver: false, result: returned ?? fromLocation,
+                    paramCount: receiver ? paramCount : site.args.length, receiver, result: returned ?? fromLocation,
                     decode: fromLocation !== undefined && located.decode ? pstack0Base() : undefined,
                     reads: returns ? undefined : located.reads,
-                    stores: located.stores.map(([from, into]) => [from < 0 ? 1 : 3 + from, into < 0 ? 1 : 3 + into]),
+                    stores: located.stores.map(([from, into]) => [slotOf(from), slotOf(into)]),
                     returnSlot: returns ? { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } : undefined,
+                    defaults: defaultsOf(closure),
                     returns: returnTypeOf(closure) === Types.u64 ? undefined : returnTypeOf(closure),
                 }
             }
@@ -2389,8 +2424,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const paramCount = source.compiled.paramCount
             if (site.target.op === 'local-target') {
                 const returns = site.demanded ? returnLayout(fn) : undefined
-                if (!returns) return
-                return { paramCount, receiver: false, result: returns.shape, returnSlot: { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } }
+                if (!returns) return defaultsOf(fn) === undefined ? undefined : { paramCount, receiver: false, defaults: defaultsOf(fn) }
+                return { paramCount, receiver: false, result: returns.shape, returnSlot: { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 }, defaults: defaultsOf(fn) }
             }
             const receiver = source.blocks.liveIn[0].has(source.compiled.registerCount)
             const construction = constructsOutOfLine(fn) ? constructionFor(caller, fn, site.call) : undefined
@@ -2427,6 +2462,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 returnSlot: returns ? { at: returns.slot, size: heap.ownPropertyCount(returns.shape) * 8 } : undefined,
                 target: callee === fn ? undefined : session.linkFunction(callee),
                 returns: returnTypeOf(callee) === Types.u64 ? undefined : returnTypeOf(callee),
+                defaults: defaultsOf(callee),
             }
         }
     }
