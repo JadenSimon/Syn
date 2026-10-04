@@ -30,6 +30,10 @@ type usize = u32
 
 const Intrinsics = intrinsics.Intrinsics
 const Types = intrinsics.Types
+const UnboxingOps = new Set([
+    'add', 'sub', 'mul', 'div', 'rem', 'pow', 'and', 'or', 'xor', 'shl', 'shr', 'ushr',
+    'lt', 'le', 'gt', 'ge', 'neg', 'convert', 'bitconvert',
+])
 
 const poolTag = Symbol('native.pool')
 interface PoolValue {
@@ -653,7 +657,7 @@ function obviousInline(g: Graph): InlineScore | undefined {
     const cheap = new Set([
         'load', 'store', 'select', 'ne', 'eq', 'gt', 'lt', 'le', 'ge',
         'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'shr', 'ushr',
-        'neg', 'not', 'convert', 'bitconvert', 'literal', 'void', 'encode', 'decode'
+        'neg', 'not', 'convert', 'bitconvert', 'literal', 'void', 'encode', 'decode', 'box', 'unbox'
     ])
     for (const id of reachable) {
         const n = g.nodes.get(id)!
@@ -870,7 +874,14 @@ function rewriteTargets(
             continue
         }
         if (n.op === 'rt') {
-            nodes.set(id, rt.lowerNative(n, { runtimeHeapBase }))
+            nodes.set(id, rt.lowerNative(n, {
+                runtimeHeapBase,
+                add: node => {
+                    const fresh = maxId++
+                    nodes.set(fresh, node)
+                    return fresh
+                },
+            }))
             continue
         }
         if (n.op !== 'heap-handle') {
@@ -1373,7 +1384,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         mapCapture: (capture: any) => any,
         params?: Map<number, intrinsics.Handle>,
         constructed?: Constructed,
-    ): { graph: Graph, closures: boolean, shapes: Map<number, intrinsics.Handle>, encoded: Set<number> } {
+    ): { graph: Graph, closures: boolean, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, unions: Set<number> } {
         const name = fn.name
         if (intrinsics.argv().includes(`pe-input:${name}`)) console.log(dumpGraph(traced.graph))
         for (const [index, T] of paramKinds.get(fn) ?? []) {
@@ -1386,15 +1397,17 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         let frame = frames.get(fn)
         if (frame === undefined) frames.set(fn, frame = propertyEval.frameShape(frameSize(source)))
         let created = false
-        const resolved = propertyEval.resolveClosures(traced.graph, session, traced.frameProxy, frameSize(source), params, constructed, callsFor(fn), {
+        const bound: (UnionBinding | ClosureArgs)[] = []
+        const resolved = propertyEval.resolveClosures(traced.graph, session, traced.frameProxy, frameSize(source), params, constructed, callsFor(fn, bound), {
             locate, stored: (shape, path, value) => setFact(name, shape, path, { shape: value, encoded: false }),
-            frame, contextShape: contextShapes.get(fn),
+            frame, contextShape: contextShapes.get(fn), unionParams: unionParamBases(fn),
             created: (closure, shape) => {
                 created = true
                 contextShapes.set(closureFunction(closure, name), shape)
             },
         })
-        return { graph: resolved.graph, closures: traced.frameProxy !== undefined || created, shapes: resolved.memoryShapes, encoded: resolved.encoded ?? new Set() }
+        rebindUnions(resolved.graph, bound)
+        return { graph: resolved.graph, closures: traced.frameProxy !== undefined || created, shapes: resolved.memoryShapes, encoded: resolved.encoded ?? new Set(), unions: resolved.unions ?? new Set() }
     }
     const paramShapes = new Map<Function, Map<number, intrinsics.Handle>>()
     const numberParams = new Map<Function, Set<number>>()
@@ -1577,7 +1590,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const closed = timed('close', () => closeOver(unit.fn, { ...entry.traced, graph }, entry.source, mapCapture, closeParams(unit.fn, entry.source.compiled.paramCount), constructedFor(layout, graph)))
         entry.closed = snapshotGraph(closed.graph)
         entry.closedShapes = closed.shapes
-        encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(unit.fn))
+        encodeHandles(closed.graph, closed.shapes, closed.encoded, closed.unions, receiverUnions.has(unit.fn), () => encodesReturns(unit.fn))
         const lifted = liftReturnedHeapValues(closed.graph)
         const source = snapshotGraph({ ...lifted.graph, name })
         const normalized = normalize({ ...lifted.graph, name }, { firstPass: true })
@@ -2020,7 +2033,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const specializedFrom = new Map<Function, Function>()
     const specializations = new Map<Function, Function[]>()
     const used = new Set<Function>()
-    function specializationFor(fn: Function, wanted: Map<number, intrinsics.Handle>, kinds: Map<number, intrinsics.Types>): Function {
+    const receiverUnions = new Map<Function, string>()
+    function specializationFor(fn: Function, wanted: Map<number, intrinsics.Handle>, kinds: Map<number, intrinsics.Types>, unionPaths = ''): Function {
         const origin = specializedFrom.get(fn) ?? fn
         let family = specializations.get(origin)
         if (!family) specializations.set(origin, family = [origin])
@@ -2030,10 +2044,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const known = paramKinds.get(candidate)
             if (!shapes?.size && !known?.size && !used.has(candidate)) {
                 if (floats && fnGraphs.has(candidate)) continue
+                if (unionPaths) continue
                 used.add(candidate)
                 return candidate
             }
-            let fits = (shapes?.size ?? 0) === wanted.size && (known?.size ?? 0) === kinds.size
+            let fits = (shapes?.size ?? 0) === wanted.size && (known?.size ?? 0) === kinds.size && (receiverUnions.get(candidate) ?? '') === unionPaths
             for (const [index, T] of kinds) if (known?.get(index) !== T) fits = false
             for (const [index, shape] of wanted) {
                 const prior = shapes?.get(index)
@@ -2048,6 +2063,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         codes.set(specialized, codeOf(origin)!)
         specializedFrom.set(specialized, origin)
         family.push(specialized)
+        if (unionPaths) receiverUnions.set(specialized, unionPaths)
         if (intrinsics.argv().includes('call-sites')) console.log('SPECIALIZE', specialized.name, [...wanted].map(([i, s]) => `p${i}=${describe(s)}`).join(' '))
         return specialized
     }
@@ -2069,6 +2085,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     interface Fact {
         shape: intrinsics.Handle | undefined
         encoded: boolean
+        number?: boolean
     }
     const summaries = new Map<Function, Summary>()
     const summarizing = new Set<Function>()
@@ -2241,7 +2258,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const segments = path.split('/')
         for (let i = 1; i < segments.length; i++) {
             const inner = locationFacts.get(shape)?.get(segments.slice(0, i).join('/'))
-            if (inner !== undefined) return owner(inner.shape, segments.slice(i).join('/'))
+            if (inner?.shape !== undefined) return owner(inner.shape, segments.slice(i).join('/'))
         }
         return { shape, path }
     }
@@ -2256,26 +2273,36 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         reads.add(at.path)
         return fact
     }
+    function joinFact(a: Fact, b: Fact): Fact | undefined {
+        if (a.shape !== undefined && b.shape !== undefined && !sameSnapshotShape(a.shape, b.shape)) return
+        if (a.encoded !== b.encoded) return
+        const shape = a.shape ?? b.shape
+        const number = !!a.number || !!b.number
+        const opaque = (a.shape === undefined && !a.number) || (b.shape === undefined && !b.number)
+        if (number && opaque) return
+        if (number && shape !== undefined && !a.encoded) return
+        return { shape, encoded: a.encoded, number }
+    }
     function setFact(name: string, shape: intrinsics.Handle, path: string, fact: Fact): void {
-        intrinsics.assert(fact.shape !== undefined || fact.encoded, `native: ${name} records an unencoded value of unknown shape`)
+        intrinsics.assert(fact.shape !== undefined || fact.encoded || !!fact.number, `native: ${name} records an unencoded value of unknown shape`)
         const at = owner(shape, path)
         let facts = locationFacts.get(at.shape)
         if (!facts) locationFacts.set(at.shape, facts = new Map())
         const prior = facts.get(at.path)
-        if (prior !== undefined) {
-            if (!sameSnapshotShape(prior.shape, fact.shape) || prior.encoded !== fact.encoded) throw `native: ${name} stores ${describe(fact.shape)} into [${at.path}] of ${describe(at.shape)}, which holds ${describe(prior.shape)}`
-            return
-        }
+        const joined = prior === undefined ? fact : joinFact(prior, fact)
+        if (joined === undefined) throw `native: ${name} stores ${describe(fact.shape)} into [${at.path}] of ${describe(at.shape)}, which holds ${describe(prior!.shape)}`
+        if (prior !== undefined && (prior.shape === undefined) === (joined.shape === undefined) && !!prior.number === !!joined.number) return
         if (readLocations.get(at.shape)?.has(at.path)) throw `native: ${name} widens [${at.path}] of ${describe(at.shape)} after it was read`
-        facts.set(at.path, fact)
-        if (intrinsics.argv().includes('call-sites')) console.log('FACT', name, describe(at.shape), `[${at.path}]`, '<-', describe(fact.shape), fact.encoded ? 'encoded' : '')
+        facts.set(at.path, joined)
+        if (intrinsics.argv().includes('call-sites')) console.log('FACT', name, describe(at.shape), `[${at.path}]`, '<-', joined.shape !== undefined ? describe(joined.shape) : '', joined.number ? 'number' : '', joined.encoded ? 'encoded' : '')
     }
-    function locate(shape: intrinsics.Handle, path: string): { shape?: intrinsics.Handle, decode?: number } | undefined {
+    function locate(shape: intrinsics.Handle, path: string): { shape?: intrinsics.Handle, decode?: number, union?: boolean } | undefined {
         const fact = factAt(shape, path)
         if (fact === undefined) return
-        return { shape: fact.shape, decode: fact.encoded ? pstack0Base() : undefined }
+        if (fact.number && fact.shape === undefined) return
+        return { shape: fact.shape, decode: fact.encoded ? pstack0Base() : undefined, union: fact.number }
     }
-    function applySummary(callee: Function, name: string, shapeOfArg: (i: number) => intrinsics.Handle | undefined, result: intrinsics.Handle | undefined): { result?: intrinsics.Handle, heap: number[], decode: boolean, reads: intrinsics.Handle[], stores: [number, number][] } {
+    function applySummary(callee: Function, name: string, shapeOfArg: (i: number) => intrinsics.Handle | undefined, result: intrinsics.Handle | undefined, numberArg: (i: number) => boolean): { result?: intrinsics.Handle, union: boolean, heap: number[], decode: boolean, reads: intrinsics.Handle[], stores: [number, number][] } {
         const summary = summaryOf(callee)
         const argShape = (i: number) => {
             const shape = shapeOfArg(i)
@@ -2286,6 +2313,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (x.path) return factAt(argShape(x.param), x.path)
             const shape = argShape(x.param)
             if (shape !== undefined) return { shape, encoded: false }
+            if (numberArg(x.param)) return { shape: undefined, encoded: false, number: true }
             return paramKinds.get(callee)?.get(x.param) === Types.vm_value ? { shape: undefined, encoded: true } : undefined
         }
         const resolve = (x: Stored) => factOf(x)?.shape
@@ -2293,19 +2321,20 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const target = argShape(e.target.param)
             const fact = factOf(e.value)
             if (target === undefined || fact === undefined) continue
-            setFact(name, target, e.target.path, { shape: fact.shape, encoded: e.encoded })
+            setFact(name, target, e.target.path, { shape: fact.shape, encoded: e.encoded, number: fact.number })
         }
         if (result !== undefined) {
             for (const [key, content] of summary.fields) {
                 const fact = factOf(content.value)
                 const offset = propertyEval.fieldOffset(result, key, refinements)
                 if (offset === undefined || fact === undefined) continue
-                setFact(name, result, String(offset), { shape: fact.shape, encoded: content.encoded })
+                setFact(name, result, String(offset), { shape: fact.shape, encoded: content.encoded, number: fact.number })
             }
         }
         const heap: number[] = []
         for (const e of summary.effects) if (e.encoded && isLoc(e.value) && !e.value.path && !heap.includes(e.value.param)) heap.push(e.value.param)
         const shapes = summary.rets.map(r => resolve(r.value))
+        const union = summary.rets.some(r => factOf(r.value)?.number === true) && shapes.some(x => x !== undefined)
         let resolved: intrinsics.Handle | undefined = shapes.length && shapes.every(x => x !== undefined) ? shapes[0] : undefined
         if (resolved !== undefined && shapes.some(x => !sameSnapshotShape(x, resolved))) throw `native: ${callee.name} returns ${shapes.map(describe).join(' or ')}`
         if (summary.rets.some(r => r.encoded !== summary.rets[0].encoded)) throw `native: ${callee.name} returns both encoded and unencoded values`
@@ -2316,14 +2345,14 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
         const stores: [number, number][] = []
         for (const e of summary.effects) if (isLoc(e.value) && !e.value.path && e.value.param !== e.target.param) stores.push([e.value.param, e.target.param])
-        return { result: resolved, heap, decode: summary.rets[0]?.encoded ?? false, reads, stores }
+        return { result: resolved, union, heap, decode: summary.rets[0]?.encoded ?? false, reads, stores }
     }
     let pstack0BaseAddress: number | undefined
     function pstack0Base(): number {
         pstack0BaseAddress ??= pstackCell(0) + 8
         return pstack0BaseAddress
     }
-    function encodeHandles(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, returns: () => boolean): void {
+    function encodeHandles(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, unions: Set<number>, boxesNumbers: boolean, returns: () => boolean): void {
         function encode(value: number): number {
             const encoded = freshId(graph)
             graph.nodes.set(encoded, makeNode('encode', [value, { literal: pstack0Base() }]))
@@ -2377,8 +2406,188 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             setRef(copy, at, encode(getRef(n, at)))
             graph.nodes.set(id, copy)
         }
+        if (boxesNumbers) {
+            function word(ref: number): boolean {
+                const n = graph.nodes.get(valueOf(ref))
+                return !!n && (n.op === 'encode' || n.op === 'box' || resultType(graph, n) === Types.vm_value || objectValue(ref))
+            }
+            for (const [id, n] of [...graph.nodes]) {
+                if (n.op !== 'store' || typeOf(n) !== Types.vm_value) continue
+                const value = getRef(n, 3)
+                if (value && word(value)) continue
+                const copy = copyNode(n)
+                if (value) {
+                    const box = freshId(graph)
+                    graph.nodes.set(box, makeNode('box', [value], Types.vm_value))
+                    setRef(copy, 3, box)
+                } else {
+                    setLiteral(copy, 3, getLiteral(n, 3) * 2)
+                }
+                graph.nodes.set(id, copy)
+            }
+        }
+        if (unions.size) encodeUnions(graph, unions, objectValue, encode)
     }
-    function callsFor(caller: Function): (site: propertyEval.CallSite) => propertyEval.CallBinding | undefined {
+    function encodeUnions(graph: Graph, unions: Set<number>, objectValue: (ref: number) => boolean, encode: (value: number) => number): void {
+        const users = new Map<number, [user: number, slot: number][]>()
+        for (const [id, n] of graph.nodes) {
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (!ref) continue
+                const list = users.get(ref)
+                if (list) list.push([id, i])
+                else users.set(ref, [[id, i]])
+            }
+        }
+        const boxed = new Set<number>(unions)
+        const work = [...unions]
+        while (work.length) {
+            const id = work.pop()!
+            for (const [user, slot] of users.get(id) ?? []) {
+                const u = graph.nodes.get(user)!
+                let to = 0
+                if (u.op === 'after' && slot === countIds(u) - 1) to = user
+                else if (u.op === 'select' && slot > 0) to = user
+                else if (u.op === 'apply' && slot > 0) to = getBlock(graph, getRef(u, 0))?.params[slot - 1] ?? 0
+                if (!to || boxed.has(to)) continue
+                boxed.add(to)
+                work.push(to)
+            }
+        }
+        function add(op: string, operand: number, T: intrinsics.Types): number {
+            const id = freshId(graph)
+            graph.nodes.set(id, makeNode(op, [operand], T))
+            return id
+        }
+        function toWord(x: Operand): Operand {
+            if (typeof x !== 'number') return { literal: x.literal * 2 }
+            if (boxed.has(x)) return x
+            return objectValue(x) ? encode(x) : add('box', x, Types.vm_value)
+        }
+        function coerce(id: number, n: GraphNode, slots: number[], to: (x: Operand) => Operand): void {
+            const operands = getOperands(n)
+            let changed = false
+            for (const i of slots) {
+                const next = to(operands[i])
+                if (next === operands[i]) continue
+                operands[i] = next
+                changed = true
+            }
+            if (changed) graph.nodes.set(id, copyNode(n, operands))
+        }
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op === 'apply') {
+                const params = getBlock(graph, getRef(n, 0))?.params ?? []
+                coerce(id, n, params.flatMap((p, i) => boxed.has(p) ? [i + 1] : []), toWord)
+            } else if (n.op === 'select' && boxed.has(id)) {
+                coerce(id, n, Array.from({ length: countIds(n) - 1 }, (_, i) => i + 1), toWord)
+            } else if (n.op === 'eq' || n.op === 'ne') {
+                if (getRef(n, 0) && boxed.has(getRef(n, 0)) !== (!!getRef(n, 1) && boxed.has(getRef(n, 1)))) coerce(id, n, [0, 1], toWord)
+            } else if (UnboxingOps.has(n.op)) {
+                const slots: number[] = []
+                for (let i = 0; i < countIds(n); i++) if (getRef(n, i) && boxed.has(getRef(n, i))) slots.push(i)
+                coerce(id, n, slots, x => add('unbox', x as number, Types.i64))
+            }
+        }
+    }
+    const numberedParams = new Map<Function, Set<number>>()
+    const unionParams = new Map<Function, Set<number>>()
+    const settledClosures = new Map<Function, number>()
+    function markUnionParam(closure: Function, i: number): void {
+        let set = unionParams.get(closure)
+        if (!set) unionParams.set(closure, set = new Set())
+        if (set.has(i)) return
+        if (settledClosures.has(closure)) throw `native: parameter ${i} of ${closure.name} becomes a union after a caller was settled`
+        set.add(i)
+        let kinds = paramKinds.get(closure)
+        if (!kinds) paramKinds.set(closure, kinds = new Map())
+        kinds.set(i, Types.vm_value)
+        const entry = fnGraphs.get(closure)
+        if (entry) {
+            entry.closed = undefined
+            entry.closedShapes = undefined
+        }
+        summaries.delete(closure)
+    }
+    function unionParamBases(fn: Function): Map<number, number> | undefined {
+        const set = unionParams.get(fn)
+        if (!set) return
+        return new Map([...set].map(i => [i, pstack0Base()]))
+    }
+    interface ClosureArgs {
+        call: number
+        closure: Function
+        args: (intrinsics.Handle | undefined)[]
+        numbers: boolean[]
+    }
+    function settleClosureArgs(graph: Graph, b: ClosureArgs): void {
+        settledClosures.set(b.closure, (settledClosures.get(b.closure) ?? 0) + 1)
+        const set = unionParams.get(b.closure)
+        if (!set) return
+        const call = graph.nodes.get(b.call)!
+        const copy = copyNode(call)
+        for (const i of set) {
+            const ref = getRef(call, 3 + i)
+            if (!ref) {
+                setLiteral(copy, 3 + i, getLiteral(call, 3 + i) * 2)
+                continue
+            }
+            const coded = freshId(graph)
+            graph.nodes.set(coded, b.args[i] !== undefined ? makeNode('encode', [ref, { literal: pstack0Base() }]) : makeNode('box', [ref], Types.vm_value))
+            setRef(copy, 3 + i, coded)
+        }
+        graph.nodes.set(b.call, copy)
+    }
+    interface UnionBinding {
+        call: number
+        fn: Function
+        callee: Function
+        wanted: Map<number, intrinsics.Handle>
+        kinds: Map<number, intrinsics.Types>
+        receiver: number
+        shape: intrinsics.Handle
+        numbers: boolean[]
+        unionPaths: string
+    }
+    function receiverUnionPaths(callee: Function, receiver: number, shape: intrinsics.Handle, numbers: boolean[]): string {
+        const paths: string[] = []
+        for (const e of summaryOf(callee).effects) {
+            if (e.target.param !== receiver || !e.encoded || !isLoc(e.value) || e.value.path || !numbers[e.value.param]) continue
+            const at = owner(shape, e.target.path)
+            const fact = locationFacts.get(at.shape)?.get(at.path)
+            if (fact?.number && fact.shape !== undefined && !paths.includes(e.target.path)) paths.push(e.target.path)
+        }
+        return paths.sort().join(',')
+    }
+    function unionSpecialization(b: UnionBinding, unionPaths: string): Function {
+        const callee = specializationFor(b.fn, b.wanted, b.kinds, unionPaths)
+        let shapes = paramShapes.get(callee)
+        if (!shapes) paramShapes.set(callee, shapes = new Map())
+        for (const [index, shape] of b.wanted) shapes.set(index, shape)
+        paramKinds.set(callee, b.kinds)
+        return callee
+    }
+    function rebindUnions(graph: Graph, bound: (UnionBinding | ClosureArgs)[]): void {
+        for (const b of bound) {
+            if ('closure' in b) {
+                settleClosureArgs(graph, b)
+                continue
+            }
+            const unionPaths = receiverUnionPaths(b.callee, b.receiver, b.shape, b.numbers)
+            if (unionPaths === b.unionPaths) continue
+            const callee = unionSpecialization(b, unionPaths)
+            const call = graph.nodes.get(b.call)!
+            const target = copyNode(graph.nodes.get(getRef(call, 1))!)
+            setLiteral(target, 0, session.linkFunction(callee))
+            const targetId = freshId(graph)
+            graph.nodes.set(targetId, target)
+            const copy = copyNode(call)
+            setRef(copy, 1, targetId)
+            graph.nodes.set(b.call, copy)
+            if (intrinsics.argv().includes('call-sites')) console.log('REBIND', b.fn.name, `%${b.call}`, '->', callee.name, `[${unionPaths}]`)
+        }
+    }
+    function callsFor(caller: Function, bound?: (UnionBinding | ClosureArgs)[]): (site: propertyEval.CallSite) => propertyEval.CallBinding | undefined {
         const name = caller.name
         return site => {
             if (site.context !== undefined) {
@@ -2391,9 +2600,18 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 if (!shapes) paramShapes.set(closure, shapes = new Map())
                 const first = !used.has(closure)
                 used.add(closure)
+                let numbered = numberedParams.get(closure)
+                if (!numbered) numberedParams.set(closure, numbered = new Set())
                 for (let i = 0; i < site.args.length; i++) {
                     const shape = site.args[i]
                     const prior = shapes.get(i)
+                    if (site.numbers[i]) numbered.add(i)
+                    if (numbered.has(i) && (shape ?? prior) !== undefined) {
+                        if (prior !== undefined && shape !== undefined && !sameSnapshotShape(prior, shape)) throw `native: call sites of ${closure.name} disagree on the shape of parameter ${i}`
+                        shapes.set(i, shape ?? prior!)
+                        markUnionParam(closure, i)
+                        continue
+                    }
                     if (!first && (prior === undefined) !== (shape === undefined)) throw `native: call sites of ${closure.name} disagree on whether parameter ${i} is an object`
                     if (shape === undefined) continue
                     if (prior !== undefined && !sameSnapshotShape(prior, shape)) throw `native: call sites of ${closure.name} disagree on the shape of parameter ${i}`
@@ -2412,14 +2630,16 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                     if (prior !== undefined && !sameSnapshotShape(prior, site.receiver!)) throw `native: call sites of ${closure.name} disagree on the shape of its receiver`
                     shapes.set(paramCount, site.receiver!)
                 }
+                bound?.push({ call: site.call, closure, args: site.args.slice(), numbers: site.numbers.slice() })
                 const argShape = (i: number) => i < 0 ? site.context : receiver && i === paramCount ? site.receiver : site.args[i]
                 const slotOf = (i: number) => i < 0 ? 1 : receiver && i === paramCount ? 2 : 3 + i
                 const returns = site.demanded ? returnLayout(closure) : undefined
                 const returned = returns ? instanceShape(caller, returns.shape, site.call) : undefined
-                const located = applySummary(closure, name, argShape, returned)
+                const located = applySummary(closure, name, argShape, returned, i => i >= 0 && !!site.numbers[i])
                 const fromLocation = returns ? undefined : located.result
                 return {
                     paramCount: receiver ? paramCount : site.args.length, receiver, result: returned ?? fromLocation,
+                    union: fromLocation !== undefined && located.union,
                     decode: fromLocation !== undefined && located.decode ? pstack0Base() : undefined,
                     reads: returns ? undefined : located.reads,
                     stores: located.stores.map(([from, into]) => [slotOf(from), slotOf(into)]),
@@ -2455,7 +2675,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
                 if (site.numbers[i]) kinds.set(i, site.floats[i] ? Types.f64 : site.signed[i] ? Types.i64 : Types.unknown_number)
                 if (site.encoded[i]) kinds.set(i, Types.vm_value)
             }
-            const callee = construction ?? specializationFor(fn, wanted, kinds)
+            let callee = construction ?? specializationFor(fn, wanted, kinds)
             let shapes = paramShapes.get(callee)
             if (!shapes) paramShapes.set(callee, shapes = new Map())
             for (const [index, shape] of wanted) shapes.set(index, shape)
@@ -2465,10 +2685,18 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (known) recordPointees(known, callee)
             const returned = returns ? instanceShape(caller, returns.shape, site.call) : undefined
             if (intrinsics.argv().includes('bind-debug')) console.log('BIND', name, '->', callee.name, `%${site.call}`, 'returns', !!returns, 'fields', [...summaryOf(callee).fields.keys()].map(k => heap.stringToJs(k)).join(','))
-            const located = layout ? undefined : applySummary(callee, name, i => wanted.get(i), returned)
+            const located = layout ? undefined : applySummary(callee, name, i => wanted.get(i), returned, i => i < paramCount && !!site.numbers[i])
             const fromLocation = !instance && !returns ? located?.result : undefined
+            if (receiver && !construction && receiverShape !== undefined) {
+                const numbers = site.numbers.slice(0, paramCount)
+                const unionPaths = receiverUnionPaths(callee, paramCount, receiverShape, numbers)
+                const b: UnionBinding = { call: site.call, fn, callee, wanted, kinds, receiver: paramCount, shape: receiverShape, numbers, unionPaths }
+                if (unionPaths) b.callee = callee = unionSpecialization(b, unionPaths)
+                bound?.push(b)
+            }
             return {
                 paramCount, receiver, receiverShape: instance, result: instance ?? returned ?? fromLocation,
+                union: fromLocation !== undefined && located!.union,
                 heap: located?.heap.length ? located.heap : undefined,
                 decode: fromLocation !== undefined && located!.decode ? pstack0Base() : undefined,
                 reads: !instance && !returns ? located?.reads : undefined,
@@ -2514,7 +2742,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const closed = timed('close', () => closeOver(current, traced, unitSource, mapCapture, closeParams(current, unitSource.compiled.paramCount), constructedFor(layout, traced.graph)))
         entry.closed = snapshotGraph(closed.graph)
         entry.closedShapes = closed.shapes
-        encodeHandles(closed.graph, closed.shapes, closed.encoded, () => encodesReturns(current))
+        encodeHandles(closed.graph, closed.shapes, closed.encoded, closed.unions, receiverUnions.has(current), () => encodesReturns(current))
         if (intrinsics.argv().includes(`closed-debug:${current.name}`)) console.log(dumpGraph(closed.graph))
         const projected = projectsCallResults(closed.graph)
         const opaque = !projected && [...closed.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')
