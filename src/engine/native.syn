@@ -646,6 +646,11 @@ const targets = new Set(['syscall-target', 'local-target', 'pool-entry', 'heap-h
 const folding = new Set(['add', 'sub', 'mul', 'div', 'and', 'or', 'xor', 'shl', 'shr', 'ushr', 'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'convert'])
 
 function obviousInline(g: Graph, literals = new Set<number>()): InlineScore | undefined {
+    const cost = inlineCost(g, literals)
+    return cost !== undefined && cost <= 8 ? { cost, pressure: 0 } : undefined
+}
+
+function inlineCost(g: Graph, literals = new Set<number>()): number | undefined {
     if (g.nodes.size > 75) return
     let root = g.blocks[0].bodyId
     const reachable = new Set<number>()
@@ -720,9 +725,7 @@ function obviousInline(g: Graph, literals = new Set<number>()): InlineScore | un
         if (!cheap.has(n.op)) return
         cost += n.op === 'mul' || n.op === 'div' ? 2 : 1
     }
-    if (cost > 8) return
-
-    return { cost, pressure: 0 }
+    return cost
 }
 
 interface ShapedCallee {
@@ -778,7 +781,6 @@ interface PendingUnit {
     fn: Function
     symbol: number
     graph: Graph
-    source?: Graph
 }
 
 const panicTrap = intrinsics.argv().includes('panic-trap')
@@ -1625,13 +1627,18 @@ function calledSymbol(source: Graph, n: GraphNode): number | undefined {
     if (target?.op !== 'local-target' || getRef(target, 0)) return
     return getLiteral(target, 0)
 }
-function inlines(callSites: Map<number, number>, roots: Map<string, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit): boolean {
+const hotSite = Number(intrinsics.argv().find(a => a.startsWith('inline-hot:'))?.slice(11) ?? Infinity)
+
+function inlines(callSites: Map<number, number>, roots: Map<string, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
     if (!reachable(callee.graph)) return false
-    const score = obviousInline(callee.graph, literalParams(source, source.nodes.get(id)!, callee.graph))
-    if (!score && (callSites.get(callee.symbol) !== 1 || [...roots.values()].includes(callee.symbol))) return false
+    const cost = inlineCost(callee.graph, literalParams(source, source.nodes.get(id)!, callee.graph))
+    const neutral = cost !== undefined && cost <= 8
+    const sole = callSites.get(callee.symbol) === 1 && ![...roots.values()].includes(callee.symbol)
+    const growth = cost !== undefined && cost <= 8 + callee.graph.blocks[0].params.length && heat >= hotSite
+    if (!neutral && !sole && !growth) return false
     const only = intrinsics.argv().filter(a => a.startsWith('inline-only:')).map(a => a.slice(12))
     if (only.length && !only.includes(callee.graph.name ?? '')) return false
-    if (intrinsics.argv().includes('inline-debug')) console.log('INLINE', caller.name, '<-', callee.graph.name, `%${id}`, score?.cost ?? 'sole')
+    if (intrinsics.argv().includes('inline-debug')) console.log('INLINE', caller.name, '<-', callee.graph.name, `%${id}`, neutral ? cost : sole ? 'sole' : `growth ${cost} heat ${heat}`)
     return true
 }
 
@@ -1681,6 +1688,93 @@ function programLevels(program: ProgramGraph): Map<number, number> {
         console.log('native levels', [...levels].sort((a, b) => b[1] - a[1]).map(([symbol, level]) => `${program.units.get(symbol)!.name}=${level}`).join(' '))
     }
     return levels
+}
+
+function anchorBlockNils(graph: Graph): void {
+    for (const b of graph.blocks.slice(1)) {
+        const nil = graph.maxId++
+        graph.nodes.set(nil, makeNode('nil-effect', [{ literal: b.id }]))
+        const memo = new Map<number, number>()
+        function rewrite(id: number): number {
+            if (!id) return id
+            const known = memo.get(id)
+            if (known !== undefined) return known
+            const n = graph.nodes.get(id)
+            if (!n || n.op === 'block' || n.op === 'param') return id
+            if (n.op === 'nil-effect' && !countLiterals(n)) return nil
+            memo.set(id, id)
+            let copy: GraphNode | undefined
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = rewrite(getRef(n, i))
+                if (ref === getRef(n, i)) continue
+                copy ??= copyNode(n)
+                setRef(copy, i, ref)
+            }
+            if (!copy) return id
+            const fresh = graph.maxId++
+            graph.nodes.set(fresh, copy)
+            memo.set(id, fresh)
+            return fresh
+        }
+        b.bodyId = rewrite(b.bodyId)
+    }
+}
+
+function siteDepths(graph: Graph): Map<number, number> {
+    const { loopDepth } = graphLoops(graph)
+    const depths = new Map<number, number>()
+    for (const b of graph.blocks) {
+        const depth = loopDepth.get(b.id) ?? 0
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const id = stack.pop()!
+            const n = id ? graph.nodes.get(id) : undefined
+            if (!n || n.op === 'block' || (depths.get(id) ?? -1) >= depth) continue
+            depths.set(id, depth)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    return depths
+}
+
+function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
+    for (const graph of program.units.values()) sweepBlocks(graph)
+    const units = programUnits(program)
+    const callSites = countCallSites(program)
+    const levels = programLevels(program)
+    const inlined = new Map<number, boolean>()
+    function visit(unit: ProgramUnit): void {
+        if (inlined.has(unit.symbol)) return
+        inlined.set(unit.symbol, false)
+        const graph = snapshotGraph(unit.graph)
+        const depths = siteDepths(graph)
+        let changed = false
+        for (const [id, n] of [...graph.nodes]) {
+            const symbol = calledSymbol(graph, n)
+            if (symbol === undefined) continue
+            const callee = units.get(symbol)
+            if (!callee || callee === unit || program.noInline.has(symbol)) continue
+            visit(callee)
+            if (!inlined.get(symbol)) continue
+            if (callee.graph.blocks[0].params.some(p => isContextParam(callee.graph.nodes.get(p)!))) continue
+            if (!inlines(callSites, program.roots, unit.graph, graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            splice(graph, id, callee.graph, g => g.maxId++)
+            changed = true
+        }
+        if (changed) {
+            anchorBlockNils(graph)
+            graph.form = undefined
+            unit.graph = clock.normalize(graph)
+        }
+        inlined.set(unit.symbol, true)
+    }
+    for (const unit of units.values()) visit(unit)
+    for (const unit of units.values()) program.units.set(unit.symbol, unit.graph)
+}
+
+function prune(program: ProgramGraph): void {
+    const reached = reachUnits(program)
+    for (const symbol of [...program.units.keys()]) if (!reached.has(symbol)) program.units.delete(symbol)
 }
 
 function refineProgramEffects(program: ProgramGraph, clock: PhaseClock): void {
@@ -2527,7 +2621,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         entry.closedShapes = closed.shapes
         encodeHandles(closed.graph, closed.shapes, closed.encoded, closed.unions, unionSpecialized.has(unit.fn), () => encodesReturns(unit.fn))
         const lifted = liftReturnedHeapValues(closed.graph)
-        const source = snapshotGraph({ ...lifted.graph, name })
         const normalized = normalize({ ...lifted.graph, name }, { firstPass: true })
         if ([...normalized.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')) {
             console.log(dumpGraph(normalized))
@@ -2535,7 +2628,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         }
         entry.unit = normalized
         resolveHandles(normalized)
-        pending.push({ fn: unit.fn, symbol: unit.symbol, graph: normalized, source })
+        pending.push({ fn: unit.fn, symbol: unit.symbol, graph: normalized })
     }
     const refinements = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     const fixed = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
@@ -2791,18 +2884,17 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (!entry.returns) continue
             if (!entry.closed) throw `native: ${entry.fn.name} returns into a caller slot but was never resolved`
             const stored = { ...storeReturns(entry.fn.name, entry.closed, entry.returns), name: entry.fn.name }
-            const source = snapshotGraph(stored)
             const graph = normalize(stored, { firstPass: true })
             entry.unit = graph
             const symbol = symbols.get(entry.fn)!
             const unit = pending.find(u => u.fn === entry.fn)
             if (unit) {
                 resolveHandles(graph)
-                Object.assign(unit, { graph, source })
+                unit.graph = graph
             }
             else {
                 resolveHandles(graph)
-                pending.push({ fn: entry.fn, symbol, graph, source })
+                pending.push({ fn: entry.fn, symbol, graph })
             }
         }
     }
@@ -3748,7 +3840,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (shaped) shapedCallees.push({ fn: current, symbol, computation: intrinsics.getComputation(current), mapCapture })
             return
         }
-        const tracedSource = snapshotGraph(tracedGraph)
         tracedGraph = normalize(tracedGraph, { firstPass: true })
         const score = closed.closures || (current as any).shouldNotInline || lifted.wrapper
             ? undefined : obviousInline(tracedGraph)
@@ -3758,7 +3849,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         }
         entry.unit = tracedGraph
         resolveHandles(tracedGraph)
-        pending.push({ fn: current, symbol, graph: tracedGraph, source: tracedSource })
+        pending.push({ fn: current, symbol, graph: tracedGraph })
     }
     function referenced(unit: DeferredUnit): boolean {
         if (image.hasFunctionSlot(unit.symbol)) return true
@@ -4033,7 +4124,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             }
             for (const u of touched) {
                 u.graph = normalize({ ...u.graph, name: u.fn.name }, { firstPass: true })
-                u.source = undefined
                 resolveHandles(u.graph)
             }
             if (intrinsics.argv().includes('native-decisions')) console.log(`TAGGED ${unit.fn.name} sentinel=${summary.sentinel} sites=${sites.length}`)
@@ -4136,10 +4226,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             graph.nodes.set(id, copyNode(call, operands))
         }
         const lifted = liftReturnedHeapValues(traced.graph)
-        const source = snapshotGraph({ ...lifted.graph, name: shaped.fn.name })
         const normalized = normalize({ ...lifted.graph, name: shaped.fn.name }, { firstPass: true })
         resolveHandles(normalized)
-        pending.push({ fn: shaped.fn, symbol: shaped.symbol, graph: normalized, source })
+        pending.push({ fn: shaped.fn, symbol: shaped.symbol, graph: normalized })
     }
 
     function reconcileReturns(): void {
@@ -4184,10 +4273,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             installReturnRecord(shape, layout)
         }
         for (const shape of returnRecords.values()) {
-            const source = snapshotGraph(shape.graph)
             const graph = normalize(shape.graph, { firstPass: true })
             resolveHandles(graph)
-            pending.push({ fn: shape.fn, symbol: shape.symbol, graph, source })
+            pending.push({ fn: shape.fn, symbol: shape.symbol, graph })
         }
         for (const caller of returnCallers) {
             let nextId = caller.graph.maxId
@@ -4200,10 +4288,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
                 caller.graph.nodes.set(id, makeNode('after', [getRef(n, 0), read]))
             }
             caller.graph.maxId = nextId
-            const source = snapshotGraph(caller.graph)
             const graph = normalize(caller.graph, { firstPass: true })
             resolveHandles(graph)
-            pending.push({ fn: caller.fn, symbol: caller.symbol, graph, source })
+            pending.push({ fn: caller.fn, symbol: caller.symbol, graph })
         }
     }
 
@@ -4211,14 +4298,13 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         dumpCallShapes(pending, functions, opaqueGraphs)
         throw 'native: call shapes dumped'
     }
-    function localizeCalls(graph: Graph, linked: Set<number>): void {
+    function localizeCalls(graph: Graph): void {
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== 'call') continue
             let target = graph.nodes.get(getRef(n, 1))
             while (target?.op === 'after') target = graph.nodes.get(getRef(target, countIds(target) - 1))
             if (target?.op !== 'heap-handle' || getRef(target, 0)) continue
             const handle = heap.deref(getLiteral(target, 0) as intrinsics.Handle)
-            if (!linked.has(handle)) continue
             const slot = image.functionHandles.get(handle)
             const symbol = slot === undefined ? undefined : image.functionTargets.get(slot)
             if (symbol === undefined) continue
@@ -4229,46 +4315,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             graph.nodes.set(id, copy)
         }
     }
-    for (const unit of pending) {
-        const linked = new Set<number>()
-        for (const n of unit.graph.nodes.values()) if (n.op === 'heap-handle') linked.add(heap.deref(getLiteral(n, 0) as intrinsics.Handle))
-        localizeCalls(unit.graph, linked)
-        if (unit.source) localizeCalls(unit.source, linked)
-    }
-    const unitsBySymbol = new Map<number, PendingUnit>()
-    for (const unit of pending) unitsBySymbol.set(unit.symbol, unit)
-    const inlining = new Map<number, boolean>()
-    const callSites = new Map<number, number>()
-    for (const unit of pending) {
-        for (const n of unit.source?.nodes.values() ?? []) {
-            const symbol = calledSymbol(unit.source!, n)
-            if (symbol !== undefined) callSites.set(symbol, (callSites.get(symbol) ?? 0) + 1)
-        }
-    }
-    function inlineCallees(unit: PendingUnit): void {
-        if (inlining.has(unit.symbol)) return
-        inlining.set(unit.symbol, false)
-        const source = unit.source
-        let changed = false
-        for (const [id, n] of source ? [...source.nodes] : []) {
-            const symbol = calledSymbol(source!, n)
-            if (symbol === undefined) continue
-            const callee = unitsBySymbol.get(symbol)
-            if (!callee || callee === unit || (callee.fn as any).shouldNotInline) continue
-            inlineCallees(callee)
-            if (!inlining.get(callee.symbol) || !callee.source) continue
-            if (!inlines(callSites, roots, unit.graph, source!, id, callee)) continue
-            splice(source!, id, callee.source, freshId)
-            changed = true
-        }
-        if (changed) {
-            unit.graph = normalize(snapshotGraph(source!), { firstPass: true })
-            resolveHandles(unit.graph)
-        }
-        inlining.set(unit.symbol, true)
-    }
-    enterPhase('inline')
-    for (const unit of pending) inlineCallees(unit)
+    for (const unit of pending) localizeCalls(unit.graph)
     const program: ProgramGraph = { units: new Map(), roots, noInline: new Set(), image }
     for (const unit of pending) {
         if (unit.graph.name === undefined) unit.graph.name = unit.fn.name
@@ -4284,9 +4331,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const clock = createClock()
     const { enterPhase, timed } = clock
     const program = traceProgram(fns, opts, clock)
-    const traced = reachUnits(program)
     const tracedUnits = program.units.size
-    for (const symbol of [...program.units.keys()]) if (!traced.has(symbol)) program.units.delete(symbol)
+    prune(program)
+    timed('inline', () => inlineProgram(program, clock))
+    prune(program)
     enterPhase('effects')
     refineProgramEffects(program, clock)
     enterPhase('other')
