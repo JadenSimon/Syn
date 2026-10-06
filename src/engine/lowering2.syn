@@ -2358,6 +2358,13 @@ function optimizeValueGraph(g: Graph) {
         return insert(from ? copyNode(from, operands, op) : makeNode(op, operands))
     }
 
+    function paramLike(value: number): number {
+        const n = value ? g.nodes.get(value) : undefined
+        if (!n) return addParam()
+        const ref = typeRefOf(n)
+        return addParam(ref ? { ref } : resultType(g, n))
+    }
+
     function addParam(T?: TypeOperand): number {
         const id = g.maxId++
         g.nodes.set(id, T === undefined ? paramNode() : makeNode('param', [], T))
@@ -3315,7 +3322,7 @@ function optimizeValueGraph(g: Graph) {
         const newParams = target.params.filter(x => !coveredParams.includes(x))
         const paramToRoot = new Map<number, number>()
         for (const r of roots) {
-            const p = addParam()
+            const p = paramLike(r[0])
             replacements.set(r[0], p)
             paramToRoot.set(p, r[0])
             newParams.push(p)
@@ -3326,7 +3333,7 @@ function optimizeValueGraph(g: Graph) {
         {
             const replacements = new Map<number, number>()
             const forwardedParams = oldParams.map(x => {
-                const p = addParam()
+                const p = paramLike(x)
                 replacements.set(x, p)
                 return p
             })
@@ -3609,7 +3616,7 @@ function optimizeValueGraph(g: Graph) {
             new Map([[entryApp, addNode('apply', [...getOperands(entry), ...hoisted], entry)]]))
 
         const added = new Map<number, number[]>()
-        for (const id of carrier.keys()) added.set(id, roots.map(() => addParam()))
+        for (const id of carrier.keys()) added.set(id, roots.map(r => paramLike(r)))
         for (const [id, extra] of added) {
             const b = getGraphBlock(id)
             const replacements = new Map<number, number>()
@@ -3811,6 +3818,93 @@ function optimizeValueGraph(g: Graph) {
             for (const from of forwarded.get(pending.pop()!) ?? []) mark(from)
         }
         return liveParams = live
+    }
+
+    function shiftedArg(app: number, i: number): GraphNode | undefined {
+        const arg = g.nodes.get(getRef(g.nodes.get(app)!, i + 1))
+        return arg?.op === 'shl' && !getRef(arg, 1) && getRef(arg, 0) ? arg : undefined
+    }
+
+    function shiftAt(inbound: [number, number][], i: number): number {
+        let shift = -1
+        for (const [, app] of inbound) {
+            const arg = shiftedArg(app, i)
+            if (!arg || (shift >= 0 && getLiteral(arg, 1) !== shift)) return -1
+            shift = getLiteral(arg, 1)
+        }
+        return shift
+    }
+
+    function unshiftedAt(inbound: [number, number][], target: GraphBlock, i: number): number {
+        let at = -1
+        for (const [, app] of inbound) {
+            const unshifted = getRef(shiftedArg(app, i)!, 0)
+            const n = g.nodes.get(app)!
+            let j = target.params.length - 1
+            while (j >= 0 && (j === i || getRef(n, j + 1) !== unshifted)) j--
+            if (j < 0 || (at >= 0 && j !== at)) return -1
+            at = j
+        }
+        return at
+    }
+
+    function scaledAccess(u: number, p: number, shift: number): boolean {
+        const n = g.nodes.get(u)
+        return (n?.op === 'load' || n?.op === 'store') && getRef(n, 2) === p && getRef(n, 1) !== p
+            && intrinsics.intrinsicBitWidth(typeOf(n)) === 8 << shift
+    }
+
+    function rematerializeOffsets(target: GraphBlock): boolean {
+        if (target === g.blocks[0]) return false
+        const inbound = findInboundApplies(target)
+        if (!inbound.length) return false
+        let params: number[] | undefined
+        let local: Map<number, number> | undefined
+        for (let i = 0; i < target.params.length; i++) {
+            const p = target.params[i]
+            const users = dependents.get(p)
+            if (!users?.size) continue
+            const shift = shiftAt(inbound, i)
+            if (shift < 0) continue
+            const sample = shiftedArg(inbound[0][1], i)!
+            const j = unshiftedAt(inbound, target, i)
+            let source = j >= 0 ? target.params[j] : 0
+            if (j >= 0 && shiftAt(inbound, j) >= 0) continue
+            if (j < 0) {
+                let scaled = true
+                for (const u of users) if (!scaledAccess(u, p, shift)) { scaled = false; break }
+                if (!scaled) continue
+                params ??= target.params.slice()
+                source = params[i] = paramLike(getRef(sample, 0))
+            }
+            local ??= new Map()
+            local.set(p, addNode('shl', [source, { literal: shift }], sample))
+        }
+        if (!local) return false
+        target.bodyId = replaceAll(target.bodyId, local)
+        if (params) {
+            const edits = new Map<GraphBlock, Map<number, number>>()
+            for (const [fromId, appId] of inbound) {
+                const from = getGraphBlock(fromId)
+                const id = from === target ? local.get(appId) ?? appId : appId
+                const app = g.nodes.get(id)!
+                const operands = getOperands(app)
+                for (let i = 0; i < params.length; i++) {
+                    if (params[i] !== target.params[i]) operands[i + 1] = getRef(shiftedArg(id, i)!, 0)
+                }
+                let r = edits.get(from)
+                if (!r) edits.set(from, r = new Map())
+                r.set(id, addNode('apply', operands, app))
+            }
+            target.params = params
+            for (const [from, r] of edits) {
+                from.bodyId = replaceAll(from.bodyId, r)
+                if (from !== target) revisitBlock(from)
+            }
+        }
+        liveParams = undefined
+        revisitBlock(target)
+        return true
     }
 
     function pruneUnusedParams(b: GraphBlock) {
@@ -4154,13 +4248,13 @@ function optimizeValueGraph(g: Graph) {
         const inbound = findInboundApplies(target)
         if (!inbound.length) return false
         const oldParams = [...target.params]
-        const sharedParams = roots.map(() => addParam())
+        const sharedParams = roots.map(r => paramLike(r))
         const inside = new Map<number, number>()
         for (let i = 0; i < roots.length; i++) inside.set(roots[i], sharedParams[i])
         target.params.push(...sharedParams)
         target.bodyId = replaceAll(target.bodyId, inside)
 
-        const forwardedParams = oldParams.map(() => addParam())
+        const forwardedParams = oldParams.map(p => paramLike(p))
         const outside = new Map<number, number>()
         for (let i = 0; i < oldParams.length; i++) outside.set(oldParams[i], forwardedParams[i])
         const hoisted = roots.map(root => replaceAll(root, outside))
@@ -4322,7 +4416,7 @@ function optimizeValueGraph(g: Graph) {
                 if (closed && !addr && !getRef(n, boundAt)) {
                     operands[boundAt] = { literal: replay([0, getLiteral(n, boundAt)], (id, value) => [id, value])[1] }
                 } else {
-                    const limit = addParam()
+                    const limit = paramLike(getRef(n, boundAt))
                     limits.push([limit, [getRef(n, boundAt), getLiteral(n, boundAt)]])
                     operands[boundAt] = limit
                 }
@@ -4655,7 +4749,7 @@ function optimizeValueGraph(g: Graph) {
             if (!id) return [0, konst]
             const known = lowered.get(id)
             if (known) return known
-            const p = addParam()
+            const p = paramLike(id)
             const out: [id: number, konst: number] = [p, 0]
             lowered.set(id, out)
             params.push(p)
@@ -5245,7 +5339,7 @@ function optimizeValueGraph(g: Graph) {
                 if (b !== target) revisitBlock(b)
             }
             const params = target.params.slice()
-            params[at] = extra.length ? slots[extra[0]] : addParam()
+            params[at] = extra.length ? slots[extra[0]] : paramLike(target.params[at])
             params.push(...extra.slice(1).map(v => slots[v]))
             target.params = params
             target.bodyId = replaceAll(target.bodyId, new Map([[replaced, compare]]))
@@ -6122,7 +6216,7 @@ function optimizeValueGraph(g: Graph) {
             const start = applyArg(entryApp, i)
             if (!start[0] && start[1] < step) continue
 
-            const previous = addParam()
+            const previous = paramLike(params[i])
             const current = addNode('add', [previous, { literal: step }], g.nodes.get(getRef(backs[0], i + 1)))
             const replacements = new Map<number, number>([[params[i], current]])
             for (const [from, app] of inbound) {
@@ -6246,7 +6340,7 @@ function optimizeValueGraph(g: Graph) {
             }
             if (cost > gain) continue
 
-            const np = addParam()
+            const np = paramLike(pa)
             const back = addNode('sub', [np, pa])
             const byBlock = new Map<number, Map<number, number>>()
             for (const [from, app] of inbound) {
@@ -7088,7 +7182,7 @@ function optimizeValueGraph(g: Graph) {
                 }
                 if (!incoming.length) continue
 
-                const replacement = addParam()
+                const replacement = paramLike(id)
                 target.params.push(replacement)
                 const edits = new Map<GraphBlock, Map<number, number>>()
                 for (const [blockId, appId, value] of incoming) {
@@ -7297,7 +7391,7 @@ function optimizeValueGraph(g: Graph) {
                 }
                 if (!valid) continue
 
-                const replacement = addParam()
+                const replacement = paramLike(id)
                 target.params.push(replacement)
                 const edits = new Map<GraphBlock, Map<number, number>>()
                 for (const [blockId, appId, value] of incoming) {
@@ -7458,6 +7552,7 @@ function optimizeValueGraph(g: Graph) {
         if (optimizeTimers) time('deduplicateParams', performance.now() - dedupeStart)
         liveParams = undefined
         for (const b of reachableBlocks) {
+            step(rematerializeOffsets, b)
             step(pruneUnusedParams, b)
         }
         for (const b of reachableBlocks) {
