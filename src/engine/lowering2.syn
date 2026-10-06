@@ -567,6 +567,13 @@ const PureOps = new Set<string>([
     ...TargetingValues
 ])
 const Commutative = new Set<string>(['add', 'mul', 'and', 'or', 'xor', 'ne', 'eq'])
+const Latency = new Map<string, number>([
+    ['after', 0], ['convert', 0], ['nil-effect', 0],
+    ['mul', 3], ['div', 3], ['rem', 3], ['load', 4], ['call', 10],
+])
+function latency(op: string): number {
+    return Latency.get(op) ?? 1
+}
 const commutativeKeys = intrinsics.argv().includes('commutative-keys')
 const framedTailCalls = intrinsics.argv().includes('framed-tail-calls')
 
@@ -642,6 +649,24 @@ function literalValue(u: GraphNode) {
 const CompareEval: Record<string, (a: number, b: number) => boolean> = {
     lt: (a, b) => a < b, le: (a, b) => a <= b, gt: (a, b) => a > b,
     ge: (a, b) => a >= b, eq: (a, b) => a === b, ne: (a, b) => a !== b,
+}
+
+function latencyDepth(g: Graph): (id: number) => number {
+    const depths = new Map<number, number>()
+    function depthOf(id: number): number {
+        const known = depths.get(id)
+        if (known !== undefined) return known
+        depths.set(id, 0)
+        const n = g.nodes.get(id)
+        let d = 0
+        if (n && n.op !== 'param' && n.op !== 'block' && n.op !== 'literal') {
+            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) d = Math.max(d, depthOf(getRef(n, i)))
+            d += latency(n.op)
+        }
+        depths.set(id, d)
+        return d
+    }
+    return depthOf
 }
 
 function scalarOperand(nodes: Map<number, GraphNode>, n: GraphNode, i: number): number | undefined {
@@ -6016,6 +6041,58 @@ function optimizeValueGraph(g: Graph) {
         return changed
     }
 
+    function reassociateAdds(target: GraphBlock): boolean {
+        const adds = findValues(target.id, 'add')
+        if (!adds || adds.length < 2) return false
+        const depthOf = latencyDepth(g)
+        const leaves: number[] = []
+        let constant = 0
+        let T = Types.i64
+        function chained(id: number): boolean {
+            const n = g.nodes.get(id)
+            return n?.op === 'add' && countIds(n) === 2 && typeOf(n) === T
+        }
+        function interior(id: number): boolean {
+            const users = dependents.get(id)
+            return chained(id) && users?.size === 1 && chained([...users][0])
+        }
+        function flatten(id: number): number {
+            const n = g.nodes.get(id)!
+            let d = 0
+            for (let i = 0; i < 2; i++) {
+                const k = scalarOperand(g.nodes, n, i)
+                const ref = getRef(n, i)
+                if (k !== undefined) constant += k
+                else if (interior(ref)) d = Math.max(d, flatten(ref))
+                else {
+                    leaves.push(ref)
+                    d = Math.max(d, depthOf(ref))
+                }
+            }
+            return d + 1
+        }
+        let changed = false
+        for (const root of adds) {
+            const n = g.nodes.get(root)!
+            T = typeOf(n)
+            if (T > Types.i64 || !chained(root) || interior(root)) continue
+            leaves.length = 0
+            constant = 0
+            const before = flatten(root)
+            if (leaves.length < 2 || !Number.isSafeInteger(constant)) continue
+            leaves.sort((a, b) => depthOf(a) - depthOf(b))
+            let after = depthOf(leaves[0]) + (constant ? 1 : 0)
+            for (let i = 1; i < leaves.length; i++) after = Math.max(after, depthOf(leaves[i])) + 1
+            if (after >= before) continue
+            let acc: Operand = constant ? addNode('add', [leaves[0], { literal: constant }], n) : leaves[0]
+            for (let i = 1; i < leaves.length - 1; i++) acc = addNode('add', [acc, leaves[i]], n)
+            g.nodes.set(root, copyNode(n, [acc, leaves[leaves.length - 1]]))
+            changed = true
+        }
+        if (changed) revisitBlock(target)
+        return changed
+    }
+
     function hoistLoopStep(target: GraphBlock) {
         if (target === g.blocks[0] || !preds.get(target.id)?.has(target.id)) return false
         const inbound = findInboundApplies(target)
@@ -7392,6 +7469,7 @@ function optimizeValueGraph(g: Graph) {
             step(substituteEqualArguments, b)
             step(specializeApplySite, b)
             step(simplifyBitOperations, b)
+            step(reassociateAdds, b)
             step(rebaseAddresses, b)
             step(hoistLoopStep, b)
             step(promoteAllocas, b)
@@ -9158,8 +9236,6 @@ function outlineArm(g: Graph, uses: Map<number, number>, arm: number, exits = ne
     return createNode(g, 'apply', [blockId, ...inputs])
 }
 
-const LongLatency = new Set(['load', 'mul', 'div', 'rem'])
-
 function hoistSharedArms(g: Graph): Graph {
     if (intrinsics.argv().includes('no-hoist-arms')) return g
     const only = intrinsics.argv().find(a => a.startsWith('hoist-only:'))?.slice('hoist-only:'.length)
@@ -9222,7 +9298,7 @@ function hoistSharedArms(g: Graph): Graph {
         }
         function worth(x: number): boolean {
             const m = g.nodes.get(x)!
-            if (LongLatency.has(m.op)) return true
+            if (latency(m.op) > 1) return true
             for (const inner of interiors) {
                 for (const y of inner) {
                     const u = g.nodes.get(y)!
