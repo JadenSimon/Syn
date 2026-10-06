@@ -73,11 +73,40 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
         return m instanceof vm.SourceTextModule && m.status === 'evaluated' && !finished.has(m)
     }
 
+    function staticGraph(m: vm.Module, out = new Set<vm.Module>()): Set<vm.Module> {
+        if (out.has(m)) return out
+        out.add(m)
+        for (const spec of (m as vm.SourceTextModule).dependencySpecifiers ?? []) {
+            const p = resolve(m.identifier, spec)
+            const dep = p && modules.get(p[0])
+            if (dep) staticGraph(dep, out)
+        }
+        return out
+    }
+
+    function loadsImportsFirst(m: vm.Module): boolean {
+        for (const [, , spec] of (sources.get(m.identifier) ?? '').matchAll(/\bawait import\((['"])([^'"]+)\1\)/g)) {
+            const p = resolve(m.identifier, spec)
+            const target = p && modules.get(p[0])
+            if (target && dependsOn(target, x => x === m) && dependsOn(m, x => x === target)) return true
+        }
+        return false
+    }
+
+    async function evaluateCycleEntries(root: vm.Module): Promise<void> {
+        for (const m of staticGraph(root)) {
+            if (m === root || m.status !== 'linked' || !loadsImportsFirst(m)) continue
+            if (dependsOn(m, isEvaluating)) continue
+            await m.evaluate()
+        }
+    }
+
     async function evaluated(m: vm.Module | undefined) {
         if (!m) return m
         if (m.status === 'unlinked' && !linking.has(m)) linking.set(m, m.link(link))
         await linking.get(m)
         if (m.status !== 'linked') return m
+        await evaluateCycleEntries(m)
         const cyclic = dependsOn(m, isEvaluating)
         const done = m.evaluate()
         if (!cyclic) {
@@ -139,6 +168,7 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
         const m = instantiate(absPath, text)
         if (!reload) modules.set(absPath, m)
         await m.link(link)
+        await evaluateCycleEntries(m)
         return m.evaluate().catch(err => {
             applySourceMaps(sources, err)
             throw err
