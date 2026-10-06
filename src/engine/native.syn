@@ -9,8 +9,9 @@ import * as syscalls from './syscalls'
 import { Op, rawValue, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
-    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks,
-    printOptimizeStats, memAnalysis, type Mem, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
+    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks, encodeCallOutcomes, type CallOutcomes,
+    printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
+    stronglyConnected, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -795,7 +796,7 @@ const EffectRead = 1
 const EffectWrite = 2
 const EffectNames = ['readnone', 'readonly', 'writes']
 
-interface CallWrites { callee: number, args: number[] }
+interface CallWrites { callee: number, args: number[], node: number }
 
 function writeTarget(graph: Graph, m: Mem | undefined): number {
     if (!m) return WritesUnknown
@@ -827,7 +828,69 @@ function capturedBy(flow: Flow, captures: Map<number, number>): boolean {
     return flow.own || flow.calls.some(([callee, k]) => callee < 0 || k >= 29 || ((captures.get(callee) ?? CapturesAll) & (1 << k)) !== 0)
 }
 
-interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], fresh: boolean, params: Flow[], returned: Flow[] }
+interface RetEffect { value: number | undefined, self: number, writes: number, calls: CallWrites[], through?: number, excludes?: number }
+
+interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], fresh: boolean, params: Flow[], returned: Flow[], rets: RetEffect[] }
+
+function throughCall(ret: RetEffect): CallWrites | undefined {
+    return ret.through === undefined ? undefined : ret.calls.find(c => c.node === ret.through)
+}
+
+function outcomesOf(rets: RetEffect[], classes: Map<number, number>, masks: Map<number, number>, outcomeOf: (callee: number) => CallOutcomes | undefined): CallOutcomes {
+    const out: CallOutcomes = { other: undefined, literals: new Map(), excluding: new Map() }
+    function joined(known: [number, number] | undefined, effect: number, mask: number): [number, number] {
+        return known ? [Math.max(known[0], effect), known[1] | mask] : [effect, mask]
+    }
+    function add(value: number | undefined, effect: number, mask: number, excludes?: number): void {
+        if (effect < EffectWrite) mask = 0
+        if (value !== undefined) out.literals.set(value, joined(out.literals.get(value), effect, mask))
+        else if (excludes !== undefined) out.excluding.set(excludes, joined(out.excluding.get(excludes), effect, mask))
+        else out.other = joined(out.other, effect, mask)
+    }
+    for (const ret of rets) {
+        const through = throughCall(ret)
+        const inner = through ? outcomeOf(through.callee) : undefined
+        let effect = ret.self
+        let mask = ret.writes
+        for (const call of ret.calls) {
+            if (inner && call === through) continue
+            const c = classes.get(call.callee)
+            effect = Math.max(effect, c ?? EffectWrite)
+            if (c === undefined || c === EffectWrite) mask |= calleeWrites(c === undefined ? undefined : masks.get(call.callee), call.args)
+        }
+        if (!through || !inner) {
+            add(ret.value, effect, mask, ret.excludes)
+            continue
+        }
+        for (const [value, [e, m]] of inner.literals) {
+            if (value !== ret.excludes) add(value, Math.max(effect, e), mask | calleeWrites(m, through.args))
+        }
+        for (const [excluded, [e, m]] of inner.excluding) add(undefined, Math.max(effect, e), mask | calleeWrites(m, through.args), excluded)
+        if (inner.other) add(undefined, Math.max(effect, inner.other[0]), mask | calleeWrites(inner.other[1], through.args), ret.excludes)
+    }
+    return out
+}
+
+function noteEffect(graph: Graph, mem: MemAnalysis, id: number, n: GraphNode, out: RetEffect): void {
+    if (n.op === 'store') {
+        out.self = EffectWrite
+        out.writes |= writeTarget(graph, mem.access(n))
+    } else if (n.op === 'pstack') {
+        out.self = EffectWrite
+    } else if (n.op === 'load') {
+        if (out.self < EffectRead) out.self = EffectRead
+    } else if (n.op === 'call') {
+        const target = graph.nodes.get(getRef(n, 1))
+        if (target && target.op === 'local-target' && !getRef(target, 0)) {
+            const args: number[] = []
+            for (let i = 3; i < countIds(n); i++) args.push(getRef(n, i) ? writeTarget(graph, mem.of(getRef(n, i))) : WritesUnknown)
+            out.calls.push({ callee: getLiteral(target, 0), args, node: id })
+        } else {
+            out.self = EffectWrite
+            out.writes |= WritesUnknown
+        }
+    }
+}
 
 function captureMask(effects: GraphEffects, captures: Map<number, number>): number {
     let mask = 0
@@ -842,59 +905,131 @@ function returnsFresh(effects: GraphEffects, captures: Map<number, number>): boo
 }
 
 function graphEffects(graph: Graph): GraphEffects {
-    let self = EffectNone
-    let writes = 0
     let fresh = true
     let returns = 0
-    const callees: number[] = []
-    const calls: CallWrites[] = []
     const returned: Flow[] = []
     const mem = memAnalysis(graph)
-    for (const n of graph.nodes.values()) {
-        if (n.op === 'store') {
-            self = EffectWrite
-            writes |= writeTarget(graph, mem.access(n))
-        } else if (n.op === 'pstack') {
-            self = EffectWrite
-        } else if (n.op === 'ret') {
-            returns++
-            const m = getRef(n, 0) ? mem.of(getRef(n, 0)) : undefined
-            if (!m || m.kind !== MemFresh) fresh = false
-            else returned.push(symbolFlow(graph, mem.flows(m.base, false)))
-        } else if (n.op === 'load') {
-            if (self < EffectRead) self = EffectRead
-        } else if (n.op === 'call') {
-            const target = graph.nodes.get(getRef(n, 1))
-            if (target && target.op === 'local-target' && !getRef(target, 0)) {
-                callees.push(getLiteral(target, 0))
-                const args: number[] = []
-                for (let i = 3; i < countIds(n); i++) args.push(getRef(n, i) ? writeTarget(graph, mem.of(getRef(n, i))) : WritesUnknown)
-                calls.push({ callee: getLiteral(target, 0), args })
-            } else {
-                self = EffectWrite
-                writes |= WritesUnknown
-            }
-        }
+    const whole: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
+    for (const [id, n] of graph.nodes) {
+        noteEffect(graph, mem, id, n, whole)
+        if (n.op !== 'ret') continue
+        returns++
+        const m = getRef(n, 0) ? mem.of(getRef(n, 0)) : undefined
+        if (!m || m.kind !== MemFresh) fresh = false
+        else returned.push(symbolFlow(graph, mem.flows(m.base, false)))
     }
     const params = graph.blocks[0].params.map(p => symbolFlow(graph, mem.flows(p, true)))
-    return { self, callees, writes, calls, fresh: fresh && returns > 0, params, returned }
+    const none: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
+    function chain(roots: number[]): RetEffect {
+        const out: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
+        const seen = new Set<number>()
+        const stack = roots.slice()
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const n = graph.nodes.get(id)
+            if (!n || n.op === 'param' || n.op === 'block') continue
+            noteEffect(graph, mem, id, n, out)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+        return out
+    }
+    function join(a: RetEffect, b: RetEffect): RetEffect {
+        const known = new Set(a.calls.map(c => c.node))
+        return { value: undefined, self: Math.max(a.self, b.self), writes: a.writes | b.writes, calls: [...a.calls, ...b.calls.filter(c => !known.has(c.node))] }
+    }
+    function returning(effect: RetEffect, value: RetEffect): RetEffect {
+        return { ...effect, value: value.value, excludes: value.excludes, through: value.through }
+    }
+    const positions = new Map<number, TailPosition[]>()
+    for (const b of graph.blocks) positions.set(b.id, tailPositions(graph, b.bodyId))
+    interface Arrival { from: number, apply: number, path: SelectPath, roots: number[] }
+    const arrivals = new Map<number, Arrival[]>()
+    for (const [from, list] of positions) {
+        for (const p of list) {
+            const n = graph.nodes.get(p.at)!
+            if (n.op !== 'apply') continue
+            const arrival = { from, apply: p.at, path: p.path, roots: tailRoots(graph, p) }
+            const known = arrivals.get(getRef(n, 0))
+            if (known) known.push(arrival)
+            else arrivals.set(getRef(n, 0), [arrival])
+        }
+    }
+    const entries = new Map<number, RetEffect>()
+    const cyclic = new Set<number>()
+    for (const scc of stronglyConnected(graph.blocks.map(b => b.id), id => (arrivals.get(id) ?? []).map(a => a.from))) {
+        const members = new Set(scc)
+        let out = none
+        for (const id of scc) {
+            for (const a of arrivals.get(id) ?? []) {
+                out = join(out, chain(a.roots))
+                if (members.has(a.from)) cyclic.add(id)
+                else out = join(out, entries.get(a.from)!)
+            }
+        }
+        for (const id of scc) entries.set(id, out)
+    }
+    const passed = new Map<number, RetEffect[][]>()
+    function paramValues(block: number, k: number): RetEffect[] {
+        let known = passed.get(block)
+        if (!known) passed.set(block, known = [])
+        if (known[k]) return known[k]
+        const merged = new Map<string, RetEffect>()
+        for (const a of arrivals.get(block)!) {
+            for (const e of valueAt(a.from, a.path, graph.nodes.get(a.apply)!, k + 1, chain(a.roots))) {
+                const key = `${e.value}|${e.excludes}|${e.through}`
+                const prior = merged.get(key)
+                merged.set(key, prior ? returning(join(prior, e), e) : e)
+            }
+        }
+        return known[k] = [...merged.values()]
+    }
+    function valueAt(block: number, path: SelectPath, n: GraphNode, at: number, local: RetEffect): RetEffect[] {
+        const literal = tailScalar(graph, n, at)
+        const ref = literal === undefined ? tailOf(graph, getRef(n, at)) : 0
+        const facts: ValueFacts = ref ? valueFacts(graph, path, ref) : {}
+        const value = literal ?? facts.is
+        const k = value === undefined ? getBlock(graph, block)!.params.indexOf(ref) : -1
+        if (k >= 0 && !cyclic.has(block) && arrivals.has(block)) {
+            return paramValues(block, k)
+                .filter(e => e.value === undefined || e.value !== facts.not)
+                .map(e => returning(join(local, e), e.value === undefined && e.excludes === undefined ? { ...e, excludes: facts.not } : e))
+        }
+        const before = join(local, entries.get(block)!)
+        if (value !== undefined) return [returning(before, { ...none, value })]
+        const call = graph.nodes.get(ref)?.op === 'call' && !entries.get(block)!.calls.some(c => c.node === ref)
+        return [returning(before, { ...none, excludes: facts.not, through: call ? ref : undefined })]
+    }
+    const rets: RetEffect[] = []
+    for (const [id, list] of positions) {
+        for (const p of list) {
+            const n = graph.nodes.get(p.at)!
+            if (n.op === 'ret') rets.push(...valueAt(id, p.path, n, 0, chain(tailRoots(graph, p))))
+        }
+    }
+    return {
+        self: whole.self, callees: whole.calls.map(c => c.callee), writes: whole.writes, calls: whole.calls,
+        fresh: fresh && returns > 0, params, returned, rets,
+    }
 }
 
-function refineCallEffects(graph: Graph, classes: Map<number, number>, masks: Map<number, number>, fresh: Set<number>, captures: Map<number, number>): boolean {
+function refineCallEffects(graph: Graph, classes: Map<number, number>, masks: Map<number, number>, fresh: Set<number>, captures: Map<number, number>, outcomes: Map<number, CallOutcomes>): boolean {
     let refined = false
     for (const [id, n] of graph.nodes) {
         if (n.op !== 'local-target' || getRef(n, 0) || countIds(n) < 2) continue
         const c = classes.get(getLiteral(n, 0)) ?? EffectWrite
         const mask = (c === EffectWrite ? masks.get(getLiteral(n, 0)) ?? WritesUnknown : 0) | (fresh.has(getLiteral(n, 0)) ? ReturnsFresh : 0)
         const captured = captures.get(getLiteral(n, 0)) ?? CapturesAll
-        if (c === getLiteral(n, 1) && countIds(n) > 3 && getLiteral(n, 2) === mask && getLiteral(n, 3) === captured) continue
-        graph.nodes.set(id, copyNode(n, [getOperand(n, 0), { literal: c }, { literal: mask }, { literal: captured }]))
+        const operands: Operand[] = [getOperand(n, 0), { literal: c }, { literal: mask }, { literal: captured }, ...encodeCallOutcomes(outcomes.get(getLiteral(n, 0)))]
+        if (countIds(n) === operands.length && operands.every((x, i) => !i || getLiteral(n, i) === (x as { literal: number }).literal)) continue
+        graph.nodes.set(id, copyNode(n, operands))
         refined = true
     }
     return refined
 }
 
-function classifyEffects(pending: PendingUnit[], fresh: Set<number>, captures: Map<number, number>): { classes: Map<number, number>, masks: Map<number, number> } {
+function classifyEffects(pending: PendingUnit[], fresh: Set<number>, captures: Map<number, number>): { classes: Map<number, number>, masks: Map<number, number>, outcomes: Map<number, CallOutcomes> } {
     const classes = new Map<number, number>()
     const masks = new Map<number, number>()
     const own = new Map<number, number>()
@@ -934,11 +1069,37 @@ function classifyEffects(pending: PendingUnit[], fresh: Set<number>, captures: M
         captures.set(symbol, captured)
         for (const caller of callers.get(symbol) ?? []) work.push(caller)
     }
+    const outcomes = new Map<number, CallOutcomes>()
+    function reaches(from: number, to: number): boolean {
+        const seen = new Set<number>()
+        const stack = [from]
+        while (stack.length) {
+            const symbol = stack.pop()!
+            if (symbol === to) return true
+            if (seen.has(symbol)) continue
+            seen.add(symbol)
+            for (const ret of summaries.get(symbol)?.rets ?? []) {
+                const call = throughCall(ret)
+                if (call) stack.push(call.callee)
+            }
+        }
+        return false
+    }
+    function outcomeOf(symbol: number): CallOutcomes | undefined {
+        const known = outcomes.get(symbol)
+        if (known) return known
+        const effects = summaries.get(symbol)
+        if (!effects) return
+        const result = outcomesOf(effects.rets, classes, masks, callee => reaches(callee, symbol) ? undefined : outcomeOf(callee))
+        outcomes.set(symbol, result)
+        return result
+    }
     for (const [symbol, effects] of summaries) {
         if (returnsFresh(effects, captures)) fresh.add(symbol)
         else fresh.delete(symbol)
+        outcomeOf(symbol)
     }
-    return { classes, masks }
+    return { classes, masks, outcomes }
 }
 
 function dumpCallShapes(pending: PendingUnit[], functions: Function[], opaque: Map<number, Graph>): void {
@@ -1036,6 +1197,12 @@ function rewriteTargets(
     return { ...g, nodes, maxId }
 }
 
+function isMoveWide(word: number): boolean {
+    return ((word >>> 23) & 0x3f) === 0x25
+}
+
+const unitAlignment = Number(intrinsics.argv().find(a => a.startsWith('unit-align:'))?.slice(11) ?? 16)
+
 function align(value: number, amount: number): number {
     return (value + amount - 1) & -amount
 }
@@ -1109,7 +1276,7 @@ function installImage(
     const offsets: number[] = []
     let length = 0
     for (const unit of units) {
-        length = align(length, 16)
+        length = align(length, unitAlignment)
         offsets[unit.symbol] = length
         length += unit.code.bytes.length
     }
@@ -2861,6 +3028,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const callEffects = !intrinsics.argv().includes('no-call-effects')
     const completedEffects = new Map<number, number>()
     const completedWrites = new Map<number, number>()
+    const completedOutcomes = new Map<number, CallOutcomes>()
     const completedFresh = new Set<number>()
     const completedCaptures = new Map<number, number>()
     session.enterTrace()
@@ -2951,7 +3119,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             if (shaped) shapedCallees.push({ fn: current, symbol, computation: intrinsics.getComputation(current), mapCapture })
             return
         }
-        if (callEffects) refineCallEffects(tracedGraph, completedEffects, completedWrites, completedFresh, completedCaptures)
+        if (callEffects) refineCallEffects(tracedGraph, completedEffects, completedWrites, completedFresh, completedCaptures, completedOutcomes)
         const tracedSource = snapshotGraph(tracedGraph)
         tracedGraph = normalize(tracedGraph, { firstPass: true })
         const score = closed.closures || (current as any).shouldNotInline || lifted.wrapper
@@ -2973,6 +3141,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             }
             completedEffects.set(symbol, effect)
             completedWrites.set(symbol, writes)
+            completedOutcomes.set(symbol, outcomesOf(effects.rets, completedEffects, completedWrites, callee => completedOutcomes.get(callee)))
             completedCaptures.set(symbol, captureMask(effects, completedCaptures))
             if (returnsFresh(effects, completedCaptures)) completedFresh.add(symbol)
         }
@@ -3588,7 +3757,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             const captured = completedCaptures.get(symbol) ?? CapturesAll
             const kept: number[] = []
             for (let k = 0; k < 29; k++) if (captured & (1 << k)) kept.push(k)
-            const what = (c === EffectWrite ? `writes p${params.join(',p') || ' none'}` : EffectNames[c])
+            const outcomes = effectSummary.outcomes.get(symbol)
+            const cases = outcomes ? [...outcomes.literals].map(([v, [e]]) => ` ${v}:${EffectNames[e]}`).join('')
+                + [...outcomes.excluding].map(([v, [e]]) => ` !=${v}:${EffectNames[e]}`).join('')
+                + (outcomes.other ? ` other:${EffectNames[outcomes.other[0]]}` : '') : ''
+            const what = (c === EffectWrite ? `writes p${params.join(',p') || ' none'}` : EffectNames[c]) + (cases ? ` returns${cases}` : '')
                 + (completedFresh.has(symbol) ? ' returns fresh' : '')
                 + (captured === CapturesAll ? '' : ` captures ${kept.length ? 'p' + kept.join(',p') : 'none'}`)
             console.log('native effects', what, functions[symbol]?.name || `symbol ${symbol}`)
@@ -3597,7 +3770,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         console.log('native effects total', EffectNames.map((n, i) => `${n}=${counts[i]}`).join(' '))
     }
     for (const unit of pending) {
-        if (callEffects && refineCallEffects(unit.graph, effectClasses, effectSummary.masks, completedFresh, completedCaptures)) unit.graph.form = 'packaged'
+        if (callEffects && refineCallEffects(unit.graph, effectClasses, effectSummary.masks, completedFresh, completedCaptures, effectSummary.outcomes)) unit.graph.form = 'packaged'
         if (unit.graph.form === 'packaged') unit.graph = timed('normalize', () => optimizePackaged(unit.graph))
     }
     enterPhase('other')
@@ -4260,10 +4433,14 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         }
     }
     let unitInst = 0
-    for (const u of emitted) unitInst += u.code.words.length
+    let nonMov = 0
+    for (const u of emitted) {
+        unitInst += u.code.words.length
+        for (const word of u.code.words) if (!isMoveWide(word)) nonMov++
+    }
     if (intrinsics.argv().includes('unit-sizes')) for (const u of emitted) console.log(`UNIT ${u.fn.name || 'anonymous'}:${u.symbol} ${u.code.words.length}`)
     const inlined = pending.length === emitted.length ? '' : ` (${pending.length - emitted.length} inlined away)`
-    console.log(`native unit ${emitted.length} fns ${unitInst} instructions${inlined} [${Math.round(performance.now() - phaseStart)}ms]`)
+    console.log(`native unit ${emitted.length} fns ${unitInst}/${nonMov} instructions/non-mov${inlined} [${Math.round(performance.now() - phaseStart)}ms]`)
     const pooled = new Map<number, number>()
     for (const [slot, symbol] of localPoolTargets) if (reached.has(symbol)) pooled.set(slot, symbol)
     const installed = installImage(emitted, poolValues, pooled,

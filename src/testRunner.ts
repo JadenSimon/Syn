@@ -494,6 +494,8 @@ async function profiled<T>(file: string | undefined, heapFile: string | undefine
     }
 }
 
+declare var process: any
+
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
@@ -513,6 +515,7 @@ export async function main(...args: string[]) {
                 console.log(`--- running ${a.join(' ')} ---`)
                 await testEngine(x, a) // let it fail fast
             }
+            process.on('beforeExit', () => console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`))
             return
         }
         return testEngine(args[1], args.slice(1))
