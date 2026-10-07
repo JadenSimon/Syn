@@ -9,7 +9,7 @@ import * as syscalls from './syscalls'
 import { Op, rawValue, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
-    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks, encodeCallOutcomes, type CallOutcomes,
+    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks, encodeCallOutcomes, type CallOutcomes, firstNonOrderingSlot, substitute,
     printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
     graphLoops, stronglyConnected, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
 } from './lowering2'
@@ -18,7 +18,7 @@ import {
     getOperand, getOperands, getRef, isContextParam, isThisParam, makeNode, type Operand, operandType, resultType, setDebugLabel, setGraphBlocks,
     setLiteral, setRef, setType, typeOf, typeRefOf,
 } from './graph-node'
-import { hostTarget, isSignedType, type Target } from './lowering'
+import { accessBytes, hostTarget, isSignedType, type Target } from './lowering'
 
 import type { CompiledSource } from './trace2'
 import type { EmitResult } from './bytecode-emitter'
@@ -1234,7 +1234,60 @@ function rewriteTargets(
         }
         nodes.set(id, makeNode('pool-entry', [{ literal: slot }]))
     }
-    return { ...g, nodes, maxId }
+    const graph = { ...g, nodes, maxId }
+    setGraphBlocks(graph, g.blocks.map(b => ({ ...b, params: b.params.slice() })))
+    return graph
+}
+
+type ContextReads = [offset: number, bytes: number][] | undefined
+
+function contextReads(g: Graph): ContextReads {
+    const context = g.blocks[0].params.find(p => isContextParam(g.nodes.get(p)!))
+    const reads: [number, number][] = []
+    if (context === undefined) return reads
+    for (const n of g.nodes.values()) {
+        for (let i = 0; i < countIds(n); i++) {
+            if (getRef(n, i) !== context) continue
+            if (n.op !== 'load' || i !== 1 || getRef(n, 2)) return undefined
+            reads.push([getLiteral(n, 2), accessBytes(typeOf(n))])
+        }
+    }
+    return reads
+}
+
+function dropUnreadFields(g: Graph, readsOf: Map<number, ContextReads>): void {
+    const reads = new Map<number, [number, number][]>()
+    const stores = new Map<number, number[]>()
+    for (const [id, n] of g.nodes) {
+        if (n.op !== 'pstack') continue
+        reads.set(id, [])
+        stores.set(id, [])
+    }
+    for (const [id, n] of g.nodes) {
+        for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
+            const object = getRef(n, i)
+            const read = reads.get(object)
+            if (!read) continue
+            if (n.op === 'store' && i === 1 && !getRef(n, 2)) {
+                stores.get(object)!.push(id)
+                continue
+            }
+            const code = n.op === 'indirect-target' && i === 1 ? g.nodes.get(getRef(n, 0)) : undefined
+            const callee = code?.op === 'local-target' ? readsOf.get(getLiteral(code, 0)) : undefined
+            if (callee) read.push(...callee)
+            else reads.delete(object)
+        }
+    }
+    const dead = new Map<number, number>()
+    for (const [object, read] of reads) {
+        for (const id of stores.get(object)!) {
+            const store = g.nodes.get(id)!
+            const offset = getLiteral(store, 2)
+            const end = offset + accessBytes(typeOf(store))
+            if (!read.some(([at, bytes]) => at < end && offset < at + bytes)) dead.set(id, getRef(store, 0))
+        }
+    }
+    if (dead.size) substitute(g, dead)
 }
 
 function align(value: number, amount: number): number {
@@ -2216,9 +2269,11 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
     const clobbersOf = (symbol: number) => clobbers.get(symbol)
+    const reads = new Map<number, ContextReads>()
+    for (const symbol of symbols) reads.set(symbol, contextReads(program.units.get(symbol)!))
     const lowered = new Map<number, NativeUnit>()
     for (const scc of order) {
-        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, roots.has(symbol), clobbersOf))
+        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, roots.has(symbol), clobbersOf, reads))
         const members = new Set(scc)
         const shared = new Set<number>()
         for (const symbol of scc) {
@@ -2233,11 +2288,12 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     return symbols.map(symbol => lowered.get(symbol)!)
 }
 
-function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobbersOf?: (symbol: number) => Set<number> | undefined): NativeUnit {
+function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobbersOf: (symbol: number) => Set<number> | undefined, reads: Map<number, ContextReads>): NativeUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
     const graph = rewriteTargets(unitGraph, image.functionHandles, image.functionTargets, image.dataHandles, image.runtime)
+    dropUnreadFields(graph, reads)
     for (const [id, n] of graph.nodes) {
         if (n.op !== 'pool-entry' || getDebugLabel(graph, id)) continue
         const label = image.labels.get(getLiteral(n, 0))
