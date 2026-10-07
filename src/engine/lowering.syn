@@ -9,10 +9,11 @@ type Ty = intrinsics.Types
 
 export interface Target {
     readonly name: string
-    readonly wordBytes: number
     readonly argRegs: number[]     // physical regs holding the first N args
-    readonly retReg: number
+    readonly retRegs: number[]
     readonly zeroReg?: number
+    readonly stackReg: number
+    readonly linkReg?: number
     readonly indirectContextReg: number
     readonly allocatable: number[] // pool the register allocator may use
     readonly scratch: number[]     // reserved, never allocated (immediates etc)
@@ -21,7 +22,38 @@ export interface Target {
     readonly calleeSaved: number[]
     readonly syscall: SyscallConvention
     readonly regCount: number
+    readonly costs: TargetCosts
+    takesImmediate(op: string, imm: number): boolean
+    layoutFrame(shape: FrameShape): FrameLayout
+    relocate(view: DataView, at: number, pc: bigint, kind: Relocation['kind'], address: bigint): void
+    isMoveWide(word: number): boolean
     createAssembler(): Assembler
+}
+
+export interface TargetCosts {
+    readonly inlineLiteral: number
+    readonly writebackStride: number
+    readonly scaledIndex: boolean
+    readonly narrowOps: boolean
+    readonly latency: ReadonlyMap<string, number>
+}
+
+export interface FrameShape {
+    readonly saved: number
+    readonly link: boolean
+    readonly slots: number
+    readonly outgoingArgs: number
+    readonly allocas: number
+}
+
+export interface FrameLayout {
+    readonly bytes: number
+    readonly link: number
+    readonly allocas: number
+    saved(index: number): number
+    slot(index: number): number
+    outgoingArg(index: number): number
+    incomingArg(index: number): number
 }
 
 export interface SyscallConvention {
@@ -33,12 +65,11 @@ export interface SyscallConvention {
 
 export interface Relocation {
     offset: number
-    kind: 'aarch64-pool' | 'aarch64-call' | 'aarch64-jump'
+    kind: 'pool' | 'call' | 'jump'
     target: number
 }
 
 export interface Assembler {
-    entryStackArg(dst: number, index: number): void
     movImm(dst: number, value: number, narrow?: boolean): void
     mov(dst: number, src: number): void
     binary(op: string, dst: number, a: number, b: number, signed: boolean, narrow?: boolean): void
@@ -891,7 +922,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         let nextLabel = 0
         for (const it of items) if (it.label >= nextLabel) nextLabel = it.label + 1
         const isRet = (it: AsmItem) => it.kind === 'insn'
-            && (it.word === RET || (it.word & 0xFFFFFC1F) >>> 0 === 0xD61F0000 || it.relocationKind === 'aarch64-jump')
+            && (it.word === RET || (it.word & 0xFFFFFC1F) >>> 0 === 0xD61F0000 || it.relocationKind === 'jump')
         const stops = (it: AsmItem) => it.kind === 'label' || isBranch(it.kind) || isRet(it)
         const same = (a: AsmItem, b: AsmItem) => a.kind === b.kind && a.word === b.word
             && a.relocationKind === b.relocationKind && a.relocationTarget === b.relocationTarget
@@ -909,7 +940,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const end = items[k]
             if (it.kind === 'b' ? end.kind !== 'b' || end.label !== it.label : !same(it, end)) continue
             const n = k - j
-            if (i - n < 0 || items[i - n - 1]?.relocationKind === 'aarch64-pool') continue
+            if (i - n < 0 || items[i - n - 1]?.relocationKind === 'pool') continue
             let m = 1
             while (m <= n && !stops(items[i - m]) && same(items[i - m], items[k - m])) m++
             if (m <= n) continue
@@ -951,8 +982,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                         let n = 0
                         while (from.end - n > from.start && into.end - n > into.start
                             && same(items[from.end - 1 - n], items[into.end - 1 - n])) n++
-                        while (n > 0 && (items[from.end - n - 1]?.relocationKind === 'aarch64-pool'
-                            || items[into.end - n - 1]?.relocationKind === 'aarch64-pool')) n--
+                        while (n > 0 && (items[from.end - n - 1]?.relocationKind === 'pool'
+                            || items[into.end - n - 1]?.relocationKind === 'pool')) n--
                         const gain = from.ret ? n - 1 : n
                         if (gain > bestGain) { best = { from, into, n }; bestGain = gain }
                     }
@@ -2532,10 +2563,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     return {
-        entryStackArg: (dst, index) => {
-            // stack args begin at sp
-            ldrUnsigned(dst, SP, index * 8, 8, false)
-        },
         movImm,
         mov,
         binary,
@@ -2588,7 +2615,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             push({
                 kind: 'insn', word: (0x90000000 | dst) >>> 0,
                 text: `adrp ${x(dst)}, pool[${slot}]${name}`, label: -1, reg: dst, cond: -1,
-                relocationKind: 'aarch64-pool', relocationTarget: slot,
+                relocationKind: 'pool', relocationTarget: slot,
             })
             emit(0xF9400000 | (dst << 5) | dst, `ldr ${x(dst)}, [${x(dst)}, pool[${slot}]]${name}`)
         },
@@ -2596,14 +2623,14 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             push({
                 kind: 'insn', word: 0x94000000, text: `bl fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
-                relocationKind: 'aarch64-call', relocationTarget: target, clobbers: true,
+                relocationKind: 'call', relocationTarget: target, clobbers: true,
             })
         },
         jumpLocal: (target: number, debugName) => {
             push({
                 kind: 'insn', word: 0x14000000, text: `b fn[${target}]${debugName ? ` ${debugName}` : ''}`,
                 label: -1, reg: -1, cond: -1,
-                relocationKind: 'aarch64-jump', relocationTarget: target, clobbers: true,
+                relocationKind: 'jump', relocationTarget: target, clobbers: true,
             })
         },
         syscall: (id: number) => {
@@ -2654,13 +2681,63 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 }
 
-export const aarch64: Target = {
-    name: 'aarch64',
-    wordBytes: 8,
+const aarch64ShiftedOrLogical = new Set(['and', 'or', 'xor', 'shl', 'shr', 'ushr'])
+const aarch64Compares = new Set(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
+
+function aarch64TakesImmediate(op: string, imm: number): boolean {
+    if (aarch64ShiftedOrLogical.has(op)) return true
+    if (aarch64Compares.has(op)) return imm >= -0xFFF && imm <= 0xFFF
+    if (op === 'add' || op === 'sub') return imm >= 0 && imm <= 0xFFF
+    return false
+}
+
+function layoutAarch64Frame(shape: FrameShape): FrameLayout {
+    const outgoingArgs = (shape.outgoingArgs * 8 + 15) & ~15
+    const link = outgoingArgs + shape.saved * 8
+    const slots = link + (shape.link ? 8 : 0)
+    const allocas = (slots + shape.slots * 8 + 15) & ~15
+    const bytes = allocas + shape.allocas
+    return {
+        bytes,
+        link,
+        allocas,
+        saved: index => outgoingArgs + index * 8,
+        slot: index => slots + index * 8,
+        outgoingArg: index => index * 8,
+        incomingArg: index => bytes + index * 8,
+    }
+}
+
+function relocateAarch64(view: DataView, at: number, pc: bigint, kind: Relocation['kind'], address: bigint): void {
+    const one = BigInt(1)
+    if (kind === 'pool') {
+        const pageShift = BigInt(12)
+        const pages = (address >> pageShift) - (pc >> pageShift)
+        if (pages < -(one << BigInt(20)) || pages >= (one << BigInt(20))) throw 'aarch64: pool is out of ADRP range'
+        const imm = Number(BigInt.asUintN(21, pages))
+        const word = view.getUint32(at, true)
+        view.setUint32(at, ((word & ~((3 << 29) | (0x7FFFF << 5)))
+            | ((imm & 3) << 29) | (((imm >>> 2) & 0x7FFFF) << 5)) >>> 0, true)
+        const pageOffset = Number(address & BigInt(0xFFF))
+        if (pageOffset & 7) throw 'aarch64: unaligned pool entry'
+        const load = view.getUint32(at + 4, true)
+        view.setUint32(at + 4, ((load & ~(0xFFF << 10)) | ((pageOffset >> 3) << 10)) >>> 0, true)
+        return
+    }
+    const delta = (address - pc) >> BigInt(2)
+    if (delta < -(one << BigInt(25)) || delta >= (one << BigInt(25))) throw 'aarch64: local call is out of range'
+    const imm = Number(BigInt.asUintN(26, delta))
+    view.setUint32(at, ((kind === 'call' ? 0x94000000 : 0x14000000) | imm) >>> 0, true)
+}
+
+export const aarch64Darwin: Target = {
+    name: 'aarch64-darwin',
     argRegs: [0, 1, 2, 3, 4, 5, 6, 7],
     // x8 is also a ret reg but is used to hold an addr for a struct, provided by the caller
-    retReg: 0,
+    retRegs: [0, 1, 2, 3, 4, 5, 6, 7],
     zeroReg: 31,
+    stackReg: SP,
+    linkReg: 30,
     indirectContextReg: 15,
     allocatable: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
     scratch: [16, 17], // ip0/ip1, used for immediates and rem
@@ -2669,17 +2746,32 @@ export const aarch64: Target = {
     calleeSaved: [19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
     syscall: aarch64DarwinSyscall,
     regCount: 32,
+    costs: {
+        inlineLiteral: 0x10000,
+        writebackStride: 255,
+        scaledIndex: true,
+        narrowOps: true,
+        latency: new Map([['convert', 0], ['mul', 3], ['div', 3], ['rem', 3], ['load', 4], ['call', 10]]),
+    },
+    takesImmediate: aarch64TakesImmediate,
+    layoutFrame: layoutAarch64Frame,
+    relocate: relocateAarch64,
+    isMoveWide: word => ((word >>> 23) & 0x3f) === 0x25,
     // fp: 29
-    // link reg: 30
-    // sp: 31
     createAssembler: () => createAarch64Assembler(aarch64DarwinSyscall),
 }
 
 export const aarch64Linux: Target = {
-    ...aarch64,
+    ...aarch64Darwin,
     name: 'aarch64-linux',
     syscall: aarch64LinuxSyscall,
     createAssembler: () => createAarch64Assembler(aarch64LinuxSyscall),
 }
 
+export function targetFor(platform: string, arch: string): Target {
+    if (arch === 'arm64' && platform === 'darwin') return aarch64Darwin
+    if (arch === 'arm64' && platform === 'linux') return aarch64Linux
+    throw `lowering: no target for ${platform}-${arch}`
+}
 
+export const hostTarget = targetFor(process.platform, process.arch)
