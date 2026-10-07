@@ -484,6 +484,223 @@ const InverseCompare: Record<string, string> = {
 const UnaryOps = new Set<string>(['neg', 'not'])
 export const NumericOps = new Set<string>([...BinaryOps, ...CompareOps, ...UnaryOps])
 
+type Range = [lo: number, hi: number]
+const RangeLimit = 2 ** 53
+const ArrivalShapes = new Set<string>(['param', 'literal', 'after', 'and', 'or', 'xor', 'shl', 'ushr', 'add', 'sub', 'mul', 'convert', 'select'])
+
+const RangedTypes = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.i8, Types.i16, Types.i32, Types.i64, Types.bool])
+
+function rangeMax(T: Types): number {
+    if (!RangedTypes.has(T)) return Infinity
+    if (T === Types.bool) return 1
+    const bits = intrinsics.intrinsicBitWidth(T) - (lowering.isSignedType(T) ? 1 : 0)
+    return bits < 53 ? 2 ** bits - 1 : Infinity
+}
+
+function truncated(T: Types): Range {
+    return RangedTypes.has(T) && !lowering.isSignedType(T) ? [0, rangeMax(T)] : [0, Infinity]
+}
+
+function rangeOf(T: Types, lo: number, hi: number): Range {
+    return hi <= rangeMax(T) && hi < RangeLimit ? [lo, hi] : [0, Infinity]
+}
+
+export interface RangeFacts {
+    range(ref: number, literal: number, facts: Facts): Range
+    le(a: number, ak: number, b: number, bk: number, facts: Facts): boolean
+    lt(a: number, ak: number, b: number, bk: number, facts: Facts): boolean
+}
+
+export function rangeFacts(g: Graph, arrivalsOf: (block: number) => TailPosition[]): RangeFacts {
+    let owners: Map<number, [block: GraphBlock, index: number]> | undefined
+    function ownerOf(param: number): [block: GraphBlock, index: number] | undefined {
+        if (!owners) {
+            owners = new Map()
+            for (const b of g.blocks) for (let i = 0; i < b.params.length; i++) owners.set(b.params[i], [b, i])
+        }
+        return owners.get(param)
+    }
+    const inbound = new Map<number, TailPosition[]>()
+    function arrivals(block: number): TailPosition[] {
+        let list = inbound.get(block)
+        if (!list) inbound.set(block, list = arrivalsOf(block))
+        return list
+    }
+
+    const params = new Map<number, Range>()
+    const pending = new Set<number>()
+    function paramRange(p: number): Range {
+        const memo = params.get(p)
+        if (memo) return memo
+        const T = typeOf(g.nodes.get(p)!)
+        const full = rangeOf(T, 0, Infinity)
+        if (pending.has(p)) return full
+        const closure = [p]
+        const seen = new Set<number>([p])
+        const inputs: [ref: number, literal: number, facts: Facts][] = []
+        for (let i = 0; i < closure.length; i++) {
+            const [b, k] = ownerOf(closure[i])!
+            if (b === g.blocks[0]) return full
+            for (const pos of arrivals(b.id)) {
+                const app = g.nodes.get(pos.at)!
+                if (countIds(app) !== b.params.length + 1) return full
+                const ref = getRef(app, k + 1)
+                const facts = pathFacts(g, pos.path)
+                if (ref && g.nodes.get(ref)?.op === 'param' && ownerOf(ref) && !comparisons(g, facts, ref).length) {
+                    if (!seen.has(ref)) {
+                        seen.add(ref)
+                        closure.push(ref)
+                    }
+                    continue
+                }
+                inputs.push([ref, getLiteral(app, k + 1), facts])
+            }
+        }
+        for (const q of closure) pending.add(q)
+        let lo = Infinity
+        let hi = 0
+        for (const [ref, literal, facts] of inputs) {
+            const [l, h] = range(ref, literal, facts)
+            lo = Math.min(lo, l)
+            hi = Math.max(hi, h)
+        }
+        for (const q of closure) pending.delete(q)
+        const out = inputs.length ? rangeOf(T, lo, hi) : full
+        params.set(p, out)
+        return out
+    }
+
+    function shape(n: GraphNode, facts: Facts): Range {
+        const T = typeOf(n)
+        const operand = (i: number) => range(getRef(n, i), getLiteral(n, i), facts)
+        const fits = (lo: number, hi: number): Range => rangeOf(T, lo, hi)
+        const full = fits(0, Infinity)
+        if (CompareOps.has(n.op)) return [0, 1]
+        if (n.op === 'literal') return range(0, getLiteral(n, 0), facts)
+        if (n.op === 'after') return operand(countIds(n) - 1)
+        if (n.op === 'load') return truncated(T)
+        if (n.op === 'convert') {
+            const [lo, hi] = operand(0)
+            return hi <= rangeMax(T) && hi < RangeLimit ? [lo, hi] : truncated(T)
+        }
+        if (n.op === 'and') return fits(0, Math.min(operand(0)[1], operand(1)[1]))
+        if (n.op === 'or' || n.op === 'xor') {
+            const h = Math.max(operand(0)[1], operand(1)[1])
+            return h === Infinity ? full : fits(0, 2 ** Math.ceil(Math.log2(h + 1)) - 1)
+        }
+        if ((n.op === 'ushr' || n.op === 'shl') && !getRef(n, 1)) {
+            const a = operand(0)
+            const m = 2 ** getLiteral(n, 1)
+            if (n.op === 'shl') return fits(a[0] * m, a[1] * m)
+            const hi = a[1] !== Infinity ? Math.floor(a[1] / m) : 64 - getLiteral(n, 1) < 53 ? 2 ** (64 - getLiteral(n, 1)) - 1 : Infinity
+            return fits(Math.floor(a[0] / m), hi)
+        }
+        if (n.op === 'add') {
+            const a = operand(0)
+            const b = operand(1)
+            return fits(a[0] + b[0], a[1] + b[1])
+        }
+        if (n.op === 'mul') {
+            const a = operand(0)
+            const b = operand(1)
+            return fits(a[0] * b[0], a[1] * b[1])
+        }
+        if (n.op === 'sub') {
+            const a = operand(0)
+            const b = operand(1)
+            return a[0] >= b[1] ? fits(a[0] - b[1], a[1] - b[0]) : full
+        }
+        if (n.op === 'select') {
+            let lo = Infinity
+            let hi = 0
+            for (let i = 1; i < countIds(n); i++) {
+                const [l, h] = operand(i)
+                lo = Math.min(lo, l)
+                hi = Math.max(hi, h)
+            }
+            return fits(lo, hi)
+        }
+        return full
+    }
+
+    const plain = new Map<number, Range>()
+    function range(ref: number, literal: number, facts: Facts): Range {
+        if (!ref) return Number.isSafeInteger(literal) && literal >= 0 ? [literal, literal] : [0, Infinity]
+        const n = g.nodes.get(ref)
+        if (!n) return [0, Infinity]
+        if (n.op === 'param' && ownerOf(ref)) return refine(ref, paramRange(ref), facts)
+        if (facts.length) return refine(ref, shape(n, facts), facts)
+        const memo = plain.get(ref)
+        if (memo) return memo
+        const r = shape(n, facts)
+        plain.set(ref, r)
+        return r
+    }
+
+    function refine(ref: number, r: Range, facts: Facts): Range {
+        for (const [k, equal] of comparisons(g, facts, ref)) {
+            if (!Number.isSafeInteger(k) || k < 0) continue
+            if (equal) return [k, k]
+            if (k === r[0] && r[0] < r[1]) r = [r[0] + 1, r[1]]
+            else if (k === r[1] && r[0] < r[1]) r = [r[0], r[1] - 1]
+        }
+        return r
+    }
+
+    const pairs = new Map<string, boolean>()
+    function related(a: number, b: number, kind: string, test: (x: number, xk: number, y: number, yk: number, facts: Facts) => boolean): boolean {
+        const pa = a && g.nodes.get(a)?.op === 'param' ? ownerOf(a) : undefined
+        const pb = b && g.nodes.get(b)?.op === 'param' ? ownerOf(b) : undefined
+        if (!pa || !pb || pa[0] !== pb[0] || pa[0] === g.blocks[0]) return false
+        const key = `${kind}${a}:${b}`
+        const memo = pairs.get(key)
+        if (memo !== undefined) return memo
+        pairs.set(key, false)
+        const block = pa[0]
+        const list = arrivals(block.id)
+        let holds = list.length > 0
+        for (const pos of list) {
+            const app = g.nodes.get(pos.at)!
+            if (countIds(app) !== block.params.length + 1
+                || !test(getRef(app, pa[1] + 1), getLiteral(app, pa[1] + 1), getRef(app, pb[1] + 1), getLiteral(app, pb[1] + 1), pathFacts(g, pos.path))) {
+                holds = false
+                break
+            }
+        }
+        pairs.set(key, holds)
+        return holds
+    }
+
+    function le(a: number, ak: number, b: number, bk: number, facts: Facts, depth = 0): boolean {
+        if (a === b && (a || ak === bk)) return true
+        if (!a && ak === 0) return true
+        if (range(a, ak, facts)[1] <= range(b, bk, facts)[0]) return true
+        if (depth > 4) return false
+        const n = a ? g.nodes.get(a) : undefined
+        if (n?.op === 'and') {
+            for (const i of [0, 1]) if (le(getRef(n, i), getLiteral(n, i), b, bk, facts, depth + 1)) return true
+        }
+        return related(a, b, 'le', (x, xk, y, yk, f) => le(x, xk, y, yk, f, depth + 1))
+    }
+
+    function lt(a: number, ak: number, b: number, bk: number, facts: Facts, depth = 0): boolean {
+        if (range(a, ak, facts)[1] < range(b, bk, facts)[0]) return true
+        if (depth > 4) return false
+        const m = b ? g.nodes.get(b) : undefined
+        if (m?.op === 'add') {
+            for (const i of [0, 1]) {
+                if (getRef(m, i ^ 1) || getLiteral(m, i ^ 1) < 1) continue
+                const c = range(getRef(m, i), getLiteral(m, i), facts)
+                const top = c[1] + getLiteral(m, i ^ 1)
+                if (top <= rangeMax(typeOf(m)) && top < RangeLimit && le(a, ak, getRef(m, i), getLiteral(m, i), facts, depth + 1)) return true
+            }
+        }
+        return related(a, b, 'lt', (x, xk, y, yk, f) => lt(x, xk, y, yk, f, depth + 1))
+    }
+
+    return { range, le, lt }
+}
+
 export function isNumeric(g: Graph, id: number, entry: (param: number) => boolean, visiting = new Set<number>()): boolean {
     if (!id) return true
     const n = g.nodes.get(id)
@@ -5285,6 +5502,90 @@ function optimizeValueGraph(g: Graph) {
         return true
     }
 
+    function threadDecidedArrivals(target: GraphBlock): boolean {
+        if (target === g.blocks[0]) return false
+        const tail = g.nodes.get(target.bodyId)
+        if (!tail || tail.op !== 'select' || countIds(tail) !== 3) return false
+        for (const arm of [1, 2]) {
+            const n = g.nodes.get(getRef(tail, arm))
+            if (!n || (n.op !== 'apply' && n.op !== 'ret')) return false
+        }
+        const cond = g.nodes.get(getRef(tail, 0))
+        if (!cond || !CompareOps.has(cond.op) || comparesFloats(g, cond)) return false
+        const sides = [0, 1].map(i => getRef(cond, i) ? target.params.indexOf(getRef(cond, i)) : -2)
+        if (sides.some(at => at === -1)) return false
+        const argsOf = (app: GraphNode) => sides.map((at, i) => at === -2 ? [0, getLiteral(cond, i)] : [getRef(app, at + 1), getLiteral(app, at + 1)])
+        const compare = (args: number[][], facts: Facts) => decideCompare(cond, args[0], args[1], facts)
+        const candidate = (app: GraphNode) => !argsOf(app).some(([r]) => r && !ArrivalShapes.has(g.nodes.get(r)!.op))
+        const decided: [from: GraphBlock, path: number[], arm: number][] = []
+        let survives = false
+        for (const [fromId, appId] of findInboundApplies(target)) {
+            if (fromId === target.id || !candidate(g.nodes.get(appId)!)) {
+                survives = true
+                continue
+            }
+            const from = getGraphBlock(fromId)
+            const paths = applicationPaths(from, target.id).filter(p => p[p.length - 1] === appId)
+            if (paths.length !== 1) {
+                survives = true
+                continue
+            }
+            const path = paths[0]
+            const selects: SelectPath = []
+            for (let i = 0; i + 1 < path.length; i++) {
+                const n = g.nodes.get(path[i])!
+                if (n.op !== 'select') continue
+                for (let j = 1; j < countIds(n); j++) if (getRef(n, j) === path[i + 1]) { selects.push([path[i], j]); break }
+            }
+            const outcome = compare(argsOf(g.nodes.get(appId)!), pathFacts(g, selects))
+            if (outcome === undefined) survives = true
+            else decided.push([from, path, outcome ? 1 : 2])
+        }
+        if (!decided.length || compare(sides.map((at, i) => at === -2 ? [0, getLiteral(cond, i)] : [getRef(cond, i), 0]), []) !== undefined) return false
+        const takers = [0, 0, 0]
+        for (const [, , arm] of decided) takers[arm]++
+        const movable = [1, 2].map(arm => {
+            const t = g.nodes.get(getRef(tail, arm))!
+            let coded = false
+            for (let i = t.op === 'apply' ? 1 : 0; i < countIds(t); i++) {
+                const r = getRef(t, i)
+                if (r && !target.params.includes(r) && g.nodes.get(r)?.op !== 'literal') coded = true
+            }
+            return !coded || (takers[arm] === 1 && !survives)
+        })
+        const edits = new Map<GraphBlock, Map<number, number>>()
+        for (const [from, path, arm] of decided) {
+            if (!movable[arm - 1]) continue
+            const merged = inlineApplication(path, target, getRef(tail, arm))
+            if (merged === undefined) continue
+            let r = edits.get(from)
+            if (!r) edits.set(from, r = new Map())
+            r.set(path[path.length - 1], merged)
+        }
+        if (!edits.size) return false
+        for (const [from, r] of edits) {
+            from.bodyId = replaceAll(from.bodyId, r)
+            revisitBlock(from)
+        }
+        return true
+    }
+
+    function decideCompare(cond: GraphNode, [a, ak]: number[], [b, bk]: number[], facts: Facts): boolean | undefined {
+        const ranges = currentRanges()
+        const signed = lowering.isSignedType(operandType(g, cond, 0)) || lowering.isSignedType(operandType(g, cond, 1))
+        if (signed && (ranges.range(a, ak, facts)[1] === Infinity || ranges.range(b, bk, facts)[1] === Infinity)) return
+        const le = (x: number, xk: number, y: number, yk: number) => ranges.le(x, xk, y, yk, facts)
+        const lt = (x: number, xk: number, y: number, yk: number) => ranges.lt(x, xk, y, yk, facts)
+        const op = cond.op
+        if (op === 'gt') return lt(b, bk, a, ak) ? true : le(a, ak, b, bk) ? false : undefined
+        if (op === 'ge') return le(b, bk, a, ak) ? true : lt(a, ak, b, bk) ? false : undefined
+        if (op === 'lt') return lt(a, ak, b, bk) ? true : le(b, bk, a, ak) ? false : undefined
+        if (op === 'le') return le(a, ak, b, bk) ? true : lt(b, bk, a, ak) ? false : undefined
+        if (op === 'eq') return lt(a, ak, b, bk) || lt(b, bk, a, ak) ? false : undefined
+        if (op === 'ne') return lt(a, ak, b, bk) || lt(b, bk, a, ak) ? true : undefined
+        return
+    }
+
     function absorbConditions(target: GraphBlock): boolean {
         if (target.id === g.blocks[0].id) return false
         const inbound = findInboundApplies(target)
@@ -5371,6 +5672,22 @@ function optimizeValueGraph(g: Graph) {
             return true
         }
         return false
+    }
+
+    let ranges: RangeFacts | undefined
+    let rangesEpoch = -1
+    function currentRanges(): RangeFacts {
+        if (!ranges || rangesEpoch !== graphEpoch) {
+            const tails = new Map<number, TailPosition[]>()
+            const tailsOf = (block: number) => {
+                let list = tails.get(block)
+                if (!list) tails.set(block, list = tailPositions(g, getGraphBlock(block).bodyId))
+                return list
+            }
+            ranges = rangeFacts(g, id => findInboundApplies(getGraphBlock(id)).map(([from, app]) => tailsOf(from).find(p => p.at === app)!))
+            rangesEpoch = graphEpoch
+        }
+        return ranges
     }
 
     let mem: MemAnalysis | undefined
@@ -6568,6 +6885,11 @@ function optimizeValueGraph(g: Graph) {
                 else if (n.op === 'ne' || n.op === 'lt' || n.op === 'gt') result = { id: 0, value: 0 }
             }
             if (!result && !floating && args.length === 2 && (n.op === 'add' || n.op === 'sub') && (chained(args[0]) || chained(args[1]))) result = linear(n, args)
+            if (!result && !floating && args.length === 2 && CompareOps.has(n.op)
+                && (!args[0].id || !args[1].id)) {
+                const known = decideCompare(n, [args[0].id, args[0].id ? 0 : args[0].value], [args[1].id, args[1].id ? 0 : args[1].value], [])
+                if (known !== undefined) result = { id: 0, value: known ? 1 : 0 }
+            }
             if (!result && args.length === 2 && operandType(g, n, 0) <= Types.i64 && operandType(g, n, 1) <= Types.i64) {
                 const left = (value: number) => !args[0].id && args[0].value === value
                 const right = (value: number) => !args[1].id && args[1].value === value
@@ -6917,17 +7239,28 @@ function optimizeValueGraph(g: Graph) {
         const [callerId, freeId] = inbound[free]
         const freeApp = g.nodes.get(freeId)!
         const liftedOperands = getOperands(ex)
+        let coded = false
         for (let i = 0; i < liftedOperands.length; i++) {
             const r = getRef(ex, i)
             if (!r) continue
             const op = g.nodes.get(r)?.op
             if (op === 'block' || op === 'nil-effect' || op === 'void') continue
             const slot = target.params.indexOf(r)
-            if (slot < 0) return false
+            if (slot < 0) {
+                coded = true
+                break
+            }
             liftedOperands[i] = getOperand(freeApp, slot + 1)
         }
-
-        const lifted = addNode(ex.op, liftedOperands, ex)
+        let lifted: number
+        if (coded) {
+            const path = applicationPaths(getGraphBlock(callerId), target.id).find(p => p[p.length - 1] === freeId)
+            const merged = path ? inlineApplication(path, target, exclusiveId) : undefined
+            if (merged === undefined) return false
+            lifted = merged
+        } else {
+            lifted = addNode(ex.op, liftedOperands, ex)
+        }
         const takenOperands = getOperands(freeApp)
         takenOperands[at + 1] = { literal }
         const taken = addNode('apply', takenOperands, freeApp)
@@ -7637,6 +7970,7 @@ function optimizeValueGraph(g: Graph) {
             step(mergeBlocks, b)
             step(absorbConditions, b)
             step(threadConstantBranches, b)
+            step(threadDecidedArrivals, b)
             step(foldKnownConditions, b)
             step(reduceSelects, b)
             step(forwardMemory, b)
