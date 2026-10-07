@@ -819,6 +819,7 @@ export interface LowerGraphOptions {
     target?: lowering.Target
     regBudget?: number
     debug?: boolean
+    clobbersOf?: (symbol: number) => Set<number> | undefined
 }
 
 export interface LowerGraphResult {
@@ -827,6 +828,8 @@ export interface LowerGraphResult {
     bytes: number[]
     relocations: lowering.Relocation[]
     listing: string
+    clobbers: Set<number>
+    localCalls: Set<number>
 }
 
 // TODO:
@@ -8170,6 +8173,7 @@ interface ParamSlot {
     ordinal: number
     isStatic: boolean
     soft: boolean
+    home?: number
 }
 
 export function assignBlockSignatures(
@@ -8179,6 +8183,7 @@ export function assignBlockSignatures(
     inStatePos: Map<number, [parent: number, idx: number][]>,
     applyOwner: Map<number, number>,
     staticBudget: number,
+    volatileHomes: { safeFor: (v: number) => number[], volatiles: number[] },
 ): Map<number, ParamSlot[]> {
     const owner = new Map<number, number>()
     const parent = new Map<number, number>()
@@ -8238,6 +8243,7 @@ export function assignBlockSignatures(
             staticArrivals.set(q, (staticArrivals.get(q) ?? true) && shouldSpillUntil.has(getRef(n, i + 1)))
         }
     }
+    const spilledArrivals = new Map<number, number[]>()
     for (const [app, from] of applyOwner) {
         const n = g.nodes.get(app)
         const into = n ? getBlock(g, getRef(n, 0)) : undefined
@@ -8257,6 +8263,9 @@ export function assignBlockSignatures(
                     } else edges[at][2] += weight
                 }
             } else if (shouldSpillUntil.has(a)) {
+                const list = spilledArrivals.get(q)
+                if (list) list.push(a)
+                else spilledArrivals.set(q, [a])
                 if (staticArrivals.get(q) && !wants.has(q)
                     && staticWidth.get(into.id)! < staticBudget) rigid.add(q)
             } else if (g.nodes.get(a)?.op === 'call') {
@@ -8309,10 +8318,35 @@ export function assignBlockSignatures(
         takenStatic.set(b.id, new Set())
     }
     const slotOf = new Map<number, ParamSlot>()
+    const members = new Map<number, number[]>()
+    for (const b of g.blocks) for (const p of b.params) {
+        const list = members.get(find(p))
+        if (list) list.push(p)
+        else members.set(find(p), [p])
+    }
     for (const root of groups) {
         const where = occupies.get(root)!
         const isStatic = rigid.has(root)
         const soft = isStatic && !hardRigid.has(root)
+        if (isStatic && !where.has(g.blocks[0].id)) {
+            let candidates = volatileHomes.volatiles
+            for (const p of members.get(root)!) {
+                for (const v of [p, ...spilledArrivals.get(p) ?? []]) {
+                    const safe = volatileHomes.safeFor(v)
+                    candidates = candidates.filter(r => safe.includes(r))
+                }
+            }
+            const home = candidates.find(r => {
+                for (const id of where) if (takenVolatile.get(id)!.has(volatileHomes.volatiles.indexOf(r))) return false
+                return true
+            })
+            if (home !== undefined) {
+                const ordinal = volatileHomes.volatiles.indexOf(home)
+                for (const id of where) takenVolatile.get(id)!.add(ordinal)
+                slotOf.set(root, { ordinal, isStatic: false, soft: false, home })
+                continue
+            }
+        }
         const taken = isStatic ? takenStatic : takenVolatile
         const free = (n: number) => {
             for (const id of where) {
@@ -8750,6 +8784,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
 
     // BAGGAGE CLAIM
     const shouldSpillUntil = new Map<number, number>()
+    const crossedCalls = new Map<number, Set<number>>()
     const visitOrder = new Map<number, number>()
     const operandOrder = new Map<number, number[]>()
     {
@@ -9034,6 +9069,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         }
         for (const res of state.crosses) {
             visitForSpill(res[0], res[1])
+            crossedCalls.set(res[0], res[1])
         }
         if (opts?.debug) {
             const claimed = [...visitOrder]
@@ -9339,6 +9375,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         returnsAt,
         pure,
         shouldSpillUntil,
+        crossedCalls,
         blockOrder,
         fallsIn,
         sinks,
@@ -10737,8 +10774,29 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (preserved.length >= budget) continue
         preserved.push(r)
     }
+    const clobberAll = new Set<number>(target.volatiles)
+    const callClobbers = new Map<number, Set<number>>()
+    function clobberOfCall(call: number): Set<number> {
+        let s = callClobbers.get(call)
+        if (s) return s
+        const n = g.nodes.get(call)
+        const t = n?.op === 'call' ? g.nodes.get(getRef(n, 1)) : undefined
+        s = t?.op === 'local-target' && !getRef(t, 0) ? opts.clobbersOf?.(getLiteral(t, 0)) ?? clobberAll : clobberAll
+        callClobbers.set(call, s)
+        return s
+    }
+    const safeCache = new Map<number, number[]>()
+    function safeVolatiles(v: number): number[] {
+        let s = safeCache.get(v)
+        if (s) return s
+        const crossed = analysis.crossedCalls.get(v)
+        s = target.callerSaved.filter(r => volatiles.includes(r) && (!crossed || [...crossed].every(c => !clobberOfCall(c).has(r))))
+        safeCache.set(v, s)
+        return s
+    }
     const signatures = assignBlockSignatures(g, analysis.shouldSpillUntil,
-        analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, preserved.length)
+        analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, preserved.length,
+        { safeFor: safeVolatiles, volatiles })
     const CALLEE = target.scratch[1]
     const SWAP = target.scratch[0]
     const SP = target.stackReg
@@ -10816,6 +10874,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             console.log(errorDump(g))
             throw `lowering3: invalid transfer source ${src} while queuing %${materializing} in B${currentBlock} (dst: ${dst})`
         }
+        if (dst < SLOTS) written.add(dst)
         code.push({ dst, src, consumed })
     }
 
@@ -10830,8 +10889,11 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
 
 
     const NOTHING = new Set<number>()
+    const written = new Set<number>()
+    const localCalls = new Set<number>()
     function bind(id: number, reg: number): number {
         if (opts.debug) console.log('home +', id, reg, 'at', materializing, 'over', heldBy.get(reg) ?? '-')
+        written.add(reg)
         homeOf.set(id, reg)
         heldBy.set(reg, id)
         if (isPreserved(reg)) {
@@ -10934,6 +10996,10 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             }
         }
         if (steering && sigStats) sigStats.steerFailed++
+        if (first === preserved) {
+            if (want >= 0 && !heldBy.has(want) && safeVolatiles(id).includes(want)) return bind(id, want)
+            for (const safe of safeVolatiles(id)) if (!heldBy.has(safe) && !pendingHomes.has(safe)) return bind(id, safe)
+        }
         let r = pendingHomes.size ? freeReg(first, pendingHomes) : -1
         if (r < 0) r = freeReg(first, NOTHING)
         if (r < 0) r = freeReg(second, NOTHING)
@@ -10947,7 +11013,15 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             throw `lowering: value ${v} is not live`
         }
         if (!isSlot(home)) return home
-        const first = acrossCall.has(v) ? preserved : volatiles
+        if (acrossCall.has(v)) {
+            for (const safe of safeVolatiles(v)) {
+                if (heldBy.has(safe) || avoid.has(safe)) continue
+                transfer(safe, home)
+                copyOf.set(v, home)
+                return bind(v, safe)
+            }
+        }
+        const first = acrossCall.has(v) && !stashed.has(v) ? preserved : volatiles
         const second = first === preserved ? volatiles : preserved
         const r = freeRegIn([first, second], avoid)
         if (r < 0) throw 'lowering: out of registers'
@@ -11051,8 +11125,39 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             for (const x of getArgIds(n)) stack.push(x)
         }
     }
+    const stashed = stashedArgs()
+    function stashedArgs(): Set<number> {
+        const out = new Set<number>()
+        const entry = g.blocks[0]
+        const slots = signatures.get(entry.id) ?? []
+        const shared = new Set<number>()
+        for (const b of g.blocks) {
+            const own = signatures.get(b.id) ?? []
+            for (let i = 0; i < b.params.length; i++) {
+                if (b === entry || !own[i]?.isStatic) continue
+                shared.add(own[i].ordinal)
+            }
+        }
+        const pressure = new Map<number, number>()
+        for (const calls of analysis.crossedCalls.values()) for (const c of calls) pressure.set(c, (pressure.get(c) ?? 0) + 1)
+        let peak = 0
+        for (const n of pressure.values()) peak = Math.max(peak, n)
+        for (let i = 0; i < entry.params.length && i < target.argRegs.length; i++) {
+            const p = entry.params[i]
+            const slot = slots[i]
+            const uses = analysis.usedBy.get(p) ?? []
+            if (!acrossCall.has(p) || !slot?.isStatic || slot.ordinal >= preserved.length || shared.has(slot.ordinal)) continue
+            if (uses.length !== 1 || g.nodes.get(uses[0])?.op === 'apply') continue
+            const crossed = analysis.crossedCalls.get(p)!
+            let atPeak = true
+            for (const [c, n] of pressure) if (n === peak && !crossed.has(c)) atPeak = false
+            if (atPeak) out.add(p)
+        }
+        return out
+    }
     const slotHomes = new Map<string, number>()
     function homeForSlot(slot: ParamSlot): number {
+        if (slot.home !== undefined) return slot.home
         const pool = slot.isStatic ? preserved : volatiles
         if (sigStats) {
             sigStats.params++
@@ -11089,7 +11194,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
                 if (slots[i] && pool[slots[i].ordinal] === undefined) sigStats.threadedOverflow++
             }
         }
-        sig.set(b.id, (signatures.get(b.id) ?? []).map(homeForSlot))
+        sig.set(b.id, (signatures.get(b.id) ?? []).map((slot, i) => stashed.has(b.params[i]) ? takeSlot() : homeForSlot(slot)))
     }
     const paramAt = new Map<number, [block: number, idx: number]>()
     for (const b of g.blocks) {
@@ -11545,6 +11650,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         for (const x of volatiles) {
             const v = heldBy.get(x)
             if (v === undefined) continue
+            if (acrossCall.has(v) && !clobberOfCall(id).has(x)) continue
             const copy = copyOf.get(v)
             if (copy === undefined || !acrossCall.has(v)) {
                 freeValue(v, id)
@@ -11557,11 +11663,13 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         if (syscall) {
             const number = getLiteral(syscall, 0)
             assert(!getRef(syscall, 0) && Number.isSafeInteger(number))
+            for (const r of target.volatiles) written.add(r)
             put(() => asm.syscall(number))
         } else if (local) {
             const target = getLiteral(local, 0)
             const name = getDebugLabel(g, getRef(n, 1))
             assert(!getRef(local, 0) && Number.isSafeInteger(target) && target >= 0)
+            localCalls.add(target)
             const region = currentRegion
             put(() => {
                 if (!tailCalls || !tails.has(id)) return asm.callLocal(target, name)
@@ -11569,6 +11677,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
                 asm.jumpLocal(target, name)
             })
         } else {
+            for (const r of target.volatiles) written.add(r)
             const region = currentRegion
             put(() => {
                 if (!tailCalls || !tails.has(id)) return asm.blr(linkReg)
@@ -12161,9 +12270,11 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         reportBranchWaste(g.name ?? '<anonymous>', asm.listing())
     }
     let listing: string | undefined
+    for (const r of target.calleeSaved) written.delete(r)
     return {
         target, words: asm.words(), bytes: asm.bytes(), relocations: asm.relocations(),
         get listing() { return listing ??= asm.listing() },
+        clobbers: written, localCalls,
     }
 }
 
