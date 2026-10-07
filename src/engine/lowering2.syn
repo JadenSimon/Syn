@@ -785,7 +785,7 @@ const PureOps = new Set<string>([
     'add', 'sub', 'mul', 'div', 'rem', 'pow', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
     'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'select', 'convert', 'bitconvert',
     'pool-entry', 'void', 'param', 'heap-handle', 'nil-effect', 'block', 
-    'literal', 'get', 'record', 'unreachable', 'alloca', 'frame-address', 'encode', 'decode', 'box', 'unbox',
+    'literal', 'get', 'record', 'unreachable', 'alloca', 'frame-address', 'pc', 'encode', 'decode', 'box', 'unbox',
     ...TargetingValues
 ])
 const Commutative = new Set<string>(['add', 'mul', 'and', 'or', 'xor', 'ne', 'eq'])
@@ -823,6 +823,7 @@ export interface LowerGraphOptions {
     regBudget?: number
     debug?: boolean
     clobbersOf?: (symbol: number) => Set<number> | undefined
+    poolSlot?: (value: number) => number
 }
 
 export interface LowerGraphResult {
@@ -833,6 +834,7 @@ export interface LowerGraphResult {
     listing: string
     clobbers: Set<number>
     localCalls: Set<number>
+    island?: number[]
 }
 
 // TODO:
@@ -848,7 +850,7 @@ export function pureValues(g: Graph): Set<number> {
         if (!id) return true
         const n = g.nodes.get(id)!
         if (!markVisited(n, epoch)) return !impure.has(id)
-        let ok = PureOps.has(n.op)
+        let ok = PureOps.has(n.op) || islandLoad(g, n)
         if (ok) for (const a of gn.enumerateRefs(n)) if (!walk(a)) { ok = false; break }
         if (!ok) impure.add(id)
         return ok
@@ -8407,6 +8409,54 @@ function substitute(g: Graph, by: Map<number, Operand>): void {
     for (const id of by.keys()) g.nodes.delete(id)
 }
 
+function islandLoad(g: Graph, n: GraphNode): boolean {
+    if (n.op !== 'load' || getRef(n, 0) || getRef(n, 2)) return false
+    const base = g.nodes.get(getRef(n, 1))
+    return base?.op === 'pc' && getLiteral(base, 0) === 0
+}
+
+function islandLoads(g: Graph, poolSlot: (value: number) => number): number[] {
+    const island: number[] = []
+    const entries = new Map<number, number>()
+    const entryOf = (slot: number) => {
+        let at = entries.get(slot)
+        if (at === undefined) {
+            entries.set(slot, at = island.length)
+            island.push(slot)
+        }
+        return at
+    }
+    const wide = (v: number) => Number.isSafeInteger(v) && (v >= 2 ** 32 || v < -(2 ** 31))
+    const floats = floatValues(g)
+    const loads: [id: number, entry: number, type: Types][] = []
+    for (const [id, n] of [...g.nodes]) {
+        if (n.op === 'pool-entry' && !getRef(n, 0)) {
+            loads.push([id, entryOf(getLiteral(n, 0)), Types.u64])
+            continue
+        }
+        if (n.op === 'literal') {
+            if (!floats.has(id) && typeOf(n) !== Types.f64 && wide(getLiteral(n, 0))) loads.push([id, entryOf(poolSlot(getLiteral(n, 0))), typeOf(n)])
+            continue
+        }
+        if (floats.has(id)) continue
+        let copy: GraphNode | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            if (getRef(n, i) || !liftableSlot(n.op, i) || !wide(getLiteral(n, i))) continue
+            const lifted = g.maxId++
+            loads.push([lifted, entryOf(poolSlot(getLiteral(n, i))), Types.u64])
+            copy ??= copyNode(n)
+            setRef(copy, i, lifted)
+        }
+        if (copy) g.nodes.set(id, copy)
+    }
+    for (const [id, entry, type] of loads) {
+        const pc = g.maxId++
+        g.nodes.set(pc, makeNode('pc', [{ literal: 0 }, { literal: (entry - island.length) * 8 }]))
+        g.nodes.set(id, makeNode('load', [{ literal: 0 }, pc, { literal: 0 }], type))
+    }
+    return island
+}
+
 function stripMem(g: Graph): boolean {
     const pointers = new Map<number, Operand>()
     for (const [id, n] of g.nodes) if (n.op === 'mem') pointers.set(id, getOperand(n, 0))
@@ -10730,6 +10780,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     // }
     const target = opts.target ?? lowering.hostTarget
     const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target)
+    const island = opts.poolSlot ? islandLoads(g, opts.poolSlot) : undefined
     const floats = floatValues(g)
 
     const rootBlock = g.blocks[0]
@@ -11821,6 +11872,14 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         defer materializing = outer
         done.add(id)
         const T = typeOf(n)
+        if (islandLoad(g, n)) {
+            const pc = g.nodes.get(getRef(n, 1))!
+            finish()
+            const dst = regFor(id, want)
+            const name = getDebugLabel(g, id)
+            put(() => asm.loadLiteral(dst, getLiteral(pc, 1) + getLiteral(n, 2), name))
+            return
+        }
         if (!getRef(n, 2)) {
             let b0 = 0
             for (const i of orderedOperands(id, [0, 1])) {
@@ -12286,7 +12345,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     return {
         target, words: asm.words(), bytes: asm.bytes(), relocations: asm.relocations(),
         get listing() { return listing ??= asm.listing() },
-        clobbers: written, localCalls,
+        clobbers: written, localCalls, island,
     }
 }
 
