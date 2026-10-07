@@ -9,16 +9,17 @@ import * as syscalls from './syscalls'
 import { Op, rawValue, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
-    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks, encodeCallOutcomes, type CallOutcomes, firstNonOrderingSlot, substitute,
+    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, sweepBlocks, encodeCallOutcomes, type CallOutcomes,
     printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
     graphLoops, stronglyConnected, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
-    getOperand, getOperands, getRef, isContextParam, isThisParam, makeNode, type Operand, operandType, resultType, setDebugLabel, setGraphBlocks,
+    getOperand, getOperands, getRef, isThisParam, makeNode, type Operand, operandType, resultType, setDebugLabel, setGraphBlocks,
+    createFnType, fnLocations, fnReturn, paramLocation,
     setLiteral, setRef, setType, typeOf, typeRefOf,
 } from './graph-node'
-import { accessBytes, hostTarget, isSignedType, type Target } from './lowering'
+import { hostTarget, isSignedType, type Target } from './lowering'
 
 import type { CompiledSource } from './trace2'
 import type { EmitResult } from './bytecode-emitter'
@@ -1173,7 +1174,6 @@ function dumpCallShapes(pending: PendingUnit[], functions: Function[], opaque: M
 function rewriteTargets(
     g: Graph,
     functionHandles: Map<number, number>,
-    functionTargets: Map<number, number>,
     dataHandles: Map<number, number>,
     runtimeTargets: Map<number, number>,
 ): Graph {
@@ -1204,20 +1204,6 @@ function rewriteTargets(
             }))
             continue
         }
-        if (n.op === 'indirect-target') {
-            const code = g.nodes.get(getRef(n, 0))
-            const slot = code?.op === 'heap-handle' && !getRef(code, 0)
-                ? functionHandles.get(heap.deref(getLiteral(code, 0) as intrinsics.Handle)) : undefined
-            const symbol = slot === undefined ? undefined : functionTargets.get(slot)
-            if (symbol !== undefined) {
-                const local = maxId++
-                nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: EffectWrite }], Types.u32))
-                const copy = copyNode(n)
-                setRef(copy, 0, local)
-                nodes.set(id, copy)
-                continue
-            }
-        }
         if (n.op !== 'heap-handle') {
             nodes.set(id, n)
             continue
@@ -1237,57 +1223,6 @@ function rewriteTargets(
     const graph = { ...g, nodes, maxId }
     setGraphBlocks(graph, g.blocks.map(b => ({ ...b, params: b.params.slice() })))
     return graph
-}
-
-type ContextReads = [offset: number, bytes: number][] | undefined
-
-function contextReads(g: Graph): ContextReads {
-    const context = g.blocks[0].params.find(p => isContextParam(g.nodes.get(p)!))
-    const reads: [number, number][] = []
-    if (context === undefined) return reads
-    for (const n of g.nodes.values()) {
-        for (let i = 0; i < countIds(n); i++) {
-            if (getRef(n, i) !== context) continue
-            if (n.op !== 'load' || i !== 1 || getRef(n, 2)) return undefined
-            reads.push([getLiteral(n, 2), accessBytes(typeOf(n))])
-        }
-    }
-    return reads
-}
-
-function dropUnreadFields(g: Graph, readsOf: Map<number, ContextReads>): void {
-    const reads = new Map<number, [number, number][]>()
-    const stores = new Map<number, number[]>()
-    for (const [id, n] of g.nodes) {
-        if (n.op !== 'pstack') continue
-        reads.set(id, [])
-        stores.set(id, [])
-    }
-    for (const [id, n] of g.nodes) {
-        for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
-            const object = getRef(n, i)
-            const read = reads.get(object)
-            if (!read) continue
-            if (n.op === 'store' && i === 1 && !getRef(n, 2)) {
-                stores.get(object)!.push(id)
-                continue
-            }
-            const code = n.op === 'indirect-target' && i === 1 ? g.nodes.get(getRef(n, 0)) : undefined
-            const callee = code?.op === 'local-target' ? readsOf.get(getLiteral(code, 0)) : undefined
-            if (callee) read.push(...callee)
-            else reads.delete(object)
-        }
-    }
-    const dead = new Map<number, number>()
-    for (const [object, read] of reads) {
-        for (const id of stores.get(object)!) {
-            const store = g.nodes.get(id)!
-            const offset = getLiteral(store, 2)
-            const end = offset + accessBytes(typeOf(store))
-            if (!read.some(([at, bytes]) => at < end && offset < at + bytes)) dead.set(id, getRef(store, 0))
-        }
-    }
-    if (dead.size) substitute(g, dead)
 }
 
 function align(value: number, amount: number): number {
@@ -1618,7 +1553,7 @@ function reachable(graph: Graph): GraphNode[] | undefined {
             const id = stack.pop()!
             const n = id ? graph.nodes.get(id) : undefined
             if (!n || seen.has(id) || n.op === 'block') continue
-            if (n.op === 'call-context' || n.op === 'alloca' || n.op === 'frame-address') return
+            if (n.op === 'alloca' || n.op === 'frame-address') return
             seen.add(id)
             found.push(n)
             for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
@@ -1669,23 +1604,10 @@ function splice(graph: Graph, call: number, callee: Graph, freshId: (graph: Grap
     }
     let body = (traced ?? copier(true))(callee.blocks[0].bodyId)
     const token = getRef(n, 0)
-    if (token && !reaches(body, token)) {
+    if (token) {
         const ordered = freshId(graph)
         graph.nodes.set(ordered, makeNode('after', [token, body]))
         body = ordered
-    }
-    function reaches(from: number, to: number): boolean {
-        const seen = new Set<number>()
-        const stack = [from]
-        while (stack.length) {
-            const id = stack.pop()!
-            if (id === to) return true
-            const m = id ? graph.nodes.get(id) : undefined
-            if (!m || m.op === 'block' || m.op === 'select' || seen.has(id)) continue
-            seen.add(id)
-            for (let i = 0; i < countIds(m); i++) stack.push(getRef(m, i))
-        }
-        return false
     }
     graph.nodes.set(call, makeNode('inlined', [body, { literal: call }]))
 }
@@ -1830,7 +1752,6 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
             if (!callee || callee === unit || program.noInline.has(symbol)) continue
             visit(callee)
             if (!inlined.get(symbol)) continue
-            if (callee.graph.blocks[0].params.some(p => isContextParam(callee.graph.nodes.get(p)!))) continue
             if (!inlines(callSites, program.roots, unit.graph, graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
             splice(graph, id, callee.graph, g => g.maxId++)
             changed = true
@@ -2240,7 +2161,6 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
             if (callee === unit || program.noInline.has(callee.symbol)) continue
             finish(callee)
             if (!finished.has(callee.symbol)) continue
-            if (callee.graph.blocks[0].params.some(p => isContextParam(callee.graph.nodes.get(p)!))) continue
             if (!inlines(callSites, program.roots, unit.graph, graph, id, callee)) continue
             splice(graph, id, callee.graph, g => g.maxId++)
         }
@@ -2269,11 +2189,9 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
     const clobbersOf = (symbol: number) => clobbers.get(symbol)
-    const reads = new Map<number, ContextReads>()
-    for (const symbol of symbols) reads.set(symbol, contextReads(program.units.get(symbol)!))
     const lowered = new Map<number, NativeUnit>()
     for (const scc of order) {
-        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, roots.has(symbol), clobbersOf, reads))
+        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, roots.has(symbol), clobbersOf))
         const members = new Set(scc)
         const shared = new Set<number>()
         for (const symbol of scc) {
@@ -2288,19 +2206,18 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     return symbols.map(symbol => lowered.get(symbol)!)
 }
 
-function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobbersOf: (symbol: number) => Set<number> | undefined, reads: Map<number, ContextReads>): NativeUnit {
+function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobbersOf: (symbol: number) => Set<number> | undefined): NativeUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
-    const graph = rewriteTargets(unitGraph, image.functionHandles, image.functionTargets, image.dataHandles, image.runtime)
-    dropUnreadFields(graph, reads)
+    const graph = rewriteTargets(unitGraph, image.functionHandles, image.dataHandles, image.runtime)
     for (const [id, n] of graph.nodes) {
         if (n.op !== 'pool-entry' || getDebugLabel(graph, id)) continue
         const label = image.labels.get(getLiteral(n, 0))
         if (label) setDebugLabel(graph, id, label)
     }
     if (isRoot) {
-        intrinsics.assert(graph.blocks[0].params.filter(p => !isContextParam(graph.nodes.get(p)!)).length <= maxRootArgs)
+        intrinsics.assert(graph.blocks[0].params.filter(p => paramLocation(graph.nodes.get(p)!) < 0).length <= maxRootArgs)
     }
     const debug = intrinsics.argv().includes('lower-debug')
         || intrinsics.argv().includes(`lower-debug:${name}`)
@@ -4406,22 +4323,48 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         throw 'native: call shapes dumped'
     }
     function localizeCalls(graph: Graph): void {
+        function valueOf(id: number): GraphNode | undefined {
+            let n = graph.nodes.get(id)
+            while (n?.op === 'after') n = graph.nodes.get(getRef(n, countIds(n) - 1))
+            return n
+        }
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== 'call') continue
-            let target = graph.nodes.get(getRef(n, 1))
-            while (target?.op === 'after') target = graph.nodes.get(getRef(target, countIds(target) - 1))
+            let target = valueOf(getRef(n, 1))
+            const signature = target?.op === 'indirect-target' ? typeRefOf(target) : 0
+            if (target?.op === 'indirect-target') target = valueOf(getRef(target, 0))
             if (target?.op !== 'heap-handle' || getRef(target, 0)) continue
             const handle = heap.deref(getLiteral(target, 0) as intrinsics.Handle)
             const slot = image.functionHandles.get(handle)
             const symbol = slot === undefined ? undefined : image.functionTargets.get(slot)
             if (symbol === undefined) continue
             const local = freshId(graph)
-            graph.nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: 2 }], resultType(graph, n)))
-            const copy = copyNode(n)
-            setRef(copy, 1, local)
-            graph.nodes.set(id, copy)
+            if (!signature) {
+                graph.nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: 2 }], resultType(graph, n)))
+                const copy = copyNode(n)
+                setRef(copy, 1, local)
+                graph.nodes.set(id, copy)
+                continue
+            }
+            const callee = units.get(symbol)!
+            const locations = callee.blocks[0].params.map(p => paramLocation(callee.nodes.get(p)!))
+            const passed = fnLocations(graph.nodes.get(signature)!)
+            const positional: Operand[] = []
+            const located = new Map<number, Operand>()
+            for (let i = 3; i < countIds(n); i++) {
+                if ((passed[i - 3] ?? -1) < 0) positional.push(getOperand(n, i))
+                else located.set(passed[i - 3], getOperand(n, i))
+            }
+            let next = 0
+            const args = locations.map(at => at >= 0 ? located.get(at) ?? { literal: 0 }
+                : next < positional.length ? positional[next++] : { literal: 0 })
+            const fnType = freshId(graph)
+            graph.nodes.set(fnType, createFnType(fnReturn(graph.nodes.get(signature)!), locations))
+            graph.nodes.set(local, makeNode('local-target', [{ literal: symbol }, { literal: 2 }], { ref: fnType }))
+            graph.nodes.set(id, copyNode(n, [getOperand(n, 0), local, getOperand(n, 2), ...args]))
         }
     }
+    const units = new Map(pending.map(unit => [unit.symbol, unit.graph]))
     for (const unit of pending) localizeCalls(unit.graph)
     const program: ProgramGraph = { units: new Map(), roots, noInline: new Set(), image, target }
     for (const unit of pending) {
