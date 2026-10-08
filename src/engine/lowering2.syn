@@ -9844,7 +9844,7 @@ function retFor(g: Graph, exits: Map<number, number>, n: GraphNode, operand: (id
     return copyNode(ret, [at < 0 ? { literal: getLiteral(ret, 0) } : operand(getRef(n, at + 1)) || { literal: getLiteral(n, at + 1) }])
 }
 
-function coveredRegion(g: Graph, uses: Map<number, number>, arm: number, params?: Set<number>): boolean{
+function coveredRegion(g: Graph, uses: Map<number, number>, arm: number, params?: Set<number>, passed?: Set<number>): boolean{
     const refs = new Map<number, number>()
     const epoch = nextEpoch(g)
     const stack = [arm]
@@ -9853,7 +9853,7 @@ function coveredRegion(g: Graph, uses: Map<number, number>, arm: number, params?
         for (const x of getArgIds(g.nodes.get(next)!)) {
             if (!x) continue
             const u = g.nodes.get(x)!
-            if (u.op === 'param') {
+            if (u.op === 'param' || passed?.has(x)) {
                 params?.add(x)
                 continue
             }
@@ -9869,12 +9869,112 @@ function coveredRegion(g: Graph, uses: Map<number, number>, arm: number, params?
     return true
 }
 
+// TODO: factor out baggage claim and use it here, it would be more accurate.
+function sharedArmValues(g: Graph, select: GraphNode, memo: Map<GraphNode, { every: Set<number>, arms: Set<number>[] }>): Set<number> {
+    const none = new Set<number>()
+    const control = (n: GraphNode) => n.op === 'apply' || n.op === 'ret' || n.op === 'select' || n.op === 'after'
+    const shareable = (id: number) => {
+        const n = g.nodes.get(id)
+        return !!n && !isArgless(n) && n.op !== 'param' && !control(n)
+    }
+    for (let i = 1; i < countIds(select); i++) {
+        const arm = g.nodes.get(getRef(select, i))
+        if (!arm || ((arm.op === 'apply' || arm.op === 'ret') && !getArgIds(arm).some(x => x && shareable(x)))) return none
+    }
+    function certain(id: number, into: Set<number>): Set<number> {
+        const stack = [id]
+        while (stack.length) {
+            const x = stack.pop()!
+            if (!x || into.has(x)) continue
+            into.add(x)
+            const n = g.nodes.get(x)
+            if (!n || n.op === 'block') continue
+            if (n.op === 'select') {
+                stack.push(getRef(n, 0))
+                for (const y of armsShare(n).every) into.add(y)
+                continue
+            }
+            for (const y of getArgIds(n)) if (y) stack.push(y)
+        }
+        return into
+    }
+    function armsShare(n: GraphNode): { every: Set<number>, arms: Set<number>[] } {
+        const known = memo.get(n)
+        if (known) return known
+        const arms: Set<number>[] = []
+        let every: Set<number> | undefined
+        for (let i = 1; i < countIds(n) && (!every || every.size); i++) {
+            const arm = getRef(n, i) ? certain(getRef(n, i), new Set()) : new Set<number>()
+            arms.push(arm)
+            every = every ? new Set([...every].filter(x => arm.has(x))) : arm
+        }
+        const out = { every: every ?? none, arms }
+        memo.set(n, out)
+        return out
+    }
+    const { every: shared, arms } = armsShare(select)
+    if (![...shared].some(shareable)) return none
+    const condition = certain(getRef(select, 0), new Set())
+    const out = new Set<number>()
+    for (const arm of arms) {
+        for (const m of arm) {
+            const n = g.nodes.get(m)
+            if (!n || shared.has(m) || control(n)) continue
+            for (const x of getArgIds(n)) if (x && shared.has(x) && !condition.has(x) && shareable(x)) out.add(x)
+        }
+    }
+    return out
+}
+
+function shareArmValues(g: Graph): boolean {
+    let changed = false
+    const memo = new Map<GraphNode, { every: Set<number>, arms: Set<number>[] }>()
+    function sorted(b: GraphBlock, params: Set<number>, passed: Set<number>): number[] {
+        const order = [...b.params, ...passed]
+        return [...params].sort((x, y) => order.indexOf(x) - order.indexOf(y))
+    }
+    for (let i = 0; i < g.blocks.length; i++) {
+        const b = g.blocks[i]
+        const root = g.nodes.get(b.bodyId)
+        const passed = root?.op === 'select' ? sharedArmValues(g, root, memo) : new Set<number>()
+        if (passed.size) {
+            const params = new Set<number>()
+            coveredRegion(g, countUses(g, b.bodyId), b.bodyId, params, passed)
+            b.bodyId = moveRegion(g, sorted(b, params, passed), b.bodyId)
+            changed = true
+            continue
+        }
+        const uses = countUses(g, b.bodyId)
+        function visit(id: number): void {
+            const n = g.nodes.get(id)
+            if (n?.op === 'after') return visit(getRef(n, countIds(n) - 1))
+            if (n?.op !== 'select') return
+            for (let k = 1; k < countIds(n); k++) {
+                const arm = getRef(n, k)
+                const u = arm ? g.nodes.get(tailOf(g, arm)) : undefined
+                if (u?.op !== 'select') continue
+                const inner = sharedArmValues(g, u, memo)
+                const params = new Set<number>()
+                if (!inner.size || !coveredRegion(g, uses, arm, params, inner)) {
+                    visit(arm)
+                    continue
+                }
+                setRef(n, k, moveRegion(g, sorted(b, params, inner), arm))
+                changed = true
+            }
+        }
+        visit(b.bodyId)
+    }
+    return changed
+}
+
 function moveRegion(g: Graph, params: number[], arm: number): number {
     const r = new Map<number, number>()
     const newParams: number[] = []
     for (const p of params) {
         const id = g.maxId++
-        g.nodes.set(id, paramNode())
+        const n = g.nodes.get(p)!
+        g.nodes.set(id, n.op === 'param' ? paramNode() : makeNode('param', [], typeRefOf(n) ? { ref: typeRefOf(n) } : resultType(g, n)))
         r.set(p, id)
         newParams.push(id)
     }
@@ -10669,7 +10769,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target): Graph {
 
 export function prepareValueGraph(g: Graph, target: lowering.Target): Graph {
     g = expandValueGraph(g, target)
-    g = runPipeline('shape', g, target.costs, [stripMem, outlineBlocks, cloneExits, splitTailSelects, hoistSharedArms, isolateSelectArms, sweepBlocks, narrowTypes, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [stripMem, outlineBlocks, cloneExits, shareArmValues, splitTailSelects, hoistSharedArms, isolateSelectArms, sweepBlocks, narrowTypes, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
