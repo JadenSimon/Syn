@@ -1970,6 +1970,7 @@ export interface MemAnalysis {
     covers(outer: GraphNode, inner: GraphNode): boolean
     clobbers(call: number, load: GraphNode, returned?: number): boolean
     flows(root: number, viaReturn: boolean): MemFlow
+    users(id: number): Iterable<number>
 }
 export interface MemFlow { own: boolean, calls: [call: number, arg: number][] }
 export interface CallOutcomes {
@@ -1978,7 +1979,15 @@ export interface CallOutcomes {
     other: [effect: number, mask: number] | undefined
 }
 
-const outcomeSlot = 4
+const CaptureSlot = 3
+export const DeepCaptureSlot = 4
+const outcomeSlot = 5
+
+export function targetCaptures(g: Graph, call: number, k: number, slot = CaptureSlot): boolean {
+    const target = g.nodes.get(getRef(g.nodes.get(call)!, 1))
+    if (!target || target.op !== 'local-target' || getRef(target, 0) || countIds(target) <= slot || k >= 29) return true
+    return (getLiteral(target, slot) & (1 << k)) !== 0
+}
 
 export function encodeCallOutcomes(outcomes: CallOutcomes | undefined): Operand[] {
     if (!outcomes) return []
@@ -2009,6 +2018,11 @@ function targetEffects(target: GraphNode | undefined, returned?: number): [effec
         joinedMask |= getLiteral(target, at + 2)
     }
     return joined < 0 ? [0, mask & ReturnsFresh] : [joined, joinedMask | (mask & ReturnsFresh)]
+}
+
+function usedPastToken(n: GraphNode, x: number): boolean {
+    for (let i = 1; i < countIds(n); i++) if (getRef(n, i) === x) return true
+    return false
 }
 
 export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[], dependents?: (id: number) => Iterable<number>): MemAnalysis {
@@ -2321,6 +2335,8 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
                     if (getRef(n, countIds(n) - 1) === x) visit(u)
                 } else if (n.op === 'select') {
                     if (getRef(n, 1) === x || getRef(n, 2) === x) visit(u)
+                } else if (OrderedValues.has(n.op) && !usedPastToken(n, x)) {
+                    continue
                 } else if (!CompareOps.has(n.op)) {
                     if (PureOps.has(n.op)) visit(u)
                     else flow.own = true
@@ -2331,14 +2347,9 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
         flowCache.set(key, flow)
         return flow
     }
-    function captures(call: number, k: number): boolean {
-        const target = g.nodes.get(getRef(g.nodes.get(call)!, 1))
-        if (!target || target.op !== 'local-target' || getRef(target, 0) || countIds(target) < 4 || k >= 29) return true
-        return (getLiteral(target, 3) & (1 << k)) !== 0
-    }
     function escaped(root: number): boolean {
         const flow = flows(root, false)
-        return flow.own || flow.calls.some(([call, k]) => captures(call, k))
+        return flow.own || flow.calls.some(([call, k]) => targetCaptures(g, call, k))
     }
     function clobbers(call: number, load: GraphNode, returned?: number): boolean {
         const n = g.nodes.get(call)!
@@ -2361,7 +2372,7 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
         }
         return false
     }
-    return { of, access, disjoint, covers, clobbers, flows }
+    return { of, access, disjoint, covers, clobbers, flows, users: usersOf }
 }
 
 function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
@@ -6574,6 +6585,20 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             changed = true
             g.nodes.set(id, copyNode(n, [getRef(n, valueAt), { literal: shift }], 'shl'))
         }
+        for (const op of ['div', 'rem']) {
+            for (const id of findValues(target.id, op) ?? []) {
+                const n = g.nodes.get(id)!
+                if (typeOf(n) === Types.f64 || !getRef(n, 0) || getRef(n, 1)) continue
+                if (lowering.isSignedType(operandType(g, n, 0)) || lowering.isSignedType(operandType(g, n, 1))) continue
+                const divisor = getLiteral(n, 1)
+                const shift = Math.log2(divisor)
+                if (!Number.isSafeInteger(shift) || shift <= 0) continue
+                changed = true
+                g.nodes.set(id, op === 'div'
+                    ? copyNode(n, [getRef(n, 0), { literal: shift }], 'ushr')
+                    : copyNode(n, [getRef(n, 0), { literal: divisor - 1 }], 'and'))
+            }
+        }
         for (const id of findValues(target.id, 'load') ?? []) foldOffset(id)
         for (const id of findValues(target.id, 'store') ?? []) foldOffset(id)
         for (const id of findValues(target.id, 'eq') ?? []) foldTest(id)
@@ -10596,9 +10621,127 @@ export function normalizeValueGraph(g: Graph, opts: { firstPass?: boolean, targe
     return optimizePackaged(g, target)
 }
 
+function demotePstacks(g: Graph): boolean {
+    const mem = memAnalysis(g)
+    const { loopDepth, loopsOf } = graphLoops(g)
+    const owner = new Map<number, number>()
+    const bodies = new Set<number>()
+    for (const b of g.blocks) {
+        bodies.add(b.bodyId)
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id || owner.has(id)) continue
+            const n = g.nodes.get(id)
+            if (!n || n.op === 'param') continue
+            owner.set(id, b.id)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    const loadsFrom = new Map<number, number[]>()
+    for (const [id, n] of g.nodes) {
+        if (n.op !== 'load' || !getRef(n, 1)) continue
+        const base = mem.of(getRef(n, 1)).base
+        const list = loadsFrom.get(base)
+        if (list) list.push(id)
+        else loadsFrom.set(base, [id])
+    }
+    const container = (id: number) => {
+        const n = g.nodes.get(id)
+        return n?.op === 'pstack' && !getRef(n, 2) && !getLiteral(n, 2)
+    }
+    const verdicts = new Map<number, boolean>()
+    function escapes(root: number, headers?: Set<number>): boolean {
+        const known = headers ? undefined : verdicts.get(root)
+        if (known !== undefined) return known
+        if (!headers) verdicts.set(root, true)
+        const seen = new Set<number>([root])
+        const work = [root]
+        const follow = (x: number) => {
+            if (seen.has(x)) return
+            seen.add(x)
+            work.push(x)
+        }
+        let escaped = false
+        while (work.length && !escaped) {
+            const x = work.pop()!
+            for (const u of mem.users(x)) {
+                const n = g.nodes.get(u)!
+                const ordering = n.op === 'after' ? countIds(n) - 1 : OrderedValues.has(n.op) ? 1 : 0
+                for (let i = ordering; i < countIds(n) && !escaped; i++) {
+                    if (getRef(n, i) !== x) continue
+                    if (n.op === 'load') continue
+                    if (n.op === 'store') {
+                        if (i !== 3) continue
+                        if (headers) { escaped = true; break }
+                        const into = mem.of(getRef(n, 1)).base
+                        if (into === root || !container(into) || escapes(into)) { escaped = true; break }
+                        if (mem.flows(into, true).calls.some(([call, k]) => targetCaptures(g, call, k, DeepCaptureSlot))) { escaped = true; break }
+                        for (const l of loadsFrom.get(into) ?? []) follow(l)
+                    } else if (n.op === 'call') {
+                        if (i < 3 || targetCaptures(g, u, i - 3)) escaped = true
+                    } else if (n.op === 'apply') {
+                        const param = getBlock(g, getRef(n, 0))?.params[i - 1]
+                        if (param === undefined || headers?.has(getRef(n, 0))) escaped = true
+                        else follow(param)
+                    } else if (n.op === 'after' || n.op === 'select' || (PureOps.has(n.op) && !TargetingValues.has(n.op))) {
+                        follow(u)
+                    } else if (!CompareOps.has(n.op)) {
+                        escaped = true
+                    }
+                }
+                if (escaped) break
+            }
+        }
+        if (!headers) verdicts.set(root, escaped)
+        return escaped
+    }
+    const candidates = new Set<number>()
+    const iterationLocal = new Set<number>()
+    for (const [id, n] of g.nodes) {
+        if (n.op !== 'pstack' || getRef(n, 2) || getLiteral(n, 2) || getRef(n, 3) || !getLiteral(n, 3)) continue
+        if (bodies.has(id)) continue
+        if (!loopDepth.get(owner.get(id) ?? -1)) {
+            if (!escapes(id)) candidates.add(id)
+            continue
+        }
+        if (escapes(id, new Set(loopsOf.get(owner.get(id)!) ?? []))) continue
+        candidates.add(id)
+        iterationLocal.add(id)
+    }
+    if (!candidates.size) return false
+    const tokenOf = (id: number): Operand => {
+        let operand = getOperand(g.nodes.get(id)!, 0)
+        while (typeof operand === 'number' && candidates.has(operand)) operand = getOperand(g.nodes.get(operand)!, 0)
+        return operand
+    }
+    const demoted = new Map<number, number>()
+    for (const id of candidates) {
+        let token = tokenOf(id)
+        if (iterationLocal.has(id)) g.nodes.set(token = g.maxId++, makeNode('nil-effect', []))
+        const alloca = g.maxId++
+        g.nodes.set(alloca, makeNode('alloca', [token, { literal: getLiteral(g.nodes.get(id)!, 3) }, { literal: 8 }]))
+        demoted.set(id, alloca)
+    }
+    for (const [id, n] of [...g.nodes]) {
+        let copy: GraphNode | undefined
+        const ordering = n.op === 'after' ? countIds(n) - 1 : OrderedValues.has(n.op) ? 1 : 0
+        for (let i = 0; i < countIds(n); i++) {
+            const alloca = demoted.get(getRef(n, i))
+            if (alloca === undefined) continue
+            copy ??= copyNode(n)
+            if (i < ordering) setOperand(copy, i, tokenOf(getRef(n, i)))
+            else setRef(copy, i, alloca)
+        }
+        if (copy) g.nodes.set(id, copy)
+    }
+    for (const id of candidates) g.nodes.delete(id)
+    return true
+}
+
 export function expandValueGraph(g: Graph, target: lowering.Target): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
-    const expanded = runPipeline('expand', g, target.costs, [expandCodecs, expandPstacks])
+    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, expandCodecs, expandPstacks])
     g = expanded.graph
     if (expanded.changed || g.form === 'packaged') g = optimizePackaged(g, target)
     return g

@@ -861,7 +861,7 @@ function capturedBy(flow: Flow, captures: Map<number, number>): boolean {
 
 interface RetEffect { value: number | undefined, self: number, writes: number, calls: CallWrites[], through?: number, excludes?: number }
 
-interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], fresh: boolean, params: Flow[], returned: Flow[], rets: RetEffect[] }
+interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], fresh: boolean, params: Flow[], loaded: Flow[][], returned: Flow[], rets: RetEffect[] }
 
 function throughCall(ret: RetEffect): CallWrites | undefined {
     return ret.through === undefined ? undefined : ret.calls.find(c => c.node === ret.through)
@@ -931,6 +931,20 @@ function captureMask(effects: GraphEffects, captures: Map<number, number>): numb
     return mask
 }
 
+function deepCaptureMask(effects: GraphEffects, captures: Map<number, number>, deep: Map<number, number>): number {
+    const through = (flow: Flow) => flow.calls.some(([callee, k]) => callee < 0 || k >= 29 || ((deep.get(callee) ?? CapturesAll) & (1 << k)) !== 0)
+    let mask = 0
+    effects.params.forEach((flow, k) => {
+        if (k >= 29) return
+        if (through(flow) || effects.loaded[k].some(inner => capturedBy(inner, captures) || through(inner))) mask |= 1 << k
+    })
+    return mask
+}
+
+function mayHoldPointer(T: number): boolean {
+    return T !== Types.u8 && T !== Types.u16 && T !== Types.i8 && T !== Types.i16 && T !== Types.bool && T !== Types.f16 && T !== Types.f32 && T !== Types.f64
+}
+
 function returnsFresh(effects: GraphEffects, captures: Map<number, number>): boolean {
     return effects.fresh && effects.returned.every(flow => !capturedBy(flow, captures))
 }
@@ -950,6 +964,26 @@ function graphEffects(graph: Graph): GraphEffects {
         else returned.push(symbolFlow(graph, mem.flows(m.base, false)))
     }
     const params = graph.blocks[0].params.map(p => symbolFlow(graph, mem.flows(p, true)))
+    const loadsFrom = new Map<number, number[]>()
+    for (const [id, n] of graph.nodes) {
+        if (n.op !== 'load' || !getRef(n, 1) || !mayHoldPointer(typeOf(n))) continue
+        const base = mem.of(getRef(n, 1)).base
+        loadsFrom.set(base, [...loadsFrom.get(base) ?? [], id])
+    }
+    const loaded = graph.blocks[0].params.map(p => {
+        const out: Flow[] = []
+        const seen = new Set<number>([p])
+        const roots = [p]
+        while (roots.length) {
+            for (const id of loadsFrom.get(roots.pop()!) ?? []) {
+                if (seen.has(id)) continue
+                seen.add(id)
+                out.push(symbolFlow(graph, mem.flows(id, true)))
+                roots.push(id)
+            }
+        }
+        return out
+    })
     const none: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
     function chain(roots: number[]): RetEffect {
         const out: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
@@ -1041,18 +1075,19 @@ function graphEffects(graph: Graph): GraphEffects {
     }
     return {
         self: whole.self, callees: whole.calls.map(c => c.callee), writes: whole.writes, calls: whole.calls,
-        fresh: fresh && returns > 0, params, returned, rets,
+        fresh: fresh && returns > 0, params, loaded, returned, rets,
     }
 }
 
-function refineCallEffects(graph: Graph, classes: Map<number, number>, masks: Map<number, number>, fresh: Set<number>, captures: Map<number, number>, outcomes: Map<number, CallOutcomes>): boolean {
+function refineCallEffects(graph: Graph, classes: Map<number, number>, masks: Map<number, number>, fresh: Set<number>, captures: Map<number, number>, outcomes: Map<number, CallOutcomes>, deep: Map<number, number>): boolean {
     let refined = false
     for (const [id, n] of graph.nodes) {
         if (n.op !== 'local-target' || getRef(n, 0) || countIds(n) < 2) continue
         const c = classes.get(getLiteral(n, 0)) ?? EffectWrite
         const mask = (c === EffectWrite ? masks.get(getLiteral(n, 0)) ?? WritesUnknown : 0) | (fresh.has(getLiteral(n, 0)) ? ReturnsFresh : 0)
         const captured = captures.get(getLiteral(n, 0)) ?? CapturesAll
-        const operands: Operand[] = [getOperand(n, 0), { literal: c }, { literal: mask }, { literal: captured }, ...encodeCallOutcomes(outcomes.get(getLiteral(n, 0)))]
+        const deepCaptured = deep.get(getLiteral(n, 0)) ?? CapturesAll
+        const operands: Operand[] = [getOperand(n, 0), { literal: c }, { literal: mask }, { literal: captured }, { literal: deepCaptured }, ...encodeCallOutcomes(outcomes.get(getLiteral(n, 0)))]
         if (countIds(n) === operands.length && operands.every((x, i) => !i || getLiteral(n, i) === (x as { literal: number }).literal)) continue
         graph.nodes.set(id, copyNode(n, operands))
         refined = true
@@ -1060,7 +1095,7 @@ function refineCallEffects(graph: Graph, classes: Map<number, number>, masks: Ma
     return refined
 }
 
-function classifyEffects(units: Map<number, Graph>, fresh: Set<number>, captures: Map<number, number>): { classes: Map<number, number>, masks: Map<number, number>, outcomes: Map<number, CallOutcomes> } {
+function classifyEffects(units: Map<number, Graph>, fresh: Set<number>, captures: Map<number, number>, deep: Map<number, number>): { classes: Map<number, number>, masks: Map<number, number>, outcomes: Map<number, CallOutcomes> } {
     const classes = new Map<number, number>()
     const masks = new Map<number, number>()
     const own = new Map<number, number>()
@@ -1075,6 +1110,7 @@ function classifyEffects(units: Map<number, Graph>, fresh: Set<number>, captures
         masks.set(symbol, effects.writes)
         calls.set(symbol, effects.calls)
         captures.set(symbol, 0)
+        deep.set(symbol, 0)
     }
     for (const [symbol, out] of calls) {
         for (const call of out) {
@@ -1094,10 +1130,12 @@ function classifyEffects(units: Map<number, Graph>, fresh: Set<number>, captures
             if (c === undefined || c === EffectWrite) mask |= calleeWrites(c === undefined ? undefined : masks.get(call.callee), call.args)
         }
         const captured = captureMask(summaries.get(symbol)!, captures)
-        if (want === classes.get(symbol) && mask === masks.get(symbol) && captured === captures.get(symbol)) continue
+        const deepCaptured = deepCaptureMask(summaries.get(symbol)!, captures, deep)
+        if (want === classes.get(symbol) && mask === masks.get(symbol) && captured === captures.get(symbol) && deepCaptured === deep.get(symbol)) continue
         classes.set(symbol, want)
         masks.set(symbol, mask)
         captures.set(symbol, captured)
+        deep.set(symbol, deepCaptured)
         for (const caller of callers.get(symbol) ?? []) work.push(caller)
     }
     const outcomes = new Map<number, CallOutcomes>()
@@ -2175,7 +2213,8 @@ function prune(program: ProgramGraph): void {
 function refineProgramEffects(program: ProgramGraph, clock: PhaseClock): void {
     const passFresh = new Set<number>()
     const passCaptures = new Map<number, number>()
-    const effectSummary = classifyEffects(program.units, passFresh, passCaptures)
+    const passDeep = new Map<number, number>()
+    const effectSummary = classifyEffects(program.units, passFresh, passCaptures, passDeep)
     const effectClasses = effectSummary.classes
     if (intrinsics.argv().includes('native-effects')) {
         const counts = [0, 0, 0]
@@ -2203,7 +2242,7 @@ function refineProgramEffects(program: ProgramGraph, clock: PhaseClock): void {
         console.log('native effects total', EffectNames.map((n, i) => `${n}=${counts[i]}`).join(' '))
     }
     for (const [symbol, graph] of program.units) {
-        if (callEffects && refineCallEffects(graph, effectClasses, effectSummary.masks, passFresh, passCaptures, effectSummary.outcomes)) graph.form = 'packaged'
+        if (callEffects && refineCallEffects(graph, effectClasses, effectSummary.masks, passFresh, passCaptures, effectSummary.outcomes, passDeep)) graph.form = 'packaged'
         if (graph.form === 'packaged') program.units.set(symbol, clock.timed('normalize', () => optimizePackaged(graph, program.target)))
     }
 }
