@@ -47,6 +47,7 @@ export interface Graph {
     debugLabels: Map<number, string>
     name?: string
     level?: number
+    unswitch?: number
 }
 
 export function isParam(nodes: Map<number, GraphNode>, id: number): boolean {
@@ -1914,6 +1915,7 @@ export function isJumbo(g: Graph): boolean {
 const optimizeRounds = Number(intrinsics.argv().find(a => a.startsWith('optimize-rounds:'))?.slice(16) ?? 0)
 const disabledPasses = new Set(intrinsics.argv().filter(a => a.startsWith('no-pass:')).map(a => a.slice(8)))
 const unswitchScan = intrinsics.argv().includes('unswitch-scan')
+const UnswitchableOps = new Set(['eq', 'ne', 'lt', 'le', 'gt', 'ge', 'and', 'or', 'xor', 'add', 'sub', 'shl', 'shr', 'ushr', 'not', 'neg'])
 
 function debugsGraph(flag: string, g: Graph): boolean {
     return intrinsics.argv().includes(flag) || (g.name !== undefined && intrinsics.argv().includes(`${flag}:${g.name}`))
@@ -3704,6 +3706,121 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             if (selects) console.log(`UNSWITCH ${g.name} B${header.id} blocks=${members.size} nodes=${nodes} invariants=${new Set(invariant.values()).size} conditions=${conditions.size} selects=${selects} exiting=${exits.size}`)
         }
+    }
+
+    let unswitched = false
+    function unswitchLoop(header: GraphBlock) {
+        if (!g.unswitch || unswitched || header === g.blocks[0]) return
+        if (preds.get(header.id)!.size === 1) return
+        const members = loopMembers(header)
+        if (![...(preds.get(header.id) ?? [])].some(p => members.has(p))) return
+        const entries = findInboundApplies(header).filter(([from]) => !members.has(from))
+        if (entries.length !== 1) return
+        for (const m of members) if (m !== header.id && [...(preds.get(m) ?? [])].some(p => !members.has(p))) return
+        const owned = new Map<number, number[]>()
+        let size = 0
+        for (const m of members) {
+            const ids: number[] = []
+            for (const list of byOp.get(m)?.values() ?? []) ids.push(...list)
+            owned.set(m, ids)
+            size += ids.length
+        }
+        if (size > g.unswitch) return
+        const slotOf = new Map<number, number>()
+        for (let slot = 0; slot < header.params.length; slot++) {
+            const chain = relayChain(header, slot, members)
+            if (chain) for (const [b, k] of chain) slotOf.set(getGraphBlock(b).params[k], slot)
+        }
+        if (!slotOf.size) return
+        const keyOf = (id: number): string | undefined => {
+            if (slotOf.has(id)) return `p${slotOf.get(id)}`
+            const n = g.nodes.get(id)
+            if (!n || !UnswitchableOps.has(n.op) || !countIds(n)) return
+            const parts: string[] = [n.op]
+            for (let i = 0; i < countIds(n); i++) {
+                const r = getRef(n, i)
+                if (r && !slotOf.has(r)) return
+                parts.push(r ? `p${slotOf.get(r)}` : `#${getLiteral(n, i)}`)
+            }
+            return parts.join(' ')
+        }
+        const stays = (id: number) => tailPositions(g, id).every(p => {
+            const t = g.nodes.get(p.at)
+            return t?.op !== 'ret' && !(t?.op === 'apply' && !members.has(getRef(t, 0)))
+        })
+        const control = (id: number) => ['apply', 'select', 'after', 'ret'].includes(g.nodes.get(id)?.op ?? '')
+        const votes = new Map<string, [condition: number, selects: number]>()
+        for (const m of members) for (const id of findValues(m, 'select') ?? []) {
+            const n = g.nodes.get(id)!
+            let inside = true
+            let tail = false
+            for (let i = 1; i < countIds(n); i++) {
+                if (!getRef(n, i)) continue
+                if (control(getRef(n, i))) tail = true
+                if (!stays(getRef(n, i))) inside = false
+            }
+            if (!inside) continue
+            if (!tail && ![...(dependents.get(id) ?? [])].some(u => g.nodes.get(u)?.op !== 'apply' || members.has(getRef(g.nodes.get(u)!, 0)))) continue
+            const k = keyOf(getRef(n, 0))
+            if (k === undefined) continue
+            const known = votes.get(k)
+            votes.set(k, [known?.[0] ?? getRef(n, 0), (known?.[1] ?? 0) + 1])
+        }
+        let chosen: number | undefined
+        let key: string | undefined
+        let best = 0
+        for (const [k, [c, count]] of votes) if (count > best) { best = count; key = k; chosen = c }
+        if (chosen === undefined) return
+        const fixed = new Set<number>()
+        for (const p of slotOf.keys()) if (keyOf(p) === key) fixed.add(p)
+        for (const ids of owned.values()) for (const id of ids) if (keyOf(id) === key) fixed.add(id)
+        const [entryBlock, entry] = entries[0]
+        const e = g.nodes.get(entry)!
+        let condition: Operand
+        if (slotOf.has(chosen)) condition = getOperand(e, slotOf.get(chosen)! + 1)
+        else {
+            const c = g.nodes.get(chosen)!
+            const operands = getOperands(c)
+            for (let i = 0; i < countIds(c); i++) if (getRef(c, i)) operands[i] = getOperand(e, slotOf.get(getRef(c, i))! + 1)
+            condition = insert(copyNode(c, operands))
+        }
+        function clone(value: number): number {
+            const blocks = new Map<number, number>()
+            for (const m of members) blocks.set(m, addNode('block', []))
+            for (const m of members) {
+                const b = getGraphBlock(m)
+                const copies = new Map<number, number>()
+                const literal = insert(makeNode('literal', [{ literal: value }]))
+                for (const id of fixed) copies.set(id, literal)
+                function copy(id: number): number {
+                    if (!id) return id
+                    const known = copies.get(id) ?? blocks.get(id)
+                    if (known !== undefined) return known
+                    const n = g.nodes.get(id)!
+                    if (n.op === 'block') return id
+                    const fresh = g.maxId++
+                    copies.set(id, fresh)
+                    const copied = copyNode(n, getOperands(n).map(x => typeof x === 'number' ? copy(x) : x))
+                    if (n.op === 'nil-effect' && countLiterals(n)) setLiteral(copied, 0, blocks.get(getLiteral(n, 0)) ?? getLiteral(n, 0))
+                    if (typeRefOf(n)) setType(copied, { ref: copy(typeRefOf(n)) })
+                    g.nodes.set(fresh, copied)
+                    return fresh
+                }
+                const params = b.params.map(p => fixed.has(p) ? insert(copyNode(g.nodes.get(p)!)) : copy(p))
+                addGraphBlock(g, { ...b, id: blocks.get(m)!, params, bodyId: copy(b.bodyId) })
+            }
+            const operands = getOperands(e)
+            operands[0] = blocks.get(header.id)!
+            return insert(copyNode(e, operands))
+        }
+        const arms = [clone(1), clone(0)]
+        const from = getGraphBlock(entryBlock)
+        from.bodyId = replaceAll(from.bodyId, new Map([[entry, addNode('select', [condition, arms[0], arms[1]])]]))
+        for (const m of members) removeBlock(getGraphBlock(m))
+        g.unswitch -= size
+        unswitched = true
+        revisitBlock(from)
+        return true
     }
 
     function relayChain(header: GraphBlock, slot: number, members: Set<number>): Map<number, number> | undefined {
@@ -8208,6 +8325,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (closeDoublingLoops && step(closeDoublingLoop, b)) continue
             if (step(closeCountedLoop, b)) continue
             step(reverseLoop, b)
+            if (step(unswitchLoop, b)) continue
             step(hoistInvariants, b)
             step(hoistLoopInvariants, b)
             step(sinkReloadedStores, b)
@@ -8297,6 +8415,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     for (let round = 0; round < maxRounds; round++) {
         const roundStart = performance.now()
         didAnyChange = false
+        unswitched = false
         optimize()
         if (optimizeTimers) time(`(round ${round})`, performance.now() - roundStart)
         if (!didAnyChange) break
