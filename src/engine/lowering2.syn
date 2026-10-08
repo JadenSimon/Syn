@@ -483,7 +483,8 @@ const CompareOps = new Set<string>(['lt', 'le', 'gt', 'ge', 'eq', 'ne'])
 const InverseCompare: Record<string, string> = {
     eq: 'ne', ne: 'eq', lt: 'ge', ge: 'lt', le: 'gt', gt: 'le',
 }
-const UnaryOps = new Set<string>(['neg', 'not'])
+const UnaryOps = new Set<string>(['neg', 'not', 'clz'])
+const closeDoublingLoops = intrinsics.argv().includes('close-doubling-loops')
 export const NumericOps = new Set<string>([...BinaryOps, ...CompareOps, ...UnaryOps])
 
 type Range = [lo: number, hi: number]
@@ -783,7 +784,7 @@ function firstNonOrderingSlot(n: GraphNode): number {
 const PureOps = new Set<string>([
     'mem',
     'add', 'sub', 'mul', 'div', 'rem', 'pow', 'or', 'and', 'xor', 'shl', 'shr', 'ushr', 'subsat',
-    'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'select', 'convert', 'bitconvert',
+    'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'neg', 'not', 'clz', 'select', 'convert', 'bitconvert',
     'pool-entry', 'void', 'param', 'heap-handle', 'nil-effect', 'block', 
     'literal', 'get', 'record', 'unreachable', 'alloca', 'frame-address', 'pc', 'encode', 'decode', 'box', 'unbox',
     ...TargetingValues
@@ -1949,7 +1950,7 @@ export const MemFresh = 0, MemPre = 1, MemUnknown = 2, MemInt = 3
 export const WritesUnknown = 1 << 30
 export const ReturnsFresh = 1 << 29
 export const CapturesAll = (1 << 29) - 1
-const IntegerOps = new Set(['mul', 'div', 'rem', 'pow', 'shl', 'shr', 'ushr', 'xor', 'neg', 'not', 'lt', 'le', 'gt', 'ge', 'eq', 'ne'])
+const IntegerOps = new Set(['mul', 'div', 'rem', 'pow', 'shl', 'shr', 'ushr', 'xor', 'neg', 'not', 'clz', 'lt', 'le', 'gt', 'ge', 'eq', 'ne'])
 const MemAbsolute = 0
 export interface Mem { base: number, pos: number | undefined, kind: number, pending?: boolean }
 export interface MemAnalysis {
@@ -4475,6 +4476,61 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         operands[ivAt + 1] = addNode('add', [iv, { literal: step * factor }], increment)
         g.nodes.set(self[0][1], copyNode(back, operands))
         revisitBlock(target)
+        return true
+    }
+
+    function closeDoublingLoop(target: GraphBlock) {
+        if (!preds.get(target.id)?.has(target.id)) return
+        const tail = g.nodes.get(target.bodyId)
+        if (!tail || tail.op !== 'select' || countIds(tail) !== 3) return
+        const inbound = findInboundApplies(target)
+        const self = inbound.filter(x => x[0] === target.id)
+        const entries = inbound.filter(x => x[0] !== target.id)
+        if (self.length !== 1 || !entries.length || getRef(tail, 1) !== self[0][1]) return
+        const exit = g.nodes.get(getRef(tail, 2))
+        const cond = g.nodes.get(getRef(tail, 0))
+        if (!exit || exit.op !== 'apply' || !cond || cond.op !== 'lt') return
+        const at = target.params.indexOf(getRef(cond, 0))
+        if (at < 0) return
+        const back = g.nodes.get(self[0][1])!
+        const doubled = g.nodes.get(getRef(back, at + 1))
+        if (!doubled || doubled.op !== 'shl' || getRef(doubled, 0) !== target.params[at] || getRef(doubled, 1) || getLiteral(doubled, 1) !== 1) return
+        for (let i = 0; i < target.params.length; i++) if (i !== at && getRef(back, i + 1) !== target.params[i]) return
+        const bound = getRef(cond, 1)
+        if (bound && !target.params.includes(bound)) return
+        const body = new Set([target.bodyId, getRef(tail, 0), getRef(back, at + 1), self[0][1], getRef(tail, 2)])
+        for (const id of body) {
+            const n = g.nodes.get(id)!
+            for (const r of getArgIds(n)) if (r && !body.has(r) && !target.params.includes(r) && g.nodes.get(r)?.op !== 'block') return
+        }
+        const touched: number[] = []
+        for (const [blockId, appId] of entries) {
+            const app = g.nodes.get(appId)!
+            const start = getLiteral(app, at + 1)
+            if (getRef(app, at + 1) || start < 1 || !Number.isSafeInteger(Math.log2(start))) continue
+            const argOf = (p: number): Operand => {
+                const i = target.params.indexOf(p)
+                return getRef(app, i + 1) || { literal: getLiteral(app, i + 1) }
+            }
+            const limit: Operand = bound ? argOf(bound) : { literal: getLiteral(cond, 1) }
+            const below = addNode('lt', [{ literal: start }, limit], cond)
+            const highest = addNode('clz', [addNode('sub', [limit, { literal: 1 }], doubled)])
+            const rounded = addNode('shl', [{ literal: 1 }, addNode('neg', [highest])], doubled)
+            const leave = (final: Operand) => {
+                const operands = getOperands(exit)
+                for (let i = 1; i < operands.length; i++) {
+                    const ref = getRef(exit, i)
+                    if (ref === target.params[at]) operands[i] = final
+                    else if (target.params.includes(ref)) operands[i] = argOf(ref)
+                }
+                return addNode('apply', operands, exit)
+            }
+            const caller = getGraphBlock(blockId)
+            caller.bodyId = replaceAll(caller.bodyId, new Map([[appId, addNode('select', [below, leave(rounded), leave({ literal: start })])]]))
+            touched.push(blockId)
+        }
+        if (!touched.length) return
+        for (const blockId of touched) revisitBlock(getGraphBlock(blockId))
         return true
     }
 
@@ -8149,6 +8205,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (const b of reachableBlocks) {
             step(deriveIncrementor, b)
             step(widenCountedStores, b)
+            if (closeDoublingLoops && step(closeDoublingLoop, b)) continue
             if (step(closeCountedLoop, b)) continue
             step(reverseLoop, b)
             step(hoistInvariants, b)
