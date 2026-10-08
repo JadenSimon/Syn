@@ -774,7 +774,7 @@ function comparesFloats(g: Graph, c: GraphNode): boolean {
 const TargetingValues = new Set([
     'syscall-target', 'local-target', 'indirect-target'
 ])
-const OrderedValues = new Set([
+export const OrderedValues = new Set([
     'load', 'store', 'call', 'pstack', 'rt'
 ])
 function firstNonOrderingSlot(n: GraphNode): number {
@@ -8190,7 +8190,7 @@ export function assignBlockSignatures(
     applyOwner: Map<number, number>,
     staticBudget: number,
     volatileHomes: { safeFor: (v: number) => number[], volatiles: number[] },
-    arrivals: { entry: number[], call: (call: number, index: number) => number },
+    arrivals: { entry: number[], entryStatic: number[], call: (call: number, index: number, value: number) => number },
 ): Map<number, ParamSlot[]> {
     const owner = new Map<number, number>()
     const parent = new Map<number, number>()
@@ -8204,7 +8204,7 @@ export function assignBlockSignatures(
             owner.set(p, b.id)
             parent.set(p, p)
             occupies.set(p, new Set([b.id]))
-            if (shouldSpillUntil.has(p)) { rigid.add(p); hardRigid.add(p) }
+            if (shouldSpillUntil.has(p) || (b === g.blocks[0] && arrivals.entryStatic[i] >= 0)) { rigid.add(p); hardRigid.add(p) }
         }
     }
     function find(x: number): number {
@@ -8229,7 +8229,7 @@ export function assignBlockSignatures(
     for (const [v, positions] of inArgPos) {
         if (!owner.has(v)) continue
         for (const at of positions) {
-            if (g.nodes.get(at[0])?.op === 'call') prefer(v, arrivals.call(at[0], at[1]))
+            if (g.nodes.get(at[0])?.op === 'call') prefer(v, arrivals.call(at[0], at[1], v))
         }
     }
     const staticWidth = new Map<number, number>()
@@ -8313,7 +8313,8 @@ export function assignBlockSignatures(
     const pinned = new Map<number, number>()
     for (let i = 0; i < g.blocks[0].params.length; i++) {
         const root = find(g.blocks[0].params[i])
-        if (rigid.has(root) || pinned.has(root)) continue
+        if (arrivals.entryStatic[i] >= 0 && !pinned.has(root)) pinned.set(root, arrivals.entryStatic[i])
+        if (rigid.has(root) || pinned.has(root) || arrivals.entry[i] < 0) continue
         pinned.set(root, arrivals.entry[i])
     }
     const rank = (x: number) => (pinned.has(x) ? 2 : 0) + (wants.has(x) ? 1 : 0)
@@ -8386,7 +8387,7 @@ export function assignBlockSignatures(
     return out
 }
 
-function substitute(g: Graph, by: Map<number, Operand>): void {
+export function substitute(g: Graph, by: Map<number, Operand>): void {
     function resolve(id: number): Operand {
         let at: Operand = id
         while (typeof at === 'number' && by.has(at)) at = by.get(at)!
@@ -10786,13 +10787,26 @@ function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
     for (const b of g.blocks) b.bodyId = target(b.bodyId)
 }
 
-export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
-    // if (!opts.debug && _g.name && intrinsics.argv().includes(`lower-debug:${_g.name}`)) {
-    //     opts.debug = true
-    // }
+export interface PreparedLowering {
+    g: Graph
+    island?: number[]
+    analysis: ReturnType<typeof analyzeValueGraph>
+}
+
+export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): PreparedLowering {
     const target = opts.target ?? lowering.hostTarget
     const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue) : undefined
+    return { g, island, analysis: analyzeValueGraph(g, opts) }
+}
+
+export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
+    return lowerPrepared(prepareLowering(_g, opts), opts)
+}
+
+export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOptions = {}): LowerGraphResult {
+    const target = opts.target ?? lowering.hostTarget
+    const { g, island, analysis } = prepared
     const floats = floatValues(g)
 
     const rootBlock = g.blocks[0]
@@ -10807,7 +10821,6 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     }
 
     const asm = target.createAssembler()
-    const analysis = analyzeValueGraph(g, opts)
     if (opts?.debug) {
         console.log(dumpGraph(g))
         const sets = (m: Map<number, Set<number>>) => [...m]
@@ -10903,7 +10916,15 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     const signatures = assignBlockSignatures(g, analysis.shouldSpillUntil,
         analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, preserved.length,
         { safeFor: safeVolatiles, volatiles },
-        { entry: entryHomes.map(ordinalOf), call: (call, i) => (argLocations(call)[i] ?? -1) < 0 ? i : -1 })
+        {
+            entry: entryHomes.map((h, i) => isPreserved(h) ? -1 : ordinalOf(h, i)),
+            entryStatic: entryHomes.map(h => isPreserved(h) ? preserved.indexOf(h) : -1),
+            call: (call, i, v) => {
+                if ((argLocations(call)[i] ?? -1) < 0) return i
+                const home = argHomes(call)[i]
+                return isPreserved(home) && acrossCall.has(v) ? preserved.indexOf(home) : -1
+            },
+        })
     const CALLEE = target.scratch[1]
     const SWAP = target.scratch[0]
     const SP = target.stackReg
@@ -10970,8 +10991,15 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
             console.log(errorDump(g))
             throw `lowering3: invalid transfer source ${src} while queuing %${materializing} in B${currentBlock} (dst: ${dst})`
         }
-        if (dst < SLOTS) written.add(dst)
+        noteWrite(dst)
         code.push({ dst, src, consumed })
+    }
+    function noteWrite(dst: number): void {
+        if (dst < SLOTS) written.add(dst)
+        if (isPreserved(dst)) {
+            usedPreserved.add(dst)
+            currentRegion.writes.add(dst)
+        }
     }
 
     const homeOf = new Map<number, number>()
@@ -10999,11 +11027,14 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         return reg
     }
     function place(id: number, home: number): void {
-        if (isSlot(home)) {
-            reusableSlots.delete(home)
-            homeOf.set(id, home)
+        if (isSlot(home)) reusableSlots.delete(home)
+        homeOf.set(id, home)
+        if (isSlot(home)) return
+        heldBy.set(home, id)
+        if (isPreserved(home)) {
+            usedPreserved.add(home)
+            currentRegion.writes.add(home)
         }
-        else bind(id, home)
     }
     function freeValue(v: number, site = materializing, announce = true): void {
         const home = homeOf.get(v)
@@ -11579,6 +11610,15 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         pendingHomes = outerPending
         if (!sequenced) sequence[1]()
         slots = slots.filter(s => !s.id || feeds.has(s))
+        const call = g.nodes.get(site)?.op === 'call'
+        for (const dst of landing) {
+            const held = call && isPreserved(dst) ? heldBy.get(dst) : undefined
+            if (held === undefined || slots.some(s => s.dst === dst && feeds.get(s) === held)) continue
+            const slot = takeSlot()
+            transfer(slot, dst)
+            homeOf.set(held, slot)
+            heldBy.delete(dst)
+        }
         const settled = new Map<number, number>()
         const copied = new Map<number, number>()
         for (const v of feeds.values()) {
@@ -11684,6 +11724,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         }
         shuffle(shuffled, expired)
         for (const c of consts) {
+            noteWrite(c.dst)
             if (isSlot(c.dst) && c.src === 0 && target.zeroReg !== undefined) put(() => asm.store(SP, slotOffset(c.dst), target.zeroReg!, Types.u64))
             else if (isSlot(c.dst)) put(() => {
                 asm.movImm(SWAP, c.src)
@@ -11717,7 +11758,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
         const homes = argHomes(id)
         const stacked = homes.some(isOutgoingArg)
         if (syscall) assert(!stacked, `lowering: syscall at %${id} takes more than ${target.syscall.argRegs.length} args`)
-        if (syscall || stacked) tails.delete(id)
+        if (syscall || stacked || homes.some(isPreserved)) tails.delete(id)
         if (!syscall) callsOut ||= !tails.has(id)
         for (const h of homes) if (isOutgoingArg(h)) outgoingArgWords = Math.max(outgoingArgWords, h - OUTGOING_ARGS + 1)
         const slots: Handover[] = []
@@ -12269,7 +12310,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     }
 
     function assignRegionRegisters(region: EmitRegion, inherited: Set<number>): void {
-        region.owned = target.calleeSaved.filter(r => region.writes.has(r) && !inherited.has(r))
+        region.owned = target.calleeSaved.filter(r => region.writes.has(r) && written.has(r) && !inherited.has(r))
         const watermark = new Set(inherited)
         for (const r of region.owned) watermark.add(r)
         for (const child of region.children) assignRegionRegisters(child, watermark)
@@ -12279,7 +12320,7 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
 
     tailCalls = !analysis.frameAllocas && (framedTailCalls || (!usedPreserved.size && !slotCount && !callsOut))
     if (!tailCalls && tails.size) callsOut = true
-    const saved = target.calleeSaved.filter(r => usedPreserved.has(r))
+    const saved = target.calleeSaved.filter(r => usedPreserved.has(r) && written.has(r))
     for (let i = 0; i < saved.length; i++) savedIndex.set(saved[i], i)
     const savesLink = callsOut && LR !== undefined
     const layout = target.layoutFrame({

@@ -9,9 +9,9 @@ import * as syscalls from './syscalls'
 import { Op, rawValue, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
-    isNumeric, isParam, lowerValueGraph, normalizeValueGraph, optimizePackaged, expandValueGraph, sweepBlocks, encodeCallOutcomes, type CallOutcomes, wideLiteral, liftableSlot,
+    isNumeric, isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, expandValueGraph, sweepBlocks, encodeCallOutcomes, type CallOutcomes, wideLiteral, liftableSlot,
     printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
-    graphLoops, stronglyConnected, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
+    graphLoops, OrderedValues, stronglyConnected, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -1567,8 +1567,8 @@ function pinnedSymbols(program: ProgramGraph): Set<number> {
     const pinned = new Set<number>([...program.roots.values(), ...program.image.runtime.values()])
     for (const graph of program.units.values()) {
         for (const n of graph.nodes.values()) {
-            if (n.op !== 'heap-handle' || getRef(n, 0)) continue
-            const slot = program.image.functionHandles.get(heap.deref(getLiteral(n, 0) as intrinsics.Handle))
+            if ((n.op !== 'heap-handle' && n.op !== 'pool-entry') || getRef(n, 0)) continue
+            const slot = n.op === 'pool-entry' ? getLiteral(n, 0) : program.image.functionHandles.get(heap.deref(getLiteral(n, 0) as intrinsics.Handle))
             const target = slot === undefined ? undefined : program.image.functionTargets.get(slot)
             if (target !== undefined) pinned.add(target)
         }
@@ -1585,20 +1585,32 @@ function appendParam(program: ProgramGraph, callee: number, param: GraphNode, si
     sites.forEach(([symbol, call], k) => {
         const caller = program.units.get(symbol)!
         const n = caller.nodes.get(call)!
-        const args = countIds(n) - 2
+        const locations = callLocations(caller, call)
         caller.nodes.set(call, copyNode(n, [...getOperands(n), argOf(k)]))
-        const target = caller.nodes.get(getRef(n, 1))!
-        const signature = caller.nodes.get(typeRefOf(target))
-        if (signature?.op !== 'fn-type' && location < 0) return
-        const locations = signature?.op === 'fn-type' ? fnLocations(signature) : []
-        while (locations.length < args - 1) locations.push(-1)
-        const fnType = caller.maxId++
-        caller.nodes.set(fnType, createFnType(signature?.op === 'fn-type' ? fnReturn(signature) : typeOf(target), [...locations, location]))
-        const retyped = copyNode(target)
-        setType(retyped, { ref: fnType })
-        caller.nodes.set(getRef(n, 1), retyped)
+        if (!locations && location < 0) return
+        setCallLocations(caller, call, [...locations ?? new Array(countIds(n) - 3).fill(-1), location])
     })
     return id
+}
+
+function callLocations(graph: Graph, call: number): number[] | undefined {
+    const n = graph.nodes.get(call)!
+    const signature = graph.nodes.get(typeRefOf(graph.nodes.get(getRef(n, 1))!))
+    if (signature?.op !== 'fn-type') return
+    const locations = fnLocations(signature)
+    while (locations.length < countIds(n) - 3) locations.push(-1)
+    return locations
+}
+
+function setCallLocations(graph: Graph, call: number, locations: number[]): void {
+    const target = getRef(graph.nodes.get(call)!, 1)
+    const n = graph.nodes.get(target)!
+    const signature = graph.nodes.get(typeRefOf(n))
+    const fnType = graph.maxId++
+    graph.nodes.set(fnType, createFnType(signature?.op === 'fn-type' ? fnReturn(signature) : typeOf(n), locations))
+    const retyped = copyNode(n)
+    setType(retyped, { ref: fnType })
+    graph.nodes.set(target, retyped)
 }
 
 interface ConstantUses {
@@ -1758,6 +1770,165 @@ function threadConstants(program: ProgramGraph, clock: PhaseClock): void {
         }
     }
     if (intrinsics.argv().includes('thread-stats')) console.log('THREADED', [...received].map(([s, k]) => `${program.units.get(s)!.name}:${k.length}`).join(' '))
+    for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+}
+
+function freeCallees(program: ProgramGraph, sites: Map<number, [caller: number, call: number][]>): number[] {
+    const pinned = pinnedSymbols(program)
+    const callees = new Map<number, number[]>()
+    for (const [symbol, graph] of program.units) {
+        const out: number[] = []
+        for (const n of graph.nodes.values()) {
+            const called = calledSymbol(graph, n)
+            if (called !== undefined) out.push(called)
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = graph.nodes.get(getRef(n, i))
+                if (ref?.op === 'local-target' && !getRef(ref, 0) && !(n.op === 'call' && i === 1)) pinned.add(getLiteral(ref, 0))
+            }
+        }
+        callees.set(symbol, out)
+    }
+    const free: number[] = []
+    for (const scc of stronglyConnected(program.units.keys(), symbol => callees.get(symbol)!)) {
+        const symbol = scc[0]
+        const calls = sites.get(symbol)
+        if (scc.length !== 1 || pinned.has(symbol) || !calls || calls.some(([caller]) => caller === symbol)) continue
+        const params = program.units.get(symbol)!.blocks[0].params.length
+        if (calls.some(([caller, call]) => countIds(program.units.get(caller)!.nodes.get(call)!) - 3 !== params)) continue
+        free.push(symbol)
+    }
+    return free
+}
+
+function entryValues(graph: Graph, conditional: boolean): Set<number> {
+    const found = new Set<number>()
+    const stack = [graph.blocks[0].bodyId]
+    while (stack.length) {
+        const id = stack.pop()!
+        const n = id ? graph.nodes.get(id) : undefined
+        if (!n || found.has(id) || n.op === 'block') continue
+        found.add(id)
+        const refs = n.op === 'select' && !conditional ? 1 : countIds(n)
+        for (let i = 0; i < refs; i++) stack.push(getRef(n, i))
+    }
+    return found
+}
+
+function hoistEntryLoads(program: ProgramGraph, clock: PhaseClock): void {
+    const sites = programCallSites(program)
+    const touched = new Set<number>()
+    const hoisted: string[] = []
+    for (const callee of freeCallees(program, sites)) {
+        const calls = sites.get(callee)!
+        const graph = program.units.get(callee)!
+        const entry = graph.blocks[0]
+        const demanded = entryValues(graph, false)
+        const users = new Map<number, number[]>()
+        for (const id of entryValues(graph, true)) {
+            const n = graph.nodes.get(id)!
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (ref) users.set(ref, [...users.get(ref) ?? [], id])
+            }
+        }
+        function entryToken(id: number): boolean {
+            const n = graph.nodes.get(id)
+            return n?.op === 'nil-effect' && (countLiterals(n) === 0 || getLiteral(n, 0) === entry.id)
+        }
+        function hoistable(load: GraphNode): boolean {
+            for (let i = 2; i < countIds(load); i++) if (getRef(load, i)) return false
+            return entryToken(getRef(load, 0))
+        }
+        function cover(id: number, loads: number[]): boolean {
+            for (const user of users.get(id) ?? []) {
+                const n = graph.nodes.get(user)!
+                let slots = 0
+                for (let i = 0; i < countIds(n); i++) if (getRef(n, i) === id) slots++
+                if (slots !== 1) return false
+                if (n.op === 'load' && getRef(n, 1) === id && demanded.has(user) && hoistable(n)) {
+                    if (!loads.includes(user)) loads.push(user)
+                } else if ((n.op === 'decode' || n.op === 'add') && getRef(n, 0) === id && !getRef(n, 1)) {
+                    if (!cover(user, loads)) return false
+                } else return false
+            }
+            return true
+        }
+        let headroom = program.target.argRegs.length - entry.params.filter(p => paramLocation(graph.nodes.get(p)!) < 0).length
+        const chosen: number[] = []
+        for (const p of entry.params) {
+            const loads: number[] = []
+            if (!users.has(p) || !cover(p, loads) || loads.length - 1 > headroom) continue
+            headroom -= loads.length - 1
+            chosen.push(...loads)
+        }
+        if (!chosen.length) continue
+        const params = entry.params.slice()
+        const by = new Map<number, Operand>()
+        for (const load of chosen) {
+            const param = appendParam(program, callee, makeNode('param', [], resultType(graph, graph.nodes.get(load)!)), calls, k => {
+                const [symbol, call] = calls[k]
+                const caller = program.units.get(symbol)!
+                const site = caller.nodes.get(call)!
+                function copy(id: number): Operand {
+                    const n = graph.nodes.get(id)!
+                    if (n.op === 'param') return getOperand(site, 3 + params.indexOf(id))
+                    if (n.op === 'nil-effect') return getOperand(site, 0)
+                    const operands = getOperands(n)
+                    for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) operands[i] = copy(getRef(n, i))
+                    const out = caller.maxId++
+                    caller.nodes.set(out, copyNode(n, operands))
+                    return out
+                }
+                return copy(load)
+            })
+            by.set(load, param)
+        }
+        substitute(graph, by)
+        hoisted.push(`${graph.name}:${chosen.length}`)
+        touched.add(callee)
+        for (const [caller] of calls) touched.add(caller)
+    }
+    if (intrinsics.argv().includes('hoist-stats')) console.log('HOISTED', hoisted.join(' '))
+    for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+}
+
+function pruneDeadArgs(program: ProgramGraph, clock: PhaseClock): void {
+    const sites = programCallSites(program)
+    const touched = new Set<number>()
+    const pruned: string[] = []
+    for (const callee of freeCallees(program, sites)) {
+        const calls = sites.get(callee)!
+        const graph = program.units.get(callee)!
+        const entry = graph.blocks[0]
+        const live = entryValues(graph, true)
+        const used = new Set<number>()
+        for (const id of live) {
+            const n = graph.nodes.get(id)!
+            for (let i = 0; i < countIds(n); i++) used.add(getRef(n, i))
+        }
+        const dead = new Set<number>()
+        entry.params.forEach((p, i) => {
+            if (used.has(p)) return
+            const ordered = calls.some(([symbol, call]) => {
+                const arg = program.units.get(symbol)!.nodes.get(getRef(program.units.get(symbol)!.nodes.get(call)!, 3 + i))
+                return !!arg && OrderedValues.has(arg.op)
+            })
+            if (!ordered) dead.add(i)
+        })
+        if (!dead.size) continue
+        entry.params = entry.params.filter((_, i) => !dead.has(i))
+        for (const [symbol, call] of calls) {
+            const caller = program.units.get(symbol)!
+            const n = caller.nodes.get(call)!
+            const locations = callLocations(caller, call)
+            caller.nodes.set(call, copyNode(n, getOperands(n).filter((_, i) => i < 3 || !dead.has(i - 3))))
+            if (locations) setCallLocations(caller, call, locations.filter((_, i) => !dead.has(i)))
+        }
+        pruned.push(`${graph.name}:${dead.size}`)
+        touched.add(callee)
+        for (const [caller] of calls) touched.add(caller)
+    }
+    if (intrinsics.argv().includes('hoist-stats')) console.log('PRUNED', pruned.join(' '))
     for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
 }
 
@@ -2411,10 +2582,12 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     }
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
-    const clobbersOf = (symbol: number) => clobbers.get(symbol)
+    const prepared = new Map<number, PreparedUnit>()
+    for (const symbol of symbols) prepared.set(symbol, prepareUnit(program, symbol, roots.has(symbol)))
+    nonvolatileArgs(program, prepared)
     const lowered = new Map<number, NativeUnit>()
     for (const scc of order) {
-        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, roots.has(symbol), clobbersOf))
+        for (const symbol of scc) lowered.set(symbol, lowerUnit(program, symbol, prepared.get(symbol)!, symbol => clobbers.get(symbol)))
         const members = new Set(scc)
         const shared = new Set<number>()
         for (const symbol of scc) {
@@ -2429,7 +2602,14 @@ function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[]
     return symbols.map(symbol => lowered.get(symbol)!)
 }
 
-function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobbersOf: (symbol: number) => Set<number> | undefined): NativeUnit {
+interface PreparedUnit {
+    name: string
+    debug: boolean
+    prepared: PreparedLowering
+    returnsFloat: boolean
+}
+
+function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean): PreparedUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
@@ -2446,12 +2626,89 @@ function lowerUnit(program: ProgramGraph, symbol: number, isRoot: boolean, clobb
         || intrinsics.argv().includes(`lower-debug:${name}`)
     if (debug) console.log('lower native', name)
     seedPstacks(graph)
-    const code = lowerValueGraph(graph, { debug, target: program.target, clobbersOf, poolSlot: value => image.constantSlot(value), poolValue: slot => image.knownValue(slot) })
+    const float = returnsFloat(graph)
+    const prepared = prepareLowering(graph, { debug, target: program.target, poolSlot: value => image.constantSlot(value), poolValue: slot => image.knownValue(slot) })
+    return { name, debug, prepared, returnsFloat: float }
+}
+
+function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, clobbersOf: (symbol: number) => Set<number> | undefined): NativeUnit {
+    const image = program.image
+    const { name, debug, prepared } = unit
+    const code = lowerPrepared(prepared, { debug, target: program.target, clobbersOf })
     if (debug || intrinsics.argv().includes('listings')) {
         console.log(`--- ${name} listing ---\n`, code.listing)
         if (code.island?.length) console.log(`--- ${name} island ---\n` + code.island.map((slot, i) => `  ${i}: pool[${slot}] ${image.labels.get(slot) ?? ''} = 0x${BigInt.asUintN(64, BigInt(image.values[slot])).toString(16)}`).join('\n'))
     }
-    return { name, symbol, code, returnsFloat: returnsFloat(graph) }
+    return { name, symbol, code, returnsFloat: unit.returnsFloat }
+}
+
+function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>): void {
+    const sites = new Map<number, [caller: number, call: number][]>()
+    for (const [caller, unit] of prepared) {
+        const g = unit.prepared.g
+        for (const [id, n] of g.nodes) {
+            const target = n.op === 'call' ? g.nodes.get(getRef(n, 1)) : undefined
+            if (target?.op !== 'local-target' || getRef(target, 0)) continue
+            const list = sites.get(getLiteral(target, 0))
+            if (list) list.push([caller, id])
+            else sites.set(getLiteral(target, 0), [[caller, id]])
+        }
+    }
+    const origins = new Map<number, Map<number, number>>()
+    function entryIndex(caller: number, value: number): number {
+        let known = origins.get(caller)
+        if (!known) origins.set(caller, known = new Map())
+        const g = prepared.get(caller)!.prepared.g
+        const owner = new Map<number, [block: number, index: number]>()
+        for (const b of g.blocks) b.params.forEach((p, i) => owner.set(p, [b.id, i]))
+        const inbound = new Map<number, GraphNode[]>()
+        for (const n of g.nodes.values()) {
+            if (n.op !== 'apply') continue
+            const list = inbound.get(getRef(n, 0))
+            if (list) list.push(n)
+            else inbound.set(getRef(n, 0), [n])
+        }
+        function resolve(v: number, seen: Set<number>): number {
+            if (known!.has(v)) return known!.get(v)!
+            const at = owner.get(v)
+            if (!at) return -1
+            if (at[0] === g.blocks[0].id) return at[1]
+            if (seen.has(v)) return -2
+            seen.add(v)
+            let found = -2
+            for (const apply of inbound.get(at[0]) ?? []) {
+                const r = resolve(getRef(apply, at[1] + 1), seen)
+                if (r === -2) continue
+                if (r < 0 || (found >= 0 && found !== r)) return -1
+                found = r
+            }
+            return found
+        }
+        const r = resolve(value, new Set())
+        known.set(value, r)
+        return r
+    }
+    for (const symbol of freeCallees(program, programCallSites(program))) {
+        const calls = sites.get(symbol)
+        const g = prepared.get(symbol)?.prepared.g
+        if (!calls?.length || !g) continue
+        const params = g.blocks[0].params
+        const locations = params.map(p => paramLocation(g.nodes.get(p)!))
+        let changed = false
+        params.forEach((p, i) => {
+            const crossing = calls.every(([caller, call]) => {
+                const unit = prepared.get(caller)!.prepared
+                const value = getRef(unit.g.nodes.get(call)!, 3 + i)
+                return !!value && !!unit.analysis.crossedCalls.get(value)?.has(call) && entryIndex(caller, value) === i
+            })
+            if (!crossing || i >= program.target.calleeSaved.length) return
+            locations[i] = program.target.calleeSaved[i]
+            g.nodes.set(p, copyNode(g.nodes.get(p)!, [{ literal: locations[i] }]))
+            changed = true
+        })
+        if (!changed) continue
+        for (const [caller, call] of calls) setCallLocations(prepared.get(caller)!.prepared.g, call, locations)
+    }
 }
 
 function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions, clock: PhaseClock, target: Target): ProgramGraph {
@@ -4618,6 +4875,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     let reached = reachUnits(program)
     timed('records', () => recordReturns(program, reached, clock))
     if (intrinsics.argv().includes('thread-constants')) timed('records', () => threadConstants(program, clock))
+    if (intrinsics.argv().includes('hoist-loads')) timed('records', () => hoistEntryLoads(program, clock))
+    if (intrinsics.argv().includes('prune-args')) timed('records', () => pruneDeadArgs(program, clock))
     reached = reachUnits(program)
     for (const [symbol, level] of programLevels(program)) program.units.get(symbol)!.level = level
     enterPhase('lower')
