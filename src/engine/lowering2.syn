@@ -4695,6 +4695,90 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return true
     }
 
+    function mergeConstantStores(target: GraphBlock) {
+        const stores = findValues(target.id, 'store')
+        if (!stores || stores.length < 2) return
+        const integer = new Map<number, Types>([[1, Types.u8], [2, Types.u16], [4, Types.u32], [8, Types.u64]])
+        function piece(n: GraphNode): [offset: number, bytes: number, value: number] | undefined {
+            const T = typeOf(n)
+            if (T === Types.f64 || T === Types.f32 || getRef(n, 2) || getRef(n, 3)) return
+            const bytes = intrinsics.intrinsicBitWidth(T) / 8
+            const value = getLiteral(n, 3)
+            if (!integer.has(bytes) || !Number.isSafeInteger(value)) return
+            return [getLiteral(n, 2), bytes, ((value % 2 ** (bytes * 8)) + 2 ** (bytes * 8)) % 2 ** (bytes * 8)]
+        }
+        function continues(id: number): boolean {
+            const n = g.nodes.get(id)!
+            const prior = g.nodes.get(getRef(n, 0))
+            return prior?.op === 'store' && getRef(prior, 1) === getRef(n, 1) && dependents.get(getRef(n, 0))?.size === 1
+                && !!piece(prior) && !!piece(n)
+        }
+        let changed = false
+        const inChain = new Set<number>()
+        for (const id of stores) {
+            if (inChain.has(id) || !piece(g.nodes.get(id)!)) continue
+            const chain = [id]
+            for (let at = id; continues(at); at = getRef(g.nodes.get(at)!, 0)) chain.unshift(getRef(g.nodes.get(at)!, 0))
+            for (let more = true; more;) {
+                more = false
+                for (const u of dependents.get(chain[chain.length - 1]) ?? []) {
+                    if (g.nodes.get(u)?.op === 'store' && getRef(g.nodes.get(u)!, 0) === chain[chain.length - 1] && continues(u)) {
+                        chain.push(u)
+                        more = true
+                        break
+                    }
+                }
+            }
+            for (const x of chain) inChain.add(x)
+            if (chain.length < 2) continue
+            const bytes = new Map<number, number>()
+            let overlap = false
+            for (const x of chain) {
+                const [offset, size, value] = piece(g.nodes.get(x)!)!
+                for (let k = 0; k < size; k++) {
+                    if (bytes.has(offset + k)) overlap = true
+                    bytes.set(offset + k, Math.floor(value / 2 ** (8 * k)) % 256)
+                }
+            }
+            if (overlap) continue
+            const offsets = [...bytes.keys()].sort((a, b) => a - b)
+            const emitted: [offset: number, size: number, value: number][] = []
+            for (let i = 0; i < offsets.length;) {
+                const at = offsets[i]
+                let size = 8
+                for (; size > 1; size = size / 2) {
+                    if (at % size !== 0) continue
+                    let whole = true
+                    let value = 0
+                    for (let k = 0; k < size && whole; k++) {
+                        if (!bytes.has(at + k)) whole = false
+                        else value += bytes.get(at + k)! * 2 ** (8 * k)
+                    }
+                    if (whole && Number.isSafeInteger(value)) break
+                }
+                let value = 0
+                for (let k = 0; k < size; k++) value += bytes.get(at + k)! * 2 ** (8 * k)
+                emitted.push([at, size, value])
+                i += size
+                while (i < offsets.length && offsets[i] < at + size) i++
+            }
+            if (emitted.length >= chain.length) continue
+            const last = g.nodes.get(chain[chain.length - 1])!
+            let token = getOperand(g.nodes.get(chain[0])!, 0)
+            emitted.forEach(([offset, size, value], i) => {
+                const operands = [token, getOperand(last, 1), { literal: offset }, { literal: value }]
+                const node = copyNode(last, operands)
+                setType(node, integer.get(size)!)
+                if (i === emitted.length - 1) g.nodes.set(chain[chain.length - 1], node)
+                else token = insert(node)
+            })
+            changed = true
+        }
+        if (!changed) return
+        revisitBlock(target)
+        return true
+    }
+
     function closeDoublingLoop(target: GraphBlock) {
         if (!preds.get(target.id)?.has(target.id)) return
         const tail = g.nodes.get(target.bodyId)
@@ -8421,6 +8505,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(foldKnownConditions, b)
             step(reduceSelects, b)
             step(forwardMemory, b)
+            step(mergeConstantStores, b)
             step(forwardArrivalLoads, b)
             step(forwardArrivalCalls, b)
             step(liftCommonEffects, b)
