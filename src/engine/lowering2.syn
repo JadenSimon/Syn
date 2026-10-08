@@ -161,7 +161,7 @@ function unsignedBits(T: Types): number | undefined {
     return bits && bits < 64 ? bits : undefined
 }
 
-function lowZeros(g: Graph, ref: number, literal: number): number {
+function lowZeros(g: Graph, ref: number, literal: number, param?: (p: number) => number): number {
     if (!ref) {
         if (!Number.isSafeInteger(literal)) return 0
         if (literal === 0) return 64
@@ -171,9 +171,17 @@ function lowZeros(g: Graph, ref: number, literal: number): number {
     }
     const n = g.nodes.get(ref)
     if (!n) return 0
-    const a = () => lowZeros(g, getRef(n, 0), getLiteral(n, 0))
-    const b = () => lowZeros(g, getRef(n, 1), getLiteral(n, 1))
+    const a = () => lowZeros(g, getRef(n, 0), getLiteral(n, 0), param)
+    const b = () => lowZeros(g, getRef(n, 1), getLiteral(n, 1), param)
     if (n.op === 'literal') return lowZeros(g, 0, getLiteral(n, 0))
+    if (n.op === 'param') return param ? param(ref) : 0
+    if (n.op === 'convert') return a()
+    if (n.op === 'after') return lowZeros(g, getRef(n, countIds(n) - 1), getLiteral(n, countIds(n) - 1), param)
+    if (n.op === 'select') {
+        let zeros = 64
+        for (let i = 1; i < countIds(n); i++) zeros = Math.min(zeros, lowZeros(g, getRef(n, i), getLiteral(n, i), param))
+        return zeros
+    }
     if (n.op === 'shl' && !getRef(n, 1)) return Math.min(64, a() + getLiteral(n, 1))
     if (n.op === 'mul') return Math.min(64, a() + b())
     if (n.op === 'and') return Math.max(a(), b())
@@ -513,6 +521,7 @@ export interface RangeFacts {
     range(ref: number, literal: number, facts: Facts): Range
     le(a: number, ak: number, b: number, bk: number, facts: Facts): boolean
     lt(a: number, ak: number, b: number, bk: number, facts: Facts): boolean
+    zeros(ref: number, literal: number): number
 }
 
 export function rangeFacts(g: Graph, arrivalsOf: (block: number) => TailPosition[]): RangeFacts {
@@ -702,7 +711,30 @@ export function rangeFacts(g: Graph, arrivalsOf: (block: number) => TailPosition
         return related(a, b, 'lt', (x, xk, y, yk, f) => lt(x, xk, y, yk, f, depth + 1))
     }
 
-    return { range, le, lt }
+    const paramZeros = new Map<number, number>()
+    function zerosOf(p: number): number {
+        const memo = paramZeros.get(p)
+        if (memo !== undefined) return memo
+        const owner = ownerOf(p)
+        if (!owner || owner[0] === g.blocks[0]) return 0
+        const [b, k] = owner
+        paramZeros.set(p, 0)
+        let z = 64
+        for (const pos of arrivals(b.id)) {
+            const app = g.nodes.get(pos.at)!
+            if (countIds(app) !== b.params.length + 1) return 0
+            if (getRef(app, k + 1) === p) continue
+            z = Math.min(z, zeros(getRef(app, k + 1), getLiteral(app, k + 1)))
+            if (!z) break
+        }
+        paramZeros.set(p, z)
+        return z
+    }
+    function zeros(ref: number, literal: number): number {
+        return lowZeros(g, ref, literal, zerosOf)
+    }
+
+    return { range, le, lt, zeros }
 }
 
 export function isNumeric(g: Graph, id: number, entry: (param: number) => boolean, visiting = new Set<number>()): boolean {
@@ -4572,29 +4604,47 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const entries = inbound.filter(x => x[0] !== target.id)
         if (self.length !== 1 || !entries.length || tailOf(g, getRef(tail, 1)) !== self[0][1]) return
         const cond = g.nodes.get(getRef(tail, 0))
-        if (!cond || cond.op !== 'lt' || getRef(cond, 1)) return
+        if (!cond || cond.op !== 'lt') return
         const ivAt = target.params.indexOf(getRef(cond, 0))
         if (ivAt < 0) return
         const iv = target.params[ivAt]
         const back = g.nodes.get(self[0][1])!
+        function invariant(id: number): boolean {
+            if (!id) return true
+            const at = target.params.indexOf(id)
+            if (at >= 0) return getRef(back, at + 1) === id
+            const n = g.nodes.get(id)!
+            if (n.op === 'literal') return true
+            if (!BinaryOps.has(n.op) && !UnaryOps.has(n.op) && n.op !== 'convert') return false
+            for (let i = 0; i < countIds(n); i++) if (!invariant(getRef(n, i))) return false
+            return true
+        }
+        const bound = getRef(cond, 1)
+        if (!invariant(bound)) return
         const increment = g.nodes.get(getRef(back, ivAt + 1))
         if (!increment || increment.op !== 'add' || getRef(increment, 0) !== iv || getRef(increment, 1)) return
         const step = getLiteral(increment, 1)
-        const starts = entries.map(([, app]) => g.nodes.get(app)!).map(app => getRef(app, ivAt + 1) ? -1 : getLiteral(app, ivAt + 1))
-        const start = starts[0]
-        if (start < 0 || starts.some(x => x !== start) || step <= 0) return
-        const span = getLiteral(cond, 1) - start
-        if (span <= 0 || span % step) return
-        const trips = span / step
-        if (findValues(target.id, 'load')?.length || findValues(target.id, 'call')?.length) return
+        if (step <= 0) return
         const stores = findValues(target.id, 'store') ?? []
         if (!stores.length) return
         let width = 0
         for (const id of stores) {
             const n = g.nodes.get(id)!
             const bytes = intrinsics.intrinsicBitWidth(typeOf(n)) / 8
-            if (getRef(n, 2) !== iv || getRef(n, 3) || bytes !== step || (width && bytes !== width)) return
+            if (getRef(n, 2) !== iv || getRef(n, 3) || !invariant(getRef(n, 1)) || bytes !== step || (width && bytes !== width)) return
             width = bytes
+        }
+        const looping = new Set<number>()
+        const work = [getRef(tail, 0), ...stores]
+        for (let i = 1; i < countIds(back); i++) work.push(getRef(back, i))
+        while (work.length) {
+            const id = work.pop()!
+            if (!id || looping.has(id)) continue
+            const n = g.nodes.get(id)!
+            if (n.op === 'param' || n.op === 'block') continue
+            if (n.op === 'load' || n.op === 'call') return
+            looping.add(id)
+            for (let i = 0; i < countIds(n); i++) work.push(getRef(n, i))
         }
         const allowed = new Set<number>([getRef(tail, 0), getRef(back, ivAt + 1), ...stores])
         for (const u of dependents.get(iv) ?? []) {
@@ -4602,8 +4652,25 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (allowed.has(u) || (n?.op === 'apply' && u !== self[0][1])) continue
             return
         }
+        const ranges = currentRanges()
+        function spanZeros(app: GraphNode): number {
+            const s = getRef(app, ivAt + 1)
+            const sk = getLiteral(app, ivAt + 1)
+            const at = target.params.indexOf(bound)
+            const b = at >= 0 ? getRef(app, at + 1) : bound
+            const bk = at >= 0 ? getLiteral(app, at + 1) : getLiteral(cond!, 1)
+            if (!s && !b) return lowZeros(g, 0, bk - sk)
+            const sum = b ? g.nodes.get(b) : undefined
+            if (s && sum?.op === 'add') {
+                for (const i of [0, 1]) if (getRef(sum, i) === s) return ranges.zeros(getRef(sum, i ^ 1), getLiteral(sum, i ^ 1))
+            }
+            return Math.min(ranges.zeros(s, sk), ranges.zeros(b, bk))
+        }
+        let zeros = 64
+        for (const [, app] of entries) zeros = Math.min(zeros, spanZeros(g.nodes.get(app)!))
+        const span = 2 ** zeros
         let factor = 1
-        while (trips % (factor * 2) === 0 && factor * 2 * width <= 8) factor = factor * 2
+        while (span % (step * factor * 2) === 0 && factor * 2 * width <= 8) factor = factor * 2
         if (factor === 1) return
         const wide = factor * width === 8 ? Types.u64 : factor * width === 4 ? Types.u32 : Types.u16
         for (const id of stores) {
@@ -6158,9 +6225,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             expected.push(ref ? getOperand(app, target.params.indexOf(ref) + 1) : { literal: getLiteral(call, k) })
         }
         let positions: TailPosition[] | undefined
+        const callee = nodeKey(g.nodes.get(getRef(call, 1))!)
         for (const id of findValues(from.id, 'call') ?? []) {
             const m = g.nodes.get(id)!
-            if (getRef(m, 1) !== getRef(call, 1) || countIds(m) !== countIds(call)) continue
+            if (countIds(m) !== countIds(call) || (getRef(m, 1) !== getRef(call, 1) && nodeKey(g.nodes.get(getRef(m, 1))!) !== callee)) continue
             let same = true
             for (let k = 2; k < countIds(m) && same; k++) {
                 const want = expected[k - 2]
@@ -8409,10 +8477,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(specializeApplySite, b)
             step(simplifyBitOperations, b)
             step(reassociateAdds, b)
-            step(rebaseAddresses, b)
             step(hoistLoopStep, b)
             step(promoteAllocas, b)
             step(deduplicateValues, b)
+        }
+        for (const b of [...reachableBlocks].reverse()) {
+            step(rebaseAddresses, b)
         }
         for (const b of reachableBlocks) {
             step(mergeBlocks, b)
@@ -10220,6 +10290,20 @@ function sharedArmValues(g: Graph, select: GraphNode, memo: Map<GraphNode, { eve
     return out
 }
 
+function withDependencies(g: Graph, roots: Set<number>): Set<number> {
+    const out = new Set<number>()
+    const stack = [...roots]
+    while (stack.length) {
+        const x = stack.pop()!
+        if (out.has(x)) continue
+        const n = g.nodes.get(x)
+        if (!n || n.op === 'param' || n.op === 'block' || isArgless(n)) continue
+        out.add(x)
+        for (const y of getArgIds(n)) if (y) stack.push(y)
+    }
+    return new Set([...roots, ...out])
+}
+
 function shareArmValues(g: Graph): boolean {
     let changed = false
     const memo = new Map<GraphNode, { every: Set<number>, arms: Set<number>[] }>()
@@ -10230,7 +10314,8 @@ function shareArmValues(g: Graph): boolean {
     for (let i = 0; i < g.blocks.length; i++) {
         const b = g.blocks[i]
         const root = g.nodes.get(b.bodyId)
-        const passed = root?.op === 'select' ? sharedArmValues(g, root, memo) : new Set<number>()
+        const shared = root?.op === 'select' ? sharedArmValues(g, root, memo) : new Set<number>()
+        const passed = shared.size ? withDependencies(g, shared) : shared
         if (passed.size) {
             const params = new Set<number>()
             coveredRegion(g, countUses(g, b.bodyId), b.bodyId, params, passed)
