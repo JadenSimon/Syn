@@ -8,18 +8,21 @@ import type { TraceSession } from './trace2'
 import { NumericOps, floatValues, type Graph, type GraphNode } from './lowering2'
 import {
     cloneRefs, copyNode, countIds, countLiterals, createFnType, createGraph, getLiteral, getOperands, getRef, makeNode, type Operand, setGraphBlocks,
-    setOperand, setRef, setType, type TypeOperand, typeOf, typeSlots,
+    setFact, setOperand, setRef, setType, type TypeOperand, typeOf, typeSlots,
 } from './graph-node'
 import { isSignedType } from './lowering'
 import type { HeapState } from './heap-records'
 import { symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmValue } from './vm'
 import * as native from './native'
 import { Op as RtOp, runtimeFunction } from './rt'
+import { globals as builtinGlobals } from './builtins'
 
 type Handle = intrinsics.Handle
+const loopPreload = intrinsics.argv().includes('loop-preload')
 const Types = intrinsics.Types
 
 export const numberShape = 0xFFFFFFFE as Handle
+const iteratorKey = heap.fromJsSymbol(Symbol.iterator)
 export const stringShape = heap.fromJsString('')
 
 export interface PropertyEvalOptions {
@@ -33,6 +36,7 @@ export interface PropertyEvalOptions {
     constructed?: Constructed
     calls?: (site: CallSite) => CallBinding | undefined
     locate?: (shape: Handle, path: string) => { shape?: Handle, decode?: number, union?: boolean, float?: boolean } | undefined
+    iterationField?: (method: Handle) => Handle | undefined
     stored?: (shape: Handle, path: string, value: Handle) => void
 }
 
@@ -105,6 +109,7 @@ export interface Resolved {
     shapes: Map<number, Handle>
     encoded: Set<number>
     unions: Set<number>
+    arrayIterations: Map<number, Handle>
 }
 
 const orderedOps = new Set(['load', 'store', 'call', 'pstack'])
@@ -302,7 +307,7 @@ export function resolveProperties(
             const [ref, literal] = nested ? addressOf(nested[1]) : operandOf(slot)
             if (!nested && holdsAlready(mem, i, ref)) continue
             const store = newId()
-            nodes.set(store, makeNode('store', [token, mem.ptr, { literal: mem.base + mem.offsets[i] }, ref || { literal }], Types.u64))
+            nodes.set(store, ownedField(makeNode('store', [token, mem.ptr, { literal: mem.base + mem.offsets[i] }, ref || { literal }], Types.u64), mem.shape, mem.keys[i]))
             token = store
             const storedShape = nested ? nested[1].shape : homes.get(slot)?.shape ?? (ref ? memory.get(ref)?.shape : undefined)
             if (storedShape !== undefined) opts.stored?.(mem.shape, String(mem.offsets[i]), storedShape)
@@ -623,7 +628,7 @@ export function resolveProperties(
             const located = opts.locate?.(mem.shape, String(mem.offsets[at]))
             const valued = located !== undefined && located.shape === undefined
             const load = newId()
-            nodes.set(load, makeNode('load', [stable ? readonlyToken() : token, mem.ptr, { literal: offset }], valued ? Types.vm_value : Types.u64))
+            nodes.set(load, ownedField(makeNode('load', [stable ? readonlyToken() : token, mem.ptr, { literal: offset }], valued ? Types.vm_value : Types.u64), mem.shape, key))
             nodes.set(id, makeNode('after', [token, load]))
             if (located?.float) unbox(id, load, located.decode!)
             if (valued) return
@@ -647,9 +652,18 @@ export function resolveProperties(
             }
             return
         }
-        nodes.set(id, makeNode('store', [token, mem.ptr, { literal: offset }, value[0] || { literal: value[1] }], Types.u64))
+        nodes.set(id, ownedField(makeNode('store', [token, mem.ptr, { literal: offset }, value[0] || { literal: value[1] }], Types.u64), mem.shape, key))
         const storedShape = value[0] ? shapeOf(value[0]) : undefined
         if (storedShape !== undefined) opts.stored?.(mem.shape, String(mem.offsets[at]), storedShape)
+    }
+
+    function ownedField(n: GraphNode, shape: Handle, key: Handle): GraphNode {
+        if (!loopPreload) return n
+        const fact = newId()
+        out.facts ??= new Map()
+        out.facts.set(fact, makeNode('owned', [{ literal: heap.getPrototypeOf(shape) }, { literal: key }]))
+        setFact(n, fact)
+        return n
     }
 
     function resolveEmbedded(id: number, n: GraphNode, mem: Memory, token: number, offset: number, inner: Handle, value: [number, number]): void {
@@ -677,7 +691,41 @@ export function resolveProperties(
         inline(id, desc.slot0 as Handle, symbolValue(getRef(n, 1)), [], getRef(n, 0))
     }
 
+    let arrayIteratorMethod: Handle | undefined
+    function iteratesArray(of: Handle): boolean {
+        if (arrayIteratorMethod === undefined) {
+            const proto = heap.deref(heap.getPrototypeProperty(heap.deref(session.linkFunction(builtinGlobals.Array) as Handle)))
+            arrayIteratorMethod = methodOf(proto, iteratorKey)
+        }
+        return arrayIteratorMethod !== undefined && methodOf(of, iteratorKey) === arrayIteratorMethod
+    }
+    function methodOf(of: Handle, key: Handle): Handle | undefined {
+        const addr = heap.getPropertyDescriptor(of, key)
+        return addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as Handle : undefined
+    }
+    const arrayIterations = new Map<number, Handle>()
+    function fieldIteratesArray(of: Handle, field: Handle): boolean {
+        const fields = layout(of)
+        const at = fields.keys.indexOf(field)
+        if (at < 0) return false
+        const located = opts.locate?.(of, String(fields.offsets[at]))?.shape
+        if (located !== undefined) return iteratesArray(located)
+        const slot = methodOf(of, field)
+        return slot !== undefined && isObjectSlot(slot) && iteratesArray(heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot)
+    }
+    function iterationSource(of: Handle, key: Handle): Handle | undefined {
+        const method = methodOf(of, key)
+        if (method === undefined) return
+        if (key === iteratorKey && iteratesArray(of)) return 0 as Handle
+        const field = opts.iterationField?.(method)
+        return field !== undefined && fieldIteratesArray(of, field) ? field : undefined
+    }
     function resolve(id: number, n: GraphNode): void {
+        if (n.op === 'get-prop' && !getRef(n, 2)) {
+            const of = shape(getRef(n, 1))
+            const source = of && of !== pendingShape && of !== numberShape && of !== stringShape ? iterationSource(of, getLiteral(n, 2) as Handle) : undefined
+            if (source !== undefined) arrayIterations.set(id, source)
+        }
         const union = unions.get(getRef(n, 1))
         if (union && n.op === 'get-prop') return resolveUnion(id, n, union)
         const mem = memory.get(getRef(n, 1))
@@ -1534,13 +1582,14 @@ export function resolveProperties(
     const unionValues = new Set<number>()
     for (const [id, mem] of memory) if (mem.union) unionValues.add(id)
     out.maxId = Math.max(out.maxId, tracer.getNanCount() + 1)
-    return { graph: out, calls, addresses, shapes, encoded, unions: unionValues }
+    return { graph: out, calls, addresses, shapes, encoded, unions: unionValues, arrayIterations }
 }
 
 export interface ClosureOptions {
     unionParams?: Map<number, number>
     locate?: PropertyEvalOptions['locate']
     stored?: PropertyEvalOptions['stored']
+    iterationField?: PropertyEvalOptions['iterationField']
     contextShape?: Handle
     created?: (closure: u32, shape: Handle) => void
 }
@@ -1587,8 +1636,8 @@ export function resolveClosures(
     if (!objects.size && ![...pointers.values()].some(shape => shape !== numberShape) && !calls && !typed) return { graph, memoryShapes: new Map() }
     const unionPointers = new Map<number, number>()
     for (const [i, base] of extra.unionParams ?? []) unionPointers.set(graph.blocks[0].params[i], base)
-    const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, unionPointers, partial: true, constructed, calls, locate: extra.locate, stored: extra.stored })
-    return { graph: resolved.graph, memoryShapes: resolved.shapes, encoded: resolved.encoded, unions: resolved.unions }
+    const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, unionPointers, partial: true, constructed, calls, locate: extra.locate, stored: extra.stored, iterationField: extra.iterationField })
+    return { graph: resolved.graph, memoryShapes: resolved.shapes, encoded: resolved.encoded, unions: resolved.unions, arrayIterations: resolved.arrayIterations }
 }
 
 function isObjectSlot(slot: Handle): boolean {

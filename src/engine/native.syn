@@ -11,13 +11,13 @@ import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isNumeric, isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, expandValueGraph, sweepBlocks, encodeCallOutcomes, type CallOutcomes, wideLiteral, liftableSlot,
     printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
-    graphLoops, OrderedValues, stronglyConnected, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
+    graphLoops, OrderedValues, stronglyConnected, importFact, mapTailPositions, ownedFields, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, isThisParam, makeNode, type Operand, operandType, resultType, setDebugLabel, setGraphBlocks,
     createFnType, fnLocations, fnReturn, paramLocation, type TypeOperand,
-    setLiteral, setRef, setType, typeOf, typeRefOf, typeSlots,
+    setLiteral, setRef, setType, typeOf, typeRefOf, typeSlots, NodeFlags, factOf, withFact,
 } from './graph-node'
 import { hostTarget, isSignedType, type Target } from './lowering'
 
@@ -2001,6 +2001,13 @@ function expandParams(program: ProgramGraph, clock: PhaseClock): void {
             })
             by.set(load, param)
         }
+        const hoistedAt = new Map<string, number>()
+        for (const load of chosen) {
+            const n = graph.nodes.get(load)!
+            const param = by.get(load)
+            if (typeof param === 'number' && getRef(n, 1) && !getRef(n, 2)) hoistedAt.set(`${getRef(n, 1)}:${getLiteral(n, 2)}`, param)
+        }
+        rewriteFactNodes(graph, f => f.op === 'load' && getRef(f, 1) && !getRef(f, 2) ? hoistedAt.get(`${getRef(f, 1)}:${getLiteral(f, 2)}`) : undefined)
         substitute(graph, by)
         hoisted.push(`${graph.name}:${chosen.length}`)
         touched.add(callee)
@@ -2046,7 +2053,7 @@ function structuralKeys(graph: Graph, table: Map<string, number>, leaves: Map<nu
         const parts = getOperands(n).map((o, i) => n.op === 'call' && i === 0 ? 'nil' : n.op === 'nil-effect' ? '' : part(o))
         if (SymmetricOps.has(n.op) && parts.length === 2 && parts[0] > parts[1]) parts.reverse()
         const type = !typeSlots(n.op) ? '' : typeRefOf(n) ? `:${part(typeRefOf(n))}` : `:${typeOf(n)}`
-        const key = intern(`${n.op}${n.flags ? '!' + n.flags : ''}(${parts.join(',')})${type}`)
+        const key = intern(`${n.op}${n.flags & ~NodeFlags.guarded ? '!' + (n.flags & ~NodeFlags.guarded) : ''}(${parts.join(',')})${type}`)
         memo.set(operand, key)
         return key
     }
@@ -2192,13 +2199,14 @@ function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
 function snapshotGraph(graph: Graph): Graph {
     const nodes = new Map<number, GraphNode>()
     for (const [id, n] of graph.nodes) nodes.set(id, copyNode(n))
-    const out = { ...graph, nodes }
+    const out = { ...graph, nodes, facts: graph.facts ? new Map(graph.facts) : undefined }
     setGraphBlocks(out, graph.blocks.map(b => ({ ...b, params: b.params.slice() })))
     return out
 }
 
 const callEffects = !intrinsics.argv().includes('no-call-effects')
 
+const Effectful = new Set(['store', 'call', 'pstack', 'alloca', 'rt', 'get-prop', 'set-prop'])
 function reachable(graph: Graph): GraphNode[] {
     const seen = new Set<number>()
     const found: GraphNode[] = []
@@ -2244,7 +2252,7 @@ function splice(graph: Graph, call: number, callee: Graph, freshId: (graph: Grap
                 const copied = copyNode(m, getOperands(m).map(x => typeof x === 'number' ? copy(x) : x))
                 if (m.op === 'nil-effect' && countLiterals(m)) setLiteral(copied, 0, blocks.get(getLiteral(m, 0)) ?? getLiteral(m, 0))
                 if (typeRefOf(m)) setType(copied, { ref: copy(typeRefOf(m)) })
-                graph.nodes.set(fresh, copied)
+                graph.nodes.set(fresh, factOf(m) && callee.facts?.has(factOf(m)) ? withFact(copied, importFact(graph, callee, factOf(m), copy)) : withFact(copied, 0))
             }
             copies.set(id, fresh)
             return fresh
@@ -2872,6 +2880,10 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
 
 function lowerProgram(program: ProgramGraph, reached: Set<number>): NativeUnit[] {
     const roots = new Set(program.roots.values())
+    if (intrinsics.argv().includes('loop-preload')) {
+        const owned = ownedFields(program.units.values())
+        for (const graph of program.units.values()) graph.owned = owned
+    }
     const symbols = [...program.units.keys()].filter(symbol => reached.has(symbol))
     const callees = new Map<number, number[]>()
     for (const symbol of symbols) {
@@ -3245,17 +3257,162 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         const frameShapes = new Map<u32, intrinsics.Handle>()
         for (const [proxy, size] of traced.frames) frameShapes.set(proxy, proxy === traced.frameProxy ? frame : propertyEval.frameShape(size))
         let created = false
-        const bound: (UnionBinding | ClosureArgs)[] = []
-        const resolved = propertyEval.resolveClosures(traced.graph, session, frameShapes, params, constructed, callsFor(fn, bound), {
-            locate, stored: (shape, path, value) => setFact(name, shape, path, { shape: value, encoded: false }),
+        let bound: (UnionBinding | ClosureArgs)[] = []
+        const resolve = () => propertyEval.resolveClosures(traced.graph, session, frameShapes, params, constructed, callsFor(fn, bound), {
+            locate, stored: (shape, path, value) => setFact(name, shape, path, { shape: value, encoded: false }), iterationField,
             contextShape: contextShapes.get(fn), unionParams: unionParamBases(fn),
             created: (closure, shape) => {
                 created = true
                 contextShapes.set(closureFunction(closure, name), shape)
             },
         })
+        let resolved = resolve()
+        if (resolved.arrayIterations?.size && !intrinsics.argv().includes('no-index-iterations') && indexArrayIterations(traced.graph, resolved.arrayIterations)) {
+            created = false
+            bound = []
+            resolved = resolve()
+        }
         rebindUnions(resolved.graph, bound)
         return { graph: resolved.graph, closures: traced.frameProxy !== undefined || created, shapes: resolved.memoryShapes, encoded: resolved.encoded ?? new Set(), unions: resolved.unions ?? new Set() }
+    }
+    const iterationFields = new Map<intrinsics.Handle, intrinsics.Handle | null>()
+    function iterationField(method: intrinsics.Handle): intrinsics.Handle | undefined {
+        const known = iterationFields.get(method)
+        if (known !== undefined) return known ?? undefined
+        iterationFields.set(method, null)
+        const fn = session.stubFunctions.get(method as u32) ?? (session.templateOf(method as u32) ? closureFunction(method as u32, 'method') : undefined)
+        if (!fn || !codeOf(fn) || !usesReceiver(fn) || tracing.has(fn)) return
+        const g = graphsOf(fn).traced.graph
+        const self = thisParamOf(g)
+        if (self === undefined || g.blocks.length !== 1) return
+        const strip = (id: number): GraphNode | undefined => {
+            let n = g.nodes.get(id)
+            while (n?.op === 'after') n = g.nodes.get(getRef(n, countIds(n) - 1))
+            return n
+        }
+        const ret = strip(g.blocks[0].bodyId)
+        const call = ret?.op === 'ret' ? strip(getRef(ret, 0)) : undefined
+        if (call?.op !== 'call' || countIds(call) !== 3) return
+        const target = strip(getRef(call, 1))
+        const field = strip(getRef(call, 2))
+        if (target?.op !== 'get-prop' || getRef(target, 2) || getLiteral(target, 2) !== heap.fromJsSymbol(Symbol.iterator)) return
+        if (strip(getRef(target, 1)) !== field || field?.op !== 'get-prop' || getRef(field, 2) || getRef(field, 1) !== self) return
+        const key = getLiteral(field, 2) as intrinsics.Handle
+        iterationFields.set(method, key)
+        return key
+    }
+    const iterationKeys = {
+        next: heap.fromJsString('next'), done: heap.fromJsString('done'), value: heap.fromJsString('value'), length: heap.fromJsString('length'),
+    }
+    function indexArrayIterations(graph: Graph, iterations: Map<number, intrinsics.Handle>): boolean {
+        const users = new Map<number, [user: number, slot: number][]>()
+        for (const [id, n] of graph.nodes) {
+            for (let i = 0; i < countIds(n); i++) {
+                const r = getRef(n, i)
+                if (!r) continue
+                const list = users.get(r)
+                if (list) list.push([id, i])
+                else users.set(r, [[id, i]])
+            }
+        }
+        const ordering = (user: number, slot: number): boolean => {
+            const n = graph.nodes.get(user)!
+            if (n.op === 'after') return slot < countIds(n) - 1
+            return slot === 0 && (n.op === 'get-prop' || n.op === 'set-prop' || n.op === 'call' || n.op === 'load' || n.op === 'store' || n.op === 'pstack')
+        }
+        const literalKey = (n: GraphNode | undefined, op: string, key: intrinsics.Handle) => n?.op === op && !getRef(n, 2) && getLiteral(n, 2) === key
+        const blockOf = (id: number): number | undefined => {
+            for (let n = graph.nodes.get(id); n; n = graph.nodes.get(id)) {
+                if (n.op === 'nil-effect') return countLiterals(n) ? getLiteral(n, 0) : undefined
+                id = getRef(n, 0)
+                if (!id) return
+            }
+        }
+        const owners = new Map<number, number>()
+        for (const b of graph.blocks) {
+            const stack = [b.bodyId]
+            while (stack.length) {
+                const id = stack.pop()!
+                const n = id ? graph.nodes.get(id) : undefined
+                if (!n || owners.has(id) || n.op === 'block' || n.op === 'param') continue
+                if (n.op === 'apply') owners.set(id, b.id)
+                if (n.op !== 'apply' && n.op !== 'select' && n.op !== 'after') continue
+                for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+            }
+        }
+        const loops = graphLoops(graph)
+        let changed = false
+        for (const [symbol, field] of iterations) {
+            const s = graph.nodes.get(symbol)
+            if (s?.op !== 'get-prop') continue
+            const object = getRef(s, 1)
+            const makers = (users.get(symbol) ?? []).filter(([u, slot]) => !ordering(u, slot))
+            if (makers.length !== 1 || makers[0][1] !== 1) continue
+            const iterator = makers[0][0]
+            const make = graph.nodes.get(iterator)!
+            if (make.op !== 'call' || getRef(make, 2) !== object || countIds(make) !== 3) continue
+            const nextProps: number[] = []
+            const nextCalls: number[] = []
+            let valid = true
+            for (const [u, slot] of users.get(iterator) ?? []) {
+                if (ordering(u, slot)) continue
+                const n = graph.nodes.get(u)!
+                if (slot === 1 && literalKey(n, 'get-prop', iterationKeys.next)) nextProps.push(u)
+                else if (slot === 2 && n.op === 'call' && countIds(n) === 3) nextCalls.push(u)
+                else valid = false
+            }
+            if (!valid || nextCalls.length !== 1) continue
+            const call = nextCalls[0]
+            if (!nextProps.includes(getRef(graph.nodes.get(call)!, 1))) continue
+            for (const prop of nextProps) {
+                for (const [u, slot] of users.get(prop) ?? []) if (!ordering(u, slot) && !(u === call && slot === 1)) valid = false
+            }
+            const done: number[] = []
+            const values: number[] = []
+            for (const [u, slot] of users.get(call) ?? []) {
+                if (ordering(u, slot)) continue
+                const n = graph.nodes.get(u)!
+                if (slot === 1 && literalKey(n, 'get-prop', iterationKeys.done)) done.push(u)
+                else if (slot === 1 && literalKey(n, 'get-prop', iterationKeys.value)) values.push(u)
+                else valid = false
+            }
+            if (!valid || !done.length) continue
+            const header = blockOf(call)
+            const members = header === undefined ? undefined : loops.loopMembers.get(header)
+            if (header === undefined || !members) continue
+            const block = getBlock(graph, header)!
+            const token = getRef(graph.nodes.get(call)!, 0)
+            let array = object
+            if (field) {
+                array = graph.maxId++
+                graph.nodes.set(array, makeNode('get-prop', [getRef(make, 0), object, { literal: field }]))
+            }
+            const index = graph.maxId++
+            graph.nodes.set(index, makeNode('param', []))
+            block.params.push(index)
+            for (const [app, owner] of owners) {
+                const n = graph.nodes.get(app)!
+                if (getRef(n, 0) !== header) continue
+                let arg: Operand = { literal: 0 }
+                if (members.has(owner)) {
+                    arg = graph.maxId++
+                    graph.nodes.set(arg, makeNode('add', [index, { literal: 1 }]))
+                }
+                graph.nodes.set(app, copyNode(n, [...getOperands(n), arg]))
+            }
+            const length = graph.maxId++
+            graph.nodes.set(length, makeNode('get-prop', [token, array, { literal: iterationKeys.length }]))
+            const finished = graph.maxId++
+            graph.nodes.set(finished, makeNode('ge', [index, length]))
+            for (const id of done) graph.nodes.set(id, makeNode('after', [length, finished]))
+            for (const id of values) graph.nodes.set(id, makeNode('get-prop', [getRef(graph.nodes.get(id)!, 0), array, index]))
+            for (const id of [call, ...nextProps, iterator, symbol]) {
+                const tok = getRef(graph.nodes.get(id)!, 0)
+                graph.nodes.set(id, makeNode('after', [tok, tok]))
+            }
+            changed = true
+        }
+        return changed
     }
     const paramShapes = new Map<Function, Map<number, intrinsics.Handle>>()
     const numberParams = new Map<Function, Set<number>>()
@@ -3743,6 +3900,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         lowerPanics(traced.graph)
         linkRuntimeCalls(traced.graph)
         closeRootDefaults(fn, traced.graph)
+        if (intrinsics.argv().includes(`traced-debug:${fn.name}`)) console.log(dumpGraph(traced.graph))
         enterPhase(outer)
         const entry: FnGraphs = { fn, source: code.source, traced }
         fnGraphs.set(fn, entry)
@@ -4207,6 +4365,252 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         pstack0BaseAddress ??= pstackCell(0) + 8
         return pstack0BaseAddress
     }
+    const pureReaders = new Map<Function, boolean>()
+    function pureReader(fn: Function): boolean {
+        const known = pureReaders.get(fn)
+        if (known !== undefined) return known
+        pureReaders.set(fn, false)
+        const pure = !!codeOf(fn) && reachable(resolvedOf(fn)).every(n => !Effectful.has(n.op))
+        pureReaders.set(fn, pure)
+        return pure
+    }
+    function reuseTrapReads(graph: Graph): void {
+        const reader = (n: GraphNode | undefined): boolean => {
+            if (n?.op === 'load') return true
+            if (n?.op !== 'call') return false
+            const target = graph.nodes.get(getRef(n, 1))
+            if (target?.op !== 'heap-handle' || getRef(target, 0)) return false
+            const fn = session.stubFunctions.get(getLiteral(target, 0))
+            return !!fn && pureReader(fn)
+        }
+        const same = (a: GraphNode, b: GraphNode): boolean => {
+            if (a.op !== b.op || countIds(a) !== countIds(b)) return false
+            if (a.op === 'load' && resultType(graph, a) !== resultType(graph, b)) return false
+            if (a.op === 'call' && getLiteral(graph.nodes.get(getRef(a, 1))!, 0) !== getLiteral(graph.nodes.get(getRef(b, 1))!, 0)) return false
+            for (let i = a.op === 'load' ? 1 : 2; i < countIds(a); i++) if (getRef(a, i) !== getRef(b, i) || getLiteral(a, i) !== getLiteral(b, i)) return false
+            return true
+        }
+        const loops = graphLoops(graph)
+        const roots = new Map<number, number>()
+        function rootOf(id: number): number {
+            const known = roots.get(id)
+            if (known !== undefined) return known
+            roots.set(id, 0)
+            const n = graph.nodes.get(id)
+            let root = 0
+            if (n?.op === 'nil-effect') root = countLiterals(n) ? getLiteral(n, 0) : 0
+            else if (n && (reader(n) || Effectful.has(n.op) || n.op === 'after')) root = rootOf(getRef(n, 0))
+            roots.set(id, root)
+            return root
+        }
+        const arrivals = new Map<number, [token: number[], from: number][]>()
+        function arrivalsOf(block: number): [token: number[], from: number][] | undefined {
+            if (block === graph.blocks[0].id || loops.loopMembers.has(block)) return
+            const known = arrivals.get(block)
+            if (known) return known
+            const list: [number[], number][] = []
+            for (const from of loops.preds.get(block) ?? []) {
+                for (const p of tailPositions(graph, getBlock(graph, from)!.bodyId)) {
+                    const n = graph.nodes.get(p.at)!
+                    if (n.op === 'apply' && getRef(n, 0) === block) list.push([p.tokens, from])
+                }
+            }
+            arrivals.set(block, list)
+            return list
+        }
+        const None = 0
+        const Dirty = -1
+        function join(results: number[]): number {
+            let found = None
+            for (const r of results) {
+                if (r === Dirty || (r !== None && found !== None && r !== found)) return Dirty
+                if (r !== None) found = r
+            }
+            return found
+        }
+        function earlier(token: number, block: number, read: GraphNode, seen: Map<number, number>): number {
+            if (!token || rootOf(token) !== block) return None
+            const known = seen.get(token)
+            if (known !== undefined) return known
+            seen.set(token, None)
+            const n = graph.nodes.get(token)!
+            let result: number
+            if (reader(n)) {
+                const deeper = earlier(getRef(n, 0), block, read, seen)
+                result = same(n, read) && deeper <= 0 ? token : deeper
+            }
+            else if (n.op === 'after') result = join(getArgIds(n).map(x => earlier(x, block, read, seen)))
+            else if (n.op === 'nil-effect') {
+                const list = arrivalsOf(block)
+                if (!list?.length) result = None
+                else {
+                    const each = list.map(([tokens, from]) => tokens.length ? join(tokens.map(t => earlier(t, from, read, seen))) : earlier(entryOf(from), from, read, seen))
+                    result = each.every(r => r > 0 && r === each[0]) ? each[0] : each.includes(Dirty) ? Dirty : None
+                }
+            } else result = Dirty
+            seen.set(token, result)
+            return result
+        }
+        const entries = new Map<number, number>()
+        function entryOf(block: number): number {
+            if (!entries.size) for (const [id, n] of graph.nodes) if (n.op === 'nil-effect' && countLiterals(n)) entries.set(getLiteral(n, 0), id)
+            return entries.get(block) ?? 0
+        }
+        const reused = new Map<number, number>()
+        for (const [id, n] of graph.nodes) {
+            if (!reader(n)) continue
+            const found = earlier(getRef(n, 0), rootOf(id), n, new Map())
+            if (found > 0) reused.set(id, found)
+        }
+        for (const [id, found] of reused) graph.nodes.set(id, makeNode('after', [getRef(graph.nodes.get(id)!, 0), found]))
+    }
+    function trapCallee(graph: Graph, n: GraphNode | undefined): Function | undefined {
+        if (n?.op !== 'call') return
+        const target = graph.nodes.get(getRef(n, 1))
+        if (target?.op !== 'heap-handle' || getRef(target, 0)) return
+        return session.stubFunctions.get(getLiteral(target, 0))
+    }
+    function receiverSlot(fn: Function): number | undefined {
+        const source = sourceOfLinked(fn)
+        return source && usesReceiver(fn) ? 3 + source.compiled.paramCount : undefined
+    }
+    const receiverWriters = new Map<Function, boolean>()
+    function receiverWriter(fn: Function): boolean {
+        const known = receiverWriters.get(fn)
+        if (known !== undefined) return known
+        receiverWriters.set(fn, false)
+        const source = sourceOfLinked(fn)
+        if (!source || !usesReceiver(fn)) return false
+        const g = resolvedOf(fn)
+        const self = g.blocks[0].params[source.compiled.paramCount]
+        function fromSelf(id: number): boolean {
+            for (let n = g.nodes.get(id); n; n = g.nodes.get(id)) {
+                if (id === self) return true
+                if (n.op === 'after') id = getRef(n, countIds(n) - 1)
+                else if (n.op === 'add' && getRef(n, 0) && fromSelf(getRef(n, 0))) return true
+                else if (n.op === 'add' && getRef(n, 1)) id = getRef(n, 1)
+                else if (n.op === 'load') id = getRef(n, 1)
+                else return false
+            }
+            return false
+        }
+        const nodes = reachable(g)
+        const ok = nodes.every(n => n.op === 'store' ? fromSelf(getRef(n, 1)) : !Effectful.has(n.op))
+        receiverWriters.set(fn, ok)
+        return ok
+    }
+    function hoistTrapReads(graph: Graph, shapes: Map<number, intrinsics.Handle>): void {
+        const loops = graphLoops(graph)
+        const identity = (id: number): number => {
+            for (let n = graph.nodes.get(id); n?.op === 'after'; n = graph.nodes.get(id)) id = getRef(n, countIds(n) - 1)
+            return id
+        }
+        const distinct = (a: number, b: number): boolean => {
+            const x = identity(a)
+            const y = identity(b)
+            if (x === y) return false
+            const sx = shapes.get(x)
+            const sy = shapes.get(y)
+            return sx !== undefined && sy !== undefined && sx !== sy
+        }
+        for (const [header, members] of loops.loopMembers) {
+            const entries: [number, number][] = []
+            for (const from of loops.preds.get(header) ?? []) {
+                if (members.has(from)) continue
+                for (const p of tailPositions(graph, getBlock(graph, from)!.bodyId)) {
+                    const n = graph.nodes.get(p.at)!
+                    if (n.op === 'apply' && getRef(n, 0) === header) entries.push([from, p.at])
+                }
+            }
+            if (entries.length !== 1) continue
+            const params = new Set<number>()
+            for (const m of members) for (const p of getBlock(graph, m)!.params) params.add(p)
+            const variant = new Map<number, boolean>()
+            function varies(id: number): boolean {
+                if (!id) return false
+                const known = variant.get(id)
+                if (known !== undefined) return known
+                variant.set(id, false)
+                const n = graph.nodes.get(id)
+                let out = false
+                if (!n || n.op === 'block') out = false
+                else if (n.op === 'param') out = params.has(id)
+                else if (n.op === 'nil-effect') out = countLiterals(n) > 0 && members.has(getLiteral(n, 0))
+                else for (let i = 0; i < countIds(n) && !out; i++) out = varies(getRef(n, i))
+                variant.set(id, out)
+                return out
+            }
+            const effects: number[] = []
+            const seen = new Set<number>()
+            for (const m of members) {
+                const stack = [getBlock(graph, m)!.bodyId]
+                while (stack.length) {
+                    const id = stack.pop()!
+                    if (!id || seen.has(id) || !varies(id)) continue
+                    seen.add(id)
+                    const n = graph.nodes.get(id)!
+                    if (n.op === 'block' || n.op === 'param') continue
+                    if (Effectful.has(n.op) || n.op === 'load') effects.push(id)
+                    for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+                }
+            }
+            const reads: number[] = []
+            let blocked = false
+            for (const id of effects) {
+                const n = graph.nodes.get(id)!
+                const fn = trapCallee(graph, n)
+                if (fn && pureReader(fn)) {
+                    let invariant = true
+                    for (let i = 1; i < countIds(n) && invariant; i++) invariant = !varies(getRef(n, i))
+                    if (invariant && receiverSlot(fn) !== undefined) reads.push(id)
+                    continue
+                }
+                if (n.op === 'load') continue
+                if (n.op === 'store' || (fn && receiverWriter(fn) && receiverSlot(fn) !== undefined)) continue
+                blocked = true
+                break
+            }
+            if (blocked || !reads.length) continue
+            const writes = effects.filter(id => {
+                const n = graph.nodes.get(id)!
+                return n.op === 'store' || (trapCallee(graph, n) !== undefined && !pureReader(trapCallee(graph, n)!))
+            })
+            const receiverOf = (n: GraphNode): number => n.op === 'store' ? getRef(n, 1) : getRef(n, receiverSlot(trapCallee(graph, n)!)!)
+            const hoisted = new Map<number, number>()
+            const [entryBlock, entryApp] = entries[0]
+            const before: number[] = []
+            for (const id of reads) {
+                const n = graph.nodes.get(id)!
+                const receiver = getRef(n, receiverSlot(trapCallee(graph, n)!)!)
+                if (!receiver || !writes.every(w => distinct(receiverOf(graph.nodes.get(w)!), receiver))) continue
+                const copy = graph.maxId++
+                const operands = getOperands(n)
+                operands[0] = 0
+                graph.nodes.set(copy, makeNode('call', operands))
+                hoisted.set(id, copy)
+                before.push(copy)
+            }
+            if (!hoisted.size) continue
+            const block = getBlock(graph, entryBlock)!
+            block.bodyId = mapTailPositions(graph, block.bodyId, p => {
+                if (p.at !== entryApp) return p.at
+                const token = p.tokens.length ? p.tokens[p.tokens.length - 1] : 0
+                for (const copy of before) {
+                    const n = graph.nodes.get(copy)!
+                    graph.nodes.set(copy, copyNode(n, [token || nilEffect(graph), ...getOperands(n).slice(1)]))
+                }
+                const id = graph.maxId++
+                graph.nodes.set(id, makeNode('after', [...before, p.at]))
+                return id
+            })
+            for (const [id, copy] of hoisted) graph.nodes.set(id, makeNode('after', [getRef(graph.nodes.get(id)!, 0), copy]))
+        }
+    }
+    function nilEffect(graph: Graph): number {
+        const id = graph.maxId++
+        graph.nodes.set(id, makeNode('nil-effect', []))
+        return id
+    }
     function encodeHandles(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, unions: Set<number>, boxesNumbers: boolean, returns: () => boolean): void {
         function encode(value: number): number {
             const encoded = freshId(graph)
@@ -4620,6 +5024,8 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         entry.closed = snapshotGraph(closed.graph)
         entry.closedShapes = closed.shapes
         encodeHandles(closed.graph, closed.shapes, closed.encoded, closed.unions, unionSpecialized.has(current), () => encodesReturns(current))
+        reuseTrapReads(closed.graph)
+        hoistTrapReads(closed.graph, closed.shapes)
         if (intrinsics.argv().includes(`closed-debug:${current.name}`)) console.log(dumpGraph(closed.graph))
         const projected = projectsCallResults(closed.graph)
         const opaque = !projected && [...closed.graph.nodes.values()].some(n => n.op === 'get-prop' || n.op === 'set-prop')
