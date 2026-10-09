@@ -1863,6 +1863,24 @@ export function packageBlocksFINAL(g: Graph) {
         visit(b.bodyId)
     }
     visitBlock(g.blocks[0], new Set())
+    function finish(): Graph {
+        for (const n of g.nodes.values()) {
+            if (n.op !== 'nil-effect' || !countIds(n)) continue
+            clearOperands(n)
+        }
+        return g
+    }
+    let captured = false
+    for (const [k, v] of seenInBlock) {
+        const n = g.nodes.get(k)!
+        if (!isPlaceholder(n) && (!countIds(n) || TargetingValues.has(n.op))) continue
+        const home = pinned.get(k)
+        if (v.size > 1 || (home !== undefined && !v.has(home))) {
+            captured = true
+            break
+        }
+    }
+    if (!captured) return finish()
 
     for (const [k, v] of preds) {
         savedPreds.set(k, new Set(v))
@@ -2132,11 +2150,7 @@ export function packageBlocksFINAL(g: Graph) {
             }
         }
     }
-    for (const n of g.nodes.values()) {
-        if (n.op !== 'nil-effect' || !countIds(n)) continue
-        clearOperands(n)
-    }
-    return g
+    return finish()
 }
 
 const optimizeTimers = intrinsics.argv().includes('optimize-stats') ? new Map<string, number>() : undefined
@@ -4210,8 +4224,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function hoistLoopInvariants(target: GraphBlock) {
+        if (target === g.blocks[0] || (preds.get(target.id)?.size ?? 0) < 2) return false
         currentMem()
-        if (target === g.blocks[0]) return false
         const members = loopPreload ? currentLoops().loopMembers.get(target.id) : loopMembers(target)
         if (!members || members.size < 2) return false
         const entries = findInboundApplies(target).filter(x => !members.has(x[0]))
@@ -4471,7 +4485,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function sinkReloadedStores(target: GraphBlock): boolean {
-        if (target === g.blocks[0]) return false
+        if (target === g.blocks[0] || (preds.get(target.id)?.size ?? 0) < 2) return false
         const members = loopMembers(target)
         const inbound = findInboundApplies(target)
         const entries = inbound.filter(x => !members.has(x[0]))
@@ -4920,9 +4934,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (const id of selects) {
             const n = g.nodes.get(id)
             if (!n || n.op !== 'select') continue
-            const before = guaranteed(getRef(n, 0))
             const yes = guaranteed(getRef(n, 1))
+            if (!yes.size) continue
             const no = guaranteed(getRef(n, 2))
+            if (!no.size) continue
+            const before = guaranteed(getRef(n, 0))
             const unordered = !orderedUse(id)
             const users = [...dependents.get(id) ?? []].map(u => g.nodes.get(u))
             const orderedBefore = (effect: number) => !!users.length && users.every(m => {
@@ -6112,13 +6128,40 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function foldKnownConditions(target: GraphBlock): boolean {
-        if ((findValues(target.id, 'select')?.length ?? 0) < 2) return false
+        const selects = findValues(target.id, 'select') ?? []
+        if (selects.length < 2) return false
         interface Known { keys: Map<string, number>, facts: Facts }
         function keyOf(id: number): string | undefined {
             const n = g.nodes.get(id)
             if (!n) return
             return n.op === 'param' || n.op === 'block' ? `#${id}` : nodeKey(n)
         }
+        const conditions = new Set<string>()
+        let repeated = false
+        for (const s of selects) {
+            const cond = getRef(g.nodes.get(s)!, 0)
+            const key = cond ? keyOf(cond) : undefined
+            if (key === undefined) continue
+            if (conditions.has(key)) {
+                repeated = true
+                break
+            }
+            conditions.add(key)
+            const n = g.nodes.get(cond)!
+            if (CompareOps.has(n.op) && !comparesFloats(g, n)) conditions.add(nodeKey(copyNode(n, getOperands(n), InverseCompare[n.op])))
+        }
+        const offsetBy = (n: GraphNode, a: number, b: number) => {
+            const m = getRef(n, a) ? g.nodes.get(getRef(n, a)) : undefined
+            return m?.op === 'sub' && !!getRef(n, b) && getRef(m, 0) === getRef(n, b)
+        }
+        let offsetCompare = false
+        for (const op of CompareOps) {
+            for (const id of findValues(target.id, op) ?? []) {
+                const n = g.nodes.get(id)!
+                if (offsetBy(n, 0, 1) || offsetBy(n, 1, 0)) offsetCompare = true
+            }
+        }
+        if (!repeated && !offsetCompare) return false
         function assume(known: Known, cond: number, value: number): Known {
             const keys = new Map(known.keys)
             const facts: Facts = [...known.facts, [cond, value === 1]]
@@ -6803,6 +6846,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
     function forwardArrivalLoads(target: GraphBlock): boolean {
         if (target === g.blocks[0] || workingParams(target) >= maxLoopParams) return false
+        if (!findValues(target.id, 'load')?.some(id => isNilOrVoid(getRef(g.nodes.get(id)!, 0)))) return false
         const inbound = findInboundApplies(target)
         if (inbound.length < 2 || inbound.some(([from]) => from === target.id)) return false
         const into = (p: TailPosition) => {
@@ -8106,6 +8150,18 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function substituteEqualArguments(target: GraphBlock) {
         if (target === g.blocks[0] || !target.params.length) return false
+        const sites = findInboundApplies(target).map(([, app]) => g.nodes.get(app)!)
+        if (!sites.length) return false
+        const slotsByOp = new Map<string, number[]>()
+        for (let slot = 1; slot <= target.params.length; slot++) {
+            const arg = getRef(sites[0], slot)
+            const u = arg ? g.nodes.get(arg) : undefined
+            if (!u || u.op === 'param' || isArgless(u)) continue
+            const list = slotsByOp.get(u.op)
+            if (list) list.push(slot)
+            else slotsByOp.set(u.op, [slot])
+        }
+        if (!slotsByOp.size) return false
         const slotOf = new Map<number, number>()
         for (let i = 0; i < target.params.length; i++) slotOf.set(target.params[i], i + 1)
         function closed(n: GraphNode): boolean {
@@ -8119,16 +8175,14 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const candidates = new Set<number>()
         for (const [op, ids] of byOp.get(target.id) ?? []) {
+            if (!slotsByOp.has(op)) continue
             for (const id of ids) {
                 const n = g.nodes.get(id)
-                if (!n || isArgless(n) || op === 'param') continue
-                if (!isUnordered(op === 'load' ? getRef(n, 0) : id)) continue
-                if (closed(n)) candidates.add(id)
+                if (!n || isArgless(n) || !closed(n)) continue
+                if (isUnordered(op === 'load' ? getRef(n, 0) : id)) candidates.add(id)
             }
         }
         if (!candidates.size) return false
-        const sites = findInboundApplies(target).map(([, app]) => g.nodes.get(app)!)
-        if (!sites.length) return false
         function imageOf(n: GraphNode, site: GraphNode, arg: GraphNode): boolean {
             if (arg.op !== n.op || (arg.flags & ~gn.NodeFlags.guarded) !== (n.flags & ~gn.NodeFlags.guarded) || countIds(arg) !== countIds(n)) return false
             if (typeSlots(n.op) && (typeOf(arg) !== typeOf(n) || typeRefOf(arg) !== typeRefOf(n))) return false
@@ -8144,10 +8198,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const replacements = new Map<number, number>()
         for (const id of candidates) {
             const n = g.nodes.get(id)!
-            let options: number[] | undefined
+            let options: number[] | undefined = slotsByOp.get(n.op)
+            if (!options) continue
             for (const site of sites) {
                 const fits: number[] = []
-                for (const slot of options ?? target.params.map((_, i) => i + 1)) {
+                for (const slot of options) {
                     const arg = getRef(site, slot)
                     if (arg && imageOf(n, site, g.nodes.get(arg)!)) fits.push(slot)
                 }
@@ -8289,6 +8344,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function decodeParams(target: GraphBlock) {
         if (target === g.blocks[0] || !target.params.length) return false
+        if (!findValues(target.id, 'decode')?.some(id => g.nodes.get(getRef(g.nodes.get(id)!, 0))?.op === 'param')) return false
         const inbound = findInboundApplies(target)
         if (!inbound.length) return false
         const decoded = new Map<number, number>()
@@ -8492,6 +8548,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
         }
         visit((n, op, slot, value) => counts.set(value, (counts.get(value) ?? 0) + 1))
+        if (![...counts.values()].some(c => c >= 2)) return false
         const made = new Map<number, number>()
         visit((n, op, slot, value) => {
             if ((counts.get(value) ?? 0) < 2) return
@@ -10763,6 +10820,26 @@ function outlineBlocks(g: Graph): Graph {
 
     enter(g.blocks[0])
 
+    const rootShapes = new Set<string>()
+    let repeats = false
+    for (const info of postOrder) {
+        const body = g.nodes.get(info.block.bodyId)
+        if (info.block !== g.blocks[0] && body && body.op !== 'param') {
+            const key = `B${body.op}/${countIds(body)}/${smuggledOperands(body)}`
+            if (rootShapes.has(key)) repeats = true
+            rootShapes.add(key)
+        }
+        for (const id of info.tails) {
+            const n = g.nodes.get(id)
+            if (!n || n.op === 'param' || isArgless(n) || info.uses.get(id)! > 1) continue
+            const key = `${n.op}/${countIds(n)}`
+            if (rootShapes.has(key)) repeats = true
+            rootShapes.add(key)
+        }
+        if (repeats) break
+    }
+    if (!repeats) return g
+
     const representative = new Map<number, OutlineBlock>()
     const merged = new Map<number, OutlineBlock>()
     for (const info of postOrder) {
@@ -10778,22 +10855,32 @@ function outlineBlocks(g: Graph): Graph {
     }
 
     const groups = new Map<number, [OutlineBlock, number, number][]>()
+    const ordinal = new Map<string, number>()
+    let active: [info: OutlineBlock, id: number, size: number, key: number][] = []
     for (const info of postOrder) {
         if (merged.has(info.block.id)) continue
         for (const id of info.tails) {
             const n = g.nodes.get(id)
             if (!n || n.op === 'param' || isArgless(n) || info.uses.get(id)! > 1) continue
-            for (let depth = 1, size = 0; ; depth++) {
-                const grown = tree(info, id, depth).size
-                if (grown === size) break
-                size = grown
-                const key = mini(info, id, true, depth).key
-                let arr = groups.get(key)
-                if (!arr) groups.set(key, arr = [])
-                arr.push([info, id, depth])
-            }
+            ordinal.set(`${info.block.id}:${id}`, ordinal.size)
+            active.push([info, id, 0, 0])
         }
     }
+    for (let depth = 1; active.length; depth++) {
+        const next: typeof active = []
+        for (const [info, id, size] of active) {
+            const grown = tree(info, id, depth).size
+            if (grown === size) continue
+            const key = mini(info, id, true, depth).key
+            let arr = groups.get(key)
+            if (!arr) groups.set(key, arr = [])
+            arr.push([info, id, depth])
+            next.push([info, id, grown, key])
+        }
+        active = next.filter(([, , , key]) => groups.get(key)!.length > 1)
+    }
+    const siteOrder = ([info, id, depth]: [OutlineBlock, number, number]) => ordinal.get(`${info.block.id}:${id}`)! * 4096 + depth
+    for (const sites of groups.values()) if (sites.length > 1) sites.sort((a, b) => siteOrder(a) - siteOrder(b))
 
     const claimed = new Map<OutlineBlock, Set<number>>()
     const chosen: [OutlineBlock, number, number][][] = []
