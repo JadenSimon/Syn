@@ -6,6 +6,7 @@ const value_graph = @import("./value_graph.zig");
 const synth_helper = @import("./synth_helper.zig");
 const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringMap;
 const getAllocator = @import("./string_immutable.zig").getAllocator;
+const Reifier = @import("./reifier.zig").Reifier;
 const debugPrint = parser.debugPrint;
 
 const SymbolRef = parser.SymbolRef;
@@ -2510,6 +2511,19 @@ pub const Program = struct {
             fn callHelper(self: *@This(), helper_name: []const u8, subject: u32) !u32 {
                 const fn_ident = try self.factory.createIdentifier(helper_name);
                 return self.factory.createCallExpression(fn_ident, subject);
+            }
+
+            fn replaceReifyExpression(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                var reifier = Reifier.init(getAllocator(), self.analyzer);
+                const blob = try reifier.reifyExpression(self.file, unwrapRef(n), n.len);
+                const text = try std.fmt.allocPrint(getAllocator(), "Type.__replay({s})", .{blob});
+                const replacement = try self.nodes.push(.{
+                    .kind = .verbatim_node,
+                    .data = @intFromPtr(text.ptr),
+                    .len = @intCast(text.len),
+                    .next = n.next,
+                });
+                try self.replacements.put(ref, replacement);
             }
 
             fn addReplacement(self: *@This(), ref: NodeRef, new_ref: NodeRef) !void {
@@ -11097,6 +11111,7 @@ pub const Program = struct {
                     },
                     .block => try self.transformDeferScope(n, ref),
                     .enum_declaration => try self.lowerEnumDeclaration(n, ref),
+                    .reify_expression => try self.replaceReifyExpression(n, ref),
                     else => {
                         try parser.forEachChild(self.nodes, n, self);
                     },

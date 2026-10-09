@@ -6017,7 +6017,7 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
         if (reifier) return reifier
 
         const types = reifiedTypes.createTypeNamespace()
-        const reifierHandle = api.createReifier(programHandle, types)
+        const reifierHandle = api.createReifier(programHandle)
 
         function __reify(fileName: string, nodeRef: number, typeParams = 0) {
             const sf = getSourceFile(fileName)
@@ -6028,11 +6028,11 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
             if (!h) {
                 throw new Error(`missing sf handle: ${fileName}`)
             }
-            return api.getReifiedType(reifierHandle, h.handle, nodeRef, typeParams)
+            return types.__replay(JSON.parse(api.getReifiedType(reifierHandle, h.handle, nodeRef, typeParams)))
         }
 
         function __callTypeFunction(typeRef: number, args: number[]) {
-            return api.callTypeFunction(reifierHandle, typeRef, args)
+            return types.__replay(JSON.parse(api.callTypeFunction(reifierHandle, typeRef, args)))
         }
 
         types.__callTypeFunction = __callTypeFunction
@@ -6673,6 +6673,10 @@ function createSystem(): ts.System {
 }
 
 export const sys = createSystem()
+
+export function getBuildId(): string {
+    return api.getBuildId()
+}
 
 export function optimizeVson(source: string, emitVson = false): string {
     return api.optimizeVson(source, emitVson)

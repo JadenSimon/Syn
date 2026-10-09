@@ -1,4 +1,3 @@
-const js = @import("js");
 const std = @import("std");
 const parser = @import("./parser.zig");
 const program = @import("./program.zig");
@@ -8,203 +7,92 @@ const TypeRef =  program.Analyzer.TypeRef;
 
 const getSlice2 = program.Analyzer.getSlice2;
 
-pub const Reifier = struct {    
-    env: *js.Env,
+pub const Reifier = struct {
     analyzer: *program.Analyzer,
-    type_map: std.AutoArrayHashMapUnmanaged(TypeRef, *js.Value) = std.AutoArrayHashMapUnmanaged(TypeRef, *js.Value){},
     allocator: std.mem.Allocator,
-    type_module: *js.Ref,
+    out: std.ArrayListUnmanaged(u8) = .{},
+    cached: std.AutoHashMapUnmanaged(TypeRef, void) = .{},
 
-
-    pub fn init(env: *js.Env, allocator: std.mem.Allocator, analyzer: *program.Analyzer, type_module: *js.Object) @This() {
-        const ref = js.Ref.init(env, @ptrCast(type_module), 1) catch unreachable;
+    pub fn init(allocator: std.mem.Allocator, analyzer: *program.Analyzer) @This() {
         return .{
-            .env = env,
             .allocator = allocator,
             .analyzer = analyzer,
-            .type_module = ref,
         };
     }
 
-    pub fn initCurrentEnv(allocator: std.mem.Allocator, analyzer: *program.Analyzer, type_module: *js.Object) @This() {
-        return @This().init(js.getCurrentEnv(), allocator, analyzer, type_module);
+    fn raw(this: *@This(), s: []const u8) !void {
+        try this.out.appendSlice(this.allocator, s);
     }
 
-    fn createShape(this: *@This(), comptime name: [:0]const u8) !*js.Object {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, name);
-
-        const f: *js.Function = @ptrCast(prop);
-        const val = try f.call(.{});
-
-        return @ptrCast(val);
+    fn print(this: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        try this.out.writer(this.allocator).print(fmt, args);
     }
 
-    fn getIntrinsic(this: *@This(), comptime name: [:0]const u8) !*js.Value {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, name);
-
-        return prop;
+    fn string(this: *@This(), s: []const u8) !void {
+        try std.json.encodeJsonString(s, .{}, this.out.writer(this.allocator));
     }
 
-    fn getMachineIntrinsic(this: *@This(), ref: u32, kind: u8, width: u24) !*js.Value {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, "getMachineDataType");
-        const f: *js.Function = @ptrCast(prop);
-        return try f.callWithThisArg(this.env, type_module, .{ref, kind, width});
+    fn number(this: *@This(), v: f64) !void {
+        if (std.math.isNan(v)) return this.raw("[\"d\",\"NaN\"]");
+        if (std.math.isInf(v)) return this.raw(if (v > 0) "[\"d\",\"Infinity\"]" else "[\"d\",\"-Infinity\"]");
+        try this.print("{d}", .{v});
     }
 
-    fn createSavedShape(this: *@This(), ty: TypeRef, comptime name: [:0]const u8) !*js.Object {
-        const val = try this.createShape(name);
-       // try this.type_map.put(this.allocator, ty, @ptrCast(val));
-       _ = ty;
-
-        return val;
+    fn intrinsic(this: *@This(), comptime name: []const u8) !void {
+        try this.raw("[\"i\",\"" ++ name ++ "\"]");
     }
 
-    fn callMethod(this: *@This(), o: *js.Object, comptime name: [:0]const u8, args: anytype) !void {        
-        const prop = try o.getNamedProperty(this.env, name);
-
-        const f: *js.Function = @ptrCast(prop);
-        _ = try f.callWithThisArg(this.env, o, args);
-    }
-
-    fn setField(this: *@This(), o: *js.Object, comptime name: [:0]const u8, v: *js.Value) !void {
-     //   const nt_name = try js.String.fromUtf8(this.env, name);
-        try o.setNamedProperty(this.env, name, v);
-    }
-
-    fn hasCached(this: *@This(), n: TypeRef) !bool {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, "__hasCachedType");
-
-        const f: *js.Function = @ptrCast(prop);
-        const val = try f.call(.{n});
-        const b: *Boolean = @ptrCast(val);
-
-        return try b.getValue(this.env);
-    }
-
-    fn getCached(this: *@This(), n: TypeRef) !*js.Value {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, "__getCachedType");
-
-        const f: *js.Function = @ptrCast(prop);
-        const val = try f.call(.{n});
-
-        return val;
-    }
-
-    fn setCached(this: *@This(), n: TypeRef, v: *js.Value) !void {
-        const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-        const prop = try type_module.getNamedProperty(this.env, "__setCachedType");
-
-        const f: *js.Function = @ptrCast(prop);
-        _ = try f.call(.{n, v});
-    }
-
-    fn buildTuple(this: *@This(), o: *js.Object, types: []const TypeRef) !void {
-        for (types) |u| {
+    fn writeTuple(this: *@This(), types: []const TypeRef) !void {
+        try this.raw("[\"T\",[");
+        for (types, 0..) |u, i| {
+            if (i > 0) try this.raw(",");
             if (u < @intFromEnum(Kind.false)) {
                 const t2 = this.analyzer.types.at(u);
-                if (t2.getKind() != .tuple_element) {
-                    try this.callMethod(o, "add", .{
-                        @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    });
+                if (t2.getKind() == .tuple_element) {
+                    try this.write(t2.slot1);
                     continue;
                 }
-                const el_type = t2.slot1;
-                try this.callMethod(o, "add", .{
-                    @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(el_type))))
-                });
-                continue;
             }
-
-            try this.callMethod(o, "add", .{
-                @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-            });
+            try this.write(u);
         }
-        try this.callMethod(o, "simplify", .{});
+        try this.raw("]]");
     }
 
-    fn reifyType(this: *@This(), ty: program.Analyzer.TypeRef) anyerror!*anyopaque {
+    fn writePrimitive(this: *@This(), ty: TypeRef) !void {
+        if (ty == @intFromEnum(Kind.false)) return this.raw("false");
+        if (ty == @intFromEnum(Kind.true)) return this.raw("true");
+        if (ty == @intFromEnum(Kind.undefined)) return this.raw("[\"u\"]");
+        if (ty == @intFromEnum(Kind.null)) return this.raw("null");
+        if (ty == @intFromEnum(Kind.void)) return this.intrinsic("Void");
+        if (ty == @intFromEnum(Kind.any)) return this.intrinsic("any");
+        if (ty == @intFromEnum(Kind.never)) return this.intrinsic("never");
+        if (ty == @intFromEnum(Kind.unknown)) return this.intrinsic("unknown");
+        if (ty == @intFromEnum(Kind.string)) return this.intrinsic("string");
+        if (ty == @intFromEnum(Kind.number)) return this.intrinsic("number");
+        if (ty == @intFromEnum(Kind.boolean)) return this.intrinsic("boolean");
+        if (ty == @intFromEnum(Kind.object)) return this.intrinsic("object");
+        if (ty == @intFromEnum(Kind.symbol)) return this.intrinsic("symbol");
+        if (ty == @intFromEnum(Kind.empty_string)) return this.raw("\"\"");
+        if (ty == @intFromEnum(Kind.empty_object)) return this.raw("[\"O\",null,[],[]]");
+        if (ty == @intFromEnum(Kind.empty_tuple)) return this.raw("[\"t\"]");
+        if (ty >= @intFromEnum(Kind.zero)) return this.number(this.analyzer.getDoubleFromType(ty));
+
+        this.analyzer.printTypeInfo(ty);
+        return error.TODO_unhandled_primitve_type;
+    }
+
+    fn write(this: *@This(), ty: TypeRef) anyerror!void {
         if (this.analyzer.isParameterizedRef(ty)) {
             this.analyzer.printTypeInfo(ty);
             return error.TODO_parameterized;
         }
 
-        if (ty >= @intFromEnum(Kind.false)) {
-            if (ty == @intFromEnum(Kind.false)) {
-                return try this.env.getBool(false);
-            }
-            if (ty == @intFromEnum(Kind.true)) {
-                return try this.env.getBool(true);
-            }
-            if (ty == @intFromEnum(Kind.undefined)) {
-                return try this.env.getUndefined();
-            }
-            if (ty == @intFromEnum(Kind.null)) {
-                return try this.env.getNull();
-            }
-
-            if (ty == @intFromEnum(Kind.void)) {
-                return try this.getIntrinsic("Void");
-            }
-
-            if (ty == @intFromEnum(Kind.any)) {
-                return try this.getIntrinsic("any");
-            }
-            if (ty == @intFromEnum(Kind.never)) {
-                return try this.getIntrinsic("never");
-            }
-            if (ty == @intFromEnum(Kind.unknown)) {
-                return try this.getIntrinsic("unknown");
-            }
-
-            if (ty == @intFromEnum(Kind.string)) {
-                return try this.getIntrinsic("string");
-            }
-            if (ty == @intFromEnum(Kind.number)) {
-                return try this.getIntrinsic("number");
-            }
-            if (ty == @intFromEnum(Kind.boolean)) {
-                return try this.getIntrinsic("boolean");
-            }
-            if (ty == @intFromEnum(Kind.object)) {
-                return try this.getIntrinsic("object");
-            }
-            if (ty == @intFromEnum(Kind.symbol)) {
-                return try this.getIntrinsic("symbol");
-            }
-
-            if (ty == @intFromEnum(Kind.empty_string)) {
-                return try js.String.fromUtf8(this.env, "");
-            } else if (ty == @intFromEnum(Kind.empty_object)) {
-                return try this.createShape("__Object");
-            } else if (ty == @intFromEnum(Kind.empty_tuple)) {
-                return try this.createShape("__Tuple");
-            }
-
-            // empty_element -> undefined ?
-
-            if (ty >= @intFromEnum(Kind.zero)) {
-                return try js.Number.createDouble(this.env, this.analyzer.getDoubleFromType(ty));
-            }
-
-            this.analyzer.printTypeInfo(ty);
-            return error.TODO_unhandled_primitve_type;
-        }
-
-        if (this.type_map.get(ty)) |p| {
-            return p;
-        }
+        if (ty >= @intFromEnum(Kind.false)) return this.writePrimitive(ty);
 
         const t = this.analyzer.types.at(ty);
         switch (t.getKind()) {
             .alias => {
-                if (try this.hasCached(ty)) {
-                    return try this.getCached(ty);
-                }
+                if (this.cached.contains(ty)) return this.print("[\"c\",{d}]", .{ty});
 
                 const followed = try this.analyzer.evaluateType(ty, 1 << 0);
                 if (ty == followed) {
@@ -212,10 +100,10 @@ pub const Reifier = struct {
                     return error.RecursiveAlias;
                 }
 
-                const result = try this.reifyType(followed);
-                try this.setCached(ty, @ptrCast(result));
-
-                return result;
+                try this.print("[\"a\",{d},", .{ty});
+                try this.write(followed);
+                try this.raw("]");
+                try this.cached.put(this.allocator, ty, {});
             },
             .conditional, .indexed, .keyof, .query, .mapped, .intersection => {
                 const followed = try this.analyzer.evaluateType(ty, 1 << 0 | 1 << 30);
@@ -224,285 +112,87 @@ pub const Reifier = struct {
                     return error.Recursive;
                 }
 
-                return try this.reifyType(followed);
+                try this.write(followed);
             },
             .array => {
-                const o = try this.createSavedShape(ty, "__ArrayType");
-                try this.setField(o, "element", @alignCast(@ptrCast(try this.reifyType(t.slot0))));
-                return o;
+                try this.raw("[\"A\",");
+                try this.write(t.slot0);
+                try this.raw("]");
             },
-            .tuple => {
-                const o = try this.createSavedShape(ty, "__Tuple");
-                const types = getSlice2(t, TypeRef);
-                try this.buildTuple(o, types);
-                return o;
-            },
-            // .tuple_element => {
-            //     const o = try this.createSavedShape(ty, "__TupleElement");
-            //     const types = getSlice2(t, TypeRef);
-            //     for (types) |u| {
-            //         try this.callMethod(o, "add", .{
-            //             @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-            //         });
-            //     }
-            //     return o;
-            // },
+            .tuple => try this.writeTuple(getSlice2(t, TypeRef)),
             .@"union" => {
-                const o = try this.createSavedShape(ty, "__Union");
-                const types = getSlice2(t, TypeRef);
-                for (types) |u| {
-                    try this.callMethod(o, "add", .{
-                        @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(u))))
-                    });
+                try this.raw("[\"U\",[");
+                for (getSlice2(t, TypeRef), 0..) |u, i| {
+                    if (i > 0) try this.raw(",");
+                    try this.write(u);
                 }
-                return o;
+                try this.raw("]]");
             },
-            .string_literal => {
-                const s = this.analyzer.getSliceFromLiteral(ty);
-                return try js.String.fromUtf8(this.env, s);
-            },
-            .number_literal => {
-                return try js.Number.createDouble(this.env, this.analyzer.getDoubleFromType(ty));
-            },
+            .string_literal => try this.string(this.analyzer.getSliceFromLiteral(ty)),
+            .number_literal => try this.number(this.analyzer.getDoubleFromType(ty)),
             .object_literal => {
-                if (try this.hasCached(ty)) {
-                    return try this.getCached(ty);
+                if (this.cached.contains(ty)) return this.print("[\"c\",{d}]", .{ty});
+                try this.cached.put(this.allocator, ty, {});
+
+                try this.print("[\"O\",{d},[", .{ty});
+                if (t.slot3 != 0) try this.write(t.slot3);
+                try this.raw("],[");
+
+                var first = true;
+                for (getSlice2(t, program.Analyzer.ObjectLiteralMember)) |*u| {
+                    if (u.kind != .property) continue;
+                    if (!first) try this.raw(",");
+                    first = false;
+                    try this.raw("[");
+                    try this.write(u.name);
+                    try this.raw(",");
+                    try this.write(try u.getType(this.analyzer));
+                    try this.raw("]");
                 }
-
-                const o = try this.createSavedShape(ty, "__Object");
-                try this.setCached(ty, @ptrCast(o));
-
-                if (t.slot3 != 0) {
-                    const base = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(t.slot3))));
-                    try this.callMethod(o, "__setBase", .{base});
-                }
-
-                const members = getSlice2(t, program.Analyzer.ObjectLiteralMember);
-                for (members) |*u| {
-                    if (u.kind != .property) continue; // TODO
-
-                    const name: *js.Value = @alignCast(@ptrCast(try this.reifyType(u.name)));
-
-                    const inner = try u.getType(this.analyzer);
-                    const v = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(inner))));
-                    try o.setProperty(this.env, name, v);
-                }
-                return o;
+                try this.raw("]]");
             },
             .function_literal => {
-                if (try this.hasCached(ty)) {
-                    return try this.getCached(ty);
-                }
+                if (this.cached.contains(ty)) return this.print("[\"c\",{d}]", .{ty});
+                try this.cached.put(this.allocator, ty, {});
 
-                const o = try this.createSavedShape(ty, "__FunctionType");
-                try this.setCached(ty, @ptrCast(o));
-
-                const tuple = try this.createSavedShape(ty, "__Tuple");
-                try this.buildTuple(tuple, getSlice2(t, TypeRef));
-                try this.setField(o, "params", @ptrCast(tuple));
+                try this.print("[\"F\",{d},", .{ty});
+                try this.writeTuple(getSlice2(t, TypeRef));
                 if (t.slot3 != @intFromEnum(Kind.void)) {
-                    const v = @as(*js.Value, @alignCast(@ptrCast(try this.reifyType(t.slot3))));
-                    try this.setField(o, "returns", v);
+                    try this.raw(",");
+                    try this.write(t.slot3);
                 }
-
-                return o;
+                try this.raw("]");
             },
-            .machine_data_type => {
-                return try this.getMachineIntrinsic(ty, @intCast(t.slot0), @intCast(t.slot1));
+            .machine_data_type => try this.print("[\"m\",{d},{d},{d}]", .{ ty, t.slot0, t.slot1 }),
+            else => {
+                this.analyzer.printTypeInfo(ty);
+                return error.TODO_unhandled_allocated_type;
             },
-            else => {},
-            // class
-            // template_literal
-            // module_namespace
-            // symbol_literal (only well-known symbols)
         }
-
-        this.analyzer.printTypeInfo(ty);
-        return error.TODO_unhandled_allocated_type;
     }
 
-    pub fn processReifyExpression(this: *@This(), f: *program.ParsedFileData, node_ref: parser.NodeRef, type_params: parser.NodeRef) !*anyopaque {
-        // const scope = try HandleScope.init(this.env);
-        // defer scope.deinit(this.env) catch {};
-        const scope = try EscapableHandleScope.open(this.env);
-        defer scope.close(this.env) catch {};
+    fn finish(this: *@This()) ![:0]u8 {
+        defer {
+            this.out.clearRetainingCapacity();
+            this.cached.clearRetainingCapacity();
+        }
+        return try this.allocator.dupeZ(u8, this.out.items);
+    }
 
+    pub fn reifyExpression(this: *@This(), f: *program.ParsedFileData, node_ref: parser.NodeRef, type_params: parser.NodeRef) ![:0]u8 {
         const ty = try this.analyzer.getType(f, node_ref);
-
         if (type_params != 0) {
             const ty2 = try this.analyzer.createParameterizedTypeFromParams(f, type_params, ty);
-
-            const type_module = @as(*js.Object, @ptrCast(try this.type_module.getValue(this.env)));
-            const prop = try type_module.getNamedProperty(this.env, "__TypeFunction");
-
-            const createTypeFn: *js.Function = @ptrCast(prop);
-            const val = try createTypeFn.call(.{ ty2 }); // TODO: compute arity
-
-            try this.setCached(ty2, val);
-
-            return try scope.escape(this.env, val);
+            try this.print("[\"f\",{d}]", .{ty2});
+        } else {
+            try this.write(ty);
         }
-
-        return try scope.escape(this.env, @alignCast(@ptrCast(try this.reifyType(ty))));
+        return this.finish();
     }
 
-    pub fn evaluateTypeFunction(this: *@This(), inner: TypeRef, args: []TypeRef) !*anyopaque {
-        const scope = try EscapableHandleScope.open(this.env);
-        defer scope.close(this.env) catch {};
-
+    pub fn evaluateTypeFunction(this: *@This(), inner: TypeRef, args: []TypeRef) ![:0]u8 {
         const ty = try this.analyzer.resolveWithTypeArgsSlice(this.analyzer.types.at(inner), args);
-
-        return try scope.escape(this.env, @alignCast(@ptrCast(try this.reifyType(ty))));
-    }
-
-    pub fn valueToTypeRef(this: *@This(), val: *js.Value) !TypeRef {
-        _ = this;
-        _ = val;
-        return 0;
-    }
-
-    // try js.ArrayPointer.initCapacity(this.env, 0),
-};
-
-// const Tag = enum {
-//     object,
-//     array,
-//     tuple,
-//     @"union",
-//     function,
-//     template,
-//     type_function,
-//     intrinsic,
-//     literal,
-// };
-
-const EscapableHandleScope = opaque {
-    extern fn napi_open_escapable_handle_scope(env: *js.Env, result: **EscapableHandleScope) Status;
-    extern fn napi_close_escapable_handle_scope(env: *js.Env, scope: *EscapableHandleScope) Status;
-    extern fn napi_escape_handle(env: *js.Env, scope: *EscapableHandleScope, escapee: *js.Value, result: **js.Value) Status;
-
-    pub fn open(env: *js.Env) !*EscapableHandleScope {
-        var result: *EscapableHandleScope = undefined;
-        const status = napi_open_escapable_handle_scope(env, &result);
-        try checkStatus(status);
-
-        return result;
-    }
-
-    pub fn close(this: *EscapableHandleScope, env: *js.Env) !void {
-        const status = napi_close_escapable_handle_scope(env, this);
-        try checkStatus(status);
-    }
-
-    pub fn escape(this: *EscapableHandleScope, env: *js.Env, escapee: *js.Value) !*js.Value {
-        var result: *js.Value = undefined;
-        const status = napi_escape_handle(env, this, escapee, &result);
-        try checkStatus(status);
-
-        return result;
-    }
-};
-
-
-const Status = enum(u16) {
-    napi_ok,
-    napi_invalid_arg,
-    napi_object_expected,
-    napi_string_expected,
-    napi_name_expected,
-    napi_function_expected,
-    napi_number_expected,
-    napi_boolean_expected,
-    napi_array_expected,
-    napi_generic_failure,
-    napi_pending_exception,
-    napi_cancelled,
-    napi_escape_called_twice,
-    napi_handle_scope_mismatch,
-    napi_callback_scope_mismatch,
-    napi_queue_full,
-    napi_closing,
-    napi_bigint_expected,
-    napi_date_expected,
-    napi_arraybuffer_expected,
-    napi_detachable_arraybuffer_expected,
-    napi_would_deadlock,
-    napi_no_external_buffers_allowed,
-    napi_cannot_run_js,
-};
-
-const JSError = error{
-    InvalidArg,
-    ObjectExpected,
-    StringExpected,
-    NameExpected,
-    FunctionExpected,
-    NumberExpected,
-    BooleanExpected,
-    ArrayExpected,
-    GenericFailure,
-    PendingException,
-    Cancelled,
-    EscapeCalledTwice,
-    HandleScopeMismatch,
-    CallbackScopeMismatch,
-    QueueFull,
-    Closing,
-    BigintExpected,
-    DateExpected,
-    ArrayBufferExpected,
-    DetatchableArrayBufferExpected,
-    WouldDeadlock,
-    NoExternalArrayBuffersAllowed,
-    CannotRunJs,
-};
-
-fn checkStatus(status: Status) JSError!void {
-    return switch (status) {
-        .napi_ok => {},
-        .napi_invalid_arg => JSError.InvalidArg,
-        .napi_object_expected => JSError.ObjectExpected,
-        .napi_string_expected => JSError.StringExpected,
-        .napi_name_expected => JSError.NameExpected,
-        .napi_function_expected => JSError.FunctionExpected,
-        .napi_number_expected => JSError.NumberExpected,
-        .napi_boolean_expected => JSError.NameExpected,
-        .napi_array_expected => JSError.ArrayExpected,
-        .napi_generic_failure => JSError.GenericFailure,
-        .napi_pending_exception => JSError.PendingException,
-        .napi_cancelled => JSError.Cancelled,
-        .napi_escape_called_twice => JSError.EscapeCalledTwice,
-        .napi_handle_scope_mismatch => JSError.HandleScopeMismatch,
-        .napi_callback_scope_mismatch => JSError.CallbackScopeMismatch,
-        .napi_queue_full => JSError.QueueFull,
-        .napi_closing => JSError.Closing,
-        .napi_bigint_expected => JSError.BigintExpected,
-        .napi_date_expected => JSError.DateExpected,
-        .napi_arraybuffer_expected => JSError.ArrayBufferExpected,
-        .napi_detachable_arraybuffer_expected => JSError.DetatchableArrayBufferExpected,
-        .napi_would_deadlock => JSError.WouldDeadlock,
-        .napi_no_external_buffers_allowed => JSError.NoExternalArrayBuffersAllowed,
-        .napi_cannot_run_js => JSError.CannotRunJs, 
-    };
-}
-
-const Boolean = opaque {
-    extern fn napi_get_boolean(env: *js.Env, val: bool, result: **Boolean) Status;
-    extern fn napi_get_value_bool(env: *js.Env, val: *const Boolean, result: *bool) Status;
-
-    pub fn getBoolean(env: *js.Env, val: bool) !*Boolean {
-        var result: *Boolean = undefined;
-        const status = napi_get_boolean(env, val, &result);
-        try checkStatus(status);
-
-        return result;
-    }
-
-    pub fn getValue(this: *const Boolean, env: *js.Env) !bool {
-        var result: bool = undefined;
-        const status = napi_get_value_bool(env, this, &result);
-        try checkStatus(status);
-
-        return result;
+        try this.write(ty);
+        return this.finish();
     }
 };

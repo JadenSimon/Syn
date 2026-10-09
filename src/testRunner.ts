@@ -1,6 +1,8 @@
 import * as api from './api'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import * as crypto from 'node:crypto'
+import * as reifiedTypes from './reifiedTypes'
 import { createModuleLoader, runSynScript } from './synModules'
 
 const filenameMarker = '// @filename:'
@@ -369,24 +371,65 @@ async function runVsonTestCase(name: string) {
     await writeFile(snapshotPath, output)
 }
 
-async function compileEngine() {
-    const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
+const engineCompilerOptions = {
+    lib: ['reify', 'machine'],
+    sourceMap: true,
+    inlineSourceMap: true,
+}
 
-    const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name))
-    const prog = api.createProgram(roots, {
-        lib: ['reify', 'machine'],
-        sourceMap: true,
-        inlineSourceMap: true,
-    })
+interface EngineCacheEntry {
+    inputs: Record<string, string>
+    emitted: Record<string, string>
+}
 
-    const emitted = new Map<string, string>()
+function contentHash(data: string | Buffer) {
+    return crypto.createHash('sha256').update(data).digest('hex')
+}
+
+function readEngineCache(file: string): Map<string, string> | undefined {
+    let entry: EngineCacheEntry
+    try {
+        entry = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    } catch {
+        return
+    }
+    for (const [name, hash] of Object.entries(entry.inputs)) {
+        let data: Buffer
+        try {
+            data = fs.readFileSync(name)
+        } catch {
+            return
+        }
+        if (contentHash(data) !== hash) return
+    }
+    return new Map(Object.entries(entry.emitted))
+}
+
+function writeEngineCache(file: string, entry: EngineCacheEntry) {
+    const dir = path.dirname(file)
+    fs.mkdirSync(dir, { recursive: true })
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(entry))
+    fs.renameSync(tmp, file)
+    const stale = fs.readdirSync(dir)
+        .filter(name => name.endsWith('.json'))
+        .map(name => path.resolve(dir, name))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+        .slice(8)
+    for (const name of stale) fs.rmSync(name, { force: true })
+}
+
+async function emitEngine(roots: string[]): Promise<EngineCacheEntry> {
+    const prog = api.createProgram(roots, engineCompilerOptions)
+
+    const emitted: Record<string, string> = {}
     const sourceFiles = prog.getSourceFiles().filter(sf => sf.fileName.endsWith('.syn'))
     const promises = []
     for (const sf of sourceFiles) {
         const p = new Promise<void>((resolve, reject) => {
             const expected = new Set<string>()
             const x = prog.emit(sf, (name, text) => {
-                emitted.set(name, text)
+                emitted[name] = text
                 expected.delete(name)
                 if (expected.size === 0) {
                     resolve()
@@ -399,10 +442,34 @@ async function compileEngine() {
 
     await Promise.all(promises)
 
-    const reifier = (prog as any).getReifier()
-    reifier.__readFile = (file: string) => fs.readFileSync(file, 'utf8')
-    reifier.__writeFile = (file: string, text: string) => fs.writeFileSync(file, text)
-    reifier.__readDir = (dir: string) => fs.readdirSync(dir)
+    const inputs: Record<string, string> = {}
+    for (const sf of prog.getSourceFiles()) {
+        if (fs.existsSync(sf.fileName)) inputs[sf.fileName] = contentHash(fs.readFileSync(sf.fileName))
+    }
+    return { inputs, emitted }
+}
+
+async function compileEngine() {
+    const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
+
+    const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name)).sort()
+    const sources = roots.map(r => [r, contentHash(fs.readFileSync(r))])
+    const key = contentHash(JSON.stringify([api.getBuildId(), contentHash(fs.readFileSync(path.resolve('src/api.ts'))), engineCompilerOptions, sources]))
+    const cacheFile = path.resolve('out/engine-cache', `${key}.json`)
+    let emitted = readEngineCache(cacheFile)
+    if (!emitted) {
+        const entry = await emitEngine(roots)
+        writeEngineCache(cacheFile, entry)
+        emitted = new Map(Object.entries(entry.emitted))
+    }
+
+    const reifier = {
+        types: reifiedTypes.createTypeNamespace(),
+        __reify: undefined,
+        __readFile: (file: string) => fs.readFileSync(file, 'utf8'),
+        __writeFile: (file: string, text: string) => fs.writeFileSync(file, text),
+        __readDir: (dir: string) => fs.readdirSync(dir),
+    }
     const loader = createModuleLoader(reifier, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
         if (!path.extname(r)) r = `${r}.js`

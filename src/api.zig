@@ -397,6 +397,43 @@ pub fn parseJson5(text: js.UTF8String) !*js.Value {
     return @import("./json_parser.zig").parseJson5ToJs(text.data, getAllocator());
 }
 
+const DlInfo = extern struct {
+    fname: ?[*:0]const u8,
+    fbase: ?*const anyopaque,
+    sname: ?[*:0]const u8,
+    saddr: ?*const anyopaque,
+};
+
+extern "c" fn dladdr(addr: *const anyopaque, info: *DlInfo) c_int;
+
+pub fn getBuildId() !js.UTF8String {
+    var info: DlInfo = undefined;
+    if (dladdr(@ptrCast(&getBuildId), &info) == 0) return error.MissingImageInfo;
+    if (comptime builtin.os.tag.isDarwin()) {
+        const header: *const std.macho.mach_header_64 = @alignCast(@ptrCast(info.fbase orelse return error.MissingImageInfo));
+        var at: [*]const u8 = @as([*]const u8, @ptrCast(header)) + @sizeOf(std.macho.mach_header_64);
+        for (0..header.ncmds) |_| {
+            const lc: *const std.macho.load_command = @alignCast(@ptrCast(at));
+            if (lc.cmd == .UUID) {
+                const uuid: *const std.macho.uuid_command = @alignCast(@ptrCast(at));
+                return .{ .data = try std.fmt.allocPrintZ(getAllocator(), "{}", .{std.fmt.fmtSliceHexLower(&uuid.uuid)}) };
+            }
+            at += lc.cmdsize;
+        }
+        return error.MissingBuildId;
+    }
+    const file = try std.fs.openFileAbsoluteZ(info.fname orelse return error.MissingImageInfo, .{});
+    defer file.close();
+    var hasher = std.hash.Wyhash.init(0);
+    var buf: [1 << 16]u8 = undefined;
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+    return .{ .data = try std.fmt.allocPrintZ(getAllocator(), "{x:0>16}", .{hasher.final()}) };
+}
+
 pub fn optimizeVson(source: js.UTF8String, emit_vson: bool) !js.UTF8String {
     const result = try @import("./value_graph.zig").optimizeVson(source.data, emit_vson);
     return .{ .data = @ptrCast(@constCast(result)) };
@@ -542,30 +579,28 @@ pub fn getFormattedDiagnostics(program: *js.Object, sf: WrappedFile) !js.UTF8Str
 
 const Reifier = @import("./reifier.zig").Reifier;
 
-pub fn createReifier(program: *js.Object, type_ns: *js.Object) !js.Wrapped {
+pub fn createReifier(program: *js.Object) !js.Wrapped {
     const p = try unwrap(Program, program);
     const reifier = try getAllocator().create(Reifier);
-    reifier.* = Reifier.initCurrentEnv(getAllocator(), try p.getAnalyzer(), type_ns);
+    reifier.* = Reifier.init(getAllocator(), try p.getAnalyzer());
 
     return .{ .value = reifier };
 }
 
-pub fn getReifiedType(reifier: *js.Object, sf: WrappedFile, node_ref: u32, type_params: u32) !*js.Value {
+pub fn getReifiedType(reifier: *js.Object, sf: WrappedFile, node_ref: u32, type_params: u32) !js.UTF8String {
     const r = try unwrap(Reifier, reifier);
     const source_name = sf.value.source_name;
     const ref = try r.analyzer.program.getFileIdByPath(source_name orelse return error.MissingSourceFileName);
     const data = r.analyzer.program.getFileData(ref);
     try r.analyzer.program.bindModule(data);
-    const result = try r.processReifyExpression(data, node_ref, type_params);
 
-    return @ptrCast(result);
+    return .{ .data = try r.reifyExpression(data, node_ref, type_params) };
 }
 
-pub fn callTypeFunction(reifier: *js.Object, target: u32, args: js.Array(u32)) !*js.Value {
+pub fn callTypeFunction(reifier: *js.Object, target: u32, args: js.Array(u32)) !js.UTF8String {
     const r = try unwrap(Reifier, reifier);
-    const result = try r.evaluateTypeFunction(target, args.elements);
 
-    return @ptrCast(result);
+    return .{ .data = try r.evaluateTypeFunction(target, args.elements) };
 }
 
 pub fn isLateBoundSymbol(sf: WrappedFile, sym_ref: u32) bool {

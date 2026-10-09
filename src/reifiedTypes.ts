@@ -417,6 +417,64 @@ export function createTypeNamespace() {
         return t instanceof ArrayType
     }
 
+    const intrinsicTypes: Record<string, symbol> = { any, never, unknown, Void, number, string, object, boolean, symbol }
+
+    function __replay(v: any): any {
+        if (!Array.isArray(v)) return v
+        switch (v[0]) {
+            case 'u': return undefined
+            case 'd': return Number(v[1])
+            case 'i': return intrinsicTypes[v[1]]
+            case 'c': return cache.get(v[1])
+            case 'm': return getMachineDataType(v[1], v[2], v[3])
+            case 'a': {
+                if (cache.has(v[1])) return cache.get(v[1])
+                const result = __replay(v[2])
+                __setCachedType(v[1], result)
+                return result
+            }
+            case 'A': {
+                const o = __ArrayType() as any
+                o.element = __replay(v[1])
+                return o
+            }
+            case 't': return __Tuple()
+            case 'T': {
+                const o = __Tuple()
+                for (const x of v[1]) o.add(__replay(x))
+                o.simplify()
+                return o
+            }
+            case 'U': {
+                const o = __Union()
+                for (const x of v[1]) o.add(__replay(x))
+                return o
+            }
+            case 'O': {
+                if (v[1] !== null && cache.has(v[1])) return cache.get(v[1])
+                const o = __Object() as any
+                if (v[1] !== null) __setCachedType(v[1], o)
+                if (v[2].length) o.__setBase(__replay(v[2][0]))
+                for (const [k, x] of v[3]) o[__replay(k)] = __replay(x)
+                return o
+            }
+            case 'F': {
+                if (cache.has(v[1])) return cache.get(v[1])
+                const o = __FunctionType() as any
+                __setCachedType(v[1], o)
+                o.params = __replay(v[2])
+                if (v.length > 3) o.returns = __replay(v[3])
+                return o
+            }
+            case 'f': {
+                const f = __TypeFunction(v[1])
+                __setCachedType(v[1], f)
+                return f
+            }
+        }
+        throw new Error(`unknown reify op: ${v[0]}`)
+    }
+
     return {
         kind,
         findDiscriminant,
@@ -457,6 +515,7 @@ export function createTypeNamespace() {
         __getCachedType,
         __hasCachedType,
         __setCachedType,
+        __replay,
     }
 }
 
