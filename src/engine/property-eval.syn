@@ -32,7 +32,7 @@ export interface PropertyEvalOptions {
     partial?: boolean
     constructed?: Constructed
     calls?: (site: CallSite) => CallBinding | undefined
-    locate?: (shape: Handle, path: string) => { shape?: Handle, decode?: number } | undefined
+    locate?: (shape: Handle, path: string) => { shape?: Handle, decode?: number, union?: boolean, float?: boolean } | undefined
     stored?: (shape: Handle, path: string, value: Handle) => void
 }
 
@@ -55,6 +55,7 @@ export interface CallBinding {
     receiverShape?: Handle
     result?: Handle
     union?: boolean
+    float?: boolean
     returnSlot?: { at: number, size: number }
     target?: number
     returns?: intrinsics.Types
@@ -618,11 +619,13 @@ export function resolveProperties(
                 nodes.set(id, makeNode('after', [token, { literal: heap.unboxF64(slot) }]))
                 return
             }
+            locations.set(id, [mem.shape, String(mem.offsets[at])])
             const located = opts.locate?.(mem.shape, String(mem.offsets[at]))
             const valued = located !== undefined && located.shape === undefined
             const load = newId()
             nodes.set(load, makeNode('load', [stable ? readonlyToken() : token, mem.ptr, { literal: offset }], valued ? Types.vm_value : Types.u64))
             nodes.set(id, makeNode('after', [token, load]))
+            if (located?.float) unbox(id, load, located.decode!)
             if (valued) return
             if (heap.isString(slot)) {
                 commit(id, stringShape)
@@ -854,15 +857,17 @@ export function resolveProperties(
         return { ...fields, ptr: id, base: 0, shape, reduced: fields.keys.length === 1 && readonlyKeys(shape, fields.keys), pointer: true, address: [id, 0] }
     }
     const derived = new Map<number, Handle | null | undefined>()
+    const locations = new Map<number, [shape: Handle, path: string]>()
     const adoptable = new Set(['param', 'get', 'select', 'after'])
     const assumed: number[] = []
+    const optimistic = new Set<number>()
     function commit(id: number, value: Handle | null | undefined): void {
         if (value && value !== numberShape && value !== stringShape && adoptable.has(source.get(id)?.op ?? '')) memory.set(id, pointerMemory(id, value))
         else derived.set(id, value)
     }
     function pin(id: number, value: Handle | null | undefined): void {
         if (!id || armOverride?.id === id || memory.has(id) || addressed.has(id) || derived.has(id)) return
-        commit(id, value)
+        commit(id, optimistic.has(id) ? undefined : value)
         assumed.push(id)
     }
     function shape(id: number): Handle | null | undefined {
@@ -876,6 +881,7 @@ export function resolveProperties(
         return query(`s${id}`, () => {
             const result = deriveShape(id)
             if (result === pendingShape || !settled()) return result
+            optimistic.delete(id)
             commit(id, result)
             if (frames[frames.length - 1].cyclic) assumed.push(id)
             return result
@@ -884,15 +890,20 @@ export function resolveProperties(
     function pointerShape(id: number): Handle | null | undefined {
         return snapshotNode(id) && !memory.has(id) ? undefined : shape(id)
     }
+    function joinShapes(id: number, ids: number[]): [joined: Handle | null | undefined, shapes: (Handle | null | undefined)[]] {
+        const shapes = ids.map(x => x ? pointerShape(x) : numberShape)
+        const joined = agree(shapes)
+        if (joined !== pendingShape && ids.some((x, k) => shapes[k] === pendingShape || optimistic.has(x))) optimistic.add(id)
+        return [joined, shapes]
+    }
     function deriveShape(id: number): Handle | null | undefined {
         const n = source.get(id)
         if (!n) return
-        if (n.op === 'after') return pointerShape(getRef(n, countIds(n) - 1))
+        if (n.op === 'after') return joinShapes(id, [getRef(n, countIds(n) - 1)])[0]
         if (n.op === 'literal' || NumericOps.has(n.op)) return numberShape
-        if (n.op === 'select') return agree([1, 2].map(i => getRef(n, i) ? pointerShape(getRef(n, i)) : numberShape))
+        if (n.op === 'select') return joinShapes(id, [getRef(n, 1), getRef(n, 2)])[0]
         if (n.op === 'param') {
-            const shapes = arrivals(id).map(pointerShape)
-            const joined = agree(shapes)
+            const [joined, shapes] = joinShapes(id, arrivals(id))
             if (joined === undefined && settled()) unionOf(id, shapes)
             return joined
         }
@@ -906,6 +917,7 @@ export function resolveProperties(
             return heap.isIndirect(cell) ? heap.indirectTarget(cell) : undefined
         }
         if (n.op === 'get-prop' && !evaluate(id)) return pendingShape
+        if (n.op === 'load') return loadShape(id, n)
         if (n.op === 'call' && opts.calls) {
             bindCall(id, true)
             if (!boundCalls.has(id)) return pendingShape
@@ -913,6 +925,23 @@ export function resolveProperties(
         if (n.op !== 'get-prop' && n.op !== 'call') return
         resolvePending(id)
         return waitingResults.has(id) ? pendingShape : memory.get(id)?.shape
+    }
+    function loadShape(id: number, n: GraphNode): Handle | null | undefined {
+        if (shape(getRef(n, 1)) === pendingShape) return pendingShape
+        const base = locations.get(getRef(n, 1))
+        if (!base) return
+        const path = `${base[1]}/${getRef(n, 2) ? '*' : getLiteral(n, 2)}`
+        const located = opts.locate?.(base[0], path)
+        if (located?.float) {
+            unbox(id, id, located.decode!)
+            return numberShape
+        }
+        if (located?.shape === undefined) {
+            locations.set(id, [base[0], path])
+            return
+        }
+        bindResult(id, located.shape, located.decode, located.union)
+        return located.shape
     }
     function fieldShape(id: number, key: Handle): Handle | null | undefined {
         const n = source.get(id)
@@ -1047,6 +1076,12 @@ export function resolveProperties(
             if (settled()) writersKnown.add(root)
         }, undefined)
     }
+    function demandStores(target: Handle): void {
+        const root = rootOf(target)
+        seed(root, [])
+        drain()
+        for (const id of writerSets.get(root) ?? []) if (source.get(id)!.op === 'set-prop') evaluate(id)
+    }
     function readsState(n: GraphNode, of: Handle): boolean {
         if (getRef(n, 2)) return true
         const key = getLiteral(n, 2) as Handle
@@ -1065,15 +1100,18 @@ export function resolveProperties(
         for (const read of waiting.reads) demandWriters(read, operands)
         if (!settled() && !waiting.reads.every(read => writersKnown.has(rootOf(read)))) return
         waitingResults.delete(id)
-        const binding = opts.calls!(waiting.site)
-        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union)
+        bindValue(id, opts.calls!(waiting.site))
         learn(id)
     }
     function settleResult(id: number, site: CallSite, binding: CallBinding | undefined): void {
         if (binding) bindings.set(id, binding)
-        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union)
-        else if (binding?.result === undefined && binding?.reads?.length) waitingResults.set(id, { site, reads: binding.reads })
+        if (binding?.result === undefined && !binding?.float && binding?.reads?.length) waitingResults.set(id, { site, reads: binding.reads })
+        else bindValue(id, binding)
         learn(id)
+    }
+    function bindValue(id: number, binding: CallBinding | undefined): void {
+        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union)
+        else if (binding?.float && !unboxed.has(id)) unbox(id, id, binding.decode!)
     }
     const accessed = new Set<number>()
     for (const n of source.values()) if (n.op === 'get-prop' || n.op === 'set-prop') accessed.add(getRef(n, 1))
@@ -1143,6 +1181,18 @@ export function resolveProperties(
         }
         if (!settled()) inputs.forEach((input, i) => pin(input, values[i]))
         boundCalls.add(id)
+        const reached = new Set<Handle>()
+        function demandNested(of: Handle | null | undefined): void {
+            if (!of || of === numberShape || of === stringShape || reached.has(of)) return
+            reached.add(of)
+            for (const offset of layout(of).offsets) {
+                const inner = opts.locate?.(of, String(offset))?.shape
+                if (inner === undefined || reached.has(inner)) continue
+                demandStores(inner)
+                demandNested(inner)
+            }
+        }
+        values.forEach(demandNested)
         const closure = memory.get(getRef(n, 1))
         const args: (Handle | undefined)[] = []
         const numbers: boolean[] = []
@@ -1152,11 +1202,11 @@ export function resolveProperties(
         for (let i = 3; i < countIds(n); i++) {
             const arg = getRef(n, i)
             const argShape = shapeOf(arg)
-            const callable = argShape !== undefined && !!heap.getOwnProperty(argShape, heap.closureCallKey)
-            args.push(callable ? undefined : argShape)
-            encoded.push(callable)
-            numbers.push(!arg || shape(arg) === numberShape)
-            floats.push(arg ? (floating ??= floatValues(graph)).has(arg) : !Number.isInteger(getLiteral(n, i)))
+            args.push(argShape)
+            encoded.push(false)
+            const float = arg ? (floating ??= floatValues(graph)).has(arg) || closureReturns.get(arg) === Types.f64 : !Number.isInteger(getLiteral(n, i))
+            numbers.push(!arg || float || shape(arg) === numberShape)
+            floats.push(float)
             const producer = arg ? source.get(arg) ?? nodes.get(arg) : undefined
             signed.push(producer ? producer.op === 'sub' || (typeSlots(producer.op) > 0 && isSignedType(typeOf(producer))) : getLiteral(n, i) < 0)
         }
@@ -1267,6 +1317,12 @@ export function resolveProperties(
         nodes.set(ptr, makeNode('decode', [raw, { literal: base }]))
         decodeInputs.add(ptr)
         return ptr
+    }
+    const unboxed = new Map<number, number>()
+    function unbox(id: number, handle: number, base: number): void {
+        const value = newId()
+        nodes.set(value, makeNode('load', [readonlyToken(), decodeHandle(handle, base), { literal: 0 }], Types.f64))
+        unboxed.set(id, value)
     }
     for (const [id, base] of opts.unionPointers ?? []) bindResult(id, opts.pointers!.get(id)!, base, true)
     function bindResult(id: number, shape: Handle, decode: number | undefined, union?: boolean): void {
@@ -1408,6 +1464,7 @@ export function resolveProperties(
         if (mem.union) continue
         if (!mem.pointer || mem.decoded) replaced.set(id, addressOf(mem))
     }
+    for (const [id, value] of unboxed) replaced.set(id, [value, 0])
     for (const [id, n] of nodes) {
         if (n.op !== 'heap-handle' || getRef(n, 0) || countIds(n) !== 1 || memory.has(id) || replaced.has(id)) continue
         const home = homes.get(getLiteral(n, 0) as Handle)
@@ -1431,7 +1488,7 @@ export function resolveProperties(
             if (!ref || (!forward.has(ref) && !replaced.has(ref))) continue
             if (decodeInputs.has(id) && !forward.has(ref)) continue
             const tail = nodes.get(id)!.op === 'ret' ? 0 : countIds(n) - 1
-            if (returning.has(id) && i === tail && memory.get(ref)?.decoded && !forward.has(ref)) continue
+            if (returning.has(id) && i === tail && (memory.get(ref)?.decoded || unboxed.has(ref)) && !forward.has(ref)) continue
             copy ??= copyNode(n)
             if (forward.has(ref)) {
                 setRef(copy, i, target(ref))
@@ -1484,7 +1541,6 @@ export interface ClosureOptions {
     unionParams?: Map<number, number>
     locate?: PropertyEvalOptions['locate']
     stored?: PropertyEvalOptions['stored']
-    frame?: Handle
     contextShape?: Handle
     created?: (closure: u32, shape: Handle) => void
 }
@@ -1505,8 +1561,7 @@ export function frameShape(size: number): Handle {
 export function resolveClosures(
     graph: Graph,
     session: TraceSession,
-    frameProxy: u32 | undefined,
-    frameSize: number,
+    frames: Map<u32, Handle>,
     params?: Map<number, Handle>,
     constructed?: Constructed,
     calls?: PropertyEvalOptions['calls'],
@@ -1515,13 +1570,13 @@ export function resolveClosures(
     const objects = new Map<number, Handle>()
     const pointers = new Map<number, Handle>()
     for (const [i, shape] of params ?? []) pointers.set(graph.blocks[0].params[i], shape)
-    const frame = extra.frame ?? frameShape(frameSize)
     const closures = new Map<u32, Handle>()
     for (const [id, n] of graph.nodes) {
         if (n.op === 'call-context' && extra.contextShape !== undefined) pointers.set(id, extra.contextShape)
         if (n.op !== 'heap-handle' || getRef(n, 0)) continue
         const cell = getLiteral(n, 0) as u32
-        if (cell === frameProxy) objects.set(id, frame)
+        const frame = frames.get(cell)
+        if (frame !== undefined) objects.set(id, frame)
         if (!heap.isIndirect(cell as Handle) || !session.templateOf(cell)) continue
         const shape = (countIds(n) > 1 ? getLiteral(n, 1) : heap.indirectTarget(cell as Handle)) as Handle
         if (!closures.has(cell)) extra.created?.(cell, shape)
