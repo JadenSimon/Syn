@@ -123,6 +123,7 @@ export interface Resolved {
     addresses: Map<number, number>
     shapes: Map<number, Handle>
     numbers: Set<number>
+    strings: Set<number>
     encoded: Set<number>
     unions: Set<number>
     arrayIterations: Map<number, Handle>
@@ -1213,7 +1214,53 @@ export function resolveProperties(
         const joined = agree(shapes)
         return [joined, shapes]
     }
+    const asserted = new Map<number, Handle>()
+    function doomed(id: number): boolean {
+        let n = id ? source.get(id) : undefined
+        while (n?.op === NodeOp.after) n = source.get(getRef(n, countIds(n) - 1))
+        return n?.op === NodeOp.panic || n?.op === NodeOp.unreachable
+    }
+    function assume(id: number, truth: boolean): void {
+        const n = source.get(id)
+        if (n?.op !== NodeOp.eq && n?.op !== NodeOp.ne) return
+        const equal = n.op === NodeOp.eq ? truth : !truth
+        for (let i = 0; i < 2; i++) {
+            if (!getRef(n, i) || getRef(n, 1 - i)) continue
+            const other = getLiteral(n, 1 - i) as Handle
+            if (!other) {
+                assume(getRef(n, i), !equal)
+                continue
+            }
+            const tested = source.get(getRef(n, i))
+            if (!equal || !heap.isString(other) || tested?.op !== NodeOp.rt || getLiteral(tested, 1) !== RtOp.typeof || !getRef(tested, 2)) continue
+            const name = heap.stringToJs(other)
+            const refined = name === 'string' ? stringShape : name === 'number' ? numberShape : undefined
+            if (refined !== undefined) asserted.set(getRef(tested, 2), refined)
+        }
+    }
+    {
+        const visited = new Set<number>()
+        const walk = [graph.blocks[0].bodyId]
+        while (walk.length) {
+            const id = walk.pop()!
+            const n = id ? source.get(id) : undefined
+            if (!n || visited.has(id)) continue
+            visited.add(id)
+            if (n.op === NodeOp.after) for (let i = 0; i < countIds(n); i++) walk.push(getRef(n, i))
+            else if (n.op === NodeOp.inlined || n.op === NodeOp.ret) walk.push(getRef(n, 0))
+            else if (n.op === NodeOp.select && countIds(n) === 3) {
+                const arm = doomed(getRef(n, 1)) ? 1 : doomed(getRef(n, 2)) ? 2 : 0
+                if (!arm) continue
+                assume(getRef(n, 0), arm === 2)
+                walk.push(getRef(n, 3 - arm))
+            }
+        }
+    }
     function deriveShape(id: number): Handle | null | undefined {
+        const derived = deriveFromNode(id)
+        return derived === undefined ? asserted.get(id) : derived
+    }
+    function deriveFromNode(id: number): Handle | null | undefined {
         const n = source.get(id)
         if (!n) return
         if (n.op === NodeOp.after) return joinShapes(id, [getRef(n, countIds(n) - 1)])[0]
@@ -1228,7 +1275,6 @@ export function resolveProperties(
             return joined
         }
         if (n.op === NodeOp.get && !getRef(n, 1)) return fieldShape(getRef(n, 0), getLiteral(n, 1) as Handle)
-        if (n.op === NodeOp.rt && (getLiteral(n, 1) === RtOp.concat || getLiteral(n, 1) === RtOp.toString)) return stringShape
         if (n.op === NodeOp.heapHandle && !getRef(n, 0)) {
             const cell = getLiteral(n, 0) as Handle
             if (!cell) return null
@@ -1445,11 +1491,17 @@ export function resolveProperties(
         }
     }
     function demandPreceding(target: Handle, call: number): void {
-        const dependents = dataDependents(call)
-        const preceding = before(call, 'all')
+        let preceding: Set<number> | undefined
+        let dependents: Set<number> | undefined
         for (const root of rootsOf(target)) {
             seed(root, [])
-            demandWritersWhere(root, id => id !== call && preceding.has(id) && !dependents.has(id))
+            demandWritersWhere(root, id => {
+                if (id === call) return false
+                preceding ??= before(call, 'all')
+                if (!preceding.has(id)) return false
+                dependents ??= dataDependents(call)
+                return !dependents.has(id)
+            })
         }
     }
     function demandRoot(root: Handle): void {
@@ -2001,24 +2053,6 @@ export function resolveProperties(
         const name = typeofName(id)
         if (name !== undefined) nodes.set(id, makeNode(NodeOp.literal, [{ literal: heap.fromJsString(name) }]))
     }
-    for (const [id, n] of source) {
-        if (n.op !== NodeOp.rt || getLiteral(n, 1) !== RtOp.concat) continue
-        const operands = getOperands(n)
-        if (opts.partial && operands.some((_, i) => i >= 2 && getRef(n, i) && shape(getRef(n, i)) === undefined)) continue
-        for (let i = 2; i < operands.length; i++) {
-            const known = getRef(n, i) ? shape(getRef(n, i)) : numberShape
-            if (known === stringShape) continue
-            if (known !== numberShape) throw `property-eval: %${id} concatenates %${getRef(n, i)}, which is neither a string nor a number`
-            const float = newId()
-            nodes.set(float, makeNode(NodeOp.convert, [operands[i]], Types.f64))
-            const bits = newId()
-            nodes.set(bits, makeNode(NodeOp.bitconvert, [float], Types.u64))
-            const text = newId()
-            nodes.set(text, makeNode(NodeOp.rt, [operands[0], { literal: RtOp.toString }, bits]))
-            operands[i] = text
-        }
-        nodes.set(id, makeNode(NodeOp.rt, operands))
-    }
     for (const { state, block, arrivalState } of entries.values()) {
         for (const apply of inbound.get(block) ?? []) {
             if (!sameState(state, arrivalState(apply)!)) throw `property-eval: B${block} changes object state around its loop`
@@ -2145,8 +2179,12 @@ export function resolveProperties(
     for (const [id, mem] of memory) if (mem.union) unionValues.add(id)
     out.maxId = Math.max(out.maxId, tracer.getNanCount() + 1)
     const numberValues = new Set(numbers)
-    for (const [id, derivedShape] of derived) if (derivedShape === numberShape) numberValues.add(id)
-    return { graph: out, calls, addresses, shapes, numbers: numberValues, encoded, unions: unionValues, arrayIterations, locations }
+    const stringValues = new Set(strings)
+    for (const [id, derivedShape] of derived) {
+        if (derivedShape === numberShape) numberValues.add(id)
+        if (derivedShape === stringShape) stringValues.add(id)
+    }
+    return { graph: out, calls, addresses, shapes, numbers: numberValues, strings: stringValues, encoded, unions: unionValues, arrayIterations, locations }
 }
 
 export interface ClosureOptions {
@@ -2163,6 +2201,7 @@ export interface ResolvedClosures {
     graph: Graph
     memoryShapes: Map<number, Handle>
     numbers?: Set<number>
+    strings?: Set<number>
     encoded?: Set<number>
     unions?: Set<number>
     locations?: Map<number, [shape: Handle, path: string]>
@@ -2200,12 +2239,12 @@ export function resolveClosures(
         closures.set(cell, shape)
         objects.set(id, shape)
     }
-    const typed = [...graph.nodes.values()].some(n => n.op === NodeOp.rt && (getLiteral(n, 1) === RtOp.typeof || getLiteral(n, 1) === RtOp.concat))
+    const typed = [...graph.nodes.values()].some(n => n.op === NodeOp.rt && (getLiteral(n, 1) === RtOp.typeof || runtimeFunction(getLiteral(n, 1)) !== undefined))
     if (!objects.size && ![...pointers.values()].some(shape => shape !== numberShape) && !calls && !typed) return { graph, memoryShapes: new Map() }
     const unionPointers = new Map<number, number>()
     for (const [i, base] of extra.unionParams ?? []) unionPointers.set(graph.blocks[0].params[i], base)
     const resolved = resolveProperties(graph, session, objects, { representation: 'memory', pointers, unionPointers, partial: true, constructed, calls, locate: extra.locate, stored: extra.stored, iterationField: extra.iterationField, unify: extra.unify })
-    return { graph: resolved.graph, memoryShapes: resolved.shapes, numbers: resolved.numbers, encoded: resolved.encoded, unions: resolved.unions, arrayIterations: resolved.arrayIterations, locations: resolved.locations }
+    return { graph: resolved.graph, memoryShapes: resolved.shapes, numbers: resolved.numbers, strings: resolved.strings, encoded: resolved.encoded, unions: resolved.unions, arrayIterations: resolved.arrayIterations, locations: resolved.locations }
 }
 
 function isObjectSlot(slot: Handle): boolean {
