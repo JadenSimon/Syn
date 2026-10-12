@@ -13,9 +13,20 @@ export interface Reifier {
 
 export type ResolveModule = (from: string, name: string) => [absPath: string, text: string | undefined] | undefined
 
+const trimmedStacks = `
+Error.stackTraceLimit = Infinity
+Error.prepareStackTrace = (error, frames) => {
+    const keep = 10
+    const shown = frames.length > keep * 2
+        ? [...frames.slice(0, keep).map(f => '    at ' + f), '    ... ' + (frames.length - keep * 2) + ' frames ...', ...frames.slice(-keep).map(f => '    at ' + f)]
+        : frames.map(f => '    at ' + f)
+    return [String(error), ...shown].join('\\n')
+}
+`
+
 function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
     ;(globalThis as any).Type = reifier.types
-    return vm.createContext({
+    const ctx = vm.createContext({
         Type: reifier.types,
         __reify: reifier.__reify,
         __readFile: reifier.__readFile,
@@ -33,6 +44,8 @@ function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
         exports: {},
         ...extra,
     })
+    vm.runInContext(trimmedStacks, ctx)
+    return ctx
 }
 
 export function runSynScript(text: string, fileName: string, reifier: Reifier) {

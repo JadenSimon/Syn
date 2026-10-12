@@ -5,7 +5,7 @@
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as gn from './graph-node'
 import * as intrinsics from './intrinsics'
-import { Op as RtOp, runtimeFunction } from './rt'
+import { Op as RtOp, heapOps, runtimeFunction, writingOps } from './rt'
 import * as bytecode from './bytecode-emitter'
 import {
     Op, createInterpreter, frameSize, frameRegs, isVmHandle, rawValue,
@@ -398,7 +398,6 @@ function deriveBlocks(
 export interface TraceSession {
     intrinsicContext: Record<string, any>
     moduleContext: Record<string, any>
-    objectBuiltins: Record<string, any>
     globals: Record<string, any>
     intrinsicFns: Map<number, string>
     functionStubs: Map<Function, number>
@@ -560,7 +559,6 @@ export function createTraceSession(): TraceSession {
         Intrinsics: getCachedIntrinsics().wrapper,
         isNative: intrinsics.tagConcrete(() => true),
     })
-    const objectBuiltins = { assign: Object.assign, create: Object.create, setPrototypeOf: Object.setPrototypeOf }
     const intrinsicFns = getCachedIntrinsics().stubs
     const functionStubs = new Map<Function, number>()
     const stubFunctions = new Map<number, Function>()
@@ -572,7 +570,7 @@ export function createTraceSession(): TraceSession {
     let nodeCache: Map<string, number> | undefined
 
     const ctx: Record<string, any> = {
-        Intrinsics: intrinsicContext, Object: objectBuiltins, Error: TracedError,
+        Intrinsics: intrinsicContext, Error: TracedError,
         Symbol: heap.symbolConstants, ...builtinGlobals,
         intrinsics: moduleContext, heap, syscalls,
     }
@@ -614,13 +612,10 @@ export function createTraceSession(): TraceSession {
         heap.setBoxedF64(box, heap.unboxF64(vmHandle(Intrinsics.static(rebuild) as u32)))
     }
     function construct(rebuild: Function): heap.Handle {
-        if (!intrinsics.argv().includes('folded-constructions')) {
-            const box = heap.boxF64(0)
-            statics.set(box, rebuild)
-            if (runtime) fillStatic(box, rebuild)
-            return box
-        }
-        return fold(rebuild)
+        const box = heap.boxF64(0)
+        statics.set(box, rebuild)
+        if (runtime) fillStatic(box, rebuild)
+        return box
     }
     function fold(rebuild: Function): heap.Handle {
         const r = enterTrace()
@@ -815,7 +810,6 @@ export function createTraceSession(): TraceSession {
     const session: TraceSession = {
         intrinsicContext,
         moduleContext,
-        objectBuiltins,
         globals: ctx,
         intrinsicFns,
         functionStubs,
@@ -888,7 +882,6 @@ function layoutOf(fn: Function, session: TraceSession): { params: number, rest: 
     return layout
 }
 let logTraceCalls = intrinsics.argv().includes('trace-calls')
-let symbolicAssigns = 0
 export const traceStats = {
     calls: 0, nested: 0, compileMisses: 0, finalizeMisses: 0,
     bySource: new Map<string, { name: string, count: number, self: number }>(),
@@ -980,6 +973,8 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (!tokenId || nodes.get(tokenId)?.op === 'nil-effect') return v
         const vid = symbolOf(v)
         if (vid === tokenId) return v
+        const n = nodes.get(vid)
+        if (n && gn.countIds(n) && lowering2.OrderedValues.has(n.op) && gn.getRef(n, 0) === tokenId) return v
         return mk('after', [token, v])
     }
 
@@ -1044,7 +1039,6 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     const captured = source.captured
     const vmStubs = new Set<Function>([
         session.symbolicPanic, session.symbolicJmp, session.symbolicBranch, session.symbolicDispatch,
-        ...Object.values(session.objectBuiltins),
     ])
     function syncsFrame(linked: any): boolean {
         if (!linked) return true
@@ -1425,27 +1419,6 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             if (intrinsics.getNanId(pc)) return { value: traceValue(pc) }
             return { value: mk('dispatch', [traceValue(pc)]) }
         }
-        if (linked === session.objectBuiltins.assign) {
-            const target = cellOf(traceMem.get(regStart)) || callArg(regStart, 0) as u32
-            const source = cellOf(traceMem.get(regStart + 4)) || callArg(regStart, 1) as u32
-            if (intrinsics.getNanId(source) || intrinsics.getNanId(target)) {
-                if (intrinsics.argv().includes('assign-debug')) console.log('SYMBOLIC ASSIGN in', opts.name, 'count', ++symbolicAssigns)
-                const value = mk('rt', [readToken(), traceValue(RtOp.assign), escapedValue(toGraphValue(traceMem.get(regStart))), escapedValue(toGraphValue(traceMem.get(regStart + 4)))])
-                writeToken(value)
-                return { value }
-            }
-            heap.copyEnumerableOwnProperties(target, source)
-            return { value: traceMem.get(regStart) }
-        }
-        if (linked === session.objectBuiltins.create && nargs === 1) {
-            const proto = callArg(regStart, 0) as u32
-            return { value: handleValue(heap.makeObject(proto)) }
-        }
-        if (linked === session.objectBuiltins.setPrototypeOf) {
-            const obj = callArg(regStart, 0)
-            heap.setPrototypeOf(heap.isIndirect(obj) ? heap.prepareWrite(obj) : obj as u32, callArg(regStart, 1) as u32)
-            return { value: handleValue(obj) }
-        }
         if (((linked as any).shouldInline || opts.shouldInline?.(linked))
             && typeof (linked as any)[Symbol.for('toComputation')] === 'function') {
             const args: number[] = []
@@ -1702,6 +1675,8 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     return tagCallResult(0)
                 }
                 if (intrinsicName === 'rt') {
+                    const op = vmValue(iargs[0] as u32)
+                    if (heapOps.has(op)) return tagCallResult(heapOperation(op, iargs.slice(1)))
                     return tagCallResult(mk('rt', [nilEffect, ...iargs.map(graphOperand)]))
                 }
                 if (intrinsicName === 'pstack') {
@@ -2465,9 +2440,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (n.op === 'join') {
             return getOrderingFromInlined(operand(n, countIds(n) - 1), incoming)
         }
-        if (n.op === 'load' || n.op === 'store' || n.op === 'call' || n.op === 'pstack') {
-            return val
-        }
+        if (lowering2.OrderedValues.has(n.op)) return sameValue(operand(n, 0), nilEffect) ? incoming : val
         if (n.op === 'apply') return val
         if (n.op === 'unreachable') return val
         if (n.op === 'panic' || n.op === 'trap') return unreachable()
@@ -2665,6 +2638,15 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         }
         out[TOKEN] = st[TOKEN]
         return out
+    }
+
+    function heapOperation(op: RtOp, values: any[]): any {
+        const cells = values.map(value => cellOf(value) || vmValue(value as u32))
+        if (!cells.some(cell => intrinsics.getNanId(cell))) return handleValue(tracer.saved.rt(op, ...cells))
+        const writes = writingOps.has(op)
+        const value = mk('rt', [writes ? readToken() : nilEffect, traceValue(op), ...values.map(v => escapedValue(toGraphValue(v)))])
+        if (writes) writeToken(value)
+        return value
     }
 
     function graphOperand(value: any): any {
@@ -3634,22 +3616,6 @@ if (intrinsics.argv()[0] === 'trace2') {
     }
     testTokenAfterLoop()
 
-    function testConcreteConstruction() {
-        const captured = new Map<number, number>([[1, 10], [3, 30]])
-        function capturedSize() {
-            return captured.size
-        }
-        const session = createTraceSession()
-        session.enterTrace()
-        const traced = trace2(capturedSize, { session })
-        session.leaveTrace()
-        const size = traced.returns[0]
-        assert(traced.returns.length === 1 && !symbolOf(size) && vmValue(size as u32) === 2,
-            'trace2: a captured Map should be constructed concretely')
-    }
-    const foldedConstructions = intrinsics.argv().includes('folded-constructions')
-    if (foldedConstructions) testConcreteConstruction()
-
     function testCapturedMapNative() {
         const x = new Map([[1, 1]])
         function capturedMapHas(key: u32): u32 {
@@ -3665,20 +3631,10 @@ if (intrinsics.argv()[0] === 'trace2') {
             x.set(key, key)
             return 0
         }
-        const compiled: any = native.createNatives(foldedConstructions ? { capturedMapHas } : { capturedMapSet, capturedMapHas })
+        const compiled: any = native.createNatives({ capturedMapSet, capturedMapHas })
         assert(compiled.capturedMapHas(1) === 1, 'trace2: native lookup in a captured Map misses a present key')
         assert(compiled.capturedMapHas(2) === 0, 'trace2: native lookup in a captured Map finds an absent key')
-        if (!foldedConstructions) {
-            assert(compiled.capturedMapSet(5) === 0 && compiled.capturedMapHas(5) === 1, 'trace2: a write to a captured Map is not visible to a later native lookup')
-            return
-        }
-        let rejected = ''
-        try {
-            native.createNatives({ capturedMapSet })
-        } catch (e) {
-            rejected = String(e)
-        }
-        assert(rejected.includes('read-only'), `trace2: writing a captured Map should fail to compile, got: ${rejected.split('\n')[0] || 'no error'}`)
+        assert(compiled.capturedMapSet(5) === 0 && compiled.capturedMapHas(5) === 1, 'trace2: a write to a captured Map is not visible to a later native lookup')
     }
     testCapturedMapNative()
 
