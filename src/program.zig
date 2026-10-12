@@ -24469,7 +24469,7 @@ pub const Analyzer = struct {
         }
 
         if (args.len < s_params.len) {
-            const n = this.types.at(s_params[args.len - 1]);
+            const n = this.types.at(s_params[args.len]);
             if (!n.hasFlag(.spread) and !n.hasFlag(.optional)) {
                 return null; // TODO
             }
