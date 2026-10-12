@@ -215,6 +215,7 @@ function deriveBlocks(
     code: readonly u8[], codeLen: number,
     accSlot: number, tokenSlot: number,
     captured: bytecode.FrameCaptures,
+    handlers: { start: number, end: number, handler: number }[],
 ): Blocks {
     function readsToken(opcode: number): boolean {
         if (TerminalOpcodes.has(opcode)) return true
@@ -283,6 +284,15 @@ function deriveBlocks(
     for (let i = 0; i < n; i++) {
         for (const target of succs[i]) preds[target].push(i)
     }
+    const throwsTo: number[][] = preds.map(() => [])
+    for (const range of handlers) {
+        const handler = at.get(range.handler)
+        intrinsics.assert(handler !== undefined, `trace2: EH handler pc ${range.handler} is not a block leader`)
+        for (let i = 0; i < n; i++) {
+            const end = i + 1 < n ? leaders[i + 1] : codeLen
+            if (leaders[i] < range.end && end > range.start) throwsTo[i].push(handler)
+        }
+    }
     const order: number[] = []
     const visited = new Set<number>()
     const active = new Set<number>()
@@ -295,6 +305,7 @@ function deriveBlocks(
             if (active.has(next)) backPreds[next].push(b)
             else visit(next)
         }
+        for (const handler of throwsTo[b]) visit(handler)
         active.delete(b)
         order.push(b)
     }
@@ -410,6 +421,7 @@ export interface TraceSession {
     leaveTrace(): void
     constructions: Map<u32, Construction>
     sealed: Set<intrinsics.Handle>
+    fold(rebuild: Function): heap.Handle
 }
 
 export interface Construction {
@@ -597,15 +609,30 @@ export function createTraceSession(): TraceSession {
 
     const constructions = new Map<u32, Construction>()
     const sealed = new Set<intrinsics.Handle>()
+    const statics = new Map<heap.Handle, Function>()
+    function fillStatic(box: heap.Handle, rebuild: Function): void {
+        heap.setBoxedF64(box, heap.unboxF64(vmHandle(Intrinsics.static(rebuild) as u32)))
+    }
     function construct(rebuild: Function): heap.Handle {
+        if (!intrinsics.argv().includes('folded-constructions')) {
+            const box = heap.boxF64(0)
+            statics.set(box, rebuild)
+            if (runtime) fillStatic(box, rebuild)
+            return box
+        }
+        return fold(rebuild)
+    }
+    function fold(rebuild: Function): heap.Handle {
+        const r = enterTrace()
+        defer leaveTrace()
         const traced = trace2(rebuild, { session, shouldInline: () => true, foldEffects: true })
         const result = traced.returns[0]
-        const returned = runtime!.nodes.get(symbolOf(result))
-        assert(traced.returns.every(r => r === result) && returned?.op === 'heap-handle' && !getRef(returned, 0),
+        const returned = r.nodes.get(symbolOf(result))
+        assert(traced.returns.every(x => x === result) && returned?.op === 'heap-handle' && !getRef(returned, 0),
             `trace2: the construction ${rebuild.name || '<anonymous>'} did not return a single heap value`)
         const handle = getLiteral(returned!, 0) as heap.Handle
         constructions.set(handle, { rebuild, graph: traced.graph })
-        runtime!.objects.seal(handle)
+        r.objects.seal(handle)
         return handle
     }
     const convertJsValue = heap.createJsValueConverter(linkFunction, construct)
@@ -675,7 +702,7 @@ export function createTraceSession(): TraceSession {
         const ACC = compiled.registerCount
         ;(compiled.code as u8[]).push(Op.Return as u8, Op.Ldar as u8, ACC as u8)
         const captured = bytecode.frameCaptures(compiled)
-        const blocks = deriveBlocks(compiled.code as u8[], codeLen, ACC, ACC + 1, captured)
+        const blocks = deriveBlocks(compiled.code as u8[], codeLen, ACC, ACC + 1, captured, compiled.labels?.eh ?? [])
         return { compiled, codeLen, blocks, captured }
     }
 
@@ -756,6 +783,7 @@ export function createTraceSession(): TraceSession {
                     return tracer.saved.rt(op, ...args)
                 },
                 call: (target, thisArg, regStart, nargs, cb) => frame().call(target, thisArg, regStart, nargs, cb),
+                static: (fn: any) => mk('static', [mk('heap-handle', [traceValue(typeof fn === 'function' ? linkFunction(fn) : fn)])]),
             })
             runtime = {
                 tracer, nodes, debugLabels, blocks, frames,
@@ -769,6 +797,7 @@ export function createTraceSession(): TraceSession {
                 depth: 0,
             }
             session.runtime = runtime
+            for (const [box, rebuild] of statics) fillStatic(box, rebuild)
         }
         runtime.depth++
         return runtime
@@ -809,6 +838,7 @@ export function createTraceSession(): TraceSession {
         leaveTrace,
         constructions,
         sealed,
+        fold,
     }
     return session
 }
@@ -858,6 +888,7 @@ function layoutOf(fn: Function, session: TraceSession): { params: number, rest: 
     return layout
 }
 let logTraceCalls = intrinsics.argv().includes('trace-calls')
+let symbolicAssigns = 0
 export const traceStats = {
     calls: 0, nested: 0, compileMisses: 0, finalizeMisses: 0,
     bySource: new Map<string, { name: string, count: number, self: number }>(),
@@ -1020,18 +1051,23 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (linked.concrete) return false
         return !vmStubs.has(linked)
     }
+    let synced = new Map<number, any>()
     function syncOut(env: any): void {
         for (const r of captured.reads) {
-            writeToken(mk('set-prop', [readToken(), env, traceValue(heap.indexKey(r as u32)), toGraphValue(traceMem.get(slotAddr(r)))]))
+            const value = toGraphValue(traceMem.get(slotAddr(r)))
+            if (synced.has(r) && sameValue(synced.get(r), value)) continue
+            writeToken(mk('set-prop', [readToken(), env, traceValue(heap.indexKey(r as u32)), value]))
+            synced.set(r, value)
         }
     }
     function syncIn(env: any): void {
         if (!captured.writes.size) return
-        if (step.kind === 'inline-cont') throw `trace2: ${traceName} inlines a callee that continues past a closure write-back`
+        if (step.kind === 'inline-cont') return
         for (const r of captured.writes) {
             const value = mk('get-prop', [readToken(), env, traceValue(heap.indexKey(r as u32))])
             writeToken(value)
             traceMem.set(slotAddr(r), fromGraphValue(value))
+            synced.set(r, toGraphValue(traceMem.get(slotAddr(r))))
         }
     }
     const envs: number[] = []
@@ -1183,6 +1219,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     let folding: Set<number> | undefined
 
     function watch(b: number): boolean {
+        if (envs.length && B.insts[b].some(inst => inst.opcode === Op.LoadFrame || inst.opcode === Op.StoreFrame)) return true
         for (const slot of B.readSlots[b]) {
             if (symbolOf(traceMem.get(slotAddr(slot)))) return true
         }
@@ -1224,12 +1261,22 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return heap.isString(cell as intrinsics.Handle) ? 0 : cell
     }
 
+    function textual(cell: intrinsics.Handle): boolean {
+        if (heap.isString(cell)) return true
+        let n = nodes.get(heap.boxedNanId(cell))
+        while (n?.op === 'after') n = nodes.get(getRef(n, countIds(n) - 1))
+        if (n?.op === 'rt') return getLiteral(n, 1) === RtOp.concat || getLiteral(n, 1) === RtOp.toString
+        return n?.op === 'heap-handle' && !getRef(n, 0) && heap.isString(getLiteral(n, 0) as intrinsics.Handle)
+    }
+
     function concatCell(op: number, cells: intrinsics.Handle[]): intrinsics.Handle {
-        if (op === RtOp.addOrConcat && !cells.some(cell => heap.isString(cell))) {
+        if (op === RtOp.addOrConcat && !cells.some(textual)) {
             return heap.boxF64(Intrinsics.add(heap.unboxF64(cells[0]), heap.unboxF64(cells[1])))
         }
         const text = cells.map(cell => heap.boxedNanId(cell) ? traceValue(heap.unboxF64(cell)) : handleValue(tracer.saved.rt(RtOp.toString, cell)))
-        return vmHandle(mk('rt', [nilEffect, traceValue(RtOp.concat), text[0], text[1]]))
+        const value = mk('rt', [readToken(), traceValue(RtOp.concat), text[0], text[1]])
+        writeToken(value)
+        return vmHandle(value)
     }
 
     let nullish: any
@@ -1307,7 +1354,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return tagged
     }
 
-    function callLinked(linked: Function, thisArg: any, regStart: number, nargs: number): { value: any } | undefined {
+    function callLinked(linked: Function, thisArg: any, regStart: number, nargs: number, env: any): { value: any } | undefined {
         const native = linked as any
         if (native.concrete) {
             const args: any[] = []
@@ -1333,6 +1380,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             for (let i = 0; i < nargs; i++) args.push(escapedArg(regStart, i))
             const value = mk('call', args)
             writeToken(value)
+            for (let i = 3; i < args.length; i++) syncEscaped(args[i])
             return { value }
         }
         if (linked === session.symbolicProxyGet) {
@@ -1380,8 +1428,14 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         if (linked === session.objectBuiltins.assign) {
             const target = cellOf(traceMem.get(regStart)) || callArg(regStart, 0) as u32
             const source = cellOf(traceMem.get(regStart + 4)) || callArg(regStart, 1) as u32
+            if (intrinsics.getNanId(source) || intrinsics.getNanId(target)) {
+                if (intrinsics.argv().includes('assign-debug')) console.log('SYMBOLIC ASSIGN in', opts.name, 'count', ++symbolicAssigns)
+                const value = mk('rt', [readToken(), traceValue(RtOp.assign), escapedValue(toGraphValue(traceMem.get(regStart))), escapedValue(toGraphValue(traceMem.get(regStart + 4)))])
+                writeToken(value)
+                return { value }
+            }
             heap.copyEnumerableOwnProperties(target, source)
-            return { value: handleValue(target) }
+            return { value: traceMem.get(regStart) }
         }
         if (linked === session.objectBuiltins.create && nargs === 1) {
             const proto = callArg(regStart, 0) as u32
@@ -1397,7 +1451,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             const args: number[] = []
             for (let i = 0; i < nargs; i++) args.push(graphCallArg(regStart, i))
             const effect = readToken()
-            const cont = folding ? undefined : continuationFor()
+            const cont = folding ? undefined : continuationFor(env)
             let nested: ReturnType<typeof trace2> | undefined
             tracer.setActive(false)
             try {
@@ -1478,6 +1532,13 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             }
             const block = blockOf.get(pc)
             if (block === undefined) return pc
+            const own = B.insts[current]
+            if (own[own.length - 1].opcode === Op.ReThrow) {
+                traceFrame.panic(0)
+                injectedRet = true
+                step.target = pc
+                return SYN_RET
+            }
             if (folding?.has(block)) {
                 tracer.setActive(watch(block))
                 if (!tracedBlocks.has(block)) noteTracedBlock(block, pc, 'concrete loop')
@@ -1544,14 +1605,20 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     return layout.rest < 0 ? 0 as intrinsics.Handle : session.linkFunction(builtinGlobals.Array) as intrinsics.Handle
                 }
             }
+            if (op === RtOp.getprop) {
+                const value = mk('get-prop', [readToken(), escapedValue(toGraphValue(args[0])), toGraphValue(args[1])])
+                writeToken(value)
+                return value
+            }
             if (runtimeFunction(op)) {
                 const value = mk('rt', [readToken(), traceValue(op), ...args.map(arg => escapedValue(toGraphValue(arg)))])
                 writeToken(value)
                 return value
             }
             if (op === RtOp.nullish) {
-                const bit = presentBits.get(heap.boxedNanId(args[0]))
-                if (bit === undefined) return heap.boxF64(0)
+                const id = heap.boxedNanId(args[0])
+                const bit = presentBits.get(id)
+                if (bit === undefined) return heap.boxF64(rawValue(mk('eq', [symbolValue(id), nullishValue()], '', Types.bool)))
                 return heap.boxF64(Intrinsics.eq(Intrinsics.and(Intrinsics.shr(rawValue(presence), bit), 1), 0))
             }
             if (op !== RtOp.typeof || !objects.joinOf(traceValue(args[0]))) {
@@ -1631,17 +1698,18 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                     if (T !== undefined) return tagCallResult(traceValue(T))
                 }
                 if (intrinsicName === 'store') {
-                    memoryStore(iargs[0], iargs[1], iargs[2], vmValue(iargs[3] as u32))
+                    memoryStore(iargs[0], iargs[1], graphOperand(iargs[2]), vmValue(iargs[3] as u32))
                     return tagCallResult(0)
                 }
                 if (intrinsicName === 'rt') {
-                    const operands = iargs.map(value => isVmHandle(value as u32) && !heap.isBoxedF64(vmHandle(value as u32))
-                        ? mk('heap-handle', [traceValue(vmHandle(value as u32))]) : value)
-                    return tagCallResult(mk('rt', [nilEffect, ...operands]))
+                    return tagCallResult(mk('rt', [nilEffect, ...iargs.map(graphOperand)]))
                 }
                 if (intrinsicName === 'pstack') {
                     const v = stackOperation(iargs[0], iargs[1], iargs[2])
                     return tagCallResult(v)
+                }
+                if (intrinsicName === 'static') {
+                    return tagCallResult(Intrinsics.static(vmHandle(iargs[0] as u32)))
                 }
                 if (intrinsicName === 'load') {
                     const loaded = memoryLoad(iargs[0], iargs[1], vmValue(iargs[2] as u32))
@@ -1652,7 +1720,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             }
             const env = syncsFrame(linked) ? frameEnvironment() : undefined
             if (env) syncOut(env)
-            const result = linked ? callLinked(linked, thisArg, regStart, nargs) : undefined
+            const result = linked ? callLinked(linked, thisArg, regStart, nargs, env) : undefined
             let value = result?.value
             if (!result) {
                 const calleeValue = intrinsics.getNanId(callee)
@@ -1810,7 +1878,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return R
     }
 
-    function continuationFor(): Continuation {
+    function continuationFor(env: any): Continuation {
         assert(folding === undefined, `trace2: continuation for a call inside concrete loop B${current}`)
         const own = B.insts[current]
         const last = own[own.length - 1]
@@ -1837,6 +1905,12 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
             if (cont.multi) reifyBlock(target)
             const ins = saved.slice()
             if (writesAcc) ins[ACC] = toGraphValue(value)
+            if (env) {
+                for (const r of captured.writes) {
+                    token = mk('get-prop', [token, env, traceValue(heap.indexKey(r as u32))])
+                    ins[r] = token
+                }
+            }
             ins[TOKEN] = token
             return arrive(target, ins, from)
         }) as Continuation
@@ -1919,7 +1993,8 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     }
 
     function captureHeap(ins: Float64Array, slots: number[]): HeapState {
-        const roots: u32[] = [thisArg as u32]
+        const receiver = cellOf(thisValue) || (!intrinsics.getNanId(thisValue) && isVmHandle(thisValue) ? vmHandle(thisValue) : 0)
+        const roots: u32[] = receiver ? [receiver as u32] : []
         for (const slot of slots) {
             const cell = cellOf(ins[slot])
             if (cell) roots.push(cell)
@@ -2094,7 +2169,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         const found = new Map<number, u32>()
         for (const slot of R.inputs) {
             if (slot === TOKEN) continue
-            const cells = R.arrivals.map(a => cellOf(a.values[slot]))
+            const cells = R.arrivals.map(a => identityOf(a.values[slot]))
             if (cells.every(c => c) || !cells.some(c => c)) continue
             if (R.arrivals.some((a, i) => !cells[i] && !symbolOf(a.values[slot]))) continue
             const cell = cells.find(c => c)!
@@ -2147,9 +2222,10 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         for (const slot of R.inputs) {
             if (slot === TOKEN) continue
             const cells = R.arrivals.map(a => identityOf(a.values[slot]))
-            if (!cells.every(c => c) || cells.every(c => c === cells[0])) continue
+            if (!cells.some(c => c) || cells.every(c => c === cells[0])) continue
+            if (R.arrivals.some((a, i) => !cells[i] && symbolOf(a.values[slot]))) continue
             const states = R.arrivals.map((a, i) => a.heap.get(cells[i]))
-            if (states.every(state => state !== undefined && objects.sameShape(states[0]!, state))) continue
+            if (cells.every(c => c) && states.every(state => state !== undefined && objects.sameShape(states[0]!, state))) continue
             found.add(slot)
         }
         if (!found.size) return found
@@ -2166,6 +2242,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     function bindInputs(R: Reified): Float64Array {
         assert(!tracedBlocks.has(R.header) && R.arrivals.length > 0)
+        synced = new Map()
         const first = R.arrivals[0]
         const ins = first.values.slice()
         const unions = joinUnknownObjects(R)
@@ -2399,7 +2476,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
 
     function arrive(b: number, ins: Float64Array, from: number): f64 {
         const R = reified.get(b)
-        if (!R) assert(!tracedBlocks.has(b))
+        if (!R) assert(!tracedBlocks.has(b), `trace: B${b} of ${traceName || '?'} arrives again from B${from} after it was traced without a reified entry (preds ${B.preds[b].join(',')})`)
         if (blockOrderOn) {
             const kind = R ? (tracedBlocks.has(b) ? 'back edge' : 'first arrival ') : 'trace  '
             const self = R ? `%${R.selfId}` : '%?'
@@ -2440,12 +2517,16 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         const branch = branchInputs(r)
         const marks = tracer.inactive(() => objects.mark())
         const depth = refinements.length
+        const syncedAtBranch = synced
+        synced = new Map(syncedAtBranch)
         refine(r.outs, branch[0])
         const a = arrive(blockOf.get(r.thenPc)!, branch[0], r.from)
         refinements.length = depth
         const thenChanges = tracer.inactive(() => objects.take(marks))
+        synced = syncedAtBranch
         refine(r.outs, branch[1])
         const c = arrive(blockOf.get(r.elsePc)!, branch[1], r.from)
+        synced = new Map()
         refinements.length = depth
         const elseChanges = tracer.inactive(() => objects.take(marks))
         if (intrinsics.argv().includes('probe-merge') && (thenChanges.size || elseChanges.size)) {
@@ -2586,6 +2667,10 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
         return out
     }
 
+    function graphOperand(value: any): any {
+        return isVmHandle(value as u32) && !heap.isBoxedF64(vmHandle(value as u32)) ? mk('heap-handle', [traceValue(vmHandle(value as u32))]) : value
+    }
+
     function sameValue(a: any, b: any): boolean {
         if (a === b) return true
         const ia = symbolOf(a)
@@ -2651,7 +2736,7 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
     if (runtime.nilEffect === undefined) runtime.nilEffect = mk('nil-effect', [])
     nilEffect = runtime.nilEffect
     ins[ACC] = thisValue
-    ins[TOKEN] = opts.inputs?.effect ?? nilEffect
+    ins[TOKEN] = opts.inputs?.effect ?? mk('nil-effect', [traceValue(0)])
 
     reifyBlocks()
     function doTrace() {
@@ -2829,19 +2914,29 @@ export function trace2(input: string | Function | bytecode.EmitResult, opts: Tra
                 for (const i of indices) operands.push(visit(getRef(n, i)) || { literal: getLiteral(n, i) })
                 visit(typeRefOf(n))
                 if (n.op === 'heap-handle' && !getRef(n, 0) && heap.isIndirect(getLiteral(n, 0) as u32) && !objects.isSealed(getLiteral(n, 0) as intrinsics.Handle)) {
-                    const base = (countIds(n) > 1 ? getLiteral(n, 1) : heap.indirectTarget(getLiteral(n, 0) as u32)) as u32
-                    for (const key of dataKeys(base)) {
-                        const slot = slotOf(base, key)
-                        if (heap.isBoxedF64(slot)) {
-                            const id = intrinsics.getNanId(heap.unboxF64(slot))
-                            if (id) visit(id)
-                        }
-                    }
+                    visitSlots((countIds(n) > 1 ? getLiteral(n, 1) : heap.indirectTarget(getLiteral(n, 0) as u32)) as u32)
                 }
                 out.set(id, copyNode(n, operands))
                 return id
             }
             return id
+        }
+
+        const seenCells = new Set<number>()
+        function visitSlots(base: u32): void {
+            if (seenCells.has(base)) return
+            seenCells.add(base)
+            for (const key of dataKeys(base)) {
+                const slot = slotOf(base, key)
+                if (heap.isBoxedF64(slot)) {
+                    const id = intrinsics.getNanId(heap.unboxF64(slot))
+                    if (!id) continue
+                    const resolved = visit(id)
+                    if (resolved !== id) heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(base, key))).slot0 = heap.boxF64(intrinsics.getNanFromId(resolved))
+                } else if (slot && heap.isIndirect(slot) && !objects.isSealed(slot as intrinsics.Handle)) {
+                    visitSlots(heap.indirectTarget(slot) as u32)
+                }
+            }
         }
 
         function tail(v: any): number[] {
@@ -3552,7 +3647,8 @@ if (intrinsics.argv()[0] === 'trace2') {
         assert(traced.returns.length === 1 && !symbolOf(size) && vmValue(size as u32) === 2,
             'trace2: a captured Map should be constructed concretely')
     }
-    testConcreteConstruction()
+    const foldedConstructions = intrinsics.argv().includes('folded-constructions')
+    if (foldedConstructions) testConcreteConstruction()
 
     function testCapturedMapNative() {
         const x = new Map([[1, 1]])
@@ -3565,13 +3661,16 @@ if (intrinsics.argv()[0] === 'trace2') {
         session.leaveTrace()
         assert(![...graph.nodes.values()].some(n => n.op === 'pstack' || n.op === 'store'),
             'trace2: a captured construction spills its contents into the trace that uses it')
-        const compiled: any = native.createNatives({ capturedMapHas })
-        assert(compiled.capturedMapHas(1) === 1, 'trace2: native lookup in a captured Map misses a present key')
-        assert(compiled.capturedMapHas(2) === 0, 'trace2: native lookup in a captured Map finds an absent key')
-
         function capturedMapSet(key: u32): u32 {
             x.set(key, key)
             return 0
+        }
+        const compiled: any = native.createNatives(foldedConstructions ? { capturedMapHas } : { capturedMapSet, capturedMapHas })
+        assert(compiled.capturedMapHas(1) === 1, 'trace2: native lookup in a captured Map misses a present key')
+        assert(compiled.capturedMapHas(2) === 0, 'trace2: native lookup in a captured Map finds an absent key')
+        if (!foldedConstructions) {
+            assert(compiled.capturedMapSet(5) === 0 && compiled.capturedMapHas(5) === 1, 'trace2: a write to a captured Map is not visible to a later native lookup')
+            return
         }
         let rejected = ''
         try {

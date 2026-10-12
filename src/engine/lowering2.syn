@@ -1001,8 +1001,8 @@ const TargetingValues = new Set([
 export const OrderedValues = new Set([
     'load', 'store', 'call', 'pstack', 'rt'
 ])
-function firstNonOrderingSlot(n: GraphNode): number {
-    return n.op === 'after' ? countIds(n) - 1 : OrderedValues.has(n.op) ? 1 : 0
+export function firstNonOrderingSlot(n: GraphNode): number {
+    return n.op === 'after' ? countIds(n) - 1 : OrderedValues.has(n.op) || n.op === 'get-prop' || n.op === 'set-prop' ? 1 : 0
 }
 const PureOps = new Set<string>([
     'mem',
@@ -1715,6 +1715,42 @@ export function inlineBlocks(g: Graph) {
                 g.nodes.set(type, createRecordType(shape.map(key => ({ key, type: Types.u64 }))))
                 param = makeNode('param', [], { ref: type })
             }
+            let entry = 0
+            const kept = new Set<number>()
+            for (const stack = [block.bodyId]; stack.length;) {
+                const id = stack.pop()!
+                const n = id ? g.nodes.get(id) : undefined
+                if (!n || kept.has(id) || n.op === 'block') continue
+                kept.add(id)
+                for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+            }
+            const restarted = new Set<number>()
+            function restart(id: number): void {
+                if (!id || id === site || kept.has(id) || restarted.has(id)) return
+                restarted.add(id)
+                const n = g.nodes.get(id)!
+                if (n.op === 'block' || n.op === 'param') return
+                let copy: GraphNode | undefined
+                const ordering = firstNonOrderingSlot(n)
+                for (let i = 0; i < countIds(n); i++) {
+                    const ref = getRef(n, i)
+                    const m = ref ? g.nodes.get(ref) : undefined
+                    const root = m?.op === 'nil-effect' ? countLiterals(m) > 0 && getLiteral(m, 0) === block.id : block.params.includes(ref)
+                    if (!ref || i >= ordering || !root) {
+                        restart(ref)
+                        continue
+                    }
+                    copy ??= copyNode(n)
+                    setOperand(copy, i, entry ||= addNil(blockId))
+                }
+                if (copy) g.nodes.set(id, copy)
+            }
+            function addNil(label: number): number {
+                const at = g.maxId++
+                g.nodes.set(at, makeNode('nil-effect', [{ literal: label }]))
+                return at
+            }
+            restart(body)
             g.nodes.set(site, param)
             setDebugLabel(g, site, `inline${site}`)
             addGraphBlock(g, { id: blockId, params: [site], bodyId: body, bodyConst: 0 })
@@ -1835,6 +1871,14 @@ export function packageBlocksFINAL(g: Graph) {
         if (n.op !== 'param' && isPlaceholder(n)) pinned.set(id, getLiteral(n, 0))
         else if (n.op === 'nil-effect' && countLiterals(n) === 0) pinned.set(id, 0)
     }
+    function chainBlock(id: number): number | undefined {
+        const n = g.nodes.get(id)
+        if (!n || (n.op === 'nil-effect' && !countLiterals(n))) return
+        if (pinned.has(id) || n.op === 'after' || !firstNonOrderingSlot(n)) return pinned.get(id)
+        const home = chainBlock(getRef(n, 0))
+        if (home !== undefined) pinned.set(id, home)
+        return home
+    }
     function visitBlock(b: GraphBlock, blocksSeen: Set<number>) {
         for (const x of b.params) {
             pinned.set(x, b.id)
@@ -1856,6 +1900,8 @@ export function packageBlocksFINAL(g: Graph) {
             if (!countIds(n) && !isPlaceholder(n)) return
             const didAdd = addAndCheck(seenInBlock, id, b.id)
             if (!didAdd) return
+            const home = chainBlock(id)
+            if (home !== undefined && home !== b.id) return
             for (let i = 0; i < countIds(n); i++) {
                 visit(getRef(n, i))
             }
@@ -2125,7 +2171,9 @@ export function packageBlocksFINAL(g: Graph) {
             const id = g.maxId++
             mapping.set(vid, id)
             b.params.push(id)
-            g.nodes.set(id, paramNode())
+            const value = g.nodes.get(vid)!
+            const ref = typeRefOf(value)
+            g.nodes.set(id, makeNode('param', [], ref ? { ref } : resultType(g, value)))
         }
         valToParam.set(bid, mapping)
         const p = savedPreds.get(bid)
@@ -2266,7 +2314,7 @@ function usedPastToken(n: GraphNode, x: number): boolean {
     return false
 }
 
-export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[], dependents?: (id: number) => Iterable<number>): MemAnalysis {
+export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[], dependents?: (id: number) => Iterable<number>, homeOf?: (id: number) => GraphBlock | undefined): MemAnalysis {
     const cache = new Map<number, Mem>()
     const arrivals = new Map<number, [ref: number, literal: number][]>()
     const inFlight = new Set<number>()
@@ -2275,6 +2323,7 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
     let pending = 0
     let solving: Set<number> | undefined
     function ownerOf(param: number): GraphBlock | undefined {
+        if (homeOf) return homeOf(param)
         if (!owners) {
             owners = new Map()
             for (const b of g.blocks) for (const p of b.params) owners.set(p, b)
@@ -2716,7 +2765,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     const byOp = new Map<number, Map<string, number[]>>()
+    const homeBlock = new Map<number, number>()
     function indexValue(id: number, op: string, blockId: number) {
+        homeBlock.set(id, blockId)
         let m = byOp.get(blockId)
         if (!m) byOp.set(blockId, m = new Map())
         let arr = m.get(op)
@@ -2877,6 +2928,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function indexGraph() {
         dependents.clear()
         byOp.clear()
+        homeBlock.clear()
         successors.clear()
         preds.clear()
         visited.clear()
@@ -3188,8 +3240,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const r = new Map<number, number>()
         for (const id of findValues(target.id, 'select') ?? []) {
             const n = g.nodes.get(id)!
-            if (countIds(n) === 3 && !getRef(n, 0)) {
-                const arm = getLiteral(n, 0) ? 1 : 2
+            const test = g.nodes.get(skipAfter(getRef(n, 0)) ?? 0)
+            const nullish = test?.op === 'heap-handle' && !getRef(test, 0) && !getLiteral(test, 0)
+            if (countIds(n) === 3 && (!getRef(n, 0) || nullish)) {
+                const arm = !nullish && getLiteral(n, 0) ? 1 : 2
                 r.set(id, getRef(n, arm) || addNode('literal', [{ literal: getLiteral(n, arm) }]))
                 continue
             }
@@ -3604,7 +3658,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     argIds[i] = nil()
                     continue
                 }
-                const ordering = n.op === 'call' && callEffect(n) === 0 ? undefined : simplifyOrdering(q, from)
+                const ordering = n.op === 'call' && callEffect(n) === 0 && !writesBefore(q, new Set()) ? undefined : simplifyOrdering(q, from)
                 if (ordering === q || (isNilOrVoid(ordering) && isNilOrVoid(q))) {
                     continue
                 }
@@ -3628,7 +3682,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const sink = replacements.get(getRef(n, end)) ?? getRef(n, end)
                 const covered = slotParts(sink)
                 const unordered = !orderedUse(id) && !writes(g.nodes.get(sink))
-                const kept = orderings.filter(p => !covered.has(p) && !(unordered && isRead(g.nodes.get(p))))
+                const kept: number[] = []
+                for (let p of orderings) {
+                    while (unordered && isRead(g.nodes.get(p))) p = getRef(g.nodes.get(p)!, 0)
+                    if (!covered.has(p) && !isNilOrVoid(p)) kept.push(p)
+                }
                 const joined = effectsJoin(kept, sink)
                 if (joined < fresh) {
                     replacements.set(id, joined)
@@ -4195,26 +4253,50 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return true
     }
 
+    interface RelayIndex {
+        passes: Map<number, [into: number, slot: number][]>
+        inbound: Map<number, [from: number, app: number][]>
+    }
+    let relayCache: { members: Set<number>, epoch: number, index: RelayIndex } | undefined
+    function relayIndex(members: Set<number>): RelayIndex {
+        if (relayCache?.members === members && relayCache.epoch === graphEpoch) return relayCache.index
+        const index: RelayIndex = { passes: new Map(), inbound: new Map() }
+        for (const id of members) {
+            const own = new Set(getGraphBlock(id).params)
+            for (const app of findValues(id, 'apply') ?? []) {
+                const n = g.nodes.get(app)!
+                const into = getRef(n, 0)
+                if (!members.has(into)) continue
+                let inbound = index.inbound.get(into)
+                if (!inbound) index.inbound.set(into, inbound = [])
+                inbound.push([id, app])
+                for (let k = 1; k < countIds(n); k++) {
+                    const ref = getRef(n, k)
+                    if (!own.has(ref)) continue
+                    let passes = index.passes.get(ref)
+                    if (!passes) index.passes.set(ref, passes = [])
+                    passes.push([into, k - 1])
+                }
+            }
+        }
+        relayCache = { members, epoch: graphEpoch, index }
+        return index
+    }
     function relayChain(header: GraphBlock, slot: number, members: Set<number>): Map<number, number> | undefined {
+        const index = relayIndex(members)
         const chain = new Map<number, number>([[header.id, slot]])
         const work = [header]
         while (work.length) {
             const b = work.pop()!
-            const p = b.params[chain.get(b.id)!]
-            for (const u of dependents.get(p) ?? []) {
-                const n = g.nodes.get(u)!
-                if (n.op !== 'apply' || !members.has(getRef(n, 0))) continue
-                const into = getGraphBlock(getRef(n, 0))
-                for (let k = 1; k < countIds(n); k++) {
-                    if (getRef(n, k) !== p || chain.has(into.id)) continue
-                    chain.set(into.id, k - 1)
-                    work.push(into)
-                }
+            for (const [into, at] of index.passes.get(b.params[chain.get(b.id)!]) ?? []) {
+                if (chain.has(into)) continue
+                chain.set(into, at)
+                work.push(getGraphBlock(into))
             }
         }
         for (const [id, at] of chain) {
-            for (const [from, app] of findInboundApplies(getGraphBlock(id))) {
-                if (id === header.id && !members.has(from)) continue
+            if (id !== header.id) for (const from of preds.get(id)!) if (!members.has(from)) return
+            for (const [from, app] of index.inbound.get(id) ?? []) {
                 const fromAt = chain.get(from)
                 if (fromAt === undefined) return
                 if (getRef(g.nodes.get(app)!, at + 1) !== getGraphBlock(from).params[fromAt]) return
@@ -6650,7 +6732,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
     function currentMem(): MemAnalysis {
         if (!mem || memEpoch !== graphEpoch) {
-            mem = memAnalysis(g, b => findInboundApplies(b).map(x => x[1]), id => dependents.get(id) ?? [])
+            mem = memAnalysis(g, b => findInboundApplies(b).map(x => x[1]), id => dependents.get(id) ?? [], id => {
+                const home = homeBlock.get(id)
+                return home === undefined ? undefined : getBlock(g, home)
+            })
             memEpoch = graphEpoch
         }
         return mem
@@ -6992,6 +7077,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         return false
     }
+    const neededStores = new WeakSet<GraphNode>()
+    const liveStores = new WeakSet<GraphNode>()
     function forwardMemory(target: GraphBlock): boolean {
         currentMem()
 
@@ -7051,10 +7138,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!r.size) {
             for (const id of findValues(target.id, 'store') ?? []) {
                 const store = g.nodes.get(id)!
-                if (redundant(store)) {
-                    r.set(id, removedStore(store))
-                    break
-                }
+                if (neededStores.has(store)) continue
+                if (redundant(store)) r.set(id, removedStore(store))
+                else neededStores.add(store)
             }
         }
         function overwritten(id: number, store: GraphNode): boolean {
@@ -7159,7 +7245,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!r.size) {
             for (const id of findValues(target.id, 'store') ?? []) {
                 const store = g.nodes.get(id)!
+                if (liveStores.has(store)) continue
                 if (overwritten(id, store)) r.set(id, removedStore(store))
+                else liveStores.add(store)
             }
         }
         if (!r.size) return false
@@ -7956,12 +8044,14 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const folded = new Map<number, Value>()
         const epoch = nextEpoch(g)
 
-        function operand(n: GraphNode, i: number): Value {
+        function operand(n: GraphNode, i: number, compare = CompareOps.has(n.op)): Value {
             const ref = getRef(n, i)
             if (!ref) return { id: 0, value: getLiteral(n, i) }
             const m = g.nodes.get(ref)
             if (m && FoldableOps.has(m.op)) return fold(ref, m)
             if (m?.op === 'literal' && inlineableLiteral(costs, literalValue(m))) return { id: 0, value: literalValue(m) }
+            if (compare && m?.op === 'after') return operand(m, countIds(m) - 1, true)
+            if (compare && m?.op === 'heap-handle' && !getRef(m, 0) && !getLiteral(m, 0)) return { id: 0, value: 0 }
             return { id: ref, value: 0 }
         }
 
@@ -9498,6 +9588,45 @@ export function wideLiteral(v: number): boolean {
     return Number.isSafeInteger(v) && (v >= 2 ** 32 || v < -(2 ** 31))
 }
 
+function splitSharedLiterals(g: Graph, wanted: (id: number) => boolean): void {
+    const users = new Map<number, Map<number, number[]>>()
+    for (const b of g.blocks) {
+        const seen = new Set<number>()
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const n = g.nodes.get(id)
+            if (!n || n.op === 'block') continue
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (!ref) continue
+                stack.push(ref)
+                if (!wanted(ref)) continue
+                let byBlock = users.get(ref)
+                if (!byBlock) users.set(ref, byBlock = new Map())
+                const list = byBlock.get(b.id)
+                if (list) list.push(id)
+                else byBlock.set(b.id, [id])
+            }
+        }
+    }
+    for (const [literal, byBlock] of users) {
+        if (byBlock.size < 2) continue
+        const original = g.nodes.get(literal)!
+        for (const list of byBlock.values()) {
+            const copy = g.maxId++
+            g.nodes.set(copy, copyNode(original))
+            for (const user of new Set(list)) {
+                const n = copyNode(g.nodes.get(user)!)
+                for (let i = 0; i < countIds(n); i++) if (getRef(n, i) === literal) setRef(n, i, copy)
+                g.nodes.set(user, n)
+            }
+        }
+    }
+}
+
 function islandLoads(g: Graph, costs: lowering.TargetCosts, poolSlot: (value: number) => number, poolValue?: (slot: number) => number | undefined): number[] {
     const island: number[] = []
     const entries = new Map<number, number>()
@@ -9510,6 +9639,11 @@ function islandLoads(g: Graph, costs: lowering.TargetCosts, poolSlot: (value: nu
         return at
     }
     const floats = floatValues(g)
+    function pooled(id: number): boolean {
+        const n = g.nodes.get(id)
+        return n?.op === 'literal' && !floats.has(id) && typeOf(n) !== Types.f64 && wideLiteral(getLiteral(n, 0))
+    }
+    splitSharedLiterals(g, pooled)
     const loads: [id: number, entry: number, type: Types][] = []
     for (const [id, n] of [...g.nodes]) {
         if (n.op === 'pool-entry' && !getRef(n, 0)) {
@@ -9519,7 +9653,7 @@ function islandLoads(g: Graph, costs: lowering.TargetCosts, poolSlot: (value: nu
             continue
         }
         if (n.op === 'literal') {
-            if (!floats.has(id) && typeOf(n) !== Types.f64 && wideLiteral(getLiteral(n, 0))) loads.push([id, entryOf(poolSlot(getLiteral(n, 0))), typeOf(n)])
+            if (pooled(id)) loads.push([id, entryOf(poolSlot(getLiteral(n, 0))), typeOf(n)])
             continue
         }
         if (floats.has(id)) continue
@@ -9618,6 +9752,11 @@ function expandCodecs(g: Graph): boolean {
         g.nodes.set(id, makeNode(op, [ref, { literal: literal }]))
         return id
     }
+    function pstackOffset(ref: number): number {
+        const id = g.maxId++
+        g.nodes.set(id, makeNode('convert', [ref], Types.u28))
+        return id
+    }
     const derefs = new Map<number, number[]>()
     const others = new Set<number>()
     for (const [id, n] of g.nodes) {
@@ -9651,8 +9790,8 @@ function expandCodecs(g: Graph): boolean {
         const base = getLiteral(n, 1)
         assert(!getRef(n, 1) && base >= 0, `lowering: ${n.op} %${id} needs a constant heap base`)
         const coded = n.op === 'decode'
-            ? node('add', node('ushr', value, 1), base)
-            : node('add', node('shl', value, 1), 1 - 2 * base)
+            ? node('add', pstackOffset(node('ushr', value, 1)), base)
+            : node('add', node('shl', value, 1), heap.pstackWordTag + 1 - 2 * base)
         // TODO: in debug panic on a null handle instead of UB
         for (const user of others.has(id) ? [] : derefs.get(id) ?? []) {
             const u = g.nodes.get(user)!
@@ -12109,10 +12248,13 @@ function demotePstacks(g: Graph): boolean {
                         for (const l of loadsFrom.get(into) ?? []) follow(l)
                     } else if (n.op === 'call') {
                         if (i < 3 || targetCaptures(g, u, i - 3)) escaped = true
+                        else follow(u)
                     } else if (n.op === 'apply') {
                         const param = getBlock(g, getRef(n, 0))?.params[i - 1]
                         if (param === undefined || headers?.has(getRef(n, 0))) escaped = true
                         else follow(param)
+                    } else if (n.op === 'encode') {
+                        escaped = true
                     } else if (n.op === 'after' || n.op === 'select' || (PureOps.has(n.op) && !TargetingValues.has(n.op))) {
                         follow(u)
                     } else if (!CompareOps.has(n.op)) {
@@ -12390,6 +12532,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             relocations: [],
             target,
             words: [],
+            clobbers: new Set(),
+            localCalls: new Set(),
         }
     }
 
@@ -12713,7 +12857,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const home = homeOf.get(v)
         if (home === undefined) {
             console.log(errorDump(g), materializing)
-            throw `lowering: value ${v} is not live`
+            throw `lowering: value ${v} is not live (demanded by %${materializing} = ${g.nodes.get(materializing)?.op})`
         }
         if (!isSlot(home)) return home
         if (acrossCall.has(v)) {
@@ -13388,13 +13532,13 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         transient = outer + 1
         defer transient = outer
         if (n.op === 'call') {
-            if (!done.has(id) && !homeOf.has(id)) build(id)
+            if (!done.has(id)) build(id)
         } else if (n.op === 'after') {
             if (!done.has(id)) build(id)
         } else if (n.op === 'store') {
             if (!done.has(id)) buildStore(id, n)
         } else if (n.op === 'load') {
-            if (!done.has(id) && !homeOf.has(id)) build(id)
+            if (!done.has(id)) build(id)
         } else if (n.op === 'select') {
             const taken = g.nodes.get(getRef(n, 1))?.op === 'panic' ? 2
                 : g.nodes.get(getRef(n, 2))?.op === 'panic' ? 1 : 0

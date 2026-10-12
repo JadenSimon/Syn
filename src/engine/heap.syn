@@ -16,6 +16,10 @@ type usize = u32
 export type Handle = intrinsics.Handle
 type RawPtr = intrinsics.RawPtr
 
+export const boxedCellBit = 1 << 30
+export const pstackWordTag = 0xc0000000
+export const pstackBoxWordTag = 0xe0000000
+
 export interface HeapAllocator {
     allocate(bytes: usize): Handle
     resolve(handle: Handle): usize
@@ -157,7 +161,7 @@ export function boxF64(value: f64): Handle {
     if (id) {
         if (const cached = f64NanCache.get(id)) return cached
     }
-    const handle = allocateHeapCell(HeapF64.sizeof)
+    const handle = (allocateHeapCell(HeapF64.sizeof) | boxedCellBit) as Handle
     const boxed = HeapF64(resolveHeapCell(handle))
     boxed.td = heapF64TD
     boxed.value = value
@@ -167,6 +171,14 @@ export function boxF64(value: f64): Handle {
         f64NanIds.set(handle, id)
     }
     return handle
+}
+
+export function setBoxedF64(handle: Handle, value: f64): void {
+    HeapF64(resolveHeapCell(handle)).value = value
+    const id = intrinsics.getNanId(value)
+    if (!id) return
+    f64NanCache.set(id, handle)
+    f64NanIds.set(handle, id)
 }
 
 export function boxedNanId(value: Handle): number {
@@ -238,6 +250,48 @@ export function isBoxedF64(value: Handle): boolean {
     return value !== 0 && HeapObject(resolveHeapCell(value)).td === heapF64TD
 }
 
+function mixHash(h: u32): u32 {
+    return (h ^ (h >>> 3) ^ (h >>> 11)) as u32
+}
+
+function numberHash(value: f64): u32 {
+    const whole = Intrinsics.convert(value, Types.f64, Types.i64)
+    if (Intrinsics.convert(whole, Types.i64, Types.f64) === value && whole >= -0x40000000 && whole < 0x40000000) {
+        return mixHash(Intrinsics.convert(whole, Types.i64, Types.u32))
+    }
+    const bits = Intrinsics.bitconvert(value, Types.f64, Types.u64)
+    return mixHash(Intrinsics.convert(bits ^ (bits >>> 32), Types.u64, Types.u32))
+}
+
+export function nativeHashKey(key: any): u32 {
+    const word = Intrinsics.bitconvert(key, Types.vm_value, Types.u32)
+    if (!(word & 1)) return mixHash(Intrinsics.convert(Intrinsics.convert(word, Types.u32, Types.i32) >> 1, Types.i32, Types.u32))
+    if (word >= pstackBoxWordTag) return numberHash(Intrinsics.load(rt.pstackaddr(word), 0, Types.f64))
+    if (word >= pstackWordTag) return mixHash(word)
+    if (word & (boxedCellBit << 1)) return numberHash(HeapF64(resolveHeapCell((word >>> 1) as Handle)).value)
+    return mixHash(word >>> 1)
+}
+
+const hashBits = new Float64Array(1)
+const hashWords = new Uint32Array(hashBits.buffer)
+
+function hostMixHash(h: number): u32 {
+    const u = h >>> 0
+    return ((u ^ (u >>> 3) ^ (u >>> 11)) >>> 0) as u32
+}
+
+function hostNumberHash(value: number): u32 {
+    if (Number.isInteger(value) && value >= -0x40000000 && value < 0x40000000) return hostMixHash(value)
+    hashBits[0] = value
+    return hostMixHash(hashWords[0] ^ hashWords[1])
+}
+
+export function hostHashKey(value: any): u32 {
+    const handle = intrinsics.getNanId(value) as Handle
+    if (!handle) return hostNumberHash(value)
+    return isBoxedF64(handle) ? hostNumberHash(unboxF64(handle)) : hostMixHash(handle)
+}
+
 export function unboxF64(value: Handle): f64 {
     return HeapF64(resolveHeapCell(value)).value
 }
@@ -279,35 +333,69 @@ function allocString(bytes: Uint8Array): Handle {
 
 // copies `s` (as utf-8) onto the heap, returns the string instance's address
 const internedStrings = new Map<string, Handle>()
+const internedHandles = new Set<Handle>()
 
 export function fromJsString(s: string): Handle {
     const known = internedStrings.get(s)
     if (known !== undefined) return known
     const handle = allocString(new TextEncoder().encode(s))
     internedStrings.set(s, handle)
+    internedHandles.add(handle)
     return handle
 }
 
 export const runtimeCells = intrinsics.heapMaxAddress as Handle
 
-export function concatStrings(lhs: Handle, rhs: Handle): Handle {
-    const a = HeapString(resolveHeapCell(lhs))
-    const b = HeapString(resolveHeapCell(rhs))
+function externalString(data: u32, length: u32): Handle {
     const next = resolveHeapCell(runtimeCells)
     const handle = Intrinsics.load(next, 0, Types.u32) as Handle
     Intrinsics.store(next, 0, handle + HeapString.sizeof, Types.u32)
-    const data = allocate(a.length + b.length)
-    for (let i: u32 = 0; i < a.length; i++) Intrinsics.store(data, i, Intrinsics.load(a.ptr, i, Types.u8), Types.u8)
-    for (let i: u32 = 0; i < b.length; i++) Intrinsics.store(data, a.length + i, Intrinsics.load(b.ptr, i, Types.u8), Types.u8)
     const str = HeapString(resolveHeapCell(handle))
     str.td = externalStringTD
     str.properties = 0 as Handle
-    str.length = a.length + b.length
+    str.length = length
     str.ptr = data as RawPtr
     return handle
 }
 
+export function residualAccess(object: u32, key: u32): u32 {
+    Intrinsics.trap(0)
+    return 0
+}
+intrinsics.tagNoInline(residualAccess)
+
+export function concatStrings(lhs: Handle, rhs: Handle): Handle {
+    const a = HeapString(resolveHeapCell(lhs))
+    const b = HeapString(resolveHeapCell(rhs))
+    const data = allocate(a.length + b.length)
+    for (let i: u32 = 0; i < a.length; i++) Intrinsics.store(data, i, Intrinsics.load(a.ptr, i, Types.u8), Types.u8)
+    for (let i: u32 = 0; i < b.length; i++) Intrinsics.store(data, a.length + i, Intrinsics.load(b.ptr, i, Types.u8), Types.u8)
+    return externalString(data, a.length + b.length)
+}
+
 intrinsics.tagNoInline(concatStrings)
+
+export function numberToString(bits: u64): Handle {
+    const x = Intrinsics.bitconvert(bits, Types.u64, Types.f64)
+    const whole = Intrinsics.convert(x, Types.f64, Types.i64)
+    if (Intrinsics.convert(whole, Types.i64, Types.f64) !== x) Intrinsics.panic('numberToString: non-integer numbers are not formatted natively')
+    const negative = whole < 0
+    let n = Intrinsics.convert(negative ? Intrinsics.sub(0, whole, Types.i64) : whole, Types.i64, Types.u64)
+    const data = allocate(20)
+    let at: u32 = 20
+    do {
+        at = at - 1
+        Intrinsics.store(data, at, Intrinsics.add(48, Intrinsics.rem(n, 10, Types.u64), Types.u64), Types.u8)
+        n = Intrinsics.div(n, 10, Types.u64)
+    } while (n !== 0)
+    if (negative) {
+        at = at - 1
+        Intrinsics.store(data, at, 45, Types.u8)
+    }
+    return externalString(data + at, 20 - at)
+}
+
+intrinsics.tagNoInline(numberToString)
 
 function stringLength(addr: Handle): u32 {
     return HeapString(resolveHeapCell(addr)).length
@@ -351,6 +439,7 @@ export const symbolConstants = Object.fromEntries(Object.getOwnPropertyNames(Sym
 
 function propertyKeysEqual(a: Handle, b: Handle): boolean {
     if (a === b) return true
+    if (!intrinsics.isNative() && internedHandles.has(a) && internedHandles.has(b)) return false
     if (typeDescriptorOf(a) === symbolTD || typeDescriptorOf(b) === symbolTD) return false
     return stringBytesEqual(a, b)
 }
