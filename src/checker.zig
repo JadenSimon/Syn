@@ -10,6 +10,8 @@ const getSlice2 = program.Analyzer.getSlice2;
 const getPackedData = parser.getPackedData;
 const getSlice = parser.getSlice;
 
+const enable_checking = false;
+
 pub const Checker = struct {
     file: *program.ParsedFileData,
     analyzer: *program.Analyzer,
@@ -24,6 +26,7 @@ pub const Checker = struct {
     }
 
     pub fn checkReadonlyAssignment(this: *@This(), node_ref: NodeRef) !void {
+        if (!comptime enable_checking) return;
         const node = this.file.ast.nodes.at(node_ref);
 
         const target_ref = switch (node.kind) {
@@ -75,6 +78,7 @@ pub const Checker = struct {
     }
 
     pub fn checkDuplicateDeclaration(this: *@This(), decl_ref: NodeRef) !void {
+        if (!comptime enable_checking) return;
         const decl = this.file.ast.nodes.at(decl_ref);
         const d = getPackedData(decl);
 
@@ -97,6 +101,7 @@ pub const Checker = struct {
     }
 
     pub fn checkCallExpressionWithCallee(this: *@This(), call_ref: NodeRef, callee_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (callee_type >= @intFromEnum(Kind.false)) {
             return this.emitNotCallableError(call_ref, callee_type);
         }
@@ -189,6 +194,7 @@ pub const Checker = struct {
     }
 
     pub fn checkArgsAgainstSignature(this: *@This(), fn_type: TypeRef, args: []const NodeRef, call_ref: NodeRef) !void {
+        if (!comptime enable_checking) return;
         const fn_node = this.analyzer.types.at(fn_type);
         const params = getSlice2(fn_node, TypeRef);
         const min_params = this.countRequiredParams(params);
@@ -226,6 +232,7 @@ pub const Checker = struct {
     }
 
     pub fn checkPointlessTypeofComparison(this: *@This(), node_ref: NodeRef, rhs_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (this.couldBeString(rhs_type)) return;
 
         const rhs_str = try this.analyzer.printType(rhs_type);
@@ -251,6 +258,7 @@ pub const Checker = struct {
     }
 
     pub fn checkComparisonOverlap(this: *@This(), node_ref: NodeRef, left_type: TypeRef, right_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         const has_overlap = try this.analyzer.isAssignableTo(left_type, right_type) or
             try this.analyzer.isAssignableTo(right_type, left_type);
 
@@ -262,12 +270,14 @@ pub const Checker = struct {
     }
 
     pub fn checkAsyncCallInSyncContext(this: *@This(), call_ref: NodeRef, return_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (try this.analyzer.maybeUnwrapPromise(return_type) != null) {
             try this.file.emitErrorFmt(call_ref, "Async call in sync context requires 'as async'", .{});
         }
     }
 
     pub fn checkAsAsyncOnNonAsyncCall(this: *@This(), node_ref: NodeRef, call_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (call_type == @intFromEnum(Kind.any) or call_type == @intFromEnum(Kind.error_any)) return;
         if (try this.analyzer.maybeUnwrapPromise(call_type) == null) {
             try this.file.emitErrorFmt(node_ref, "Cannot use 'as async' on a non-async call signature", .{});
@@ -275,16 +285,19 @@ pub const Checker = struct {
     }
 
     pub fn checkAwaitInSyncContext(this: *@This(), node_ref: NodeRef) !void {
+        if (!comptime enable_checking) return;
         try this.file.emitErrorFmt(node_ref, "'await' expressions are only allowed within async functions", .{});
     }
 
     pub fn checkAwaitOnNonPromise(this: *@This(), node_ref: NodeRef, inner_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (try this.analyzer.maybeUnwrapPromise(inner_type) == null) {
             try this.file.emitErrorFmt(node_ref, "'await' has no effect on the type of this expression", .{});
         }
     }
 
     pub fn checkFunctionReturnType(this: *@This(), _: NodeRef, func: *const parser.AstNode) !void {
+        if (!comptime enable_checking) return;
         const return_type_ref = func.extra_data2;
         if (return_type_ref == 0) return;
 
@@ -300,6 +313,7 @@ pub const Checker = struct {
     }
 
     pub fn checkUseBeforeInit(this: *@This(), node_ref: NodeRef, flow_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         if (!try this.analyzer.isAssignableTo(@intFromEnum(Kind.undefined), flow_type)) return;
 
         const name_node = this.file.ast.nodes.at(node_ref);
@@ -308,6 +322,7 @@ pub const Checker = struct {
     }
 
     pub fn checkArithmeticAssignment(this: *@This(), expr_ref: NodeRef, _dest_type: TypeRef) !void {
+        if (!comptime enable_checking) return;
         const dest_type = try this.analyzer.followAllAliases(_dest_type);
 
         if (this.analyzer.getKindOfRef(dest_type) != .@"union") return;
