@@ -13,7 +13,7 @@ import {
     isNumeric, isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, expandValueGraph, sweepBlocks, encodeCallOutcomes, type CallOutcomes, wideLiteral, liftableSlot,
     printOptimizeStats, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, ReturnsFresh, CapturesAll,
     graphLoops, OrderedValues, firstNonOrderingSlot, stronglyConnected, importFact, mapTailPositions, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
-    NumericOps, isJumbo, panicOrdering,
+    NumericOps, isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock,
 } from './lowering2'
 import {
     addGraphBlock, copyNode, countIds, countLiterals, createGraph, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -2777,7 +2777,7 @@ function reachable(graph: Graph): GraphNode[] {
     }
     return found
 }
-function splice(graph: Graph, call: number, callee: Graph): void {
+function splice(graph: Graph, call: number, callee: Graph): number[] {
     const n = getNode(graph, call)!
     const args = new Map<number, number>()
     callee.blocks[0].params.forEach((p, i) => {
@@ -2822,6 +2822,7 @@ function splice(graph: Graph, call: number, callee: Graph): void {
         body = ordered
     }
     putNode(graph, call, NodeOp.inlined, [body, { literal: call }])
+    return [...blocks.values()]
 }
 function budgetedLoops(program: ProgramGraph, levels: Map<number, number>, share: number): Set<number> {
     const pieces: { symbol: number, loop: boolean, size: number }[] = []
@@ -2898,8 +2899,8 @@ function returnsAllocation(g: Graph): boolean {
     return fresh
 }
 function inlineAllocations(program: ProgramGraph, units: Map<number, ProgramUnit>, unit: ProgramUnit, clock: PhaseClock): void {
-    if (isJumbo(unit.graph)) return
     let graph: Graph | undefined
+    const spliced = new Map<number, number[]>()
     let mem: MemAnalysis | undefined
     for (const [id, n] of [...unit.graph.nodes]) {
         const symbol = calledSymbol(unit.graph, n)
@@ -2910,12 +2911,12 @@ function inlineAllocations(program: ProgramGraph, units: Map<number, ProgramUnit
         const flow = (mem ??= memAnalysis(unit.graph)).flows(id, true)
         if (flow.own || flow.calls.length) continue
         graph ??= snapshotGraph(unit.graph)
-        splice(graph, id, callee.graph)
+        spliced.set(id, splice(graph, id, callee.graph))
     }
-    if (graph) unit.graph = renormalize(graph, clock)
+    if (graph) unit.graph = repackage(graph, spliced, clock, program.target)
 }
 function inlines(callSites: Map<number, number>, roots: Map<string, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
-    if (isJumbo(callee.graph) || isJumbo(caller)) return false
+    if (isJumbo(callee.graph)) return false
     if (reachable(callee.graph).some(n => n.op === NodeOp.alloca || n.op === NodeOp.frameAddress)) return false
     const cost = inlineCost(callee.graph, literalParams(source, getNode(source, id)!, callee.graph))
     const neutral = cost !== undefined && cost <= 8
@@ -3005,6 +3006,108 @@ function rebasePath(path: string, base: number): string {
     return [/^\d+$/.test(first) ? String(Number(first) + base) : '*', ...rest].join('/')
 }
 
+function repackage(graph: Graph, spliced: Map<number, number[]>, clock: PhaseClock, target: Target): Graph {
+    return clock.timed('normalize', () => {
+        recordSnapshots(graph)
+        const owners = new Map<number, number>()
+        for (const b of graph.blocks) {
+            const stack = [b.bodyId]
+            const seen = new Set<number>()
+            while (stack.length) {
+                const id = stack.pop()!
+                const n = id && !seen.has(id) ? getNode(graph, id) : undefined
+                if (!n || n.op === NodeOp.block || n.op === NodeOp.param) continue
+                seen.add(id)
+                if (spliced.has(id)) owners.set(id, b.id)
+                for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+            }
+        }
+        const regions = new Map<number, Set<number>>()
+        for (const [site, blocks] of spliced) {
+            const owner = owners.get(site)
+            intrinsics.assert(owner !== undefined, `native: inlined site %${site} has no owning block`)
+            let inner = regions.get(owner)
+            if (!inner) regions.set(owner, inner = new Set())
+            for (const b of blocks) inner.add(b)
+        }
+        for (const [entry, inner] of regions) packageRegion(graph, getBlock(graph, entry)!, inner, target)
+        sweepBlocks(graph)
+        resolveNumberTypes(graph)
+        graph.form = 'packaged'
+        return isJumbo(graph) ? graph : optimizePackaged(graph, target)
+    })
+}
+
+function packageRegion(graph: Graph, entry: GraphBlock, inner: Set<number>, target: Target): void {
+    const store = new Map<number, GraphNode>()
+    const stubs = new Map<number, GraphBlock>()
+    const stubParams = new Set<number>()
+    const stack: number[] = []
+    function add(id: number): void {
+        if (!id || store.has(id)) return
+        const n = getNode(graph, id)
+        if (!n) return
+        store.set(id, n)
+        stack.push(id)
+    }
+    const members = [entry, ...[...inner].map(id => getBlock(graph, id)!)]
+    for (const b of members) {
+        add(b.id)
+        for (const p of b.params) add(p)
+        add(b.bodyId)
+    }
+    while (stack.length) {
+        const id = stack.pop()!
+        const n = store.get(id)!
+        if (n.op === NodeOp.block) {
+            if (id === entry.id || inner.has(id) || stubs.has(id)) continue
+            const b = getBlock(graph, id)!
+            stubs.set(id, { id, params: b.params.slice(), bodyId: 0, bodyConst: 0 })
+            for (const p of b.params) {
+                add(p)
+                stubParams.add(p)
+            }
+            continue
+        }
+        add(typeRefOf(n))
+        for (let i = 0; i < countIds(n); i++) add(getRef(n, i))
+    }
+    const arity = entry.params.length
+    const region = createGraph({
+        ids: graph.ids, literals: graph.literals, nodes: store, root: entry.id, blocks: [...members, ...stubs.values()],
+        epoch: graph.epoch, debugLabels: graph.debugLabels, facts: graph.facts && new Map(graph.facts), name: graph.name,
+    })
+    const end = addNode(region, NodeOp.unreachable, [])
+    for (const stub of stubs.values()) stub.bodyId = end
+    anchorBlockNils(region)
+    const packaged = packageValueGraph(region, target)
+    const root = packaged.blocks[0]
+    intrinsics.assert(root.id === entry.id && root.params.length === arity, `native: repackaging ${graph.name ?? 'anonymous'} changed the signature of B${entry.id}`)
+    for (const [id, stub] of stubs) {
+        const b = getBlock(graph, id)!
+        intrinsics.assert(stub.params.length === b.params.length && stub.params.every((p, i) => p === b.params[i]), `native: repackaging ${graph.name ?? 'anonymous'} changed the signature of B${id}`)
+    }
+    for (const p of stubParams) {
+        const before = getNode(graph, p)!
+        const after = getNode(packaged, p)!
+        if (after === before) continue
+        intrinsics.assert(after.op === NodeOp.param && typeRefOf(after) === typeRefOf(before), `native: repackaging ${graph.name ?? 'anonymous'} rewrote %${p} of an outside block`)
+    }
+    for (const [id, n] of packaged.nodes) setNode(graph, id, n)
+    const kept = packaged.blocks.filter(b => !stubs.has(b.id))
+    const blocks: GraphBlock[] = []
+    for (const b of graph.blocks) {
+        if (b.id === entry.id) blocks.push(...kept)
+        else if (!inner.has(b.id)) blocks.push(b)
+    }
+    setGraphBlocks(graph, blocks)
+    if (packaged.facts) {
+        graph.facts ??= new Map()
+        for (const [k, v] of packaged.facts) graph.facts.set(k, v)
+    }
+    graph.epoch = packaged.epoch
+}
+
 function renormalize(graph: Graph, clock: PhaseClock): Graph {
     anchorBlockNils(graph)
     graph.form = undefined
@@ -3075,7 +3178,7 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
         inlined.set(unit.symbol, false)
         const graph = snapshotGraph(unit.graph)
         const depths = siteDepths(graph)
-        let changed = false
+        const spliced = new Map<number, number[]>()
         for (const [id, n] of [...graph.nodes]) {
             const symbol = calledSymbol(graph, n)
             if (symbol === undefined) continue
@@ -3084,10 +3187,9 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
             visit(callee)
             if (!inlined.get(symbol)) continue
             if (!inlines(callSites, program.roots, unit.graph, graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
-            splice(graph, id, callee.graph)
-            changed = true
+            spliced.set(id, splice(graph, id, callee.graph))
         }
-        if (changed) unit.graph = renormalize(graph, clock)
+        if (spliced.size) unit.graph = repackage(graph, spliced, clock, program.target)
         inlineAllocations(program, units, unit, clock)
         inlined.set(unit.symbol, true)
     }
