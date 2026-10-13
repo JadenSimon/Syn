@@ -985,6 +985,8 @@ export interface LowerGraphOptions {
     regBudget?: number
     debug?: boolean
     clobbersOf?: (symbol: number) => Set<number> | undefined
+    continues?: (symbol: number) => boolean
+    endless?: (symbol: number) => boolean
     poolSlot?: (value: number) => number
     poolValue?: (slot: number) => number | undefined
 }
@@ -998,6 +1000,7 @@ export interface LowerGraphResult {
     clobbers: Set<number>
     localCalls: Set<number>
     island?: number[]
+    continued?: Map<number, number[]>
 }
 
 // TODO:
@@ -1404,23 +1407,28 @@ function outlineReturns(g: Graph): Graph {
     return g
 }
 
+export function panicOrdering(g: Graph, thrown: number): number[] {
+    const n = thrown ? getNode(g, thrown) : undefined
+    if (!n) return []
+    const tokens = n.op === NodeOp.after ? cloneRefs(n, 0, countIds(n) - 1) : OrderedValues.has(n.op) ? [getRef(n, 0)] : []
+    return tokens.filter(t => {
+        const op = getNode(g, t)?.op
+        return op && op !== NodeOp.nilEffect && op !== NodeOp.void
+    })
+}
+
 function replacePanics(g: Graph): boolean {
     let inlined = false
     for (const [id, n] of g.nodes) {
         if (n.op === NodeOp.inlined) inlined = true
         if (n.op !== NodeOp.panic) continue
         const unreachable = createNode(g, NodeOp.unreachable, [], n)
-        if (!getRef(n, 0)) {
+        const tokens = panicOrdering(g, getRef(n, 0))
+        if (!tokens.length) {
             setNode(g, id, getNode(g, unreachable)!)
             continue
         }
-        const op = getNode(g, getRef(n, 0))!.op
-        if (op !== NodeOp.param && PureOps.has(op)) {
-            setNode(g, id, getNode(g, unreachable)!)
-            continue
-        }
-        const v = operand(n, 0)
-        const a = createNode(g, NodeOp.after, [v, unreachable])
+        const a = createNode(g, NodeOp.after, [...tokens, unreachable])
         setNode(g, id, getNode(g, a)!)
     }
     return inlined
@@ -3062,12 +3070,43 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return
     }
 
+    function armEffects(n: GraphNode, arm: number): boolean {
+        const calls: number[] = []
+        const seen = new Set<number>()
+        const walk = [getRef(n, arm)]
+        while (walk.length) {
+            const id = walk.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const u = getNode(g, id)
+            if (!u) continue
+            if (u.op === NodeOp.call) {
+                const [effect, mask] = targetEffects(getNode(g, getRef(u, 1)))
+                if (effect > 1 && (mask & WritesUnknown) !== 0) calls.push(id)
+            }
+            if (u.op === NodeOp.after) for (let i = 0; i < countIds(u); i++) walk.push(getRef(u, i))
+            else if (OrderedValues.has(u.op)) walk.push(getRef(u, 0))
+        }
+        if (!calls.length) return false
+        const shared = new Set<number>()
+        const others: number[] = []
+        for (let i = 0; i < countIds(n); i++) if (i !== arm) others.push(getRef(n, i))
+        while (others.length) {
+            const id = others.pop()!
+            if (!id || shared.has(id)) continue
+            shared.add(id)
+            const u = getNode(g, id)
+            if (u) for (let i = 0; i < countIds(u); i++) others.push(getRef(u, i))
+        }
+        return calls.some(id => !shared.has(id))
+    }
+
     function simplifySelect(target: GraphBlock) {
         const loops = (id: number) => {
             const n = getNode(g, skipAfter(id) ?? 0)
             return n?.op === NodeOp.apply && getRef(n, 0) === target.id
         }
-        const diverges = (id: number) => isUnreachable(skipAfter(id) ?? 0)
+        const diverges = (n: GraphNode, arm: number) => isUnreachable(skipAfter(getRef(n, arm)) ?? 0) && !armEffects(n, arm)
         const r = new Map<number, number>()
         for (const id of findValues(target.id, NodeOp.select) ?? []) {
             const n = getNode(g, id)!
@@ -3078,12 +3117,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 r.set(id, getRef(n, arm) || addNode(g, NodeOp.literal, [{ literal: getLiteral(n, arm) }]))
                 continue
             }
-            if (diverges(getRef(n, 2))) {
+            if (diverges(n, 2)) {
                 const x = createNode(g, NodeOp.after, [getRef(n, 0), operand(n, 1)])
                 r.set(id, x)
                 continue
             }
-            if (diverges(getRef(n, 1))) {
+            if (diverges(n, 1)) {
                 const x = createNode(g, NodeOp.after, [getRef(n, 0), operand(n, 2)])
                 r.set(id, x)
                 continue
@@ -3364,6 +3403,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 arr.push(q)
             }
             if (r) arr.push(r)
+            if (r && isUnreachable(r) && arr.length > 1) return changed ? createNode(g, NodeOp.after, arr) : vid
             if (changed) return effectsJoin(arr)
             const fresh = g.ids.next
             const joined = effectsJoin(arr)
@@ -7034,6 +7074,20 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 }
                 return true
             }
+            function feeds(load: number): boolean {
+                const stack = [getRef(store, 3)]
+                const visited = new Set<number>()
+                let steps = 64
+                while (stack.length) {
+                    const at = stack.pop()!
+                    if (at === load) return true
+                    if (!at || visited.has(at) || --steps < 0) continue
+                    visited.add(at)
+                    const n = getNode(g, at)
+                    if (n && n.op !== NodeOp.select) for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+                }
+                return false
+            }
             users(id)
             while (pending.length) {
                 let next = 0
@@ -7063,7 +7117,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     const value = getNode(g, sequenced)
                     if (sequenced !== from && value && !isUnordered(sequenced)) {
                         if (value.op === NodeOp.load) {
-                            if (!mem!.disjoint(value, store)) return false
+                            if (!mem!.disjoint(value, store) && !feeds(sequenced)) return false
                         } else if (value.op === NodeOp.apply) {
                             if (!enter(sequenced)) return false
                         } else if (value.op === NodeOp.select) {
@@ -7071,7 +7125,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                                 const tail = getNode(g, p.at)!
                                 if (tail.op === NodeOp.apply ? !enter(p.at) : tail.op !== NodeOp.unreachable) return false
                             }
-                        } else if (value.op !== NodeOp.pstack && value.op !== NodeOp.alloca && !PureOps.has(value.op)) {
+                        } else if (value.op !== NodeOp.pstack && value.op !== NodeOp.alloca && value.op !== NodeOp.void && !PureOps.has(value.op)) {
                             return false
                         }
                     }
@@ -9395,7 +9449,9 @@ export function assignBlockSignatures(
             for (const id of where) if (taken.get(id)!.has(r)) return false
             return true
         }
-        let home = wants.get(root)!.find(free) ?? candidates.get(root)!.find(free) ?? spills.find(free)
+        const arrived = g.blocks[0].params.map((p, i) => find(p) === root ? homes.arrival[i] : -1)
+            .find(h => h >= 0 && !homes.volatiles.includes(h) && !homes.preserved.includes(h) && free(h))
+        let home = wants.get(root)!.find(free) ?? candidates.get(root)!.find(free) ?? arrived ?? spills.find(free)
         if (home === undefined) spills.push(home = homes.overflow())
         for (const id of where) taken.get(id)!.add(home)
         homeOf.set(root, home)
@@ -12129,11 +12185,12 @@ function demotePstacks(g: Graph): boolean {
     }
     const candidates = new Set<number>()
     const iterationLocal = new Set<number>()
+    const forever = ![...g.nodes.values()].some(n => n.op === NodeOp.ret)
     for (const [id, n] of g.nodes) {
         if (!demotable(n)) continue
         if (bodies.has(id)) continue
         if (!loopDepth.get(owner.get(id) ?? -1)) {
-            if (!escapes(id)) candidates.add(id)
+            if (forever || !escapes(id)) candidates.add(id)
             continue
         }
         if (escapes(id, new Set(loopsOf.get(owner.get(id)!) ?? []))) continue
@@ -12512,8 +12569,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const usedPreserved = new Set<number>()
     let callsOut = false
     const tails = new Set<number>()
+    const noreturns = new Set<number>()
+    const continued = new Map<number, number[]>()
     let tailCalls = false
     let reachesExit = false
+    let returns = false
     function isPreserved(r: number): boolean { return target.calleeSaved.indexOf(r) >= 0 }
 
     const spillStats = intrinsics.argv().includes('spill-stats') ? { total: 0, again: 0 } : undefined
@@ -12799,6 +12859,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     }
 
     function jumpToExit(tail = 0): void {
+        returns = true
         const region = currentRegion
         put(() => {
             if (tailCalls && tails.has(tail)) return
@@ -13297,8 +13358,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const stacked = homes.some(isOutgoingArg)
         if (syscall) assert(!stacked, `lowering: syscall at %${id} takes more than ${target.syscall.argRegs.length} args`)
         if (syscall || stacked || homes.some(isPreserved)) tails.delete(id)
-        if (!syscall) callsOut ||= !tails.has(id)
-        for (const h of homes) if (isOutgoingArg(h)) outgoingArgWords = Math.max(outgoingArgWords, h - OUTGOING_ARGS + 1)
+        if (syscall) noreturns.delete(id)
+        if (!syscall) callsOut ||= !tails.has(id) && !noreturns.has(id)
+        const continues = local && noreturns.has(id) && opts.continues?.(getLiteral(local, 0)) ? [] as number[] : undefined
+        if (continues) continued.set(getLiteral(local!, 0), continues)
+        else for (const h of homes) if (isOutgoingArg(h)) outgoingArgWords = Math.max(outgoingArgWords, h - OUTGOING_ARGS + 1)
         const slots: Handover[] = []
         let sequenceIdx = -1
         for (const i of analysis.operandOrder.get(id) ?? []) {
@@ -13309,8 +13373,9 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             }
             if (i < 3 && (i !== 1 || syscall || local)) continue
             slots.push({
-                dst: i === 1 ? CALLEE : homes[i - 3],
+                dst: i === 1 ? CALLEE : continues ? OPEN : homes[i - 3],
                 id: getRef(n, i), konst: getLiteral(n, i),
+                settle: continues ? (r: number) => { continues[i - 3] = r } : undefined,
             })
         }
         done.add(id)
@@ -13346,6 +13411,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             localCalls.add(target)
             const region = currentRegion
             put(() => {
+                if (noreturns.has(id)) return asm.jumpLocal(target, name)
                 if (!tailCalls || !tails.has(id)) return asm.callLocal(target, name)
                 popFrame(region)
                 asm.jumpLocal(target, name)
@@ -13354,6 +13420,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             for (const r of target.volatiles) written.add(r)
             const region = currentRegion
             put(() => {
+                if (noreturns.has(id)) return asm.br(linkReg)
                 if (!tailCalls || !tails.has(id)) return asm.blr(linkReg)
                 const reg = isPreserved(linkReg) ? CALLEE : linkReg
                 if (reg !== linkReg) asm.mov(reg, linkReg)
@@ -13696,8 +13763,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const returned = value?.op === NodeOp.ret && getRef(value, 0) === last
             const tail = (value?.op === NodeOp.void || returned) && getNode(g, last)?.op === NodeOp.call && !done.has(last)
             if (tail) tails.add(last)
+            const callee = getNode(g, last)?.op === NodeOp.call ? getNode(g, getRef(getNode(g, last)!, 1)) : undefined
+            if (value?.op === NodeOp.unreachable && ordering.length === 1 && callee?.op === NodeOp.localTarget && !getRef(callee, 0) && opts.endless?.(getLiteral(callee, 0)) && !done.has(last)) noreturns.add(last)
             for (const i of ordering) if (!returned || !tail || getRef(n, i) !== last) effect(getRef(n, i))
             if (tail && !returned) return jumpToExit(last)
+            if (noreturns.has(last)) return finish(getRef(n, result))
             emitTail(getRef(n, result), getLiteral(n, result))
             return
         }
@@ -13841,13 +13911,13 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         for (const child of region.children) assignRegionRegisters(child, watermark)
     }
     promoteCommonRegionWrites(rootRegion)
-    assignRegionRegisters(rootRegion, new Set())
+    if (returns) assignRegionRegisters(rootRegion, new Set())
 
     tailCalls = !analysis.frameAllocas && (framedTailCalls || (!usedPreserved.size && !slotCount && !callsOut))
     if (!tailCalls && tails.size) callsOut = true
-    const saved = target.calleeSaved.filter(r => usedPreserved.has(r) && written.has(r))
+    const saved = returns ? target.calleeSaved.filter(r => usedPreserved.has(r) && written.has(r)) : []
     for (let i = 0; i < saved.length; i++) savedIndex.set(saved[i], i)
-    const savesLink = callsOut && LR !== undefined
+    const savesLink = returns && callsOut && LR !== undefined
     const layout = target.layoutFrame({
         saved: saved.length, link: savesLink, slots: slotCount, outgoingArgs: outgoingArgWords, allocas: analysis.frameAllocas,
     })
@@ -13927,10 +13997,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     }
     let listing: string | undefined
     for (const r of target.calleeSaved) written.delete(r)
+    for (const homes of continued.values()) homes.forEach((h, i) => { homes[i] = isSlot(h) ? INCOMING_ARGS + slotOffset(h) / 8 : h })
     return {
         target, words: asm.words(), bytes: asm.bytes(), relocations: asm.relocations(),
         get listing() { return listing ??= asm.listing() },
-        clobbers: written, localCalls, island,
+        clobbers: written, localCalls, island, continued,
     }
 }
 
