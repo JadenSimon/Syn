@@ -420,6 +420,7 @@ export interface TraceSession {
     linkFunction(f: Function): u32
     compileSource(code: string): CompiledSource
     compileTemplate(compiled: bytecode.EmitResult): CompiledSource
+    functionCode(fn: Function): FunctionCode
     templateOf(closure: u32): Template | undefined
     finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
     enterTrace(): TraceRuntime
@@ -444,6 +445,13 @@ export interface CompiledSource {
     codeLen: number
     blocks: Blocks
     captured: bytecode.FrameCaptures
+}
+
+export interface FunctionCode {
+    input: string | bytecode.EmitResult
+    captures: any[]
+    ambient?: string[]
+    source: CompiledSource
 }
 
 const symbolicMemoryTag = Symbol('trace.symbolicMemory')
@@ -572,6 +580,10 @@ export function createTraceSession(): TraceSession {
     const compiledTemplates = new Map<bytecode.EmitResult, CompiledSource>()
     const templates = new Map<u32, Template>()
     const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
+    const functionCodes = new Map<Function, FunctionCode>()
+    const memberOwners = new Map<Function, Function>()
+    const classMembers = new Map<Function, [cls: Function, member: bytecode.EmitResult]>()
+    const memberClasses = new Map<bytecode.EmitResult, Function>()
     let runtime: TraceRuntime | undefined
     let nodeCache: Map<string, number> | undefined
 
@@ -580,6 +592,7 @@ export function createTraceSession(): TraceSession {
         Symbol: heap.symbolConstants, ...builtinGlobals,
         intrinsics: moduleContext, heap, syscalls,
     }
+    for (const value of Object.values(builtinGlobals)) if (typeof value === 'function' && isConstructor(value)) noteMembers(value)
 
     function context(captures: any[] = []): Record<string, any> {
         for (let i = 0; i < captures.length; i++) {
@@ -600,6 +613,7 @@ export function createTraceSession(): TraceSession {
         const stub = heap.makeIndirect(heap.makeFunctionObject())
         functionStubs.set(f, stub)
         stubFunctions.set(stub, f)
+        if (isConstructor(f)) noteMembers(f)
         const intrinsicName = intrinsicNames.get(f)
         if (intrinsicName !== undefined) intrinsicFns.set(stub, intrinsicName)
         const proto = (f as any).prototype
@@ -698,6 +712,54 @@ export function createTraceSession(): TraceSession {
         return templates.get(heap.FunctionBytecode(heap.resolveHeapCell(bc)).bytecode as u32)
     }
 
+    function noteMembers(cls: Function): void {
+        for (const holder of [cls, (cls as any).prototype]) {
+            for (const key of Reflect.ownKeys(holder)) {
+                const d = Object.getOwnPropertyDescriptor(holder, key)!
+                for (const member of [d.value, d.get, d.set]) if (typeof member === 'function' && member !== cls) memberOwners.set(member, cls)
+            }
+        }
+    }
+
+    function bindMembers(cls: Function, holder: any, expandos: bytecode.Expandos): void {
+        for (const [key, value] of expandos) {
+            if (holder === cls && key === 'prototype') {
+                bindMembers(cls, holder.prototype, value as bytecode.Expandos)
+                continue
+            }
+            const d = Object.getOwnPropertyDescriptor(holder, key)
+            assert(d !== undefined, `trace2: ${cls.name} has no member ${String(key)}`)
+            if ('code' in value) {
+                classMembers.set(d!.value, [cls, value as bytecode.EmitResult])
+                continue
+            }
+            const accessor = value as bytecode.ClassAccessor
+            if (accessor.getter) classMembers.set(d!.get!, [cls, accessor.getter])
+            if (accessor.setter) classMembers.set(d!.set!, [cls, accessor.setter])
+        }
+    }
+
+    function functionCode(fn: Function): FunctionCode {
+        const known = functionCodes.get(fn)
+        if (known) return known
+        const owner = memberOwners.get(fn)
+        if (owner) functionCode(owner)
+        const member = classMembers.get(fn)
+        let code: FunctionCode
+        if (member) {
+            const [cls, result] = member
+            const classCode = functionCode(cls)
+            code = { input: result, captures: classCode.captures, ambient: classCode.ambient, source: compileTemplate(result) }
+            memberClasses.set(code.source.compiled, cls)
+        } else {
+            const computation = intrinsics.getComputation(fn)
+            code = { input: computation[0], captures: computation[1], ambient: computation[2], source: compileSource(computation[0]) }
+            if (code.source.compiled.expandos) bindMembers(fn, fn, code.source.compiled.expandos)
+        }
+        functionCodes.set(fn, code)
+        return code
+    }
+
     function prepareSource(compiled: bytecode.EmitResult): CompiledSource {
         const codeLen = compiled.code.length
         const ACC = compiled.registerCount
@@ -729,11 +791,13 @@ export function createTraceSession(): TraceSession {
             if (sameCaptures(entry.captures, captures)) return entry.fn
         }
         traceStats.finalizeMisses++
+        const cls = memberClasses.get(compiled)
         const fn = bytecode.finalize(
             compiled,
             bytecode.createCtx(context(captures)),
             linkFunction,
             fromJsValue,
+            cls && linkFunction(cls) as intrinsics.Handle,
         )
         known.push({ captures, fn })
         noteTemplates(compiled, fn, captures)
@@ -834,6 +898,7 @@ export function createTraceSession(): TraceSession {
         linkFunction,
         compileSource,
         compileTemplate,
+        functionCode,
         templateOf,
         finalize,
         enterTrace,
@@ -884,7 +949,7 @@ function layoutOf(fn: Function, session: TraceSession): { params: number, rest: 
     if (Number.isSafeInteger(linked.__syscall) || linked.concrete) return { params: -1, rest: -1 }
     const known = layouts.get(fn)
     if (known) return known
-    const compiled = session.compileSource(intrinsics.getComputation(fn)[0]).compiled
+    const compiled = session.functionCode(fn).source.compiled
     const layout = { params: compiled.paramCount, rest: compiled.rest ? compiled.paramCount - 1 : -1 }
     layouts.set(fn, layout)
     return layout
@@ -900,22 +965,18 @@ let blockOrderStep = 0
 let blockOrderDepth = 0
 
 export function trace2(input: string | Function | bytecode.EmitResult, opts: TraceOptions = {}) {
-    let code: string
+    const session = opts.session ?? createTraceSession()
     let captures = opts.captures
-    let template: bytecode.EmitResult | undefined
+    let resolved: string | bytecode.EmitResult = input as string | bytecode.EmitResult
     if (typeof input === 'function') {
-        const computation = intrinsics.getComputation(input)
-        code = computation[0]
-        captures = computation[1]
-    } else if (typeof input === 'string') {
-        code = input
-    } else {
-        template = input
-        code = `<template ${opts.name ?? ''}>`
+        const fnCode = session.functionCode(input)
+        resolved = fnCode.input
+        captures = fnCode.captures
     }
+    const template = typeof resolved === 'string' ? undefined : resolved
+    const code = typeof resolved === 'string' ? resolved : `<template ${opts.name ?? (typeof input === 'function' ? input.name : '')}>`
     if (captures && opts.mapCapture) captures = captures.map(opts.mapCapture)
     const traceName = opts.name ?? (typeof input === 'function' ? input.name : '')
-    const session = opts.session ?? createTraceSession()
     const debugTrace = typeof input === 'function'
         && intrinsics.argv().includes(`trace-debug:${input.name}`)
     const debugBlocks = intrinsics.argv().includes(`trace-blocks:${traceName}`)

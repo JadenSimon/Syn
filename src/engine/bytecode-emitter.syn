@@ -47,6 +47,7 @@ export enum ConstantKind {
     nested_function,
     scope,
     class_,
+    private_name,
 }
 
 type ScopeBinding = { slot: number, parentSlot: number }
@@ -56,6 +57,7 @@ type EmitCtx = {
     outerSymbols: Map<number, OuterSymbol>
     outerFolded: Map<number, [FoldResultValue]>
     owner?: ts.Identifier
+    privateNames?: Map<string, symbol>
 }
 const thisSymbol = -3
 
@@ -70,7 +72,8 @@ interface Labels {
     jump: number[]
 }
 
-export type Expandos = Map<string | symbol, EmitResult | Expandos>
+export type ClassAccessor = { getter?: EmitResult, setter?: EmitResult }
+export type Expandos = Map<string | symbol, EmitResult | Expandos | ClassAccessor>
 
 function wellKnownSymbol(name: ts.PropertyName): symbol | undefined {
     if (!ts.isComputedPropertyName(name)) return
@@ -84,12 +87,30 @@ function isStaticMember(member: ts.ClassElement): boolean {
     return !!member.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword)
 }
 
-function classMemberKey(member: ts.ClassElement): string | symbol {
-    if (!ts.isMethodDeclaration(member)) throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
+function classPrivateNames(node: ts.ClassDeclaration | ts.ClassExpression, outer: Map<string, symbol> | undefined): Map<string, symbol> {
+    const names = new Map(outer)
+    for (const member of node.members) {
+        if (member.name && ts.isPrivateIdentifier(member.name)) names.set(member.name.text, Symbol(member.name.text))
+    }
+    return names
+}
+
+function isFieldDeclaration(member: ts.ClassElement): boolean {
+    if (!ts.isPropertyDeclaration(member)) return false
+    if (member.initializer) throw `class field initializers are not supported: ${member.name.getText()}`
+    return true
+}
+
+function classMemberName(member: ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration): string | symbol {
     if (ts.isIdentifier(member.name)) return member.name.text
     const symbol = wellKnownSymbol(member.name)
     if (symbol === undefined) throw `unsupported class member name: ${member.name.getText()}`
     return symbol
+}
+
+function classMemberKey(member: ts.ClassElement): string | symbol {
+    if (!ts.isMethodDeclaration(member)) throw `unsupported class member: ${ts.SyntaxKind[member.kind]}`
+    return classMemberName(member)
 }
 
 export type EmitResult = {
@@ -147,16 +168,17 @@ function isNumericExpression(e: ts.Expression): boolean {
 }
 
 function emitFunction(
-    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration,
+    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration,
     emitCtx: EmitCtx = { outerSymbols: new Map(), outerFolded: new Map() },
 ): EmitResult {
     const outerSymbols = emitCtx.outerSymbols
+    let privateNames = emitCtx.privateNames
     const code: number[] = []
     const constants: any[] = []
     const constantKinds: ConstantKind[] = []
     const sourceMapping: EmitResult['sourceMapping'] = []
 
-    const internMap = new Map<string, number>()  // interning key -> slot
+    const internMap = new Map<string | symbol, number>()  // interning key -> slot
     const symToReg = new Map<number, number>()    // symbol id -> register
     const lateBound = new Map<number, number>()   // symbol id -> constant slot
     const scopedSymbols = new Map<number, OuterSymbol>()
@@ -531,6 +553,20 @@ function emitFunction(
         constantKinds.push(ConstantKind.number)
         internMap.set(key, slot)
         return slot
+    }
+    function internPrivate(name: string): number {
+        const key = privateNames?.get(name)
+        if (!key) throw `private name ${name} is not declared by an enclosing class`
+        const existing = internMap.get(key)
+        if (existing !== undefined) return existing
+        const slot = constants.length
+        constants.push(key)
+        constantKinds.push(ConstantKind.private_name)
+        internMap.set(key, slot)
+        return slot
+    }
+    function internName(name: ts.MemberName): number {
+        return ts.isPrivateIdentifier(name) ? internPrivate(name.text) : internString(name.text)
     }
     function internValue(s: string | number): number {
         if (typeof s === 'string') return internString(s)
@@ -1080,7 +1116,7 @@ function emitFunction(
             }
         }
 
-        const keySlot = isConstName ? internString(target.name.text) : allocReg()
+        const keySlot = isConstName ? internName(target.name) : allocReg()
         defer if (!isConstName) freeReg()
 
         if (!isConstName) {
@@ -1197,7 +1233,7 @@ function emitFunction(
         }
 
         const isConstName = node.kind === ts.SyntaxKind.PropertyAccessExpression
-        const keySlot = isConstName ? internString(node.name.text) : allocReg()
+        const keySlot = isConstName ? internName(node.name) : allocReg()
         defer if (!isConstName) freeReg()
 
         let spilledRecv: number | undefined
@@ -1235,7 +1271,7 @@ function emitFunction(
         }
 
         if (node.kind === ts.SyntaxKind.PropertyAccessExpression) {
-            emit2(Op.GetPropertyConst, internString(node.name.text))
+            emit2(Op.GetPropertyConst, internName(node.name))
             return
         }
 
@@ -2355,11 +2391,14 @@ function emitFunction(
             if (thisReg !== undefined) childOuter.set(thisSymbol, { scopeSlot: -1, reg: thisReg })
             else if (outerSymbols.has(thisSymbol)) childOuter.set(thisSymbol, scopedSymbol(thisSymbol)!)
         }
-        return { outerSymbols: childOuter, outerFolded: foldedVariables }
+        return { outerSymbols: childOuter, outerFolded: foldedVariables, privateNames }
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
         if (node.heritageClauses?.length) throw 'class heritage is not supported'
+        const outerPrivateNames = privateNames
+        privateNames = classPrivateNames(node, outerPrivateNames)
+        defer privateNames = outerPrivateNames
         const rctor = allocReg()
         const rproto = allocReg()
         defer freeReg()
@@ -2374,7 +2413,7 @@ function emitFunction(
         emit1(Op.CreateEmptyObject)
         star(rproto)
         for (const member of node.members) {
-            if (member === ctor) continue
+            if (member === ctor || isFieldDeclaration(member)) continue
             const key = classMemberKey(member)
             const method = member as ts.MethodDeclaration
             const target = isStaticMember(member) ? rctor : rproto
@@ -2437,7 +2476,7 @@ function emitFunction(
     }
 
     const lexicalThis = ts.isArrowFunction(fn) && outerSymbols.has(thisSymbol)
-    if (!lexicalThis && (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || isConstructor)) {
+    if (!lexicalThis && (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || ts.isGetAccessorDeclaration(fn) || ts.isSetAccessorDeclaration(fn) || isConstructor)) {
         skipNextLookbehind = true
         thisReg = allocReg()
         star(thisReg)
@@ -2543,14 +2582,23 @@ function fixupMethodLikeDecl(src: string) {
 function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
     if (node.heritageClauses?.length) throw 'class heritage is not supported'
     const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
-    const memberCtx = (): EmitCtx => ({ outerSymbols: new Map(), outerFolded: new Map(), owner })
+    const privateNames = classPrivateNames(node, undefined)
+    const memberCtx = (): EmitCtx => ({ outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames })
     const ctor = node.members.find(ts.isConstructorDeclaration)
     const result = ctor ? emitFunction(ctor, memberCtx()) : defaultConstructorResult()
     const prototype: Expandos = new Map()
     const expandos: Expandos = new Map()
     for (const member of node.members) {
-        if (member === ctor) continue
+        if (member === ctor || isFieldDeclaration(member)) continue
         const target = isStaticMember(member) ? expandos : prototype
+        if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
+            const key = classMemberName(member)
+            const accessor = (target.get(key) ?? {}) as ClassAccessor
+            if (ts.isGetAccessorDeclaration(member)) accessor.getter = emitFunction(member, memberCtx())
+            else accessor.setter = emitFunction(member, memberCtx())
+            target.set(key, accessor)
+            continue
+        }
         target.set(classMemberKey(member), emitFunction(member as ts.MethodDeclaration, memberCtx()))
     }
     expandos.set('prototype', prototype)
@@ -2972,7 +3020,7 @@ export function finalize(
             constants[i] = 0
             continue
         }
-        if (kinds[i] === ConstantKind.string) {
+        if (kinds[i] === ConstantKind.string || kinds[i] === ConstantKind.private_name) {
             constants[i] = fromJsValue(result.constants[i])
         } else {
             constants[i] = result.constants[i]
@@ -3050,10 +3098,26 @@ export function finalize(
         if (kinds[i] !== ConstantKind.class_) continue
         Intrinsics.store(heap.resolveHeapCell(v.constants), i*8 as u32, tagVmHandle(fn), Types.u64)
     }
-    for (const [key, value] of result.expandos) {
-        heap.setProperty(fn, fromJsValue(key), materializeExpando(value, ctx, compileFn, fromJsValue, fn))
-    }
+    for (const [key, value] of result.expandos) installExpando(fn, key, value, ctx, compileFn, fromJsValue, fn)
     return fn
+}
+
+function installExpando(
+    obj: Handle,
+    key: string | symbol,
+    value: EmitResult | Expandos | ClassAccessor,
+    ctx: Ctx | undefined,
+    compileFn: ((f: Function) => Handle) | undefined,
+    fromJsValue: (v: any) => Handle,
+    owner: Handle,
+): void {
+    if (value instanceof Map || 'code' in value) {
+        heap.setProperty(obj, fromJsValue(key), materializeExpando(value, ctx, compileFn, fromJsValue, owner))
+        return
+    }
+    const getter = value.getter ? finalize(value.getter, ctx, compileFn, fromJsValue, owner) : 0 as Handle
+    const setter = value.setter ? finalize(value.setter, ctx, compileFn, fromJsValue, owner) : 0 as Handle
+    heap.setAccessorProperty(obj, fromJsValue(key), getter, setter)
 }
 
 function materializeExpando(
@@ -3065,9 +3129,7 @@ function materializeExpando(
 ): Handle {
     if (!(value instanceof Map)) return finalize(value, ctx, compileFn, fromJsValue, owner)
     const obj = heap.makeObject(0 as Handle)
-    for (const [key, nested] of value) {
-        heap.setProperty(obj, fromJsValue(key), materializeExpando(nested, ctx, compileFn, fromJsValue, owner))
-    }
+    for (const [key, nested] of value) installExpando(obj, key, nested, ctx, compileFn, fromJsValue, owner)
     return obj
 }
 
