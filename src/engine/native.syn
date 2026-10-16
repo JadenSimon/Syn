@@ -37,7 +37,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, type Generic, instantiate, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ValueTypes } from './value-types'
+import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, type Generic, instantiate, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -3467,6 +3467,7 @@ interface ShapePlan {
     constants: Map<intrinsics.Handle, intrinsics.Handle>
     strings: Map<Function, Set<number>>
     embedded: PlannedEmbeddings
+    fixedStatic: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean
 }
 interface Planned {
     units: Map<Function, PlannedUnit>
@@ -4037,7 +4038,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
 }
 
 function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramImage, facts: Facts, clock: PhaseClock) {
-    const { session, functions, discovered, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureFunction, placedStatics, discover, schedule, link, linkStatics, isRoot, usesReceiver, thisParamOf } = linker
+    const { session, functions, discovered, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureFunction, discover, schedule, link, linkStatics, isRoot, usesReceiver, thisParamOf } = linker
     const { enterPhase } = clock
     const units: Unit[] = []
     const engineArrays = new Map<intrinsics.Handle, intrinsics.Handle>()
@@ -4067,6 +4068,9 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         return engine
     }
     const engineElements = new Map<intrinsics.Handle, intrinsics.Handle[]>()
+    function heapValue(cell: intrinsics.Handle): intrinsics.Handle {
+        return cell && heap.isArray(cell) ? engineArrayOf(cell) : cell
+    }
     function engineHeapArrays(graph: Graph): void {
         for (const [id, n] of graph.nodes) {
             if (n.op !== NodeOp.heapHandle || getRef(n, 0)) continue
@@ -4457,11 +4461,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         const after = reachableNodes(graph)
         for (const id of [...graph.nodes.keys()]) if (!after.has(id)) deleteNode(graph, id)
     }
-    const rawTraces = new Map<Function, Map<string, FastTraced>>()
-    const rawUnits = new Map<Function, FastTraced>()
-    const scannedStatics = new Map<Function, Set<string>>()
-    const writtenStatics = new Set<number>()
-    const foldedStatics = new Map<number, string>()
+    const assumed: [intrinsics.Handle, intrinsics.Handle, string][] = []
     const fastMapped = new Map<any, any>()
     function fastMapCapture(capture: any): any {
         if (typeof capture !== 'function') return linkCapture(capture)
@@ -4473,23 +4473,13 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
     }
     function rawTrace(fn: Function, paramTypes: Map<number, intrinsics.Types>, receiver: boolean, verbose: boolean): FastTraced {
         const code = codeOf(fn)!
-        const traced = fastTraceModule.fastTrace(code.source, {
+        return fastTraceModule.fastTrace(code.source, {
             captures: code.captures, session, mapCapture: fastMapCapture, verbose, name: fn.name, paramTypes,
             self: code.scope ? undefined : fn, env: !!code.scope, receiver,
         })
-        if (!rawUnits.has(fn)) rawUnits.set(fn, traced)
-        return traced
     }
     function fastTraced(fn: Function, paramTypes: Map<number, intrinsics.Types>, verbose: boolean): FastTraced {
-        const receiver = constructsOutOfLine(fn) || usesReceiver(fn)
-        const key = `${[...paramTypes].join(';')}|${receiver}`
-        const byKey = rawTraces.get(fn)
-        let traced = byKey?.get(key)
-        if (traced) byKey!.delete(key)
-        else {
-            traced = rawTrace(fn, paramTypes, receiver, verbose)
-            scanStatics(fn, traced, new Map())
-        }
+        const traced = rawTrace(fn, paramTypes, constructsOutOfLine(fn) || usesReceiver(fn), verbose)
         resolveReads(traced)
         applyPrototypes(traced)
         spliceTagged(fn, traced)
@@ -4508,20 +4498,16 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         }
     }
     function traceProgramUnits(): void {
-        const units: Function[] = []
-        for (const fn of discovered) {
-            if (!codeOf(fn) || rawTraces.has(fn)) continue
-            const receiver = constructsOutOfLine(fn) || usesReceiver(fn)
-            rawTraces.set(fn, new Map([[`|${receiver}`, rawTrace(fn, new Map(), receiver, false)]]))
-            units.push(fn)
-        }
-        for (const fn of units) scanStatics(fn, rawUnits.get(fn)!, new Map())
-        for (const fn of units) graphsOf(fn)
+        for (const fn of discovered) if (codeOf(fn)) graphsOf(fn)
     }
-    function checkFoldedStatics(): void {
-        for (const [cell, unit] of foldedStatics) {
-            if (writtenStatics.has(cell)) throw `native: ${unit} folded a read of a static object that another unit writes`
-        }
+    let fixedStatic: ((state: intrinsics.Handle, key: intrinsics.Handle) => boolean) | undefined
+    function assume(state: intrinsics.Handle, key: intrinsics.Handle, unit: string): void {
+        if (!fixedStatic) assumed.push([state, key, unit])
+        else if (!fixedStatic(state, key)) throw `native: ${unit} inlined ${describe(state)}.${heap.isString(key) ? heap.stringToJs(key) : key}, which compiled code writes`
+    }
+    function useStaticFacts(fixed: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean): void {
+        fixedStatic = fixed
+        for (const [state, key, unit] of assumed.splice(0)) assume(state, key, unit)
     }
     function runtimeObjects() {
         return session.runtime!.objects
@@ -4553,104 +4539,47 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         if (!(full.flags & flag)) return
         return (flag === heap.PropFlags.has_getter ? full.slot0 : full.slot1) as intrinsics.Handle
     }
-    function staticTarget(slot: intrinsics.Handle | undefined): intrinsics.Handle | undefined {
-        if (!slot || heap.isBoxedF64(slot) || heap.isString(slot)) return
-        const target = heap.deref(slot)
-        return heap.isOrdinaryObject(target) && !heap.isArray(target) && !heap.isCallable(target) ? target : undefined
+    function tagged(slot: intrinsics.Handle): boolean {
+        if (!slot || heap.isBoxedF64(slot) || heap.isString(slot) || !heap.isCallable(heap.deref(slot))) return false
+        const linked: any = session.stubFunctions.get(runtimeObjects().intern(slot) as u32)
+        const fn = linked && isLocalStub(linked) ? functions[linked.__localTarget] : linked
+        return !!fn?.shouldInline
     }
-    function staticObject(traced: FastTraced, id: number, bound: Map<number, intrinsics.Handle>): intrinsics.Handle | undefined {
-        const at = strippedAfter(traced.graph, id)
-        const known = bound.get(at)
-        if (known !== undefined) return known
-        const n = getNode(traced.graph, at)
-        if (n?.op === NodeOp.heapHandle && !getRef(n, 0)) {
-            const cell = getLiteral(traced.graph, n, 0)
-            if (cell <= 1 || traced.allocations.has(cell as u32) || traced.frames.has(cell as u32) || session.templateOf(cell)) return
-            return staticTarget(cell as intrinsics.Handle)
-        }
-        if (n?.op !== NodeOp.getProp || getRef(n, 2)) return
-        const base = staticObject(traced, getRef(n, 1), bound)
-        return base === undefined ? undefined : staticTarget(dataSlot(base, getLiteral(traced.graph, n, 2) as intrinsics.Handle))
+    function staticRead(traced: Traced, n: GraphNode): intrinsics.Handle | undefined {
+        if (n.op !== NodeOp.getProp || getRef(n, 2)) return
+        const graph = traced.graph
+        const target = getNode(graph, strippedAfter(graph, getRef(n, 1)))
+        if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) return
+        const cell = getLiteral(graph, target, 0) as intrinsics.Handle
+        if (!cell || heap.isBoxedF64(cell) || heap.isString(cell) || traced.frames.has(cell as u32) || session.templateOf(cell) || traced.allocations?.has(cell as u32) || session.sealed.has(cell)) return
+        return cell
     }
-    function staticCallee(traced: FastTraced, id: number, bound: Map<number, intrinsics.Handle>): Function | undefined {
-        const n = getNode(traced.graph, strippedAfter(traced.graph, id))
-        if (n?.op === NodeOp.localTarget && !getRef(n, 0)) return functions[getLiteral(traced.graph, n, 0)]
-        if (n?.op === NodeOp.heapHandle && !getRef(n, 0)) return session.stubFunctions.get(getLiteral(traced.graph, n, 0) as u32)
-        if (n?.op !== NodeOp.getProp || getRef(n, 2)) return
-        const base = staticObject(traced, getRef(n, 1), bound)
-        const slot = base === undefined ? undefined : dataSlot(base, getLiteral(traced.graph, n, 2) as intrinsics.Handle)
-        return slot && !heap.isBoxedF64(slot) ? session.stubFunctions.get(runtimeObjects().intern(slot)) : undefined
+    function fixedSlot(traced: Traced, n: GraphNode, fixed: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean): intrinsics.Handle | undefined {
+        const cell = staticRead(traced, n)
+        if (cell === undefined) return
+        const state = heap.deref(cell)
+        const key = getLiteral(traced.graph, n, 2) as intrinsics.Handle
+        const slot = dataSlot(state, key)
+        if (slot === undefined || (heap.isBoxedF64(slot) && heap.boxedNanId(slot)) || !fixed(state, key)) return
+        return slot
     }
-    function scanStatics(fn: Function, traced: FastTraced, bound: Map<number, intrinsics.Handle>): void {
-        const key = [...bound].map(([param, object]) => `${param}=${object}`).join(',')
-        let scanned = scannedStatics.get(fn)
-        if (!scanned) scannedStatics.set(fn, scanned = new Set())
-        if (scanned.has(key)) return
-        scanned.add(key)
-        const object = (id: number) => id ? staticObject(traced, id, bound) : undefined
-        for (const n of traced.graph.nodes.values()) {
-            if (n.op === NodeOp.after || n.op === NodeOp.eq || n.op === NodeOp.ne) continue
-            if (n.op === NodeOp.getProp) {
-                const read = bound.size && viaParam(traced, getRef(n, 1), bound) ? object(getRef(n, 1)) : undefined
-                if (read !== undefined) placeStatic(read)
-                continue
+    function slotValues(graph: Graph): (slot: intrinsics.Handle) => Operand {
+        const nodes = new Map<intrinsics.Handle, number>()
+        return slot => {
+            if (heap.isBoxedF64(slot)) {
+                const id = heap.boxedNanId(slot)
+                return id ? id : { literal: heap.unboxF64(slot) }
             }
-            if (n.op === NodeOp.call) {
-                scanCall(traced, n, bound)
-                continue
-            }
-            if (n.op === NodeOp.rt) {
-                const op = getLiteral(traced.graph, n, 1)
-                const target = op === rt.Op.assign || op === rt.Op.setPrototypeOf ? object(getRef(n, 2)) : undefined
-                if (target !== undefined) makeWritable(target)
-                continue
-            }
-            for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
-                const used = object(getRef(n, i))
-                if (used !== undefined) makeWritable(used)
-            }
+            const cell = slot <= 1 ? slot : runtimeObjects().intern(slot)
+            if (cell === 1) return { literal: 1 }
+            let known = nodes.get(cell)
+            if (known === undefined) nodes.set(cell, known = addNode(graph, NodeOp.heapHandle, [{ literal: cell }], Types.unknown_number))
+            return known
         }
     }
-    function scanCall(traced: FastTraced, n: GraphNode, bound: Map<number, intrinsics.Handle>): void {
-        const callee = staticCallee(traced, getRef(n, 1), bound)
-        const raw = callee ? rawUnits.get(callee) : undefined
-        const params = raw?.graph.blocks[0].params
-        const self = raw ? thisParamOf(raw.graph) : undefined
-        const passed = new Map<number, intrinsics.Handle>()
-        for (let i = 2; i < countIds(n); i++) {
-            const used = getRef(n, i) ? staticObject(traced, getRef(n, i), bound) : undefined
-            if (used === undefined) continue
-            const param = i === 2 ? self : params?.[i - 3]
-            const bindable = param !== undefined && (i === 2 || param !== self)
-            if (bindable) passed.set(param, used)
-            else if (i > 2 || !callee) makeWritable(used)
-        }
-        if (passed.size) scanStatics(callee!, raw!, passed)
-    }
-    function makeWritable(handle: intrinsics.Handle): void {
-        const target = heap.deref(handle)
-        if (writtenStatics.has(target)) return
-        writtenStatics.add(target)
-        placeStatic(target)
-        for (const key of propertyEval.dataKeys(target)) {
-            const nested = staticTarget(dataSlot(target, key))
-            if (nested !== undefined) makeWritable(nested)
-        }
-    }
-    function placeStatic(handle: intrinsics.Handle): void {
-        const target = heap.deref(handle)
-        if (placedStatics.has(target)) return
-        placedStatics.add(target)
-        for (const key of propertyEval.dataKeys(target)) {
-            const nested = staticTarget(dataSlot(target, key))
-            if (nested !== undefined) placeStatic(nested)
-        }
-    }
-    function viaParam(traced: FastTraced, id: number, bound: Map<number, intrinsics.Handle>): boolean {
-        const at = strippedAfter(traced.graph, id)
-        if (bound.has(at)) return true
-        const n = getNode(traced.graph, at)
-        return n?.op === NodeOp.getProp && !getRef(n, 2) && viaParam(traced, getRef(n, 1), bound)
+    function foldRead(graph: Graph, id: number, n: GraphNode, value: Operand, folded: Map<number, number>): void {
+        putNode(graph, id, NodeOp.after, [getRef(n, 0), value])
+        if (typeof value === 'number') folded.set(id, value)
     }
     function freshKeysOf(traced: FastTraced): Map<number, Set<number> | null> {
         const graph = traced.graph
@@ -4674,19 +4603,8 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
     }
     function resolveReads(traced: FastTraced): void {
         const graph = traced.graph
-        const nodes = new Map<intrinsics.Handle, number>()
+        const valueOf = slotValues(graph)
         const folded = new Map<number, number>()
-        function valueOf(slot: intrinsics.Handle): Operand {
-            if (heap.isBoxedF64(slot)) {
-                const id = heap.boxedNanId(slot)
-                return id ? id : { literal: heap.unboxF64(slot) }
-            }
-            const cell = slot <= 1 ? slot : runtimeObjects().intern(slot)
-            if (cell === 1) return { literal: 1 }
-            let known = nodes.get(cell)
-            if (known === undefined) nodes.set(cell, known = addNode(graph, NodeOp.heapHandle, [{ literal: cell }], Types.unknown_number))
-            return known
-        }
         function freshCell(n: GraphNode): intrinsics.Handle | undefined {
             const target = getNode(graph, strippedAfter(graph, getRef(n, 1)))
             if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) return
@@ -4702,29 +4620,49 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         const freshKeys = freshKeysOf(traced)
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== NodeOp.getProp || getRef(n, 2)) continue
+            const key = getLiteral(graph, n, 2) as intrinsics.Handle
             const owner = freshCell(n)
-            const getter = owner && !freshKeys.get(owner)?.has(getLiteral(graph, n, 2)) && freshKeys.get(owner) !== null
-                && accessorOf(heap.deref(owner), getLiteral(graph, n, 2) as intrinsics.Handle, heap.PropFlags.has_getter)
-            if (getter) {
-                putNode(graph, id, NodeOp.call, [getRef(n, 0), valueOf(getter), getOperand(graph, n, 1)])
+            if (owner !== undefined) {
+                const own = freshKeys.get(owner)
+                const getter = !own?.has(key) && own !== null && accessorOf(heap.deref(owner), key, heap.PropFlags.has_getter)
+                if (getter) {
+                    putNode(graph, id, NodeOp.call, [getRef(n, 0), valueOf(getter), getOperand(graph, n, 1)])
+                    continue
+                }
+                if (own === null || own?.has(key)) continue
+                const slot = dataSlot(heap.deref(owner), key)
+                if (slot && !heap.isBoxedF64(slot) && heap.isCallable(heap.deref(slot))) foldRead(graph, id, n, valueOf(slot), folded)
                 continue
             }
-            const object = strippedAfter(graph, getRef(n, 1))
-            const target = getNode(graph, object)
-            if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) continue
-            const cell = getLiteral(graph, target, 0) as intrinsics.Handle
-            if (!cell || heap.isBoxedF64(cell) || heap.isString(cell) || traced.frames.has(cell as u32) || session.templateOf(cell)) continue
-            const base = heap.deref(cell)
-            const key = getLiteral(graph, n, 2)
-            const fresh = traced.allocations.has(cell as u32)
-            if (fresh ? freshKeys.get(cell) === null || freshKeys.get(cell)?.has(key) : writtenStatics.has(base)) continue
-            const slot = dataSlot(base, key as intrinsics.Handle)
-            if (slot === undefined || (fresh && (!slot || heap.isBoxedF64(slot) || !heap.isCallable(heap.deref(slot))))) continue
-            const value = valueOf(slot)
-            if (!fresh) foldedStatics.set(base, graph.name ?? '?')
-            putNode(graph, id, NodeOp.after, [getRef(n, 0), value])
-            if (typeof value === 'number') folded.set(id, value)
+            const cell = staticRead(traced, n)
+            if (cell === undefined) continue
+            const state = heap.deref(cell)
+            const slot = dataSlot(state, key)
+            if (slot === undefined) continue
+            if (!heap.isArray(state)) {
+                if (!tagged(slot)) continue
+                assume(state, key, graph.name ?? '?')
+            }
+            foldRead(graph, id, n, valueOf(slot), folded)
         }
+        retarget(graph, folded)
+    }
+    function foldStatics(traced: Traced, shared: Graph): void {
+        let valueOf: ((slot: intrinsics.Handle) => Operand) | undefined
+        const folded = new Map<number, number>()
+        for (const [id, n] of [...traced.graph.nodes]) {
+            if (n.op !== NodeOp.getProp) continue
+            const slot = fixedSlot(traced, n, fixedStatic!)
+            if (slot === undefined) continue
+            if (traced.graph === shared) traced.graph = withNodes(shared, new Map(shared.nodes))
+            valueOf ??= slotValues(traced.graph)
+            foldRead(traced.graph, id, n, valueOf(slot), folded)
+        }
+        if (!valueOf) return
+        retarget(traced.graph, folded)
+        engineHeapArrays(traced.graph)
+    }
+    function retarget(graph: Graph, folded: Map<number, number>): void {
         if (!folded.size) return
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== NodeOp.call) continue
@@ -5229,7 +5167,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         units.push(unit)
         return unit
     }
-    return { units, graphsOf, lowerPanics, engineElements, traceProgramUnits, checkFoldedStatics, strippedAfter, reachableNodes }
+    return { units, graphsOf, lowerPanics, engineElements, heapValue, traceProgramUnits, useStaticFacts, foldStatics, fixedSlot, strippedAfter, reachableNodes }
 }
 
 function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: ReturnType<typeof createTracer>, facts: Facts, clock: PhaseClock) {
@@ -5602,6 +5540,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         const params = paramShapes(fn, source.compiled.paramCount)
         const traced = { ...withNullishParams(graph ? { ...unit.traced!, graph } : unit.traced!, nullish) }
         const outer = enterPhase('resolve')
+        tracer.foldStatics(traced, unit.traced!.graph)
         if (planned?.units.get(fn)?.blocks.size) pruneUnentered(traced, planned.units.get(fn)!)
         if (intrinsics.argv().includes(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...refinements.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
@@ -5981,11 +5920,11 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const { normalize } = clock
     const image = createImage()
     const linker = createLinker(fns, opts, image)
-    const { session, functions, roots, order, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureBody, link, staticOrder, resolveHandles } = linker
+    const { session, functions, roots, order, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureBody, placedStatics, link, staticOrder, resolveHandles } = linker
     const facts: Facts = new Map()
     const plannedHandles = new Set<intrinsics.Handle>()
     const tracer = createTracer(linker, image, facts, clock)
-    const { graphsOf, traceProgramUnits, checkFoldedStatics } = tracer
+    const { graphsOf, traceProgramUnits, useStaticFacts } = tracer
     function published(): Unit[] {
         return [...new Set(order)].map(unitOf).filter(unit => unit.graph !== undefined)
     }
@@ -6056,6 +5995,8 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         traceable: fn => !!codeOf(fn),
         invariantsOf: proto => genericOf(proto)?.invariants,
         constantElements: state => tracer.engineElements.get(state),
+        heapValue: tracer.heapValue,
+        receiverless: fn => Array.isArray((fn as any).__args),
         paramCount: fn => codeOf(fn)?.source.compiled.paramCount,
         variantOf: (fn, floats) => {
             const variants = unitOf(fn).variants ??= new Map()
@@ -6099,7 +6040,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     }
     const { returnTypeOf, resolveUnit, returnMode, tagUnit, boundSites, usePlan, encodePlannedUnions, boxesPlanned, paramShapesOf, nullishParams, isPlanned, plannedUnit } = createShapeAnalysis(linker, tracer, facts, clock)
     let shownPlan: { inst: Instantiations, plan: Map<Function, PlannedUnit[]> } | undefined
-    usePlan(clock.timed('plan', () => planShapes(valueTypes)))
+    const shapePlan = clock.timed('plan', () => planShapes(valueTypes))
+    usePlan(shapePlan)
+    useStaticFacts(shapePlan.fixedStatic)
     function joinedPlan(types: ValueTypes) {
         const joins: [number, number][] = []
         let inst = instantiate(types, genericOf)
@@ -6244,7 +6187,23 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         for (const [P, byKey] of embeddings.fields) embedded.set(handles.get(P)!, new Map([...byKey].map(([k, I]) => [types.keyHandles.get(k)!, handles.get(I)!])))
         const sites = new Map<PlannedUnit, Map<number, intrinsics.Handle>>()
         for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, k]) => [node, types.keyHandles.get(k)!])))
-        return { units: plan, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites } }
+        const fixedStatic = (state: intrinsics.Handle, key: intrinsics.Handle) => fixedField(types, state, key)
+        const owned = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
+        for (const unit of tracer.units) for (const cell of unit.traced!.allocations?.keys() ?? []) owned.add(heap.deref(cell as intrinsics.Handle))
+        function folds(site: Site): boolean {
+            const traced = graphsOf(site.unit).traced!
+            const n = getNode(traced.graph, site.node)
+            return !!n && tracer.fixedSlot(traced, n, fixedStatic) !== undefined
+        }
+        for (const [state, ids] of types.stateAllocations) {
+            if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
+            const accessed = ids.some(id => {
+                const object = types.objects[id]
+                return object.escaped || [...object.forms.values()].some(forms => forms.some(form => form !== 'init')) || object.readers.some(site => !folds(site))
+            })
+            if (accessed) placedStatics.add(state)
+        }
+        return { units: plan, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites }, fixedStatic }
     }
     do {
         traceUnits()
@@ -6255,7 +6214,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             roots.set(staticInitName, link(staticInitializer(staticOrder().map(slot => [staticFns[slot], slot] as [Function, number]), symbolicMemory(table))))
         }
     } while (tracedUnits < order.length)
-    checkFoldedStatics()
     if (intrinsics.argv().includes('facts-dump')) {
         const seen = new Set<Map<string, Fact>>()
         for (const [shape, known] of facts) {

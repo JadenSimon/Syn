@@ -119,6 +119,8 @@ export interface AccessHost {
     variantOf?(fn: Function, floats: number[]): Function
     constantElements?(state: Handle): Handle[] | undefined
     paramCount?(fn: Function): number | undefined
+    heapValue?(slot: Handle): Handle
+    receiverless?(fn: Function): boolean
 }
 
 export interface Invariants {
@@ -780,8 +782,18 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         values.push(init())
         return values.length - 1
     }
-    function functionValue(fn: Function): number {
-        return intern(`f${unitKey(fn)}`, () => ({ kind: ValueKind.function, fn }))
+    const functionObjects = new Map<number, Set<Handle>>()
+    function functionValue(fn: Function, handle?: Handle): number {
+        const v = intern(`f${unitKey(fn)}`, () => ({ kind: ValueKind.function, fn }))
+        if (handle) setOf(functionObjects, v).add(heap.deref(handle))
+        return v
+    }
+    function objectsOf(frame: number, node: number, v: number): number[] {
+        const value = values[v]
+        if (value.allocation !== undefined) return [value.allocation]
+        const out: number[] = []
+        for (const state of functionObjects.get(v) ?? []) out.push(values[heapObject(frame, node, `@${state}`, state, true)].allocation!)
+        return out
     }
     function closureValue(fn: Function, allocation: number): number {
         return intern(`c${unitKey(fn)}:${allocation}`, () => ({ kind: ValueKind.function, fn, allocation }))
@@ -886,13 +898,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         setOf(indexReaders, allocation).add(key(frame, node))
         for (const other of indexLocations.get(allocation) ?? []) read(frame, node, other)
     }
-    function member(proto: Handle | undefined, k: Handle): [kind: 'method' | 'getter' | 'field', fn?: Function] {
+    function member(proto: Handle | undefined, k: Handle): [kind: 'method' | 'getter' | 'field', fn?: Function, slot?: Handle] {
         const addr = proto ? heap.getPropertyDescriptor(proto, k) : 0
         if (!addr) return ['field']
         const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
         if (d.flags & heap.PropFlags.has_getter) return ['getter', host.functionOf(d.slot0 as u32)]
         const fn = host.functionOf(d.slot0 as u32)
-        return fn ? ['method', fn] : ['field']
+        return fn ? ['method', fn, d.slot0 as Handle] : ['field']
     }
     function setterOf(proto: Handle | undefined, k: Handle): Function | undefined {
         const addr = proto ? heap.getPropertyDescriptor(proto, k) : 0
@@ -911,17 +923,18 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
         return host.functionOf(getLiteral(g, n, 0) as u32)
     }
-    function handleValue(frame: number, node: number, slot: Handle): number {
-        if (heap.isBoxedF64(slot)) return literal(heap.unboxF64(slot))
-        if (!slot) return Undefined
-        if (heap.isString(slot)) return Str
+    function handleValue(frame: number, node: number, raw: Handle): number {
+        if (heap.isBoxedF64(raw)) return literal(heap.unboxF64(raw))
+        if (!raw) return Undefined
+        if (heap.isString(raw)) return Str
+        const slot = host.heapValue ? host.heapValue(raw) : raw
         if (heap.isFrameProxy(slot)) {
             const [scope] = allocate(`scope${frame}:${slot}`, frame, node, 'Scope', undefined, false)
             allocations[scope].native = true
             return objectValue(scope)
         }
         const held = host.functionOf(slot as u32)
-        if (held) return functionValue(held)
+        if (held) return functionValue(held, slot)
         const inner = heap.deref(slot)
         if (!inner || !heap.isOrdinaryObject(inner)) return Unknown
         if (heap.isIndirect(slot) && !host.session.sealed.has(slot)) return heapObject(frame, cellSites(frames[frame].graph!).get(slot) ?? node, `${frame}:${slot}`, inner, false)
@@ -1020,7 +1033,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             return
         }
         if (known) {
-            flow(frame, id, [functionValue(known)])
+            flow(frame, id, [functionValue(known, cell)])
             return
         }
         if (n.op === NodeOp.heapHandle && !getRef(n, 0)) {
@@ -1226,9 +1239,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     function exposeArgs(frame: number, n: GraphNode, first: number): void {
         for (let i = first; i < countIds(n); i++) {
             if (!getRef(n, i)) continue
-            for (const v of valuesAt(frame, getRef(n, i))) {
-                const allocation = values[v].allocation
-                if (allocation === undefined || opaqueAllocations.has(allocation)) continue
+            for (const v of [...valuesAt(frame, getRef(n, i))]) for (const allocation of objectsOf(frame, getRef(n, i), v)) {
+                if (opaqueAllocations.has(allocation)) continue
                 opaqueAllocations.add(allocation)
                 store(location(allocation, numberKey), [Unknown])
                 locations.forEach((loc, i) => { if (loc.allocation === allocation) store(i, [Unknown]) })
@@ -1246,7 +1258,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             const callee = values[t].fn
             if (!callee) continue
             if (!host.traceable(callee)) {
-                exposeArgs(frame, n, 2)
+                exposeArgs(frame, n, host.receiverless?.(callee) ? 3 : 2)
                 flow(frame, id, [opaqueValue(frames[frame].graph!, id)])
                 continue
             }
@@ -1283,30 +1295,27 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 flow(frame, u, [Undefined])
                 continue
             }
-            if (value.allocation === undefined) {
-                if (value.kind === ValueKind.variable) flow(frame, u, [variable({ unit: frames[frame].unit, node: u })])
-                else if (value.kind === ValueKind.string || value.kind === ValueKind.unknown) flow(frame, u, [Unknown])
-                continue
+            if (value.kind === ValueKind.variable) flow(frame, u, [variable({ unit: frames[frame].unit, node: u })])
+            else if (value.kind === ValueKind.string || value.kind === ValueKind.unknown) flow(frame, u, [Unknown])
+            for (const allocation of objectsOf(frame, getRef(user, 1), v)) {
+                const proto = allocations[allocation].proto
+                if (k === undefined) {
+                    const trap = indexTrap(proto, false)
+                    if (trap && host.traceable(trap)) delegate(frame, u, user, trap, v)
+                    else readKey(frame, u, allocation, getRef(user, 2) ? numberKey : nameOf(getLiteral(g, user, 2) as Handle))
+                    continue
+                }
+                const [kind, fn, slot] = member(proto, k)
+                if (kind === 'method') flow(frame, u, [functionValue(fn!, slot)])
+                else if (kind === 'getter' && fn && host.traceable(fn)) delegate(frame, u, user, fn, v)
+                else read(frame, u, access(false, frame, u, allocation, nameOf(k)))
             }
-            const proto = allocations[value.allocation].proto
-            if (k === undefined) {
-                const trap = indexTrap(proto, false)
-                if (trap && host.traceable(trap)) delegate(frame, u, user, trap, v)
-                else readKey(frame, u, value.allocation, getRef(user, 2) ? numberKey : nameOf(getLiteral(g, user, 2) as Handle))
-                continue
-            }
-            const [kind, fn] = member(proto, k)
-            if (kind === 'method') flow(frame, u, [functionValue(fn!)])
-            else if (kind === 'getter' && fn && host.traceable(fn)) delegate(frame, u, user, fn, v)
-            else read(frame, u, access(false, frame, u, value.allocation, nameOf(k)))
         }
     }
     function setProperty(frame: number, u: number, user: GraphNode): void {
         const g = frames[frame].graph!
         const k = indexKey(g, user)
-        for (const v of [...seen(frame, u, getRef(user, 1))]) {
-            const allocation = values[v].allocation
-            if (allocation === undefined) continue
+        for (const v of [...seen(frame, u, getRef(user, 1))]) for (const allocation of objectsOf(frame, getRef(user, 1), v)) {
             const trap = k === undefined ? indexTrap(allocations[allocation].proto, true) : setterOf(allocations[allocation].proto, k)
             const name = k !== undefined ? nameOf(k) : getRef(user, 2) ? numberKey : nameOf(getLiteral(g, user, 2) as Handle)
             if (trap && host.traceable(trap)) delegate(frame, u, user, trap, v)
@@ -1460,10 +1469,19 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const g = frame.graph
         if (!g) return
         for (const n of g.nodes.values()) {
-            if (!opaque(f, n, g) && !(n.op === NodeOp.call && [...valuesAt(f, getRef(n, 1))].some(v => values[v].fn && !host.traceable(values[v].fn!)))) continue
-            for (let i = 2; i < countIds(n); i++) {
+            const untraced = n.op === NodeOp.call ? [...valuesAt(f, getRef(n, 1))].flatMap(v => values[v].fn && !host.traceable(values[v].fn!) ? [values[v].fn!] : []) : []
+            const blind = opaque(f, n, g)
+            if (!blind && !untraced.length) continue
+            const first = !blind && untraced.every(fn => host.receiverless?.(fn)) ? 3 : 2
+            for (let i = first; i < countIds(n); i++) {
                 if (!getRef(n, i)) continue
-                for (const v of valuesAt(f, getRef(n, i))) if (values[v].allocation !== undefined) allocations[values[v].allocation!].escaped = true
+                for (const v of valuesAt(f, getRef(n, i))) {
+                    if (values[v].allocation !== undefined) allocations[values[v].allocation!].escaped = true
+                    for (const state of functionObjects.get(v) ?? []) {
+                        const allocation = allocationIds.get(`@${state}`)
+                        if (allocation !== undefined) allocations[allocation].escaped = true
+                    }
+                }
             }
         }
     })
@@ -1620,6 +1638,8 @@ export interface ObjectType {
     fields: Map<string, Type>
     forms: Map<string, string[]>
     initialized: Set<string>
+    escaped: boolean
+    readers: Site[]
 }
 
 export interface Signature {
@@ -1654,6 +1674,7 @@ export interface ValueTypes {
     classOf: number[]
     stateAllocations: Map<Handle, number[]>
     keyHandles: Map<string, Handle>
+    keyNames: Map<Handle, string>
     strings: Map<Function, Set<number>>
 }
 
@@ -1771,7 +1792,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
     if (broken.size) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) }, undefined, fixedFloats)
-    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, proto: allocation.proto, state: allocation.state, fields: new Map(), forms: new Map(), initialized: new Set<string>() }))
+    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, proto: allocation.proto, state: allocation.state, fields: new Map(), forms: new Map(), initialized: new Set<string>(), escaped: allocation.escaped, readers: [] }))
     function typeOf(list: number[]): Type {
         const type = emptyType()
         if (!list.length) type.undefined = true
@@ -1803,6 +1824,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         if (!written(location) && indexed.has(location.allocation) && (location.key === numberKey || constantIndex(location.key))) continue
         object.fields.set(location.key, union(object.fields.get(location.key) ?? emptyType(), typeOf(location.values)))
         object.forms.set(location.key, merge(object.forms.get(location.key) ?? [], location.forms))
+        object.readers.push(...location.readers)
         const writers = new Set(location.writers.map(w => `${unitIdentity(w.unit)}:${w.node}`))
         if (writers.size === 1 && location.writers[0].unit === object.site.unit && !location.forms.includes('init')) initialWrites.set(object, [location.key, location.writers[0].node])
     }
@@ -1878,7 +1900,16 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         set.add(node)
     }
     if (intrinsics.argv().includes('frames-dump')) frames.forEach((frame, id) => console.log('FRAME', id, frame.unit.name || '<anon>', `<${frame.context}>`, frame.params.map(p => `${p.label}:${formatType({ objects } as ValueTypes, p.type)}`).join(' '), '->', formatType({ objects } as ValueTypes, frame.returns)))
-    return { ms: performance.now() - start, objects, signatures, frames, classes, classOf, stateAllocations, keyHandles: data.keyHandles, strings }
+    const keyNames = new Map<Handle, string>()
+    for (const [name, k] of data.keyHandles) keyNames.set(k, name)
+    return { ms: performance.now() - start, objects, signatures, frames, classes, classOf, stateAllocations, keyHandles: data.keyHandles, keyNames, strings }
+}
+
+export function fixedField(types: ValueTypes, state: Handle, key: Handle): boolean {
+    const index = heap.keyIndex(key)
+    const name = index !== undefined ? `[${index}]` : types.keyNames.get(key)
+    const initOnly = (object: ObjectType, k: string | undefined) => k === undefined || (object.forms.get(k) ?? []).every(form => form === 'init')
+    return (types.stateAllocations.get(state) ?? []).every(id => !types.objects[id].escaped && initOnly(types.objects[id], name) && initOnly(types.objects[id], numberKey))
 }
 
 function floating(T: intrinsics.Types): boolean {
