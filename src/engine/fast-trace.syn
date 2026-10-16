@@ -1,0 +1,1282 @@
+/// @synth
+
+"use wrapped";
+
+import * as gn from './graph-node'
+import * as intrinsics from './intrinsics'
+import * as bytecode from './bytecode-emitter'
+import { Op, isVmHandle, vmHandle, vmPayload, tagVmHandle } from './vm'
+import * as lowering2 from './lowering2'
+import * as heap from './heap'
+import { Op as RtOp, effectOps, heapOps } from './rt'
+import {
+    NodeOp, countIds, createGraph, getLiteral, getNode, getRef, internNode, literalSlot, putNode, refSlot,
+    setDebugLabel, setGraphBlocks, setNode, slotLiteral, slotRef,
+} from './graph-node'
+import type { TraceSession, TraceOptions, CompiledSource } from './trace2'
+
+type Handle = intrinsics.Handle
+type Runtime = NonNullable<TraceSession['runtime']>
+
+const Types = intrinsics.Types
+const assert = intrinsics.assert
+
+export interface Allocation {
+    token: number | undefined
+    call: number | undefined
+}
+
+export interface FastTraced {
+    graph: lowering2.Graph
+    readonly text: string
+    session: TraceSession
+    frameProxy: u32 | undefined
+    frames: Map<u32, number>
+    allocations: Map<u32, Allocation>
+    closures: Set<number>
+    usesSelf: boolean
+}
+
+enum Kind {
+    Number,
+    Cell,
+    Host,
+    Node,
+}
+
+interface Registers {
+    kind: Uint8Array
+    value: Float64Array
+    token: number
+}
+
+interface Arrival {
+    regs: Registers
+    node: number
+}
+
+interface Merge {
+    block: number
+    id: number
+    live: number[]
+    firstParam: number
+    arrivals: Arrival[]
+    params: number[]
+    paramArgs: number[]
+    bound: boolean
+    body: number
+}
+
+interface Constants {
+    kind: number[]
+    value: number[]
+}
+
+interface Hosts {
+    values: any[]
+    index: Map<any, number>
+    cells: number[]
+}
+
+interface Parent {
+    fn: number
+    bytecode: Handle
+}
+
+interface Frame {
+    id: number
+    cell: number
+}
+
+interface TraceCtx {
+    session: TraceSession
+    runtime: Runtime
+    source: CompiledSource
+    shape: SourceShape
+    opts: TraceOptions
+    captures: any[] | undefined
+    self: Function | undefined
+    name: string
+    accRegIdx: number
+    frozenCells: Set<number>
+    root: number
+    params: number[]
+    presenceParam: number
+    constants: Constants
+    hosts: Hosts
+    parent: Parent | undefined
+    frame: Frame | undefined
+}
+
+interface TraceState {
+    interned: Map<number, number>
+    regs: Registers
+    block: number
+    tail: number
+    merges: (Merge | undefined)[]
+    traced: Uint8Array
+    allocations: Map<u32, Allocation>
+    closures: Set<number>
+    usesSelf: boolean
+}
+
+let C: TraceCtx
+let T: TraceState
+const got = { kind: Kind.Number as number, value: 0 }
+let syntheticFrames = 0xF000_0000
+
+export function fastTrace(source: CompiledSource, opts: TraceOptions): FastTraced {
+    const session = opts.session!
+    const captures = opts.captures && opts.mapCapture ? opts.captures.map(opts.mapCapture) : opts.captures
+    const runtime = session.enterTrace()
+    const outerCtx = C
+    const outerState = T
+    defer finally {
+        C = outerCtx
+        T = outerState
+        session.leaveTrace()
+    }
+    C = {
+        session, runtime, source, shape: shapeOf(source), opts, captures, self: opts.self, name: opts.name ?? '',
+        accRegIdx: source.compiled.registerCount, frozenCells: frozenCellsOf(session),
+        root: 0, params: [], presenceParam: 0,
+        constants: { kind: [], value: [] },
+        hosts: { values: [], index: new Map(), cells: [] },
+        parent: undefined, frame: undefined,
+    }
+    return runtime.tracer.inactive(traceSource)
+}
+
+function node(op: NodeOp, slots: number[], type?: gn.TypeOperand): number {
+    return internNode(C.runtime, T.interned, op, slots, type)
+}
+
+function uniqueNode(op: NodeOp): number {
+    const id = C.runtime.ids.next++
+    setNode(C.runtime, id, gn.makeNodeFromSlots(op, new Uint32Array(0)))
+    return id
+}
+
+function nullishNode(): number {
+    return node(NodeOp.heapHandle, [literalSlot(C.runtime, 0)])
+}
+
+function looseNil(): number {
+    return node(NodeOp.nilEffect, [])
+}
+
+function cellNode(cell: number): number {
+    return node(NodeOp.heapHandle, [literalSlot(C.runtime, cell)])
+}
+
+function effect(op: NodeOp, slots: number[], type?: gn.TypeOperand): number {
+    slots.unshift(refSlot(T.regs.token))
+    const id = node(op, slots, type)
+    T.regs.token = id
+    return id
+}
+
+function after(slot: number, token: number): number {
+    const tokenNode = getNode(C.runtime, token)
+    if (!tokenNode || tokenNode.op === NodeOp.nilEffect) return slot
+    const id = slotRef(slot)
+    if (id === token) return slot
+    const n = id ? getNode(C.runtime, id) : undefined
+    if (n && countIds(n) && lowering2.OrderedValues.has(n.op) && getRef(n, 0) === token) return slot
+    return refSlot(node(NodeOp.after, [refSlot(token), slot]))
+}
+
+function select(cond: number, yes: number, no: number): number {
+    if (yes === no) return yes
+    return refSlot(node(NodeOp.select, [cond, yes, no]))
+}
+
+function internCell(cell: number): number {
+    if (cell <= 1 || heap.isIndirect(cell as Handle)) return cell
+    return C.runtime.objects.intern(cell as Handle) as number
+}
+
+function hostCell(index: number): number {
+    const hosts = C.hosts
+    if (hosts.cells[index] === undefined) {
+        const host = hosts.values[index]
+        hosts.cells[index] = typeof host === 'function' ? C.session.linkFunction(host) as number : C.session.fromJsValue(host) as number
+    }
+    return hosts.cells[index]
+}
+
+function cellOf(kind: number, value: number): number {
+    return internCell(kind === Kind.Host ? hostCell(value) : value)
+}
+
+function numberOf(kind: number, value: number): number {
+    return kind === Kind.Number ? value : cellOf(kind, value)
+}
+
+function slotOf(kind: number, value: number): number {
+    if (kind === Kind.Node) return refSlot(value)
+    if (kind === Kind.Number) return literalSlot(C.runtime, value)
+    const cell = cellOf(kind, value)
+    if (cell === 0) return refSlot(nullishNode())
+    if (cell === 1) return literalSlot(C.runtime, 1)
+    return refSlot(cellNode(cell))
+}
+
+function wordOf(kind: number, value: number): number {
+    if (kind === Kind.Node) return refSlot(value)
+    return literalSlot(C.runtime, numberOf(kind, value))
+}
+
+function fromHandle(handle: number): void {
+    if (handle > 1 && heap.isBoxedF64(handle as Handle)) {
+        const id = heap.boxedNanId(handle as Handle)
+        got.kind = id ? Kind.Node : Kind.Number
+        got.value = id || heap.unboxF64(handle as Handle)
+        return
+    }
+    got.kind = Kind.Cell
+    got.value = handle
+}
+
+function fromWord(word: number): void {
+    if (isVmHandle(word as u32)) return fromHandle(vmHandle(word as u32))
+    got.kind = Kind.Number
+    got.value = vmPayload(word as u32)
+}
+
+function fromHost(host: any): void {
+    if (typeof host === 'number') {
+        const id = Number.isNaN(host) ? intrinsics.getNanId(host) : 0
+        got.kind = id ? Kind.Node : Kind.Number
+        got.value = id || host
+        return
+    }
+    if (typeof host === 'boolean') {
+        got.kind = Kind.Number
+        got.value = host ? 1 : 0
+        return
+    }
+    if (host === null || host === undefined) {
+        got.kind = Kind.Cell
+        got.value = 0
+        return
+    }
+    if (typeof host === 'function' || isFrozenHost(host)) {
+        const hosts = C.hosts
+        let index = hosts.index.get(host)
+        if (index === undefined) {
+            index = hosts.values.length
+            hosts.values.push(host)
+            hosts.index.set(host, index)
+        }
+        got.kind = Kind.Host
+        got.value = index
+        return
+    }
+    fromHandle(C.session.fromJsValue(host))
+}
+
+function constant(index: number): void {
+    const constants = C.constants
+    if (constants.kind[index] === undefined) {
+        resolveConstant(index)
+        constants.kind[index] = got.kind
+        constants.value[index] = got.value
+    }
+    got.kind = constants.kind[index]
+    got.value = constants.value[index]
+}
+
+function resolveConstant(index: number): void {
+    const kind = C.source.compiled.constantKinds[index]
+    const value = C.source.compiled.constants[index]
+    if (kind === bytecode.ConstantKind.number) {
+        got.kind = Kind.Number
+        got.value = value
+        return
+    }
+    if (kind === bytecode.ConstantKind.string) return fromHandle(C.session.fromJsValue(value))
+    if (kind === bytecode.ConstantKind.scope) {
+        got.kind = Kind.Cell
+        got.value = 0
+        return
+    }
+    if (kind === bytecode.ConstantKind.late_bound) return fromHost(hostBinding(value as string))
+    fromWord(heap.constantAt(parent().bytecode, index as u32))
+}
+
+function parent(): Parent {
+    if (!C.parent) {
+        const compiled = C.source.compiled
+        const fn = C.session.finalize(compiled, C.captures)
+        const bytecode = heap.functionBytecode(fn as Handle)
+        if (C.opts.env) for (const binding of compiled.scopeBindings) heap.setConstant(bytecode, binding.slot as u32, tagVmHandle(heap.boxSymbol(C.constants.value[binding.slot])))
+        C.parent = { fn, bytecode }
+    }
+    return C.parent
+}
+
+function frameCell(): number {
+    if (!C.frame) {
+        const id = syntheticFrames++
+        C.frame = { id, cell: heap.frameProxyOf(id as u32, 0 as Handle, 0 as Handle) as number }
+    }
+    return C.frame.cell
+}
+
+function frameKey(r: number): number {
+    return literalSlot(C.runtime, heap.indexKey(r as u32))
+}
+
+function read(r: number): void {
+    if (C.shape.captured[r]) {
+        got.kind = Kind.Node
+        got.value = effect(NodeOp.getProp, [refSlot(cellNode(frameCell())), frameKey(r)])
+        return
+    }
+    got.kind = T.regs.kind[r]
+    got.value = T.regs.value[r]
+}
+
+function write(r: number, kind: number, value: number): void {
+    if (C.shape.captured[r]) {
+        effect(NodeOp.setProp, [refSlot(cellNode(frameCell())), frameKey(r), slotOf(kind, value)])
+        return
+    }
+    T.regs.kind[r] = kind
+    T.regs.value[r] = value
+}
+
+function setAcc(kind: number, value: number): void {
+    T.regs.kind[C.accRegIdx] = kind
+    T.regs.value[C.accRegIdx] = value
+}
+
+function setAccSlot(slot: number): void {
+    const id = slotRef(slot)
+    if (id) setAcc(Kind.Node, id)
+    else setAcc(Kind.Number, slotLiteral(C.runtime, slot))
+}
+
+function accKind(): number {
+    return T.regs.kind[C.accRegIdx]
+}
+
+function accValue(): number {
+    return T.regs.value[C.accRegIdx]
+}
+
+function fold(name: string, args: number[]): number {
+    const result = (C.runtime.tracer.saved as any)[name](...args)
+    if (typeof result === 'boolean') return result ? 1 : 0
+    return typeof result === 'number' ? result : 0
+}
+
+const binaryNames: string[] = []
+binaryNames[Op.Add] = 'add'
+binaryNames[Op.Sub] = 'sub'
+binaryNames[Op.Mul] = 'mul'
+binaryNames[Op.Div] = 'div'
+binaryNames[Op.Mod] = 'rem'
+binaryNames[Op.Exp] = 'pow'
+binaryNames[Op.BitOr] = 'or'
+binaryNames[Op.BitAnd] = 'and'
+binaryNames[Op.BitXor] = 'xor'
+binaryNames[Op.ShiftLeft] = 'shl'
+binaryNames[Op.ShiftRight] = 'shr'
+binaryNames[Op.ShiftRightLogical] = 'ushr'
+binaryNames[Op.TestLessThan] = 'lt'
+binaryNames[Op.TestGreaterThan] = 'gt'
+binaryNames[Op.TestLessThanOrEqual] = 'le'
+binaryNames[Op.TestGreaterThanOrEqual] = 'ge'
+
+const comparisonOps = new Set<NodeOp>([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne])
+
+function binary(name: string, ak: number, av: number, bk: number, bv: number): void {
+    if (ak !== Kind.Node && bk !== Kind.Node) return setAcc(Kind.Number, fold(name, [numberOf(ak, av), numberOf(bk, bv)]))
+    const op = gn.nodeOp(name)
+    setAcc(Kind.Node, node(op, [wordOf(ak, av), wordOf(bk, bv)], comparisonOps.has(op) ? Types.bool : Types.unknown_number))
+}
+
+function unary(name: string): void {
+    if (accKind() !== Kind.Node) return setAcc(Kind.Number, fold(name, [numberOf(accKind(), accValue())]))
+    setAcc(Kind.Node, node(gn.nodeOp(name), [refSlot(accValue())]))
+}
+
+function textual(kind: number, value: number): boolean {
+    if (kind === Kind.Cell) return value > 1 && heap.isString(value as Handle)
+    if (kind !== Kind.Node) return false
+    let n = getNode(C.runtime, value)
+    while (n?.op === NodeOp.after) n = getNode(C.runtime, getRef(n, countIds(n) - 1))
+    if (n?.op === NodeOp.rt) return getLiteral(C.runtime, n, 1) === RtOp.concat
+    return n?.op === NodeOp.heapHandle && !getRef(n, 0) && heap.isString(getLiteral(C.runtime, n, 0) as Handle)
+}
+
+function stringSlot(kind: number, value: number): number {
+    if (kind !== Kind.Number) return slotOf(kind, value)
+    return refSlot(cellNode(fold('rt', [RtOp.toString, heap.boxF64(value)])))
+}
+
+function concat(r: number, maybeAdd: boolean): void {
+    read(r)
+    const ak = accKind()
+    const av = accValue()
+    const bk = got.kind
+    const bv = got.value
+    if (maybeAdd && !textual(ak, av) && !textual(bk, bv)) return binary('add', ak, av, bk, bv)
+    if (ak === Kind.Cell && bk === Kind.Cell && heap.isString(av as Handle) && heap.isString(bv as Handle)) {
+        fromHandle(fold('rt', [RtOp.concat, av, bv]))
+        return setAcc(got.kind, got.value)
+    }
+    setAcc(Kind.Node, effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.concat), stringSlot(ak, av), stringSlot(bk, bv)]))
+}
+
+function strictEqual(r: number, negate: boolean): void {
+    read(r)
+    let ak = accKind()
+    let av = accValue()
+    let bk = got.kind
+    let bv = got.value
+    if (ak === Kind.Host && bk === Kind.Host) return setAcc(Kind.Number, (av === bv) !== negate ? 1 : 0)
+    if (ak === Kind.Host) {
+        av = hostCell(av)
+        ak = Kind.Cell
+    }
+    if (bk === Kind.Host) {
+        bv = hostCell(bv)
+        bk = Kind.Cell
+    }
+    if (ak === Kind.Node || bk === Kind.Node) {
+        return setAcc(Kind.Node, node(negate ? NodeOp.ne : NodeOp.eq, [wordOf(ak, av), wordOf(bk, bv)], Types.bool))
+    }
+    setAcc(Kind.Number, (ak === bk && av === bv) !== negate ? 1 : 0)
+}
+
+function typeOfAcc(): void {
+    const kind = accKind()
+    const value = accValue()
+    if (kind === Kind.Number) return setAcc(Kind.Cell, heap.typeNames.number)
+    if (kind === Kind.Host) return setAcc(Kind.Cell, typeof C.hosts.values[value] === 'function' ? heap.typeNames.function : heap.typeNames.object)
+    if (kind === Kind.Cell) return setAcc(Kind.Cell, heap.typeNameOf(value as Handle))
+    if (C.opts.paramTypes?.has(paramIndex(value))) return setAcc(Kind.Cell, heap.typeNames.number)
+    setAcc(Kind.Node, node(NodeOp.rt, [refSlot(looseNil()), literalSlot(C.runtime, RtOp.typeof), refSlot(value)]))
+}
+
+function nullishTest(kind: number, value: number): number {
+    if (kind === Kind.Cell) return literalSlot(C.runtime, value === 0 ? 1 : 0)
+    if (kind !== Kind.Node) return literalSlot(C.runtime, 0)
+    const bit = C.presenceParam ? paramIndex(value) : -1
+    if (bit < 0) return refSlot(node(NodeOp.eq, [refSlot(value), refSlot(nullishNode())], Types.bool))
+    const shifted = node(NodeOp.shr, [refSlot(C.presenceParam), literalSlot(C.runtime, bit)])
+    const present = node(NodeOp.and, [refSlot(shifted), literalSlot(C.runtime, 1)])
+    return refSlot(node(NodeOp.eq, [refSlot(present), literalSlot(C.runtime, 0)], Types.bool))
+}
+
+function truthTest(kind: number, value: number): number {
+    if (kind === Kind.Node) return refSlot(value)
+    if (kind === Kind.Host) return literalSlot(C.runtime, 1)
+    return literalSlot(C.runtime, value !== 0 ? 1 : 0)
+}
+
+function propertyKey(kind: number, value: number): number {
+    if (kind === Kind.Number) return literalSlot(C.runtime, heap.indexKey(value as u32))
+    if (kind === Kind.Node) return refSlot(value)
+    return literalSlot(C.runtime, cellOf(kind, value))
+}
+
+function hostKey(key: Handle): string | number | undefined {
+    const index = heap.keyIndex(key)
+    if (index !== undefined) return index
+    return heap.isString(key) ? heap.stringToJs(key) : undefined
+}
+
+function frozenRead(kind: number, value: number, key: number): boolean {
+    if (slotRef(key)) return false
+    if (kind === Kind.Host) {
+        const host = C.hosts.values[value]
+        const name = hostKey(slotLiteral(C.runtime, key) as Handle)
+        if (name === undefined) return false
+        const descriptor = Object.getOwnPropertyDescriptor(host, name)
+        if (!descriptor || !('value' in descriptor)) return false
+        fromHost(descriptor.value)
+        setAcc(got.kind, got.value)
+        return true
+    }
+    if (kind !== Kind.Cell || !C.frozenCells.has(value)) return false
+    const property = heap.getOwnProperty(heap.deref(value as Handle), slotLiteral(C.runtime, key) as Handle)
+    if (!property) return false
+    const descriptor = heap.FullPropertyDescriptor(heap.resolveHeapCell(property))
+    if (descriptor.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return false
+    fromHandle(descriptor.slot0)
+    setAcc(got.kind, got.value)
+    return true
+}
+
+function getProp(key: number): void {
+    if (frozenRead(accKind(), accValue(), key)) return
+    setAcc(Kind.Node, effect(NodeOp.getProp, [slotOf(accKind(), accValue()), key]))
+}
+
+function setProp(r: number, key: number): void {
+    read(r)
+    effect(NodeOp.setProp, [slotOf(got.kind, got.value), key, slotOf(accKind(), accValue())])
+}
+
+function argSlots(first: number, count: number): number[] {
+    const out: number[] = []
+    for (let i = 0; i < count; i++) {
+        read(first + i)
+        out.push(slotOf(got.kind, got.value))
+    }
+    return out
+}
+
+function packRest(args: number[], rest: number): number[] {
+    if (rest < 0) return args
+    const fixed = args.slice(0, rest)
+    while (fixed.length < rest) fixed.push(refSlot(nullishNode()))
+    const extra = args.slice(rest)
+    const array = effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayLiteral), literalSlot(C.runtime, extra.length)])
+    for (let i = 0; i < extra.length; i++) effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayElement), refSlot(array), literalSlot(C.runtime, i), extra[i]])
+    fixed.push(refSlot(array))
+    return fixed
+}
+
+interface Layout {
+    params: number
+    rest: number
+}
+
+const unknownLayout: Layout = { params: -1, rest: -1 }
+const layouts = new Map<Function, Layout>()
+
+function layoutOf(fn: any): Layout {
+    if (Number.isSafeInteger(fn.__localTarget)) return { params: fn.__args.length, rest: fn.__rest }
+    if (Number.isSafeInteger(fn.__native)) return { params: fn.__args.length, rest: -1 }
+    if (Number.isSafeInteger(fn.__syscall) || fn.concrete || !intrinsics.hasComputation(fn)) return unknownLayout
+    const known = layouts.get(fn)
+    if (known) return known
+    const compiled = C.session.functionCode(fn).source.compiled
+    const layout = { params: compiled.paramCount, rest: compiled.rest ? compiled.paramCount - 1 : -1 }
+    layouts.set(fn, layout)
+    return layout
+}
+
+function layoutOfValue(kind: number, value: number, fn: any): Layout {
+    if (fn) return layoutOf(fn)
+    if (kind !== Kind.Cell || value <= 1) return unknownLayout
+    const target = heap.deref(value as Handle)
+    const code = heap.functionBytecode(target)
+    if (code === target) return unknownLayout
+    const record = heap.FunctionBytecode(heap.resolveHeapCell(code))
+    return { params: record.paramCount, rest: record.restArray ? record.paramCount - 1 : -1 }
+}
+
+function hostFunction(kind: number, value: number): any {
+    if (kind === Kind.Host) return typeof C.hosts.values[value] === 'function' ? C.hosts.values[value] : undefined
+    if (kind !== Kind.Cell || value <= 1) return
+    const linked = C.session.stubFunctions.get(value as u32)
+    if (linked) return linked
+    if (!C.parent || heap.functionBytecode(heap.deref(value as Handle)) !== C.parent.fn) return
+    const self = C.self
+    if (!self) return
+    T.usesSelf = true
+    return C.opts.mapCapture ? C.opts.mapCapture(self) : self
+}
+
+function panic(slot: number): number {
+    const n = getNode(C.runtime, slotRef(slot))
+    if (n && (n.op === NodeOp.panic || n.op === NodeOp.trap || n.op === NodeOp.ret || n.op === NodeOp.unreachable)) return slot
+    return refSlot(node(NodeOp.panic, [after(slot, T.regs.token)]))
+}
+
+function ret(slot: number): number {
+    return refSlot(node(NodeOp.ret, [after(slot, T.regs.token), refSlot(T.block)]))
+}
+
+const intrinsicArity = new Map<string, number>()
+for (const name of ['add', 'sub', 'mul', 'div', 'rem', 'pow', 'lt', 'le', 'gt', 'ge', 'eq', 'ne', 'or', 'and', 'xor', 'ushr', 'shr', 'shl', 'mem', 'load']) intrinsicArity.set(name, 2)
+for (const name of ['neg', 'not', 'convert', 'bitconvert', 'typeof', 'ret', 'stackalloc', 'stackfree']) intrinsicArity.set(name, 1)
+for (const name of ['select', 'store']) intrinsicArity.set(name, 3)
+
+function intrinsic(name: string, first: number, count: number): number {
+    const kinds: number[] = []
+    const values: number[] = []
+    const words: number[] = []
+    let symbolic = false
+    for (let i = 0; i < count; i++) {
+        read(first + i)
+        kinds.push(got.kind)
+        values.push(got.value)
+        words.push(wordOf(got.kind, got.value))
+        if (got.kind === Kind.Node) symbolic = true
+    }
+    if (symbolic) {
+        const first = name === 'rt' ? 0 : intrinsicArity.get(name) ?? count
+        const end = name === 'rt' ? 1 : count
+        for (let i = first; i < end; i++) {
+            if (slotRef(words[i])) throw `fast-trace: ${name} argument ${i} must be a literal [${C.name}]`
+        }
+    }
+    if (name === 'callcontext') return refSlot(node(NodeOp.callContext, []))
+    if (name === 'load') {
+        const type = slotLiteral(C.runtime, words[2])
+        const loaded = effect(NodeOp.load, [words[0], words[1]], type)
+        if (type !== Types.fnptr) return refSlot(loaded)
+        const context = slotRef(words[1]) || slotLiteral(C.runtime, words[1]) !== 0 ? refSlot(node(NodeOp.add, [words[0], words[1]], Types.usize)) : words[0]
+        return refSlot(node(NodeOp.indirectTarget, [refSlot(loaded), context]))
+    }
+    if (name === 'store') {
+        effect(NodeOp.store, [words[0], words[1], slotOf(kinds[2], values[2])], slotLiteral(C.runtime, words[3]))
+        return literalSlot(C.runtime, 0)
+    }
+    if (name === 'pstack') return refSlot(effect(NodeOp.pstack, words.slice(0, 3)))
+    if (name === 'static') return refSlot(node(NodeOp.static, [slotOf(kinds[0], values[0])]))
+    if (name === 'typeof') {
+        const id = slotRef(words[0])
+        const n = id ? getNode(C.runtime, id) : undefined
+        if (n && (paramIndex(id) >= 0 || gn.typeOf(n) === Types.f64)) return literalSlot(C.runtime, gn.typeOf(n))
+    }
+    if (name === 'rt') return runtimeOp(kinds, values, words)
+    if (name === 'select') {
+        if (!slotRef(words[0])) return slotLiteral(C.runtime, words[0]) ? words[1] : words[2]
+        return refSlot(node(NodeOp.select, words.slice(0, 3), count > 3 ? slotLiteral(C.runtime, words[3]) : Types.unknown_number))
+    }
+    if (!symbolic) {
+        const literals: number[] = []
+        for (const word of words) literals.push(slotLiteral(C.runtime, word))
+        return literalSlot(C.runtime, fold(name, literals))
+    }
+    const op = gn.maybeNodeOp(name)
+    if (op === NodeOp.none) throw `fast-trace: unsupported intrinsic ${name} with symbolic args [${C.name}]`
+    const arity = name === 'call' ? count : intrinsicArity.get(name) ?? 0
+    const type = intrinsics.resultTypeOf(name, count > arity ? slotLiteral(C.runtime, words[arity]) : undefined, count > arity + 1 ? slotLiteral(C.runtime, words[arity + 1]) : undefined)
+    return refSlot(node(op, words.slice(0, arity), type))
+}
+
+function runtimeOp(kinds: number[], values: number[], words: number[]): number {
+    const op = slotLiteral(C.runtime, words[0])
+    if (op === RtOp.create && kinds[1] !== Kind.Node) return slotOf(Kind.Cell, allocate(slotLiteral(C.runtime, words[1])))
+    const args: number[] = [literalSlot(C.runtime, op)]
+    for (let i = 1; i < kinds.length; i++) args.push(slotOf(kinds[i], values[i]))
+    if (effectOps.has(op)) return refSlot(effect(NodeOp.rt, args))
+    args.unshift(refSlot(heapOps.has(op) ? T.regs.token : looseNil()))
+    return refSlot(node(NodeOp.rt, args))
+}
+
+function allocate(prototype: number): number {
+    const cell = internCell(heap.makeObject(prototype ? heap.deref(prototype as Handle) : 0 as Handle) as number)
+    T.allocations.set(cell as u32, { token: T.regs.token, call: undefined })
+    return cell
+}
+
+function call(calleeKind: number, callee: number, receiverKind: number, receiver: number, first: number, count: number): number {
+    if (calleeKind === Kind.Cell && callee > 1) {
+        const name = C.session.intrinsicFns.get(callee as u32)
+        if (name === 'panic' || name === 'trap') {
+            read(first)
+            T.tail = name === 'panic' ? panic(slotOf(got.kind, got.value)) : refSlot(node(NodeOp.trap, [refSlot(T.regs.token), wordOf(got.kind, got.value)]))
+            return 0
+        }
+        if (name) return intrinsic(name, first, count)
+    }
+    const fn = hostFunction(calleeKind, callee)
+    if (fn?.concrete) return concreteCall(fn, first, count)
+    if (fn === C.session.symbolicPanic) {
+        read(first)
+        T.tail = panic(slotOf(got.kind, got.value))
+        return 0
+    }
+    const signed = fn && Array.isArray(fn.__args)
+    if (signed && (Number.isSafeInteger(fn.__localTarget) || Number.isSafeInteger(fn.__native))) {
+        const local = Number.isSafeInteger(fn.__localTarget)
+        if (count > fn.__args.length && !(local && fn.__rest >= 0)) throw `fast-trace: ${fn.name || '<anonymous>'} takes ${fn.__args.length} arguments, got ${count} [${C.name}]`
+        const target = local ? refSlot(node(NodeOp.localTarget, [literalSlot(C.runtime, fn.__localTarget), literalSlot(C.runtime, 2)])) : literalSlot(C.runtime, fn.__native)
+        return refSlot(effect(NodeOp.call, [target, literalSlot(C.runtime, 0), ...packRest(argSlots(first, count), local ? fn.__rest ?? -1 : -1)]))
+    }
+    if (signed && Number.isSafeInteger(fn.__syscall)) {
+        if (count !== fn.__args.length) throw `fast-trace: syscall ${fn.__syscall} takes ${fn.__args.length} arguments, got ${count} [${C.name}]`
+        return refSlot(effect(NodeOp.call, [refSlot(node(NodeOp.syscallTarget, [literalSlot(C.runtime, fn.__syscall)])), literalSlot(C.runtime, 0), ...argSlots(first, count)]))
+    }
+    const args = packRest(argSlots(first, count), layoutOfValue(calleeKind, callee, fn).rest)
+    return refSlot(effect(NodeOp.call, [slotOf(calleeKind, callee), slotOf(receiverKind, receiver), ...args]))
+}
+
+function concreteCall(fn: any, first: number, count: number): number {
+    const args: number[] = []
+    for (let i = 0; i < count; i++) {
+        read(first + i)
+        if (got.kind === Kind.Node) throw `fast-trace: ${fn.name || '<anonymous>'} is concrete but argument ${i} is symbolic [${C.name}]`
+        args.push(numberOf(got.kind, got.value))
+    }
+    const result = fn(...args)
+    if (typeof result === 'boolean') return literalSlot(C.runtime, result ? 1 : 0)
+    return literalSlot(C.runtime, typeof result === 'number' ? result : 0)
+}
+
+function construct(calleeKind: number, callee: number, first: number, count: number): number {
+    const constructor = calleeKind === Kind.Cell || calleeKind === Kind.Host ? cellOf(calleeKind, callee) : 0
+    if (constructor > 1) {
+        const receiver = allocate(heap.getProperty(heap.deref(constructor as Handle), heap.prototypeKey) as number)
+        const result = call(calleeKind, callee, Kind.Cell, receiver, first, count)
+        T.allocations.get(receiver as u32)!.call = slotRef(result) || undefined
+        return result
+    }
+    const prototype = effect(NodeOp.getProp, [slotOf(calleeKind, callee), literalSlot(C.runtime, heap.prototypeKey)])
+    const created = effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.create), refSlot(prototype)])
+    return call(calleeKind, callee, Kind.Node, created, first, count)
+}
+
+function createClosure(constSlot: number): void {
+    const { bytecode } = parent()
+    const template = vmHandle(heap.constantAt(bytecode, constSlot as u32))
+    const closure = internCell(heap.makeClosure(template, bytecode, frameCell() as Handle) as number)
+    T.closures.add(closure)
+    setAcc(Kind.Cell, closure)
+}
+
+function arrayLiteral(firstReg: number, lastReg: number): void {
+    const count = lastReg - firstReg + 1
+    const array = effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayLiteral), literalSlot(C.runtime, count)])
+    for (let i = 0; i < count; i++) {
+        read(firstReg + i)
+        effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayElement), refSlot(array), literalSlot(C.runtime, i), slotOf(got.kind, got.value)])
+    }
+    setAcc(Kind.Node, array)
+}
+
+function spreadCall(calleeReg: number, arrayReg: number): void {
+    read(calleeReg)
+    const calleeKind = got.kind
+    const callee = got.value
+    const layout = layoutOfValue(calleeKind, callee, hostFunction(calleeKind, callee))
+    read(arrayReg)
+    const array = slotOf(got.kind, got.value)
+    const args: number[] = []
+    if (layout.rest === 0) {
+        args.push(array)
+    } else if (layout.rest < 0 && layout.params >= 0) {
+        for (let i = 0; i < layout.params; i++) args.push(refSlot(effect(NodeOp.getProp, [array, literalSlot(C.runtime, heap.indexKey(i as u32))])))
+    } else {
+        throw `fast-trace: spread call into an unknown parameter layout [${C.name}]`
+    }
+    setAcc(Kind.Node, effect(NodeOp.call, [slotOf(calleeKind, callee), slotOf(accKind(), accValue()), ...args]))
+}
+
+function throwTarget(pc: number): number {
+    for (const range of C.source.compiled.labels?.eh ?? []) {
+        if (pc >= range.start && pc <= range.end) return range.handler
+    }
+    return -1
+}
+
+function copyRegisters(from: Registers): Registers {
+    return { kind: from.kind.slice(), value: from.value.slice(), token: from.token }
+}
+
+function arrive(block: number, from: number): number {
+    const merge = T.merges[block]
+    if (!merge) return tracePath(block, T.regs)
+    const regs = T.regs
+    const args = [refSlot(merge.id)]
+    for (const r of merge.live) args.push(slotOf(regs.kind[r], regs.value[r]))
+    args.push(refSlot(regs.token))
+    const applied = after(refSlot(node(NodeOp.apply, args)), regs.token)
+    if (C.source.blocks.backPreds[block].includes(from)) {
+        assert(merge.bound, `fast-trace: back edge into unbound B${block} [${C.name}]`)
+    } else {
+        assert(!T.traced[block], `fast-trace: B${from} arrived after B${block} was traced [${C.name}]`)
+        merge.arrivals.push({ regs: copyRegisters(regs), node: slotRef(applied) })
+    }
+    return applied
+}
+
+function bind(merge: Merge): Registers {
+    const first = merge.arrivals[0].regs
+    const regs = copyRegisters(first)
+    const B = C.source.blocks
+    const loopWrites = B.backPreds[merge.block].length ? B.cycleWrites[merge.block] : undefined
+    regs.token = node(NodeOp.nilEffect, [refSlot(merge.id)])
+    for (let i = 0; i < merge.live.length; i++) {
+        const r = merge.live[i]
+        let varies = !!loopWrites?.has(r)
+        for (let a = 1; a < merge.arrivals.length && !varies; a++) {
+            const other = merge.arrivals[a].regs
+            varies = other.kind[r] !== first.kind[r] || other.value[r] !== first.value[r]
+        }
+        if (!varies) continue
+        const param = merge.firstParam + i
+        setDebugLabel(C.runtime, param, r === C.accRegIdx ? 'acc' : `s${r}`)
+        putNode(C.runtime, param, NodeOp.param, [])
+        merge.params.push(param)
+        merge.paramArgs.push(i + 1)
+        regs.kind[r] = Kind.Node
+        regs.value[r] = param
+    }
+    merge.bound = true
+    return regs
+}
+
+function inlineMerge(merge: Merge, inlined: number[]): void {
+    const arrival = merge.arrivals[0]
+    merge.bound = true
+    const body = slotRef(tracePath(merge.block, arrival.regs))
+    assert(body, `fast-trace: B${merge.block} has one arrival and a constant body [${C.name}]`)
+    inlined.push(arrival.node, body)
+}
+
+function narrowed(from: Registers, id: number, value: number): Registers {
+    let hit = false
+    for (let r = 0; r <= C.accRegIdx && !hit; r++) hit = from.kind[r] === Kind.Node && from.value[r] === id
+    if (!hit) return from
+    const out = copyRegisters(from)
+    for (let r = 0; r <= C.accRegIdx; r++) {
+        if (out.kind[r] !== Kind.Node || out.value[r] !== id) continue
+        out.kind[r] = Kind.Number
+        out.value[r] = value
+    }
+    return out
+}
+
+function branchRegisters(from: Registers, cond: number): Registers[] {
+    const test = getNode(C.runtime, cond)
+    let yes = from
+    let no = narrowed(from, cond, 0)
+    if (test && comparisonOps.has(test.op)) yes = narrowed(from, cond, 1)
+    if (test && (test.op === NodeOp.eq || test.op === NodeOp.ne)) {
+        const a = getRef(test, 0)
+        const b = getRef(test, 1)
+        const id = a && !b ? a : b && !a ? b : 0
+        const value = a && !b ? getLiteral(C.runtime, test, 1) : getLiteral(C.runtime, test, 0)
+        if (id && test.op === NodeOp.eq) yes = narrowed(yes, id, value)
+        if (id && test.op === NodeOp.ne) no = narrowed(no, id, value)
+    }
+    return [yes, no]
+}
+
+function tracePath(start: number, from: Registers): number {
+    const outer = T.regs
+    T.regs = copyRegisters(from)
+    defer finally {
+        T.regs = outer
+    }
+    let block = start
+    for (;;) {
+        if (T.traced[block]) throw `fast-trace: bytecode block B${block} traced twice [${C.name}]`
+        T.traced[block] = 1
+        const jumpTo = traceBlock(block)
+        if (T.tail) {
+            const tail = T.tail
+            T.tail = 0
+            return tail
+        }
+        const exit = blockExit(block, jumpTo)
+        if (exit.other < 0) {
+            const next = C.shape.blockAt[exit.target]
+            if (T.merges[next]) return arrive(next, block)
+            block = next
+            continue
+        }
+        const regs = T.regs
+        const [yesRegs, noRegs] = branchRegisters(regs, slotRef(exit.cond))
+        T.regs = yesRegs
+        const yes = arrive(C.shape.blockAt[exit.target], block)
+        T.regs = noRegs
+        const no = arrive(C.shape.blockAt[exit.other], block)
+        T.regs = regs
+        return select(exit.cond, yes, no)
+    }
+}
+
+interface Exit {
+    target: number
+    other: number
+    cond: number
+}
+
+function blockExit(block: number, jumpTo: number): Exit {
+    const B = C.source.blocks
+    const last = B.insts[block][B.insts[block].length - 1]
+    const op = last.opcode
+    const next = block + 1 < B.leaders.length ? B.leaders[block + 1] : C.source.codeLen
+    const exit: Exit = { target: next, other: -1, cond: 0 }
+    if (jumpTo >= 0) {
+        exit.target = jumpTo
+    } else if (op === Op.Jump) {
+        exit.target = last.jumpTarget!
+    } else if (op === Op.JumpLabel) {
+        exit.target = C.source.compiled.labels!.jump[last.jumpLabel!]
+    } else if (op === Op.JumpAcc) {
+        assert(accKind() === Kind.Number, `fast-trace: computed jump on a non-number [${C.name}]`)
+        exit.target = last.pos + 1 + accValue()
+    } else if (last.jumpTarget !== undefined) {
+        const jumpsWhenTrue = op === Op.JumpIfToBooleanTrue || op === Op.JumpIfNullish || op === Op.JumpIfNull || op === Op.JumpIfUndefined
+        const truth = op === Op.JumpIfToBooleanTrue || op === Op.JumpIfToBooleanFalse
+        exit.cond = truth ? truthTest(accKind(), accValue()) : nullishTest(accKind(), accValue())
+        exit.target = jumpsWhenTrue ? last.jumpTarget : next
+        exit.other = jumpsWhenTrue ? next : last.jumpTarget
+        if (!slotRef(exit.cond)) {
+            if (!slotLiteral(C.runtime, exit.cond)) exit.target = exit.other
+            exit.other = -1
+        }
+    }
+    if (exit.target >= C.source.codeLen) throw `fast-trace: B${block} runs off the end of the code [${C.name}]`
+    return exit
+}
+
+function immediate(width: number, imm: number): number {
+    return width === 4 && imm < 0 ? imm + 0x1_0000_0000 : imm
+}
+
+function traceBlock(block: number): number {
+    const insts = C.source.blocks.insts[block]
+    for (let i = 0; i < insts.length && !T.tail; i++) {
+        const inst = insts[i]
+        const op = inst.opcode
+        const regs = inst.regs
+        switch (op) {
+            case Op.Nop: continue
+            case Op.Star: case Op.Star0: case Op.Star1: case Op.Star2: case Op.Star3:
+            case Op.Star4: case Op.Star5: case Op.Star6: case Op.Star7: case Op.Star8:
+            case Op.Star9: case Op.Star10: case Op.Star11: case Op.Star12: case Op.Star13:
+            case Op.Star14: case Op.Star15:
+                write(regs[0], accKind(), accValue())
+            case Op.Ldar: case Op.Ldar0: case Op.Ldar1: case Op.Ldar2: case Op.Ldar3:
+                read(regs[0])
+                setAcc(got.kind, got.value)
+            case Op.Mov: case Op.MovPacked:
+                read(regs[1])
+                write(regs[0], got.kind, got.value)
+            case Op.LdaZero: setAcc(Kind.Number, 0)
+            case Op.LdaImm: setAcc(Kind.Number, immediate(inst.width, inst.imm!))
+            case Op.LdaConst:
+                constant(inst.constSlot!)
+                setAcc(got.kind, got.value)
+            case Op.LdaUndefined: case Op.LdaNull: setAcc(Kind.Cell, 0)
+            case Op.LdaTrue: setAcc(Kind.Number, 1)
+            case Op.LdaFalse: setAcc(Kind.Number, 0)
+            case Op.LoadFrame:
+                constant(inst.constSlot!)
+                setAcc(Kind.Node, effect(NodeOp.getProp, [slotOf(got.kind, got.value), literalSlot(C.runtime, heap.indexKey(inst.frameReg! as u32))]))
+            case Op.StoreFrame:
+                constant(inst.constSlot!)
+                effect(NodeOp.setProp, [slotOf(got.kind, got.value), literalSlot(C.runtime, heap.indexKey(inst.frameReg! as u32)), slotOf(accKind(), accValue())])
+            case Op.Add: case Op.Sub: case Op.Mul: case Op.Div: case Op.Mod: case Op.Exp:
+            case Op.BitOr: case Op.BitAnd: case Op.BitXor: case Op.ShiftLeft: case Op.ShiftRight: case Op.ShiftRightLogical:
+            case Op.TestLessThan: case Op.TestGreaterThan: case Op.TestLessThanOrEqual: case Op.TestGreaterThanOrEqual:
+                read(regs[0])
+                binary(binaryNames[op], accKind(), accValue(), got.kind, got.value)
+            case Op.AddOrConcat: concat(regs[0], true)
+            case Op.Concat: concat(regs[0], false)
+            case Op.TestStrictEqual: strictEqual(regs[0], false)
+            case Op.TestNotStrictEqual: strictEqual(regs[0], true)
+            case Op.IncPost: case Op.DecPost: {
+                read(regs[0])
+                const kind = got.kind === Kind.Node ? Kind.Node : Kind.Number
+                const value = got.value
+                binary(op === Op.IncPost ? 'add' : 'sub', kind, value, Kind.Number, 1)
+                write(regs[0], accKind(), accValue())
+                setAcc(kind, value)
+            }
+            case Op.Inc: binary('add', accKind(), accValue(), Kind.Number, 1)
+            case Op.Dec: binary('sub', accKind(), accValue(), Kind.Number, 1)
+            case Op.Negate: unary('neg')
+            case Op.BitNot: unary('not')
+            case Op.LogicalNot: binary('eq', accKind(), accValue(), Kind.Number, 0)
+            case Op.LogicalNotNot: binary('ne', accKind(), accValue(), Kind.Number, 0)
+            case Op.ToNumber: continue
+            case Op.TypeOf: typeOfAcc()
+            case Op.GetProperty:
+                read(regs[0])
+                getProp(propertyKey(got.kind, got.value))
+            case Op.GetPropertyConst:
+                constant(inst.constSlot!)
+                getProp(propertyKey(got.kind, got.value))
+            case Op.GetPropertyImm: getProp(literalSlot(C.runtime, heap.indexKey(inst.imm! as u32)))
+            case Op.SetProperty:
+                read(regs[1])
+                setProp(regs[0], propertyKey(got.kind, got.value))
+            case Op.SetPropertyConst:
+                constant(inst.constSlot!)
+                setProp(regs[0], propertyKey(got.kind, got.value))
+            case Op.SetPropertyImm: setProp(regs[0], literalSlot(C.runtime, heap.indexKey(inst.imm! as u32)))
+            case Op.CreateEmptyObject: setAcc(Kind.Cell, allocate(0))
+            case Op.CreateClosure: createClosure(inst.constSlot!)
+            case Op.CreateEmptyArray:
+                constant(inst.constSlot!)
+                setAccSlot(construct(got.kind, got.value, 0, 0))
+            case Op.CreateArrayLiteral: arrayLiteral(regs[0], regs[1])
+            case Op.Call: {
+                read(regs[0])
+                const count = regs.length === 3 ? regs[2] - regs[1] + 1 : 0
+                setAccSlot(call(got.kind, got.value, accKind(), accValue(), count ? regs[1] : 0, count))
+            }
+            case Op.CallConst: {
+                constant(inst.constSlot!)
+                const count = regs.length ? regs[1] - regs[0] + 1 : 0
+                setAccSlot(call(got.kind, got.value, accKind(), accValue(), count ? regs[0] : 0, count))
+            }
+            case Op.Construct: {
+                read(regs[0])
+                const count = regs.length === 3 ? regs[2] - regs[1] + 1 : 0
+                setAccSlot(construct(got.kind, got.value, count ? regs[1] : 0, count))
+            }
+            case Op.ConstructConst: {
+                constant(inst.constSlot!)
+                const count = regs.length ? regs[1] - regs[0] + 1 : 0
+                setAccSlot(construct(got.kind, got.value, count ? regs[0] : 0, count))
+            }
+            case Op.CallArray: spreadCall(regs[0], regs[1])
+            case Op.Return: T.tail = ret(slotOf(accKind(), accValue()))
+            case Op.ReturnVoid: T.tail = ret(refSlot(node(NodeOp.void, [])))
+            case Op.Throw: {
+                const handler = throwTarget(inst.pos + 1)
+                if (handler >= 0) return handler
+                T.tail = panic(slotOf(accKind(), accValue()))
+            }
+            case Op.ReThrow: T.tail = panic(literalSlot(C.runtime, 0))
+            case Op.Jump: case Op.JumpIfNull: case Op.JumpIfUndefined: case Op.JumpIfNullish:
+            case Op.JumpIfToBooleanFalse: case Op.JumpIfNotNull: case Op.JumpIfNotUndefined:
+            case Op.JumpIfNotNullish: case Op.JumpIfToBooleanTrue: case Op.JumpAcc: case Op.JumpLabel:
+                continue
+            default: throw `fast-trace: unsupported opcode ${inst.opname} [${C.name}]`
+        }
+    }
+    return -1
+}
+
+function traceSource(): FastTraced {
+    const { session, runtime, source, shape, opts, accRegIdx } = C
+    const compiled = source.compiled
+    T = {
+        interned: new Map(),
+        regs: { kind: new Uint8Array(accRegIdx + 1), value: new Float64Array(accRegIdx + 1), token: 0 }, block: 0, tail: 0,
+        merges: [], traced: new Uint8Array(source.blocks.leaders.length),
+        allocations: new Map(), closures: new Set(), usesSelf: false,
+    }
+    C.root = uniqueNode(NodeOp.block)
+    T.block = C.root
+    if (opts.env) bindScope()
+    bindEntry()
+    for (let i = 0; i < shape.merges.length; i++) {
+        const block = shape.merges[i]
+        const live = shape.live[i]
+        const id = uniqueNode(NodeOp.block)
+        setDebugLabel(runtime, id, `B${block}`)
+        const firstParam = runtime.ids.next
+        runtime.ids.next += live.length
+        T.merges[block] = { block, id, live, firstParam, arrivals: [], params: [], paramArgs: [], bound: false, body: 0 }
+    }
+    let result = 0
+    const inlined: number[] = []
+    const bodies = new Map<number, Merge>()
+    try {
+        result = arrive(0, -1)
+        for (const block of source.blocks.order) {
+            const merge = T.merges[block]
+            if (!merge?.arrivals.length) continue
+            T.block = merge.id
+            if (merge.arrivals.length === 1 && !source.blocks.backPreds[block].length) {
+                inlineMerge(merge, inlined)
+                continue
+            }
+            merge.body = tracePath(block, bind(merge))
+            bodies.set(merge.id, merge)
+        }
+        for (let i = inlined.length - 2; i >= 0; i -= 2) setNode(runtime, inlined[i], gn.copyNode(runtime, getNode(runtime, inlined[i + 1])!))
+    } catch (e) {
+        if (opts.verbose || intrinsics.argv().includes('fast-trace-debug')) {
+            console.log(`fast-trace failed in ${C.name}`)
+            console.log(bytecode.disassemble(compiled.code as any, compiled.paramCount, compiled.registerCount))
+        }
+        throw e
+    }
+    const graph = assembleGraph(result, bodies)
+    const frames = new Map<u32, number>()
+    if (C.frame) {
+        heap.releaseFrameProxy(C.frame.id as u32)
+        frames.set(C.frame.cell as u32, bytecode.frameSize(source.captured))
+    }
+    if (opts.verbose) console.log(lowering2.dumpGraph(graph))
+    return {
+        graph,
+        get text() { return lowering2.dumpGraph(graph) },
+        session,
+        frameProxy: C.frame?.cell as u32 | undefined,
+        frames,
+        allocations: T.allocations,
+        closures: T.closures,
+        usesSelf: T.usesSelf,
+    }
+}
+
+function bindScope(): void {
+    const context = node(NodeOp.callContext, [])
+    const bindings = C.source.compiled.scopeBindings
+    for (let i = 0; i < bindings.length; i++) {
+        C.constants.kind[bindings[i].slot] = Kind.Node
+        C.constants.value[bindings[i].slot] = node(NodeOp.getProp, [refSlot(looseNil()), refSlot(context), literalSlot(C.runtime, heap.closureScopeKey(i as u32))])
+    }
+}
+
+function paramIndex(id: number): number {
+    const index = C.params.indexOf(id)
+    return index < C.source.compiled.paramCount ? index : -1
+}
+
+function bindEntry(): void {
+    const { runtime, opts } = C
+    const regs = T.regs
+    const compiled = C.source.compiled
+    for (let i = 0; i < compiled.paramCount; i++) {
+        const param = runtime.ids.next++
+        setDebugLabel(runtime, param, `p${i}`)
+        putNode(runtime, param, NodeOp.param, [], opts.paramTypes?.get(i) === Types.f64 ? Types.f64 : Types.u64)
+        C.params.push(param)
+        regs.kind[i] = Kind.Node
+        regs.value[i] = param
+    }
+    if (opts.receiver) {
+        const receiver = runtime.ids.next++
+        setDebugLabel(runtime, receiver, 'this')
+        setNode(runtime, receiver, gn.createThisParam(runtime))
+        C.params.push(receiver)
+        regs.kind[C.accRegIdx] = Kind.Node
+        regs.value[C.accRegIdx] = receiver
+    } else if (compiled.expandos !== undefined) {
+        regs.kind[C.accRegIdx] = Kind.Cell
+        regs.value[C.accRegIdx] = internCell(heap.makeObject(heap.deref(heap.getPrototypeProperty(parent().fn as Handle))) as number)
+    }
+    if (compiled.defaults) {
+        C.presenceParam = runtime.ids.next++
+        setDebugLabel(runtime, C.presenceParam, 'present')
+        putNode(runtime, C.presenceParam, NodeOp.param, [])
+        C.params.push(C.presenceParam)
+    }
+    regs.token = node(NodeOp.nilEffect, [refSlot(C.root)])
+    for (let r = 0; r < compiled.paramCount; r++) {
+        if (!C.shape.captured[r]) continue
+        regs.token = node(NodeOp.setProp, [refSlot(regs.token), refSlot(cellNode(frameCell())), frameKey(r), slotOf(regs.kind[r], regs.value[r])])
+    }
+}
+
+interface SourceShape {
+    blockAt: Int32Array
+    captured: Uint8Array
+    merges: number[]
+    live: number[][]
+}
+
+const shapes = new WeakMap<CompiledSource, SourceShape>()
+
+function shapeOf(source: CompiledSource): SourceShape {
+    const known = shapes.get(source)
+    if (known) return known
+    const B = source.blocks
+    const token = source.compiled.registerCount + 1
+    const blockAt = new Int32Array(source.codeLen + 1)
+    for (let i = 0; i < B.leaders.length; i++) blockAt[B.leaders[i]] = i
+    const captured = new Uint8Array(token + 1)
+    for (const r of source.captured.reads) captured[r] = 1
+    for (const r of source.captured.writes) captured[r] = 1
+    const merges: number[] = []
+    const live: number[][] = []
+    for (const b of B.order) {
+        if (B.preds[b].length < 2 && !B.backPreds[b].length && !exitsNestedLoop(B, b)) continue
+        const own: number[] = []
+        for (const r of B.liveIn[b]) if (r !== token && !captured[r]) own.push(r)
+        own.sort((x, y) => x - y)
+        merges.push(b)
+        live.push(own)
+    }
+    const shape = { blockAt, captured, merges, live }
+    shapes.set(source, shape)
+    return shape
+}
+
+function exitsNestedLoop(B: CompiledSource['blocks'], b: number): boolean {
+    for (const p of B.preds[b]) {
+        if (!B.backPreds[p].length || B.cycles[p].has(b)) continue
+        for (const m of B.cycles[p]) if (m !== p && (B.preds[m].length >= 2 || B.backPreds[m].length > 0)) return true
+    }
+    return false
+}
+
+function assembleGraph(result: number, bodies: Map<number, Merge>): lowering2.Graph {
+    const runtime = C.runtime
+    const graph = createGraph({ ids: runtime.ids, literals: runtime.literals, root: C.root, debugLabels: runtime.debugLabels, name: C.name || undefined })
+    const base = C.root
+    const marked = new Uint8Array(runtime.ids.next - base)
+    const older = new Set<number>()
+    const blocks: lowering2.GraphBlock[] = []
+    const order: number[] = []
+    const applies = new Map<number, lowering2.GraphNode>()
+    function visit(id: number): number {
+        if (!id) return id
+        if (id >= base) {
+            if (marked[id - base]) return id
+            marked[id - base] = 1
+        } else {
+            if (older.has(id)) return id
+            older.add(id)
+        }
+        const n = getNode(runtime, id)
+        if (!n) return id
+        if (n.op === NodeOp.block) {
+            const merge = bodies.get(id)
+            if (merge) blocks.push({ id, params: merge.params.slice(), bodyId: visit(slotRef(merge.body)), bodyConst: slotRef(merge.body) ? 0 : slotLiteral(C.runtime, merge.body) })
+        }
+        if (n.op === NodeOp.apply) {
+            const merge = bodies.get(getRef(n, 0))
+            const operands: gn.Operand[] = [visit(getRef(n, 0))]
+            for (const i of merge?.paramArgs ?? []) operands.push(visit(getRef(n, i)) || { literal: getLiteral(runtime, n, i) })
+            order.push(id)
+            applies.set(id, gn.copyNode(runtime, n, operands))
+            return id
+        }
+        for (let i = 0; i < countIds(n); i++) visit(getRef(n, i))
+        visit(gn.typeRefOf(n))
+        order.push(id)
+        return id
+    }
+    blocks.unshift({ id: visit(C.root), params: C.params, bodyId: visit(slotRef(result)), bodyConst: slotRef(result) ? 0 : slotLiteral(C.runtime, result) })
+    for (const block of blocks) for (const param of block.params) visit(param)
+    if (T.closures.size && C.opts.env) for (const binding of C.source.compiled.scopeBindings) visit(C.constants.value[binding.slot])
+    order.sort((a, b) => a - b)
+    for (const id of order) setNode(graph, id, applies.get(id) ?? getNode(runtime, id)!)
+    setGraphBlocks(graph, blocks)
+    return graph
+}
+
+function hostBinding(name: string): any {
+    if (name.startsWith('$') && name[1] !== '$') {
+        const capture = C.captures?.[Number(name.slice(1))]
+        if (capture === Symbol) return heap.symbolConstants
+        if (capture === intrinsics.Intrinsics) return C.session.moduleContext.Intrinsics
+        if (capture === intrinsics) return C.session.moduleContext
+        if (capture === intrinsics.Types) return C.session.typesWrapper
+        if (capture === intrinsics.isNative) return C.session.moduleContext.isNative
+        return capture
+    }
+    if (name in C.session.globals) return C.session.globals[name]
+    throw `fast-trace: failed to find symbol ${name}`
+}
+
+function isFrozenHost(host: any): boolean {
+    if (host === heap.symbolConstants) return true
+    return host !== null && typeof host === 'object' && Object.isFrozen(host)
+}
+
+const frozenBySession = new WeakMap<TraceSession, Set<number>>()
+
+function frozenCellsOf(session: TraceSession): Set<number> {
+    const known = frozenBySession.get(session)
+    if (known) return known
+    const cells = new Set<number>()
+    for (const value of [session.moduleContext.Intrinsics, session.typesWrapper]) {
+        const cell = session.fromJsValue(value)
+        if (cell > 1) cells.add(cell)
+    }
+    frozenBySession.set(session, cells)
+    return cells
+}
