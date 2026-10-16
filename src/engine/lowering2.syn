@@ -6663,21 +6663,33 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const cond = getNode(g, getRef(tail, 0))
         if (!cond || !CompareOps.has(cond.op) || comparesFloats(g, cond)) return false
-        const sides = [0, 1].map(i => getRef(cond, i) ? target.params.indexOf(getRef(cond, i)) : -2)
+        const loads = [0, 1].map(i => entryLoad(target, getRef(cond, i)))
+        const sides = [0, 1].map(i => !getRef(cond, i) ? -2 : loads[i] ? -3 : target.params.indexOf(getRef(cond, i)))
         if (sides.some(at => at === -1)) return false
-        const argsOf = (app: GraphNode) => sides.map((at, i) => at === -2 ? [0, getLiteral(g, cond, i)] : [getRef(app, at + 1), getLiteral(g, app, at + 1)])
+        if (loads.some(n => n)) currentMem()
+        const argsOf = (from: GraphBlock, appId: number) => {
+            const app = getNode(g, appId)!
+            const args: number[][] = []
+            for (let i = 0; i < 2; i++) {
+                const at = sides[i]
+                const arg = at === -2 ? [0, getLiteral(g, cond, i)] : at === -3 ? arrivingLoad(target, from, appId, loads[i]!) : [getRef(app, at + 1), getLiteral(g, app, at + 1)]
+                if (!arg || (arg[0] && !ArrivalShapes.has(getNode(g, arg[0])!.op))) return
+                args.push(arg)
+            }
+            return args
+        }
         const compare = (args: number[][], facts: Facts) => decideCompare(cond, args[0], args[1], facts)
-        const candidate = (app: GraphNode) => !argsOf(app).some(([r]) => r && !ArrivalShapes.has(getNode(g, r)!.op))
         const decided: [from: GraphBlock, path: number[], arm: number][] = []
         let survives = false
         for (const [fromId, appId] of findInboundApplies(target)) {
-            if (fromId === target.id || !candidate(getNode(g, appId)!)) {
+            if (fromId === target.id) {
                 survives = true
                 continue
             }
             const from = getGraphBlock(fromId)
             const paths = applicationPaths(from, target.id).filter(p => p[p.length - 1] === appId)
-            if (paths.length !== 1) {
+            const args = paths.length === 1 ? argsOf(from, appId) : undefined
+            if (!args) {
                 survives = true
                 continue
             }
@@ -6688,7 +6700,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (n.op !== NodeOp.select) continue
                 for (let j = 1; j < countIds(n); j++) if (getRef(n, j) === path[i + 1]) { selects.push([path[i], j]); break }
             }
-            const outcome = compare(argsOf(getNode(g, appId)!), pathFacts(g, selects))
+            const outcome = compare(args, pathFacts(g, selects))
             if (outcome === undefined) survives = true
             else decided.push([from, path, outcome ? 1 : 2])
         }
@@ -6711,6 +6723,32 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             revisitBlock(from)
         }
         return true
+    }
+
+    function entryLoad(target: GraphBlock, id: number): GraphNode | undefined {
+        const n = id ? getNode(g, id) : undefined
+        if (n?.op !== NodeOp.load || !isNilOrVoid(getRef(n, 0)) || typeOf(n) === Types.f64) return
+        for (let k = 1; k < countIds(n); k++) if (getRef(n, k) && !target.params.includes(getRef(n, k))) return
+        return n
+    }
+
+    function arrivingLoad(target: GraphBlock, from: GraphBlock, appId: number, load: GraphNode): number[] | undefined {
+        const app = getNode(g, appId)!
+        const operands = getOperands(g, load)
+        for (let k = 1; k < countIds(load); k++) if (getRef(load, k)) operands[k] = getOperand(g, app, target.params.indexOf(getRef(load, k)) + 1)
+        const positions = tailPositions(g, from.bodyId).filter(p => p.at === appId)
+        if (positions.length !== 1) return
+        const store = arrivingStore(from, positions[0], copyNode(g, load, operands))
+        if (!store || typeOf(store) === Types.f64) return
+        const width = bits(load)
+        const constant = scalarOperand(g, g.nodes, store, 3)
+        if (constant !== undefined) {
+            if (width === 64) return [0, constant]
+            if (lowering.isSignedType(typeOf(load))) return
+            const m = 2 ** width
+            return [0, ((constant % m) + m) % m]
+        }
+        return width === 64 ? [getRef(store, 3), 0] : undefined
     }
 
     function armCode(target: GraphBlock, arm: number): number {
@@ -6971,6 +7009,23 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         return walk(token)
     }
+    function arrivalEffects(p: TailPosition): number[] {
+        const out = new Set<number>(p.tokens)
+        for (const root of tailRoots(g, p)) for (const e of guaranteed(root)) out.add(e)
+        return [...out]
+    }
+    function arrivingStore(from: GraphBlock, p: TailPosition, access: GraphNode): GraphNode | undefined {
+        const stop = new Set(from.params)
+        let writer: Writer = 'quiet'
+        for (const e of arrivalEffects(p)) {
+            const w = writerOf(e, access, stop)
+            if (w === undefined) return
+            if (w === 'quiet' || w === writer) continue
+            if (writer === 'quiet' || precedes(writer, w)) writer = w
+            else if (!precedes(w, writer)) return
+        }
+        return typeof writer === 'number' ? getNode(g, writer) : undefined
+    }
     function writesBefore(root: number, stop: Set<number>): boolean {
         const seen = new Set<number>()
         const stack = [root]
@@ -7119,14 +7174,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (matches(load, 1, m, 1, env) && matches(load, 2, m, 2, env)) return id
             }
         }
-        function effects(p: TailPosition): number[] {
-            const out = new Set<number>(p.tokens)
-            for (const root of tailRoots(g, p)) for (const e of guaranteed(root)) out.add(e)
-            return [...out]
-        }
         function quiet(b: GraphBlock, p: TailPosition, access: GraphNode): boolean {
             const stop = new Set(b.params)
-            return effects(p).every(e => writerOf(e, access, stop) === 'quiet')
+            return arrivalEffects(p).every(e => writerOf(e, access, stop) === 'quiet')
         }
         function available(b: GraphBlock, p: TailPosition, load: GraphNode, env: Env): number | undefined {
             const found = candidate(b, load, env)
@@ -7183,7 +7233,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return addCopy(g, load, operands, NodeOp.load)
         }
         function reload(p: TailPosition, load: GraphNode, env: Env): number {
-            const order = effects(p).filter(e => getNode(g, e)!.op !== NodeOp.load)
+            const order = arrivalEffects(p).filter(e => getNode(g, e)!.op !== NodeOp.load)
             return relocated(load, env, order.length ? joinEffects(g, order) : nil())
         }
         for (const id of findValues(target.id, NodeOp.load) ?? []) {
