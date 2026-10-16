@@ -979,20 +979,10 @@ function liftReturnedHeapValues(
     return { graph: out, wrapper: makeHeapWrapper(prototype) }
 }
 
-interface InlineScore {
-    cost: number
-    pressure: number
-}
-
 const interpreted = new Set([NodeOp.ret, NodeOp.panic, NodeOp.unreachable, NodeOp.record, NodeOp.get, NodeOp.block, NodeOp.void, NodeOp.apply, NodeOp.after, NodeOp.inlined, NodeOp.trap, NodeOp.nilEffect, NodeOp.mem, NodeOp.join])
 const targets = new Set([NodeOp.syscallTarget, NodeOp.localTarget, NodeOp.poolEntry, NodeOp.heapHandle])
 
 const folding = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.neg, NodeOp.not, NodeOp.convert])
-
-function obviousInline(g: Graph, literals = new Set<number>()): InlineScore | undefined {
-    const cost = inlineCost(g, literals)
-    return cost !== undefined && cost <= 8 ? { cost, pressure: 0 } : undefined
-}
 
 const inlineNodeLimit = 75
 
@@ -2503,25 +2493,14 @@ function programLevels(program: ProgramGraph): Map<number, number> {
     const incoming = new Map<number, [caller: number, depth: number][]>()
     const callees = new Map<number, number[]>()
     for (const [symbol, graph] of program.units) {
-        const { loopDepth } = graphLoops(graph)
         const out: number[] = []
         callees.set(symbol, out)
-        for (const b of graph.blocks) {
-            const depth = loopDepth.get(b.id) ?? 0
-            const seen = new Set<number>()
-            const stack = [b.bodyId]
-            while (stack.length) {
-                const id = stack.pop()!
-                const n = id ? getNode(graph, id) : undefined
-                if (!n || seen.has(id) || n.op === NodeOp.block) continue
-                seen.add(id)
-                for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
-                const callee = siteTarget(program, graph, n)
-                if (callee === undefined || !program.units.has(callee)) continue
-                out.push(callee)
-                if (!incoming.has(callee)) incoming.set(callee, [])
-                incoming.get(callee)!.push([symbol, depth])
-            }
+        for (const [id, depth] of siteDepths(graph)) {
+            const callee = siteTarget(program, graph, getNode(graph, id)!)
+            if (callee === undefined || !program.units.has(callee)) continue
+            out.push(callee)
+            if (!incoming.has(callee)) incoming.set(callee, [])
+            incoming.get(callee)!.push([symbol, depth])
         }
     }
     const levels = new Map<number, number>()
@@ -2704,16 +2683,32 @@ function anchorBlockNil(graph: Graph, b: GraphBlock): void {
 
 function siteDepths(graph: Graph): Map<number, number> {
     const { loopDepth } = graphLoops(graph)
+    const exits = new Map<number, number>()
+    function exitDepth(id: number): number {
+        const tail = tailOf(graph, id)
+        const known = exits.get(tail)
+        if (known !== undefined) return known
+        const n = getNode(graph, tail)
+        let depth = 0
+        if (n?.op === NodeOp.apply) depth = loopDepth.get(getRef(n, 0)) ?? 0
+        else if (n?.op === NodeOp.select) for (let i = 1; i < countIds(n); i++) depth = Math.max(depth, exitDepth(getRef(n, i)))
+        exits.set(tail, depth)
+        return depth
+    }
     const depths = new Map<number, number>()
-    for (const b of graph.blocks) {
-        const depth = loopDepth.get(b.id) ?? 0
-        const stack = [b.bodyId]
-        while (stack.length) {
-            const id = stack.pop()!
-            const n = id ? getNode(graph, id) : undefined
-            if (!n || n.op === NodeOp.block || (depths.get(id) ?? -1) >= depth) continue
-            depths.set(id, depth)
-            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+    const stack: [id: number, depth: number, tail: boolean][] = []
+    for (const b of graph.blocks) stack.push([b.bodyId, loopDepth.get(b.id) ?? 0, true])
+    while (stack.length) {
+        const [id, depth, tail] = stack.pop()!
+        const n = id ? getNode(graph, id) : undefined
+        if (!n || n.op === NodeOp.block || (depths.get(id) ?? -1) >= depth) continue
+        depths.set(id, depth)
+        const last = countIds(n) - 1
+        for (let i = 0; i <= last; i++) {
+            const ref = getRef(n, i)
+            if (tail && n.op === NodeOp.after && i === last) stack.push([ref, depth, true])
+            else if (tail && n.op === NodeOp.select && i > 0) stack.push([ref, Math.min(depth, exitDepth(ref)), true])
+            else stack.push([ref, depth, false])
         }
     }
     return depths
@@ -3460,7 +3455,6 @@ interface Planned {
 }
 interface Resolution {
     graph: Graph
-    closures: boolean
     shapes: Map<number, intrinsics.Handle>
     numbers: Set<number>
     strings: Set<number>
@@ -3479,7 +3473,7 @@ interface Unit {
     tracing?: boolean
     traced?: Traced
     traces?: Map<string, Traced>
-    inline?: InlineScore | false
+    probed?: boolean
     wrapper?: Function
     frame?: intrinsics.Handle
     contextShape?: intrinsics.Handle
@@ -4014,7 +4008,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
 
 function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramImage, facts: Facts, clock: PhaseClock) {
     const { session, functions, discovered, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureFunction, placedStatics, discover, schedule, link, linkStatics, isRoot, usesReceiver, thisParamOf } = linker
-    const { enterPhase, normalize } = clock
+    const { enterPhase } = clock
     const units: Unit[] = []
     const engineArrays = new Map<intrinsics.Handle, intrinsics.Handle>()
     function engineArrayOf(cell: intrinsics.Handle): intrinsics.Handle {
@@ -4310,14 +4304,11 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
     }
     function traceDependency(fn: Function): void {
         const unit = unitOf(fn)
-        if (unit.inline !== undefined || unit.tracing || !codeOf(fn) || (fn as any).shouldInline) return
+        if (unit.probed || unit.tracing || !codeOf(fn) || (fn as any).shouldInline) return
         const lifted = liftReturnedHeapValues(snapshotGraph(graphsOf(fn).traced.graph))
         if (lifted.wrapper) unit.wrapper = lifted.wrapper
-        const scored = !(fn as any).shouldNotInline && !lifted.wrapper && lifted.graph.nodes.size <= inlineNodeLimit
-        const score = scored ? obviousInline(normalize({ ...lifted.graph, name: fn.name }, { firstPass: true })) : undefined
-        unit.inline = score ?? false
-        if (score && intrinsics.argv().includes('native-inline')) console.log('traced inline', fn.name, score)
-        if (intrinsics.argv().includes('dep-debug')) console.log('DEP', fn.name, 'wrapper', !!lifted.wrapper, 'score', !!score)
+        unit.probed = true
+        if (intrinsics.argv().includes('dep-debug')) console.log('DEP', fn.name, 'wrapper', !!lifted.wrapper)
     }
     function recordTypeOf(graph: Graph, id: number): RecordField[] | undefined {
         const n = getNode(graph, id)
@@ -5464,7 +5455,6 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         const frame = unit.frame ??= propertyEval.frameShape(frameSize(source.captured))
         const frameShapes = new Map<u32, intrinsics.Handle>()
         for (const [proxy, size] of traced.frames) frameShapes.set(proxy, proxy === traced.frameProxy ? frame : propertyEval.frameShape(size))
-        let created = false
         const plannedUnit = planned?.units.get(fn)
         let allocationShapes = plannedUnit ? new Map([...plannedUnit.allocations].flatMap(([node, id]) => planned!.shapes.has(id) ? [[node, planned!.shapes.get(id)!] as [number, intrinsics.Handle]] : [])) : undefined
         if (traced.allocations?.size) {
@@ -5515,7 +5505,6 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
             plannedShapes: plannedUnit ? plannedNodeShapes(plannedUnit) : undefined, plannedUnions: plannedUnit ? plannedUnions(plannedUnit) : undefined,
             contextShape: unit.contextShape, unionParams: unionParamBases(fn), bound: unit.cold,
             created: (closure, shape) => {
-                created = true
                 const body = closureFunction(closure, name)
                 unitOf(body).contextShape = shape
                 closureByContext.set(shape, body)
@@ -5524,7 +5513,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         const result = evaluate()
         linkRuntimeCalls(result.graph)
         enterPhase(outer)
-        return { graph: result.graph, closures: traced.frameProxy !== undefined || created, shapes: result.memoryShapes, numbers: result.numbers ?? new Set(), strings: result.strings ?? new Set(), encoded: result.encoded ?? new Set() }
+        return { graph: result.graph, shapes: result.memoryShapes, numbers: result.numbers ?? new Set(), strings: result.strings ?? new Set(), encoded: result.encoded ?? new Set() }
     }
     const iterationKeys = {
         next: heap.fromJsString('next'), done: heap.fromJsString('done'), value: heap.fromJsString('value'), length: heap.fromJsString('length'),
@@ -5851,17 +5840,11 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         tracedGraph.name = current.name
         if (traceDebug) console.log(entry.traced!.text)
         if (lifted.wrapper) unit.wrapper = lifted.wrapper
-        finishUnit(current, tracedGraph, resolved.closures || !!lifted.wrapper)
+        publish(current, normalize(tracedGraph, { firstPass: true }))
     }
-    function finishUnit(fn: Function, graph: Graph, closures: boolean): void {
-        const unit = normalize(graph, { firstPass: true })
-        const score = closures || (fn as any).shouldNotInline ? undefined : obviousInline(unit)
-        if (score && intrinsics.argv().includes('native-inline')) console.log('native inline', fn.name, score)
-        publish(fn, unit, score ?? false)
-    }
-    function publish(fn: Function, graph: Graph, inline: InlineScore | false = false): void {
+    function publish(fn: Function, graph: Graph): void {
         const entry = unitOf(fn)
-        entry.inline = inline
+        entry.probed = true
         entry.graph = graph
         resolveHandles(graph)
     }
