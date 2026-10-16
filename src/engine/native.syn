@@ -4522,6 +4522,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         const traced = rawTrace(fn, paramTypes, constructsOutOfLine(fn) || usesReceiver(fn), verbose)
         resolveReads(traced)
         applyPrototypes(traced)
+        sealStaticClosures(traced)
         spliceTagged(fn, traced)
         expandAssigns(traced)
         if (!paramTypes.size) spliceables.set(fn, { graph: snapshotGraph(traced.graph), allocations: new Map(traced.allocations), frames: traced.frames.size > 0 })
@@ -4738,16 +4739,97 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
     function applyPrototypes(traced: FastTraced): void {
         const graph = traced.graph
         if (!traced.allocations.size) return
-        for (const [id, n] of [...graph.nodes]) {
-            if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.setPrototypeOf) continue
-            const object = getNode(graph, strippedAfter(graph, getRef(n, 2)))
-            const proto = getNode(graph, strippedAfter(graph, getRef(n, 3)))
+        const fixed = new Map<u32, boolean>()
+        for (const id of [...graph.nodes.keys()]) {
+            const linked = getNode(graph, id)
+            if (linked?.op !== NodeOp.rt || getLiteral(graph, linked, 1) !== rt.Op.setPrototypeOf) continue
+            const object = getNode(graph, strippedAfter(graph, getRef(linked, 2)))
+            const proto = getNode(graph, strippedAfter(graph, getRef(linked, 3)))
             if (object?.op !== NodeOp.heapHandle || getRef(object, 0) || proto?.op !== NodeOp.heapHandle || getRef(proto, 0)) continue
             const cell = getLiteral(graph, object, 0) as intrinsics.Handle
             if (!traced.allocations.has(cell as u32)) continue
-            heap.setPrototypeOf(heap.isIndirect(cell) ? heap.prepareWrite(cell) : cell, heap.deref(getLiteral(graph, proto, 0) as intrinsics.Handle))
-            putNode(graph, id, NodeOp.after, [getRef(n, 0), getRef(n, 2)])
+            const protoCell = getLiteral(graph, proto, 0) as u32
+            if (traced.allocations.has(protoCell) && !fixed.has(protoCell)) fixed.set(protoCell, sealStaticPrototype(traced, protoCell))
+            const n = getNode(graph, id)!
+            heap.setPrototypeOf(heap.isIndirect(cell) ? heap.prepareWrite(cell) : cell, heap.deref(protoCell as intrinsics.Handle))
+            if (fixed.get(protoCell) === false) putNode(graph, id, NodeOp.setProp, [getRef(n, 0), getRef(n, 2), { literal: heap.protoSlotKey }, getRef(n, 3)])
+            else putNode(graph, id, NodeOp.after, [getRef(n, 0), getRef(n, 2)])
         }
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op === NodeOp.heapHandle && !getRef(n, 0) && fixed.get(getLiteral(graph, n, 0) as u32)) deleteNode(graph, id)
+        }
+    }
+    function sealStaticClosures(traced: FastTraced): void {
+        const graph = traced.graph
+        const candidates = new Set<number>()
+        for (const closure of traced.closures) if (constantClosure(closure as intrinsics.Handle)) candidates.add(closure)
+        if (!candidates.size) return
+        for (const n of graph.nodes.values()) {
+            for (let i = 0; i < countIds(n); i++) {
+                const m = getRef(n, i) ? getNode(graph, getRef(n, i)) : undefined
+                if (m?.op !== NodeOp.heapHandle || getRef(m, 0)) continue
+                if (n.op !== NodeOp.call || i !== 1) candidates.delete(getLiteral(graph, m, 0))
+            }
+        }
+        for (const closure of candidates) runtimeObjects().seal(closure as intrinsics.Handle)
+    }
+    function constantClosure(closure: intrinsics.Handle): boolean {
+        const state = heap.deref(closure)
+        for (const key of propertyEval.dataKeys(state)) {
+            const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, key))).slot0 as intrinsics.Handle
+            if (key === heap.closureCallKey || heap.isBoxedF64(slot) || !heap.isIndirect(slot) || session.sealed.has(slot)) continue
+            return false
+        }
+        return !heap.getOwnProperty(state, heap.closureScopeKey(0 as u32))
+    }
+    function sealStaticPrototype(traced: FastTraced, proto: u32): boolean {
+        const graph = traced.graph
+        const cellAt = (id: number): u32 | undefined => {
+            const m = getNode(graph, id)
+            return m?.op === NodeOp.heapHandle && !getRef(m, 0) && countIds(m) === 1 ? getLiteral(graph, m, 0) as u32 : undefined
+        }
+        const holders = new Set<u32>()
+        for (const closure of traced.closures) {
+            const state = heap.deref(closure as intrinsics.Handle)
+            for (const key of propertyEval.dataKeys(state)) {
+                if (heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, key))).slot0 === proto) holders.add(closure as u32)
+            }
+        }
+        const state = heap.deref(proto as intrinsics.Handle)
+        for (let i: u32 = 0; i < heap.ownPropertyCount(state); i++) {
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, heap.ownPropertyKeyAt(state, i))))
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) throw `native: ${graph.name} constructs a local class with accessors, which native code does not support`
+        }
+        const writes = new Map<number, number>()
+        for (const [id, n] of graph.nodes) {
+            if (n.op !== NodeOp.setProp || getRef(n, 2) || cellAt(getRef(n, 1)) !== proto) continue
+            const member = cellAt(getRef(n, 3))
+            if (member === undefined || !session.templateOf(member) || !constantClosure(member as intrinsics.Handle)) return false
+            writes.set(id, getRef(n, 3))
+        }
+        const members = new Set(writes.values())
+        for (const [id, n] of graph.nodes) {
+            const linking = n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.setPrototypeOf
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (!ref) continue
+                const cell = cellAt(ref)
+                const target = i === 1 && (n.op === NodeOp.call || (n.op === NodeOp.setProp && !getRef(n, 2)))
+                if (cell === proto && !(writes.has(id) && i === 1) && !(linking && i === 3)) return false
+                if (cell !== undefined && holders.has(cell) && !target) return false
+                if (members.has(ref) && !(writes.has(id) && i === 3)) return false
+            }
+        }
+        const by = new Map<number, Operand>()
+        for (const id of writes.keys()) by.set(id, getRef(getNode(graph, id)!, 0))
+        for (const allocation of traced.allocations.values()) {
+            while (allocation.token !== undefined && by.has(allocation.token)) allocation.token = by.get(allocation.token) as number
+        }
+        substitute(graph, by)
+        for (const id of members) deleteNode(graph, id)
+        traced.allocations.delete(proto)
+        runtimeObjects().seal(proto as intrinsics.Handle)
+        return true
     }
     function expandAssigns(traced: FastTraced): void {
         const graph = traced.graph
@@ -4843,6 +4925,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         const traced = rawTrace(origin, floats, constructsOutOfLine(origin) || usesReceiver(origin), false)
         resolveReads(traced)
         applyPrototypes(traced)
+        sealStaticClosures(traced)
         spliceTagged(origin, traced)
         expandAssigns(traced)
         const prepared: Spliceable = { graph: snapshotGraph(traced.graph), allocations: new Map(traced.allocations), frames: traced.frames.size > 0 }
@@ -4876,6 +4959,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             simplifySpliced(graph)
             resolveReads(traced)
             applyPrototypes(traced)
+            sealStaticClosures(traced)
         }
         resolveRegions(traced, regions)
         if (regions.size || spliced) {

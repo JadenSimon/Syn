@@ -2388,7 +2388,7 @@ function emitFunction(
         return hoisted
     }
 
-    function closureCtx(node: ts.FunctionDeclaration | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.ArrowFunction | ts.FunctionExpression): EmitCtx {
+    function closureCtx(node: ts.FunctionDeclaration | ClassMember | ts.ArrowFunction | ts.FunctionExpression): EmitCtx {
         const childOuter = new Map<number, OuterSymbol>()
         for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
         for (const [sym] of outerSymbols) {
@@ -2404,44 +2404,10 @@ function emitFunction(
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
-        if (node.heritageClauses?.length) throw 'class heritage is not supported'
         const outerPrivateNames = privateNames
         privateNames = classPrivateNames(node, outerPrivateNames)
         defer privateNames = outerPrivateNames
-        const rctor = allocReg()
-        const rproto = allocReg()
-        defer freeReg()
-        defer freeReg()
-        const ctor = node.members.find(ts.isConstructorDeclaration)
-        if (ctor) {
-            emitClosure(ctor)
-        } else {
-            emitNested(defaultConstructorResult())
-        }
-        star(rctor)
-        emit1(Op.CreateEmptyObject)
-        star(rproto)
-        for (const member of node.members) {
-            if (member === ctor || isFieldDeclaration(member)) continue
-            const key = classMemberKey(member)
-            const method = member as ts.MethodDeclaration
-            const target = isStaticMember(member) ? rctor : rproto
-            if (typeof key === 'string') {
-                emitClosure(method)
-                emit3(Op.SetPropertyConst, target, internString(key))
-                continue
-            }
-            const name = (method.name as ts.ComputedPropertyName).expression as ts.PropertyAccessExpression
-            emitLoadConst(lateBoundSlot(-1, 'Symbol'))
-            emit2(Op.GetPropertyConst, internString(name.name.text))
-            const rkey = allocReg(); star(rkey)
-            emitClosure(method)
-            emit3(Op.SetProperty, target, rkey)
-            freeReg()
-        }
-        ldar(rproto)
-        emit3(Op.SetPropertyConst, rctor, internString('prototype'))
-        ldar(rctor)
+        emitNested(emitClassTemplate(node, member => emitFunction(member, closureCtx(member))))
     }
 
     function emitDefaultInit(exp: ts.Expression, reg: number, effectOnly = false) {
@@ -2588,13 +2554,12 @@ function fixupMethodLikeDecl(src: string) {
     return `function ${src}`
 }
 
-function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
+type ClassMember = ts.ConstructorDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration
+
+function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitMember: (member: ClassMember) => EmitResult): EmitResult {
     if (node.heritageClauses?.length) throw 'class heritage is not supported'
-    const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
-    const privateNames = classPrivateNames(node, undefined)
-    const memberCtx = (): EmitCtx => ({ outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames })
     const ctor = node.members.find(ts.isConstructorDeclaration)
-    const result = ctor ? emitFunction(ctor, memberCtx()) : defaultConstructorResult()
+    const result = ctor ? emitMember(ctor) : defaultConstructorResult()
     const prototype: Expandos = new Map()
     const expandos: Expandos = new Map()
     for (const member of node.members) {
@@ -2603,16 +2568,22 @@ function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): E
         if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
             const key = classMemberName(member)
             const accessor = (target.get(key) ?? {}) as ClassAccessor
-            if (ts.isGetAccessorDeclaration(member)) accessor.getter = emitFunction(member, memberCtx())
-            else accessor.setter = emitFunction(member, memberCtx())
+            if (ts.isGetAccessorDeclaration(member)) accessor.getter = emitMember(member)
+            else accessor.setter = emitMember(member)
             target.set(key, accessor)
             continue
         }
-        target.set(classMemberKey(member), emitFunction(member as ts.MethodDeclaration, memberCtx()))
+        target.set(classMemberKey(member), emitMember(member as ts.MethodDeclaration))
     }
     expandos.set('prototype', prototype)
     result.expandos = expandos
     return result
+}
+
+function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
+    const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
+    const privateNames = classPrivateNames(node, undefined)
+    return emitClassTemplate(node, member => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames }))
 }
 
 export function compile(src: string): EmitResult {
@@ -2857,24 +2828,48 @@ export function frameSize(captures: FrameCaptures): number {
     return Math.max(0, ...captures.reads, ...captures.writes) + 1
 }
 
+export function memberTemplates(template: EmitResult): EmitResult[] {
+    const members: EmitResult[] = []
+    function collect(expandos: Expandos): void {
+        for (const value of expandos.values()) {
+            if (value instanceof Map) {
+                collect(value)
+                continue
+            }
+            if ('code' in value) {
+                members.push(value as EmitResult)
+                continue
+            }
+            const accessor = value as ClassAccessor
+            if (accessor.getter) members.push(accessor.getter)
+            if (accessor.setter) members.push(accessor.setter)
+        }
+    }
+    if (template.expandos) collect(template.expandos)
+    return members
+}
+
 export function frameCaptures(result: EmitResult): FrameCaptures {
     const captures: FrameCaptures = { reads: new Set(), writes: new Set() }
     function visit(fn: EmitResult, frameSlots: Set<number>): void {
         for (let i = 0; i < fn.constants.length; i++) {
             if (fn.constantKinds[i] !== ConstantKind.nested_function) continue
-            const nested: EmitResult = fn.constants[i]
-            const slots = new Set<number>()
-            for (const b of nested.scopeBindings) if (frameSlots.has(b.parentSlot)) slots.add(b.slot)
-            if (!slots.size) continue
-            const it = createCodeIterator(nested.code as u8[])
-            while (const inst = it.next()) {
-                if (inst.opcode !== Op.LoadFrame && inst.opcode !== Op.StoreFrame) continue
-                if (!slots.has(inst.constSlot!)) continue
-                captures.reads.add(inst.frameReg!)
-                if (inst.opcode === Op.StoreFrame) captures.writes.add(inst.frameReg!)
-            }
-            visit(nested, slots)
+            visitNested(fn.constants[i], frameSlots)
+            for (const member of memberTemplates(fn.constants[i])) visitNested(member, frameSlots)
         }
+    }
+    function visitNested(nested: EmitResult, frameSlots: Set<number>): void {
+        const slots = new Set<number>()
+        for (const b of nested.scopeBindings) if (frameSlots.has(b.parentSlot)) slots.add(b.slot)
+        if (!slots.size) return
+        const it = createCodeIterator(nested.code as u8[])
+        while (const inst = it.next()) {
+            if (inst.opcode !== Op.LoadFrame && inst.opcode !== Op.StoreFrame) continue
+            if (!slots.has(inst.constSlot!)) continue
+            captures.reads.add(inst.frameReg!)
+            if (inst.opcode === Op.StoreFrame) captures.writes.add(inst.frameReg!)
+        }
+        visit(nested, slots)
     }
     visit(result, new Set([-1]))
     return captures
