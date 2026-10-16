@@ -2,6 +2,7 @@ import * as api from './api'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
+import { Worker } from 'node:worker_threads'
 import * as reifiedTypes from './reifiedTypes'
 import { createModuleLoader, runSynScript } from './synModules'
 
@@ -485,7 +486,7 @@ async function testEngine(entrypoint = 'heap', argv: string[] = []) {
     const entry = path.resolve(`src/engine/${entrypoint}.js`)
     const text = emitted.get(entry)
     if (!text) throw `entrypoint "${entrypoint}" not found`
-    const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:'))?.replace(/^(cpu|heap)-prof:/, '')
+    const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:') || a.startsWith('coverage:'))?.replace(/^(cpu-prof|heap-prof|coverage):/, '')
     if (prof) {
         fs.mkdirSync(`${prof}.src`, { recursive: true })
         for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
@@ -526,8 +527,8 @@ async function gatherTestCases() {
     return files.filter(x => x.isFile()).map(x => path.resolve(x.parentPath, x.name))
 }
 
-async function profiled<T>(file: string | undefined, heapFile: string | undefined, run: () => Promise<T>): Promise<T> {
-    if (!file && !heapFile) return run()
+async function profiled<T>(file: string | undefined, heapFile: string | undefined, run: () => Promise<T>, coverageFile?: string): Promise<T> {
+    if (!file && !heapFile && !coverageFile) return run()
     const inspector = await import('node:inspector')
     const session = new inspector.Session()
     session.connect()
@@ -538,6 +539,10 @@ async function profiled<T>(file: string | undefined, heapFile: string | undefine
         await post('Profiler.enable')
         await post('Profiler.setSamplingInterval', { interval: 100 })
         await post('Profiler.start')
+    }
+    if (coverageFile) {
+        await post('Profiler.enable')
+        await post('Profiler.startPreciseCoverage', { callCount: true, detailed: true })
     }
     if (heapFile) {
         await post('HeapProfiler.enable')
@@ -554,6 +559,10 @@ async function profiled<T>(file: string | undefined, heapFile: string | undefine
             const { profile } = await post('Profiler.stop')
             fs.writeFileSync(file, JSON.stringify(profile))
         }
+        if (coverageFile) {
+            const { result } = await post('Profiler.takePreciseCoverage')
+            fs.writeFileSync(coverageFile, JSON.stringify(result.filter((script: any) => script.url.includes('/src/engine/'))))
+        }
         if (heapFile) {
             const { profile } = await post('HeapProfiler.stopSampling')
             fs.writeFileSync(heapFile, JSON.stringify(profile))
@@ -563,13 +572,32 @@ async function profiled<T>(file: string | undefined, heapFile: string | undefine
 
 declare var process: any
 
+const watchdogSource = `
+const { workerData } = require('node:worker_threads')
+const fs = require('node:fs')
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.seconds * 1000)
+fs.writeSync(2, '\\nwatchdog: killed after ' + workerData.seconds + 's\\n')
+process.kill(workerData.pid, 'SIGKILL')
+`
+
+function startWatchdog(seconds: number): void {
+    if (!(seconds > 0)) return
+    const worker = new Worker(watchdogSource, { eval: true, workerData: { seconds, pid: process.pid } })
+    worker.unref()
+}
+
 export async function main(...args: string[]) {
     const files = await gatherTestCases()
     const filter = args[0]
+    if (filter === '--engine') {
+        const given = args.find(a => a.startsWith('timeout:'))
+        startWatchdog(given ? Number(given.slice('timeout:'.length)) : args[1] === 'all' ? 120 : 30)
+    }
     if (filter === '--engine' && args[1] !== 'all') {
         const prof = args.find(a => a.startsWith('cpu-prof:'))?.slice('cpu-prof:'.length)
         const heapProf = args.find(a => a.startsWith('heap-prof:'))?.slice('heap-prof:'.length)
-        if (prof || heapProf) return profiled(prof, heapProf, () => testEngine(args[1], args.slice(1)))
+        const coverage = args.find(a => a.startsWith('coverage:'))?.slice('coverage:'.length)
+        if (prof || heapProf || coverage) return profiled(prof, heapProf, () => testEngine(args[1], args.slice(1)), coverage)
     }
     if (filter === '--engine') {
         if (args[1] === 'all') {
