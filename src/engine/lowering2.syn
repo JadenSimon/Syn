@@ -10331,6 +10331,106 @@ function expandCodecs(g: Graph): boolean {
     return found
 }
 
+interface ArithForm { 
+    op: NodeOp
+    li: number
+    ri: number
+    imm: number
+    operandImm: number
+    signed: boolean
+    narrow: boolean
+    narrowCompare: boolean
+    immediate: boolean 
+}
+
+function arithForm(g: Graph, target: lowering.Target, n: GraphNode): ArithForm {
+    const signed = lowering.isSignedType(operandType(g, n, 0)) || lowering.isSignedType(operandType(g, n, 1))
+    const swap = !getRef(n, 0) && getRef(n, 1) !== 0
+        && (Commutative.has(n.op) || SwappedCmp[n.op] !== undefined)
+    const op = swap ? SwappedCmp[n.op] ?? n.op : n.op
+    const cmp = CompareOps.has(op)
+    const li = swap ? 1 : 0
+    const ri = swap ? 0 : 1
+    const imm = getLiteral(g, n, ri)
+    const narrow = !cmp && NarrowableOps.has(op) && typeOf(n) === Types.u32
+    const narrowCompare = cmp && (op === NodeOp.eq || op === NodeOp.ne || !signed) && imm > 0x7FFF_FFFF && imm <= 0xFFFF_FFFF
+        && zeroExtendedBits(operandType(g, n, li)) <= 32
+    const operandImm = narrowCompare ? imm - 0x1_0000_0000 : imm
+    const immediate = !getRef(n, ri) && target.takesImmediate(opName(op), operandImm)
+    return { op, li, ri, imm, operandImm, signed, narrow, narrowCompare, immediate }
+}
+
+function zeroOperand(g: Graph, target: lowering.Target, n: GraphNode, i: number): boolean {
+    return target.zeroReg !== undefined && !getRef(n, i) && getLiteral(g, n, i) === 0
+}
+
+function registerLiterals(g: Graph, target: lowering.Target): void {
+    const floats = floatValues(g)
+    function plain(k: number): Types {
+        return !Number.isInteger(k) ? Types.f64 : k < 0 ? Types.i64 : Types.u64
+    }
+    function narrowed(k: number): Types {
+        return k >= 0 && k <= 0xFFFF_FFFF ? Types.u32 : plain(k)
+    }
+    function inRegister(n: GraphNode, i: number, value: boolean): Types | undefined {
+        const k = getLiteral(g, n, i)
+        if (BinaryOps.has(n.op) || CompareOps.has(n.op)) {
+            if (i > 1) return
+            for (let j = 0; j < 2; j++) if (getRef(n, j) ? floats.has(getRef(n, j)) : !Number.isInteger(getLiteral(g, n, j))) return Types.f64
+            const form = arithForm(g, target, n)
+            if (form.immediate) return i === form.ri ? undefined : plain(k)
+            return form.narrow ? narrowed(k) : plain(k)
+        }
+        if (UnaryOps.has(n.op) || n.op === NodeOp.convert || n.op === NodeOp.bitconvert) return i === 0 ? plain(k) : undefined
+        if (n.op === NodeOp.load) return i === 1 ? plain(k) : undefined
+        if (n.op === NodeOp.store) {
+            if (i === 1) return plain(k)
+            if (i !== 3 || zeroOperand(g, target, n, 3)) return
+            const T = typeOf(n)
+            return T === Types.f64 ? Types.f64 : intrinsics.intrinsicBitWidth(T) <= 32 ? narrowed(k) : plain(k)
+        }
+        if (n.op === NodeOp.select) {
+            if (i === 0) return plain(k)
+            return value && !zeroOperand(g, target, n, i) ? plain(k) : undefined
+        }
+        if (n.op === NodeOp.after) return i === countIds(n) - 1 && value ? plain(k) : undefined
+    }
+    for (const b of g.blocks) {
+        const tails = new Set<number>()
+        const values = new Set<number>()
+        const stack: [id: number, tail: boolean][] = [[b.bodyId, true]]
+        while (stack.length) {
+            const [id, tail] = stack.pop()!
+            const n = getNode(g, id)
+            const into = tail ? tails : values
+            if (!n || n.op === NodeOp.block || into.has(id)) continue
+            into.add(id)
+            const last = countIds(n) - 1
+            for (let i = 0; i < countIds(n); i++) {
+                if (!getRef(n, i)) continue
+                stack.push([getRef(n, i), tail && (n.op === NodeOp.after ? i === last : n.op === NodeOp.select && i > 0)])
+            }
+        }
+        const made = new Map<string, number>()
+        for (const id of new Set([...tails, ...values])) {
+            const n = getNode(g, id)!
+            let ops: Operand[] | undefined
+            for (let i = 0; i < countIds(n); i++) {
+                if (getRef(n, i)) continue
+                const T = inRegister(n, i, values.has(id))
+                if (T === undefined) continue
+                const k = getLiteral(g, n, i)
+                const key = `${T}:${k}`
+                let lifted = made.get(key)
+                if (lifted === undefined) made.set(key, lifted = addNode(g, NodeOp.literal, [{ literal: k }], T))
+                ops ??= getOperands(g, n)
+                ops[i] = lifted
+            }
+            if (ops) putCopy(g, id, n, ops)
+        }
+    }
+}
+
 function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
     const members = g.blocks.map(b => {
         const seen = new Set<number>()
@@ -13156,6 +13256,7 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     const target = opts.target ?? lowering.hostTarget
     const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue, opts.floatSlot) : undefined
+    registerLiterals(g, target)
     return { g, island, analysis: analyzeValueGraph(g, opts) }
 }
 
@@ -13372,10 +13473,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const copyOf = new Map<number, number>()
     const heldBy = new Map<number, number>()
     const done = new Set<number>()
-    const temporariesAt = new Map<number, number[]>()
     const freedAt = new Map<number, number>()
     let materializing = 0
-    let synth = 0
 
 
     const NOTHING = new Set<number>()
@@ -13419,8 +13518,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     function finish(id = materializing, handedOver?: Set<number>): void {
         done.add(id)
         for (const arm of armStack) for (const v of releaseAt.get(arm)?.get(id) ?? []) freeValue(v, id, !handedOver?.has(v))
-        for (const v of temporariesAt.get(id) ?? []) freeValue(v, id, !handedOver?.has(v))
-        temporariesAt.delete(id)
     }
 
     const armStack = [0]
@@ -13736,18 +13833,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         return !getRef(n, i) || floats.has(getRef(n, i)) ? Types.f64 : operandType(g, n, i)
     }
 
-    function demand(id: number, konst: number, want = -1, narrow = false, float = false): number {
-        if (!id) {
-            const k = --synth
-            let temps = temporariesAt.get(materializing)
-            if (!temps) temporariesAt.set(materializing, temps = [])
-            temps.push(k)
-            const r = freeRegIn([volatiles, preserved], NOTHING)
-            if (r < 0) throw 'lowering3: out of registers'
-            bind(k, r)
-            put(() => float ? asm.movF64(r, konst) : asm.movImm(r, konst, narrow))
-            return k
-        }
+    function demand(id: number, konst: number, want = -1): number {
+        if (!id) throw `lowering: literal ${konst} at %${materializing} needs a register but is not a value [unit: ${g.name ?? '<anonymous>'}]`
         const n = getNode(g, id)
         if (n?.op === NodeOp.void) return 0
         if (!homeOf.has(id)) {
@@ -13793,8 +13880,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         defer materializing = outer
         const n = getNode(g, id)
         if (!n || isParam(g.nodes, id)) throw `lowering3: no definition for value ${id} while materializing ${materializing}`
-        const signed = lowering.isSignedType(operandType(g, n, 0)) || lowering.isSignedType(operandType(g, n, 1))
-
         if (n.op === NodeOp.call) { buildCall(id, n); return }
         if (n.op === NodeOp.after) { buildAfter(id, n, want); return }
         if (n.op === NodeOp.select) { buildSelect(id, n, want); return }
@@ -13821,11 +13906,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             put(() => asm.spRead(dst, frame!.allocas + offset))
             return
         }
-        if (BinaryOps.has(n.op) || CompareOps.has(n.op)) { buildArith(id, n, signed, want); return }
+        if (BinaryOps.has(n.op) || CompareOps.has(n.op)) { buildArith(id, n, want); return }
         if (UnaryOps.has(n.op)) {
             const op = n.op
             const float = floatOperand(n, 0)
-            const a = demand(getRef(n, 0), getLiteral(g, n, 0), -1, false, float)
+            const a = demand(getRef(n, 0), getLiteral(g, n, 0))
             const ra = at(a, NOTHING)
             finish()
             const dst = regFor(id, want)
@@ -13875,7 +13960,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         let a = 0
         let b = 0
         for (const i of orderedOperands(id, [0, 1])) {
-            const v = demand(getRef(n, i), getLiteral(g, n, i), -1, false, true)
+            const v = demand(getRef(n, i), getLiteral(g, n, i))
             if (i === 0) a = v
             else b = v
         }
@@ -13889,20 +13974,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         put(() => cmp ? asm.floatCompare(opName(n.op), dst, ra, rb, from) : asm.floatBinary(opName(n.op), dst, ra, rb, from))
     }
 
-    function buildArith(id: number, n: GraphNode, signed: boolean, want: number): void {
+    function buildArith(id: number, n: GraphNode, want: number): void {
         if (floatOperand(n, 0) || floatOperand(n, 1)) return buildFloatArith(id, n, want)
-        const swap = !getRef(n, 0) && getRef(n, 1) !== 0
-            && (Commutative.has(n.op) || SwappedCmp[n.op] !== undefined)
-        const op = swap ? SwappedCmp[n.op] ?? n.op : n.op
+        const { op, li, ri, imm, operandImm, signed, narrow, narrowCompare, immediate } = arithForm(g, target, n)
         const cmp = CompareOps.has(op)
-        const li = swap ? 1 : 0
-        const ri = swap ? 0 : 1
-        const imm = getLiteral(g, n, ri)
-        const narrow = !cmp && NarrowableOps.has(op) && typeOf(n) === Types.u32
-        const narrowCompare = cmp && (op === NodeOp.eq || op === NodeOp.ne || !signed) && imm > 0x7FFF_FFFF && imm <= 0xFFFF_FFFF
-            && zeroExtendedBits(operandType(g, n, li)) <= 32
-        const operandImm = narrowCompare ? imm - 0x1_0000_0000 : imm
-        if (!getRef(n, ri) && target.takesImmediate(opName(op), operandImm)) {
+        if (immediate) {
             const a = demand(getRef(n, li), getLiteral(g, n, li))
             const ra = at(a, NOTHING)
             finish(id)
@@ -13916,7 +13992,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         let a = 0
         let b = 0
         for (const i of orderedOperands(id, [li, ri])) {
-            const v = demand(getRef(n, i), getLiteral(g, n, i), undefined, narrow)
+            const v = demand(getRef(n, i), getLiteral(g, n, i))
             if (i === li) a = v
             else b = v
         }
@@ -14254,17 +14330,13 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         }
     }
 
-    function zeroOperand(n: GraphNode, i: number): boolean {
-        return target.zeroReg !== undefined && !getRef(n, i) && getLiteral(g, n, i) === 0
-    }
-
     function buildStore(id: number, n: GraphNode): void {
         const outer = materializing
         materializing = id
         defer materializing = outer
         done.add(id)
         const T = typeOf(n)
-        const zero = zeroOperand(n, 3)
+        const zero = zeroOperand(g, target, n, 3)
         const wanted = [0, 1]
         if (getRef(n, 2)) wanted.push(2)
         if (!zero) wanted.push(3)
@@ -14279,7 +14351,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             if (i === 3 && T === Types.f64 && getRef(n, 3) && !floats.has(getRef(n, 3))) {
                 throw `lowering: f64 store of the non-f64 value %${getRef(n, 3)} [unit: ${g.name ?? '<anonymous>'}]`
             }
-            const d = demand(getRef(n, i), getLiteral(g, n, i), -1, i === 3 && intrinsics.intrinsicBitWidth(T) <= 32, i === 3 && T === Types.f64)
+            const d = demand(getRef(n, i), getLiteral(g, n, i))
             if (i === 1) b = d
             else if (i === 2) o = d
             else v = d
@@ -14369,7 +14441,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
 
     function buildSelect(id: number, n: GraphNode, want: number): void {
         if (preferBranchless(n)) {
-            const zero = (i: number) => zeroOperand(n, i)
+            const zero = (i: number) => zeroOperand(g, target, n, i)
             const slots: number[] = []
             for (const i of orderedOperands(id, [0, 1, 2])) {
                 if (i > 0 && zero(i)) continue
