@@ -282,6 +282,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     const touched = new Map<number, Set<number>>()
     const contents = new Map<number, Set<number>>()
     const contentReaders = new Map<number, Set<number>>()
+    const fieldsOf = new Map<number, number[]>()
+    const copiers = new Map<number, Set<number>>()
     const storedInto = new Map<number, Map<number, [intrinsics.Types | undefined, number]>>()
     const returns = new Map<number, Set<number>>()
     const returnTargets = new Map<number, Set<number>>()
@@ -720,6 +722,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const sides = [0, 1].map(i => getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))])
         if (sides.some(side => !side.length)) return []
         if (sides.every(side => side.length === 1 && values[side[0]].form === NumberForm.literal)) return [literal(fold(n.op, values[sides[0][0]].literal!, values[sides[1][0]].literal!)!)]
+        const undefinedOnly = (side: number[]) => side.every(v => values[v].kind === ValueKind.undefined)
+        const neverUndefined = (side: number[]) => side.every(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.function || values[v].kind === ValueKind.string)
+        const disjoint = (undefinedOnly(sides[0]) && neverUndefined(sides[1])) || (neverUndefined(sides[0]) && undefinedOnly(sides[1]))
+        if (disjoint && (n.op === NodeOp.eq || n.op === NodeOp.ne)) return [literal(n.op === NodeOp.ne ? 1 : 0)]
         return [fixedValue(Types.bool)]
     }
     function operandNumbers(frame: number, node: number, n: GraphNode): number[] {
@@ -828,6 +834,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         locationIds.set(id, locations.length)
         locations.push({ allocation, key: name, values: [], forms: [], readers: [], writers: [] })
         const loc = locations.length - 1
+        let fields = fieldsOf.get(allocation)
+        if (!fields) fieldsOf.set(allocation, fields = [])
+        fields.push(loc)
+        for (const copier of copiers.get(allocation) ?? []) invalidate(copier)
         if (opaqueAllocations.has(allocation)) setOf(contents, loc).add(Unknown)
         if (name === numberKey) for (const reader of constantReaders.get(allocation) ?? []) setOf(contentReaders, loc).add(reader)
         else if (/^(\[\d+\]|@\d+)$/.test(name)) {
@@ -862,6 +872,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             grew = true
         }
         if (!grew) return
+        for (const copier of copiers.get(locations[loc].allocation) ?? []) invalidate(copier)
         for (const watcher of fieldWatchers.get(loc) ?? []) changed(watcher)
         for (const reader of contentReaders.get(loc) ?? []) {
             const [frame, node] = parse(reader)
@@ -1274,6 +1285,28 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             }
         }
     }
+    function assign(frame: number, id: number, n: GraphNode): void {
+        const target = getRef(n, 2)
+        const source = getRef(n, 3)
+        flow(frame, id, seen(frame, id, target))
+        const into = [...seen(frame, id, target)].flatMap(v => objectsOf(frame, target, v))
+        for (const v of [...seen(frame, id, source)]) {
+            const from = objectsOf(frame, source, v)
+            if (!from.length) exposeArgs(frame, n, 2)
+            for (const allocation of from) {
+                setOf(copiers, allocation).add(key(frame, id))
+                for (const loc of [...fieldsOf.get(allocation) ?? []]) {
+                    const name = locations[loc].key
+                    access(false, frame, id, allocation, name)
+                    for (const to of into) {
+                        const copy = access(true, frame, id, to, name)
+                        if (!locations[copy].forms.includes('prop')) locations[copy].forms.push('prop')
+                        store(copy, [...setOf(contents, loc)])
+                    }
+                }
+            }
+        }
+    }
     function resolveCall(frame: number, id: number, n: GraphNode): void {
         const target = getNode(frames[frame].graph!, getRef(n, 1))
         if (target?.op === NodeOp.syscallTarget) {
@@ -1333,8 +1366,14 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 if (kind === 'method') flow(frame, u, [functionValue(fn!, slot)])
                 else if (kind === 'getter' && fn && host.traceable(fn)) bind(frame, u, user, fn, v, 2)
                 else read(frame, u, access(false, frame, u, allocation, nameOf(k)))
+                if (kind === 'field' && absentKey(allocation, k)) flow(frame, u, [Undefined])
             }
         }
+    }
+    function absentKey(allocation: number, k: Handle): boolean {
+        const { constant, state, proto } = allocations[allocation]
+        if (!constant || state === undefined || heap.getOwnProperty(state, k)) return false
+        return !proto || !heap.getPropertyDescriptor(proto, k)
     }
     function setProperty(frame: number, u: number, user: GraphNode): void {
         const g = frames[frame].graph!
@@ -1366,8 +1405,9 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 flow(frame, id, [Str])
             }
             if (impl && host.traceable(impl)) bind(frame, id, n, impl, undefined, 2)
+            else if (getLiteral(g, n, 1) === rt.Op.assign) assign(frame, id, n)
             else if (getLiteral(g, n, 1) !== rt.Op.typeof) {
-                exposeArgs(frame, n, 2)
+                if (!rt.shallowOps.has(getLiteral(g, n, 1))) exposeArgs(frame, n, 2)
                 flow(frame, id, [opaqueValue(g, id)])
             }
         }
@@ -1457,7 +1497,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     }
     function opaque(frame: number, n: GraphNode, g: Graph): boolean {
         if (n.op === NodeOp.call) return getNode(g, getRef(n, 1))?.op !== NodeOp.syscallTarget && ![...valuesAt(frame, getRef(n, 1))].some(v => values[v].fn || values[v].kind === ValueKind.variable)
-        if (n.op !== NodeOp.rt) return false
+        if (n.op !== NodeOp.rt || rt.shallowOps.has(getLiteral(g, n, 1)) || getLiteral(g, n, 1) === rt.Op.assign) return false
         const impl = rt.bindingOf(getLiteral(g, n, 1))?.impl
         return !(impl && host.traceable(impl))
     }
@@ -1494,7 +1534,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     frames.forEach((frame, f) => {
         const g = frame.graph
         if (!g) return
-        for (const n of g.nodes.values()) {
+        for (const [id, n] of g.nodes) {
+            if (!seeded.has(key(f, id))) continue
             const untraced = n.op === NodeOp.call ? [...valuesAt(f, getRef(n, 1))].flatMap(v => values[v].fn && !host.traceable(values[v].fn!) ? [values[v].fn!] : []) : []
             const blind = opaque(f, n, g)
             if (!blind && !untraced.length) continue
@@ -2392,6 +2433,7 @@ export interface Rep {
     fresh?: boolean
     element?: Rep
     encoded?: boolean
+    constant?: Function
 }
 
 export interface Instantiations {
@@ -2399,6 +2441,7 @@ export interface Instantiations {
     table: Map<string, Instantiation>
     shapes: Map<string, ShapeSignature>
     constantShapes: Map<Handle, string>
+    nullable: Set<string>
     rep(type: Type): string
     repOf(type: Type): Rep
     shapeOf(allocation: number): string | undefined
@@ -2616,6 +2659,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         return id
     }
     const reps = new Map<Type, Rep>()
+    const nullable = new Set<string>()
     function repOf(type: Type): Rep {
         const known = reps.get(type)
         if (known) return known
@@ -2647,6 +2691,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const nulls = !type.fixed.length && !type.bounds.length && type.literals.length === 1 && type.literals[0] === 0
         if (numeric && !nulls) return { text: pointers ? `union<${targets.join('|')}>` : 'union', kind: 'union', targets, nullable: false }
         const fresh = !nativeIds.length && !type.functions.length && !type.string && objects.length > 0 && objects.every(id => !types.objects[id].constant && !raw(id))
+        if (type.undefined || nulls) for (const target of targets) if (shapeTarget(target)) nullable.add(target)
         return { text: `ptr<${targets.join('|')}>${type.undefined || nulls ? '?' : ''}`, kind: 'pointer', targets, nullable: type.undefined || nulls, fresh }
     }
     for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].name !== 'buffer') shapeId(key)
@@ -2655,7 +2700,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (!object.constant || object.state === undefined || !joinable(id) || recordMembers.get(findRecord(id))!.length < 2) return
         constantShapes.set(object.state, shapeId(keyOf(id)))
     })
-    return { keys, table, shapes, constantShapes, rep, repOf: type => repOf(type), shapeOf: id => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { keys, table, shapes, constantShapes, nullable, rep, repOf: type => repOf(type), shapeOf: id => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 
 export interface PlannedUnit {
@@ -2675,6 +2720,12 @@ export interface PlannedUnit {
     boxedCalls: Set<number>
 }
 
+function constantRep(type: Type): Rep | undefined {
+    if (type.functions.length !== 1 || type.closures.length || type.objects.length || type.undefined || type.string || type.unknown) return
+    if (type.literals.length || type.fixed.length || type.bounds.length) return
+    return { text: `fn@${unitIdentity(type.functions[0])}`, kind: 'pointer', targets: ['fn'], nullable: false, constant: type.functions[0] }
+}
+
 export function planUnits(types: ValueTypes, inst: Instantiations): Map<Function, PlannedUnit[]> {
     const created = new Map<number, string[]>()
     const contextFrames = new Map<string, number>()
@@ -2689,7 +2740,7 @@ export function planUnits(types: ValueTypes, inst: Instantiations): Map<Function
         list.push(`%${object.site.node}=${shape}`)
     })
     const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = []) => {
-        const reps = params.map(param => ({ label: param.label, rep: inst.repOf(param.type) }))
+        const reps = params.map(param => ({ label: param.label, rep: constantRep(param.type) ?? inst.repOf(param.type) }))
         const abis = reps.map(param => `${param.label}: ${param.rep.text}`)
         const made = [...new Set(allocations)].sort()
         const returned = inst.repOf(returns)
@@ -3036,7 +3087,7 @@ function repKey(rep: Rep, target: (target: string) => string): string {
     const targets = rep.targets.map(target).join('|')
     switch (rep.kind) {
         case 'number': return `${rep.number}${nullable}`
-        case 'pointer': return `ptr<${targets}>${nullable}`
+        case 'pointer': return rep.constant ? rep.text : `ptr<${targets}>${nullable}`
         case 'union': return `union<${targets}>`
         case 'buffer': return `buf<${rep.element!.encoded ? `enc<${repKey(rep.element!, target)}>` : repKey(rep.element!, target)}>${nullable}`
         case 'any': return rep.text
