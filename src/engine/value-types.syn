@@ -105,6 +105,7 @@ export interface Accesses {
     numeric: Set<number>
     keyHandles: Map<string, Handle>
     floatSets: Map<Function, Map<string, number[]>>
+    consulted: Set<Handle>
 }
 
 export const numberKey = '[number]'
@@ -296,6 +297,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     const delegated = new Map<number, Set<number>>()
     const work: number[] = []
     const queued = new Set<number>()
+    const stale = new Set<number>()
+    const dirty = new Set<number>()
 
     function setOf<K, V>(map: Map<K, Set<V>>, k: K): Set<V> {
         let set = map.get(k)
@@ -519,6 +522,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             const fields = pairs.flatMap(([x, y]) => x === path && !y.includes('.') ? [y] : y === path && !x.includes('.') ? [x] : [])
             common = common ? common.filter(f => fields.includes(f)) : fields
         }
+        if (common?.length) for (const v of valuesAt(frame, node)) consulted.add(allocations[values[v].allocation!].proto!)
         return common ?? []
     }
     function predicate(op: NodeOp, a: string, b: string, positive: boolean): string {
@@ -534,6 +538,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     function negated(p: string): string {
         return p.startsWith('true') ? `false${p.slice(4)}` : `true${p.slice(5)}`
     }
+    const consulted = new Set<Handle>()
     const refutations = new Map<Graph, Map<string, boolean>>()
     let refuting: string | undefined
     const refutationWatchers = new Map<number, Set<string>>()
@@ -628,6 +633,14 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         if (queued.has(k)) return
         queued.add(k)
         work.push(k)
+    }
+    function changed(k: number): void {
+        dirty.add(k)
+        schedule(k)
+    }
+    function invalidate(k: number): void {
+        stale.add(k)
+        schedule(k)
     }
     function valuesAt(frame: number, node: number): Set<number> {
         return setOf(sets, key(frame, node))
@@ -771,7 +784,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             grew = true
         }
         if (grew) {
-            schedule(key(frame, node))
+            changed(key(frame, node))
             recheck(key(frame, node))
         }
     }
@@ -856,7 +869,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             grew = true
         }
         if (!grew) return
-        for (const watcher of fieldWatchers.get(loc) ?? []) schedule(watcher)
+        for (const watcher of fieldWatchers.get(loc) ?? []) changed(watcher)
         for (const reader of contentReaders.get(loc) ?? []) {
             const [frame, node] = parse(reader)
             flow(frame, node, set)
@@ -1069,7 +1082,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             entered.add(key(frame, getRef(n, 0)))
             const params = getBlock(g, getRef(n, 0))!.params
             for (let i = 1; i < countIds(n); i++) {
-                if (getRef(n, i)) schedule(key(frame, getRef(n, i)))
+                if (getRef(n, i)) changed(key(frame, getRef(n, i)))
                 else flow(frame, params[i - 1], carried(g, params[i - 1]) ? widened([literal(getLiteral(g, n, i))]) : [literal(getLiteral(g, n, i))])
             }
         }
@@ -1089,7 +1102,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         if (n.op === NodeOp.indirectTarget) flow(frame, id, [Unknown])
         if (n.op === NodeOp.load && !getRef(n, 1)) flow(frame, id, [opaqueValue(g, id)])
         if (n.op === NodeOp.rt && getLiteral(g, n, 1) === rt.Op.typeof) flow(frame, id, [Str])
-        if (n.op === NodeOp.call || n.op === NodeOp.static || n.op === NodeOp.rt || valuesAt(frame, id).size) schedule(k)
+        if (n.op === NodeOp.call || n.op === NodeOp.static || n.op === NodeOp.rt) invalidate(k)
+        if (valuesAt(frame, id).size) changed(k)
     }
     function receiverOf(g: Graph): number | undefined {
         return g.blocks[0].params.find(p => isThisParam(getNode(g, p)!))
@@ -1331,15 +1345,16 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const [frame, id] = parse(k)
         const g = frames[frame].graph!
         const n = getNode(g, id)!
-        const mine = valuesAt(frame, id)
-        const released = waiting.get(k)
+        const evaluate = stale.delete(k)
+        const propagate = dirty.delete(k)
+        const released = propagate ? waiting.get(k) : undefined
         if (released) {
             waiting.delete(k)
             for (const node of released) seedNode(frame, node)
         }
         if (!seeded.has(k)) return
-        if (n.op === NodeOp.call) resolveCall(frame, id, n)
-        if (n.op === NodeOp.rt) {
+        if (n.op === NodeOp.call && evaluate) resolveCall(frame, id, n)
+        if (n.op === NodeOp.rt && evaluate) {
             const impl = rt.bindingOf(getLiteral(g, n, 1))?.impl
             if (getLiteral(g, n, 1) === rt.Op.concat) {
                 resultTyped.add(k)
@@ -1351,11 +1366,12 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 flow(frame, id, [opaqueValue(g, id)])
             }
         }
-        if (n.op === NodeOp.static) {
+        if (n.op === NodeOp.static && evaluate) {
             const init = literalFunction(g, getRef(n, 0))
             if (init && host.traceable(init)) bind(frame, id, n, init, undefined, countIds(n))
             else flow(frame, id, [Unknown])
         }
+        if (!propagate) return
         for (const [loc, [T, node]] of storedInto.get(k) ?? []) store(loc, typed(seen(frame, node, id), T))
         for (const [u, slot] of usersOf(g).get(id) ?? []) {
             const user = getNode(g, u)!
@@ -1419,10 +1435,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                     }
                     break
                 case NodeOp.call:
-                    if (slot >= 1) schedule(key(frame, u))
+                    if (slot >= 1) invalidate(key(frame, u))
                     break
                 case NodeOp.rt:
-                    if (slot >= 2) schedule(key(frame, u))
+                    if (slot >= 2) invalidate(key(frame, u))
                     break
             }
         }
@@ -1617,7 +1633,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         console.log(lines.join('\n'))
     })
     if (intrinsics.argv().includes('analysis-stats')) console.log('ANALYSIS-RUN', roots.map(r => r.name).join(','), 'frames', frames.length, 'allocations', allocations.length, 'locations', locations.length, 'values', values.length, 'variant', !!fixedFloats)
-    return { allocations, locations, values, nodes: out, units, frames: frameValues, graphs, numeric, keyHandles, floatSets }
+    return { allocations, locations, values, nodes: out, units, frames: frameValues, graphs, numeric, keyHandles, floatSets, consulted }
 }
 
 export interface Type {
@@ -1772,6 +1788,7 @@ function merge<T>(a: T[], b: T[]): T[] {
 }
 
 function union(a: Type, b: Type): Type {
+    if (a === b) return a
     return {
         undefined: a.undefined || b.undefined,
         string: a.string || b.string,
@@ -1796,10 +1813,15 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     }
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
-    if (broken.size) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) }, undefined, fixedFloats)
+    if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) }, undefined, fixedFloats)
     const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, proto: allocation.proto, state: allocation.state, fields: new Map(), forms: new Map(), initialized: new Set<string>(), escaped: allocation.escaped, readers: [] }))
+    const interned = new Map<string, Type>()
     function typeOf(list: number[]): Type {
+        const k = list.join()
+        const known = interned.get(k)
+        if (known) return known
         const type = emptyType()
+        interned.set(k, type)
         if (!list.length) type.undefined = true
         for (const v of list) {
             const value = data.values[v]
@@ -2544,7 +2566,15 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         shapeIds.set(key, id)
         return id
     }
-    function repOf(type: Type, pointers = true): Rep {
+    const reps = new Map<Type, Rep>()
+    function repOf(type: Type): Rep {
+        const known = reps.get(type)
+        if (known) return known
+        const rep = repFor(type, true)
+        reps.set(type, rep)
+        return rep
+    }
+    function repFor(type: Type, pointers: boolean): Rep {
         if (type.unknown) return { text: 'any', kind: 'any', targets: [], nullable: false }
         const numeric = type.fixed.length > 0 || type.bounds.length > 0 || type.literals.length > 0
         const objects = type.objects.filter(id => !types.objects[id].native)
