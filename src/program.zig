@@ -22978,6 +22978,9 @@ pub const Analyzer = struct {
         if (s.getKind() == .alias) {
             const r = try this.maybeResolveAlias(subject);
             if (r == subject) {
+                if (comptime suppress_gaps) {
+                    return @intFromEnum(Kind.error_any);
+                }
                 debugPrint("subject: ", .{});
                 this.printTypeInfo(r);
                 debugPrint("element: ", .{});
