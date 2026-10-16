@@ -661,7 +661,12 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         if (T === Types.unknown_number) return [...incoming].map(v => opaqueKind(v) ? boundValue('num64') : v)
         if (T === Types.u64 || T === Types.usize || T === Types.ptr) return [...incoming].map(v => opaqueKind(v) ? fixedValue(T) : v)
         if (!scalarType(T)) return incoming
-        return [...incoming].map(v => values[v].kind === ValueKind.number || opaqueKind(v) ? fixedValue(T) : v)
+        return [...incoming].map(v => (values[v].kind === ValueKind.number && !fitsLiteral(v, T)) || opaqueKind(v) ? fixedValue(T) : v)
+    }
+    function fitsLiteral(v: number, T: intrinsics.Types): boolean {
+        const value = values[v]
+        if (value.form !== NumberForm.literal || !Number.isInteger(value.literal) || T === Types.f64 || T === Types.f32 || T === Types.f16) return false
+        return intrinsics.inRange(T, value.literal)
     }
     function opaqueKind(v: number): boolean {
         return values[v].kind === ValueKind.unknown || values[v].kind === ValueKind.variable
@@ -2866,32 +2871,55 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     return { fields: new Map(), sites: new Map() }
 }
 
-function movedWords(g: Graph): Set<number> {
-    const known = movedSets.get(g)
+interface Moves {
+    words: Set<number>
+    elements: ElementReads
+}
+
+export type ElementReads = Set<Handle> | 'all'
+
+function movesOf(g: Graph): Moves {
+    const known = moveSets.get(g)
     if (known) return known
     const users = usersOf(g)
-    const memo = new Map<number, boolean>()
-    function moved(id: number): boolean {
-        const done = memo.get(id)
-        if (done !== undefined) return done
-        memo.set(id, false)
-        const result = (users.get(id) ?? []).every(([user, slot]) => {
-            const n = getNode(g, user)!
-            if (n.op === NodeOp.after) return slot < countIds(n) - 1 || moved(user)
-            if (slot === 0 && (n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp || n.op === NodeOp.call)) return true
-            if (n.op === NodeOp.store) return slot === 3 && resultType(g, n) === Types.vm_value
-            if (n.op === NodeOp.call) return slot >= 3
-            return n.op === NodeOp.ret && slot === 0
-        })
-        memo.set(id, result)
-        return result
+    function movedBy(passing: boolean): (id: number) => boolean {
+        const memo = new Map<number, boolean>()
+        function moved(id: number): boolean {
+            const done = memo.get(id)
+            if (done !== undefined) return done
+            memo.set(id, false)
+            const result = (users.get(id) ?? []).every(([user, slot]) => {
+                const n = getNode(g, user)!
+                if (n.op === NodeOp.after) return slot < countIds(n) - 1 || moved(user)
+                if (slot === 0 && (n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp || n.op === NodeOp.call)) return true
+                if (n.op === NodeOp.store) return slot === 3 && resultType(g, n) === Types.vm_value
+                if (n.op === NodeOp.setProp) return passing && slot === 3
+                if (n.op === NodeOp.call) return passing && slot >= 3
+                return n.op === NodeOp.ret && slot === 0
+            })
+            memo.set(id, result)
+            return result
+        }
+        return moved
     }
-    const out = new Set<number>()
-    for (const [id, n] of g.nodes) if (((n.op === NodeOp.load && resultType(g, n) === Types.vm_value) || g.blocks[0].params.includes(id)) && moved(id)) out.add(id)
-    movedSets.set(g, out)
+    const moved = movedBy(true)
+    const kept = movedBy(false)
+    const words = new Set<number>()
+    let elements: ElementReads = new Set<Handle>()
+    for (const [id, n] of g.nodes) {
+        const load = n.op === NodeOp.load && resultType(g, n) === Types.vm_value
+        if (n.op === NodeOp.load && elements !== 'all' && !(load && kept(id))) {
+            const base = getNode(g, getRef(n, 1))
+            if (base?.op === NodeOp.load) elements = 'all'
+            else if (base?.op === NodeOp.getProp && !getRef(base, 2)) elements.add(getLiteral(g, base, 2) as Handle)
+        }
+        if ((load || n.op === NodeOp.getProp || n.op === NodeOp.call || g.blocks[0].params.includes(id)) && moved(id)) words.add(id)
+    }
+    const out = { words, elements }
+    moveSets.set(g, out)
     return out
 }
-const movedSets = new WeakMap<Graph, Set<number>>()
+const moveSets = new WeakMap<Graph, Moves>()
 
 function rawCandidate(g: Graph): boolean {
     const seen = new Set<number>()
@@ -2912,6 +2940,18 @@ function shapeTarget(target: string): boolean {
     return target.startsWith('S')
 }
 
+function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean): string {
+    if (rep.number === 'int' || (rep.kind === 'undefined' && !param) || (rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str')) return 'word'
+    if (rep.kind === 'number') return rep.number!
+    return `${repKey(rep, target => movedTarget(target, reduced))}${rep.fresh ? '!' : ''}`
+}
+
+function movedTarget(target: string, reduced: (target: string) => boolean): string {
+    const kind = shapeTarget(target) ? 'S' : target.startsWith('clo@') ? 'clo' : undefined
+    if (kind === undefined) return target
+    return reduced(target) ? `${kind}R` : kind
+}
+
 function repKey(rep: Rep, target: (target: string) => string): string {
     const nullable = rep.nullable ? '?' : ''
     const targets = rep.targets.map(target).join('|')
@@ -2925,7 +2965,7 @@ function repKey(rep: Rep, target: (target: string) => string): string {
     }
 }
 
-export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: boolean) => string, sites: Map<PlannedUnit, Map<number, string>>, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
+export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, string>>, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
     const byNode = <T>(map: Map<number, T>, show: (value: T) => string) => [...map].sort((a, b) => a[0] - b[0]).map(([node, value]) => `%${node}:${show(value)}`).join(' ')
     const units = [...plan.values()].flat()
     const intern = (keyOf: (unit: PlannedUnit) => string): [Map<PlannedUnit, number>, number] => {
@@ -2941,19 +2981,19 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
     }
     const parts = (unit: PlannedUnit) => {
         const g = graphOf(unit.fn)
-        const elements = [...g.nodes.values()].some(n => n.op === NodeOp.load || n.op === NodeOp.store)
+        const { words: moved, elements } = movesOf(g)
         const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
         const value = (rep: Rep) => rep.kind === 'number' ? rep.number! : view(rep)
         const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : value(rep)
         const returns = unit.returns.kind === 'pointer' && unit.returns.fresh && unit.returns.targets.length === 1 && shapeTarget(unit.returns.targets[0]) && (!unit.returns.nullable || rawCandidate(g)) ? view(unit.returns) : unit.returns.number === 'f64' ? 'f64' : 'word'
-        const moved = movedWords(g)
-        const opaque = (rep: Rep) => rep.kind === 'number' ? rep.number! : `${repKey(rep, target => shapeTarget(target) ? 'S' : target)}${rep.fresh ? '!' : ''}`
+        const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced)
         const entry = g.blocks[0].params
+        const keyed = (id: number) => !moved.has(id) || getNode(g, id)!.op !== NodeOp.load
         return [
             unitIdentity(unit.fn), unit.boxes, [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
-            `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep) : value(p.rep)}`).join(',')}->${returns}`,
+            `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${returns}`,
             byNode(unit.allocations, shape => layoutOf(shape, elements)), byNode(sites.get(unit) ?? new Map<number, string>(), k => k),
-            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(new Map([...unit.nodes].filter(([id]) => !moved.has(id) || entry.includes(id)).map(([id, rep]) => [id, moved.has(id) ? opaque(rep) : node(rep)])), x => x),
+            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? opaque(rep, entry.includes(id)) : node(rep)])), x => x),
         ]
     }
     let [classes, count] = intern(unit => parts(unit).join('|'))
