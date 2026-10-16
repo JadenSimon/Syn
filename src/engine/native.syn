@@ -37,7 +37,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, type Generic, instantiate, type ElementReads, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
+import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -649,8 +649,9 @@ function writesStaticMemory(program: ProgramGraph): boolean {
 }
 
 function foldStaticLoads(program: ProgramGraph): void {
-    const regions = program.image.staticRegions
-    if (!regions.length || writesStaticMemory(program)) return
+    const image = program.image
+    const regions = image.staticRegions.length && !writesStaticMemory(program) ? [...image.readonlyRegions, ...image.staticRegions] : image.readonlyRegions
+    if (!regions.length) return
     for (const symbol of reachUnits(program)) {
         const g = program.units.get(symbol)
         if (!g) continue
@@ -662,7 +663,10 @@ function foldStaticLoads(program: ProgramGraph): void {
             const n = getNode(g, id)
             let value: number | undefined
             if (n?.op === NodeOp.literal) value = getLiteral(g, n, 0)
-            else if (n?.op === NodeOp.after) value = operand(n, countIds(n) - 1)
+            else if (n?.op === NodeOp.heapHandle && !getRef(n, 0)) {
+                const slot = image.dataHandles.get(heap.deref(getLiteral(g, n, 0) as intrinsics.Handle))
+                value = slot === undefined ? undefined : image.knownValue(slot)
+            } else if (n?.op === NodeOp.after) value = operand(n, countIds(n) - 1)
             else if (n?.op === NodeOp.add) {
                 const a = operand(n, 0), b = operand(n, 1)
                 if (a !== undefined && b !== undefined) value = a + b
@@ -1700,6 +1704,7 @@ function createImage() {
     const statics = new Map<number, number>()
     const staticSymbols: number[] = []
     const staticRegions: [base: number, size: number][] = []
+    const readonlyRegions: [base: number, size: number][] = []
     const staticTable = { base: 0 }
     function valueSlot(value: PoolValue): number {
         const known = pooled.get(value)
@@ -1765,8 +1770,8 @@ function createImage() {
         addressSlots.set(handle, slot)
         return slot
     }
-    function constructionSlot(cell: number, graphOf: (cell: number) => Graph | undefined): number {
-        return addressSlot(cell, `construction @${cell}`, () => placeConstruction(cell, graphOf))
+    function constructionSlot(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean): number {
+        return addressSlot(cell, `construction @${cell}`, () => placeConstruction(cell, graphOf, readonly))
     }
     function staticObjectSlot(handle: intrinsics.Handle): number {
         return addressSlot(handle, `static @${handle}`, () => placeObject(handle, () => undefined, why => { throw `native: static object @${handle} cannot be placed: ${why}` }))
@@ -1783,7 +1788,7 @@ function createImage() {
     }
     const placedConstructions = new Map<number, number>()
     const placingConstructions = new Set<number>()
-    function placeConstruction(cell: number, graphOf: (cell: number) => Graph | undefined): number {
+    function placeConstruction(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean): number {
         const known = placedConstructions.get(cell)
         if (known !== undefined) return known
         const fail = (why: string): never => { throw `native: construction @${cell} cannot be placed in static memory: ${why}` }
@@ -1802,7 +1807,7 @@ function createImage() {
         function construction(id: number): number | undefined {
             const n = getNode(graph, id)
             if (n?.op !== NodeOp.heapHandle || getRef(n, 0) || !graphOf(getLiteral(graph, n, 0))) return
-            return placeConstruction(getLiteral(graph, n, 0), graphOf)
+            return placeConstruction(getLiteral(graph, n, 0), graphOf, readonly)
         }
         function constantString(id: number): number | undefined {
             const n = getNode(graph, id)
@@ -1850,6 +1855,7 @@ function createImage() {
             const allocated = allocation(id)
             return allocated ? addresses.get(allocated) : undefined
         }, fail)
+        if (readonly(cell)) readonlyRegions.push([at, propertyEval.dataKeys(heap.deref(cell as intrinsics.Handle)).length * 8])
         placingConstructions.delete(cell)
         placedConstructions.set(cell, at)
         return at
@@ -1880,7 +1886,7 @@ function createImage() {
         return at
     }
     return {
-        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticRegions, staticTable,
+        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticRegions, readonlyRegions, staticTable,
         valueSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot,
         knownValue: (slot: number) => final.get(slot),
     }
@@ -3977,6 +3983,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         return codeOf(fn)!.scope?.length ? undefined : fn
     }
     const placedStatics = new Set<number>()
+    const readonlyConstructions = new Set<intrinsics.Handle>()
     function functionSlot(symbol: number): number {
         return image.functionSlot(symbol, functions[symbol]?.name || `${symbol}`)
     }
@@ -3987,7 +3994,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (n.op !== NodeOp.heapHandle) continue
             const handle = heap.deref(getLiteral(graph, n, 0) as intrinsics.Handle)
             if (session.constructions.has(getLiteral(graph, n, 0) as u32)) {
-                dataHandleSlots.set(handle, image.constructionSlot(getLiteral(graph, n, 0), cell => session.constructions.get(cell as u32)?.graph))
+                dataHandleSlots.set(handle, image.constructionSlot(getLiteral(graph, n, 0), cell => session.constructions.get(cell as u32)?.graph, cell => readonlyConstructions.has(heap.deref(cell as intrinsics.Handle))))
                 continue
             }
             if (placedStatics.has(handle)) {
@@ -4034,7 +4041,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
     intrinsics.assert(roots.size > 0)
     for (const fn of Object.values(fns)) discover(fn)
     for (const fn of Object.values(fns)) schedule(fn)
-    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureBody, closureFunction, closureByContext, functionOfCell, placedStatics, discover, schedule, link, linkRuntimeCalls, linkStatics, staticOrder, isRoot, defaultsOf, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
+    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureBody, closureFunction, closureByContext, functionOfCell, placedStatics, readonlyConstructions, discover, schedule, link, linkRuntimeCalls, linkStatics, staticOrder, isRoot, defaultsOf, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
 }
 
 function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramImage, facts: Facts, clock: PhaseClock) {
@@ -4528,13 +4535,22 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         for (const fn of discovered) if (codeOf(fn)) graphsOf(fn)
     }
     let fixedStatic: ((state: intrinsics.Handle, key: intrinsics.Handle) => boolean) | undefined
-    function assume(state: intrinsics.Handle, key: intrinsics.Handle, unit: string): void {
-        if (!fixedStatic) assumed.push([state, key, unit])
-        else if (!fixedStatic(state, key)) throw `native: ${unit} inlined ${describe(state)}.${heap.isString(key) ? heap.stringToJs(key) : key}, which compiled code writes`
+    function analyzedState(cell: intrinsics.Handle): intrinsics.Handle | undefined {
+        if (!heap.isArray(cell)) return heap.deref(cell)
+        const engine = engineArrays.get(heap.isIndirect(cell) ? heap.indirectTarget(cell) : cell)
+        return engine === undefined ? undefined : heap.deref(engine)
+    }
+    function assume(cell: intrinsics.Handle, key: intrinsics.Handle, unit: string): void {
+        if (!fixedStatic) {
+            assumed.push([cell, key, unit])
+            return
+        }
+        const state = analyzedState(cell)
+        if (state !== undefined && !fixedStatic(state, key)) throw `native: ${unit} inlined ${describe(heap.deref(cell))}.${heap.isString(key) ? heap.stringToJs(key) : key}, which compiled code writes`
     }
     function useStaticFacts(fixed: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean): void {
         fixedStatic = fixed
-        for (const [state, key, unit] of assumed.splice(0)) assume(state, key, unit)
+        for (const [cell, key, unit] of assumed.splice(0)) assume(cell, key, unit)
     }
     function runtimeObjects() {
         return session.runtime!.objects
@@ -4571,6 +4587,9 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         const linked: any = session.stubFunctions.get(runtimeObjects().intern(slot) as u32)
         const fn = linked && isLocalStub(linked) ? functions[linked.__localTarget] : linked
         return !!fn?.shouldInline
+    }
+    function reference(slot: intrinsics.Handle): boolean {
+        return slot > 1 && !heap.isBoxedF64(slot)
     }
     function staticRead(traced: Traced, n: GraphNode): intrinsics.Handle | undefined {
         if (n.op !== NodeOp.getProp || getRef(n, 2)) return
@@ -4665,11 +4684,8 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             if (cell === undefined) continue
             const state = heap.deref(cell)
             const slot = dataSlot(state, key)
-            if (slot === undefined) continue
-            if (!heap.isArray(state)) {
-                if (!tagged(slot)) continue
-                assume(state, key, graph.name ?? '?')
-            }
+            if (slot === undefined || !(tagged(slot) || reference(slot))) continue
+            assume(cell, key, graph.name ?? '?')
             foldRead(graph, id, n, valueOf(slot), folded)
         }
         retarget(graph, folded)
@@ -5198,7 +5214,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
 }
 
 function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: ReturnType<typeof createTracer>, facts: Facts, clock: PhaseClock) {
-    const { session, functions, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureFunction, closureByContext, placedStatics, link, linkRuntimeCalls, isRoot, defaultsOf, sourceOfLinked, usesReceiver, thisParamOf, calleeOf } = linker
+    const { session, functions, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureFunction, closureByContext, placedStatics, readonlyConstructions, link, linkRuntimeCalls, isRoot, defaultsOf, sourceOfLinked, usesReceiver, thisParamOf, calleeOf } = linker
     const { graphsOf, reachableNodes } = tracer
     const refinements = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     const fixed = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
@@ -5608,8 +5624,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
                 if (n.op !== NodeOp.heapHandle || getRef(n, 0) || countIds(n) !== 1) continue
                 const cell = getLiteral(traced.graph, n, 0) as intrinsics.Handle
                 const state = cell ? heap.deref(cell) : 0 as intrinsics.Handle
-                const fresh = cell && heap.isIndirect(cell) && !session.sealed.has(cell) ? allocationShapes.get(id) : undefined
-                const shape = fresh ?? (state ? planned!.constants.get(state) : undefined)
+                const shape = state ? planned!.constants.get(state) : undefined
                 if (shape === undefined) continue
                 if (traced.graph === unit.traced!.graph) traced.graph = withNodes(traced.graph, new Map(traced.graph.nodes))
                 putNode(traced.graph, id, NodeOp.heapHandle, [{ literal: cell }, { literal: state }])
@@ -5631,7 +5646,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
             })
         }
         const evaluate = () => propertyEval.resolveClosures(traced.graph, session, frameShapes, params, constructed(plannedUnit, traced.graph), callsFor(traced.graph, fn), {
-            facts, allocationShapes, fixedFacts: planned!.fixed, statics: placedStatics, allocations: traced.allocations, rawReturns: !encodesReturns(fn),
+            facts, allocationShapes, fixedFacts: planned!.fixed, readonly: readonlyConstructions, statics: placedStatics, allocations: traced.allocations, rawReturns: !encodesReturns(fn),
             plannedShapes: plannedUnit ? plannedNodeShapes(plannedUnit) : undefined, plannedUnions: plannedUnit ? plannedUnions(plannedUnit) : undefined,
             contextShape: unit.contextShape, unionParams: unionParamBases(fn), bound: unit.cold,
             created: (closure, shape) => {
@@ -5947,7 +5962,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const { normalize } = clock
     const image = createImage()
     const linker = createLinker(fns, opts, image)
-    const { session, functions, roots, order, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureBody, placedStatics, link, staticOrder, resolveHandles } = linker
+    const { session, functions, roots, order, staticFns, unitOf, originOf, constructsOutOfLine, codeOf, closureBody, placedStatics, readonlyConstructions, link, staticOrder, resolveHandles } = linker
     const facts: Facts = new Map()
     const plannedHandles = new Set<intrinsics.Handle>()
     const tracer = createTracer(linker, image, facts, clock)
@@ -6226,7 +6241,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         const sites = new Map<PlannedUnit, Map<number, intrinsics.Handle>>()
         for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, k]) => [node, types.keyHandles.get(k)!])))
         const fixedStatic = (state: intrinsics.Handle, key: intrinsics.Handle) => fixedField(types, state, key)
-        const owned = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
+        const constructed = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
+        for (const state of constructed) if (fixedState(types, state)) readonlyConstructions.add(state)
+        const owned = new Set(constructed)
         for (const unit of tracer.units) for (const cell of unit.traced!.allocations?.keys() ?? []) owned.add(heap.deref(cell as intrinsics.Handle))
         function folds(site: Site): boolean {
             const traced = graphsOf(site.unit).traced!
@@ -6235,11 +6252,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         }
         for (const [state, ids] of types.stateAllocations) {
             if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
-            const accessed = ids.some(id => {
-                const object = types.objects[id]
-                return object.escaped || [...object.forms.values()].some(forms => forms.some(form => form !== 'init')) || object.readers.some(site => !folds(site))
-            })
-            if (accessed) placedStatics.add(state)
+            if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
         }
         return { units: plan, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites }, fixedStatic }
     }
