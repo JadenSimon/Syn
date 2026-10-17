@@ -62,10 +62,17 @@ type EmitCtx = {
 }
 const thisSymbol = -3
 
-interface EhRange {
+export interface EhRange {
     start: number
     end: number
     handler: number
+}
+
+export function ehHandler(ranges: readonly EhRange[], pc: number): number {
+    for (const range of ranges) {
+        if (pc >= range.start && pc <= range.end) return range.handler
+    }
+    return -1
 }
 
 interface Labels {
@@ -485,22 +492,30 @@ function emitFunction(
     }
 
     type IteratorScope = { iterator: number, open: number }
-    const iterators: IteratorScope[] = []
+    type Guard = { start: number, segments: EhRange[] }
     type LoopLabels = {
         breaks: number[]
         continues: number[]
         continueTarget: number
         canContinue: boolean
         iterator?: IteratorScope
+        finallyBlock?: ts.Block
+        guard?: Guard
         outer?: LoopLabels
         names: string[]
         labeledOnly?: boolean
     }
     let labels: LoopLabels | undefined = undefined
     let pendingLabels: string[] = []
-    function enterLabels(continueTarget: number, canContinue: boolean, iterator?: IteratorScope): LoopLabels {
-        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget, canContinue, iterator, outer: labels, names: pendingLabels }
+    function enterLabels(continueTarget: number, canContinue: boolean): LoopLabels {
+        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget, canContinue, outer: labels, names: pendingLabels }
         pendingLabels = []
+        labels = ctx
+        return ctx
+    }
+    function enterGuarded(): LoopLabels {
+        const ctx: LoopLabels = { breaks: [], continues: [], continueTarget: -1, canContinue: false, outer: labels, names: [], labeledOnly: true }
+        ctx.guard = openGuard()
         labels = ctx
         return ctx
     }
@@ -517,23 +532,62 @@ function emitFunction(
         if (label !== undefined) throw `unknown label: ${label}`
         throw continuing ? "`continue` outside of a loop" : "`break` outside of a loop"
     }
-    function closeIterators(target: LoopLabels, inclusive: boolean): void {
-        for (let ctx = labels; ctx; ctx = ctx.outer) {
-            if (ctx === target && !inclusive) return
-            if (ctx.iterator) emitIteratorClose(ctx.iterator)
-            if (ctx === target) return
+    function openGuard(): Guard {
+        return { start: code.length, segments: [] }
+    }
+    function suspendGuard(guard: Guard): void {
+        if (code.length > guard.start) {
+            const range: EhRange = { start: guard.start, end: code.length, handler: 0 }
+            guard.segments.push(range)
+            getExtraLabels().eh.push(range)
         }
+        guard.start = -1
+    }
+    function resumeGuards(guards: Guard[]): void {
+        for (const guard of guards) guard.start = code.length
+    }
+    function handleGuard(guard: Guard): void {
+        for (const range of guard.segments) range.handler = code.length
+    }
+    function hasCleanup(): boolean {
+        for (let ctx = labels; ctx; ctx = ctx.outer) {
+            if (ctx.iterator || ctx.finallyBlock) return true
+        }
+        return false
+    }
+    function leaveScopes(target: LoopLabels | undefined, inclusive: boolean): Guard[] {
+        const inner = labels
+        const guards: Guard[] = []
+        let suspended = 0
+        for (let ctx = labels; ctx; ctx = ctx.outer) {
+            if (ctx === target && !inclusive) break
+            if (ctx.guard) guards.push(ctx.guard)
+            if (ctx.iterator || ctx.finallyBlock) {
+                while (suspended < guards.length) {
+                    suspendGuard(guards[suspended])
+                    suspended += 1
+                }
+                labels = ctx.outer
+                if (ctx.iterator) emitIteratorClose(ctx.iterator)
+                if (ctx.finallyBlock) emitBlock(ctx.finallyBlock)
+                labels = inner
+            }
+            if (ctx === target) break
+        }
+        return guards.slice(0, suspended)
     }
     function emitBreak(label?: string) {
         const target = jumpTarget(label, false)
-        closeIterators(target, true)
+        const suspended = leaveScopes(target, true)
         target.breaks.push(emitJumpPlaceholder(Op.Jump))
+        resumeGuards(suspended)
     }
     function emitContinue(label?: string) {
         const target = jumpTarget(label, true)
-        closeIterators(target, false)
-        if (target.continueTarget >= 0) { emitJumpTo(Op.Jump, target.continueTarget); return }
-        target.continues.push(emitJumpPlaceholder(Op.Jump))
+        const suspended = leaveScopes(target, false)
+        if (target.continueTarget >= 0) emitJumpTo(Op.Jump, target.continueTarget)
+        else target.continues.push(emitJumpPlaceholder(Op.Jump))
+        resumeGuards(suspended)
     }
 
     function internString(s: string): number {
@@ -2130,20 +2184,20 @@ function emitFunction(
         emit2(Op.GetPropertyConst, internString('value'))
         star(step)
         emit1(Op.LdaTrue); star(open)
-        const range: EhRange = { start: code.length, end: 0, handler: 0 }
+        const guard = openGuard()
         ldar(step)
         if (binding) assignPattern(binding)
         else if (ts.isIdentifier(node.initializer)) star(symToReg.get(getSymbolId(node.initializer))!)
         else throw 'for...of assignment target must be an identifier'
 
-        const ctx = enterLabels(top, true, scope)
-        iterators.push(scope)
+        const ctx = enterLabels(top, true)
+        ctx.iterator = scope
+        ctx.guard = guard
         emitStatement(node.statement)
-        iterators.pop()
-        range.end = code.length
+        suspendGuard(guard)
         emitJumpTo(Op.Jump, top)
 
-        range.handler = code.length
+        handleGuard(guard)
         skipNextLookbehind = true
         const error = allocReg(); star(error)
         const closeRange: EhRange = { start: code.length, end: 0, handler: 0 }
@@ -2153,48 +2207,61 @@ function emitFunction(
         ldar(error)
         emit1(Op.ReThrow)
         freeReg()
-        const extras = getExtraLabels()
-        extras.eh.push(closeRange, range)
+        getExtraLabels().eh.push(closeRange)
         patchJump(end)
         for (const at of ctx.breaks) patchJump(at)
     }
 
-    // TODO: `finally` which requires swapping out subsequent control flow labels w/ jumps
     function emitTryStatement(node: ts.TryStatement) {
-        if (node.finallyBlock) throw "TODO: finally block"
-        const extras = getExtraLabels()
-        const range: EhRange = {
-            start: code.length,
-            end: 0,
-            handler: 0,
+        if (!node.finallyBlock) {
+            emitTryCatch(node.tryBlock, node.catchClause!)
+            return
         }
-        emitBlock(node.tryBlock)
-        range.end = code.length
-        // FIXME: we don't need a jump if the block ends with an unconditional jump
-        const handleEnd = extras.jump.length
-        emit2(Op.JumpLabel, handleEnd)
+        const savedLabels = labels
+        const ctx = enterGuarded()
+        ctx.finallyBlock = node.finallyBlock
+        if (node.catchClause) emitTryCatch(node.tryBlock, node.catchClause)
+        else emitBlock(node.tryBlock)
+        suspendGuard(ctx.guard!)
+        labels = savedLabels
+        emitBlock(node.finallyBlock)
+        const done = emitJumpPlaceholder(Op.Jump)
 
-        if (!node.catchClause) {
-            range.handler = code.length
-            emit1(Op.ReThrow)
-            extras.jump[handleEnd] = code.length
-        } else {
-            prevStoreOffset = -1 // acc was clobbered
-            range.handler = code.length
-            const decl = node.catchClause.variableDeclaration
-            if (decl && ts.isIdentifier(decl.name)) {
-                const reg = bindingReg(getSymbolId(decl.name))
-                symToReg.set(getSymbolId(decl.name), reg)
-                star(reg)
-            } else if (decl) {
-                bindPattern(decl.name)
-                assignPattern(decl.name)
-            }
-            emitBlock(node.catchClause.block)
-            extras.jump[handleEnd] = code.length
+        handleGuard(ctx.guard!)
+        prevStoreOffset = -1
+        skipNextLookbehind = true
+        const error = allocReg(); star(error)
+        emitBlock(node.finallyBlock)
+        ldar(error)
+        emit1(Op.ReThrow)
+        freeReg()
+        patchJump(done)
+        skipNextLookbehind = true
+    }
+
+    function emitTryCatch(tryBlock: ts.Block, catchClause: ts.CatchClause) {
+        const savedLabels = labels
+        const ctx = enterGuarded()
+        emitBlock(tryBlock)
+        suspendGuard(ctx.guard!)
+        labels = savedLabels
+        const done = emitJumpPlaceholder(Op.Jump)
+
+        handleGuard(ctx.guard!)
+        prevStoreOffset = -1
+        skipNextLookbehind = true
+        const decl = catchClause.variableDeclaration
+        if (decl && ts.isIdentifier(decl.name)) {
+            const reg = bindingReg(getSymbolId(decl.name))
+            symToReg.set(getSymbolId(decl.name), reg)
+            star(reg)
+        } else if (decl) {
+            bindPattern(decl.name)
+            assignPattern(decl.name)
         }
-
-        extras.eh.push(range)
+        emitBlock(catchClause.block)
+        patchJump(done)
+        skipNextLookbehind = true
     }
 
     function emitSwitch(node: ts.SwitchStatement) {
@@ -2347,7 +2414,8 @@ function emitFunction(
         currentNode = node
   
         if (ts.isReturnStatement(node)) {
-            if (!node.expression && !iterators.length) {
+            const cleanups = hasCleanup()
+            if (!node.expression && !cleanups) {
                 if (isConstructor) ldar(thisReg!)
                 emit1(isConstructor ? Op.Return : Op.ReturnVoid)
                 return
@@ -2355,13 +2423,16 @@ function emitFunction(
             if (node.expression) emitExpr(node.expression)
             else if (isConstructor) ldar(thisReg!)
             else emit1(Op.LdaUndefined)
-            if (iterators.length) {
-                const value = allocReg(); star(value)
-                for (let i = iterators.length - 1; i >= 0; i--) emitIteratorClose(iterators[i])
-                ldar(value)
-                freeReg()
+            if (!cleanups) {
+                emit1(Op.Return)
+                return
             }
+            const value = allocReg(); star(value)
+            const suspended = leaveScopes(undefined, true)
+            ldar(value)
+            freeReg()
             emit1(Op.Return)
+            resumeGuards(suspended)
             return
         }
         if (ts.isExpressionStatement(node)) { emitExpr(node.expression); return }
@@ -3702,6 +3773,18 @@ function runTest() {
     e2eTest('function destructureCapture(a) { const { x } = { x: a }; function f() { return x + 1 } return f() }', [5])
     e2eTest('function destructureFor(a) { let t = 0; for (let [i, n] = [0, a]; i < n; i++) t += i; return t }', [4])
     e2eTest('function destructureCatch(a) { try { throw { v: a } } catch ({ v }) { return v + 1 } }', [2])
+    e2eTest('function finallyNormal(n) { let s = 0; try { s = n } finally { s += 1 } return s }', [4])
+    e2eTest('function finallyReturn(n) { const o = { v: 0 }; function inner() { let s = 0; try { if (n > 2) return n; s = 1 } finally { o.v += 10 } return s } return inner() + o.v }', [4])
+    e2eTest('function finallyReturn(n) { const o = { v: 0 }; function inner() { let s = 0; try { if (n > 2) return n; s = 1 } finally { o.v += 10 } return s } return inner() + o.v }', [1])
+    e2eTest('function finallyThrow(n) { let s = 0; try { try { if (n > 2) throw n } finally { s += 10 } } catch (e) { return e + s } return s }', [4])
+    e2eTest('function finallyThrow(n) { let s = 0; try { try { if (n > 2) throw n } finally { s += 10 } } catch (e) { return e + s } return s }', [1])
+    e2eTest('function finallyLoop(n) { let s = 0; for (let i = 0; i < n; i += 1) { try { if (i === 2) continue; if (i === 4) break; s += i } finally { s += 100 } } return s }', [6])
+    e2eTest('function finallyOverride(n) { try { return n } finally { if (n > 2) return 7 } }', [4])
+    e2eTest('function finallyOverride(n) { try { return n } finally { if (n > 2) return 7 } }', [1])
+    e2eTest('function catchFinally(n) { let s = 0; try { if (n > 2) throw n; s = 1 } catch (e) { s = e } finally { s += 100 } return s }', [4])
+    e2eTest('function catchFinally(n) { let s = 0; try { if (n > 2) throw n; s = 1 } catch (e) { s = e } finally { s += 100 } return s }', [1])
+    e2eTest('function finallyRethrows(n) { let s = 0; try { try { throw n } catch (e) { throw e + 1 } finally { s = 10 } } catch (e) { return e + s } }', [4])
+    e2eTest('function finallyIteration(o) { let s = 0; try { for (const x of o) { try { if (x === 2) return s } finally { s += x } } } finally { s += 100 } return s }', [iterable()])
 
     {
         function shortcircuit(x: number, y: (o: any) => number) {
