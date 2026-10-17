@@ -6953,8 +6953,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (let k = 1; k < countIds(load); k++) if (getRef(load, k)) operands[k] = getOperand(g, app, target.params.indexOf(getRef(load, k)) + 1)
         const positions = tailPositions(g, from.bodyId).filter(p => p.at === appId)
         if (positions.length !== 1) return
-        const store = arrivingStore(from, positions[0], copyNode(g, load, operands))
+        const access = copyNode(g, load, operands)
+        const store = arrivingStore(from, positions[0], access)
         if (!store || typeOf(store) === Types.f64) return
+        if (bits(store) !== bits(access) || !sameLocation(store, access)) return [0, constantSlice(store, access)!]
         const width = bits(load)
         const constant = scalarOperand(g, g.nodes, store, 3)
         if (constant !== undefined) {
@@ -7184,12 +7186,22 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return x !== undefined && x === scalarOperand(g, g.nodes, b, j)
     }
     function sameLocation(a: GraphNode, b: GraphNode): boolean {
-        if (!sameOperand(a, b, 2)) return false
+        return sameOperand(a, b, 2) && sameBase(a, b)
+    }
+    function sameBase(a: GraphNode, b: GraphNode): boolean {
         if (sameOperand(a, b, 1)) return true
         const x = tailOf(g, getRef(a, 1))
         return !!x && x === tailOf(g, getRef(b, 1))
     }
     const bits = (n: GraphNode) => intrinsics.intrinsicBitWidth(typeOf(n))
+    function constantSlice(store: GraphNode, access: GraphNode): number | undefined {
+        const constant = scalarOperand(g, g.nodes, store, 3)
+        if (constant === undefined || constant < 0 || !Number.isSafeInteger(constant) || typeOf(store) === Types.f64 || typeOf(access) === Types.f64 || lowering.isSignedType(typeOf(access))) return
+        if (getRef(store, 2) || getRef(access, 2) || !sameBase(store, access)) return
+        const delta = getLiteral(g, access, 2) - getLiteral(g, store, 2)
+        if (delta < 0 || delta * 8 + bits(access) > bits(store)) return
+        return Math.floor(constant / 2 ** (8 * delta)) % 2 ** bits(access)
+    }
     type Writer = number | 'quiet' | undefined
     function writerOf(token: number, access: GraphNode, stop?: Set<number>): Writer {
         const memo = new Map<number, Writer>()
@@ -7204,6 +7216,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             else if (m.op === NodeOp.call) result = mem!.clobbers(t, access) ? undefined : walk(getRef(m, 0))
             else if (m.op === NodeOp.store) {
                 result = sameLocation(m, access) && bits(m) === bits(access) ? t
+                    : constantSlice(m, access) !== undefined ? t
                     : mem!.disjoint(access, m) ? walk(getRef(m, 0)) : undefined
             } else if (OrderedValues.has(m.op)) result = undefined
             else {
@@ -7491,6 +7504,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         currentMem()
 
         function stored(store: GraphNode, load: GraphNode): number {
+            if (bits(store) !== bits(load) || !sameLocation(store, load)) return addNode(g, NodeOp.literal, [{ literal: constantSlice(store, load)! }])
             const value = getRef(store, 3)
             const constant = scalarOperand(g, g.nodes, store, 3)
             const width = bits(load)
@@ -7554,6 +7568,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (redundant(store)) r.set(id, removedStore(store))
             }
         }
+        let partial = false
         function overwritten(id: number, store: GraphNode): boolean {
             const kills = new Set<number>()
             let budget = 512
@@ -7624,6 +7639,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                         kills.add(node)
                         continue
                     }
+                    if (mem!.covers(store, n)) partial = true
                     users(node)
                     continue
                 }
@@ -7674,10 +7690,33 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             return kills.size > 0
         }
+        function liveHalf(id: number, store: GraphNode): number | undefined {
+            const width = bits(store)
+            const constant = scalarOperand(g, g.nodes, store, 3)
+            if (width < 16 || getRef(store, 2) || constant === undefined || constant < 0 || !Number.isSafeInteger(constant) || typeOf(store) === Types.f64 || typeOf(store) === Types.f32) return
+            const half = width / 2
+            const pieces = [0, 1].map(k => {
+                const operands = getOperands(g, store)
+                operands[2] = { literal: getLiteral(g, store, 2) + k * half / 8 }
+                operands[3] = { literal: Math.floor(constant / 2 ** (k * half)) % 2 ** half }
+                const piece = copyNode(g, store, operands)
+                setType(piece, half === 32 ? Types.u32 : half === 16 ? Types.u16 : Types.u8)
+                return piece
+            })
+            const dead = pieces.map(piece => overwritten(id, piece))
+            if (dead[0] === dead[1]) return
+            return insertNode(g, pieces[dead[0] ? 1 : 0])
+        }
         if (!r.size) {
             for (const id of findValues(target.id, NodeOp.store) ?? []) {
                 const store = getNode(g, id)!
-                if (overwritten(id, store)) r.set(id, removedStore(store))
+                partial = false
+                if (overwritten(id, store)) {
+                    r.set(id, removedStore(store))
+                    continue
+                }
+                const kept = partial ? liveHalf(id, store) : undefined
+                if (kept !== undefined) r.set(id, kept)
             }
         }
         if (!r.size) return false
@@ -12300,6 +12339,7 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
                 const r = getRef(m, i)
                 const u = r ? getNode(g, r) : undefined
                 if (!r || outer(u)) continue
+                if (m.op === NodeOp.after && i < countIds(m) - 1 && here.has(r) && !condition.has(r)) continue
                 if (u!.op === NodeOp.param || (here.has(r) && !condition.has(r)) || hoisted.has(r) || (u!.op === NodeOp.get && here.has(getRef(u!, 0)))) {
                     if (!cutSet.has(r)) {
                         cutSet.add(r)
@@ -12337,6 +12377,20 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
             if (known !== undefined) return known
             if (!inside.has(id)) return id
             const m = getNode(g, id)!
+            if (m.op === NodeOp.after) {
+                const last = countIds(m) - 1
+                const kept = getArgIds(m).flatMap((r, i) => i === last || !r || params.has(r) || inside.has(r) ? [i] : [])
+                if (kept.length === 1 && getRef(m, last)) {
+                    const c = copy(getRef(m, last))
+                    copies.set(id, c)
+                    return c
+                }
+                if (kept.length <= last) {
+                    const c = createNode(g, NodeOp.after, kept.map(i => copy(getRef(m, i)) || literal(g, getLiteral(g, m, i))), m)
+                    copies.set(id, c)
+                    return c
+                }
+            }
             const ids = getArgIds(m)
             for (let i = m.op === NodeOp.apply ? 1 : 0; i < ids.length; i++) ids[i] = copy(ids[i])
             const c = addCopy(g, m, withRefs(g, m, ids))

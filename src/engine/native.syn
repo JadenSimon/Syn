@@ -37,7 +37,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
+import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, threadConstants, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -5440,10 +5440,16 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
     function nullishParams(fn: Function): number[] {
         return plannedParams(fn).filter(({ index, rep }) => rep.kind === 'undefined' && index < (sourceOfLinked(fn)?.compiled.paramCount ?? 0)).map(({ index }) => index)
     }
-    function constantParams(fn: Function): Map<number, intrinsics.Handle> {
-        const out = new Map<number, intrinsics.Handle>()
-        for (const index of nullishParams(fn)) out.set(index, 0 as intrinsics.Handle)
-        for (const { index, rep } of plannedParams(fn)) if (rep.constant) out.set(index, session.linkFunction(rep.constant) as intrinsics.Handle)
+    function constantParams(fn: Function): Map<number, ParamConstant> {
+        const out = new Map<number, ParamConstant>()
+        for (const index of nullishParams(fn)) out.set(index, { handle: 0 as intrinsics.Handle })
+        for (const { index, rep } of plannedParams(fn)) {
+            const constant = rep.constant
+            if (!constant || isRoot(fn)) continue
+            if (constant.fn) out.set(index, { handle: session.linkFunction(constant.fn) as intrinsics.Handle })
+            else if (constant.handle !== undefined) out.set(index, { handle: constant.handle })
+            else out.set(index, { literal: constant.literal! })
+        }
         return out
     }
     function encodePlannedUnions(fn: Function, graph: Graph): void {
@@ -6223,12 +6229,12 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         }
         return shapes
     }
-    function withConstantParams(traced: Traced, constants: Map<number, intrinsics.Handle>): Traced {
+    function withConstantParams(traced: Traced, constants: Map<number, ParamConstant>): Traced {
         if (!constants.size) return traced
         const graph = traced.graph
         const out = withNodes(graph, new Map())
         const params = new Map<number, number>()
-        for (const [i, handle] of constants) params.set(graph.blocks[0].params[i], addNode(out, NodeOp.heapHandle, [{ literal: handle }]))
+        for (const [i, constant] of constants) params.set(graph.blocks[0].params[i], addNode(out, constant.handle !== undefined ? NodeOp.heapHandle : NodeOp.literal, [{ literal: constant.handle ?? constant.literal! }]))
         for (const [id, n] of graph.nodes) {
             let ops: Operand[] | undefined
             for (let i = 0; i < countIds(n); i++) {
@@ -6265,6 +6271,11 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         return site => plannedCall(g, caller, site)
     }
     return { returnTypeOf, resolveUnit, encodesReturns, returnMode, tagUnit, boundSites, usePlan, encodePlannedUnions, paramShapesOf, nullishParams, isPlanned: () => !!planned, plannedUnit: (fn: Function) => planned?.units.get(fn) }
+}
+
+interface ParamConstant {
+    handle?: intrinsics.Handle
+    literal?: number
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {
@@ -6465,6 +6476,20 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             const index = /^\[(\d+)\]$/.exec(name)
             return index ? heap.indexKey(Number(index[1]) as u32) : types.keyHandles.get(name)
         }
+        const fixedStatic = (state: intrinsics.Handle, key: intrinsics.Handle) => fixedField(types, state, key)
+        const constructed = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
+        for (const state of constructed) if (fixedState(types, state)) readonlyConstructions.add(state)
+        const owned = new Set(constructed)
+        for (const unit of tracer.units) for (const cell of unit.traced!.allocations?.keys() ?? []) owned.add(heap.deref(cell as intrinsics.Handle))
+        function folds(site: Site): boolean {
+            const traced = graphsOf(site.unit).traced!
+            const n = getNode(traced.graph, site.node)
+            return !!n && tracer.fixedSlot(traced, n, fixedStatic) !== undefined
+        }
+        for (const [state, ids] of types.stateAllocations) {
+            if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
+            if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
+        }
         const { inst, plan } = joinedPlan(types)
         const handles = new Map<string, intrinsics.Handle>()
         const fixedFields = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
@@ -6587,6 +6612,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             return propertyEval.reducedShape(target.startsWith('clo@') ? Number(target.slice('clo@'.length)) as intrinsics.Handle : handles.get(target)!)
         }
         shareUnits(plan, layoutOf, reducedTarget, embeddings.sites, fn => host.graphOf(fn))
+        threadConstants(plan, types, inst, state => placedStatics.has(state) || constructed.has(state))
         shownPlan = { inst, plan }
         const constants = new Map<intrinsics.Handle, intrinsics.Handle>()
         for (const [state, id] of inst.constantShapes) constants.set(state, handles.get(id)!)
@@ -6596,20 +6622,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         for (const [P, byKey] of embeddings.fields) embedded.set(handles.get(P)!, new Map([...byKey].map(([k, I]) => [types.keyHandles.get(k)!, handles.get(I)!])))
         const sites = new Map<PlannedUnit, Map<number, intrinsics.Handle>>()
         for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, k]) => [node, types.keyHandles.get(k)!])))
-        const fixedStatic = (state: intrinsics.Handle, key: intrinsics.Handle) => fixedField(types, state, key)
-        const constructed = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
-        for (const state of constructed) if (fixedState(types, state)) readonlyConstructions.add(state)
-        const owned = new Set(constructed)
-        for (const unit of tracer.units) for (const cell of unit.traced!.allocations?.keys() ?? []) owned.add(heap.deref(cell as intrinsics.Handle))
-        function folds(site: Site): boolean {
-            const traced = graphsOf(site.unit).traced!
-            const n = getNode(traced.graph, site.node)
-            return !!n && tracer.fixedSlot(traced, n, fixedStatic) !== undefined
-        }
-        for (const [state, ids] of types.stateAllocations) {
-            if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
-            if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
-        }
         return { units: plan, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites }, fixedStatic }
     }
     do {
