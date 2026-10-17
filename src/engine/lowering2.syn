@@ -990,6 +990,7 @@ export interface LowerGraphOptions {
     poolSlot?: (value: number) => number
     poolValue?: (slot: number) => number | undefined
     floatSlot?: (value: number) => number
+    staticData?: (bytes: Uint8Array) => number
 }
 
 export interface LowerGraphResult {
@@ -13510,9 +13511,85 @@ export interface PreparedLowering {
     analysis: ReturnType<typeof analyzeValueGraph>
 }
 
+function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number): void {
+    const allocas: number[] = []
+    for (const [id, n] of g.nodes) if (n.op === NodeOp.alloca) allocas.push(id)
+    if (!allocas.length) return
+    const mem = memAnalysis(g)
+    let floats: Set<number> | undefined
+    const accesses = new Map<number, number[]>()
+    for (const [id, n] of g.nodes) {
+        if ((n.op !== NodeOp.load && n.op !== NodeOp.store) || !getRef(n, 1)) continue
+        const base = mem.of(getRef(n, 1)).base
+        const list = accesses.get(base)
+        if (list) list.push(id)
+        else accesses.set(base, [id])
+    }
+    function addressedOnlyHere(id: number, reached: Set<number>): boolean {
+        for (const x of reached) {
+            for (const u of mem.users(x)) {
+                const n = getNode(g, u)!
+                if (n.op !== NodeOp.load && n.op !== NodeOp.store) continue
+                if (getRef(n, 2) === x) return false
+                if (getRef(n, 1) === x && mem.of(x).base !== id) return false
+            }
+        }
+        return true
+    }
+    function storedBytes(store: number): Uint8Array | undefined {
+        const n = getNode(g, store)!
+        const type = typeOf(n)
+        const bits = intrinsics.intrinsicBitWidth(type)
+        const value = scalarOperand(g, g.nodes, n, 3)
+        if (value === undefined || !bits || bits % 8 || bits > 64 || type === Types.f16 || type === Types.f32) return
+        const word = new Uint8Array(8)
+        if (type === Types.f64) {
+            new DataView(word.buffer).setFloat64(0, value, true)
+            return word.subarray(0, 8)
+        }
+        if (!Number.isSafeInteger(value)) return
+        floats ??= floatValues(g)
+        if (floats.has(store) || floats.has(getRef(n, 3))) return
+        new DataView(word.buffer).setBigUint64(0, BigInt.asUintN(64, BigInt(value)), true)
+        return word.subarray(0, bits / 8)
+    }
+    function constantContents(id: number): [bytes: Uint8Array, stores: number[]] | undefined {
+        const flow = mem.flows(id, true)
+        if (flow.own || flow.calls.length || !addressedOnlyHere(id, flow.reached)) return
+        const bytes = new Uint8Array(getLiteral(g, getNode(g, id)!, 1))
+        const written = new Uint8Array(bytes.length)
+        const stores: number[] = []
+        for (const s of accesses.get(id) ?? []) {
+            const n = getNode(g, s)!
+            if (n.op !== NodeOp.store) continue
+            const at = mem.access(n)?.pos
+            const word = storedBytes(s)
+            if (at === undefined || !word || at < 0 || at + word.length > bytes.length) return
+            for (let i = 0; i < word.length; i++) {
+                if (written[at + i] && bytes[at + i] !== word[i]) return
+                written[at + i] = 1
+                bytes[at + i] = word[i]
+            }
+            stores.push(s)
+        }
+        if (!stores.length) return
+        return [bytes, stores]
+    }
+    const dropped = new Map<number, Operand>()
+    for (const id of allocas) {
+        const contents = constantContents(id)
+        if (!contents) continue
+        const address = addNode(g, NodeOp.literal, [{ literal: staticData(contents[0]) }], Types.u64)
+        putNode(g, id, NodeOp.after, [getOperand(g, getNode(g, id)!, 0), address])
+        for (const s of contents[1]) dropped.set(s, getOperand(g, getNode(g, s)!, 0))
+    }
+    if (dropped.size) substitute(g, dropped)
+}
+
 export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): PreparedLowering {
     const target = opts.target ?? lowering.hostTarget
     const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target)
+    if (opts.staticData) readonlyAllocas(g, opts.staticData)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue, opts.floatSlot) : undefined
     registerLiterals(g, target)
     return { g, island, analysis: analyzeValueGraph(g, opts) }
