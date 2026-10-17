@@ -2090,6 +2090,98 @@ pub const Program = struct {
                 fdefers_name: []const u8 = &.{},
                 ret_name: []const u8 = &.{},
                 ret_used: bool = false,
+                inline_mode: bool = false,
+                payloads: std.ArrayListUnmanaged(NodeRef) = .{},
+            };
+
+            const DeferNameScan = struct {
+                nodes: *BumpAllocator(AstNode),
+                names: *std.StringHashMapUnmanaged(void),
+                declared_only: bool,
+                defer_depth: u32 = 0,
+                function_depth: u32 = 0,
+                needs_stack: bool = false,
+                unsafe_payload: bool = false,
+
+                fn addBinding(scan: *@This(), ref: NodeRef) anyerror!void {
+                    if (ref == 0) return;
+                    const b = scan.nodes.at(ref);
+                    switch (b.kind) {
+                        .identifier => try scan.names.put(getAllocator(), getSlice(b, u8), {}),
+                        .binding_element => try scan.addBinding(getPackedData(b).left),
+                        .object_binding_pattern, .array_binding_pattern => {
+                            var iter = NodeIterator.init(scan.nodes, maybeUnwrapRef(b) orelse return);
+                            while (iter.nextPair()) |pair| {
+                                if (pair[0].kind == .binding_element) try scan.addBinding(pair[1]);
+                            }
+                        },
+                        else => {},
+                    }
+                }
+
+                pub fn visit(scan: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
+                    _ = ref;
+                    if (!scan.declared_only) {
+                        if (n.kind == .identifier) try scan.names.put(getAllocator(), getSlice(n, u8), {});
+                        switch (n.kind) {
+                            .function_declaration, .function_expression, .arrow_function, .method_declaration, .class_declaration, .class_expression, .get_accessor, .set_accessor => {
+                                if (n.kind == .function_declaration and scan.function_depth == 0) scan.unsafe_payload = true;
+                                scan.function_depth += 1;
+                                defer scan.function_depth -= 1;
+                                return parser.forEachChild(scan.nodes, n, scan);
+                            },
+                            .return_statement, .break_statement, .continue_statement, .yield_expression => {
+                                if (scan.function_depth == 0) scan.unsafe_payload = true;
+                            },
+                            .variable_statement => {
+                                if (scan.function_depth == 0 and !n.hasFlag(.let) and !n.hasFlag(.@"const")) scan.unsafe_payload = true;
+                            },
+                            .enum_declaration, .module_declaration, .import_equals_declaration => {
+                                if (scan.function_depth == 0) scan.unsafe_payload = true;
+                            },
+                            else => {},
+                        }
+                        return parser.forEachChild(scan.nodes, n, scan);
+                    }
+                    switch (n.kind) {
+                        .function_declaration, .class_declaration => {
+                            if (parser.getDeclarationNameRef(n)) |name| try scan.addBinding(name);
+                        },
+                        .function_expression, .arrow_function, .method_declaration, .class_expression, .get_accessor, .set_accessor => {},
+                        .variable_declaration, .enum_declaration, .module_declaration, .import_equals_declaration => {
+                            try scan.addBinding(getPackedData(n).left);
+                            try parser.forEachChild(scan.nodes, n, scan);
+                        },
+                        .defer_statement => {
+                            if (scan.defer_depth == 0) scan.needs_stack = true;
+                        },
+                        .try_statement => {
+                            // A caught cleanup error or overriding finally return must not run a defer twice.
+                            scan.needs_stack = true;
+                        },
+                        .call_expression => {
+                            const callee = scan.nodes.at(getPackedData(n).left);
+                            if (callee.kind == .identifier and strings.eql(getSlice(callee, u8), "eval")) scan.needs_stack = true;
+                            try parser.forEachChild(scan.nodes, n, scan);
+                        },
+                        .block => {
+                            var owns_defers = false;
+                            var iter = NodeIterator.init(scan.nodes, maybeUnwrapRef(n) orelse 0);
+                            while (iter.next()) |stmt| {
+                                if (stmt.kind == .defer_statement) {
+                                    owns_defers = true;
+                                    break;
+                                }
+                            }
+                            if (owns_defers) scan.defer_depth += 1;
+                            defer {
+                                if (owns_defers) scan.defer_depth -= 1;
+                            }
+                            try parser.forEachChild(scan.nodes, n, scan);
+                        },
+                        else => try parser.forEachChild(scan.nodes, n, scan),
+                    }
+                }
             };
 
             const helper_code = struct {
@@ -2413,6 +2505,8 @@ pub const Program = struct {
             defer_scopes: std.ArrayListUnmanaged(DeferScope) = .{},
             defer_scope_floor: u32 = 0,
             defer_counter: u32 = 0,
+            defer_names: std.StringHashMapUnmanaged(void) = .{},
+            defer_names_initialized: bool = false,
 
             style_visitor: StyleVisitor = .{},
 
@@ -3527,6 +3621,26 @@ pub const Program = struct {
                 return self.factory.createIdentifierAllocated(name);
             }
 
+            fn deferName(self: *@This(), prefix: []const u8) ![]const u8 {
+                if (!self.defer_names_initialized) {
+                    for (0..self.file.binder.nodes.count()) |i| {
+                        const n = self.nodes.at(i);
+                        if (n.kind == .identifier) try self.defer_names.put(getAllocator(), getSlice(n, u8), {});
+                    }
+                    self.defer_names_initialized = true;
+                }
+                while (true) {
+                    const name = try std.fmt.allocPrint(getAllocator(), "{s}{d}", .{ prefix, self.defer_counter });
+                    self.defer_counter += 1;
+                    if (self.defer_names.contains(name)) {
+                        getAllocator().free(name);
+                        continue;
+                    }
+                    try self.defer_names.put(getAllocator(), name, {});
+                    return name;
+                }
+            }
+
             fn runDefersStatement(self: *@This(), name: []const u8) !NodeRef {
                 return self.factory.createExpressionStatement(try self.runDefersCall(name));
             }
@@ -3546,6 +3660,69 @@ pub const Program = struct {
 
             fn commaExp(self: *@This(), left: NodeRef, right: NodeRef) !NodeRef {
                 return self.factory.createBinaryExpression(left, .comma_token, right);
+            }
+
+            fn canInlineDefers(self: *@This(), head: NodeRef) !bool {
+                var used = std.StringHashMapUnmanaged(void){};
+                defer used.deinit(getAllocator());
+                var declared = std.StringHashMapUnmanaged(void){};
+                defer declared.deinit(getAllocator());
+                var used_scan = DeferNameScan{ .nodes = self.nodes, .names = &used, .declared_only = false };
+                var decl_scan = DeferNameScan{ .nodes = self.nodes, .names = &declared, .declared_only = true };
+                var iter = NodeIterator.init(self.nodes, head);
+                while (iter.nextPair()) |pair| {
+                    switch (pair[0].kind) {
+                        .defer_statement => {
+                            const payload_ref = unwrapRef(pair[0]);
+                            try used_scan.visit(self.nodes.at(payload_ref), payload_ref);
+                        },
+                        .variable_statement, .function_declaration, .class_declaration => {},
+                        else => try decl_scan.visit(pair[0], pair[1]),
+                    }
+                }
+                if (decl_scan.needs_stack or used_scan.unsafe_payload or used.contains("eval")) return false;
+                var names = used.keyIterator();
+                while (names.next()) |name| {
+                    if (declared.contains(name.*)) return false;
+                }
+                return true;
+            }
+
+            fn inlineDeferStatement(self: *@This(), payload_ref: NodeRef) !NodeRef {
+                const resolved = self.replacements.get(payload_ref) orelse payload_ref;
+                const payload = self.nodes.at(resolved);
+                if (payload.kind == .expression_statement and payload.next == 0) {
+                    return self.factory.createExpressionStatement(unwrapRef(payload));
+                }
+                if (payload.kind == .block and payload.next == 0) {
+                    return self.factory.createBlock(maybeUnwrapRef(payload) orelse 0);
+                }
+                return self.factory.createBlock(resolved);
+            }
+
+            fn inlineDefersOnReturn(self: *@This(), n: *const AstNode) !NodeRef {
+                const exp_ref = maybeUnwrapRef(n) orelse 0;
+                var chain = Chain{};
+                const ret_name = if (exp_ref != 0) try self.deferName("__dret") else "";
+                if (exp_ref != 0) {
+                    chain.push(self.nodes, try self.factory.createConstVariable(try self.deferIdent(ret_name), exp_ref));
+                }
+                var j = self.defer_scopes.items.len;
+                while (j > self.defer_scope_floor) {
+                    j -= 1;
+                    const scope = &self.defer_scopes.items[j];
+                    if (scope.inline_mode) {
+                        var k = scope.payloads.items.len;
+                        while (k > 0) {
+                            k -= 1;
+                            chain.push(self.nodes, try self.inlineDeferStatement(scope.payloads.items[k]));
+                        }
+                    } else if (scope.defers_name.len > 0) {
+                        chain.push(self.nodes, try self.runDefersStatement(scope.defers_name));
+                    }
+                }
+                chain.push(self.nodes, try self.factory.createReturnStatement(if (exp_ref != 0) try self.deferIdent(ret_name) else 0));
+                return self.factory.createBlock(chain.head);
             }
 
             fn deferPayloadArrow(self: *@This(), n: *const AstNode) !NodeRef {
@@ -3733,25 +3910,39 @@ pub const Program = struct {
                     return parser.forEachChild(self.nodes, n, self);
                 }
 
-                const id = self.defer_counter;
-                self.defer_counter += 1;
-
                 var scope = DeferScope{};
-                if (first_plain != 0) {
-                    scope.defers_name = try std.fmt.allocPrint(getAllocator(), "__defers{d}", .{id});
-                    scope.ret_name = try std.fmt.allocPrint(getAllocator(), "__dret{d}", .{id});
-                }
-                if (first_finally != 0) {
-                    scope.fdefers_name = try std.fmt.allocPrint(getAllocator(), "__fdefers{d}", .{id});
+                if (first_finally == 0 and try self.canInlineDefers(head)) {
+                    scope.inline_mode = true;
+                } else {
+                    if (first_plain != 0) {
+                        scope.defers_name = try self.deferName("__defers");
+                        scope.ret_name = try self.deferName("__dret");
+                    }
+                    if (first_finally != 0) {
+                        scope.fdefers_name = try self.deferName("__fdefers");
+                    }
                 }
 
                 try self.defer_scopes.append(getAllocator(), scope);
                 const depth = self.defer_scopes.items.len;
+                defer {
+                    self.defer_scopes.items[depth - 1].payloads.deinit(getAllocator());
+                    self.defer_scopes.items.len = depth - 1;
+                }
 
                 try parser.forEachChild(self.nodes, n, self);
 
                 const finished = self.defer_scopes.items[depth - 1];
-                self.defer_scopes.items.len = depth - 1;
+
+                if (finished.inline_mode and !isTerminalStatement(self.nodes.at(last_ref).kind)) {
+                    var trailing = Chain{};
+                    var k = finished.payloads.items.len;
+                    while (k > 0) {
+                        k -= 1;
+                        trailing.push(self.nodes, try self.inlineDeferStatement(finished.payloads.items[k]));
+                    }
+                    if (trailing.head != 0) try self.insertChainAfter(last_ref, trailing);
+                }
 
                 var pre = Chain{};
                 if (finished.defers_name.len > 0) {
@@ -3824,11 +4015,21 @@ pub const Program = struct {
 
             fn transformDeferStatement(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
                 const payload_ref = unwrapRef(n);
-                try self.visit(self.nodes.at(payload_ref), payload_ref);
+                {
+                    const floor = self.defer_scope_floor;
+                    defer self.defer_scope_floor = floor;
+                    self.defer_scope_floor = @intCast(self.defer_scopes.items.len);
+                    try self.visit(self.nodes.at(payload_ref), payload_ref);
+                }
 
-                if (self.defer_scopes.items.len == 0) return;
+                if (self.defer_scopes.items.len <= self.defer_scope_floor) return;
 
                 const scope = &self.defer_scopes.items[self.defer_scopes.items.len - 1];
+                if (n.extra_data != 1 and scope.inline_mode) {
+                    try scope.payloads.append(getAllocator(), payload_ref);
+                    try self.replacements.put(ref, try self.factory.nodes.push(.{ .kind = .empty_statement, .next = n.next }));
+                    return;
+                }
                 const name = if (n.extra_data == 1) scope.fdefers_name else scope.defers_name;
                 if (name.len == 0) return;
 
@@ -3843,13 +4044,14 @@ pub const Program = struct {
             fn maybeRunDefersOnReturn(self: *@This(), n: *const AstNode) !?NodeRef {
                 var i = self.defer_scopes.items.len;
                 var innermost: ?*DeferScope = null;
+                var any_inline = false;
                 while (i > self.defer_scope_floor) {
                     i -= 1;
-                    if (self.defer_scopes.items[i].defers_name.len > 0) {
-                        innermost = &self.defer_scopes.items[i];
-                        break;
-                    }
+                    const scope = &self.defer_scopes.items[i];
+                    if (scope.inline_mode and scope.payloads.items.len > 0) any_inline = true;
+                    if (innermost == null and scope.defers_name.len > 0) innermost = scope;
                 }
+                if (any_inline) return try self.inlineDefersOnReturn(n);
 
                 const inner = innermost orelse return null;
                 const exp_ref = maybeUnwrapRef(n) orelse 0;
@@ -11133,6 +11335,8 @@ pub const Program = struct {
             .factory = &factory,
             .replacements = &r,
         };
+        defer v.defer_names.deinit(getAllocator());
+        defer v.defer_scopes.deinit(getAllocator());
 
         v.style_visitor.nodes = &f.ast.nodes;
         try v.style_visitor.visit(f.ast.nodes.at(start), start);
