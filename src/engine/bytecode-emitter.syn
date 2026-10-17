@@ -48,6 +48,7 @@ export enum ConstantKind {
     scope,
     class_,
     private_name,
+    object_template,
 }
 
 type ScopeBinding = { slot: number, parentSlot: number }
@@ -562,6 +563,16 @@ function emitFunction(
         const slot = constants.length
         constants.push(key)
         constantKinds.push(ConstantKind.private_name)
+        internMap.set(key, slot)
+        return slot
+    }
+    function internObjectTemplate(keys: string[]): number {
+        const key = '#template:' + JSON.stringify(keys)
+        const existing = internMap.get(key)
+        if (existing !== undefined) return existing
+        const slot = constants.length
+        constants.push(keys)
+        constantKinds.push(ConstantKind.object_template)
         internMap.set(key, slot)
         return slot
     }
@@ -1545,7 +1556,41 @@ function emitFunction(
         return emitLiteral(v[0])
     }
 
+    function objTemplateKeys(node: ts.ObjectLiteralExpression): string[] | undefined {
+        if (!node.properties.length) return
+        const keys: string[] = []
+        for (const p of node.properties) {
+            let name: string | undefined
+            if (ts.isShorthandPropertyAssignment(p)) {
+                name = p.name.text
+            } else if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) {
+                name = p.name.getText().replace(/^['"]|['"]$/g, '')
+            } else if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) {
+                name = p.name.text
+            }
+            if (name === undefined || name === '__proto__' || keys.includes(name)) return
+            keys.push(name)
+        }
+        return keys
+    }
+
+    function emitObjectTemplate(node: ts.ObjectLiteralExpression, keys: string[]): void {
+        const savedReg = nextReg
+        defer nextReg = savedReg
+        const registers = keys.map(() => allocReg())
+        for (let i = 0; i < keys.length; i++) {
+            const p = node.properties[i]
+            if (ts.isMethodDeclaration(p)) emitClosure(p)
+            else if (ts.isShorthandPropertyAssignment(p)) emitExpr(p.name)
+            else emitExpr((p as ts.PropertyAssignment).initializer)
+            star(registers[i])
+        }
+        emit4(Op.CreateObjectLiteral, internObjectTemplate(keys), registers[0], keys.length)
+    }
+
     function emitObjectLiteral(node: ts.ObjectLiteralExpression): void {
+        const keys = objTemplateKeys(node)
+        if (keys) return emitObjectTemplate(node, keys)
         emit1(Op.CreateEmptyObject)
         const robj = allocReg()
         star(robj)
@@ -2798,6 +2843,13 @@ export function createCodeIterator(bytes: readonly u8[]) {
             inst.regs[1] += inst.regs[0] - 1
             return inst
         }
+        if (opcode === Op.CreateObjectLiteral) {
+            inst.writesAcc = true
+            inst.constSlot = readByte()
+            inst.regs.push(readByte(), readByte())
+            inst.regs[1] += inst.regs[0] - 1
+            return inst
+        }
         if (opcode === Op.CallConst || opcode === Op.ConstructConst) {
             inst.readsAcc = inst.writesAcc = true
             inst.constSlot = readByte() 
@@ -2899,7 +2951,7 @@ export function getRegReads(inst: CodeInstruction): number[] {
         if (inst.regs.length === 3) {
             for (let i = inst.regs[1]; i <= inst.regs[2]; i++) regs.push(i)
         }
-    } else if (inst.opcode === Op.CallConst || inst.opcode === Op.ConstructConst || inst.opcode === Op.CreateArrayLiteral) {
+    } else if (inst.opcode === Op.CallConst || inst.opcode === Op.ConstructConst || inst.opcode === Op.CreateArrayLiteral || inst.opcode === Op.CreateObjectLiteral) {
         if (inst.regs.length) {
             for (let i = inst.regs[0]; i <= inst.regs[1]; i++) regs.push(i)
         }
@@ -2978,6 +3030,18 @@ function emitTest() {
 
     testBytecodeEmit('class Error {\n  constructor(message) {\n    this.message = message;\n  }\n}', 'classDecl')
 
+    function opcodesOf(source: string): number[] {
+        const it = createCodeIterator(compile(source).code as u8[])
+        const ops: number[] = []
+        while (const inst = it.next()) ops.push(inst.opcode)
+        return ops
+    }
+    const templated = opcodesOf('function f(a) { return { x: a, y: 2, m() { return 1 } } }')
+    assert(templated.includes(Op.CreateObjectLiteral) && !templated.includes(Op.CreateEmptyObject), 'static keys create the object from a template')
+    for (const source of ['function f(a) { return { x: a, x: 2 } }', 'function f(a) { return { __proto__: a } }', 'function f(a) { return { [a]: 1 } }', 'function f(a) { return { ...a } }', 'function f() { return {} }']) {
+        assert(!opcodesOf(source).includes(Op.CreateObjectLiteral), `no template for ${source}`)
+    }
+
     const statics = compile('class A {\n  static twice(x) { return x * 2 }\n  get() { return 1 }\n}')
     const prototype = statics.expandos?.get('prototype') as Expandos
     assert(statics.expandos?.has('twice') && prototype.has('get') && !prototype.has('twice'), 'static methods belong to the constructor')
@@ -3021,6 +3085,12 @@ export function finalize(
         }
         if (kinds[i] === ConstantKind.scope) {
             constants[i] = 0
+            continue
+        }
+        if (kinds[i] === ConstantKind.object_template) {
+            const template = heap.makeObject(0 as Handle)
+            for (const key of result.constants[i] as string[]) heap.setProperty(template, fromJsValue(key), 0 as Handle)
+            constants[i] = template
             continue
         }
         if (kinds[i] === ConstantKind.string || kinds[i] === ConstantKind.private_name) {
@@ -3617,6 +3687,16 @@ function runTest() {
     }))
     e2eTest('function destructureArray(a) { const [x, , y] = [a, 0, a + 1]; return x * y }', [3])
     e2eTest('function destructureObject(a) { const { x, y: z } = { x: a, y: 2 }; return x + z }', [3])
+    e2eTest('function literalFields(a, b) { const o = { x: a, y: b, z: a + b }; return o.x * 100 + o.y * 10 + o.z }', [1, 2])
+    e2eTest('function literalOrder(a) { let n = a; const o = { p: (n = n * 10 + 1), q: (n = n * 10 + 2), r: n }; return o.p * 10000 + o.q * 100 + o.r }', [0])
+    e2eTest('function literalThis(a) { const o = { v: a, twice() { return this.v * 2 } }; return o.twice() }', [4])
+    e2eTest('function literalShorthand(a, b) { const o = { a, b, c: 3 }; return o.a * 100 + o.b * 10 + o.c }', [1, 2])
+    e2eTest('function literalStringKeys(a) { const o = { "k": a, \'m n\': 2 }; return o.k * 10 + o["m n"] }', [3])
+    e2eTest('function literalNested(a) { const o = { inner: { v: a }, w: 3 }; return o.inner.v * 10 + o.w }', [4])
+    e2eTest('function literalThenStore(a) { const o = { x: a }; o.x = o.x + 1; o.y = 3; return o.x * 10 + o.y }', [4])
+    e2eTest('function literalDuplicate(a) { const o = { x: 1, y: 2, x: a }; return o.x * 10 + o.y }', [5])
+    e2eTest('function literalComputed(a) { const k = "x"; const o = { y: 1, [k]: a }; return o.x * 10 + o.y }', [5])
+    e2eTest('function literalSpread(a) { const o = { y: 1, ...{ x: a } }; return o.x * 10 + o.y }', [5])
     e2eTest('function destructureDefault(a) { let { x, y = 7 } = { x: a }; const [p = 1, q = 2] = [a]; return x + y + p + q }', [3])
     e2eTest('function destructureNested(a) { const [{ x }, [y, w]] = [{ x: a }, [1, 3]]; return x + y + w }', [4])
     e2eTest('function destructureCapture(a) { const { x } = { x: a }; function f() { return x + 1 } return f() }', [5])
