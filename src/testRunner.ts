@@ -483,17 +483,15 @@ async function compileEngine() {
 
 let engine: ReturnType<typeof compileEngine> | undefined
 
-async function testEngine(entrypoint = 'heap', argv: string[] = []) {
+async function testEngine(suite = 'heap', argv: string[] = []) {
     const { emitted, loader } = await (engine ??= compileEngine())
-    const entry = path.resolve(`src/engine/${entrypoint}.js`)
-    const text = emitted.get(entry)
-    if (!text) throw `entrypoint "${entrypoint}" not found`
+    const harness = path.resolve('src/engine/harness.js')
     const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:') || a.startsWith('coverage:'))?.replace(/^(cpu-prof|heap-prof|coverage):/, '')
     if (prof) {
         fs.mkdirSync(`${prof}.src`, { recursive: true })
         for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
     }
-    return loader.run(entry, text, argv)
+    return loader.run(harness, emitted.get(harness)!, argv, (exports: any) => exports.runSuite(suite))
 }
 
 function lineDiff(a: string, b: string) {
@@ -598,24 +596,17 @@ const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'container
 interface CrashResume {
     suite: string
     case: number
-    event: number
-    message: string
 }
 
 const crashFd = Number(process.env.SYN_CRASH_FD ?? 0)
 const crashResume: CrashResume | undefined = process.env.SYN_CRASH_RESUME ? JSON.parse(process.env.SYN_CRASH_RESUME) : undefined
 const crashSignals = new Set(['SIGSEGV', 'SIGBUS', 'SIGTRAP', 'SIGILL', 'SIGABRT', 'SIGFPE', 'SIGSYS'])
 
-function markSuite(suite: string): void {
-    if (crashFd) fs.writeSync(crashFd, `suite\t${suite}\n`)
-}
-
 interface CrashMarks {
     suite?: string
     caseNumber?: number
     caseLabel?: string
     step?: string
-    event: number
     eventLabel?: string
 }
 
@@ -625,19 +616,16 @@ function readMark(marks: CrashMarks, line: string): void {
         marks.suite = fields[1]
         marks.caseNumber = undefined
         marks.step = undefined
-        marks.event = 0
         marks.eventLabel = undefined
     } else if (fields[0] === 'case') {
         marks.caseNumber = Number(fields[1])
         marks.caseLabel = fields[2]
         marks.step = undefined
-        marks.event = 0
         marks.eventLabel = undefined
     } else if (fields[0] === 'step') {
         marks.step = fields[1]
     } else if (fields[0] === 'event') {
-        marks.event = Number(fields[1])
-        marks.eventLabel = fields[2]
+        marks.eventLabel = fields[1]
     } else if (fields[0] === 'end') {
         marks.caseNumber = undefined
         marks.step = undefined
@@ -662,7 +650,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
         const child = spawn(process.argv[1], process.argv.slice(2), { stdio: ['inherit', 'inherit', 'inherit', 'pipe'], env })
-        const marks: CrashMarks = { event: 0 }
+        const marks: CrashMarks = {}
         let pending = ''
         child.stdio[3]!.setEncoding('utf8')
         child.stdio[3]!.on('data', (chunk: string) => {
@@ -680,12 +668,11 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         let next: CrashResume | undefined
         if (marks.suite !== undefined && marks.caseNumber !== undefined) {
             label = marks.step ?? (marks.eventLabel ? `${marks.suite} ${marks.eventLabel}` : marks.caseLabel!)
-            next = { suite: marks.suite, case: marks.caseNumber, event: marks.event > 0 ? marks.event : -1, message }
-            if (resume && resume.suite === next.suite && resume.case === next.case && (next.event < 0 || next.event >= resume.event)) next.event = -1
+            next = { suite: marks.suite, case: marks.caseNumber }
         } else {
             if (marks.eventLabel) label = `${label} in ${marks.eventLabel}`
             const following = suites[suites.indexOf(marks.suite!) + 1]
-            if (marks.suite !== undefined && following) next = { suite: following, case: 0, event: -1, message }
+            if (marks.suite !== undefined && following) next = { suite: following, case: 0 }
         }
         console.log(`${label} FAILED: ${message}`)
         crashes.push(label)
@@ -726,13 +713,11 @@ export async function main(...args: string[]) {
                 if (hasNativeOption.has(x)) a.unshift('native')
                 a.unshift(x)
                 if (!crashResume || crashResume.suite !== x || crashResume.case === 0) console.log(`--- running ${a.join(' ')} ---`)
-                markSuite(x)
                 await testEngine(x, a) // let it fail fast
             }
             if (!crashFd) process.on('beforeExit', () => console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`))
             return
         }
-        markSuite(args[1])
         return testEngine(args[1], args.slice(1))
     }
 

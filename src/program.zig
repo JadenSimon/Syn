@@ -22769,7 +22769,7 @@ pub const Analyzer = struct {
         }
 
         if (ns_sym.hasFlag(.imported)) {
-            const f = this.program.getFileData(getOrdinal(ns_sym));
+            const f = try this.getAnalyzedFile(getOrdinal(ns_sym));
             if (ns_sym.hasFlag(.namespace)) {
                 // star export
                 const sym_ref = f.binder.exports.type_symbols.get(getHashFromNode(member)) orelse return error.SymbolNotInNamespace;

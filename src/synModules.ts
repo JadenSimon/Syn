@@ -175,17 +175,20 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
         return m
     }
 
-    async function run(absPath: string, text: string, argv: string[]): Promise<unknown> {
+    async function run(absPath: string, text: string, argv: string[], main: (exports: any) => unknown): Promise<unknown> {
         ctx.__argv = argv
-        const reload = modules.has(absPath)
-        const m = instantiate(absPath, text)
-        if (!reload) modules.set(absPath, m)
-        await m.link(link)
-        await evaluateCycleEntries(m)
-        return m.evaluate().catch(err => {
-            applySourceMaps(sources, err)
+        let m = modules.get(absPath)
+        if (!m) {
+            m = instantiate(absPath, text)
+            modules.set(absPath, m)
+        }
+        try {
+            await evaluated(m)
+            return await main(m.namespace)
+        } catch (err) {
+            applySourceMaps(sources, err as Error)
             throw err
-        })
+        }
     }
 
     return { run }
