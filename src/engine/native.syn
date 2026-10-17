@@ -1062,6 +1062,10 @@ function inlineCost(g: Graph, literals = new Set<number>()): number | undefined 
             cost += 3
             continue
         }
+        if (n.op === NodeOp.rt && rt.bindingOf(getLiteral(g, n, 1))?.lower) {
+            cost += 2
+            continue
+        }
         if (!cheap.has(n.op)) return
         cost += n.op === NodeOp.mul || n.op === NodeOp.div ? 2 : 1
     }
@@ -1478,6 +1482,14 @@ function classifyEffects(units: Map<number, Graph>, fresh: Set<number>, captures
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.add, [getOperand(g, n, 2), { literal: ctx.runtimeHeapBase() }], Types.u64) })
 rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [getOperand(g, n, 2), { literal: ctx.pstackBase() }]) })
+rt.bind(rt.Op.handleHash, {
+    interned: (g, n) => makeNode(g, NodeOp.bitconvert, [getOperand(g, n, 2)], Types.u32),
+    lower: (g, n, ctx) => {
+        const handle = ctx.add(makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32))
+        const addr = ctx.add(makeNode(g, NodeOp.add, [handle, { literal: ctx.runtimeHeapBase() }], Types.u64))
+        return makeNode(g, NodeOp.load, [getOperand(g, n, 0), addr, { literal: heap.stringHashOffset }], Types.u32)
+    },
+})
 rt.bind(rt.Op.typeof, {
     lower: (g, n, ctx) => {
         const tag = ctx.add(makeNode(g, NodeOp.and, [getOperand(g, n, 2), { literal: 1 }], Types.u64))
@@ -5825,6 +5837,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         const outer = enterPhase('resolve')
         tracer.foldStatics(traced, unit.traced!.graph)
         if (planned?.units.get(fn)?.blocks.size) pruneUnentered(traced, planned.units.get(fn)!)
+        if (planned?.units.get(fn)) runtimeStringCalls(traced, planned.units.get(fn)!)
         if (intrinsics.argv().includes(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...refinements.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
             const shapes = [...paramShapesOf(fn)].map(([i, s]) => `${i}=${describe(s)} refined=${refined(s)}`).join(' ')
@@ -5903,6 +5916,46 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
     const iterationKeys = {
         next: heap.fromJsString('next'), done: heap.fromJsString('done'), value: heap.fromJsString('value'), length: heap.fromJsString('length'),
         return: heap.fromJsString('return'),
+    }
+    function textualRep(rep: Rep | undefined): boolean {
+        return rep?.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str'
+    }
+    function runtimeStringCalls(traced: FastTraced, unit: PlannedUnit): void {
+        const g = traced.graph
+        const sites: number[] = []
+        const interned: number[] = []
+        for (const [id, n] of g.nodes) {
+            if ((n.op === NodeOp.eq || n.op === NodeOp.ne) && unit.calls.has(id)) sites.push(id)
+            if (n.op !== NodeOp.rt || !rt.bindingOf(getLiteral(g, n, 1))?.interned) continue
+            const rep = getRef(n, 2) ? unit.nodes.get(getRef(n, 2)) : undefined
+            const content = planned!.byFunction.has(rt.bindingOf(getLiteral(g, n, 1))!.strings!)
+            intrinsics.assert(!content || !rep?.targets.includes('str') || textualRep(rep), `native: ${g.name} %${id} hashes strings through ${rep?.text}`)
+            if (!content || !textualRep(rep)) interned.push(id)
+            else if (unit.calls.has(id)) sites.push(id)
+        }
+        if (!sites.length && !interned.length) return
+        traced.graph = withNodes(g, new Map(g.nodes))
+        for (const id of interned) {
+            const n = getNode(g, id)!
+            setNode(traced.graph, id, rt.bindingOf(getLiteral(g, n, 1))!.interned!(traced.graph, n))
+        }
+        for (const id of sites) {
+            const n = getNode(traced.graph, id)!
+            const op = n.op === NodeOp.rt ? getLiteral(traced.graph, n, 1) : rt.Op.strictEqual
+            const target = addNode(traced.graph, NodeOp.heapHandle, [{ literal: session.linkFunction(rt.bindingOf(op)!.strings!) }])
+            if (n.op === NodeOp.rt) {
+                setNode(traced.graph, id, rt.callOf(traced.graph, n, target))
+                continue
+            }
+            const operands = [addNode(traced.graph, NodeOp.nilEffect, []), target, { literal: 0 }, getOperand(traced.graph, n, 0), getOperand(traced.graph, n, 1)]
+            if (n.op === NodeOp.eq) {
+                putNode(traced.graph, id, NodeOp.call, operands)
+                continue
+            }
+            const equal = addNode(traced.graph, NodeOp.call, operands)
+            unit.calls.set(equal, unit.calls.get(id)!)
+            putNode(traced.graph, id, NodeOp.eq, [equal, { literal: 0 }], Types.bool)
+        }
     }
     function pruneUnentered(traced: FastTraced, unit: PlannedUnit): void {
         const dead = traced.graph.blocks.filter(b => b.id !== traced.graph.root && !unit.blocks.has(b.id))
@@ -6329,7 +6382,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     function joinedPlan(types: ValueTypes) {
         const joins: [number, number][] = []
         let inst = instantiate(types, genericOf)
-        let plan = planUnits(types, inst)
+        let plan = planUnits(types, inst, host.graphOf)
         const requested = new Set<string>()
         for (let round = 0; round < 8; round++) {
             const more = pendingJoins(types, inst, plan).filter(([a, b]) => {
@@ -6341,7 +6394,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (!more.length) break
             joins.push(...more)
             inst = instantiate(types, genericOf, joins)
-            plan = planUnits(types, inst)
+            plan = planUnits(types, inst, host.graphOf)
         }
         return { inst, plan }
     }
