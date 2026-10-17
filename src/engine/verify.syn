@@ -1,0 +1,191 @@
+/// @synth
+
+"use wrapped";
+
+import * as heap from './heap'
+import * as intrinsics from './intrinsics'
+import { countIds, getBlock, getLiteral, getNode, getRef, NodeOp, opName, resultType, typeRefOf } from './graph-node'
+import type { Graph, GraphNode } from './lowering2'
+
+const Types = intrinsics.Types
+
+export interface CallEdge {
+    raw: boolean
+    params: Map<number, { word: boolean, pointer: boolean }>
+}
+
+function fail(stage: string, g: Graph, id: number, reason: string): never {
+    throw `verify: ${stage}: ${g.name || '<anonymous>'} %${id} ${reason}`
+}
+
+export function verifyGraph(g: Graph, stage: string, packaged: boolean): void {
+    const constants = new Map<number, boolean>()
+    function constant(id: number): boolean {
+        const known = constants.get(id)
+        if (known !== undefined) return known
+        const n = getNode(g, id)
+        let result = !!n && n.op !== NodeOp.param && n.op !== NodeOp.apply
+        for (let i = 0; result && i < countIds(n!); i++) {
+            const ref = getRef(n!, i)
+            if (ref && !constant(ref)) result = false
+        }
+        constants.set(id, result)
+        return result
+    }
+    const base = g.epoch + 1
+    const index = new Map<number, number>()
+    for (let k = 0; k < g.blocks.length; k++) {
+        const b = g.blocks[k]
+        index.set(b.id, k)
+        for (const p of b.params) {
+            const n = getNode(g, p)
+            if (n?.op !== NodeOp.param) fail(stage, g, b.id, `is a block whose param %${p} is missing`)
+            n.epoch = base + k
+        }
+    }
+    g.epoch = base + g.blocks.length
+    const reached = new Set<number>([g.root])
+    const blocks = [g.root]
+    const work: number[] = []
+    let next = 0
+    while (next < blocks.length) {
+        const b = getBlock(g, blocks[next++])!
+        const epoch = packaged ? base + index.get(b.id)! : base
+        if (!getNode(g, b.bodyId)) fail(stage, g, b.id, `is a block whose body %${b.bodyId} is missing`)
+        work.push(b.bodyId)
+        while (work.length) {
+            const id = work.pop()!
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.param) {
+                if (packaged && n.epoch !== epoch) fail(stage, g, id, `is a param of ${n.epoch >= base ? `B${g.blocks[n.epoch - base].id}` : 'no block'} used in B${b.id}`)
+                continue
+            }
+            if (n.epoch === epoch) continue
+            if (n.epoch >= base && packaged && !constant(id)) fail(stage, g, id, `(${opName(n.op)}) is shared by B${g.blocks[n.epoch - base].id} and B${b.id}`)
+            if (n.epoch >= base) continue
+            n.epoch = epoch
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (!ref) continue
+                const m = getNode(g, ref)
+                if (!m) fail(stage, g, id, `(${opName(n.op)}) slot ${i} names missing %${ref}`)
+                if (m.op !== NodeOp.block) {
+                    work.push(ref)
+                    continue
+                }
+                if (n.op !== NodeOp.apply || i) continue
+                if (!getBlock(g, ref)) fail(stage, g, id, `(apply) targets B${ref}, which is not a block of the graph`)
+                if (!reached.has(ref)) {
+                    reached.add(ref)
+                    blocks.push(ref)
+                }
+            }
+            const T = typeRefOf(n)
+            if (T && !getNode(g, T)) fail(stage, g, id, `(${opName(n.op)}) type slot names missing %${T}`)
+        }
+    }
+}
+
+export function verifyAllocationTokens(g: Graph, stage: string, tokens: Map<u32, { token?: number }> | undefined): void {
+    if (!tokens?.size) return
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.heapHandle || getRef(n, 0)) continue
+        const token = tokens.get(getLiteral(g, n, 0) as u32)?.token
+        if (token !== undefined && !getNode(g, token)) fail(stage, g, id, `allocates with token %${token}, which is not in the graph`)
+    }
+}
+
+function keyHandle(key: number): boolean {
+    return heap.isCell(key as intrinsics.Handle) && heap.describeKey(key as intrinsics.Handle) !== undefined
+}
+
+export function verifyKeys(g: Graph, stage: string): void {
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
+        if (getRef(n, 2)) continue
+        const key = getLiteral(g, n, 2)
+        if (!keyHandle(key)) fail(stage, g, id, `(${opName(n.op)}) key slot holds literal ${key}, not a key handle`)
+    }
+}
+
+function valueOf(g: Graph, id: number): number {
+    let n = getNode(g, id)
+    while (n?.op === NodeOp.after) {
+        id = getRef(n, countIds(n) - 1)
+        n = getNode(g, id)
+    }
+    return id
+}
+
+function wordOf(g: Graph, words: Set<number>, vmValues: boolean): (x: number) => string {
+    return x => {
+        const v = valueOf(g, x)
+        const n = v ? getNode(g, v) : undefined
+        if (!n) return ''
+        if (n.op === NodeOp.encode || n.op === NodeOp.box) return `%${v} is ${opName(n.op)}`
+        if (words.has(x) || words.has(v)) return `%${v} (${opName(n.op)}) is a word by resolve or plan`
+        if (vmValues && resultType(g, n) === Types.vm_value) return `%${v} (${opName(n.op)}) is vm_value`
+        return ''
+    }
+}
+
+function rawOf(g: Graph, edges: Map<number, CallEdge>): (x: number) => string {
+    return x => {
+        const v = valueOf(g, x)
+        const n = v ? getNode(g, v) : undefined
+        if (!n) return ''
+        if (n.op === NodeOp.decode) return `%${v} is decode`
+        if (n.op === NodeOp.call && edges.get(v)?.raw) return `%${v} is a call to a raw-mode callee`
+        return ''
+    }
+}
+
+export function verifyCodecs(g: Graph, stage: string, words: Set<number>, edges: Map<number, CallEdge>): void {
+    const word = wordOf(g, words, false)
+    const raw = rawOf(g, edges)
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.box && n.op !== NodeOp.encode && n.op !== NodeOp.decode) continue
+        const x = getRef(n, 0)
+        if (!x) continue
+        const why = n.op === NodeOp.decode ? raw(x) : word(x)
+        if (why) fail(stage, g, id, `(${opName(n.op)}) takes %${x}, which is already ${n.op === NodeOp.decode ? 'raw' : 'a word'}: ${why}`)
+    }
+}
+
+export function verifyArrivals(g: Graph, stage: string, words: Set<number>, edges: Map<number, CallEdge>): void {
+    const word = wordOf(g, words, true)
+    const raw = rawOf(g, edges)
+    for (const [call, edge] of edges) {
+        const n = getNode(g, call)
+        if (n?.op !== NodeOp.call) continue
+        for (const [index, param] of edge.params) {
+            const x = 3 + index < countIds(n) ? getRef(n, 3 + index) : 0
+            if (!x) continue
+            const why = param.pointer ? word(x) : param.word ? raw(x) : ''
+            if (why) fail(stage, g, call, `passes %${x} into ${param.pointer ? 'raw pointer' : 'word'} param ${index}: ${why}`)
+        }
+    }
+}
+
+export function verifySetterBinding(g: Graph, stage: string, id: number, n: GraphNode, first: number, params: number): void {
+    if (n.op !== NodeOp.setProp) return
+    const value = countIds(n) - 1
+    if (value - first >= params) fail(stage, g, id, `(set-prop) binds a callee's ${params} param(s) from slot ${first}, so none takes the value slot ${value}`)
+}
+
+export function verifyNumericUses(g: Graph, stage: string, unions: Set<number>, ops: Set<NodeOp>, rets: number[]): void {
+    function word(x: number): boolean {
+        return unions.has(x) || unions.has(valueOf(g, x))
+    }
+    for (const [id, n] of g.nodes) {
+        if (!ops.has(n.op)) continue
+        for (let i = 0; i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (x && word(x)) fail(stage, g, id, `(${opName(n.op)}) computes on %${x}, a union word by plan`)
+        }
+    }
+    for (const id of rets) {
+        const x = getRef(getNode(g, id)!, 0)
+        if (x && word(x)) fail(stage, g, id, `(ret) returns %${x}, a union word by plan, from a unit whose ABI returns a number`)
+    }
+}

@@ -37,6 +37,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
+import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses } from './verify'
 import { type AccessHost, analyzeGenerics, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, pendingJoins, planEmbeddings, planUnits, shareUnits, threadConstants, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type Site, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
@@ -1718,6 +1719,7 @@ function createClock(target: Target): PhaseClock {
     function normalize(graph: Graph, opts?: { firstPass?: boolean }): Graph {
         if (flags.has('trace-stats')) normalizeStats.push([graph.name ?? '?', graph.nodes.size, !!opts?.firstPass])
         if (flags.has('norm-log')) console.log('NORM', graph.name ?? '?', graph.nodes.size, opts?.firstPass ? 'first' : 'again')
+        verifyGraph(graph, 'normalize:input', graph.form !== undefined)
         recordSnapshots(graph)
         return timed('normalize', () => normalizeValueGraph(graph, { ...opts, target }))
     }
@@ -3604,7 +3606,7 @@ interface Arrival {
     shaped: boolean
 }
 
-function realizeWords(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, local: UnitPlan | undefined, returns: ReturnMode, calleeParams: Map<number, Map<number, Arrival>>): void {
+function realizeWords(graph: Graph, shapes: Map<number, intrinsics.Handle>, encoded: Set<number>, local: UnitPlan | undefined, returns: ReturnMode, calleeParams: Map<number, Map<number, Arrival>>, rawCalls: Set<number>): void {
     const reps = local?.nodes ?? new Map<number, Rep>()
     const floats = floatValues(graph)
     const own = new Set(ownRets(graph))
@@ -3618,6 +3620,7 @@ function realizeWords(graph: Graph, shapes: Map<number, intrinsics.Handle>, enco
     }
     function union(x: Operand): boolean {
         if (typeof x !== 'number' || !x) return false
+        if (rawCalls.has(tailOf(graph, x))) return false
         const rep = reps.get(x) ?? reps.get(tailOf(graph, x))
         return !!rep && unionOfShape(rep)
     }
@@ -3685,8 +3688,6 @@ function realizeWords(graph: Graph, shapes: Map<number, intrinsics.Handle>, enco
         for (const at of encoding) operands[at] = encode(getRef(n, at))
         putCopy(graph, id, n, operands)
     }
-    const unionArgs = [...calleeParams.values()].some(params => [...params.values()].some(param => unionOfShape(param.rep)))
-    if (!unionArgs && !encoded.size && ![...reps.values()].some(unionOfShape)) return
     function coerce(id: number, n: GraphNode, slots: number[], to: (x: Operand, i: number) => Operand): void {
         const operands = getOperands(graph, n)
         let changed = false
@@ -3703,7 +3704,7 @@ function realizeWords(graph: Graph, shapes: Map<number, intrinsics.Handle>, enco
     }
     function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
         if (rep && unionOfShape(rep)) return toWord(x)
-        if (shaped && encodedWord(x)) return addNode(graph, NodeOp.decode, [x as number, { literal: pstack0Base() }])
+        if (shaped && (encodedWord(x) || (pointerOfShapes(rep) && word(x)))) return addNode(graph, NodeOp.decode, [x as number, { literal: pstack0Base() }])
         if (!union(x)) return x
         if (rep?.kind === 'number' && rep.number === 'f64') return add(NodeOp.convert, add(NodeOp.unbox, x as number, Types.i64), Types.f64)
         if (rep?.kind === 'number') return add(NodeOp.unbox, x as number, Types.i64)
@@ -5990,6 +5991,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const unions = new Set(unionParams(fn))
         const params = paramShapes(fn, source.compiled.paramCount)
         const traced = { ...withConstantParams(unit.traced!, constantParams(fn)) }
+        verifyTraced(traced, 'resolve:entry')
         const outer = enterPhase('resolve')
         const plannedUnit = planned.units.get(fn)
         const local: UnitPlan | undefined = plannedUnit && { unit: plannedUnit, nodes: plannedUnit.nodes, calls: plannedUnit.calls, boxedCalls: plannedUnit.boxedCalls }
@@ -6071,6 +6073,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 closureByContext.set(shape, body)
             },
         })
+        verifyTraced(traced, 'resolve:input')
         const result = evaluate()
         linkRuntimeCalls(result.graph)
         enterPhase(outer)
@@ -6345,10 +6348,43 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const shaped = new Set(plannedParams(fn).filter(({ rep }) => plannedShape(plan, rep) !== undefined).map(({ index }) => index))
         return new Map(unionParams(fn).filter(i => shaped.has(i)).map(i => [i, pstack0Base()]))
     }
+    function verifyTraced(traced: Traced, stage: string): void {
+        verifyGraph(traced.graph, stage, false)
+        verifyAllocationTokens(traced.graph, stage, traced.allocations)
+        verifyKeys(traced.graph, stage)
+    }
+    function callEdges(resolved: Resolution, params: Map<number, Map<number, Arrival>>): Map<number, CallEdge> {
+        const edges = new Map<number, CallEdge>()
+        for (const [call, arrivals] of params) {
+            const callee = planned.functions.get(resolved.callees.get(call)!)!
+            edges.set(call, { raw: abiOf(callee).mode === 'raw', params: new Map([...arrivals].map(([index, { rep, shaped }]) => [index, { word: unionOfShape(rep), pointer: shaped && pointerOfShapes(rep) }])) })
+        }
+        return edges
+    }
+    function unionWords(resolved: Resolution, edges: Map<number, CallEdge>): Set<number> {
+        const words = new Set<number>()
+        for (const [id, rep] of resolved.local?.nodes ?? []) if (unionOfShape(rep) && !edges.get(id)?.raw) words.add(id)
+        return words
+    }
+    function verifyResolved(resolved: Resolution, edges: Map<number, CallEdge>, stage: string, realized: boolean): void {
+        const unions = unionWords(resolved, edges)
+        const words = new Set([...resolved.encoded, ...unions])
+        verifyGraph(resolved.graph, stage, false)
+        verifyCodecs(resolved.graph, stage, words, edges)
+        if (!realized) return
+        verifyArrivals(resolved.graph, stage, words, edges)
+        verifyNumericUses(resolved.graph, stage, unions, UnboxingOps, resolved.local?.unit.returns.kind === 'number' ? ownRets(resolved.graph) : [])
+    }
     function realizeUnit(fn: Function): Graph {
         const resolved = resolveUnit(fn)
-        realizeWords(resolved.graph, resolved.shapes, resolved.encoded, resolved.local, abiOf(fn).mode, calleeParams(resolved))
+        const params = calleeParams(resolved)
+        const edges = callEdges(resolved, params)
+        verifyResolved(resolved, edges, 'resolve', false)
+        const rawCalls = new Set([...resolved.callees].filter(([, unit]) => abiOf(planned.functions.get(unit)!).mode === 'raw').map(([call]) => call))
+        realizeWords(resolved.graph, resolved.shapes, resolved.encoded, resolved.local, abiOf(fn).mode, params, rawCalls)
+        verifyResolved(resolved, edges, 'realizeWords', true)
         tagUnit(fn, resolved)
+        verifyResolved(resolved, edges, 'tagUnit', true)
         return resolved.graph
     }
     return { abiOf, realizeUnit, paramShapesOf, nullishParams, plannedUnit: (fn: Function) => planned.units.get(fn) }
