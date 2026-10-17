@@ -3678,11 +3678,14 @@ function pointerOfShapes(rep: Rep | undefined): boolean {
 function unionOfShape(rep: Rep): boolean {
     return rep.kind === 'union' && rep.targets.length > 0 && rep.targets.every(target => target.startsWith('S'))
 }
+function unionWord(graph: Graph, reps: Map<number, Rep>, x: Operand): boolean {
+    if (typeof x !== 'number' || !x) return false
+    const rep = reps.get(x) ?? reps.get(tailOf(graph, x))
+    return !!rep && unionOfShape(rep)
+}
 function encodeUnions(graph: Graph, reps: Map<number, Rep>, returns: Rep, objectValue: (ref: number) => boolean, encode: (value: number) => number): void {
     function word(x: Operand): boolean {
-        if (typeof x !== 'number' || !x) return false
-        const rep = reps.get(x) ?? reps.get(tailOf(graph, x))
-        return !!rep && unionOfShape(rep)
+        return unionWord(graph, reps, x)
     }
     function add(op: NodeOp, operand: number, T: intrinsics.Types): number {
         const id = addNode(graph, op, [operand], T)
@@ -4146,6 +4149,33 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             putNode(graph, id, NodeOp.heapHandle, [{ literal: engineArrayOf(cell) }])
         }
     }
+    function ownProperties(graph: Graph): void {
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.ownKeys) continue
+            const object = getNode(graph, getRef(n, 2))
+            if (object?.op !== NodeOp.heapHandle || getRef(object, 0)) continue
+            const keys = heap.enumerableKeys(heap.deref(getLiteral(graph, object, 0) as intrinsics.Handle))
+            const mode = getLiteral(graph, n, 3)
+            const array = addNode(graph, NodeOp.rt, [getRef(n, 0), { literal: rt.Op.arrayLiteral }, { literal: keys.length }])
+            let token = array
+            for (let i = 0; i < keys.length; i++) {
+                const key = addNode(graph, NodeOp.heapHandle, [{ literal: keys[i] }])
+                let element = key
+                if (mode !== 0) {
+                    element = addNode(graph, NodeOp.getProp, [token, getRef(n, 2), { literal: keys[i] }])
+                    token = element
+                }
+                if (mode === 2) {
+                    const pair = addNode(graph, NodeOp.rt, [token, { literal: rt.Op.arrayLiteral }, { literal: 2 }])
+                    token = addNode(graph, NodeOp.rt, [pair, { literal: rt.Op.arrayElement }, pair, { literal: 0 }, key])
+                    token = addNode(graph, NodeOp.rt, [token, { literal: rt.Op.arrayElement }, pair, { literal: 1 }, element])
+                    element = pair
+                }
+                token = addNode(graph, NodeOp.rt, [token, { literal: rt.Op.arrayElement }, array, { literal: i }, element])
+            }
+            putNode(graph, id, NodeOp.after, [token, array])
+        }
+    }
     interface ColdRegion {
         entry: number
         blocks: Set<number>
@@ -4319,7 +4349,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             if (frames.has(value as u32) || (heap.isBoxedF64(value) && intrinsics.getNanId(heap.unboxF64(value)))) return true
         }
     }
-    function reachableNodes(graph: Graph): Set<number> {
+    function reachableNodes(graph: Graph, allocations?: Map<u32, Allocation>): Set<number> {
         const reached = new Set<number>()
         const walk: number[] = []
         for (const b of graph.blocks) walk.push(b.id, b.bodyId, ...b.params)
@@ -4328,7 +4358,9 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             if (!id || reached.has(id)) continue
             reached.add(id)
             const n = getNode(graph, id)
-            if (n) nodeRefs(graph, n, walk)
+            if (!n) continue
+            nodeRefs(graph, n, walk)
+            if (allocations && n.op === NodeOp.heapHandle && !getRef(n, 0)) walk.push(allocations.get(getLiteral(graph, n, 0) as u32)?.token ?? 0)
         }
         return reached
     }
@@ -4534,7 +4566,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         if (!removed.size) return
         for (const region of regions) if (![...region.blocks].every(b => removed.has(b))) for (const b of region.blocks) removed.delete(b)
         setGraphBlocks(graph, graph.blocks.filter(b => !removed.has(b.id)))
-        const after = reachableNodes(graph)
+        const after = reachableNodes(graph, traced.allocations)
         for (const id of [...graph.nodes.keys()]) if (!after.has(id)) deleteNode(graph, id)
     }
     const assumed: [intrinsics.Handle, intrinsics.Handle, string][] = []
@@ -5024,7 +5056,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
         }
         resolveRegions(traced, regions)
         if (regions.size || spliced) {
-            const live = reachableNodes(graph)
+            const live = reachableNodes(graph, traced.allocations)
             for (const id of [...graph.nodes.keys()]) if (!live.has(id)) graph.nodes.delete(id)
         }
     }
@@ -5348,6 +5380,7 @@ function createTracer(linker: ReturnType<typeof createLinker>, image: ProgramIma
             if (intrinsics.argv().includes('trace-time')) console.log('TRACETIME', fn.name, (performance.now() - traceStart).toFixed(2), traced.graph.nodes.size)
             lowerPanics(traced.graph)
             engineHeapArrays(traced.graph)
+            ownProperties(traced.graph)
             outlineCold(fn, code, traced)
             if (intrinsics.argv().includes(`traced-debug:${fn.name}`)) console.log(dumpGraph(traced.graph))
             traces.set(key, traced)
@@ -5456,12 +5489,13 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         return out
     }
     function encodePlannedUnions(fn: Function, graph: Graph): void {
+        const reps = planned?.units.get(fn)?.nodes ?? new Map<number, Rep>()
         for (const [call, args] of planned?.unionArgs.get(fn) ?? []) {
             const n = getNode(graph, call)
             if (n?.op !== NodeOp.call) continue
             const operands = getOperands(graph, n)
             for (const [i, kind] of args) {
-                if (kind === 'word' || 3 + i >= countIds(n)) continue
+                if (3 + i >= countIds(n) || unionWord(graph, reps, operands[3 + i])) continue
                 const ref = getRef(n, 3 + i)
                 if (!ref) {
                     operands[3 + i] = { literal: getLiteral(graph, n, 3 + i) * 2 }
@@ -5470,6 +5504,25 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
                 operands[3 + i] = kind === 'object' ? addNode(graph, NodeOp.encode, [ref, { literal: pstack0Base() }]) : addNode(graph, NodeOp.box, [ref], Types.vm_value)
             }
             putCopy(graph, call, n, operands)
+        }
+        if (![...reps.values()].some(unionOfShape)) return
+        for (const [call, unit] of planned!.sites.get(fn) ?? []) {
+            const n = getNode(graph, call)
+            if (n?.op !== NodeOp.call) continue
+            const callee = planned!.functions.get(unit)!
+            const shapes = paramShapesOf(callee)
+            const operands = getOperands(graph, n)
+            let changed = false
+            for (const { index, rep } of plannedParams(callee)) {
+                if (3 + index >= countIds(n) || unionOfShape(rep) || !unionWord(graph, reps, operands[3 + index])) continue
+                const ref = getRef(n, 3 + index)
+                if (rep.kind === 'number' && rep.number === 'f64') throw `native: ${fn.name} %${call} passes the union word %${ref} into an f64 param`
+                if (shapes.has(index)) operands[3 + index] = addNode(graph, NodeOp.decode, [ref, { literal: pstack0Base() }])
+                else if (rep.kind === 'number') operands[3 + index] = addNode(graph, NodeOp.unbox, [ref], Types.i64)
+                else continue
+                changed = true
+            }
+            if (changed) putCopy(graph, call, n, operands)
         }
     }
     const wordReturns = new Map<Function, boolean>()
@@ -5523,7 +5576,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
         if (unions.length) {
             let args = planned!.unionArgs.get(caller)
             if (!args) planned!.unionArgs.set(caller, args = new Map())
-            args.set(site.call, unions.map(i => [i, site.encoded[i] ? 'word' : site.args[i] !== undefined ? 'object' : 'number'] as [number, string]))
+            args.set(site.call, unions.map(i => [i, site.args[i] !== undefined ? 'object' : 'number'] as [number, string]))
         }
         const callee = planned!.functions.get(unit)!
         const source = sourceOfLinked(callee)
@@ -5552,7 +5605,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
             argShapes: Array.from({ length: paramCount }, (_, i) => shapes.get(i)),
             result, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionOfShape(returned) || undefined,
             boxed: ((returned.number === 'int' || returned.number === 'i64') && (planned!.units.get(caller)?.calls.has(site.call) ? planned!.units.get(caller)!.boxedCalls.has(site.call) : unit.boxedReturn)) || undefined,
-            decode: (result !== undefined && !string && !numeric && !propertyEval.reducedShape(result) && encodesReturns(callee)) || boxedFloat ? pstack0Base() : undefined,
+            decode: (result !== undefined && !string && !numeric && !propertyEval.reducedShape(result) && (encodesReturns(callee) || unionOfShape(returned))) || boxedFloat ? pstack0Base() : undefined,
             target,
             returns: returnMode(callee) === 'raw' ? Types.u64 : returnTypeOf(callee) === Types.u64 ? undefined : returnTypeOf(callee),
         }
@@ -6043,7 +6096,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
             putCopy(traced.graph, select, n, operands)
         }
         setGraphBlocks(traced.graph, traced.graph.blocks.map(b => ids.has(b.id) ? { ...b, bodyId: end, bodyConst: 0 } : b))
-        const live = reachableNodes(traced.graph)
+        const live = reachableNodes(traced.graph, traced.allocations)
         for (const id of [...traced.graph.nodes.keys()]) if (!live.has(id)) traced.graph.nodes.delete(id)
     }
     let arrayProto: intrinsics.Handle | undefined
@@ -6505,7 +6558,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
                     const state = types.objects[m].state
                     const addr = state !== undefined ? heap.getOwnProperty(state, key) : 0
                     return !!addr && !(heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).flags & heap.PropFlags.writable)
-                }) || (sig.fields.length === 1 && sig.fields[0][1].kind === 'number' && sig.fields[0][1].number !== 'f64' && !sig.fields[0][1].nullable && !inst.nullable.has(id) && sig.members.every(m => types.objects[m].initialized.has(k)))
+                }) || (sig.fields.length === 1 && sig.fields[0][1].kind === 'number' && sig.fields[0][1].number !== 'f64' && !sig.fields[0][1].nullable && !inst.addressed.has(id) && sig.members.every(m => types.objects[m].initialized.has(k)))
                 if (readonly) heap.setReadonlyProperty(shape, key, heap.boxF64(0) as intrinsics.Handle)
                 else heap.setProperty(shape, key, heap.boxF64(0) as intrinsics.Handle)
             }
