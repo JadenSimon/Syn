@@ -3,6 +3,8 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
+import { spawn } from 'node:child_process'
+import * as os from 'node:os'
 import * as reifiedTypes from './reifiedTypes'
 import { createModuleLoader, runSynScript } from './synModules'
 
@@ -575,15 +577,127 @@ declare var process: any
 const watchdogSource = `
 const { workerData } = require('node:worker_threads')
 const fs = require('node:fs')
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.seconds * 1000)
+const wait = new Int32Array(new SharedArrayBuffer(4))
+while (Date.now() < workerData.deadline) {
+    Atomics.wait(wait, 0, 0, Math.min(250, workerData.deadline - Date.now()))
+    if (workerData.ppid && process.ppid !== workerData.ppid) process.kill(workerData.pid, 'SIGKILL')
+}
 fs.writeSync(2, '\\nwatchdog: killed after ' + workerData.seconds + 's\\n')
 process.kill(workerData.pid, 'SIGKILL')
 `
 
-function startWatchdog(seconds: number): void {
-    if (!(seconds > 0)) return
-    const worker = new Worker(watchdogSource, { eval: true, workerData: { seconds, pid: process.pid } })
+function startWatchdog(seconds: number, deadline = Date.now() + seconds * 1000, ppid = 0): void {
+    if (!(seconds > 0) && !ppid) return
+    const workerData = { seconds, deadline: seconds > 0 ? deadline : Infinity, pid: process.pid, ppid }
+    const worker = new Worker(watchdogSource, { eval: true, workerData })
     worker.unref()
+}
+
+const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer']
+
+interface CrashResume {
+    suite: string
+    case: number
+    event: number
+    message: string
+}
+
+const crashFd = Number(process.env.SYN_CRASH_FD ?? 0)
+const crashResume: CrashResume | undefined = process.env.SYN_CRASH_RESUME ? JSON.parse(process.env.SYN_CRASH_RESUME) : undefined
+const crashSignals = new Set(['SIGSEGV', 'SIGBUS', 'SIGTRAP', 'SIGILL', 'SIGABRT', 'SIGFPE', 'SIGSYS'])
+
+function markSuite(suite: string): void {
+    if (crashFd) fs.writeSync(crashFd, `suite\t${suite}\n`)
+}
+
+interface CrashMarks {
+    suite?: string
+    caseNumber?: number
+    caseLabel?: string
+    step?: string
+    event: number
+    eventLabel?: string
+}
+
+function readMark(marks: CrashMarks, line: string): void {
+    const fields = line.split('\t')
+    if (fields[0] === 'suite') {
+        marks.suite = fields[1]
+        marks.caseNumber = undefined
+        marks.step = undefined
+        marks.event = 0
+        marks.eventLabel = undefined
+    } else if (fields[0] === 'case') {
+        marks.caseNumber = Number(fields[1])
+        marks.caseLabel = fields[2]
+        marks.step = undefined
+        marks.event = 0
+        marks.eventLabel = undefined
+    } else if (fields[0] === 'step') {
+        marks.step = fields[1]
+    } else if (fields[0] === 'event') {
+        marks.event = Number(fields[1])
+        marks.eventLabel = fields[2]
+    } else if (fields[0] === 'end') {
+        marks.caseNumber = undefined
+        marks.step = undefined
+        marks.eventLabel = undefined
+    }
+}
+
+function crashOf(code: number | null, signal: string | null): string | undefined {
+    const signals = os.constants.signals as Record<string, number>
+    const name = signal ?? Object.keys(signals).find(k => code !== null && code > 128 && signals[k] === code - 128)
+    if (!name || !crashSignals.has(name)) return
+    return `CRASH signal ${signals[name]} (exit ${128 + signals[name]})`
+}
+
+async function superviseEngine(args: string[], seconds: number): Promise<void> {
+    const suites = args[1] === 'all' ? allTestableFiles : [args[1]]
+    const deadline = Date.now() + seconds * 1000
+    const crashes: string[] = []
+    let resume: CrashResume | undefined
+    let exitCode = 0
+    while (true) {
+        const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
+        if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
+        const child = spawn(process.argv[1], process.argv.slice(2), { stdio: ['inherit', 'inherit', 'inherit', 'pipe'], env })
+        const marks: CrashMarks = { event: 0 }
+        let pending = ''
+        child.stdio[3]!.setEncoding('utf8')
+        child.stdio[3]!.on('data', (chunk: string) => {
+            const lines = (pending + chunk).split('\n')
+            pending = lines.pop()!
+            for (const line of lines) readMark(marks, line)
+        })
+        const [code, signal] = await new Promise<[number | null, string | null]>(resolve => child.on('close', (c, s) => resolve([c, s])))
+        const message = crashOf(code, signal)
+        if (!message) {
+            exitCode = code ?? 128 + ((os.constants.signals as Record<string, number>)[signal!] ?? 0)
+            break
+        }
+        let label = marks.suite ?? args[1]
+        let next: CrashResume | undefined
+        if (marks.suite !== undefined && marks.caseNumber !== undefined) {
+            label = marks.step ?? (marks.eventLabel ? `${marks.suite} ${marks.eventLabel}` : marks.caseLabel!)
+            next = { suite: marks.suite, case: marks.caseNumber, event: marks.event > 0 ? marks.event : -1, message }
+            if (resume && resume.suite === next.suite && resume.case === next.case && (next.event < 0 || next.event >= resume.event)) next.event = -1
+        } else {
+            if (marks.eventLabel) label = `${label} in ${marks.eventLabel}`
+            const following = suites[suites.indexOf(marks.suite!) + 1]
+            if (marks.suite !== undefined && following) next = { suite: following, case: 0, event: -1, message }
+        }
+        console.log(`${label} FAILED: ${message}`)
+        crashes.push(label)
+        if (!next || crashes.length >= 100) {
+            exitCode = 128 + Number(message.match(/signal (\d+)/)![1])
+            break
+        }
+        resume = next
+    }
+    if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
+    if (args[1] === 'all') console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`)
+    process.exitCode = exitCode
 }
 
 export async function main(...args: string[]) {
@@ -591,7 +705,11 @@ export async function main(...args: string[]) {
     const filter = args[0]
     if (filter === '--engine') {
         const given = args.find(a => a.startsWith('timeout:'))
-        startWatchdog(given ? Number(given.slice('timeout:'.length)) : args[1] === 'all' ? 120 : 30)
+        const seconds = given ? Number(given.slice('timeout:'.length)) : args[1] === 'all' ? 120 : 30
+        const profiling = args[1] !== 'all' && args.some(a => /^(cpu-prof|heap-prof|coverage):/.test(a))
+        if (!crashFd && !profiling && !args.includes('in-process')) return superviseEngine(args, seconds)
+        if (crashFd) startWatchdog(seconds, Number(process.env.SYN_CRASH_DEADLINE), Number(process.env.SYN_CRASH_PPID))
+        else startWatchdog(seconds)
     }
     if (filter === '--engine' && args[1] !== 'all') {
         const prof = args.find(a => a.startsWith('cpu-prof:'))?.slice('cpu-prof:'.length)
@@ -601,18 +719,20 @@ export async function main(...args: string[]) {
     }
     if (filter === '--engine') {
         if (args[1] === 'all') {
-            const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer']
             const hasNativeOption = new Set(['cg', 'containers'])
-            for (const x of allTestableFiles) {
+            const first = crashResume ? Math.max(0, allTestableFiles.indexOf(crashResume.suite)) : 0
+            for (const x of allTestableFiles.slice(first)) {
                 const a = args.slice(2)
                 if (hasNativeOption.has(x)) a.unshift('native')
                 a.unshift(x)
-                console.log(`--- running ${a.join(' ')} ---`)
+                if (!crashResume || crashResume.suite !== x || crashResume.case === 0) console.log(`--- running ${a.join(' ')} ---`)
+                markSuite(x)
                 await testEngine(x, a) // let it fail fast
             }
-            process.on('beforeExit', () => console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`))
+            if (!crashFd) process.on('beforeExit', () => console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`))
             return
         }
+        markSuite(args[1])
         return testEngine(args[1], args.slice(1))
     }
 
