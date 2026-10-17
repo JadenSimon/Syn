@@ -26,6 +26,7 @@ export interface Allocation {
     constant: boolean
     escaped: boolean
     native?: boolean
+    dynamic?: boolean
 }
 
 export interface Location {
@@ -103,6 +104,7 @@ export interface Accesses {
 }
 
 export const numberKey = '[number]'
+export const dynamicKey = '[key]'
 
 export interface AccessHost {
     session: TraceSession
@@ -277,6 +279,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     const valueIds = new Map<string, number>()
     const allocations: Allocation[] = []
     const allocationIds = new Map<string, number>()
+    const allocationFrames = new Map<number, number>()
     const locations: Location[] = []
     const locationIds = new Map<string, number>()
     const recorded = new Set<string>()
@@ -849,6 +852,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const known = allocationIds.get(id)
         if (known !== undefined) return [known, false]
         allocationIds.set(id, allocations.length)
+        allocationFrames.set(allocations.length, frame)
         const owner = frames[frame].object
         const depth = constant || owner < 0 ? 0 : allocations[owner].depth + 1
         allocations.push({ site: { unit: frames[frame].unit, node }, name, depth, context: constant ? '' : frames[frame].context, proto, constant, escaped: false })
@@ -1271,7 +1275,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         }
         return combos
     }
-    function bind(caller: number, call: number, n: GraphNode, callee: Function, receiver: number | undefined, first: number, closure?: number): number[] {
+    function bind(caller: number, call: number, n: GraphNode, callee: Function, receiver: number | undefined, first: number, closure?: number, given?: number[][]): number[] {
         const site = `${unitKey(frames[caller].unit)}:${call}`
         const program = n.op === NodeOp.static
         const object = closure ?? (receiver !== undefined ? values[receiver].allocation ?? -1 : program ? -1 : frames[caller].object)
@@ -1288,7 +1292,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const plain = g.blocks[0].params.filter(p => p !== self)
         const entered: number[] = []
         const exact = new Set([...addressRelevant(g)].map(i => plain.indexOf(g.blocks[0].params[i])).filter(i => i >= 0))
-        for (const [signature, args] of argumentGroups(caller, call, n, first, plain.length, exact)) {
+        const groups: [string, number[][]][] = given ? [[given.map(list => `${argClass(list[0], false)},`).join(''), given]] : argumentGroups(caller, call, n, first, plain.length, exact)
+        for (const [signature, args] of groups) {
             const frame = enter(callee, `${base}|${signature}`, owner)
             entered.push(frame)
             const sites = setOf(callSites, frame)
@@ -1375,6 +1380,81 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const k = getLiteral(g, n, 2) as Handle
         return heap.keyIndex(k) !== undefined ? undefined : k
     }
+    const dynamicReceivers = new Map<number, Set<number>>()
+    const dynamicSites = new Map<number, [frame: number, node: number, user: GraphNode, locs: Set<number>]>()
+    const word = () => [fixedValue(Types.u32)]
+    function dynamicCandidate(allocation: number): boolean {
+        const object = allocations[allocation]
+        return !object.constant && !object.native && !object.proto && allocationFrames.has(allocation)
+    }
+    function markDynamic(allocation: number): void {
+        const object = allocations[allocation]
+        if (object.dynamic) return
+        object.dynamic = true
+        const frame = allocationFrames.get(allocation)!
+        const g = frames[frame].graph!
+        const site = getNode(g, object.site.node)!
+        resultTyped.add(key(frame, object.site.node))
+        bind(frame, object.site.node, site, heap.makePlainObject, undefined, countIds(site), undefined, [])
+        for (const receiver of dynamicReceivers.get(allocation) ?? []) changed(receiver)
+    }
+    function dynamicAccess(frame: number, u: number, user: GraphNode, allocation: number): boolean {
+        setOf(dynamicReceivers, allocation).add(key(frame, getRef(user, 1)))
+        if (!allocations[allocation].dynamic) {
+            if (!getRef(user, 2) || !dynamicCandidate(allocation)) return false
+            if (![...seen(frame, u, getRef(user, 2))].some(v => values[v].kind !== ValueKind.number)) return false
+            markDynamic(allocation)
+        }
+        const write = user.op === NodeOp.setProp
+        const loc = access(write, frame, u, allocation, dynamicKey)
+        let site = dynamicSites.get(key(frame, u))
+        if (!site) dynamicSites.set(key(frame, u), site = [frame, u, user, new Set()])
+        site[3].add(loc)
+        resultTyped.add(key(frame, u))
+        if (write) {
+            if (getRef(user, 3)) for (const v of [...seen(frame, u, getRef(user, 3))]) for (const stored of objectsOf(frame, getRef(user, 3), v)) if (dynamicCandidate(stored)) markDynamic(stored)
+            storeFrom(frame, u, user, 3, loc)
+            return true
+        }
+        read(frame, u, loc)
+        flow(frame, u, [Undefined])
+        return true
+    }
+    function slotForm(list: Iterable<number>, write: boolean): 'int' | 'float' | 'handle' | undefined {
+        let numbers = false
+        let float = false
+        let handles = false
+        let undefinedStored = false
+        for (const v of list) {
+            const value = values[v]
+            if (value.kind === ValueKind.undefined) {
+                undefinedStored = write
+                continue
+            }
+            if (value.kind === ValueKind.string || (value.kind === ValueKind.object && allocations[value.allocation!].dynamic)) {
+                handles = true
+                continue
+            }
+            if (value.kind !== ValueKind.number) return
+            numbers = true
+            if ((value.form === NumberForm.fixed && floating(value.type!)) || value.bound === 'num64' || (value.form === NumberForm.literal && !Number.isInteger(value.literal))) float = true
+        }
+        if (numbers && (handles || undefinedStored)) return
+        return numbers ? float ? 'float' : 'int' : 'handle'
+    }
+    function bindDynamicSites(): void {
+        for (const [frame, u, user, locs] of dynamicSites.values()) {
+            const write = user.op === NodeOp.setProp
+            const stored = write ? (getRef(user, 3) ? [...seen(frame, u, getRef(user, 3))] : [literal(getLiteral(frames[frame].graph!, user, 3))]) : [...locs].flatMap(loc => [...setOf(contents, loc)])
+            const form = slotForm(stored, write)
+            if (form === undefined) continue
+            const value = form === 'int' ? [fixedValue(Types.i64)] : form === 'float' ? [fixedValue(Types.f64)] : word()
+            const fn = form === 'int' ? (write ? heap.setIntProperty : heap.getIntProperty)
+                : form === 'float' ? (write ? heap.setFloatProperty : heap.getFloatProperty)
+                : write ? heap.setHandleProperty : heap.getHandleProperty
+            bind(frame, u, user, fn, undefined, 1, undefined, write ? [word(), word(), value] : [word(), word()])
+        }
+    }
     function getProperty(frame: number, u: number, user: GraphNode): void {
         const g = frames[frame].graph!
         const k = indexKey(g, user)
@@ -1387,6 +1467,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             if (value.kind === ValueKind.variable) flow(frame, u, [variable({ unit: frames[frame].unit, node: u })])
             else if (value.kind === ValueKind.string || value.kind === ValueKind.unknown) flow(frame, u, [Unknown])
             for (const allocation of objectsOf(frame, getRef(user, 1), v)) {
+                if (dynamicAccess(frame, u, user, allocation)) continue
                 const proto = allocations[allocation].proto
                 if (k === undefined) {
                     const trap = indexTrap(proto, false)
@@ -1430,6 +1511,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const g = frames[frame].graph!
         const k = indexKey(g, user)
         for (const v of [...seen(frame, u, getRef(user, 1))]) for (const allocation of objectsOf(frame, getRef(user, 1), v)) {
+            if (dynamicAccess(frame, u, user, allocation)) continue
             const trap = k === undefined ? indexTrap(allocations[allocation].proto, true) : setterOf(allocations[allocation].proto, k)
             const name = k !== undefined ? nameOf(k) : getRef(user, 2) ? numberKey : nameOf(getLiteral(g, user, 2) as Handle)
             if (trap && host.traceable(trap)) bind(frame, u, user, trap, v, 2)
@@ -1569,6 +1651,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         drain()
     }
     opaqueCalls()
+    if (dynamicSites.size) {
+        bindDynamicSites()
+        drain()
+    }
     for (let round = 0; round < 4; round++) {
         let added = false
         frames.forEach((frame, f) => {
@@ -1722,6 +1808,7 @@ export interface ObjectType {
     context: string
     constant: boolean
     native: boolean
+    dynamic: boolean
     proto?: Handle
     state?: Handle
     fields: Map<string, Type>
@@ -1890,7 +1977,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
     if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) }, undefined, fixedFloats)
-    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, proto: allocation.proto, state: allocation.state, fields: new Map(), forms: new Map(), initialized: new Set<string>(), escaped: allocation.escaped, readers: [] }))
+    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, proto: allocation.proto, state: allocation.state, fields: new Map(), forms: new Map(), initialized: new Set<string>(), escaped: allocation.escaped, readers: [] }))
     const interned = new Map<string, Type>()
     function typeOf(list: Iterable<number>): Type {
         let k = ''
@@ -2558,7 +2645,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     }
     const joinable = (id: number) => {
         const object = types.objects[id]
-        if (object.native || object.name === 'buffer') return false
+        if (object.native || object.dynamic || object.name === 'buffer') return false
         return genericFor(id) ? true : !object.constant || object.name === 'Object'
     }
     function joinRecords(list: number[]): boolean {
@@ -2726,10 +2813,11 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     function repFor(type: Type, pointers: boolean): Rep {
         if (type.unknown) return { text: 'any', kind: 'any', targets: [], nullable: false }
         const numeric = type.fixed.length > 0 || type.bounds.length > 0 || type.literals.length > 0
-        const objects = type.objects.filter(id => !types.objects[id].native)
+        const objects = type.objects.filter(id => !types.objects[id].native && !types.objects[id].dynamic)
         const raw = (id: number) => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id))
         const targets = pointers ? [...new Set(objects.map(id => raw(id) ? 'buf' : shapeId(keyOf(id))))].sort() : objects.length ? ['*'] : []
         if (type.string) targets.push('str')
+        if (type.objects.some(id => types.objects[id].dynamic)) targets.push('heap')
         const nativeIds = [...type.closures, ...type.objects.filter(id => types.objects[id].native)]
         const natives = [...new Set(nativeIds.map(id => types.objects[id].state))]
         const plain = type.functions.some(fn => !type.closures.length)
@@ -2750,13 +2838,13 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (type.undefined || nulls) for (const target of targets) if (shapeTarget(target)) nullable.add(target)
         return { text: `ptr<${targets.join('|')}>${type.undefined || nulls ? '?' : ''}`, kind: 'pointer', targets, nullable: type.undefined || nulls, fresh }
     }
-    for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].name !== 'buffer') shapeId(key)
+    for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].name !== 'buffer' && !types.objects[table.get(key)!.members[0]].dynamic) shapeId(key)
     const constantShapes = new Map<Handle, string>()
     types.objects.forEach((object, id) => {
         if (!object.constant || object.state === undefined || !joinable(id) || recordMembers.get(findRecord(id))!.length < 2) return
         constantShapes.set(object.state, shapeId(keyOf(id)))
     })
-    return { keys, table, shapes, constantShapes, nullable, rep, repOf: type => repOf(type), shapeOf: id => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { keys, table, shapes, constantShapes, nullable, rep, repOf: type => repOf(type), shapeOf: id => types.objects[id].dynamic || types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 
 export interface PlannedUnit {
@@ -2788,7 +2876,7 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
     types.frames.forEach((frame, id) => contextFrames.set(`${unitIdentity(frame.unit)}|${frame.context}`, id))
     types.objects.forEach((object, id) => {
         if (object.constant || object.native || addressView(object)) return
-        const shape = inst.shapeOf(id)
+        const shape = object.dynamic ? 'heap' : inst.shapeOf(id)
         const frame = contextFrames.get(`${unitIdentity(object.site.unit)}|${object.context}`)
         if (shape === undefined || frame === undefined) return
         let list = created.get(frame)
@@ -2901,7 +2989,7 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
     const conflicted = new Set<string>()
     types.objects.forEach((object, id) => {
         if (object.constant || object.native || addressView(object)) return
-        const shape = inst.shapeOf(id)
+        const shape = object.dynamic ? 'heap' : inst.shapeOf(id)
         if (shape === undefined) return
         for (const unit of plan.get(object.site.unit) ?? []) {
             if (!unit.frames.some(f => types.frames[f].context === object.context)) continue
@@ -3253,7 +3341,7 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
         return [
             unitIdentity(unit.fn), unit.boxes, [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${returns}`,
-            byNode(unit.allocations, shape => layoutOf(shape, elements)), byNode(sites.get(unit) ?? new Map<number, string>(), k => k),
+            byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, string>(), k => k),
             [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? opaque(rep, entry.includes(id)) : node(rep)])), x => x),
         ]
     }

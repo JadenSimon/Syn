@@ -188,17 +188,34 @@ function mirrorRaw(ptr: number): void {
     mirroredCells.add(ptr)
     writeRuntimeHeap(ptr, vmBytes(ptr, intrinsics.allocationSize(ptr)))
 }
+function mirrorTypeDescriptor(td: number): void {
+    if (mirroredCells.has(td)) return
+    mirrorRaw(td)
+    mirrorValue(heap.objectPrototypeOfTD(td as intrinsics.Handle))
+}
+function mirrorValue(handle: number): void {
+    if (heap.isTypeDescriptor(handle as intrinsics.Handle)) mirrorTypeDescriptor(handle)
+    else if (heap.isCell(handle as intrinsics.Handle)) mirrorCell(handle)
+}
+function mirrorProperties(dict: number): void {
+    if (!dict || mirroredCells.has(dict)) return
+    const { raw, cells } = heap.propertyStorage(dict as intrinsics.Handle)
+    for (const at of raw) mirrorRaw(at)
+    for (const cell of cells) mirrorValue(cell)
+}
 function mirrorCell(handle: number): void {
     if (!handle || mirroredCells.has(handle)) return
     mirroredCells.add(handle)
-    const view = heap.cellViewOf(heap.typeDescriptorOf(handle as intrinsics.Handle))
+    const view = heap.cellLayout(heap.typeDescriptorOf(handle as intrinsics.Handle))
     if (!view) throw `native: heap cell ${handle} has no view for its type descriptor`
     const bytes = vmBytes(heap.resolveHeapCell(handle as intrinsics.Handle), view.sizeof)
     const data = new DataView(bytes.buffer)
     for (const offset of view.handleOffsets) {
         const child = data.getUint32(offset, true)
-        if (offset === 0) mirrorRaw(child)
-        else mirrorCell(child)
+        if (!child) continue
+        if (offset === 0) mirrorTypeDescriptor(child)
+        else if (heap.isTypeDescriptor(child as intrinsics.Handle) || heap.isCell(child as intrinsics.Handle)) mirrorValue(child)
+        else mirrorProperties(child)
     }
     for (const offset of view.rawOffsets) {
         const raw = Number(data.getBigUint64(offset, true))
@@ -4001,9 +4018,21 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
     function functionSlot(symbol: number): number {
         return image.functionSlot(symbol, functions[symbol]?.name || `${symbol}`)
     }
+    function mirrorReferenced(graph: Graph): void {
+        const nodes = reachable(graph)
+        if (!nodes.some(n => n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.heapaddr)) return
+        for (const n of nodes) {
+            if (n.op === NodeOp.heapHandle) continue
+            for (const operand of getOperands(graph, n)) {
+                if (typeof operand === 'number' || !Number.isInteger(operand.literal) || operand.literal <= 0 || operand.literal >= 2 ** 32) continue
+                mirrorValue(operand.literal)
+            }
+        }
+    }
     function resolveHandles(graph: Graph): void {
         const functionHandleSlots = image.functionHandles
         const dataHandleSlots = image.dataHandles
+        mirrorReferenced(graph)
         for (const n of reachable(graph)) {
             if (n.op !== NodeOp.heapHandle) continue
             const handle = heap.deref(getLiteral(graph, n, 0) as intrinsics.Handle)
@@ -5614,7 +5643,7 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
                 }
                 continue
             }
-            if (n.op === NodeOp.call) {
+            if (n.op === NodeOp.call || (n.op === NodeOp.getProp && [...unit.calls.get(id) ?? []].some(callee => runtimeHeapAccessors.has(originOf(callee.fn))))) {
                 const callees = unit.calls.get(id)
                 if (!callees?.size || ![...callees].every(returnTaggable)) {
                     leaves.push([unit, id])
@@ -5875,8 +5904,9 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
                 }
             })
         }
+        const dynamic = plannedUnit ? runtimeHeapSites(plannedUnit, traced.graph) : undefined
         const evaluate = () => propertyEval.resolveClosures(traced.graph, session, frameShapes, params, constructed(plannedUnit, traced.graph), callsFor(traced.graph, fn), {
-            facts, allocationShapes, fixedFacts: planned!.fixed, readonly: readonlyConstructions, statics: placedStatics, allocations: traced.allocations, rawReturns: !encodesReturns(fn),
+            dynamic, facts, allocationShapes, fixedFacts: planned!.fixed, readonly: readonlyConstructions, statics: placedStatics, allocations: traced.allocations, rawReturns: !encodesReturns(fn),
             plannedShapes: plannedUnit ? plannedNodeShapes(plannedUnit) : undefined, plannedUnions: plannedUnit ? plannedUnions(plannedUnit) : undefined,
             contextShape: unit.contextShape, unionParams: unionParamBases(fn), bound: unit.cold,
             created: (closure, shape) => {
@@ -5933,6 +5963,22 @@ function createShapeAnalysis(linker: ReturnType<typeof createLinker>, tracer: Re
             unit.calls.set(equal, unit.calls.get(id)!)
             putNode(traced.graph, id, NodeOp.eq, [equal, { literal: 0 }], Types.bool)
         }
+    }
+    const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty])
+    function runtimeHeapSites(unit: PlannedUnit, graph: Graph): Map<number, Function> | undefined {
+        const out = new Map<number, Function>()
+        for (const [node, shape] of unit.allocations) if (shape === 'heap') out.set(node, heap.makePlainObject)
+        if (!out.size && ![...unit.nodes.values()].some(rep => rep.targets.includes('heap'))) return
+        for (const [id, n] of graph.nodes) {
+            if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
+            const fn = [...unit.calls.get(id) ?? []].map(callee => originOf(callee.fn)).find(fn => runtimeHeapAccessors.has(fn))
+            if (fn) {
+                out.set(id, fn)
+                continue
+            }
+            if (unit.nodes.get(getRef(n, 1))?.targets.includes('heap')) throw `native: %${id} in ${graph.name} keeps ${unit.nodes.get(n.op === NodeOp.setProp ? getRef(n, 3) : id)?.text ?? 'a literal'} in a runtime-heap object, whose slots hold numbers or runtime-heap handles, not both`
+        }
+        return out.size ? out : undefined
     }
     function pruneUnentered(traced: FastTraced, unit: PlannedUnit): void {
         const dead = traced.graph.blocks.filter(b => b.id !== traced.graph.root && !unit.blocks.has(b.id))

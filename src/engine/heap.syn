@@ -28,7 +28,15 @@ export interface HeapAllocator {
     finish(handle: Handle): void
 }
 
+function runtimeAllocate(bytes: usize): Handle {
+    const next = rt.heapaddr(runtimeCells)
+    const handle = Intrinsics.load(next, 0, Types.u32) as Handle
+    Intrinsics.store(next, 0, handle + ((bytes + 7) & ~7), Types.u32)
+    return handle
+}
+
 function bootstrapAllocate(bytes: usize): Handle {
+    if (intrinsics.isNative()) return runtimeAllocate(bytes)
     return Intrinsics.alloc(bytes) as Handle
 }
 
@@ -76,6 +84,7 @@ export function finishHeapCell(handle: Handle): void {
     finishCell(handle)
 }
 
+intrinsics.tagInline(runtimeAllocate)
 intrinsics.tagInline(bootstrapAllocate)
 intrinsics.tagInline(bootstrapResolve)
 intrinsics.tagInline(bootstrapFinish)
@@ -131,9 +140,16 @@ export function cellViewOf(td: Handle): intrinsics.StructViewFactory<any> | unde
     return cellViews.get(td)
 }
 
+const typeDescriptors = new Set<Handle>()
+
+export function isTypeDescriptor(handle: Handle): boolean {
+    return typeDescriptors.has(handle)
+}
+
 function allocTypeDescriptor(kind: u8, variant: u8, extraSlots: u8, flags: u8, slot1: Handle = 0 as Handle) {
     const size = TypeDescriptor.sizeof + (extraSlots as u32) * 4
     const handle = allocateHeapCell(size)
+    typeDescriptors.add(handle)
     const td = TypeDescriptor(resolveHeapCell(handle))
     td.kind = kind
     td.variant = variant
@@ -625,13 +641,22 @@ function objectTDFor(proto: Handle): Handle {
     return td
 }
 
-export function makeObject(proto: Handle): Handle {
-    const handle = allocateHeapCell(HeapObject.sizeof)
+const plainObjectTD = objectTDFor(0 as Handle)
+
+function initObject(handle: Handle, td: Handle): Handle {
     const obj = HeapObject(resolveHeapCell(handle))
-    obj.td = objectTDFor(proto)
+    obj.td = td
     obj.properties = 0
     finishHeapCell(handle)
     return handle
+}
+
+export function makeObject(proto: Handle): Handle {
+    return initObject(allocateHeapCell(HeapObject.sizeof), objectTDFor(proto))
+}
+
+export function makePlainObject(): Handle {
+    return initObject(allocateHeapCell(HeapObject.sizeof), plainObjectTD)
 }
 
 bind(RtOp.create, { host: (proto: Handle): Handle => makeObject(deref(proto)) })
@@ -1054,6 +1079,111 @@ function hasProperty(obj: Handle, key: Handle): boolean {
 export function getProperty(obj: Handle, key: Handle): Handle {
     const desc = getPropertyDescriptor(obj, key)
     return desc === 0 ? 0 : FullPropertyDescriptor(resolveHeapCell(desc)).slot0 as Handle
+}
+
+export function isCell(handle: Handle): boolean {
+    if (!handle || (handle & ~boxedCellBit) >= runtimeCells) return false
+    return typeDescriptors.has(Intrinsics.load(resolveHeapCell(handle), 0, Types.u32) as Handle)
+}
+
+export function cellLayout(td: Handle): intrinsics.StructViewFactory<any> | undefined {
+    const view = cellViews.get(td)
+    if (view) return view
+    const header = TypeDescriptor(resolveHeapCell(td))
+    if (header.kind === BaseTypeKind.number) return HeapF64
+    if (header.kind === BaseTypeKind.symbol) return HeapSymbol
+    if (header.kind === BaseTypeKind.fn) return HeapObject
+    if (header.kind !== BaseTypeKind.object) return
+    return header.variant === indirectVariant ? HeapIndirect : HeapObject
+}
+
+export function objectPrototypeOfTD(td: Handle): Handle {
+    const header = TypeDescriptor(resolveHeapCell(td))
+    return header.kind === BaseTypeKind.object ? header.slot1 : 0 as Handle
+}
+
+export function propertyStorage(dictHandle: Handle): { raw: Handle[], cells: Handle[] } {
+    const dict = PropertyDict(resolveHeapCell(dictHandle))
+    intrinsics.assert(dict.count <= dict.capacity && dict.entries !== 0, `heap: ${dictHandle} is not a property dictionary`)
+    const raw: Handle[] = [dictHandle, dict.entries]
+    const cells: Handle[] = []
+    for (let i: u32 = 0; i < dict.count; i++) {
+        const entry = PropertyEntry(resolveHeapCell(dict.entries) + i * PropertyEntry.sizeof)
+        cells.push(entry.key)
+        raw.push(entry.descriptor)
+        const desc = FullPropertyDescriptor(resolveHeapCell(entry.descriptor))
+        cells.push(desc.slot0 as Handle, desc.slot1 as Handle)
+    }
+    return { raw, cells }
+}
+
+export const undefinedWord = 1
+
+function smiRange(value: i64): boolean {
+    return value >= -0x40000000 && value < 0x40000000
+}
+
+function boxWord(value: f64): u32 {
+    const handle = allocateHeapCell(HeapF64.sizeof)
+    const boxed = HeapF64(resolveHeapCell(handle))
+    boxed.td = heapF64TD
+    boxed.value = value
+    finishHeapCell(handle)
+    return handleWord(handle)
+}
+
+function handleWord(handle: Handle): u32 {
+    return Intrinsics.or(Intrinsics.shl(handle, 1, Types.u32), 1, Types.u32)
+}
+
+function intWord(value: i64): u32 {
+    if (smiRange(value)) return Intrinsics.convert(Intrinsics.shl(value, 1, Types.i64), Types.i64, Types.u32)
+    return boxWord(Intrinsics.convert(value, Types.i64, Types.f64))
+}
+
+function floatWord(value: f64): u32 {
+    const whole = Intrinsics.convert(value, Types.f64, Types.i64)
+    if (Intrinsics.convert(whole, Types.i64, Types.f64) === value && smiRange(whole)) return intWord(whole)
+    return boxWord(value)
+}
+
+function wordAt(obj: Handle, key: Handle): u32 {
+    const desc = getPropertyDescriptor(obj, key)
+    return desc === 0 ? undefinedWord : FullPropertyDescriptor(resolveHeapCell(desc)).slot0
+}
+
+function boxedWord(word: u32): f64 {
+    return unboxF64(Intrinsics.ushr(word, 1, Types.u32) as Handle)
+}
+
+export function setIntProperty(obj: Handle, key: Handle, value: i64): void {
+    setProperty(obj, key, intWord(value) as Handle)
+}
+
+export function setFloatProperty(obj: Handle, key: Handle, value: f64): void {
+    setProperty(obj, key, floatWord(value) as Handle)
+}
+
+export function setHandleProperty(obj: Handle, key: Handle, value: Handle): void {
+    setProperty(obj, key, handleWord(value) as Handle)
+}
+
+export function getIntProperty(obj: Handle, key: Handle): number | undefined {
+    const word = wordAt(obj, key)
+    if (word === undefinedWord) return undefined
+    if (Intrinsics.and(word, 1, Types.u32) === 0) return Intrinsics.shr(Intrinsics.convert(word, Types.u32, Types.i32), 1, Types.i64)
+    return Intrinsics.convert(boxedWord(word), Types.f64, Types.i64)
+}
+
+export function getFloatProperty(obj: Handle, key: Handle): number | undefined {
+    const word = wordAt(obj, key)
+    if (word === undefinedWord) return undefined
+    if (Intrinsics.and(word, 1, Types.u32) === 0) return Intrinsics.convert(Intrinsics.shr(Intrinsics.convert(word, Types.u32, Types.i32), 1, Types.i64), Types.i64, Types.f64)
+    return boxedWord(word)
+}
+
+export function getHandleProperty(obj: Handle, key: Handle): Handle {
+    return Intrinsics.ushr(wordAt(obj, key), 1, Types.u32) as Handle
 }
 
 export const prototypeKey = fromJsString('prototype')
