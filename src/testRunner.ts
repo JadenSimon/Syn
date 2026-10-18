@@ -676,7 +676,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         }
         console.log(`${label} FAILED: ${message}`)
         crashes.push(label)
-        if (!next || crashes.length >= 100) {
+        if (!next || crashes.length >= 3) {
+            console.log('...max crash count exceeded')
             exitCode = 128 + Number(message.match(/signal (\d+)/)![1])
             break
         }
