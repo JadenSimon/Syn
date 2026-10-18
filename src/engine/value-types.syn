@@ -53,9 +53,11 @@ export enum ValueKind {
 
 export enum NumberForm {
     literal,
-    fixed,
-    bound,
+    range,
+    float,
 }
+
+export type Interval = [lo: number, hi: number]
 
 export interface Value {
     kind: ValueKind
@@ -63,8 +65,8 @@ export interface Value {
     fn?: Function
     form?: NumberForm
     literal?: number
-    type?: intrinsics.Types
-    bound?: string
+    range?: Interval
+    word?: boolean
     site?: Site
     param?: number
     narrow?: string
@@ -117,7 +119,6 @@ export interface Accesses {
     graphs: Map<Function, Graph>
     numeric: Set<number>
     keyHandles: Map<string, Handle>
-    floatSets: Map<Function, Map<string, number[]>>
     consulted: Set<Handle>
 }
 
@@ -131,7 +132,6 @@ export interface AccessHost {
     localFunction(symbol: number): Function | undefined
     traceable(fn: Function): boolean
     invariantsOf?(proto: Handle): Invariants | undefined
-    variantOf?(fn: Function, floats: number[]): Function
     constantElements?(state: Handle): Handle[] | undefined
     paramCount?(fn: Function): number | undefined
     heapValue?(slot: Handle): Handle
@@ -156,19 +156,104 @@ const maxDepth = 3
 const maxSignatures = 16
 const nodeSpan = 2 ** 24
 
-function widestInteger(types: intrinsics.Types[]): intrinsics.Types {
-    const order = [Types.bool, Types.u8, Types.i8, Types.u16, Types.i16, Types.u32, Types.i32, Types.u64, Types.i64]
-    let best = types[0]
-    for (const T of types) if (order.indexOf(T) > order.indexOf(best)) best = T
-    const signed = types.some(T => T === Types.i8 || T === Types.i16 || T === Types.i32 || T === Types.i64)
-    if (signed && (best === Types.u32 || best === Types.u16 || best === Types.u8)) return best === Types.u32 ? Types.i64 : Types.i32
-    if (signed && best === Types.u64) return Types.i64
-    return best
-}
 const Types = intrinsics.Types
 
 export function scalarType(T: intrinsics.Types): boolean {
     return T !== Types.u64 && T !== Types.vm_value && T !== Types.ptr && T !== Types.fnptr && T !== Types.usize && T !== Types.void && T !== Types.unknown && T !== Types.handle && T !== Types.unknown_number
+}
+
+const MinI64 = -(2 ** 63)
+const MaxI64 = 2 ** 63
+const MaxU64 = 2 ** 64
+const Boundaries: [intrinsics.Types, Interval][] = [
+    [Types.u8, [0, 255]], [Types.u16, [0, 65535]], [Types.u32, [0, 2 ** 32 - 1]], [Types.u64, [0, MaxU64]],
+    [Types.i8, [-128, 127]], [Types.i16, [-32768, 32767]], [Types.i32, [-(2 ** 31), 2 ** 31 - 1]], [Types.i64, [MinI64, MaxI64]],
+]
+const U64: Interval = Boundaries[3][1]
+const I64: Interval = Boundaries[7][1]
+
+function typeInterval(T: intrinsics.Types): Interval | undefined {
+    if (T === Types.bool) return [0, 1]
+    if (floating(T) || T === Types.unknown_number) return
+    const known = Boundaries.find(([U]) => U === T)
+    return known ? known[1] : U64
+}
+
+function within(a: Interval, b: Interval): boolean {
+    return a[0] >= b[0] && a[1] <= b[1]
+}
+
+function wrapped(lo: number, hi: number): Interval {
+    if (lo >= 0 && hi <= MaxU64) return [lo, hi]
+    if (lo >= MinI64 && hi <= MaxI64) return [lo, hi]
+    return lo < 0 ? I64 : U64
+}
+
+function boundary(range: Interval): Interval {
+    for (const [, bound] of Boundaries) if (within(range, bound)) return bound
+    return I64
+}
+
+function rangeName(range: Interval): string {
+    const exact = Boundaries.find(([, bound]) => bound[0] === range[0] && bound[1] === range[1])
+    return exact ? typeName(exact[0]) : `${range[0]}..${range[1]}`
+}
+
+function hull(a: Interval | undefined, b: Interval | undefined): Interval | undefined {
+    if (!a || !b) return a ?? b
+    if (within(b, a)) return a
+    if (within(a, b)) return b
+    return [Math.min(a[0], b[0]), Math.max(a[1], b[1])]
+}
+
+function interval(op: NodeOp, a: Interval, b: Interval): Interval {
+    switch (op) {
+        case NodeOp.add: return wrapped(a[0] + b[0], a[1] + b[1])
+        case NodeOp.sub: return wrapped(a[0] - b[1], a[1] - b[0])
+        case NodeOp.subsat: return [Math.max(0, a[0] - b[1]), Math.max(0, a[1] - b[0])]
+        case NodeOp.neg: return wrapped(-a[1], -a[0])
+        case NodeOp.mul: {
+            const corners = [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]]
+            return wrapped(Math.min(...corners), Math.max(...corners))
+        }
+        case NodeOp.shl: return a[0] >= 0 && b[0] >= 0 && b[1] < 64 ? wrapped(a[0] * 2 ** b[0], a[1] * 2 ** b[1]) : I64
+        case NodeOp.shr:
+        case NodeOp.ushr:
+            if (a[0] >= 0 && b[0] >= 0) return [Math.floor(a[0] / 2 ** Math.min(b[1], 64)), Math.floor(a[1] / 2 ** Math.min(b[0], 64))]
+            return op === NodeOp.ushr ? U64 : I64
+        case NodeOp.and:
+            if (a[0] >= 0 && b[0] >= 0) return [0, Math.min(a[1], b[1])]
+            if (a[0] >= 0) return [0, a[1]]
+            if (b[0] >= 0) return [0, b[1]]
+            return I64
+        case NodeOp.or:
+        case NodeOp.xor:
+            return a[0] >= 0 && b[0] >= 0 ? [0, Math.min(MaxU64, 2 ** Math.ceil(Math.log2(Math.max(a[1], b[1]) + 1)) - 1)] : I64
+        case NodeOp.div:
+        case NodeOp.rem:
+            return a[0] >= 0 && b[0] >= 0 ? [0, a[1]] : I64
+        case NodeOp.not: return [0, 1]
+        case NodeOp.clz: return [0, 64]
+    }
+    return a[0] >= 0 && b[0] >= 0 ? U64 : I64
+}
+
+export interface IntFormat {
+    bits: 32 | 64
+    signed: boolean
+}
+
+function numberText(format: IntFormat | undefined): 'int' | 'i64' | 'f64' {
+    return !format ? 'f64' : format.signed ? 'i64' : 'int'
+}
+
+export function numberName(rep: Rep | undefined): 'int' | 'i64' | 'f64' | undefined {
+    return rep?.kind === 'number' ? numberText(rep.format) : undefined
+}
+
+function intFormat(range: Interval): IntFormat {
+    const signed = range[0] < 0
+    return { bits: within(range, signed ? Boundaries[6][1] : Boundaries[2][1]) ? 32 : 64, signed }
 }
 const Undefined = 0
 const Str = 1
@@ -289,7 +374,7 @@ function comparison(op: NodeOp): boolean {
     return op === NodeOp.lt || op === NodeOp.le || op === NodeOp.gt || op === NodeOp.ge || op === NodeOp.eq || op === NodeOp.ne
 }
 
-function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated, fixedFloats?: Map<Function, number[]>): Accesses {
+function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated): Accesses {
     const frames: Frame[] = []
     const frameIds = new Map<string, number>()
     const unitKeys = new Map<Function, number>()
@@ -355,6 +440,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                     if (!handle || !heap.isString(handle as Handle)) return []
                     return [[getRef(t, 2), { test: heap.stringToJs(handle as Handle), positive: c.op === NodeOp.eq }]]
                 }
+                if (t?.op === NodeOp.typeof && getRef(t, 0) && !getRef(c, other) && getLiteral(g, c, other) === Types.f64) return [[getRef(t, 0), { test: 'float', positive: c.op === NodeOp.eq }]]
                 if (t?.op === NodeOp.heapHandle && !getRef(t, 0) && !getLiteral(g, t, 0) && countIds(t) === 1 && getRef(c, other)) return [[getRef(c, other), { test: 'undefined', positive: c.op === NodeOp.eq }]]
                 if (t?.op === NodeOp.getProp && !getRef(t, 2) && !getRef(c, other)) {
                     const field: Test = [getRef(t, 1), { test: 'field', key: nameOf(getLiteral(g, t, 2) as Handle), literal: getLiteral(g, c, other), positive: c.op === NodeOp.eq }]
@@ -442,6 +528,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         }
         switch (filter.test) {
             case 'number': return (value.kind === ValueKind.number) === filter.positive
+            case 'float': return (value.kind === ValueKind.number && !integral(v)) === filter.positive
             case 'string': return (value.kind === ValueKind.string || handleWord(v)) === filter.positive
             case 'undefined': return (value.kind === ValueKind.undefined) === filter.positive
             case 'object': return (value.kind === ValueKind.object) === filter.positive
@@ -650,8 +737,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         return [...set].filter(v => filters.every(filter => accepts(v, filter, frame, ref))).map(v => narrowed(v, filters))
     }
     function handleWord(v: number): boolean {
-        const value = values[v]
-        return value.kind === ValueKind.number && value.form === NumberForm.fixed && (value.type === Types.u32 || value.type === Types.u64)
+        return !!values[v].word
     }
     function nonZero(filter: Filter): boolean {
         if (filter.test === 'truthy') return filter.positive
@@ -660,15 +746,25 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     function narrowedLeast(low: number, filters: Filter[]): number {
         let out = low
         for (const filter of filters) {
-            if (filter.test === 'least' && filter.positive) out = Math.max(out, filter.literal!)
+            if (filter.test === 'least' && filter.positive) out = Math.max(out, Math.ceil(filter.literal!))
             else if (nonZero(filter) && low >= 0) out = Math.max(out, 1)
         }
+        return out
+    }
+    function narrowedMost(high: number, filters: Filter[]): number {
+        let out = high
+        for (const filter of filters) if (filter.test === 'least' && !filter.positive) out = Math.min(out, Math.ceil(filter.literal!) - 1)
         return out
     }
     function narrowed(v: number, filters: Filter[]): number {
         const value = values[v]
         if (handleWord(v) && filters.some(filter => filter.positive && filter.test === 'string')) return Str
-        if ((value.bound === 'int64' || value.bound === 'i64') && narrowedLeast(-Infinity, filters) >= 0) return boundValue('uint64')
+        if (value.range) {
+            const lo = narrowedLeast(value.range[0], filters)
+            const hi = narrowedMost(value.range[1], filters)
+            if (lo > hi || (lo === value.range[0] && hi === value.range[1])) return v
+            return rangeValue([lo, hi], value.word)
+        }
         if (value.kind !== ValueKind.variable) return v
         const test = filters.find(filter => filter.positive && filter.test !== 'truthy' && filter.test !== 'field' && filter.test !== 'least')?.test
         if (!test || value.narrow === test) return v
@@ -701,11 +797,16 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     function literal(value: number): number {
         return intern(`l${value}`, () => ({ kind: ValueKind.number, form: NumberForm.literal, literal: value }))
     }
-    function fixedValue(T: intrinsics.Types): number {
-        return intern(`t${T}`, () => ({ kind: ValueKind.number, form: NumberForm.fixed, type: T }))
+    function rangeValue(range: Interval, word?: boolean): number {
+        if (word) return intern(`w${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range, word }))
+        return intern(`r${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range }))
     }
-    function boundValue(bound: string): number {
-        return intern(`b${bound}`, () => ({ kind: ValueKind.number, form: NumberForm.bound, bound }))
+    function floatValue(): number {
+        return intern('f', () => ({ kind: ValueKind.number, form: NumberForm.float }))
+    }
+    function typedValue(T: intrinsics.Types): number {
+        const range = typeInterval(T)
+        return range ? rangeValue(range, T === Types.u32 || T === Types.u64) : floatValue()
     }
     function isZero(v: number): boolean {
         return values[v].form === NumberForm.literal && values[v].literal === 0
@@ -713,8 +814,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     function integral(v: number): boolean {
         const value = values[v]
         if (value.form === NumberForm.literal) return Number.isInteger(value.literal)
-        if (value.form === NumberForm.bound) return value.bound !== 'num64'
-        return false
+        return value.form === NumberForm.range
+    }
+    function spanOf(v: number): Interval {
+        const value = values[v]
+        return value.range ?? [value.literal!, value.literal!]
     }
     function operand(frame: number, node: number, n: GraphNode, i: number): Iterable<number> {
         if (getRef(n, i)) return seen(frame, node, getRef(n, i))
@@ -724,15 +828,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     }
     function typed(incoming: Iterable<number>, T: intrinsics.Types | undefined): Iterable<number> {
         if (T === undefined) return incoming
-        if (T === Types.unknown_number) return [...incoming].map(v => opaqueKind(v) ? boundValue('num64') : v)
-        if (T === Types.u64 || T === Types.usize || T === Types.ptr) return [...incoming].map(v => opaqueKind(v) ? fixedValue(T) : v)
+        if (T === Types.unknown_number) return [...incoming].map(v => opaqueKind(v) ? floatValue() : v)
+        if (T === Types.u64 || T === Types.usize || T === Types.ptr) return [...incoming].map(v => opaqueKind(v) ? typedValue(T) : v)
         if (!scalarType(T)) return incoming
-        return [...incoming].map(v => (values[v].kind === ValueKind.number && !fitsLiteral(v, T)) || opaqueKind(v) ? fixedValue(T) : v)
-    }
-    function fitsLiteral(v: number, T: intrinsics.Types): boolean {
-        const value = values[v]
-        if (value.form !== NumberForm.literal || !Number.isInteger(value.literal) || T === Types.f64 || T === Types.f32 || T === Types.f16) return false
-        return intrinsics.inRange(T, value.literal)
+        const bound = typeInterval(T)
+        return [...incoming].map(v => (values[v].kind === ValueKind.number && !(bound && integral(v) && within(spanOf(v), bound))) || opaqueKind(v) ? typedValue(T) : v)
     }
     function opaqueKind(v: number): boolean {
         return values[v].kind === ValueKind.unknown || values[v].kind === ValueKind.variable
@@ -784,7 +884,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         const neverUndefined = (side: number[]) => side.every(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.function || values[v].kind === ValueKind.string)
         const disjoint = (undefinedOnly(sides[0]) && neverUndefined(sides[1])) || (neverUndefined(sides[0]) && undefinedOnly(sides[1]))
         if (disjoint && (n.op === NodeOp.eq || n.op === NodeOp.ne)) return [literal(n.op === NodeOp.ne ? 1 : 0)]
-        return [fixedValue(Types.bool)]
+        return [rangeValue([0, 1])]
     }
     function compareStrings(frame: number, node: number, n: GraphNode): void {
         if (!getRef(n, 0) || !getRef(n, 1)) return
@@ -800,50 +900,32 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         bind(frame, node, n, rt.bindingOf(rt.Op.truthy)!.impl!, undefined, 0)
     }
     function operandNumbers(frame: number, node: number, n: GraphNode): number[] {
-        const fixed = new Set<number>()
-        let whole = true
-        const literals: number[][] = []
+        const g = frames[frame].graph!
+        const sets: number[][] = []
         for (let i = 0; i < countIds(n); i++) {
-            const operands = getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(frames[frame].graph!, n, i))]
+            const operands = getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))]
             if (!operands.some(v => values[v].kind === ValueKind.number || opaqueKind(v))) return []
-            literals.push(operands.length === 1 && values[operands[0]].form === NumberForm.literal ? [values[operands[0]].literal!] : [])
+            sets.push(operands)
         }
-        if (countIds(n) === 2 && literals.every(list => list.length)) {
-            const result = fold(n.op, literals[0][0], literals[1][0])
+        const single = (list: number[]) => list.length === 1 && values[list[0]].form === NumberForm.literal
+        if (countIds(n) === 2 && sets.every(single)) {
+            const result = fold(n.op, values[sets[0][0]].literal!, values[sets[1][0]].literal!)
             if (result !== undefined && Number.isFinite(result)) return [literal(result)]
         }
-        for (let i = 0; i < countIds(n); i++) {
-            const operands = getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(frames[frame].graph!, n, i))]
-            for (const v of operands) {
-                if (values[v].kind !== ValueKind.number) continue
-                if (values[v].form === NumberForm.fixed) fixed.add(v)
-                else if (!integral(v)) whole = false
+        const spans: Interval[] = []
+        for (const list of sets) {
+            let span: Interval | undefined
+            for (const v of list) {
+                if (opaqueKind(v)) span = hull(span, [MinI64, MaxU64])
+                else if (values[v].kind !== ValueKind.number) continue
+                else if (!integral(v)) return [floatValue()]
+                else span = hull(span, spanOf(v))
             }
+            spans.push(span!)
         }
-        if (!fixed.size) return [boundValue(!whole ? 'num64' : leastResult(frame, node, n) >= 0 ? 'uint64' : 'int64')]
-        const types = [...fixed].map(v => values[v].type!)
-        if (types.some(T => T === Types.f64 || T === Types.f32) || !whole) return [fixedValue(Types.f64)]
-        return [fixedValue(widestInteger(types))]
-    }
-    function least(v: number): number {
-        const value = values[v]
-        if (value.kind !== ValueKind.number) return -Infinity
-        if (value.form === NumberForm.literal) return Number.isInteger(value.literal) ? value.literal! : -Infinity
-        if (value.form === NumberForm.fixed) return UnsignedTypes.has(value.type!) ? 0 : -Infinity
-        return value.bound === 'uint64' || UnsignedTypes.has((Types as any)[value.bound!]) ? 0 : -Infinity
-    }
-    function operandLeast(frame: number, node: number, n: GraphNode, i: number): number {
-        if (!getRef(n, i)) return least(literal(getLiteral(frames[frame].graph!, n, i)))
-        const filters = narrowingOf(frames[frame].graph!).get(node)?.get(canonical(frames[frame].graph!, getRef(n, i))) ?? []
-        let low = Infinity
-        for (const v of seen(frame, node, getRef(n, i))) low = Math.min(low, narrowedLeast(least(v), filters))
-        return low
-    }
-    function leastResult(frame: number, node: number, n: GraphNode): number {
-        const a = operandLeast(frame, node, n, 0)
-        const b = countIds(n) > 1 ? operandLeast(frame, node, n, 1) : -Infinity
-        if (n.op === NodeOp.sub) return Math.max(getRef(n, 1) ? -Infinity : a - b, orderedDifference(frames[frame].graph!, node, n))
-        return a >= 0 && b >= 0 && UnsignedOps.has(n.op) ? 0 : -Infinity
+        let result = interval(n.op, spans[0], spans[spans.length - 1])
+        if (n.op === NodeOp.sub) result = [Math.min(result[1], Math.max(result[0], orderedDifference(g, node, n))), result[1]]
+        return [rangeValue(sets.every(list => list.length === 1) ? result : boundary(result))]
     }
     function orderedDifference(g: Graph, node: number, n: GraphNode): number {
         if (!getRef(n, 0) || !getRef(n, 1)) return -Infinity
@@ -877,9 +959,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     }
     function opaqueValue(g: Graph, id: number): number {
         const T = resultType(g, getNode(g, id)!)
-        if (T === Types.unknown_number) return boundValue('num64')
         if (T === Types.vm_value || T === Types.unknown || T === Types.void) return Unknown
-        return fixedValue(T)
+        return typedValue(T)
     }
     function flow(frame: number, node: number, incoming: Iterable<number>): void {
         const set = valuesAt(frame, node)
@@ -1138,15 +1219,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         return object
     }
     const dumped = new Set<Graph>()
-    const floatSets = new Map<Function, Map<string, number[]>>()
-    function enter(origin: Function, context: string, object: number): number {
+    function enter(unit: Function, context: string, object: number): number {
         const signature = context.includes('|') ? context.slice(context.indexOf('|') + 1).split(',').slice(0, -1) : []
-        const numeric = (c: string | undefined) => c === undefined || c === 'i' || c === 'd' || c === 'u' || c.startsWith('l')
-        const floats = fixedFloats ? (fixedFloats.get(origin) ?? []).filter(i => numeric(signature[i])) : signature.flatMap((c, i) => c === 'd' ? [i] : [])
-        const unit = floats.length && host.variantOf ? host.variantOf(origin, floats) : origin
-        let used = floatSets.get(origin)
-        if (!used) floatSets.set(origin, used = new Map())
-        used.set(floats.join(), floats)
         const k = `${unitKey(unit)}|${context}`
         const known = frameIds.get(k)
         if (known !== undefined) return known
@@ -1164,7 +1238,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             const self = receiverOf(g)
             g.blocks[0].params.forEach((p, i) => flow(frame, p, [p === self ? objectValue(0) : variable({ unit, node: p }, i)]))
         } else if (frame < rootCount) for (const p of g.blocks[0].params) {
-            flow(frame, p, [boundValue(typeName(typeOf(getNode(g, p)!)))])
+            const range = typeInterval(typeOf(getNode(g, p)!))
+            flow(frame, p, [range ? rangeValue(range) : floatValue()])
         }
         for (const id of g.nodes.keys()) seedNode(frame, id)
         return frame
@@ -1228,13 +1303,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         if (n.op === NodeOp.ret && !getRef(n, 0)) returned(frame, id, [literal(getLiteral(g, n, 0))])
         if (comparison(n.op)) {
             if (!Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, comparisonValues(frame, id, n))
-        } else if (arithmetic(n) && typeOf(n) !== Types.unknown_number) flow(frame, id, [fixedValue(resultType(g, n))])
+        } else if (arithmetic(n) && typeOf(n) !== Types.unknown_number) flow(frame, id, [typedValue(resultType(g, n))])
         else if (arithmetic(n) && !Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, operandNumbers(frame, id, n))
         if (n.op === NodeOp.pstack) {
             if (getRef(n, 3) || getLiteral(g, n, 3) > 0) {
                 const [allocation] = allocate(`${frame}:${id}`, frame, id, 'buffer', undefined, false)
                 flow(frame, id, [objectValue(allocation)])
-            } else flow(frame, id, [fixedValue(resultType(g, n))])
+            } else flow(frame, id, [typedValue(resultType(g, n))])
         }
         if (n.op === NodeOp.indirectTarget) flow(frame, id, [Unknown])
         if (n.op === NodeOp.load && !getRef(n, 1)) flow(frame, id, [opaqueValue(g, id)])
@@ -1288,7 +1363,12 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         return known.has(param)
     }
     function widened(view: Iterable<number>): number[] {
-        return [...view].map(v => values[v].form === NumberForm.literal ? boundValue(Number.isInteger(values[v].literal) ? values[v].literal! >= 0 ? 'uint64' : 'int64' : 'num64') : v)
+        return [...view].map(v => {
+            const value = values[v]
+            if (value.form === NumberForm.literal) return Number.isInteger(value.literal) ? rangeValue(value.literal! >= 0 ? U64 : I64) : floatValue()
+            if (value.form === NumberForm.range) return rangeValue(boundary(value.range!), value.word)
+            return v
+        })
     }
     const addressParams = new Map<Graph, Set<number>>()
     function addressRelevant(g: Graph): Set<number> {
@@ -1322,9 +1402,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             case ValueKind.function: return `f${unitKey(value.fn!)}`
             case ValueKind.object: return `o${allocations[value.allocation!].name}`
             case ValueKind.number:
-                if (value.form === NumberForm.fixed) return value.type === Types.f64 || value.type === Types.f32 ? 'd' : 'i'
-                if (value.form === NumberForm.bound) return value.bound === 'num64' ? 'd' : 'i'
-                return Number.isInteger(value.literal) ? 'i' : 'd'
+                return integral(v) ? 'i' : 'd'
         }
         return '?'
     }
@@ -1467,7 +1545,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     }
     const dynamicReceivers = new Map<number, Set<number>>()
     const dynamicSites = new Map<number, [frame: number, node: number, user: GraphNode, locs: Set<number>]>()
-    const word = () => [fixedValue(Types.u32)]
+    const word = () => [typedValue(Types.u32)]
     function dynamicCandidate(allocation: number): boolean {
         const object = allocations[allocation]
         return !object.constant && !object.native && !object.proto && allocationFrames.has(allocation)
@@ -1522,18 +1600,21 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             }
             if (value.kind !== ValueKind.number) return
             numbers = true
-            if ((value.form === NumberForm.fixed && floating(value.type!)) || value.bound === 'num64' || (value.form === NumberForm.literal && !Number.isInteger(value.literal))) float = true
+            if (!integral(v)) float = true
         }
         if (numbers && (handles || undefinedStored)) return
         return numbers ? float ? 'float' : 'int' : 'handle'
     }
+    const boundSites = new Set<number>()
     function bindDynamicSites(): void {
-        for (const [frame, u, user, locs] of dynamicSites.values()) {
+        for (const [k, [frame, u, user, locs]] of dynamicSites) {
+            if (boundSites.has(k)) continue
+            boundSites.add(k)
             const write = user.op === NodeOp.setProp
             const stored = write ? (getRef(user, 3) ? [...seen(frame, u, getRef(user, 3))] : [literal(getLiteral(frames[frame].graph!, user, 3))]) : [...locs].flatMap(loc => [...setOf(contents, loc)])
             const form = slotForm(stored, write)
             if (form === undefined) continue
-            const value = form === 'int' ? [fixedValue(Types.i64)] : form === 'float' ? [fixedValue(Types.f64)] : word()
+            const value = form === 'int' ? [typedValue(Types.i64)] : form === 'float' ? [floatValue()] : word()
             const fn = form === 'int' ? (write ? heap.setIntProperty : heap.getIntProperty)
                 : form === 'float' ? (write ? heap.setFloatProperty : heap.getFloatProperty)
                 : write ? heap.setHandleProperty : heap.getHandleProperty
@@ -1664,6 +1745,9 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 case NodeOp.inlined:
                     if (slot === 0) flow(frame, u, view)
                     break
+                case NodeOp.typeof:
+                    flow(frame, u, [...view].flatMap(v => opaqueKind(v) ? [literal(Types.f64), literal(Types.u64)] : [literal(values[v].kind === ValueKind.number && !integral(v) ? Types.f64 : Types.u64)]))
+                    break
                 case NodeOp.add:
                 case NodeOp.sub:
                     for (const v of view) {
@@ -1734,21 +1818,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
     const rootCount = roots.length
     if (isolated) allocations.push({ site: { unit: roots[0], node: 0 }, name: isolated.name, depth: 0, context: 'self', proto: isolated.proto, constant: false, escaped: false })
     roots.forEach((root, i) => enter(root, `root${i}`, isolated ? 0 : -1))
-    drain()
     function opaqueCalls(): void {
         frames.forEach((frame, f) => {
             const g = frame.graph
             if (g) for (const [id, n] of g.nodes) if (n.op === NodeOp.call && seeded.has(key(f, id)) && opaque(f, n, g)) flow(f, id, [opaqueValue(g, id)])
         })
-        drain()
     }
-    opaqueCalls()
-    if (dynamicSites.size) {
-        bindDynamicSites()
-        drain()
-    }
-    for (let round = 0; round < 4; round++) {
-        let added = false
+    function undefinedReads(): void {
         frames.forEach((frame, f) => {
             const g = frame.graph
             if (!g) return
@@ -1758,12 +1834,20 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
                 const locs = touched.get(key(f, id))
                 if (!locs?.size || [...locs].some(loc => contents.get(loc)?.size)) continue
                 flow(f, id, [Undefined])
-                added = true
             }
         })
-        if (!added) break
+    }
+    const settles = [opaqueCalls, bindDynamicSites, undefinedReads]
+    drain()
+    let step = 0
+    while (step < settles.length) {
+        settles[step]()
+        if (!work.length) {
+            step++
+            continue
+        }
         drain()
-        opaqueCalls()
+        step = 0
     }
     frames.forEach((frame, f) => {
         const g = frame.graph
@@ -1879,7 +1963,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
         for (const id of frame.graph!.nodes.keys()) lines.push(`  %${id}${seeded.has(key(f, id)) ? '' : ' (unseeded)'}: ${[...valuesAt(f, id)].map(v => JSON.stringify(values[v])).join(' ')}`)
         console.log(lines.join('\n'))
     })
-    if (intrinsics.argv().includes('analysis-stats')) console.log('ANALYSIS-RUN', roots.map(r => r.name).join(','), 'frames', frames.length, 'allocations', allocations.length, 'locations', locations.length, 'values', values.length, 'variant', !!fixedFloats)
+    if (intrinsics.argv().includes('analysis-stats')) console.log('ANALYSIS-RUN', roots.map(r => r.name).join(','), 'frames', frames.length, 'allocations', allocations.length, 'locations', locations.length, 'values', values.length)
     const wordSlots: WordSlot[] = locations.map((location, loc) => {
         const held = [...setOf(contents, loc)]
         return {
@@ -1889,7 +1973,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated,
             object: held.some(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.string),
         }
     })
-    return { allocations, locations, wordSlots, values, units, frames: frameValues, graphs, numeric, keyHandles, floatSets, consulted }
+    return { allocations, locations, wordSlots, values, units, frames: frameValues, graphs, numeric, keyHandles, consulted }
 }
 
 export interface Type {
@@ -1897,8 +1981,8 @@ export interface Type {
     string: boolean
     unknown: boolean
     literals: number[]
-    fixed: intrinsics.Types[]
-    bounds: string[]
+    range?: Interval
+    float: boolean
     objects: number[]
     functions: Function[]
     closures: number[]
@@ -1909,6 +1993,7 @@ export interface ObjectType {
     name: string
     site: Site
     context: string
+    frame?: number
     constant: boolean
     native: boolean
     dynamic: boolean
@@ -2046,7 +2131,7 @@ function constantIndex(key: string): boolean {
 }
 
 function emptyType(): Type {
-    return { undefined: false, string: false, unknown: false, literals: [], fixed: [], bounds: [], objects: [], functions: [], closures: [], strings: [] }
+    return { undefined: false, string: false, unknown: false, literals: [], float: false, objects: [], functions: [], closures: [], strings: [] }
 }
 
 function merge<T>(a: T[], b: T[]): T[] {
@@ -2066,29 +2151,22 @@ function merge<T>(a: T[], b: T[]): T[] {
 function union(a: Type, b: Type): Type {
     if (a === b) return a
     const literals = merge(a.literals, b.literals)
-    const fixed = merge(a.fixed, b.fixed)
-    const bounds = merge(a.bounds, b.bounds)
+    const range = hull(a.range, b.range)
     const objects = merge(a.objects, b.objects)
     const functions = merge(a.functions, b.functions)
     const closures = merge(a.closures, b.closures)
     const strings = merge(a.strings, b.strings)
-    const flags = (a.undefined || !b.undefined) && (a.string || !b.string) && (a.unknown || !b.unknown)
-    if (flags && literals === a.literals && fixed === a.fixed && bounds === a.bounds && objects === a.objects && functions === a.functions && closures === a.closures && strings === a.strings) return a
-    return { undefined: a.undefined || b.undefined, string: a.string || b.string, unknown: a.unknown || b.unknown, literals, fixed, bounds, objects, functions, closures, strings }
+    const flags = (a.undefined || !b.undefined) && (a.string || !b.string) && (a.unknown || !b.unknown) && (a.float || !b.float)
+    if (flags && literals === a.literals && range === a.range && objects === a.objects && functions === a.functions && closures === a.closures && strings === a.strings) return a
+    return { undefined: a.undefined || b.undefined, string: a.string || b.string, unknown: a.unknown || b.unknown, literals, range, float: a.float || b.float, objects, functions, closures, strings }
 }
 
 export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const start = performance.now()
     let data = analyzeValues(roots, host)
-    let fixedFloats: Map<Function, number[]> | undefined
-    if (host.variantOf && [...data.floatSets.values()].some(sets => sets.size > 1)) {
-        fixedFloats = new Map()
-        for (const [origin, sets] of data.floatSets) fixedFloats.set(origin, [...new Set([...sets.values()].flat())].sort((a, b) => a - b))
-        data = analyzeValues(roots, host, undefined, fixedFloats)
-    }
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
-    if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) }, undefined, fixedFloats)
+    if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) })
     const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, proto: allocation.proto, state: allocation.state, handle: allocation.handle, fields: new Map(), forms: new Map(), initialized: new Set<string>(), stored: new Set<string>(), escaped: allocation.escaped, readers: [] }))
     const interned = new Map<string, Type>()
     function typeOf(list: Iterable<number>): Type {
@@ -2119,8 +2197,8 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
                     break
                 case ValueKind.number:
                     if (value.form === NumberForm.literal) type.literals = merge(type.literals, [value.literal!])
-                    else if (value.form === NumberForm.fixed) type.fixed = merge(type.fixed, [value.type!])
-                    else type.bounds = merge(type.bounds, [value.bound!])
+                    else if (value.form === NumberForm.range) type.range = hull(type.range, value.range)
+                    else type.float = true
                     break
             }
         }
@@ -2188,7 +2266,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         for (const id of type.closures) parent[find(id)] = find(anchor)
         return anchor
     }
-    const stringOnly = (type: Type) => type.string && !type.undefined && !type.unknown && !type.literals.length && !type.fixed.length && !type.bounds.length && !type.objects.length && !type.functions.length
+    const stringOnly = (type: Type) => type.string && !type.undefined && !type.unknown && !numericType(type) && !type.objects.length && !type.functions.length
     const anchors = new Map<Function, Map<number, number>>()
     const unitFrames = new Map<Function, FrameSignature[]>()
     const stringCandidates = new Map<Function, Set<number>>()
@@ -2225,6 +2303,9 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         list.push(signature)
         return signature
     })
+    const frameIds = new Map<string, number>()
+    frames.forEach((frame, id) => frameIds.set(`${unitIdentity(frame.unit)}|${frame.context}`, id))
+    for (const object of objects) object.frame = frameIds.get(`${unitIdentity(object.site.unit)}|${object.context}`)
     const classes: LayoutClass[] = []
     const classIds = new Map<number, number>()
     const classOf = objects.map((object, i) => {
@@ -2282,71 +2363,45 @@ function floating(T: intrinsics.Types): boolean {
     return T === Types.f64 || T === Types.f32 || T === Types.f16
 }
 
-function signedType(T: intrinsics.Types): boolean {
-    return T === Types.i8 || T === Types.i16 || T === Types.i32 || T === Types.i64
-}
-
-function holds(T: intrinsics.Types, literal: number): boolean {
-    if (floating(T)) return true
-    if (!Number.isInteger(literal)) return false
-    return literal >= 0 || signedType(T)
-}
-
 export function formatType(types: ValueTypes, type: Type): string {
     const atoms: string[] = []
-    const numeric = type.fixed.length > 0 || type.bounds.length > 0
     if (type.undefined) atoms.push('undefined')
-    for (const literal of type.literals) {
-        const absorbed = type.fixed.some(T => holds(T, literal)) || type.bounds.some(b => b === 'num64' || Number.isInteger(literal))
-        if (!absorbed) atoms.push(String(literal))
-    }
-    for (const T of type.fixed) atoms.push(typeName(T))
-    if (!type.fixed.length) for (const bound of type.bounds) if (!(bound === 'int64' && type.bounds.includes('num64'))) atoms.push(`<=${bound}`)
+    for (const literal of type.literals) if (!type.float && !(type.range && Number.isInteger(literal) && within([literal, literal], type.range))) atoms.push(String(literal))
+    if (type.range) atoms.push(rangeName(type.range))
+    if (type.float) atoms.push('f64')
     if (type.string) atoms.push('string')
     for (const id of type.objects) atoms.push(`${types.objects[id].name}#${id}`)
     for (const fn of type.functions) atoms.push(`fn ${fn.name || '<anon>'}`)
     if (type.unknown) atoms.push('unknown')
-    return atoms.join(' | ') || (numeric ? 'number' : 'never')
+    return atoms.join(' | ') || 'never'
 }
 
-const intWidths: [intrinsics.Types, number, boolean][] = [
-    [Types.u8, 8, false], [Types.u16, 16, false], [Types.u32, 32, false], [Types.u64, 64, false],
-    [Types.i8, 8, true], [Types.i16, 16, true], [Types.i32, 32, true], [Types.i64, 64, true],
-]
+function floatType(type: Type): boolean {
+    return type.float || type.literals.some(l => !Number.isInteger(l))
+}
 
-function intShape(T: intrinsics.Types): [width: number, signed: boolean] | undefined {
-    const known = intWidths.find(([U]) => U === T)
-    if (known) return [known[1], known[2]]
-    if (T === Types.bool) return [8, false]
+function numberSpan(type: Type): Interval | undefined {
+    let span = type.range
+    for (const l of type.literals) span = hull(span, [l, l])
+    return span
 }
 
 function numberRepresentation(type: Type): string {
-    if (type.fixed.length) {
-        if (type.fixed.some(floating)) return 'f64'
-        const shapes = type.fixed.map(intShape)
-        if (shapes.some(shape => !shape)) return type.fixed.map(typeName).join('|')
-        const signed = shapes.some(shape => shape![1]) || type.literals.some(l => l < 0)
-        const width = Math.max(...shapes.map(shape => shape![0]))
-        const mixed = signed && shapes.some(shape => !shape![1] && shape![0] >= width)
-        return typeName((mixed ? intWidths.find(([, w, s]) => s && w > width) ?? intWidths[7] : intWidths.find(([, w, s]) => w === width && s === signed)!)[0])
-    }
-    if (type.bounds.includes('num64') || type.literals.some(l => !Number.isInteger(l))) return 'f64'
-    if (type.bounds.includes('int64')) return 'i64'
-    if (type.bounds.includes('uint64')) return 'u64'
-    if (type.bounds.length) return type.bounds[0]
-    const low = Math.min(...type.literals)
-    const high = Math.max(...type.literals)
-    if (low >= 0 && high < 2 ** 32) return 'u32'
-    if (low >= -(2 ** 31) && high < 2 ** 31) return 'i32'
-    return 'i64'
+    if (floatType(type)) return 'f64'
+    const format = intFormat(numberSpan(type)!)
+    return `${format.signed ? 'i' : 'u'}${format.bits}`
+}
+
+function nullsOnly(type: Type): boolean {
+    return !opaqueNumber(type) && type.literals.length === 1 && type.literals[0] === 0
 }
 
 export function representation(types: ValueTypes, type: Type): string {
     if (type.unknown) return 'any'
-    const numeric = type.fixed.length > 0 || type.bounds.length > 0 || type.literals.length > 0
+    const numeric = numericType(type)
     const refs = [...new Set([...type.objects, ...type.closures].map(a => types.classOf[a]))].sort((a, b) => a - b)
     const pointers = refs.length > 0 || type.string || type.functions.some(fn => !type.closures.length)
-    const nulls = !type.fixed.length && !type.bounds.length && type.literals.length === 1 && type.literals[0] === 0
+    const nulls = nullsOnly(type)
     if (numeric && pointers && !nulls) return 'union'
     if (numeric && !pointers && type.undefined) return 'union'
     if (numeric && !pointers) return numberRepresentation(type)
@@ -2424,7 +2479,7 @@ export function checkTypes(types: ValueTypes, units: NativeUnit[]): string {
             if (!mine) continue
             const repr = representation(types, mine)
             const shown = `${formatType(types, mine)} => ${repr}`
-            if (param.nullish && !(mine.undefined && !mine.objects.length && !mine.fixed.length && !mine.bounds.length && !mine.literals.length)) lines.push(`NULLISH ${unit.name}.${param.label}: native nullish, analysis ${shown}`)
+            if (param.nullish && !(mine.undefined && !mine.objects.length && !numericType(mine))) lines.push(`NULLISH ${unit.name}.${param.label}: native nullish, analysis ${shown}`)
             if (param.kind === Types.f64 && repr !== 'f64') lines.push(`F64 ${unit.name}.${param.label}: native f64, analysis ${shown}`)
             if (param.kind !== undefined && param.kind !== Types.f64 && param.kind !== Types.vm_value && (mine.objects.some(a => types.objects[a].name !== 'buffer') || mine.string || mine.unknown)) lines.push(`NUMBER ${unit.name}.${param.label}: native ${typeName(param.kind)}, analysis ${shown}`)
             if (param.keys && !mine.functions.length) {
@@ -2572,7 +2627,7 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
                 }
                 case ValueKind.number:
                     if (value.form === NumberForm.literal) literals.push(value.literal!)
-                    else atoms.add(value.form === NumberForm.fixed ? typeName(value.type!) : `<=${value.bound}`)
+                    else atoms.add(value.range ? rangeName(value.range) : 'f64')
                     break
             }
         }
@@ -2697,7 +2752,6 @@ export interface ShapeSignature {
 export interface Rep {
     text: string
     kind: 'any' | 'never' | 'undefined' | 'number' | 'pointer' | 'union' | 'buffer'
-    number?: 'int' | 'i64' | 'f64'
     format?: IntFormat
     targets: string[]
     nullable: boolean
@@ -2710,8 +2764,8 @@ export interface Rep {
 }
 
 function bitValued(type: Type): boolean {
-    if (type.unknown || type.undefined || type.string || type.bounds.length || type.objects.length || type.functions.length || type.closures.length || type.strings.length) return false
-    return type.fixed.length > 0 && type.fixed.every(T => T === Types.bool) && type.literals.every(l => l === 0 || l === 1)
+    if (type.unknown || type.undefined || type.string || type.float || type.objects.length || type.functions.length || type.closures.length || type.strings.length) return false
+    return !!type.range && within(type.range, [0, 1]) && type.literals.every(l => l === 0 || l === 1)
 }
 
 export interface Constant {
@@ -2731,7 +2785,7 @@ export interface Instantiations {
     shapeOf(allocation: number): string | undefined
 }
 
-export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, joins: [number, number][] = []): Instantiations {
+export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, joins: number[][] = []): Instantiations {
     const keys: string[] = []
     const owners: (string | undefined)[] = []
     const ownerClasses: (string | undefined)[] = []
@@ -2742,14 +2796,13 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     }
     function rep(type: Type): string {
         if (type.unknown) return 'any'
-        const numeric = type.fixed.length > 0 || type.bounds.length > 0 || type.literals.length > 0
+        const numeric = numericType(type)
         const targets = [...new Set([...type.objects, ...type.closures].map(keyOf))].sort()
         if (type.string) targets.push('str')
         if (type.functions.length && !type.closures.length) targets.push('fn')
         if (!targets.length) return numeric ? (type.undefined ? 'union' : numberRepresentation(type)) : type.undefined ? 'undefined' : 'never'
-        const nulls = !type.fixed.length && !type.bounds.length && type.literals.length === 1 && type.literals[0] === 0
-        if (numeric && !nulls) return 'union'
-        return `ptr<${targets.join('|')}>${type.undefined || nulls ? '?' : ''}`
+        if (numeric && !nullsOnly(type)) return 'union'
+        return `ptr<${targets.join('|')}>${type.undefined || nullsOnly(type) ? '?' : ''}`
     }
     function layoutOf(members: number[], indexed: boolean): [string, Type][] {
         const merged = new Map<string, Type>()
@@ -2804,7 +2857,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         return merged
     }
     for (const object of types.objects) for (const field of object.fields.values()) joinRecords(field.objects)
-    for (const pair of joins) joinRecords(pair)
+    for (const list of joins) joinRecords(list)
     for (const frame of types.frames) {
         for (const param of frame.params) joinRecords(param.type.objects)
         joinRecords(frame.returns.objects)
@@ -2898,8 +2951,8 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         }
         if (!stored.length) return repOf(type)
         const text = stored.sort().join('|')
-        if (text === 'f64' || text === 'f32') return { text, kind: 'number', number: 'f64', targets: [], nullable: false }
-        if (/^(bool|[ui](8|16|32|64))$/.test(text)) return { text, kind: 'number', number: 'int', targets: [], nullable: false }
+        if (text === 'f64' || text === 'f32') return { text, kind: 'number', targets: [], nullable: false }
+        if (/^(bool|[ui](8|16|32|64))$/.test(text)) return { text, kind: 'number', format: { bits: text.endsWith('64') ? 64 : 32, signed: false }, targets: [], nullable: false }
         return { text, kind: 'any', targets: [], nullable: false }
     }
     function shapeId(key: string): string {
@@ -2959,7 +3012,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
             const buffers = bufferFields.get(`${id}/${k}`)
             if (field.kind !== 'buffer' || !buffers) return [k, field]
             const element = elementRep(buffers)
-            const stride = classStride(buffers, element)
+            const stride = flexible(buffers, element) ? holderStrides.get(`${sig.proto}/${k}`) === 8 ? 8 : 4 : classStride(buffers, element)
             for (const buffer of buffers) {
                 const known = strides.get(keyOf(buffer))
                 if (known !== undefined && known !== stride) throw `value-types: buffer ${keyOf(buffer)} has stride ${known} but ${id}.${k} needs stride ${stride}`
@@ -2972,6 +3025,10 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     const reps = new Map<Type, Rep>()
     const addressed = new Set<string>()
     const strides = new Map<string, number>()
+    const holderStrides = new Map<string, number>()
+    function flexible(members: number[], element: Rep): boolean {
+        return !!element.encoded && element.format?.bits === 32 && !members.some(id => types.objects[id].constant)
+    }
     function classStride(members: number[], element: Rep): number {
         return members.some(id => types.objects[id].constant) ? 4 : elementStride(element)
     }
@@ -2995,7 +3052,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     }
     function repFor(type: Type, pointers: boolean): Rep {
         if (type.unknown) return { text: 'any', kind: 'any', targets: [], nullable: false }
-        const numeric = type.fixed.length > 0 || type.bounds.length > 0 || type.literals.length > 0
+        const numeric = numericType(type)
         const objects = type.objects.filter(id => !types.objects[id].native && !types.objects[id].dynamic)
         const raw = (id: number) => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id))
         const targets = pointers ? [...new Set(objects.map(id => raw(id) ? bufferStride(id) === 8 ? 'buf8' : 'buf' : shapeId(keyOf(id))))].sort() : objects.length ? ['*'] : []
@@ -3008,20 +3065,26 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (pointers && natives.length === 1 && natives[0] !== undefined && !plain) targets.push(`clo@${natives[0]}`)
         else if (nativeShapes.length === 1) targets.push(nativeShapes[0])
         else if (type.functions.length || natives.length) targets.push('fn')
-        const float = type.fixed.some(floating) || type.bounds.includes('num64') || type.literals.some(l => !Number.isInteger(l))
-        const signed = type.literals.some(l => l < 0) || type.fixed.some(T => T === Types.i8 || T === Types.i16 || T === Types.i32 || T === Types.i64) || type.bounds.includes('int64')
         if (!targets.length && numeric) {
-            const number = float ? 'f64' : signed ? 'i64' : 'int'
-            return { text: `${number}${type.undefined ? '?' : ''}`, kind: 'number', number, format: float ? undefined : intFormat(type, signed), targets: [], nullable: type.undefined }
+            const format = floatType(type) ? undefined : intFormat(numberSpan(type)!)
+            return { text: `${numberText(format)}${type.undefined ? '?' : ''}`, kind: 'number', format, targets: [], nullable: type.undefined }
         }
         if (!targets.length) return type.undefined ? { text: 'undefined', kind: 'undefined', targets: [], nullable: true, constant: { handle: 0 as Handle } } : { text: 'never', kind: 'never', targets: [], nullable: false }
-        const nulls = !type.fixed.length && !type.bounds.length && type.literals.length === 1 && type.literals[0] === 0
+        const nulls = nullsOnly(type)
         if (numeric || type.undefined) for (const target of targets) if (shapeTarget(target)) addressed.add(target)
         if (numeric && !nulls) return { text: pointers ? `union<${targets.join('|')}>` : 'union', kind: 'union', targets, nullable: false }
         const fresh = !nativeIds.length && !type.functions.length && !type.string && objects.length > 0 && objects.every(id => !types.objects[id].constant && !raw(id))
         return { text: `ptr<${targets.join('|')}>${type.undefined || nulls ? '?' : ''}`, kind: 'pointer', targets, nullable: type.undefined || nulls, fresh }
     }
     for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].name !== 'buffer' && !types.objects[table.get(key)!.members[0]].dynamic) shapeId(key)
+    for (const [id, sig] of shapes) for (const [k, field] of sig.fields) {
+        const buffers = bufferFields.get(`${id}/${k}`)
+        if (field.kind !== 'buffer' || !buffers) continue
+        const element = elementRep(buffers)
+        if (flexible(buffers, element)) continue
+        const at = `${sig.proto}/${k}`
+        holderStrides.set(at, Math.min(holderStrides.get(at) ?? 8, classStride(buffers, element)))
+    }
     for (const id of shapes.keys()) fixStrides(id)
     stridesFixed = true
     const constantShapes = new Map<Handle, string>()
@@ -3050,7 +3113,7 @@ export interface PlannedUnit {
 }
 
 function singleValued(type: Type): boolean {
-    if (type.unknown || type.fixed.length || type.bounds.length || type.closures.length || type.strings.includes(0)) return false
+    if (type.unknown || opaqueNumber(type) || type.closures.length || type.strings.includes(0)) return false
     return (type.undefined ? 1 : 0) + type.literals.length + type.functions.length + type.objects.length + type.strings.length === 1
 }
 
@@ -3069,17 +3132,51 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn: Function) => Graph, oneObject: (state: Handle) => boolean): Map<Function, PlannedUnit[]> {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]> } {
+    const callees = new Map<string, number[]>()
+    const outgoing = types.frames.map(() => [] as [node: number, callee: number][])
+    types.frames.forEach((frame, id) => {
+        for (const site of frame.sites) {
+            if (site.frame === undefined) continue
+            outgoing[site.frame].push([site.node, id])
+            const k = `${site.frame}|${site.node}`
+            let from = callees.get(k)
+            if (!from) callees.set(k, from = [])
+            from.push(id)
+        }
+    })
+    const find = congruence(types, callees)
+    const atoms = new Map<number, number[]>()
+    types.frames.forEach((_, id) => {
+        const root = find(id)
+        const members = atoms.get(root)
+        if (members) members.push(id)
+        else atoms.set(root, [id])
+    })
+    const joins: number[][] = []
+    const bySite = new Map<string, number[]>()
+    types.objects.forEach((object, id) => {
+        if (object.constant || object.native || object.frame === undefined) return
+        const k = `${find(object.frame)}|${object.site.node}`
+        const list = bySite.get(k)
+        if (list) list.push(id)
+        else bySite.set(k, [id])
+    })
+    for (const list of bySite.values()) if (list.length > 1) joins.push(list)
+    for (const members of atoms.values()) {
+        if (members.length < 2) continue
+        types.frames[members[0]].params.forEach((_, i) => joins.push(members.flatMap(f => types.frames[f].params[i].type.objects)))
+        joins.push(members.flatMap(f => types.frames[f].returns.objects))
+    }
+    const inst = instantiate(types, genericOf, joins)
     const created = new Map<number, string[]>()
-    const contextFrames = new Map<string, number>()
-    types.frames.forEach((frame, id) => contextFrames.set(`${unitIdentity(frame.unit)}|${frame.context}`, id))
     types.objects.forEach((object, id) => {
         if (object.constant || object.native || addressView(object)) return
         const shape = object.dynamic ? 'heap' : inst.shapeOf(id)
-        const frame = contextFrames.get(`${unitIdentity(object.site.unit)}|${object.context}`)
+        const frame = object.frame
         if (shape === undefined || frame === undefined) return
-        let list = created.get(frame)
-        if (!list) created.set(frame, list = [])
+        let list = created.get(find(frame))
+        if (!list) created.set(find(frame), list = [])
         list.push(`%${object.site.node}=${shape}`)
     })
     const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = []) => {
@@ -3089,43 +3186,47 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
         const returned = inst.repOf(returns)
         return { params: reps, returns: returned, signature: `(${abis.join(', ')}) -> ${returned.text}${made.length ? ` new ${made.join(' ')}` : ''}` }
     }
-    const targets = new Map<number, string[]>()
-    types.frames.forEach((frame, id) => {
-        for (const site of frame.sites) {
-            if (site.frame === undefined) continue
-            let list = targets.get(site.frame)
-            if (!list) targets.set(site.frame, list = [])
-            list.push(`%${site.node}=${unitIdentity(frame.unit)}`)
+    const joinedOf = (members: number[]) => {
+        const first = types.frames[members[0]]
+        const params = first.params.map((param, i) => ({ label: param.label, type: members.map(f => types.frames[f].params[i].type).reduce(union) }))
+        return signatureOf(params, members.map(f => types.frames[f].returns).reduce(union), created.get(find(members[0])))
+    }
+    let classOf = new Map<number, number>()
+    const initial = new Map<string, number>()
+    for (const [root, members] of atoms) {
+        const boxes = members.some(f => types.frames[f].boxes)
+        const boxedReturn = members.some(f => types.frames[f].boxedReturn)
+        const k = `${unitIdentity(types.frames[root].unit)}|${joinedOf(members).signature.replace(/\bint\b/g, 'i64')}|${boxes}|${boxedReturn}`
+        if (!initial.has(k)) initial.set(k, initial.size)
+        classOf.set(root, initial.get(k)!)
+    }
+    let count = initial.size
+    while (true) {
+        const groups = new Map<number, { calls: Map<string, number>, id: number }[]>()
+        const next = new Map<number, number>()
+        let size = 0
+        for (const [root, members] of atoms) {
+            const calls = new Map<string, number>()
+            for (const f of members) for (const [node, callee] of outgoing[f]) calls.set(`${node}:${unitIdentity(types.frames[callee].unit)}`, classOf.get(find(callee))!)
+            let list = groups.get(classOf.get(root)!)
+            if (!list) groups.set(classOf.get(root)!, list = [])
+            let group = list.find(known => [...calls].every(([k, c]) => !known.calls.has(k) || known.calls.get(k) === c))
+            if (!group) list.push(group = { calls: new Map(), id: size++ })
+            for (const [k, c] of calls) group.calls.set(k, c)
+            next.set(root, group.id)
         }
-    })
-    const callees = new Map<string, number[]>()
-    types.frames.forEach((frame, id) => {
-        for (const site of frame.sites) {
-            if (site.frame === undefined) continue
-            const k = `${site.frame}|${site.node}`
-            let list = callees.get(k)
-            if (!list) callees.set(k, list = [])
-            list.push(id)
-        }
-    })
-    const classes = congruence(types, callees)
-    const { parent, find } = classes
-    const bySignature = new Map<string, number>()
-    types.frames.forEach((frame, id) => {
-        const calls = [...new Set(targets.get(id) ?? [])].sort().join(' ')
-        const signature = signatureOf(frame.params, frame.returns, created.get(id)).signature
-        const keyed = signature.replace(/\bint\b/g, 'i64')
-        const k = `${unitIdentity(frame.unit)}|${keyed}|${calls}|${frame.boxes}|${frame.boxedReturn}`
-        const first = bySignature.get(k)
-        if (first === undefined) bySignature.set(k, id)
-        else classes.merge(first, id)
-    })
-    splitMemberUnions(types, parent, find, callees, graphOf)
+        classOf = next
+        if (size === count) break
+        count = size
+    }
+    const classRoot = new Map<number, number>()
+    for (const root of atoms.keys()) if (!classRoot.has(classOf.get(root)!)) classRoot.set(classOf.get(root)!, root)
+    const unitRoot = (id: number) => classRoot.get(classOf.get(find(id))!)!
     const plan = new Map<Function, PlannedUnit[]>()
     const unitOfRoot = new Map<number, PlannedUnit>()
     const unitOfFrame: PlannedUnit[] = []
     types.frames.forEach((frame, id) => {
-        const root = find(id)
+        const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
             unitOfRoot.set(root, unit = { fn: frame.unit, boxes: false, boxedReturn: false, allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), boxedCalls: new Set() })
@@ -3159,7 +3260,7 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
         unit.returnsSelf = unit.frames.every(f => {
             const frame = types.frames[f]
             const r = frame.returns
-            return r.objects.length > 0 && r.objects.every(id => frame.context.startsWith(`o${id}|`)) && !r.undefined && !r.string && !r.unknown && !r.literals.length && !r.fixed.length && !r.bounds.length && !r.functions.length && !r.closures.length
+            return r.objects.length > 0 && r.objects.every(id => frame.context.startsWith(`o${id}|`)) && !r.undefined && !r.string && !r.unknown && !numericType(r) && !r.functions.length && !r.closures.length
         })
         unit.params = joined.params
         unit.returns = joined.returns
@@ -3202,20 +3303,17 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
             else unit.boxedReturn = true
         }
     }
-    const conflicted = new Set<string>()
+    const conflicted: [PlannedUnit, number][] = []
     types.objects.forEach((object, id) => {
-        if (object.constant || object.native || addressView(object)) return
+        if (object.constant || object.native || addressView(object) || object.frame === undefined) return
         const shape = object.dynamic ? 'heap' : inst.shapeOf(id)
         if (shape === undefined) return
-        for (const unit of plan.get(object.site.unit) ?? []) {
-            if (!unit.frames.some(f => types.frames[f].context === object.context)) continue
-            const known = unit.allocations.get(object.site.node)
-            const k = `${unit.signature}|${object.site.node}`
-            if (known !== undefined && known !== shape) conflicted.add(k)
-            unit.allocations.set(object.site.node, shape)
-        }
+        const unit = unitOfFrame[object.frame]
+        const known = unit.allocations.get(object.site.node)
+        if (known !== undefined && known !== shape) conflicted.push([unit, object.site.node])
+        unit.allocations.set(object.site.node, shape)
     })
-    for (const units of plan.values()) for (const unit of units) for (const node of [...unit.allocations.keys()]) if (conflicted.has(`${unit.signature}|${node}`)) unit.allocations.delete(node)
+    for (const [unit, node] of conflicted) unit.allocations.delete(node)
     types.frames.forEach((frame, id) => {
         for (const site of frame.sites) {
             if (site.frame === undefined) continue
@@ -3235,20 +3333,18 @@ export function planUnits(types: ValueTypes, inst: Instantiations, graphOf: (fn:
             for (const unit of units) unit.params[i] = { label: unit.params[i].label, rep }
         })
     }
-    return plan
+    return { inst, plan }
 }
 
 function numericType(type: Type): boolean {
-    return type.literals.length > 0 || type.fixed.length > 0 || type.bounds.length > 0
+    return type.literals.length > 0 || opaqueNumber(type)
 }
 
-function memberClass(type: Type): string {
-    if (type.string && !numericType(type)) return 's'
-    if (numericType(type) && !type.string) return 'n'
-    return ''
+function opaqueNumber(type: Type): boolean {
+    return !!type.range || type.float
 }
 
-function congruence(types: ValueTypes, callees: Map<string, number[]>): { parent: number[], find(a: number): number, merge(a: number, b: number): void } {
+function congruence(types: ValueTypes, callees: Map<string, number[]>): (a: number) => number {
     const parent = types.frames.map((_, i) => i)
     function find(a: number): number {
         while (parent[a] !== a) a = parent[a] = parent[parent[a]]
@@ -3290,158 +3386,7 @@ function congruence(types: ValueTypes, callees: Map<string, number[]>): { parent
         }
     }
     drain()
-    function merge(a: number, b: number): void {
-        pending.push([a, b])
-        drain()
-    }
-    return { parent, find, merge }
-}
-
-function splitMemberUnions(types: ValueTypes, parent: number[], find: (a: number) => number, callees: Map<string, number[]>, graphOf: (fn: Function) => Graph): void {
-    const groups = new Map<number, number[]>()
-    types.frames.forEach((_, id) => {
-        const root = find(id)
-        const members = groups.get(root)
-        if (members) members.push(id)
-        else groups.set(root, [id])
-    })
-    const candidates: [members: number[], index: number][] = []
-    for (const members of groups.values()) {
-        if (members.length < 2) continue
-        const unions = types.frames[members[0]].params.map((_, i) => {
-            const joined = members.map(f => types.frames[f].params[i].type).reduce(union)
-            return joined.string && numericType(joined)
-        })
-        if (!unions.includes(true)) continue
-        const g = graphOf(types.frames[members[0]].unit)
-        const moved = movesOf(g).words
-        const entry = g.blocks[0].params
-        const index = unions.findIndex((joined, i) => joined && !moved.has(entry[i]))
-        if (index >= 0) candidates.push([members, index])
-    }
-    if (!candidates.length) return
-    const calledFrom = new Map<number, [caller: number, node: string][]>()
-    for (const [k, list] of callees) {
-        const [caller, node] = k.split('|')
-        for (const f of list) {
-            const from = calledFrom.get(f)
-            if (from) from.push([Number(caller), node])
-            else calledFrom.set(f, [[Number(caller), node]])
-        }
-    }
-    const same = congruence(types, callees).find
-    function refine(members: number[], keyOf: (f: number) => string): void {
-        const keys = members.map(f => `${find(f)}|${keyOf(f)}`)
-        for (const f of members) parent[f] = f
-        const firstOf = new Map<string, number>()
-        members.forEach((f, i) => {
-            const first = firstOf.get(keys[i])
-            if (first === undefined) firstOf.set(keys[i], f)
-            else parent[f] = first
-        })
-    }
-    function settle(split: number[]): boolean {
-        const work = [split]
-        while (work.length) {
-            const members = work.pop()!
-            const reached = new Map<string, Set<number>>()
-            for (const f of members) for (const [caller, node] of calledFrom.get(f) ?? []) {
-                const site = `${find(caller)}|${node}`
-                const roots = reached.get(site)
-                if (roots) roots.add(find(f))
-                else reached.set(site, new Set([find(f)]))
-            }
-            const conflicts = new Map<number, string[]>()
-            for (const [site, roots] of reached) {
-                if (roots.size < 2) continue
-                const [caller, node] = site.split('|')
-                const nodes = conflicts.get(Number(caller))
-                if (nodes) nodes.push(node)
-                else conflicts.set(Number(caller), [node])
-            }
-            for (const [root, nodes] of conflicts) {
-                const callers = types.frames.map((_, id) => id).filter(id => find(id) === root)
-                const keys = new Map<number, string>()
-                for (const f of callers) {
-                    const parts: number[] = []
-                    for (const node of nodes) {
-                        const roots = new Set((callees.get(`${f}|${node}`) ?? []).map(find))
-                        if (roots.size > 1) return false
-                        parts.push(roots.size ? [...roots][0] : -1)
-                    }
-                    if (parts.some(part => part >= 0)) keys.set(f, parts.join(','))
-                }
-                const fallback = [...keys.values()][0]
-                refine(callers, f => keys.get(f) ?? fallback)
-                work.push(callers)
-            }
-        }
-        return true
-    }
-    for (const [members, index] of candidates) {
-        const classes = new Map<number, string>()
-        for (const f of members) classes.set(f, memberClass(types.frames[f].params[index].type))
-        let mixed = members.some(f => types.frames[f].params[index].type.string && numericType(types.frames[f].params[index].type))
-        const bySame = new Map<number, string>()
-        for (const f of members) {
-            const c = classes.get(f)
-            if (!c) continue
-            const known = bySame.get(same(f))
-            if (known && known !== c) mixed = true
-            bySame.set(same(f), c)
-        }
-        for (const f of members) if (!classes.get(f)) classes.set(f, bySame.get(same(f)) ?? '')
-        if (mixed) continue
-        const fallback = members.map(f => classes.get(f)).find(c => c)!
-        const saved = [...parent]
-        refine(members, f => classes.get(f) || fallback)
-        if (settle(members)) continue
-        saved.forEach((p, i) => {
-            parent[i] = p
-        })
-    }
-}
-
-export function pendingJoins(types: ValueTypes, inst: Instantiations, plan: Map<Function, PlannedUnit[]>): [number, number][] {
-    const pairs: [number, number][] = []
-    function collect(objects: number[]): void {
-        const byProto = new Map<Handle | undefined, Map<string, number>>()
-        for (const id of objects) {
-            const object = types.objects[id]
-            if (object.native || object.name === 'buffer') continue
-            const shape = inst.shapeOf(id)
-            if (shape === undefined) continue
-            let shapes = byProto.get(object.proto)
-            if (!shapes) byProto.set(object.proto, shapes = new Map())
-            if (!shapes.has(shape)) shapes.set(shape, id)
-        }
-        for (const shapes of byProto.values()) {
-            const [first, ...rest] = [...shapes.values()]
-            for (const other of rest) pairs.push([first, other])
-        }
-    }
-    const unitByFrame = new Map<number, PlannedUnit>()
-    for (const units of plan.values()) for (const unit of units) {
-        const first = types.frames[unit.frames[0]]
-        first.params.forEach((_, i) => collect([...new Set(unit.frames.flatMap(f => types.frames[f].params[i].type.objects))]))
-        collect([...new Set(unit.frames.flatMap(f => types.frames[f].returns.objects))])
-        for (const f of unit.frames) unitByFrame.set(f, unit)
-    }
-    const contextFrames = new Map<string, number>()
-    types.frames.forEach((frame, id) => contextFrames.set(`${unitIdentity(frame.unit)}|${frame.context}`, id))
-    const bySite = new Map<string, number[]>()
-    types.objects.forEach((object, id) => {
-        if (object.constant || object.native) return
-        const frame = contextFrames.get(`${unitIdentity(object.site.unit)}|${object.context}`)
-        const unit = frame === undefined ? undefined : unitByFrame.get(frame)
-        if (!unit) return
-        const k = `${unit.signature}|${object.site.node}`
-        let list = bySite.get(k)
-        if (!list) bySite.set(k, list = [])
-        list.push(id)
-    })
-    for (const list of bySite.values()) if (list.length > 1) collect(list)
-    return pairs
+    return find
 }
 
 export interface Embeddings {
@@ -3460,7 +3405,7 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     })
     const returned = new Set(types.frames.flatMap(frame => frame.returns.objects.filter(id => !frame.context.startsWith(`o${id}|`))))
     const sameSite = (a: number, b: number) => types.objects[a].site.unit === types.objects[b].site.unit && types.objects[a].site.node === types.objects[b].site.node
-    const onlyObjects = (t: Type) => !t.undefined && !t.string && !t.unknown && !t.literals.length && !t.fixed.length && !t.bounds.length && !t.functions.length && !t.closures.length && t.objects.length > 0
+    const onlyObjects = (t: Type) => !t.undefined && !t.string && !t.unknown && !numericType(t) && !t.functions.length && !t.closures.length && t.objects.length > 0
     function owner(inner: number): [number, string] | undefined {
         const object = types.objects[inner]
         if (object.constant || object.native || object.name === 'buffer' || returned.has(inner)) return
@@ -3491,48 +3436,44 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
         }
         if (byKey.size) fields.set(P, byKey)
     }
-    const contextFrames = new Map<string, number>()
-    types.frames.forEach((frame, id) => contextFrames.set(`${unitIdentity(frame.unit)}|${frame.context}`, id))
     const unitOfFrame = new Map<number, PlannedUnit>()
-    for (const units of plan.values()) for (const unit of units) for (const f of unit.frames) unitOfFrame.set(f, unit)
-    for (let round = 0; round < 2; round++) {
-        const keys = new Map<string, Set<string>>()
-        const placed = new Map<string, [PlannedUnit, number]>()
-        types.objects.forEach((object, id) => {
-            const frame = contextFrames.get(`${unitIdentity(object.site.unit)}|${object.context}`)
-            const unit = frame === undefined ? undefined : unitOfFrame.get(frame)
-            if (!unit || !unit.allocations.has(object.site.node)) return
-            const k = `${unit.signature}|${unitIdentity(unit.fn)}|${object.site.node}`
-            const found = owner(id)
-            const P = found ? inst.shapeOf(found[0]) : undefined
-            const key = found && P !== undefined && fields.get(P)?.get(found[1]) === inst.shapeOf(id) ? `${P}.${found[1]}` : ''
-            let set = keys.get(k)
-            if (!set) keys.set(k, set = new Set())
-            set.add(key)
-            placed.set(k, [unit, object.site.node])
-        })
-        let dropped = false
-        for (const set of keys.values()) {
-            if (set.size < 2) continue
-            for (const key of set) {
-                if (!key) continue
-                const [P, field] = [key.slice(0, key.indexOf('.')), key.slice(key.indexOf('.') + 1)]
-                if (fields.get(P)?.delete(field)) dropped = true
-            }
-        }
-        if (dropped && round === 0) continue
-        const sites = new Map<PlannedUnit, Map<number, string>>()
-        for (const [k, set] of keys) {
-            const [key] = [...set]
-            if (set.size !== 1 || !key || !fields.get(key.slice(0, key.indexOf('.')))?.has(key.slice(key.indexOf('.') + 1))) continue
-            const [unit, node] = placed.get(k)!
-            let map = sites.get(unit)
-            if (!map) sites.set(unit, map = new Map())
-            map.set(node, key.slice(key.indexOf('.') + 1))
-        }
-        return { fields, sites }
+    const unitIndex = new Map<PlannedUnit, number>()
+    for (const units of plan.values()) for (const unit of units) {
+        unitIndex.set(unit, unitIndex.size)
+        for (const f of unit.frames) unitOfFrame.set(f, unit)
     }
-    return { fields: new Map(), sites: new Map() }
+    const keys = new Map<string, Set<string>>()
+    const placed = new Map<string, [PlannedUnit, number]>()
+    types.objects.forEach((object, id) => {
+        const unit = object.frame === undefined ? undefined : unitOfFrame.get(object.frame)
+        if (!unit || !unit.allocations.has(object.site.node)) return
+        const k = `${unitIndex.get(unit)}|${object.site.node}`
+        const found = owner(id)
+        const P = found ? inst.shapeOf(found[0]) : undefined
+        const key = found && P !== undefined && fields.get(P)?.get(found[1]) === inst.shapeOf(id) ? `${P}.${found[1]}` : ''
+        let set = keys.get(k)
+        if (!set) keys.set(k, set = new Set())
+        set.add(key)
+        placed.set(k, [unit, object.site.node])
+    })
+    for (const set of keys.values()) {
+        if (set.size < 2) continue
+        for (const key of set) {
+            if (!key) continue
+            const [P, field] = [key.slice(0, key.indexOf('.')), key.slice(key.indexOf('.') + 1)]
+            fields.get(P)?.delete(field)
+        }
+    }
+    const sites = new Map<PlannedUnit, Map<number, string>>()
+    for (const [k, set] of keys) {
+        const [key] = [...set]
+        if (set.size !== 1 || !key || !fields.get(key.slice(0, key.indexOf('.')))?.has(key.slice(key.indexOf('.') + 1))) continue
+        const [unit, node] = placed.get(k)!
+        let map = sites.get(unit)
+        if (!map) sites.set(unit, map = new Map())
+        map.set(node, key.slice(key.indexOf('.') + 1))
+    }
+    return { fields, sites }
 }
 
 interface Moves {
@@ -3600,30 +3541,9 @@ export function elementStride(element: Rep): number {
     return 4
 }
 
-export interface IntFormat {
-    bits: 32 | 64
-    signed: boolean
-}
-
-// XXX: ranges belong in the type
-function intFormat(type: Type, signed: boolean): IntFormat {
-    const wide = { bits: 64 as const, signed }
-    if (type.bounds.length) return wide
-    for (const T of type.fixed) {
-        const shape = intShape(T)
-        if (!shape || shape[0] > 32) return wide
-        if (signed && !shape[1] && shape[0] >= 32) return wide
-    }
-    for (const l of type.literals) {
-        if (!Number.isInteger(l)) return wide
-        if (signed ? l < -2147483648 || l > 2147483647 : l < 0 || l > 4294967295) return wide
-    }
-    return { bits: 32, signed }
-}
-
 function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean): string {
-    if (rep.number === 'int' || (rep.kind === 'undefined' && !param) || (rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str')) return 'word'
-    if (rep.kind === 'number') return rep.number!
+    if (numberName(rep) === 'int' || (rep.kind === 'undefined' && !param) || (rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str')) return 'word'
+    if (rep.kind === 'number') return numberText(rep.format)
     return `${repKey(rep, target => movedTarget(target, reduced))}${rep.fresh ? '!' : ''}`
 }
 
@@ -3637,7 +3557,7 @@ function repKey(rep: Rep, target: (target: string) => string): string {
     const nullable = rep.nullable ? '?' : ''
     const targets = rep.targets.map(target).join('|')
     switch (rep.kind) {
-        case 'number': return `${rep.number}${nullable}`
+        case 'number': return `${numberText(rep.format)}${nullable}`
         case 'pointer': return rep.constant ? rep.text : `ptr<${targets}>${nullable}`
         case 'union': return `union<${targets}>`
         case 'buffer': return `buf${rep.stride === 8 ? '8' : ''}<${rep.element!.encoded ? `enc<${repKey(rep.element!, target)}>` : repKey(rep.element!, target)}>${nullable}`
@@ -3664,7 +3584,7 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
         const g = graphOf(unit.fn)
         const { words: moved, elements } = movesOf(g)
         const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
-        const value = (rep: Rep) => rep.kind === 'number' ? rep.number! : view(rep)
+        const value = (rep: Rep) => rep.kind === 'number' ? numberText(rep.format) : view(rep)
         const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf8' ? 'int8' : value(rep)
         const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced)
         const entry = g.blocks[0].params
@@ -4266,5 +4186,3 @@ function backEdges(g: Graph): Set<number> {
     backEdgeSets.set(g, found)
     return found
 }
-const UnsignedOps = new Set([NodeOp.add, NodeOp.mul, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.ushr, NodeOp.shr, NodeOp.div, NodeOp.rem])
-const UnsignedTypes = new Set([Types.u8, Types.u16, Types.u32, Types.u64, Types.usize, Types.bool])

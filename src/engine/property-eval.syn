@@ -24,7 +24,6 @@ import { snapshotField, snapshotKeys } from './heap-records'
 import { newSymbolId, symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmValue } from './vm'
 import * as native from './native'
 import { Op as RtOp, bindingOf, callOf, earlyCalls } from './rt'
-import { globals as builtinGlobals } from './builtins'
 
 type Handle = intrinsics.Handle
 const Types = intrinsics.Types
@@ -203,11 +202,14 @@ export function resolveProperties(
     const tracer = runtime.tracer
     intrinsics.assert(graph.ids === runtime.ids, 'property-eval: the graph must come from the current trace runtime')
     const source: NodeSpace = { nodes: new Map(graph.nodes), ids: graph.ids, literals: graph.literals }
-    function locate(shape: Handle, path: string) {
+    function locate(shape: Handle, path: string): native.Codec | undefined {
         return opts.facts && native.locate(opts.facts, shape, path)
     }
     function storeFact(shape: Handle, path: string, value: Handle): void {
-        if (opts.facts && !opts.fixedFacts?.has(shape)) native.setFact(opts.facts, graph.name ?? 'property-eval', shape, path, value === numberShape ? { shape: undefined, encoded: false, number: true } : { shape: value, encoded: false })
+        if (opts.facts && !opts.fixedFacts?.has(shape)) native.setFact(opts.facts, graph.name ?? 'property-eval', shape, path, value === numberShape ? { kind: 'int', encoded: false } : { kind: 'ref', shape: value, encoded: false, union: false })
+    }
+    function wordCodec(codec: native.Codec | undefined): boolean {
+        return (codec?.kind === 'word' || codec?.kind === 'ref') && codec.encoded
     }
     for (const [id, n] of [...source.nodes]) {
         if (n.op !== NodeOp.rt || getLiteral(runtime, n, 1) !== RtOp.assign) continue
@@ -516,8 +518,7 @@ export function resolveProperties(
         return addNode(out, NodeOp.ne, [ref, undefinedValue()], Types.bool)
     }
     function storeField(id: number, token: number, base: number, displacement: number, owner: Handle, offset: number, value: Operand): void {
-        const located = locate(owner, String(offset))
-        const word = located !== undefined && located.decode !== undefined && !located.float
+        const word = wordCodec(locate(owner, String(offset)))
         const stored = !word ? value : typeof value !== 'number' ? { literal: value.literal * 2 } : shape(value) === numberShape ? addNode(out, NodeOp.box, [value], Types.vm_value) : value
         putNode(out, id, NodeOp.store, [token, base, { literal: displacement }, stored], word ? Types.vm_value : Types.u64)
     }
@@ -911,15 +912,14 @@ export function resolveProperties(
             }
             locations.set(id, [mem.shape, String(mem.offsets[at])])
             const located = locate(mem.shape, String(mem.offsets[at]))
-            if (located?.nullish) {
+            if (located?.kind === 'undefined') {
                 readUndefined(id, token)
                 return
             }
-            const rawFloat = !!located?.float && located.decode === undefined
-            const valued = located !== undefined && located.shape === undefined && !located.number && !rawFloat && located.decode !== undefined
-            const word = located !== undefined && located.decode !== undefined && !located.float
+            const rawFloat = located?.kind === 'f64' && !located.encoded
+            const word = wordCodec(located)
             const load = newId()
-            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : opts.signed?.has(id) ? opts.signed.get(id) ? Types.i64 : Types.u64 : located?.type ?? Types.u64)
+            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : opts.signed?.has(id) ? opts.signed.get(id) ? Types.i64 : Types.u64 : native.intType(located) ?? Types.u64)
             putNode(out, id, NodeOp.after, [token, load])
             const tag = mem.tags[at]
             if (tag) fieldTags.set(id, readBit(stable ? readonlyToken() : token, base, embedded ? tag.offset : mem.base + tag.offset, tag))
@@ -927,20 +927,20 @@ export function resolveProperties(
                 numbers.add(id)
                 return
             }
-            if (located?.float) unbox(id, load, located.decode!)
-            if (located?.boxed) unboxNumber(id, load)
-            if (located?.number) {
+            if (located?.kind === 'f64') unbox(id, load, native.pstack0Base())
+            if (located?.kind === 'boxed') unboxNumber(id, load)
+            if (located?.kind === 'int') {
                 numbers.add(id)
                 return
             }
-            if (valued) return
-            if (heap.isString(slot) || located?.shape === stringShape) {
+            if (located?.kind === 'word' && located.encoded) return
+            if (heap.isString(slot) || (located?.kind === 'ref' && located.shape === stringShape)) {
                 commit(id, stringShape)
                 return
             }
-            if (located?.shape !== undefined) {
-                const ptr = located.decode !== undefined ? decodeHandle(load, located.decode) : load
-                memory.set(id, { ...layout(located.shape), ptr, base: 0, shape: located.shape, reduced: false, pointer: true, address: [ptr, 0], decoded: located.decode !== undefined, union: located.union })
+            if (located?.kind === 'ref') {
+                const ptr = located.encoded ? decodeHandle(load, native.pstack0Base()) : load
+                memory.set(id, { ...layout(located.shape), ptr, base: 0, shape: located.shape, reduced: false, pointer: true, address: [ptr, 0], decoded: located.encoded, union: located.union })
                 return
             }
             if (located !== undefined) return
@@ -1005,14 +1005,6 @@ export function resolveProperties(
         inline(id, desc.slot0 as Handle, symbolValue(getRef(n, 1)), [], getRef(n, 0))
     }
 
-    function prototypeName(shape: Handle): string {
-        const proto = heap.getPrototypeOf(shape)
-        for (const [name, value] of Object.entries(builtinGlobals)) {
-            if (typeof value !== 'function') continue
-            if (heap.deref(heap.getPrototypeProperty(heap.deref(session.linkFunction(value) as Handle))) === proto) return name
-        }
-        return 'object'
-    }
     function resolve(id: number, n: GraphNode): void {
         const union = unions.get(getRef(n, 1))
         if (union && n.op === NodeOp.getProp) return resolveUnion(id, n, union)
@@ -1439,20 +1431,21 @@ export function resolveProperties(
         if (!base) return numberShape
         const path = `${base[1]}/${getRef(n, 2) ? '*' : getLiteral(runtime, n, 2)}`
         const located = locate(base[0], path)
-        if (located?.float) {
-            unbox(id, id, located.decode!)
+        if (located?.kind === 'f64') {
+            intrinsics.assert(located.encoded, 'property-eval: a raw f64 element is read through a word load')
+            unbox(id, id, native.pstack0Base())
             return numberShape
         }
-        if (located?.boxed) {
+        if (located?.kind === 'boxed') {
             unboxNumber(id, id)
             return numberShape
         }
-        if (located?.number) return numberShape
-        if (located?.shape === undefined) {
+        if (located?.kind === 'int') return numberShape
+        if (located?.kind !== 'ref') {
             locations.set(id, [base[0], path])
             return
         }
-        bindResult(id, located.shape, located.decode, located.union)
+        bindResult(id, located.shape, located.encoded ? native.pstack0Base() : undefined, located.union)
         return located.shape
     }
     function fieldShape(id: number, key: Handle): Handle | null | undefined {
@@ -2103,12 +2096,13 @@ export function resolveProperties(
         if (!base) continue
         const located = locate(base[0], `${base[1]}/${getRef(n, 2) ? '*' : getLiteral(runtime, n, 2)}`)
         if (getNode(out, id)?.op !== n.op) continue
+        const type = native.intType(located)
         if (located?.stride === 8) {
-            retypeNode(out, id, n.op === NodeOp.store ? Types.u64 : located.type ?? Types.u64)
+            retypeNode(out, id, n.op === NodeOp.store ? Types.u64 : type ?? Types.u64)
             continue
         }
-        if (located?.type === undefined) continue
-        retypeNode(out, id, n.op === NodeOp.store ? Types.u32 : located.type)
+        if (type === undefined) continue
+        retypeNode(out, id, n.op === NodeOp.store ? Types.u32 : type)
     }
     const addresses = new Map<number, number>()
     const replaced = new Map<number, [number, number]>()
