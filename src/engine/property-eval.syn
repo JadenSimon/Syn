@@ -48,6 +48,7 @@ export interface PropertyEvalOptions {
     readonly?: Set<Handle>
     plannedShapes?: Map<number, Handle | null>
     plannedUnions?: Map<number, Handle[]>
+    signed?: Map<number, boolean>
     rawReturns?: boolean
     dynamic?: Map<number, Function>
 }
@@ -84,6 +85,18 @@ export interface Constructed {
     refinements: Map<Handle, Map<Handle, Handle>>
     embedded?: Map<number, { parent: number, key: Handle }>
     fixed?: Map<Handle, Map<Handle, Handle>>
+    bits?: Map<Handle, RecordBits>
+}
+
+export interface RecordBits {
+    flags: Set<Handle>
+    tagged: Set<Handle>
+}
+
+export interface BitSlot {
+    offset: number
+    bit: number
+    shared: boolean
 }
 
 export interface AccessorCall {
@@ -93,11 +106,64 @@ export interface AccessorCall {
     pointer: boolean
 }
 
-interface Layout {
+export interface Layout {
     keys: Handle[]
     offsets: number[]
     nested: (Handle | undefined)[]
+    flags: (BitSlot | undefined)[]
+    tags: (BitSlot | undefined)[]
+    zeroed: BitSlot[]
     size: number
+}
+
+const wordBits = 32
+
+export function bitWord(slot: BitSlot): intrinsics.Types {
+    return slot.shared ? Types.u32 : Types.u64
+}
+
+export function recordLayout(shape: Handle, refinements?: Map<Handle, Map<Handle, Handle>>, bits?: Map<Handle, RecordBits>): Layout {
+    const keys = dataKeys(shape)
+    const fields = refinements?.get(shape)
+    const kinds = bits?.get(shape)
+    const offsets: number[] = []
+    const nested: (Handle | undefined)[] = []
+    let size = 0
+    for (const key of keys) {
+        const inner = fields?.get(key)
+        offsets.push(size)
+        nested.push(inner)
+        if (inner === undefined && kinds?.flags.has(key)) continue
+        size += inner !== undefined ? recordLayout(inner, refinements, bits).size : 8
+    }
+    const base = size
+    const flags: (BitSlot | undefined)[] = []
+    const tags: (BitSlot | undefined)[] = []
+    let count = 0
+    function place(): BitSlot {
+        const at = { offset: base + 8 * Math.floor(count / wordBits), bit: count % wordBits, shared: false }
+        count++
+        return at
+    }
+    for (let i = 0; i < keys.length; i++) {
+        const plain = nested[i] === undefined
+        const flag = plain && kinds?.flags.has(keys[i]) ? place() : undefined
+        if (flag) offsets[i] = flag.offset
+        flags.push(flag)
+        tags.push(plain && kinds?.tagged.has(keys[i]) ? place() : undefined)
+    }
+    const zeroed: BitSlot[] = []
+    function share(slot: BitSlot | undefined, tag: boolean): void {
+        if (!slot) return
+        const word = (slot.offset - base) / 8
+        slot.shared = Math.min(wordBits, count - word * wordBits) > 1
+        if ((slot.shared || tag) && !zeroed.some(z => z.offset === slot.offset)) zeroed.push(slot)
+    }
+    for (let i = 0; i < keys.length; i++) {
+        share(flags[i], false)
+        share(tags[i], true)
+    }
+    return { keys, offsets, nested, flags, tags, zeroed, size: base + 8 * Math.ceil(count / wordBits) }
 }
 
 interface Memory extends Layout {
@@ -120,6 +186,7 @@ export interface Resolved {
     numbers: Set<number>
     strings: Set<number>
     encoded: Set<number>
+    tags: Map<number, number>
 }
 
 const narrowLoads = new Set<TypeOperand>([intrinsics.Types.u8, intrinsics.Types.u16, intrinsics.Types.i8, intrinsics.Types.i16, intrinsics.Types.bool])
@@ -183,18 +250,7 @@ export function resolveProperties(
         return !!opts.readonly?.has(shape)
     }
     function layout(shape: Handle): Layout {
-        const keys = dataKeys(shape)
-        const fields = opts.constructed?.refinements.get(shape)
-        const offsets: number[] = []
-        const nested: (Handle | undefined)[] = []
-        let size = 0
-        for (const key of keys) {
-            offsets.push(size)
-            const inner = fields?.get(key)
-            nested.push(inner)
-            size += inner !== undefined ? layout(inner).size : 8
-        }
-        return { keys, offsets, nested, size }
+        return recordLayout(shape, opts.constructed?.refinements, opts.constructed?.bits)
     }
     const numbers = new Set<number>()
     const strings = new Set<number>()
@@ -214,7 +270,7 @@ export function resolveProperties(
     const byHandle = new Map<Handle, Memory>()
     let initToken = 0
     let allocToken: number | undefined
-    function heapAllocate(size: number): number {
+    function heapAllocate(size: number, zeroed: BitSlot[]): number {
         let token = allocToken
         if (token === undefined) {
             if (!initToken) {
@@ -223,8 +279,10 @@ export function resolveProperties(
             token = initToken
         }
         const ptr = addNode(out, NodeOp.pstack, [token, 0, 0, { literal: size }])
-        if (allocToken !== undefined) allocToken = ptr
-        else initToken = ptr
+        let last = ptr
+        for (const slot of zeroed) last = addNode(out, NodeOp.store, [last, ptr, { literal: slot.offset }, { literal: 0 }], bitWord(slot))
+        if (allocToken !== undefined) allocToken = last
+        else initToken = last
         return ptr
     }
     function handleOf(token: number, operand: Operand): number {
@@ -382,7 +440,7 @@ export function resolveProperties(
         if (!mem) {
             const reduced = keys.length <= 1 && readonlyKeys(handle, keys)
             let ptr = 0
-            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8))
+            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed)
             mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false }
             if (cell !== undefined) homes.set(cell, mem)
         }
@@ -429,6 +487,34 @@ export function resolveProperties(
         const nested = ref ? memory.get(ref) : undefined
         return nested && !nested.pointer ? [ref, nested] : undefined
     }
+    const fieldTags = new Map<number, number>()
+    function readBit(token: number, base: number, displacement: number, slot: BitSlot): number {
+        const word = addNode(out, NodeOp.load, [token, base, { literal: displacement }], bitWord(slot))
+        if (!slot.shared) return word
+        const shifted = slot.bit ? addNode(out, NodeOp.ushr, [word, { literal: slot.bit }], Types.u32) : word
+        return addNode(out, NodeOp.and, [shifted, { literal: 1 }], Types.u32)
+    }
+    function writeBit(id: number, token: number, base: number, displacement: number, slot: BitSlot, value: Operand): void {
+        if (!slot.shared) {
+            putNode(out, id, NodeOp.store, [token, base, { literal: displacement }, value], Types.u64)
+            return
+        }
+        const word = addNode(out, NodeOp.load, [token, base, { literal: displacement }], Types.u32)
+        const mask = 2 ** slot.bit
+        const kept = addNode(out, NodeOp.and, [word, { literal: 0xFFFFFFFF - mask }], Types.u32)
+        let next: Operand = kept
+        if (typeof value !== 'number' && value.literal) next = addNode(out, NodeOp.or, [word, { literal: mask }], Types.u32)
+        else if (typeof value === 'number') next = addNode(out, NodeOp.or, [kept, slot.bit ? addNode(out, NodeOp.shl, [value, { literal: slot.bit }], Types.u32) : value], Types.u32)
+        putNode(out, id, NodeOp.store, [word, base, { literal: displacement }, next], Types.u32)
+    }
+    function tagValue(ref: number, literal: number): Operand {
+        if (!ref) return { literal }
+        const known = fieldTags.get(ref)
+        if (known !== undefined) return known
+        const n = getNode(source, ref)
+        if (n?.op === NodeOp.heapHandle && countIds(n) === 1 && !getRef(n, 0) && !getLiteral(runtime, n, 0)) return { literal: 0 }
+        return addNode(out, NodeOp.ne, [ref, undefinedValue()], Types.bool)
+    }
     function storeField(id: number, token: number, base: number, displacement: number, owner: Handle, offset: number, value: Operand): void {
         const located = locate(owner, String(offset))
         const word = located !== undefined && located.decode !== undefined && !located.float
@@ -437,6 +523,20 @@ export function resolveProperties(
     }
     const initialized = new Set<Memory>()
     const initStores: [shape: Handle, path: string, value: number][] = []
+    function storeKey(mem: Memory, i: number, token: number, value: Operand, tag: Operand): number {
+        const store = newId()
+        const flag = mem.flags[i]
+        if (flag) {
+            writeBit(store, token, mem.ptr, mem.base + flag.offset, flag, value)
+            return store
+        }
+        storeField(store, token, mem.ptr, mem.base + mem.offsets[i], mem.shape, mem.offsets[i], value)
+        const slot = mem.tags[i]
+        if (!slot) return store
+        const marked = newId()
+        writeBit(marked, store, mem.ptr, mem.base + slot.offset, slot, tag)
+        return marked
+    }
     function initChain(id: number, mem: Memory, token: number, visited = new Set<Memory>()): number {
         initialized.add(mem)
         visited.add(mem)
@@ -446,19 +546,14 @@ export function resolveProperties(
             if (mem.nested[i] !== undefined) continue
             const nested = nestedMemory(id, mem.keys[i])
             if (!nested && !heap.getOwnProperty(state, mem.keys[i])) {
-                if (opts.fixedFacts?.has(mem.shape)) {
-                    const store = newId()
-                    storeField(store, token, mem.ptr, mem.base + mem.offsets[i], mem.shape, mem.offsets[i], { literal: 0 })
-                    token = store
-                }
+                if (opts.fixedFacts?.has(mem.shape)) token = storeKey(mem, i, token, { literal: 0 }, { literal: 0 })
                 continue
             }
             const slot = slotAt(state, mem.keys[i])
             const [ref, literal] = nested ? addressOf(nested[1]) : operandOf(slot)
             if (!nested && holdsAlready(mem, i, ref)) continue
-            const store = newId()
-            storeField(store, token, mem.ptr, mem.base + mem.offsets[i], mem.shape, mem.offsets[i], ref || { literal })
-            token = store
+            token = storeKey(mem, i, token, ref || { literal }, mem.tags[i] ? tagValue(ref, slot ? 1 : 0) : { literal: 1 })
+            if (mem.flags[i]) continue
             const storedShape = nested ? nested[1].shape : homes.get(slot)?.shape ?? (ref ? memory.get(ref)?.shape : heap.isBoxedF64(slot) ? numberShape : undefined)
             if (storedShape !== undefined) storeFact(mem.shape, String(mem.offsets[i]), storedShape)
             else if (ref) initStores.push([mem.shape, String(mem.offsets[i]), ref])
@@ -808,6 +903,12 @@ export function resolveProperties(
                 putNode(out, id, NodeOp.after, [token, { literal: heap.unboxF64(slot) }])
                 return
             }
+            const flag = mem.flags[at]
+            if (flag) {
+                putNode(out, id, NodeOp.after, [token, readBit(stable ? readonlyToken() : token, base, displacement, flag)])
+                numbers.add(id)
+                return
+            }
             locations.set(id, [mem.shape, String(mem.offsets[at])])
             const located = locate(mem.shape, String(mem.offsets[at]))
             if (located?.nullish) {
@@ -818,8 +919,10 @@ export function resolveProperties(
             const valued = located !== undefined && located.shape === undefined && !located.number && !rawFloat && located.decode !== undefined
             const word = located !== undefined && located.decode !== undefined && !located.float
             const load = newId()
-            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : located?.type ?? Types.u64)
+            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : opts.signed?.has(id) ? opts.signed.get(id) ? Types.i64 : Types.u64 : located?.type ?? Types.u64)
             putNode(out, id, NodeOp.after, [token, load])
+            const tag = mem.tags[at]
+            if (tag) fieldTags.set(id, readBit(stable ? readonlyToken() : token, base, embedded ? tag.offset : mem.base + tag.offset, tag))
             if (rawFloat) {
                 numbers.add(id)
                 return
@@ -849,7 +952,17 @@ export function resolveProperties(
             if (contents.get(`${mem.shape}/${mem.offsets[at]}`) === numberShape) numbers.add(id)
             return
         }
-        storeField(id, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] })
+        const flag = mem.flags[at]
+        if (flag) {
+            writeBit(id, token, base, displacement, flag, value[0] || { literal: value[1] })
+            return
+        }
+        const tag = mem.tags[at]
+        if (tag) {
+            const payload = newId()
+            storeField(payload, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] })
+            writeBit(id, payload, base, embedded ? tag.offset : mem.base + tag.offset, tag, tagValue(value[0], 1))
+        } else storeField(id, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] })
         const storedShape = value[0] ? storedFact(value[0]) : literalStored(mem.shape, key, value[1])
         if (storedShape !== undefined && !dead(id)) storeFact(mem.shape, String(mem.offsets[at]), storedShape)
     }
@@ -1020,6 +1133,8 @@ export function resolveProperties(
         }
         const chosen = tagSelect(union.tag, arms)
         putNode(out, id, NodeOp.after, [getRef(n, 0), chosen])
+        const armTags = arms.map(arm => fieldTags.get(arm))
+        if (armTags.every(tag => tag !== undefined)) fieldTags.set(id, tagSelect(union.tag, armTags as number[]))
         if (constants) unionTargets.set(id, { tag: union.tag, arms: arms.map(a => getRef(getNode(out, a)!, countIds(getNode(out, a)!) - 1)) })
         if (shapes.every(s => s !== undefined)) joinResult(id, union.tag, shapes as Handle[])
     }
@@ -1969,7 +2084,7 @@ export function resolveProperties(
             return addNode(out, NodeOp.heapHandle, [{ literal: slot }])
         })
         const direct = closureTargets.get(id)
-        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }, { literal: 2 }]) : union ? tagSelect(union.tag, codes) : codes[0]
+        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }]) : union ? tagSelect(union.tag, codes) : codes[0]
         const [context, contextLiteral] = mem ? addressOf(mem) : [getRef(n, 1), 0]
         const target = newId()
         const returns = callReturns.get(id)
@@ -1987,7 +2102,12 @@ export function resolveProperties(
         const base = locations.get(getRef(n, 1))
         if (!base) continue
         const located = locate(base[0], `${base[1]}/${getRef(n, 2) ? '*' : getLiteral(runtime, n, 2)}`)
-        if (located?.type === undefined || getNode(out, id)?.op !== n.op) continue
+        if (getNode(out, id)?.op !== n.op) continue
+        if (located?.stride === 8) {
+            retypeNode(out, id, n.op === NodeOp.store ? Types.u64 : located.type ?? Types.u64)
+            continue
+        }
+        if (located?.type === undefined) continue
         retypeNode(out, id, n.op === NodeOp.store ? Types.u32 : located.type)
     }
     const addresses = new Map<number, number>()
@@ -2083,20 +2203,20 @@ export function resolveProperties(
         if (derivedShape === numberShape) numberValues.add(id)
         if (derivedShape === stringShape) stringValues.add(id)
     }
-    return { graph: out, calls, addresses, shapes, numbers: numberValues, strings: stringValues, encoded }
+    return { graph: out, calls, addresses, shapes, numbers: numberValues, strings: stringValues, encoded, tags: fieldTags }
 }
 
 export interface ClosureOptions {
     unionParams?: Map<number, number>
     facts?: native.Facts
     contextShape?: Handle
-    created?: (closure: u32, shape: Handle) => void
     bound?: Map<u32, number>
     allocationShapes?: Map<number, Handle>
     fixedFacts?: Set<Handle>
     readonly?: Set<Handle>
     plannedShapes?: Map<number, Handle | null>
     plannedUnions?: Map<number, Handle[]>
+    signed?: Map<number, boolean>
     statics?: Set<number>
     allocations?: Map<u32, Allocation>
     rawReturns?: boolean
@@ -2109,6 +2229,7 @@ export interface ResolvedClosures {
     numbers?: Set<number>
     strings?: Set<number>
     encoded?: Set<number>
+    tags?: Map<number, number>
 }
 
 export function frameShape(size: number): Handle {
@@ -2129,7 +2250,6 @@ export function resolveClosures(
     const objects = new Map<number, Handle>()
     const pointers = new Map<number, Handle>()
     for (const [i, shape] of params ?? []) pointers.set(graph.blocks[0].params[i], shape)
-    const closures = new Map<u32, Handle>()
     for (const [id, n] of graph.nodes) {
         if (n.op === NodeOp.callContext && extra.contextShape !== undefined) pointers.set(id, extra.contextShape)
         if (n.op !== NodeOp.heapHandle || getRef(n, 0)) continue
@@ -2141,8 +2261,6 @@ export function resolveClosures(
         else if (extra.statics?.has(heap.deref(cell as Handle))) pointers.set(id, heap.deref(cell as Handle))
         if (!heap.isIndirect(cell as Handle) || !session.templateOf(cell)) continue
         const shape = (countIds(n) > 1 ? getLiteral(graph, n, 1) : heap.indirectTarget(cell as Handle)) as Handle
-        if (!closures.has(cell)) extra.created?.(cell, shape)
-        closures.set(cell, shape)
         objects.set(id, shape)
     }
     const typed = [...graph.nodes.values()].some(n => n.op === NodeOp.rt && (getLiteral(graph, n, 1) === RtOp.typeof || earlyCalls.has(getLiteral(graph, n, 1))))
@@ -2152,10 +2270,10 @@ export function resolveClosures(
     const resolved = resolveProperties(graph, session, objects, {
         pointers, unionPointers, partial: true, constructed, calls,
         facts: extra.facts, bound: extra.bound, allocationShapes: extra.allocationShapes, fixedFacts: extra.fixedFacts, readonly: extra.readonly,
-        allocations: extra.allocations, rawReturns: extra.rawReturns, plannedShapes: extra.plannedShapes, plannedUnions: extra.plannedUnions, dynamic: extra.dynamic,
+        allocations: extra.allocations, rawReturns: extra.rawReturns, plannedShapes: extra.plannedShapes, plannedUnions: extra.plannedUnions, signed: extra.signed, dynamic: extra.dynamic,
     })
     return {
-        graph: resolved.graph, memoryShapes: resolved.shapes, numbers: resolved.numbers, strings: resolved.strings, encoded: resolved.encoded,
+        graph: resolved.graph, memoryShapes: resolved.shapes, numbers: resolved.numbers, strings: resolved.strings, encoded: resolved.encoded, tags: resolved.tags,
     }
 }
 
@@ -2179,24 +2297,6 @@ function readonlyKeys(target: Handle, keys: Handle[]): boolean {
 export function reducedShape(shape: Handle): boolean {
     const keys = dataKeys(shape)
     return keys.length === 1 && readonlyKeys(shape, keys)
-}
-
-export function fieldOffset(shape: Handle, key: Handle, refinements?: Map<Handle, Map<Handle, Handle>>): number | undefined {
-    function size(of: Handle): number {
-        let total = 0
-        for (const k of dataKeys(of)) {
-            const inner = refinements?.get(of)?.get(k)
-            total += inner !== undefined ? size(inner) : 8
-        }
-        return total
-    }
-    let offset = 0
-    for (const k of dataKeys(shape)) {
-        if (k === key) return offset
-        const inner = refinements?.get(shape)?.get(k)
-        offset += inner !== undefined ? size(inner) : 8
-    }
-    return undefined
 }
 
 export function dataKeys(target: Handle): Handle[] {

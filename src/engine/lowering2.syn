@@ -65,8 +65,7 @@ function heapAllocation(g: Graph, id: number): boolean {
     const n = getNode(g, id)
     if (n?.op === NodeOp.pstack) return !getRef(n, 2) && !getLiteral(g, n, 2) && !!(getRef(n, 3) || getLiteral(g, n, 3))
     if (n?.op !== NodeOp.call) return false
-    const target = getNode(g, getRef(n, 1))
-    return target?.op === NodeOp.localTarget && !getRef(target, 0) && countIds(target) > 2 && (getLiteral(g, target, 2) & ReturnsFresh) !== 0
+    return !!callSummary(g, n)?.fresh
 }
 
 const FactOps = new Set([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.convert, NodeOp.load, NodeOp.literal])
@@ -332,7 +331,7 @@ function nonZero(g: Graph, ref: number, literal: number, facts: Facts): boolean 
     if (!n) return false
     if (n.op === NodeOp.literal) return getLiteral(g, n, 0) !== 0
     if (n.op === NodeOp.pstack || n.op === NodeOp.alloca || n.op === NodeOp.frameAddress) return true
-    if (n.op === NodeOp.call && (targetEffects(g, getNode(g, getRef(n, 1)))[1] & ReturnsFresh) !== 0) return true
+    if (n.op === NodeOp.call && callSummary(g, n)?.fresh) return true
     if (n.op === NodeOp.after) return nonZero(g, getRef(n, countIds(n) - 1), getLiteral(g, n, countIds(n) - 1), facts)
     if (comparisons(g, facts, ref).some(([k, equal]) => k === 0 && !equal)) return true
     if (n.op === NodeOp.or) return nonZero(g, getRef(n, 0), getLiteral(g, n, 0), facts) || nonZero(g, getRef(n, 1), getLiteral(g, n, 1), facts)
@@ -1404,22 +1403,24 @@ function returnedRecord(g: Graph, ret: GraphNode): GraphNode | undefined {
 }
 
 function outlineReturns(g: Graph): Graph {
-    const blockId = createNode(g, NodeOp.block, [])
-    let replaced = false
+    let returns = 0
+    let only: GraphNode | undefined
     let hasLiterals = false
     let fields = 0
     for (const n of g.nodes.values()) {
         if (n.op !== NodeOp.ret) continue
         const record = returnedRecord(g, n)
         const width = record ? countIds(record) / 2 : 0
-        assert(!replaced || fields === width, 'lowering: returns disagree on shape')
-        replaced = true
+        assert(!returns || fields === width, 'lowering: returns disagree on shape')
+        returns++
+        only = n
         fields = width
     }
-    replaced = false
+    if (!returns) return g
+    if (returns === 1 && countIds(only!) === 1 && g.blocks.some(b => getNode(g, b.bodyId) === only && b.params.includes(getRef(only!, 0)))) return g
+    const blockId = createNode(g, NodeOp.block, [])
     for (const [id, n] of g.nodes) {
         if (n.op !== NodeOp.ret) continue
-        replaced = true
         const operands: (number | GraphNode)[] = [blockId]
         const record = returnedRecord(g, n)
         if (record) {
@@ -1432,10 +1433,6 @@ function outlineReturns(g: Graph): Graph {
             if (!getRef(n, 0)) hasLiterals = true
         }
         setNode(g, id, getNode(g, createNode(g, NodeOp.apply, operands, n))!)
-    }
-    if (!replaced) {
-        deleteNode(g, blockId)
-        return g
     }
     const params: number[] = []
     for (let i = 0; i < Math.max(fields, 1); i++) params.push(createNode(g, NodeOp.param, []))
@@ -1460,8 +1457,8 @@ export function panicOrdering(g: Graph, thrown: number): number[] {
         const u = getNode(g, id)
         if (!u) continue
         if (u.op === NodeOp.call) {
-            const [effect, mask] = targetEffects(g, getNode(g, getRef(u, 1)))
-            if (effect > 1 && (mask & WritesUnknown) !== 0) {
+            const s = callSummary(g, u) ?? unknownCall
+            if (s.effect === EffectWrite && (s.writes & WritesUnknown) !== 0) {
                 observed.push(id)
                 continue
             }
@@ -1470,6 +1467,53 @@ export function panicOrdering(g: Graph, thrown: number): number[] {
         else if (OrderedValues.has(u.op)) walk.push(getRef(u, 0))
     }
     return observed
+}
+
+function panicNullishCalls(g: Graph): void {
+    const nullish: number[] = []
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.call) continue
+        const target = getNode(g, tailOf(g, getRef(n, 1)))
+        if (target?.op === NodeOp.heapHandle && !getRef(target, 0) && !getLiteral(g, target, 0)) nullish.push(id)
+    }
+    if (!nullish.length) return
+    const users = new Map<number, number[]>()
+    for (const [id, n] of g.nodes) {
+        const demanded = n.op === NodeOp.select ? 1 : countIds(n)
+        for (let i = 0; i < demanded; i++) {
+            const ref = getRef(n, i)
+            if (!ref) continue
+            const list = users.get(ref)
+            if (list) list.push(id)
+            else users.set(ref, [id])
+        }
+    }
+    function spread(from: number[], marks: Map<number, number>): void {
+        const work = from.map(call => [call, call])
+        while (work.length) {
+            const [id, call] = work.pop()!
+            for (const user of users.get(id) ?? []) {
+                if (marks.has(user)) continue
+                marks.set(user, call)
+                work.push([user, call])
+            }
+        }
+    }
+    const later = new Map<number, number>()
+    spread(nullish, later)
+    const doomedBy = new Map<number, number>()
+    const first = nullish.filter(call => !later.has(call))
+    for (const call of first) doomedBy.set(call, call)
+    spread(first, doomedBy)
+    for (const b of g.blocks) {
+        b.bodyId = mapTailPositions(g, b.bodyId, p => {
+            for (const root of tailRoots(g, p)) {
+                const call = doomedBy.get(root)
+                if (call !== undefined) return createNode(g, NodeOp.panic, [call])
+            }
+            return p.at
+        })
+    }
 }
 
 function replacePanics(g: Graph): boolean {
@@ -1750,6 +1794,7 @@ export function inlineBlocks(g: Graph) {
             }
         }
     }
+    panicNullishCalls(g)
     if (replacePanics(g)) reduceInlined()
     return g
 }
@@ -1771,11 +1816,39 @@ function copyCallTargets(g: Graph) {
 
 const placementRegions = intrinsics.argv().includes('optimize-stats') ? new Map<string, number>() : undefined
 
-export function packageBlocksFINAL(g: Graph) {
+function blockRegions(g: Graph, entries: Set<number>): GraphBlock[][] {
+    const groups: GraphBlock[][] = []
+    const order = new Map(g.blocks.map((b, i) => [b.id, i]))
+    const seen = new Set<number>()
+    for (const entry of entries) {
+        const members: GraphBlock[] = []
+        const work = [entry]
+        while (work.length) {
+            const id = work.pop()!
+            const b = getBlock(g, id)
+            if (!b || seen.has(id)) continue
+            seen.add(id)
+            members.push(b)
+            for (const p of tailPositions(g, b.bodyId)) {
+                const n = getNode(g, p.at)!
+                const to = n.op === NodeOp.apply ? getRef(n, 0) : 0
+                if (to && !entries.has(to)) work.push(to)
+            }
+        }
+        if (members.length) groups.push(members.sort((a, b) => order.get(a.id)! - order.get(b.id)!))
+    }
+    return groups
+}
+
+export function packageBlocksFINAL(g: Graph, entries?: Set<number>) {
     g = outlineReturns(g)
     g = outlinePanics(g)
-    const roots = deduplicate(g, g.blocks.map(b => b.bodyId), n => PureOps.has(n.op))
-    if (roots) g.blocks.forEach((b, i) => { b.bodyId = roots[i] })
+    const groups = entries ? blockRegions(g, entries) : [g.blocks]
+    if (entries) setGraphBlocks(g, groups.flat())
+    for (const members of groups) {
+        const roots = deduplicate(g, members.map(b => b.bodyId), n => PureOps.has(n.op))
+        if (roots) members.forEach((b, i) => { b.bodyId = roots[i] })
+    }
     g = copyCallTargets(g)
     const successors = new Map<number, Set<number>>()
     const preds = new Map<number, Set<number>>()
@@ -1794,13 +1867,10 @@ export function packageBlocksFINAL(g: Graph) {
         const r = new Set<number>()
         ancestors.set(bid, r)
         if (bid === g.root) return r
-        const l = [...preds.get(bid)!]
-        while (const x = l.pop()) {
-            if (r.has(x)) continue
-            r.add(x)
-            for (const q of ancestorsOf(x)) {
-                if (r.has(q)) continue
-                l.push(q)
+        for (const pred of preds.get(bid)!) {
+            r.add(pred)
+            for (const q of ancestorsOf(pred)) {
+                r.add(q)
             }
         }
         return r
@@ -2242,16 +2312,6 @@ const ResultUsedFlag = 1
 const FoldableOps = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.pow, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne])
 
 export const MemFresh = 0, MemPre = 1, MemUnknown = 2, MemInt = 3
-export const ArgBits = 28
-export const WritesUnknown = 1 << 30
-export const ReturnsFresh = 1 << 29
-export const ReturnsTagged = 1 << 28
-export const CapturesAll = (1 << ArgBits) - 1
-
-export function returnsTagged(g: NodeSpace, call: GraphNode): boolean {
-    const target = getNode(g, getRef(call, 1))
-    return target?.op === NodeOp.localTarget && !getRef(target, 0) && countIds(target) > 2 && (getLiteral(g, target, 2) & ReturnsTagged) !== 0
-}
 
 export function zeroWhenZero(g: Graph, arrivalsOf: (block: GraphBlock) => number[]): (value: number, valueLiteral: number, tag: number, tagLiteral: number) => boolean {
     let owners: Map<number, [block: GraphBlock, index: number]> | undefined
@@ -2313,7 +2373,7 @@ export function zeroWhenZero(g: Graph, arrivalsOf: (block: GraphBlock) => number
             if (getRef(ny, 0) !== getRef(nt, 0) || getRef(ny, 1) || getRef(nt, 1)) return false
             if (getLiteral(g, ny, 1) !== 0 || getLiteral(g, nt, 1) !== 1) return false
             const call = getNode(g, getRef(ny, 0))
-            return call?.op === NodeOp.call && returnsTagged(g, call)
+            return call?.op === NodeOp.call && !!callSummary(g, call)?.tagged
         }
         if (ny.op !== NodeOp.param || nt.op !== NodeOp.param) return false
         const a = ownerOf(y)
@@ -2338,26 +2398,10 @@ export function zeroWhenZero(g: Graph, arrivalsOf: (block: GraphBlock) => number
     }
 }
 
-export function returnsTaggedRecord(g: Graph): boolean {
-    const inbound = new Map<number, number[]>()
-    for (const [id, n] of g.nodes) {
-        if (n.op !== NodeOp.apply) continue
-        const list = inbound.get(getRef(n, 0))
-        if (list) list.push(id)
-        else inbound.set(getRef(n, 0), [id])
-    }
-    const holds = zeroWhenZero(g, b => inbound.get(b.id) ?? [])
-    let returns = 0
-    for (const n of g.nodes.values()) {
-        if (n.op !== NodeOp.ret) continue
-        const record = returnedRecord(g, n)
-        if (!record || countIds(record) !== 4 || getRef(record, 0) || getRef(record, 2)) return false
-        if (getLiteral(g, record, 0) !== 0 || getLiteral(g, record, 2) !== 1) return false
-        if (!holds(getRef(record, 1), getLiteral(g, record, 1), getRef(record, 3), getLiteral(g, record, 3))) return false
-        returns++
-    }
-    return returns > 0
+function sameSlotBits(a: intrinsics.Types, b: intrinsics.Types): boolean {
+    return a === b || ((a === Types.i64 || a === Types.u64) && (b === Types.i64 || b === Types.u64))
 }
+
 const IntegerOps = new Set([NodeOp.mul, NodeOp.div, NodeOp.rem, NodeOp.pow, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.xor, NodeOp.neg, NodeOp.not, NodeOp.clz, NodeOp.crc32, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne])
 const MemAbsolute = 0
 export interface Mem { base: number, pos: number | undefined, kind: number, pending?: boolean }
@@ -2377,45 +2421,97 @@ export interface CallOutcomes {
     other: [effect: number, mask: number] | undefined
 }
 
-const CaptureSlot = 3
-export const DeepCaptureSlot = 4
-const outcomeSlot = 5
+export const EffectNone = 0
+export const EffectRead = 1
+export const EffectWrite = 2
+const ArgBits = 28
+export const WritesUnknown = 1 << 30
+export const CapturesAll = (1 << ArgBits) - 1
 
-export function targetCaptures(g: Graph, call: number, k: number, slot = CaptureSlot): boolean {
-    const target = getNode(g, getRef(getNode(g, call)!, 1))
-    if (!target || target.op !== NodeOp.localTarget || getRef(target, 0) || countIds(target) <= slot || k >= ArgBits) return true
-    return (getLiteral(g, target, slot) & (1 << k)) !== 0
+export function argBit(k: number): number {
+    return k >= 0 && k < ArgBits ? 1 << k : 0
 }
 
-export function encodeCallOutcomes(outcomes: CallOutcomes | undefined): Operand[] {
-    if (!outcomes) return []
-    const slots: Operand[] = [
-        { literal: outcomes.literals.size }, { literal: outcomes.excluding.size },
-        { literal: outcomes.other?.[0] ?? -1 }, { literal: outcomes.other?.[1] ?? 0 },
-    ]
+export function hasArg(mask: number, k: number): boolean {
+    return k >= ArgBits || (mask & (1 << k)) !== 0
+}
+
+export function maskArgs(mask: number): number[] {
+    const args: number[] = []
+    for (let k = 0; k < ArgBits; k++) {
+        if (mask & (1 << k)) args.push(k)
+    }
+    return args
+}
+
+export interface CallSummary {
+    effect: number
+    writes: number
+    fresh: boolean
+    tagged: boolean
+    captures: number
+    deepCaptures: number
+    outcomes: CallOutcomes | undefined
+}
+
+export const unknownCall: CallSummary = { effect: EffectWrite, writes: WritesUnknown, fresh: false, tagged: false, captures: CapturesAll, deepCaptures: CapturesAll, outcomes: undefined }
+
+const SummarySlots = 7
+
+export function encodeCallSummary(symbol: number, s: CallSummary): number[] {
+    const slots = [symbol, s.effect, s.writes, s.fresh ? 1 : 0, s.tagged ? 1 : 0, s.captures, s.deepCaptures]
+    const outcomes = s.outcomes
+    if (!outcomes) return slots
+    slots.push(outcomes.literals.size, outcomes.excluding.size, outcomes.other?.[0] ?? -1, outcomes.other?.[1] ?? 0)
     for (const table of [outcomes.literals, outcomes.excluding]) {
-        for (const [value, [effect, mask]] of table) slots.push({ literal: value }, { literal: effect }, { literal: mask })
+        for (const [value, [effect, mask]] of table) slots.push(value, effect, mask)
     }
     return slots
 }
 
-function targetEffects(g: NodeSpace, target: GraphNode | undefined, returned?: number): [effect: number, mask: number] {
-    if (!target || target.op !== NodeOp.localTarget || getRef(target, 0)) return [2, WritesUnknown]
-    const effect = countIds(target) > 1 ? getLiteral(g, target, 1) : 2
-    const mask = countIds(target) > 2 ? getLiteral(g, target, 2) : WritesUnknown
-    if (returned === undefined || countIds(target) < outcomeSlot + 4) return [effect, mask]
-    const literals = getLiteral(g, target, outcomeSlot)
-    const excluding = getLiteral(g, target, outcomeSlot + 1)
-    let joined = getLiteral(g, target, outcomeSlot + 2)
-    let joinedMask = joined < 0 ? 0 : getLiteral(g, target, outcomeSlot + 3)
-    for (let i = 0; i < literals + excluding; i++) {
-        const at = outcomeSlot + 4 + i * 3
-        const value = getLiteral(g, target, at)
-        if ((i < literals) !== (value === returned)) continue
-        joined = Math.max(joined, getLiteral(g, target, at + 1))
-        joinedMask |= getLiteral(g, target, at + 2)
+export function callSummary(g: NodeSpace, call: GraphNode): CallSummary | undefined {
+    const target = getNode(g, getRef(call, 1))
+    if (gn.localSymbol(g, target) === undefined) return undefined
+    if (countIds(target!) < SummarySlots) return unknownCall
+    return {
+        effect: getLiteral(g, target!, 1),
+        writes: getLiteral(g, target!, 2),
+        fresh: getLiteral(g, target!, 3) !== 0,
+        tagged: getLiteral(g, target!, 4) !== 0,
+        captures: getLiteral(g, target!, 5),
+        deepCaptures: getLiteral(g, target!, 6),
+        outcomes: countIds(target!) > SummarySlots ? decodeCallOutcomes(g, target!) : undefined,
     }
-    return joined < 0 ? [0, mask & ReturnsFresh] : [joined, joinedMask | (mask & ReturnsFresh)]
+}
+
+function decodeCallOutcomes(g: NodeSpace, target: GraphNode): CallOutcomes {
+    const literals = getLiteral(g, target, SummarySlots)
+    const excluding = getLiteral(g, target, SummarySlots + 1)
+    const other = getLiteral(g, target, SummarySlots + 2)
+    const out: CallOutcomes = { literals: new Map(), excluding: new Map(), other: other < 0 ? undefined : [other, getLiteral(g, target, SummarySlots + 3)] }
+    for (let i = 0; i < literals + excluding; i++) {
+        const at = SummarySlots + 4 + i * 3
+        const table = i < literals ? out.literals : out.excluding
+        table.set(getLiteral(g, target, at), [getLiteral(g, target, at + 1), getLiteral(g, target, at + 2)])
+    }
+    return out
+}
+
+export function summaryEffect(s: CallSummary, returned?: number): [effect: number, writes: number] {
+    if (returned === undefined || !s.outcomes) return [s.effect, s.writes]
+    let joined = s.outcomes.other?.[0] ?? -1
+    let writes = s.outcomes.other?.[1] ?? 0
+    for (const [value, [effect, mask]] of s.outcomes.literals) {
+        if (value !== returned) continue
+        joined = Math.max(joined, effect)
+        writes |= mask
+    }
+    for (const [value, [effect, mask]] of s.outcomes.excluding) {
+        if (value === returned) continue
+        joined = Math.max(joined, effect)
+        writes |= mask
+    }
+    return joined < 0 ? [EffectNone, 0] : [joined, writes]
 }
 
 function usedPastToken(n: GraphNode, x: number): boolean {
@@ -2484,9 +2580,7 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
         if (n.op === NodeOp.pstack) return own(!getRef(n, 2) && !getLiteral(g, n, 2) && (getRef(n, 3) || getLiteral(g, n, 3)) ? MemFresh : MemUnknown)
         if (n.op === NodeOp.alloca || n.op === NodeOp.mem) return own(MemFresh)
         if (n.op === NodeOp.call) {
-            const target = getNode(g, getRef(n, 1))
-            const fresh = target?.op === NodeOp.localTarget && !getRef(target, 0) && countIds(target) > 2 && (getLiteral(g, target, 2) & ReturnsFresh) !== 0
-            return own(fresh ? MemFresh : MemUnknown)
+            return own(callSummary(g, n)?.fresh ? MemFresh : MemUnknown)
         }
         if (n.op === NodeOp.literal) return { base: MemAbsolute, pos: getLiteral(g, n, 0), kind: MemPre }
         if (n.op === NodeOp.poolEntry) return own(MemPre)
@@ -2748,22 +2842,21 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
     }
     function escaped(root: number): boolean {
         const flow = flows(root, false)
-        return flow.own || flow.calls.some(([call, k]) => targetCaptures(g, call, k))
+        return flow.own || flow.calls.some(([call, k]) => hasArg((callSummary(g, getNode(g, call)!) ?? unknownCall).captures, k))
     }
     function clobbers(call: number, load: GraphNode, returned?: number): boolean {
         const n = getNode(g, call)!
-        const target = getNode(g, getRef(n, 1))
-        if (!target || target.op !== NodeOp.localTarget || getRef(target, 0)) return true
-        const [effect, mask] = targetEffects(g, target, returned)
-        if (effect <= 1) return false
+        const summary = callSummary(g, n)
+        if (!summary) return true
+        const [effect, writes] = summaryEffect(summary, returned)
+        if (effect !== EffectWrite) return false
         const x = access(load)
         if (!x) return true
-        if (mask & WritesUnknown) {
+        if (writes & WritesUnknown) {
             if (x.kind !== MemFresh || escaped(x.base)) return true
             return flows(x.base, false).calls.some(([c]) => c === call)
         }
-        for (let k = 0; k < ArgBits; k++) {
-            if (!(mask & (1 << k))) continue
+        for (const k of maskArgs(writes)) {
             const arg = getRef(n, 3 + k)
             const y = arg ? of(arg) : { base: MemAbsolute, pos: getLiteral(g, n, 3 + k), kind: MemPre }
             if (y.pending || y.base === x.base) return true
@@ -3569,7 +3662,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function callEffect(n: GraphNode, returned?: number): number {
-        return targetEffects(g, getNode(g, getRef(n, 1)), returned)[0]
+        return summaryEffect(callSummary(g, n) ?? unknownCall, returned)[0]
     }
 
     function simplifyOrdering(
@@ -4717,7 +4810,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const loaded = getNode(g, skipAfter(getRef(getNode(g, app)!, slot + 1)) ?? 0)
                 if (!loaded || loaded.op !== NodeOp.load) return false
                 if (getRef(loaded, 1) !== getRef(store, 1) || getRef(loaded, 2)) return false
-                if (getLiteral(g, loaded, 2) !== getLiteral(g, store, 2) || typeOf(loaded) !== typeOf(store)) return false
+                if (getLiteral(g, loaded, 2) !== getLiteral(g, store, 2) || !sameSlotBits(typeOf(loaded), typeOf(store))) return false
                 if (applyWriter(block, app) !== lastWriter(getRef(loaded, 0))) return false
             }
             return true
@@ -7519,7 +7612,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             let value = getRef(store, 3)
             for (let m = getNode(g, value); m?.op === NodeOp.after; m = getNode(g, value)) value = getRef(m, countIds(m) - 1)
             const loaded = getNode(g, value)
-            if (loaded?.op !== NodeOp.load || !sameLocation(loaded, store) || typeOf(loaded) !== typeOf(store)) return false
+            if (loaded?.op !== NodeOp.load || !sameLocation(loaded, store) || !sameSlotBits(typeOf(loaded), typeOf(store))) return false
             return (writer !== undefined && writerOf(getRef(loaded, 0), loaded) === writer) || writerOf(getRef(store, 0), store, new Set([value, getRef(loaded, 0)])) === 'quiet'
         }
         if (!r.size) {
@@ -7923,8 +8016,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (n.op === NodeOp.store && getRef(n, 3) === a) return false
                 const offset = slotOf(a, getLiteral(g, n, 2))
                 const known = slotTypes.get(offset)
-                if (known !== undefined && known !== gn.machineType(typeOf(n))) return false
-                slotTypes.set(offset, gn.machineType(typeOf(n)))
+                const T = gn.machineType(typeOf(n))
+                if (known !== undefined && !sameSlotBits(known, T)) return false
+                slotTypes.set(offset, known !== undefined && lowering.isSignedType(known) ? known : T)
             }
         }
         for (const s of selectors) {
@@ -8190,13 +8284,20 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const pointers = pointerSlots.get(getRef(n, 0))
                 if (!offsets && !pointers) return id
                 const operands = getOperands(g, n)
-                for (const i of pointers ?? []) operands[i + 1] = { literal: 0 }
+                const kept: number[] = []
+                for (const i of pointers ?? []) {
+                    for (let m = getNode(g, getRef(n, i + 1)); m?.op === NodeOp.after; m = getNode(g, getRef(m, countIds(m) - 1))) {
+                        for (let k = 0; k < countIds(m) - 1; k++) if (getRef(m, k)) kept.push(getRef(m, k))
+                    }
+                    operands[i + 1] = { literal: 0 }
+                }
                 const target = getGraphBlock(getRef(n, 0))
                 for (const offset of offsets ?? []) {
                     const [ref, literal] = arrivalValue(b, tokens, id, target, offset)!
                     operands.push(ref || { literal })
                 }
-                return addCopy(g, n, operands, NodeOp.apply)
+                const app = addCopy(g, n, operands, NodeOp.apply)
+                return kept.length ? addNode(g, NodeOp.after, [...kept, app]) : app
             }
             return walk(b.bodyId, [])
         }
@@ -8342,7 +8443,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         function foldTest(id: number) {
             const n = getNode(g, id)
-            if (!n || countIds(n) < 2) return
+            if (!n || (n.op !== NodeOp.eq && n.op !== NodeOp.ne) || countIds(n) < 2) return
             const valueAt = !getRef(n, 0) && getLiteral(g, n, 0) === 0 ? 1
                 : !getRef(n, 1) && getLiteral(g, n, 1) === 0 ? 0 : -1
             if (valueAt < 0) return
@@ -10221,7 +10322,7 @@ export function substitute(g: Graph, by: Map<number, Operand>): void {
 function rebuildable(g: Graph, id: number): boolean {
     const n = getNode(g, id)
     if (!n) return false
-    return n.op === NodeOp.literal || n.op === NodeOp.frameAddress || (n.op === NodeOp.localTarget && !getRef(n, 0))
+    return n.op === NodeOp.literal || n.op === NodeOp.frameAddress || gn.localSymbol(g, n) !== undefined
 }
 
 function islandLoad(g: Graph, n: GraphNode): boolean {
@@ -12162,7 +12263,7 @@ function outlineArm(g: Graph, uses: Map<number, number>, arm: number, exits = ne
             const k = (refs.get(x) ?? 0) + 1
             refs.set(x, k)
             const u = getNode(g, x)!
-            if (u.op === NodeOp.param || u.op === NodeOp.block) continue
+            if (u.op === NodeOp.param || u.op === NodeOp.block || u.op === NodeOp.get) continue
             if (k === uses.get(x) || hasStructuredTail(g, x)) take(x)
         }
     }
@@ -13042,12 +13143,13 @@ export function optimizePackaged(g: Graph, target: lowering.Target): Graph {
     return g
 }
 
-export function packageValueGraph(g: Graph, target: lowering.Target): Graph {
+export function packageValueGraph(g: Graph, target: lowering.Target, entries?: Set<number>): Graph {
     expectForm(g, 'package', undefined)
     checkCaptures(g)
     if (intrinsics.argv().includes('check-creation-order')) checkCreationOrder(g, 'trace', new Set())
     const _bindCallContext: GraphPass = g => bindCallContext(g, target.indirectContextReg)
-    g = runPipeline('package', g, target.costs, [_bindCallContext, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, packageBlocksFINAL, pruneDeadParams]).graph
+    const _packageBlocks: GraphPass = g => packageBlocksFINAL(g, entries)
+    g = runPipeline('package', g, target.costs, [_bindCallContext, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams]).graph
     g.form = 'packaged'
     verifyGraph(g, 'package', true)
     return g
@@ -13213,10 +13315,10 @@ function demotePstacks(g: Graph): boolean {
                         if (headers) { escaped = true; break }
                         const into = mem.of(getRef(n, 1)).base
                         if (into === root || !container(into) || escapes(into)) { escaped = true; break }
-                        if (mem.flows(into, true).calls.some(([call, k]) => targetCaptures(g, call, k, DeepCaptureSlot))) { escaped = true; break }
+                        if (mem.flows(into, true).calls.some(([call, k]) => hasArg((callSummary(g, getNode(g, call)!) ?? unknownCall).deepCaptures, k))) { escaped = true; break }
                         for (const l of loadsFrom.get(into) ?? []) follow(l)
                     } else if (n.op === NodeOp.call) {
-                        if (i < 3 || targetCaptures(g, u, i - 3)) escaped = true
+                        if (i < 3 || hasArg((callSummary(g, n) ?? unknownCall).captures, i - 3)) escaped = true
                         else follow(u)
                     } else if (n.op === NodeOp.apply) {
                         const param = getBlock(g, getRef(n, 0))?.params[i - 1]
@@ -13662,7 +13764,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (s) return s
         const n = getNode(g, call)
         const t = n?.op === NodeOp.call ? getNode(g, getRef(n, 1)) : undefined
-        s = t?.op === NodeOp.localTarget && !getRef(t, 0) ? opts.clobbersOf?.(getLiteral(g, t, 0)) ?? clobberAll : clobberAll
+        const callee = gn.localSymbol(g, t)
+        s = callee !== undefined ? opts.clobbersOf?.(callee) ?? clobberAll : clobberAll
         const handed = n?.op === NodeOp.call ? argHomes(call).filter(h => h < SLOTS && !s!.has(h)) : []
         if (handed.length) s = new Set([...s, ...handed])
         callClobbers.set(call, s)
@@ -14539,11 +14642,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const local = callee?.op === NodeOp.localTarget ? callee : undefined
         assert(!indirect || countIds(indirect) === 1, `lowering: call %${id} still carries its context in the target`)
         const code = indirect ? [getRef(indirect, 0), getLiteral(g, indirect, 0)] : [getRef(n, 1), getLiteral(g, n, 1)]
-        const panics = isZeroValue(code[0], code[1])
+        assert(!isZeroValue(code[0], code[1]), `lowering: ${g.name ?? 'graph'} calls undefined at %${id}, which panicNullishCalls should have turned into a panic`)
         const homes = argHomes(id)
         const stacked = homes.some(isOutgoingArg)
         if (syscall) assert(!stacked, `lowering: syscall at %${id} takes more than ${target.syscall.argRegs.length} args`)
-        if (syscall || stacked || panics || homes.some(isPreserved)) tails.delete(id)
+        if (syscall || stacked || homes.some(isPreserved)) tails.delete(id)
         if (syscall) noreturns.delete(id)
         if (!syscall) callsOut ||= !tails.has(id) && !noreturns.has(id)
         const continues = local && noreturns.has(id) && opts.continues?.(getLiteral(g, local, 0)) ? [] as number[] : undefined
@@ -14602,8 +14705,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 popFrame(region)
                 asm.jumpLocal(target, name)
             })
-        } else if (panics) {
-            jumpToExit()
         } else {
             for (const r of target.volatiles) written.add(r)
             const region = currentRegion
@@ -14939,8 +15040,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const returned = value?.op === NodeOp.ret && getRef(value, 0) === last
             const tail = (value?.op === NodeOp.void || returned) && getNode(g, last)?.op === NodeOp.call && !done.has(last)
             if (tail) tails.add(last)
-            const callee = getNode(g, last)?.op === NodeOp.call ? getNode(g, getRef(getNode(g, last)!, 1)) : undefined
-            if (value?.op === NodeOp.unreachable && ordering.length === 1 && callee?.op === NodeOp.localTarget && !getRef(callee, 0) && opts.endless?.(getLiteral(g, callee, 0)) && !done.has(last)) noreturns.add(last)
+            const callee = getNode(g, last)?.op === NodeOp.call ? gn.localSymbol(g, getNode(g, getRef(getNode(g, last)!, 1))) : undefined
+            if (value?.op === NodeOp.unreachable && ordering.length === 1 && callee !== undefined && opts.endless?.(callee) && !done.has(last)) noreturns.add(last)
             for (const i of ordering) if (!returned || !tail || getRef(n, i) !== last) effect(getRef(n, i))
             if (tail && !returned) return jumpToExit(last)
             if (noreturns.has(last)) return finish(getRef(n, result))
