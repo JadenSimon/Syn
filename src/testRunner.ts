@@ -644,6 +644,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     const suites = args[1] === 'all' ? allTestableFiles : [args[1]]
     const deadline = Date.now() + seconds * 1000
     const crashes: string[] = []
+    const given = args.find(a => a.startsWith('max-crashes:'))
+    const maxCrashes = given ? Number(given.slice('max-crashes:'.length)) : 3
     let resume: CrashResume | undefined
     let exitCode = 0
     while (true) {
@@ -676,7 +678,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         }
         console.log(`${label} FAILED: ${message}`)
         crashes.push(label)
-        if (!next || crashes.length >= 3) {
+        if (!next || crashes.length >= maxCrashes) {
             console.log('...max crash count exceeded')
             exitCode = 128 + Number(message.match(/signal (\d+)/)![1])
             break
