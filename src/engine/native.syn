@@ -27,7 +27,7 @@ import {
     opName,
     getNode, setNode, hasNode, deleteNode, localSymbol,
     putNode, addNode, putCopy, addCopy,
-    withOperand, retypeNode, isNullishValue,
+    withOperand, retypeNode, isNullishValue, nodeUsers,
     type NodeSpace,
 } from './graph-node'
 import { hostTarget, isSignedType, type Target } from './lowering'
@@ -39,7 +39,7 @@ import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
 import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
-import { type AccessHost, analyzeGenerics, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type AccessHost, analyzeGenerics, constructedAllocation, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -2300,21 +2300,6 @@ function valuesFrom(graph: Graph, root: number, conditional: boolean): Set<numbe
     return found
 }
 
-function valueUsers(graph: Graph, values: Iterable<number>): Map<number, number[]> {
-    const users = new Map<number, number[]>()
-    for (const id of values) {
-        const n = getNode(graph, id)!
-        for (let i = 0; i < countIds(n); i++) {
-            const ref = getRef(n, i)
-            if (!ref) continue
-            let list = users.get(ref)
-            if (!list) users.set(ref, list = [])
-            list.push(id)
-        }
-    }
-    return users
-}
-
 function expandParams(program: ProgramGraph, touched: Set<number>): void {
     const sites = programCallSites(program)
     const hoisted: string[] = []
@@ -2329,7 +2314,7 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         const graph = program.units.get(callee)!
         const entry = graph.blocks[0]
         const demanded = valuesFrom(graph, graph.blocks[0].bodyId, false)
-        const users = valueUsers(graph, valuesFrom(graph, graph.blocks[0].bodyId, true))
+        const users = nodeUsers(graph, valuesFrom(graph, graph.blocks[0].bodyId, true))
         function entryToken(id: number): boolean {
             const n = getNode(graph, id)
             return n?.op === NodeOp.nilEffect && (countLiterals(n) === 0 || getRef(n, 0) === entry.id)
@@ -2497,7 +2482,7 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
             twinsAt.push(found)
         }
         if (!candidates.length) continue
-        const users = valueUsers(graph, values)
+        const users = nodeUsers(graph, values)
         function saving(v: number): { dead: Set<number>, cost: number } {
             const dead = new Set<number>([v])
             const stack = [v]
@@ -2627,7 +2612,7 @@ function reachable(graph: Graph): GraphNode[] {
     }
     return found
 }
-function splice(graph: Graph, call: number, callee: Graph): number[] {
+function splice(graph: Graph, call: number, callee: Graph): void {
     const n = getNode(graph, call)!
     const args = new Map<number, number>()
     callee.blocks[0].params.forEach((p, i) => {
@@ -2674,7 +2659,6 @@ function splice(graph: Graph, call: number, callee: Graph): number[] {
         body = ordered
     }
     putNode(graph, call, NodeOp.inlined, [body, { literal: call }])
-    return [...blocks.values()]
 }
 function budgetedLoops(program: ProgramGraph, levels: Map<number, number>, share: number): Set<number> {
     const pieces: { symbol: number, loop: boolean, size: number }[] = []
@@ -2749,31 +2733,36 @@ function returnsAllocation(g: Graph): boolean {
     return fresh
 }
 function inlineAllocations(program: ProgramGraph, units: Map<number, ProgramUnit>, unit: ProgramUnit, clock: PhaseClock): void {
-    let graph: Graph | undefined
-    const spliced = new Map<number, number[]>()
     let mem: MemAnalysis | undefined
-    for (const [id, n] of [...unit.graph.nodes]) {
-        const symbol = calledSymbol(unit.graph, n)
-        const callee = symbol === undefined ? undefined : units.get(symbol)
-        if (!callee || callee === unit || program.noInline.has(callee.symbol) || isJumbo(callee.graph) || !returnsAllocation(callee.graph)) continue
-        const cost = inlineCost(callee.graph, literalParams(unit.graph, n, callee.graph))
-        if (cost === undefined || cost > 16) continue
+    const graph = inlineSites(program, units, unit, unit.graph.nodes.keys(), (id, callee) => {
+        if (isJumbo(callee.graph) || !returnsAllocation(callee.graph)) return false
+        const cost = inlineCost(callee.graph, literalParams(unit.graph, getNode(unit.graph, id)!, callee.graph))
+        if (cost === undefined || cost > 16) return false
         const flow = (mem ??= memAnalysis(unit.graph)).flows(id, true)
-        if (flow.own || (flow.calls.length && !flags.has("ia-calls"))) continue
+        return !flow.own && (!flow.calls.length || flags.has("ia-calls"))
+    })
+    if (graph) unit.graph = repackage(graph, unit.graph, clock, program.target)
+}
+function inlineSites(program: ProgramGraph, units: Map<number, ProgramUnit>, unit: ProgramUnit, sites: Iterable<number>, accept: (id: number, callee: ProgramUnit) => boolean): Graph | undefined {
+    let graph: Graph | undefined
+    for (const id of sites) {
+        const symbol = calledSymbol(unit.graph, getNode(unit.graph, id)!)
+        const callee = symbol === undefined ? undefined : units.get(symbol)
+        if (!callee || callee === unit || program.noInline.has(callee.symbol) || !accept(id, callee)) continue
         graph ??= snapshotGraph(unit.graph)
-        spliced.set(id, splice(graph, id, callee.graph))
+        splice(graph, id, callee.graph)
     }
-    if (graph) unit.graph = repackage(graph, spliced, clock, program.target)
+    return graph
 }
 function canInline(graph: Graph): boolean {
     return !isJumbo(graph) && !reachable(graph).some(n => n.op === NodeOp.alloca || n.op === NodeOp.frameAddress)
 }
 
-function worthInlining(program: ProgramGraph, callSites: Map<number, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
+function worthInlining(program: ProgramGraph, callSites: Map<number, number>, caller: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
     if (program.alwaysInline.has(callee.symbol)) return true
     if (program.constructors.has(callee.symbol)) return true
     const roots = program.roots
-    const cost = inlineCost(callee.graph, literalParams(source, getNode(source, id)!, callee.graph))
+    const cost = inlineCost(callee.graph, literalParams(caller, getNode(caller, id)!, callee.graph))
     const neutral = cost !== undefined && cost <= 8
     const sole = callSites.get(callee.symbol) === 1 && ![...roots.values()].includes(callee.symbol)
     const growth = cost !== undefined && cost <= 8 + callee.graph.blocks[0].params.length && heat >= 6
@@ -2862,10 +2851,9 @@ function paramArrivals(graph: Graph): Arrivals {
     return arrivals
 }
 
-function repackage(graph: Graph, spliced: Map<number, number[]>, clock: PhaseClock, target: Target): Graph {
+function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Target): Graph {
     return clock.timed('normalize', () => {
-        const added = new Set([...spliced.values()].flat())
-        const entries = new Set(graph.blocks.filter(b => !added.has(b.id)).map(b => b.id))
+        const entries = new Set(original.blocks.map(b => b.id))
         recordSnapshots(graph)
         anchorBlockNils(graph)
         graph.form = undefined
@@ -2962,32 +2950,14 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
     function visit(unit: ProgramUnit): void {
         if (inlineable.has(unit.symbol)) return
         inlineable.set(unit.symbol, false)
-        let graph: Graph | undefined
         let depths: Map<number, number> | undefined
-        const spliced = new Map<number, number[]>()
-        for (const [id, n] of unit.graph.nodes) {
-            const symbol = calledSymbol(unit.graph, n)
-            if (symbol === undefined) continue
-            const callee = units.get(symbol)
-            if (!callee || callee === unit || program.noInline.has(symbol)) continue
+        const graph = inlineSites(program, units, unit, unit.graph.nodes.keys(), (id, callee) => {
             visit(callee)
-            if (!inlineable.get(symbol)) continue
+            if (!inlineable.get(callee.symbol)) return false
             depths ??= siteDepths(unit.graph)
-            if (!worthInlining(program, callSites, unit.graph, graph ?? unit.graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
-            graph ??= snapshotGraph(unit.graph)
-            spliced.set(id, splice(graph, id, callee.graph))
-        }
-        if (graph) {
-            try {
-                unit.graph = repackage(graph, spliced, clock, program.target)
-            } catch (e) {
-                if (flags.has('inline-fail-debug')) {
-                    for (const [site] of spliced) console.log('SPLICED', unit.graph.name, `%${site}`, units.get(calledSymbol(unit.graph, getNode(unit.graph, site)!)!)?.graph.name)
-                    console.log(dumpGraph(unit.graph))
-                }
-                throw e
-            }
-        }
+            return worthInlining(program, callSites, unit.graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))
+        })
+        if (graph) unit.graph = repackage(graph, unit.graph, clock, program.target)
         inlineAllocations(program, units, unit, clock)
         inlineable.set(unit.symbol, canInline(unit.graph))
     }
@@ -3019,15 +2989,8 @@ function inlineSpecialized(program: ProgramGraph, touched: Set<number>, clock: P
     for (const [symbol, calls] of byCaller) {
         const unit = units.get(symbol)!
         const depths = siteDepths(unit.graph)
-        let graph: Graph | undefined
-        const spliced = new Map<number, number[]>()
-        for (const id of calls) {
-            const callee = units.get(calledSymbol(unit.graph, getNode(unit.graph, id)!)!)!
-            if (!worthInlining(program, callSites, unit.graph, graph ?? unit.graph, id, callee, (levels.get(symbol) ?? 0) + (depths.get(id) ?? 0))) continue
-            graph ??= snapshotGraph(unit.graph)
-            spliced.set(id, splice(graph, id, callee.graph))
-        }
-        if (graph) program.units.set(symbol, repackage(graph, spliced, clock, program.target))
+        const graph = inlineSites(program, units, unit, calls, (id, callee) => worthInlining(program, callSites, unit.graph, id, callee, (levels.get(symbol) ?? 0) + (depths.get(id) ?? 0)))
+        if (graph) program.units.set(symbol, repackage(graph, unit.graph, clock, program.target))
     }
 }
 
@@ -3138,14 +3101,7 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
             const n = id ? getNode(g, id) : undefined
             if (!n || seen.has(id) || n.op === NodeOp.block) continue
             seen.add(id)
-            for (let i = 0; i < countIds(n); i++) {
-                const ref = getRef(n, i)
-                if (!ref) continue
-                const list = index.users.get(ref)
-                if (list) list.push([id, i])
-                else index.users.set(ref, [[id, i]])
-                stack.push(ref)
-            }
+            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
             if (n.op === NodeOp.ret) index.rets.push(id)
             if (n.op === NodeOp.apply) {
                 const list = index.applies.get(getRef(n, 0))
@@ -3159,6 +3115,7 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
                 else index.calls.set(callee, [id])
             }
         }
+        index.users = nodeUsers(g, seen, true)
         indexes.set(unit.symbol, index)
         return index
     }
@@ -3524,18 +3481,12 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
         if (started.has(unit.symbol)) return
         started.add(unit.symbol)
         if (debug && flags.has(`record-returns:${unit.graph.name}`)) console.log(dumpGraph(unit.graph))
-        const graph = snapshotGraph(unit.graph)
-        for (const [id, n] of [...graph.nodes]) {
-            const symbol = calledSymbol(graph, n)
-            if (symbol === undefined || !transformed.has(symbol)) continue
-            const callee = units.get(symbol)!
-            if (callee === unit || program.noInline.has(callee.symbol)) continue
+        const graph = inlineSites(program, units, unit, unit.graph.nodes.keys(), (id, callee) => {
+            if (!transformed.has(callee.symbol)) return false
             finish(callee)
-            if (!finished.has(callee.symbol) || !canInline(callee.graph)) continue
-            if (!worthInlining(program, callSites, unit.graph, graph, id, callee)) continue
-            splice(graph, id, callee.graph)
-        }
-        unit.graph = renormalize(graph, clock)
+            return finished.has(callee.symbol) && canInline(callee.graph) && worthInlining(program, callSites, unit.graph, id, callee)
+        })
+        unit.graph = renormalize(graph ?? unit.graph, clock)
         inlineAllocations(program, units, unit, clock)
         if (transformed.has(unit.symbol)) sweepBlocks(unit.graph)
         finished.add(unit.symbol)
@@ -4415,8 +4366,9 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const target = heap.indirectTarget(engine)
         engineElements.set(target, values)
         const fields = propertyEval.recordLayout(target)
-        const at = fields.keys.indexOf(heap.fromJsString('data'))
-        intrinsics.assert(at >= 0, 'native: engine Array has no data field')
+        const construction = session.constructions.get(engine)!.graph
+        const at = fields.keys.findIndex(key => constructedAllocation(construction, snapshotField(target, key)))
+        intrinsics.assert(at >= 0 || !values.length, 'native: engine Array with elements has no buffer field')
         const data = `${fields.offsets[at]}/*`
         for (const value of values) {
             if (heap.isBoxedF64(value)) setFact(facts, 'construction', target, data, { kind: 'int', encoded: true })
@@ -5070,15 +5022,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const shapes = freshShapes(traced)
         let users: Map<number, [number, number][]> | undefined
         function demanded(id: number, referent: intrinsics.Handle): boolean {
-            if (!users) {
-                users = new Map()
-                for (const [user, m] of graph.nodes) for (let i = 0; i < countIds(m); i++) {
-                    if (!getRef(m, i)) continue
-                    let list = users.get(getRef(m, i))
-                    if (!list) users.set(getRef(m, i), list = [])
-                    list.push([user, i])
-                }
-            }
+            users ??= nodeUsers(graph, graph.nodes.keys(), true)
             for (const [u, slot] of users.get(id) ?? []) {
                 const m = getNode(graph, u)!
                 if (slot < firstNonOrderingSlot(m)) continue
@@ -6786,7 +6730,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 if (found) pairs.set(next, found)
                 return found?.fields
             }
-            indexArrayIterations(traced.graph, iterations, pairOf, id => local!.calls.has(id), (next, values, index) => {
+            indexArrayIterations(traced.graph, iterations, pairOf, (next, values, index) => {
                 local!.nodes = new Map(local!.nodes).set(index, { text: 'i64', kind: 'number', format: { bits: 64, signed: true }, targets: [], nullable: false })
                 const pair = pairs.get(next)
                 const reads = new Set([...local!.calls.get(next) ?? []].flatMap(unit => [...unit.calls.values()].flatMap(set => [...set])).filter(unit => originOf(unit.fn) === indexGetter()))
@@ -6962,17 +6906,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         }
         return iterations
     }
-    function indexArrayIterations(graph: Graph, iterations: Map<number, Iterated>, pairOf: (next: number) => intrinsics.Handle[] | undefined, effectful: (id: number) => boolean, rewrote: (next: number, values: [read: number, slot: number][], index: number) => void): boolean {
-        const users = new Map<number, [user: number, slot: number][]>()
-        for (const [id, n] of graph.nodes) {
-            for (let i = 0; i < countIds(n); i++) {
-                const r = getRef(n, i)
-                if (!r) continue
-                const list = users.get(r)
-                if (list) list.push([id, i])
-                else users.set(r, [[id, i]])
-            }
-        }
+    function indexArrayIterations(graph: Graph, iterations: Map<number, Iterated>, pairOf: (next: number) => intrinsics.Handle[] | undefined, rewrote: (next: number, values: [read: number, slot: number][], index: number) => void): boolean {
+        const users = nodeUsers(graph, graph.nodes.keys(), true)
         const ordering = (user: number, slot: number): boolean => slot < firstNonOrderingSlot(getNode(graph, user)!)
         const literalKey = (n: GraphNode | undefined, op: NodeOp, key: intrinsics.Handle) => n?.op === op && !getRef(n, 2) && getLiteral(graph, n, 2) === key
         const blockOf = (id: number): number | undefined => {
@@ -7005,20 +6940,6 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if ((users.get(prop) ?? []).some(([u, slot]) => !ordering(u, slot) && !(u === call && slot === 1))) return
             return [prop, call]
         }
-        function sameRead(read: number, again: number): boolean {
-            if (read === again) return true
-            const first = getNode(graph, read)
-            const second = getNode(graph, again)
-            if (first?.op !== NodeOp.getProp || second?.op !== NodeOp.getProp || getRef(first, 2) || getRef(second, 2)) return false
-            if (getRef(first, 1) !== getRef(second, 1) || getLiteral(graph, first, 2) !== getLiteral(graph, second, 2)) return false
-            let at = getRef(second, 0)
-            while (at !== read) {
-                const n = getNode(graph, at)
-                if (n?.op !== NodeOp.getProp || effectful(at)) return false
-                at = getRef(n, 0)
-            }
-            return true
-        }
         const loops = graphLoops(graph)
         let changed = false
         for (const [symbol, field] of iterations) {
@@ -7029,7 +6950,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (makers.length !== 1 || makers[0][1] !== 1) continue
             const made = makers[0][0]
             const make = getNode(graph, made)!
-            if (make.op !== NodeOp.call || !sameRead(object, getRef(make, 2)) || countIds(make) !== 3) continue
+            if (make.op !== NodeOp.call || getRef(make, 2) !== object || countIds(make) !== 3) continue
             const relay = selfIteration(made)
             const iterator = relay ? relay[1] : made
             const nextProps: number[] = []
@@ -7273,12 +7194,14 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
     const boxedConstructions = new Map<intrinsics.Handle, Set<string>>()
     for (const object of types.objects) {
         if (object.state === undefined || !constructed.has(object.state)) continue
-        for (const id of object.fields.get('data')?.objects ?? []) {
-            const keys = boxed.get(id)
-            if (!keys) continue
-            const known = boxedConstructions.get(object.state)
-            if (known) for (const key of keys) known.add(key)
-            else boxedConstructions.set(object.state, new Set(keys))
+        for (const field of object.fields.values()) {
+            for (const id of field.objects) {
+                const keys = types.objects[id].name === 'buffer' ? boxed.get(id) : undefined
+                if (!keys) continue
+                const known = boxedConstructions.get(object.state)
+                if (known) for (const key of keys) known.add(key)
+                else boxedConstructions.set(object.state, new Set(keys))
+            }
         }
     }
     const handles = new Map<string, intrinsics.Handle>()

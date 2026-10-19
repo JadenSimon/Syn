@@ -3,7 +3,7 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { dumpGraph, NumericOps, type Graph, type GraphNode, typeName } from './lowering2'
-import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, localSymbol, NodeOp, resultType, typeOf } from './graph-node'
+import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, localSymbol, NodeOp, nodeUsers, resultType, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
 import * as rt from './rt'
@@ -269,21 +269,15 @@ export interface Isolated {
     proto: Handle
 }
 
-const users = new WeakMap<Graph, Map<number, [number, number][]>>()
+const users = new WeakMap<Graph, { size: number, index: Map<number, [number, number][]> }>()
 export function usersOf(g: Graph): Map<number, [number, number][]> {
-    let index = users.get(g)
-    if (index) return index
-    index = new Map()
-    for (const [id, n] of g.nodes) {
-        for (let i = 0; i < countIds(n); i++) {
-            const ref = getRef(n, i)
-            if (!ref) continue
-            const list = index.get(ref)
-            if (list) list.push([id, i])
-            else index.set(ref, [[id, i]])
-        }
+    const known = users.get(g)
+    if (known) {
+        intrinsics.assert(known.size === g.nodes.size, `value-types: ${g.name ?? 'graph'} changed after its users were indexed`)
+        return known.index
     }
-    users.set(g, index)
+    const index = nodeUsers(g, g.nodes.keys(), true)
+    users.set(g, { size: g.nodes.size, index })
     return index
 }
 const exclusives = new WeakMap<Graph, Map<number, Set<number>>>()
@@ -1493,7 +1487,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (held) return functionValue(held, slot)
         const inner = heap.deref(slot)
         if (!inner || !heap.isOrdinaryObject(inner)) return Unknown
-        const object = heapObject(frame, cellSites(frames[frame].graph!).get(slot) ?? node, `@${inner}`, inner, true)
+        const object = heapObject(frame, cellSites(frames[frame].graph!).get(slot) ?? node, `@${inner}`, inner, true, host.session.constructions.get(slot)?.graph)
         const allocation = allocations[values[object].allocation!]
         allocation.handle = allocation.handle === undefined || allocation.handle === slot ? slot : 0 as Handle
         return object
@@ -1503,13 +1497,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const fn = ctor ? host.functionOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(ctor)).slot0 as u32) : undefined
         return fn?.name || 'Object'
     }
-    function symbolic(state: Handle): boolean {
-        return dataKeys(state).some(k => {
-            const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, k))).slot0 as Handle
-            return heap.isBoxedF64(slot) && !!intrinsics.getNanId(heap.unboxF64(slot))
-        })
-    }
-    function heapObject(frame: number, node: number, id: string, state: Handle, constant: boolean): number {
+    function heapObject(frame: number, node: number, id: string, state: Handle, constant: boolean, construction?: Graph): number {
         const proto = heap.getPrototypeOf(state)
         const [allocation, fresh] = allocate(id, frame, node, heap.isArray(state) ? 'Array' : protoName(proto), proto, constant)
         allocations[allocation].state ??= state
@@ -1517,12 +1505,16 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (heap.getOwnProperty(state, heap.closureCallKey) || heap.isFrameProxy(state)) allocations[allocation].native = true
         const object = objectValue(allocation)
         if (!fresh) return object
-        const elements = constant || !symbolic(state) ? host.constantElements?.(state) : undefined
+        const elements = construction ? host.constantElements?.(state) : undefined
+        let seeded = false
         dataKeys(state).forEach(k => {
             const loc = access(true, frame, node, allocation, nameOf(k))
             if (!locations[loc].forms.includes('init')) locations[loc].forms.push('init')
-            if (elements && nameOf(k) === 'data') {
-                const [buffer] = allocate(`${id}/data`, frame, node, 'buffer', undefined, true)
+            const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, k))).slot0 as Handle
+            if (elements && constructedAllocation(construction!, slot)) {
+                intrinsics.assert(!seeded, `value-types: constant elements of ${id} have more than one buffer`)
+                seeded = true
+                const [buffer] = allocate(`${id}/${nameOf(k)}`, frame, node, 'buffer', undefined, true)
                 elements.forEach((element, i) => {
                     const at = access(true, frame, node, buffer, elements.length > maxTuple ? numberKey : `@${i}`)
                     if (!locations[at].forms.includes('vm_value')) locations[at].forms.push('vm_value')
@@ -1531,7 +1523,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 store(loc, [objectValue(buffer)])
                 return
             }
-            const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, k))).slot0 as Handle
             const init = host.session.statics.get(slot)
             if (init && host.traceable(init)) {
                 heldStatics.set(loc, init)
@@ -1547,6 +1538,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             }
             store(loc, [handleValue(frame, node, slot)])
         })
+        intrinsics.assert(!elements?.length || seeded, `value-types: constant elements of ${id} have no buffer`)
         return object
     }
     const dumped = new Set<Graph>()
@@ -2733,6 +2725,12 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
 
 function initOnly(object: ObjectType, k: string | undefined): boolean {
     return k === undefined || (object.forms.get(k) ?? []).every(form => form === 'init')
+}
+
+export function constructedAllocation(construction: Graph, slot: Handle | undefined): boolean {
+    let n = slot !== undefined && heap.isBoxedF64(slot) ? getNode(construction, intrinsics.getNanId(heap.unboxF64(slot))) : undefined
+    while (n?.op === NodeOp.after) n = getNode(construction, getRef(n, countIds(n) - 1))
+    return n?.op === NodeOp.pstack
 }
 
 function fixedElements(types: ValueTypes, object: ObjectType): boolean {
