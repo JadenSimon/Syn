@@ -91,6 +91,7 @@ export interface FrameValues extends UnitValues {
     boxes: boolean
     boxedReturn: boolean
     accesses: WordAccess[]
+    slices: Map<number, number[]>
     nodes: Map<number, Set<number>>
     blocks: Set<number>
     selects: Map<number, boolean[]>
@@ -1229,15 +1230,125 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
     }
     function storeFrom(frame: number, node: number, n: GraphNode, i: number, loc: number): void {
-        const T = n.op === NodeOp.store ? typeOf(n) : undefined
+        const T = n.op === NodeOp.store ? typeOf(n) : n.op === NodeOp.rt ? rt.elementType(frames[frame].graph!, n) : undefined
         const form = T === undefined ? 'prop' : typeName(T)
         if (!locations[loc].forms.includes(form)) locations[loc].forms.push(form)
         locations[loc].stored = true
+        if (n.op === NodeOp.setProp && overwritten(frame, n, loc)) {
+            let list = shadowed.get(frame)
+            if (!list) shadowed.set(frame, list = [])
+            list.push([node, n, i, loc])
+            return
+        }
         if (!getRef(n, i)) return store(loc, typed([literal(getLiteral(frames[frame].graph!, n, i))], T))
         let into = storedInto.get(key(frame, getRef(n, i)))
         if (!into) storedInto.set(key(frame, getRef(n, i)), into = new Map())
         into.set(loc, [T, node])
         store(loc, typed(seen(frame, node, getRef(n, i)), T))
+    }
+    const shadowed = new Map<number, [number, GraphNode, number, number][]>()
+    function overwritten(frame: number, n: GraphNode, loc: number): boolean {
+        const g = frames[frame].graph!
+        const self = receiverOf(g)
+        if (self === undefined || valueTail(g, getRef(n, 1)) !== self || getRef(n, 2)) return false
+        const { allocation, key: name } = locations[loc]
+        const { site, proto } = allocations[allocation]
+        if (!initializer(g, self, proto)) return false
+        const sites = callSites.get(frame)
+        if (!sites?.size) return false
+        for (const s of sites) {
+            const [caller, call] = parse(s)
+            if (frames[caller].unit !== site.unit) return false
+            if (!killedAfter(frames[caller].graph!, call, site.node, name, proto, returnsSelf(g, self))) return false
+        }
+        return true
+    }
+    const initializers = new Map<Graph, Map<Handle | undefined, boolean>>()
+    function initializer(g: Graph, self: number, proto: Handle | undefined): boolean {
+        let byGraph = initializers.get(g)
+        if (!byGraph) initializers.set(g, byGraph = new Map())
+        const known = byGraph.get(proto)
+        if (known !== undefined) return known
+        const found = initializerOf(g, self, proto)
+        byGraph.set(proto, found)
+        return found
+    }
+    function initializerOf(g: Graph, self: number, proto: Handle | undefined): boolean {
+        for (const n of g.nodes.values()) {
+            if (n.op === NodeOp.call || n.op === NodeOp.static || n.op === NodeOp.inlined) return false
+            if (n.op === NodeOp.rt && rt.sliceOf(g, n) === undefined) return false
+        }
+        for (const [user, slot] of usersOf(g).get(self) ?? []) {
+            const m = getNode(g, user)!
+            if (m.op === NodeOp.setProp && slot === 1 && !getRef(m, 2) && !setterOf(proto, getLiteral(g, m, 2) as Handle)) continue
+            if (m.op === NodeOp.after && slot === countIds(m) - 1) continue
+            if (m.op === NodeOp.ret && slot === 0) continue
+            return false
+        }
+        return true
+    }
+    function returnsSelf(g: Graph, self: number): boolean {
+        for (const n of g.nodes.values()) if (n.op === NodeOp.ret && getRef(n, 0) && valueTail(g, getRef(n, 0)) !== self) return false
+        return true
+    }
+    const kills = new Map<Graph, Map<string, boolean>>()
+    function killedAfter(g: Graph, call: number, allocated: number, name: string, proto: Handle | undefined, self: boolean): boolean {
+        let byGraph = kills.get(g)
+        if (!byGraph) kills.set(g, byGraph = new Map())
+        const id = `${call}:${name}:${self}:${proto}`
+        const known = byGraph.get(id)
+        if (known !== undefined) return known
+        const found = killedOf(g, call, allocated, name, proto, self)
+        byGraph.set(id, found)
+        return found
+    }
+    function killedOf(g: Graph, call: number, allocated: number, name: string, proto: Handle | undefined, self: boolean): boolean {
+        const c = getNode(g, call)
+        if (c?.op !== NodeOp.call || valueTail(g, getRef(c, 2)) !== allocated) return false
+        const objects = self ? new Set([allocated, call]) : new Set([allocated])
+        const arms = armsOf(g)
+        const outer = arms.get(call) ?? []
+        for (const [id, n] of g.nodes) {
+            if (n.op !== NodeOp.setProp || getRef(n, 2) || nameOf(getLiteral(g, n, 2) as Handle) !== name) continue
+            if (!objects.has(valueTail(g, getRef(n, 1)))) continue
+            if (!(arms.get(id) ?? []).every(([cond, positive]) => outer.some(([c2, p2]) => c2 === cond && p2 === positive))) continue
+            if (unobserved(g, getRef(n, 0), call, objects, proto)) return true
+        }
+        return false
+    }
+    function unobserved(g: Graph, from: number, call: number, objects: Set<number>, proto: Handle | undefined): boolean {
+        let reached = false
+        const visited = new Set<number>()
+        const work = [from]
+        while (work.length) {
+            const id = work.pop()!
+            if (!id || visited.has(id)) continue
+            visited.add(id)
+            if (id === call) {
+                reached = true
+                continue
+            }
+            const n = getNode(g, id)
+            if (!n) return false
+            if (n.op === NodeOp.nilEffect) continue
+            if (n.op === NodeOp.after) {
+                for (let i = 0; i < countIds(n) - 1; i++) work.push(getRef(n, i))
+                continue
+            }
+            const escapes = (at: number) => !!getRef(n, at) && objects.has(valueTail(g, getRef(n, at)))
+            const own = escapes(1)
+            if (n.op === NodeOp.setProp) {
+                if (escapes(3) || (own && (getRef(n, 2) || setterOf(proto, getLiteral(g, n, 2) as Handle)))) return false
+            } else if (n.op === NodeOp.getProp) {
+                if (own) return false
+            } else if (n.op === NodeOp.store) {
+                if (escapes(3)) return false
+            } else if (n.op === NodeOp.rt && rt.sliceOf(g, n) !== undefined) {
+                if (escapes(4)) return false
+            } else if (n.op !== NodeOp.load && n.op !== NodeOp.pstack) return false
+            work.push(getRef(n, 0))
+        }
+        return reached
     }
     const keyHandles = new Map<string, Handle>()
     function nameOf(k: Handle): string {
@@ -1249,10 +1360,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     function offsetKeys(frame: number, node: number, n: GraphNode): string[] {
         const g = frames[frame].graph!
-        const base = getNode(g, getRef(n, 1))
+        const at = n.op === NodeOp.rt ? 2 : 1
+        const base = getNode(g, getRef(n, at))
         if (base?.op === NodeOp.add || base?.op === NodeOp.sub) return [numberKey]
-        if (!getRef(n, 2)) return [`@${getLiteral(g, n, 2)}`]
-        const offsets = [...seen(frame, node, getRef(n, 2))]
+        if (!getRef(n, at + 1)) return [`@${getLiteral(g, n, at + 1)}`]
+        const offsets = [...seen(frame, node, getRef(n, at + 1))]
         if (!offsets.length || !offsets.every(v => values[v].form === NumberForm.literal)) return [numberKey]
         return offsets.map(v => `@${values[v].literal}`)
     }
@@ -1464,24 +1576,28 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             if (!Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, comparisonValues(frame, id, n))
         } else if (arithmetic(n) && typeOf(n) !== Types.unknown_number) flow(frame, id, [typedValue(resultType(g, n))])
         else if (arithmetic(n) && !Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, operandNumbers(frame, id, n))
-        if (n.op === NodeOp.pstack) {
-            if (getRef(n, 3) || getLiteral(g, n, 3) > 0) {
+        const slice = rt.sliceOf(g, n)
+        if (n.op === NodeOp.pstack || slice === rt.Op.slice) {
+            const size = slice === rt.Op.slice ? 2 : 3
+            if (getRef(n, size) || getLiteral(g, n, size) > 0) {
                 const [allocation] = allocate(`${frame}:${id}`, frame, id, 'buffer', undefined, false)
                 flow(frame, id, [objectValue(allocation)])
             } else flow(frame, id, [typedValue(resultType(g, n))])
         }
         if (n.op === NodeOp.indirectTarget) flow(frame, id, [Unknown])
-        if (n.op === NodeOp.load && !getRef(n, 1)) flow(frame, id, [opaqueValue(g, id)])
+        if ((n.op === NodeOp.load && !getRef(n, 1)) || (slice === rt.Op.sliceRead && !getRef(n, 2))) flow(frame, id, [opaqueValue(g, id)])
         if (n.op === NodeOp.rt && getLiteral(g, n, 1) === rt.Op.typeof) flow(frame, id, [Interned])
-        if (n.op === NodeOp.call || n.op === NodeOp.static || n.op === NodeOp.rt) invalidate(k)
+        if (n.op === NodeOp.call || n.op === NodeOp.static || (n.op === NodeOp.rt && slice === undefined)) invalidate(k)
         if (!unrecorded(valuesAt(frame, id))) changed(k)
     }
     function receiverOf(g: Graph): number | undefined {
         return g.blocks[0].params.find(p => isThisParam(getNode(g, p)!))
     }
     const numeric = new Set<number>()
-    function numericUse(user: GraphNode, slot: number): boolean {
+    function numericUse(g: Graph, user: GraphNode, slot: number): boolean {
         if (user.op === NodeOp.load || user.op === NodeOp.store) return slot === 1 || slot === 2
+        const slice = rt.sliceOf(g, user)
+        if (slice !== undefined) return slot === 2 || (slot === 3 && slice !== rt.Op.slice)
         if (user.op === NodeOp.lt || user.op === NodeOp.le || user.op === NodeOp.gt || user.op === NodeOp.ge) return true
         if (user.op === NodeOp.eq || user.op === NodeOp.ne) return false
         if (user.op === NodeOp.add && typeOf(user) === Types.unknown_number) return false
@@ -1539,6 +1655,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const work: number[] = []
         for (const n of g.nodes.values()) {
             if ((n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp) && getRef(n, 2)) work.push(getRef(n, 2))
+            if (rt.sliceOf(g, n) !== undefined && rt.sliceOf(g, n) !== rt.Op.slice && getRef(n, 3)) work.push(getRef(n, 3))
         }
         while (work.length) {
             const id = work.pop()!
@@ -1618,7 +1735,12 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             const frame = enter(callee, `${base}|${signature}`, owner)
             entered.push(frame)
             const sites = setOf(callSites, frame)
-            if (!sites.has(key(caller, call))) sites.add(key(caller, call))
+            if (!sites.has(key(caller, call))) {
+                sites.add(key(caller, call))
+                const pending = shadowed.get(frame)
+                shadowed.delete(frame)
+                for (const [node, m, i, loc] of pending ?? []) storeFrom(frame, node, m, i, loc)
+            }
             const fg = frames[frame].graph!
             const fself = receiverOf(fg)
             const fplain = fg.blocks[0].params.filter(p => p !== fself)
@@ -1860,7 +1982,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         if (!seeded.has(k)) return
         if (n.op === NodeOp.call && evaluate) resolveCall(frame, id, n)
-        if (n.op === NodeOp.rt && evaluate) {
+        if (n.op === NodeOp.rt && evaluate && rt.sliceOf(g, n) === undefined) {
             const impl = rt.bindingOf(getLiteral(g, n, 1))?.impl
             if (getLiteral(g, n, 1) === rt.Op.concat) {
                 resultTyped.add(k)
@@ -1884,7 +2006,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         for (const [u, slot] of usersOf(g).get(id) ?? []) {
             const user = getNode(g, u)!
             const view = seen(frame, u, id)
-            if (isolated && numericUse(user, slot)) for (const v of view) if (values[v].kind === ValueKind.variable && !values[v].narrow) numeric.add(v)
+            if (isolated && numericUse(g, user, slot)) for (const v of view) if (values[v].kind === ValueKind.variable && !values[v].narrow) numeric.add(v)
             if (comparison(user.op)) {
                 flow(frame, u, comparisonValues(frame, u, user))
                 if (user.op === NodeOp.eq || user.op === NodeOp.ne) compareStrings(frame, u, user)
@@ -1937,25 +2059,35 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                     if (slot >= 1 && seeded.has(key(frame, u))) setProperty(frame, u, user)
                     break
                 case NodeOp.load:
-                    if (slot === 1 || slot === 2) for (const v of [...seen(frame, u, getRef(user, 1))]) {
-                        const allocation = values[v].allocation
-                        if (allocation !== undefined) for (const name of offsetKeys(frame, u, user)) readKey(frame, u, allocation, name)
-                        else if (!isZero(v)) flow(frame, u, [opaqueValue(g, u)])
-                    }
+                    if (slot === 1 || slot === 2) loadFrom(frame, u, user, 1)
                     break
                 case NodeOp.store:
-                    if ((slot === 1 || slot === 2) && seeded.has(key(frame, u))) for (const v of [...seen(frame, u, getRef(user, 1))]) {
-                        const allocation = values[v].allocation
-                        if (allocation !== undefined) for (const name of offsetKeys(frame, u, user)) storeFrom(frame, u, user, 3, access(true, frame, u, allocation, name))
-                    }
+                    if ((slot === 1 || slot === 2) && seeded.has(key(frame, u))) storeInto(frame, u, user, 1)
                     break
                 case NodeOp.call:
                     if (slot >= 1) invalidate(key(frame, u))
                     break
-                case NodeOp.rt:
-                    if (slot >= 2) invalidate(key(frame, u))
+                case NodeOp.rt: {
+                    const slice = rt.sliceOf(g, user)
+                    if (slice === rt.Op.sliceRead && (slot === 2 || slot === 3)) loadFrom(frame, u, user, 2)
+                    else if (slice === rt.Op.sliceWrite && (slot === 2 || slot === 3) && seeded.has(key(frame, u))) storeInto(frame, u, user, 2)
+                    else if (slice === undefined && slot >= 2) invalidate(key(frame, u))
                     break
+                }
             }
+        }
+    }
+    function loadFrom(frame: number, u: number, user: GraphNode, at: number): void {
+        for (const v of [...seen(frame, u, getRef(user, at))]) {
+            const allocation = values[v].allocation
+            if (allocation !== undefined) for (const name of offsetKeys(frame, u, user)) readKey(frame, u, allocation, name)
+            else if (!isZero(v)) flow(frame, u, [opaqueValue(frames[frame].graph!, u)])
+        }
+    }
+    function storeInto(frame: number, u: number, user: GraphNode, at: number): void {
+        for (const v of [...seen(frame, u, getRef(user, at))]) {
+            const allocation = values[v].allocation
+            if (allocation !== undefined) for (const name of offsetKeys(frame, u, user)) storeFrom(frame, u, user, at + 2, access(true, frame, u, allocation, name))
         }
     }
     function drain(): void {
@@ -2065,20 +2197,22 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         stores: number[]
         loads: number[]
         selects: number[]
+        slices: number[]
     }
     const scans = new Map<Graph, Scan>()
     function scanOf(g: Graph): Scan {
         const known = scans.get(g)
         if (known) return known
-        const scan: Scan = { stores: [], loads: [], selects: [] }
+        const scan: Scan = { stores: [], loads: [], selects: [], slices: [] }
         for (const [id, n] of g.nodes) {
-            if (n.op === NodeOp.store && resultType(g, n) === Types.vm_value) scan.stores.push(id)
+            if (wordStore(g, n)) scan.stores.push(id)
             if (n.op === NodeOp.select) scan.selects.push(id)
+            if (rt.sliceOf(g, n) !== undefined) scan.slices.push(id)
             if (n.op !== NodeOp.ret || !getRef(n, 0) || regionRets(g).has(id)) continue
             let at = getRef(n, 0)
             for (let m = getNode(g, at); m?.op === NodeOp.after; m = getNode(g, at)) at = getRef(m, countIds(m) - 1)
             const load = getNode(g, at)
-            if (load?.op === NodeOp.load && resultType(g, load) === Types.vm_value) scan.loads.push(at)
+            if (load && wordLoad(g, load)) scan.loads.push(at)
         }
         scans.set(g, scan)
         return scan
@@ -2112,7 +2246,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const boxes = scan.stores.some(id => touchesMixed(f, id))
         const boxedReturn = scan.loads.some(id => touchesMixed(f, id))
         const accesses: WordAccess[] = [...scan.stores.map(node => ({ node, store: true, slots: [...touched.get(key(f, node)) ?? []] })), ...scan.loads.map(node => ({ node, store: false, slots: [...touched.get(key(f, node)) ?? []] }))]
-        frameValues.push({ unit: frame.unit, context: frame.context, sites, signature: frame.signature, params, returns: [...returns.get(f) ?? []].sort((a, b) => a - b), boxes, boxedReturn, accesses, nodes: frame.nodes, blocks: new Set(g.blocks.map(b => b.id).filter(b => entered.has(key(f, b)))), selects: liveArms(f, g) })
+        const slices = new Map<number, number[]>()
+        for (const node of scan.slices) {
+            const made = allocationIds.get(`${f}:${node}`)
+            const touching = made !== undefined ? [made] : [...new Set([...touched.get(key(f, node)) ?? []].map(loc => locations[loc].allocation))]
+            if (touching.length) slices.set(node, touching)
+        }
+        frameValues.push({ unit: frame.unit, context: frame.context, sites, signature: frame.signature, params, returns: [...returns.get(f) ?? []].sort((a, b) => a - b), boxes, boxedReturn, accesses, slices, nodes: frame.nodes, blocks: new Set(g.blocks.map(b => b.id).filter(b => entered.has(key(f, b)))), selects: liveArms(f, g) })
     })
     const graphs = new Map<Function, Graph>()
     for (const frame of frames) if (frame.graph) graphs.set(frame.unit, frame.graph)
@@ -2186,6 +2326,7 @@ export interface FrameSignature extends Signature {
     boxes: boolean
     boxedReturn: boolean
     accesses: WordAccess[]
+    slices: Map<number, number[]>
     nodes: Map<number, Type>
     blocks: Set<number>
     selects: Map<number, boolean[]>
@@ -2203,6 +2344,7 @@ export interface ValueTypes {
     keyHandles: Map<string, Handle>
     keyNames: Map<Handle, string>
     strings: Map<Function, Set<number>>
+    fieldStores: Set<string>
 }
 
 export interface Field {
@@ -2283,6 +2425,16 @@ function encapsulationViolations(data: Accesses, host: AccessHost): Set<Handle> 
 
 function unrecorded(values: Set<number> | number[]): boolean {
     return values instanceof Set ? values.size === 0 : values.length === 0
+}
+
+function wordStore(g: Graph, n: GraphNode): boolean {
+    if (n.op === NodeOp.store) return resultType(g, n) === Types.vm_value
+    return rt.sliceOf(g, n) === rt.Op.sliceWrite && rt.elementType(g, n) === Types.vm_value
+}
+
+function wordLoad(g: Graph, n: GraphNode): boolean {
+    if (n.op === NodeOp.load) return resultType(g, n) === Types.vm_value
+    return rt.sliceOf(g, n) === rt.Op.sliceRead && rt.elementType(g, n) === Types.vm_value
 }
 
 function constantIndex(key: string): boolean {
@@ -2456,6 +2608,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
             blocks: frame.blocks,
             selects: frame.selects,
             accesses: frame.accesses,
+            slices: frame.slices,
         }
         let list = unitFrames.get(frame.unit)
         if (!list) unitFrames.set(frame.unit, list = [])
@@ -2488,9 +2641,11 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         set.add(node)
     }
     if (intrinsics.argv().includes('frames-dump')) frames.forEach((frame, id) => console.log('FRAME', id, frame.unit.name || '<anon>', `<${frame.context}>`, frame.params.map(p => `${p.label}:${formatType({ objects } as ValueTypes, p.type)}`).join(' '), '->', formatType({ objects } as ValueTypes, frame.returns)))
+    const fieldStores = new Set<string>()
+    for (const location of data.locations) for (const site of location.writers) fieldStores.add(`${unitIdentity(site.unit)}:${site.node}`)
     const keyNames = new Map<Handle, string>()
     for (const [name, k] of data.keyHandles) keyNames.set(k, name)
-    return { ms: performance.now() - start, objects, signatures, frames, wordSlots: data.wordSlots, classes, classOf, stateAllocations, keyHandles: data.keyHandles, keyNames, strings }
+    return { ms: performance.now() - start, objects, signatures, frames, wordSlots: data.wordSlots, classes, classOf, stateAllocations, keyHandles: data.keyHandles, keyNames, strings, fieldStores }
 }
 
 function initOnly(object: ObjectType, k: string | undefined): boolean {
@@ -2865,7 +3020,7 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
             for (let i = 0; i < countIds(n); i++) {
                 const ref = getRef(n, i)
                 if (!ref) continue
-                const kind = divergence(n, i)
+                const kind = divergence(g, n, i)
                 if (!kind) continue
                 for (const v of byNode.get(ref) ?? []) {
                     if (data.values[v].kind !== ValueKind.variable || data.numeric.has(baseOf(v))) continue
@@ -2881,7 +3036,9 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
     return { name, ms, params, paths: allPaths, invariants, lines }
 }
 
-function divergence(n: GraphNode, slot: number): string | undefined {
+function divergence(g: Graph, n: GraphNode, slot: number): string | undefined {
+    const slice = rt.sliceOf(g, n)
+    if (slice !== undefined) return slot === 2 || (slot === 3 && slice !== rt.Op.slice) ? 'address' : undefined
     if (n.op === NodeOp.rt) return slot >= 2 ? 'rt' : undefined
     if (n.op === NodeOp.call) return slot === 1 ? 'call' : undefined
     if (n.op === NodeOp.getProp || n.op === NodeOp.setProp) return slot === 1 ? 'property' : slot === 2 ? 'key' : undefined
@@ -2916,7 +3073,6 @@ export interface Rep {
     nullable: boolean
     fresh?: boolean
     element?: Rep
-    stride?: number
     encoded?: boolean
     constant?: Constant
     bit?: boolean
@@ -2941,7 +3097,9 @@ export interface Instantiations {
     addressed: Set<string>
     rep(type: Type): string
     repOf(type: Type): Rep
+    elementOf(buffers: number[]): Rep
     shapeOf(allocation: number): string | undefined
+    layOut(tagged: Set<number>): void
 }
 
 export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, joins: number[][] = []): Instantiations {
@@ -3083,17 +3241,8 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (!entry) table.set(key, entry = { key, members: [], fields: new Map() })
         entry.members.push(id)
     })
-    for (const entry of table.values()) {
-        const owned = owners[entry.members[0]] !== undefined
-        for (const [k, type] of layoutOf(entry.members, owned)) entry.fields.set(k, rep(type))
-    }
-    const shapes = new Map<string, ShapeSignature>()
-    const protoOrders = new Map<Handle, string[]>()
-    const shapeIds = new Map<string, string>()
-    const shapePending = new Map<string, string>()
-    const referenced = new Set<string>()
-    let nextShape = 0
-    function elementRep(members: number[]): Rep {
+    const raw = (id: number) => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id))
+    function elementType(members: number[]): [Type | undefined, string[]] {
         const forms = new Set<string>()
         let type: Type | undefined
         for (const id of members) for (const [k, field] of types.objects[id].fields) {
@@ -3102,10 +3251,81 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
             for (const form of types.objects[id].forms.get(k)!) forms.add(form)
             type = type ? union(type, field) : field
         }
+        return [type, [...forms].filter(form => form !== 'prop' && form !== 'init')]
+    }
+    const bufferRoot = types.objects.map((_, i) => i)
+    function bufferGroup(a: number): number {
+        while (bufferRoot[a] !== a) a = bufferRoot[a] = bufferRoot[bufferRoot[a]]
+        return a
+    }
+    function joinBuffers(ids: number[]): void {
+        for (const id of ids) bufferRoot[bufferGroup(id)] = bufferGroup(ids[0])
+    }
+    for (const entry of table.values()) {
+        const owned = owners[entry.members[0]] !== undefined
+        if (raw(entry.members[0])) joinBuffers(entry.members)
+        for (const [k, type] of layoutOf(entry.members, owned)) {
+            entry.fields.set(k, rep(type))
+            joinBuffers(type.objects.filter(raw))
+        }
+    }
+    for (const frame of types.frames) for (const touched of frame.slices.values()) joinBuffers(touched)
+    function groupBuffers(): Map<number, number[]> {
+        const groups = new Map<number, number[]>()
+        types.objects.forEach((_, id) => {
+            if (!raw(id)) return
+            const list = groups.get(bufferGroup(id))
+            if (list) list.push(id)
+            else groups.set(bufferGroup(id), [id])
+        })
+        return groups
+    }
+    let bufferMembers: Map<number, number[]> | undefined
+    let tagged = new Set<number>()
+    const wideGroups = new Set<number>()
+    const elements = new Map<number, Rep>()
+    function elementOf(buffers: number[]): Rep {
+        if (!buffers.length) return elementRep([])
+        intrinsics.assert(bufferMembers !== undefined, 'value-types: element layout read before layOut')
+        const group = bufferGroup(buffers[0])
+        const known = elements.get(group)
+        if (known) return known
+        const element = elementRep(bufferMembers.get(group) ?? buffers, wideGroups.has(group))
+        elements.set(group, element)
+        return element
+    }
+    function elementText(members: number[]): string {
+        const [type, stored] = elementType(members)
+        if (type && stored.length === 1 && stored[0] === 'vm_value') return repOf(type).text
+        return elementRep(members).text
+    }
+    const heldBuffers = new Map<string, Map<string, number[]>>()
+    function layOutShape(id: string): void {
+        const sig = shapes.get(id)!
+        const held = heldBuffers.get(id)!
+        sig.fields = sig.fields.map(([k, field]) => {
+            const buffers = held.get(k)
+            if (!buffers) return [k, field]
+            const element = elementOf(buffers)
+            const text = `buf<${element.text}>${field.nullable ? '?' : ''}`
+            intrinsics.assert(field.element === undefined || field.text === text, `value-types: ${id}.${k} was laid out as ${field.text}, its buffers now need ${text}`)
+            return [k, { ...field, text, element }]
+        })
+    }
+    const shapes = new Map<string, ShapeSignature>()
+    const protoOrders = new Map<Handle, string[]>()
+    const shapeIds = new Map<string, string>()
+    const shapePending = new Map<string, string>()
+    const referenced = new Set<string>()
+    let nextShape = 0
+    function elementRep(members: number[], wide = false): Rep {
+        const [type, stored] = elementType(members)
         if (!type) return { text: 'never', kind: 'never', targets: [], nullable: false }
-        const stored = [...forms].filter(form => form !== 'prop' && form !== 'init')
         if (stored.length === 1 && stored[0] === 'vm_value') {
-            const inner = repOf(type)
+            const shown = repOf(type)
+            const inner = elementTagged(shown) && !members.some(id => tagged.has(id)) ? repOf({ ...type, undefined: false }) : shown
+            const free = wide && inner.kind === 'number' && !!inner.format && !inner.nullable
+            if ((free || rawElement(inner) || elementTagged(inner)) && !members.some(id => types.objects[id].constant)) return inner
             return { ...inner, text: `enc<${inner.text}>`, encoded: true }
         }
         if (!stored.length) return repOf(type)
@@ -3141,10 +3361,9 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
             const type = partial ? { ...merged, undefined: true } : merged
             const buffers = [...new Set([...type.objects].filter(id => owners[id] !== undefined && !genericFor(id)))]
             if (buffers.length && buffers.length === type.objects.length) {
-                const element = elementRep(buffers)
                 const nullable = type.undefined || type.literals.includes(0)
                 held.push([k, buffers])
-                fields.push([k, { text: `buf<${element.text}>${nullable ? '?' : ''}`, kind: 'buffer', element, targets: [], nullable }])
+                fields.push([k, { text: `buf<${elementText(buffers)}>${nullable ? '?' : ''}`, kind: 'buffer', targets: [], nullable }])
             } else fields.push([k, bitValued(type) ? { ...repOf(type), text: 'u1', bit: true } : repOf(type)])
         }
         if (order.length) fields.sort((x, y) => (order.indexOf(x[0]) + 1 || order.length + 1) - (order.indexOf(y[0]) + 1 || order.length + 1))
@@ -3153,55 +3372,20 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         let id = referenced.has(reserved) ? undefined : [...shapes].find(([, sig]) => sig.text === text && sig.proto === object.proto)?.[0]
         if (!id) shapes.set(id = reserved, { text, proto: object.proto, fields, members: [] })
         shapes.get(id)!.members.push(...entry.members)
+        let byField = heldBuffers.get(id)
+        if (!byField) heldBuffers.set(id, byField = new Map())
         for (const [k, buffers] of held) {
-            const at = `${id}/${k}`
-            const list = bufferFields.get(at)
+            const list = byField.get(k)
             if (list) list.push(...buffers)
-            else bufferFields.set(at, [...buffers])
+            else byField.set(k, [...buffers])
+            if (!bufferMembers) joinBuffers(byField.get(k)!)
         }
-        if (stridesFixed && held.length) fixStrides(id)
+        if (bufferMembers) layOutShape(id)
         shapeIds.set(key, id)
         return id
     }
-    const bufferFields = new Map<string, number[]>()
-    let stridesFixed = false
-    function fixStrides(id: string): void {
-        const sig = shapes.get(id)!
-        sig.fields = sig.fields.map(([k, field]) => {
-            const buffers = bufferFields.get(`${id}/${k}`)
-            if (field.kind !== 'buffer' || !buffers) return [k, field]
-            const element = elementRep(buffers)
-            const stride = flexible(buffers, element) ? holderStrides.get(`${sig.proto}/${k}`) === 8 ? 8 : 4 : classStride(buffers, element)
-            for (const buffer of buffers) {
-                const known = strides.get(keyOf(buffer))
-                if (known !== undefined && known !== stride) throw `value-types: buffer ${keyOf(buffer)} has stride ${known} but ${id}.${k} needs stride ${stride}`
-                strides.set(keyOf(buffer), stride)
-            }
-            const wide = stride === 8 ? '8' : ''
-            return [k, { ...field, text: `buf${wide}<${element.text}>${field.nullable ? '?' : ''}`, element, stride: stride === 8 ? 8 : undefined }]
-        })
-    }
     const reps = new Map<Type, Rep>()
     const addressed = new Set<string>()
-    const strides = new Map<string, number>()
-    const holderStrides = new Map<string, number>()
-    function flexible(members: number[], element: Rep): boolean {
-        return !!element.encoded && element.format?.bits === 32 && !members.some(id => types.objects[id].constant)
-    }
-    function classStride(members: number[], element: Rep): number {
-        return members.some(id => types.objects[id].constant) ? 4 : elementStride(element)
-    }
-    function bufferStride(id: number): number {
-        const key = keyOf(id)
-        const known = strides.get(key)
-        if (known !== undefined) return known
-        if (!stridesFixed) throw `value-types: the stride of buffer ${key} is needed before shapes are laid out`
-        strides.set(key, 4)
-        const members = table.get(key)?.members ?? [id]
-        const stride = classStride(members, elementRep(members))
-        strides.set(key, stride)
-        return stride
-    }
     function repOf(type: Type): Rep {
         const known = reps.get(type)
         if (known) return known
@@ -3213,8 +3397,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (type.unknown) return { text: 'any', kind: 'any', targets: [], nullable: false }
         const numeric = numericType(type)
         const objects = type.objects.filter(id => !types.objects[id].native && !types.objects[id].dynamic)
-        const raw = (id: number) => types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id))
-        const targets = pointers ? [...new Set(objects.map(id => raw(id) ? bufferStride(id) === 8 ? 'buf8' : 'buf' : shapeId(keyOf(id))))].sort() : objects.length ? ['*'] : []
+        const targets = pointers ? [...new Set(objects.map(id => raw(id) ? 'buf' : shapeId(keyOf(id))))].sort() : objects.length ? ['*'] : []
         if (type.string) targets.push('str')
         if (type.objects.some(id => types.objects[id].dynamic)) targets.push('heap')
         const nativeIds = [...type.closures, ...type.objects.filter(id => types.objects[id].native)]
@@ -3236,22 +3419,29 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         return { text: `ptr<${targets.join('|')}>${type.undefined || nulls ? '?' : ''}`, kind: 'pointer', targets, nullable: type.undefined || nulls, fresh }
     }
     for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].name !== 'buffer' && !types.objects[table.get(key)!.members[0]].dynamic) shapeId(key)
-    for (const [id, sig] of shapes) for (const [k, field] of sig.fields) {
-        const buffers = bufferFields.get(`${id}/${k}`)
-        if (field.kind !== 'buffer' || !buffers) continue
-        const element = elementRep(buffers)
-        if (flexible(buffers, element)) continue
-        const at = `${sig.proto}/${k}`
-        holderStrides.set(at, Math.min(holderStrides.get(at) ?? 8, classStride(buffers, element)))
-    }
-    for (const id of shapes.keys()) fixStrides(id)
-    stridesFixed = true
     const constantShapes = new Map<Handle, string>()
     types.objects.forEach((object, id) => {
         if (!object.constant || object.state === undefined || !joinable(id) || recordMembers.get(findRecord(id))!.length < 2) return
         constantShapes.set(object.state, shapeId(keyOf(id)))
     })
-    return { keys, table, shapes, constantShapes, addressed, rep, repOf: type => repOf(type), shapeOf: id => types.objects[id].dynamic || types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    function layOut(observed: Set<number>): void {
+        intrinsics.assert(bufferMembers === undefined, 'value-types: elements laid out twice')
+        tagged = observed
+        const groups = groupBuffers()
+        bufferMembers = groups
+        const holderWidths = new Map<string, number>()
+        const freeGroups = new Map<number, string>()
+        for (const [id, byField] of heldBuffers) for (const [k, buffers] of byField) {
+            const group = bufferGroup(buffers[0])
+            const members = groups.get(group)!
+            const at = `${shapes.get(id)!.proto}/${k}`
+            if (elementRep(members).encoded && !elementRep(members, true).encoded) freeGroups.set(group, at)
+            else holderWidths.set(at, Math.min(holderWidths.get(at) ?? 8, elementWidth(elementRep(members))))
+        }
+        for (const [group, at] of freeGroups) if (holderWidths.get(at) === 8) wideGroups.add(group)
+        for (const id of shapes.keys()) layOutShape(id)
+    }
+    return { keys, table, shapes, constantShapes, addressed, rep, repOf: type => repOf(type), elementOf, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 
 export interface PlannedUnit {
@@ -3265,6 +3455,7 @@ export interface PlannedUnit {
     returns: Rep
     returnsSelf: boolean
     nodes: Map<number, Rep>
+    slices: Map<number, Rep>
     blocks: Set<number>
     deadArms: Map<number, number[]>
     calls: Map<number, Set<PlannedUnit>>
@@ -3291,7 +3482,7 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]> } {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph): { inst: Instantiations, plan: Map<Function, PlannedUnit[]> } {
     const callees = new Map<string, number[]>()
     const outgoing = types.frames.map(() => [] as [node: number, callee: number][])
     types.frames.forEach((frame, id) => {
@@ -3383,12 +3574,13 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     const unitRoot = (id: number) => classRoot.get(classOf.get(find(id))!)!
     const plan = new Map<Function, PlannedUnit[]>()
     const unitOfRoot = new Map<number, PlannedUnit>()
+    const touchedOf = new Map<PlannedUnit, Map<number, number[]>>()
     const unitOfFrame: PlannedUnit[] = []
     types.frames.forEach((frame, id) => {
         const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
-            unitOfRoot.set(root, unit = { fn: frame.unit, boxes: false, boxedReturn: false, allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), boxedCalls: new Set() })
+            unitOfRoot.set(root, unit = { fn: frame.unit, boxes: false, boxedReturn: false, allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), boxedCalls: new Set() })
             let units = plan.get(frame.unit)
             if (!units) plan.set(frame.unit, units = [])
             units.push(unit)
@@ -3406,6 +3598,9 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const merged = new Map<number, Type>()
         for (const f of unit.frames) for (const [node, type] of types.frames[f].nodes) merged.set(node, merged.has(node) ? union(merged.get(node)!, type) : type)
         for (const [node, type] of merged) unit.nodes.set(node, inst.repOf(type))
+        const touched = new Map<number, number[]>()
+        for (const f of unit.frames) for (const [node, buffers] of types.frames[f].slices) touched.set(node, [...touched.get(node) ?? [], ...buffers])
+        touchedOf.set(unit, touched)
         for (const f of unit.frames) for (const b of types.frames[f].blocks) unit.blocks.add(b)
         const live = new Map<number, boolean[]>()
         for (const f of unit.frames) for (const [select, arms] of types.frames[f].selects) {
@@ -3492,7 +3687,194 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
             for (const unit of units) unit.params[i] = { label: unit.params[i].label, rep }
         })
     }
+    inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf))
+    for (const [unit, touched] of touchedOf) for (const [node, buffers] of touched) unit.slices.set(node, inst.elementOf(buffers))
     return { inst, plan }
+}
+
+export function nullableNumber(rep: Rep | undefined): boolean {
+    return rep?.kind === 'number' && rep.nullable
+}
+
+export function nonzeroLiteral(g: Graph, n: GraphNode, at: number): boolean {
+    const ref = getRef(n, at)
+    if (!ref) return getLiteral(g, n, at) !== 0
+    const m = getNode(g, ref)
+    return m?.op === NodeOp.literal && getLiteral(g, m, 0) !== 0
+}
+
+function nullishElements(object: ObjectType): boolean {
+    let type = emptyType()
+    for (const [k, field] of object.fields) if (k === numberKey || constantIndex(k)) type = union(type, field)
+    return type.undefined && numericType(type) && !type.string && !type.unknown && !type.objects.length && !type.functions.length
+}
+
+function firstArg(call: GraphNode, plain: number): number {
+    if (call.op === NodeOp.call) return 3
+    if (call.op === NodeOp.rt) return 2
+    if (call.op === NodeOp.getProp || call.op === NodeOp.setProp) return countIds(call) - plain
+    return -1
+}
+
+function nullishReads(types: ValueTypes, units: PlannedUnit[], touchedOf: Map<PlannedUnit, Map<number, number[]>>, graphOf: (fn: Function) => Graph): Set<number> {
+    const observed = new Set<number>()
+    if (!types.objects.some(object => !object.constant && nullishElements(object))) return observed
+    const index = new Map<PlannedUnit, number>()
+    units.forEach((unit, u) => index.set(unit, u))
+    const graphs = units.map(unit => graphOf(unit.fn))
+    const at = (u: number, node: number) => u * nodeSpan + node
+    const callers = units.map(() => [] as [number, number][])
+    const readers = new Map<number, [number, number][]>()
+    const writers = new Map<number, [number, number][]>()
+    function add(map: Map<number, [number, number][]>, k: number, item: [number, number]): void {
+        const list = map.get(k)
+        if (list) list.push(item)
+        else map.set(k, [item])
+    }
+    units.forEach((unit, u) => {
+        for (const [node, callees] of unit.calls) for (const callee of callees) callers[index.get(callee)!].push([u, node])
+        for (const [node, touched] of touchedOf.get(unit)!) {
+            const slice = rt.sliceOf(graphs[u], getNode(graphs[u], node)!)
+            for (const allocation of touched) {
+                if (slice === rt.Op.sliceRead) add(readers, allocation, [u, node])
+                if (slice === rt.Op.sliceWrite) add(writers, allocation, [u, node])
+            }
+        }
+    })
+    const rooted = units.map(unit => unit.frames.some(f => !types.frames[f].sites.length))
+    const plains = new Map<Graph, number[]>()
+    function plainOf(g: Graph): number[] {
+        let known = plains.get(g)
+        if (!known) plains.set(g, known = g.blocks[0].params.filter(p => !isThisParam(getNode(g, p)!)))
+        return known
+    }
+    function calleeTargets(u: number, node: number, n: GraphNode, slot: number): [number, number][] | undefined {
+        const callees = units[u].calls.get(node)
+        if (!callees) return
+        const out: [number, number][] = []
+        for (const callee of callees) {
+            const c = index.get(callee)!
+            const plain = plainOf(graphs[c])
+            const first = firstArg(n, plain.length)
+            if (first < 0 || slot < first) return
+            if (slot - first >= plain.length) continue
+            if (!nullableNumber(callee.nodes.get(plain[slot - first]))) return
+            out.push([c, plain[slot - first]])
+        }
+        return out
+    }
+    function targetsOf(u: number, node: number, slot: number): [number, number][] | undefined {
+        const g = graphs[u]
+        const n = getNode(g, node)!
+        if (effect(n.op) && slot === 0) return []
+        if (n.op === NodeOp.after) return slot === countIds(n) - 1 ? [[u, node]] : []
+        if (n.op === NodeOp.select) return slot > 0 ? [[u, node]] : undefined
+        if (n.op === NodeOp.mem || n.op === NodeOp.inlined) return slot === 0 ? [[u, node]] : undefined
+        if (n.op === NodeOp.apply) return slot > 0 ? [[u, getBlock(g, getRef(n, 0))!.params[slot - 1]]] : undefined
+        if (n.op === NodeOp.ret) {
+            const region = regionRets(g).get(node)
+            if (region !== undefined) return [[u, region]]
+            return rooted[u] ? undefined : callers[u]
+        }
+        if (n.op === NodeOp.eq || n.op === NodeOp.ne) return countIds(n) === 2 && nonzeroLiteral(g, n, 1 - slot) ? [] : undefined
+        if (n.op === NodeOp.add && typeOf(n) === Types.unknown_number && units[u].nodes.get(node)?.kind !== 'number') return
+        if (NumericOps.has(n.op) || n.op === NodeOp.convert || n.op === NodeOp.bitconvert) return []
+        if (n.op === NodeOp.load) return slot === 1 || slot === 2 ? [] : undefined
+        const slice = rt.sliceOf(g, n)
+        if (slice === rt.Op.slice) return slot === 2 ? [] : undefined
+        if (slice === rt.Op.sliceRead) return slot === 3 ? [] : undefined
+        if (slice === rt.Op.sliceWrite) {
+            if (slot === 3) return []
+            const touched = touchedOf.get(units[u])!.get(node)
+            if (slot !== 4 || !touched) return
+            return touched.flatMap(allocation => readers.get(allocation) ?? [])
+        }
+        if (n.op === NodeOp.setProp && slot === 3 && types.fieldStores.has(`${unitIdentity(units[u].fn)}:${node}`)) return
+        if (n.op === NodeOp.call || n.op === NodeOp.rt || n.op === NodeOp.getProp || n.op === NodeOp.setProp) return calleeTargets(u, node, n, slot)
+    }
+    function observes(u: number, node: number, slot: number): boolean {
+        const targets = targetsOf(u, node, slot)
+        if (!targets) return true
+        for (const [t, id] of targets) {
+            const rep = units[t].nodes.get(id)
+            if (rep && rep.kind !== 'number' && rep.kind !== 'undefined' && rep.kind !== 'never') return true
+        }
+        return false
+    }
+    const seen = new Set<number>()
+    const work: [number, number][] = []
+    function need(u: number, id: number): void {
+        if (!id || !nullableNumber(units[u].nodes.get(id))) return
+        if (seen.has(at(u, id))) return
+        seen.add(at(u, id))
+        work.push([u, id])
+    }
+    units.forEach((unit, u) => {
+        const users = usersOf(graphs[u])
+        for (const [id, rep] of unit.nodes) {
+            if (!nullableNumber(rep)) continue
+            for (const [user, slot] of users.get(id) ?? []) {
+                if (!observes(u, user, slot)) continue
+                need(u, id)
+                break
+            }
+        }
+    })
+    while (work.length) {
+        const [u, id] = work.pop()!
+        const unit: PlannedUnit = units[u]
+        const g = graphs[u]
+        const n = getNode(g, id)
+        if (!n) continue
+        if (n.op === NodeOp.param) {
+            const slotOf = paramSlots(g).get(id)
+            if (!slotOf) continue
+            const [block, i] = slotOf
+            for (const apply of predsOf(g, block)) need(u, getRef(getNode(g, apply)!, i + 1))
+            if (block !== g.blocks[0]) continue
+            const position = plainOf(g).indexOf(id)
+            if (position < 0) continue
+            const incoming: [number, number][] = callers[u]
+            for (const [caller, node] of incoming) {
+                const call = getNode(graphs[caller], node)!
+                const first = firstArg(call, plainOf(g).length)
+                if (first >= 0 && first + position < countIds(call)) need(caller, getRef(call, first + position))
+            }
+            continue
+        }
+        if (n.op === NodeOp.after) {
+            need(u, getRef(n, countIds(n) - 1))
+            continue
+        }
+        if (n.op === NodeOp.select) {
+            for (let i = 1; i < countIds(n); i++) need(u, getRef(n, i))
+            continue
+        }
+        if (n.op === NodeOp.mem) {
+            need(u, getRef(n, 0))
+            continue
+        }
+        if (n.op === NodeOp.inlined) {
+            need(u, getRef(n, 0))
+            for (const [ret, root] of regionRets(g)) if (root === id) need(u, getRef(getNode(g, ret)!, 0))
+            continue
+        }
+        const slice = rt.sliceOf(g, n)
+        if (slice === rt.Op.sliceRead) {
+            for (const allocation of touchedOf.get(unit)!.get(id) ?? []) {
+                if (observed.has(allocation)) continue
+                observed.add(allocation)
+                for (const [w, write] of writers.get(allocation) ?? []) need(w, getRef(getNode(graphs[w], write)!, 4))
+            }
+            continue
+        }
+        if (slice !== undefined) continue
+        for (const callee of unit.calls.get(id) ?? []) {
+            const c = index.get(callee)!
+            for (const ret of retsOf(graphs[c])) if (!regionRets(graphs[c]).has(ret)) need(c, getRef(getNode(graphs[c], ret)!, 0))
+        }
+    }
+    return observed
 }
 
 function numericType(type: Type): boolean {
@@ -3655,8 +4037,9 @@ function movesOf(g: Graph): Moves {
             const result = (users.get(id) ?? []).every(([user, slot]) => {
                 const n = getNode(g, user)!
                 if (n.op === NodeOp.after) return slot < countIds(n) - 1 || moved(user)
-                if (slot === 0 && (n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp || n.op === NodeOp.call)) return true
+                if (slot === 0 && (n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp || n.op === NodeOp.call || rt.sliceOf(g, n) !== undefined)) return true
                 if (n.op === NodeOp.store) return slot === 3 && resultType(g, n) === Types.vm_value
+                if (rt.sliceOf(g, n) === rt.Op.sliceWrite) return slot === 4 && wordStore(g, n)
                 if (n.op === NodeOp.setProp) return passing && slot === 3
                 if (n.op === NodeOp.call) return passing && slot >= 3
                 return n.op === NodeOp.ret && slot === 0
@@ -3671,10 +4054,11 @@ function movesOf(g: Graph): Moves {
     const words = new Set<number>()
     let elements: ElementReads = new Set<Handle>()
     for (const [id, n] of g.nodes) {
-        const load = n.op === NodeOp.load && resultType(g, n) === Types.vm_value
-        if (n.op === NodeOp.load && elements !== 'all' && !(load && kept(id))) {
-            const base = getNode(g, getRef(n, 1))
-            if (base?.op === NodeOp.load) elements = 'all'
+        const load = wordLoad(g, n)
+        const read = n.op === NodeOp.load || rt.sliceOf(g, n) === rt.Op.sliceRead
+        if (read && elements !== 'all' && !(load && kept(id))) {
+            const base = getNode(g, getRef(n, n.op === NodeOp.load ? 1 : 2))
+            if (base?.op === NodeOp.load || (base && rt.sliceOf(g, base) === rt.Op.sliceRead)) elements = 'all'
             else if (base?.op === NodeOp.getProp && !getRef(base, 2)) elements.add(getLiteral(g, base, 2) as Handle)
         }
         if ((load || n.op === NodeOp.getProp || n.op === NodeOp.call || g.blocks[0].params.includes(id)) && moved(id)) words.add(id)
@@ -3689,15 +4073,20 @@ function shapeTarget(target: string): boolean {
     return target.startsWith('S')
 }
 
-export function bufferTarget(target: string | undefined): boolean {
-    return target === 'buf' || target === 'buf8'
+function rawElement(element: Rep): boolean {
+    if (element.kind === 'number') return element.format?.bits === 64 && !element.nullable
+    return element.kind === 'pointer' && element.targets.length === 1 && shapeTarget(element.targets[0]) && !element.constant
 }
 
-export function elementStride(element: Rep): number {
-    if (!element.encoded) return 4
-    if (element.kind === 'number' && element.format?.bits === 64) return 8
-    if (element.kind === 'pointer' && element.targets.length === 1 && shapeTarget(element.targets[0]) && !element.constant) return 8
-    return 4
+export function elementTagged(element: Rep): boolean {
+    return !element.encoded && element.kind === 'number' && !!element.format && element.nullable
+}
+
+export function elementWidth(element: Rep): number {
+    if (element.encoded) return 4
+    if (elementTagged(element)) return 16
+    if (element.kind === 'number' && element.format) return 8
+    return rawElement(element) ? 8 : 4
 }
 
 function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean): string {
@@ -3719,13 +4108,13 @@ function repKey(rep: Rep, target: (target: string) => string): string {
         case 'number': return `${numberText(rep.format)}${nullable}`
         case 'pointer': return rep.constant ? rep.text : `ptr<${targets}>${nullable}`
         case 'union': return `union<${targets}>`
-        case 'buffer': return `buf${rep.stride === 8 ? '8' : ''}<${rep.element!.encoded ? `enc<${repKey(rep.element!, target)}>` : repKey(rep.element!, target)}>${nullable}`
+        case 'buffer': return `buf<${rep.element!.encoded ? `enc<${repKey(rep.element!, target)}>` : repKey(rep.element!, target)}>${nullable}`
         case 'any': return rep.text
         default: return rep.kind
     }
 }
 
-export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
+export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, number> {
     const byNode = <T>(map: Map<number, T>, show: (value: T) => string) => [...map].sort((a, b) => a[0] - b[0]).map(([node, value]) => `%${node}:${show(value)}`).join(' ')
     const units = [...plan.values()].flat()
     const intern = (keyOf: (unit: PlannedUnit) => string): [Map<PlannedUnit, number>, number] => {
@@ -3744,20 +4133,17 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
         const { words: moved, elements } = movesOf(g)
         const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
         const value = (rep: Rep) => rep.kind === 'number' ? numberText(rep.format) : view(rep)
-        const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf8' ? 'int8' : value(rep)
+        const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : value(rep)
         const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced)
         const entry = g.blocks[0].params
-        const wide = (id: number) => {
-            const n = getNode(g, id)!
-            const base = n.op === NodeOp.load ? unit.nodes.get(getRef(n, 1)) : undefined
-            return !!base && base.targets.includes('buf8')
-        }
-        const keyed = (id: number) => !moved.has(id) || getNode(g, id)!.op !== NodeOp.load || wide(id)
+        const wide = (id: number) => unit.slices.has(id) && elementWidth(unit.slices.get(id)!) === 8
+        const read = (id: number) => getNode(g, id)!.op === NodeOp.load || rt.sliceOf(g, getNode(g, id)!) === rt.Op.sliceRead
+        const keyed = (id: number) => !moved.has(id) || !read(id) || wide(id)
         return [
             unitIdentity(unit.fn), unit.boxes, [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${abiOf(unit)}`,
             byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, Handle>(), k => String(k)),
-            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
+            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.slices, element => String(elementWidth(element))), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
         ]
     }
     let [classes, count] = intern(unit => parts(unit).join('|'))
@@ -3767,6 +4153,13 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
         if (size === count) break
         count = size
     }
+    if (intrinsics.argv().includes('share-debug')) for (const list of plan.values()) for (const unit of list) console.log('SHARE-PARTS', unit.fn.name, list.indexOf(unit), JSON.stringify(parts(unit).map(String)))
+    return classes
+}
+
+export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
+    const classes = shareClasses(plan, layoutOf, reduced, sites, abiOf, graphOf)
+    const units = [...plan.values()].flat()
     const shared = new Map<PlannedUnit, PlannedUnit>()
     const kept = new Map<number, PlannedUnit>()
     for (const [fn, list] of plan) plan.set(fn, list.filter(unit => {
@@ -3781,7 +4174,6 @@ export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape:
     }))
     for (const unit of units) for (const [node, set] of unit.calls) unit.calls.set(node, new Set([...set].map(c => shared.get(c) ?? c)))
     for (const unit of shared.keys()) sites.delete(unit)
-    if (intrinsics.argv().includes('share-debug')) for (const list of plan.values()) for (const unit of list) console.log('SHARE-PARTS', unit.fn.name, list.indexOf(unit), JSON.stringify(parts(unit).map(String)))
     return shared
 }
 
@@ -3981,7 +4373,7 @@ export function proveInvariants(methods: [string, Function][], ctor: Function, d
             if (n.op === NodeOp.call && getNode(frame.g, getRef(n, 1))?.op !== NodeOp.syscallTarget) {
                 const fns = functionsAt(frame.unit, getRef(n, 1))
                 if (fns?.length === 1) found = child(frame, id, fns[0], 2, 3)
-            } else if (n.op === NodeOp.rt) {
+            } else if (n.op === NodeOp.rt && rt.sliceOf(frame.g, n) === undefined) {
                 const impl = rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
                 if (impl) found = child(frame, id, impl, -1, 2)
             } else if ((n.op === NodeOp.setProp || n.op === NodeOp.getProp) && getRef(n, 2)) {
@@ -3993,7 +4385,7 @@ export function proveInvariants(methods: [string, Function][], ctor: Function, d
         }
         function opaqueCall(frame: SymbolicFrame, n: GraphNode): boolean {
             if (n.op === NodeOp.call) return getNode(frame.g, getRef(n, 1))?.op !== NodeOp.syscallTarget
-            if (n.op === NodeOp.rt) return !!rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
+            if (n.op === NodeOp.rt) return rt.sliceOf(frame.g, n) === undefined && !!rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
             return false
         }
         function operand(frame: SymbolicFrame, n: GraphNode, i: number): Lin | undefined {
@@ -4296,6 +4688,15 @@ function cellSites(g: Graph): Map<Handle, number> {
     for (const [id, n] of g.nodes) if (n.op === NodeOp.heapHandle && !getRef(n, 0) && !known.has(getLiteral(g, n, 0) as Handle)) known.set(getLiteral(g, n, 0) as Handle, id)
     cellSiteMaps.set(g, known)
     return known
+}
+
+function valueTail(g: Graph, id: number): number {
+    let n = getNode(g, id)
+    while (n?.op === NodeOp.after) {
+        id = getRef(n, countIds(n) - 1)
+        n = getNode(g, id)
+    }
+    return id
 }
 
 function blockOf(g: Graph, id: number): Block | undefined {
