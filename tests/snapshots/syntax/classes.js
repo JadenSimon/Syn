@@ -59,3 +59,16 @@ class TestClass {
     return this.data
   }
 }
+export class SameLineAccessors {
+  n = 0;
+  constructor() {}
+  get value() {
+    return this.n
+  }
+  set value(v) {
+    this.n = v;
+  }
+  static get zero() {
+    return 0
+  }
+}

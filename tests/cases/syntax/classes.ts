@@ -64,3 +64,5 @@ class TestClass {
 
     readonly [a: number]: number
 }
+
+export class SameLineAccessors { n = 0; constructor() {} get value() { return this.n } set value(v: number) { this.n = v } static get zero() { return 0 } }
