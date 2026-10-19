@@ -652,8 +652,12 @@ pub const AstData = struct {
     source_name: ?[]const u8 = null,
     parse_errors: std.ArrayListUnmanaged(js_lexer.Diagnostic) = .{},
 
-    pub fn deinit(this: @This()) void {
-        _ = this; // TODO
+    pub fn deinit(this: *@This()) void {
+        this.nodes.deinit();
+        if (this.positions) |*positions| positions.positions.deinit();
+        if (this.lines) |*lines| lines.deinit();
+        this.decorators.deinit(getAllocator());
+        this.parse_errors.deinit(getAllocator());
     }
 
     pub inline fn getSliceFromRef(this: *const @This(), ref: NodeRef) []const u8 {
@@ -11227,10 +11231,12 @@ pub const ParsedFile = struct {
     source: []const u8,
     source_name: ?[]const u8 = null,
     owns_source: bool = false,
+    owns_source_name: bool = false,
     is_lib: bool = false,
 
     // Used to store the associated JS object
     api_handle: ?*anyopaque = null,
+    api_source_ref: ?*anyopaque = null,
 
     const allocator = getAllocator();
 
@@ -11246,6 +11252,9 @@ pub const ParsedFile = struct {
         this.ast.deinit();
 
         if (this.owns_source) allocator.free(this.source);
+        if (this.owns_source_name) {
+            if (this.source_name) |name| allocator.free(name.ptr[0..name.len :0]);
+        }
 
         allocator.destroy(this);
     }

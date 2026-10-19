@@ -20,20 +20,41 @@ inline fn getProgram(o: *js.Object) !*Program {
 
 const WrappedFile = js.TypedWrap(*parser.ParsedFile);
 
-pub fn createSourceFile(file_name: js.UTF8String, contents: js.ReferencedBuffer, is_lib: bool) !WrappedFile {
-    const c = try getAllocator().allocSentinel(u8, file_name.data.len, 0); // XXX
-    @memcpy(c, file_name.data);
-    const parsed = try parser.ParsedFile.createFromBuffer(contents.data, c, is_lib, null);
+fn parseSourceFile(file_name: []const u8, contents: []const u8, is_lib: bool) !*parser.ParsedFile {
+    const name = try getAllocator().dupeZ(u8, file_name);
+    errdefer getAllocator().free(name);
+    const parsed = try parser.ParsedFile.createFromBuffer(contents, name, is_lib, null);
+    parsed.owns_source_name = true;
+    return parsed;
+}
 
+pub fn createSourceFile(file_name: js.UTF8String, contents: js.ReferencedBuffer, is_lib: bool) !WrappedFile {
+    const parsed = try parseSourceFile(file_name.data, contents.data, is_lib);
+    parsed.api_source_ref = contents.ref;
     return .{ .value = parsed };
 }
 
+pub fn disposeSourceFile(sf: WrappedFile) !void {
+    if (sf.value.api_source_ref) |source_ref| {
+        const ref: *js.Ref = @ptrCast(source_ref);
+        try ref.deinit(js.getCurrentEnv());
+        sf.value.api_source_ref = null;
+    }
+    if (sf.value.api_handle) |handle| {
+        const ref: *js.Ref = @ptrCast(handle);
+        try ref.deinit(js.getCurrentEnv());
+        sf.value.api_handle = null;
+    }
+    sf.value.deinit();
+}
+
 pub fn createSourceFileAsync(file_name: js.UTF8String, contents: ?js.ReferencedBuffer, is_lib: bool) !js.Promise(WrappedFile) {
-    const text = contents orelse blk: {
-        const data = try std.fs.cwd().readFileAlloc(getAllocator(), file_name.data, std.math.maxInt(u32));
-        break :blk js.ReferencedBuffer{ .data = data, .source = undefined, .ref = undefined }; 
-    };
-    return .{try createSourceFile(file_name, text, is_lib)};
+    if (contents) |text| return .{try createSourceFile(file_name, text, is_lib)};
+    const data = try std.fs.cwd().readFileAlloc(getAllocator(), file_name.data, std.math.maxInt(u32));
+    errdefer getAllocator().free(data);
+    const parsed = try parseSourceFile(file_name.data, data, is_lib);
+    parsed.owns_source = true;
+    return .{ .{ .value = parsed } };
 }
 
 // not really worth it
@@ -98,20 +119,15 @@ pub fn ptrOffset(this: *js.Receiver, left: u32, right: u32, source: []u8) !u32 {
 pub fn serialize(sf: *js.Object) !js.ArrayBuffer {
     const p = try getSourceFile(sf);
     const nodes = p.ast.nodes;
-    var b = try std.ArrayList(u8).initCapacity(getAllocator(), nodes.count() * 32);
-
-    std.debug.assert(nodes.pages.items.len > 0);
-
-    for (0..(nodes.pages.items.len - 1)) |i| {
-        const z: [*]u8 = @ptrCast(nodes.pages.items[i].ptr);
-        b.appendSliceAssumeCapacity(z[0..(nodes.pages.items[i].len * 32)]);
+    const buffer = try js.ArrayBuffer.initJs(nodes.count() * @sizeOf(parser.AstNode));
+    var offset: usize = 0;
+    for (nodes.pages.items, 0..) |page, i| {
+        const count = if (i + 1 == nodes.pages.items.len) nodes.local_count else page.len;
+        const bytes = std.mem.sliceAsBytes(page[0..count]);
+        @memcpy(buffer.buf[offset..][0..bytes.len], bytes);
+        offset += bytes.len;
     }
-
-    const last = nodes.pages.items[nodes.pages.items.len - 1];
-    const z: [*]u8 = @ptrCast(last.ptr);
-    b.appendSliceAssumeCapacity(z[0..(nodes.local_count * 32)]);
-
-    return js.ArrayBuffer.from(b.items);
+    return buffer;
 }
 
 const PrintResult = struct {
@@ -446,7 +462,11 @@ pub fn getLineMap(sf: WrappedFile) !?js.ArrayBuffer {
         lines.count,
     );
 
-    return try js.ArrayBuffer.from(@as([*]u8, @constCast(@ptrCast(decoded.ptr)))[0 .. decoded.len * 4]);
+    defer getAllocator().free(decoded);
+    const bytes = std.mem.sliceAsBytes(decoded);
+    const buffer = try js.ArrayBuffer.initJs(bytes.len);
+    @memcpy(buffer.buf, bytes);
+    return buffer;
 }
 
 pub fn getStart(sf: WrappedFile, index: u32) u32 {

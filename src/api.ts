@@ -5132,12 +5132,29 @@ class SourceFileInternal {
     private _fullText?: string
 
     constructor(
-        public readonly handle: any, 
+        private nativeHandle: any,
         public readonly source: Uint8Array,
         public readonly ref: number,
-        public readonly fileName: string
+        public readonly fileName: string,
+        private readonly ownsHandle = false,
     ) {
         this.kind = SyntaxKind.SourceFile
+    }
+
+    get handle(): any {
+        if (this.nativeHandle === undefined) throw new Error('Source file has been disposed')
+        return this.nativeHandle
+    }
+
+    dispose(): void {
+        if (this.nativeHandle === undefined) return
+        if (!this.ownsHandle) throw new Error('Cannot dispose a source file owned by a program')
+        api.disposeSourceFile(this.nativeHandle)
+        this.nativeHandle = undefined
+        this._view = undefined
+        this._node = undefined
+        this._lineMap = undefined
+        this._fullText = undefined
     }
 
     get view(): Uint32Array {
@@ -5278,7 +5295,12 @@ export function createSourceFile(fileName: string, sourceText: string | Uint8Arr
     const data = typeof sourceText === 'string' ? Buffer.from(sourceText, 'utf-8') : (sourceText ?? fs.readFileSync(fileName))
     const handle = api.createSourceFile(fileName.toString(), data, false)
 
-    return new SourceFileInternal(handle, data, api.getStartRef(handle), fileName).node as any as ts.SourceFile
+    return new SourceFileInternal(handle, data, api.getStartRef(handle), fileName, true).node as any as ts.SourceFile
+}
+
+export function disposeSourceFile(sourceFile: ts.SourceFile): void {
+    const internal = getSourceFileInternal(sourceFile)
+    if (internal) internal.dispose()
 }
 
 function getRootTypesFile(dir: string, host: Pick<ts.System, 'readFile'>): string {
