@@ -157,6 +157,7 @@ interface Frame {
 
 const maxDepth = 3
 const maxSignatures = 16
+const maxTuple = 8
 const nodeSpan = 2 ** 24
 
 const Types = intrinsics.Types
@@ -452,6 +453,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     const storedInto = new Map<number, Map<number, [intrinsics.Types | undefined, number]>>()
     const returns = new Map<number, Set<number>>()
     const returnTargets = new Map<number, Set<number>>()
+    const returnLocations = new Map<number, Set<number>>()
+    const heldStatics = new Map<number, Function>()
     const resultTyped = new Set<number>()
     const retSets = new Map<number, Map<number, Set<number>>>()
     const callSites = new Map<number, Set<number>>()
@@ -790,6 +793,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             set.add(v)
             grew = true
         }
+        if (grew) for (const loc of returnLocations.get(frame) ?? []) store(loc, set)
         if (grew) for (const target of returnTargets.get(frame) ?? []) {
             if (resultTyped.has(target)) continue
             const [f, c] = parse(target)
@@ -1252,6 +1256,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         return loc
     }
     function read(frame: number, node: number, loc: number): void {
+        const init = heldStatics.get(loc)
+        if (init) {
+            heldStatics.delete(loc)
+            const entered = enter(init, 'static|', -1)
+            setOf(returnLocations, entered).add(loc)
+            store(loc, setOf(returns, entered))
+        }
         setOf(contentReaders, loc).add(key(frame, node))
         flow(frame, node, setOf(contents, loc))
     }
@@ -1512,13 +1523,20 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             if (!locations[loc].forms.includes('init')) locations[loc].forms.push('init')
             if (elements && nameOf(k) === 'data') {
                 const [buffer] = allocate(`${id}/data`, frame, node, 'buffer', undefined, true)
-                const contents = access(true, frame, node, buffer, numberKey)
-                if (!locations[contents].forms.includes('vm_value')) locations[contents].forms.push('vm_value')
-                store(contents, elements.map(element => handleValue(frame, node, element)))
+                elements.forEach((element, i) => {
+                    const at = access(true, frame, node, buffer, elements.length > maxTuple ? numberKey : `@${i}`)
+                    if (!locations[at].forms.includes('vm_value')) locations[at].forms.push('vm_value')
+                    store(at, [handleValue(frame, node, element)])
+                })
                 store(loc, [objectValue(buffer)])
                 return
             }
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, k))).slot0 as Handle
+            const init = host.session.statics.get(slot)
+            if (init && host.traceable(init)) {
+                heldStatics.set(loc, init)
+                return
+            }
             const ref = heap.isBoxedF64(slot) ? intrinsics.getNanId(heap.unboxF64(slot)) : 0
             if (ref) {
                 let into = storedInto.get(key(frame, ref))
@@ -1533,10 +1551,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     const dumped = new Set<Graph>()
     function enter(unit: Function, context: string, object: number): number {
-        const signature = context.includes('|') ? context.slice(context.indexOf('|') + 1).split(',').slice(0, -1) : []
         const k = `${unitKey(unit)}|${context}`
         const known = frameIds.get(k)
         if (known !== undefined) return known
+        const signature = context.includes('|') ? context.slice(context.indexOf('|') + 1).split(',').slice(0, -1) : []
         const frame = frames.length
         frameIds.set(k, frame)
         frames.push({ unit, context, object, signature, nodes: new Map() })
@@ -1726,7 +1744,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     function argumentGroups(caller: number, call: number, n: GraphNode, first: number, count: number, exact: Set<number>): [signature: string, args: number[][]][] {
         const classes: Map<string, number[]>[] = []
-        for (let i = first; i < countIds(n) && i - first < count; i++) if (getRef(n, i) && unrecorded([...seen(caller, call, getRef(n, i))])) return []
         for (let i = first; i < countIds(n) && i - first < count; i++) {
             const byClass = new Map<string, number[]>()
             for (const v of operand(caller, call, n, i)) {
@@ -1735,6 +1752,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 if (!list) byClass.set(c, list = [])
                 list.push(v)
             }
+            if (!byClass.size && getRef(n, i)) return []
             if (byClass.has('d')) for (const [c, list] of [...byClass]) {
                 if (c !== 'i' && c !== 'u' && !c.startsWith('l')) continue
                 byClass.get('d')!.push(...list)
@@ -1755,6 +1773,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         return combos
     }
     function bind(caller: number, call: number, n: GraphNode, callee: Function, receiver: number | undefined, first: number, closure?: number, given?: number[][]): number[] {
+        const g = host.graphOf(callee)
+        const self = receiverOf(g)
+        const plain = g.blocks[0].params.filter(p => p !== self)
+        verifySetterBinding(frames[caller].graph!, 'analysis', call, n, first, plain.length)
+        const exact = new Set([...addressRelevant(g)].map(i => plain.indexOf(g.blocks[0].params[i])).filter(i => i >= 0))
+        const groups: [string, number[][]][] = given ? [[given.map(list => `${argClass(list[0], false)},`).join(''), given]] : argumentGroups(caller, call, n, first, plain.length, exact)
+        if (!groups.length) return []
         const site = `${unitKey(frames[caller].unit)}:${call}`
         const program = n.op === NodeOp.static
         const object = closure ?? (receiver !== undefined ? values[receiver].allocation ?? -1 : program ? -1 : frames[caller].object)
@@ -1766,13 +1791,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             : frames[caller].context.split('|')[0].includes('@') ? frames[caller].context.split('|')[0]
             : `${object}`
         const owner = closure !== undefined || receiver !== undefined ? (shallow ? object : -1) : object
-        const g = host.graphOf(callee)
-        const self = receiverOf(g)
-        const plain = g.blocks[0].params.filter(p => p !== self)
-        verifySetterBinding(frames[caller].graph!, 'analysis', call, n, first, plain.length)
         const entered: number[] = []
-        const exact = new Set([...addressRelevant(g)].map(i => plain.indexOf(g.blocks[0].params[i])).filter(i => i >= 0))
-        const groups: [string, number[][]][] = given ? [[given.map(list => `${argClass(list[0], false)},`).join(''), given]] : argumentGroups(caller, call, n, first, plain.length, exact)
         for (const [signature, args] of groups) {
             const frame = enter(callee, `${base}|${signature}`, owner)
             entered.push(frame)
@@ -1783,13 +1802,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 shadowed.delete(frame)
                 for (const [node, m, i, loc] of pending ?? []) storeFrom(frame, node, m, i, loc)
             }
-            const fg = frames[frame].graph!
-            const fself = receiverOf(fg)
-            const fplain = fg.blocks[0].params.filter(p => p !== fself)
-            if (closure !== undefined) for (const [id, m] of fg.nodes) if (m.op === NodeOp.callContext) flow(frame, id, [objectValue(closure)])
-            if (fself !== undefined && receiver !== undefined) flow(frame, fself, [receiver])
-            args.forEach((list, i) => flow(frame, fplain[i], list))
-            if (host.paramCount?.(callee) !== undefined) for (let i = args.length; i < fplain.length; i++) flow(frame, fplain[i], [Undefined])
+            if (closure !== undefined) for (const [id, m] of g.nodes) if (m.op === NodeOp.callContext) flow(frame, id, [objectValue(closure)])
+            if (self !== undefined && receiver !== undefined) flow(frame, self, [receiver])
+            args.forEach((list, i) => flow(frame, plain[i], list))
+            if (host.paramCount?.(callee) !== undefined) for (let i = args.length; i < plain.length; i++) flow(frame, plain[i], [Undefined])
             if (!resultTyped.has(key(caller, call))) for (const [ret, set] of retSets.get(frame) ?? []) if (!refuted(caller, call, frame, ret)) flow(caller, call, set)
             setOf(returnTargets, frame).add(key(caller, call))
         }
@@ -2237,9 +2253,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (!list) elementSets.set(location.allocation, list = [])
         list.push(...setOf(contents, loc))
     })
+    function tuple(allocation: number): boolean {
+        const computed = locationIds.get(`${allocation}/${numberKey}`)
+        return computed === undefined || (!setOf(contents, computed).size && !locations[computed].readers.length && !locations[computed].writers.length)
+    }
     function mixedSlot(loc: number): boolean {
         const location = locations[loc]
-        const list = location.key === numberKey || constantIndex(location.key) ? elementSets.get(location.allocation)! : [...setOf(contents, loc)]
+        const list = location.key === numberKey || (constantIndex(location.key) && !tuple(location.allocation)) ? elementSets.get(location.allocation)! : [...setOf(contents, loc)]
         return list.some(v => values[v].kind === ValueKind.number) && list.some(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.string)
     }
     const frameValues: FrameValues[] = []
@@ -2317,7 +2337,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const held = [...setOf(contents, loc)]
         return {
             allocation: location.allocation,
-            key: location.key === numberKey || constantIndex(location.key) ? numberKey : location.key,
+            key: location.key === numberKey || (constantIndex(location.key) && !tuple(location.allocation)) ? numberKey : location.key,
             number: held.some(v => values[v].kind === ValueKind.number),
             object: held.some(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.string),
         }
@@ -3557,7 +3577,7 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph): { inst: Instantiations, plan: Map<Function, PlannedUnit[]> } {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, boxed: Map<number, Set<string>> } {
     const callees = new Map<string, number[]>()
     const outgoing = types.frames.map(() => [] as [node: number, callee: number][])
     types.frames.forEach((frame, id) => {
@@ -3725,6 +3745,13 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     types.wordSlots.forEach((slot, i) => {
         if (memberKinds.get(`${slot.allocation}:${slot.key}`) === 3) mixedGroups.add(groupKey(i))
     })
+    const boxed = new Map<number, Set<string>>()
+    types.wordSlots.forEach((slot, i) => {
+        if (!mixedGroups.has(groupKey(i))) return
+        const keys = boxed.get(slot.allocation)
+        if (keys) keys.add(slot.key)
+        else boxed.set(slot.allocation, new Set([slot.key]))
+    })
     for (const unit of unitOfRoot.values()) {
         for (const access of accessesOf(unit)) {
             if (!access.slots.some(slot => mixedGroups.has(groupKey(slot)))) continue
@@ -3764,7 +3791,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     }
     inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf))
     for (const [unit, touched] of touchedOf) for (const [node, buffers] of touched) unit.slices.set(node, inst.elementOf(buffers))
-    return { inst, plan }
+    return { inst, plan, boxed }
 }
 
 export function nullableNumber(rep: Rep | undefined): boolean {

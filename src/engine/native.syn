@@ -9,7 +9,7 @@ import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as syscalls from './syscalls'
-import { rawValue, tagVmHandleNode, traceValue } from './vm'
+import { rawValue, tagVmHandle, tagVmHandleNode, traceValue, vmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
@@ -38,8 +38,8 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringOperands } from './verify'
-import { type AccessHost, analyzeGenerics, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
+import { type AccessHost, analyzeGenerics, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -288,11 +288,15 @@ interface StaticContext {
     runtime: Map<number, number>
     address(cell: intrinsics.Handle): number | undefined
     static(handle: intrinsics.Handle): bigint | undefined
+    readable(address: number, size: number): boolean
+    reserve?: (size: number) => number
     regions: { base: number, bytes: Uint8Array }[]
     steps: number
+    budget: number
 }
 
 const staticStepBudget = 1_000_000
+const callStepBudget = 20_000
 
 function staticWidth(T: intrinsics.Types): number {
     if (T === Types.bool) return 1
@@ -325,8 +329,7 @@ function staticMemory(ctx: StaticContext, address: number, size: number): { byte
     for (const region of ctx.regions) {
         if (address >= region.base && address + size <= region.base + region.bytes.length) return { bytes: region.bytes, at: address - region.base, owned: true }
     }
-    const pstack = pstackCell(0)
-    if (address < pstack || address + size > Number(pstackMark(0))) throw `static: reads memory at ${address} that it does not own`
+    if (!ctx.readable(address, size)) throw `static: reads memory at ${address} that it does not own`
     const bytes = new Uint8Array(size)
     if (!nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), address, size)) throw 'static: failed to read placed memory'
     return { bytes, at: 0, owned: false }
@@ -377,7 +380,7 @@ function evaluateUnit(ctx: StaticContext, symbol: number, args: StaticValue[]): 
 function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<number, StaticValue>): StaticValue {
     const known = values.get(id)
     if (known !== undefined) return known
-    if (++ctx.steps > staticStepBudget) throw 'static: evaluation takes too long'
+    if (++ctx.steps > ctx.budget) throw 'static: evaluation takes too long'
     const n = getNode(graph, id)
     if (!n) throw `static: %${id} is missing`
     const operand = (i: number): StaticValue => getRef(n, i) ? evaluateNode(ctx, graph, getRef(n, i), values) : staticLiteral(getLiteral(graph, n, i))
@@ -425,6 +428,10 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         case NodeOp.heapHandle: {
             const cell = getLiteral(graph, n, 0) as intrinsics.Handle
             if (getRef(n, 0)) throw `static: %${id} is a symbolic heap value`
+            if (mirroredCells.has(heap.deref(cell))) {
+                value = BigInt(heap.deref(cell))
+                break
+            }
             const at = cell ? ctx.address(cell) : 0
             if (at === undefined) throw `static: %${id} refers to heap value @${cell}, which has no static address`
             value = BigInt(at)
@@ -441,7 +448,8 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             operand(0)
             if (getRef(n, 2) || getLiteral(graph, n, 2)) throw `static: %${id} resets a stack`
             const size = Number(int(3))
-            const base = staticReserve(size)
+            if (!ctx.reserve) throw `static: %${id} allocates`
+            const base = ctx.reserve(size)
             ctx.regions.push({ base, bytes: new Uint8Array(size) })
             value = BigInt(base)
             break
@@ -460,19 +468,25 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         case NodeOp.call:
         case NodeOp.rt: {
             operand(0)
-            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof) {
-                value = BigInt(heap.fromJsString(int(2) & BigInt(1) ? 'object' : 'number'))
-                break
-            }
             let symbol: number | undefined
             if (n.op === NodeOp.rt) symbol = ctx.runtime.get(getLiteral(graph, n, 1))
             else symbol = calledSymbol(graph, n)
+            if (symbol === undefined && n.op === NodeOp.rt && rt.bindingOf(getLiteral(graph, n, 1))?.lower) {
+                value = evaluateLowered(ctx, graph, n, values, operand)
+                break
+            }
             if (symbol === undefined) throw `static: %${id} in ${graph.name ?? "anonymous"} calls something other than a known unit`
             const args: StaticValue[] = []
             for (let i = n.op === NodeOp.rt ? 2 : 3; i < countIds(n); i++) args.push(operand(i))
             value = evaluateUnit(ctx, symbol, args)
             break
         }
+        case NodeOp.box:
+            value = staticNorm(int(0) << BigInt(1), T)
+            break
+        case NodeOp.unbox:
+            value = BigInt.asIntN(32, int(0)) >> BigInt(1)
+            break
         case NodeOp.encode: {
             const ptr = int(0)
             if (!ptr) throw `static: %${id} encodes a null pointer`
@@ -508,6 +522,25 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
     }
     values.set(id, value)
     return value
+}
+
+function evaluateLowered(ctx: StaticContext, graph: Graph, n: GraphNode, values: Map<number, StaticValue>, operand: (i: number) => StaticValue): StaticValue {
+    for (let i = 2; i < countIds(n); i++) operand(i)
+    const added: number[] = []
+    const add = (node: GraphNode): number => {
+        const fresh = newId(graph)
+        setNode(graph, fresh, node)
+        added.push(fresh)
+        return fresh
+    }
+    const lowered = add(rt.lowerNative(graph, n, { runtimeHeapBase, pstackBase: () => pstackCell(0) + 8, add }))
+    defer finally {
+        for (const id of added) {
+            deleteNode(graph, id)
+            values.delete(id)
+        }
+    }
+    return evaluateNode(ctx, graph, lowered, values)
 }
 
 function staticLiteral(v: number): StaticValue {
@@ -598,8 +631,11 @@ function evaluateStatics(program: ProgramGraph): void {
                 const slot = image.statics.get(handle)
                 return slot === undefined ? undefined : evaluateSlot(slot)
             },
+            readable: (address, size) => address >= pstackCell(0) && address + size <= Number(pstackMark(0)) || inMirroredString(address, size),
+            reserve: staticReserve,
             regions: [],
             steps: 0,
+            budget: staticStepBudget,
         }
         let word: bigint
         try {
@@ -617,6 +653,8 @@ function evaluateStatics(program: ProgramGraph): void {
         const bytes = new BigUint64Array([word])
         staticWrite(image.staticTable.base + slot * 8, new Uint8Array(bytes.buffer))
         words.set(slot, word)
+        const address = new BigUint64Array([((word >> BigInt(1)) & BigInt((1 << 28) - 1)) + BigInt(pstackCell(0) + 8)])
+        for (const [at, held] of image.staticFields) if (held === slot) staticWrite(at, new Uint8Array(address.buffer))
         if (flags.has('static-debug')) console.log(`static ${slot} evaluates to ${word}`)
         return word
     }
@@ -637,6 +675,9 @@ function evaluateStatics(program: ProgramGraph): void {
             putNode(initGraph, id, NodeOp.after, [getOperand(initGraph, called ? call! : n, 0)])
             remaining--
         }
+    }
+    for (const [at, held] of image.staticFields) {
+        if (!words.get(held)) throw `native: static memory at ${at} holds static ${held}, which only initializes at runtime`
     }
     if (!remaining) program.roots.delete(staticInitName)
     for (const graph of program.units.values()) {
@@ -663,6 +704,119 @@ function evaluateStatics(program: ProgramGraph): void {
             }
             if (ops) putCopy(graph, id, n, ops)
         }
+    }
+}
+
+function inMirroredString(address: number, size: number): boolean {
+    if (!mirroredStrings.size) return false
+    const at = address - runtimeHeapBase()
+    for (const handle of mirroredStrings) if (at >= handle && at + size <= handle + heap.HeapString.sizeof) return true
+    return false
+}
+
+function constantRegions(program: ProgramGraph): [base: number, size: number][] {
+    const image = program.image
+    return image.staticRegions.length && !writesStaticMemory(program) ? [...image.readonlyRegions, ...image.staticRegions] : image.readonlyRegions
+}
+
+function foldConstantCalls(program: ProgramGraph, clock: PhaseClock): void {
+    const image = program.image
+    const regions = constantRegions(program)
+    const results = new Map<string, StaticValue | null>()
+    for (const symbol of reachUnits(program)) {
+        const g = program.units.get(symbol)
+        if (!g) continue
+        const evaluated = new Map<number, StaticValue>()
+        for (const [id, n] of g.nodes) {
+            if (n.op !== NodeOp.call) continue
+            const callee = calledSymbol(g, n)
+            if (callee === undefined || !program.units.has(callee)) continue
+            let constant = true
+            for (let i = 3; i < countIds(n); i++) {
+                const arg = getRef(n, i) ? getNode(g, getRef(n, i)) : undefined
+                if (getRef(n, i) && arg?.op !== NodeOp.literal && arg?.op !== NodeOp.heapHandle) constant = false
+            }
+            if (!constant) continue
+            const ctx: StaticContext = {
+                units: program.units,
+                runtime: image.runtime,
+                address: cell => {
+                    const slot = image.dataHandles.get(heap.deref(cell))
+                    return slot === undefined ? undefined : image.knownValue(slot)
+                },
+                static: () => undefined,
+                readable: (address, size) => inStaticRegion(regions, address, size) || inMirroredString(address, size),
+                regions: [],
+                steps: 0,
+                budget: callStepBudget,
+            }
+            try {
+                const values = new Map<number, StaticValue>()
+                const args: StaticValue[] = []
+                for (let i = 3; i < countIds(n); i++) args.push(getRef(n, i) ? evaluateNode(ctx, g, getRef(n, i), values) : staticLiteral(getLiteral(g, n, i)))
+                const key = `${callee}:${args.join(',')}`
+                let result = results.get(key)
+                if (result === undefined) {
+                    results.set(key, null)
+                    result = evaluateUnit(ctx, callee, args)
+                    results.set(key, result)
+                }
+                if (result !== null) evaluated.set(id, result)
+            } catch (e) {
+                const message = e instanceof Error ? e.message : String(e)
+                if (!message.startsWith('static:')) throw e
+                if (flags.has('static-debug')) console.log(`call %${id} in ${g.name ?? 'anonymous'} stays: ${message}`)
+            }
+        }
+        if (!evaluated.size) continue
+        const projections: [id: number, call: number, value: number][] = []
+        const kept = new Set<number>()
+        for (const [id, n] of g.nodes) {
+            for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
+                const value = evaluated.get(getRef(n, i))
+                if (value === undefined || staticScalar(value) !== undefined) continue
+                const field = n.op === NodeOp.get && !getRef(n, 1) && typeof value === 'object' && 'fields' in value ? value.fields.get(getLiteral(g, n, 1)) : undefined
+                const scalar = field === undefined ? undefined : staticScalar(field)
+                if (scalar === undefined) kept.add(getRef(n, i))
+                else projections.push([id, getRef(n, i), scalar])
+            }
+        }
+        const folded = new Map<number, number>()
+        const tokens = new Map<number, Operand>()
+        for (const [id, value] of evaluated) {
+            const scalar = staticScalar(value)
+            if (scalar === undefined && kept.has(id)) continue
+            const n = getNode(g, id)!
+            folded.set(id, scalar ?? 0)
+            tokens.set(id, getOperand(g, n, 0))
+            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), { literal: scalar ?? 0 }])
+        }
+        for (const [id, call, value] of projections) {
+            folded.set(id, value)
+            tokens.set(id, tokens.get(call) ?? call)
+        }
+        if (!folded.size) continue
+        replaceFolded(g, folded, tokens)
+        program.units.set(symbol, renormalize(g, clock))
+    }
+}
+
+function staticScalar(value: StaticValue): number | undefined {
+    if (typeof value !== 'bigint') return
+    if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) return
+    return Number(value)
+}
+
+function replaceFolded(g: Graph, folded: Map<number, number>, tokens: Map<number, Operand>): void {
+    for (const [id, n] of [...g.nodes]) {
+        let ops: Operand[] | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            const value = folded.get(getRef(n, i))
+            if (value === undefined) continue
+            ops ??= getOperands(g, n)
+            ops[i] = i < firstNonOrderingSlot(n) ? tokens.get(getRef(n, i))! : { literal: value }
+        }
+        if (ops) putCopy(g, id, n, ops)
     }
 }
 
@@ -706,7 +860,7 @@ function writesStaticMemory(program: ProgramGraph): boolean {
 
 function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
     const image = program.image
-    const regions = image.staticRegions.length && !writesStaticMemory(program) ? [...image.readonlyRegions, ...image.staticRegions] : image.readonlyRegions
+    const regions = constantRegions(program)
     const strings = mirroredStrings
     if (!regions.length && !strings.size) return
     const heapBase = strings.size ? runtimeHeapBase() : 0
@@ -760,16 +914,7 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
         }
         if (!folded.size) continue
         touched.add(symbol)
-        for (const [id, n] of [...g.nodes]) {
-            let ops: Operand[] | undefined
-            for (let i = 0; i < countIds(n); i++) {
-                const value = folded.get(getRef(n, i))
-                if (value === undefined) continue
-                ops ??= getOperands(g, n)
-                ops[i] = i < firstNonOrderingSlot(n) ? tokens.get(getRef(n, i))! : { literal: value }
-            }
-            if (ops) putCopy(g, id, n, ops)
-        }
+        replaceFolded(g, folded, tokens)
     }
 }
 
@@ -1515,10 +1660,29 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>): Map<nu
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.add, [getOperand(g, n, 2), { literal: ctx.runtimeHeapBase() }], Types.u64) })
 rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [getOperand(g, n, 2), { literal: ctx.pstackBase() }]) })
+const typeofStrings = 1
+const typeofObjects = 2
+
 rt.bind(rt.Op.typeof, {
     lower: (g, n, ctx) => {
-        const tag = ctx.add(makeNode(g, NodeOp.and, [getOperand(g, n, 2), { literal: 1 }], Types.u64))
-        return makeNode(g, NodeOp.select, [tag, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }])
+        const word = getOperand(g, n, 2)
+        const tag = ctx.add(makeNode(g, NodeOp.and, [word, { literal: 1 }], Types.u64))
+        const kinds = countIds(n) < 4 ? 0 : getLiteral(g, n, 3)
+        if (!kinds) return makeNode(g, NodeOp.select, [tag, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }])
+        const boxed = ctx.add(makeNode(g, NodeOp.ge, [word, { literal: heap.pstackBoxWordTag }], Types.bool))
+        if (kinds === typeofStrings) return makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.select, [boxed, { literal: heap.typeNames.number }, { literal: heap.typeNames.string }])), { literal: heap.typeNames.number }])
+        const handled = ctx.add(makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.lt, [word, { literal: heap.pstackWordTag }], Types.bool)), { literal: 0 }]))
+        const shifted = ctx.add(makeNode(g, NodeOp.convert, [ctx.add(makeNode(g, NodeOp.ushr, [word, { literal: 1 }], Types.u32))], Types.u64))
+        const handle = ctx.add(makeNode(g, NodeOp.select, [handled, shifted, { literal: 0 }]))
+        const cell = ctx.add(makeNode(g, NodeOp.add, [handle, { literal: ctx.runtimeHeapBase() }], Types.u64))
+        const td = ctx.add(makeNode(g, NodeOp.load, [getOperand(g, n, 0), cell, { literal: 0 }], Types.u32))
+        const [externalTD, internedTD] = heap.stringTypeDescriptors
+        const external = ctx.add(makeNode(g, NodeOp.eq, [td, { literal: externalTD }], Types.bool))
+        const string = ctx.add(makeNode(g, NodeOp.or, [external, ctx.add(makeNode(g, NodeOp.eq, [td, { literal: internedTD }], Types.bool))], Types.bool))
+        const object = ctx.add(makeNode(g, NodeOp.and, [tag, ctx.add(makeNode(g, NodeOp.not, [boxed], Types.bool))], Types.bool))
+        const named = ctx.add(makeNode(g, NodeOp.and, [handled, string], Types.bool))
+        const kind = ctx.add(makeNode(g, NodeOp.select, [object, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }]))
+        return makeNode(g, NodeOp.select, [named, { literal: heap.typeNames.string }, kind])
     },
 })
 
@@ -1765,6 +1929,8 @@ function createImage() {
     const functions = new Map<number, number>()
     const statics = new Map<number, number>()
     const staticSymbols: number[] = []
+    const staticBoxes = new Map<number, number>()
+    const staticFields: [address: number, slot: number][] = []
     const staticRegions: [base: number, size: number][] = []
     const readonlyRegions: [base: number, size: number][] = []
     const staticTable = { base: 0 }
@@ -1833,8 +1999,8 @@ function createImage() {
         addressSlots.set(handle, slot)
         return slot
     }
-    function constructionSlot(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean): number {
-        return addressSlot(cell, `construction @${cell}`, () => placeConstruction(cell, graphOf, readonly))
+    function constructionSlot(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean, boxed: (cell: number) => Set<string> | undefined): number {
+        return addressSlot(cell, `construction @${cell}`, () => placeConstruction(cell, graphOf, readonly, boxed))
     }
     function staticObjectSlot(handle: intrinsics.Handle): number {
         return addressSlot(handle, `static @${handle}`, () => placeObject(handle, () => undefined, why => { throw `native: static object @${handle} cannot be placed: ${why}` }))
@@ -1851,7 +2017,7 @@ function createImage() {
     }
     const placedConstructions = new Map<number, number>()
     const placingConstructions = new Set<number>()
-    function placeConstruction(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean): number {
+    function placeConstruction(cell: number, graphOf: (cell: number) => Graph | undefined, readonly: (cell: number) => boolean, boxed: (cell: number) => Set<string> | undefined): number {
         const known = placedConstructions.get(cell)
         if (known !== undefined) return known
         const fail = (why: string): never => { throw `native: construction @${cell} cannot be placed in static memory: ${why}` }
@@ -1870,7 +2036,7 @@ function createImage() {
         function construction(id: number): number | undefined {
             const n = getNode(graph, id)
             if (n?.op !== NodeOp.heapHandle || getRef(n, 0) || !graphOf(getLiteral(graph, n, 0))) return
-            return placeConstruction(getLiteral(graph, n, 0), graphOf, readonly)
+            return placeConstruction(getLiteral(graph, n, 0), graphOf, readonly, boxed)
         }
         function constantString(id: number): number | undefined {
             const n = getNode(graph, id)
@@ -1885,6 +2051,8 @@ function createImage() {
             if (!handle || heap.isString(handle) || !heap.isOrdinaryObject(heap.deref(handle))) return
             return placeObject(handle, () => undefined, fail)
         }
+        const boxedKeys = boxed(cell)
+        const word = (n: GraphNode, offset: number, width: number) => typeOf(n) === Types.vm_value && !!boxedKeys && (boxedKeys.has(numberKey) || boxedKeys.has(`@${offset / width}`))
         const buffers = new Map<number, Uint8Array>()
         const addresses = new Map<number, number>()
         const stores: number[] = []
@@ -1912,7 +2080,7 @@ function createImage() {
                 else if (nested !== undefined && width === 4) view.setUint32(offset, staticWord(nested), true)
                 else if (nested !== undefined && width === 8) view.setBigUint64(offset, BigInt(nested), true)
                 else if (text !== undefined && width === 8) view.setBigUint64(offset, BigInt(text), true)
-                else if (text !== undefined && width === 4) view.setUint32(offset, text, true)
+                else if (text !== undefined && width === 4) view.setUint32(offset, word(n, offset, width) ? tagVmHandle(text as intrinsics.Handle) : text, true)
                 else if (object !== undefined && width === 4) view.setUint32(offset, staticWord(object), true)
                 else if (object !== undefined && width === 8) view.setBigUint64(offset, BigInt(object), true)
                 else fail(`store %${id} writes a value that is neither an allocation, a construction nor a constant string`)
@@ -1922,6 +2090,7 @@ function createImage() {
             if (typeOf(n) === Types.f64) view.setFloat64(offset, value, true)
             else if (!Number.isInteger(value) && typeOf(n) === Types.vm_value) view.setUint32(offset, staticBox(value), true)
             else if (!Number.isInteger(value)) fail(`store %${id} writes ${value}, which is not an integer`)
+            else if (word(n, offset, width)) view.setUint32(offset, Number(BigInt.asUintN(32, BigInt(value) * BigInt(2))), true)
             else for (let i = 0; i < width; i++) view.setUint8(offset + i, Number(BigInt.asUintN(8, BigInt(value) >> BigInt(i * 8))))
         }
         for (const [id, bytes] of buffers) staticWrite(addresses.get(id)!, bytes)
@@ -1929,6 +2098,7 @@ function createImage() {
             const allocated = allocation(id)
             return allocated ? addresses.get(allocated) : undefined
         }, fail)
+        for (const [id, bytes] of buffers) staticRegions.push([addresses.get(id)!, bytes.length])
         if (readonly(cell)) readonlyRegions.push([at, propertyEval.recordLayout(heap.deref(cell as intrinsics.Handle), undefined, recordBits).size])
         placingConstructions.delete(cell)
         placedConstructions.set(cell, at)
@@ -1954,7 +2124,11 @@ function createImage() {
             const offset = fields.offsets[i]
             const flag = fields.flags[i]
             const tag = fields.tags[i]
-            if (heap.isBoxedF64(slot)) {
+            const held = staticBoxes.get(slot)
+            if (held !== undefined) {
+                staticFields.push([at + offset, held])
+                if (tag) setBit(tag)
+            } else if (heap.isBoxedF64(slot)) {
                 const raw = heap.unboxF64(slot)
                 const id = intrinsics.getNanId(raw)
                 if (flag && !id && (raw === 0 || raw === 1)) {
@@ -1972,10 +2146,11 @@ function createImage() {
             } else fail(`field ${heap.stringToJs(keys[i])} holds an unsupported value`)
         }
         staticWrite(at, bytes)
+        staticRegions.push([at, bytes.length])
         return at
     }
     return {
-        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticRegions, readonlyRegions, staticTable, recordBits,
+        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, staticFields, staticRegions, readonlyRegions, staticTable, recordBits,
         valueSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot,
         knownValue: (slot: number) => final.get(slot),
     }
@@ -2125,6 +2300,21 @@ function valuesFrom(graph: Graph, root: number, conditional: boolean): Set<numbe
     return found
 }
 
+function valueUsers(graph: Graph, values: Iterable<number>): Map<number, number[]> {
+    const users = new Map<number, number[]>()
+    for (const id of values) {
+        const n = getNode(graph, id)!
+        for (let i = 0; i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!ref) continue
+            let list = users.get(ref)
+            if (!list) users.set(ref, list = [])
+            list.push(id)
+        }
+    }
+    return users
+}
+
 function expandParams(program: ProgramGraph, touched: Set<number>): void {
     const sites = programCallSites(program)
     const hoisted: string[] = []
@@ -2139,14 +2329,7 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         const graph = program.units.get(callee)!
         const entry = graph.blocks[0]
         const demanded = valuesFrom(graph, graph.blocks[0].bodyId, false)
-        const users = new Map<number, number[]>()
-        for (const id of valuesFrom(graph, graph.blocks[0].bodyId, true)) {
-            const n = getNode(graph, id)!
-            for (let i = 0; i < countIds(n); i++) {
-                const ref = getRef(n, i)
-                if (ref) users.set(ref, [...users.get(ref) ?? [], id])
-            }
-        }
+        const users = valueUsers(graph, valuesFrom(graph, graph.blocks[0].bodyId, true))
         function entryToken(id: number): boolean {
             const n = getNode(graph, id)
             return n?.op === NodeOp.nilEffect && (countLiterals(n) === 0 || getRef(n, 0) === entry.id)
@@ -2283,11 +2466,6 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
         const graph = program.units.get(callee)!
         const entry = graph.blocks[0]
         const values = valuesFrom(graph, entry.bodyId, true)
-        const users = new Map<number, number[]>()
-        for (const id of values) {
-            const n = getNode(graph, id)!
-            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) users.set(getRef(n, i), [...users.get(getRef(n, i)) ?? [], id])
-        }
         const table = new Map<string, number>()
         let candidates = [...values].filter(id => {
             const n = getNode(graph, id)!
@@ -2295,6 +2473,7 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
         })
         const twinsAt: Map<number, number>[] = []
         for (const [symbol, call] of calls) {
+            if (!candidates.length) break
             const caller = program.units.get(symbol)!
             const site = getNode(caller, call)!
             const block = blocksOf(symbol).find(b => b.all.has(call))!
@@ -2317,6 +2496,8 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
             })
             twinsAt.push(found)
         }
+        if (!candidates.length) continue
+        const users = valueUsers(graph, values)
         function saving(v: number): { dead: Set<number>, cost: number } {
             const dead = new Set<number>([v])
             const stack = [v]
@@ -2584,9 +2765,11 @@ function inlineAllocations(program: ProgramGraph, units: Map<number, ProgramUnit
     }
     if (graph) unit.graph = repackage(graph, spliced, clock, program.target)
 }
-function inlines(program: ProgramGraph, callSites: Map<number, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
-    if (isJumbo(callee.graph)) return false
-    if (reachable(callee.graph).some(n => n.op === NodeOp.alloca || n.op === NodeOp.frameAddress)) return false
+function canInline(graph: Graph): boolean {
+    return !isJumbo(graph) && !reachable(graph).some(n => n.op === NodeOp.alloca || n.op === NodeOp.frameAddress)
+}
+
+function worthInlining(program: ProgramGraph, callSites: Map<number, number>, caller: Graph, source: Graph, id: number, callee: ProgramUnit, heat = 0): boolean {
     if (program.alwaysInline.has(callee.symbol)) return true
     if (program.constructors.has(callee.symbol)) return true
     const roots = program.roots
@@ -2775,24 +2958,26 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
     const units = programUnits(program)
     const callSites = countCallSites(program)
     const levels = programLevels(program)
-    const inlined = new Map<number, boolean>()
+    const inlineable = new Map<number, boolean>()
     function visit(unit: ProgramUnit): void {
-        if (inlined.has(unit.symbol)) return
-        inlined.set(unit.symbol, false)
-        const graph = snapshotGraph(unit.graph)
-        const depths = siteDepths(graph)
+        if (inlineable.has(unit.symbol)) return
+        inlineable.set(unit.symbol, false)
+        let graph: Graph | undefined
+        let depths: Map<number, number> | undefined
         const spliced = new Map<number, number[]>()
-        for (const [id, n] of [...graph.nodes]) {
-            const symbol = calledSymbol(graph, n)
+        for (const [id, n] of unit.graph.nodes) {
+            const symbol = calledSymbol(unit.graph, n)
             if (symbol === undefined) continue
             const callee = units.get(symbol)
             if (!callee || callee === unit || program.noInline.has(symbol)) continue
             visit(callee)
-            if (!inlined.get(symbol)) continue
-            if (!inlines(program, callSites, unit.graph, graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            if (!inlineable.get(symbol)) continue
+            depths ??= siteDepths(unit.graph)
+            if (!worthInlining(program, callSites, unit.graph, graph ?? unit.graph, id, callee, (levels.get(unit.symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            graph ??= snapshotGraph(unit.graph)
             spliced.set(id, splice(graph, id, callee.graph))
         }
-        if (spliced.size) {
+        if (graph) {
             try {
                 unit.graph = repackage(graph, spliced, clock, program.target)
             } catch (e) {
@@ -2804,7 +2989,7 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
             }
         }
         inlineAllocations(program, units, unit, clock)
-        inlined.set(unit.symbol, true)
+        inlineable.set(unit.symbol, canInline(unit.graph))
     }
     for (const unit of units.values()) visit(unit)
     for (const unit of units.values()) program.units.set(unit.symbol, unit.graph)
@@ -2815,7 +3000,7 @@ function inlineSpecialized(program: ProgramGraph, touched: Set<number>, clock: P
         const graph = program.units.get(symbol)
         if (!graph || program.noInline.has(symbol)) return false
         const cost = inlineCost(graph)
-        return cost !== undefined && cost <= 8 + graph.blocks[0].params.length
+        return cost !== undefined && cost <= 8 + graph.blocks[0].params.length && canInline(graph)
     })
     if (!candidates.length) return
     const units = programUnits(program)
@@ -2833,15 +3018,16 @@ function inlineSpecialized(program: ProgramGraph, touched: Set<number>, clock: P
     }
     for (const [symbol, calls] of byCaller) {
         const unit = units.get(symbol)!
-        const graph = snapshotGraph(unit.graph)
-        const depths = siteDepths(graph)
+        const depths = siteDepths(unit.graph)
+        let graph: Graph | undefined
         const spliced = new Map<number, number[]>()
         for (const id of calls) {
-            const callee = units.get(calledSymbol(graph, getNode(graph, id)!)!)!
-            if (!inlines(program, callSites, unit.graph, graph, id, callee, (levels.get(symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            const callee = units.get(calledSymbol(unit.graph, getNode(unit.graph, id)!)!)!
+            if (!worthInlining(program, callSites, unit.graph, graph ?? unit.graph, id, callee, (levels.get(symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            graph ??= snapshotGraph(unit.graph)
             spliced.set(id, splice(graph, id, callee.graph))
         }
-        if (spliced.size) program.units.set(symbol, repackage(graph, spliced, clock, program.target))
+        if (graph) program.units.set(symbol, repackage(graph, spliced, clock, program.target))
     }
 }
 
@@ -3345,8 +3531,8 @@ function recordReturns(program: ProgramGraph, reached: Set<number>, clock: Phase
             const callee = units.get(symbol)!
             if (callee === unit || program.noInline.has(callee.symbol)) continue
             finish(callee)
-            if (!finished.has(callee.symbol)) continue
-            if (!inlines(program, callSites, unit.graph, graph, id, callee)) continue
+            if (!finished.has(callee.symbol) || !canInline(callee.graph)) continue
+            if (!worthInlining(program, callSites, unit.graph, graph, id, callee)) continue
             splice(graph, id, callee.graph)
         }
         unit.graph = renormalize(graph, clock)
@@ -3646,6 +3832,7 @@ export type Codec =
 interface StaticPlacement {
     placed: Set<number>
     readonly: Set<intrinsics.Handle>
+    boxed: Map<intrinsics.Handle, Set<string>>
 }
 
 interface ShapePlan {
@@ -3790,8 +3977,8 @@ function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined): Slic
     }
     return tags
 }
-function unionOfShape(rep: Rep): boolean {
-    return rep.kind === 'union' && rep.targets.length > 0 && rep.targets.every(target => target.startsWith('S'))
+function unionWord(rep: Rep): boolean {
+    return rep.kind === 'union' && rep.targets.length > 0 && rep.targets.every(target => target.startsWith('S') || target === 'str')
 }
 
 export type Facts = Map<intrinsics.Handle, Map<string, Codec>>
@@ -4042,6 +4229,20 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         }
     }
     const staticFns: Function[] = []
+    function linkStatic(handle: number, fn: Function): number {
+        const known = image.statics.get(handle)
+        if (known !== undefined) return known
+        intrinsics.assert(!roots.has(staticInitName), `native: static ${fn.name || 'anonymous'} was found after ${staticInitName} was built`)
+        image.statics.set(handle, staticFns.length)
+        staticFns.push(fn)
+        image.staticSymbols.push(link(fn))
+        return staticFns.length - 1
+    }
+    function linkHeldStatics(entered: Set<Function>): void {
+        for (const [box, rebuild] of session.statics) {
+            if (entered.has(rebuild)) image.staticBoxes.set(box, linkStatic(heap.deref(session.linkFunction(rebuild) as intrinsics.Handle), rebuild))
+        }
+    }
     function linkStatics(owner: Function, graph: Graph): void {
         const refs: number[] = []
         unitOf(owner).staticRefs = refs
@@ -4055,14 +4256,10 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
                 refs.push(known)
                 continue
             }
-            refs.push(staticFns.length)
-            intrinsics.assert(!roots.has(staticInitName), `native: static %${id} in ${owner.name || 'anonymous'} was found after ${staticInitName} was built`)
             const linked = calleeOf(graph, target)
             const fn = linked && isLocalStub(linked) ? functions[(linked as any).__localTarget] : linked
             if (!fn) throw `native: static %${id} in ${graph.name ?? 'anonymous graph'} calls a function that cannot be compiled`
-            image.statics.set(handle, staticFns.length)
-            staticFns.push(fn)
-            image.staticSymbols.push(link(fn))
+            refs.push(linkStatic(handle, fn))
         }
     }
     function staticOrder(): number[] {
@@ -4146,7 +4343,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (n.op !== NodeOp.heapHandle) continue
             const handle = heap.deref(getLiteral(graph, n, 0) as intrinsics.Handle)
             if (session.constructions.has(getLiteral(graph, n, 0) as u32)) {
-                dataHandleSlots.set(handle, image.constructionSlot(getLiteral(graph, n, 0), cell => session.constructions.get(cell as u32)?.graph, cell => statics.readonly.has(heap.deref(cell as intrinsics.Handle))))
+                dataHandleSlots.set(handle, image.constructionSlot(getLiteral(graph, n, 0), cell => session.constructions.get(cell as u32)?.graph, cell => statics.readonly.has(heap.deref(cell as intrinsics.Handle)), cell => statics.boxed.get(heap.deref(cell as intrinsics.Handle))))
                 continue
             }
             if (statics.placed.has(handle)) {
@@ -4193,7 +4390,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
     intrinsics.assert(roots.size > 0)
     for (const fn of Object.values(fns)) discover(fn)
     for (const fn of Object.values(fns)) schedule(fn)
-    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
+    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, linkHeldStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
 }
 
 type Linker = ReturnType<typeof createLinker>
@@ -6118,7 +6315,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         return out
     }
     function unionParams(fn: Function): number[] {
-        return plannedParams(fn).filter(({ rep }) => unionOfShape(rep)).map(({ index }) => index)
+        return plannedParams(fn).filter(({ rep }) => unionWord(rep)).map(({ index }) => index)
     }
     function constantParams(fn: Function): Map<number, ParamConstant> {
         const out = new Map<number, ParamConstant>()
@@ -6178,10 +6375,10 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             paramCount: site.context !== undefined && !receiver ? site.args.length : paramCount, receiver,
             receiverShape: receiver ? shapes.get(paramCount) : undefined,
             argShapes: Array.from({ length: paramCount }, (_, i) => shapes.get(i)),
-            result, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionOfShape(returned) || undefined,
+            result, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionWord(returned) || undefined,
             stringWord: (isStringRep(returned) && boxedResult) || undefined,
             boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && boxedResult) || undefined,
-            decode: (result !== undefined && !string && !numeric && !propertyEval.reducedShape(result) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionOfShape(returned))) || boxedFloat ? pstack0Base() : undefined,
+            decode: (result !== undefined && !string && !numeric && !propertyEval.reducedShape(result) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned))) || boxedFloat ? pstack0Base() : undefined,
             target,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
         }
@@ -6205,7 +6402,15 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (typeof x !== 'number' || !x) return false
             if (rawCalls.has(tailOf(graph, x))) return false
             const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))
-            return !!rep && unionOfShape(rep)
+            return !!rep && unionWord(rep)
+        }
+        function stringTarget(x: number): boolean {
+            const rep = x ? nodes.get(x) ?? nodes.get(tailOf(graph, x)) : undefined
+            return !!rep && union(x) && rep.targets.includes('str')
+        }
+        function typeofKinds(x: number): number {
+            const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))!
+            return rep.targets.some(target => target !== 'str') ? typeofStrings | typeofObjects : typeofStrings
         }
         function word(x: Operand): boolean {
             if (typeof x !== 'number' || !x) return false
@@ -6243,11 +6448,12 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             return object(x) ? encode(x as number) : x
         }
         function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
-            if (rep && unionOfShape(rep)) return toWord(x)
+            if (rep && unionWord(rep)) return toWord(x)
             if (shaped && (encodedWord(x) || (pointerOfShapes(rep) && word(x)))) return decode(x as number)
             if (!union(x)) return x
             if (numberName(rep) === 'f64') return addNode(graph, NodeOp.convert, [unbox(x as number)], Types.f64)
             if (rep?.kind === 'number') return unbox(x as number)
+            if (isStringRep(rep)) return vmHandleNode(graph, x as number)
             if (shaped) return decode(x as number)
             throw `native: ${graph.name} passes union word %${x} into ${into} (${rep?.text ?? 'no rep'})`
         }
@@ -6278,7 +6484,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (!own.has(id)) return
             const value = getRef(n, 0)
             if (abi.mode === 'raw' && word(value)) coerce(id, [0], () => decode(value))
-            else if (abi.mode === 'keep' && !!local && unionOfShape(local.unit.returns) && rawCalls.has(tailOf(graph, value))) coerce(id, [0], () => encode(value))
+            else if (abi.mode === 'keep' && !!local && unionWord(local.unit.returns) && rawCalls.has(tailOf(graph, value))) coerce(id, [0], () => encode(value))
+            else if (abi.mode === 'keep' && !!local && unionWord(local.unit.returns)) coerce(id, [0], toWord)
             else if (abi.mode === 'encoded') coerce(id, [0], asWord)
         }
         for (const [id, n] of [...graph.nodes]) {
@@ -6289,6 +6496,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 const code = addNode(graph, NodeOp.load, [getRef(n, 0), ptr, 0], Types.fnptr)
                 coerce(id, [1], () => addNode(graph, NodeOp.indirectTarget, [code, ptr]))
             } else if (n.op === NodeOp.bitconvert) coerce(id, [0], asWord)
+            else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && stringTarget(getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(getRef(n, 2)) }])
             else if (n.op === NodeOp.rt) coerce(id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), asWord)
             else if (n.op === NodeOp.eq || n.op === NodeOp.ne) coerce(id, [0, 1].filter(at => word(getRef(n, 1 - at))), asWord)
         }
@@ -6953,23 +7161,23 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const edges = new Map<number, CallEdge>()
         for (const [call, arrivals] of params) {
             const callee = planned.functions.get(resolved.callees.get(call)!)!
-            edges.set(call, { raw: abiOf(callee).mode === 'raw', params: new Map([...arrivals].map(([index, { rep, shaped }]) => [index, { word: unionOfShape(rep), pointer: shaped && pointerOfShapes(rep) }])) })
+            edges.set(call, { raw: abiOf(callee).mode === 'raw', params: new Map([...arrivals].map(([index, { rep, shaped }]) => [index, { word: unionWord(rep), pointer: shaped && pointerOfShapes(rep) }])) })
         }
         return edges
     }
     function unionWords(resolved: Resolution, edges: Map<number, CallEdge>): Set<number> {
         const words = new Set<number>()
-        for (const [id, rep] of resolved.local?.nodes ?? []) if (unionOfShape(rep) && !edges.get(id)?.raw) words.add(id)
+        for (const [id, rep] of resolved.local?.nodes ?? []) if (unionWord(rep) && !edges.get(id)?.raw) words.add(id)
         return words
     }
-    function stringRep(resolved: Resolution): (x: number) => string {
+    function stringRep(resolved: Resolution): (x: number, word: boolean) => string {
         const graph = resolved.graph
         const params = graph.blocks[0].params
-        return x => {
+        return (x, word) => {
             const value = tailOf(graph, x)
             const index = params.indexOf(value)
             const rep = resolved.local?.nodes.get(x) ?? resolved.local?.nodes.get(value) ?? (index >= 0 ? resolved.local?.unit.params[index]?.rep : undefined)
-            if (!rep) return ''
+            if (!rep || (word && unionWord(rep))) return ''
             return rep.kind === 'any' || rep.targets.includes('str') ? `%${value} is ${rep.text}` : ''
         }
     }
@@ -6977,7 +7185,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const mode = abiOf(fn).mode
         if (mode === 'raw') return 'raw'
         if (mode === 'encoded') return 'word'
-        if (mode === 'keep' && !!resolved.local && unionOfShape(resolved.local.unit.returns)) return 'word'
+        if (mode === 'keep' && !!resolved.local && unionWord(resolved.local.unit.returns)) return 'word'
         return undefined
     }
     function verifyResolved(fn: Function, resolved: Resolution, edges: Map<number, CallEdge>, stage: string, realized: boolean): void {
@@ -6990,6 +7198,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         verifyNumericUses(resolved.graph, stage, unions, UnboxingOps, resolved.local?.unit.returns.kind === 'number' ? ownRets(resolved.graph) : [])
         verifyReturns(resolved.graph, stage, words, edges, ownRets(resolved.graph), returnedForm(fn, resolved))
         verifyStringOperands(resolved.graph, stage, stringRep(resolved))
+        verifyStringCompares(resolved.graph, stage, unions, x => isStringRep(resolved.local?.nodes.get(x)))
     }
     function realizeUnit(fn: Function): Graph {
         return clock.timed('resolve', () => {
@@ -7060,7 +7269,18 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
         if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
         if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
     }
-    const { inst, plan } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => host.graphOf(fn))
+    const { inst, plan, boxed } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => host.graphOf(fn))
+    const boxedConstructions = new Map<intrinsics.Handle, Set<string>>()
+    for (const object of types.objects) {
+        if (object.state === undefined || !constructed.has(object.state)) continue
+        for (const id of object.fields.get('data')?.objects ?? []) {
+            const keys = boxed.get(id)
+            if (!keys) continue
+            const known = boxedConstructions.get(object.state)
+            if (known) for (const key of keys) known.add(key)
+            else boxedConstructions.set(object.state, new Set(keys))
+        }
+    }
     const handles = new Map<string, intrinsics.Handle>()
     const fixedFields = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     for (const [id, sig] of inst.shapes) {
@@ -7200,7 +7420,7 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
     if (flags.has('plan')) for (const [unit, byNode] of embeddings.sites) console.log('EMBED-SITE', unit.fn.name, [...byNode].map(([n, k]) => `%${n}.${k}`).join(' '))
     const sites = new Map<PlannedUnit, Map<number, intrinsics.Handle>>()
     for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, k]) => [node, types.keyHandles.get(k)!])))
-    return { units: plan, inst, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites }, bits, layoutOf, reducedTarget, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions } }
+    return { units: plan, inst, shapes: handles, fixedFields, constants, strings: types.strings, embedded: { fields: embedded, sites }, bits, layoutOf, reducedTarget, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, boxed: boxedConstructions } }
 }
 
 interface ParamConstant {
@@ -7493,6 +7713,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const { host, genericOf } = createAccessHost(linker, tracer)
     clock.timed('trace', () => tracer.traceProgramUnits())
     const valueTypes = clock.timed('analysis', () => analyzeTypes(rootFns, host))
+    linker.linkHeldStatics(new Set(valueTypes.frames.filter(frame => frame.context === 'static|').map(frame => frame.unit)))
     printAnalysis(valueTypes, genericOf)
     const { plan, planned, reps } = clock.timed('plan', () => {
         const plan = planShapes(valueTypes, linker, tracer, host, genericOf, facts)
@@ -7531,6 +7752,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const { timed } = clock
     const program = traceProgram(fns, opts, clock, target)
     timed('statics', () => evaluateStatics(program))
+    timed('statics', () => foldConstantCalls(program, clock))
     const tracedUnits = program.units.size
     prune(program)
     timed('inline', () => mergeBeforeInlining(program))
