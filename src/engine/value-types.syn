@@ -137,6 +137,7 @@ export interface AccessHost {
     paramCount?(fn: Function): number | undefined
     heapValue?(slot: Handle): Handle
     receiverless?(fn: Function): boolean
+    isConstructor?(fn: Function): boolean
 }
 
 export interface Invariants {
@@ -2302,6 +2303,7 @@ export interface ObjectType {
     fields: Map<string, Type>
     forms: Map<string, string[]>
     initialized: Set<string>
+    constructed: Set<string>
     stored: Set<string>
     escaped: boolean
     readers: Site[]
@@ -2478,7 +2480,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
     if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) })
-    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, proto: allocation.proto, state: allocation.state, handle: allocation.handle, fields: new Map(), forms: new Map(), initialized: new Set<string>(), stored: new Set<string>(), escaped: allocation.escaped, readers: [] }))
+    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, proto: allocation.proto, state: allocation.state, handle: allocation.handle, fields: new Map(), forms: new Map(), initialized: new Set<string>(), constructed: new Set<string>(), stored: new Set<string>(), escaped: allocation.escaped, readers: [] }))
     const interned = new Map<string, Type>()
     function typeOf(list: Iterable<number>): Type {
         let k = ''
@@ -2516,6 +2518,16 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         return type
     }
     const written = (location: Location) => location.values.length > 0 || location.writers.length > 0
+    function constructorStore(object: ObjectType, site: Site): boolean {
+        const ctor = object.proto ? heap.getOwnProperty(object.proto, heap.fromJsString('constructor')) : 0
+        const fn = ctor ? host.functionOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(ctor)).slot0 as u32) : undefined
+        if (fn !== site.unit || !host.isConstructor?.(fn)) return false
+        const g = host.graphOf(fn)
+        const n = getNode(g, site.node)
+        if (n?.op !== NodeOp.setProp || !receiverValue(g, getRef(n, 1))) return false
+        const block = blockOf(g, site.node)
+        return !!block && !repeats(g, block, site.node)
+    }
     const initialWrites = new Map<ObjectType, [string, number]>()
     const indexed = new Set(data.locations.filter(location => (location.key === numberKey || constantIndex(location.key)) && written(location)).map(location => location.allocation))
     for (const location of data.locations) {
@@ -2527,6 +2539,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         object.readers.push(...location.readers)
         const writers = new Set(location.writers.map(w => `${unitIdentity(w.unit)}:${w.node}`))
         if (writers.size === 1 && location.writers[0].unit === object.site.unit && !location.forms.includes('init')) initialWrites.set(object, [location.key, location.writers[0].node])
+        if (writers.size === 1 && constructorStore(object, location.writers[0])) object.constructed.add(location.key)
     }
     const contained = new Set(objects.flatMap(object => [...object.fields.values()].flatMap(type => type.objects)))
     for (const [object, [key, node]] of initialWrites) {
@@ -3950,11 +3963,12 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     function owner(inner: number): [number, string] | undefined {
         const object = types.objects[inner]
         if (object.constant || object.native || object.name === 'buffer' || returned.has(inner)) return
-        const held = holders.get(inner) ?? []
+        const holding = holders.get(inner) ?? []
+        const held = holding.filter(([id]) => object.context.startsWith(`o${id}|`))
         if (held.length !== 1) return
         const [parent, key] = held[0]
         const outer = types.objects[parent]
-        if (outer.constant || outer.native || !object.context.startsWith(`o${parent}|`)) return
+        if (outer.constant || outer.native || (holding.length > 1 && !outer.constructed.has(key))) return
         const type = outer.fields.get(key)!
         if (!onlyObjects(type) || !type.objects.every(id => sameSite(id, inner))) return
         return [parent, key]
@@ -4720,6 +4734,63 @@ function paramSlots(g: Graph): Map<number, [Block, number]> {
 
 function predsOf(g: Graph, block: Block): number[] {
     return (usersOf(g).get(block.id) ?? []).filter(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply).map(([u]) => u)
+}
+
+function successorsOf(g: Graph, block: Block): Block[] {
+    const out: Block[] = []
+    for (const id of bodyNodes(g, block.bodyId)) {
+        const n = getNode(g, id)
+        if (n?.op !== NodeOp.apply) continue
+        const target = getBlock(g, getRef(n, 0))
+        if (target) out.push(target)
+    }
+    return out
+}
+
+function reaches(g: Graph, from: Block, to: Block): boolean {
+    const seen = new Set<number>()
+    const work = [from]
+    while (work.length) {
+        const next = work.pop()!
+        if (next.id === to.id) return true
+        if (seen.has(next.id)) continue
+        seen.add(next.id)
+        work.push(...successorsOf(g, next))
+    }
+    return false
+}
+
+function repeats(g: Graph, block: Block, id: number): boolean {
+    const arms = armsOf(g)
+    const guards = arms.get(id) ?? []
+    for (const member of bodyNodes(g, block.bodyId)) {
+        const n = getNode(g, member)
+        if (n?.op !== NodeOp.apply) continue
+        const other = arms.get(member) ?? []
+        if (other.some(([cond, positive]) => guards.some(([c, p]) => c === cond && p !== positive))) continue
+        const target = getBlock(g, getRef(n, 0))
+        if (target && reaches(g, target, block)) return true
+    }
+    return false
+}
+
+function receiverValue(g: Graph, id: number): boolean {
+    const slots = paramSlots(g)
+    const seen = new Set<number>()
+    const work = [id]
+    while (work.length) {
+        const value = valueTail(g, work.pop()!)
+        if (seen.has(value)) continue
+        seen.add(value)
+        const n = getNode(g, value)
+        const slot = slots.get(value)
+        if (n?.op !== NodeOp.param || !slot) return false
+        const [block, index] = slot
+        const preds = predsOf(g, block)
+        if (block === g.blocks[0] && (!isThisParam(n) || preds.length)) return false
+        for (const pred of preds) work.push(getRef(getNode(g, pred)!, index + 1))
+    }
+    return true
 }
 
 const backEdgeSets = new WeakMap<Graph, Set<number>>()

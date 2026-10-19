@@ -1,0 +1,352 @@
+"use wrapped";
+
+type Range = [number, number]
+
+type Assertion = 'start' | 'end' | 'word' | 'nonword'
+
+type Ast =
+    | { kind: 'empty' }
+    | { kind: 'class', ranges: Range[], negate: boolean }
+    | { kind: 'assert', assertion: Assertion }
+    | { kind: 'sequence' | 'choice', children: Ast[] }
+    | { kind: 'repeat', child: Ast, min: number, max: number, lazy: boolean }
+
+type Instruction =
+    | { op: 'match' }
+    | { op: 'class', ranges: Range[], negate: boolean, next: number }
+    | { op: 'assert', assertion: Assertion, next: number }
+    | { op: 'split', first: number, second: number }
+
+interface Flags {
+    ignoreCase: boolean
+    multiline: boolean
+    dotAll: boolean
+}
+
+interface Program {
+    flags: Flags
+    instructions: Instruction[]
+    entry: number
+}
+
+const digits: Range[] = [[48, 57]]
+const words: Range[] = [[48, 57], [65, 90], [95, 95], [97, 122]]
+const spaces: Range[] = [[9, 13], [32, 32]]
+
+function parseFlags(text: string): Flags {
+    const seen = new Set<string>()
+    for (const c of text) {
+        if (seen.has(c)) throw new SyntaxError(`regex: duplicate flag ${c}`)
+        if (!'ims'.includes(c)) throw new SyntaxError(`regex: unsupported flag ${c}`)
+        seen.add(c)
+    }
+    return { ignoreCase: seen.has('i'), multiline: seen.has('m'), dotAll: seen.has('s') }
+}
+
+function contains(ranges: Range[], c: number, ignoreCase: boolean): boolean {
+    for (const [lo, hi] of ranges) {
+        if (c >= lo && c <= hi) return true
+    }
+    if (!ignoreCase) return false
+    if (c >= 65 && c <= 90) return contains(ranges, c + 32, false)
+    if (c >= 97 && c <= 122) return contains(ranges, c - 32, false)
+    return false
+}
+
+function singleCode(ast: Ast): number | undefined {
+    if (ast.kind !== 'class' || ast.negate || ast.ranges.length !== 1) return
+    const [lo, hi] = ast.ranges[0]
+    if (lo === hi) return lo
+}
+
+function isHex(text: string): boolean {
+    for (const c of text) {
+        if (!'0123456789abcdefABCDEF'.includes(c)) return false
+    }
+    return true
+}
+
+function controlEscape(c: string): number | undefined {
+    if (c === 'n') return 10
+    if (c === 'r') return 13
+    if (c === 't') return 9
+    if (c === 'v') return 11
+    if (c === 'f') return 12
+    if (c === 'b') return 8
+    if (c === '0') return 0
+}
+
+function parse(source: string, flags: Flags): Ast {
+    let at = 0
+    let depth = 0
+    function fail(message: string): never {
+        throw new SyntaxError(`regex at ${at}: ${message}`)
+    }
+    function cls(ranges: Range[], negate = false): Ast {
+        return { kind: 'class', ranges, negate }
+    }
+    function code(c: string): number {
+        if (!c.length || c.charCodeAt(0) > 127) return fail('only ASCII patterns are supported')
+        return c.charCodeAt(0)
+    }
+    function escape(inClass: boolean): Ast {
+        if (at === source.length) return fail('trailing escape')
+        const c = source[at]
+        at++
+        if (c === 'd' || c === 'D') return cls(digits, c === 'D')
+        if (c === 'w' || c === 'W') return cls(words, c === 'W')
+        if (c === 's' || c === 'S') return cls(spaces, c === 'S')
+        if (!inClass && c === 'b') return { kind: 'assert', assertion: 'word' }
+        if (!inClass && c === 'B') return { kind: 'assert', assertion: 'nonword' }
+        if (c === 'x' || c === 'u') {
+            const width = c === 'x' ? 2 : 4
+            const text = source.slice(at, at + width)
+            if (text.length !== width || !isHex(text)) return fail('invalid hex escape')
+            at += width
+            const value = parseInt(text, 16)
+            if (value > 127) return fail('only ASCII escapes are supported')
+            return cls([[value, value]])
+        }
+        if ((c >= '1' && c <= '9') || c === 'k' || c === 'p' || c === 'P' || c === 'c') return fail('unsupported escape')
+        if (c === '0' && source[at] >= '0' && source[at] <= '9') return fail('octal escapes are unsupported')
+        const value = controlEscape(c) ?? code(c)
+        return cls([[value, value]])
+    }
+    function classAtom(): Ast {
+        const c = source[at]
+        at++
+        if (c === '\\') return escape(true)
+        return cls([[code(c), code(c)]])
+    }
+    function characterClass(): Ast {
+        const negate = source[at] === '^'
+        if (negate) at++
+        const ranges: Range[] = []
+        while (at < source.length && source[at] !== ']') {
+            const left = classAtom() as Extract<Ast, { kind: 'class' }>
+            if (source[at] === '-' && at + 1 < source.length && source[at + 1] !== ']') {
+                at++
+                const lo = singleCode(left)
+                const hi = singleCode(classAtom())
+                if (lo === undefined || hi === undefined) return fail('invalid range endpoint')
+                if (lo > hi) return fail('reversed range')
+                ranges.push([lo, hi])
+                continue
+            }
+            if (!left.negate) {
+                ranges.push(...left.ranges)
+                continue
+            }
+            for (let c = 0; c < 128; c++) {
+                if (!contains(left.ranges, c, false)) ranges.push([c, c])
+            }
+        }
+        if (source[at] !== ']') return fail('unterminated character class')
+        at++
+        return cls(ranges, negate)
+    }
+    function group(): Ast {
+        depth++
+        if (depth > 128) return fail('group nesting limit exceeded')
+        if (source[at] === '?') {
+            if (source.slice(at, at + 2) !== '?:') return fail('lookaround and named groups are unsupported')
+            at += 2
+        }
+        const child = choice()
+        if (source[at] !== ')') return fail('unterminated group')
+        at++
+        depth--
+        return child
+    }
+    function atom(): Ast {
+        const c = source[at]
+        at++
+        if (c === '(') return group()
+        if (c === '[') return characterClass()
+        if (c === '\\') return escape(false)
+        if (c === '.') return cls(flags.dotAll ? [] : [[10, 10], [13, 13]], true)
+        if (c === '^') return { kind: 'assert', assertion: 'start' }
+        if (c === '$') return { kind: 'assert', assertion: 'end' }
+        if ('*+?{}'.includes(c)) return fail('unexpected quantifier')
+        return cls([[code(c), code(c)]])
+    }
+    function integer(): number {
+        const start = at
+        while (source[at] >= '0' && source[at] <= '9') at++
+        if (start === at) return fail('expected repetition count')
+        const n = Number(source.slice(start, at))
+        if (n > 1000) return fail('repetition count limit exceeded')
+        return n
+    }
+    function quantified(child: Ast): Ast {
+        const c = source[at]
+        if (c !== '*' && c !== '+' && c !== '?' && c !== '{') return child
+        if (child.kind === 'assert') return fail('quantified assertion')
+        at++
+        let min = c === '+' ? 1 : 0
+        let max = c === '?' ? 1 : Infinity
+        if (c === '{') {
+            min = integer()
+            max = min
+            if (source[at] === ',') {
+                at++
+                max = source[at] === '}' ? Infinity : integer()
+            }
+            if (source[at] !== '}' || max < min) return fail('invalid repetition bounds')
+            at++
+        }
+        const lazy = source[at] === '?'
+        if (lazy) at++
+        return { kind: 'repeat', child, min, max, lazy }
+    }
+    function sequence(): Ast {
+        const children: Ast[] = []
+        while (at < source.length && source[at] !== ')' && source[at] !== '|') children.push(quantified(atom()))
+        if (children.length === 0) return { kind: 'empty' }
+        if (children.length === 1) return children[0]
+        return { kind: 'sequence', children }
+    }
+    function choice(): Ast {
+        const children = [sequence()]
+        while (source[at] === '|') {
+            at++
+            children.push(sequence())
+        }
+        if (children.length === 1) return children[0]
+        return { kind: 'choice', children }
+    }
+    const result = choice()
+    if (at !== source.length) return fail('unmatched closing group')
+    return result
+}
+
+function compile(source: string, flagText: string): Program {
+    const flags = parseFlags(flagText)
+    const instructions: Instruction[] = [{ op: 'match' }]
+    function emit(instruction: Instruction): number {
+        if (instructions.length >= 4096) throw new SyntaxError('regex: bytecode size limit exceeded')
+        instructions.push(instruction)
+        return instructions.length - 1
+    }
+    function split(first: number, second: number, lazy: boolean): number {
+        if (lazy) return emit({ op: 'split', first: second, second: first })
+        return emit({ op: 'split', first, second })
+    }
+    function caseFolded(ranges: Range[]): Range[] {
+        const folded: Range[] = []
+        for (let c = 0; c < 128; c++) {
+            if (!contains(ranges, c, flags.ignoreCase)) continue
+            const last = folded[folded.length - 1]
+            if (last && last[1] === c - 1) last[1] = c
+            else folded.push([c, c])
+        }
+        return folded
+    }
+    function build(ast: Ast, next: number): number {
+        if (ast.kind === 'empty') return next
+        if (ast.kind === 'class') return emit({ op: 'class', ranges: caseFolded(ast.ranges), negate: ast.negate, next })
+        if (ast.kind === 'assert') return emit({ op: 'assert', assertion: ast.assertion, next })
+        if (ast.kind === 'sequence') {
+            for (let i = ast.children.length - 1; i >= 0; i--) next = build(ast.children[i], next)
+            return next
+        }
+        if (ast.kind === 'choice') {
+            let entry = build(ast.children[ast.children.length - 1], next)
+            for (let i = ast.children.length - 2; i >= 0; i--) entry = emit({ op: 'split', first: build(ast.children[i], next), second: entry })
+            return entry
+        }
+        if (ast.max === Infinity) {
+            const loop = emit({ op: 'split', first: next, second: next })
+            const body = build(ast.child, loop)
+            instructions[loop] = ast.lazy ? { op: 'split', first: next, second: body } : { op: 'split', first: body, second: next }
+            next = loop
+        } else {
+            for (let i = ast.min; i < ast.max; i++) next = split(build(ast.child, next), next, ast.lazy)
+        }
+        for (let i = 0; i < ast.min; i++) next = build(ast.child, next)
+        return next
+    }
+    const entry = build(parse(source, flags), 0)
+    return { flags, instructions, entry }
+}
+
+function wordTest(c: string): string {
+    return `(((${c}>=48)&(${c}<=57))|((${c}>=65)&(${c}<=90))|(${c}===95)|((${c}>=97)&(${c}<=122)))`
+}
+
+function assertionTest(flags: Flags, assertion: Assertion): string {
+    if (assertion === 'start') return flags.multiline ? '(p===0||before===10||before===13)' : 'p===0'
+    if (assertion === 'end') return flags.multiline ? '(p===length||c===10||c===13)' : 'p===length'
+    if (assertion === 'word') return `${wordTest('before')}!==${wordTest('c')}`
+    return `${wordTest('before')}===${wordTest('c')}`
+}
+
+function classTest(ranges: Range[], negate: boolean): string {
+    if (!ranges.length) return negate ? '1' : '0'
+    const tests: string[] = []
+    for (const [lo, hi] of ranges) tests.push(lo === hi ? `c===${lo}` : `(c>=${lo}&&c<=${hi})`)
+    const matches = `(${tests.join('||')})`
+    return negate ? `!${matches}` : matches
+}
+
+function emitSource(program: Program): string {
+    const seeds: number[] = []
+    for (const ins of program.instructions) {
+        if (ins.op === 'class' && !seeds.includes(ins.next)) seeds.push(ins.next)
+    }
+    const clauses = new Map<number, string[]>()
+    let expansions = 0
+    function closure(pc: number, condition: string, path: Set<number>): void {
+        if (path.has(pc)) return
+        expansions++
+        if (expansions > 32768) throw new SyntaxError('regex: epsilon expansion limit exceeded')
+        const nextPath = new Set(path)
+        nextPath.add(pc)
+        const ins = program.instructions[pc]
+        if (ins.op === 'split') {
+            closure(ins.first, condition, nextPath)
+            closure(ins.second, condition, nextPath)
+            return
+        }
+        if (ins.op === 'assert') {
+            closure(ins.next, `(${condition}&&(${assertionTest(program.flags, ins.assertion)}))`, nextPath)
+            return
+        }
+        const list = clauses.get(pc)
+        if (list) list.push(condition)
+        else clauses.set(pc, [condition])
+    }
+    closure(program.entry, '1', new Set())
+    for (const pc of seeds) closure(pc, `s${pc}`, new Set())
+    const lines = ['function regexTest(text) {', 'const length=text.length;']
+    for (const pc of seeds) lines.push(`let s${pc}=0;`)
+    lines.push('for(let p=0;p<=length;p++){')
+    lines.push('const c=p<length?text.charCodeAt(p):-1;')
+    lines.push('const before=p>0?text.charCodeAt(p-1):-1;')
+    for (const [pc, conditions] of clauses) {
+        if (program.instructions[pc].op === 'match') lines.push(`if(${conditions.join('||')})return true;`)
+    }
+    for (const pc of seeds) lines.push(`let n${pc}=0;`)
+    for (const [pc, conditions] of clauses) {
+        const ins = program.instructions[pc]
+        if (ins.op === 'class') lines.push(`if((${conditions.join('||')})&&p<length&&(${classTest(ins.ranges, ins.negate)}))n${ins.next}=1;`)
+    }
+    for (const pc of seeds) lines.push(`s${pc}=n${pc};`)
+    lines.push('}')
+    lines.push('return false;')
+    lines.push('}')
+    return lines.join('\n')
+}
+
+const matchers = new Map<string, (text: string) => boolean>()
+
+export function compileMatcher(source: string, flags: string): (text: string) => boolean {
+    const key = JSON.stringify([source, flags])
+    const known = matchers.get(key)
+    if (known) return known
+    const text = emitSource(compile(source, flags))
+    const fn = new Function(`return (${text})`)()
+    Object.defineProperty(fn, Symbol.for('toComputation'), { value: () => [text, []] })
+    matchers.set(key, fn)
+    return fn
+}

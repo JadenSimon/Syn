@@ -24,7 +24,7 @@ import {
     insertNode, newId,
     NodeOp,
     opName,
-    getNode, setNode, deleteNode, localSymbol,
+    getNode, setNode, hasNode, deleteNode, localSymbol,
     putNode, addNode, putCopy, addCopy,
     withOperand, retypeNode, isNullishValue,
     type NodeSpace,
@@ -604,7 +604,8 @@ function evaluateStatics(program: ProgramGraph): void {
         try {
             word = BigInt.asUintN(64, staticInt(evaluateUnit(ctx, image.staticSymbols[slot], []), 'the static result'))
         } catch (e) {
-            if (typeof e !== 'string' || !e.startsWith('static:')) throw e
+            const message = e instanceof Error ? e.message : String(e)
+            if (!message.startsWith('static:')) throw e
             if (flags.has('static-debug')) console.log(`static ${slot} stays in ${staticInitName}: ${e}`)
             return
         }
@@ -618,13 +619,20 @@ function evaluateStatics(program: ProgramGraph): void {
         if (flags.has('static-debug')) console.log(`static ${slot} evaluates to ${word}`)
         return word
     }
+    function literalOperand(n: GraphNode, i: number): number | undefined {
+        if (!getRef(n, i)) return getLiteral(initGraph, n, i)
+        const value = getNode(initGraph, getRef(n, i))
+        if (value?.op === NodeOp.literal) return getLiteral(initGraph, value, 0)
+    }
     let remaining = image.staticSymbols.length
     for (let slot = 0; slot < image.staticSymbols.length; slot++) {
         if (evaluateSlot(slot) === undefined) continue
         for (const [id, n] of initGraph.nodes) {
-            if (n.op !== NodeOp.store || getRef(n, 1) || getLiteral(initGraph, n, 1) !== image.staticTable.base || getRef(n, 2) || getLiteral(initGraph, n, 2) !== slot * 8) continue
-            const call = getNode(initGraph, getRef(n, 3))
-            const called = call?.op === NodeOp.call && getRef(n, 0) === getRef(n, 3)
+            if (n.op !== NodeOp.store || literalOperand(n, 1) !== image.staticTable.base || literalOperand(n, 2) !== slot * 8) continue
+            const stored = getNode(initGraph, getRef(n, 3))
+            const value = stored?.op === NodeOp.bitconvert ? getRef(stored, 0) : getRef(n, 3)
+            const call = getNode(initGraph, value)
+            const called = call?.op === NodeOp.call && getRef(n, 0) === value
             putNode(initGraph, id, NodeOp.after, [getOperand(initGraph, called ? call! : n, 0)])
             remaining--
         }
@@ -3592,6 +3600,14 @@ interface ShapePlan {
     fixedStatic: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean
     statics: StaticPlacement
 }
+type Iterated = intrinsics.Handle | 'entries'
+
+interface PairReads {
+    fields: intrinsics.Handle[]
+    getters: Set<PlannedUnit>[]
+    boxed: boolean[]
+}
+
 interface UnitPlan {
     unit: PlannedUnit
     nodes: Map<number, Rep>
@@ -4705,6 +4721,14 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             return known
         }
     }
+    function importRuntimeNode(graph: Graph, id: number): void {
+        if (hasNode(graph, id)) return
+        const n = getNode(session.runtime!, id)!
+        setNode(graph, id, n)
+        for (let i = 0; i < countIds(n); i++) {
+            if (getRef(n, i)) importRuntimeNode(graph, getRef(n, i))
+        }
+    }
     function foldRead(graph: Graph, id: number, n: GraphNode, value: Operand, folded: Map<number, number>): void {
         putNode(graph, id, NodeOp.after, [getRef(n, 0), value])
         if (typeof value === 'number') folded.set(id, value)
@@ -4791,7 +4815,10 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (cell === undefined) continue
             const state = heap.deref(cell)
             const slot = dataSlot(state, key)
-            if (slot === undefined || !(tagged(slot) || (reference(slot) && demanded(id, slot)))) continue
+            if (slot === undefined) continue
+            const deferred = heap.isBoxedF64(slot) && getNode(session.runtime!, heap.boxedNanId(slot))?.op === NodeOp.static
+            if (!(deferred || tagged(slot) || (reference(slot) && demanded(id, slot)))) continue
+            if (deferred) importRuntimeNode(graph, heap.boxedNanId(slot))
             assumed.push([cell, key, graph.name ?? '?'])
             foldRead(graph, id, n, valueOf(slot), folded)
         }
@@ -5083,6 +5110,23 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr,
         NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne,
     ])
+    function constantHandle(graph: Graph, n: GraphNode, slot: number): intrinsics.Handle | undefined {
+        if (!getRef(n, slot)) return session.fromJsValue(getLiteral(graph, n, slot)) as intrinsics.Handle
+        const value = getNode(graph, strippedAfter(graph, getRef(n, slot)))
+        if (value?.op === NodeOp.heapHandle && !getRef(value, 0)) return getLiteral(graph, value, 0) as intrinsics.Handle
+    }
+    function foldRuntime(graph: Graph, n: GraphNode): GraphNode | undefined {
+        const fold = rt.bindingOf(getLiteral(graph, n, 1))?.fold
+        if (!fold) return
+        const args: intrinsics.Handle[] = []
+        for (let i = 2; i < countIds(n); i++) {
+            const arg = constantHandle(graph, n, i)
+            if (arg === undefined) return
+            args.push(arg)
+        }
+        const value = addNode(graph, NodeOp.heapHandle, [{ literal: fold(args, session) }])
+        return makeNode(graph, NodeOp.after, [getOperand(graph, n, 0), ...getOperands(graph, n).slice(2), value])
+    }
     function simplifySpliced(graph: Graph): void {
         const forward = new Map<number, Operand>()
         function chase(op: Operand): Operand {
@@ -5105,6 +5149,11 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                 }
                 const current = operands ? copyNode(graph, n, operands) : n
                 if (operands) setNode(graph, id, current)
+                const folded = current.op === NodeOp.rt ? foldRuntime(graph, current) : undefined
+                if (folded) {
+                    setNode(graph, id, folded)
+                    continue
+                }
                 if (foldable.has(current.op) && !getRef(current, 0) && !getRef(current, 1)) {
                     const a = getLiteral(graph, current, 0)
                     const b = getLiteral(graph, current, 1)
@@ -6421,19 +6470,27 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 allocationShapes.set(id, shape)
             }
         }
-        const iterations = local ? plannedIterations(local, traced.graph) : new Map<number, intrinsics.Handle>()
+        const iterations = local ? plannedIterations(local, traced.graph) : new Map<number, Iterated>()
         if (iterations.size) {
             if (traced.graph === unit.traced!.graph) traced.graph = withNodes(traced.graph, new Map(traced.graph.nodes))
-            indexArrayIterations(traced.graph, iterations, (next, values, index) => {
+            const pairs = new Map<number, PairReads>()
+            const pairOf = (next: number) => {
+                const found = pairReads(local!.calls.get(next) ?? new Set())
+                if (found) pairs.set(next, found)
+                return found?.fields
+            }
+            indexArrayIterations(traced.graph, iterations, pairOf, id => local!.calls.has(id), (next, values, index) => {
                 local!.nodes = new Map(local!.nodes).set(index, { text: 'i64', kind: 'number', format: { bits: 64, signed: true }, targets: [], nullable: false })
+                const pair = pairs.get(next)
                 const reads = new Set([...local!.calls.get(next) ?? []].flatMap(unit => [...unit.calls.values()].flatMap(set => [...set])).filter(unit => originOf(unit.fn) === indexGetter()))
                 const boxed = [...local!.calls.get(next) ?? []].some(unit => [...unit.calls].some(([node, set]) => unit.boxedCalls.has(node) && [...set].some(read => reads.has(read))))
-                if (reads.size !== 1) return
+                if (!pair && reads.size !== 1) return
                 local!.calls = new Map(local!.calls)
                 local!.boxedCalls = new Set(local!.boxedCalls)
-                for (const id of values) {
-                    local!.calls.set(id, reads)
-                    if (boxed) local!.boxedCalls.add(id)
+                for (const [id, slot] of values) {
+                    local!.calls.set(id, pair ? pair.getters[slot] : reads)
+                    if (pair ? pair.boxed[slot] : boxed) local!.boxedCalls.add(id)
+                    else if (pair) local!.boxedCalls.delete(id)
                 }
             })
         }
@@ -6522,8 +6579,36 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         arrayIndexGetter = linked ? originOf(linked) : undefined
         return arrayIndexGetter
     }
-    function plannedIterations(local: UnitPlan, graph: Graph): Map<number, intrinsics.Handle> {
-        const iterations = new Map<number, intrinsics.Handle>()
+    function pairReads(nexts: Set<PlannedUnit>): PairReads | undefined {
+        let fields: intrinsics.Handle[] | undefined
+        const getters = [new Set<PlannedUnit>(), new Set<PlannedUnit>()]
+        const boxed = [false, false]
+        for (const unit of nexts) {
+            const g = graphsOf(unit.fn).traced!.graph
+            const found: intrinsics.Handle[] = []
+            for (const [, n] of g.nodes) {
+                if (n.op !== NodeOp.rt || getRef(n, 1) || getLiteral(g, n, 1) !== rt.Op.arrayElement || getRef(n, 3)) continue
+                const slot = getLiteral(g, n, 3)
+                const value = getRef(n, 4)
+                const read = getNode(g, value)
+                const array = read?.op === NodeOp.getProp && getRef(read, 2) ? getNode(g, getRef(read, 1)) : undefined
+                if (slot > 1 || array?.op !== NodeOp.getProp || getRef(array, 2)) return
+                const callees = [...unit.calls.get(value) ?? []]
+                if (!callees.length || callees.some(callee => originOf(callee.fn) !== indexGetter())) return
+                found[slot] = getLiteral(g, array, 2) as intrinsics.Handle
+                for (const callee of callees) getters[slot].add(callee)
+                if (unit.boxedCalls.has(value)) boxed[slot] = true
+            }
+            if (found[0] === undefined || found[1] === undefined) return
+            if (fields && (fields[0] !== found[0] || fields[1] !== found[1])) return
+            fields = found
+        }
+        if (!fields || getters.some(set => set.size !== 1)) return
+        return { fields, getters, boxed }
+    }
+    function plannedIterations(local: UnitPlan, graph: Graph): Map<number, Iterated> {
+        const iterations = new Map<number, Iterated>()
+        const entries = new Set<Function>([builtinGlobals.Map.prototype[Symbol.iterator], builtinGlobals.Map.prototype.entries])
         arrayProto ??= heap.deref(heap.getPrototypeProperty(heap.deref(session.linkFunction(builtinGlobals.Array) as intrinsics.Handle)))
         const key = heap.fromJsSymbol(Symbol.iterator)
         function iteratesArray(calls: Map<number, Set<PlannedUnit>>, g: Graph, call: GraphNode, id: number): boolean {
@@ -6560,13 +6645,17 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             const target = getNode(graph, getRef(n, 1))
             const callees = local.calls.get(id)
             if (target?.op !== NodeOp.getProp || getRef(target, 2) || !callees?.size) continue
+            if ([...callees].every(callee => entries.has(originOf(callee.fn)))) {
+                iterations.set(getRef(n, 1), 'entries')
+                continue
+            }
             const fields = new Set([...callees].map(iteratedField))
             const field = fields.size === 1 ? [...fields][0] : undefined
             if (field !== undefined) iterations.set(getRef(n, 1), field)
         }
         return iterations
     }
-    function indexArrayIterations(graph: Graph, iterations: Map<number, intrinsics.Handle>, rewrote: (next: number, values: number[], index: number) => void): boolean {
+    function indexArrayIterations(graph: Graph, iterations: Map<number, Iterated>, pairOf: (next: number) => intrinsics.Handle[] | undefined, effectful: (id: number) => boolean, rewrote: (next: number, values: [read: number, slot: number][], index: number) => void): boolean {
         const users = new Map<number, [user: number, slot: number][]>()
         for (const [id, n] of graph.nodes) {
             for (let i = 0; i < countIds(n); i++) {
@@ -6609,6 +6698,20 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if ((users.get(prop) ?? []).some(([u, slot]) => !ordering(u, slot) && !(u === call && slot === 1))) return
             return [prop, call]
         }
+        function sameRead(read: number, again: number): boolean {
+            if (read === again) return true
+            const first = getNode(graph, read)
+            const second = getNode(graph, again)
+            if (first?.op !== NodeOp.getProp || second?.op !== NodeOp.getProp || getRef(first, 2) || getRef(second, 2)) return false
+            if (getRef(first, 1) !== getRef(second, 1) || getLiteral(graph, first, 2) !== getLiteral(graph, second, 2)) return false
+            let at = getRef(second, 0)
+            while (at !== read) {
+                const n = getNode(graph, at)
+                if (n?.op !== NodeOp.getProp || effectful(at)) return false
+                at = getRef(n, 0)
+            }
+            return true
+        }
         const loops = graphLoops(graph)
         let changed = false
         for (const [symbol, field] of iterations) {
@@ -6619,7 +6722,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (makers.length !== 1 || makers[0][1] !== 1) continue
             const made = makers[0][0]
             const make = getNode(graph, made)!
-            if (make.op !== NodeOp.call || getRef(make, 2) !== object || countIds(make) !== 3) continue
+            if (make.op !== NodeOp.call || !sameRead(object, getRef(make, 2)) || countIds(make) !== 3) continue
             const relay = selfIteration(made)
             const iterator = relay ? relay[1] : made
             const nextProps: number[] = []
@@ -6652,15 +6755,27 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 else valid = false
             }
             if (!valid || !done.length) continue
+            const pair = field === 'entries' ? pairOf(call) : undefined
+            if (field === 'entries' && !pair) continue
+            const elements: [read: number, slot: number][] = []
+            for (const id of pair ? values : []) {
+                for (const [u, slot] of users.get(id) ?? []) {
+                    if (ordering(u, slot)) continue
+                    const n = getNode(graph, u)!
+                    const index = slot === 1 && n.op === NodeOp.getProp && !getRef(n, 2) ? [0, 1].find(i => getLiteral(graph, n, 2) === heap.indexKey(i as u32)) : undefined
+                    if (index === undefined) valid = false
+                    else elements.push([u, index])
+                }
+            }
+            if (!valid) continue
             const header = blockOf(call)
             const members = header === undefined ? undefined : loops.loopMembers.get(header)
             if (header === undefined || !members) continue
             const block = getBlock(graph, header)!
             const token = getRef(getNode(graph, call)!, 0)
             let array = object
-            if (field) {
-                array = addNode(graph, NodeOp.getProp, [getRef(make, 0), object, { literal: field }])
-            }
+            const arrays = (pair ?? (field ? [field as intrinsics.Handle] : [])).map(key => addNode(graph, NodeOp.getProp, [getRef(make, 0), object, { literal: key }]))
+            if (arrays.length) array = arrays[0]
             const index = addNode(graph, NodeOp.param, [])
             block.params.push(index)
             for (const [app, owner] of owners) {
@@ -6675,8 +6790,13 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             const length = addNode(graph, NodeOp.getProp, [token, array, { literal: iterationKeys.length }])
             const finished = addNode(graph, NodeOp.ge, [index, length], Types.bool)
             for (const id of done) putNode(graph, id, NodeOp.after, [length, finished])
-            for (const id of values) putNode(graph, id, NodeOp.getProp, [getRef(getNode(graph, id)!, 0), array, index])
-            rewrote(call, values, index)
+            for (const [id, slot] of elements) putNode(graph, id, NodeOp.getProp, [getRef(getNode(graph, id)!, 0), arrays[slot], index])
+            for (const id of values) {
+                const tok = getRef(getNode(graph, id)!, 0)
+                if (pair) putNode(graph, id, NodeOp.after, [tok, tok])
+                else putNode(graph, id, NodeOp.getProp, [tok, array, index])
+            }
+            rewrote(call, pair ? elements : values.map(id => [id, -1]), index)
             for (const id of returnProps) putNode(graph, id, NodeOp.heapHandle, [{ literal: 0 }])
             for (const id of [call, ...nextProps, ...returnCalls, iterator, ...relay ?? [], made, symbol]) {
                 if (!getNode(graph, id) || getNode(graph, id)!.op === NodeOp.after) continue
@@ -7424,9 +7544,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
 const staticInitName = '[[Init]]'
 
 function staticInitializer(steps: [Function, number][], table: usize): () => void {
-    let init = () => {}
-    for (let i = steps.length - 1; i >= 0; i--) init = staticStep(steps[i][0], steps[i][1] * 8, table, init)
-    return init
+    const captures = [Intrinsics, Types, table, ...steps.map(([fn]) => fn)]
+    const stores = steps.map(([, slot], i) =>
+        `$0.store($2, ${slot * 8}, $0.bitconvert($${i + 3}(), $1.vm_value, $1.u64), $1.u64);`)
+    return inlineComputation(`function initializeStatics() {\n${stores.join('\n')}\n}`, captures, 0) as () => void
 }
 
 function copyInto(elements: any[]): () => any {
@@ -7434,13 +7555,6 @@ function copyInto(elements: any[]): () => any {
         const out = new Array()
         for (let i = 0; i < elements.length; i++) out.push(elements[i])
         return out
-    }
-}
-
-function staticStep(fn: Function, offset: u32, table: usize, next: () => void): () => void {
-    return () => {
-        Intrinsics.store(table, offset, fn(), Types.u64)
-        next()
     }
 }
 
