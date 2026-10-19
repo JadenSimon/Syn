@@ -344,27 +344,42 @@ function bodyNodes(g: Graph, body: number): Set<number> {
     byGraph.set(body, found)
     return found
 }
+const armMaps = new WeakMap<Graph, Map<number, [cond: number, positive: boolean][]>>()
+function armsOf(g: Graph): Map<number, [cond: number, positive: boolean][]> {
+    const known = armMaps.get(g)
+    if (known) return known
+    const out = new Map<number, [number, boolean][]>()
+    for (const n of g.nodes.values()) {
+        if (n.op !== NodeOp.select || countIds(n) !== 3 || !getRef(n, 0)) continue
+        for (const [arm, polarity] of [[getRef(n, 1), true], [getRef(n, 2), false]] as [number, boolean][]) {
+            if (!arm) continue
+            for (const member of exclusive(g, arm)) {
+                let list = out.get(member)
+                if (!list) out.set(member, list = [])
+                list.push([getRef(n, 0), polarity])
+            }
+        }
+    }
+    armMaps.set(g, out)
+    return out
+}
 const guardMaps = new WeakMap<Graph, Map<number, [cond: number, positive: boolean][]>>()
 function guardsOf(g: Graph): Map<number, [cond: number, positive: boolean][]> {
     const known = guardMaps.get(g)
     if (known) return known
     const out = new Map<number, [number, boolean][]>()
-    for (const n of g.nodes.values()) {
-        if (n.op !== NodeOp.select || countIds(n) !== 3 || !getRef(n, 0)) continue
-        let cond = getRef(n, 0)
-        let positive = true
-        for (let c = getNode(g, cond); c?.op === NodeOp.not && getRef(c, 0); c = getNode(g, cond)) {
-            cond = getRef(c, 0)
-            positive = !positive
-        }
-        if (!comparison(getNode(g, cond)?.op ?? NodeOp.literal)) continue
-        for (const [arm, polarity] of [[getRef(n, 1), positive], [getRef(n, 2), !positive]] as [number, boolean][]) {
-            if (!arm) continue
-            for (const member of exclusive(g, arm)) {
-                let list = out.get(member)
-                if (!list) out.set(member, list = [])
-                list.push([cond, polarity])
+    for (const [member, arms] of armsOf(g)) {
+        for (const [arm, polarity] of arms) {
+            let cond = arm
+            let positive = polarity
+            for (let c = getNode(g, cond); c?.op === NodeOp.not && getRef(c, 0); c = getNode(g, cond)) {
+                cond = getRef(c, 0)
+                positive = !positive
             }
+            if (!comparison(getNode(g, cond)?.op ?? NodeOp.literal)) continue
+            let list = out.get(member)
+            if (!list) out.set(member, list = [])
+            list.push([cond, positive])
         }
     }
     guardMaps.set(g, out)
@@ -412,23 +427,39 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         positive: boolean
         key?: string
         literal?: number
+        when?: boolean
     }
     type Test = [x: number, filter: Filter]
+    function negate(tests: Test[]): Test[] {
+        return tests.map(([x, filter]) => [x, filter.when === undefined ? { ...filter, positive: !filter.positive } : { ...filter, when: !filter.when }])
+    }
+    function holding(tests: Test[], truth: boolean): Test[] {
+        const out: Test[] = []
+        for (const [x, filter] of tests) {
+            if (filter.when === undefined) out.push([x, { ...filter, positive: filter.positive === truth }])
+            else if (filter.when === truth) out.push([x, { test: filter.test, positive: filter.positive, key: filter.key, literal: filter.literal }])
+        }
+        return out
+    }
     const narrowings = new Map<Graph, Map<number, Map<number, Filter[]>>>()
     function condition(g: Graph, id: number): Test[] {
         const c = getNode(g, id)
         if (!c) return []
-        if (c.op === NodeOp.not) return condition(g, getRef(c, 0)).map(([x, filter]) => [x, { ...filter, positive: !filter.positive }])
+        if (c.op === NodeOp.not) return negate(condition(g, getRef(c, 0)))
         if (c.op === NodeOp.select && countIds(c) === 3 && getRef(c, 0) && !getRef(c, 1) && !getRef(c, 2)) {
             const a = getLiteral(g, c, 1)
             const b = getLiteral(g, c, 2)
-            if ((a === 0 && b === 1) || (a === 1 && b === 0)) return [[getRef(c, 0), { test: 'falsy', positive: a === 0 }]]
+            if ((a === 0 && b === 1) || (a === 1 && b === 0)) {
+                const inner = condition(g, getRef(c, 0))
+                return [[getRef(c, 0), { test: 'falsy', positive: a === 0 }], ...(a === 0 ? negate(inner) : inner)]
+            }
         }
         if (c.op === NodeOp.eq || c.op === NodeOp.ne) {
             for (const side of [0, 1]) {
                 const inner = getRef(c, side) ? getNode(g, getRef(c, side)) : undefined
                 if (inner && !getRef(c, 1 - side) && getLiteral(g, c, 1 - side) === 0 && (comparison(inner.op) || inner.op === NodeOp.not)) {
-                    return condition(g, getRef(c, side)).map(([x, filter]) => [x, { ...filter, positive: c.op === NodeOp.eq ? !filter.positive : filter.positive }])
+                    const tests = condition(g, getRef(c, side))
+                    return c.op === NodeOp.eq ? negate(tests) : tests
                 }
             }
             for (const side of [0, 1]) {
@@ -454,7 +485,124 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (NumericOps.has(c.op) || c.op === NodeOp.literal) return []
         const tests: Test[] = [[id, { test: 'truthy', positive: true }]]
         if (c.op === NodeOp.getProp && !getRef(c, 2)) tests.push([getRef(c, 1), { test: 'field', key: nameOf(getLiteral(g, c, 2) as Handle), positive: true }])
+        if (c.op === NodeOp.call) tests.push(...calleeFacts(g, c))
         return tests
+    }
+    type Fact = [param: number, filter: Filter]
+    const summaries = new Map<Graph, Fact[]>()
+    function calleeFacts(g: Graph, c: GraphNode): Test[] {
+        const callee = literalFunction(g, getRef(c, 1))
+        if (!callee || !host.traceable(callee)) return []
+        const calleeGraph = host.graphOf(callee)
+        const out: Test[] = []
+        for (const [param, filter] of summaryOf(calleeGraph)) {
+            const slot = argSlot(c, calleeGraph, param)
+            if (slot < countIds(c) && getRef(c, slot)) out.push([getRef(c, slot), filter])
+        }
+        return out
+    }
+    function summaryOf(g: Graph): Fact[] {
+        const known = summaries.get(g)
+        if (known) return known
+        summaries.set(g, [])
+        const params = g.blocks[0].params
+        const facts: Fact[] = []
+        for (const truth of [true, false]) {
+            let met: Test[] | undefined
+            for (const r of retsOf(g)) {
+                if (regionRets(g).has(r)) continue
+                const found = valueFacts(g, r, 0, truth)
+                if (found) met = met ? meet(met, found) : found
+            }
+            const kept = new Set<string>()
+            for (const test of met ?? []) {
+                const param = params.indexOf(test[0])
+                if (param < 0 || kept.has(factKey(test))) continue
+                kept.add(factKey(test))
+                facts.push([param, { ...test[1], when: truth }])
+            }
+        }
+        summaries.set(g, facts)
+        return facts
+    }
+    function factKey([x, filter]: Test): string {
+        return `${x}:${filter.test}:${filter.positive}:${filter.key}:${filter.literal}`
+    }
+    function meet(a: Test[], b: Test[]): Test[] {
+        const keys = new Set(b.map(factKey))
+        return a.filter(test => keys.has(factKey(test)))
+    }
+    function valueFacts(g: Graph, at: number, slot: number, truth: boolean): Test[] | undefined {
+        let holder = getNode(g, at)!
+        let index = slot
+        while (getRef(holder, index) && getNode(g, getRef(holder, index))?.op === NodeOp.after) {
+            holder = getNode(g, getRef(holder, index))!
+            index = countIds(holder) - 1
+        }
+        const found = getRef(holder, index) ? refFacts(g, getRef(holder, index), truth) : (getLiteral(g, holder, index) !== 0) === truth ? [] : undefined
+        const path = found && pathFacts(g, at)
+        return path && [...path, ...found!]
+    }
+    const truths = new Map<Graph, Map<number, Test[] | null>>()
+    function refFacts(g: Graph, id: number, truth: boolean): Test[] | undefined {
+        let byGraph = truths.get(g)
+        if (!byGraph) truths.set(g, byGraph = new Map())
+        const k = id * 2 + (truth ? 1 : 0)
+        const known = byGraph.get(k)
+        if (known !== undefined) return known ?? undefined
+        byGraph.set(k, [])
+        const found = joinedFacts(g, id, truth)
+        byGraph.set(k, found ?? null)
+        return found
+    }
+    function joinedFacts(g: Graph, id: number, truth: boolean): Test[] | undefined {
+        const n = getNode(g, id)!
+        if (n.op === NodeOp.not) return refFacts(g, getRef(n, 0), !truth)
+        if (n.op === NodeOp.select && countIds(n) === 3 && getRef(n, 0)) {
+            let joined: Test[] | undefined
+            for (const arm of [1, 2]) {
+                const found = valueFacts(g, id, arm, truth)
+                const guard = found && refFacts(g, getRef(n, 0), arm === 1)
+                if (!guard) continue
+                const armed = [...found!, ...guard]
+                joined = joined ? meet(joined, armed) : armed
+            }
+            return joined
+        }
+        const param = paramSlots(g).get(id)
+        if (!param || param[0] === g.blocks[0]) return holding(condition(g, id), truth)
+        let joined: Test[] | undefined
+        for (const apply of predsOf(g, param[0])) {
+            const found = valueFacts(g, apply, param[1] + 1, truth)
+            if (found) joined = joined ? meet(joined, found) : found
+        }
+        return joined
+    }
+    function pathFacts(g: Graph, node: number): Test[] | undefined {
+        const out: Test[] = []
+        for (const [cond, polarity] of armsOf(g).get(node) ?? []) {
+            const found = refFacts(g, cond, polarity)
+            if (!found) return
+            out.push(...found)
+        }
+        const block = blockOf(g, node)
+        const entry = block ? entryFacts(g, block) : []
+        return entry && [...out, ...entry]
+    }
+    const entries = new Map<Block, Test[] | null>()
+    function entryFacts(g: Graph, block: Block): Test[] | undefined {
+        if (block === g.blocks[0]) return []
+        const known = entries.get(block)
+        if (known !== undefined) return known ?? undefined
+        entries.set(block, [])
+        const preds = predsOf(g, block)
+        let joined: Test[] | undefined = preds.length ? undefined : []
+        for (const apply of preds) {
+            const found = pathFacts(g, apply)
+            if (found) joined = joined ? meet(joined, found) : found
+        }
+        entries.set(block, joined ?? null)
+        return joined
     }
     function bounded(g: Graph, c: GraphNode): Test[] {
         const side = getRef(c, 0) ? 0 : 1
@@ -493,18 +641,19 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             if (n.op !== NodeOp.select || countIds(n) !== 3) continue
             const tests = condition(g, getRef(n, 0))
             for (const [arm, polarity] of [[getRef(n, 1), true], [getRef(n, 2), false]] as [number, boolean][]) {
-                if (!arm || !tests.length) continue
+                const held = holding(tests, polarity)
+                if (!arm || !held.length) continue
                 const other = polarity ? getRef(n, 2) : getRef(n, 1)
                 const members = new Set(exclusive(g, arm))
                 if (other && panics(other)) for (const m of ordered(id)) members.add(m)
                 for (const member of members) {
                     let byOperand = out.get(member)
                     if (!byOperand) out.set(member, byOperand = new Map())
-                    for (const [x, filter] of tests) {
+                    for (const [x, filter] of held) {
                         const operand = canonical(g, x)
                         let list = byOperand.get(operand)
                         if (!list) byOperand.set(operand, list = [])
-                        list.push({ ...filter, positive: filter.positive === polarity })
+                        list.push(filter)
                     }
                 }
             }
@@ -517,7 +666,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const value = values[v]
         if (value.kind === ValueKind.unknown || value.kind === ValueKind.variable) return true
         if (filter.test === 'field') {
-            if (value.kind !== ValueKind.object || value.allocation === undefined) return true
+            if (value.kind !== ValueKind.object || value.allocation === undefined || !ownField(value.allocation, filter.key!)) return true
             const loc = location(value.allocation, filter.key!)
             setOf(fieldWatchers, loc).add(key(frame, x))
             const held = setOf(contents, loc)
@@ -551,6 +700,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             }
         }
         return true
+    }
+    function ownField(allocation: number, name: string): boolean {
+        const { proto, dynamic } = allocations[allocation]
+        if (dynamic || (proto !== undefined && allocatedStates.has(proto))) return false
+        const k = keyHandles.get(name)
+        if (k === undefined) return !indexTrap(proto, false)
+        return accessorOf(proto, k).kind === 'field'
     }
     const canonicals = new Map<Graph, Map<number, number>>()
     function canonical(g: Graph, id: number): number {
@@ -614,13 +770,16 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (object < 0 || priorRead(g, getRef(m, 0), getRef(m, 1), keyLabel(getLiteral(g, m, 2) as Handle)) !== 'entry') return
         return { param: object, key: getLiteral(g, m, 2) }
     }
-    function callerTerm(caller: number, g: Graph, call: GraphNode, term: Term, calleeGraph: Graph): string | undefined {
-        if ('literal' in term) return `#${term.literal}`
+    function argSlot(call: GraphNode, calleeGraph: Graph, param: number): number {
         const self = receiverOf(calleeGraph)
         const params = calleeGraph.blocks[0].params
         const receiverSlot = call.op === NodeOp.call ? 2 : call.op === NodeOp.getProp || call.op === NodeOp.setProp ? 1 : -1
         const first = call.op === NodeOp.call ? 3 : 2
-        const slot = params[term.param] === self ? receiverSlot : first + params.filter(p => p !== self).indexOf(params[term.param])
+        return params[param] === self ? receiverSlot : first + params.filter(p => p !== self).indexOf(params[param])
+    }
+    function callerTerm(caller: number, g: Graph, call: GraphNode, term: Term, calleeGraph: Graph): string | undefined {
+        if ('literal' in term) return `#${term.literal}`
+        const slot = argSlot(call, calleeGraph, term.param)
         if (slot < 0 || slot >= countIds(call)) return
         if (!getRef(call, slot)) return term.key === undefined ? `#${getLiteral(g, call, slot)}` : undefined
         const object = canonical(g, getRef(call, slot))
