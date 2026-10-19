@@ -1160,6 +1160,7 @@ class AstNode {
 
     get dotDotDotToken() {
         switch (this.kind) {
+            case SyntaxKind.BindingElement:
             case SyntaxKind.Parameter:
                 if ((this.flags & InternalNodeFlags.Generator) === InternalNodeFlags.Generator) {
                     return { kind: SyntaxKind.DotDotDotToken }
@@ -2055,11 +2056,11 @@ function createNodeSerializer(nodeCount: number, sourceLen: number, skipTypes = 
             }
 
             case SyntaxKind.BindingElement: {
-                // TODO: `dotDotDotToken`
+                const flags = node.dotDotDotToken ? InternalNodeFlags.Generator : 0
                 const name = serializeNode(node.name)
                 const initializer = serializeNode(node.initializer)
                 const propertyName = serializeNode(node.propertyName)
-                buf[offset + 0] = SyntaxKind.BindingElement
+                buf[offset + 0] = (flags << 10) | SyntaxKind.BindingElement
                 // buf[offset + 1] = next
                 buf[offset + 2] = name
                 buf[offset + 3] = initializer

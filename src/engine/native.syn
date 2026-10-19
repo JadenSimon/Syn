@@ -4,11 +4,12 @@
 
 import type { Allocation, FastTraced } from './fast-trace'
 import { globals as builtinGlobals, programStack } from './builtins'
+import { assignOne } from './builtin/Object'
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as syscalls from './syscalls'
-import { rawValue, traceValue } from './vm'
+import { rawValue, tagVmHandleNode, traceValue } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
@@ -38,7 +39,7 @@ import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
 import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringOperands } from './verify'
-import { type AccessHost, analyzeGenerics, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type AccessHost, analyzeGenerics, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -2354,6 +2355,32 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
     if (flags.has('hoist-stats')) console.log('SHARED', shared.join(' '))
 }
 
+function specializeLiteralArgs(program: ProgramGraph, touched: Set<number>): void {
+    const sites = programCallSites(program)
+    const limit = program.target.costs.inlineLiteral
+    for (const symbol of freeCallees(program, sites)) {
+        const graph = program.units.get(symbol)!
+        const calls = sites.get(symbol)!
+        const by = new Map<number, Operand>()
+        graph.blocks[0].params.forEach((param, index) => {
+            const values = calls.map(([caller, call]) => {
+                const g = program.units.get(caller)!
+                const n = getNode(g, call)!
+                return 3 + index < countIds(n) ? tailScalar(g, n, 3 + index) : undefined
+            })
+            const value = values[0]
+            if (value === undefined || !values.every(v => Object.is(v, value))) return
+            if (!Number.isSafeInteger(value) || value <= -limit || value >= limit) return
+            by.set(param, { literal: value })
+        })
+        if (!by.size) continue
+        const params = new Map([...by.keys()].map(id => [id, getNode(graph, id)!]))
+        substitute(graph, by)
+        for (const [id, node] of params) setNode(graph, id, node)
+        touched.add(symbol)
+    }
+}
+
 function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
     const sites = programCallSites(program)
     const pruned: string[] = []
@@ -2781,6 +2808,41 @@ function inlineProgram(program: ProgramGraph, clock: PhaseClock): void {
     }
     for (const unit of units.values()) visit(unit)
     for (const unit of units.values()) program.units.set(unit.symbol, unit.graph)
+}
+
+function inlineSpecialized(program: ProgramGraph, touched: Set<number>, clock: PhaseClock): void {
+    const candidates = [...touched].filter(symbol => {
+        const graph = program.units.get(symbol)
+        if (!graph || program.noInline.has(symbol)) return false
+        const cost = inlineCost(graph)
+        return cost !== undefined && cost <= 8 + graph.blocks[0].params.length
+    })
+    if (!candidates.length) return
+    const units = programUnits(program)
+    const sites = programCallSites(program)
+    const callSites = new Map([...sites].map(([symbol, list]) => [symbol, list.length]))
+    const levels = programLevels(program)
+    const byCaller = new Map<number, number[]>()
+    for (const symbol of candidates) {
+        for (const [caller, call] of sites.get(symbol) ?? []) {
+            if (caller === symbol) continue
+            const calls = byCaller.get(caller)
+            if (calls) calls.push(call)
+            else byCaller.set(caller, [call])
+        }
+    }
+    for (const [symbol, calls] of byCaller) {
+        const unit = units.get(symbol)!
+        const graph = snapshotGraph(unit.graph)
+        const depths = siteDepths(graph)
+        const spliced = new Map<number, number[]>()
+        for (const id of calls) {
+            const callee = units.get(calledSymbol(graph, getNode(graph, id)!)!)!
+            if (!inlines(program, callSites, unit.graph, graph, id, callee, (levels.get(symbol) ?? 0) + (depths.get(id) ?? 0))) continue
+            spliced.set(id, splice(graph, id, callee.graph))
+        }
+        if (spliced.size) program.units.set(symbol, repackage(graph, spliced, clock, program.target))
+    }
 }
 
 function prune(program: ProgramGraph): void {
@@ -4178,12 +4240,75 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             putNode(graph, id, NodeOp.heapHandle, [{ literal: engineArrayOf(cell) }])
         }
     }
-    function ownProperties(graph: Graph): void {
+    function freshCellOf(traced: FastTraced, ref: number): u32 | undefined {
+        const n = getNode(traced.graph, strippedAfter(traced.graph, ref))
+        if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
+        const cell = getLiteral(traced.graph, n, 0) as u32
+        return traced.allocations.has(cell) ? cell : undefined
+    }
+    function freshShapes(traced: FastTraced): Map<u32, Map<number, intrinsics.Handle | undefined>> {
+        const graph = traced.graph
+        const shapes = new Map<u32, Map<number, intrinsics.Handle | undefined>>()
+        for (const [id, n] of graph.nodes) {
+            const assign = n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.assign
+            if (n.op !== NodeOp.setProp && !assign) continue
+            const cell = freshCellOf(traced, getRef(n, assign ? 2 : 1))
+            if (cell === undefined) continue
+            let writes = shapes.get(cell)
+            if (!writes) shapes.set(cell, writes = new Map())
+            writes.set(id, assign || getRef(n, 2) ? undefined : getLiteral(graph, n, 2) as intrinsics.Handle)
+        }
+        return shapes
+    }
+    function keysAt(traced: FastTraced, shapes: Map<u32, Map<number, intrinsics.Handle | undefined>>, cell: u32, token: number): intrinsics.Handle[] | undefined {
+        const graph = traced.graph
+        const keys = heap.enumerableKeys(heap.deref(cell as intrinsics.Handle))
+        const allocation = traced.allocations.get(cell)
+        if (!allocation) return keys
+        const writes = shapes.get(cell)
+        const seen = new Set<number>()
+        function preceding(id: number): boolean {
+            if (!id || id === allocation!.token || seen.has(id)) return true
+            seen.add(id)
+            const n = getNode(graph, id)
+            if (!n) return false
+            if (n.op === NodeOp.nilEffect) return true
+            if (n.op === NodeOp.after) {
+                for (let i = 0; i < countIds(n); i++) {
+                    if (!preceding(getRef(n, i))) return false
+                }
+                return true
+            }
+            if (n.op === NodeOp.param || n.op === NodeOp.apply || n.op === NodeOp.select || n.op === NodeOp.call) return false
+            if (!OrderedValues.has(n.op)) return true
+            if (!preceding(getRef(n, 0))) return false
+            if (!writes?.has(id)) return true
+            const key = writes.get(id)
+            if (key !== undefined) {
+                if (!keys.includes(key)) keys.push(key)
+                return true
+            }
+            const source = n.op === NodeOp.rt ? getNode(graph, strippedAfter(graph, getRef(n, 3))) : undefined
+            if (source?.op !== NodeOp.heapHandle || getRef(source, 0)) return false
+            const copied = keysAt(traced, shapes, getLiteral(graph, source, 0) as u32, getRef(n, 0))
+            if (!copied) return false
+            const excluded = rt.assignExcluded(graph, n)
+            for (const key of copied) {
+                if (!excluded.includes(key) && !keys.includes(key)) keys.push(key)
+            }
+            return true
+        }
+        return preceding(token) ? keys : undefined
+    }
+    function ownProperties(traced: FastTraced): void {
+        const graph = traced.graph
+        const shapes = freshShapes(traced)
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.ownKeys) continue
-            const object = getNode(graph, getRef(n, 2))
-            if (object?.op !== NodeOp.heapHandle || getRef(object, 0)) continue
-            const keys = heap.enumerableKeys(heap.deref(getLiteral(graph, object, 0) as intrinsics.Handle))
+            const target = getNode(graph, strippedAfter(graph, getRef(n, 2)))
+            if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) continue
+            const keys = keysAt(traced, shapes, getLiteral(graph, target, 0) as u32, getRef(n, 0))
+            if (keys === undefined) throw `native: ${graph.name} enumerates an allocation whose keys are not statically known`
             const mode = getLiteral(graph, n, 3)
             const array = addNode(graph, NodeOp.rt, [getRef(n, 0), { literal: rt.Op.arrayLiteral }, { literal: keys.length }])
             let token = array
@@ -4622,7 +4747,6 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         applyPrototypes(traced)
         sealStaticClosures(traced)
         spliceTagged(fn, traced)
-        expandAssigns(traced)
         spliceables.set(fn, { graph: snapshotGraph(traced.graph), allocations: new Map(traced.allocations), frames: traced.frames.size > 0 })
         markAllocations(traced)
         return traced
@@ -4676,7 +4800,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         if (heap.isProxy(object) || heap.getPropertyProxy(object, key)) return
         const descriptor = heap.getPropertyDescriptor(object, key)
         if (!descriptor) return
-        const full = heap.FullPropertyDescriptor(descriptor)
+        const full = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
         if (!(full.flags & flag)) return
         return (flag === heap.PropFlags.has_getter ? full.slot0 : full.slot1) as intrinsics.Handle
     }
@@ -4733,35 +4857,12 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         putNode(graph, id, NodeOp.after, [getRef(n, 0), value])
         if (typeof value === 'number') folded.set(id, value)
     }
-    function freshKeysOf(traced: FastTraced): Map<number, Set<number> | null> {
-        const graph = traced.graph
-        const keys = new Map<number, Set<number> | null>()
-        for (const n of graph.nodes.values()) {
-            const assign = n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.assign
-            if (n.op !== NodeOp.setProp && !assign) continue
-            const t = getNode(graph, strippedAfter(graph, getRef(n, assign ? 2 : 1)))
-            if (t?.op !== NodeOp.heapHandle || getRef(t, 0)) continue
-            const cell = getLiteral(graph, t, 0)
-            if (!traced.allocations.has(cell as u32) || keys.get(cell) === null) continue
-            if (assign || getRef(n, 2)) {
-                keys.set(cell, null)
-                continue
-            }
-            let own = keys.get(cell)
-            if (!own) keys.set(cell, own = new Set())
-            own.add(getLiteral(graph, n, 2))
-        }
-        return keys
-    }
     function resolveReads(traced: FastTraced): void {
         const graph = traced.graph
         const valueOf = slotValues(graph)
         const folded = new Map<number, number>()
         function freshCell(n: GraphNode): intrinsics.Handle | undefined {
-            const target = getNode(graph, strippedAfter(graph, getRef(n, 1)))
-            if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) return
-            const cell = getLiteral(graph, target, 0)
-            return traced.allocations.has(cell as u32) ? cell as intrinsics.Handle : undefined
+            return freshCellOf(traced, getRef(n, 1)) as intrinsics.Handle | undefined
         }
         for (const [id, n] of [...graph.nodes]) {
             if (n.op !== NodeOp.setProp || getRef(n, 2)) continue
@@ -4769,7 +4870,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             const setter = cell && accessorOf(heap.deref(cell), getLiteral(graph, n, 2) as intrinsics.Handle, heap.PropFlags.has_setter)
             if (setter) putNode(graph, id, NodeOp.call, [getRef(n, 0), valueOf(setter), getOperand(graph, n, 1), getOperand(graph, n, 3)])
         }
-        const freshKeys = freshKeysOf(traced)
+        const shapes = freshShapes(traced)
         let users: Map<number, [number, number][]> | undefined
         function demanded(id: number, referent: intrinsics.Handle): boolean {
             if (!users) {
@@ -4800,13 +4901,14 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             const key = getLiteral(graph, n, 2) as intrinsics.Handle
             const owner = freshCell(n)
             if (owner !== undefined) {
-                const own = freshKeys.get(owner)
-                const getter = !own?.has(key) && own !== null && accessorOf(heap.deref(owner), key, heap.PropFlags.has_getter)
+                const writes = shapes.get(owner as u32)
+                const own = !!writes && [...writes.values()].some(written => written === undefined || written === key)
+                const getter = !own && accessorOf(heap.deref(owner), key, heap.PropFlags.has_getter)
                 if (getter) {
                     putNode(graph, id, NodeOp.call, [getRef(n, 0), valueOf(getter), getOperand(graph, n, 1)])
                     continue
                 }
-                if (own === null || own?.has(key)) continue
+                if (own) continue
                 const slot = dataSlot(heap.deref(owner), key)
                 if (slot && !heap.isBoxedF64(slot) && heap.isCallable(heap.deref(slot))) foldRead(graph, id, n, valueOf(slot), folded)
                 continue
@@ -4839,6 +4941,17 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         retarget(traced.graph, folded)
         engineHeapArrays(traced.graph)
     }
+    function packRest(graph: Graph, operands: Operand[], rest: number): void {
+        const extra = operands.splice(3 + rest)
+        while (operands.length < 3 + rest) operands.push(addNode(graph, NodeOp.heapHandle, [{ literal: 0 }], Types.unknown_number))
+        const array = addNode(graph, NodeOp.rt, [operands[0], { literal: rt.Op.arrayLiteral }, { literal: extra.length }])
+        let token = array
+        for (let i = 0; i < extra.length; i++) {
+            token = addNode(graph, NodeOp.rt, [token, { literal: rt.Op.arrayElement }, array, { literal: i }, extra[i]])
+        }
+        operands[0] = token
+        operands.push(array)
+    }
     function retarget(graph: Graph, folded: Map<number, number>): void {
         if (!folded.size) return
         for (const [id, n] of [...graph.nodes]) {
@@ -4848,6 +4961,20 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             const target = getNode(graph, value)!
             const linked: any = session.stubFunctions.get(getLiteral(graph, target, 0) as u32)
             const operands = withOperand(graph, n, 1, value)
+            const fn = linked && isLocalStub(linked) ? functions[linked.__localTarget] : linked
+            // XXX: each source becomes its own call to keep its own shape; inside the rest loop the sources are a union, which assign cannot copy from
+            if (fn === builtinGlobals.Object.assign && countIds(n) >= 4) {
+                let token = getOperand(graph, n, 0)
+                const target = getOperand(graph, n, 3)
+                const callee = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(assignOne) }])
+                for (let i = 4; i < countIds(n); i++) {
+                    token = addNode(graph, NodeOp.call, [token, callee, 0, target, getOperand(graph, n, i)])
+                }
+                putNode(graph, id, NodeOp.after, [token, target])
+                continue
+            }
+            const compiled = fn ? codeOf(fn)?.source.compiled : undefined
+            if (compiled?.rest) packRest(graph, operands, compiled.paramCount - 1)
             if (linked && Array.isArray(linked.__args)) {
                 if (Number.isSafeInteger(linked.__syscall)) {
                     operands[1] = addNode(graph, NodeOp.syscallTarget, [{ literal: linked.__syscall }])
@@ -4958,43 +5085,6 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         runtimeObjects().seal(proto as intrinsics.Handle)
         return true
     }
-    function expandAssigns(traced: FastTraced): void {
-        const graph = traced.graph
-        if (!traced.allocations.size) return
-        const live = reachableNodes(graph)
-        const keysOf = new Map<number, intrinsics.Handle[]>()
-        for (const id of [...live].sort((a, b) => a - b)) {
-            const n = getNode(graph, id)
-            if (n?.op !== NodeOp.setProp || getRef(n, 2)) continue
-            const object = strippedAfter(graph, getRef(n, 1))
-            const target = getNode(graph, object)
-            if (target?.op !== NodeOp.heapHandle || getRef(target, 0) || !traced.allocations.has(getLiteral(graph, target, 0) as u32)) continue
-            let keys = keysOf.get(object)
-            if (!keys) keysOf.set(object, keys = [])
-            const key = getLiteral(graph, n, 2) as intrinsics.Handle
-            if (!keys.includes(key)) keys.push(key)
-        }
-        const order = [...live].sort((a, b) => a - b)
-        for (const id of order) {
-            const n = getNode(graph, id)
-            if (n?.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.assign) continue
-            const target = getRef(n, 2)
-            const source = strippedAfter(graph, getRef(n, 3))
-            const keys = keysOf.get(source)
-            if (!target || !keys) continue
-            let token: Operand = getOperand(graph, n, 0)
-            for (const key of keys) {
-                const read = addNode(graph, NodeOp.getProp, [token, getRef(n, 3), { literal: key }])
-                const write = addNode(graph, NodeOp.setProp, [read, target, { literal: key }, read])
-                token = write
-                const targetCell = strippedAfter(graph, target)
-                let targetKeys = keysOf.get(targetCell)
-                if (!targetKeys) keysOf.set(targetCell, targetKeys = [])
-                if (!targetKeys.includes(key)) targetKeys.push(key)
-            }
-            putNode(graph, id, NodeOp.after, [token, target])
-        }
-    }
     interface Spliceable {
         graph: Graph
         allocations: Map<u32, Allocation>
@@ -5054,7 +5144,6 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         applyPrototypes(traced)
         sealStaticClosures(traced)
         spliceTagged(origin, traced)
-        expandAssigns(traced)
         const prepared: Spliceable = { graph: snapshotGraph(traced.graph), allocations: new Map(traced.allocations), frames: traced.frames.size > 0 }
         byKey.set(key, prepared)
         return prepared
@@ -5438,7 +5527,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                 if (flags.has('trace-time')) console.log('TRACETIME', fn.name, (performance.now() - traceStart).toFixed(2), traced.graph.nodes.size)
                 lowerPanics(traced.graph)
                 engineHeapArrays(traced.graph)
-                ownProperties(traced.graph)
+                ownProperties(traced)
                 outlineCold(fn, code, traced)
                 if (flags.has(`traced-debug:${fn.name}`)) console.log(dumpGraph(traced.graph))
                 origin.trace = traced
@@ -6084,12 +6173,14 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const result = string ? propertyEval.stringShape : numeric ? propertyEval.numberShape : plannedShape(plan, returned)
         const origin = originOf(callee)
         const target = callee === origin ? undefined : site.context !== undefined || site.target.op === NodeOp.localTarget ? link(callee) : session.linkFunction(callee)
+        const boxedResult = local?.calls.has(site.call) ? local.boxedCalls.has(site.call) : unit.boxedReturn
         return {
             paramCount: site.context !== undefined && !receiver ? site.args.length : paramCount, receiver,
             receiverShape: receiver ? shapes.get(paramCount) : undefined,
             argShapes: Array.from({ length: paramCount }, (_, i) => shapes.get(i)),
             result, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionOfShape(returned) || undefined,
-            boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && (local?.calls.has(site.call) ? local.boxedCalls.has(site.call) : unit.boxedReturn)) || undefined,
+            stringWord: (isStringRep(returned) && boxedResult) || undefined,
+            boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && boxedResult) || undefined,
             decode: (result !== undefined && !string && !numeric && !propertyEval.reducedShape(result) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionOfShape(returned))) || boxedFloat ? pstack0Base() : undefined,
             target,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
@@ -6135,10 +6226,18 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         function encodedWord(x: Operand): boolean {
             return typeof x === 'number' && !!x && (encoded.has(x) || encoded.has(tailOf(graph, x)))
         }
+        function stringWord(x: Operand): number | undefined {
+            if (typeof x !== 'number' || !x || word(x)) return
+            const n = getNode(graph, tailOf(graph, x))
+            const handle = n?.op === NodeOp.heapHandle && !getRef(n, 0) ? getLiteral(graph, n, 0) as intrinsics.Handle : 0 as intrinsics.Handle
+            const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))
+            if (!(handle && heap.isString(handle)) && !isStringRep(rep)) return
+            return tagVmHandleNode(graph, x)
+        }
         function toWord(x: Operand): Operand {
             if (typeof x !== 'number') return { literal: x.literal * 2 }
             if (union(x) || word(x)) return x
-            return object(x) ? encode(x) : addNode(graph, NodeOp.box, [x], Types.vm_value)
+            return stringWord(x) ?? (object(x) ? encode(x) : addNode(graph, NodeOp.box, [x], Types.vm_value))
         }
         function asWord(x: Operand): Operand {
             return object(x) ? encode(x as number) : x
@@ -7446,8 +7545,10 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const touched = new Set(folded)
         expandParams(program, touched)
         shareCallerValues(program, touched)
+        specializeLiteralArgs(program, touched)
         pruneDeadArgs(program, touched)
         for (const symbol of touched) { program.units.set(symbol, renormalize(program.units.get(symbol)!, clock)) }
+        inlineSpecialized(program, touched, clock)
     })
     reached = reachUnits(program)
     unswitchHot(program, programLevels(program), clock)

@@ -5275,6 +5275,10 @@ fn Parser_(comptime skip_trivia: bool) type {
             var decorators = NodeList_.init(this);
 
             while (this.lexer.token != .t_close_brace) {
+                // FIXME: find where we lose ctx and remove this
+                if (this.lexer.token == .t_identifier) {
+                    this.lexer.token = js_lexer.ClassScopeKeywords.get(this.lexer.identifier) orelse .t_identifier;
+                }
                 switch (this.lexer.token) {
                     .t_at => {
                         try decorators.append(try this.parseDecoratorNode());

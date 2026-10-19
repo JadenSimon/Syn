@@ -29,6 +29,7 @@ export interface Allocation {
     escaped: boolean
     native?: boolean
     dynamic?: boolean
+    copied?: boolean
 }
 
 export interface Location {
@@ -311,6 +312,46 @@ function exclusiveOf(g: Graph, root: number): Set<number> {
                 if (entries.every(e => inside.has(e) || own.has(e))) {
                     inside.add(block.bodyId)
                     work.push(block.bodyId)
+                } else {
+                    const region = new Map<number, Set<number>>()
+                    const reached = [block.id]
+                    while (reached.length) {
+                        const next = reached.pop()!
+                        if (region.has(next)) continue
+                        const body = getBlock(g, next)?.bodyId
+                        if (!body) continue
+                        const members = bodyNodes(g, body)
+                        region.set(next, members)
+                        for (const member of members) {
+                            const app = getNode(g, member)
+                            if (app?.op === NodeOp.apply) reached.push(getRef(app, 0))
+                        }
+                    }
+                    const covered = new Set<number>()
+                    for (const members of region.values()) {
+                        for (const member of members) covered.add(member)
+                    }
+                    const entered: number[] = []
+                    for (const target of region.keys()) {
+                        const incoming = users.get(target) ?? []
+                        if (incoming.some(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply && !inside.has(u) && !covered.has(u))) entered.push(target)
+                    }
+                    while (entered.length) {
+                        const target = entered.pop()!
+                        const members = region.get(target)
+                        if (!members) continue
+                        region.delete(target)
+                        for (const member of members) {
+                            const app = getNode(g, member)
+                            if (app?.op === NodeOp.apply && !inside.has(member) && region.has(getRef(app, 0))) entered.push(getRef(app, 0))
+                        }
+                    }
+                    for (const target of region.keys()) {
+                        const body = getBlock(g, target)!.bodyId
+                        if (inside.has(body)) continue
+                        inside.add(body)
+                        work.push(body)
+                    }
                 }
             }
         }
@@ -1771,13 +1812,16 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const source = getRef(n, 3)
         flow(frame, id, seen(frame, id, target))
         const into = [...seen(frame, id, target)].flatMap(v => objectsOf(frame, target, v))
+        const excluded = rt.assignExcluded(frames[frame].graph!, n).map(key => nameOf(key))
         for (const v of [...seen(frame, id, source)]) {
             const from = objectsOf(frame, source, v)
             if (!from.length) exposeArgs(frame, n, 2)
             for (const allocation of from) {
+                allocations[allocation].copied = true
                 setOf(copiers, allocation).add(key(frame, id))
                 for (const loc of [...fieldsOf.get(allocation) ?? []]) {
                     const name = locations[loc].key
+                    if (excluded.includes(name)) continue
                     access(false, frame, id, allocation, name)
                     for (const to of into) {
                         const copy = access(true, frame, id, to, name)
@@ -2121,10 +2165,15 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             const g = frame.graph
             if (!g) return
             for (const [id, n] of g.nodes) {
-                if (n.op !== NodeOp.getProp || !seeded.has(key(f, id)) || !unrecorded(valuesAt(f, id))) continue
+                if (n.op !== NodeOp.getProp || !seeded.has(key(f, id))) continue
                 if (![...valuesAt(f, getRef(n, 1))].some(v => values[v].allocation !== undefined)) continue
                 const locs = touched.get(key(f, id))
-                if (!locs?.size || [...locs].some(loc => contents.get(loc)?.size)) continue
+                if (!locs?.size) continue
+                const receivers = new Set([...seen(f, id, getRef(n, 1))].flatMap(v => objectsOf(f, getRef(n, 1), v)))
+                const missing = [...locs].filter(loc => receivers.has(locations[loc].allocation) && !contents.get(loc)?.size)
+                if (!missing.length) continue
+                const keyed = !!getRef(n, 2) || heap.keyIndex(getLiteral(g, n, 2) as Handle) !== undefined
+                if (keyed && missing.length !== locs.size) continue
                 flow(f, id, [Undefined])
             }
         })
@@ -2297,6 +2346,7 @@ export interface ObjectType {
     constant: boolean
     native: boolean
     dynamic: boolean
+    copied: boolean
     proto?: Handle
     state?: Handle
     handle?: Handle
@@ -2480,7 +2530,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const broken = encapsulationViolations(data, host)
     if (broken.size && intrinsics.argv().includes('invariant-debug')) console.log('ENCAPSULATION-BROKEN', [...broken].join(' '))
     if ([...broken].some(proto => data.consulted.has(proto))) data = analyzeValues(roots, { ...host, invariantsOf: proto => broken.has(proto) ? undefined : host.invariantsOf!(proto) })
-    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, proto: allocation.proto, state: allocation.state, handle: allocation.handle, fields: new Map(), forms: new Map(), initialized: new Set<string>(), constructed: new Set<string>(), stored: new Set<string>(), escaped: allocation.escaped, readers: [] }))
+    const objects: ObjectType[] = data.allocations.map(allocation => ({ name: allocation.name, site: allocation.site, context: allocation.context, constant: allocation.constant, native: !!allocation.native, dynamic: !!allocation.dynamic, copied: !!allocation.copied, proto: allocation.proto, state: allocation.state, handle: allocation.handle, fields: new Map(), forms: new Map(), initialized: new Set<string>(), constructed: new Set<string>(), stored: new Set<string>(), escaped: allocation.escaped, readers: [] }))
     const interned = new Map<string, Type>()
     function typeOf(list: Iterable<number>): Type {
         let k = ''
@@ -3172,17 +3222,29 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (object.native || object.dynamic || object.name === 'buffer') return false
         return genericFor(id) ? true : !object.constant || object.name === 'Object'
     }
+    const recordKeys = types.objects.map(object => [...object.fields.keys()].sort().join(','))
+    const recordCopied = types.objects.map(object => object.copied)
+    function presenceKept(a: number, b: number): boolean {
+        if (!recordCopied[a] && !recordCopied[b]) return true
+        return recordKeys[a] === recordKeys[b]
+    }
     function joinRecords(list: number[]): boolean {
         const byProto = new Map<Handle | undefined, number>()
         let merged = false
         for (const id of list) {
             if (!joinable(id)) continue
             const first = byProto.get(types.objects[id].proto)
-            if (first === undefined) byProto.set(types.objects[id].proto, id)
-            else if (findRecord(id) !== findRecord(first)) {
-                recordParent[findRecord(id)] = findRecord(first)
-                merged = true
+            if (first === undefined) {
+                byProto.set(types.objects[id].proto, id)
+                continue
             }
+            const into = findRecord(first)
+            const from = findRecord(id)
+            if (into === from || !presenceKept(into, from)) continue
+            recordParent[from] = into
+            recordCopied[into] = recordCopied[into] || recordCopied[from]
+            if (recordKeys[into] !== recordKeys[from]) recordKeys[into] = '*'
+            merged = true
         }
         return merged
     }
@@ -4103,8 +4165,13 @@ export function elementWidth(element: Rep): number {
     return rawElement(element) ? 8 : 4
 }
 
-function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean): string {
-    if (numberName(rep) === 'int' || (rep.kind === 'undefined' && !param) || (rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str')) return 'word'
+export function isStringRep(rep: Rep | undefined): boolean {
+    return rep?.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str'
+}
+
+function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean, boxed: boolean): string {
+    if (boxed && isStringRep(rep)) return 'string-word'
+    if (numberName(rep) === 'int' || (rep.kind === 'undefined' && !param) || isStringRep(rep)) return 'word'
     if (rep.kind === 'number') return numberText(rep.format)
     return `${repKey(rep, target => movedTarget(target, reduced))}${rep.fresh ? '!' : ''}`
 }
@@ -4148,13 +4215,13 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
         const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
         const value = (rep: Rep) => rep.kind === 'number' ? numberText(rep.format) : view(rep)
         const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : value(rep)
-        const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced)
+        const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced, unit.boxes || unit.boxedReturn)
         const entry = g.blocks[0].params
         const wide = (id: number) => unit.slices.has(id) && elementWidth(unit.slices.get(id)!) === 8
         const read = (id: number) => getNode(g, id)!.op === NodeOp.load || rt.sliceOf(g, getNode(g, id)!) === rt.Op.sliceRead
         const keyed = (id: number) => !moved.has(id) || !read(id) || wide(id)
         return [
-            unitIdentity(unit.fn), unit.boxes, [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
+            unitIdentity(unit.fn), unit.boxes, unit.boxedReturn ? view(unit.returns) : '', [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${abiOf(unit)}`,
             byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, Handle>(), k => String(k)),
             [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.slices, element => String(elementWidth(element))), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),

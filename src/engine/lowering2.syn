@@ -5554,6 +5554,122 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
 
+    function unrollSmallLoop(target: GraphBlock): boolean {
+        const tail = getNode(g, target.bodyId)
+        if (tail?.op !== NodeOp.select || countIds(tail) !== 3) return false
+        const stay = getRef(tail, 1)
+        const leave = getRef(tail, 2)
+        const cond = getNode(g, getRef(tail, 0))
+        if (!cond || (cond.op !== NodeOp.lt && cond.op !== NodeOp.le && cond.op !== NodeOp.ne) || comparesFloats(g, cond)) return false
+        const counter = getRef(cond, 0)
+        if (!target.params.includes(counter)) return false
+        const chain: GraphBlock[] = [target]
+        let next = getNode(g, tailOf(g, stay))
+        while (next?.op === NodeOp.apply && getRef(next, 0) !== target.id) {
+            const block = getGraphBlock(getRef(next, 0))
+            if (chain.includes(block) || chain.length >= 4) return false
+            chain.push(block)
+            next = getNode(g, tailOf(g, block.bodyId))
+        }
+        if (next?.op !== NodeOp.apply) return false
+        for (const block of chain) {
+            for (const op of [NodeOp.call, NodeOp.store, NodeOp.pstack, NodeOp.alloca, NodeOp.rt]) {
+                if (findValues(block.id, op)?.length) return false
+            }
+            for (const p of block.params) {
+                const T = typeOf(getNode(g, p)!)
+                if (typeof T === 'number' && RangedTypes.has(T) && intrinsics.intrinsicBitWidth(T) < 64) return false
+            }
+        }
+        const members = new Set(chain.map(b => b.id))
+        const exit = getNode(g, tailOf(g, leave))
+        if (exit?.op === NodeOp.apply && members.has(getRef(exit, 0))) return false
+        for (const block of chain.slice(1)) {
+            if (findInboundApplies(block).some(([from]) => !members.has(from))) return false
+        }
+        interface Linear {
+            param: number
+            offset: number
+        }
+        function linear(id: number, literal: number, env: Map<number, Linear>): Linear | undefined {
+            if (!id) return Number.isSafeInteger(literal) ? { param: 0, offset: literal } : undefined
+            if (env.has(id)) return env.get(id)
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.literal) return linear(0, getLiteral(g, n, 0), env)
+            if (n.op === NodeOp.after) return linear(getRef(n, countIds(n) - 1), getLiteral(g, n, countIds(n) - 1), env)
+            if (n.op !== NodeOp.add && n.op !== NodeOp.sub) return
+            const a = linear(getRef(n, 0), getLiteral(g, n, 0), env)
+            const b = linear(getRef(n, 1), getLiteral(g, n, 1), env)
+            if (!a || !b || b.param) return
+            if (a.param && n.op === NodeOp.sub && a.offset < b.offset) return
+            return { param: a.param, offset: n.op === NodeOp.add ? a.offset + b.offset : a.offset - b.offset }
+        }
+        let env = new Map<number, Linear>()
+        for (const p of target.params) env.set(p, { param: p, offset: 0 })
+        for (let i = 0; i < chain.length; i++) {
+            const app = getNode(g, tailOf(g, i === 0 ? stay : chain[i].bodyId))!
+            const into = chain[(i + 1) % chain.length]
+            const mapped = new Map<number, Linear>()
+            for (let k = 0; k < into.params.length; k++) {
+                const value = linear(getRef(app, k + 1), getLiteral(g, app, k + 1), env)
+                if (value) mapped.set(into.params[k], value)
+            }
+            env = mapped
+        }
+        const update = env.get(counter)
+        if (!update || update.param !== counter || update.offset <= 0) return false
+        const stride = update.offset
+        const entries = findInboundApplies(target).filter(([from]) => !members.has(from))
+        if (!entries.length) return false
+        function incoming(index: number): number | undefined {
+            const values = entries.map(([, id]) => constantOf(getNode(g, id)!, index + 1))
+            return values.every(v => v !== undefined && v === values[0]) ? values[0] : undefined
+        }
+        const start = incoming(target.params.indexOf(counter))
+        const limit = getRef(cond, 1)
+        const limitAt = target.params.indexOf(limit)
+        let bound: number | undefined
+        if (!limit) bound = getLiteral(g, cond, 1)
+        else if (limitAt >= 0 && env.get(limit)?.param === limit && env.get(limit)!.offset === 0) bound = incoming(limitAt)
+        if (start === undefined || bound === undefined) return false
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(bound) || start < 0 || bound < 0) return false
+        if (cond.op === NodeOp.ne && (bound < start || (bound - start) % stride !== 0)) return false
+        const span = cond.op === NodeOp.le ? Math.floor((bound - start) / stride) + 1 : Math.ceil((bound - start) / stride)
+        const count = Math.max(0, span)
+        const T = typeOf(getNode(g, counter)!)
+        if (count > 4 || start + count * stride > Math.min(Number.MAX_SAFE_INTEGER, rangeMax(T))) return false
+        let size = 0
+        for (const block of chain) size += blockSize(block, 49)
+        if (size * Math.max(count, 1) > 48) return false
+        const initial = new Map<number, number>()
+        initial.set(counter, addNode(g, NodeOp.literal, [{ literal: start }], T))
+        if (limitAt >= 0) initial.set(limit, addNode(g, NodeOp.literal, [{ literal: bound }]))
+        function expand(block: GraphBlock, iteration: number, params: Map<number, number>): number {
+            const last = block === target && iteration === count
+            let original = block.bodyId
+            if (block === target) original = last ? leave : stay
+            const copied: number[] = []
+            const body = freshCopy(original, params, copied)
+            if (copied.length) remapFacts(copied, params)
+            if (last) return body
+            const applied = tailOf(g, body)
+            const app = getNode(g, applied)!
+            const into = getGraphBlock(getRef(app, 0))
+            const args = new Map<number, number>()
+            for (let k = 0; k < into.params.length; k++) {
+                const T = typeOf(getNode(g, into.params[k])!)
+                args.set(into.params[k], getRef(app, k + 1) || addNode(g, NodeOp.literal, [{ literal: getLiteral(g, app, k + 1) }], T))
+            }
+            const following = expand(into, into === target ? iteration + 1 : iteration, args)
+            putNode(g, applied, NodeOp.after, [...getOperands(g, app).slice(1), following])
+            return body
+        }
+        target.bodyId = expand(target, 0, initial)
+        for (const block of chain.slice(1)) removeBlock(block)
+        revisitBlock(target)
+        return true
+    }
+
     function closeCountedLoop(target: GraphBlock) {
         if (!preds.get(target.id)?.has(target.id)) return
         const tail = getNode(g, target.bodyId)
@@ -10108,6 +10224,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(deriveIncrementor, b)
             step(widenCountedStores, b)
             if (step(closeCountedLoop, b)) continue
+            if (step(unrollSmallLoop, b)) continue
             step(reverseLoop, b)
             if (step(unswitchLoop, b)) continue
             step(hoistInvariants, b)
@@ -14818,9 +14935,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const taken = getNode(g, getRef(n, 1))?.op === NodeOp.panic ? 2
                 : getNode(g, getRef(n, 2))?.op === NodeOp.panic ? 1 : 0
             if (!taken && preferBranchless(n)) {
-                for (let i = 0; i < countIds(n); i++) {
-                    effect(getRef(n, i))
-                }
+                if (!done.has(id)) build(id)
             } else {
                 if (!taken) throw `lowering: effect ${id} branches before the tail\n${errorDump(g)}`
                 effect(getRef(n, taken))

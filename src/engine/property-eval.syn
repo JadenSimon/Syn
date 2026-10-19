@@ -21,9 +21,9 @@ import {
     addCopy, retypeNode, insertNode,
 } from './graph-node'
 import { snapshotField, snapshotKeys } from './heap-records'
-import { newSymbolId, symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmValue } from './vm'
+import { newSymbolId, symbolOf, symbolValue, tagVmHandle, tagVmScalar, vmHandleNode, vmValue } from './vm'
 import * as native from './native'
-import { Op as RtOp, bindingOf, callOf, earlyCalls } from './rt'
+import { Op as RtOp, assignExcluded, bindingOf, callOf, earlyCalls } from './rt'
 
 type Handle = intrinsics.Handle
 const Types = intrinsics.Types
@@ -76,6 +76,7 @@ export interface CallBinding {
     reads?: Handle[]
     location?: [Handle, string]
     boxed?: boolean
+    stringWord?: boolean
     stores?: [from: number, into: number][]
     argShapes?: (Handle | undefined)[]
 }
@@ -213,10 +214,12 @@ export function resolveProperties(
     }
     for (const [id, n] of [...source.nodes]) {
         if (n.op !== NodeOp.rt || getLiteral(runtime, n, 1) !== RtOp.assign) continue
-        const from = opts.pointers?.get(getRef(n, 3))
-        if (from === undefined || from === numberShape || from === stringShape) continue
+        const from = opts.pointers?.get(getRef(n, 3)) ?? opts.plannedShapes?.get(getRef(n, 3))
+        if (!from || from === numberShape || from === stringShape) continue
         let token = getRef(n, 0)
+        const excluded = assignExcluded(runtime, n)
         for (const key of dataKeys(from)) {
+            if (excluded.includes(key)) continue
             const read = addNode(source, NodeOp.getProp, [token, getRef(n, 3), { literal: key }])
             token = addNode(source, NodeOp.setProp, [read, getRef(n, 2), { literal: key }, read])
         }
@@ -1073,7 +1076,8 @@ export function resolveProperties(
     const unionTargets = new Map<number, { tag: number, arms: number[] }>()
     let armOverride: { id: number, shape: Handle } | undefined
     function memberIndex(members: Handle[], shape: Handle): number {
-        return members.findIndex(m => native.sameSnapshotShape(m, shape))
+        const exact = members.indexOf(shape)
+        return exact >= 0 ? exact : members.findIndex(m => native.sameSnapshotShape(m, shape))
     }
     function unionOf(param: number, members: Handle[]): void {
         if (unions.has(param)) return
@@ -1088,14 +1092,30 @@ export function resolveProperties(
             const current = getNode(out, apply)!
             const arrival = getRef(getNode(source, apply)!, at.index + 1)
             const operands = getOperands(runtime, current)
-            const carried = unions.get(strippedValue(arrival))
-            if (carried && !(carried.members.length === members.length && carried.members.every((m, i) => native.sameSnapshotShape(m, members[i])))) throw `property-eval: %${apply} carries a differently numbered union into %${param}`
-            const arrived = carried ? undefined : pointerShape(arrival)
-            const index = arrived ? memberIndex(members, arrived) : -1
-            if (!carried && index < 0) throw `property-eval: %${apply} brings an unknown shape into the union at %${param}`
-            operands.splice(position + 1, 0, carried ? carried.tag : { literal: index })
+            let carried = unions.get(strippedValue(arrival))
+            let arrived: Handle | null | undefined
+            if (!carried) {
+                arrived = pointerShape(arrival)
+                carried = unions.get(strippedValue(arrival))
+            }
+            if (carried) {
+                const indices = carried.members.map(m => memberIndex(members, m))
+                if (indices.some(i => i < 0)) throw `property-eval: %${apply} carries an unknown union member into %${param}`
+                operands.splice(position + 1, 0, remapTag(carried.tag, indices))
+                putCopy(out, apply, current, operands)
+                continue
+            }
+            let index = -1
+            if (arrived === null) index = 0
+            else if (arrived) index = memberIndex(members, arrived)
+            if (index < 0) throw `property-eval: %${apply} brings an unknown shape into the union at %${param}`
+            operands.splice(position + 1, 0, { literal: index })
             putCopy(out, apply, current, operands)
         }
+    }
+    function remapTag(tag: number, indices: number[]): number {
+        if (indices.every((index, i) => index === i)) return tag
+        return tagSelect(tag, indices.map(index => addNode(out, NodeOp.literal, [{ literal: index }])))
     }
     function tagSelect(tag: number, arms: number[]): number {
         let chosen = arms[arms.length - 1]
@@ -1109,15 +1129,16 @@ export function resolveProperties(
     }
     function resolveUnion(id: number, n: GraphNode, union: Union): void {
         const arms: number[] = []
-        const shapes: (Handle | undefined)[] = []
+        const shapes: (Handle | null | undefined)[] = []
         let constants = true
-        for (const shape of union.members) {
-            const fields = layout(shape)
-            const member: Memory = { ...fields, ptr: getRef(n, 1), base: 0, shape, reduced: false, pointer: true, address: [getRef(n, 1), 0] }
+        for (const memberShape of union.members) {
+            const fields = layout(memberShape)
+            const member: Memory = { ...fields, ptr: getRef(n, 1), base: 0, shape: memberShape, reduced: false, pointer: true, address: [getRef(n, 1), 0] }
             const arm = newId()
             resolveMemory(arm, n, member)
             arms.push(arm)
-            shapes.push(memory.get(arm)?.shape)
+            const forwarded = forwardedReads.get(arm)
+            shapes.push(memory.get(arm)?.shape ?? (forwarded !== undefined ? shape(forwarded) : undefined))
             const resolved = getNode(out, arm)!
             const value = resolved.op === NodeOp.after ? getRef(resolved, countIds(resolved) - 1) : 0
             const valueNode = value ? getNode(out, value) : undefined
@@ -1128,17 +1149,22 @@ export function resolveProperties(
         const armTags = arms.map(arm => fieldTags.get(arm))
         if (armTags.every(tag => tag !== undefined)) fieldTags.set(id, tagSelect(union.tag, armTags as number[]))
         if (constants) unionTargets.set(id, { tag: union.tag, arms: arms.map(a => getRef(getNode(out, a)!, countIds(getNode(out, a)!) - 1)) })
-        if (shapes.every(s => s !== undefined)) joinResult(id, union.tag, shapes as Handle[])
+        if (shapes.every(s => s !== undefined)) joinResult(id, union.tag, shapes as (Handle | null)[])
     }
-    function joinResult(id: number, tag: number, shapes: Handle[]): void {
+    function joinResult(id: number, tag: number, shapes: (Handle | null)[]): void {
         const members: Handle[] = []
-        for (const s of shapes) if (memberIndex(members, s) < 0) members.push(s)
+        for (const s of shapes) if (s !== null && memberIndex(members, s) < 0) members.push(s)
+        if (!members.length) {
+            derived.set(id, null)
+            return
+        }
         if (members.length === 1) {
             const fields = layout(members[0])
             memory.set(id, { ...fields, ptr: id, base: 0, shape: members[0], reduced: false, pointer: true, address: [id, 0] })
             return
         }
-        unions.set(id, { tag, members })
+        const indices = shapes.map(s => s === null ? 0 : memberIndex(members, s))
+        unions.set(id, { tag: remapTag(tag, indices), members })
     }
     const active = new Set<string>()
     function query<T>(key: string, compute: () => T): T {
@@ -1354,6 +1380,7 @@ export function resolveProperties(
         if (numbers.has(id)) return numberShape
         if (strings.has(id)) return stringShape
         if (derived.has(id)) return derived.get(id)
+        if (unions.has(id)) return
         const planned = plannedAnswer(id)
         if (planned !== undefined) {
             commit(id, planned)
@@ -1762,6 +1789,12 @@ export function resolveProperties(
     function bindValue(id: number, binding: CallBinding | undefined): void {
         if (binding?.nullish && !memory.has(id) && !derived.has(id)) commit(id, null)
         if (binding?.boxed) unboxNumber(id, id)
+        if (binding?.stringWord && !unboxed.has(id)) {
+            const value = vmHandleNode(out, id)
+            decodeInputs.add(value)
+            unboxed.set(id, value)
+            strings.add(id)
+        }
         if (binding?.location !== undefined && !locations.has(id)) locations.set(id, binding.location)
         if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union)
         else if (binding?.float && !unboxed.has(id)) unbox(id, id, binding.decode!)
