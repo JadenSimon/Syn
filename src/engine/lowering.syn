@@ -5,6 +5,30 @@ import * as intrinsics from './intrinsics'
 const Types = intrinsics.Types
 const assert = intrinsics.assert
 
+const emitterStats = intrinsics.argv().includes('optimize-stats') ? new Map<string, [ms: number, idle: number, calls: number, changes: number]>() : undefined
+
+function emitterStep<T>(pass: (arg: T) => boolean, arg: T): boolean {
+    if (!emitterStats) return pass(arg)
+    const start = performance.now()
+    const changed = pass(arg)
+    const elapsed = performance.now() - start
+    const stats = emitterStats.get(pass.name) ?? [0, 0, 0, 0]
+    stats[0] += elapsed
+    if (!changed) stats[1] += elapsed
+    stats[2]++
+    if (changed) stats[3]++
+    emitterStats.set(pass.name, stats)
+    return changed
+}
+
+export function printEmitterStats(): void {
+    if (!emitterStats) return
+    for (const [name, [ms, idle, calls, changes]] of emitterStats) {
+        console.log('optimize step', ms.toFixed(3), `emitter:${name}`, `${changes}/${calls}`, `idle ${idle.toFixed(3)}`)
+    }
+    emitterStats.clear()
+}
+
 type Ty = intrinsics.Types
 
 export interface Target {
@@ -159,6 +183,7 @@ interface AsmItem {
     label: number  // branch target, or the label's own id
     reg: number    // for cbnz/cbz/cset
     cond: number   // for cset/bcond
+    testBit?: number // final CBZ/CBNZ contraction to TBZ/TBNZ
     storeBase?: number
     storeOffset?: number
     storeBytes?: number
@@ -1086,7 +1111,16 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
             else if (i > 0) invertOverJump(i - 1)
         }
-        for (let i = items.length - 1; i >= 3; i--) reuseConditionalFlags(i)
+        for (let i = items.length - 1; i >= 3; i--) {
+            reuseConditionalFlags(i)
+            const branch = items[i]
+            if ((branch?.kind === 'cbz' || branch?.kind === 'cbnz') && items[i - 1]?.aluName === 'and'
+                && branch.deadAfter?.has(branch.reg)) {
+                const before = items.length
+                emitterStep(fuseLateConjunction, i)
+                i -= before - items.length
+            }
+        }
         const returns = new Map<number, AsmItem>()
         for (let i = 0; i < items.length; i++) {
             if (items[i].kind !== 'label') continue
@@ -1213,6 +1247,26 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     // assign word addresses and encode the displacements
+    function fuseBitBranch(at: number): boolean {
+        const branch = items[at]
+        const mask = items[at - 1]
+        if ((mask.logicalDst ?? mask.extractDst ?? mask.shiftDst ?? mask.convertDst) !== branch.reg) return false
+        const tested = testedBits(mask)
+        if (!tested) return false
+        const [src, bits] = tested
+        const one = BigInt(1)
+        if (!bits || (bits & (bits - one)) !== BigInt(0)) return false
+        const target = items.findIndex(it => it.kind === 'label' && it.label === branch.label)
+        if (target < 0 || Math.abs(target - at) >= (1 << 13) - 1) return false
+        let bit = 0
+        for (let value = bits; value > one; value >>= one) bit++
+        branch.testBit = bit
+        branch.reg = src
+        inheritDead(branch, mask)
+        items.splice(at - 1, 1)
+        return true
+    }
+
     function resolve(): void {
         if (finished) return
         finished = true
@@ -1224,10 +1278,18 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
         const addrOf = new Map<number, number>()
         let pc = 0
-        for (const it of items) {
+        for (let i = 0; i < items.length; i++) {
+            const it = items[i]
             if (it.kind === 'label') {
                 addrOf.set(it.label, pc)
                 continue
+            }
+            if (i > 0 && (it.kind === 'cbz' || it.kind === 'cbnz') && it.deadAfter?.has(it.reg)
+                && (items[i - 1].logicalOp === 'and' || items[i - 1].extractWidth === 1
+                    || (items[i - 1].shiftKind === 'lsr' && items[i - 1].shiftAmount === (items[i - 1].narrow ? 31 : 63)))
+                && emitterStep(fuseBitBranch, i)) {
+                i--
+                pc--
             }
             pc++
         }
@@ -1252,6 +1314,12 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     if (delta < -(1 << 18) || delta >= (1 << 18)) throw `aarch64: conditional branch out of range`
                     it.word = (0x54000000 | ((delta & 0x7FFFF) << 5) | it.cond) >>> 0
                     it.text = `b.${CondNames[it.cond]} L${it.label}`
+                } else if (it.testBit !== undefined) {
+                    if (delta < -(1 << 13) || delta >= (1 << 13)) throw `aarch64: test-bit branch out of range`
+                    const bit = it.testBit
+                    const base = it.kind === 'cbnz' ? 0x37000000 : 0x36000000
+                    it.word = (base | ((bit >> 5) << 31) | ((bit & 31) << 19) | ((delta & 0x3FFF) << 5) | it.reg) >>> 0
+                    it.text = `${it.kind === 'cbnz' ? 'tbnz' : 'tbz'} ${bit < 32 ? w(it.reg) : x(it.reg)}, #${bit}, L${it.label}`
                 } else {
                     if (delta < -(1 << 18) || delta >= (1 << 18)) throw `aarch64: conditional branch out of range`
                     const base = it.kind === 'cbnz' ? 0xB5000000 : 0xB4000000
@@ -1506,7 +1574,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 const immr = (encoded >>> 6) & 0x3F
                 const imms = encoded & 0x3F
                 emit(base | (immr << 16) | (imms << 10) | (a << 5) | dst,
-                    `${op === 'or' ? 'orr' : op === 'xor' ? 'eor' : 'and'} ${w(dst)}, ${w(a)}, #${v}`)
+                    `${op === 'or' ? 'orr' : op === 'xor' ? 'eor' : 'and'} ${w(dst)}, ${w(a)}, #${v}`,
+                    { logicalDst: dst, logicalSrc: a, logicalImmediate: v, logicalOp: op, narrow: true })
                 return
             }
         }
@@ -1891,6 +1960,12 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             `${signed ? 'fcvtzs' : 'fcvtzu'} ${wide ? x(dst) : w(dst)}, ${dreg(fpA)}`)
     }
 
+    function redundantU32(src: number): boolean {
+        const prior = items[items.length - 1]
+        return prior?.kind === 'insn' && !!prior.narrow
+            && (prior.addDst ?? prior.logicalDst ?? prior.shiftDst) === src
+    }
+
     function convert(dst: number, src: number, from: Ty, to: Ty): void {
         if (from === Types.f64 || to === Types.f64) return convertFloat(dst, src, from, to)
         if (to >= Types.u1 && to <= Types.u31) {
@@ -1907,6 +1982,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (signed) {
                 emit(0x93407C00 | (src << 5) | dst, `sxtw ${x(dst)}, ${w(src)}`, meta)
             } else {
+                if (dst === src && emitterStep(redundantU32, src)) return
                 emit(0x2A0003E0 | (src << 16) | dst, `mov ${w(dst)}, ${w(src)}`, meta)
             }
         } else if (bytes === 2) {
@@ -2395,8 +2471,27 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
     }
 
-    function fuseConjunction(dead: Set<number>): boolean {
-        const len = items.length
+    function flagsUnusedFrom(at: number, budget = 32): boolean {
+        for (let i = at; i < items.length && budget-- > 0; i++) {
+            const it = items[i]
+            if (it.kind === 'bcond' || it.kind === 'cset' || it.cselCond !== undefined || it.cond >= 0) return false
+            if (it.setsFlags || it.clobbers || it.word === 0xD65F03C0) return true
+            if (isBranch(it.kind)) {
+                const target = items.findIndex(label => label.kind === 'label' && label.label === it.label)
+                if (target < 0 || !flagsUnusedFrom(target + 1, Math.floor(budget / 2))) return false
+                if (it.kind === 'b') return true
+            }
+        }
+        return false
+    }
+
+    function fuseLateConjunction(at: number): boolean {
+        const target = items.findIndex(it => it.kind === 'label' && it.label === items[at].label)
+        if (target < 0 || !flagsUnusedFrom(at + 1) || !flagsUnusedFrom(target + 1)) return false
+        return fuseConjunction(items[at].deadAfter!, at + 1)
+    }
+
+    function fuseConjunction(dead: Set<number>, len = items.length): boolean {
         if (len < 6) return false
         const branch = items[len - 1]
         const conj = items[len - 2]
@@ -2688,9 +2783,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
             return { src: item.shiftSrc, dst: item.shiftDst, lsb: amount, width: bits - amount, pos: 0, signed: item.shiftKind === 'asr' }
         }
-        if (item.logicalOp === 'and' && !item.narrow && item.logicalSrc !== undefined && item.logicalDst !== undefined
+        if (item.logicalOp === 'and' && item.logicalSrc !== undefined && item.logicalDst !== undefined
             && item.logicalImmediate !== undefined) {
-            const run = runOf(item.logicalImmediate)
+            const run = runOf(item.narrow ? Number.asUintN(32, item.logicalImmediate) : item.logicalImmediate)
             if (!run) return
             return { src: item.logicalSrc, dst: item.logicalDst, lsb: run[0], width: run[1], pos: run[0], signed: false }
         }
@@ -2707,8 +2802,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
     function knownZeros(item: AsmItem): bigint | undefined {
         const all = BigInt.asUintN(64, BigInt(-1))
-        if (item.logicalOp === 'and' && !item.narrow && item.logicalImmediate !== undefined) {
-            return all ^ BigInt.asUintN(64, BigInt(item.logicalImmediate))
+        if (item.logicalOp === 'and' && item.logicalImmediate !== undefined) {
+            return all ^ BigInt.asUintN(item.narrow ? 32 : 64, BigInt(item.logicalImmediate))
         }
         const field = fieldOf(item)
         if (!field) return
@@ -2777,8 +2872,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         item.extractSourceBits = sourceBits
     }
     function testedBits(item: AsmItem): [src: number, bits: bigint] | undefined {
-        if (item.logicalOp === 'and' && !item.narrow && item.logicalSrc !== undefined && item.logicalImmediate !== undefined) {
-            return [item.logicalSrc, BigInt.asUintN(64, BigInt(item.logicalImmediate))]
+        if (item.logicalOp === 'and' && item.logicalSrc !== undefined && item.logicalImmediate !== undefined) {
+            return [item.logicalSrc, BigInt.asUintN(item.narrow ? 32 : 64, BigInt(item.logicalImmediate))]
         }
         const field = fieldOf(item)
         if (!field) return
@@ -3019,9 +3114,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         // TODO: optionally use CPU feature flags
         incrementSelect(dead)
         constantSelect(dead)
-        maskedTest(dead)
+        emitterStep(maskedTest, dead)
         forwardCopy(dead)
-        if (fuseConjunction(dead)) return
+        if (emitterStep(fuseConjunction, dead)) return
         if (recoverPrior(dead)) return
         if (sinkIntoMove(dead)) return
 
@@ -3134,7 +3229,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
         }
 
-        if (fuseFields(dead)) return
+        if (emitterStep(fuseFields, dead)) return
         if (extendOperand(dead)) return
         if (invertOperand(dead)) return
         if (insertField(dead)) return
