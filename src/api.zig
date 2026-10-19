@@ -613,6 +613,11 @@ pub fn isReferencedSymbol(sf: WrappedFile, sym_ref: u32) bool {
     return sym.hasFlag(.referenced);
 }
 
+pub fn isConstSymbol(sf: WrappedFile, sym_ref: u32) bool {
+    const sym = sf.value.binder.symbols.at(sym_ref);
+    return sym.hasFlag(.@"const");
+}
+
 pub fn usesThisBinding(sf: WrappedFile, node_ref: u32) bool {
     const node = sf.value.ast.nodes.at(node_ref);
     switch (node.kind) {

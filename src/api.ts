@@ -1437,6 +1437,15 @@ class AstNode {
         return api.isReferencedSymbol(sf.handle, sym_ref)
     }
 
+    public isConstSymbol(): boolean {
+        if (this.kind !== SyntaxKind.Identifier) return false
+        const sym_ref = this.extra
+        if (!sym_ref) return false
+        const sf = getSourceFileInternal(this as any)
+        if (sf === undefined) throw new Error(`No source file found`)
+        return api.isConstSymbol(sf.handle, sym_ref)
+    }
+
     public usesThisBinding(): boolean {
         switch (this.kind) {
             case SyntaxKind.FunctionDeclaration:
