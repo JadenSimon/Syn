@@ -2,7 +2,7 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { dumpGraph, NumericOps, type Graph, type GraphNode, typeName } from './lowering2'
+import { dumpGraph, NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
 import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, localSymbol, NodeOp, nodeUsers, resultType, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
@@ -273,89 +273,205 @@ export function usersOf(g: Graph): Map<number, [number, number][]> {
     users.set(g, { size: g.nodes.size, index })
     return index
 }
-const exclusives = new WeakMap<Graph, Map<number, Set<number>>>()
-function exclusive(g: Graph, root: number): Set<number> {
-    let byGraph = exclusives.get(g)
-    if (!byGraph) exclusives.set(g, byGraph = new Map())
-    const known = byGraph.get(root)
-    if (known) return known
-    const found = exclusiveOf(g, root)
-    byGraph.set(root, found)
-    return found
-}
-function exclusiveOf(g: Graph, root: number): Set<number> {
+function useDominators(g: Graph): { idom: Map<number, number>, order: number[] } {
     const users = usersOf(g)
-    const inside = new Set<number>([root])
-    const pending = new Map<number, number>()
-    const work = [root]
-    while (work.length) {
-        const id = work.pop()!
-        const n = getNode(g, id)
-        if (!n) continue
-        if (n.op === NodeOp.apply) {
-            const block = getBlock(g, getRef(n, 0))
-            const entries = (users.get(getRef(n, 0)) ?? []).filter(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply).map(([u]) => u)
-            if (block && block.bodyId && !inside.has(block.bodyId)) {
-                const own = bodyNodes(g, block.bodyId)
-                if (entries.every(e => inside.has(e) || own.has(e))) {
-                    inside.add(block.bodyId)
-                    work.push(block.bodyId)
-                } else {
-                    const region = new Map<number, Set<number>>()
-                    const reached = [block.id]
-                    while (reached.length) {
-                        const next = reached.pop()!
-                        if (region.has(next)) continue
-                        const body = getBlock(g, next)?.bodyId
-                        if (!body) continue
-                        const members = bodyNodes(g, body)
-                        region.set(next, members)
-                        for (const member of members) {
-                            const app = getNode(g, member)
-                            if (app?.op === NodeOp.apply) reached.push(getRef(app, 0))
-                        }
-                    }
-                    const covered = new Set<number>()
-                    for (const members of region.values()) {
-                        for (const member of members) covered.add(member)
-                    }
-                    const entered: number[] = []
-                    for (const target of region.keys()) {
-                        const incoming = users.get(target) ?? []
-                        if (incoming.some(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply && !inside.has(u) && !covered.has(u))) entered.push(target)
-                    }
-                    while (entered.length) {
-                        const target = entered.pop()!
-                        const members = region.get(target)
-                        if (!members) continue
-                        region.delete(target)
-                        for (const member of members) {
-                            const app = getNode(g, member)
-                            if (app?.op === NodeOp.apply && !inside.has(member) && region.has(getRef(app, 0))) entered.push(getRef(app, 0))
-                        }
-                    }
-                    for (const target of region.keys()) {
-                        const body = getBlock(g, target)!.bodyId
-                        if (inside.has(body)) continue
-                        inside.add(body)
-                        work.push(body)
-                    }
-                }
-            }
+    const bodyOf = new Map<number, number[]>()
+    for (const b of g.blocks) {
+        if (!b.bodyId) continue
+        const list = bodyOf.get(b.bodyId)
+        if (list) list.push(b.id)
+        else bodyOf.set(b.bodyId, [b.id])
+    }
+    const entries = (block: number) => (users.get(block) ?? []).filter(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply).map(([u]) => u)
+    function succs(v: number): number[] {
+        const out: number[] = []
+        if (v === 0) {
+            for (const b of g.blocks) if (!entries(b.id).length) out.push(-b.id)
+            for (const id of g.nodes.keys()) if (!users.get(id)?.length && !bodyOf.has(id)) out.push(id)
+            return out
         }
+        if (v < 0) {
+            const body = getBlock(g, -v)?.bodyId
+            if (body && g.nodes.has(body)) out.push(body)
+            return out
+        }
+        const n = getNode(g, v)!
         for (let i = 0; i < countIds(n); i++) {
             const ref = getRef(n, i)
-            if (!ref || inside.has(ref)) continue
-            const m = getNode(g, ref)
-            if (!m || m.op === NodeOp.param) continue
-            const left = (pending.get(ref) ?? (users.get(ref) ?? []).length) - 1
-            pending.set(ref, left)
-            if (left > 0) continue
-            inside.add(ref)
-            work.push(ref)
+            if (ref && g.nodes.has(ref)) out.push(ref)
+        }
+        if (n.op === NodeOp.apply && getBlock(g, getRef(n, 0))) out.push(-getRef(n, 0))
+        return out
+    }
+    function preds(v: number): number[] {
+        const out = v < 0 ? entries(-v) : (users.get(v) ?? []).map(([u]) => u)
+        if (v > 0) for (const b of bodyOf.get(v) ?? []) out.push(-b)
+        if (!out.length) out.push(0)
+        return out
+    }
+    const order: number[] = [0]
+    const index = new Map<number, number>([[0, 0]])
+    const parent: number[] = [0]
+    const path: number[] = [0]
+    const pending: number[][] = [succs(0).reverse()]
+    while (pending.length) {
+        const top = pending[pending.length - 1]
+        if (!top.length) {
+            path.pop()
+            pending.pop()
+            continue
+        }
+        const w = top.pop()!
+        if (index.has(w)) continue
+        index.set(w, order.length)
+        parent.push(path[path.length - 1])
+        path.push(order.length)
+        order.push(w)
+        pending.push(succs(w).reverse())
+    }
+    const semi = order.map((_, i) => i)
+    const ancestor = order.map(() => -1)
+    const label = order.map((_, i) => i)
+    const dom = order.map(() => 0)
+    const bucket: number[][] = order.map(() => [])
+    function evaluate(v: number): number {
+        if (ancestor[v] === -1) return v
+        const chain: number[] = []
+        let at = v
+        while (ancestor[ancestor[at]] !== -1) {
+            chain.push(at)
+            at = ancestor[at]
+        }
+        while (chain.length) {
+            const x = chain.pop()!
+            const a = ancestor[x]
+            if (semi[label[a]] < semi[label[x]]) label[x] = label[a]
+            ancestor[x] = ancestor[a]
+        }
+        return label[v]
+    }
+    for (let i = order.length - 1; i > 0; i--) {
+        for (const p of preds(order[i])) {
+            const v = index.get(p)
+            if (v === undefined) continue
+            const u = evaluate(v)
+            if (semi[u] < semi[i]) semi[i] = semi[u]
+        }
+        bucket[semi[i]].push(i)
+        ancestor[i] = parent[i]
+        for (const v of bucket[parent[i]]) {
+            const u = evaluate(v)
+            dom[v] = semi[u] < semi[v] ? u : parent[i]
+        }
+        bucket[parent[i]] = []
+    }
+    const idom = new Map<number, number>()
+    for (let i = 1; i < order.length; i++) {
+        if (dom[i] !== semi[i]) dom[i] = dom[dom[i]]
+        idom.set(order[i], order[dom[i]])
+    }
+    return { idom, order }
+}
+export interface ArmRecord {
+    select: number
+    arm: number
+    positive: boolean
+    order: number
+}
+interface ArmIndex {
+    records: Map<number, ArmRecord[]>
+    nearest: Map<number, number>
+    parent: Map<number, number>
+    chains: Map<number, ArmRecord[]>
+    arms: Map<number, [cond: number, positive: boolean][]>
+    guards: Map<number, [cond: number, positive: boolean][]>
+}
+const armIndexes = new WeakMap<Graph, ArmIndex>()
+function armIndexOf(g: Graph): ArmIndex {
+    const known = armIndexes.get(g)
+    if (known) return known
+    const records = new Map<number, ArmRecord[]>()
+    let order = 0
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.select || countIds(n) !== 3) continue
+        for (let slot = 1; slot < 3; slot++) {
+            const arm = getRef(n, slot)
+            order++
+            if (!arm) continue
+            const list = records.get(arm)
+            const record = { select: id, arm, positive: slot === 1, order }
+            if (list) list.push(record)
+            else records.set(arm, [record])
         }
     }
-    return inside
+    const nearest = new Map<number, number>()
+    const parent = new Map<number, number>()
+    if (records.size) {
+        const { idom, order: preorder } = useDominators(g)
+        for (const v of preorder) {
+            if (v === 0) continue
+            const up = nearest.get(idom.get(v)!)
+            const param = v > 0 && getNode(g, v)!.op === NodeOp.param
+            if (records.has(v)) {
+                nearest.set(v, v)
+                if (up !== undefined && !param) parent.set(v, up)
+            } else if (up !== undefined && !param) nearest.set(v, up)
+        }
+        for (const root of records.keys()) if (!nearest.has(root)) nearest.set(root, root)
+    }
+    const index = { records, nearest, parent, chains: new Map(), arms: new Map(), guards: new Map() }
+    armIndexes.set(g, index)
+    return index
+}
+function armChain(g: Graph, root: number): ArmRecord[] {
+    const index = armIndexOf(g)
+    const climb: number[] = []
+    let at: number | undefined = root
+    while (at !== undefined && !index.chains.has(at)) {
+        climb.push(at)
+        at = index.parent.get(at)
+    }
+    let below = at === undefined ? [] : index.chains.get(at)!
+    while (climb.length) {
+        const r = climb.pop()!
+        const chain = [...below, ...index.records.get(r)!].sort((a, b) => a.order - b.order)
+        index.chains.set(r, chain)
+        below = chain
+    }
+    return below
+}
+function armsAt(g: Graph, node: number): [cond: number, positive: boolean][] | undefined {
+    const index = armIndexOf(g)
+    const root = index.nearest.get(node)
+    if (root === undefined) return
+    const known = index.arms.get(root)
+    if (known) return known
+    const out: [number, boolean][] = []
+    for (const record of armChain(g, root)) {
+        const cond = getRef(getNode(g, record.select)!, 0)
+        if (cond) out.push([cond, record.positive])
+    }
+    index.arms.set(root, out)
+    return out
+}
+function guardsAt(g: Graph, node: number): [cond: number, positive: boolean][] | undefined {
+    const index = armIndexOf(g)
+    const root = index.nearest.get(node)
+    if (root === undefined) return
+    const known = index.guards.get(root)
+    if (known) return known
+    const out: [number, boolean][] = []
+    for (const [arm, polarity] of armsAt(g, node)!) {
+        let cond = arm
+        let positive = polarity
+        for (let c = getNode(g, cond); c?.op === NodeOp.not && getRef(c, 0); c = getNode(g, cond)) {
+            cond = getRef(c, 0)
+            positive = !positive
+        }
+        if (comparison(getNode(g, cond)?.op ?? NodeOp.literal)) out.push([cond, positive])
+    }
+    index.guards.set(root, out)
+    return out
 }
 const bodies = new WeakMap<Graph, Map<number, Set<number>>>()
 function bodyNodes(g: Graph, body: number): Set<number> {
@@ -374,47 +490,6 @@ function bodyNodes(g: Graph, body: number): Set<number> {
     }
     byGraph.set(body, found)
     return found
-}
-const armMaps = new WeakMap<Graph, Map<number, [cond: number, positive: boolean][]>>()
-function armsOf(g: Graph): Map<number, [cond: number, positive: boolean][]> {
-    const known = armMaps.get(g)
-    if (known) return known
-    const out = new Map<number, [number, boolean][]>()
-    for (const n of g.nodes.values()) {
-        if (n.op !== NodeOp.select || countIds(n) !== 3 || !getRef(n, 0)) continue
-        for (const [arm, polarity] of [[getRef(n, 1), true], [getRef(n, 2), false]] as [number, boolean][]) {
-            if (!arm) continue
-            for (const member of exclusive(g, arm)) {
-                let list = out.get(member)
-                if (!list) out.set(member, list = [])
-                list.push([getRef(n, 0), polarity])
-            }
-        }
-    }
-    armMaps.set(g, out)
-    return out
-}
-const guardMaps = new WeakMap<Graph, Map<number, [cond: number, positive: boolean][]>>()
-function guardsOf(g: Graph): Map<number, [cond: number, positive: boolean][]> {
-    const known = guardMaps.get(g)
-    if (known) return known
-    const out = new Map<number, [number, boolean][]>()
-    for (const [member, arms] of armsOf(g)) {
-        for (const [arm, polarity] of arms) {
-            let cond = arm
-            let positive = polarity
-            for (let c = getNode(g, cond); c?.op === NodeOp.not && getRef(c, 0); c = getNode(g, cond)) {
-                cond = getRef(c, 0)
-                positive = !positive
-            }
-            if (!comparison(getNode(g, cond)?.op ?? NodeOp.literal)) continue
-            let list = out.get(member)
-            if (!list) out.set(member, list = [])
-            list.push([cond, positive])
-        }
-    }
-    guardMaps.set(g, out)
-    return out
 }
 function comparison(op: NodeOp): boolean {
     return op === NodeOp.lt || op === NodeOp.le || op === NodeOp.gt || op === NodeOp.ge || op === NodeOp.eq || op === NodeOp.ne
@@ -473,7 +548,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         return out
     }
-    const narrowings = new Map<Graph, Map<number, Map<number, Filter[]>>>()
+    const narrowings = new Map<Graph, Narrowing>()
     function condition(g: Graph, id: number): Test[] {
         const c = getNode(g, id)
         if (!c) return []
@@ -612,7 +687,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     function pathFacts(g: Graph, node: number): Test[] | undefined {
         const out: Test[] = []
-        for (const [cond, polarity] of armsOf(g).get(node) ?? []) {
+        for (const [cond, polarity] of armsAt(g, node) ?? []) {
             const found = refFacts(g, cond, polarity)
             if (!found) return
             out.push(...found)
@@ -644,11 +719,18 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const strict = c.op === NodeOp.lt || c.op === NodeOp.gt
         return [[getRef(c, side), { test: 'least', literal: above === strict ? k + 1 : k, positive: above }]]
     }
-    function narrowingOf(g: Graph): Map<number, Map<number, Filter[]>> {
+    interface Narrowing {
+        own: Map<number, Map<number, [order: number, filter: Filter][]>>
+        extras: Map<number, Map<number, [order: number, filter: Filter][]>>
+        tested: Set<number>
+        combined: Map<number, { pairs: [number, Filter][], filters: Filter[] } | null>
+    }
+    function narrowingOf(g: Graph): Narrowing {
         const known = narrowings.get(g)
         if (known) return known
-        const out = new Map<number, Map<number, Filter[]>>()
+        const index = armIndexOf(g)
         const users = usersOf(g)
+        const out: Narrowing = { own: new Map(), extras: new Map(), tested: new Set(), combined: new Map() }
         function panics(arm: number): boolean {
             let at = getNode(g, arm)
             while (at?.op === NodeOp.after) at = getNode(g, getRef(at, countIds(at) - 1))
@@ -669,29 +751,68 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             }
             return found
         }
-        for (const [id, n] of g.nodes) {
-            if (n.op !== NodeOp.select || countIds(n) !== 3) continue
-            const tests = condition(g, getRef(n, 0))
-            for (const [arm, polarity] of [[getRef(n, 1), true], [getRef(n, 2), false]] as [number, boolean][]) {
-                const held = holding(tests, polarity)
-                if (!arm || !held.length) continue
-                const other = polarity ? getRef(n, 2) : getRef(n, 1)
-                const members = new Set(exclusive(g, arm))
-                if (other && panics(other)) for (const m of ordered(id)) members.add(m)
-                for (const member of members) {
-                    let byOperand = out.get(member)
-                    if (!byOperand) out.set(member, byOperand = new Map())
-                    for (const [x, filter] of held) {
-                        const operand = canonical(g, x)
-                        let list = byOperand.get(operand)
-                        if (!list) byOperand.set(operand, list = [])
-                        list.push(filter)
-                    }
-                }
+        function member(node: number, root: number): boolean {
+            let at = index.nearest.get(node)
+            while (at !== undefined && at !== root) at = index.parent.get(at)
+            return at === root
+        }
+        function add(into: Map<number, Map<number, [number, Filter][]>>, at: number, order: number, held: Test[]): void {
+            let byOperand = into.get(at)
+            if (!byOperand) into.set(at, byOperand = new Map())
+            for (const [x, filter] of held) {
+                const operand = canonical(g, x)
+                out.tested.add(operand)
+                let list = byOperand.get(operand)
+                if (!list) byOperand.set(operand, list = [])
+                list.push([order, filter])
             }
         }
+        const tests = new Map<number, Test[]>()
+        for (const [root, records] of index.records) {
+            for (const record of records) {
+                const n = getNode(g, record.select)!
+                let known = tests.get(record.select)
+                if (!known) tests.set(record.select, known = condition(g, getRef(n, 0)))
+                const held = holding(known, record.positive)
+                if (!held.length) continue
+                add(out.own, root, record.order, held)
+                const other = getRef(n, record.positive ? 2 : 1)
+                if (!other || !panics(other)) continue
+                for (const m of ordered(record.select)) if (!member(m, root)) add(out.extras, m, record.order, held)
+            }
+        }
+        for (const lists of out.extras.values()) for (const list of lists.values()) list.sort((x, y) => x[0] - y[0])
         narrowings.set(g, out)
         return out
+    }
+    function combinedOn(g: Graph, narrowing: Narrowing, root: number, x: number): { pairs: [number, Filter][], filters: Filter[] } | undefined {
+        const index = armIndexOf(g)
+        const climb: number[] = []
+        let at: number | undefined = root
+        while (at !== undefined && !narrowing.combined.has(at * nodeSpan + x)) {
+            climb.push(at)
+            at = index.parent.get(at)
+        }
+        let below = at === undefined ? undefined : narrowing.combined.get(at * nodeSpan + x) ?? undefined
+        while (climb.length) {
+            const r = climb.pop()!
+            const own = narrowing.own.get(r)?.get(x)
+            if (own) {
+                const pairs = below ? [...below.pairs, ...own].sort((p, q) => p[0] - q[0]) : own
+                below = { pairs, filters: pairs.map(([, filter]) => filter) }
+            }
+            narrowing.combined.set(r * nodeSpan + x, below ?? null)
+        }
+        return below
+    }
+    function narrowAt(g: Graph, node: number, x: number): Filter[] | undefined {
+        const narrowing = narrowingOf(g)
+        if (!narrowing.tested.has(x)) return
+        const root = armIndexOf(g).nearest.get(node)
+        const base = root === undefined ? undefined : combinedOn(g, narrowing, root, x)
+        const extra = narrowing.extras.get(node)?.get(x)
+        if (!extra) return base?.filters
+        return [...base?.pairs ?? [], ...extra].sort((p, q) => p[0] - q[0]).map(([, filter]) => filter)
     }
     const fieldWatchers = new Map<number, Set<number>>()
     function accepts(v: number, filter: Filter, frame: number, x: number): boolean {
@@ -889,13 +1010,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (known !== undefined) return known
         const callNode = getNode(g, call)!
         const facts = new Set<string>()
-        for (const [cond, positive] of guardsOf(g).get(call) ?? []) {
+        for (const [cond, positive] of guardsAt(g, call) ?? []) {
             const c = getNode(g, cond)!
             const side = (i: number) => getRef(c, i) ? `n${canonical(g, getRef(c, i))}` : `#${getLiteral(g, c, i)}`
             facts.add(predicate(c.op, side(0), side(1), positive))
         }
         let result = false
-        if (facts.size) for (const [cond, positive] of guardsOf(calleeGraph).get(ret) ?? []) {
+        if (facts.size) for (const [cond, positive] of guardsAt(calleeGraph, ret) ?? []) {
             const c = getNode(calleeGraph, cond)!
             const terms = [0, 1].map(i => calleeTerm(calleeGraph, c, i))
             if (terms.some(t => !t)) continue
@@ -910,21 +1031,81 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         return result
     }
     const waiting = new Map<number, Set<number>>()
+    const rootStates = new Map<number, boolean>()
+    const rootWaiting = new Map<number, Set<number>>()
+    const rootChildren = new Map<number, Set<number>>()
+    const rootNodes = new Map<number, Set<number>>()
+    function holds(frame: number, x: number, filters: Filter[]): boolean {
+        const recorded = valuesAt(frame, x)
+        return !unrecorded(recorded) && [...recorded].some(v => filters.every(filter => accepts(v, filter, frame, x)))
+    }
+    function rootOpen(frame: number, root: number): boolean {
+        const k = key(frame, root)
+        const state = rootStates.get(k)
+        if (state !== undefined) return state
+        const g = frames[frame].graph!
+        const up = armIndexOf(g).parent.get(root)
+        if (up !== undefined && !rootOpen(frame, up)) {
+            setOf(rootChildren, key(frame, up)).add(root)
+            rootStates.set(k, false)
+            return false
+        }
+        const narrowing = narrowingOf(g)
+        for (const x of narrowing.own.get(root)?.keys() ?? []) {
+            if (holds(frame, x, combinedOn(g, narrowing, root, x)!.filters)) continue
+            setOf(rootWaiting, key(frame, x)).add(root)
+            rootStates.set(k, false)
+            return false
+        }
+        rootStates.set(k, true)
+        return true
+    }
+    function retryRoot(frame: number, root: number): void {
+        rootStates.delete(key(frame, root))
+        if (!rootOpen(frame, root)) return
+        const k = key(frame, root)
+        const nodes = rootNodes.get(k)
+        if (nodes) {
+            rootNodes.delete(k)
+            for (const node of nodes) seedNode(frame, node)
+        }
+        const children = rootChildren.get(k)
+        if (children) {
+            rootChildren.delete(k)
+            for (const child of children) retryRoot(frame, child)
+        }
+    }
     function enabled(frame: number, node: number): boolean {
-        const guards = narrowingOf(frames[frame].graph!).get(node)
-        if (!guards) return true
-        for (const [x, filters] of guards) {
-            const recorded = valuesAt(frame, x)
-            if (unrecorded(recorded) || ![...recorded].some(v => filters.every(filter => accepts(v, filter, frame, x)))) {
+        const g = frames[frame].graph!
+        const narrowing = narrowingOf(g)
+        const root = armIndexOf(g).nearest.get(node)
+        const extra = narrowing.extras.get(node)
+        if (extra) {
+            const operands: [number, number][] = []
+            for (const [x, list] of extra) operands.push([list[0][0], x])
+            let at = root
+            while (at !== undefined) {
+                for (const [x, list] of narrowing.own.get(at) ?? []) operands.push([list[0][0], x])
+                at = armIndexOf(g).parent.get(at)
+            }
+            operands.sort((p, q) => p[0] - q[0])
+            const checked = new Set<number>()
+            for (const [, x] of operands) {
+                if (checked.has(x)) continue
+                checked.add(x)
+                if (holds(frame, x, narrowAt(g, node, x)!)) continue
                 setOf(waiting, key(frame, x)).add(node)
                 return false
             }
+            return true
         }
-        return true
+        if (root === undefined || rootOpen(frame, root)) return true
+        setOf(rootNodes, key(frame, root)).add(node)
+        return false
     }
     function seen(frame: number, user: number, ref: number): Iterable<number> {
         const set = valuesAt(frame, ref)
-        const filters = narrowingOf(frames[frame].graph!).get(user)?.get(canonical(frames[frame].graph!, ref))
+        const filters = narrowAt(frames[frame].graph!, user, canonical(frames[frame].graph!, ref))
         if (!filters) return set
         return [...set].filter(v => filters.every(filter => accepts(v, filter, frame, ref))).map(v => narrowed(v, filters))
     }
@@ -1125,7 +1306,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const subtrahend = canonical(g, getRef(n, 1))
         if (countedFrom(g, getRef(n, 0), subtrahend)) return 0
         let low = -Infinity
-        for (const [cond, positive] of guardsOf(g).get(node) ?? []) {
+        for (const [cond, positive] of guardsAt(g, node) ?? []) {
             const c = getNode(g, cond)!
             if (c.op === NodeOp.eq || c.op === NodeOp.ne || !getRef(c, 0) || !getRef(c, 1)) continue
             const below = (c.op === NodeOp.gt || c.op === NodeOp.ge) === positive ? 1 : 0
@@ -1344,12 +1525,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const c = getNode(g, call)
         if (c?.op !== NodeOp.call || valueTail(g, getRef(c, 2)) !== allocated) return false
         const objects = self ? new Set([allocated, call]) : new Set([allocated])
-        const arms = armsOf(g)
-        const outer = arms.get(call) ?? []
+        const outer = armsAt(g, call) ?? []
         for (const [id, n] of g.nodes) {
             if (n.op !== NodeOp.setProp || getRef(n, 2) || nameOf(getLiteral(g, n, 2) as Handle) !== name) continue
             if (!objects.has(valueTail(g, getRef(n, 1)))) continue
-            if (!(arms.get(id) ?? []).every(([cond, positive]) => outer.some(([c2, p2]) => c2 === cond && p2 === positive))) continue
+            if (!(armsAt(g, id) ?? []).every(([cond, positive]) => outer.some(([c2, p2]) => c2 === cond && p2 === positive))) continue
             if (unobserved(g, getRef(n, 0), call, objects, proto)) return true
         }
         return false
@@ -2024,6 +2204,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             waiting.delete(k)
             for (const node of released) seedNode(frame, node)
         }
+        const reopened = propagate ? rootWaiting.get(k) : undefined
+        if (reopened) {
+            rootWaiting.delete(k)
+            for (const root of reopened) retryRoot(frame, root)
+        }
         if (!seeded.has(k)) return
         if (n.op === NodeOp.call && evaluate) resolveCall(frame, id, n)
         if (n.op === NodeOp.rt && evaluate && rt.sliceOf(g, n) === undefined) {
@@ -2471,6 +2656,50 @@ function union(a: Type, b: Type): Type {
     return { undefined: a.undefined || b.undefined, unknown: a.unknown || b.unknown, literals, range, float: a.float || b.float, objects, functions, closures, strings }
 }
 
+function mergeAll<T>(lists: T[][]): T[] {
+    let out = lists[0]
+    let seen: Set<T> | undefined
+    let copied = false
+    for (let i = 1; i < lists.length; i++) {
+        const b = lists[i]
+        if (b === out || !b.length) continue
+        if (!out.length) {
+            out = b
+            continue
+        }
+        if (!seen) seen = new Set(out)
+        for (const x of b) {
+            if (seen.has(x)) continue
+            seen.add(x)
+            if (!copied) {
+                out = out.slice()
+                copied = true
+            }
+            out.push(x)
+        }
+    }
+    return out
+}
+
+function unionAll(types: Type[]): Type {
+    if (types.length === 1) return types[0]
+    if (types.length === 2) return union(types[0], types[1])
+    const a = types[0]
+    const literals = mergeAll(types.map(type => type.literals))
+    let range = a.range
+    for (let i = 1; i < types.length; i++) range = hull(range, types[i].range)
+    const objects = mergeAll(types.map(type => type.objects))
+    const functions = mergeAll(types.map(type => type.functions))
+    const closures = mergeAll(types.map(type => type.closures))
+    const strings = mergeAll(types.map(type => type.strings))
+    const anyUndefined = types.some(type => type.undefined)
+    const anyUnknown = types.some(type => type.unknown)
+    const anyFloat = types.some(type => type.float)
+    const flags = (a.undefined || !anyUndefined) && (a.unknown || !anyUnknown) && (a.float || !anyFloat)
+    if (flags && literals === a.literals && range === a.range && objects === a.objects && functions === a.functions && closures === a.closures && strings === a.strings) return a
+    return { undefined: anyUndefined, unknown: anyUnknown, literals, range, float: anyFloat, objects, functions, closures, strings }
+}
+
 export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const start = performance.now()
     let data = analyzeValues(roots, host)
@@ -2642,10 +2871,10 @@ export function typeStats(types: ValueTypes): string {
     return `TYPES ${types.ms.toFixed(1)}ms frames=${types.frames.length} objects=${types.objects.length}`
 }
 
-function joinedSignature<T>(frames: Signature<T>[], join: (a: T, b: T) => T): Signature<T> {
+function joinedSignature<T>(frames: Signature<T>[], joinAll: (list: T[]) => T): Signature<T> {
     return {
-        params: frames[0].params.map((param, i) => ({ label: param.label, type: frames.map(frame => frame.params[i].type).reduce(join) })),
-        returns: frames.map(frame => frame.returns).reduce(join),
+        params: frames[0].params.map((param, i) => ({ label: param.label, type: joinAll(frames.map(frame => frame.params[i].type)) })),
+        returns: joinAll(frames.map(frame => frame.returns)),
     }
 }
 
@@ -2665,7 +2894,7 @@ export function dumpTypes(types: ValueTypes): string {
         else units.set(frame.unit, [frame])
     }
     for (const [unit, frames] of units) {
-        const signature = joinedSignature(frames, union)
+        const signature = joinedSignature(frames, unionAll)
         const params = signature.params.map(p => `${p.label}: ${formatType(types, p.type)} => ${representation(p.type)}`).join(', ')
         lines.push(`SIG ${unit.name || '<anon>'}(${params}) -> ${formatType(types, signature.returns)} => ${representation(signature.returns)}`)
     }
@@ -2703,7 +2932,7 @@ export function checkTypes(types: ValueTypes, units: NativeUnit[]): string {
         const frames = types.frames.filter(frame => frame.unit === unit.origin)
         const sited = frames.filter(frame => compatible(frame) && frame.sites.some(s => unit.sites.some(site => s.unit === site.unit && s.node === site.node)))
         const selected = sited.length ? sited : frames
-        const signature = selected.length ? joinedSignature(selected, union) : undefined
+        const signature = selected.length ? joinedSignature(selected, unionAll) : undefined
         if (!signature) {
             lines.push(`UNSEEN ${unit.name}`)
             continue
@@ -2929,7 +3158,7 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
     for (const [method, fn] of methods) {
         const frames = data.frames.filter(frame => frame.unit === fn)
         if (!frames.length) continue
-        const signature = joinedSignature(frames, (a, b) => [...new Set([...a, ...b])].sort((a, b) => a - b))
+        const signature = joinedSignature(frames, lists => lists.length === 1 ? lists[0] : [...new Set(lists.flat())].sort((a, b) => a - b))
         const args = signature.params.filter(param => param.label !== 'this').map(param => format(param.type))
         lines.push(`  ${method}(${args.join(', ')}) -> ${format(signature.returns)}`)
     }
@@ -3460,7 +3689,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         return { params: reps, returns: returned, signature: `(${abis.join(', ')}) -> ${returned.text}${made.length ? ` new ${made.join(' ')}` : ''}` }
     }
     const joinedOf = (members: number[]) => {
-        const joined = joinedSignature(members.map(f => types.frames[f]), union)
+        const joined = joinedSignature(members.map(f => types.frames[f]), unionAll)
         return signatureOf(joined.params, joined.returns, created.get(find(members[0])))
     }
     let classOf = new Map<number, number>()
@@ -3472,25 +3701,43 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         if (!initial.has(k)) initial.set(k, initial.size)
         classOf.set(root, initial.get(k)!)
     }
-    let count = initial.size
-    while (true) {
-        const groups = new Map<number, { calls: Map<string, number>, id: number }[]>()
-        const next = new Map<number, number>()
-        let size = 0
-        for (const [root, members] of atoms) {
-            const calls = new Map<string, number>()
-            for (const f of members) for (const [node, callee] of outgoing[f]) calls.set(`${node}:${unitIdentity(types.frames[callee].unit)}`, classOf.get(find(callee))!)
-            let list = groups.get(classOf.get(root)!)
-            if (!list) groups.set(classOf.get(root)!, list = [])
-            let group = list.find(known => [...calls].every(([k, c]) => !known.calls.has(k) || known.calls.get(k) === c))
-            if (!group) list.push(group = { calls: new Map(), id: size++ })
-            for (const [k, c] of calls) group.calls.set(k, c)
-            next.set(root, group.id)
-        }
-        classOf = next
-        if (size === count) break
-        count = size
+    const calleesOf = new Map<number, [site: string, callee: number][]>()
+    for (const [root, members] of atoms) {
+        const out: [string, number][] = []
+        for (const f of members) for (const [node, callee] of outgoing[f]) out.push([`${node}:${unitIdentity(types.frames[callee].unit)}`, find(callee)])
+        calleesOf.set(root, out)
     }
+    const membersOf = new Map<number, number[]>()
+    const dependsOn = new Map<number, Set<number>>()
+    for (const [root, out] of calleesOf) {
+        const c = classOf.get(root)!
+        let members = membersOf.get(c)
+        if (!members) {
+            membersOf.set(c, members = [])
+            dependsOn.set(c, new Set())
+        }
+        members.push(root)
+        for (const [, callee] of out) dependsOn.get(c)!.add(classOf.get(callee)!)
+    }
+    const settled = new Map<number, number>()
+    for (const scc of stronglyConnected(membersOf.keys(), c => [...dependsOn.get(c)!])) {
+        const inside = new Set(scc)
+        for (const c of scc) {
+            const groups: Map<string, number>[] = []
+            for (const root of membersOf.get(c)!) {
+                const calls = new Map<string, number>()
+                for (const [site, callee] of calleesOf.get(root)!) calls.set(site, inside.has(classOf.get(callee)!) ? -1 - classOf.get(callee)! : settled.get(callee)!)
+                let group = groups.findIndex(known => [...calls].every(([k, v]) => !known.has(k) || known.get(k) === v))
+                if (group < 0) {
+                    group = groups.length
+                    groups.push(new Map())
+                }
+                for (const [k, v] of calls) groups[group].set(k, v)
+                settled.set(root, c * atoms.size + group)
+            }
+        }
+    }
+    classOf = settled
     const classRoot = new Map<number, number>()
     for (const root of atoms.keys()) if (!classRoot.has(classOf.get(root)!)) classRoot.set(classOf.get(root)!, root)
     const unitRoot = (id: number) => classRoot.get(classOf.get(find(id))!)!
@@ -3513,13 +3760,25 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         unitOfFrame[id] = unit
     })
     for (const unit of unitOfRoot.values()) {
-        const signature = joinedSignature(unit.frames.map(f => types.frames[f]), union)
+        const signature = joinedSignature(unit.frames.map(f => types.frames[f]), unionAll)
         const joined = signatureOf(signature.params, signature.returns, unit.frames.flatMap(f => created.get(f) ?? []))
-        const merged = new Map<number, Type>()
-        for (const f of unit.frames) for (const [node, type] of types.frames[f].nodes) merged.set(node, merged.has(node) ? union(merged.get(node)!, type) : type)
-        for (const [node, type] of merged) unit.nodes.set(node, inst.repOf(type))
+        const merged = new Map<number, Type[]>()
+        for (const f of unit.frames) {
+            for (const [node, type] of types.frames[f].nodes) {
+                const list = merged.get(node)
+                if (list) list.push(type)
+                else merged.set(node, [type])
+            }
+        }
+        for (const [node, list] of merged) unit.nodes.set(node, inst.repOf(unionAll(list)))
         const touched = new Map<number, number[]>()
-        for (const f of unit.frames) for (const [node, buffers] of types.frames[f].slices) touched.set(node, [...touched.get(node) ?? [], ...buffers])
+        for (const f of unit.frames) {
+            for (const [node, buffers] of types.frames[f].slices) {
+                const list = touched.get(node)
+                if (list) list.push(...buffers)
+                else touched.set(node, [...buffers])
+            }
+        }
         touchedOf.set(unit, touched)
         for (const f of unit.frames) for (const b of types.frames[f].blocks) unit.blocks.add(b)
         const live = new Map<number, boolean[]>()
@@ -3602,7 +3861,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const frames = units.flatMap(unit => unit.frames)
         units[0].params.forEach((_, i) => {
             if (units.some(unit => unit.params[i].rep.constant)) return
-            const rep = valueRep(types, inst, frames.map(f => types.frames[f].params[i].type).reduce(union), oneObject)
+            const rep = valueRep(types, inst, unionAll(frames.map(f => types.frames[f].params[i].type)), oneObject)
             if (!rep) return
             for (const unit of units) unit.params[i] = { label: unit.params[i].label, rep }
         })
@@ -4517,7 +4776,7 @@ export function proveInvariants(methods: [string, Function][], ctor: Function, d
         }
         function factsAt(frame: SymbolicFrame, id: number): Map<string, Bound> | undefined {
             const facts = new Map(frame.facts)
-            for (const [cond, positive] of guardsOf(frame.g).get(id) ?? []) {
+            for (const [cond, positive] of guardsAt(frame.g, id) ?? []) {
                 const c = getNode(frame.g, cond)!
                 const x = operand(frame, c, 0)
                 const y = operand(frame, c, 1)
@@ -4673,12 +4932,11 @@ function reaches(g: Graph, from: Block, to: Block): boolean {
 }
 
 function repeats(g: Graph, block: Block, id: number): boolean {
-    const arms = armsOf(g)
-    const guards = arms.get(id) ?? []
+    const guards = armsAt(g, id) ?? []
     for (const member of bodyNodes(g, block.bodyId)) {
         const n = getNode(g, member)
         if (n?.op !== NodeOp.apply) continue
-        const other = arms.get(member) ?? []
+        const other = armsAt(g, member) ?? []
         if (other.some(([cond, positive]) => guards.some(([c, p]) => c === cond && p !== positive))) continue
         const target = getBlock(g, getRef(n, 0))
         if (target && reaches(g, target, block)) return true
