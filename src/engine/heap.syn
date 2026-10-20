@@ -455,6 +455,11 @@ function propertyKeysEqual(a: Handle, b: Handle): boolean {
     return stringBytesEqual(a, b)
 }
 
+function propertyKeyHash(key: Handle): u32 {
+    if (typeDescriptorOf(key) === symbolTD) return 0 // XXX
+    return HeapString(resolveHeapCell(key)).hash
+}
+
 function stringBytesEqual(a: Handle, b: Handle): boolean {
     const sa = HeapString(resolveHeapCell(a))
     const sb = HeapString(resolveHeapCell(b))
@@ -535,6 +540,7 @@ export const FullPropertyDescriptor = intrinsics.DefineStructView(reify FullProp
 
 interface PropertyEntry {
     key: Handle
+    hash: u32
     descriptor: Handle // -> FullPropertyDescriptor
 }
 
@@ -904,8 +910,10 @@ function findEntry(dictAddr: Handle, key: Handle): usize {
     const dict = PropertyDict(resolveHeapCell(dictAddr))
     const entries = resolveHeapCell(dict.entries)
     const count = dict.count
+    const hash = propertyKeyHash(key)
     for (let i: u32 = 0; i < count; i++) {
         const e = PropertyEntry(entries + i * PropertyEntry.sizeof)
+        if (e.hash !== hash) continue
         if (propertyKeysEqual(e.key, key)) return entries + i * PropertyEntry.sizeof
     }
     return 0
@@ -921,37 +929,45 @@ function growDict(dictAddr: Handle): void {
     finishHeapCell(newEntries)
 }
 
-export function setProperty(obj: Handle, key: Handle, value: Handle): void {
-    const dictAddr = objectDict(obj)
-
-    const found = findEntry(dictAddr, key)
-    if (found) {
-        const desc = FullPropertyDescriptor(resolveHeapCell(PropertyEntry(found).descriptor))
-        desc.slot0 = value
-        desc.flags = dataPropertyFlags
-        return
-    }
-
+function appendEntry(dictAddr: Handle, key: Handle, descHandle: Handle): void {
     const dict = PropertyDict(resolveHeapCell(dictAddr))
     if (dict.count >= dict.capacity) growDict(dictAddr)
+    const count = dict.count
+    const e = PropertyEntry(resolveHeapCell(dict.entries) + count * PropertyEntry.sizeof)
+    e.key = key
+    e.hash = propertyKeyHash(key)
+    e.descriptor = descHandle
+    dict.count = count + 1
+}
 
+function appendDataProperty(dictAddr: Handle, key: Handle, value: Handle): Handle {
     const descHandle = allocateHeapCell(FullPropertyDescriptor.sizeof)
     const desc = FullPropertyDescriptor(resolveHeapCell(descHandle))
     desc.slot0 = value
     desc.slot1 = 0
     desc.flags = dataPropertyFlags
-
-    const count = dict.count
-    const e = PropertyEntry(resolveHeapCell(dict.entries) + count * PropertyEntry.sizeof)
-    e.key = key
-    e.descriptor = descHandle
-    dict.count = count + 1
+    appendEntry(dictAddr, key, descHandle)
     finishHeapCell(descHandle)
+    return descHandle
+}
+
+function putProperty(obj: Handle, key: Handle, value: Handle): Handle {
+    const dictAddr = objectDict(obj)
+    const found = findEntry(dictAddr, key)
+    if (!found) return appendDataProperty(dictAddr, key, value)
+    const descHandle = PropertyEntry(found).descriptor
+    const desc = FullPropertyDescriptor(resolveHeapCell(descHandle))
+    desc.slot0 = value
+    desc.flags = dataPropertyFlags
+    return descHandle
+}
+
+export function setProperty(obj: Handle, key: Handle, value: Handle): void {
+    putProperty(obj, key, value)
 }
 
 export function setAccessorProperty(obj: Handle, key: Handle, getter: Handle, setter: Handle): void {
-    setProperty(obj, key, getter)
-    const desc = FullPropertyDescriptor(resolveHeapCell(getOwnProperty(obj, key)))
+    const desc = FullPropertyDescriptor(resolveHeapCell(putProperty(obj, key, getter)))
     desc.slot1 = setter
     let flags: u8 = PropFlags.configurable
     if (getter) flags |= PropFlags.has_getter
@@ -960,8 +976,7 @@ export function setAccessorProperty(obj: Handle, key: Handle, getter: Handle, se
 }
 
 export function setReadonlyProperty(obj: Handle, key: Handle, value: Handle): void {
-    setProperty(obj, key, value)
-    const desc = FullPropertyDescriptor(resolveHeapCell(getOwnProperty(obj, key)))
+    const desc = FullPropertyDescriptor(resolveHeapCell(putProperty(obj, key, value)))
     desc.flags = desc.flags & ~PropFlags.writable
 }
 
@@ -979,6 +994,14 @@ export function ownPropertyKeyAt(obj: Handle, index: u32): Handle {
     const dict = PropertyDict(resolveHeapCell(properties))
     if (index >= dict.count) return 0
     return PropertyEntry(resolveHeapCell(dict.entries) + index * PropertyEntry.sizeof).key
+}
+
+export function ownPropertyAt(obj: Handle, index: u32): Handle {
+    const properties = HeapObject(resolveHeapCell(obj)).properties
+    intrinsics.assert(properties, 'Object was missing properties')
+    const dict = PropertyDict(resolveHeapCell(properties))
+    intrinsics.assert(index >= 0 && index < dict.count, `Invalid property index "${index}", dictionary has "${dict.count}" keys`)
+    return PropertyEntry(resolveHeapCell(dict.entries) + index * PropertyEntry.sizeof).descriptor
 }
 
 export function shallowClone(obj: Handle): Handle {
@@ -1010,6 +1033,7 @@ export function shallowClone(obj: Handle): Handle {
             resolveHeapCell(PropertyDict(resolveHeapCell(dictHandle)).entries)
             + i * PropertyEntry.sizeof)
         target.key = key
+        target.hash = source.hash
         target.descriptor = descHandle
     }
     HeapObject(resolveHeapCell(handle)).properties = dictHandle
@@ -1027,9 +1051,7 @@ export function copyEnumerableOwnProperties(target: Handle, source: Handle): voi
     for (let i: u32 = 0; i < ownPropertyCount(readable); i++) {
         const key = ownPropertyKeyAt(readable, i)
         if (!key) continue
-        const descriptor = getOwnProperty(readable, key)
-        if (!descriptor) continue
-        const d = FullPropertyDescriptor(resolveHeapCell(descriptor))
+        const d = FullPropertyDescriptor(resolveHeapCell(ownPropertyAt(readable, i)))
         if (!(d.flags & PropFlags.enumerable)) continue
         setProperty(writable, key, d.slot0 as Handle)
     }
@@ -1067,7 +1089,7 @@ export function enumerableKeys(obj: Handle): Handle[] {
     for (let i: u32 = 0; i < ownPropertyCount(obj); i++) {
         const key = ownPropertyKeyAt(obj, i)
         if (!key || !isString(key)) continue
-        if (FullPropertyDescriptor(resolveHeapCell(getOwnProperty(obj, key))).flags & PropFlags.enumerable) keys.push(key)
+        if (FullPropertyDescriptor(resolveHeapCell(ownPropertyAt(obj, i))).flags & PropFlags.enumerable) keys.push(key)
     }
     return keys
 }
@@ -1270,7 +1292,7 @@ function fromJsObjectInner(o: object, compileFn: ((f: Function) => Handle) | und
         seen.set(o, handle)
         const length = o.length as u32
         for (let i: u32 = 0; i < length; i++) {
-            setProperty(handle, indexKey(i), fromJsValueInner(o[i], compileFn, seen, construct))
+            appendDataProperty(objectDict(handle), indexKey(i), fromJsValueInner(o[i], compileFn, seen, construct))
         }
         setProperty(handle, arrayLengthKey, boxF64(length as f64))
         return handle
@@ -1323,12 +1345,7 @@ function fromJsObjectInner(o: object, compileFn: ((f: Function) => Handle) | und
             }
         }
         desc.flags = flags
-        const dict = PropertyDict(resolveHeapCell(dictAddr))
-        if (dict.count >= dict.capacity) growDict(dictAddr)
-        const e = PropertyEntry(resolveHeapCell(dict.entries) + dict.count * PropertyEntry.sizeof)
-        e.key = typeof k === 'symbol' ? fromJsSymbol(k) : fromJsString(k)
-        e.descriptor = descHandle
-        dict.count = dict.count + 1
+        appendEntry(dictAddr, typeof k === 'symbol' ? fromJsSymbol(k) : fromJsString(k), descHandle)
         finishHeapCell(descHandle)
     }
     finishHeapCell(obj)
