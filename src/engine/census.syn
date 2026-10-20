@@ -1,0 +1,1876 @@
+/// @synth
+
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as harness from './harness'
+import * as native from './native'
+import * as gn from './graph-node'
+import { createGraph, addNode, getNode, setGraphBlocks, NodeOp, getArgIds, getRef, getLiteral, countIds, makeNode, copyNode, internNode, opName, nodeOp, maybeNodeOp, typeSlots, encodeSlot, slotLiteral, refSlot, literalSlot, slotRef, slotKey, factOf, setFact, withFact, typeOf, resultType, operandType, createFnType, fnReturn, fnLocations, createRecordType, recordFields, createThisParam, isThisParam, createLocatedParam, swapBinaryOperands, enumerateRefs, getArgConsts, cloneRefs, getOperands, withRefs, setOperand, setRef, setLiteral, pushRefs, clearOperands, setDebugLabel, getDebugLabel, putNode, putCopy, addCopy, insertNode, newId, hasNode, deleteNode, retypeNode, withOperand, getBlock, addGraphBlock, withNodes, createLiteralPool } from './graph-node'
+import * as lowering2 from './lowering2'
+import { type Graph, type GraphNode } from './lowering2'
+import * as lowering from './lowering'
+import * as bytecode from './bytecode-emitter'
+import * as valueTypes from './value-types'
+import * as vm from './vm'
+import * as rtModule from './rt'
+import * as cg from './cg'
+import * as records from './records'
+import * as heap from './heap'
+import { makeNodeFromSlots } from './graph-node'
+import { solvePlacements } from './placement-flow'
+import { recordSnapshots } from './records'
+import { getRegReads } from './bytecode-emitter'
+import { usersOf, scalarType } from './value-types'
+import { isSignedType } from './lowering'
+
+const Types = intrinsics.Types
+
+function stageOf(e: unknown): string {
+    const error = e as native.CompileError
+    return `stage=${error?.stage ?? 'none'} unit=${error?.unit || '-'} node=${error?.node ?? '-'}`
+}
+
+function firstLine(e: unknown): string {
+    return String(e).split('\n')[0].slice(0, 240)
+}
+
+type Entry = [group: string, fn: Function, ...argSets: number[][]]
+
+function runCensus(entries: Entry[]): void {
+    const errorType: any = Error
+    errorType.stackTraceLimit = 200
+    const stacks = intrinsics.argv().includes('census-stacks')
+    const groups = intrinsics.argv().filter(a => a.startsWith('group:')).map(a => a.slice(6))
+    for (const [group, fn, ...argSets] of entries) {
+        if (groups.length && !groups.includes(group)) continue
+        harness.test(fn.name, () => {
+            const expected: number[] = []
+            let jsFailure = ''
+            for (const args of argSets) {
+                try {
+                    expected.push(Number((fn as any)(...args)))
+                } catch (e) {
+                    jsFailure = firstLine(e)
+                    break
+                }
+            }
+            const start = performance.now()
+            let run: any
+            try {
+                run = (native.createNatives({ [fn.name]: fn }) as any)[fn.name]
+            } catch (e) {
+                console.log(`CENSUS ${group} ${fn.name} NOCOMPILE ${stageOf(e)} ${firstLine(e)}`)
+                if (stacks) console.log((e as any)?.stack)
+                return
+            }
+            const ms = Math.round(performance.now() - start)
+            if (jsFailure) {
+                console.log(`CENSUS ${group} ${fn.name} compiled (JSFAIL ${jsFailure}) [${ms}ms]`)
+                return
+            }
+            let status = 'ok'
+            for (let i = 0; i < argSets.length; i++) {
+                try {
+                    const actual = Number(run(...argSets[i]))
+                    if (actual !== expected[i]) status = `MISMATCH (${argSets[i].join(',')}) native=${actual} js=${expected[i]}`
+                } catch (e) {
+                    status = `RUNFAIL ${firstLine(e)}`
+                }
+                if (status !== 'ok') break
+            }
+            console.log(`CENSUS ${group} ${fn.name} ${status} [${ms}ms]`)
+        })
+    }
+}
+
+function rawNode(op: NodeOp, values: number[]): GraphNode {
+    const slots = new Uint32Array(values.length)
+    for (let i = 0; i < values.length; i++) slots[i] = values[i] as u32
+    return makeNodeFromSlots(op, slots)
+}
+
+function rawGraph(n: u32): Graph {
+    const nodes = new Map<number, GraphNode>()
+    nodes.set(1, rawNode(NodeOp.block, []))
+    nodes.set(2, rawNode(NodeOp.param, [Types.u32]))
+    nodes.set(3, rawNode(NodeOp.add, [refSlot(2), n, Types.u32]))
+    nodes.set(4, rawNode(NodeOp.mul, [refSlot(3), 3, Types.u32]))
+    nodes.set(5, rawNode(NodeOp.ret, [refSlot(4), refSlot(1)]))
+    return createGraph({ nodes, ids: { next: 6 }, root: 1, blocks: [{ id: 1, params: [2], bodyId: 5, bodyConst: 0 }] })
+}
+
+function rawBranchGraph(n: u32): Graph {
+    const nodes = new Map<number, GraphNode>()
+    nodes.set(1, rawNode(NodeOp.block, []))
+    nodes.set(2, rawNode(NodeOp.param, [Types.u32]))
+    nodes.set(3, rawNode(NodeOp.block, []))
+    nodes.set(4, rawNode(NodeOp.block, []))
+    nodes.set(5, rawNode(NodeOp.param, [Types.u32]))
+    nodes.set(6, rawNode(NodeOp.lt, [refSlot(2), n, Types.u32]))
+    nodes.set(7, rawNode(NodeOp.apply, [refSlot(3), refSlot(2)]))
+    nodes.set(8, rawNode(NodeOp.apply, [refSlot(4)]))
+    nodes.set(9, rawNode(NodeOp.select, [refSlot(6), refSlot(7), refSlot(8)]))
+    nodes.set(10, rawNode(NodeOp.add, [refSlot(5), 1, Types.u32]))
+    nodes.set(11, rawNode(NodeOp.ret, [refSlot(10), refSlot(3)]))
+    nodes.set(12, rawNode(NodeOp.ret, [7, refSlot(4)]))
+    return createGraph({
+        nodes, ids: { next: 13 }, root: 1, blocks: [
+            { id: 1, params: [2], bodyId: 9, bodyConst: 0 },
+            { id: 3, params: [5], bodyId: 11, bodyConst: 0 },
+            { id: 4, params: [], bodyId: 12, bodyConst: 0 },
+        ],
+    })
+}
+
+const reproLabels: string[] = []
+for (const key of ['alpha', 'beta']) reproLabels.push(key.replace(/a/g, 'A'))
+const reproPlain: string[] = ['alpha', 'beta']
+
+function refOrNumber(x: number | { ref: number }): number {
+    return typeof x === 'number' ? x + 1 : x.ref
+}
+
+function refOrDefault(x: number | { ref: number } = 5): number {
+    return typeof x === 'number' ? x + 1 : x.ref
+}
+
+function forwardDefault(x: number | { ref: number } = 5): number {
+    return refOrNumber(x)
+}
+
+function subA(g: Graph, by: Map<number, gn.Operand>): number {
+    function resolve(id: number): gn.Operand {
+        let at: gn.Operand = id
+        while (typeof at === 'number' && by.has(at)) at = by.get(at)!
+        return at
+    }
+    let s = 0
+    for (const [id, n] of g.nodes) {
+        const r = resolve(getRef(n, 0))
+        s += typeof r === 'number' ? r : r.literal
+    }
+    return s
+}
+
+function subB(g: Graph, by: Map<number, gn.Operand>): number {
+    let s = 0
+    for (const [id, n] of g.nodes) {
+        if (by.has(id)) continue
+        let operands: gn.Operand[] | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            if (!by.has(getRef(n, i))) continue
+            operands ??= getOperands(g, n)
+            operands[i] = by.get(getRef(n, i))!
+        }
+        if (operands) s += operands.length
+    }
+    return s
+}
+
+function subC(g: Graph, by: Map<number, gn.Operand>): number {
+    let s = 0
+    for (const [id, n] of g.nodes) {
+        if (!by.has(id)) continue
+        putCopy(g, id, n, [1, { literal: 2 }])
+        s++
+    }
+    return s
+}
+
+function subD(by: Map<number, gn.Operand>): number {
+    let at: gn.Operand = 1
+    while (typeof at === 'number' && by.has(at)) at = by.get(at)!
+    return typeof at === 'number' ? at : at.literal
+}
+
+function unionOf(n: number): number | { ref: number } {
+    return n > 2 ? { ref: n } : n
+}
+
+function opaqueLike(...refs: number[]): GraphNode {
+    const slots = new Uint32Array(refs.length)
+    for (let i = 0; i < refs.length; i++) slots[i] = 2 ** 29 + refs[i]
+    return { op: NodeOp.opaque, slots, flags: 0, scratchFlags: 0, epoch: 0 } as GraphNode
+}
+
+function spreadCopy(o: { a: number, b: number }): { a: number, b: number } {
+    return { ...o, b: 3 }
+}
+
+function explicitGraph(n: u32): Graph {
+    const g = createGraph({ ids: { next: 1 } })
+    const root = addNode(g, NodeOp.block, [], Types.u64)
+    const p = addNode(g, NodeOp.param, [], Types.u32)
+    const a = addNode(g, NodeOp.add, [p, { literal: n }], Types.u32)
+    const m = addNode(g, NodeOp.mul, [a, { literal: 3 }], Types.u32)
+    const r = addNode(g, NodeOp.ret, [m, root], Types.u64)
+    g.root = root
+    setGraphBlocks(g, [{ id: root, params: [p], bodyId: r, bodyConst: 0 }])
+    return g
+}
+
+function makeGraph(n: u32): Graph {
+    const g = createGraph()
+    const root = addNode(g, NodeOp.block, [])
+    const p = addNode(g, NodeOp.param, [], Types.u32)
+    const a = addNode(g, NodeOp.add, [p, { literal: n }], Types.u32)
+    const m = addNode(g, NodeOp.mul, [a, { literal: 3 }], Types.u32)
+    const r = addNode(g, NodeOp.ret, [m, root])
+    g.root = root
+    setGraphBlocks(g, [{ id: root, params: [p], bodyId: r, bodyConst: 0 }])
+    return g
+}
+
+function makeBranchGraph(n: u32): Graph {
+    const g = createGraph()
+    const root = addNode(g, NodeOp.block, [])
+    const p = addNode(g, NodeOp.param, [], Types.u32)
+    const yes = addNode(g, NodeOp.block, [])
+    const no = addNode(g, NodeOp.block, [])
+    const yp = addNode(g, NodeOp.param, [], Types.u32)
+    const c = addNode(g, NodeOp.lt, [p, { literal: n }], Types.u32)
+    const ay = addNode(g, NodeOp.apply, [yes, p])
+    const an = addNode(g, NodeOp.apply, [no])
+    const s = addNode(g, NodeOp.select, [c, ay, an])
+    const ry = addNode(g, NodeOp.ret, [addNode(g, NodeOp.add, [yp, { literal: 1 }], Types.u32), yes])
+    const rn = addNode(g, NodeOp.ret, [{ literal: 7 }, no])
+    g.root = root
+    setGraphBlocks(g, [
+        { id: root, params: [p], bodyId: s, bodyConst: 0 },
+        { id: yes, params: [yp], bodyId: ry, bodyConst: 0 },
+        { id: no, params: [], bodyId: rn, bodyConst: 0 },
+    ])
+    return g
+}
+
+export function suite() {
+    function arrSlice(n: u32): number {
+        const a = [n, n + 1, n + 2, n + 3]
+        return a.slice(1, 3).length * 100 + a.slice(1)[0]
+    }
+    function arrIndexOf(n: u32): number {
+        const a = [1, n, 3]
+        return a.indexOf(n) + a.indexOf(99) * 10
+    }
+    function arrIncludes(n: u32): number {
+        const a = [1, n, 3]
+        return (a.includes(n) ? 1 : 0) + (a.includes(99) ? 10 : 0)
+    }
+    function arrConcat(n: u32): number {
+        return [1, n].concat([3, 4]).length
+    }
+    function arrFind(n: u32): number {
+        const a = [1, n, 3]
+        return a.find(x => x > 2) ?? 0
+    }
+    function arrFindIndex(n: u32): number {
+        return [1, n, 3].findIndex(x => x === n)
+    }
+    function arrForEach(n: u32): number {
+        let s = 0
+        const a = [1, n, 3]
+        a.forEach(x => {
+            s += x
+        })
+        return s
+    }
+    function arrReduce(n: u32): number {
+        return [1, n, 3].reduce((a, b) => a + b, 0)
+    }
+    function arrSplice(n: u32): number {
+        const a = [1, n, 3, 4]
+        a.splice(1, 1)
+        return a.length * 100 + a[1]
+    }
+    function arrFill(n: u32): number {
+        const a = new Array(n).fill(2)
+        return a.length + a[0]
+    }
+    function arrNewArray(n: u32): number {
+        const a = new Array(n)
+        for (let i = 0; i < n; i++) a[i] = i
+        return a.length + a[n - 1]
+    }
+    function arrAt(n: u32): number {
+        return [1, 2, n].at(-1)!
+    }
+    function arrShiftUnshift(n: u32): number {
+        const a = [1, 2, n]
+        a.unshift(9)
+        const x = a.shift()!
+        return x * 10 + a.length
+    }
+    function arrLastIndexOf(n: u32): number {
+        return [n, 1, n].lastIndexOf(n)
+    }
+    function arrFrom(n: u32): number {
+        return Array.from({ length: n }, (_, i) => i * 2)[n - 1]
+    }
+    function arrSpread(n: u32): number {
+        const a = [1, n]
+        return [...a, 3].length
+    }
+    function arrPushMany(n: u32): number {
+        const a: number[] = []
+        a.push(n, n + 1)
+        return a.length
+    }
+    function arrLengthReset(n: u32): number {
+        const a = [1, 2, n]
+        a.length = 0
+        return a.length
+    }
+    function arrSortNumbers(n: u32): number {
+        const a = [3, n, 1]
+        a.sort((x, y) => x - y)
+        return a[0] * 100 + a[1] * 10 + a[2]
+    }
+    function arrJoin(n: u32): number {
+        return [1, n, 3].join(',').length
+    }
+    function arrFilterMap(n: u32): number {
+        return [1, n, 3].filter(x => x > 1).map(x => x * 2)[0]
+    }
+    function arrFlatMap(n: u32): number {
+        return [1, n].flatMap(x => [x, x]).length
+    }
+    function arrEntries(n: u32): number {
+        let s = 0
+        for (const [i, x] of [1, n].entries()) s += i * x
+        return s
+    }
+    function arrKeys(n: u32): number {
+        let s = 0
+        for (const i of [1, n, 3].keys()) s += i
+        return s
+    }
+    function arrIsArray(n: u32): number {
+        return Array.isArray([n]) ? 1 : 0
+    }
+    function arrOfArrays(n: u32): number {
+        const rows: number[][] = []
+        for (let i: u32 = 0; i < n; i++) rows.push([i, i + 1])
+        let s = 0
+        for (const row of rows) s += row[1]
+        return s
+    }
+    function arrDestructure(n: u32): number {
+        const [a, b] = [n, n + 1]
+        return a * 10 + b
+    }
+
+    function mapGetSet(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        m.set(2, n * 2)
+        return m.get(2)! + (m.has(3) ? 1 : 0) + m.size
+    }
+    function mapDelete(n: u32): number {
+        const m = new Map<number, number>()
+        for (let i: u32 = 0; i < n; i++) m.set(i, i)
+        m.delete(1)
+        return m.size
+    }
+    function mapForEach(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        let s = 0
+        m.forEach((v, k) => {
+            s += v + k
+        })
+        return s
+    }
+    function mapEntriesIter(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        m.set(2, 3)
+        let s = 0
+        for (const [k, v] of m.entries()) s += k * v
+        return s
+    }
+    function mapClear(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        m.clear()
+        return m.size
+    }
+    function mapCtorEntries(n: u32): number {
+        const m = new Map<number, number>([[1, n], [2, 3]])
+        return m.get(1)!
+    }
+    function mapStringKeys(n: u32): number {
+        const m = new Map<string, number>()
+        m.set('a', n)
+        m.set('b', 2)
+        return m.get('a')!
+    }
+    function mapSpreadKeys(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(n, 1)
+        return [...m.keys()][0]
+    }
+    function mapOfArrays(n: u32): number {
+        const m = new Map<number, number[]>()
+        m.set(1, [n])
+        m.get(1)!.push(2)
+        return m.get(1)!.length
+    }
+    function mapGetOrDefault(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        return (m.get(1) ?? 0) + (m.get(2) ?? 5)
+    }
+    function setAddHas(n: u32): number {
+        const s = new Set<number>()
+        s.add(n)
+        s.add(1)
+        return (s.has(n) ? 1 : 0) + s.size
+    }
+    function setDelete(n: u32): number {
+        const s = new Set<number>()
+        for (let i: u32 = 0; i < n; i++) s.add(i)
+        s.delete(0)
+        return s.size
+    }
+    function setCtorArray(n: u32): number {
+        return new Set([1, n, 1]).size
+    }
+    function setForEach(n: u32): number {
+        const s = new Set<number>()
+        s.add(n)
+        let t = 0
+        s.forEach(x => {
+            t += x
+        })
+        return t
+    }
+    function setSpread(n: u32): number {
+        const s = new Set<number>()
+        s.add(n)
+        s.add(2)
+        return [...s].length
+    }
+    function setClear(n: u32): number {
+        const s = new Set<number>()
+        s.add(n)
+        s.clear()
+        return s.size
+    }
+    function setOfStrings(n: u32): number {
+        const s = new Set<string>()
+        s.add('a')
+        s.add(n > 2 ? 'b' : 'a')
+        return s.size
+    }
+
+    function mathOps(n: u32): number {
+        return Math.max(n, 3) + Math.min(n, 3) + Math.abs(-4) + Math.floor(n / 2) + Math.ceil(n / 2)
+    }
+    function mathRound(n: u32): number {
+        return Math.round(n / 3) + Math.trunc(n / 3) + Math.sign(n)
+    }
+    function mathSqrt(n: u32): number {
+        return Math.sqrt(n * n)
+    }
+    function mathMaxSpread(n: u32): number {
+        return Math.max(...[1, n, 3])
+    }
+    function mathClz(n: u32): number {
+        return Math.clz32(n) + Math.imul(n, 3)
+    }
+    function numberInteger(n: u32): number {
+        return (Number.isInteger(n / 2) ? 1 : 0) + (Number.isSafeInteger(n) ? 10 : 0)
+    }
+    function numberAsUint(n: u32): number {
+        return Number.asUintN(8, n + 256) + Number.asIntN(8, 255)
+    }
+    function numberCall(n: u32): number {
+        return Number(n > 2) + Number(n)
+    }
+    function numberIsNaN(n: u32): number {
+        return (Number.isNaN(n / 0) ? 1 : 0) + (isNaN(n) ? 10 : 0)
+    }
+    function bigIntOps(n: u32): number {
+        return Number(BigInt(n) << BigInt(3))
+    }
+    function stringLength(n: u32): number {
+        return (n > 2 ? 'abc' : 'de').length
+    }
+    function stringCharCode(n: u32): number {
+        return 'abc'.charCodeAt(n % 3)
+    }
+    function stringSlice(n: u32): number {
+        return 'abcdef'.slice(n % 3).length
+    }
+    function stringStartsWith(n: u32): number {
+        return (`x${n}`.startsWith('x') ? 1 : 0)
+    }
+    function stringIndexOf(n: u32): number {
+        return `ab${n}`.indexOf('b')
+    }
+    function stringSplit(n: u32): number {
+        return `a,b,${n}`.split(',').length
+    }
+    function stringEquals(n: u32): number {
+        const s = n > 2 ? 'abc' : 'de'
+        return s === 'abc' ? 1 : 0
+    }
+    function stringNumber(n: u32): number {
+        return Number(`${n}`) + 1
+    }
+    function stringReplace(n: u32): number {
+        return `a-${n}`.replace(/-/g, '_').length
+    }
+    function stringToUpper(n: u32): number {
+        return `a${n}`.toUpperCase().length
+    }
+    function stringPadStart(n: u32): number {
+        return `${n}`.padStart(5, '0').length
+    }
+    function stringRepeat(n: u32): number {
+        return 'ab'.repeat(n).length
+    }
+    function stringIncludes(n: u32): number {
+        return `ab${n}`.includes('b') ? 1 : 0
+    }
+    function stringFromCharCode(n: u32): number {
+        return String.fromCharCode(65 + n).length
+    }
+    function stringToFixed(n: u32): number {
+        return (n / 3).toFixed(2).length
+    }
+    function stringConcatLoop(n: u32): number {
+        let s = ''
+        for (let i: u32 = 0; i < n; i++) s += 'x'
+        return s.length
+    }
+    function stringKeyedObject(n: u32): number {
+        const o: Record<string, number> = {}
+        o[`k${n}`] = n
+        return o[`k${n}`]
+    }
+    function typedSlice(n: u32): number {
+        const a = new Uint32Array(n)
+        a[1] = 5
+        return a.slice(1).length + a.slice(1)[0]
+    }
+    function typedSort(n: u32): number {
+        const a = new Uint32Array([3, n, 1])
+        a.sort()
+        return a[0] * 100 + a[1] * 10 + a[2]
+    }
+    function typedSet(n: u32): number {
+        const a = new Uint32Array(4)
+        a.set([n, 2], 1)
+        return a[1] + a[2]
+    }
+    function typedSubarray(n: u32): number {
+        const a = new Uint32Array(n)
+        a[2] = 7
+        return a.subarray(1)[1]
+    }
+    function typedFill(n: u32): number {
+        const a = new Int32Array(n).fill(3)
+        return a[n - 1]
+    }
+    function typedFloat(n: u32): number {
+        const a = new Float64Array(n)
+        a[0] = n / 2
+        return a[0] * 2
+    }
+    function typedUint16(n: u32): number {
+        const a = new Uint16Array(n)
+        a[0] = n
+        return a[0]
+    }
+    function typedUint8Slice(n: u32): number {
+        const a = new Uint8Array(n)
+        a[0] = 200
+        return a.slice(0, 1)[0]
+    }
+    function typedFromArray(n: u32): number {
+        return new Int32Array([1, -2, n])[1]
+    }
+    function typedLengthLoop(n: u32): number {
+        const a = new Uint32Array(n)
+        let s = 0
+        for (let i = 0; i < a.length; i++) s += a[i] + i
+        return s
+    }
+    function objectKeys(n: u32): number {
+        const o = { a: n, b: 2 }
+        return Object.keys(o).length
+    }
+    function objectEntries(n: u32): number {
+        const o = { a: n, b: 2 }
+        let s = 0
+        for (const [, v] of Object.entries(o)) s += v
+        return s
+    }
+    function objectAssign(n: u32): number {
+        const o = Object.assign({ a: 1 }, { b: n })
+        return o.a + o.b
+    }
+    function objectSpread(n: u32): number {
+        const a = { x: n, y: 2 }
+        const b = { ...a, y: 3 }
+        return b.x + b.y
+    }
+    function objectInOperator(n: u32): number {
+        const o: { a?: number } = n > 2 ? { a: 1 } : {}
+        return 'a' in o ? 1 : 0
+    }
+    function objectFreeze(n: u32): number {
+        const o = Object.freeze({ a: n })
+        return o.a
+    }
+    function instanceofOp(n: u32): number {
+        const a: any = n > 2 ? [1] : new Map()
+        return a instanceof Map ? 1 : 2
+    }
+    function typeofOp(n: u32): number {
+        const a: number | string = n > 2 ? 1 : 'x'
+        return typeof a === 'number' ? 1 : 2
+    }
+    function tryCatch(n: u32): number {
+        try {
+            if (n > 2) throw 'big'
+            return 1
+        } catch (e) {
+            return 2
+        }
+    }
+    function throwOnly(n: u32): number {
+        if (n > 100) throw `too big ${n}`
+        return n
+    }
+    function finallyBlock(n: u32): number {
+        let s = 0
+        try {
+            s = n
+        } finally {
+            s += 1
+        }
+        return s
+    }
+    function localClass(n: u32): number {
+        class P {
+            x: number
+            constructor(x: number) {
+                this.x = x
+            }
+            twice() {
+                return this.x * 2
+            }
+        }
+        return new P(n).twice()
+    }
+    function closureCounter(n: u32): number {
+        let c = 0
+        const inc = () => {
+            c++
+        }
+        for (let i: u32 = 0; i < n; i++) inc()
+        return c
+    }
+    function recursion(n: u32): number {
+        function fib(k: number): number {
+            return k < 2 ? k : fib(k - 1) + fib(k - 2)
+        }
+        return fib(n)
+    }
+    function optionalChain(n: u32): number {
+        const o: { a?: { b: number } } = n > 2 ? { a: { b: n } } : {}
+        return o.a?.b ?? 9
+    }
+    function switchStmt(n: u32): number {
+        switch (n % 3) {
+            case 0:
+                return 10
+            case 1:
+                return 20
+            default:
+                return 30
+        }
+    }
+    function labeledBreak(n: u32): number {
+        let s = 0
+        outer: for (let i: u32 = 0; i < n; i++) {
+            for (let j: u32 = 0; j < n; j++) {
+                if (i * j > 4) break outer
+                s++
+            }
+        }
+        return s
+    }
+    function forInLoop(n: u32): number {
+        const o = { a: n, b: 2 }
+        let s = 0
+        for (const k in o) s += (o as any)[k]
+        return s
+    }
+    function restParams(n: u32): number {
+        function sum(...xs: number[]): number {
+            let s = 0
+            for (const x of xs) s += x
+            return s
+        }
+        return sum(1, n, 3)
+    }
+    function defaultParams(n: u32): number {
+        function f(a: number, b = 3): number {
+            return a + b
+        }
+        return f(n) + f(n, 1)
+    }
+    function destructureObj(n: u32): number {
+        const { a, b = 4 } = { a: n } as { a: number, b?: number }
+        return a + b
+    }
+    function nullishAssign(n: u32): number {
+        const o: { a?: number } = {}
+        o.a ??= n
+        return o.a
+    }
+    function bitOps(n: u32): number {
+        return ((n << 3) | 1) ^ (n >>> 1) & 0xff
+    }
+    function floatDivision(n: u32): number {
+        return Math.floor((n / 7) * 1000)
+    }
+    function negativeMod(n: u32): number {
+        return (-(n as number)) % 3 + 5
+    }
+    function u64Math(n: u32): number {
+        const x: u64 = n as u64
+        return Number((x * (x as u64)) >> (1 as u64))
+    }
+
+    function gnCreateGraph(n: u32): number {
+        const g = createGraph()
+        return g.ids.next + g.nodes.size + n
+    }
+    function gnMakeGraph(n: u32): number {
+        const g = makeGraph(n)
+        return g.nodes.size * 100 + g.blocks.length * 10 + g.root
+    }
+    function gnAddNode(n: u32): number {
+        const g = createGraph()
+        const id = addNode(g, NodeOp.add, [{ literal: n }, { literal: 2 }], Types.u32)
+        return id * 10 + getNode(g, id)!.slots.length
+    }
+    function gnBigLiteral(n: u32): number {
+        const g = createGraph()
+        const id = addNode(g, NodeOp.add, [{ literal: n * 2 ** 30 }, { literal: -1 }], Types.u32)
+        const node = getNode(g, id)!
+        return getLiteral(g, node, 0) / 2 ** 30 + getLiteral(g, node, 1)
+    }
+    function gnArgIds(n: u32): number {
+        const g = makeGraph(n)
+        let s = 0
+        for (const id of g.nodes.keys()) s += getArgIds(getNode(g, id)!).length
+        return s
+    }
+    function gnOpName(n: u32): number {
+        return opName(n > 2 ? NodeOp.add : NodeOp.sub).length
+    }
+    function gnNodeOp(n: u32): number {
+        return nodeOp(n > 2 ? 'add' : 'sub') + maybeNodeOp('zzz')
+    }
+    function gnInternNode(n: u32): number {
+        const g = createGraph()
+        const table = new Map<number, number>()
+        const a = internNode(g, table, NodeOp.add, [literalSlot(g, n), literalSlot(g, 2)], Types.u32)
+        const b = internNode(g, table, NodeOp.add, [literalSlot(g, n), literalSlot(g, 2)], Types.u32)
+        return a === b ? a : 0
+    }
+    function gnSlots(n: u32): number {
+        const g = createGraph()
+        const s = encodeSlot(g, n, 0)
+        const l = literalSlot(g, n + 1)
+        return slotRef(s) * 100 + slotLiteral(g, l) + slotRef(refSlot(3))
+    }
+    function gnSlotKey(n: u32): number {
+        const g = makeGraph(n)
+        const node = getNode(g, 3)!
+        return slotKey(node.op, node.slots).length
+    }
+    function gnFacts(n: u32): number {
+        const g = makeGraph(n)
+        const node = getNode(g, 3)!
+        setFact(node, n)
+        return factOf(node) * 10 + countIds(node)
+    }
+    function gnTypes(n: u32): number {
+        const g = makeGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += typeOf(node) + resultType(g, node)
+        return s
+    }
+    function gnOperandType(n: u32): number {
+        const g = makeGraph(n)
+        return operandType(g, getNode(g, 3)!, 0) + operandType(g, getNode(g, 3)!, 1)
+    }
+    function gnFnType(n: u32): number {
+        const g = createGraph()
+        const t = createFnType(g, Types.u32, [n, 2])
+        const r = fnReturn(t)
+        return (typeof r === 'number' ? r : 0) + fnLocations(t).length * 100
+    }
+    function gnRecordType(n: u32): number {
+        const g = createGraph()
+        const t = createRecordType(g, [{ key: n, type: Types.u32 }, { key: 2, type: Types.f64 }])
+        return recordFields(g, t).length * 100 + recordFields(g, t)[0].key
+    }
+    function gnThisParam(n: u32): number {
+        const g = createGraph()
+        const t = createThisParam(g)
+        const l = createLocatedParam(g, n)
+        return (isThisParam(t) ? 1 : 0) + (isThisParam(l) ? 10 : 0)
+    }
+    function gnCopyNode(n: u32): number {
+        const g = makeGraph(n)
+        const c = copyNode(g, getNode(g, 3)!, [1, { literal: 5 }])
+        return getLiteral(g, c, 1) + countIds(c) * 10
+    }
+    function gnSwap(n: u32): number {
+        const g = makeGraph(n)
+        const node = getNode(g, 3)!
+        swapBinaryOperands(node)
+        return getRef(node, 1)
+    }
+    function gnEnumerateRefs(n: u32): number {
+        const g = makeGraph(n)
+        let s = 0
+        for (const r of enumerateRefs(getNode(g, 4)!)) s += r
+        return s
+    }
+    function gnArgConsts(n: u32): number {
+        const g = makeGraph(n)
+        return getArgConsts(g, getNode(g, 3)!)[1]
+    }
+    function gnCloneRefs(n: u32): number {
+        const g = makeGraph(n)
+        return cloneRefs(getNode(g, 4)!).length + getLiteral(g, getNode(g, 3)!, 1)
+    }
+    function gnGetOperands(n: u32): number {
+        const g = makeGraph(n)
+        const ops = getOperands(g, getNode(g, 3)!)
+        const x = ops[1]
+        return typeof x === 'number' ? x : x.literal
+    }
+    function gnWithRefs(n: u32): number {
+        const g = makeGraph(n)
+        return withRefs(g, getNode(g, 3)!, [0, 0]).length
+    }
+    function gnSetOperands(n: u32): number {
+        const g = makeGraph(n)
+        const node = getNode(g, 3)!
+        setOperand(g, node, 1, { literal: n * 2 })
+        setRef(node, 0, 2)
+        setLiteral(g, node, 1, n + 9)
+        return getLiteral(g, node, 1) + getRef(node, 0) * 100
+    }
+    function gnPushRefs(n: u32): number {
+        const g = makeGraph(n)
+        const node = getNode(g, 5)!
+        pushRefs(node, [1, n])
+        const before = countIds(node)
+        clearOperands(node)
+        return before * 10 + countIds(node)
+    }
+    function gnDebugLabel(n: u32): number {
+        const g = makeGraph(n)
+        setDebugLabel(g, 3, 'x')
+        return getDebugLabel(g, 3)!.length + (getDebugLabel(g, 4) === undefined ? 10 : 0)
+    }
+    function gnPutCopy(n: u32): number {
+        const g = makeGraph(n)
+        const id = newId(g)
+        putNode(g, id, NodeOp.sub, [3, { literal: 1 }], Types.u32)
+        const c = addCopy(g, getNode(g, id)!)
+        putCopy(g, c, getNode(g, 3)!, [2, { literal: n }])
+        return id * 100 + c + (hasNode(g, c) ? 1000 : 0)
+    }
+    function gnDeleteNode(n: u32): number {
+        const g = makeGraph(n)
+        const id = insertNode(g, makeNode(g, NodeOp.add, [{ literal: n }, { literal: 1 }], Types.u32))
+        deleteNode(g, id)
+        return g.nodes.size + (hasNode(g, id) ? 100 : 0)
+    }
+    function gnRetype(n: u32): number {
+        const g = makeGraph(n)
+        retypeNode(g, 3, Types.u64)
+        return typeOf(getNode(g, 3)!)
+    }
+    function gnWithOperand(n: u32): number {
+        const g = makeGraph(n)
+        return withOperand(g, getNode(g, 3)!, 1, { literal: n }).length
+    }
+    function gnBlocks(n: u32): number {
+        const g = makeBranchGraph(n)
+        const b = getBlock(g, g.root)!
+        return b.params.length + g.blocks.length * 10
+    }
+    function gnAddBlock(n: u32): number {
+        const g = makeGraph(n)
+        const id = addNode(g, NodeOp.block, [])
+        addGraphBlock(g, { id, params: [], bodyId: 0, bodyConst: n })
+        return g.blocks.length * 10 + g.blockIndex.size
+    }
+    function gnWithNodes(n: u32): number {
+        const g = makeGraph(n)
+        const h = withNodes(g, new Map(g.nodes))
+        return h.nodes.size + h.blocks.length
+    }
+
+    function l2StronglyConnected(n: u32): number {
+        const edges = (v: number): number[] => v < n ? [v + 1, 0] : []
+        return lowering2.stronglyConnected([0], edges).length
+    }
+    function l2GraphLoops(n: u32): number {
+        const g = makeBranchGraph(n)
+        const loops = lowering2.graphLoops(g)
+        return loops.loopDepth.size
+    }
+    function l2TailOf(n: u32): number {
+        const g = makeGraph(n)
+        return lowering2.tailOf(g, 5)
+    }
+    function l2IsParam(n: u32): number {
+        const g = makeGraph(n)
+        return (lowering2.isParam(g.nodes, 2) ? 1 : 0) + (lowering2.isParam(g.nodes, 3) ? 10 : 0)
+    }
+    function l2FloatValues(n: u32): number {
+        return lowering2.floatValues(makeGraph(n)).size
+    }
+    function l2ImpureValues(n: u32): number {
+        return lowering2.impureValues(makeBranchGraph(n)).size
+    }
+    function l2WideLiteral(n: u32): number {
+        return (lowering2.wideLiteral(n * 2 ** 40) ? 1 : 0) + (lowering2.wideLiteral(n) ? 10 : 0)
+    }
+    function l2TypeName(n: u32): number {
+        return lowering2.typeName(n > 2 ? Types.u32 : Types.f64).length
+    }
+    function l2FirstSlot(n: u32): number {
+        const g = makeGraph(n)
+        return lowering2.firstNonOrderingSlot(getNode(g, 3)!) + (lowering2.liftableSlot(NodeOp.add, 1) ? 10 : 0)
+    }
+    function l2SweepBlocks(n: u32): number {
+        const g = makeBranchGraph(n)
+        lowering2.sweepBlocks(g)
+        return g.nodes.size
+    }
+    function l2DumpGraph(n: u32): number {
+        return lowering2.dumpGraph(makeGraph(n)).length
+    }
+    function l2Substitute(n: u32): number {
+        const g = makeGraph(n)
+        const by = new Map<number, gn.Operand>()
+        by.set(3, { literal: n })
+        lowering2.substitute(g, by)
+        return g.nodes.size
+    }
+    function l2CloneExits(n: u32): number {
+        return lowering2.cloneExits(makeBranchGraph(n)).nodes.size
+    }
+    function l2MemAnalysis(n: u32): number {
+        const m = lowering2.memAnalysis(makeGraph(n))
+        return m ? 1 : 0
+    }
+    function l2IsJumbo(n: u32): number {
+        return lowering2.isJumbo(makeGraph(n)) ? 1 : 0
+    }
+    function l2ResolveNumberTypes(n: u32): number {
+        const g = makeGraph(n)
+        lowering2.resolveNumberTypes(g)
+        return g.nodes.size
+    }
+    function l2Normalize(n: u32): number {
+        return lowering2.normalizeValueGraph(makeGraph(n)).nodes.size
+    }
+    function l2NormalizeBranch(n: u32): number {
+        return lowering2.normalizeValueGraph(makeBranchGraph(n)).nodes.size
+    }
+    function l2Lower(n: u32): number {
+        return lowering2.lowerValueGraph(lowering2.normalizeValueGraph(makeGraph(n))).words.length
+    }
+
+    function asmRet(n: u32): number {
+        const a = lowering.createAarch64Assembler()
+        a.ret()
+        return a.words().length + n
+    }
+    function asmMovRet(n: u32): number {
+        const a = lowering.createAarch64Assembler()
+        a.movImm(0, n)
+        a.ret()
+        return a.words()[0] & 0xffff
+    }
+    function asmIsSigned(n: u32): number {
+        return lowering.isSignedType(n > 2 ? Types.i32 : Types.u32) ? 1 : 0
+    }
+    function asmTargetFor(n: u32): number {
+        return lowering.targetFor('darwin', 'arm64').name.length + n
+    }
+
+    function bcCompile(n: u32): number {
+        return bytecode.compile(`function f(x) { return x + ${n} }`).code.length
+    }
+    function bcCodeIterator(n: u32): number {
+        const it = bytecode.createCodeIterator([0, 0, n])
+        return it ? 1 : 0
+    }
+
+
+    function gnEmptyGraph(n: u32): number {
+        const g = createGraph({})
+        return g.ids.next + n
+    }
+    function gnGraphIds(n: u32): number {
+        const g = createGraph({ ids: { next: n } })
+        return g.ids.next
+    }
+    function gnRawGraph(n: u32): number {
+        const g = rawGraph(n)
+        return g.nodes.size * 100 + g.blocks.length * 10 + g.root
+    }
+    function gnRawArgIds(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += getArgIds(node).length
+        return s
+    }
+    function gnRawRefs(n: u32): number {
+        const g = rawGraph(n)
+        const node = getNode(g, 3)!
+        return getRef(node, 0) * 100 + getLiteral(g, node, 1) + countIds(node) * 1000
+    }
+    function gnRawTypeOf(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += typeOf(node)
+        return s
+    }
+    function gnRawResultType(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += resultType(g, node)
+        return s
+    }
+    function gnRawFact(n: u32): number {
+        const g = rawGraph(n)
+        const node = withFact(getNode(g, 3)!, n)
+        return factOf(node) * 10 + countIds(node)
+    }
+    function gnRawSwap(n: u32): number {
+        const g = rawGraph(n)
+        const node = getNode(g, 3)!
+        swapBinaryOperands(node)
+        return getRef(node, 1) + getLiteral(g, node, 0) * 10
+    }
+    function gnRawCloneRefs(n: u32): number {
+        const g = rawGraph(n)
+        return cloneRefs(getNode(g, 5)!).length * 10 + getLiteral(g, getNode(g, 3)!, 1)
+    }
+    function gnRawPushRefs(n: u32): number {
+        const g = rawGraph(n)
+        const node = getNode(g, 5)!
+        pushRefs(node, [1, n])
+        const before = countIds(node)
+        clearOperands(node)
+        return before * 10 + countIds(node)
+    }
+    function gnRawSetRef(n: u32): number {
+        const g = rawGraph(n)
+        const node = getNode(g, 4)!
+        setRef(node, 0, n)
+        setLiteral(g, node, 1, n * 3)
+        return getRef(node, 0) * 100 + getLiteral(g, node, 1)
+    }
+    function gnRawArgConsts(n: u32): number {
+        const g = rawGraph(n)
+        return getArgConsts(g, getNode(g, 3)!)[1]
+    }
+    function gnRawSlotKey(n: u32): number {
+        const g = rawGraph(n)
+        const node = getNode(g, 3)!
+        return slotKey(node.op, node.slots).length
+    }
+    function gnRawEnumerate(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        const it = enumerateRefs(getNode(g, 5)!)
+        for (let r = it.next(); !r.done; r = it.next()) s += r.value
+        return s + n
+    }
+    function gnRawBlocks(n: u32): number {
+        const g = rawBranchGraph(n)
+        return getBlock(g, 3)!.params.length + g.blocks.length * 10 + g.blockIndex.size * 100
+    }
+    function gnRawIntern(n: u32): number {
+        const g = rawGraph(n)
+        const table = new Map<number, number>()
+        const a = internNode(g, table, NodeOp.sub, [refSlot(2), literalSlot(g, n)], Types.u32)
+        const b = internNode(g, table, NodeOp.sub, [refSlot(2), literalSlot(g, n)], Types.u32)
+        return a === b ? a : 0
+    }
+    function gnRawDelete(n: u32): number {
+        const g = rawGraph(n)
+        deleteNode(g, 4)
+        return g.nodes.size + (hasNode(g, 4) ? 100 : 0) + newId(g)
+    }
+    function gnRawOpName(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += opName(node.op).length
+        return s
+    }
+    function gnRawLabels(n: u32): number {
+        const g = rawGraph(n)
+        setDebugLabel(g, 3, n > 2 ? 'abc' : 'x')
+        return getDebugLabel(g, 3)!.length
+    }
+    function vtScalarType(n: u32): number {
+        return (valueTypes.scalarType(n > 2 ? Types.u32 : Types.u64) ? 1 : 0)
+    }
+    function vtUsersOf(n: u32): number {
+        const users = valueTypes.usersOf(rawGraph(n))
+        return users.size * 10 + users.get(2)!.length
+    }
+    function vtRegionRets(n: u32): number {
+        return valueTypes.regionRets(rawBranchGraph(n)).size + n
+    }
+    function l2RawTailOf(n: u32): number {
+        return lowering2.tailOf(rawGraph(n), 5) + n
+    }
+    function l2RawIsParam(n: u32): number {
+        const g = rawGraph(n)
+        return (lowering2.isParam(g.nodes, 2) ? 1 : 0) + (lowering2.isParam(g.nodes, 3) ? 10 : 0)
+    }
+    function l2RawGraphLoops(n: u32): number {
+        return lowering2.graphLoops(rawBranchGraph(n)).loopDepth.size
+    }
+    function l2RawTailPositions(n: u32): number {
+        return lowering2.tailPositions(rawBranchGraph(n), 9).length
+    }
+    function l2RawFloatValues(n: u32): number {
+        return lowering2.floatValues(rawGraph(n)).size + n
+    }
+    function l2RawImpure(n: u32): number {
+        return lowering2.impureValues(rawBranchGraph(n)).size + n
+    }
+    function l2RawFirstSlot(n: u32): number {
+        const g = rawGraph(n)
+        return lowering2.firstNonOrderingSlot(getNode(g, 3)!) + n
+    }
+    function l2RawSweep(n: u32): number {
+        const g = rawBranchGraph(n)
+        lowering2.sweepBlocks(g)
+        return g.nodes.size
+    }
+    function l2RawIsNumeric(n: u32): number {
+        const g = rawGraph(n)
+        return lowering2.isNumeric(g, 4, () => true) ? 1 : 0
+    }
+    function l2RawIsJumbo(n: u32): number {
+        return lowering2.isJumbo(rawGraph(n)) ? 1 : 0
+    }
+    function l2RawDumpBlock(n: u32): number {
+        return lowering2.dumpBlockGraph(rawGraph(n)).length
+    }
+    function l2RawCloneExits(n: u32): number {
+        return lowering2.cloneExits(rawBranchGraph(n)).nodes.size
+    }
+    function l2RawJoinEffects(n: u32): number {
+        const g = rawGraph(n)
+        return lowering2.joinEffects(g, [3, 4])
+    }
+    function l2RawHotCold(n: u32): number {
+        const g = rawBranchGraph(n)
+        const h = lowering2.hotCold(g, lowering2.graphLoops(g))
+        return h ? 1 : 0
+    }
+    function l2RawResolveNumbers(n: u32): number {
+        const g = rawGraph(n)
+        lowering2.resolveNumberTypes(g)
+        return g.nodes.size
+    }
+    function l2RawNormalize(n: u32): number {
+        return lowering2.normalizeValueGraph(rawGraph(n)).nodes.size
+    }
+    function l2RawLower(n: u32): number {
+        return lowering2.lowerValueGraph(lowering2.normalizeValueGraph(rawGraph(n))).words.length
+    }
+    function recSnapshots(n: u32): number {
+        const g = rawGraph(n)
+        records.recordSnapshots(g)
+        return g.nodes.size
+    }
+    function recFlatten(n: u32): number {
+        return records.flattenRecords(rawGraph(n)).nodes.size
+    }
+    function vmTags(n: u32): number {
+        return vm.tagVmScalar(n) + vm.tagVmHandle(n as intrinsics.Handle) + (vm.isVmHandle(n) ? 1000 : 0)
+    }
+    function vmFrameSize(n: u32): number {
+        return vm.frameSize(n) + vm.frameArg(16, n)
+    }
+    function rtOpName(n: u32): number {
+        return rtModule.opName(n as rtModule.Op).length
+    }
+    function heapBoxF64(n: u32): number {
+        const h = heap.boxF64(n / 4)
+        return heap.isBoxedF64(h) ? heap.unboxF64(h) * 4 : 0
+    }
+    function heapIndirect(n: u32): number {
+        const target = heap.boxF64(n + 0.5)
+        const cell = heap.makeIndirect(target)
+        return heap.isIndirect(cell) && heap.indirectTarget(cell) === target ? 1 : 0
+    }
+    function heapNumberString(n: u32): number {
+        return heap.stringToJs(heap.numberToString(n as u64)).length
+    }
+    function cgReleaseArena(n: u32): number {
+        const h = cg.createHeap(32, 0)
+        const root = cg.rootSc(h)
+        const arena = cg.createArenaSc(h, root, 1)
+        for (let i: u32 = 0; i < n; i++) cg.allocCell(h, arena, 8)
+        cg.releaseArena(h, arena)
+        return cg.scDepth(h, root) + n
+    }
+    function cgConvertArena(n: u32): number {
+        const h = cg.createHeap(32, 0)
+        const root = cg.rootSc(h)
+        const arena = cg.createArenaSc(h, root, 1)
+        const a = cg.allocCell(h, arena, 8)
+        const b = cg.allocCell(h, arena, 8)
+        cg.setSingleEdge(h, a, b)
+        cg.convertArena(h, arena)
+        return cg.localRefCount(h, b) + n
+    }
+    function cgBuild(n: u32): number {
+        const h = cg.createHeap(32, 0)
+        const root = cg.rootSc(h)
+        const sc = cg.createPoolSc(h, root, 1, 16)
+        const build = intrinsics.Intrinsics.alloc(4096)
+        cg.initBuild(build)
+        const parent = cg.beginBuild(h, build, sc, 16)
+        const child = cg.beginBuild(h, build, sc, 16)
+        cg.finishBuild(h, build, child)
+        cg.setSingleEdgeRaw(h, parent, child)
+        cg.finishBuild(h, build, parent)
+        const out = cg.localRefCount(h, child) + n
+        intrinsics.Intrinsics.free(build)
+        return out
+    }
+    function bcRegReads(n: u32): number {
+        const inst: bytecode.CodeInstruction = { pos: 0, width: 1, opcode: n, opname: 'x', regs: [1, 2], readsAcc: true }
+        return bytecode.getRegReads(inst).length * 10 + bytecode.getRegWrites(inst).length
+    }
+    function bcIterate(n: u32): number {
+        const it = bytecode.createCodeIterator([n, 0, 0, 0])
+        const first = it.next()
+        return first ? first.opcode + first.width * 100 : 0
+    }
+
+    function nsRecordsNamed(n: u32): number {
+        const g = rawGraph(n)
+        recordSnapshots(g)
+        return g.nodes.size
+    }
+    function nsL2After(n: u32): number {
+        const g = rawGraph(n)
+        return lowering2.tailOf(g, 5) + n
+    }
+    function nsVtNamed(n: u32): number {
+        const users = usersOf(rawGraph(n))
+        return users.size * 10 + users.get(2)!.length
+    }
+    function nsVtScalarNamed(n: u32): number {
+        return scalarType(n > 2 ? Types.u32 : Types.u64) ? 1 : 0
+    }
+    function nsBcNamed(n: u32): number {
+        const inst: bytecode.CodeInstruction = { pos: 0, width: 1, opcode: n, opname: 'x', regs: [1, 2], readsAcc: true }
+        return getRegReads(inst).length
+    }
+    function nsLoweringNamed(n: u32): number {
+        return isSignedType(n > 2 ? Types.i32 : Types.u32) ? 1 : 0
+    }
+    function nsVmAfterCall(n: u32): number {
+        const g = rawGraph(n)
+        return vm.tagVmScalar(g.nodes.size)
+    }
+
+    function rpTypeofNumberArm(n: u32): number {
+        return refOrNumber(n)
+    }
+    function rpNumberObjectUnion(n: u32): number {
+        return refOrNumber(n) + refOrNumber({ ref: n * 2 })
+    }
+    function rpComputedLabels(n: u32): number {
+        return reproLabels[n % 2].length
+    }
+    function rpPlainLabels(n: u32): number {
+        return reproPlain[n % 2].length
+    }
+    function rpMapStringValue(n: u32): number {
+        const m = new Map<number, string>()
+        m.set(1, n > 2 ? 'abc' : 'x')
+        return m.get(1)!.length
+    }
+    function rpSpreadParam(n: u32): number {
+        const c = spreadCopy({ a: n, b: 1 })
+        return c.a + c.b
+    }
+    function rpPushSpread(n: u32): number {
+        const a = [1]
+        const b = [n, n]
+        a.push(...b)
+        return a.length
+    }
+    function rpNegMod(n: u32): number {
+        const x = -n
+        return x % 3 + 5
+    }
+    function rpNeg(n: u32): number {
+        return -n + 10
+    }
+    function rpShiftAfterMul(n: u32): number {
+        return (n * n) >> 1
+    }
+    function rpNumberOfBool(n: u32): number {
+        return Number(n > 2)
+    }
+    function rpNumberOfNumber(n: u32): number {
+        return Number(n) + 1
+    }
+    function rpDivide(n: u32): number {
+        return (n / 2) * 2
+    }
+    function rpTypeofUnion(n: u32): number {
+        const a: number | string = n > 2 ? 1 : 'x'
+        return typeof a === 'number' ? 1 : 2
+    }
+    function rpTypeofObject(n: u32): number {
+        const a: number | { x: number } = n > 2 ? 1 : { x: n }
+        return typeof a === 'number' ? 1 : 2
+    }
+    function rpOptionalParamObject(n: u32): number {
+        function make(init?: { next: number }): number {
+            return init?.next ?? 7
+        }
+        return make() + make({ next: n })
+    }
+    function rpOptionalAbsent(n: u32): number {
+        function make(init?: { next: number }): { next: number } {
+            return { next: init?.next ?? n }
+        }
+        return make().next
+    }
+
+    function rpDefaultArm(n: u32): number {
+        return refOrDefault(n) + refOrDefault()
+    }
+    function rpDefaultArmPassed(n: u32): number {
+        return refOrDefault(n)
+    }
+    function rpForwardDefault(n: u32): number {
+        return forwardDefault(n) + forwardDefault()
+    }
+
+    function gxGraph(n: u32): number {
+        const g = explicitGraph(n)
+        return g.nodes.size * 100 + g.blocks.length * 10 + g.root
+    }
+    function gxArgIds(n: u32): number {
+        const g = explicitGraph(n)
+        let s = 0
+        for (const node of g.nodes.values()) s += getArgIds(node).length
+        return s
+    }
+    function gxCopyNode(n: u32): number {
+        const g = explicitGraph(n)
+        const c = copyNode(g, getNode(g, 3)!, [1, { literal: 5 }], NodeOp.add)
+        return getLiteral(g, c, 1) + countIds(c) * 10
+    }
+    function gxPutNode(n: u32): number {
+        const g = explicitGraph(n)
+        const id = newId(g)
+        putNode(g, id, NodeOp.sub, [3, { literal: n }], Types.u32)
+        return getLiteral(g, getNode(g, id)!, 1) + id * 100
+    }
+    function gxOperands(n: u32): number {
+        const g = explicitGraph(n)
+        const ops = getOperands(g, getNode(g, 3)!, 0, 2)
+        const x = ops[1]
+        return typeof x === 'number' ? x : x.literal
+    }
+    function gxIntern(n: u32): number {
+        const g = explicitGraph(n)
+        const table = new Map<number, number>()
+        const a = internNode(g, table, NodeOp.add, [literalSlot(g, n), literalSlot(g, 2)], Types.u32)
+        const b = internNode(g, table, NodeOp.add, [literalSlot(g, n), literalSlot(g, 2)], Types.u32)
+        return a === b ? a : 0
+    }
+    function gxTailOf(n: u32): number {
+        return lowering2.tailOf(explicitGraph(n), 5) + n
+    }
+    function gxSweep(n: u32): number {
+        const g = explicitGraph(n)
+        lowering2.sweepBlocks(g)
+        return g.nodes.size
+    }
+    function gxFloatValues(n: u32): number {
+        return lowering2.floatValues(explicitGraph(n)).size + n
+    }
+    function gxCaptureFact(n: u32): number {
+        const g = explicitGraph(n)
+        return lowering2.captureFact(g, 4, 0)
+    }
+    function gxPanicOrdering(n: u32): number {
+        return lowering2.panicOrdering(rawGraph(n), 4).length + n
+    }
+    function gxInlineBlocks(n: u32): number {
+        const g = rawBranchGraph(n)
+        lowering2.inlineBlocks(g)
+        return g.nodes.size
+    }
+    function gxPackageBlocks(n: u32): number {
+        return lowering2.packageBlocksFINAL(rawBranchGraph(n)).nodes.size
+    }
+    function gxAnalyze(n: u32): number {
+        const a = lowering2.analyzeValueGraph(rawGraph(n))
+        return a ? 1 : 0
+    }
+    function gxSolvePlacements(n: u32): number {
+        const g = rawBranchGraph(n)
+        const choices = new Map<number, number[]>()
+        choices.set(3, [1, 3])
+        choices.set(10, [3])
+        return solvePlacements(g, choices).parameterCount
+    }
+
+    function tbResolveLoop(n: u32): number {
+        const by = new Map<number, number>()
+        by.set(1, n)
+        by.set(n, n + 1)
+        function resolve(id: number): number {
+            let at = id
+            while (by.has(at)) at = by.get(at)!
+            return at
+        }
+        return resolve(1)
+    }
+    function tbSpreadEntries(n: u32): number {
+        const m = new Map<number, number>()
+        m.set(1, n)
+        let s = 0
+        for (const [k, v] of [...m]) s += k + v
+        return s
+    }
+    function tbSubstitute(n: u32): number {
+        const g = rawGraph(n)
+        const by = new Map<number, gn.Operand>()
+        lowering2.substitute(g, by)
+        return g.nodes.size
+    }
+    function tbDeleteLoop(n: u32): number {
+        const g = rawGraph(n)
+        const by = new Map<number, number>()
+        by.set(4, 1)
+        for (const id of by.keys()) deleteNode(g, id)
+        return g.nodes.size
+    }
+    function tbBlocksLoop(n: u32): number {
+        const g = rawGraph(n)
+        const by = new Map<number, number>()
+        by.set(5, 4)
+        for (const b of g.blocks) {
+            if (!by.has(b.bodyId)) continue
+            b.bodyId = by.get(b.bodyId)!
+        }
+        return g.blocks[0].bodyId
+    }
+    function tbNodesSpread(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const [id, node] of [...g.nodes]) s += id + countIds(node)
+        return s
+    }
+    function hostArgv(n: u32): number {
+        return intrinsics.argv().includes('nope') ? 1 : n
+    }
+    function hostPerformance(n: u32): number {
+        const t = performance.now()
+        return t >= 0 ? n : 0
+    }
+    function hostConsole(n: u32): number {
+        if (n > 100) console.log('big', n)
+        return n
+    }
+
+    function tbSubA(n: u32): number {
+        return subA(rawGraph(n), new Map<number, gn.Operand>())
+    }
+    function tbSubB(n: u32): number {
+        return subB(rawGraph(n), new Map<number, gn.Operand>())
+    }
+    function tbSubC(n: u32): number {
+        return subC(rawGraph(n), new Map<number, gn.Operand>())
+    }
+    function tbSubD(n: u32): number {
+        const by = new Map<number, gn.Operand>()
+        by.set(1, { literal: n })
+        return subD(by)
+    }
+    function tbSubDEmpty(n: u32): number {
+        return subD(new Map<number, gn.Operand>()) + n
+    }
+
+    function tbPutCopy(n: u32): number {
+        const g = rawGraph(n)
+        putCopy(g, 4, getNode(g, 4)!, [1, { literal: 2 }])
+        return g.nodes.size
+    }
+    function tbCopyNodeRaw(n: u32): number {
+        const g = rawGraph(n)
+        const c = copyNode(g, getNode(g, 4)!, [1, { literal: n }])
+        return countIds(c)
+    }
+    function tbCopyNodeSame(n: u32): number {
+        const g = rawGraph(n)
+        const c = copyNode(g, getNode(g, 4)!)
+        return countIds(c) + n
+    }
+    function tbLoopPutCopy(n: u32): number {
+        const g = rawGraph(n)
+        let s = 0
+        for (const [id, node] of g.nodes) {
+            if (id !== 4) continue
+            putCopy(g, id, node, [1, { literal: 2 }])
+            s++
+        }
+        return s
+    }
+
+    function fnUnionArg(n: u32): number {
+        return refOrNumber(unionOf(n))
+    }
+    function fnTyperLoopCopy(n: u32): number {
+        const nodes = new Map<number, GraphNode>()
+        nodes.set(1, opaqueLike())
+        nodes.set(2, opaqueLike(1))
+        const g = createGraph({ nodes, ids: { next: 3 } })
+        let s = 0
+        for (const [id, node] of g.nodes) {
+            if (id !== 2) continue
+            putCopy(g, id, node, [1, { literal: n }])
+            s++
+        }
+        return s + g.nodes.size
+    }
+    function fnArrayIndexOf(n: u32): number {
+        const a = [1, n, 3]
+        return a.indexOf(n) + (a.includes(3) ? 10 : 0)
+    }
+    function fnTryCatch(n: u32): number {
+        try {
+            if (n > 2) throw 'big'
+            return 1
+        } catch (e) {
+            return 2
+        }
+    }
+    function fnNamespaceCall(n: u32): number {
+        return lowering.isSignedType(n > 2 ? Types.i32 : Types.u32) ? 1 : 0
+    }
+    const entries: Entry[] = [
+        ['array', arrSlice, [3]],
+        ['array', arrIndexOf, [3]],
+        ['array', arrIncludes, [3]],
+        ['array', arrConcat, [3]],
+        ['array', arrFind, [3]],
+        ['array', arrFindIndex, [3]],
+        ['array', arrForEach, [3]],
+        ['array', arrReduce, [3]],
+        ['array', arrSplice, [3]],
+        ['array', arrFill, [3]],
+        ['array', arrNewArray, [3]],
+        ['array', arrAt, [3]],
+        ['array', arrShiftUnshift, [3]],
+        ['array', arrLastIndexOf, [3]],
+        ['array', arrFrom, [3]],
+        ['array', arrSpread, [3]],
+        ['array', arrPushMany, [3]],
+        ['array', arrLengthReset, [3]],
+        ['array', arrSortNumbers, [2]],
+        ['array', arrJoin, [3]],
+        ['array', arrFilterMap, [3]],
+        ['array', arrFlatMap, [3]],
+        ['array', arrEntries, [3]],
+        ['array', arrKeys, [3]],
+        ['array', arrIsArray, [3]],
+        ['array', arrOfArrays, [3]],
+        ['array', arrDestructure, [3]],
+        ['map', mapGetSet, [3]],
+        ['map', mapDelete, [5]],
+        ['map', mapForEach, [3]],
+        ['map', mapEntriesIter, [3]],
+        ['map', mapClear, [3]],
+        ['map', mapCtorEntries, [3]],
+        ['map', mapStringKeys, [3]],
+        ['map', mapSpreadKeys, [3]],
+        ['map', mapOfArrays, [3]],
+        ['map', mapGetOrDefault, [3]],
+        ['set', setAddHas, [3]],
+        ['set', setDelete, [5]],
+        ['set', setCtorArray, [3]],
+        ['set', setForEach, [3]],
+        ['set', setSpread, [3]],
+        ['set', setClear, [3]],
+        ['set', setOfStrings, [3], [1]],
+        ['number', mathOps, [5]],
+        ['number', mathRound, [5]],
+        ['number', mathSqrt, [5]],
+        ['number', mathMaxSpread, [5]],
+        ['number', mathClz, [5]],
+        ['number', numberInteger, [5]],
+        ['number', numberAsUint, [5]],
+        ['number', numberCall, [5]],
+        ['number', numberIsNaN, [5]],
+        ['number', bigIntOps, [5]],
+        ['string', stringLength, [3], [1]],
+        ['string', stringCharCode, [4]],
+        ['string', stringSlice, [4]],
+        ['string', stringStartsWith, [4]],
+        ['string', stringIndexOf, [4]],
+        ['string', stringSplit, [4]],
+        ['string', stringEquals, [3], [1]],
+        ['string', stringNumber, [4]],
+        ['string', stringReplace, [4]],
+        ['string', stringToUpper, [4]],
+        ['string', stringPadStart, [4]],
+        ['string', stringRepeat, [4]],
+        ['string', stringIncludes, [4]],
+        ['string', stringFromCharCode, [4]],
+        ['string', stringToFixed, [4]],
+        ['string', stringConcatLoop, [4]],
+        ['string', stringKeyedObject, [4]],
+        ['typed', typedSlice, [4]],
+        ['typed', typedSort, [2]],
+        ['typed', typedSet, [4]],
+        ['typed', typedSubarray, [4]],
+        ['typed', typedFill, [4]],
+        ['typed', typedFloat, [5]],
+        ['typed', typedUint16, [4]],
+        ['typed', typedUint8Slice, [4]],
+        ['typed', typedFromArray, [4]],
+        ['typed', typedLengthLoop, [4]],
+        ['object', objectKeys, [4]],
+        ['object', objectEntries, [4]],
+        ['object', objectAssign, [4]],
+        ['object', objectSpread, [4]],
+        ['object', objectInOperator, [4], [1]],
+        ['object', objectFreeze, [4]],
+        ['object', instanceofOp, [4], [1]],
+        ['object', typeofOp, [4], [1]],
+        ['lang', tryCatch, [4], [1]],
+        ['lang', throwOnly, [4]],
+        ['lang', finallyBlock, [4]],
+        ['lang', localClass, [4]],
+        ['lang', closureCounter, [4]],
+        ['lang', recursion, [7]],
+        ['lang', optionalChain, [4], [1]],
+        ['lang', switchStmt, [4], [5], [6]],
+        ['lang', labeledBreak, [4]],
+        ['lang', forInLoop, [4]],
+        ['lang', restParams, [4]],
+        ['lang', defaultParams, [4]],
+        ['lang', destructureObj, [4]],
+        ['lang', nullishAssign, [4]],
+        ['lang', bitOps, [4]],
+        ['lang', floatDivision, [4]],
+        ['lang', negativeMod, [4]],
+        ['lang', u64Math, [4]],
+        ['graph-node', gnCreateGraph, [3]],
+        ['graph-node', gnMakeGraph, [3]],
+        ['graph-node', gnAddNode, [3]],
+        ['graph-node', gnBigLiteral, [3]],
+        ['graph-node', gnArgIds, [3]],
+        ['graph-node', gnOpName, [3], [1]],
+        ['graph-node', gnNodeOp, [3], [1]],
+        ['graph-node', gnInternNode, [3]],
+        ['graph-node', gnSlots, [3]],
+        ['graph-node', gnSlotKey, [3]],
+        ['graph-node', gnFacts, [3]],
+        ['graph-node', gnTypes, [3]],
+        ['graph-node', gnOperandType, [3]],
+        ['graph-node', gnFnType, [3]],
+        ['graph-node', gnRecordType, [3]],
+        ['graph-node', gnThisParam, [3]],
+        ['graph-node', gnCopyNode, [3]],
+        ['graph-node', gnSwap, [3]],
+        ['graph-node', gnEnumerateRefs, [3]],
+        ['graph-node', gnArgConsts, [3]],
+        ['graph-node', gnCloneRefs, [3]],
+        ['graph-node', gnGetOperands, [3]],
+        ['graph-node', gnWithRefs, [3]],
+        ['graph-node', gnSetOperands, [3]],
+        ['graph-node', gnPushRefs, [3]],
+        ['graph-node', gnDebugLabel, [3]],
+        ['graph-node', gnPutCopy, [3]],
+        ['graph-node', gnDeleteNode, [3]],
+        ['graph-node', gnRetype, [3]],
+        ['graph-node', gnWithOperand, [3]],
+        ['graph-node', gnBlocks, [3]],
+        ['graph-node', gnAddBlock, [3]],
+        ['graph-node', gnWithNodes, [3]],
+        ['lowering2', l2StronglyConnected, [3]],
+        ['lowering2', l2GraphLoops, [3]],
+        ['lowering2', l2TailOf, [3]],
+        ['lowering2', l2IsParam, [3]],
+        ['lowering2', l2FloatValues, [3]],
+        ['lowering2', l2ImpureValues, [3]],
+        ['lowering2', l2WideLiteral, [3]],
+        ['lowering2', l2TypeName, [3], [1]],
+        ['lowering2', l2FirstSlot, [3]],
+        ['lowering2', l2SweepBlocks, [3]],
+        ['lowering2', l2DumpGraph, [3]],
+        ['lowering2', l2Substitute, [3]],
+        ['lowering2', l2CloneExits, [3]],
+        ['lowering2', l2MemAnalysis, [3]],
+        ['lowering2', l2IsJumbo, [3]],
+        ['lowering2', l2ResolveNumberTypes, [3]],
+        ['lowering2', l2Normalize, [3]],
+        ['lowering2', l2NormalizeBranch, [3]],
+        ['lowering2', l2Lower, [3]],
+        ['lowering', asmRet, [3]],
+        ['lowering', asmMovRet, [3]],
+        ['lowering', asmIsSigned, [3], [1]],
+        ['lowering', asmTargetFor, [3]],
+        ['bytecode', bcCompile, [3]],
+        ['bytecode', bcCodeIterator, [3]],
+        ['graph-node', gnEmptyGraph, [3]],
+        ['graph-node', gnGraphIds, [3]],
+        ['graph-node', gnRawGraph, [3]],
+        ['graph-node', gnRawArgIds, [3]],
+        ['graph-node', gnRawRefs, [3]],
+        ['graph-node', gnRawTypeOf, [3]],
+        ['graph-node', gnRawResultType, [3]],
+        ['graph-node', gnRawFact, [3]],
+        ['graph-node', gnRawSwap, [3]],
+        ['graph-node', gnRawCloneRefs, [3]],
+        ['graph-node', gnRawPushRefs, [3]],
+        ['graph-node', gnRawSetRef, [3]],
+        ['graph-node', gnRawArgConsts, [3]],
+        ['graph-node', gnRawSlotKey, [3]],
+        ['graph-node', gnRawEnumerate, [3]],
+        ['graph-node', gnRawBlocks, [3]],
+        ['graph-node', gnRawIntern, [3]],
+        ['graph-node', gnRawDelete, [3]],
+        ['graph-node', gnRawOpName, [3]],
+        ['graph-node', gnRawLabels, [3], [1]],
+        ['value-types', vtScalarType, [3], [1]],
+        ['value-types', vtUsersOf, [3]],
+        ['value-types', vtRegionRets, [3]],
+        ['lowering2', l2RawTailOf, [3]],
+        ['lowering2', l2RawIsParam, [3]],
+        ['lowering2', l2RawGraphLoops, [3]],
+        ['lowering2', l2RawTailPositions, [3]],
+        ['lowering2', l2RawFloatValues, [3]],
+        ['lowering2', l2RawImpure, [3]],
+        ['lowering2', l2RawFirstSlot, [3]],
+        ['lowering2', l2RawSweep, [3]],
+        ['lowering2', l2RawIsNumeric, [3]],
+        ['lowering2', l2RawIsJumbo, [3]],
+        ['lowering2', l2RawDumpBlock, [3]],
+        ['lowering2', l2RawCloneExits, [3]],
+        ['lowering2', l2RawJoinEffects, [3]],
+        ['lowering2', l2RawHotCold, [3]],
+        ['lowering2', l2RawResolveNumbers, [3]],
+        ['lowering2', l2RawNormalize, [3]],
+        ['lowering2', l2RawLower, [3]],
+        ['records', recSnapshots, [3]],
+        ['records', recFlatten, [3]],
+        ['vm', vmTags, [3]],
+        ['vm', vmFrameSize, [3]],
+        ['rt', rtOpName, [3]],
+        ['heap', heapBoxF64, [3]],
+        ['heap', heapIndirect, [3]],
+        ['heap', heapNumberString, [3]],
+        ['cg', cgReleaseArena, [3]],
+        ['cg', cgConvertArena, [3]],
+        ['cg', cgBuild, [3]],
+        ['bytecode', bcRegReads, [3], [40]],
+        ['bytecode', bcIterate, [3]],
+        ['ns', nsRecordsNamed, [3]],
+        ['ns', nsL2After, [3]],
+        ['ns', nsVtNamed, [3]],
+        ['ns', nsVtScalarNamed, [3], [1]],
+        ['ns', nsBcNamed, [3], [40]],
+        ['ns', nsLoweringNamed, [3], [1]],
+        ['ns', nsVmAfterCall, [3]],
+        ['repro', rpTypeofNumberArm, [3]],
+        ['repro', rpNumberObjectUnion, [3]],
+        ['repro', rpComputedLabels, [3], [4]],
+        ['repro', rpPlainLabels, [3], [4]],
+        ['repro', rpMapStringValue, [3], [1]],
+        ['repro', rpSpreadParam, [3]],
+        ['repro', rpPushSpread, [3]],
+        ['repro', rpNegMod, [4]],
+        ['repro', rpNeg, [4]],
+        ['repro', rpShiftAfterMul, [4]],
+        ['repro', rpNumberOfBool, [4], [1]],
+        ['repro', rpNumberOfNumber, [4]],
+        ['repro', rpDivide, [5]],
+        ['repro', rpTypeofUnion, [4], [1]],
+        ['repro', rpTypeofObject, [4], [1]],
+        ['repro', rpOptionalParamObject, [4]],
+        ['repro', rpOptionalAbsent, [4]],
+        ['repro', rpDefaultArm, [3]],
+        ['repro', rpDefaultArmPassed, [3]],
+        ['repro', rpForwardDefault, [3]],
+        ['graph-node', gxGraph, [3]],
+        ['graph-node', gxArgIds, [3]],
+        ['graph-node', gxCopyNode, [3]],
+        ['graph-node', gxPutNode, [3]],
+        ['graph-node', gxOperands, [3]],
+        ['graph-node', gxIntern, [3]],
+        ['lowering2', gxTailOf, [3]],
+        ['lowering2', gxSweep, [3]],
+        ['lowering2', gxFloatValues, [3]],
+        ['lowering2', gxCaptureFact, [3]],
+        ['lowering2', gxPanicOrdering, [3]],
+        ['lowering2', gxInlineBlocks, [3]],
+        ['lowering2', gxPackageBlocks, [3]],
+        ['lowering2', gxAnalyze, [3]],
+        ['placement', gxSolvePlacements, [3]],
+        ['typer', tbResolveLoop, [3]],
+        ['typer', tbSpreadEntries, [3]],
+        ['typer', tbSubstitute, [3]],
+        ['typer', tbDeleteLoop, [3]],
+        ['typer', tbBlocksLoop, [3]],
+        ['typer', tbNodesSpread, [3]],
+        ['host', hostArgv, [3]],
+        ['host', hostPerformance, [3]],
+        ['host', hostConsole, [3]],
+        ['typer', tbSubA, [3]],
+        ['typer', tbSubB, [3]],
+        ['typer', tbSubC, [3]],
+        ['typer', tbSubD, [3]],
+        ['typer', tbSubDEmpty, [3]],
+        ['typer', tbPutCopy, [3]],
+        ['typer', tbCopyNodeRaw, [3]],
+        ['typer', tbCopyNodeSame, [3]],
+        ['typer', tbLoopPutCopy, [3]],
+        ['final', fnUnionArg, [3], [1]],
+        ['final', fnTyperLoopCopy, [3]],
+        ['final', fnArrayIndexOf, [3]],
+        ['final', fnTryCatch, [3], [1]],
+        ['final', fnNamespaceCall, [3], [1]],
+    ]
+    runCensus(entries)
+}

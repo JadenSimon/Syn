@@ -7411,9 +7411,355 @@ function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, g
 
 type Resolver = ReturnType<typeof createResolver>
 
+// graph cuts are used for obnoxiously large fns
+const cutLimit = Number(intrinsics.argv().find(a => a.startsWith('cut:'))?.slice(4) ?? 5_000)
+const cutWidth = 32
+
+interface CutRegion {
+    entry: number
+    blocks: Set<number>
+    inlined: Set<number>
+    size: number
+    total: number
+}
+
+function cutRegion(graph: Graph): CutRegion | undefined {
+    const targets = (body: number, out: number[]) => {
+        for (const p of tailPositions(graph, body)) {
+            const n = getNode(graph, p.at)
+            if (n?.op === NodeOp.apply && getBlock(graph, getRef(n, 0))) out.push(getRef(n, 0))
+        }
+    }
+    const succ = new Map<number, number[]>()
+    const ownOf = new Map<number, number>()
+    const inlinedBlocks = new Set<number>()
+    const seen = new Set<number>()
+    const scan = [graph.root]
+    while (scan.length) {
+        const id = scan.pop()!
+        if (succ.has(id)) continue
+        const b = getBlock(graph, id)!
+        const out: number[] = []
+        targets(b.bodyId, out)
+        let own = 0
+        const walk = [b.bodyId, ...b.params]
+        while (walk.length) {
+            const x = walk.pop()!
+            if (!x || seen.has(x)) continue
+            seen.add(x)
+            const n = getNode(graph, x)
+            if (!n || n.op === NodeOp.block) continue
+            own++
+            if (n.op === NodeOp.inlined) {
+                const from = out.length
+                targets(getRef(n, 0), out)
+                for (let k = from; k < out.length; k++) inlinedBlocks.add(out[k])
+            }
+            for (let k = 0; k < countIds(n); k++) walk.push(getRef(n, k))
+            if (typeRefOf(n)) walk.push(typeRefOf(n))
+        }
+        if (inlinedBlocks.has(id)) for (const t of out) inlinedBlocks.add(t)
+        succ.set(id, out)
+        ownOf.set(id, own)
+        for (let k = out.length - 1; k >= 0; k--) scan.push(out[k])
+    }
+    const order: number[] = []
+    const index = new Map<number, number>()
+    const visited = new Set<number>([graph.root])
+    const stack: [block: number, next: number][] = [[graph.root, 0]]
+    while (stack.length) {
+        const top = stack[stack.length - 1]
+        const out = succ.get(top[0])!
+        if (top[1] < out.length) {
+            const s = out[top[1]++]
+            if (visited.has(s)) continue
+            visited.add(s)
+            stack.push([s, 0])
+            continue
+        }
+        stack.pop()
+        order.push(top[0])
+    }
+    order.reverse()
+    order.forEach((b, i) => index.set(b, i))
+    const preds: number[][] = order.map(() => [])
+    for (const b of order) for (const s of succ.get(b)!) preds[index.get(s)!].push(index.get(b)!)
+    const idom: number[] = [0]
+    for (let i = 1; i < order.length; i++) {
+        let d = -1
+        for (const p of preds[i]) {
+            if (p >= i) continue
+            if (d < 0) {
+                d = p
+                continue
+            }
+            let a = d
+            let b = p
+            while (a !== b) {
+                while (a > b) a = idom[a]
+                while (b > a) b = idom[b]
+            }
+            d = a
+        }
+        idom.push(d)
+    }
+    const own: number[] = order.map(b => ownOf.get(b)!)
+    let total = 0
+    for (const n of own) total += n
+    const children: number[][] = order.map(() => [])
+    for (let i = 1; i < order.length; i++) children[idom[i]].push(i)
+    const pre: number[] = order.map(() => 0)
+    const last: number[] = order.map(() => 0)
+    const preorder: number[] = [0]
+    const visit: [node: number, next: number][] = [[0, 0]]
+    while (visit.length) {
+        const top = visit[visit.length - 1]
+        if (top[1] < children[top[0]].length) {
+            const c = children[top[0]][top[1]++]
+            pre[c] = preorder.length
+            preorder.push(c)
+            visit.push([c, 0])
+            continue
+        }
+        visit.pop()
+        last[top[0]] = preorder.length - 1
+    }
+    const size: number[] = own.slice()
+    const lo: number[] = order.map(() => Infinity)
+    const hi: number[] = order.map(() => -Infinity)
+    for (let i = 0; i < order.length; i++) {
+        for (const s of succ.get(order[i])!) {
+            lo[i] = Math.min(lo[i], pre[index.get(s)!])
+            hi[i] = Math.max(hi[i], pre[index.get(s)!])
+        }
+    }
+    let best = -1
+    for (let k = preorder.length - 1; k > 0; k--) {
+        const i = preorder[k]
+        const parent = idom[i]
+        size[parent] += size[i]
+        lo[parent] = Math.min(lo[parent], lo[i])
+        hi[parent] = Math.max(hi[parent], hi[i])
+        if (lo[i] < k || hi[i] > last[i]) continue
+        if (best < 0 || Math.abs(total / 2 - size[i]) < Math.abs(total / 2 - size[best])) best = i
+    }
+    if (best < 0 || Math.min(size[best], total - size[best]) * 4 < total) return
+    const blocks = new Set<number>()
+    for (let k = pre[best]; k <= last[best]; k++) blocks.add(order[preorder[k]])
+    const entry = order[best]
+    for (const b of blocks) {
+        if (b === entry) continue
+        for (const p of preds[index.get(b)!]) if (!blocks.has(order[p])) return
+    }
+    const inlined = new Set<number>()
+    for (const b of blocks) if (inlinedBlocks.has(b)) inlined.add(b)
+    return { entry, blocks, inlined, size: size[best], total }
+}
+
+interface CutPlan {
+    copied: Set<number>
+    liveIns: number[]
+    frontier: Set<number>
+    why?: string
+}
+
+function cutPlan(graph: Graph, region: CutRegion): CutPlan {
+    const hot = new Set<number>()
+    const reach: number[] = []
+    for (const b of graph.blocks) if (!region.blocks.has(b.id)) reach.push(b.bodyId, ...b.params)
+    while (reach.length) {
+        const id = reach.pop()!
+        if (!id || hot.has(id)) continue
+        hot.add(id)
+        const n = getNode(graph, id)
+        if (!n) continue
+        for (let i = n.op === NodeOp.apply ? 1 : 0; i < countIds(n); i++) reach.push(getRef(n, i))
+        if (typeRefOf(n)) reach.push(typeRefOf(n))
+    }
+    const constant = new Map<number, boolean>()
+    const constantOf = (root: number): boolean => {
+        const stack = [root]
+        while (stack.length) {
+            const id = stack[stack.length - 1]
+            if (constant.has(id)) {
+                stack.pop()
+                continue
+            }
+            const n = getNode(graph, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.nilEffect || n.op === NodeOp.callContext || n.op === NodeOp.block || OrderedValues.has(n.op)) {
+                constant.set(id, false)
+                stack.pop()
+                continue
+            }
+            let pending = false
+            let all = true
+            const refs: number[] = []
+            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) refs.push(getRef(n, i))
+            if (typeRefOf(n)) refs.push(typeRefOf(n))
+            for (const r of refs) {
+                const known = constant.get(r)
+                if (known === undefined) {
+                    stack.push(r)
+                    pending = true
+                } else if (!known) all = false
+            }
+            if (pending) continue
+            constant.set(id, all)
+            stack.pop()
+        }
+        return constant.get(root)!
+    }
+    const recomputable = (id: number): boolean => {
+        const n = getNode(graph, id)!
+        if (!NumericOps.has(n.op)) return false
+        let inputs = 0
+        for (let i = 0; i < countIds(n); i++) if (getRef(n, i) && !constantOf(getRef(n, i))) inputs++
+        return inputs <= 1
+    }
+    const copied = new Set<number>()
+    const liveIns = new Set<number>()
+    const frontier = new Set<number>()
+    const walk: number[] = []
+    for (const b of graph.blocks) if (region.blocks.has(b.id)) walk.push(b.bodyId, ...b.params)
+    let why: string | undefined
+    while (walk.length) {
+        const id = walk.pop()!
+        if (copied.has(id)) continue
+        copied.add(id)
+        const n = getNode(graph, id)
+        if (!n) continue
+        if (n.op === NodeOp.heapHandle && !getRef(n, 0) && countIds(n) > 1) why ??= 'snapshot'
+        const ordering = firstNonOrderingSlot(n)
+        const refs: [ref: number, token: boolean][] = []
+        for (let i = n.op === NodeOp.apply ? 1 : 0; i < countIds(n); i++) refs.push([getRef(n, i), i < ordering])
+        if (typeRefOf(n)) refs.push([typeRefOf(n), false])
+        for (const [r, token] of refs) {
+            if (!r || copied.has(r)) continue
+            if (getNode(graph, r)?.op === NodeOp.callContext) liveIns.add(r)
+            else if (!hot.has(r) || constantOf(r) || recomputable(r)) walk.push(r)
+            else if (token) frontier.add(r)
+            else liveIns.add(r)
+        }
+    }
+    for (const id of liveIns) {
+        const n = getNode(graph, id)!
+        if (n.op === NodeOp.alloca || n.op === NodeOp.frameAddress) why ??= opName(n.op)
+        if (typeRefOf(n) || resultType(graph, n) === Types.unknown) why ??= `typed ${opName(n.op)}`
+    }
+    for (const p of getBlock(graph, region.entry)!.params) if (typeRefOf(getNode(graph, p)!)) why ??= 'record param'
+    return { copied, liveIns: [...liveIns], frontier, why }
+}
+
+function cutReturnType(graph: Graph, region: CutRegion): TypeOperand | string {
+    let T: intrinsics.Types | undefined
+    for (const b of region.blocks) {
+        if (region.inlined.has(b)) continue
+        for (const p of tailPositions(graph, getBlock(graph, b)!.bodyId)) {
+            const n = getNode(graph, p.at)
+            if (n?.op !== NodeOp.ret || !getRef(n, 0)) continue
+            const value = getNode(graph, getRef(n, 0))!
+            if (value.op === NodeOp.record || typeRefOf(value)) return 'record return'
+            if (value.op === NodeOp.literal) continue
+            const U = resultType(graph, value)
+            if (T !== undefined && T !== U) return `returns ${typeName(T)} and ${typeName(U)}`
+            T = U
+        }
+    }
+    return T ?? Types.u64
+}
+
+function outlineRegion(graph: Graph, region: CutRegion, plan: CutPlan, returns: TypeOperand, symbol: number, name: string): Graph {
+    const nodes = new Map<number, GraphNode>()
+    const rootId = newId(graph)
+    nodes.set(rootId, makeNode(graph, NodeOp.block, []))
+    const entryToken = newId(graph)
+    nodes.set(entryToken, makeNode(graph, NodeOp.nilEffect, []))
+    for (const id of plan.copied) {
+        const n = getNode(graph, id)
+        if (!n) continue
+        const copy = copyNode(graph, n)
+        for (let i = 0; i < firstNonOrderingSlot(n); i++) if (plan.frontier.has(getRef(n, i))) setRef(copy, i, entryToken)
+        nodes.set(id, copy)
+    }
+    for (const b of graph.blocks) if (region.blocks.has(b.id)) nodes.set(b.id, copyNode(graph, getNode(graph, b.id)!))
+    const entry = getBlock(graph, region.entry)!
+    const params: number[] = []
+    const passed: Operand[] = [region.entry]
+    for (const p of entry.params) {
+        const q = newId(graph)
+        nodes.set(q, makeNode(graph, NodeOp.param, [], typeOf(getNode(graph, p)!)))
+        params.push(q)
+        passed.push(q)
+    }
+    for (const id of plan.liveIns) {
+        nodes.set(id, makeNode(graph, NodeOp.param, [], resultType(graph, getNode(graph, id)!)))
+        params.push(id)
+    }
+    const body = newId(graph)
+    nodes.set(body, makeNode(graph, NodeOp.apply, passed))
+    const blocks: GraphBlock[] = [{ id: rootId, params, bodyId: body, bodyConst: 0 }]
+    for (const b of graph.blocks) if (region.blocks.has(b.id)) blocks.push({ ...b, params: b.params.slice() })
+    const callee = createGraph({ ids: graph.ids, literals: graph.literals, root: rootId, nodes, blocks, name, facts: graph.facts && new Map(graph.facts) })
+    const target = addNode(graph, NodeOp.localTarget, [{ literal: symbol }], returns)
+    for (const b of graph.blocks) {
+        if (region.blocks.has(b.id)) continue
+        b.bodyId = mapTailPositions(graph, b.bodyId, p => {
+            const n = getNode(graph, p.at)!
+            if (n.op !== NodeOp.apply || getRef(n, 0) !== region.entry) return p.at
+            const tokens = [...p.tokens, ...plan.frontier]
+            const token = tokens.length === 1 ? tokens[0] : tokens.length ? addNode(graph, NodeOp.after, tokens) : addNode(graph, NodeOp.nilEffect, [b.id])
+            const args = getOperands(graph, n).slice(1)
+            const call = addNode(graph, NodeOp.call, [token, target, { literal: 0 }, ...args, ...plan.liveIns], returns)
+            return addNode(graph, NodeOp.ret, [call, b.id])
+        })
+    }
+    setGraphBlocks(graph, graph.blocks.filter(b => !region.blocks.has(b.id)))
+    const kept = new Set<number>()
+    const walk: number[] = []
+    for (const b of graph.blocks) walk.push(b.id, b.bodyId, ...b.params)
+    while (walk.length) {
+        const id = walk.pop()!
+        if (!id || kept.has(id)) continue
+        kept.add(id)
+        const n = getNode(graph, id)
+        if (!n) continue
+        for (let i = 0; i < countIds(n); i++) walk.push(getRef(n, i))
+        if (typeRefOf(n)) walk.push(typeRefOf(n))
+    }
+    for (const id of plan.copied) if (!kept.has(id)) deleteNode(graph, id)
+    for (const b of region.blocks) deleteNode(graph, b)
+    return callee
+}
+
+function cutGraph(graph: Graph, limit: number, symbolFor: (name: string) => number, out: [symbol: number, graph: Graph][]): void {
+    if (graph.nodes.size <= limit) return
+    const region = cutRegion(graph)
+    const debug = flags.has('cut-debug')
+    if (!region) {
+        if (debug) console.log('CUT-NONE', graph.name, graph.nodes.size)
+        return
+    }
+    const plan = cutPlan(graph, region)
+    const width = plan.liveIns.length + getBlock(graph, region.entry)!.params.length
+    const returns = plan.why ?? (width > cutWidth ? `interface ${width}` : cutReturnType(graph, region))
+    if (typeof returns === 'string') {
+        if (debug) console.log('CUT-REJECT', graph.name, `${region.size}/${region.total}`, returns, plan.liveIns.map(id => opName(getNode(graph, id)!.op)).join(' '))
+        return
+    }
+    const name = `${graph.name}/cut${out.length}`
+    const symbol = symbolFor(name)
+    const callee = outlineRegion(graph, region, plan, returns, symbol, name)
+    if (debug) console.log('CUT', graph.name, `${region.size}/${region.total}`, 'blocks', region.blocks.size, 'liveIns', plan.liveIns.length, 'params', callee.blocks[0].params.length, 'frontier', plan.frontier.size, '->', name, callee.nodes.size, 'caller', graph.nodes.size)
+    out.push([symbol, callee])
+    cutGraph(graph, limit, symbolFor, out)
+    cutGraph(callee, limit, symbolFor, out)
+}
+
 function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan: ShapePlan, image: ProgramImage, target: Target, clock: PhaseClock): ProgramGraph {
-    const { session, roots, order, staticFns, unitOf, link, linkRuntimeCalls, staticOrder, resolveHandles, sourceOfLinked, constructsOutOfLine, usesReceiver } = linker
+    const { session, roots, order, staticFns, unitOf, link, intern, functions, linkRuntimeCalls, staticOrder, resolveHandles, sourceOfLinked, constructsOutOfLine, usesReceiver } = linker
+    const outlined: [Function, Graph][] = []
     const { realizeUnit, plannedUnit } = resolver
+    const outline = (name: string) => intern(Object.defineProperty(Object.assign(function cut() {}, { shouldNotInline: true }), 'name', { value: name }))
     const program: ProgramGraph = { units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), image, target }
     function compileUnit(fn: Function): Graph {
         const unit = unitOf(fn)
@@ -7429,6 +7775,11 @@ function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan
         const lifted = liftReturnedHeapValues(graph)
         lifted.name = fn.name
         if (traceDebug) console.log(unit.traced!.text)
+        if (cutLimit) {
+            const pieces: [number, Graph][] = []
+            cutGraph(lifted, cutLimit, outline, pieces)
+            for (const [symbol, piece] of pieces) outlined.push([functions[symbol], piece])
+        }
         return clock.normalize(lifted, { firstPass: true })
     }
     if (staticFns.length) {
@@ -7445,7 +7796,12 @@ function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan
         const wave = order.slice(next)
         next = order.length
         const graphs = new Map<Function, Graph>()
+        outlined.length = 0
         for (const fn of flags.has('reverse-units') ? [...wave].reverse() : wave) graphs.set(fn, compileUnit(fn))
+        for (const [fn, piece] of outlined) {
+            graphs.set(fn, clock.normalize(piece, { firstPass: true }))
+            wave.push(fn)
+        }
         for (const fn of wave) {
             const graph = graphs.get(fn)!
             linkRuntimeCalls(graph)
@@ -7607,9 +7963,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
 }
 
 let nativeObserver: ((event: string) => void) | undefined
-const emittedTotals = { units: 0, instructions: 0, nonMov: 0 }
+const emittedTotals = { units: 0, fns: 0, instructions: 0, nonMov: 0 }
 
-export function emittedCounts(): { units: number, instructions: number, nonMov: number } {
+export function emittedCounts(): { units: number, fns: number, instructions: number, nonMov: number } {
     return { ...emittedTotals }
 }
 
@@ -7667,6 +8023,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     if (flags.has('unit-sizes')) for (const u of emitted) console.log(`UNIT ${u.name || 'anonymous'}:${u.symbol} ${u.code.words.length} ${u.code.words.filter(w => !u.code.target.isMoveWide(w)).length} ${(u.code.island?.length ?? 0) * 8}`)
     const inlined = (tracedUnits - emitted.length - merged ? ` (${tracedUnits - emitted.length - merged} inlined away)` : '') + (merged ? ` (${merged} merged)` : '')
     emittedTotals.units++
+    emittedTotals.fns += emitted.length
     emittedTotals.instructions += unitInst
     emittedTotals.nonMov += nonMov
     console.log(`native unit ${emitted.length} fns ${unitInst}/${nonMov} instructions/non-mov, ${unitInst * 4 + islandBytes} image bytes (${islandBytes} island)${inlined} [${Math.round(performance.now() - clock.start)}ms]`)
