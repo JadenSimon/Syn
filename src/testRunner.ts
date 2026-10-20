@@ -695,7 +695,7 @@ export async function main(...args: string[]) {
     const filter = args[0]
     if (filter === '--engine') {
         const given = args.find(a => a.startsWith('timeout:'))
-        const seconds = given ? Number(given.slice('timeout:'.length)) : args[1] === 'all' ? 120 : 30
+        const seconds = given ? Number(given.slice('timeout:'.length)) : args[1] === 'all' ? 90 : 30
         const profiling = args[1] !== 'all' && args.some(a => /^(cpu-prof|heap-prof|coverage):/.test(a))
         if (!crashFd && !profiling && !args.includes('in-process')) return superviseEngine(args, seconds)
         if (crashFd) startWatchdog(seconds, Number(process.env.SYN_CRASH_DEADLINE), Number(process.env.SYN_CRASH_PPID))

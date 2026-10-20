@@ -17,6 +17,10 @@ takesId("123");
   tooFewArgs();
 }
 {
+  function tooManyArgs(id) {}
+  tooManyArgs(1, 2);
+}
+{
   function generic(id) {}
   generic(1);
   generic('a');

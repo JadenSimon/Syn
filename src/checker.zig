@@ -203,6 +203,11 @@ pub const Checker = struct {
             return;
         }
 
+        if (args.len > params.len and this.hasFixedArity(params, args)) {
+            try this.file.emitErrorFmt(call_ref,  "Expected {} arguments, but got {}", .{ params.len, args.len });
+            return;
+        }
+
         const check_count = @min(args.len, params.len);
         for (0..check_count) |i| {
             const param_ref = params[i];
@@ -217,6 +222,14 @@ pub const Checker = struct {
                 return;
             }
         }
+    }
+
+    fn hasFixedArity(this: *@This(), params: []const TypeRef, args: []const NodeRef) bool {
+        if (params.len > 0 and this.analyzer.isSpreadElement(params[params.len - 1])) return false;
+        for (args) |a| {
+            if (this.file.ast.nodes.at(a).kind == .spread_element) return false;
+        }
+        return true;
     }
 
     fn countRequiredParams(this: *@This(), params: []const TypeRef) usize {
