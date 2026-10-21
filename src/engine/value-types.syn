@@ -3,7 +3,7 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { BitwiseOps, dumpGraph, NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
-import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, localSymbol, NodeOp, nodeUsers, resultType, typeOf } from './graph-node'
+import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, localSymbol, NodeOp, nodeUsers, resultType, spreadsLast, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
 import * as rt from './rt'
@@ -128,6 +128,7 @@ export interface AccessHost {
     invariantsOf?(proto: Handle): Invariants | undefined
     constantElements?(state: Handle): Handle[] | undefined
     paramCount?(fn: Function): number | undefined
+    bindTarget?(fn: Function, count: number, spread: boolean): Function
     heapValue?(slot: Handle): Handle
     receiverless?(fn: Function): boolean
     isConstructor?(fn: Function): boolean
@@ -890,8 +891,9 @@ function sharedFacts(host: AccessHost): SharedFacts {
     }
     const summaries = new Map<Graph, Fact[]>()
     function calleeFacts(g: Graph, c: GraphNode): Test[] {
-        const callee = literalFunction(g, getRef(c, 1))
-        if (!callee || !host.traceable(callee)) return []
+        const literal = literalFunction(g, getRef(c, 1))
+        if (!literal || !host.traceable(literal)) return []
+        const callee = boundCallee(host, literal, c)
         const calleeGraph = host.graphOf(callee)
         const out: Test[] = []
         for (const [param, filter] of summaryOf(calleeGraph)) {
@@ -2168,13 +2170,14 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         for (const t of [...seen(frame, id, getRef(n, 1))]) {
             if (values[t].kind === ValueKind.variable) flow(frame, id, [variable({ unit: frames[frame].unit, node: id })])
-            const callee = values[t].fn
-            if (!callee) continue
-            if (!host.traceable(callee)) {
-                exposeArgs(frame, n, host.receiverless?.(callee) ? 3 : 2)
+            const fn = values[t].fn
+            if (!fn) continue
+            if (!host.traceable(fn)) {
+                exposeArgs(frame, n, host.receiverless?.(fn) ? 3 : 2)
                 flow(frame, id, [opaqueValue(frames[frame].graph, id)])
                 continue
             }
+            const callee = boundCallee(host, fn, n)
             const closure = values[t].allocation
             const g = frames[frame].graph
             let method = getNode(g, getRef(n, 1))
@@ -2186,7 +2189,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 const allocation = values[r].allocation
                 if (lookup === undefined || allocation === undefined) return true
                 const accessor = accessorOf(allocations[allocation].proto, lookup)
-                return accessor.kind !== 'method' || accessor.fn === callee
+                return accessor.kind !== 'method' || accessor.fn === fn
             })
             if (unrecorded(recorded) || !receivers.length) bind(frame, id, n, callee, [], 3, closure)
             if (receivers.length) bind(frame, id, n, callee, receivers, 3, closure)
@@ -2767,6 +2770,10 @@ function encapsulationViolations(data: Accesses, host: AccessHost): Set<Handle> 
         }
     })
     return broken
+}
+
+function boundCallee(host: AccessHost, fn: Function, n: GraphNode): Function {
+    return host.bindTarget ? host.bindTarget(fn, countIds(n) - 3, spreadsLast(n)) : fn
 }
 
 function unrecorded(values: Set<number> | number[]): boolean {
@@ -4358,7 +4365,7 @@ function shapeTarget(target: string): boolean {
 }
 
 function rawElement(element: Rep): boolean {
-    if (element.kind === 'number') return element.format?.bits === 64 && !element.nullable
+    if (element.kind === 'number') return (!element.format || element.format.bits === 64) && !element.nullable
     return element.kind === 'pointer' && element.targets.length === 1 && shapeTarget(element.targets[0]) && !element.constant
 }
 
@@ -4432,7 +4439,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
             unitIdentity(unit.fn), unit.boxes, unit.boxedReturn ? view(unit.returns) : '', [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${abiOf(unit)}`,
             byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, Handle>(), k => String(k)),
-            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.slices, element => String(elementWidth(element))), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
+            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.slices, element => `${elementWidth(element)}${numberName(element) === 'f64' ? 'f' : ''}`), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
         ]
     }
     let [classes, count] = intern(unit => parts(unit).join('|'))
@@ -4661,7 +4668,7 @@ function proveInvariants(methods: [string, Function][], ctor: Function, data: Ac
             let found: SymbolicFrame | undefined
             if (n.op === NodeOp.call && getNode(frame.g, getRef(n, 1))?.op !== NodeOp.syscallTarget) {
                 const fns = functionsAt(frame.unit, getRef(n, 1))
-                if (fns?.length === 1) found = child(frame, id, fns[0], 2, 3)
+                if (fns?.length === 1) found = child(frame, id, boundCallee(host, fns[0], n), 2, 3)
             } else if (n.op === NodeOp.rt && rt.sliceOf(frame.g, n) === undefined) {
                 const impl = rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
                 if (impl) found = child(frame, id, impl, -1, 2)

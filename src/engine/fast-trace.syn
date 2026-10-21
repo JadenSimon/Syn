@@ -11,7 +11,7 @@ import * as heap from './heap'
 import { Op as RtOp, effectOps, heapOps } from './rt'
 import {
     NodeOp, countIds, createGraph, getLiteral, getNode, getRef, internNode, literalSlot, putNode, refSlot,
-    setDebugLabel, setGraphBlocks, setNode, slotLiteral, slotRef,
+    setDebugLabel, setGraphBlocks, setNode, slotLiteral, slotRef, ArgForm, argForm, unknownLayout, type Layout,
 } from './graph-node'
 import type { TraceSession, TraceOptions, CompiledSource } from './trace2'
 
@@ -108,6 +108,14 @@ interface TraceCtx {
     frame: Frame | undefined
 }
 
+interface Tuple {
+    kind: number[]
+    value: number[]
+    slots: number[]
+    chain: number[]
+    read: boolean
+}
+
 interface TraceState {
     interned: Map<number, number>
     regs: Registers
@@ -120,6 +128,7 @@ interface TraceState {
     usesSelf: boolean
     pc: number
     accesses: Map<number, number>
+    tuples: Map<number, Tuple>
 }
 
 let C: TraceCtx
@@ -217,7 +226,7 @@ function numberOf(kind: number, value: number): number {
 }
 
 function slotOf(kind: number, value: number): number {
-    if (kind === Kind.Node) return refSlot(value)
+    if (kind === Kind.Node) return escape(value)
     if (kind === Kind.Number) return literalSlot(C.runtime, value)
     const cell = cellOf(kind, value)
     if (cell === 0) return refSlot(nullishNode())
@@ -226,7 +235,7 @@ function slotOf(kind: number, value: number): number {
 }
 
 function wordOf(kind: number, value: number): number {
-    if (kind === Kind.Node) return refSlot(value)
+    if (kind === Kind.Node) return escape(value)
     return literalSlot(C.runtime, numberOf(kind, value))
 }
 
@@ -529,9 +538,35 @@ function frozenRead(kind: number, value: number, key: number): boolean {
     return true
 }
 
+function escape(id: number): number {
+    if (T.tuples.size) T.tuples.delete(id)
+    return refSlot(id)
+}
+
+function tupleRead(key: number): boolean {
+    if (accKind() !== Kind.Node) return false
+    const elements = T.tuples.get(accValue())
+    if (!elements) return false
+    const name = slotRef(key) ? undefined : slotLiteral(C.runtime, key) as Handle
+    if (name === heap.arrayLengthKey) {
+        setAcc(Kind.Number, elements.slots.length)
+        return true
+    }
+    const index = name === undefined ? undefined : heap.keyIndex(name)
+    if (index === undefined) {
+        elements.read = true
+        return false
+    }
+    if (index >= elements.slots.length) setAcc(Kind.Cell, 0)
+    else setAcc(elements.kind[index], elements.value[index])
+    return true
+}
+
 function getProp(key: number): void {
     if (frozenRead(accKind(), accValue(), key)) return
-    setAcc(Kind.Node, effect(NodeOp.getProp, [slotOf(accKind(), accValue()), key]))
+    if (tupleRead(key)) return
+    const object = accKind() === Kind.Node ? refSlot(accValue()) : slotOf(accKind(), accValue())
+    setAcc(Kind.Node, effect(NodeOp.getProp, [object, key]))
 }
 
 function setProp(r: number, key: number): void {
@@ -549,7 +584,6 @@ function argSlots(first: number, count: number): number[] {
 }
 
 function packRest(args: number[], rest: number): number[] {
-    if (rest < 0) return args
     const fixed = args.slice(0, rest)
     while (fixed.length < rest) fixed.push(refSlot(nullishNode()))
     const extra = args.slice(rest)
@@ -559,12 +593,20 @@ function packRest(args: number[], rest: number): number[] {
     return fixed
 }
 
-interface Layout {
-    params: number
-    rest: number
+function unpackSpread(array: number, params: number): number[] {
+    const args: number[] = []
+    for (let i = 0; i < params; i++) args.push(refSlot(effect(NodeOp.getProp, [array, literalSlot(C.runtime, heap.indexKey(i as u32))])))
+    return args
 }
 
-const unknownLayout: Layout = { params: -1, rest: -1 }
+function callNode(target: number, receiver: number, args: number[], spread: boolean): number {
+    const id = effect(NodeOp.call, [target, receiver, ...args])
+    if (!spread) return id
+    const n = getNode(C.runtime, id)!
+    setNode(C.runtime, id, gn.makeNodeFromSlots(n.op, n.slots, n.flags | gn.NodeFlags.spread))
+    return id
+}
+
 const layouts = new Map<Function, Layout>()
 
 function layoutOf(fn: any): Layout {
@@ -707,7 +749,7 @@ function objectRest(constSlot: number): void {
     setAcc(Kind.Cell, cell)
 }
 
-function call(calleeKind: number, callee: number, receiverKind: number, receiver: number, first: number, count: number): number {
+function call(calleeKind: number, callee: number, receiverKind: number, receiver: number, first: number, count: number, constructing = false): number {
     if (calleeKind === Kind.Cell && callee > 1) {
         const name = C.session.intrinsicFns.get(callee as u32)
         if (name === 'panic' || name === 'trap') {
@@ -724,19 +766,33 @@ function call(calleeKind: number, callee: number, receiverKind: number, receiver
         T.tail = panic(slotOf(got.kind, got.value))
         return 0
     }
-    const signed = fn && Array.isArray(fn.__args)
-    if (signed && (Number.isSafeInteger(fn.__localTarget) || Number.isSafeInteger(fn.__native))) {
-        const local = Number.isSafeInteger(fn.__localTarget)
-        if (count > fn.__args.length && !(local && fn.__rest >= 0)) throw `fast-trace: ${fn.name || '<anonymous>'} takes ${fn.__args.length} arguments, got ${count} [${C.name}]`
-        const target = local ? refSlot(node(NodeOp.localTarget, [literalSlot(C.runtime, fn.__localTarget)])) : literalSlot(C.runtime, fn.__native)
-        return refSlot(effect(NodeOp.call, [target, literalSlot(C.runtime, 0), ...packRest(argSlots(first, count), local ? fn.__rest ?? -1 : -1)]))
-    }
-    if (signed && Number.isSafeInteger(fn.__syscall)) {
+    if (fn && Array.isArray(fn.__args) && Number.isSafeInteger(fn.__syscall)) {
         if (count !== fn.__args.length) throw `fast-trace: syscall ${fn.__syscall} takes ${fn.__args.length} arguments, got ${count} [${C.name}]`
         return refSlot(effect(NodeOp.call, [refSlot(node(NodeOp.syscallTarget, [literalSlot(C.runtime, fn.__syscall)])), literalSlot(C.runtime, 0), ...argSlots(first, count)]))
     }
-    const args = packRest(argSlots(first, count), layoutOfValue(calleeKind, callee, fn).rest)
-    return refSlot(effect(NodeOp.call, [slotOf(calleeKind, callee), slotOf(receiverKind, receiver), ...args]))
+    return invoke(fn, calleeKind, callee, receiverKind, receiver, argSlots(first, count), constructing)
+}
+
+function invoke(fn: any, calleeKind: number, callee: number, receiverKind: number, receiver: number, args: number[], constructing: boolean): number {
+    const count = args.length
+    const stub = fn && Array.isArray(fn.__args) ? stubTarget(fn) : undefined
+    if (stub !== undefined) {
+        const layout = layoutOf(fn)
+        if (count > layout.params && layout.rest < 0) throw `fast-trace: ${fn.name || '<anonymous>'} takes ${fn.__args.length} arguments, got ${count} [${C.name}]`
+        const form = argForm(layout, count, false, typeof fn.__variant === 'function')
+        if (form === ArgForm.arity) return refSlot(callNode(stubTarget(fn.__variant(count))!, literalSlot(C.runtime, 0), args, false))
+        if (form === ArgForm.pack) return refSlot(callNode(stub, literalSlot(C.runtime, 0), packRest(args, layout.rest), true))
+        return refSlot(callNode(stub, literalSlot(C.runtime, 0), args, false))
+    }
+    const layout = layoutOfValue(calleeKind, callee, fn)
+    const form = argForm(layout, count, false, !constructing && !fn?.shouldNotInline)
+    if (form === ArgForm.pack) return refSlot(callNode(slotOf(calleeKind, callee), slotOf(receiverKind, receiver), packRest(args, layout.rest), true))
+    return refSlot(callNode(slotOf(calleeKind, callee), slotOf(receiverKind, receiver), args, false))
+}
+
+function stubTarget(fn: any): number | undefined {
+    if (Number.isSafeInteger(fn.__localTarget)) return refSlot(node(NodeOp.localTarget, [literalSlot(C.runtime, fn.__localTarget)]))
+    if (Number.isSafeInteger(fn.__native)) return literalSlot(C.runtime, fn.__native)
 }
 
 function concreteCall(fn: any, first: number, count: number): number {
@@ -757,13 +813,13 @@ function construct(calleeKind: number, callee: number, first: number, count: num
         const prototype = heap.getProperty(heap.deref(constructor as Handle), heap.prototypeKey) as number
         const receiver = allocate(prototype)
         if (T.allocations.has(prototype as u32)) effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.setPrototypeOf), refSlot(cellNode(receiver)), refSlot(cellNode(prototype))])
-        const result = call(calleeKind, callee, Kind.Cell, receiver, first, count)
+        const result = call(calleeKind, callee, Kind.Cell, receiver, first, count, true)
         T.allocations.get(receiver as u32)!.call = slotRef(result) || undefined
         return result
     }
     const prototype = effect(NodeOp.getProp, [slotOf(calleeKind, callee), literalSlot(C.runtime, heap.prototypeKey)])
     const created = effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.create), refSlot(prototype)])
-    return call(calleeKind, callee, Kind.Node, created, first, count)
+    return call(calleeKind, callee, Kind.Node, created, first, count, true)
 }
 
 function createClosure(constSlot: number): void {
@@ -795,10 +851,15 @@ function writeMembers(template: Handle, holder: number): void {
 function arrayLiteral(firstReg: number, lastReg: number): void {
     const count = lastReg - firstReg + 1
     const array = effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayLiteral), literalSlot(C.runtime, count)])
+    const elements: Tuple = { kind: [], value: [], slots: [], chain: [array], read: false }
     for (let i = 0; i < count; i++) {
         read(firstReg + i)
-        effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayElement), refSlot(array), literalSlot(C.runtime, i), slotOf(got.kind, got.value)])
+        elements.kind.push(got.kind)
+        elements.value.push(got.value)
+        elements.slots.push(slotOf(got.kind, got.value))
+        elements.chain.push(effect(NodeOp.rt, [literalSlot(C.runtime, RtOp.arrayElement), refSlot(array), literalSlot(C.runtime, i), elements.slots[i]]))
     }
+    T.tuples.set(array, elements)
     setAcc(Kind.Node, array)
 }
 
@@ -806,18 +867,17 @@ function spreadCall(calleeReg: number, arrayReg: number): void {
     read(calleeReg)
     const calleeKind = got.kind
     const callee = got.value
-    const layout = layoutOfValue(calleeKind, callee, hostFunction(calleeKind, callee))
+    const fn = hostFunction(calleeKind, callee)
+    const layout = layoutOfValue(calleeKind, callee, fn)
     read(arrayReg)
     const array = slotOf(got.kind, got.value)
-    const args: number[] = []
-    if (layout.rest === 0) {
-        args.push(array)
-    } else if (layout.rest < 0 && layout.params >= 0) {
-        for (let i = 0; i < layout.params; i++) args.push(refSlot(effect(NodeOp.getProp, [array, literalSlot(C.runtime, heap.indexKey(i as u32))])))
-    } else {
-        throw `fast-trace: spread call into an unknown parameter layout [${C.name}]`
-    }
-    setAcc(Kind.Node, effect(NodeOp.call, [slotOf(calleeKind, callee), slotOf(accKind(), accValue()), ...args]))
+    const form = argForm(layout, 1, true, false)
+    if (form === ArgForm.unbound && layout.params >= 0) throw `fast-trace: spread call past the fixed parameters of ${fn?.name || 'a function'} [${C.name}]`
+    const stub = fn && Array.isArray(fn.__args) ? stubTarget(fn) : undefined
+    const target = stub ?? slotOf(calleeKind, callee)
+    const receiver = stub !== undefined ? literalSlot(C.runtime, 0) : slotOf(accKind(), accValue())
+    if (form === ArgForm.unpack) setAcc(Kind.Node, callNode(target, receiver, unpackSpread(array, layout.params), false))
+    else setAcc(Kind.Node, callNode(target, receiver, [array], true))
 }
 
 
@@ -830,7 +890,7 @@ function arrive(block: number, from: number): number {
     if (!merge) return tracePath(block, T.regs)
     const regs = T.regs
     const args = [refSlot(merge.id)]
-    for (const r of merge.live) args.push(slotOf(regs.kind[r], regs.value[r]))
+    for (const r of merge.live) args.push(regs.kind[r] === Kind.Node ? refSlot(regs.value[r]) : slotOf(regs.kind[r], regs.value[r]))
     args.push(refSlot(regs.token))
     const applied = after(refSlot(node(NodeOp.apply, args)), regs.token)
     if (C.source.blocks.backPreds[block].includes(from)) {
@@ -842,12 +902,40 @@ function arrive(block: number, from: number): number {
     return applied
 }
 
+function dropLoopTuples(merge: Merge, regs: Registers): void {
+    const B = C.source.blocks
+    for (const id of [...T.tuples.keys()]) {
+        let kept = true
+        for (const r of merge.live) {
+            if (regs.kind[r] !== Kind.Node || regs.value[r] !== id) continue
+            if (r === C.accRegIdx || C.shape.captured[r] || !onlyLoaded(B.cycles[merge.block], r)) kept = false
+        }
+        if (!kept) T.tuples.delete(id)
+    }
+}
+
+function onlyLoaded(cycle: Set<number>, r: number): boolean {
+    const B = C.source.blocks
+    for (const b of cycle) {
+        const insts = B.insts[b]
+        for (let i = 0; i < insts.length; i++) {
+            if (!bytecode.getRegReads(insts[i]).includes(r)) continue
+            if (!ldarOpcodes.has(insts[i].opcode) || i + 1 >= insts.length || !loadOpcodes.has(insts[i + 1].opcode)) return false
+        }
+    }
+    return true
+}
+
+const loadOpcodes = new Set<number>([Op.GetProperty, Op.GetPropertyConst, Op.GetPropertyImm])
+const ldarOpcodes = new Set<number>([Op.Ldar, Op.Ldar0, Op.Ldar1, Op.Ldar2, Op.Ldar3])
+
 function bind(merge: Merge): Registers {
     const first = merge.arrivals[0].regs
     const regs = copyRegisters(first)
     const B = C.source.blocks
     const loopWrites = B.backPreds[merge.block].length ? B.cycleWrites[merge.block] : undefined
     regs.token = node(NodeOp.nilEffect, [refSlot(merge.id)])
+    if (loopWrites && T.tuples.size) dropLoopTuples(merge, first)
     for (let i = 0; i < merge.live.length; i++) {
         const r = merge.live[i]
         let varies = !!loopWrites?.has(r)
@@ -856,6 +944,7 @@ function bind(merge: Merge): Registers {
             varies = other.kind[r] !== first.kind[r] || other.value[r] !== first.value[r]
         }
         if (!varies) continue
+        if (T.tuples.size) for (const arrival of merge.arrivals) if (arrival.regs.kind[r] === Kind.Node) T.tuples.delete(arrival.regs.value[r])
         const param = merge.firstParam + i
         setDebugLabel(C.runtime, param, r === C.accRegIdx ? 'acc' : `s${r}`)
         putNode(C.runtime, param, NodeOp.param, [])
@@ -1112,7 +1201,7 @@ function traceSource(): FastTraced {
         interned: new Map(),
         regs: { kind: new Uint8Array(accRegIdx + 1), value: new Float64Array(accRegIdx + 1), token: 0 }, block: 0, tail: 0,
         merges: [], traced: new Uint8Array(source.blocks.leaders.length),
-        allocations: new Map(), closures: new Set(), usesSelf: false, pc: 0, accesses: new Map(),
+        allocations: new Map(), closures: new Set(), usesSelf: false, pc: 0, accesses: new Map(), tuples: new Map(),
     }
     C.root = uniqueNode(NodeOp.block)
     T.block = C.root
@@ -1151,6 +1240,11 @@ function traceSource(): FastTraced {
         }
         throw e
     }
+    const forwarded = dropDeadTuples()
+    if (forwarded) {
+        result = forwardSlot(forwarded, result)
+        for (const merge of bodies.values()) merge.body = forwardSlot(forwarded, merge.body)
+    }
     const graph = assembleGraph(result, bodies)
     const frames = new Map<u32, number>()
     if (C.frame) {
@@ -1184,11 +1278,15 @@ function bindEntry(): void {
     const { runtime, opts } = C
     const regs = T.regs
     const compiled = C.source.compiled
+    const extras = opts.restExtras
+    const fixed = extras === undefined ? compiled.paramCount : compiled.paramCount - extras
+    const registers = extras === undefined ? compiled.paramCount : fixed + 1
     for (let i = 0; i < compiled.paramCount; i++) {
         const param = runtime.ids.next++
         setDebugLabel(runtime, param, `p${i}`)
         putNode(runtime, param, NodeOp.param, [], Types.u64)
         C.params.push(param)
+        if (i >= fixed) continue
         regs.kind[i] = Kind.Node
         regs.value[i] = param
     }
@@ -1204,7 +1302,20 @@ function bindEntry(): void {
         regs.value[C.accRegIdx] = internCell(heap.makeObject(heap.deref(heap.getPrototypeProperty(parent().fn as Handle))) as number)
     }
     regs.token = node(NodeOp.nilEffect, [refSlot(C.root)])
-    for (let r = 0; r < compiled.paramCount; r++) {
+    if (extras !== undefined) {
+        const array = effect(NodeOp.rt, [literalSlot(runtime, RtOp.arrayLiteral), literalSlot(runtime, extras)])
+        const elements: Tuple = { kind: [], value: [], slots: [], chain: [array], read: false }
+        for (let i = 0; i < extras; i++) {
+            elements.kind.push(Kind.Node)
+            elements.value.push(C.params[fixed + i])
+            elements.slots.push(refSlot(C.params[fixed + i]))
+            elements.chain.push(effect(NodeOp.rt, [literalSlot(runtime, RtOp.arrayElement), refSlot(array), literalSlot(runtime, i), elements.slots[i]]))
+        }
+        regs.kind[fixed] = Kind.Node
+        regs.value[fixed] = array
+        T.tuples.set(array, elements)
+    }
+    for (let r = 0; r < registers; r++) {
         if (!C.shape.captured[r]) continue
         regs.token = node(NodeOp.setProp, [refSlot(regs.token), refSlot(cellNode(frameCell())), frameKey(r), slotOf(regs.kind[r], regs.value[r])])
     }
@@ -1250,6 +1361,47 @@ function exitsNestedLoop(B: CompiledSource['blocks'], b: number): boolean {
         for (const m of B.cycles[p]) if (m !== p && (B.preds[m].length >= 2 || B.backPreds[m].length > 0)) return true
     }
     return false
+}
+
+function dropDeadTuples(): Map<number, number> | undefined {
+    let forward: Map<number, number> | undefined
+    let first = 0
+    for (const tuple of T.tuples.values()) {
+        if (tuple.read) continue
+        forward ??= new Map()
+        if (!first || tuple.chain[0] < first) first = tuple.chain[0]
+        for (const id of tuple.chain) forward.set(id, getRef(getNode(C.runtime, id)!, 0))
+    }
+    if (!forward) return undefined
+    const resolved = forward
+    function resolve(id: number): number {
+        let target = id
+        while (resolved.has(target)) target = resolved.get(target)!
+        return target
+    }
+    for (const id of [...resolved.keys()]) resolved.set(id, resolve(id))
+    for (let id = first; id < C.runtime.ids.next; id++) {
+        if (resolved.has(id)) continue
+        const n = getNode(C.runtime, id)
+        if (!n) continue
+        let slots: Uint32Array | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            const target = resolved.get(getRef(n, i))
+            if (target === undefined) continue
+            slots ??= n.slots.slice()
+            slots[i] = refSlot(target)
+        }
+        if (slots) setNode(C.runtime, id, gn.makeNodeFromSlots(n.op, slots, n.flags))
+    }
+    for (const allocation of T.allocations.values()) {
+        if (allocation.token !== undefined && resolved.has(allocation.token)) allocation.token = resolved.get(allocation.token)
+    }
+    return resolved
+}
+
+function forwardSlot(forward: Map<number, number>, slot: number): number {
+    const target = forward.get(slotRef(slot))
+    return target === undefined ? slot : refSlot(target)
 }
 
 function assembleGraph(result: number, bodies: Map<number, Merge>): lowering2.Graph {

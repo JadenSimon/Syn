@@ -20,7 +20,7 @@ import {
 import {
     addGraphBlock, cloneRefs, copyNode, countIds, countLiterals, createGraph, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, isThisParam, literalSlot, refSlot, makeNodeFromSlots, createThisParam, makeNode, type Operand, operandType, recordFields, type RecordField, resultType, setDebugLabel, setGraphBlocks, withNodes,
-    createFnType, floatLocation, fnLocations, fnReturn, fnReturnLocation, paramLocation, type TypeOperand,
+    createFnType, floatLocation, fnLocations, fnReturn, fnReturnLocation, paramLocation, type TypeOperand, ArgForm, argForm, unknownLayout, type Layout, spreadsLast,
     setRef, setType, typeOf, typeRefOf, typeSlots, NodeFlags, factOf, withFact, machineType,
     insertNode, newId,
     NodeOp,
@@ -4444,6 +4444,9 @@ interface Unit {
     stubbed?: boolean
     staticRefs?: number[]
     cold?: Map<u32, number>
+    restExtras?: number
+    variantOf?: Function
+    stub?: any
 }
 
 
@@ -4492,6 +4495,7 @@ function taggedSlice(slices: Map<number, Rep> | undefined, id: number): boolean 
 function sliceSlot(element: Rep | undefined, T: intrinsics.Types): [width: number, type: intrinsics.Types] {
     if (T !== Types.vm_value) return [rt.wordBytes(T), T]
     if (!element || elementWidth(element) === 4) return [4, Types.vm_value]
+    if (element.kind === 'number' && numberName(element) === 'f64') return [elementWidth(element), Types.f64]
     return [elementWidth(element), element.kind === 'number' && numberName(element) === 'i64' ? Types.i64 : Types.u64]
 }
 interface SliceTags {
@@ -4663,6 +4667,7 @@ export function locate(facts: Facts, shape: intrinsics.Handle, path: string): Co
 }
 
 const genericCache = new WeakMap<Function, Generic | null>()
+const arityVariants = new WeakMap<Function, Map<number, Function>>()
 function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions, image: ProgramImage, clock: PhaseClock) {
     const session = createTraceSession()
     Object.assign(session.globals, opts.globals)
@@ -4767,6 +4772,53 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         if (unit.scheduled) return
         unit.scheduled = true
         order.push(fn)
+    }
+    function layoutOfFn(fn: Function): Layout {
+        const compiled = codeOf(fn)?.source.compiled
+        if (!compiled) return unknownLayout
+        return { params: compiled.paramCount, rest: compiled.rest ? compiled.paramCount - 1 : -1 }
+    }
+    function variantsAllowed(fn: Function): boolean {
+        return !!codeOf(fn)?.source.compiled.rest && !(fn as any).shouldNotInline && !constructsOutOfLine(fn)
+    }
+    function variantOf(fn: Function, count: number): Function {
+        const code = codeOf(fn)!
+        const rest = code.source.compiled.paramCount - 1
+        const extras = count > rest ? count - rest : 0
+        let variants = arityVariants.get(fn)
+        if (!variants) arityVariants.set(fn, variants = new Map())
+        let variant: any = variants.get(extras)
+        if (!variant) {
+            variant = Object.defineProperty(function variant() {}, 'name', { value: `${fn.name || 'anon'}/${rest + extras}` })
+            for (const k of Object.keys(fn)) variant[k] = (fn as any)[k]
+            variants.set(extras, variant)
+        }
+        const own = unitOf(variant)
+        if (own.variantOf) return variant
+        own.code = { ...code, source: { ...code.source, compiled: { ...code.source.compiled, paramCount: rest + extras, rest: false } } }
+        own.restExtras = extras
+        own.variantOf = fn
+        return variant
+    }
+    function variantStub(fn: Function, count: number): any {
+        const variant = variantOf(fn, count)
+        const unit = unitOf(variant)
+        if (unit.stub) return unit.stub
+        const target = intern(variant)
+        discover(variant)
+        schedule(variant)
+        unit.stubbed = true
+        const stub: any = nativeStub(variant, target, codeOf(variant)!.source.compiled.paramCount, -1)
+        for (const k of Object.keys(variant)) stub[k] = (variant as any)[k]
+        unit.stub = stub
+        return stub
+    }
+    function boundTarget(fn: Function, count: number, spread: boolean): Function {
+        const form = argForm(layoutOfFn(fn), count, spread, variantsAllowed(fn))
+        if (form === ArgForm.arity) return variantOf(fn, count)
+        if (form === ArgForm.pack) throw `native: ${fn.name || 'anonymous'} takes rest arguments the call does not pack`
+        if (form === ArgForm.unpack || form === ArgForm.unbound) throw `native: a spread call into ${fn.name || 'anonymous'} needs its arguments unpacked`
+        return fn
     }
     function link(fn: Function): number {
         if (!session.reached(fn)) session.typeRoots([fn], false)
@@ -4944,13 +4996,13 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
     intrinsics.assert(roots.size > 0)
     for (const fn of Object.values(fns)) discover(fn)
     for (const fn of Object.values(fns)) schedule(fn)
-    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, linkHeldStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
+    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, layoutOfFn, variantsAllowed, variantOf, variantStub, boundTarget, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, linkHeldStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
 }
 
 type Linker = ReturnType<typeof createLinker>
 
 function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: PhaseClock) {
-    const { session, functions, discovered, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureFunction, discover, schedule, link, linkStatics, isRoot, usesReceiver, thisParamOf } = linker
+    const { session, functions, discovered, unitOf, originOf, intern, constructsOutOfLine, codeOf, closureFunction, discover, schedule, link, linkStatics, isRoot, usesReceiver, thisParamOf, layoutOfFn, variantsAllowed, variantStub, boundTarget } = linker
     const units: Unit[] = []
     const engineArrays = new Map<intrinsics.Handle, intrinsics.Handle>()
     function engineArrayOf(cell: intrinsics.Handle): intrinsics.Handle {
@@ -5347,6 +5399,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const compiled = codeOf(capture)?.source.compiled
         const stub: any = nativeStub(capture, target, compiled?.paramCount ?? capture.length, compiled?.rest ? compiled.paramCount - 1 : -1)
         for (const k of Object.keys(capture)) stub[k] = capture[k]
+        if (variantsAllowed(capture)) stub.__variant = (count: number) => variantStub(capture, count)
         const wrapper = unitOf(capture).wrapper
         if (flags.has('trace-debug')) console.log('native linked summary', capture.name, { wrapper: !!wrapper })
         return wrapper ? wrapCall(stub, wrapper, capture.length) : stub
@@ -5488,9 +5541,10 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
     }
     function rawTrace(fn: Function, receiver: boolean, verbose: boolean): FastTraced {
         const code = codeOf(fn)!
+        const origin = unitOf(originOf(fn))
         return fastTraceModule.fastTrace(code.source, {
             captures: code.captures, session, mapCapture: fastMapCapture, verbose, name: fn.name,
-            self: code.scope ? undefined : fn, env: !!code.scope, receiver,
+            self: code.scope ? undefined : origin.variantOf ?? fn, env: !!code.scope, receiver, restExtras: origin.restExtras,
         })
     }
     function fastTraced(fn: Function, verbose: boolean): FastTraced {
@@ -5695,6 +5749,16 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         operands[0] = token
         operands.push(array)
     }
+    function unpackSpread(graph: Graph, operands: Operand[], params: number): void {
+        const array = operands.pop()!
+        const fixed = operands.length - 3
+        let token = operands[0]
+        for (let i = fixed; i < params; i++) {
+            token = addNode(graph, NodeOp.getProp, [token, array, { literal: heap.indexKey((i - fixed) as u32) }])
+            operands.push(token)
+        }
+        operands[0] = token
+    }
     function retarget(graph: Graph, folded: Map<number, number>): void {
         if (!folded.size) return
         for (const [id, n] of [...graph.nodes]) {
@@ -5716,21 +5780,34 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                 putNode(graph, id, NodeOp.after, [token, target])
                 continue
             }
-            const compiled = fn ? codeOf(fn)?.source.compiled : undefined
-            if (compiled?.rest) packRest(graph, operands, compiled.paramCount - 1)
+            const layout = fn ? layoutOfFn(fn) : unknownLayout
+            const stub = isLocalStub(linked) ? linked : undefined
+            const count = countIds(n) - 3
+            const form = argForm(layout, count, spreadsLast(n), stub ? typeof stub.__variant === 'function' : !!fn && variantsAllowed(fn))
+            let spread = spreadsLast(n)
+            if (form === ArgForm.pack) {
+                packRest(graph, operands, layout.rest)
+                spread = true
+            } else if (form === ArgForm.unpack) {
+                unpackSpread(graph, operands, layout.params)
+                spread = false
+            }
+            const local = form === ArgForm.arity && stub ? stub.__variant(count) : stub
             if (linked && Array.isArray(linked.__args)) {
                 if (Number.isSafeInteger(linked.__syscall)) {
                     operands[1] = addNode(graph, NodeOp.syscallTarget, [{ literal: linked.__syscall }])
                     operands[2] = { literal: 0 }
-                } else if (isLocalStub(linked) && linked.__rest < 0) {
-                    operands[1] = addNode(graph, NodeOp.localTarget, [{ literal: linked.__localTarget }])
+                } else if (local && local.__rest < 0) {
+                    operands[1] = addNode(graph, NodeOp.localTarget, [{ literal: local.__localTarget }])
                     operands[2] = { literal: 0 }
                 } else if (Number.isSafeInteger(linked.__native)) {
                     operands[1] = { literal: linked.__native }
                     operands[2] = { literal: 0 }
                 }
             }
-            putCopy(graph, id, n, operands)
+            const copy = copyNode(graph, n, operands)
+            copy.flags = (spread ? copy.flags | NodeFlags.spread : copy.flags & ~NodeFlags.spread) as u8
+            setNode(graph, id, copy)
         }
     }
     function applyPrototypes(traced: FastTraced): void {
@@ -5862,7 +5939,8 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             for (const id of live) {
                 const n = getNode(graph, id)
                 if (n?.op !== NodeOp.call) continue
-                const callee = taggedCallee(graph, n)
+                const tagged = taggedCallee(graph, n)
+                const callee = tagged && boundTarget(tagged, countIds(n) - 3, spreadsLast(n))
                 if (callee && callee !== fn) sites.push([id, callee])
             }
             if (!sites.length) break
@@ -6772,7 +6850,7 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, linker: Linker
 }
 
 function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock) {
-    const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf } = linker
+    const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget } = linker
     const { graphsOf, reachableNodes } = tracer
     const fixedShapes = new Set(plan.shapes.values())
     function abiOf(fn: Function): UnitAbi {
@@ -6849,7 +6927,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         let callees = local?.calls.get(site.call)
         if (!callees?.size && site.context === undefined) {
             const linked = calleeOf(g, site.target)
-            const fn = linked && isLocalStub(linked) ? functions[(linked as any).__localTarget] : linked
+            const known = linked && isLocalStub(linked) ? functions[(linked as any).__localTarget] : linked
+            const fn = known && codeOf(known) ? boundTarget(known, site.args.length, !!site.spread) : known
             const candidates = fn ? plan.units.get(originOf(fn)) ?? [] : []
             const matching = candidates.length > 1 ? candidates.filter(unit => {
                 const paramCount = sourceOfLinked(fn!)?.compiled.paramCount ?? 0
@@ -6876,7 +6955,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const numeric = returned.kind === 'number' && !boxedFloat
         const result = numeric ? propertyEval.numberShape : plannedShape(plan, returned)
         const origin = originOf(callee)
-        const target = callee === origin ? undefined : site.context !== undefined || site.target.op === NodeOp.localTarget ? link(callee) : session.linkFunction(callee)
+        const target = callee === origin && unitOf(origin).restExtras === undefined ? undefined : site.context !== undefined || site.target.op === NodeOp.localTarget ? link(callee) : session.linkFunction(callee)
         const boxedResult = local?.calls.has(site.call) ? local.boxedCalls.has(site.call) : unit.boxedReturn
         return {
             paramCount: site.context !== undefined && !receiver ? site.args.length : paramCount, receiver,
@@ -6976,14 +7055,21 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             }
             if (changed) putCopy(graph, id, n, operands)
         }
+        function floatSlot(id: number, value: Operand): boolean {
+            const element = local?.unit.slices.get(id)
+            if (!element?.encoded || numberName(element) !== 'f64') return false
+            return typeof value !== 'number' || nodes.get(tailOf(graph, value))?.kind === 'number'
+        }
         function storeWord(id: number, n: GraphNode): void {
             const value = getOperand(graph, n, 3)
-            if (typeof value !== 'number' || !floats.has(tailOf(graph, value))) {
+            const float = typeof value === 'number' && floats.has(tailOf(graph, value))
+            if (!float && !floatSlot(id, value)) {
                 coerce(id, [3], local?.unit.boxes ? toWord : asWord)
                 return
             }
+            const converted = float ? value : typeof value === 'number' ? addNode(graph, NodeOp.convert, [value], Types.f64) : addNode(graph, NodeOp.literal, [value], Types.f64)
             const cell = addNode(graph, NodeOp.pstack, [getRef(n, 0), 0, 0, { literal: 8 }])
-            const stored = addNode(graph, NodeOp.store, [cell, cell, { literal: 0 }, value], Types.f64)
+            const stored = addNode(graph, NodeOp.store, [cell, cell, { literal: 0 }, converted], Types.f64)
             const handle = addNode(graph, NodeOp.or, [encode(cell), { literal: heap.pstackBoxWordTag ^ heap.pstackWordTag }])
             putCopy(graph, id, n, [stored, ...getOperands(graph, n, 1, 3), handle])
         }
@@ -7978,6 +8064,7 @@ function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, g
         heapValue: tracer.heapValue,
         receiverless: fn => Array.isArray((fn as any).__args),
         paramCount: fn => codeOf(fn)?.source.compiled.paramCount,
+        bindTarget: (fn, count, spread) => linker.boundTarget(fn, count, spread),
     }
     function genericOf(proto: intrinsics.Handle): Generic | undefined {
         const ctor = heap.getOwnProperty(proto, heap.fromJsString('constructor'))
@@ -8656,7 +8743,7 @@ function copyInto(elements: any[]): () => any {
     return () => {
         const out = new Array()
         if (elements.length) out.reserve(elements.length)
-        for (let i = 0; i < elements.length; i++) out.push(elements[i])
+        for (let i = 0; i < elements.length; i++) out[i] = elements[i]
         return out
     }
 }
