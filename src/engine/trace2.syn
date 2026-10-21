@@ -522,6 +522,22 @@ const traceMem = createTraceMemory(intrinsics.heapMaxAddress * 2, 1 << 16)
 
 const constructors = new Map<Function, boolean>()
 const emittedSources = new Map<string, bytecode.EmitResult>()
+const preparedSources = new Map<string, CompiledSource>()
+const preparedTemplates = new Map<bytecode.EmitResult, CompiledSource>()
+
+function typedCopy(prepared: CompiledSource): CompiledSource {
+    const insts: bytecode.CodeInstruction[][] = []
+    for (const block of prepared.blocks.insts) {
+        const copied: bytecode.CodeInstruction[] = []
+        for (const inst of block) copied.push({ ...inst })
+        insts.push(copied)
+    }
+    return {
+        ...prepared,
+        compiled: { ...prepared.compiled, code: prepared.compiled.code.slice() },
+        blocks: { ...prepared.blocks, insts },
+    }
+}
 export function isConstructor(f: Function): boolean {
     const known = constructors.get(f)
     if (known !== undefined) return known
@@ -546,7 +562,74 @@ function frozenData(module: Record<string, any>): Record<string, any> {
     return out
 }
 
-export function createTraceSession(): TraceSession {
+interface HostWorld {
+    symbolicDispatch: Function
+    symbolicJmp: Function
+    symbolicBranch: Function
+    symbolicPanic: Function
+    symbolicProxyGet: Function
+    symbolicProxySet: Function
+    intrinsicContext: Record<string, any>
+    moduleContext: Record<string, any>
+    intrinsicFns: Map<number, string>
+    functionStubs: Map<Function, number>
+    stubFunctions: Map<number, Function>
+    templates: Map<u32, Template>
+    memberOwners: Map<Function, Function>
+    classMembers: Map<Function, [cls: Function, member: bytecode.EmitResult]>
+    memberClasses: Map<bytecode.EmitResult, Function>
+    statics: Map<heap.Handle, Function>
+    rewrites: heap.Handle[]
+    linkFunction(f: Function): u32
+    fromJsValue(v: any): u32
+    fillStatic(box: heap.Handle, rebuild: Function): void
+    begin(): void
+    active: TraceRuntime | undefined
+}
+
+const checkHostImage = intrinsics.argv().includes('check-host-image')
+let hostWorld: HostWorld | undefined
+
+function hostWorldOf(): HostWorld {
+    if (!hostWorld) hostWorld = createHostWorld()
+    hostWorld.begin()
+    return hostWorld
+}
+
+function hostState(x: any): any[] {
+    const state: any[] = []
+    if (typeof x === 'function') {
+        state.push(x.prototype)
+        for (const key of Reflect.ownKeys(x)) {
+            if (key === 'length' || key === 'name' || key === 'prototype') continue
+            state.push(key, x[key])
+        }
+        return state
+    }
+    state.push(Object.getPrototypeOf(x))
+    for (const key of Reflect.ownKeys(x)) {
+        const d = Object.getOwnPropertyDescriptor(x, key)!
+        const flags = (d.enumerable ? 1 : 0) | (d.configurable ? 2 : 0) | (d.writable ? 4 : 0) | ('value' in d ? 8 : 0)
+        state.push(key, flags, d.value, d.get, d.set)
+    }
+    return state
+}
+
+const hostBits = new Float64Array(2)
+const hostWords = new Uint32Array(hostBits.buffer)
+function sameHostValue(a: any, b: any): boolean {
+    if (a === b) return true
+    if (typeof a !== 'number' || typeof b !== 'number') return false
+    hostBits[0] = a
+    hostBits[1] = b
+    return hostWords[0] === hostWords[2] && hostWords[1] === hostWords[3]
+}
+
+function isHostReference(x: any): boolean {
+    return typeof x === 'function' || (x !== null && typeof x === 'object')
+}
+
+function createHostWorld(): HostWorld {
     const intrinsicNames = new Map<Function, string>()
     function symbolicDispatch(pc: number): number { return pc }
     function symbolicJmp(pc: number, off: number): number { return pc + off }
@@ -577,43 +660,116 @@ export function createTraceSession(): TraceSession {
     const intrinsicFns = getCachedIntrinsics().stubs
     const functionStubs = new Map<Function, number>()
     const stubFunctions = new Map<number, Function>()
-    const compiledSources = new Map<string, CompiledSource>()
-    const compiledTemplates = new Map<bytecode.EmitResult, CompiledSource>()
     const templates = new Map<u32, Template>()
-    const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
-    const functionCodes = new Map<Function, FunctionCode>()
     const memberOwners = new Map<Function, Function>()
     const classMembers = new Map<Function, [cls: Function, member: bytecode.EmitResult]>()
     const memberClasses = new Map<bytecode.EmitResult, Function>()
-    let runtime: TraceRuntime | undefined
-    let nodeCache: Map<string, number> | undefined
+    const statics = new Map<heap.Handle, Function>()
+    const rewrites: heap.Handle[] = []
+    const states = new Map<any, any[]>()
+    const parents = new Map<any, Set<any>>()
+    const checked = new Map<any, number>()
+    let epoch = 0
 
-    const ctx: Record<string, any> = {
-        Intrinsics: intrinsicContext, Error: TracedError,
-        Symbol: heap.symbolConstants, ...builtinGlobals,
-        intrinsics: moduleContext, heap, syscalls,
-    }
-    for (const value of Object.values(builtinGlobals)) if (typeof value === 'function' && isConstructor(value)) noteMembers(value)
-
-    function context(captures: any[] = []): Record<string, any> {
-        for (let i = 0; i < captures.length; i++) {
-            const capture = captures[i]
-            ctx[`$${i}`] = capture === Symbol ? heap.symbolConstants
-                : capture === Intrinsics ? getCachedIntrinsics().wrapper
-                : capture === intrinsics ? moduleContext 
-                : capture === Types ? getCachedTypes()
-                : capture === intrinsics.isNative ? moduleContext.isNative : capture
-
+    function noteMembers(cls: Function): void {
+        for (const holder of [cls, (cls as any).prototype]) {
+            for (const key of Reflect.ownKeys(holder)) {
+                const d = Object.getOwnPropertyDescriptor(holder, key)!
+                for (const member of [d.value, d.get, d.set]) if (typeof member === 'function' && member !== cls) memberOwners.set(member, cls)
+            }
         }
-        return ctx
+    }
+
+    function record(x: any): void {
+        const state = hostState(x)
+        states.set(x, state)
+        checked.set(x, epoch)
+        for (const value of state) {
+            if (!isHostReference(value)) continue
+            let known = parents.get(value)
+            if (!known) parents.set(value, known = new Set())
+            known.add(x)
+        }
+    }
+
+    function forget(x: any): void {
+        if (!states.has(x)) return
+        states.delete(x)
+        if (typeof x === 'function') functionStubs.delete(x)
+        else conversion.seen.delete(x)
+        const known = parents.get(x)
+        if (!known) return
+        parents.delete(x)
+        for (const parent of known) forget(parent)
+    }
+
+    function check(x: any): void {
+        const state = states.get(x)
+        if (!state || checked.get(x) === epoch) return
+        checked.set(x, epoch)
+        const now = hostState(x)
+        let same = now.length === state.length
+        for (let i = 0; same && i < now.length; i++) same = sameHostValue(now[i], state[i])
+        if (!same) forget(x)
+        for (const value of now) if (isHostReference(value)) check(value)
+        if (checkHostImage && states.has(x)) verify(x)
+    }
+
+    function verify(x: any): void {
+        const cached = typeof x === 'function' ? functionStubs.get(x) : conversion.seen.get(x)
+        if (cached === undefined || typeof x === 'function') return
+        const fresh = heap.fromJsValue(x, linkFunction, rebuild => heap.boxF64(0))
+        const why = sameHeapValue(cached as heap.Handle, fresh, new Set())
+        assert(!why, `trace2: the host image of ${x?.constructor?.name ?? typeof x} drifted from the host value: ${why}`)
+    }
+
+    function sameHeapValue(a: heap.Handle, b: heap.Handle, seen: Set<number>): string {
+        if (a === b) return ''
+        if (!a || !b) return `@${a} vs @${b}`
+        if (heap.isBoxedF64(a) || heap.isBoxedF64(b)) {
+            if (!heap.isBoxedF64(a) || !heap.isBoxedF64(b)) return 'number vs reference'
+            if (statics.has(a)) return ''
+            return sameHostValue(heap.unboxF64(a), heap.unboxF64(b)) ? '' : `${heap.unboxF64(a)} vs ${heap.unboxF64(b)}`
+        }
+        if (heap.isString(a) || heap.isString(b)) {
+            if (!heap.isString(a) || !heap.isString(b)) return 'string vs object'
+            return heap.stringToJs(a) === heap.stringToJs(b) ? '' : `'${heap.stringToJs(a)}' vs '${heap.stringToJs(b)}'`
+        }
+        const left = heap.deref(a)
+        const right = heap.deref(b)
+        if (left === right) return ''
+        if (seen.has(left)) return ''
+        seen.add(left)
+        if (heap.isCallable(left) || heap.isCallable(right)) return 'different functions'
+        if (!heap.isOrdinaryObject(left) || !heap.isOrdinaryObject(right)) return ''
+        const count = heap.ownPropertyCount(left)
+        if (count !== heap.ownPropertyCount(right)) return `${count} vs ${heap.ownPropertyCount(right)} properties`
+        const proto = sameHeapValue(heap.getPrototypeOf(left), heap.getPrototypeOf(right), seen)
+        if (proto) return `prototype: ${proto}`
+        for (let i: u32 = 0; i < count; i++) {
+            const key = heap.ownPropertyKeyAt(left, i)
+            const name = heap.isString(key) ? heap.stringToJs(key) : `${key}`
+            const other = heap.getOwnProperty(right, key)
+            if (!other) return `${name} is missing`
+            const l = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.ownPropertyAt(left, i)))
+            const r = heap.FullPropertyDescriptor(heap.resolveHeapCell(other))
+            if (l.flags !== r.flags) return `${name} flags ${l.flags} vs ${r.flags}`
+            const first = sameHeapValue(l.slot0 as heap.Handle, r.slot0 as heap.Handle, seen)
+            if (first) return `${name}: ${first}`
+            const second = sameHeapValue(l.slot1 as heap.Handle, r.slot1 as heap.Handle, seen)
+            if (second) return `${name}: ${second}`
+        }
+        return ''
     }
 
     function linkFunction(f: Function): u32 {
+        check(f)
         const prev = functionStubs.get(f)
         if (prev !== undefined) return prev as u32
         const stub = heap.makeIndirect(heap.makeFunctionObject())
         functionStubs.set(f, stub)
         stubFunctions.set(stub, f)
+        record(f)
         if (isConstructor(f)) noteMembers(f)
         const intrinsicName = intrinsicNames.get(f)
         if (intrinsicName !== undefined) intrinsicFns.set(stub, intrinsicName)
@@ -626,18 +782,75 @@ export function createTraceSession(): TraceSession {
         return stub
     }
 
-    const constructions = new Map<u32, Construction>()
-    const sealed = new Set<intrinsics.Handle>()
-    const statics = new Map<heap.Handle, Function>()
     function fillStatic(box: heap.Handle, rebuild: Function): void {
         heap.setBoxedF64(box, heap.unboxF64(vmHandle(Intrinsics.static(rebuild) as u32)))
     }
     function construct(rebuild: Function): heap.Handle {
         const box = heap.boxF64(0)
         statics.set(box, rebuild)
-        if (runtime) fillStatic(box, rebuild)
+        if (world.active) fillStatic(box, rebuild)
         return box
     }
+    const conversion: heap.JsConversion = { compileFn: linkFunction, construct, seen: new Map(), converted: record }
+    function fromJsValue(v: any): u32 {
+        if (isSymbolicMemory(v)) return heap.boxF64(v.ptr as f64)
+        if (isHostReference(v)) check(v)
+        return heap.convertJsValue(conversion, v)
+    }
+
+    function begin(): void {
+        if (world.active) return
+        epoch++
+        for (let i = rewrites.length - 2; i >= 0; i -= 2) heap.FullPropertyDescriptor(heap.resolveHeapCell(rewrites[i])).slot0 = rewrites[i + 1]
+        rewrites.length = 0
+    }
+
+    const world: HostWorld = {
+        symbolicDispatch, symbolicJmp, symbolicBranch, symbolicPanic, symbolicProxyGet, symbolicProxySet,
+        intrinsicContext, moduleContext, intrinsicFns, functionStubs, stubFunctions, templates, memberOwners, classMembers, memberClasses, statics, rewrites,
+        linkFunction, fromJsValue, fillStatic, begin, active: undefined,
+    }
+    for (const value of Object.values(builtinGlobals)) if (typeof value === 'function' && isConstructor(value)) noteMembers(value)
+    return world
+}
+
+export function createTraceSession(): TraceSession {
+    const world = hostWorldOf()
+    const {
+        symbolicDispatch, symbolicJmp, symbolicBranch, symbolicPanic, symbolicProxyGet, symbolicProxySet,
+        intrinsicContext, moduleContext, intrinsicFns, functionStubs, stubFunctions, templates, memberOwners, classMembers, memberClasses, statics,
+        linkFunction, fromJsValue, fillStatic,
+    } = world
+    heap.setStringPrototype(heap.deref(heap.getPrototypeProperty(heap.deref(linkFunction(builtinGlobals.String) as intrinsics.Handle))))
+    const compiledSources = new Map<string, CompiledSource>()
+    const compiledTemplates = new Map<bytecode.EmitResult, CompiledSource>()
+    const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
+    const functionCodes = new Map<Function, FunctionCode>()
+    let runtime: TraceRuntime | undefined
+    let nodeCache: Map<string, number> | undefined
+    let outerActive: TraceRuntime | undefined
+
+    const ctx: Record<string, any> = {
+        Intrinsics: intrinsicContext, Error: TracedError,
+        Symbol: heap.symbolConstants, ...builtinGlobals,
+        intrinsics: moduleContext, heap, syscalls,
+    }
+
+    function context(captures: any[] = []): Record<string, any> {
+        for (let i = 0; i < captures.length; i++) {
+            const capture = captures[i]
+            ctx[`$${i}`] = capture === Symbol ? heap.symbolConstants
+                : capture === Intrinsics ? getCachedIntrinsics().wrapper
+                : capture === intrinsics ? moduleContext
+                : capture === Types ? getCachedTypes()
+                : capture === intrinsics.isNative ? moduleContext.isNative : capture
+
+        }
+        return ctx
+    }
+
+    const constructions = new Map<u32, Construction>()
+    const sealed = new Set<intrinsics.Handle>()
     function fold(rebuild: Function): heap.Handle {
         const r = enterTrace()
         defer leaveTrace()
@@ -651,12 +864,6 @@ export function createTraceSession(): TraceSession {
         r.objects.seal(handle)
         return handle
     }
-    const convertJsValue = heap.createJsValueConverter(linkFunction, construct)
-    function fromJsValue(v: any): u32 {
-        if (!isSymbolicMemory(v)) return convertJsValue(v)
-        return heap.boxF64(v.ptr as f64)
-    }
-    heap.setStringPrototype(heap.deref(heap.getPrototypeProperty(heap.deref(linkFunction(builtinGlobals.String) as intrinsics.Handle))))
 
     function mk(op: NodeOp, args: number[], label: string = '', type?: gn.TypeOperand, unique = false): any {
         const r = runtime
@@ -684,9 +891,14 @@ export function createTraceSession(): TraceSession {
         const known = compiledSources.get(code)
         if (known) return known
         traceStats.compileMisses++
-        let emitted = emittedSources.get(code)
-        if (!emitted) emittedSources.set(code, emitted = bytecode.compile(code))
-        const source = prepareSource({ ...emitted, code: emitted.code.slice() })
+        let prepared = preparedSources.get(code)
+        if (!prepared) {
+            let emitted = emittedSources.get(code)
+            if (!emitted) emittedSources.set(code, emitted = bytecode.compile(code))
+            prepared = prepareSource({ ...emitted, code: emitted.code.slice() })
+            preparedSources.set(code, prepared)
+        }
+        const source = typedCopy(prepared)
         compiledSources.set(code, source)
         return source
     }
@@ -694,7 +906,12 @@ export function createTraceSession(): TraceSession {
     function compileTemplate(template: bytecode.EmitResult): CompiledSource {
         const known = compiledTemplates.get(template)
         if (known) return known
-        const source = prepareSource({ ...template, code: template.code.slice() })
+        let prepared = preparedTemplates.get(template)
+        if (!prepared) {
+            prepared = prepareSource({ ...template, code: template.code.slice() })
+            preparedTemplates.set(template, prepared)
+        }
+        const source = typedCopy(prepared)
         compiledTemplates.set(template, source)
         return source
     }
@@ -734,15 +951,6 @@ export function createTraceSession(): TraceSession {
     function templateOf(closure: u32): Template | undefined {
         const bc = heap.functionBytecode(heap.deref(closure as intrinsics.Handle))
         return templates.get(heap.FunctionBytecode(heap.resolveHeapCell(bc)).bytecode as u32)
-    }
-
-    function noteMembers(cls: Function): void {
-        for (const holder of [cls, (cls as any).prototype]) {
-            for (const key of Reflect.ownKeys(holder)) {
-                const d = Object.getOwnPropertyDescriptor(holder, key)!
-                for (const member of [d.value, d.get, d.set]) if (typeof member === 'function' && member !== cls) memberOwners.set(member, cls)
-            }
-        }
     }
 
     function bindMembers(cls: Function, holder: any, expandos: bytecode.Expandos): void {
@@ -889,7 +1097,7 @@ export function createTraceSession(): TraceSession {
             }, ids)
             runtime = {
                 tracer, ids, nodes, literals, debugLabels, blocks, frames,
-                objects: createHeapRecords(tracer, mk, { nodes, ids, literals }, blocks, sealed),
+                objects: createHeapRecords(tracer, mk, { nodes, ids, literals }, blocks, sealed, world.rewrites),
                 opaque: new Map(),
                 groupObjects: new Map(),
                 proxied: new Map(),
@@ -899,6 +1107,8 @@ export function createTraceSession(): TraceSession {
                 depth: 0,
             }
             session.runtime = runtime
+            outerActive = world.active
+            world.active = runtime
             for (const [box, rebuild] of statics) fillStatic(box, rebuild)
         }
         runtime.depth++
@@ -911,6 +1121,7 @@ export function createTraceSession(): TraceSession {
         r.tracer.dispose()
         runtime = undefined
         session.runtime = undefined
+        world.active = outerActive
         finalizedFunctions.clear()
     }
 
