@@ -8,7 +8,7 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots, verifyTailEffects } from './verify'
+import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots, verifyTailEffects, verifyTokenSelects } from './verify'
 import {
     addGraphBlock, blockOrder, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -625,7 +625,7 @@ type Range = [lo: number, hi: number]
 const RangeLimit = 2 ** 53
 const ArrivalShapes = new Set<NodeOp>([NodeOp.param, NodeOp.literal, NodeOp.after, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.ushr, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.convert, NodeOp.select])
 
-const RangedTypes = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.i8, Types.i16, Types.i32, Types.i64, Types.bool])
+const RangedTypes = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.ptr, Types.i8, Types.i16, Types.i32, Types.i64, Types.bool])
 
 function rangeMax(T: Types): number {
     if (!RangedTypes.has(T)) return Infinity
@@ -959,7 +959,7 @@ const PureOps = new Set<NodeOp>([
     ...TargetingValues
 ])
 const Commutative = new Set<NodeOp>([NodeOp.add, NodeOp.mul, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.ne, NodeOp.eq])
-const UnsignedResults = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64])
+const UnsignedResults = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.ptr])
 const OrderingOps = new Set<NodeOp>([NodeOp.after, NodeOp.nilEffect])
 const AddressOps = new Set<NodeOp>([NodeOp.pstack, NodeOp.alloca, NodeOp.frameAddress])
 function latency(costs: lowering.TargetCosts, op: NodeOp): number {
@@ -1029,7 +1029,7 @@ export function impureValues(g: Graph): Set<number> {
         if (!id) return true
         const n = getNode(g, id)!
         if (!markVisited(n, epoch)) return !impure.has(id)
-        let ok = PureOps.has(n.op) || islandLoad(g, n)
+        let ok = leavesArm(g, n)
         if (ok) for (const a of gn.enumerateRefs(n)) if (!walk(a)) { ok = false; break }
         if (!ok) impure.add(id)
         return ok
@@ -1086,7 +1086,7 @@ function nodeKey(g: NodeSpace, n: GraphNode, argIds = getArgIds(n), argConsts = 
     }
     const slots = typeSlots(n.op)
     // XXX: graph arithmetic can carry u32/u64 decoration that lowering treats identically.
-    const word = (type: number) => type === Types.u32 || type === Types.u64
+    const word = (type: number) => type === Types.u32 || type === Types.u64 || type === Types.ptr
     const eraseWidth = ignoreWordWidth && BinaryOps.has(n.op) && word(typeOf(n))
     if (slots) parts.push(eraseWidth ? 'tuword' : typeRefOf(n) ? `t%${typeRefOf(n)}` : `t${typeOf(n)}`)
     return parts.join(',')
@@ -3217,17 +3217,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return dst
     }
 
-    function collectUnconditional(from: number, dst: Set<number> = new Set()) {
-        dst.add(from)
-        const n = getNode(g, from)
-        if (!n) return dst
-        const count = n.op === NodeOp.select ? 1 : countIds(n)
-        for (let i = 0; i < count; i++) {
-            const u = operandEdge(n, i)
-            if (!u || dst.has(u)) continue
-            collectUnconditional(u, dst)
-        }
-        return dst
+    function demandOf(root: number, into: Set<number> = new Set()): Set<number> {
+        return demanded(g, root, into, new Map())
     }
 
     function visitBlock(b: GraphBlock) {
@@ -3412,7 +3403,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     const sweepChanges = new Set<string>()
     function verifySweep(): void {
         if (!sweepChanges.size) return
-        verifyGraph(g, `optimize(${[...sweepChanges].join(',')})`, true)
+        const stage = `optimize(${[...sweepChanges].join(',')})`
+        verifyGraph(g, stage, true)
+        verifyTokenSelects(g, stage)
         sweepChanges.clear()
     }
 
@@ -3817,7 +3810,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (guarded.has(id)) continue
             const n = getNode(g, id)!
             if (++extra > 3) return false
-            if (!PureOps.has(n.op)) return false
+            if (!leavesArm(g, n)) return false
         }
         return true
     }
@@ -4016,10 +4009,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 arr.push(q ?? nil())
             }
             if (!changed) return vid
-            if (arr.every(x => x === arr[0])) {
-                return getNode(g, arr[0])?.op === NodeOp.nilEffect ? undefined : arr[0]
-            }
-            return vid
+            if (!arr.every(x => x === arr[0])) return vid
+            const tested = simplifyOrderingIn(getRef(u, 0), from)
+            if (tested) return effectsJoin([tested, arr[0]])
+            return getNode(g, arr[0])?.op === NodeOp.nilEffect ? undefined : arr[0]
         }
         if (u.op === NodeOp.after) {
             const end = countIds(u)-1
@@ -4323,6 +4316,20 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return count
     }
 
+    function dereferencedBases(root: number, outside: (id: number) => number, into: Set<number>): Set<number> {
+        for (const id of demandOf(root)) {
+            const n = getNode(g, id)
+            if (n?.op === NodeOp.load && getRef(n, 1) && !getRef(n, 2)) into.add(outside(getRef(n, 1)))
+        }
+        return into
+    }
+
+    function fieldOfDereferenced(n: GraphNode, bases: Set<number>, outside: (id: number) => number): boolean {
+        if (n.op !== NodeOp.load || !getRef(n, 1) || getRef(n, 2)) return false
+        const base = outside(getRef(n, 1))
+        return dereferenceable(g, base) || bases.has(base)
+    }
+
     // finds values that never differ across applications and moves them to a pred
     function hoistInvariants(target: GraphBlock) {
         currentMem()
@@ -4371,6 +4378,13 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const calls = (findValues(target.id, NodeOp.call) ?? []).filter(x => iterating.has(x) && callEffect(getNode(g, x)!) > 1)
         const stores = (findValues(target.id, NodeOp.store) ?? []).filter(x => iterating.has(x))
         const relaxed = new Set<number>()
+        let required: Set<number> | undefined
+        const entering = (x: number) => {
+            const at = target.params.indexOf(x)
+            return at >= 0 && getRef(entry, at + 1) ? getRef(entry, at + 1) : x
+        }
+        let bases: Set<number> | undefined
+        const dereferenced = () => bases ??= dereferencedBases(target.bodyId, entering, dereferencedBases(getGraphBlock(entryBlock).bodyId, x => x, new Set()))
         function isInvariant(id: number): boolean {
             if (isNilOrVoid(id)) return true
             if (invariants.has(id)) return true
@@ -4382,6 +4396,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (n.op === NodeOp.select) return false
             if (n.op === NodeOp.after || n.op === NodeOp.store || n.op === NodeOp.call || n.op === NodeOp.pstack) return false
             if (TargetingValues.has(n.op)) return false
+            required ??= demandOf(target.bodyId)
+            if (!leavesArm(g, n) && !required.has(id) && !fieldOfDereferenced(n, dereferenced(), entering)) return false
             if (n.op === NodeOp.load) {
                 if (calls.some(x => mem!.clobbers(x, n))) return false
                 if (stores.some(x => !mem!.disjoint(n, getNode(g, x)!))) return false
@@ -4947,13 +4963,22 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const hoistable = new Map<number, boolean>()
         const relaxed = new Set<number>()
+        let required: Set<number> | undefined
+        const entering = (x: number) => {
+            const at = target.params.indexOf(x)
+            if (at >= 0 && getRef(entry, at + 1)) return getRef(entry, at + 1)
+            return invariant.get(x) ?? x
+        }
+        let bases: Set<number> | undefined
+        const dereferenced = () => bases ??= dereferencedBases(target.bodyId, entering, dereferencedBases(getGraphBlock(entryBlock).bodyId, x => x, new Set()))
         function canHoist(id: number): boolean {
             if (!id || invariant.has(id)) return true
             const known = hoistable.get(id)
             if (known !== undefined) return known
             const n = getNode(g, id)!
             const load = n.op === NodeOp.load
-            let ok = load || n.op === NodeOp.literal || n.op === NodeOp.convert || BinaryOps.has(n.op)
+            required ??= demandOf(target.bodyId)
+            let ok = (load || n.op === NodeOp.literal || n.op === NodeOp.convert || BinaryOps.has(n.op)) && (leavesArm(g, n) || required.has(id) || fieldOfDereferenced(n, dereferenced(), entering))
             for (let i = load ? 1 : 0; ok && i < countIds(n); i++) {
                 ok = canHoist(getRef(n, i))
                 if (reloads.has(getRef(n, i))) ok = false
@@ -5205,8 +5230,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!vid) return false
         const u = getNode(g, vid)
         if (!u) return false
-        if (!PureOps.has(u.op)) return true
-        if (u.op === NodeOp.after || u.op === NodeOp.param) {
+        if (!leavesArm(g, u)) return true
+        if (u.op === NodeOp.param) {
             return true
         }
         for (let i = 0; i < countIds(u); i++) {
@@ -6071,7 +6096,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function pureFrom(id: number): boolean {
             if (paramSet.has(id)) return true
             const n = getNode(g, id)
-            if (!n || !PureOps.has(n.op)) return false
+            if (!n || !leavesArm(g, n)) return false
             for (let i = 0; i < countIds(n); i++) if (getRef(n, i) && !pureFrom(getRef(n, i))) return false
             return true
         }
@@ -6150,16 +6175,13 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (const id of condition) if (getNode(g, id)?.op === NodeOp.call) return false
 
         let shared: Set<number> | undefined
-        let certain: Set<number> | undefined
         for (let i = 1; i < countIds(tail); i++) {
             const arm = collectSubgraph(getRef(tail, i))
             if (!shared) shared = arm
             else for (const id of shared) if (!arm.has(id)) shared.delete(id)
-            const must = collectUnconditional(getRef(tail, i))
-            if (!certain) certain = must
-            else for (const id of certain) if (!must.has(id)) certain.delete(id)
         }
         if (!shared?.size) return false
+        const demandedByArms = armDemand(g, target.bodyId, new Map()).every
         for (const id of condition) shared.delete(id)
         for (const param of target.params) shared.delete(param)
 
@@ -6167,10 +6189,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const n = getNode(g, id)
             if (!n) return false
             if (TargetingValues.has(n.op)) return false
-            if (OrderedValues.has(n.op)) {
-                if (n.op !== NodeOp.load && n.op !== NodeOp.getProp && !certain!.has(id)) return false
-                return isNilOrVoid(getRef(n, 0))
-            }
+            if (!leavesArm(g, n) && !demandedByArms.has(id)) return false
+            if (OrderedValues.has(n.op)) return isNilOrVoid(getRef(n, 0))
             if (isOrdered(id)) return false
             return n.op !== NodeOp.block && n.op !== NodeOp.literal
                 && n.op !== NodeOp.nilEffect && n.op !== NodeOp.void && n.op !== NodeOp.apply
@@ -6650,8 +6670,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function speculatable(id: number): boolean {
             if (!id || unconditional.has(id)) return true
             const n = getNode(g, id)!
-            if (n.op === NodeOp.param) return true
-            if (n.op !== NodeOp.after && !PureOps.has(n.op)) return false
+            if (!leavesArm(g, n)) return false
             for (const arg of getArgIds(n)) if (!speculatable(arg)) return false
             return true
         }
@@ -7944,10 +7963,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             for (let k = 0; k < countIds(tn); k++) if (!matches(tn, k, fn, k, env, depth + 1)) return false
             return true
         }
-        function candidate(b: GraphBlock, load: GraphNode, env: Env): number | undefined {
+        function candidate(b: GraphBlock, load: GraphNode, env: Env, required?: Set<number>): number | undefined {
             for (const id of findValues(b.id, NodeOp.load) ?? []) {
                 const m = getNode(g, id)!
                 if (!isNilOrVoid(getRef(m, 0)) || typeOf(m) !== typeOf(load)) continue
+                if (required && !required.has(id)) continue
                 if (matches(load, 1, m, 1, env) && matches(load, 2, m, 2, env)) return id
             }
         }
@@ -7955,8 +7975,17 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const stop = new Set(b.params)
             return arrivalEffects(b, p).every(e => writerOf(e, access, stop) === 'quiet')
         }
+        const arrivalDemands = new Map<TailPosition, Set<number>>()
+        function arrivalDemand(b: GraphBlock, p: TailPosition): Set<number> {
+            const known = arrivalDemands.get(p)
+            if (known) return known
+            const required = demandOf(b.bodyId)
+            for (const root of tailRoots(g, p)) if (root) demandOf(root, required)
+            arrivalDemands.set(p, required)
+            return required
+        }
         function available(b: GraphBlock, p: TailPosition, load: GraphNode, env: Env): number | undefined {
-            const found = candidate(b, load, env)
+            const found = candidate(b, load, env, arrivalDemand(b, p))
             if (found !== undefined) return quiet(b, p, getNode(g, found)!) ? found : undefined
             if (!movable(load, env)) return
             const into = findInboundApplies(b)
@@ -8013,6 +8042,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const order = arrivalEffects(from, p).filter(e => getNode(g, e)!.op !== NodeOp.load)
             return relocated(load, env, order.length ? joinEffects(g, order) : nil())
         }
+        let required: Set<number> | undefined
         for (const id of findValues(target.id, NodeOp.load) ?? []) {
             const load = getNode(g, id)!
             if (!isNilOrVoid(getRef(load, 0))) continue
@@ -8028,6 +8058,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 return value
             }))
             if (!found || missing > 1) continue
+            required ??= demandOf(target.bodyId)
+            if (missing && !required.has(id)) continue
             for (const [from, positions] of arrivals) {
                 const known = values.get(from)!
                 let i = 0
@@ -10528,7 +10560,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         if (!inbound.size) return false
 
-        const unsigned = (T: number) => T <= Types.u64 || (T >= Types.u1 && T <= Types.u31)
+        const unsigned = (T: number) => T <= Types.u64 || T === Types.ptr || (T >= Types.u1 && T <= Types.u31)
         function interpretation(b: GraphBlock, i: number): string {
             const p = getNode(g, b.params[i])!
             if (typeRefOf(p)) return `t%${typeRefOf(p)}`
@@ -11111,13 +11143,68 @@ function rebuildable(g: Graph, id: number): boolean {
     return n.op === NodeOp.literal || n.op === NodeOp.frameAddress || gn.localSymbol(g, n) !== undefined
 }
 
+type ArmDemand = Map<number, { every: Set<number>, arms: Set<number>[] }>
+
+function demanded(g: Graph, root: number, into: Set<number>, memo: ArmDemand, stop?: Set<number>): Set<number> {
+    const stack = [root]
+    while (stack.length) {
+        const x = stack.pop()!
+        if (!x || into.has(x) || stop?.has(x)) continue
+        into.add(x)
+        const n = getNode(g, x)
+        if (!n || n.op === NodeOp.block) continue
+        if (n.op === NodeOp.select) {
+            stack.push(getRef(n, 0))
+            for (const y of armDemand(g, x, memo, stop).every) into.add(y)
+            continue
+        }
+        for (const y of getArgIds(n)) if (y) stack.push(y)
+    }
+    return into
+}
+
+function armDemand(g: Graph, id: number, memo: ArmDemand, stop?: Set<number>): { every: Set<number>, arms: Set<number>[] } {
+    const known = memo.get(id)
+    if (known) return known
+    const n = getNode(g, id)!
+    const arms: Set<number>[] = []
+    let every: Set<number> | undefined
+    for (let i = 1; i < countIds(n) && (!every || every.size); i++) {
+        const arm = getRef(n, i) ? demanded(g, getRef(n, i), new Set(), memo, stop) : new Set<number>()
+        arms.push(arm)
+        every = every ? new Set([...every].filter(x => arm.has(x))) : arm
+    }
+    const out = { every: every ?? new Set<number>(), arms }
+    memo.set(id, out)
+    return out
+}
+
+function leavesArm(g: Graph, n: GraphNode): boolean {
+    return PureOps.has(n.op) || islandLoad(g, n)
+}
+
+function dereferenceable(g: Graph, id: number): boolean {
+    const n = getNode(g, id)
+    return !!n && (n.op === NodeOp.load || n.op === NodeOp.param) && typeOf(n) === Types.ptr
+}
+
+function machineTypes(g: Graph): boolean {
+    let changed = false
+    for (const [id, n] of g.nodes) {
+        if (!typeSlots(n.op) || typeRefOf(n) || typeOf(n) !== Types.ptr) continue
+        retypeNode(g, id, Types.u64)
+        changed = true
+    }
+    return changed
+}
+
 function unorderedValue(g: Graph, id: number, cache: Map<number, boolean>): boolean {
     if (!id) return true
     const known = cache.get(id)
     if (known !== undefined) return known
     cache.set(id, true)
     const n = getNode(g, id)!
-    let ok = PureOps.has(n.op) || islandLoad(g, n)
+    let ok = leavesArm(g, n)
     for (let i = 0; ok && i < countIds(n); i++) {
         const a = getRef(n, i)
         if (a && !unorderedValue(g, a, cache)) ok = false
@@ -11129,7 +11216,7 @@ function unorderedValue(g: Graph, id: number, cache: Map<number, boolean>): bool
 function effectNode(g: Graph, id: number, cache: Map<number, boolean>): boolean {
     const n = getNode(g, id)!
     if (n.op === NodeOp.select) return !unorderedValue(g, id, cache)
-    return !PureOps.has(n.op) && !islandLoad(g, n)
+    return !leavesArm(g, n)
 }
 
 function hollowOrdering(g: Graph, id: number, cache: Map<number, boolean>, hollow: Map<number, boolean>): boolean {
@@ -13016,7 +13103,7 @@ function coveredRegion(g: Graph, uses: Map<number, number>, arm: number, params?
 }
 
 // TODO: factor out baggage claim and use it here, it would be more accurate.
-function sharedArmValues(g: Graph, selectId: number, memo: Map<number, { every: Set<number>, arms: Set<number>[] }>): Set<number> {
+function sharedArmValues(g: Graph, selectId: number, memo: ArmDemand): Set<number> {
     const select = getNode(g, selectId)!
     const none = new Set<number>()
     const control = (n: GraphNode) => n.op === NodeOp.apply || n.op === NodeOp.ret || n.op === NodeOp.select || n.op === NodeOp.after
@@ -13028,41 +13115,9 @@ function sharedArmValues(g: Graph, selectId: number, memo: Map<number, { every: 
         const arm = getNode(g, getRef(select, i))
         if (!arm || ((arm.op === NodeOp.apply || arm.op === NodeOp.ret) && !getArgIds(arm).some(x => x && shareable(x)))) return none
     }
-    function certain(id: number, into: Set<number>): Set<number> {
-        const stack = [id]
-        while (stack.length) {
-            const x = stack.pop()!
-            if (!x || into.has(x)) continue
-            into.add(x)
-            const n = getNode(g, x)
-            if (!n || n.op === NodeOp.block) continue
-            if (n.op === NodeOp.select) {
-                stack.push(getRef(n, 0))
-                for (const y of armsShare(x).every) into.add(y)
-                continue
-            }
-            for (const y of getArgIds(n)) if (y) stack.push(y)
-        }
-        return into
-    }
-    function armsShare(id: number): { every: Set<number>, arms: Set<number>[] } {
-        const known = memo.get(id)
-        if (known) return known
-        const n = getNode(g, id)!
-        const arms: Set<number>[] = []
-        let every: Set<number> | undefined
-        for (let i = 1; i < countIds(n) && (!every || every.size); i++) {
-            const arm = getRef(n, i) ? certain(getRef(n, i), new Set()) : new Set<number>()
-            arms.push(arm)
-            every = every ? new Set([...every].filter(x => arm.has(x))) : arm
-        }
-        const out = { every: every ?? none, arms }
-        memo.set(id, out)
-        return out
-    }
-    const { every: shared, arms } = armsShare(selectId)
+    const { every: shared, arms } = armDemand(g, selectId, memo)
     if (![...shared].some(shareable)) return none
-    const condition = certain(getRef(select, 0), new Set())
+    const condition = demanded(g, getRef(select, 0), new Set(), memo)
     const out = new Set<number>()
     for (const arm of arms) {
         for (const m of arm) {
@@ -13105,7 +13160,7 @@ function withDependencies(g: Graph, roots: Set<number>): Set<number> {
 
 function shareArmValues(g: Graph): boolean {
     let changed = false
-    const memo = new Map<number, { every: Set<number>, arms: Set<number>[] }>()
+    const memo: ArmDemand = new Map()
     function sorted(b: GraphBlock, params: Set<number>, passed: Set<number>): number[] {
         const order = [...b.params, ...passed]
         return [...params].sort((x, y) => order.indexOf(x) - order.indexOf(y))
@@ -13249,6 +13304,8 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
             return inner
         })
         const shared = new Set<number>([...interiors[0]].filter(x => interiors[1].has(x)))
+        let demand: Set<number> | undefined
+        const demandedByArms = (x: number) => (demand ??= armDemand(g, tail, new Map(), here).every).has(x)
         const hoisted = new Set<number>()
         const settled = new Map<number, boolean>()
         function liftable(x: number): boolean {
@@ -13256,7 +13313,7 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
             if (known !== undefined) return known
             settled.set(x, false)
             const m = getNode(g, x)!
-            let ok = shared.has(x) && hoistable(m)
+            let ok = shared.has(x) && hoistable(m) && (leavesArm(g, m) || demandedByArms(x))
             for (let i = 0; ok && i < countIds(m); i++) {
                 const r = getRef(m, i)
                 const u = r ? getNode(g, r) : undefined
@@ -14333,7 +14390,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target): Graph {
 
 export function prepareValueGraph(g: Graph, target: lowering.Target): Graph {
     g = expandValueGraph(g, target)
-    g = runPipeline('shape', g, target.costs, [stripMem, outlineBlocks, rotateLoops, cloneExits, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, splitScaledShifts, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [stripMem, outlineBlocks, rotateLoops, cloneExits, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
@@ -14599,6 +14656,7 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     verifyMemoryOrder(g, 'lowerable', () => mem ??= memAnalysis(g))
     const [effectful, offTail] = effectfulSelects(g)
     verifyTailEffects(g, 'lowerable', offTail)
+    verifyTokenSelects(g, 'lowerable')
     return { g, island, analysis: analyzeValueGraph(g, opts), effectful }
 }
 
