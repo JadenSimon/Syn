@@ -591,7 +591,7 @@ function startWatchdog(seconds: number, deadline = Date.now() + seconds * 1000, 
     worker.unref()
 }
 
-const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer']
+const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer', 'lowering-repros']
 
 interface CrashResume {
     suite: string
