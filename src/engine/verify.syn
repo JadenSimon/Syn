@@ -5,8 +5,8 @@
 import * as heap from './heap'
 import * as intrinsics from './intrinsics'
 import * as rt from './rt'
-import { countIds, getBlock, getLiteral, getNode, getRef, machineType, NodeOp, opName, resultType, sameSlotBits, typeOf, typeRefOf } from './graph-node'
-import type { Graph, GraphNode } from './lowering2'
+import { blockOrder, countIds, getBlock, getLiteral, getNode, getRef, machineType, NodeOp, opName, resultType, sameSlotBits, typeOf, typeRefOf } from './graph-node'
+import type { Graph, GraphBlock, GraphNode, MemAnalysis } from './lowering2'
 import type { CompileError } from './native'
 
 const Types = intrinsics.Types
@@ -123,6 +123,237 @@ export function verifyOrderingSlots(g: Graph, stage: string, ordering: (n: Graph
         for (let i = 0; i < end; i++) {
             const ref = getRef(n, i)
             if (ref && hollow(ref)) fail(stage, g, id, `(${opName(n.op)}) is ordered after %${ref} (${opName(getNode(g, ref)!.op)}), which carries no effect of its own`)
+        }
+    }
+}
+
+interface OrderRegion {
+    parent: OrderRegion | undefined
+    depth: number
+    select: number
+    accesses: [id: number, lifted: number][]
+}
+
+interface OrderEntry {
+    id: number
+    index: number
+    lifted: number
+    proxy: number
+    proxyIndex: number
+}
+
+interface OrderSlots {
+    widest: number
+    at: Map<number, OrderEntry[]>
+    anywhere: OrderEntry[]
+}
+
+interface OrderBase {
+    stores: OrderSlots
+    loads: OrderSlots
+}
+
+function orderSlots(): OrderSlots {
+    return { widest: 0, at: new Map(), anywhere: [] }
+}
+
+function collectSlots(slots: OrderSlots, pos: number | undefined, bytes: number, out: OrderEntry[]): void {
+    for (const e of slots.anywhere) out.push(e)
+    if (pos === undefined) {
+        for (const entries of slots.at.values()) {
+            for (const e of entries) out.push(e)
+        }
+        return
+    }
+    for (let at = pos - slots.widest + 1; at < pos + bytes; at++) {
+        for (const e of slots.at.get(at) ?? []) out.push(e)
+    }
+}
+
+function addSlot(slots: OrderSlots, e: OrderEntry, pos: number | undefined, bytes: number): void {
+    if (pos === undefined) {
+        slots.anywhere.push(e)
+        return
+    }
+    let entries = slots.at.get(pos)
+    if (!entries) slots.at.set(pos, entries = [])
+    entries.push(e)
+    if (bytes > slots.widest) slots.widest = bytes
+}
+
+function pruneSlots(g: Graph, mem: MemAnalysis, slots: OrderSlots, store: GraphNode, pos: number | undefined, bytes: number): void {
+    if (pos === undefined) {
+        slots.anywhere = []
+        slots.at.clear()
+        return
+    }
+    for (let at = pos - slots.widest + 1; at < pos + bytes; at++) {
+        const entries = slots.at.get(at)
+        if (!entries) continue
+        const kept: OrderEntry[] = []
+        for (const e of entries) {
+            if (!mem.covers(store, getNode(g, e.id)!)) kept.push(e)
+        }
+        if (kept.length) slots.at.set(at, kept)
+        else slots.at.delete(at)
+    }
+}
+
+export function verifyMemoryOrder(g: Graph, stage: string, getMem: () => MemAnalysis): void {
+    for (const b of g.blocks) {
+        verifyBlockMemoryOrder(g, stage, getMem, b)
+    }
+}
+
+function verifyBlockMemoryOrder(g: Graph, stage: string, getMem: () => MemAnalysis, b: GraphBlock): void {
+    const order = blockOrder(g, b)
+    const index = new Map<number, number>()
+    let accesses = 0
+    for (let k = 0; k < order.length; k++) {
+        index.set(order[k], k)
+        const op = getNode(g, order[k])?.op
+        if (op === NodeOp.load || op === NodeOp.store) accesses++
+    }
+    if (accesses < 2) return
+    const users = new Map<number, [user: number, slot: number][]>()
+    for (const id of order) {
+        const n = getNode(g, id)!
+        for (let i = 0; i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (!x || !index.has(x)) continue
+            let list = users.get(x)
+            if (!list) users.set(x, list = [])
+            list.push([id, i])
+        }
+    }
+    const root: OrderRegion = { parent: undefined, depth: 0, select: 0, accesses: [] }
+    const regionOf = new Map<number, OrderRegion>()
+    const arms = new Map<string, OrderRegion>()
+    function armOf(select: number, arm: number): OrderRegion {
+        const key = `${select}:${arm}`
+        let region = arms.get(key)
+        if (region) return region
+        const parent = regionOf.get(select)!
+        region = { parent, depth: parent.depth + 1, select, accesses: [] }
+        arms.set(key, region)
+        return region
+    }
+    function lca(x: OrderRegion | undefined, y: OrderRegion): OrderRegion {
+        if (!x) return y
+        while (x!.depth > y.depth) x = x!.parent
+        while (y.depth > x!.depth) y = y.parent!
+        while (x !== y) {
+            x = x!.parent
+            y = y.parent!
+        }
+        return x!
+    }
+    for (let k = order.length - 1; k >= 0; k--) {
+        const id = order[k]
+        let region = id === b.bodyId ? root : undefined
+        for (const [u, i] of users.get(id) ?? []) {
+            const user = regionOf.get(u)
+            if (!user) continue
+            region = lca(region, i && getNode(g, u)!.op === NodeOp.select ? armOf(u, i) : user)
+        }
+        if (region) regionOf.set(id, region)
+    }
+    const regions: OrderRegion[] = [root]
+    for (const region of arms.values()) regions.push(region)
+    for (const id of order) {
+        const op = getNode(g, id)!.op
+        if (op !== NodeOp.load && op !== NodeOp.store) continue
+        let lifted = 0
+        for (let region = regionOf.get(id); region; region = region.parent) {
+            region.accesses.push([id, lifted])
+            lifted = region.select
+        }
+    }
+    const chains = new Map<number, [chain: number, seq: number]>()
+    const tails = new Map<number, number>()
+    for (const id of order) {
+        const n = getNode(g, id)!
+        const t = getRef(n, 0)
+        const parent = t ? chains.get(t) : undefined
+        const link: [number, number] = parent && tails.get(parent[0]) === t ? [parent[0], parent[1] + 1] : [id, 0]
+        chains.set(id, link)
+        tails.set(link[0], id)
+    }
+    function chained(later: number, earlier: number): boolean {
+        const x = chains.get(later)!
+        const y = chains.get(earlier)!
+        return x[0] === y[0] && x[1] > y[1]
+    }
+    const reached = new Map<number, number>()
+    let stamp = 0
+    function search(from: number, floor: number): void {
+        stamp++
+        const work = [from]
+        while (work.length) {
+            const id = work.pop()!
+            const n = getNode(g, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+            for (let i = 0; i < countIds(n); i++) {
+                const x = getRef(n, i)
+                const at = x ? index.get(x) : undefined
+                if (at === undefined || at < floor || reached.get(x) === stamp) continue
+                reached.set(x, stamp)
+                work.push(x)
+            }
+        }
+    }
+    for (const region of regions) {
+        if (region.accesses.length < 2) continue
+        const mem = getMem()
+        const bases = new Map<number, OrderBase>()
+        for (const [id, lifted] of region.accesses) {
+            const n = getNode(g, id)!
+            const store = n.op === NodeOp.store
+            const m = mem.access(n)
+            if (!m) continue
+            const bytes = intrinsics.intrinsicBitWidth(typeOf(n)) / 8
+            let base = bases.get(m.base)
+            if (!base) bases.set(m.base, base = { stores: orderSlots(), loads: orderSlots() })
+            const candidates: OrderEntry[] = []
+            collectSlots(base.stores, m.pos, bytes, candidates)
+            if (store) collectSlots(base.loads, m.pos, bytes, candidates)
+            const conflicts: OrderEntry[] = []
+            let floor = index.get(id)!
+            for (const e of candidates) {
+                if (lifted && e.lifted === lifted) continue
+                if (mem.disjoint(n, getNode(g, e.id)!)) continue
+                if (chained(id, e.proxy) || chained(id, e.id)) {
+                    e.proxy = id
+                    e.proxyIndex = index.get(id)!
+                    continue
+                }
+                conflicts.push(e)
+                if (e.proxyIndex < floor) floor = e.proxyIndex
+            }
+            if (conflicts.length) {
+                search(id, floor)
+                const missing: OrderEntry[] = []
+                floor = index.get(id)!
+                for (const e of conflicts) {
+                    if (reached.get(e.proxy) === stamp || reached.get(e.id) === stamp) continue
+                    missing.push(e)
+                    if (e.index < floor) floor = e.index
+                }
+                if (missing.length) search(id, floor)
+                for (const e of missing) {
+                    if (reached.get(e.id) !== stamp) fail(stage, g, id, `(${opName(n.op)}) is not ordered after conflicting %${e.id} (${opName(getNode(g, e.id)!.op)}) on the same path in B${b.id}`)
+                }
+                for (const e of conflicts) {
+                    e.proxy = id
+                    e.proxyIndex = index.get(id)!
+                }
+            }
+            if (store && !lifted) {
+                pruneSlots(g, mem, base.stores, n, m.pos, bytes)
+                pruneSlots(g, mem, base.loads, n, m.pos, bytes)
+            }
+            const at = index.get(id)!
+            addSlot(store ? base.stores : base.loads, { id, index: at, lifted, proxy: id, proxyIndex: at }, m.pos, bytes)
         }
     }
 }

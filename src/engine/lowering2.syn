@@ -8,9 +8,9 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { verifyGraph, verifyOrderingSlots } from './verify'
+import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots } from './verify'
 import {
-    addGraphBlock, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
+    addGraphBlock, blockOrder, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, makeNode, type Operand, operandType, pushRefs, setDebugLabel, setGraphBlocks, setLiteral,
     recordFields, resultType, setOperand, setRef, setType, typeOf, typeRefOf, typeSlots, withRefs,
@@ -2837,6 +2837,28 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
         return false
     }
     return { of, access, disjoint, covers, clobbers, flows, users: usersOf }
+}
+
+interface CoverBase {
+    widest: number
+    at: Map<number, number>
+}
+type Cover = Map<number, CoverBase>[]
+function emptyCover(): Cover {
+    return [new Map(), new Map(), new Map(), new Map()]
+}
+interface CoverRegion {
+    parent: CoverRegion | undefined
+    depth: number
+    nodes: number[]
+}
+const CoverInert = new Set<NodeOp>([NodeOp.after, NodeOp.apply, NodeOp.ret, NodeOp.panic, NodeOp.unreachable, NodeOp.param, NodeOp.pstack, NodeOp.alloca])
+
+interface Promotion {
+    ids: Set<number>
+    stores: Set<number>
+    values: Map<number, [number, number]>
+    touched: Set<GraphBlock>
 }
 
 function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
@@ -7795,177 +7817,339 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function removedStore(store: GraphNode): number {
             return getRef(store, 0) || addNode(g, NodeOp.nilEffect, [])
         }
-        function redundant(store: GraphNode): boolean {
-            const writer = writerOf(getRef(store, 0), store)
-            const w = typeof writer === 'number' ? getNode(g, writer)! : undefined
-            if (w && bits(w) === bits(store) && sameOperand(w, store, 3)) return true
+        function operandKey(n: GraphNode, i: number): string {
+            const constant = scalarOperand(g, g.nodes, n, i)
+            if (constant !== undefined) return `#${constant}`
+            return `%${i === 1 ? tailOf(g, getRef(n, i)) : getRef(n, i)}`
+        }
+        function storeKey(store: GraphNode): string {
+            return `${operandKey(store, 1)} ${operandKey(store, 2)} ${operandKey(store, 3)}`
+        }
+        function redundant(store: GraphNode, repeated: Set<string>): boolean {
             let value = getRef(store, 3)
             for (let m = getNode(g, value); m?.op === NodeOp.after; m = getNode(g, value)) value = getRef(m, countIds(m) - 1)
             const loaded = getNode(g, value)
-            if (loaded?.op !== NodeOp.load || !sameLocation(loaded, store) || !sameSlotBits(typeOf(loaded), typeOf(store))) return false
-            return (writer !== undefined && writerOf(getRef(loaded, 0), loaded) === writer) || writerOf(getRef(store, 0), store, new Set([value, getRef(loaded, 0)])) === 'quiet'
+            const reloaded = loaded?.op === NodeOp.load && sameLocation(loaded, store) && sameSlotBits(typeOf(loaded), typeOf(store))
+            if (!reloaded && !repeated.has(storeKey(store))) return false
+            const writer = writerOf(getRef(store, 0), store)
+            const w = typeof writer === 'number' ? getNode(g, writer)! : undefined
+            if (w && bits(w) === bits(store) && sameOperand(w, store, 3)) return true
+            if (!reloaded) return false
+            return (writer !== undefined && writerOf(getRef(loaded!, 0), loaded!) === writer) || writerOf(getRef(store, 0), store, new Set([value, getRef(loaded!, 0)])) === 'quiet'
         }
         if (!r.size) {
+            const seen = new Set<string>()
+            const repeated = new Set<string>()
+            for (const id of findValues(target.id, NodeOp.store) ?? []) {
+                const key = storeKey(getNode(g, id)!)
+                if (seen.has(key)) repeated.add(key)
+                seen.add(key)
+            }
             for (const id of findValues(target.id, NodeOp.store) ?? []) {
                 const store = getNode(g, id)!
-                if (redundant(store)) r.set(id, removedStore(store))
+                if (redundant(store, repeated)) r.set(id, removedStore(store))
             }
         }
-        let partial = false
-        function overwritten(id: number, store: GraphNode): boolean {
-            const kills = new Set<number>()
-            let budget = 512
-            const seen = new Set<number>([id])
-            const pending: [node: number, from: number][] = []
-            function reach(node: number, from: number): void {
-                if (seen.has(node)) return
-                seen.add(node)
-                pending.push([node, from])
+        function coverAt(cover: Cover, m: Mem, bytes: number): void {
+            const kinds = cover[m.kind]
+            let entry = kinds.get(m.base)
+            if (!entry) kinds.set(m.base, entry = { widest: 0, at: new Map() })
+            if ((entry.at.get(m.pos!) ?? 0) < bytes) entry.at.set(m.pos!, bytes)
+            if (bytes > entry.widest) entry.widest = bytes
+        }
+        function coverStore(cover: Cover, store: GraphNode): void {
+            const m = mem!.access(store)
+            if (m && m.pos !== undefined) coverAt(cover, m, bits(store) / 8)
+        }
+        function coveredAt(cover: Cover, m: Mem, bytes: number): boolean {
+            const entry = cover[m.kind].get(m.base)
+            if (!entry) return false
+            for (let at = m.pos! + bytes - entry.widest; at <= m.pos!; at++) {
+                const width = entry.at.get(at)
+                if (width !== undefined && m.pos! + bytes <= at + width) return true
             }
-            function afterKill(node: number): boolean {
-                if (!kills.size) return false
-                const stack = [node]
-                const visited = new Set<number>()
-                let steps = 128
-                while (stack.length) {
-                    const at = stack.pop()!
-                    if (kills.has(at)) return true
-                    if (at === id || visited.has(at) || --steps < 0) continue
-                    visited.add(at)
-                    const n = getNode(g, at)
-                    if (n && n.op !== NodeOp.select) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
-                }
-                return false
+            return false
+        }
+        function covered(cover: Cover, store: GraphNode): boolean {
+            const m = mem!.access(store)
+            return !!m && m.pos !== undefined && coveredAt(cover, m, bits(store) / 8)
+        }
+        function clearExcept(kinds: Map<number, CoverBase>, base: number): void {
+            const kept = kinds.get(base)
+            kinds.clear()
+            if (kept) kinds.set(base, kept)
+        }
+        function observe(cover: Cover, load: GraphNode): void {
+            const m = mem!.access(load)
+            if (!m) {
+                for (const kinds of cover) kinds.clear()
+                return
             }
-            function users(node: number): void {
-                for (const user of dependents.get(node) ?? []) reach(user, node)
+            if (m.kind !== MemFresh) clearExcept(cover[MemUnknown], m.base)
+            if (m.kind !== MemFresh) clearExcept(cover[MemPre], m.base)
+            if (m.kind === MemUnknown) clearExcept(cover[MemFresh], m.base)
+            if (m.kind === MemFresh) clearExcept(cover[MemUnknown], m.base)
+            const entry = cover[m.kind].get(m.base)
+            if (!entry) return
+            if (m.pos === undefined) {
+                cover[m.kind].delete(m.base)
+                return
             }
-            function enter(id: number): boolean {
-                const apply = getNode(g, id)!
-                const block = getBlock(g, getRef(apply, 0))
-                if (!block || soleArrival(block) !== id) return false
-                for (let i = 1; i < countIds(apply); i++) if (seen.has(getRef(apply, i))) reach(block.params[i - 1], 0)
-                for (const op of [NodeOp.load, NodeOp.store, NodeOp.call, NodeOp.pstack, NodeOp.alloca, NodeOp.after]) {
-                    for (const entry of findValues(block.id, op) ?? []) {
-                        if (getNode(g, getRef(getNode(g, entry)!, 0))?.op === NodeOp.nilEffect) reach(entry, 0)
-                    }
-                }
-                reach(block.bodyId, 0)
-                return true
+            const bytes = bits(load) / 8
+            for (let at = m.pos - entry.widest + 1; at < m.pos + bytes; at++) {
+                const width = entry.at.get(at)
+                if (width !== undefined && at + width > m.pos) entry.at.delete(at)
             }
-            function feeds(load: number): boolean {
-                const stack = [getRef(store, 3)]
-                const visited = new Set<number>()
-                let steps = 64
-                while (stack.length) {
-                    const at = stack.pop()!
-                    if (at === load) return true
-                    if (!at || visited.has(at) || --steps < 0) continue
-                    visited.add(at)
-                    const n = getNode(g, at)
-                    if (n && n.op !== NodeOp.select) for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
-                }
-                return false
+        }
+        function copyCover(cover: Cover): Cover {
+            const out = emptyCover()
+            for (let kind = 0; kind < cover.length; kind++) {
+                for (const [base, entry] of cover[kind]) out[kind].set(base, { widest: entry.widest, at: new Map(entry.at) })
             }
-            users(id)
-            while (pending.length) {
-                let next = 0
-                for (let i = 1; i < pending.length; i++) if (pending[i][0] < pending[next][0]) next = i
-                const [node, from] = pending[next]
-                pending[next] = pending[pending.length - 1]
-                pending.pop()
-                if (--budget < 0) return false
-                const n = getNode(g, node)
-                if (!n || afterKill(node)) continue
-                if (n.op === NodeOp.store) {
-                    if (mem!.covers(n, store)) {
-                        kills.add(node)
-                        continue
-                    }
-                    if (mem!.covers(store, n)) partial = true
-                    users(node)
-                    continue
-                }
-                if (n.op === NodeOp.load) {
-                    if (!mem!.disjoint(n, store)) return false
-                    users(node)
-                    continue
-                }
-                if (n.op === NodeOp.after) {
-                    let sequenced = getRef(n, countIds(n) - 1)
-                    for (let m = getNode(g, sequenced); m?.op === NodeOp.after; m = getNode(g, sequenced)) sequenced = getRef(m, countIds(m) - 1)
-                    const value = getNode(g, sequenced)
-                    if (sequenced !== from && value && !isUnordered(sequenced)) {
-                        if (value.op === NodeOp.load) {
-                            if (!mem!.disjoint(value, store) && !feeds(sequenced)) return false
-                        } else if (value.op === NodeOp.apply) {
-                            if (!enter(sequenced)) return false
-                        } else if (value.op === NodeOp.select) {
-                            for (const p of tailPositions(g, sequenced)) {
-                                const tail = getNode(g, p.at)!
-                                if (tail.op === NodeOp.apply ? !enter(p.at) : tail.op !== NodeOp.unreachable) return false
-                            }
-                        } else if (value.op !== NodeOp.pstack && value.op !== NodeOp.alloca && value.op !== NodeOp.void && !PureOps.has(value.op)) {
-                            return false
+            return out
+        }
+        function meetCover(a: Cover, b: Cover): Cover {
+            const out = emptyCover()
+            for (const [x, y] of [[a, b], [b, a]]) {
+                for (let kind = 0; kind < x.length; kind++) {
+                    for (const [base, entry] of x[kind]) {
+                        for (const [pos, width] of entry.at) {
+                            const m: Mem = { base, pos, kind }
+                            if (coveredAt(y, m, width)) coverAt(out, m, width)
                         }
                     }
-                    users(node)
-                    continue
                 }
-                if (n.op === NodeOp.apply) {
-                    if (!enter(node)) return false
-                    continue
+            }
+            return out
+        }
+        const entryCovers = new Map<number, Cover | undefined>()
+        function entryCover(app: number): Cover | undefined {
+            const block = getBlock(g, getRef(getNode(g, app)!, 0))
+            if (!block || block === target || soleArrival(block) !== app) return emptyCover()
+            if (entryCovers.has(block.id)) return entryCovers.get(block.id)
+            const cover = scanCover(block, false)
+            entryCovers.set(block.id, cover)
+            return cover
+        }
+        function meetCovers(a: Cover | undefined, b: Cover | undefined): Cover | undefined {
+            if (!a) return b
+            if (!b) return a
+            return meetCover(a, b)
+        }
+        function scanCover(b: GraphBlock, deep: boolean, onStore?: (id: number, store: GraphNode, cover: Cover) => void): Cover | undefined {
+            const order = blockOrder(g, b)
+            const inBlock = new Set(order)
+            const root: CoverRegion = { parent: undefined, depth: 0, nodes: [] }
+            const arms = new Map<string, CoverRegion>()
+            function armOf(select: number, arm: number): CoverRegion {
+                const key = `${select}:${arm}`
+                let region = arms.get(key)
+                if (region) return region
+                const parent = regionOf.get(select) ?? root
+                region = { parent, depth: parent.depth + 1, nodes: [] }
+                arms.set(key, region)
+                return region
+            }
+            function lca(x: CoverRegion | undefined, y: CoverRegion): CoverRegion {
+                if (!x) return y
+                while (x!.depth > y.depth) x = x!.parent
+                while (y.depth > x!.depth) y = y.parent!
+                while (x !== y) {
+                    x = x!.parent
+                    y = y.parent!
                 }
-                if (n.op === NodeOp.select) {
-                    if (!from) {
-                        for (let i = 1; i < countIds(n); i++) if (getRef(n, i)) reach(getRef(n, i), 0)
+                return x!
+            }
+            const regionOf = new Map<number, CoverRegion>()
+            const branches = !!findValues(b.id, NodeOp.select)?.length
+            if (!branches) for (let k = order.length - 1; k >= 0; k--) root.nodes.push(order[k])
+            for (let k = order.length - 1; branches && k >= 0; k--) {
+                const id = order[k]
+                let region = id === b.bodyId ? root : undefined
+                for (const u of dependents.get(id) ?? []) {
+                    const user = regionOf.get(u)
+                    if (!user || !inBlock.has(u)) continue
+                    const n = getNode(g, u)!
+                    if (n.op !== NodeOp.select) {
+                        region = lca(region, user)
                         continue
                     }
-                    if (getRef(n, 0) === from) return false
-                    continue
+                    for (let i = 0; i < countIds(n); i++) {
+                        if (getRef(n, i) === id) region = lca(region, i ? armOf(u, i) : user)
+                    }
                 }
-                if (n.op === NodeOp.unreachable) continue
-                if (n.op === NodeOp.param || n.op === NodeOp.pstack || n.op === NodeOp.alloca || PureOps.has(n.op)) {
-                    users(node)
-                    continue
-                }
-                return false
+                if (!region) continue
+                regionOf.set(id, region)
+                region.nodes.push(id)
             }
-            return kills.size > 0
+            function leafOf(id: number): number {
+                for (let n = getNode(g, id); n?.op === NodeOp.after; n = getNode(g, id)) id = getRef(n, countIds(n) - 1)
+                return id
+            }
+            function structuredArms(n: GraphNode): boolean {
+                for (let i = 1; i < countIds(n); i++) if (!hasStructuredTail(g, getRef(n, i))) return false
+                return true
+            }
+            function meetArms(select: number, n: GraphNode, continuation: Cover | undefined): Cover | undefined {
+                let out: Cover | undefined
+                let first = true
+                for (let i = 1; i < countIds(n); i++) {
+                    const arm = scanRegion(armOf(select, i), getRef(n, i), continuation)
+                    out = first ? arm : meetCovers(out, arm)
+                    first = false
+                }
+                return out
+            }
+            function scanRegion(region: CoverRegion, value: number, continuation: Cover | undefined): Cover | undefined {
+                const leaf = leafOf(value)
+                const tail = getNode(g, leaf)
+                let terminal = 0
+                let cover: Cover | undefined
+                if (tail?.op === NodeOp.unreachable) {
+                    terminal = leaf
+                } else if (tail?.op === NodeOp.apply) {
+                    terminal = leaf
+                    cover = deep ? entryCover(leaf) : emptyCover()
+                    if (cover) cover = copyCover(cover)
+                } else if (tail && (tail.op === NodeOp.ret || tail.op === NodeOp.panic || tail.op === NodeOp.trap)) {
+                    terminal = leaf
+                    cover = emptyCover()
+                } else if (tail?.op === NodeOp.select && structuredArms(tail)) {
+                    terminal = leaf
+                    cover = meetArms(leaf, tail, continuation)
+                } else {
+                    cover = continuation && copyCover(continuation)
+                }
+                for (const id of region.nodes) {
+                    if (id === terminal) continue
+                    const n = getNode(g, id)!
+                    if (n.op === NodeOp.select) {
+                        cover = meetArms(id, n, cover)
+                        continue
+                    }
+                    if (PureOps.has(n.op) || CoverInert.has(n.op)) continue
+                    cover ??= emptyCover()
+                    if (n.op === NodeOp.store) {
+                        if (onStore) onStore(id, n, cover)
+                        else coverStore(cover, n)
+                        continue
+                    }
+                    if (n.op === NodeOp.load) {
+                        observe(cover, n)
+                        continue
+                    }
+                    for (const kinds of cover) kinds.clear()
+                }
+                return cover
+            }
+            return scanRegion(root, b.bodyId, emptyCover())
         }
-        function liveHalf(id: number, store: GraphNode): number | undefined {
-            const width = bits(store)
-            const constant = scalarOperand(g, g.nodes, store, 3)
-            if (width < 16 || getRef(store, 2) || constant === undefined || constant < 0 || !Number.isSafeInteger(constant) || typeOf(store) === Types.f64 || typeOf(store) === Types.f32) return
-            const half = width / 2
-            const pieces = [0, 1].map(k => {
-                const operands = getOperands(g, store)
-                operands[2] = { literal: getLiteral(g, store, 2) + k * half / 8 }
-                operands[3] = { literal: Math.floor(constant / 2 ** (k * half)) % 2 ** half }
-                const piece = copyNode(g, store, operands)
-                setType(piece, half === 32 ? Types.u32 : half === 16 ? Types.u16 : Types.u8)
-                return piece
-            })
-            const dead = pieces.map(piece => overwritten(id, piece))
-            if (dead[0] === dead[1]) return
-            return insertNode(g, pieces[dead[0] ? 1 : 0])
+        function liveHalf(store: GraphNode, cover: Cover): GraphNode {
+            let piece = store
+            for (;;) {
+                const width = bits(piece)
+                const constant = scalarOperand(g, g.nodes, piece, 3)
+                if (width < 16 || getRef(piece, 2) || constant === undefined || constant < 0 || !Number.isSafeInteger(constant) || typeOf(piece) === Types.f64 || typeOf(piece) === Types.f32) return piece
+                const half = width / 2
+                const from = piece
+                const halves = [0, 1].map(k => {
+                    const operands = getOperands(g, from)
+                    operands[2] = { literal: getLiteral(g, from, 2) + k * half / 8 }
+                    operands[3] = { literal: Math.floor(constant / 2 ** (k * half)) % 2 ** half }
+                    const next = copyNode(g, from, operands)
+                    setType(next, half === 32 ? Types.u32 : half === 16 ? Types.u16 : Types.u8)
+                    return next
+                })
+                const dead = halves.map(h => covered(cover, h))
+                if (dead[0] === dead[1]) return piece
+                piece = halves[dead[0] ? 1 : 0]
+            }
         }
-        if (!r.size) {
-            for (const id of findValues(target.id, NodeOp.store) ?? []) {
+        function killable(): boolean {
+            const stores = findValues(target.id, NodeOp.store)?.length ?? 0
+            let following = 0
+            for (const next of successors.get(target.id) ?? []) following += findValues(next, NodeOp.store)?.length ?? 0
+            if (!stores || (stores === 1 && !following)) return false
+            const spans = new Map<string, Map<number, number[]>>()
+            const own: [number, string, number, number][] = []
+            let widest = 1
+            function add(id: number, mine: boolean): void {
                 const store = getNode(g, id)!
-                partial = false
-                if (overwritten(id, store)) {
-                    r.set(id, removedStore(store))
-                    continue
-                }
-                const kept = partial ? liveHalf(id, store) : undefined
-                if (kept !== undefined) r.set(id, kept)
+                const m = mem!.access(store)
+                if (!m || m.pos === undefined) return
+                const key = `${m.kind}:${m.base}`
+                let at = spans.get(key)
+                if (!at) spans.set(key, at = new Map())
+                const bytes = bits(store) / 8
+                if (bytes > widest) widest = bytes
+                let list = at.get(m.pos)
+                if (!list) at.set(m.pos, list = [])
+                list.push(id, bytes)
+                if (mine) own.push([id, key, m.pos, bytes])
             }
+            for (const id of findValues(target.id, NodeOp.store) ?? []) add(id, true)
+            for (const next of successors.get(target.id) ?? []) {
+                for (const id of findValues(next, NodeOp.store) ?? []) add(id, false)
+            }
+            for (const [id, key, pos, bytes] of own) {
+                const at = spans.get(key)!
+                for (let p = pos - widest + 1; p < pos + bytes; p++) {
+                    const list = at.get(p)
+                    if (!list) continue
+                    for (let i = 0; i < list.length; i += 2) {
+                        if (list[i] !== id && p + list[i + 1] > pos) return true
+                    }
+                }
+            }
+            return false
+        }
+        function inside(cover: Cover, store: GraphNode): boolean {
+            const m = mem!.access(store)
+            const entry = m && m.pos !== undefined ? cover[m.kind].get(m.base) : undefined
+            if (!entry) return false
+            const end = m!.pos! + bits(store) / 8
+            for (let at = m!.pos!; at < end; at++) {
+                const width = entry.at.get(at)
+                if (width !== undefined && at + width <= end) return true
+            }
+            return false
+        }
+        if (!r.size && killable()) {
+            const pieces = new Map<number, GraphNode>()
+            scanCover(target, true, (id, store, cover) => {
+                if (covered(cover, store)) {
+                    r.set(id, removedStore(store))
+                    return
+                }
+                const kept = inside(cover, store) ? liveHalf(store, cover) : store
+                if (kept === store) {
+                    coverStore(cover, store)
+                    return
+                }
+                pieces.set(id, kept)
+                coverStore(cover, kept)
+            })
+            for (const [id, piece] of pieces) r.set(id, insertNode(g, piece))
         }
         if (!r.size) return false
+        const resolvedValues = new Map<number, number>()
+        const resolvedTokens = new Map<number, number>()
         function resolve(id: number, value: boolean): number {
+            const memo = value ? resolvedValues : resolvedTokens
+            const path: number[] = []
             let at = id
-            for (let next = value ? forwarded.get(at) ?? r.get(at) : r.get(at); next !== undefined; next = value ? forwarded.get(at) ?? r.get(at) : r.get(at)) at = next
+            for (;;) {
+                const known = memo.get(at)
+                if (known !== undefined) {
+                    at = known
+                    break
+                }
+                const next = value ? forwarded.get(at) ?? r.get(at) : r.get(at)
+                if (next === undefined) break
+                path.push(at)
+                at = next
+            }
+            for (const x of path) memo.set(x, at)
             return at
         }
         for (const id of r.keys()) {
@@ -8065,29 +8249,96 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return key
         }
         let changed = false
-        let stored: string[] = []
-        let again = true
-        while (again) {
-            again = false
-            for (const id of allocations(target.id)) {
-                const key = keyOf(id)
-                if (key === undefined || unpromotable.has(key)) continue
-                let inside = false
-                if (!promoteAlloca(key, keyOf, () => inside = true)) {
-                    unpromotable.add(key)
-                    if (inside) stored.push(key)
-                    continue
-                }
-                changed = true
-                again = true
-                for (const k of stored) unpromotable.delete(k)
-                stored = []
-            }
+        const batch: Promotion = { ids: new Set(), stores: new Set(), values: new Map(), touched: new Set() }
+        let queue = allocations(target.id)
+        let at = 0
+        let stored: number[] = []
+        let progress = false
+        function renamed(ids: number[], rewritten: Map<number, number>): number[] {
+            const out: number[] = []
+            for (const id of ids) out.push(rewritten.get(id) ?? id)
+            return out
         }
+        function rename(rewritten: Map<number, number>): void {
+            queue = renamed(queue.slice(at), rewritten)
+            at = 0
+            stored = renamed(stored, rewritten)
+        }
+        function settle(): void {
+            const rewritten = settlePromotions(batch)
+            if (rewritten) rename(rewritten)
+        }
+        while (at < queue.length) {
+            const id = queue[at]
+            const key = keyOf(id)
+            if (key === undefined || unpromotable.has(key)) {
+                at++
+                continue
+            }
+            let inside = false
+            const result = promoteAlloca(key, keyOf, () => inside = true, batch)
+            if (result === 'settle') {
+                settle()
+                continue
+            }
+            at++
+            if (!result) {
+                unpromotable.add(key)
+                if (inside) stored.push(id)
+            } else {
+                changed = true
+                progress = true
+                if (result !== true) rename(result)
+            }
+            if (at < queue.length || !stored.length || !progress) continue
+            settle()
+            for (const k of stored) unpromotable.delete(keyOf(k)!)
+            queue = stored
+            at = 0
+            stored = []
+            progress = false
+        }
+        settle()
         return changed
     }
 
-    function promoteAlloca(key: string, keyOf: (id: number) => string | undefined, storedInside: () => void): boolean {
+    function promotedReplacements(p: Promotion): Map<number, number> {
+        const replaced = new Map<number, number>()
+        function replacement(id: number): number {
+            const known = replaced.get(id)
+            if (known !== undefined) return known
+            const n = getNode(g, id)
+            if (!n) return id
+            let result = id
+            if (p.stores.has(id) || (p.ids.has(id) && n.op === NodeOp.pstack)) {
+                result = getRef(n, 0) ? replacement(getRef(n, 0)) : addNode(g, NodeOp.nilEffect, [])
+            } else if (p.values.has(id)) {
+                const [ref, literal] = p.values.get(id)!
+                result = addNode(g, NodeOp.after, [replacement(getRef(n, 0)), ref ? replacement(ref) : { literal }])
+            }
+            if (result !== id) replaced.set(id, result)
+            return result
+        }
+        for (const id of p.stores) replacement(id)
+        for (const id of p.values.keys()) replacement(id)
+        for (const id of p.ids) replacement(id)
+        return replaced
+    }
+
+    function settlePromotions(batch: Promotion): Map<number, number> | undefined {
+        if (!batch.ids.size) return
+        const replaced = promotedReplacements(batch)
+        const rewritten = new Map<number, number>()
+        for (const b of batch.touched) b.bodyId = replaceTransitive(b.bodyId, replaced, rewritten)
+        for (const b of batch.touched) revisitBlock(b)
+        batch.ids.clear()
+        batch.stores.clear()
+        batch.values.clear()
+        batch.touched.clear()
+        return rewritten
+    }
+
+    function promoteAlloca(key: string, keyOf: (id: number) => string | undefined, storedInside: () => void, batch: Promotion): boolean | 'settle' | Map<number, number> {
         const ids = new Set<number>()
         const touched = new Set<GraphBlock>()
         const homes = new Map<number, number>()
@@ -8475,31 +8726,23 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             values.set(id, value)
         }
 
+        if (!added.size && !pointerSlots.size) {
+            for (const id of ids) if (batch.ids.has(id)) return 'settle'
+            for (const id of stores) if (batch.stores.has(id)) return 'settle'
+            for (const id of ids) batch.ids.add(id)
+            for (const id of stores) batch.stores.add(id)
+            for (const [id, value] of values) batch.values.set(id, value)
+            for (const b of touched) batch.touched.add(b)
+            return true
+        }
+        if (batch.ids.size) return 'settle'
         for (const [block, offsets] of added) {
             const b = getGraphBlock(block)
             for (const offset of offsets) b.params.push(entries.get(`${block}:${offset}`)!)
             touched.add(b)
             for (const from of preds.get(block) ?? []) touched.add(getGraphBlock(from))
         }
-        const replaced = new Map<number, number>()
-        function replacement(id: number): number {
-            const known = replaced.get(id)
-            if (known !== undefined) return known
-            const n = getNode(g, id)
-            if (!n) return id
-            let result = id
-            if (stores.has(id) || (ids.has(id) && n.op === NodeOp.pstack)) {
-                result = getRef(n, 0) ? replacement(getRef(n, 0)) : addNode(g, NodeOp.nilEffect, [])
-            } else if (values.has(id)) {
-                const [ref, literal] = values.get(id)!
-                result = addNode(g, NodeOp.after, [replacement(getRef(n, 0)), ref ? replacement(ref) : { literal }])
-            }
-            if (result !== id) replaced.set(id, result)
-            return result
-        }
-        for (const id of stores) replacement(id)
-        for (const id of values.keys()) replacement(id)
-        for (const id of ids) replacement(id)
+        const replaced = promotedReplacements({ ids, stores, values, touched })
 
         function rewriteTail(b: GraphBlock): number {
             function walk(id: number, tokens: number[]): number {
@@ -8547,7 +8790,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const rewritten = new Map<number, number>()
         for (const b of touched) b.bodyId = replaceTransitive(rewriteTail(b), replaced, rewritten)
         for (const b of touched) revisitBlock(b)
-        return true
+        return rewritten
     }
 
     function splitConstant(term: number): [term: number, offset: number] {
@@ -14058,6 +14301,8 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     const unordered = new Map<number, boolean>()
     const hollow = new Map<number, boolean>()
     verifyOrderingSlots(g, 'lowerable', firstNonOrderingSlot, id => hollowOrdering(g, id, unordered, hollow))
+    let mem: MemAnalysis | undefined
+    verifyMemoryOrder(g, 'lowerable', () => mem ??= memAnalysis(g))
     return { g, island, analysis: analyzeValueGraph(g, opts) }
 }
 
