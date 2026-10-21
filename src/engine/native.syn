@@ -176,6 +176,7 @@ function runtimeHeapBase(): number {
     if (!base || base === -1) throw 'native: failed to map the runtime heap'
     runtimeHeapAddress = base
     writeRuntimeHeap(heap.runtimeCells, new Uint8Array(new Uint32Array([heap.runtimeCells + 8]).buffer))
+    for (const handle of heap.fixedHandles) mirrorCell(handle)
     return base
 }
 const mirroredCells = new Set<number>()
@@ -429,11 +430,15 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         case NodeOp.heapHandle: {
             const cell = getLiteral(graph, n, 0) as intrinsics.Handle
             if (getRef(n, 0)) throw `static: %${id} is a symbolic heap value`
+            if (heap.isNullishHandle(cell)) {
+                value = BigInt(0)
+                break
+            }
             if (mirroredCells.has(heap.deref(cell))) {
                 value = BigInt(heap.deref(cell))
                 break
             }
-            const at = cell ? ctx.address(cell) : 0
+            const at = ctx.address(cell)
             if (at === undefined) throw `static: %${id} refers to heap value @${cell}, which has no static address`
             value = BigInt(at)
             break
@@ -490,12 +495,11 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             break
         case NodeOp.encode: {
             const ptr = int(0)
-            if (!ptr) throw `static: %${id} encodes a null pointer`
-            value = BigInt.asUintN(32, (ptr - int(1)) * BigInt(2) + BigInt(heap.pstackWordTag + 1))
+            value = !ptr ? BigInt(heap.undefinedWord) : BigInt.asUintN(32, (ptr - int(1)) * BigInt(2) + BigInt(heap.pstackWordTag + 1))
             break
         }
         case NodeOp.decode:
-            value = ((int(0) >> BigInt(1)) & BigInt((1 << 28) - 1)) + int(1)
+            value = int(0) === BigInt(heap.undefinedWord) ? BigInt(0) : ((int(0) >> BigInt(1)) & BigInt((1 << 28) - 1)) + int(1)
             break
         case NodeOp.crc32:
             value = BigInt(intrinsics.crc32Bits(Number(BigInt.asUintN(32, int(0))), int(1), intrinsics.intrinsicBitWidth(getLiteral(graph, n, 2))))
@@ -694,7 +698,8 @@ function evaluateStatics(program: ProgramGraph): void {
         if (!known.size) continue
         for (const [id, n] of graph.nodes) {
             if (n.op !== NodeOp.decode || !known.has(getRef(n, 0)) || getRef(n, 1)) continue
-            known.set(id, ((known.get(getRef(n, 0))! >>> 1) & ((1 << 28) - 1)) + getLiteral(graph, n, 1))
+            const word = known.get(getRef(n, 0))!
+            known.set(id, word === heap.undefinedWord ? 0 : ((word >>> 1) & ((1 << 28) - 1)) + getLiteral(graph, n, 1))
         }
         for (const [id, n] of [...graph.nodes]) {
             let ops: Operand[] | undefined
@@ -1669,29 +1674,39 @@ rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.add, [getOper
 rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [getOperand(g, n, 2), { literal: ctx.pstackBase() }]) })
 const typeofStrings = 1
 const typeofObjects = 2
+const typeofUndefined = 4
 
 rt.bind(rt.Op.typeof, {
     lower: (g, n, ctx) => {
         const word = getOperand(g, n, 2)
-        const tag = ctx.add(makeNode(g, NodeOp.and, [word, { literal: 1 }], Types.u64))
         const kinds = countIds(n) < 4 ? 0 : getLiteral(g, n, 3)
-        if (!kinds) return makeNode(g, NodeOp.select, [tag, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }])
-        const boxed = ctx.add(makeNode(g, NodeOp.ge, [word, { literal: heap.pstackBoxWordTag }], Types.bool))
-        if (kinds === typeofStrings) return makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.select, [boxed, { literal: heap.typeNames.number }, { literal: heap.typeNames.string }])), { literal: heap.typeNames.number }])
-        const handled = ctx.add(makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.lt, [word, { literal: heap.pstackWordTag }], Types.bool)), { literal: 0 }]))
-        const shifted = ctx.add(makeNode(g, NodeOp.convert, [ctx.add(makeNode(g, NodeOp.ushr, [word, { literal: 1 }], Types.u32))], Types.u64))
-        const handle = ctx.add(makeNode(g, NodeOp.select, [handled, shifted, { literal: 0 }]))
-        const cell = ctx.add(makeNode(g, NodeOp.add, [handle, { literal: ctx.runtimeHeapBase() }], Types.u64))
-        const td = ctx.add(makeNode(g, NodeOp.load, [getOperand(g, n, 0), cell, { literal: 0 }], Types.u32))
-        const [externalTD, internedTD] = heap.stringTypeDescriptors
-        const external = ctx.add(makeNode(g, NodeOp.eq, [td, { literal: externalTD }], Types.bool))
-        const string = ctx.add(makeNode(g, NodeOp.or, [external, ctx.add(makeNode(g, NodeOp.eq, [td, { literal: internedTD }], Types.bool))], Types.bool))
-        const object = ctx.add(makeNode(g, NodeOp.and, [tag, ctx.add(makeNode(g, NodeOp.not, [boxed], Types.bool))], Types.bool))
-        const named = ctx.add(makeNode(g, NodeOp.and, [handled, string], Types.bool))
-        const kind = ctx.add(makeNode(g, NodeOp.select, [object, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }]))
-        return makeNode(g, NodeOp.select, [named, { literal: heap.typeNames.string }, kind])
+        if (kinds & typeofUndefined) {
+            const named = ctx.add(lowerTypeof(g, n, ctx, word, kinds & ~typeofUndefined))
+            const missing = ctx.add(makeNode(g, NodeOp.eq, [word, { literal: heap.undefinedWord }], Types.bool))
+            return makeNode(g, NodeOp.select, [missing, { literal: heap.typeNames.undefined }, named])
+        }
+        return lowerTypeof(g, n, ctx, word, kinds)
     },
 })
+
+function lowerTypeof(g: NodeSpace, n: GraphNode, ctx: rt.NativeContext, word: Operand, kinds: number): GraphNode {
+    const tag = ctx.add(makeNode(g, NodeOp.and, [word, { literal: 1 }], Types.u64))
+    if (!kinds) return makeNode(g, NodeOp.select, [tag, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }])
+    const boxed = ctx.add(makeNode(g, NodeOp.ge, [word, { literal: heap.pstackBoxWordTag }], Types.bool))
+    if (kinds === typeofStrings) return makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.select, [boxed, { literal: heap.typeNames.number }, { literal: heap.typeNames.string }])), { literal: heap.typeNames.number }])
+    const handled = ctx.add(makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.lt, [word, { literal: heap.pstackWordTag }], Types.bool)), { literal: 0 }]))
+    const shifted = ctx.add(makeNode(g, NodeOp.convert, [ctx.add(makeNode(g, NodeOp.ushr, [word, { literal: 1 }], Types.u32))], Types.u64))
+    const handle = ctx.add(makeNode(g, NodeOp.select, [handled, shifted, { literal: 0 }]))
+    const cell = ctx.add(makeNode(g, NodeOp.add, [handle, { literal: ctx.runtimeHeapBase() }], Types.u64))
+    const td = ctx.add(makeNode(g, NodeOp.load, [getOperand(g, n, 0), cell, { literal: 0 }], Types.u32))
+    const [externalTD, internedTD] = heap.stringTypeDescriptors
+    const external = ctx.add(makeNode(g, NodeOp.eq, [td, { literal: externalTD }], Types.bool))
+    const string = ctx.add(makeNode(g, NodeOp.or, [external, ctx.add(makeNode(g, NodeOp.eq, [td, { literal: internedTD }], Types.bool))], Types.bool))
+    const object = ctx.add(makeNode(g, NodeOp.and, [tag, ctx.add(makeNode(g, NodeOp.not, [boxed], Types.bool))], Types.bool))
+    const named = ctx.add(makeNode(g, NodeOp.and, [handled, string], Types.bool))
+    const kind = ctx.add(makeNode(g, NodeOp.select, [object, { literal: heap.typeNames.object }, { literal: heap.typeNames.number }]))
+    return makeNode(g, NodeOp.select, [named, { literal: heap.typeNames.string }, kind])
+}
 
 function putRuntimeCall(g: NodeSpace, id: number, target: number, n: GraphNode, symbol: number): void {
     putNode(g, target, NodeOp.localTarget, [{ literal: symbol }], Types.u32)
@@ -1749,7 +1764,7 @@ function rewriteTargets(
             continue
         }
         const handle = heap.deref(getLiteral(out, n, 0) as intrinsics.Handle)
-        if (!getRef(n, 0) && mirroredCells.has(handle)) {
+        if (!getRef(n, 0) && mirroredCells.has(handle) && !heap.isNullishHandle(handle)) {
             putNode(out, id, NodeOp.literal, [{ literal: handle }], Types.u32)
             continue
         }
@@ -2400,7 +2415,7 @@ function createImage() {
                 else if (Number.isInteger(raw)) view.setBigUint64(offset, BigInt.asUintN(64, BigInt(raw)), true)
                 else fail(`field ${heap.stringToJs(keys[i])} holds ${raw}, which is not an integer`)
                 if (tag) setBit(tag)
-            } else if (!slot && tag) {
+            } else if (heap.isNullishHandle(slot) && tag) {
                 continue
             } else if (slot && heap.isOrdinaryObject(heap.deref(slot))) {
                 view.setBigUint64(offset, BigInt(placeObject(slot, allocated, fail)), true)
@@ -3155,7 +3170,7 @@ function splice(graph: Graph, call: number, callee: Graph): void {
     callee.blocks[0].params.forEach((p, i) => {
         let arg = getRef(n, 3 + i)
         if (3 + i >= countIds(n)) {
-            arg = addNode(graph, NodeOp.heapHandle, [{ literal: 0 }], Types.unknown_number)
+            arg = addNode(graph, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }], Types.unknown_number)
         } else if (!arg) {
             arg = addNode(graph, NodeOp.literal, [{ literal: getLiteral(graph, n, 3 + i) }])
         }
@@ -4529,7 +4544,7 @@ function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined, nodes
             const word = addNode(graph, NodeOp.load, [token, data, at], Types.vm_value)
             const box = addNode(graph, NodeOp.decode, [word, { literal: pstack0Base() }])
             putNode(graph, id, NodeOp.convert, [addNode(graph, NodeOp.load, [word, box, { literal: 0 }], Types.f64)], Types.i64)
-            if (element.nullable) tags.reads.set(id, addNode(graph, NodeOp.ne, [word, { literal: 0 }], Types.bool))
+            if (element.nullable) tags.reads.set(id, addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool))
             continue
         }
         if (!taggedSlice(slices, id)) {
@@ -4953,6 +4968,10 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         for (const n of reachable(graph)) {
             if (n.op !== NodeOp.heapHandle) continue
             const handle = heap.deref(getLiteral(graph, n, 0) as intrinsics.Handle)
+            if (!getRef(n, 0) && heap.isNullishHandle(handle)) {
+                dataHandleSlots.set(handle, image.pointerSlot(0, 'nullish'))
+                continue
+            }
             if (session.constructions.has(getLiteral(graph, n, 0) as u32)) {
                 dataHandleSlots.set(handle, image.constructionSlot(getLiteral(graph, n, 0), cell => session.constructions.get(cell as u32)?.graph, cell => statics.readonly.has(heap.deref(cell as intrinsics.Handle)), cell => statics.boxed.get(heap.deref(cell as intrinsics.Handle))))
                 continue
@@ -4973,7 +4992,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
             if (!heap.isCallable(handle as intrinsics.Handle)) {
                 dataHandleSlots.set(handle, heap.isString(handle as intrinsics.Handle)
                     ? image.stringSlot(heap.stringToJs(handle as intrinsics.Handle))
-                    : image.pointerSlot(handle, !handle ? 'nullish' : heap.isOrdinaryObject(handle as intrinsics.Handle) ? describe(handle as intrinsics.Handle) : `@${handle}`))
+                    : image.pointerSlot(handle, heap.isOrdinaryObject(handle as intrinsics.Handle) ? describe(handle as intrinsics.Handle) : `@${handle}`))
                 continue
             }
             const linked = session.stubFunctions.get(getLiteral(graph, n, 0)) as any
@@ -5667,7 +5686,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (full.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
             return full.slot0 as intrinsics.Handle
         }
-        return 0 as intrinsics.Handle
+        return heap.undefinedHandle
     }
     function accessorOf(object: intrinsics.Handle, key: intrinsics.Handle, flag: heap.PropFlags): intrinsics.Handle | undefined {
         if (heap.isProxy(object) || heap.getPropertyProxy(object, key)) return
@@ -5684,7 +5703,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         return !!fn?.shouldInline
     }
     function reference(slot: intrinsics.Handle): boolean {
-        return slot > 1 && !heap.isBoxedF64(slot)
+        return !!slot && !heap.isOddballHandle(slot) && !heap.isBoxedF64(slot)
     }
     function staticRead(traced: Traced, n: GraphNode): intrinsics.Handle | undefined {
         if (n.op !== NodeOp.getProp || getRef(n, 2)) return
@@ -5711,8 +5730,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                 const id = heap.boxedNanId(slot)
                 return id ? id : { literal: heap.unboxF64(slot) }
             }
-            const cell = slot <= 1 ? slot : runtimeObjects().intern(slot)
-            if (cell === 1) return { literal: 1 }
+            const cell = !slot ? heap.undefinedHandle : heap.isOddballHandle(slot) ? slot : runtimeObjects().intern(slot)
             let known = nodes.get(cell)
             if (known === undefined) nodes.set(cell, known = addNode(graph, NodeOp.heapHandle, [{ literal: cell }], Types.unknown_number))
             return known
@@ -5807,7 +5825,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
     }
     function packRest(graph: Graph, operands: Operand[], rest: number): void {
         const extra = operands.splice(3 + rest)
-        while (operands.length < 3 + rest) operands.push(addNode(graph, NodeOp.heapHandle, [{ literal: 0 }], Types.unknown_number))
+        while (operands.length < 3 + rest) operands.push(addNode(graph, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }], Types.unknown_number))
         const array = addNode(graph, NodeOp.rt, [operands[0], { literal: rt.Op.arrayLiteral }, { literal: extra.length }])
         let token = array
         for (let i = 0; i < extra.length; i++) {
@@ -6165,7 +6183,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             }
             if (regular < compiled.paramCount) {
                 if (regular < args.length) map.set(p, args[regular])
-                else map.set(p, nullishNode ||= addNode(graph, NodeOp.heapHandle, [{ literal: 0 }], Types.unknown_number))
+                else map.set(p, nullishNode ||= addNode(graph, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }], Types.unknown_number))
                 regular++
                 continue
             }
@@ -6814,7 +6832,7 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, linker: Linker
             if (n.op === NodeOp.ret || n.op === NodeOp.inlined) return raw(getRef(n, 0))
             if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.literal) return true
             if (rt.sliceOf(graph, n) === rt.Op.sliceRead) return rawSlice(unit.slices, id)
-            if (n.op === NodeOp.heapHandle && !getRef(n, 0)) return !getLiteral(graph, n, 0) || unit.allocations.has(id)
+            if (n.op === NodeOp.heapHandle && !getRef(n, 0)) return heap.isNullishHandle(getLiteral(graph, n, 0) as intrinsics.Handle) || unit.allocations.has(id)
             if (n.op === NodeOp.param) return graph.blocks[0].params.includes(id) || (arrivals.has(id) && arrivals.get(id)!.every(raw))
             if (n.op === NodeOp.call || n.op === NodeOp.getProp) {
                 const callees = unit.calls.get(id)
@@ -7054,13 +7072,25 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))
             return !!rep && unionWord(rep)
         }
-        function stringTarget(x: number): boolean {
-            const rep = x ? nodes.get(x) ?? nodes.get(tailOf(graph, x)) : undefined
-            return !!rep && union(x) && rep.targets.includes('str')
+        let users: Map<number, number[]> | undefined
+        function numberTested(id: number): boolean {
+            users ??= nodeUsers(graph, graph.nodes.keys())
+            for (const user of users.get(id) ?? []) {
+                const u = getNode(graph, user)!
+                if (u.op !== NodeOp.eq && u.op !== NodeOp.ne) return false
+                const other = getNode(graph, getRef(u, getRef(u, 0) === id ? 1 : 0))
+                if (other?.op !== NodeOp.heapHandle || getRef(other, 0) || getLiteral(graph, other, 0) !== heap.typeNames.number) return false
+            }
+            return true
         }
-        function typeofKinds(x: number): number {
+        function typeofKinds(id: number, x: number): number {
             const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))!
-            return rep.targets.some(target => target !== 'str') ? typeofStrings | typeofObjects : typeofStrings
+            const strings = !rep.targets.includes('str') ? 0 : rep.targets.some(target => target !== 'str') ? typeofStrings | typeofObjects : typeofStrings
+            return rep.nullable && !numberTested(id) ? strings | typeofUndefined : strings
+        }
+        function typeofTarget(id: number, x: number): boolean {
+            const rep = x ? nodes.get(x) ?? nodes.get(tailOf(graph, x)) : undefined
+            return !!rep && union(x) && typeofKinds(id, x) !== 0
         }
         function word(x: Operand): boolean {
             if (typeof x !== 'number' || !x) return false
@@ -7089,13 +7119,28 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (!(handle && heap.isString(handle)) && !isStringRep(rep)) return
             return tagVmHandleNode(graph, x)
         }
+        function nullishWord(x: number): Operand {
+            const n = getNode(graph, x)!
+            if (n.op !== NodeOp.after) return addNode(graph, NodeOp.literal, [{ literal: heap.undefinedWord }], Types.vm_value)
+            const last = countIds(n) - 1
+            return addNode(graph, NodeOp.after, withOperand(graph, n, last, nullishWord(getRef(n, last))))
+        }
         function toWord(x: Operand): Operand {
             if (typeof x !== 'number') return { literal: x.literal * 2 }
+            if (isNullishValue(graph, x)) return nullishWord(x)
             if (union(x) || word(x)) return x
             return stringWord(x) ?? (object(x) ? encode(x) : addNode(graph, NodeOp.box, [x], Types.vm_value))
         }
         function asWord(x: Operand): Operand {
+            if (typeof x === 'number' && isNullishValue(graph, x)) return nullishWord(x)
             return object(x) ? encode(x as number) : x
+        }
+        function truthWord(x: Operand): Operand {
+            const rep = nodes.get(x as number) ?? nodes.get(tailOf(graph, x as number))
+            const present = addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool)
+            if (!rep?.nullable) return present
+            const missing = addNode(graph, NodeOp.literal, [{ literal: heap.undefinedWord }], Types.vm_value)
+            return addNode(graph, NodeOp.and, [present, addNode(graph, NodeOp.ne, [x, missing], Types.bool)], Types.bool)
         }
         function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
             if (rep && unionWord(rep)) return toWord(x)
@@ -7141,9 +7186,12 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         function returnWord(id: number, n: GraphNode): void {
             if (!own.has(id)) return
             const value = getRef(n, 0)
+            const returns = local?.unit.returns
+            const rawNullish = isNullishValue(graph, value) && returns?.kind === 'number'
             if (abi.mode === 'raw' && word(value)) coerce(id, [0], () => decode(value))
             else if (abi.mode === 'keep' && !!local && unionWord(local.unit.returns) && rawCalls.has(tailOf(graph, value))) coerce(id, [0], () => encode(value))
             else if (abi.mode === 'keep' && !!local && unionWord(local.unit.returns)) coerce(id, [0], toWord)
+            else if (abi.mode === 'encoded' && rawNullish) return
             else if (abi.mode === 'encoded') coerce(id, [0], asWord)
         }
         for (const [id, n] of [...graph.nodes]) {
@@ -7154,9 +7202,12 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 const code = addNode(graph, NodeOp.load, [getRef(n, 0), ptr, 0], Types.fnptr)
                 coerce(id, [1], () => addNode(graph, NodeOp.indirectTarget, [code, ptr]))
             } else if (n.op === NodeOp.bitconvert) coerce(id, [0], asWord)
-            else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && stringTarget(getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(getRef(n, 2)) }])
+            else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && typeofTarget(id, getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(id, getRef(n, 2)) }])
             else if (n.op === NodeOp.rt) coerce(id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), asWord)
             else if (n.op === NodeOp.eq || n.op === NodeOp.ne) coerce(id, [0, 1].filter(at => word(getRef(n, 1 - at))), asWord)
+        }
+        for (const [id, n] of [...graph.nodes]) {
+            if (n.op === NodeOp.select && union(getRef(n, 0))) coerce(id, [0], truthWord)
         }
         for (const [id, n] of [...graph.nodes]) {
             if (n.op === NodeOp.apply) {
@@ -7760,7 +7811,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 else putNode(graph, id, NodeOp.getProp, [tok, array, index])
             }
             rewrote(call, pair ? elements : values.map(id => [id, -1]), index)
-            for (const id of returnProps) putNode(graph, id, NodeOp.heapHandle, [{ literal: 0 }])
+            for (const id of returnProps) putNode(graph, id, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }])
             for (const id of [call, ...nextProps, ...returnCalls, iterator, ...relay ?? [], made, symbol]) {
                 if (!getNode(graph, id) || getNode(graph, id)!.op === NodeOp.after) continue
                 const tok = getRef(getNode(graph, id)!, 0)
@@ -7881,7 +7932,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         if (local !== undefined) return `${head} ${functions[local]?.name || `symbol ${local}`}`
         if (n.op === NodeOp.heapHandle && !getRef(n, 0)) {
             const handle = getLiteral(graph, n, 0)
-            if (!handle) return 'undefined'
+            if (heap.isNullishHandle(handle as intrinsics.Handle)) return handle === heap.nullHandle ? 'null' : 'undefined'
             const stub = session.stubFunctions.get(handle as u32)
             return stub ? `${head} ${stub.name || 'anonymous'}` : `${head} #${handle}`
         }
