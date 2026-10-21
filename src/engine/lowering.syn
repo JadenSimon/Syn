@@ -942,12 +942,28 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 }
 
                 if (it.kind === 'cset' && i + 1 < items.length) {
-                    const br = items[i + 1]
+                    let j = i + 1
+                    let read = false
+                    const reach = Math.min(items.length - 1, i + 9)
+                    while (j < reach) {
+                        const next = items[j]
+                        if (next.kind === 'label' && !branchTarget(next.label)) {
+                            j++
+                            continue
+                        }
+                        if (next.kind !== 'insn' || next.setsFlags || next.clobbers) break
+                        const writes: number[] = []
+                        const reads: number[] = []
+                        if (!itemDefs(next, writes) || !itemUses(next, reads) || writes.includes(it.reg)) break
+                        if (reads.includes(it.reg)) read = true
+                        j++
+                    }
+                    const br = items[j]
                     if ((br.kind === 'cbnz' || br.kind === 'cbz') && br.reg === it.reg) {
                         // cbz branches when the predicate was false
                         br.cond = br.kind === 'cbz' ? (it.cond ^ 1) : it.cond
                         br.kind = 'bcond'
-                        if (br.deadAfter?.has(it.reg)) {
+                        if (br.deadAfter?.has(it.reg) && !read) {
                             removedWrites.push(it.reg)
                             items.splice(i, 1)
                         }
@@ -1162,13 +1178,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
         for (let i = items.length - 1; i >= 3; i--) {
             reuseConditionalFlags(i)
-            const branch = items[i]
-            if ((branch?.kind === 'cbz' || branch?.kind === 'cbnz') && items[i - 1]?.aluName === 'and'
-                && branch.deadAfter?.has(branch.reg)) {
-                const before = items.length
-                emitterStep(fuseLateConjunction, i)
-                i -= before - items.length
-            }
         }
         const returns = new Map<number, AsmItem>()
         for (let i = 0; i < items.length; i++) {
@@ -2584,39 +2593,19 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
     }
 
-    function flagsUnusedFrom(at: number, budget = 32): boolean {
-        for (let i = at; i < items.length && budget-- > 0; i++) {
-            const it = items[i]
-            if (it.kind === 'bcond' || it.kind === 'cset' || it.cselCond !== undefined || it.cond >= 0) return false
-            if (it.setsFlags || it.clobbers || it.word === 0xD65F03C0) return true
-            if (isBranch(it.kind)) {
-                const target = items.findIndex(label => label.kind === 'label' && label.label === it.label)
-                if (target < 0 || !flagsUnusedFrom(target + 1, Math.floor(budget / 2))) return false
-                if (it.kind === 'b') return true
-            }
-        }
-        return false
-    }
-
-    function fuseLateConjunction(at: number): boolean {
-        const target = items.findIndex(it => it.kind === 'label' && it.label === items[at].label)
-        if (target < 0 || !flagsUnusedFrom(at + 1) || !flagsUnusedFrom(target + 1)) return false
-        return fuseConjunction(items[at].deadAfter!, at + 1)
-    }
-
-    function fuseConjunction(dead: Set<number>, len = items.length): boolean {
-        if (len < 6) return false
-        const branch = items[len - 1]
-        const conj = items[len - 2]
-        const late = items[len - 3]
-        const lateCmp = items[len - 4]
-        if (branch.kind !== 'cbnz' && branch.kind !== 'cbz') return false
-        if (!dead.has(branch.reg)) return false
-        if (conj.aluName !== 'and' || conj.addDst !== branch.reg) return false
+    function fuseConjunction(dead: Set<number>): boolean {
+        const len = items.length
+        if (len < 5) return false
+        const conj = items[len - 1]
+        const late = items[len - 2]
+        const lateCmp = items[len - 3]
+        const either = conj.aluName === 'orr'
+        if (conj.aluName !== 'and' && !either) return false
+        if (conj.addDst === undefined || conj.addShiftReg !== undefined) return false
         if (late.kind !== 'cset' || !lateCmp.setsFlags) return false
 
-        const floor = Math.max(1, len - 12)
-        let at = len - 5
+        const floor = Math.max(1, len - 11)
+        let at = len - 4
         while (at >= floor && items[at].kind !== 'cset') {
             const it = items[at]
             if (it.kind === 'label' || isBranch(it.kind) || it.setsFlags) return false
@@ -2629,36 +2618,46 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if ((conj.addLeft !== early.reg || conj.addRight !== late.reg)
             && (conj.addLeft !== late.reg || conj.addRight !== early.reg)) return false
         if (FalseFlags[early.cond] === undefined || FalseFlags[late.cond] === undefined) return false
+
+        const spent = (r: number) => r === conj.addDst || dead.has(r)
         for (let k = at + 1; k < len - 3; k++) {
             const defs: number[] = []
-            if (!itemDefs(items[k], defs)) return false
-            for (const r of defs) if (r === early.reg) return false
+            const uses: number[] = []
+            if (!itemDefs(items[k], defs) || !itemUses(items[k], uses)) return false
+            if (defs.includes(early.reg)) return false
+            if (spent(early.reg) && uses.includes(early.reg)) return false
         }
 
-        const spent = (r: number) => r === conj.addDst || !!conj.deadAfter?.has(r)
         let swap = false
         if (spent(late.reg) && plainCompare(lateCmp)) swap = false
-        else if (at === len - 5 && spent(early.reg) && plainCompare(earlyCmp)) swap = true
+        else if (at === len - 4 && spent(early.reg) && plainCompare(earlyCmp)) swap = true
         else return false
         if (swap) {
             const uses: number[] = []
-            if (!itemUses(earlyCmp, uses)) return false
-            for (const r of uses) if (r === late.reg) return false
+            if (!itemUses(earlyCmp, uses) || uses.includes(late.reg)) return false
+            const reads: number[] = []
+            if (!itemUses(lateCmp, reads) || reads.includes(early.reg)) return false
         }
         const head = swap ? late : early
         const tail = swap ? early : late
         const keep: AsmItem[] = [swap ? lateCmp : earlyCmp]
         if (!spent(head.reg)) keep.push(head)
-        if (!swap) for (let k = at + 1; k < len - 4; k++) keep.push(items[k])
-        const setup = toCcmp(swap ? earlyCmp : lateCmp, tail.cond, head.cond)
+        if (!swap) for (let k = at + 1; k < len - 3; k++) keep.push(items[k])
+        const flip = either ? 1 : 0
+        const setup = toCcmp(swap ? earlyCmp : lateCmp, tail.cond ^ flip, head.cond ^ flip)
         if (setup) keep.push(setup)
         keep.push(swap ? earlyCmp : lateCmp)
-        branch.cond = branch.kind === 'cbz' ? tail.cond ^ 1 : tail.cond
-        branch.kind = 'bcond'
-        keep.push(branch)
+        const dst = conj.addDst
+        const set: AsmItem = {
+            kind: 'cset', word: (0x9A9F07E0 | ((tail.cond ^ 1) << 12) | dst) >>> 0,
+            text: `cset ${x(dst)}, ${CondNames[tail.cond]}`, label: -1, reg: dst, cond: tail.cond,
+        }
+        inheritDead(set, late)
+        inheritDead(set, conj)
+        keep.push(set)
         items.splice(at - 1, len - at + 1, ...keep)
-        removedWrites.push(conj.addDst!, tail.reg)
-        if (spent(head.reg)) removedWrites.push(head.reg)
+        if (tail.reg !== dst) removedWrites.push(tail.reg)
+        if (spent(head.reg) && head.reg !== dst) removedWrites.push(head.reg)
         return true
     }
 
