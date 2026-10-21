@@ -1366,6 +1366,10 @@ class AstNode {
         return forEachChild(this as any as ts.Node, cbNode, cbNodeArray)
     }
 
+    public getSourceFileNodeCount(): number {
+        return this.buf.length / 8
+    }
+
     public getSourceFile(): ts.SourceFile | undefined {
         return getSourceFile(this as any) as ts.SourceFile | undefined
     }
