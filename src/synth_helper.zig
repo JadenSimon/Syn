@@ -521,6 +521,7 @@ pub const SynthInstrumenter = struct {
         var exp = try self.factory.createBinaryExpression(parser.unwrapRef(self.nodes.at(assign)), .comma_token, self.class_decl_static_block);
         exp = try self.factory.createBinaryExpression(exp, .comma_token, try self.getTmpBinding());
         exp = try self.factory.createParenthesizedExpression(exp);
+        self.nodes.at(exp).next = self.nodes.at(self.class_or_obj_decl).next;
 
         try self.replacements.put(self.class_or_obj_decl, exp);
     }
