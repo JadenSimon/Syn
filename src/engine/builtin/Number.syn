@@ -6,6 +6,7 @@ import * as intrinsics from '../intrinsics'
 import * as heap from '../heap'
 import { rt } from '../rt'
 import { defineGlobal } from './globals'
+import { allocate } from './memory'
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -117,6 +118,169 @@ NumberBuiltin.isFinite = function isFinite(value: any): boolean {
     return typeof value === 'number' && value === value && value !== Infinity && value !== -Infinity
 }
 
+const limbs = 16
+
+function limbAt(big: number, i: number): number {
+    return Intrinsics.load(big, i * 4, Types.u32)
+}
+
+function setLimb(big: number, i: number, value: number): void {
+    Intrinsics.store(big, i * 4, value & 0xFFFFFFFF, Types.u32)
+}
+
+function shiftLeft(big: number, bits: number): void {
+    const words = bits >> 5
+    const shift = bits & 31
+    let i = limbs
+    while (i > 0) {
+        i--
+        const from = i - words
+        const high = from >= 0 ? limbAt(big, from) << shift : 0
+        const low = from > 0 && shift ? limbAt(big, from - 1) >>> (32 - shift) : 0
+        setLimb(big, i, high | low)
+    }
+}
+
+function shiftRight(big: number, bits: number): void {
+    const words = bits >> 5
+    const shift = bits & 31
+    for (let i = 0; i < limbs; i++) {
+        const from = i + words
+        const low = from < limbs ? limbAt(big, from) >>> shift : 0
+        const high = from + 1 < limbs && shift ? limbAt(big, from + 1) << (32 - shift) : 0
+        setLimb(big, i, low | high)
+    }
+}
+
+function addSmall(big: number, at: number, value: number): void {
+    let carry = value
+    let i = at
+    while (carry && i < limbs) {
+        const sum = limbAt(big, i) + carry
+        setLimb(big, i, sum)
+        carry = sum >>> 32
+        i++
+    }
+}
+
+function mulSmall(big: number, factor: number): void {
+    let carry = 0
+    for (let i = 0; i < limbs; i++) {
+        const product = limbAt(big, i) * factor + carry
+        setLimb(big, i, product)
+        carry = product >>> 32
+    }
+}
+
+function divSmall(big: number, divisor: number): number {
+    let rem = 0
+    let i = limbs
+    while (i > 0) {
+        i--
+        const cur = Intrinsics.add(Intrinsics.shl(rem, 32, Types.u64), limbAt(big, i), Types.u64)
+        rem = Intrinsics.rem(cur, divisor, Types.u64)
+        setLimb(big, i, Intrinsics.div(cur, divisor, Types.u64))
+    }
+    return rem
+}
+
+function isZero(big: number): boolean {
+    for (let i = 0; i < limbs; i++) {
+        if (limbAt(big, i)) return false
+    }
+    return true
+}
+
+function bigOf(value: number): number {
+    const big = allocate(limbs * 4)
+    for (let i = 0; i < limbs; i++) setLimb(big, i, 0)
+    if (Intrinsics.typeof(value) !== Types.f64) {
+        const magnitude = value < 0 ? -value : value
+        setLimb(big, 0, magnitude)
+        setLimb(big, 1, magnitude >>> 32)
+        return big
+    }
+    const bits = Intrinsics.bitconvert(value, Types.f64, Types.u64)
+    const biased = Intrinsics.and(Intrinsics.ushr(bits, 52, Types.u64), 0x7FF, Types.u64)
+    let mantissa = Intrinsics.and(bits, 0xFFFFFFFFFFFFF, Types.u64)
+    if (biased) mantissa = mantissa + 0x10000000000000
+    setLimb(big, 0, mantissa)
+    setLimb(big, 1, mantissa >>> 32)
+    return big
+}
+
+function exponentOf(value: number): number {
+    if (Intrinsics.typeof(value) !== Types.f64) return 0
+    const bits = Intrinsics.bitconvert(value, Types.f64, Types.u64)
+    const biased = Intrinsics.and(Intrinsics.ushr(bits, 52, Types.u64), 0x7FF, Types.u64)
+    return (biased ? biased : 1) - 1075
+}
+
+function digitText(big: number, radix: number, minimum: number, point: number, negative: boolean): string {
+    const data = allocate(limbs * 32 + minimum + 2)
+    let count = 0
+    while (count < minimum || !isZero(big)) {
+        const digit = divSmall(big, radix)
+        Intrinsics.store(data, count, digit < 10 ? 48 + digit : 87 + digit, Types.u8)
+        count++
+    }
+    const length = count + (point ? 1 : 0) + (negative ? 1 : 0)
+    const out = allocate(length)
+    let at = 0
+    if (negative) {
+        Intrinsics.store(out, 0, 45, Types.u8)
+        at = 1
+    }
+    let i = count
+    while (i > 0) {
+        i--
+        Intrinsics.store(out, at, Intrinsics.load(data, i, Types.u8), Types.u8)
+        at++
+        if (point && i === point) {
+            Intrinsics.store(out, at, 46, Types.u8)
+            at++
+        }
+    }
+    return rt.stringOf(heap.externalString(out, length))
+}
+
+function isIntegral(value: number): boolean {
+    if (Intrinsics.typeof(value) !== Types.f64) return true
+    if (value <= -9223372036854775808 || value >= 9223372036854775808) return false
+    return Intrinsics.convert(Intrinsics.convert(value, Types.f64, Types.i64), Types.i64, Types.f64) === value
+}
+
+class NumberPrototype {
+    toString(radix?: number): string {
+        const value: number = this as any
+        if (radix === undefined || radix === 10 || value !== value || !isIntegral(value)) return `${value}`
+        if (radix < 2 || radix > 36) throw 'toString() radix must be between 2 and 36'
+        const whole = Intrinsics.typeof(value) === Types.f64 ? Intrinsics.convert(value, Types.f64, Types.i64) : value
+        return digitText(bigOf(whole), radix, 1, 0, whole < 0)
+    }
+
+    toFixed(fractionDigits?: number): string {
+        const value: number = this as any
+        const digits = fractionDigits === undefined ? 0 : fractionDigits
+        if (digits < 0 || digits > 100) throw 'toFixed() digits argument must be between 0 and 100'
+        // XXX a literal returned beside rt-built strings trips the word return ABI as a raw string handle
+        if (value !== value) return rt.stringOf(rt.handleof('NaN'))
+        if (value >= 1e21 || value <= -1e21) return `${value}`
+        const big = bigOf(value)
+        const exponent = exponentOf(value)
+        if (exponent > 0) shiftLeft(big, exponent)
+        for (let i = 0; i < digits; i++) mulSmall(big, 10)
+        if (exponent < 0) {
+            const half = -exponent - 1
+            addSmall(big, half >> 5, 1 << (half & 31))
+            shiftRight(big, -exponent)
+        }
+        return digitText(big, 10, digits + 1, digits, value < 0)
+    }
+}
+
+NumberBuiltin.prototype = NumberPrototype.prototype
+
 function isNaN(value: any): boolean {
     const number = NumberBuiltin(value)
     return number !== number
@@ -167,7 +331,29 @@ export async function suite() {
         const text = `${n}`
         return (isNaN(n) ? 1000 : 0) + (isNaN(`x${n}`) ? 100 : 0) + (isNaN(text) ? 10 : 0) + (isNaN(Number(`${n}y`)) ? 1 : 0)
     }
+    function numberToString(n: u32): number {
+        const hex = n.toString(16)
+        const binary = (n + 5).toString(2)
+        const negative = (3 - n).toString(36)
+        return hex.length * 10000 + (hex === 'ff' ? 1000 : 0) + binary.length * 100 + negative.length * 10 + (negative === '-2' ? 1 : 0) + n.toString().length
+    }
+    function digest(text: string): number {
+        let total = text.length
+        for (let i = 0; i < text.length; i++) total = (total * 31 + text.charCodeAt(i)) & 0xFFFFFF
+        return total
+    }
+    function numberToFixed(n: u32): number {
+        const half = (n + 0.5).toFixed(2)
+        const tie = (n * 1000 + 0.125).toFixed(2)
+        const inexact = (n + 1.45).toFixed(1)
+        const whole = n.toFixed(3)
+        const negative = (0 - n - 0.004).toFixed(2)
+        const long = (n + 0.1).toFixed(20)
+        return digest(half) + digest(tie) * 3 + digest(inexact) * 5 + digest(whole) * 7 + digest(negative) * 11 + digest(long) * 13 + digest((n * 0.75).toFixed()) * 17
+    }
     harness.runCases({ prefix: 'Number', args: true }, [
+        [numberToString, [0], [5], [255]],
+        [numberToFixed, [0], [3], [1000]],
         [numberConvert, [0], [3]],
         [numberParse, [0], [42]],
         // [numberParseNegative, [42], [0]],
