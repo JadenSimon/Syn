@@ -4409,10 +4409,12 @@ interface PairReads {
     fields: intrinsics.Handle[]
     getters: Set<PlannedUnit>[]
     boxed: boolean[]
+    slices: ({ key: intrinsics.Handle, element: Rep, value: Rep } | undefined)[]
 }
 
 interface UnitPlan {
     unit: PlannedUnit
+    slices: Map<number, Rep>
     nodes: Map<number, Rep>
     calls: Map<number, Set<PlannedUnit>>
     boxedCalls: Set<number>
@@ -4522,8 +4524,10 @@ function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined): Slic
         }
         const tagAt = typeof at === 'number' ? addNode(graph, NodeOp.add, [at, { literal: 8 }], Types.unknown_number) : { literal: at.literal + 8 }
         if (op === rt.Op.sliceRead) {
-            putNode(graph, id, NodeOp.load, [token, data, at], type)
-            tags.reads.set(id, addNode(graph, NodeOp.load, [token, data, tagAt], Types.u64))
+            const tag = addNode(graph, NodeOp.load, [token, data, tagAt], Types.u64)
+            const payload = addNode(graph, NodeOp.load, [token, data, at], type)
+            putNode(graph, id, NodeOp.after, [tag, payload])
+            tags.reads.set(id, tag)
             continue
         }
         const value = getOperand(graph, n, 4)
@@ -6986,7 +6990,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             return !!n && (n.op === NodeOp.encode || n.op === NodeOp.box || resultType(graph, n) === Types.vm_value)
         }
         function rawLoad(id: number): boolean {
-            return getNode(graph, id)?.op === NodeOp.load && rawSlice(local?.unit.slices, id)
+            return getNode(graph, id)?.op === NodeOp.load && rawSlice(local?.slices, id)
         }
         function object(x: Operand): boolean {
             if (typeof x !== 'number') return false
@@ -7292,15 +7296,11 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         substituteConstantParams(traced.graph, constantParams(fn))
         verifyTraced(traced, 'resolve:entry')
         const plannedUnit = planned.units.get(fn)
-        const local: UnitPlan | undefined = plannedUnit && { unit: plannedUnit, nodes: new Map(plannedUnit.nodes), calls: new Map(plannedUnit.calls), boxedCalls: new Set(plannedUnit.boxedCalls) }
+        const local: UnitPlan | undefined = plannedUnit && { unit: plannedUnit, slices: new Map(plannedUnit.slices), nodes: new Map(plannedUnit.nodes), calls: new Map(plannedUnit.calls), boxedCalls: new Set(plannedUnit.boxedCalls) }
         const bound = new Map<number, PlannedUnit>()
         tracer.foldStatics(traced, plan.fixedStatic)
         if (plannedUnit?.blocks.size) pruneUnentered(traced.graph, plannedUnit, traced.allocations)
         if (local) plannedRuntimeCalls(traced.graph, local)
-        let sliceTags: SliceTags | undefined
-        if ([...traced.graph.nodes.values()].some(n => rt.sliceOf(traced.graph, n) !== undefined)) {
-            sliceTags = realizeSlices(traced.graph, plannedUnit?.slices)
-        }
         if (flags.has(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...plan.embedded.fields.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
             const shapes = [...paramShapesOf(fn)].map(([i, s]) => `${i}=${describe(s)} refined=${refined(s)}`).join(' ')
@@ -7365,11 +7365,26 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 const boxed = [...local!.calls.get(next) ?? []].some(unit => [...unit.calls].some(([node, set]) => unit.boxedCalls.has(node) && [...set].some(read => reads.has(read))))
                 if (!pair && reads.size !== 1) return
                 for (const [id, slot] of values) {
+                    const slice = pair?.slices[slot]
+                    if (slice) {
+                        const n = getNode(traced.graph, id)!
+                        const data = addNode(traced.graph, NodeOp.getProp, [getOperand(traced.graph, n, 0), getOperand(traced.graph, n, 1), { literal: slice.key }])
+                        putNode(traced.graph, id, NodeOp.rt, [data, { literal: rt.Op.sliceRead }, data, getOperand(traced.graph, n, 2), { literal: Types.vm_value }])
+                        local!.slices.set(id, slice.element)
+                        local!.nodes.set(id, slice.value)
+                        local!.calls.delete(id)
+                        local!.boxedCalls.delete(id)
+                        continue
+                    }
                     local!.calls.set(id, pair ? pair.getters[slot] : reads)
                     if (pair ? pair.boxed[slot] : boxed) local!.boxedCalls.add(id)
                     else if (pair) local!.boxedCalls.delete(id)
                 }
             })
+        }
+        let sliceTags: SliceTags | undefined
+        if ([...traced.graph.nodes.values()].some(n => rt.sliceOf(traced.graph, n) !== undefined)) {
+            sliceTags = realizeSlices(traced.graph, local?.slices)
         }
         const dynamic = local ? runtimeHeapSites(local, traced.graph) : undefined
         verifyTraced(traced, 'resolve:input')
@@ -7455,16 +7470,34 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         let fields: intrinsics.Handle[] | undefined
         const getters = [new Set<PlannedUnit>(), new Set<PlannedUnit>()]
         const boxed = [false, false]
+        const slices: PairReads['slices'] = []
         for (const unit of nexts) {
             const g = graphsOf(unit.fn).traced!.graph
             const found: intrinsics.Handle[] = []
             for (const [, n] of g.nodes) {
                 if (n.op !== NodeOp.rt || getRef(n, 1) || getLiteral(g, n, 1) !== rt.Op.arrayElement || getRef(n, 3)) continue
                 const slot = getLiteral(g, n, 3)
-                const value = getRef(n, 4)
+                const value = tailOf(g, getRef(n, 4))
                 const read = getNode(g, value)
-                const array = read?.op === NodeOp.getProp && getRef(read, 2) ? getNode(g, getRef(read, 1)) : undefined
+                const slice = read && rt.sliceOf(g, read) === rt.Op.sliceRead
+                const data = slice ? getNode(g, getRef(read!, 2)) : undefined
+                const array = slice && data?.op === NodeOp.getProp && !getRef(data, 2) ? getNode(g, getRef(data, 1))
+                    : read?.op === NodeOp.getProp && getRef(read, 2) ? getNode(g, getRef(read, 1)) : undefined
                 if (slot > 1 || array?.op !== NodeOp.getProp || getRef(array, 2)) return
+                if (slice) {
+                    const element = unit.slices.get(value)
+                    const rep = unit.nodes.get(value)
+                    const index = getNode(g, getRef(read!, 3))
+                    const key = getLiteral(g, data!, 2) as intrinsics.Handle
+                    const known = slices[slot]
+                    if (rt.elementType(g, read!) !== Types.vm_value || index?.op !== NodeOp.getProp || getRef(index, 2) || getRef(index, 1) !== thisParamOf(g)) return
+                    if (!element || !rep || rep.kind === 'never' || getters[slot].size) return
+                    if (known && (known.key !== key || known.element.text !== element.text || known.value.text !== rep.text)) return
+                    slices[slot] = { key, element, value: rep }
+                    found[slot] = getLiteral(g, array, 2) as intrinsics.Handle
+                    continue
+                }
+                if (slices[slot]) return
                 const callees = [...unit.calls.get(value) ?? []]
                 if (!callees.length || callees.some(callee => originOf(callee.fn) !== indexGetter())) return
                 found[slot] = getLiteral(g, array, 2) as intrinsics.Handle
@@ -7475,8 +7508,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (fields && (fields[0] !== found[0] || fields[1] !== found[1])) return
             fields = found
         }
-        if (!fields || getters.some(set => set.size !== 1)) return
-        return { fields, getters, boxed }
+        if (!fields || getters.some((set, i) => !slices[i] && set.size !== 1)) return
+        return { fields, getters, boxed, slices }
     }
     function plannedIterations(local: UnitPlan, graph: Graph): Map<number, Iterated> {
         const iterations = new Map<number, Iterated>()

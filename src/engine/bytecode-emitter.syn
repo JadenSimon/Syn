@@ -62,11 +62,13 @@ export enum ConstantKind {
 type ScopeBinding = { slot: number, parentSlot: number }
 type OuterSymbol = { scopeSlot: number, reg: number }
 type FoldResultValue = string | number | boolean | undefined | null
+type PrivateMember = { node: ts.GetAccessorDeclaration | ts.MethodDeclaration, template?: EmitResult, compiling?: boolean }
 type EmitCtx = {
     outerSymbols: Map<number, OuterSymbol>
     outerFolded: Map<number, [FoldResultValue]>
     owner?: ts.Identifier
     privateNames?: Map<string, symbol>
+    privateMembers?: Map<string, PrivateMember>
 }
 const thisSymbol = -3
 
@@ -109,6 +111,24 @@ function classPrivateNames(node: ts.ClassDeclaration | ts.ClassExpression, outer
         if (member.name && ts.isPrivateIdentifier(member.name)) names.set(member.name.text, Symbol(member.name.text))
     }
     return names
+}
+
+function isPrivateMember(member: ts.ClassElement): member is ts.GetAccessorDeclaration | ts.MethodDeclaration {
+    if (!member.name || !ts.isPrivateIdentifier(member.name)) return false
+    return ts.isGetAccessorDeclaration(member) || ts.isMethodDeclaration(member)
+}
+
+function classPrivateMembers(node: ts.ClassDeclaration | ts.ClassExpression, outer?: Map<string, PrivateMember>): Map<string, PrivateMember> {
+    const members = new Map(outer)
+    for (const member of node.members) {
+        if (member.name && ts.isPrivateIdentifier(member.name)) members.delete(member.name.text)
+    }
+    for (const member of node.members) {
+        if (!isPrivateMember(member)) continue
+        if (isStaticMember(member)) throw `static private members are not supported: ${member.name.getText()}`
+        members.set((member.name as ts.PrivateIdentifier).text, { node: member })
+    }
+    return members
 }
 
 function isFieldDeclaration(member: ts.ClassElement): boolean {
@@ -190,6 +210,8 @@ function emitFunction(
 ): EmitResult {
     const outerSymbols = emitCtx.outerSymbols
     let privateNames = emitCtx.privateNames
+    let privateMembers = emitCtx.privateMembers
+    const privateMemberSlots = new Map<PrivateMember, number>()
     const code: number[] = []
     const constants: any[] = []
     const constantKinds: ConstantKind[] = []
@@ -1194,6 +1216,7 @@ function emitFunction(
         finish: (getOp: number, setOp: number, robj: number, keySlot: number) => void,
     ) {
         if (target.questionDotToken) throw `optional chaining assignment is not supported`
+        if (ts.isPropertyAccessExpression(target) && ts.isPrivateIdentifier(target.name) && privateMembers?.has(target.name.text)) throw `cannot assign to private member ${target.name.text}`
         const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression
 
         emitExpr(target.expression) // acc = object
@@ -1304,6 +1327,76 @@ function emitFunction(
         star(reg)
     }
 
+    function privateMember(name: ts.MemberName): PrivateMember | undefined {
+        if (!ts.isPrivateIdentifier(name)) return
+        return privateMembers?.get(name.text)
+    }
+
+    function privateTemplate(member: PrivateMember, name: string): number {
+        const known = privateMemberSlots.get(member)
+        if (known !== undefined) return known
+        if (member.compiling) throw `recursive private member ${name} is not supported`
+        member.compiling = true
+        defer member.compiling = false
+        const template = member.template ?? emitFunction(member.node, closureCtx(member.node))
+        template.name = name
+        if (template.scopeBindings.length && template.selfSlot !== undefined) throw `recursive private method ${name} with captures is not supported`
+        if (!template.scopeBindings.length) member.template = template
+        const slot = constants.length
+        constants.push(template)
+        constantKinds.push(ConstantKind.nested_function)
+        privateMemberSlots.set(member, slot)
+        return slot
+    }
+
+    function ownSlot(): number {
+        if (selfSlot !== undefined) return selfSlot
+        selfSlot = constants.length
+        constants.push(fn.name!.getText())
+        constantKinds.push(ConstantKind.function_)
+        return selfSlot
+    }
+
+    function emitPrivateGetter(name: ts.MemberName): boolean {
+        const getter = privateMember(name)
+        if (!getter) return false
+        if (!ts.isGetAccessorDeclaration(getter.node)) throw `private method ${name.getText()} can only be called`
+        const slot = privateTemplate(getter, name.getText())
+        const template = constants[slot] as EmitResult
+        if (!template.scopeBindings.length) {
+            emit4(Op.CallConst, slot, 0, 0)
+        } else {
+            const receiver = allocReg()
+            star(receiver)
+            emit2(Op.CreateClosure, slot)
+            const callee = allocReg()
+            star(callee)
+            ldar(receiver)
+            emit4(Op.Call, callee, 0, 0)
+            freeReg()
+            freeReg()
+        }
+        return true
+    }
+
+    function emitPrivateCall(node: ts.CallExpression, method: PrivateMember): void {
+        const target = node.expression as ts.PropertyAccessExpression
+        if (node.questionDotToken || target.questionDotToken) throw `optional chaining is not supported`
+        const receiver = allocReg()
+        defer freeReg()
+        emitExpr(target.expression)
+        star(receiver)
+        if (method.node === fn) return emitCallArgs('CallConst', ownSlot(), node.arguments, receiver)
+        const slot = privateTemplate(method, target.name.text)
+        const template = constants[slot] as EmitResult
+        if (!template.scopeBindings.length) return emitCallArgs('CallConst', slot, node.arguments, receiver)
+        emit2(Op.CreateClosure, slot)
+        const callee = allocReg()
+        defer freeReg()
+        star(callee)
+        emitCallArgs('Call', callee, node.arguments, receiver)
+    }
+
     function emitPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number, shouldSpillRecv = true) {
         if (node.questionDotToken) throw `optional chaining is not supported`
 
@@ -1315,6 +1408,7 @@ function emitFunction(
         }
 
         if (receiverReg !== undefined && shouldSpillRecv) star(receiverReg)
+        if (ts.isPropertyAccessExpression(node) && emitPrivateGetter(node.name)) return
 
         if (node.kind === ts.SyntaxKind.ElementAccessExpression) {
             const key = tryFoldExp(node.argumentExpression)
@@ -1354,6 +1448,7 @@ function emitFunction(
     }
 
     function emitChainedPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number) {
+        if (ts.isPropertyAccessExpression(node) && emitPrivateGetter(node.name)) return
         if (node.kind === ts.SyntaxKind.ElementAccessExpression) {
             const key = tryFoldExp(node.argumentExpression)
             if (key?.[0] === 'value' && typeof key[1] === 'number') {
@@ -1942,6 +2037,10 @@ function emitFunction(
         //     return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
         // }
 
+        if (!isConstruct && ts.isPropertyAccessExpression(node.expression)) {
+            const method = privateMember(node.expression.name)
+            if (method && ts.isMethodDeclaration(method.node)) return emitPrivateCall(node as ts.CallExpression, method)
+        }
         if (!isConstruct && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))) {
             let receiverReg = allocReg()
             const originalRecv = receiverReg
@@ -2573,13 +2672,16 @@ function emitFunction(
             if (thisReg !== undefined) childOuter.set(thisSymbol, { scopeSlot: -1, reg: thisReg })
             else if (outerSymbols.has(thisSymbol)) childOuter.set(thisSymbol, scopedSymbol(thisSymbol)!)
         }
-        return { outerSymbols: childOuter, outerFolded: foldedVariables, privateNames }
+        return { outerSymbols: childOuter, outerFolded: foldedVariables, privateNames, privateMembers }
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
         const outerPrivateNames = privateNames
+        const outerPrivateMembers = privateMembers
         privateNames = classPrivateNames(node, outerPrivateNames)
+        privateMembers = classPrivateMembers(node, outerPrivateMembers)
         defer privateNames = outerPrivateNames
+        defer privateMembers = outerPrivateMembers
         emitNested(emitClassTemplate(node, member => emitFunction(member, closureCtx(member))))
     }
 
@@ -2746,6 +2848,7 @@ function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitM
     const expandos: Expandos = new Map()
     for (const member of node.members) {
         if (member === ctor || isFieldDeclaration(member)) continue
+        if (isPrivateMember(member)) continue
         const target = isStaticMember(member) ? expandos : prototype
         if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
             const key = classMemberName(member)
@@ -2765,7 +2868,8 @@ function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitM
 function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
     const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
     const privateNames = classPrivateNames(node, undefined)
-    return emitClassTemplate(node, member => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames }))
+    const privateMembers = classPrivateMembers(node)
+    return emitClassTemplate(node, member => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames, privateMembers }))
 }
 
 export function compile(src: string): EmitResult {
@@ -3376,15 +3480,18 @@ function materializeExpando(
 // this _will_ tag the fn to dedupe compilations
 const ctxSym = Symbol('ctx')
 const substitutesSym = Symbol('substitutes')
+const membersSym = Symbol('members')
 interface Ctx {
     readonly [ctxSym]: unique symbol
     readonly [substitutesSym]: Map<any, any>
+    readonly [membersSym]: Map<Function, { compiled: EmitResult, captures: any[], owner: Function }>
     [key: string]: any
 }
 export function createCtx(o: Record<string, any> = {}): Ctx {
     return Object.assign({
         [ctxSym]: Symbol('ctx brand'),
         [substitutesSym]: new Map<any, any>([[intrinsics.Intrinsics, heap.createHeapHandle(hostIntrinsics)]]),
+        [membersSym]: new Map(),
         Object: { assign: Object.assign },
         Symbol: heap.symbolConstants,
         ...builtinGlobals,
@@ -3407,17 +3514,38 @@ function withCaptures(ctx: Ctx, captures: any[] | undefined): Ctx {
     return scoped
 }
 
+function compileComputation(f: Function): [EmitResult, any[]] {
+    const [source, captures] = computationOf(f)
+    return [compile(source), captures]
+}
+
+function bindMembers(ctx: Ctx, owner: Function, holder: any, expandos: Expandos, captures: any[]): void {
+    const members = ctx[membersSym]
+    for (const [name, value] of expandos) {
+        const d = Object.getOwnPropertyDescriptor(holder, name)!
+        if (value instanceof Map) {
+            bindMembers(ctx, owner, d.value, value, captures)
+        } else if ('code' in value) {
+            members.set(d.value, { compiled: value as EmitResult, captures, owner })
+        } else {
+            if (value.getter) members.set(d.get!, { compiled: value.getter, captures, owner })
+            if (value.setter) members.set(d.set!, { compiled: value.setter, captures, owner })
+        }
+    }
+}
+
 export function compileJsFn(f: Function, ctx: Ctx): any {
     const key = ctx[ctxSym]
     const _f = f as any
     if (const prev = _f[key]) return prev
-    const [source, captures] = computationOf(f)
-    const compiled = compile(source)
+    const member = ctx[membersSym].get(f)
+    const [compiled, captures] = member ? [member.compiled, member.captures] : compileComputation(f)
+    if (compiled.expandos) bindMembers(ctx, f, f, compiled.expandos, captures)
     // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
     _f[key] = compiled
     const scoped = withCaptures(ctx, captures)
     const proto = _f.prototype
-    if (proto === null || typeof proto !== 'object') return _f[key] = finalize(compiled, scoped)
+    if (proto === null || typeof proto !== 'object') return _f[key] = finalize(compiled, scoped, undefined, undefined, member && compileJsFn(member.owner, ctx))
     const finalized = finalize(compiled, scoped)
     const fn = _f[key] = compiled.expandos ? finalized : heap.makeFunction(finalized)
     heap.setProperty(fn, heap.prototypeKey, heap.createJsValueConverter(f => compileJsFn(f, ctx))(proto))
@@ -3864,6 +3992,37 @@ function runTest() {
     e2eTest('function classStatic(a) { class A { static twice(x) { return x * 2 } } return A.twice(a) }', [6])
     e2eTest('function classStaticThis(a) { class A { static base() { return 3 } static plus(x) { return this.base() + x } } return A.plus(a) }', [4])
     e2eTest('function classStaticMixed(a) { class P { constructor(x) { this.x = x } static of(x) { return new P(x) } get() { return this.x + 1 } } return P.of(a).get() }', [8])
+    e2eTest('function privateGetter(a) { class C { constructor(x) { this.x = x } get #twice() { return this.x * 2 } read() { return this.#twice + 1 } } return new C(a).read() }', [4])
+    e2eTest('function privateGetterCapture(a) { const k = a + 1; class C { get #k() { return k } read() { return this.#k * 10 } } return new C().read() }', [2])
+    e2eTest('function privateGetterChain(a) { class C { constructor(x) { this.x = x } get #inner() { return this.x + 1 } get #outer() { return this.#inner * 3 } read() { return this.#outer } } return new C(a).read() }', [2])
+    e2eTest('function privateGetterShadow(a) { class C { get #v() { return 1 } read() { class D { constructor() { this.#v = 7 } #v; get() { return this.#v } } return new D().get() * 10 + this.#v } } return new C().read() + a }', [3])
+    e2eTest('function privateMethod(a) { class C { constructor(x) { this.x = x } #scale(k) { return this.x * k } read(k) { return this.#scale(k) + 1 } } return new C(a).read(3) }', [4])
+    e2eTest('function privateMethodCapture(a) { const k = a + 1; class C { #add(x) { return x + k } read(x) { return this.#add(x) * 10 } } return new C().read(2) }', [2])
+    e2eTest('function privateMethodRecursive(a) { class C { #sum(n) { return n ? n + this.#sum(n - 1) : 0 } read(n) { return this.#sum(n) } } return new C().read(a) }', [5])
+    e2eTest('function privateMethodShadow(a) { class C { #v() { return 1 } read() { class D { #v() { return 7 } get() { return this.#v() } } return new D().get() * 10 + this.#v() } } return new C().read() + a }', [3])
+    e2eTest('function privateMethodOther(a) { class C { constructor(x) { this.x = x } #get() { return this.x } plus(o) { return this.#get() * 10 + o.#get() } } return new C(a).plus(new C(a + 1)) }', [2])
+    e2eTest('function privateMethodGetter(a) { class C { constructor(x) { this.x = x } get #twice() { return this.#double(this.x) } #double(n) { return n * 2 } read() { return this.#twice } } return new C(a).read() }', [4])
+    for (const [source, message] of [
+        ['function f() { class C { set #v(x) {} } return 0 }', 'unsupported class member name'],
+        ['function f() { class C { static get #v() { return 1 } } return 0 }', 'static private members are not supported'],
+        ['function f() { class C { static #m() { return 1 } } return 0 }', 'static private members are not supported'],
+        ['function f() { class C { #m() { return 1 } read() { const f = this.#m; return f() } } return new C().read() }', 'can only be called'],
+        ['function f() { class C { #m() { return 1 } write() { this.#m = 2 } } return 0 }', 'cannot assign to private member'],
+        ['function f() { class C { #a() { return this.#b() } #b() { return this.#a() } read() { return this.#a() } } return new C().read() }', 'recursive private member'],
+        ['function f(k) { class C { #m(n) { return n ? k + this.#m(n - 1) : 0 } read() { return this.#m(2) } } return new C().read() }', 'recursive private method #m with captures'],
+        ['function f() { class C { get #v() { return this.#v } read() { return this.#v } } return new C().read() }', 'recursive private member'],
+        ['function f() { class C { get #v() { return 1 } write() { this.#v = 2 } } return 0 }', 'cannot assign to private member'],
+        ['function f() { class C { get #v() { return 1 } bump() { this.#v++ } } return 0 }', 'cannot assign to private member'],
+        ['function f() { class C { get #v() { return 1 } bump() { this.#v += 1 } } return 0 }', 'cannot assign to private member'],
+    ]) {
+        let error = ''
+        try {
+            compile(source)
+        } catch (e) {
+            error = String(e)
+        }
+        if (!error.includes(message)) throw `private accessor: expected "${message}" from ${source}, got "${error}"`
+    }
     e2eTest('function classFromCtx(a) { return new Point(a).value() }', [4], null, createCtx({
         Point: class Point { constructor(public x: number) {} value() { return this.x + 1 } },
     }))

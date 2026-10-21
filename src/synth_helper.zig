@@ -551,6 +551,7 @@ pub const SynthInstrumenter = struct {
                 switch (node.kind) {
                     .method_declaration => {
                         const name_ref = parser.getLeft(self.nodes.at(ref));
+                        if (self.nodes.at(name_ref).kind == .private_identifier) return;
                         var member_access = try self.getClassLikeTarget();
                         if (!node.hasFlag(.static) and self.nodes.at(member_access).kind == .this_keyword) member_access = try self.factory.createFieldAccess(member_access, "prototype");
                         member_access = try self.factory.createFieldAccess(member_access, name_ref);
@@ -563,6 +564,7 @@ pub const SynthInstrumenter = struct {
                     },
                     .get_accessor, .set_accessor => {
                         const name_ref = parser.getLeft(self.nodes.at(ref));
+                        if (self.nodes.at(name_ref).kind == .private_identifier) return;
                         var member_access = try self.getClassLikeTarget();
                         if (!node.hasFlag(.static) and self.nodes.at(member_access).kind == .this_keyword) member_access = try self.factory.createFieldAccess(member_access, "prototype");
                         const desc_call = try self.factory.createCallExpression(try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Object"), "getOwnPropertyDescriptor"), &.{
