@@ -62,13 +62,14 @@ export enum ConstantKind {
 type ScopeBinding = { slot: number, parentSlot: number }
 type OuterSymbol = { scopeSlot: number, reg: number }
 type FoldResultValue = string | number | boolean | undefined | null
-type PrivateMember = { node: ts.GetAccessorDeclaration | ts.MethodDeclaration, template?: EmitResult, compiling?: boolean }
+type PrivateMember = { node: ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.MethodDeclaration, template?: EmitResult, compiling?: boolean }
+type PrivateName = { method?: PrivateMember, getter?: PrivateMember, setter?: PrivateMember }
 type EmitCtx = {
     outerSymbols: Map<number, OuterSymbol>
     outerFolded: Map<number, [FoldResultValue]>
     owner?: ts.Identifier
     privateNames?: Map<string, symbol>
-    privateMembers?: Map<string, PrivateMember>
+    privateMembers?: Map<string, PrivateName>
 }
 const thisSymbol = -3
 
@@ -113,12 +114,12 @@ function classPrivateNames(node: ts.ClassDeclaration | ts.ClassExpression, outer
     return names
 }
 
-function isPrivateMember(member: ts.ClassElement): member is ts.GetAccessorDeclaration | ts.MethodDeclaration {
+function isPrivateMember(member: ts.ClassElement): member is ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.MethodDeclaration {
     if (!member.name || !ts.isPrivateIdentifier(member.name)) return false
-    return ts.isGetAccessorDeclaration(member) || ts.isMethodDeclaration(member)
+    return ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member) || ts.isMethodDeclaration(member)
 }
 
-function classPrivateMembers(node: ts.ClassDeclaration | ts.ClassExpression, outer?: Map<string, PrivateMember>): Map<string, PrivateMember> {
+function classPrivateMembers(node: ts.ClassDeclaration | ts.ClassExpression, outer?: Map<string, PrivateName>): Map<string, PrivateName> {
     const members = new Map(outer)
     for (const member of node.members) {
         if (member.name && ts.isPrivateIdentifier(member.name)) members.delete(member.name.text)
@@ -126,7 +127,12 @@ function classPrivateMembers(node: ts.ClassDeclaration | ts.ClassExpression, out
     for (const member of node.members) {
         if (!isPrivateMember(member)) continue
         if (isStaticMember(member)) throw `static private members are not supported: ${member.name.getText()}`
-        members.set((member.name as ts.PrivateIdentifier).text, { node: member })
+        const name = (member.name as ts.PrivateIdentifier).text
+        const entry = members.get(name) ?? {}
+        members.set(name, entry)
+        if (ts.isGetAccessorDeclaration(member)) entry.getter = { node: member }
+        else if (ts.isSetAccessorDeclaration(member)) entry.setter = { node: member }
+        else entry.method = { node: member }
     }
     return members
 }
@@ -1176,58 +1182,61 @@ function emitFunction(
         return kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment
     }
 
-    function finishPropertyAccessAssignment(
-        node: ts.BinaryExpression,
-        getOp: number,
-        setOp: number,
-        robj: number,
-        keySlot: number,
-    ) {
+    function finishPropertyAccessAssignment(node: ts.BinaryExpression, load: () => void, store: () => void) {
         const kind = node.operatorToken.kind
         if (kind === ts.SyntaxKind.EqualsToken) {
             emitExpr(node.right) // acc = value
-            emit3(setOp, robj, keySlot)
+            store()
             return
         }
 
         const jump = logicalAssignmentJump(kind)
         if (jump !== undefined) {
-            emitLogicalAssignment(jump, () => { ldar(robj); emit2(getOp, keySlot) }, node.right, () => emit3(setOp, robj, keySlot))
+            emitLogicalAssignment(jump, load, node.right, store)
             return
         }
         const op = compoundBinaryOp(kind)
         if (isLexicalIdent(node.right)) {
-            ldar(robj)
-            emit2(getOp, keySlot) // acc = obj[key]
+            load() // acc = obj[key]
             emit2(op, symToReg.get(getSymbolId(node.right))!)
         } else {
             emitExpr(node.right)
             const rR = allocReg(); star(rR)
-            ldar(robj)
-            emit2(getOp, keySlot) // acc = obj[key]
+            load() // acc = obj[key]
             emit2(op, rR)
             freeReg()
         }
-        emit3(setOp, robj, keySlot)
+        store()
     }
 
     function emitPropertyTarget(
         target: ts.PropertyAccessExpression | ts.ElementAccessExpression,
-        finish: (getOp: number, setOp: number, robj: number, keySlot: number) => void,
+        finish: (load: () => void, store: () => void) => void,
     ) {
         if (target.questionDotToken) throw `optional chaining assignment is not supported`
-        if (ts.isPropertyAccessExpression(target) && ts.isPrivateIdentifier(target.name) && privateMembers?.has(target.name.text)) throw `cannot assign to private member ${target.name.text}`
         const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression
 
         emitExpr(target.expression) // acc = object
         const robj = allocReg(); star(robj)
         defer freeReg()
 
+        if (ts.isPropertyAccessExpression(target)) {
+            const entry = privateMember(target.name)
+            if (entry) return finish(() => emitPrivateRead(entry, target.name.text, robj), () => emitPrivateWrite(entry, target.name.text, robj))
+        }
+        function finishKey(getOp: number, setOp: number, keySlot: number): void {
+            const load = () => {
+                ldar(robj)
+                emit2(getOp, keySlot)
+            }
+            finish(load, () => emit3(setOp, robj, keySlot))
+        }
+
         if (target.kind === ts.SyntaxKind.ElementAccessExpression) {
             const key = tryFoldExp(target.argumentExpression)
             if (key?.[0] === 'value' && typeof key[1] === 'number') {
                 if (!Number.isInteger(key[1]) || key[1] < 0 || key[1] > 0xFF) throw 'array index does not fit in bytecode'
-                finish(Op.GetPropertyImm, Op.SetPropertyImm, robj, key[1])
+                finishKey(Op.GetPropertyImm, Op.SetPropertyImm, key[1])
                 return
             }
         }
@@ -1238,17 +1247,16 @@ function emitFunction(
         if (!isConstName) {
             if (const val = tryFoldExp(target.argumentExpression)) {
                 if (val[0] === 'value' && typeof val[1] === 'string') {
-                    return finish(Op.GetPropertyConst, Op.SetPropertyConst, robj, internValue(val[1]))
+                    return finishKey(Op.GetPropertyConst, Op.SetPropertyConst, internValue(val[1]))
                 }
             }
             emitExpr(target.argumentExpression)
             star(keySlot)
         }
 
-        finish(
+        finishKey(
             isConstName ? Op.GetPropertyConst : Op.GetProperty,
             isConstName ? Op.SetPropertyConst : Op.SetProperty,
-            robj,
             keySlot,
         )
     }
@@ -1257,9 +1265,7 @@ function emitFunction(
         node: ts.BinaryExpression,
         target: ts.PropertyAccessExpression | ts.ElementAccessExpression
     ) {
-        emitPropertyTarget(target, (getOp, setOp, robj, keySlot) => {
-            finishPropertyAccessAssignment(node, getOp, setOp, robj, keySlot)
-        })
+        emitPropertyTarget(target, (load, store) => finishPropertyAccessAssignment(node, load, store))
     }
 
     function emitAssignment(node: ts.BinaryExpression) {
@@ -1327,7 +1333,7 @@ function emitFunction(
         star(reg)
     }
 
-    function privateMember(name: ts.MemberName): PrivateMember | undefined {
+    function privateMember(name: ts.MemberName): PrivateName | undefined {
         if (!ts.isPrivateIdentifier(name)) return
         return privateMembers?.get(name.text)
     }
@@ -1340,7 +1346,7 @@ function emitFunction(
         defer member.compiling = false
         const template = member.template ?? emitFunction(member.node, closureCtx(member.node))
         template.name = name
-        if (template.scopeBindings.length && template.selfSlot !== undefined) throw `recursive private method ${name} with captures is not supported`
+        if (template.scopeBindings.length && template.selfSlot !== undefined) throw `recursive private member ${name} with captures is not supported`
         if (!template.scopeBindings.length) member.template = template
         const slot = constants.length
         constants.push(template)
@@ -1357,25 +1363,46 @@ function emitFunction(
         return selfSlot
     }
 
-    function emitPrivateGetter(name: ts.MemberName): boolean {
-        const getter = privateMember(name)
-        if (!getter) return false
-        if (!ts.isGetAccessorDeclaration(getter.node)) throw `private method ${name.getText()} can only be called`
-        const slot = privateTemplate(getter, name.getText())
+    function emitPrivateInvoke(member: PrivateMember, name: string, call: (op: 'Call' | 'CallConst', callee: number) => void): void {
+        if (member.node === fn) return call('CallConst', ownSlot())
+        const slot = privateTemplate(member, name)
         const template = constants[slot] as EmitResult
-        if (!template.scopeBindings.length) {
-            emit4(Op.CallConst, slot, 0, 0)
-        } else {
-            const receiver = allocReg()
-            star(receiver)
-            emit2(Op.CreateClosure, slot)
-            const callee = allocReg()
-            star(callee)
+        if (!template.scopeBindings.length) return call('CallConst', slot)
+        emit2(Op.CreateClosure, slot)
+        const callee = allocReg()
+        defer freeReg()
+        star(callee)
+        call('Call', callee)
+    }
+
+    function emitPrivateRead(entry: PrivateName, name: string, receiver: number): void {
+        if (entry.method) throw `private method ${name} can only be called`
+        if (!entry.getter) throw `cannot read private member ${name}`
+        emitPrivateInvoke(entry.getter, name, (op, callee) => {
             ldar(receiver)
-            emit4(Op.Call, callee, 0, 0)
-            freeReg()
-            freeReg()
-        }
+            emit4(Op[op], callee, 0, 0)
+        })
+    }
+
+    function emitPrivateWrite(entry: PrivateName, name: string, receiver: number): void {
+        if (!entry.setter) throw `cannot assign to private member ${name}`
+        const value = allocReg()
+        defer freeReg()
+        star(value)
+        emitPrivateInvoke(entry.setter, name, (op, callee) => {
+            ldar(receiver)
+            emit4(Op[op], callee, value, 1)
+        })
+        ldar(value)
+    }
+
+    function emitPrivateGetter(name: ts.MemberName): boolean {
+        const entry = privateMember(name)
+        if (!entry) return false
+        const receiver = allocReg()
+        defer freeReg()
+        star(receiver)
+        emitPrivateRead(entry, (name as ts.PrivateIdentifier).text, receiver)
         return true
     }
 
@@ -1386,15 +1413,7 @@ function emitFunction(
         defer freeReg()
         emitExpr(target.expression)
         star(receiver)
-        if (method.node === fn) return emitCallArgs('CallConst', ownSlot(), node.arguments, receiver)
-        const slot = privateTemplate(method, target.name.text)
-        const template = constants[slot] as EmitResult
-        if (!template.scopeBindings.length) return emitCallArgs('CallConst', slot, node.arguments, receiver)
-        emit2(Op.CreateClosure, slot)
-        const callee = allocReg()
-        defer freeReg()
-        star(callee)
-        emitCallArgs('Call', callee, node.arguments, receiver)
+        emitPrivateInvoke(method, target.name.text, (op, callee) => emitCallArgs(op, callee, node.arguments, receiver))
     }
 
     function emitPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number, shouldSpillRecv = true) {
@@ -1643,10 +1662,9 @@ function emitFunction(
         const operand = node.operand
         const increment = node.operator === ts.SyntaxKind.PlusPlusToken
         if (ts.isPropertyAccessExpression(operand) || ts.isElementAccessExpression(operand)) {
-            return emitPropertyTarget(operand, (getOp, setOp, robj, keySlot) => {
-                ldar(robj)
-                emit2(getOp, keySlot)
-                emitUpdateAcc(isPrefix, increment, () => emit3(setOp, robj, keySlot))
+            return emitPropertyTarget(operand, (load, store) => {
+                load()
+                emitUpdateAcc(isPrefix, increment, store)
             })
         }
         const symId = getSymbolId(operand)
@@ -2038,8 +2056,8 @@ function emitFunction(
         // }
 
         if (!isConstruct && ts.isPropertyAccessExpression(node.expression)) {
-            const method = privateMember(node.expression.name)
-            if (method && ts.isMethodDeclaration(method.node)) return emitPrivateCall(node as ts.CallExpression, method)
+            const method = privateMember(node.expression.name)?.method
+            if (method) return emitPrivateCall(node as ts.CallExpression, method)
         }
         if (!isConstruct && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))) {
             let receiverReg = allocReg()
@@ -4002,15 +4020,32 @@ function runTest() {
     e2eTest('function privateMethodShadow(a) { class C { #v() { return 1 } read() { class D { #v() { return 7 } get() { return this.#v() } } return new D().get() * 10 + this.#v() } } return new C().read() + a }', [3])
     e2eTest('function privateMethodOther(a) { class C { constructor(x) { this.x = x } #get() { return this.x } plus(o) { return this.#get() * 10 + o.#get() } } return new C(a).plus(new C(a + 1)) }', [2])
     e2eTest('function privateMethodGetter(a) { class C { constructor(x) { this.x = x } get #twice() { return this.#double(this.x) } #double(n) { return n * 2 } read() { return this.#twice } } return new C(a).read() }', [4])
+    e2eTest('function privateSetter(a) { class C { set #v(x) { this.x = x * 2 } write(x) { this.#v = x; return this.x } } return new C().write(a) }', [3])
+    e2eTest('function privateSetterCapture(a) { const k = a + 1; class C { set #v(x) { this.x = x + k } write(x) { this.#v = x; return this.x } } return new C().write(10) }', [2])
+    e2eTest('function privateSetterValue(a) { class C { set #v(x) { this.x = x * 2 } write(x) { const r = this.#v = x + 1; return r * 100 + this.x } } return new C().write(a) }', [3])
+    e2eTest('function privateAccessorPair(a) { class C { constructor() { this.x = 1 } get #v() { return this.x } set #v(x) { this.x = x } bump(n) { this.#v = this.#v + n; return this.#v } } return new C().bump(a) }', [4])
+    e2eTest('function privateAccessorUpdate(a) { class C { constructor(x) { this.x = x } get #v() { return this.x } set #v(x) { this.x = x * 10 } bump() { const old = this.#v++; return old * 1000 + this.x } } return new C(a).bump() }', [2])
+    e2eTest('function privateAccessorPrefix(a) { class C { constructor(x) { this.x = x } get #v() { return this.x } set #v(x) { this.x = x * 10 } bump() { const r = ++this.#v; return r * 1000 + this.x } } return new C(a).bump() }', [2])
+    e2eTest('function privateAccessorCompound(a) { class C { constructor(x) { this.x = x } get #v() { return this.x } set #v(x) { this.x = x } bump(n) { const r = (this.#v += n); this.#v *= 2; return r * 100 + this.x } } return new C(a).bump(3) }', [4])
+    e2eTest('function privateAccessorReceiverOnce(a) { class C { constructor() { this.x = 1; this.n = 0 } get #v() { return this.x } set #v(x) { this.x = x } self() { this.n++; return this } bump(k) { this.self().#v += k; return this.x * 10 + this.n } } return new C().bump(a) }', [4])
+    e2eTest('function privateSetterOther(a) { class C { constructor() { this.x = 0 } set #v(x) { this.x = x } copyTo(o, x) { o.#v = x; return o } } return new C().copyTo(new C(), a).x }', [5])
+    e2eTest('function privateSetterRecursive(a) { class C { constructor() { this.total = 0 } set #v(n) { if (n) { this.total = this.total + n; this.#v = n - 1 } } sum(n) { this.#v = n; return this.total } } return new C().sum(a) }', [4])
+    e2eTest('function privateGetterRecursive(a) { class C { constructor(n) { this.n = n } get #v() { if (!this.n) return 0; this.n = this.n - 1; return this.#v + 2 } read() { return this.#v } } return new C(a).read() }', [3])
+    e2eTest('function privateSetterShadow(a) { class C { constructor() { this.x = 0 } set #v(x) { this.x = x } write() { class D { constructor() { this.y = 0 } set #v(x) { this.y = x * 2 } run(o) { o.#v = 5; return this.y } } const d = new D(); d.run(d); this.#v = d.y; return this.x } } return new C().write() + a }', [1])
     for (const [source, message] of [
-        ['function f() { class C { set #v(x) {} } return 0 }', 'unsupported class member name'],
+        ['function f() { class C { static set #v(x) {} } return 0 }', 'static private members are not supported'],
         ['function f() { class C { static get #v() { return 1 } } return 0 }', 'static private members are not supported'],
         ['function f() { class C { static #m() { return 1 } } return 0 }', 'static private members are not supported'],
         ['function f() { class C { #m() { return 1 } read() { const f = this.#m; return f() } } return new C().read() }', 'can only be called'],
         ['function f() { class C { #m() { return 1 } write() { this.#m = 2 } } return 0 }', 'cannot assign to private member'],
         ['function f() { class C { #a() { return this.#b() } #b() { return this.#a() } read() { return this.#a() } } return new C().read() }', 'recursive private member'],
-        ['function f(k) { class C { #m(n) { return n ? k + this.#m(n - 1) : 0 } read() { return this.#m(2) } } return new C().read() }', 'recursive private method #m with captures'],
-        ['function f() { class C { get #v() { return this.#v } read() { return this.#v } } return new C().read() }', 'recursive private member'],
+        ['function f(k) { class C { #m(n) { return n ? k + this.#m(n - 1) : 0 } read() { return this.#m(2) } } return new C().read() }', 'recursive private member #m with captures'],
+        ['function f(k) { class C { set #v(n) { if (n) this.#v = n - k } write() { this.#v = 2 } } return new C().write() }', 'recursive private member #v with captures'],
+        ['function f() { class C { get #v() { this.#v = 1; return 0 } set #v(x) { this.y = this.#v } read() { return this.#v } } return new C().read() }', 'recursive private member'],
+        ['function f() { class C { set #v(x) {} read() { return this.#v } } return new C().read() }', 'cannot read private member #v'],
+        ['function f() { class C { set #v(x) {} bump() { this.#v++ } } return 0 }', 'cannot read private member #v'],
+        ['function f() { class C { set #v(x) {} bump() { this.#v += 1 } } return 0 }', 'cannot read private member #v'],
+        ['function f() { class C { #m() { return 1 } bump() { this.#m += 1 } } return 0 }', 'can only be called'],
         ['function f() { class C { get #v() { return 1 } write() { this.#v = 2 } } return 0 }', 'cannot assign to private member'],
         ['function f() { class C { get #v() { return 1 } bump() { this.#v++ } } return 0 }', 'cannot assign to private member'],
         ['function f() { class C { get #v() { return 1 } bump() { this.#v += 1 } } return 0 }', 'cannot assign to private member'],
