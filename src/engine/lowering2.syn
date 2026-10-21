@@ -8,7 +8,7 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { verifyGraph } from './verify'
+import { verifyGraph, verifyOrderingSlots } from './verify'
 import {
     addGraphBlock, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -5187,18 +5187,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     const orderedCache = new Map<number, boolean>()
     function isUnordered(id: number): boolean {
-        if (!id) return true
-        const known = orderedCache.get(id)
-        if (known !== undefined) return known
-        orderedCache.set(id, true)
-        const n = getNode(g, id)!
-        let ok = PureOps.has(n.op)
-        for (let i = 0; ok && i < countIds(n); i++) {
-            const a = getRef(n, i)
-            if (a && !isUnordered(a)) ok = false
-        }
-        orderedCache.set(id, ok)
-        return ok
+        return unorderedValue(g, id, orderedCache)
     }
 
     const guaranteedEffects = new Map<number, [version: number, effects: Map<number, Set<number>>]>()
@@ -10521,6 +10510,97 @@ function rebuildable(g: Graph, id: number): boolean {
     return n.op === NodeOp.literal || n.op === NodeOp.frameAddress || gn.localSymbol(g, n) !== undefined
 }
 
+function unorderedValue(g: Graph, id: number, cache: Map<number, boolean>): boolean {
+    if (!id) return true
+    const known = cache.get(id)
+    if (known !== undefined) return known
+    cache.set(id, true)
+    const n = getNode(g, id)!
+    let ok = PureOps.has(n.op) || islandLoad(g, n)
+    for (let i = 0; ok && i < countIds(n); i++) {
+        const a = getRef(n, i)
+        if (a && !unorderedValue(g, a, cache)) ok = false
+    }
+    cache.set(id, ok)
+    return ok
+}
+
+function effectNode(g: Graph, id: number, cache: Map<number, boolean>): boolean {
+    const n = getNode(g, id)!
+    if (n.op === NodeOp.select) return !unorderedValue(g, id, cache)
+    return !PureOps.has(n.op) && !islandLoad(g, n)
+}
+
+function hollowOrdering(g: Graph, id: number, cache: Map<number, boolean>, hollow: Map<number, boolean>): boolean {
+    const known = hollow.get(id)
+    if (known !== undefined) return known
+    const n = getNode(g, id)!
+    let out = false
+    if (n.op === NodeOp.after) {
+        const result = getRef(n, countIds(n) - 1)
+        out = !!result && hollowOrdering(g, result, cache, hollow)
+    } else if (n.op !== NodeOp.nilEffect && n.op !== NodeOp.void && n.op !== NodeOp.param) {
+        out = !effectNode(g, id, cache)
+    }
+    hollow.set(id, out)
+    return out
+}
+
+function foldPureOrdering(g: Graph): void {
+    const cache = new Map<number, boolean>()
+    const hollow = new Map<number, boolean>()
+    const parts = new Map<number, number[]>()
+    let nil = 0
+    function orderingOf(id: number): number[] {
+        const known = parts.get(id)
+        if (known) return known
+        const out: number[] = []
+        parts.set(id, out)
+        if (unorderedValue(g, id, cache)) return out
+        const n = getNode(g, id)!
+        if (n.op !== NodeOp.after && effectNode(g, id, cache)) {
+            out.push(id)
+            return out
+        }
+        for (let i = 0; i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!ref) continue
+            for (const x of orderingOf(ref)) {
+                if (!out.includes(x)) out.push(x)
+            }
+        }
+        return out
+    }
+    for (const [id, n] of g.nodes) {
+        const end = firstNonOrderingSlot(n)
+        let dirty = false
+        for (let i = 0; i < end; i++) {
+            if (getRef(n, i) && hollowOrdering(g, getRef(n, i), cache, hollow)) dirty = true
+        }
+        if (!dirty) continue
+        const tokens: number[] = []
+        for (let i = 0; i < end; i++) {
+            const ref = getRef(n, i)
+            if (!ref) continue
+            const xs = hollowOrdering(g, ref, cache, hollow) ? orderingOf(ref) : [ref]
+            for (const x of xs) {
+                if (!tokens.includes(x)) tokens.push(x)
+            }
+        }
+        if (!tokens.length) {
+            if (!nil) nil = addNode(g, NodeOp.nilEffect, [])
+            tokens.push(nil)
+        }
+        const operands = getOperands(g, n)
+        if (n.op === NodeOp.after) {
+            putCopy(g, id, n, [...tokens, ...operands.slice(end)])
+            continue
+        }
+        operands[0] = tokens.length === 1 ? tokens[0] : joinEffects(g, tokens)
+        putCopy(g, id, n, operands)
+    }
+}
+
 function islandLoad(g: Graph, n: GraphNode): boolean {
     if (n.op !== NodeOp.load || getRef(n, 0) || getRef(n, 2)) return false
     const base = getNode(g, getRef(n, 1))
@@ -13860,6 +13940,10 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     if (opts.staticData) readonlyAllocas(g, opts.staticData)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue, opts.floatSlot) : undefined
     registerLiterals(g, target)
+    foldPureOrdering(g)
+    const unordered = new Map<number, boolean>()
+    const hollow = new Map<number, boolean>()
+    verifyOrderingSlots(g, 'lowerable', firstNonOrderingSlot, id => hollowOrdering(g, id, unordered, hollow))
     return { g, island, analysis: analyzeValueGraph(g, opts) }
 }
 
