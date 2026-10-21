@@ -144,7 +144,8 @@ interface Frame {
     object: number
     receiver?: number
     signature: string[]
-    graph?: Graph
+    graph: Graph
+    facts: UnitFacts
     nodes: Map<number, Set<number>>
 }
 
@@ -262,6 +263,33 @@ export interface Isolated {
     proto: Handle
 }
 
+function setOf<K, V>(map: Map<K, Set<V>>, k: K): Set<V> {
+    let set = map.get(k)
+    if (!set) map.set(k, set = new Set())
+    return set
+}
+
+function rootOf(parent: number[], a: number): number {
+    let at = a
+    while (parent[at] !== at) {
+        parent[at] = parent[parent[at]]
+        at = parent[at]
+    }
+    return at
+}
+
+function listOf<K, V>(map: Map<K, V[]>, k: K): V[] {
+    let list = map.get(k)
+    if (!list) map.set(k, list = [])
+    return list
+}
+
+function mapOf<K, K2, V>(map: Map<K, Map<K2, V>>, k: K): Map<K2, V> {
+    let inner = map.get(k)
+    if (!inner) map.set(k, inner = new Map())
+    return inner
+}
+
 const users = new WeakMap<Graph, { size: number, index: Map<number, [number, number][]> }>()
 export function usersOf(g: Graph): Map<number, [number, number][]> {
     const known = users.get(g)
@@ -278,9 +306,7 @@ function useDominators(g: Graph): { idom: Map<number, number>, order: number[] }
     const bodyOf = new Map<number, number[]>()
     for (const b of g.blocks) {
         if (!b.bodyId) continue
-        const list = bodyOf.get(b.bodyId)
-        if (list) list.push(b.id)
-        else bodyOf.set(b.bodyId, [b.id])
+        listOf(bodyOf, b.bodyId).push(b.id)
     }
     const entries = (block: number) => (users.get(block) ?? []).filter(([u, slot]) => slot === 0 && getNode(g, u)?.op === NodeOp.apply).map(([u]) => u)
     function succs(v: number): number[] {
@@ -475,8 +501,7 @@ function guardsAt(g: Graph, node: number): [cond: number, positive: boolean][] |
 }
 const bodies = new WeakMap<Graph, Map<number, Set<number>>>()
 function bodyNodes(g: Graph, body: number): Set<number> {
-    let byGraph = bodies.get(g)
-    if (!byGraph) bodies.set(g, byGraph = new Map())
+    const byGraph = mapOf(bodies, g)
     const known = byGraph.get(body)
     if (known) return known
     const found = new Set<number>()
@@ -495,48 +520,317 @@ function comparison(op: NodeOp): boolean {
     return op === NodeOp.lt || op === NodeOp.le || op === NodeOp.gt || op === NodeOp.ge || op === NodeOp.eq || op === NodeOp.ne
 }
 
-function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated): Accesses {
-    const frames: Frame[] = []
-    const frameIds = new Map<string, number>()
-    const unitKeys = new Map<Function, number>()
-    const values: Value[] = [{ kind: ValueKind.undefined }, { kind: ValueKind.string }, { kind: ValueKind.unknown }, { kind: ValueKind.string }]
-    const valueIds = new Map<string, number>()
-    const allocations: Allocation[] = []
-    const allocationIds = new Map<string, number>()
-    const locations: Location[] = []
-    const locationIds = new Map<string, number>()
-    const recorded = new Set<string>()
-    const touched = new Map<number, Set<number>>()
-    const contents = new Map<number, Set<number>>()
-    const contentReaders = new Map<number, Set<number>>()
-    const fieldsOf = new Map<number, number[]>()
-    const copiers = new Map<number, Set<number>>()
-    const storedInto = new Map<number, Map<number, [intrinsics.Types | undefined, number]>>()
-    const returns = new Map<number, Set<number>>()
-    const returnTargets = new Map<number, Set<number>>()
-    const returnLocations = new Map<number, Set<number>>()
-    const heldStatics = new Map<number, Function>()
-    const resultTyped = new Set<number>()
-    const retSets = new Map<number, Map<number, Set<number>>>()
-    const callSites = new Map<number, Set<number>>()
-    const work: number[] = []
-    const queued = new Set<number>()
-    const stale = new Set<number>()
-    const dirty = new Set<number>()
+interface RetGuard {
+    op: NodeOp
+    terms: Term[]
+    positive: boolean
+}
 
-    function setOf<K, V>(map: Map<K, Set<V>>, k: K): Set<V> {
-        let set = map.get(k)
-        if (!set) map.set(k, set = new Set())
-        return set
+type Term = { param: number, key?: number } | { literal: number }
+
+interface UnitFacts {
+    g: Graph
+    users: Map<number, [number, number][]>
+    arms?: ArmIndex
+    self: number | undefined
+    plain: number[]
+    calls: number[]
+    rts: number[]
+    gets: number[]
+    exact: Set<number>
+    carried: Set<number>
+    contexts: number[]
+    returnsSelf: boolean
+    types: Map<number, intrinsics.Types | undefined>
+    canonicals: Map<number, number>
+    callFacts: Map<number, Set<string>>
+    retGuards: Map<number, RetGuard[]>
+}
+
+function literalOperands(n: GraphNode): boolean {
+    for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) return false
+    return true
+}
+
+function arithmetic(n: GraphNode): boolean {
+    return NumericOps.has(n.op) || n.op === NodeOp.convert || n.op === NodeOp.bitconvert
+}
+
+const unitCache = new WeakMap<Graph, UnitFacts>()
+function unitOf(g: Graph): UnitFacts {
+    let known = unitCache.get(g)
+    if (!known) unitCache.set(g, known = unitFacts(g))
+    return known
+}
+
+function unitFacts(g: Graph): UnitFacts {
+    const params = g.blocks[0].params
+    const self = params.find(p => isThisParam(getNode(g, p)!))
+    const plain = params.filter(p => p !== self)
+    const contexts: number[] = []
+    const calls: number[] = []
+    const rts: number[] = []
+    const gets: number[] = []
+    const applies: GraphNode[] = []
+    const work: number[] = []
+    let returnsSelf = true
+    for (const [id, n] of g.nodes) {
+        if (n.op === NodeOp.callContext) contexts.push(id)
+        if (n.op === NodeOp.call) calls.push(id)
+        if (n.op === NodeOp.rt) rts.push(id)
+        if (n.op === NodeOp.getProp) gets.push(id)
+        if (n.op === NodeOp.apply) applies.push(n)
+        if (n.op === NodeOp.ret && getRef(n, 0) && valueTail(g, getRef(n, 0)) !== self) returnsSelf = false
+        if ((n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp) && getRef(n, 2)) work.push(getRef(n, 2))
+        if (rt.sliceOf(g, n) !== undefined && rt.sliceOf(g, n) !== rt.Op.slice && getRef(n, 3)) work.push(getRef(n, 3))
     }
-    interface Filter {
-        test: string
-        positive: boolean
-        key?: string
-        literal?: number
-        when?: boolean
+    const exact = new Set<number>()
+    const addressed = new Set<number>()
+    while (work.length) {
+        const id = work.pop()!
+        if (addressed.has(id)) continue
+        addressed.add(id)
+        if (plain.includes(id)) exact.add(plain.indexOf(id))
+        const n = getNode(g, id)
+        if (n && (NumericOps.has(n.op) || n.op === NodeOp.after || n.op === NodeOp.convert)) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) work.push(getRef(n, i))
     }
-    type Test = [x: number, filter: Filter]
+    const dependencies = new Map<number, boolean>()
+    function dependsOn(value: number, param: number): boolean {
+        const k = value * nodeSpan + param
+        const known = dependencies.get(k)
+        if (known !== undefined) return known
+        const visited = new Set<number>()
+        const pending = [value]
+        let found = false
+        while (pending.length && !found) {
+            const id = pending.pop()!
+            if (visited.has(id)) continue
+            visited.add(id)
+            if (id === param) found = true
+            const n = getNode(g, id)
+            if (n && (arithmetic(n) || n.op === NodeOp.after || n.op === NodeOp.select)) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) pending.push(getRef(n, i))
+        }
+        dependencies.set(k, found)
+        return found
+    }
+    const carried = new Set<number>()
+    for (const n of applies) {
+        const targets = getBlock(g, getRef(n, 0))?.params ?? []
+        for (let i = 1; i < countIds(n); i++) if (getRef(n, i) && targets[i - 1] !== undefined && dependsOn(getRef(n, i), targets[i - 1])) carried.add(targets[i - 1])
+    }
+    return { g, users: usersOf(g), self, plain, calls, rts, gets, exact, carried, contexts, returnsSelf, types: new Map(), canonicals: new Map(), callFacts: new Map(), retGuards: new Map() }
+}
+
+function armsOf(unit: UnitFacts): ArmIndex {
+    if (!unit.arms) unit.arms = armIndexOf(unit.g)
+    return unit.arms
+}
+
+function nodeType(unit: UnitFacts, node: number): intrinsics.Types | undefined {
+    if (unit.types.has(node)) return unit.types.get(node)
+    const g = unit.g
+    const n = getNode(g, node)
+    const T = n && n.op !== NodeOp.param && n.op !== NodeOp.after && n.op !== NodeOp.select && n.op !== NodeOp.inlined ? resultType(g, n) : undefined
+    const known = T === Types.u64 && n && n.op !== NodeOp.load && n.op !== NodeOp.convert && n.op !== NodeOp.bitconvert && !NumericOps.has(n.op) ? undefined : T
+    unit.types.set(node, known)
+    return known
+}
+
+function canonical(unit: UnitFacts, id: number): number {
+    const known = unit.canonicals.get(id)
+    if (known !== undefined) return known
+    unit.canonicals.set(id, id)
+    const g = unit.g
+    const n = getNode(g, id)
+    if (n?.op !== NodeOp.getProp || getRef(n, 2)) return id
+    const found = priorRead(unit, getRef(n, 0), canonical(unit, getRef(n, 1)), keyLabel(getLiteral(g, n, 2) as Handle))
+    const result = typeof found === 'number' ? found : id
+    unit.canonicals.set(id, result)
+    return result
+}
+
+function priorRead(unit: UnitFacts, order: number, object: number, name: string): number | 'entry' | undefined {
+    const g = unit.g
+    let at = order
+    while (at) {
+        const m = getNode(g, at)
+        if (!m) return
+        if (m.op === NodeOp.nilEffect) return getRef(m, 0) === g.blocks[0].id ? 'entry' : undefined
+        if (m.op === NodeOp.getProp) {
+            if (!getRef(m, 2) && keyLabel(getLiteral(g, m, 2) as Handle) === name && canonical(unit, getRef(m, 1)) === object) return canonical(unit, at)
+        } else if (m.op !== NodeOp.setProp || getRef(m, 2) || keyLabel(getLiteral(g, m, 2) as Handle) === name) return
+        at = getRef(m, 0)
+    }
+}
+
+function calleeTerm(unit: UnitFacts, n: GraphNode, i: number): Term | undefined {
+    const g = unit.g
+    if (!getRef(n, i)) return { literal: getLiteral(g, n, i) }
+    const id = getRef(n, i)
+    const param = g.blocks[0].params.indexOf(id)
+    if (param >= 0) return { param }
+    const m = getNode(g, id)
+    if (m?.op !== NodeOp.getProp || getRef(m, 2)) return
+    const object = g.blocks[0].params.indexOf(getRef(m, 1))
+    if (object < 0 || priorRead(unit, getRef(m, 0), getRef(m, 1), keyLabel(getLiteral(g, m, 2) as Handle)) !== 'entry') return
+    return { param: object, key: getLiteral(g, m, 2) }
+}
+
+function argSlot(call: GraphNode, callee: UnitFacts, param: number): number {
+    const p = callee.g.blocks[0].params[param]
+    const receiverSlot = call.op === NodeOp.call ? 2 : call.op === NodeOp.getProp || call.op === NodeOp.setProp ? 1 : -1
+    const first = call.op === NodeOp.call ? 3 : 2
+    return p === callee.self ? receiverSlot : first + callee.plain.indexOf(p)
+}
+
+function predicate(op: NodeOp, a: string, b: string, positive: boolean): string {
+    switch (op) {
+        case NodeOp.lt: return `${positive}<${a},${b}`
+        case NodeOp.ge: return `${!positive}<${a},${b}`
+        case NodeOp.gt: return `${positive}<${b},${a}`
+        case NodeOp.le: return `${!positive}<${b},${a}`
+        case NodeOp.eq: return `${positive}=${a < b ? a : b},${a < b ? b : a}`
+        default: return `${!positive}=${a < b ? a : b},${a < b ? b : a}`
+    }
+}
+
+function negated(p: string): string {
+    return p.startsWith('true') ? `false${p.slice(4)}` : `true${p.slice(5)}`
+}
+
+function callFacts(unit: UnitFacts, call: number): Set<string> {
+    const known = unit.callFacts.get(call)
+    if (known) return known
+    const g = unit.g
+    const facts = new Set<string>()
+    for (const [cond, positive] of guardsAt(g, call) ?? []) {
+        const c = getNode(g, cond)!
+        const side = (i: number) => getRef(c, i) ? `n${canonical(unit, getRef(c, i))}` : `#${getLiteral(g, c, i)}`
+        facts.add(predicate(c.op, side(0), side(1), positive))
+    }
+    unit.callFacts.set(call, facts)
+    return facts
+}
+
+function retGuards(unit: UnitFacts, ret: number): RetGuard[] {
+    const known = unit.retGuards.get(ret)
+    if (known) return known
+    const out: RetGuard[] = []
+    for (const [cond, positive] of guardsAt(unit.g, ret) ?? []) {
+        const c = getNode(unit.g, cond)!
+        const terms = [0, 1].map(i => calleeTerm(unit, c, i))
+        if (terms.some(t => !t)) continue
+        out.push({ op: c.op, terms: terms.map(t => t!), positive })
+    }
+    unit.retGuards.set(ret, out)
+    return out
+}
+
+interface Filter {
+    test: string
+    positive: boolean
+    key?: string
+    literal?: number
+    when?: boolean
+}
+
+type Test = [x: number, filter: Filter]
+
+type Fact = [param: number, filter: Filter]
+
+interface Narrowing {
+    own: Map<number, Map<number, [order: number, filter: Filter][]>>
+    extras: Map<number, Map<number, [order: number, filter: Filter][]>>
+    tested: Set<number>
+    combined: Map<number, { pairs: [number, Filter][], filters: Filter[] } | null>
+}
+
+interface Accessor {
+    kind: 'method' | 'getter' | 'field'
+    fn?: Function
+    slot?: Handle
+    setter?: Function
+}
+
+interface SharedFacts {
+    keyHandles: Map<string, Handle>
+    nameOf(k: Handle): string
+    literalFunction(g: Graph, id: number): Function | undefined
+    accessorOf(proto: Handle | undefined, k: Handle): Accessor
+    setterOf(proto: Handle | undefined, k: Handle): Function | undefined
+    indexTrap(proto: Handle | undefined, setter: boolean): Function | undefined
+    protoName(proto: Handle | undefined): string
+    invariantPairs(proto: Handle): [string, string][] | undefined
+    narrowingOf(unit: UnitFacts): Narrowing
+    combinedOn(unit: UnitFacts, narrowing: Narrowing, root: number, x: number): { pairs: [number, Filter][], filters: Filter[] } | undefined
+    narrowAt(unit: UnitFacts, node: number, x: number): Filter[] | undefined
+    initializer(g: Graph, self: number, proto: Handle | undefined): boolean
+    killedAfter(g: Graph, call: number, allocated: number, name: string, proto: Handle | undefined, self: boolean): boolean
+}
+
+function sharedFacts(host: AccessHost): SharedFacts {
+    const keyHandles = new Map<string, Handle>()
+    const names = new Map<Handle, string>()
+    function nameOf(k: Handle): string {
+        const index = heap.keyIndex(k)
+        if (index !== undefined) return `[${index}]`
+        let name = names.get(k)
+        if (name === undefined) names.set(k, name = keyLabel(k))
+        keyHandles.set(name, k)
+        return name
+    }
+    const accessors = new Map<string, Accessor>()
+    function accessorOf(proto: Handle | undefined, k: Handle): Accessor {
+        const id = `${proto}:${k}`
+        const known = accessors.get(id)
+        if (known) return known
+        const addr = proto ? heap.getPropertyDescriptor(proto, k) : 0
+        const d = addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)) : undefined
+        const fn = d ? host.functionOf(d.slot0 as u32) : undefined
+        const accessor: Accessor = !d ? { kind: 'field' }
+            : d.flags & heap.PropFlags.has_getter ? { kind: 'getter', fn }
+            : fn ? { kind: 'method', fn, slot: d.slot0 as Handle } : { kind: 'field' }
+        if (d && d.flags & heap.PropFlags.has_setter) accessor.setter = host.functionOf(d.slot1 as u32)
+        accessors.set(id, accessor)
+        return accessor
+    }
+    function setterOf(proto: Handle | undefined, k: Handle): Function | undefined {
+        return accessorOf(proto, k).setter
+    }
+    function indexTrap(proto: Handle | undefined, setter: boolean): Function | undefined {
+        const proxy = proto ? heap.getPropertyProxy(proto, heap.indexKey(0 as u32)) : 0
+        if (!proxy) return
+        return host.functionOf((setter ? heap.getProxySetter(proxy) : heap.getProxyGetter(proxy)) as u32)
+    }
+    const literalFunctions = new Map<Graph, Map<number, Function | null>>()
+    function literalFunction(g: Graph, id: number): Function | undefined {
+        const functions = mapOf(literalFunctions, g)
+        const known = functions.get(id)
+        if (known !== undefined) return known ?? undefined
+        const found = functionAt(g, id)
+        functions.set(id, found ?? null)
+        return found
+    }
+    function functionAt(g: Graph, id: number): Function | undefined {
+        const n = getNode(g, id)
+        const local = localSymbol(g, n)
+        if (local !== undefined) return host.localFunction(local)
+        if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
+        return host.functionOf(getLiteral(g, n, 0) as u32)
+    }
+    const invariants = new Map<Handle, [string, string][] | null>()
+    function invariantPairs(proto: Handle): [string, string][] | undefined {
+        const known = invariants.get(proto)
+        if (known !== undefined) return known ?? undefined
+        const pairs = host.invariantsOf ? host.invariantsOf(proto)?.pairs : undefined
+        invariants.set(proto, pairs ?? null)
+        return pairs
+    }
+    function protoName(proto: Handle | undefined): string {
+        const ctor = proto ? heap.getOwnProperty(proto, heap.fromJsString('constructor')) : 0
+        const fn = ctor ? host.functionOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(ctor)).slot0 as u32) : undefined
+        return fn?.name || 'Object'
+    }
     function negate(tests: Test[]): Test[] {
         return tests.map(([x, filter]) => [x, filter.when === undefined ? { ...filter, positive: !filter.positive } : { ...filter, when: !filter.when }])
     }
@@ -548,7 +842,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         return out
     }
-    const narrowings = new Map<Graph, Narrowing>()
     function condition(g: Graph, id: number): Test[] {
         const c = getNode(g, id)
         if (!c) return []
@@ -595,7 +888,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (c.op === NodeOp.call) tests.push(...calleeFacts(g, c))
         return tests
     }
-    type Fact = [param: number, filter: Filter]
     const summaries = new Map<Graph, Fact[]>()
     function calleeFacts(g: Graph, c: GraphNode): Test[] {
         const callee = literalFunction(g, getRef(c, 1))
@@ -603,7 +895,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const calleeGraph = host.graphOf(callee)
         const out: Test[] = []
         for (const [param, filter] of summaryOf(calleeGraph)) {
-            const slot = argSlot(c, calleeGraph, param)
+            const slot = argSlot(c, unitOf(calleeGraph), param)
             if (slot < countIds(c) && getRef(c, slot)) out.push([getRef(c, slot), filter])
         }
         return out
@@ -652,8 +944,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     const truths = new Map<Graph, Map<number, Test[] | null>>()
     function refFacts(g: Graph, id: number, truth: boolean): Test[] | undefined {
-        let byGraph = truths.get(g)
-        if (!byGraph) truths.set(g, byGraph = new Map())
+        const byGraph = mapOf(truths, g)
         const k = id * 2 + (truth ? 1 : 0)
         const known = byGraph.get(k)
         if (known !== undefined) return known ?? undefined
@@ -719,17 +1010,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const strict = c.op === NodeOp.lt || c.op === NodeOp.gt
         return [[getRef(c, side), { test: 'least', literal: above === strict ? k + 1 : k, positive: above }]]
     }
-    interface Narrowing {
-        own: Map<number, Map<number, [order: number, filter: Filter][]>>
-        extras: Map<number, Map<number, [order: number, filter: Filter][]>>
-        tested: Set<number>
-        combined: Map<number, { pairs: [number, Filter][], filters: Filter[] } | null>
-    }
-    function narrowingOf(g: Graph): Narrowing {
-        const known = narrowings.get(g)
+    const narrowings = new Map<UnitFacts, Narrowing>()
+    function narrowingOf(unit: UnitFacts): Narrowing {
+        const known = narrowings.get(unit)
         if (known) return known
-        const index = armIndexOf(g)
-        const users = usersOf(g)
+        const g = unit.g
+        const index = armsOf(unit)
+        const users = unit.users
         const out: Narrowing = { own: new Map(), extras: new Map(), tested: new Set(), combined: new Map() }
         function panics(arm: number): boolean {
             let at = getNode(g, arm)
@@ -757,13 +1044,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             return at === root
         }
         function add(into: Map<number, Map<number, [number, Filter][]>>, at: number, order: number, held: Test[]): void {
-            let byOperand = into.get(at)
-            if (!byOperand) into.set(at, byOperand = new Map())
+            const byOperand = mapOf(into, at)
             for (const [x, filter] of held) {
-                const operand = canonical(g, x)
+                const operand = canonical(unit, x)
                 out.tested.add(operand)
-                let list = byOperand.get(operand)
-                if (!list) byOperand.set(operand, list = [])
+                const list = listOf(byOperand, operand)
                 list.push([order, filter])
             }
         }
@@ -782,11 +1067,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             }
         }
         for (const lists of out.extras.values()) for (const list of lists.values()) list.sort((x, y) => x[0] - y[0])
-        narrowings.set(g, out)
+        narrowings.set(unit, out)
         return out
     }
-    function combinedOn(g: Graph, narrowing: Narrowing, root: number, x: number): { pairs: [number, Filter][], filters: Filter[] } | undefined {
-        const index = armIndexOf(g)
+    function combinedOn(unit: UnitFacts, narrowing: Narrowing, root: number, x: number): { pairs: [number, Filter][], filters: Filter[] } | undefined {
+        const index = armsOf(unit)
         const climb: number[] = []
         let at: number | undefined = root
         while (at !== undefined && !narrowing.combined.has(at * nodeSpan + x)) {
@@ -805,693 +1090,18 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         return below
     }
-    function narrowAt(g: Graph, node: number, x: number): Filter[] | undefined {
-        const narrowing = narrowingOf(g)
+    function narrowAt(unit: UnitFacts, node: number, x: number): Filter[] | undefined {
+        const narrowing = narrowingOf(unit)
         if (!narrowing.tested.has(x)) return
-        const root = armIndexOf(g).nearest.get(node)
-        const base = root === undefined ? undefined : combinedOn(g, narrowing, root, x)
+        const root = armsOf(unit).nearest.get(node)
+        const base = root === undefined ? undefined : combinedOn(unit, narrowing, root, x)
         const extra = narrowing.extras.get(node)?.get(x)
         if (!extra) return base?.filters
         return [...base?.pairs ?? [], ...extra].sort((p, q) => p[0] - q[0]).map(([, filter]) => filter)
     }
-    const fieldWatchers = new Map<number, Set<number>>()
-    function accepts(v: number, filter: Filter, frame: number, x: number): boolean {
-        const value = values[v]
-        if (value.kind === ValueKind.unknown || value.kind === ValueKind.variable) return true
-        if (filter.test === 'field') {
-            if (value.kind !== ValueKind.object || value.allocation === undefined || !ownField(value.allocation, filter.key!)) return true
-            const loc = location(value.allocation, filter.key!)
-            setOf(fieldWatchers, loc).add(key(frame, x))
-            const held = setOf(contents, loc)
-            const test = (c: number) => filter.literal === undefined ? accepts(c, { test: 'truthy', positive: filter.positive }, frame, x)
-                : filter.positive ? values[c].form !== NumberForm.literal || values[c].literal === filter.literal
-                : !(values[c].form === NumberForm.literal && values[c].literal === filter.literal)
-            return held.size ? [...held].some(test) : test(Undefined)
-        }
-        switch (filter.test) {
-            case 'number': return (value.kind === ValueKind.number) === filter.positive
-            case 'float': return (value.kind === ValueKind.number && !integral(v)) === filter.positive
-            case 'string': return (value.kind === ValueKind.string || handleWord(v)) === filter.positive
-            case 'undefined': return (value.kind === ValueKind.undefined) === filter.positive
-            case 'object': return (value.kind === ValueKind.object) === filter.positive
-            case 'function': return (value.kind === ValueKind.function) === filter.positive
-            case 'falsy': {
-                const falsy = value.kind === ValueKind.undefined || isZero(v)
-                const maybeFalsy = falsy || (value.kind === ValueKind.number && value.form !== NumberForm.literal)
-                return filter.positive ? maybeFalsy : !falsy
-            }
-            case 'zero': {
-                const zero = isZero(v)
-                const maybeZero = zero || (value.kind === ValueKind.number && value.form !== NumberForm.literal)
-                return filter.positive ? maybeZero : !zero
-            }
-            case 'truthy': {
-                const falsy = value.kind === ValueKind.undefined || isZero(v)
-                const truthy = value.kind !== ValueKind.undefined && !isZero(v)
-                const maybeFalsy = falsy || (value.kind === ValueKind.number && value.form !== NumberForm.literal) || value.kind === ValueKind.string
-                return filter.positive ? truthy : maybeFalsy
-            }
-        }
-        return true
-    }
-    function ownField(allocation: number, name: string): boolean {
-        const { proto, dynamic } = allocations[allocation]
-        if (dynamic || (proto !== undefined && allocatedStates.has(proto))) return false
-        const k = keyHandles.get(name)
-        if (k === undefined) return !indexTrap(proto, false)
-        return accessorOf(proto, k).kind === 'field'
-    }
-    const canonicals = new Map<Graph, Map<number, number>>()
-    function canonical(g: Graph, id: number): number {
-        let byGraph = canonicals.get(g)
-        if (!byGraph) canonicals.set(g, byGraph = new Map())
-        const known = byGraph.get(id)
-        if (known !== undefined) return known
-        byGraph.set(id, id)
-        const n = getNode(g, id)
-        if (n?.op !== NodeOp.getProp || getRef(n, 2)) return id
-        const found = priorRead(g, getRef(n, 0), canonical(g, getRef(n, 1)), keyLabel(getLiteral(g, n, 2) as Handle))
-        const result = typeof found === 'number' ? found : id
-        byGraph.set(id, result)
-        return result
-    }
-    function priorRead(g: Graph, order: number, object: number, name: string): number | 'entry' | undefined {
-        let at = order
-        while (at) {
-            const m = getNode(g, at)
-            if (!m) return
-            if (m.op === NodeOp.nilEffect) return getRef(m, 0) === g.blocks[0].id ? 'entry' : undefined
-            if (m.op === NodeOp.getProp) {
-                if (!getRef(m, 2) && keyLabel(getLiteral(g, m, 2) as Handle) === name && canonical(g, getRef(m, 1)) === object) return canonical(g, at)
-            } else if (m.op !== NodeOp.setProp || getRef(m, 2) || keyLabel(getLiteral(g, m, 2) as Handle) === name) return
-            at = getRef(m, 0)
-        }
-    }
-    function addReturns(frame: number, ret: number, incoming: Iterable<number>): void {
-        const all = setOf(returns, frame)
-        let byRet = retSets.get(frame)
-        if (!byRet) retSets.set(frame, byRet = new Map())
-        let set = byRet.get(ret)
-        if (!set) byRet.set(ret, set = new Set())
-        let grew = false
-        for (const v of incoming) {
-            all.add(v)
-            if (set.has(v)) continue
-            set.add(v)
-            grew = true
-        }
-        if (grew) for (const loc of returnLocations.get(frame) ?? []) store(loc, set)
-        if (grew) for (const target of returnTargets.get(frame) ?? []) {
-            if (resultTyped.has(target)) continue
-            const [f, c] = parse(target)
-            if (!refuted(f, c, frame, ret)) flow(f, c, set)
-        }
-    }
-    function returned(frame: number, ret: number, incoming: Iterable<number>): void {
-        const region = regionRets(frames[frame].graph!).get(ret)
-        if (region !== undefined) flow(frame, region, incoming)
-        else addReturns(frame, ret, incoming)
-    }
-    type Term = { param: number, key?: number } | { literal: number }
-    function calleeTerm(g: Graph, n: GraphNode, i: number): Term | undefined {
-        if (!getRef(n, i)) return { literal: getLiteral(g, n, i) }
-        const id = getRef(n, i)
-        const param = g.blocks[0].params.indexOf(id)
-        if (param >= 0) return { param }
-        const m = getNode(g, id)
-        if (m?.op !== NodeOp.getProp || getRef(m, 2)) return
-        const object = g.blocks[0].params.indexOf(getRef(m, 1))
-        if (object < 0 || priorRead(g, getRef(m, 0), getRef(m, 1), keyLabel(getLiteral(g, m, 2) as Handle)) !== 'entry') return
-        return { param: object, key: getLiteral(g, m, 2) }
-    }
-    function argSlot(call: GraphNode, calleeGraph: Graph, param: number): number {
-        const self = receiverOf(calleeGraph)
-        const params = calleeGraph.blocks[0].params
-        const receiverSlot = call.op === NodeOp.call ? 2 : call.op === NodeOp.getProp || call.op === NodeOp.setProp ? 1 : -1
-        const first = call.op === NodeOp.call ? 3 : 2
-        return params[param] === self ? receiverSlot : first + params.filter(p => p !== self).indexOf(params[param])
-    }
-    function callerTerm(caller: number, g: Graph, call: GraphNode, term: Term, calleeGraph: Graph): string | undefined {
-        if ('literal' in term) return `#${term.literal}`
-        const slot = argSlot(call, calleeGraph, term.param)
-        if (slot < 0 || slot >= countIds(call)) return
-        if (!getRef(call, slot)) return term.key === undefined ? `#${getLiteral(g, call, slot)}` : undefined
-        const object = canonical(g, getRef(call, slot))
-        if (term.key === undefined) return `n${object}`
-        const name = keyLabel(term.key as Handle)
-        const read = priorRead(g, getRef(call, 0), object, name)
-        if (typeof read === 'number') return `n${read}`
-        const holder = getNode(g, object)
-        if (holder?.op !== NodeOp.getProp || getRef(holder, 2)) return
-        const owner = canonical(g, getRef(holder, 1))
-        const path = `${keyLabel(getLiteral(g, holder, 2) as Handle)}.${name}`
-        for (const field of equalFields(caller, getRef(holder, 1), path)) {
-            const other = priorRead(g, getRef(call, 0), owner, field)
-            if (typeof other === 'number') return `n${other}`
-        }
-    }
-    function equalFields(frame: number, node: number, path: string): string[] {
-        if (refuting) setOf(refutationWatchers, key(frame, node)).add(refuting)
-        let common: string[] | undefined
-        for (const v of valuesAt(frame, node)) {
-            const allocation = values[v].allocation
-            const proto = allocation !== undefined ? allocations[allocation].proto : undefined
-            const pairs = proto && host.invariantsOf ? host.invariantsOf(proto)?.pairs : undefined
-            if (!pairs) return []
-            const fields = pairs.flatMap(([x, y]) => x === path && !y.includes('.') ? [y] : y === path && !x.includes('.') ? [x] : [])
-            common = common ? common.filter(f => fields.includes(f)) : fields
-        }
-        if (common?.length) for (const v of valuesAt(frame, node)) consulted.add(allocations[values[v].allocation!].proto!)
-        return common ?? []
-    }
-    function predicate(op: NodeOp, a: string, b: string, positive: boolean): string {
-        switch (op) {
-            case NodeOp.lt: return `${positive}<${a},${b}`
-            case NodeOp.ge: return `${!positive}<${a},${b}`
-            case NodeOp.gt: return `${positive}<${b},${a}`
-            case NodeOp.le: return `${!positive}<${b},${a}`
-            case NodeOp.eq: return `${positive}=${a < b ? a : b},${a < b ? b : a}`
-            default: return `${!positive}=${a < b ? a : b},${a < b ? b : a}`
-        }
-    }
-    function negated(p: string): string {
-        return p.startsWith('true') ? `false${p.slice(4)}` : `true${p.slice(5)}`
-    }
-    const consulted = new Set<Handle>()
-    const refutations = new Map<Graph, Map<string, boolean>>()
-    let refuting: string | undefined
-    const refutationWatchers = new Map<number, Set<string>>()
-    function recheck(watched: number): void {
-        const pending = refutationWatchers.get(watched)
-        if (!pending) return
-        refutationWatchers.delete(watched)
-        for (const entry of pending) {
-            const [caller, call, frame, ret] = entry.split('|').map(Number)
-            refutations.get(frames[caller].graph!)?.delete(`${caller}|${call}|${unitKey(frames[frame].unit)}|${ret}`)
-            if (!refuted(caller, call, frame, ret)) flow(caller, call, retSets.get(frame)?.get(ret) ?? [])
-        }
-    }
-    function refuted(caller: number, call: number, frame: number, ret: number): boolean {
-        const previous = refuting
-        refuting = `${caller}|${call}|${frame}|${ret}`
-        try {
-            return refutedAt(caller, call, frame, ret)
-        } finally {
-            refuting = previous
-        }
-    }
-    function refutedAt(caller: number, call: number, frame: number, ret: number): boolean {
-        const g = frames[caller].graph!
-        const calleeGraph = frames[frame].graph!
-        let byGraph = refutations.get(g)
-        if (!byGraph) refutations.set(g, byGraph = new Map())
-        const k = `${caller}|${call}|${unitKey(frames[frame].unit)}|${ret}`
-        const known = byGraph.get(k)
-        if (known !== undefined) return known
-        const callNode = getNode(g, call)!
-        const facts = new Set<string>()
-        for (const [cond, positive] of guardsAt(g, call) ?? []) {
-            const c = getNode(g, cond)!
-            const side = (i: number) => getRef(c, i) ? `n${canonical(g, getRef(c, i))}` : `#${getLiteral(g, c, i)}`
-            facts.add(predicate(c.op, side(0), side(1), positive))
-        }
-        let result = false
-        if (facts.size) for (const [cond, positive] of guardsAt(calleeGraph, ret) ?? []) {
-            const c = getNode(calleeGraph, cond)!
-            const terms = [0, 1].map(i => calleeTerm(calleeGraph, c, i))
-            if (terms.some(t => !t)) continue
-            const sides = terms.map(t => callerTerm(caller, g, callNode, t!, calleeGraph))
-            if (sides.some(side => side === undefined)) continue
-            if (facts.has(negated(predicate(c.op, sides[0]!, sides[1]!, positive)))) {
-                result = true
-                break
-            }
-        }
-        byGraph.set(k, result)
-        return result
-    }
-    const waiting = new Map<number, Set<number>>()
-    const rootStates = new Map<number, boolean>()
-    const rootWaiting = new Map<number, Set<number>>()
-    const rootChildren = new Map<number, Set<number>>()
-    const rootNodes = new Map<number, Set<number>>()
-    function holds(frame: number, x: number, filters: Filter[]): boolean {
-        const recorded = valuesAt(frame, x)
-        return !unrecorded(recorded) && [...recorded].some(v => filters.every(filter => accepts(v, filter, frame, x)))
-    }
-    function rootOpen(frame: number, root: number): boolean {
-        const k = key(frame, root)
-        const state = rootStates.get(k)
-        if (state !== undefined) return state
-        const g = frames[frame].graph!
-        const up = armIndexOf(g).parent.get(root)
-        if (up !== undefined && !rootOpen(frame, up)) {
-            setOf(rootChildren, key(frame, up)).add(root)
-            rootStates.set(k, false)
-            return false
-        }
-        const narrowing = narrowingOf(g)
-        for (const x of narrowing.own.get(root)?.keys() ?? []) {
-            if (holds(frame, x, combinedOn(g, narrowing, root, x)!.filters)) continue
-            setOf(rootWaiting, key(frame, x)).add(root)
-            rootStates.set(k, false)
-            return false
-        }
-        rootStates.set(k, true)
-        return true
-    }
-    function retryRoot(frame: number, root: number): void {
-        rootStates.delete(key(frame, root))
-        if (!rootOpen(frame, root)) return
-        const k = key(frame, root)
-        const nodes = rootNodes.get(k)
-        if (nodes) {
-            rootNodes.delete(k)
-            for (const node of nodes) seedNode(frame, node)
-        }
-        const children = rootChildren.get(k)
-        if (children) {
-            rootChildren.delete(k)
-            for (const child of children) retryRoot(frame, child)
-        }
-    }
-    function enabled(frame: number, node: number): boolean {
-        const g = frames[frame].graph!
-        const narrowing = narrowingOf(g)
-        const root = armIndexOf(g).nearest.get(node)
-        const extra = narrowing.extras.get(node)
-        if (extra) {
-            const operands: [number, number][] = []
-            for (const [x, list] of extra) operands.push([list[0][0], x])
-            let at = root
-            while (at !== undefined) {
-                for (const [x, list] of narrowing.own.get(at) ?? []) operands.push([list[0][0], x])
-                at = armIndexOf(g).parent.get(at)
-            }
-            operands.sort((p, q) => p[0] - q[0])
-            const checked = new Set<number>()
-            for (const [, x] of operands) {
-                if (checked.has(x)) continue
-                checked.add(x)
-                if (holds(frame, x, narrowAt(g, node, x)!)) continue
-                setOf(waiting, key(frame, x)).add(node)
-                return false
-            }
-            return true
-        }
-        if (root === undefined || rootOpen(frame, root)) return true
-        setOf(rootNodes, key(frame, root)).add(node)
-        return false
-    }
-    function seen(frame: number, user: number, ref: number): Iterable<number> {
-        const set = valuesAt(frame, ref)
-        const filters = narrowAt(frames[frame].graph!, user, canonical(frames[frame].graph!, ref))
-        if (!filters) return set
-        return [...set].filter(v => filters.every(filter => accepts(v, filter, frame, ref))).map(v => narrowed(v, filters))
-    }
-    function handleWord(v: number): boolean {
-        return !!values[v].word
-    }
-    function nonZero(filter: Filter): boolean {
-        if (filter.test === 'truthy') return filter.positive
-        return (filter.test === 'zero' || filter.test === 'falsy') && !filter.positive
-    }
-    function narrowedLeast(low: number, filters: Filter[]): number {
-        let out = low
-        for (const filter of filters) {
-            if (filter.test === 'least' && filter.positive) out = Math.max(out, Math.ceil(filter.literal!))
-            else if (nonZero(filter) && low >= 0) out = Math.max(out, 1)
-        }
-        return out
-    }
-    function narrowedMost(high: number, filters: Filter[]): number {
-        let out = high
-        for (const filter of filters) if (filter.test === 'least' && !filter.positive) out = Math.min(out, Math.ceil(filter.literal!) - 1)
-        return out
-    }
-    function narrowed(v: number, filters: Filter[]): number {
-        const value = values[v]
-        if (handleWord(v) && filters.some(filter => filter.positive && filter.test === 'string')) return Str
-        if (value.range) {
-            const lo = narrowedLeast(value.range[0], filters)
-            const hi = narrowedMost(value.range[1], filters)
-            if (lo > hi || (lo === value.range[0] && hi === value.range[1])) return v
-            return rangeValue([lo, hi], value.word)
-        }
-        if (value.kind !== ValueKind.variable) return v
-        const test = filters.find(filter => filter.positive && filter.test !== 'truthy' && filter.test !== 'field' && filter.test !== 'least')?.test
-        if (!test || value.narrow === test) return v
-        const base = value.base ?? v
-        return intern(`v${base}&${test}`, () => ({ kind: ValueKind.variable, site: value.site, param: value.param, narrow: test, base }))
-    }
-    function key(frame: number, node: number): number {
-        intrinsics.assert(node < nodeSpan)
-        return frame * nodeSpan + node
-    }
-    function parse(k: number): [frame: number, node: number] {
-        return [Math.floor(k / nodeSpan), k % nodeSpan]
-    }
-    function schedule(k: number): void {
-        if (queued.has(k)) return
-        queued.add(k)
-        work.push(k)
-    }
-    function changed(k: number): void {
-        dirty.add(k)
-        schedule(k)
-    }
-    function invalidate(k: number): void {
-        stale.add(k)
-        schedule(k)
-    }
-    function valuesAt(frame: number, node: number): Set<number> {
-        return setOf(frames[frame].nodes, node)
-    }
-    function literal(value: number): number {
-        return intern(`l${value}`, () => ({ kind: ValueKind.number, form: NumberForm.literal, literal: value }))
-    }
-    function rangeValue(range: Interval, word?: boolean): number {
-        if (word) return intern(`w${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range, word }))
-        return intern(`r${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range }))
-    }
-    function floatValue(): number {
-        return intern('f', () => ({ kind: ValueKind.number, form: NumberForm.float }))
-    }
-    function typedValue(T: intrinsics.Types): number {
-        const range = typeInterval(T)
-        return range ? rangeValue(range, T === Types.u32 || T === Types.u64) : floatValue()
-    }
-    function isZero(v: number): boolean {
-        return values[v].form === NumberForm.literal && values[v].literal === 0
-    }
-    function integral(v: number): boolean {
-        const value = values[v]
-        if (value.form === NumberForm.literal) return Number.isInteger(value.literal)
-        return value.form === NumberForm.range
-    }
-    function spanOf(v: number): Interval {
-        const value = values[v]
-        return value.range ?? [value.literal!, value.literal!]
-    }
-    function operand(frame: number, node: number, n: GraphNode, i: number): Iterable<number> {
-        if (getRef(n, i)) return seen(frame, node, getRef(n, i))
-        const value = getLiteral(frames[frame].graph!, n, i)
-        const index = i === 2 && (n.op === NodeOp.getProp || n.op === NodeOp.setProp) ? heap.keyIndex(value as Handle) : undefined
-        return [literal(index ?? value)]
-    }
-    function typed(incoming: Iterable<number>, T: intrinsics.Types | undefined): Iterable<number> {
-        if (T === undefined) return incoming
-        if (T === Types.unknown_number) return [...incoming].map(v => opaqueKind(v) ? floatValue() : v)
-        if (T === Types.u64 || T === Types.usize || T === Types.ptr) return [...incoming].map(v => opaqueKind(v) ? typedValue(T) : v)
-        if (!scalarType(T)) return incoming
-        const bound = typeInterval(T)
-        return [...incoming].map(v => (values[v].kind === ValueKind.number && !(bound && integral(v) && within(spanOf(v), bound))) || opaqueKind(v) ? typedValue(T) : v)
-    }
-    function opaqueKind(v: number): boolean {
-        return values[v].kind === ValueKind.unknown || values[v].kind === ValueKind.variable
-    }
-    function variable(site: Site, param?: number): number {
-        return intern(`v${unitKey(site.unit)}:${param ?? `%${site.node}`}`, () => ({ kind: ValueKind.variable, site, param }))
-    }
-    const entered = new Set<number>()
-    const nodeTypes = new Map<number, intrinsics.Types | undefined>()
-    function nodeType(frame: number, node: number): intrinsics.Types | undefined {
-        const k = key(frame, node)
-        if (nodeTypes.has(k)) return nodeTypes.get(k)
-        const g = frames[frame].graph!
-        const n = getNode(g, node)
-        const T = n && n.op !== NodeOp.param && n.op !== NodeOp.after && n.op !== NodeOp.select && n.op !== NodeOp.inlined ? resultType(g, n) : undefined
-        if (T === Types.u64 && n && n.op !== NodeOp.load && n.op !== NodeOp.convert && n.op !== NodeOp.bitconvert && !NumericOps.has(n.op)) {
-            nodeTypes.set(k, undefined)
-            return undefined
-        }
-        nodeTypes.set(k, T)
-        return T
-    }
-    function arithmetic(n: GraphNode): boolean {
-        return NumericOps.has(n.op) || n.op === NodeOp.convert || n.op === NodeOp.bitconvert
-    }
-    function fold(op: NodeOp, a: number, b: number): number | undefined {
-        switch (op) {
-            case NodeOp.lt: return a < b ? 1 : 0
-            case NodeOp.le: return a <= b ? 1 : 0
-            case NodeOp.gt: return a > b ? 1 : 0
-            case NodeOp.ge: return a >= b ? 1 : 0
-            case NodeOp.eq: return a === b ? 1 : 0
-            case NodeOp.ne: return a !== b ? 1 : 0
-            case NodeOp.add: return a + b
-            case NodeOp.sub: return a - b
-            case NodeOp.mul: return a * b
-            case NodeOp.shl: return a * 2 ** b
-            case NodeOp.and: return a & b
-            case NodeOp.or: return a | b
-            case NodeOp.xor: return a ^ b
-        }
-    }
-    function comparisonValues(frame: number, node: number, n: GraphNode): number[] {
-        const g = frames[frame].graph!
-        const sides = [0, 1].map(i => getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))])
-        if (sides.some(unrecorded)) return []
-        if (sides.every(side => side.length === 1 && values[side[0]].form === NumberForm.literal)) return [literal(fold(n.op, values[sides[0][0]].literal!, values[sides[1][0]].literal!)!)]
-        const undefinedOnly = (side: number[]) => side.every(v => values[v].kind === ValueKind.undefined)
-        const neverUndefined = (side: number[]) => side.every(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.function || values[v].kind === ValueKind.string)
-        const disjoint = (undefinedOnly(sides[0]) && neverUndefined(sides[1])) || (neverUndefined(sides[0]) && undefinedOnly(sides[1]))
-        if (disjoint && (n.op === NodeOp.eq || n.op === NodeOp.ne)) return [literal(n.op === NodeOp.ne ? 1 : 0)]
-        return [rangeValue([0, 1])]
-    }
-    function compareStrings(frame: number, node: number, n: GraphNode): void {
-        if (!getRef(n, 0) || !getRef(n, 1)) return
-        const sides = [0, 1].map(i => [...seen(frame, node, getRef(n, i))])
-        if (!sides.every(side => side.some(v => values[v].kind === ValueKind.string))) return
-        if (!sides.some(side => side.includes(Str))) return
-        resultTyped.add(key(frame, node))
-        bind(frame, node, n, rt.bindingOf(rt.Op.strictEqual)!.impl!, undefined, 0)
-    }
-    function testString(frame: number, node: number, n: GraphNode): void {
-        if (![...seen(frame, node, getRef(n, 0))].some(v => values[v].kind === ValueKind.string)) return
-        resultTyped.add(key(frame, node))
-        bind(frame, node, n, rt.bindingOf(rt.Op.truthy)!.impl!, undefined, 0)
-    }
-    function truncated(v: number): number {
-        const value = values[v]
-        if (value.kind !== ValueKind.number || integral(v)) return v
-        if (value.form === NumberForm.literal && Number.isSafeInteger(Math.trunc(value.literal!))) return literal(Math.trunc(value.literal!) || 0)
-        return rangeValue(I64)
-    }
-    function operandNumbers(frame: number, node: number, n: GraphNode): number[] {
-        const g = frames[frame].graph!
-        const sets: number[][] = []
-        for (let i = 0; i < countIds(n); i++) {
-            const operands = getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))]
-            if (!operands.some(v => values[v].kind === ValueKind.number || opaqueKind(v))) return []
-            sets.push(BitwiseOps.has(n.op) ? operands.map(truncated) : operands)
-        }
-        const single = (list: number[]) => list.length === 1 && values[list[0]].form === NumberForm.literal
-        if (countIds(n) === 2 && sets.every(single)) {
-            const result = fold(n.op, values[sets[0][0]].literal!, values[sets[1][0]].literal!)
-            if (result !== undefined && Number.isFinite(result)) return [literal(result)]
-        }
-        const spans: Interval[] = []
-        for (const list of sets) {
-            let span: Interval | undefined
-            for (const v of list) {
-                if (opaqueKind(v)) span = hull(span, [MinI64, MaxU64])
-                else if (values[v].kind !== ValueKind.number) continue
-                else if (!integral(v)) return [floatValue()]
-                else span = hull(span, spanOf(v))
-            }
-            spans.push(span!)
-        }
-        let result = interval(n.op, spans[0], spans[spans.length - 1])
-        if (n.op === NodeOp.sub) result = [Math.min(result[1], Math.max(result[0], orderedDifference(g, node, n))), result[1]]
-        return [rangeValue(sets.every(list => list.length === 1) ? result : boundary(result))]
-    }
-    function orderedDifference(g: Graph, node: number, n: GraphNode): number {
-        if (!getRef(n, 0) || !getRef(n, 1)) return -Infinity
-        const minuend = canonical(g, getRef(n, 0))
-        const subtrahend = canonical(g, getRef(n, 1))
-        if (countedFrom(g, getRef(n, 0), subtrahend)) return 0
-        let low = -Infinity
-        for (const [cond, positive] of guardsAt(g, node) ?? []) {
-            const c = getNode(g, cond)!
-            if (c.op === NodeOp.eq || c.op === NodeOp.ne || !getRef(c, 0) || !getRef(c, 1)) continue
-            const below = (c.op === NodeOp.gt || c.op === NodeOp.ge) === positive ? 1 : 0
-            const strict = (c.op === NodeOp.lt || c.op === NodeOp.gt) === positive
-            if (canonical(g, getRef(c, 1 - below)) === minuend && canonical(g, getRef(c, below)) === subtrahend) low = Math.max(low, strict ? 1 : 0)
-        }
-        return low
-    }
-    function countedFrom(g: Graph, param: number, base: number): boolean {
-        const at = paramSlots(g).get(param)
-        if (!at) return false
-        const arrivals = predsOf(g, at[0])
-        if (!arrivals.length) return false
-        for (const apply of arrivals) {
-            const x = getRef(getNode(g, apply)!, at[1] + 1)
-            if (x && canonical(g, x) === base) continue
-            const step = x ? getNode(g, x) : undefined
-            if (step?.op !== NodeOp.add || countIds(step) !== 2) return false
-            const self = getRef(step, 0) === param ? 0 : getRef(step, 1) === param ? 1 : -1
-            if (self < 0 || getRef(step, 1 - self) || getLiteral(g, step, 1 - self) < 0) return false
-        }
-        return true
-    }
-    function opaqueValue(g: Graph, id: number): number {
-        const T = resultType(g, getNode(g, id)!)
-        if (T === Types.vm_value || T === Types.unknown || T === Types.void) return Unknown
-        return typedValue(T)
-    }
-    function flow(frame: number, node: number, incoming: Iterable<number>): void {
-        const set = valuesAt(frame, node)
-        let grew = false
-        for (const v of typed(incoming, nodeType(frame, node))) {
-            if (set.has(v)) continue
-            set.add(v)
-            grew = true
-        }
-        if (grew) {
-            changed(key(frame, node))
-            recheck(key(frame, node))
-        }
-    }
-    function unitKey(unit: Function): number {
-        let k = unitKeys.get(unit)
-        if (k === undefined) unitKeys.set(unit, k = unitKeys.size)
-        return k
-    }
-    function intern(id: string, init: () => Value): number {
-        const known = valueIds.get(id)
-        if (known !== undefined) return known
-        valueIds.set(id, values.length)
-        values.push(init())
-        return values.length - 1
-    }
-    const functionObjects = new Map<number, Set<Handle>>()
-    function functionValue(fn: Function, handle?: Handle): number {
-        const v = intern(`f${unitKey(fn)}`, () => ({ kind: ValueKind.function, fn }))
-        if (handle) setOf(functionObjects, v).add(heap.deref(handle))
-        return v
-    }
-    function objectsOf(frame: number, node: number, v: number): number[] {
-        const value = values[v]
-        if (value.allocation !== undefined) return [value.allocation]
-        const out: number[] = []
-        for (const state of functionObjects.get(v) ?? []) out.push(values[heapObject(frame, node, `@${state}`, state, true)].allocation!)
-        return out
-    }
-    function closureValue(fn: Function, allocation: number): number {
-        return intern(`c${unitKey(fn)}:${allocation}`, () => ({ kind: ValueKind.function, fn, allocation }))
-    }
-    function objectValue(allocation: number): number {
-        return intern(`o${allocation}`, () => ({ kind: ValueKind.object, allocation }))
-    }
-    function allocate(id: string, frame: number, node: number, name: string, proto: Handle | undefined, constant: boolean): [number, boolean] {
-        const known = allocationIds.get(id)
-        if (known !== undefined) return [known, false]
-        allocationIds.set(id, allocations.length)
-        const owner = frames[frame].object
-        const depth = constant || owner < 0 ? 0 : allocations[owner].depth + 1
-        allocations.push({ site: { unit: frames[frame].unit, node }, frame: constant ? undefined : frame, name, depth, proto, constant, escaped: false })
-        return [allocations.length - 1, true]
-    }
-    function location(allocation: number, name: string): number {
-        const id = `${allocation}/${name}`
-        const known = locationIds.get(id)
-        if (known !== undefined) return known
-        locationIds.set(id, locations.length)
-        locations.push({ allocation, key: name, values: [], forms: [], readers: [], writers: [], stored: false })
-        const loc = locations.length - 1
-        let fields = fieldsOf.get(allocation)
-        if (!fields) fieldsOf.set(allocation, fields = [])
-        fields.push(loc)
-        for (const copier of copiers.get(allocation) ?? []) invalidate(copier)
-        if (opaqueAllocations.has(allocation)) setOf(contents, loc).add(Unknown)
-        if (name === protoKey) for (const reader of inheritedReaders.get(allocation) ?? []) setOf(fieldWatchers, loc).add(reader)
-        if (name === numberKey) for (const reader of constantReaders.get(allocation) ?? []) setOf(contentReaders, loc).add(reader)
-        else if (/^(\[\d+\]|@\d+)$/.test(name)) {
-            let list = indexLocations.get(allocation)
-            if (!list) indexLocations.set(allocation, list = [])
-            list.push(loc)
-            for (const reader of indexReaders.get(allocation) ?? []) setOf(contentReaders, loc).add(reader)
-        }
-        return loc
-    }
-    function access(write: boolean, frame: number, node: number, allocation: number, name: string): number {
-        const loc = location(allocation, name)
-        const unit = frames[frame].unit
-        const id = `${write ? 'w' : 'r'}${loc}:${unitKey(unit)}:${node}`
-        if (!recorded.has(id)) {
-            recorded.add(id)
-            ;(write ? locations[loc].writers : locations[loc].readers).push({ unit, node })
-        }
-        setOf(touched, key(frame, node)).add(loc)
-        return loc
-    }
-    function read(frame: number, node: number, loc: number): void {
-        const init = heldStatics.get(loc)
-        if (init) {
-            heldStatics.delete(loc)
-            const entered = enter(init, 'static|', -1)
-            setOf(returnLocations, entered).add(loc)
-            store(loc, setOf(returns, entered))
-        }
-        setOf(contentReaders, loc).add(key(frame, node))
-        flow(frame, node, setOf(contents, loc))
-    }
-    function store(loc: number, incoming: Iterable<number>): void {
-        const set = setOf(contents, loc)
-        let grew = false
-        for (const v of incoming) {
-            if (set.has(v)) continue
-            set.add(v)
-            grew = true
-        }
-        if (!grew) return
-        for (const copier of copiers.get(locations[loc].allocation) ?? []) invalidate(copier)
-        for (const watcher of fieldWatchers.get(loc) ?? []) changed(watcher)
-        for (const reader of contentReaders.get(loc) ?? []) {
-            const [frame, node] = parse(reader)
-            flow(frame, node, set)
-        }
-    }
-    function storeFrom(frame: number, node: number, n: GraphNode, i: number, loc: number): void {
-        const T = n.op === NodeOp.store ? typeOf(n) : n.op === NodeOp.rt ? rt.elementType(frames[frame].graph!, n) : undefined
-        const form = T === undefined ? 'prop' : typeName(T)
-        if (!locations[loc].forms.includes(form)) locations[loc].forms.push(form)
-        locations[loc].stored = true
-        if (n.op === NodeOp.setProp && overwritten(frame, n, loc)) {
-            let list = shadowed.get(frame)
-            if (!list) shadowed.set(frame, list = [])
-            list.push([node, n, i, loc])
-            return
-        }
-        if (!getRef(n, i)) return store(loc, typed([literal(getLiteral(frames[frame].graph!, n, i))], T))
-        let into = storedInto.get(key(frame, getRef(n, i)))
-        if (!into) storedInto.set(key(frame, getRef(n, i)), into = new Map())
-        into.set(loc, [T, node])
-        store(loc, typed(seen(frame, node, getRef(n, i)), T))
-    }
-    const shadowed = new Map<number, [number, GraphNode, number, number][]>()
-    function overwritten(frame: number, n: GraphNode, loc: number): boolean {
-        const g = frames[frame].graph!
-        const self = receiverOf(g)
-        if (self === undefined || valueTail(g, getRef(n, 1)) !== self || getRef(n, 2)) return false
-        const { allocation, key: name } = locations[loc]
-        const { site, proto } = allocations[allocation]
-        if (!initializer(g, self, proto)) return false
-        const sites = callSites.get(frame)
-        if (!sites?.size) return false
-        for (const s of sites) {
-            const [caller, call] = parse(s)
-            if (frames[caller].unit !== site.unit) return false
-            if (!killedAfter(frames[caller].graph!, call, site.node, name, proto, returnsSelf(g, self))) return false
-        }
-        return true
-    }
     const initializers = new Map<Graph, Map<Handle | undefined, boolean>>()
     function initializer(g: Graph, self: number, proto: Handle | undefined): boolean {
-        let byGraph = initializers.get(g)
-        if (!byGraph) initializers.set(g, byGraph = new Map())
+        const byGraph = mapOf(initializers, g)
         const known = byGraph.get(proto)
         if (known !== undefined) return known
         const found = initializerOf(g, self, proto)
@@ -1512,14 +1122,9 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         return true
     }
-    function returnsSelf(g: Graph, self: number): boolean {
-        for (const n of g.nodes.values()) if (n.op === NodeOp.ret && getRef(n, 0) && valueTail(g, getRef(n, 0)) !== self) return false
-        return true
-    }
     const kills = new Map<Graph, Map<string, boolean>>()
     function killedAfter(g: Graph, call: number, allocated: number, name: string, proto: Handle | undefined, self: boolean): boolean {
-        let byGraph = kills.get(g)
-        if (!byGraph) kills.set(g, byGraph = new Map())
+        const byGraph = mapOf(kills, g)
         const id = `${call}:${name}:${self}:${proto}`
         const known = byGraph.get(id)
         if (known !== undefined) return known
@@ -1574,16 +1179,619 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         return reached
     }
-    const keyHandles = new Map<string, Handle>()
-    function nameOf(k: Handle): string {
-        const index = heap.keyIndex(k)
-        if (index !== undefined) return `[${index}]`
-        const name = heap.isString(k) ? heap.stringToJs(k) : heap.describeKey(k) ?? `#${k}`
-        keyHandles.set(name, k)
-        return name
+    return { keyHandles, nameOf, literalFunction, accessorOf, setterOf, indexTrap, protoName, invariantPairs, narrowingOf, combinedOn, narrowAt, initializer, killedAfter }
+}
+
+function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated): Accesses {
+    const { keyHandles, nameOf, literalFunction, accessorOf, setterOf, indexTrap, protoName, invariantPairs, narrowingOf, combinedOn, narrowAt, initializer, killedAfter } = sharedFacts(host)
+    const frames: Frame[] = []
+    const frameIds = new Map<string, number>()
+    const values: Value[] = [{ kind: ValueKind.undefined }, { kind: ValueKind.string }, { kind: ValueKind.unknown }, { kind: ValueKind.string }]
+    const valueIds = new Map<string, number>()
+    const allocations: Allocation[] = []
+    const allocationIds = new Map<string, number>()
+    const locations: Location[] = []
+    const locationIds = new Map<string, number>()
+    const recorded = new Set<string>()
+    const touched = new Map<number, Set<number>>()
+    const contents = new Map<number, Set<number>>()
+    const contentReaders = new Map<number, Set<number>>()
+    const fieldsOf = new Map<number, number[]>()
+    const copiers = new Map<number, Set<number>>()
+    const storedInto = new Map<number, Map<number, [intrinsics.Types | undefined, number]>>()
+    const returns = new Map<number, Set<number>>()
+    const returnTargets = new Map<number, Set<number>>()
+    const returnLocations = new Map<number, Set<number>>()
+    const heldStatics = new Map<number, Function>()
+    const resultTyped = new Set<number>()
+    const retSets = new Map<number, Map<number, Set<number>>>()
+    const callSites = new Map<number, Set<number>>()
+    const work: number[] = []
+    const queued = new Set<number>()
+    const stale = new Set<number>()
+    const dirty = new Set<number>()
+
+    const fieldWatchers = new Map<number, Set<number>>()
+    function accepts(v: number, filter: Filter, frame: number, x: number): boolean {
+        const value = values[v]
+        if (value.kind === ValueKind.unknown || value.kind === ValueKind.variable) return true
+        if (filter.test === 'field') {
+            if (value.kind !== ValueKind.object || value.allocation === undefined || !ownField(value.allocation, filter.key!)) return true
+            const loc = location(value.allocation, filter.key!)
+            setOf(fieldWatchers, loc).add(key(frame, x))
+            const held = setOf(contents, loc)
+            const test = (c: number) => filter.literal === undefined ? accepts(c, { test: 'truthy', positive: filter.positive }, frame, x)
+                : filter.positive ? values[c].form !== NumberForm.literal || values[c].literal === filter.literal
+                : !(values[c].form === NumberForm.literal && values[c].literal === filter.literal)
+            return held.size ? [...held].some(test) : test(Undefined)
+        }
+        switch (filter.test) {
+            case 'number': return (value.kind === ValueKind.number) === filter.positive
+            case 'float': return (value.kind === ValueKind.number && !integral(v)) === filter.positive
+            case 'string': return (value.kind === ValueKind.string || !!value.word) === filter.positive
+            case 'undefined': return (value.kind === ValueKind.undefined) === filter.positive
+            case 'object': return (value.kind === ValueKind.object) === filter.positive
+            case 'function': return (value.kind === ValueKind.function) === filter.positive
+            case 'falsy': {
+                const falsy = value.kind === ValueKind.undefined || isZero(v)
+                const maybeFalsy = falsy || (value.kind === ValueKind.number && value.form !== NumberForm.literal)
+                return filter.positive ? maybeFalsy : !falsy
+            }
+            case 'zero': {
+                const zero = isZero(v)
+                const maybeZero = zero || (value.kind === ValueKind.number && value.form !== NumberForm.literal)
+                return filter.positive ? maybeZero : !zero
+            }
+            case 'truthy': {
+                const falsy = value.kind === ValueKind.undefined || isZero(v)
+                const truthy = value.kind !== ValueKind.undefined && !isZero(v)
+                const maybeFalsy = falsy || (value.kind === ValueKind.number && value.form !== NumberForm.literal) || value.kind === ValueKind.string
+                return filter.positive ? truthy : maybeFalsy
+            }
+        }
+        return true
+    }
+    function ownField(allocation: number, name: string): boolean {
+        const { proto, dynamic } = allocations[allocation]
+        if (dynamic || (proto !== undefined && allocatedStates.has(proto))) return false
+        const k = keyHandles.get(name)
+        if (k === undefined) return !indexTrap(proto, false)
+        return accessorOf(proto, k).kind === 'field'
+    }
+    function addReturns(frame: number, ret: number, incoming: Iterable<number>): void {
+        const all = setOf(returns, frame)
+        const byRet = mapOf(retSets, frame)
+        const set = setOf(byRet, ret)
+        let grew = false
+        for (const v of incoming) {
+            all.add(v)
+            if (set.has(v)) continue
+            set.add(v)
+            grew = true
+        }
+        if (grew) for (const loc of returnLocations.get(frame) ?? []) store(loc, set)
+        if (grew) for (const target of returnTargets.get(frame) ?? []) {
+            if (resultTyped.has(target)) continue
+            const [f, c] = parse(target)
+            if (!refuted(f, c, frame, ret)) flow(f, c, set)
+        }
+    }
+    function returned(frame: number, ret: number, incoming: Iterable<number>): void {
+        const region = regionRets(frames[frame].graph).get(ret)
+        if (region !== undefined) flow(frame, region, incoming)
+        else addReturns(frame, ret, incoming)
+    }
+    function callerTerm(caller: number, call: GraphNode, term: Term, callee: UnitFacts): string | undefined {
+        if ('literal' in term) return `#${term.literal}`
+        const unit = frames[caller].facts
+        const g = unit.g
+        const slot = argSlot(call, callee, term.param)
+        if (slot < 0 || slot >= countIds(call)) return
+        if (!getRef(call, slot)) return term.key === undefined ? `#${getLiteral(g, call, slot)}` : undefined
+        const object = canonical(unit, getRef(call, slot))
+        if (term.key === undefined) return `n${object}`
+        const name = keyLabel(term.key as Handle)
+        const read = priorRead(unit, getRef(call, 0), object, name)
+        if (typeof read === 'number') return `n${read}`
+        const holder = getNode(g, object)
+        if (holder?.op !== NodeOp.getProp || getRef(holder, 2)) return
+        const owner = canonical(unit, getRef(holder, 1))
+        const path = `${keyLabel(getLiteral(g, holder, 2) as Handle)}.${name}`
+        for (const field of equalFields(caller, getRef(holder, 1), path)) {
+            const other = priorRead(unit, getRef(call, 0), owner, field)
+            if (typeof other === 'number') return `n${other}`
+        }
+    }
+    function equalFields(frame: number, node: number, path: string): string[] {
+        if (refuting) setOf(refutationWatchers, key(frame, node)).add(refuting)
+        let common: string[] | undefined
+        for (const v of valuesAt(frame, node)) {
+            const allocation = values[v].allocation
+            const proto = allocation !== undefined ? allocations[allocation].proto : undefined
+            const pairs = proto ? invariantPairs(proto) : undefined
+            if (!pairs) return []
+            const fields = pairs.flatMap(([x, y]) => x === path && !y.includes('.') ? [y] : y === path && !x.includes('.') ? [x] : [])
+            common = common ? common.filter(f => fields.includes(f)) : fields
+        }
+        if (common?.length) for (const v of valuesAt(frame, node)) consulted.add(allocations[values[v].allocation!].proto!)
+        return common ?? []
+    }
+    const consulted = new Set<Handle>()
+    const refutations = new Map<string, boolean>()
+    let refuting: string | undefined
+    const refutationWatchers = new Map<number, Set<string>>()
+    function recheck(watched: number): void {
+        const pending = refutationWatchers.get(watched)
+        if (!pending) return
+        refutationWatchers.delete(watched)
+        for (const entry of pending) {
+            const [caller, call, frame, ret] = entry.split('|').map(Number)
+            refutations.delete(`${caller}|${call}|${unitIdentity(frames[frame].unit)}|${ret}`)
+            if (!refuted(caller, call, frame, ret)) flow(caller, call, retSets.get(frame)?.get(ret) ?? [])
+        }
+    }
+    function refuted(caller: number, call: number, frame: number, ret: number): boolean {
+        const previous = refuting
+        refuting = `${caller}|${call}|${frame}|${ret}`
+        try {
+            return refutedAt(caller, call, frame, ret)
+        } finally {
+            refuting = previous
+        }
+    }
+    function refutedAt(caller: number, call: number, frame: number, ret: number): boolean {
+        const k = `${caller}|${call}|${unitIdentity(frames[frame].unit)}|${ret}`
+        const known = refutations.get(k)
+        if (known !== undefined) return known
+        const callNode = getNode(frames[caller].graph, call)!
+        const facts = callFacts(frames[caller].facts, call)
+        let result = false
+        if (facts.size) for (const guard of retGuards(frames[frame].facts, ret)) {
+            const sides = guard.terms.map(t => callerTerm(caller, callNode, t, frames[frame].facts))
+            if (sides.some(side => side === undefined)) continue
+            if (facts.has(negated(predicate(guard.op, sides[0]!, sides[1]!, guard.positive)))) {
+                result = true
+                break
+            }
+        }
+        refutations.set(k, result)
+        return result
+    }
+    const waiting = new Map<number, Set<number>>()
+    const rootStates = new Map<number, boolean>()
+    const rootWaiting = new Map<number, Set<number>>()
+    const rootChildren = new Map<number, Set<number>>()
+    const rootNodes = new Map<number, Set<number>>()
+    function holds(frame: number, x: number, filters: Filter[]): boolean {
+        const recorded = valuesAt(frame, x)
+        return !unrecorded(recorded) && [...recorded].some(v => filters.every(filter => accepts(v, filter, frame, x)))
+    }
+    function rootOpen(frame: number, root: number): boolean {
+        const k = key(frame, root)
+        const state = rootStates.get(k)
+        if (state !== undefined) return state
+        const unit = frames[frame].facts
+        const up = armsOf(unit).parent.get(root)
+        if (up !== undefined && !rootOpen(frame, up)) {
+            setOf(rootChildren, key(frame, up)).add(root)
+            rootStates.set(k, false)
+            return false
+        }
+        const narrowing = narrowingOf(unit)
+        for (const x of narrowing.own.get(root)?.keys() ?? []) {
+            if (holds(frame, x, combinedOn(unit, narrowing, root, x)!.filters)) continue
+            setOf(rootWaiting, key(frame, x)).add(root)
+            rootStates.set(k, false)
+            return false
+        }
+        rootStates.set(k, true)
+        return true
+    }
+    function retryRoot(frame: number, root: number): void {
+        rootStates.delete(key(frame, root))
+        if (!rootOpen(frame, root)) return
+        const k = key(frame, root)
+        const nodes = rootNodes.get(k)
+        if (nodes) {
+            rootNodes.delete(k)
+            for (const node of nodes) seedNode(frame, node)
+        }
+        const children = rootChildren.get(k)
+        if (children) {
+            rootChildren.delete(k)
+            for (const child of children) retryRoot(frame, child)
+        }
+    }
+    function enabled(frame: number, node: number): boolean {
+        const unit = frames[frame].facts
+        const narrowing = narrowingOf(unit)
+        const root = armsOf(unit).nearest.get(node)
+        const extra = narrowing.extras.get(node)
+        if (extra) {
+            const operands: [number, number][] = []
+            for (const [x, list] of extra) operands.push([list[0][0], x])
+            let at = root
+            while (at !== undefined) {
+                for (const [x, list] of narrowing.own.get(at) ?? []) operands.push([list[0][0], x])
+                at = armsOf(unit).parent.get(at)
+            }
+            operands.sort((p, q) => p[0] - q[0])
+            const checked = new Set<number>()
+            for (const [, x] of operands) {
+                if (checked.has(x)) continue
+                checked.add(x)
+                if (holds(frame, x, narrowAt(unit, node, x)!)) continue
+                setOf(waiting, key(frame, x)).add(node)
+                return false
+            }
+            return true
+        }
+        if (root === undefined || rootOpen(frame, root)) return true
+        setOf(rootNodes, key(frame, root)).add(node)
+        return false
+    }
+    function seen(frame: number, user: number, ref: number): Iterable<number> {
+        const set = valuesAt(frame, ref)
+        const filters = narrowAt(frames[frame].facts, user, canonical(frames[frame].facts, ref))
+        if (!filters) return set
+        return [...set].filter(v => filters.every(filter => accepts(v, filter, frame, ref))).map(v => narrowed(v, filters))
+    }
+    function nonZero(filter: Filter): boolean {
+        if (filter.test === 'truthy') return filter.positive
+        return (filter.test === 'zero' || filter.test === 'falsy') && !filter.positive
+    }
+    function narrowedLeast(low: number, filters: Filter[]): number {
+        let out = low
+        for (const filter of filters) {
+            if (filter.test === 'least' && filter.positive) out = Math.max(out, Math.ceil(filter.literal!))
+            else if (nonZero(filter) && low >= 0) out = Math.max(out, 1)
+        }
+        return out
+    }
+    function narrowedMost(high: number, filters: Filter[]): number {
+        let out = high
+        for (const filter of filters) if (filter.test === 'least' && !filter.positive) out = Math.min(out, Math.ceil(filter.literal!) - 1)
+        return out
+    }
+    function narrowed(v: number, filters: Filter[]): number {
+        const value = values[v]
+        if (value.word && filters.some(filter => filter.positive && filter.test === 'string')) return Str
+        if (value.range) {
+            const lo = narrowedLeast(value.range[0], filters)
+            const hi = narrowedMost(value.range[1], filters)
+            if (lo > hi || (lo === value.range[0] && hi === value.range[1])) return v
+            return rangeValue([lo, hi], value.word)
+        }
+        if (value.kind !== ValueKind.variable) return v
+        const test = filters.find(filter => filter.positive && filter.test !== 'truthy' && filter.test !== 'field' && filter.test !== 'least')?.test
+        if (!test || value.narrow === test) return v
+        const base = value.base ?? v
+        return intern(`v${base}&${test}`, () => ({ kind: ValueKind.variable, site: value.site, param: value.param, narrow: test, base }))
+    }
+    function key(frame: number, node: number): number {
+        intrinsics.assert(node < nodeSpan)
+        return frame * nodeSpan + node
+    }
+    function parse(k: number): [frame: number, node: number] {
+        return [Math.floor(k / nodeSpan), k % nodeSpan]
+    }
+    function schedule(k: number): void {
+        if (queued.has(k)) return
+        queued.add(k)
+        work.push(k)
+    }
+    function changed(k: number): void {
+        dirty.add(k)
+        schedule(k)
+    }
+    function invalidate(k: number): void {
+        stale.add(k)
+        schedule(k)
+    }
+    const none = new Set<number>()
+    function valuesAt(frame: number, node: number): Set<number> {
+        return frames[frame].nodes.get(node) ?? none
+    }
+    function literal(value: number): number {
+        return intern(`l${value}`, () => ({ kind: ValueKind.number, form: NumberForm.literal, literal: value }))
+    }
+    function rangeValue(range: Interval, word?: boolean): number {
+        if (word) return intern(`w${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range, word }))
+        return intern(`r${range[0]}:${range[1]}`, () => ({ kind: ValueKind.number, form: NumberForm.range, range }))
+    }
+    function floatValue(): number {
+        return intern('f', () => ({ kind: ValueKind.number, form: NumberForm.float }))
+    }
+    function typedValue(T: intrinsics.Types): number {
+        const range = typeInterval(T)
+        return range ? rangeValue(range, T === Types.u32 || T === Types.u64) : floatValue()
+    }
+    function isZero(v: number): boolean {
+        return values[v].form === NumberForm.literal && values[v].literal === 0
+    }
+    function integral(v: number): boolean {
+        const value = values[v]
+        if (value.form === NumberForm.literal) return Number.isInteger(value.literal)
+        return value.form === NumberForm.range
+    }
+    function spanOf(v: number): Interval {
+        const value = values[v]
+        return value.range ?? [value.literal!, value.literal!]
+    }
+    function operand(frame: number, node: number, n: GraphNode, i: number): Iterable<number> {
+        if (getRef(n, i)) return seen(frame, node, getRef(n, i))
+        const value = getLiteral(frames[frame].graph, n, i)
+        const index = i === 2 && (n.op === NodeOp.getProp || n.op === NodeOp.setProp) ? heap.keyIndex(value as Handle) : undefined
+        return [literal(index ?? value)]
+    }
+    function typed(incoming: Iterable<number>, T: intrinsics.Types | undefined): Iterable<number> {
+        if (T === undefined) return incoming
+        if (T === Types.unknown_number) return [...incoming].map(v => opaqueKind(v) ? floatValue() : v)
+        if (T === Types.u64 || T === Types.usize || T === Types.ptr) return [...incoming].map(v => opaqueKind(v) ? typedValue(T) : v)
+        if (!scalarType(T)) return incoming
+        const bound = typeInterval(T)
+        return [...incoming].map(v => (values[v].kind === ValueKind.number && !(bound && integral(v) && within(spanOf(v), bound))) || opaqueKind(v) ? typedValue(T) : v)
+    }
+    function opaqueKind(v: number): boolean {
+        return values[v].kind === ValueKind.unknown || values[v].kind === ValueKind.variable
+    }
+    function variable(site: Site, param?: number): number {
+        return intern(`v${unitIdentity(site.unit)}:${param ?? `%${site.node}`}`, () => ({ kind: ValueKind.variable, site, param }))
+    }
+    const entered = new Set<number>()
+    function fold(op: NodeOp, a: number, b: number): number | undefined {
+        switch (op) {
+            case NodeOp.lt: return a < b ? 1 : 0
+            case NodeOp.le: return a <= b ? 1 : 0
+            case NodeOp.gt: return a > b ? 1 : 0
+            case NodeOp.ge: return a >= b ? 1 : 0
+            case NodeOp.eq: return a === b ? 1 : 0
+            case NodeOp.ne: return a !== b ? 1 : 0
+            case NodeOp.add: return a + b
+            case NodeOp.sub: return a - b
+            case NodeOp.mul: return a * b
+            case NodeOp.shl: return a * 2 ** b
+            case NodeOp.and: return a & b
+            case NodeOp.or: return a | b
+            case NodeOp.xor: return a ^ b
+        }
+    }
+    function comparisonValues(frame: number, node: number, n: GraphNode): number[] {
+        const g = frames[frame].graph
+        const sides = [0, 1].map(i => getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))])
+        if (sides.some(unrecorded)) return []
+        if (sides.every(side => side.length === 1 && values[side[0]].form === NumberForm.literal)) return [literal(fold(n.op, values[sides[0][0]].literal!, values[sides[1][0]].literal!)!)]
+        const undefinedOnly = (side: number[]) => side.every(v => values[v].kind === ValueKind.undefined)
+        const neverUndefined = (side: number[]) => side.every(v => values[v].kind === ValueKind.object || values[v].kind === ValueKind.function || values[v].kind === ValueKind.string)
+        const disjoint = (undefinedOnly(sides[0]) && neverUndefined(sides[1])) || (neverUndefined(sides[0]) && undefinedOnly(sides[1]))
+        if (disjoint && (n.op === NodeOp.eq || n.op === NodeOp.ne)) return [literal(n.op === NodeOp.ne ? 1 : 0)]
+        return [rangeValue([0, 1])]
+    }
+    function compareStrings(frame: number, node: number, n: GraphNode): void {
+        if (!getRef(n, 0) || !getRef(n, 1)) return
+        const sides = [0, 1].map(i => [...seen(frame, node, getRef(n, i))])
+        if (!sides.every(side => side.some(v => values[v].kind === ValueKind.string))) return
+        if (!sides.some(side => side.includes(Str))) return
+        resultTyped.add(key(frame, node))
+        bind(frame, node, n, rt.bindingOf(rt.Op.strictEqual)!.impl!, undefined, 0)
+    }
+    function testString(frame: number, node: number, n: GraphNode): void {
+        if (![...seen(frame, node, getRef(n, 0))].some(v => values[v].kind === ValueKind.string)) return
+        resultTyped.add(key(frame, node))
+        bind(frame, node, n, rt.bindingOf(rt.Op.truthy)!.impl!, undefined, 0)
+    }
+    function truncated(v: number): number {
+        const value = values[v]
+        if (value.kind !== ValueKind.number || integral(v)) return v
+        if (value.form === NumberForm.literal && Number.isSafeInteger(Math.trunc(value.literal!))) return literal(Math.trunc(value.literal!) || 0)
+        return rangeValue(I64)
+    }
+    function operandNumbers(frame: number, node: number, n: GraphNode): number[] {
+        const g = frames[frame].graph
+        const sets: number[][] = []
+        for (let i = 0; i < countIds(n); i++) {
+            const operands = getRef(n, i) ? [...seen(frame, node, getRef(n, i))] : [literal(getLiteral(g, n, i))]
+            if (!operands.some(v => values[v].kind === ValueKind.number || opaqueKind(v))) return []
+            sets.push(BitwiseOps.has(n.op) ? operands.map(truncated) : operands)
+        }
+        const single = (list: number[]) => list.length === 1 && values[list[0]].form === NumberForm.literal
+        if (countIds(n) === 2 && sets.every(single)) {
+            const result = fold(n.op, values[sets[0][0]].literal!, values[sets[1][0]].literal!)
+            if (result !== undefined && Number.isFinite(result)) return [literal(result)]
+        }
+        const spans: Interval[] = []
+        for (const list of sets) {
+            let span: Interval | undefined
+            for (const v of list) {
+                if (opaqueKind(v)) span = hull(span, [MinI64, MaxU64])
+                else if (values[v].kind !== ValueKind.number) continue
+                else if (!integral(v)) return [floatValue()]
+                else span = hull(span, spanOf(v))
+            }
+            spans.push(span!)
+        }
+        let result = interval(n.op, spans[0], spans[spans.length - 1])
+        if (n.op === NodeOp.sub) result = [Math.min(result[1], Math.max(result[0], orderedDifference(g, node, n))), result[1]]
+        return [rangeValue(sets.every(list => list.length === 1) ? result : boundary(result))]
+    }
+    function orderedDifference(g: Graph, node: number, n: GraphNode): number {
+        if (!getRef(n, 0) || !getRef(n, 1)) return -Infinity
+        const unit = unitOf(g)
+        const minuend = canonical(unit, getRef(n, 0))
+        const subtrahend = canonical(unit, getRef(n, 1))
+        if (countedFrom(g, getRef(n, 0), subtrahend)) return 0
+        let low = -Infinity
+        for (const [cond, positive] of guardsAt(g, node) ?? []) {
+            const c = getNode(g, cond)!
+            if (c.op === NodeOp.eq || c.op === NodeOp.ne || !getRef(c, 0) || !getRef(c, 1)) continue
+            const below = (c.op === NodeOp.gt || c.op === NodeOp.ge) === positive ? 1 : 0
+            const strict = (c.op === NodeOp.lt || c.op === NodeOp.gt) === positive
+            if (canonical(unit, getRef(c, 1 - below)) === minuend && canonical(unit, getRef(c, below)) === subtrahend) low = Math.max(low, strict ? 1 : 0)
+        }
+        return low
+    }
+    function countedFrom(g: Graph, param: number, base: number): boolean {
+        const at = paramSlots(g).get(param)
+        if (!at) return false
+        const arrivals = predsOf(g, at[0])
+        if (!arrivals.length) return false
+        for (const apply of arrivals) {
+            const x = getRef(getNode(g, apply)!, at[1] + 1)
+            if (x && canonical(unitOf(g), x) === base) continue
+            const step = x ? getNode(g, x) : undefined
+            if (step?.op !== NodeOp.add || countIds(step) !== 2) return false
+            const self = getRef(step, 0) === param ? 0 : getRef(step, 1) === param ? 1 : -1
+            if (self < 0 || getRef(step, 1 - self) || getLiteral(g, step, 1 - self) < 0) return false
+        }
+        return true
+    }
+    function opaqueValue(g: Graph, id: number): number {
+        const T = resultType(g, getNode(g, id)!)
+        if (T === Types.vm_value || T === Types.unknown || T === Types.void) return Unknown
+        return typedValue(T)
+    }
+    function flow(frame: number, node: number, incoming: Iterable<number>): void {
+        const set = setOf(frames[frame].nodes, node)
+        let grew = false
+        for (const v of typed(incoming, nodeType(frames[frame].facts, node))) {
+            if (set.has(v)) continue
+            set.add(v)
+            grew = true
+        }
+        if (grew) {
+            changed(key(frame, node))
+            recheck(key(frame, node))
+        }
+    }
+    function intern(id: string, init: () => Value): number {
+        const known = valueIds.get(id)
+        if (known !== undefined) return known
+        valueIds.set(id, values.length)
+        values.push(init())
+        return values.length - 1
+    }
+    const functionObjects = new Map<number, Set<Handle>>()
+    function functionValue(fn: Function, handle?: Handle): number {
+        const v = intern(`f${unitIdentity(fn)}`, () => ({ kind: ValueKind.function, fn }))
+        if (handle) setOf(functionObjects, v).add(heap.deref(handle))
+        return v
+    }
+    function objectsOf(frame: number, node: number, v: number): number[] {
+        const value = values[v]
+        if (value.allocation !== undefined) return [value.allocation]
+        const out: number[] = []
+        for (const state of functionObjects.get(v) ?? []) out.push(values[heapObject(frame, node, `@${state}`, state, true)].allocation!)
+        return out
+    }
+    function closureValue(fn: Function, allocation: number): number {
+        return intern(`c${unitIdentity(fn)}:${allocation}`, () => ({ kind: ValueKind.function, fn, allocation }))
+    }
+    function objectValue(allocation: number): number {
+        return intern(`o${allocation}`, () => ({ kind: ValueKind.object, allocation }))
+    }
+    function allocate(id: string, frame: number, node: number, name: string, proto: Handle | undefined, constant: boolean): [number, boolean] {
+        const known = allocationIds.get(id)
+        if (known !== undefined) return [known, false]
+        allocationIds.set(id, allocations.length)
+        const owner = frames[frame].object
+        const depth = constant || owner < 0 ? 0 : allocations[owner].depth + 1
+        allocations.push({ site: { unit: frames[frame].unit, node }, frame: constant ? undefined : frame, name, depth, proto, constant, escaped: false })
+        return [allocations.length - 1, true]
+    }
+    function location(allocation: number, name: string): number {
+        const id = `${allocation}/${name}`
+        const known = locationIds.get(id)
+        if (known !== undefined) return known
+        locationIds.set(id, locations.length)
+        locations.push({ allocation, key: name, values: [], forms: [], readers: [], writers: [], stored: false })
+        const loc = locations.length - 1
+        const fields = listOf(fieldsOf, allocation)
+        fields.push(loc)
+        for (const copier of copiers.get(allocation) ?? []) invalidate(copier)
+        if (opaqueAllocations.has(allocation)) setOf(contents, loc).add(Unknown)
+        if (name === protoKey) for (const reader of inheritedReaders.get(allocation) ?? []) setOf(fieldWatchers, loc).add(reader)
+        if (name === numberKey) for (const reader of constantReaders.get(allocation) ?? []) setOf(contentReaders, loc).add(reader)
+        else if (/^(\[\d+\]|@\d+)$/.test(name)) {
+            const list = listOf(indexLocations, allocation)
+            list.push(loc)
+            for (const reader of indexReaders.get(allocation) ?? []) setOf(contentReaders, loc).add(reader)
+        }
+        return loc
+    }
+    function addForm(loc: number, form: string): void {
+        if (!locations[loc].forms.includes(form)) locations[loc].forms.push(form)
+    }
+    function access(write: boolean, frame: number, node: number, allocation: number, name: string): number {
+        const loc = location(allocation, name)
+        const unit = frames[frame].unit
+        const id = `${write ? 'w' : 'r'}${loc}:${unitIdentity(unit)}:${node}`
+        if (!recorded.has(id)) {
+            recorded.add(id)
+            ;(write ? locations[loc].writers : locations[loc].readers).push({ unit, node })
+        }
+        setOf(touched, key(frame, node)).add(loc)
+        return loc
+    }
+    function read(frame: number, node: number, loc: number): void {
+        const init = heldStatics.get(loc)
+        if (init) {
+            heldStatics.delete(loc)
+            const entered = enter(init, 'static|', -1)
+            setOf(returnLocations, entered).add(loc)
+            store(loc, setOf(returns, entered))
+        }
+        setOf(contentReaders, loc).add(key(frame, node))
+        flow(frame, node, setOf(contents, loc))
+    }
+    function store(loc: number, incoming: Iterable<number>): void {
+        const set = setOf(contents, loc)
+        let grew = false
+        for (const v of incoming) {
+            if (set.has(v)) continue
+            set.add(v)
+            grew = true
+        }
+        if (!grew) return
+        for (const copier of copiers.get(locations[loc].allocation) ?? []) invalidate(copier)
+        for (const watcher of fieldWatchers.get(loc) ?? []) changed(watcher)
+        for (const reader of contentReaders.get(loc) ?? []) {
+            const [frame, node] = parse(reader)
+            flow(frame, node, set)
+        }
+    }
+    function storeFrom(frame: number, node: number, n: GraphNode, i: number, loc: number): void {
+        const T = n.op === NodeOp.store ? typeOf(n) : n.op === NodeOp.rt ? rt.elementType(frames[frame].graph, n) : undefined
+        const form = T === undefined ? 'prop' : typeName(T)
+        addForm(loc, form)
+        locations[loc].stored = true
+        if (n.op === NodeOp.setProp && overwritten(frame, n, loc)) {
+            const list = listOf(shadowed, frame)
+            list.push([node, n, i, loc])
+            return
+        }
+        if (!getRef(n, i)) return store(loc, typed([literal(getLiteral(frames[frame].graph, n, i))], T))
+        mapOf(storedInto, key(frame, getRef(n, i))).set(loc, [T, node])
+        store(loc, typed(seen(frame, node, getRef(n, i)), T))
+    }
+    const shadowed = new Map<number, [number, GraphNode, number, number][]>()
+    function overwritten(frame: number, n: GraphNode, loc: number): boolean {
+        const g = frames[frame].graph
+        const self = frames[frame].facts.self
+        if (self === undefined || valueTail(g, getRef(n, 1)) !== self || getRef(n, 2)) return false
+        const { allocation, key: name } = locations[loc]
+        const { site, proto } = allocations[allocation]
+        if (!initializer(g, self, proto)) return false
+        const sites = callSites.get(frame)
+        if (!sites?.size) return false
+        for (const s of sites) {
+            const [caller, call] = parse(s)
+            if (frames[caller].unit !== site.unit) return false
+            if (!killedAfter(frames[caller].graph, call, site.node, name, proto, frames[frame].facts.returnsSelf)) return false
+        }
+        return true
     }
     function offsetKeys(frame: number, node: number, n: GraphNode): string[] {
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const at = n.op === NodeOp.rt ? 2 : 1
         const base = getNode(g, getRef(n, at))
         if (base?.op === NodeOp.add || base?.op === NodeOp.sub) return [numberKey]
@@ -1609,46 +1817,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         setOf(indexReaders, allocation).add(key(frame, node))
         for (const other of indexLocations.get(allocation) ?? []) read(frame, node, other)
     }
-    interface Accessor {
-        kind: 'method' | 'getter' | 'field'
-        fn?: Function
-        slot?: Handle
-        setter?: Function
-    }
-    const accessors = new Map<string, Accessor>()
-    function accessorOf(proto: Handle | undefined, k: Handle): Accessor {
-        const id = `${proto}:${k}`
-        const known = accessors.get(id)
-        if (known) return known
-        const addr = proto ? heap.getPropertyDescriptor(proto, k) : 0
-        const d = addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)) : undefined
-        const fn = d ? host.functionOf(d.slot0 as u32) : undefined
-        const accessor: Accessor = !d ? { kind: 'field' }
-            : d.flags & heap.PropFlags.has_getter ? { kind: 'getter', fn }
-            : fn ? { kind: 'method', fn, slot: d.slot0 as Handle } : { kind: 'field' }
-        if (d && d.flags & heap.PropFlags.has_setter) accessor.setter = host.functionOf(d.slot1 as u32)
-        accessors.set(id, accessor)
-        return accessor
-    }
-    function member(proto: Handle | undefined, k: Handle): [kind: 'method' | 'getter' | 'field', fn?: Function, slot?: Handle] {
-        const accessor = accessorOf(proto, k)
-        return [accessor.kind, accessor.fn, accessor.slot]
-    }
-    function setterOf(proto: Handle | undefined, k: Handle): Function | undefined {
-        return accessorOf(proto, k).setter
-    }
-    function indexTrap(proto: Handle | undefined, setter: boolean): Function | undefined {
-        const proxy = proto ? heap.getPropertyProxy(proto, heap.indexKey(0 as u32)) : 0
-        if (!proxy) return
-        return host.functionOf((setter ? heap.getProxySetter(proxy) : heap.getProxyGetter(proxy)) as u32)
-    }
-    function literalFunction(g: Graph, id: number): Function | undefined {
-        const n = getNode(g, id)
-        const local = localSymbol(g, n)
-        if (local !== undefined) return host.localFunction(local)
-        if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
-        return host.functionOf(getLiteral(g, n, 0) as u32)
-    }
     function handleValue(frame: number, node: number, raw: Handle): number {
         if (heap.isBoxedF64(raw)) return literal(heap.unboxF64(raw))
         if (!raw) return Undefined
@@ -1664,15 +1832,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (held) return functionValue(held, slot)
         const inner = heap.deref(slot)
         if (!inner || !heap.isOrdinaryObject(inner)) return Unknown
-        const object = heapObject(frame, cellSites(frames[frame].graph!).get(slot) ?? node, `@${inner}`, inner, true, host.session.constructions.get(slot)?.graph)
+        const object = heapObject(frame, cellSites(frames[frame].graph).get(slot) ?? node, `@${inner}`, inner, true, host.session.constructions.get(slot)?.graph)
         const allocation = allocations[values[object].allocation!]
         allocation.handle = allocation.handle === undefined || allocation.handle === slot ? slot : 0 as Handle
         return object
-    }
-    function protoName(proto: Handle | undefined): string {
-        const ctor = proto ? heap.getOwnProperty(proto, heap.fromJsString('constructor')) : 0
-        const fn = ctor ? host.functionOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(ctor)).slot0 as u32) : undefined
-        return fn?.name || 'Object'
     }
     function heapObject(frame: number, node: number, id: string, state: Handle, constant: boolean, construction?: Graph): number {
         const proto = heap.getPrototypeOf(state)
@@ -1686,7 +1849,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         let seeded = false
         dataKeys(state).forEach(k => {
             const loc = access(true, frame, node, allocation, nameOf(k))
-            if (!locations[loc].forms.includes('init')) locations[loc].forms.push('init')
+            addForm(loc, 'init')
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, k))).slot0 as Handle
             if (elements && constructedAllocation(construction!, slot)) {
                 intrinsics.assert(!seeded, `value-types: constant elements of ${id} have more than one buffer`)
@@ -1694,7 +1857,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 const [buffer] = allocate(`${id}/${nameOf(k)}`, frame, node, 'buffer', undefined, true)
                 elements.forEach((element, i) => {
                     const at = access(true, frame, node, buffer, elements.length > maxTuple ? numberKey : `@${i}`)
-                    if (!locations[at].forms.includes('vm_value')) locations[at].forms.push('vm_value')
+                    addForm(at, 'vm_value')
                     store(at, [handleValue(frame, node, element)])
                 })
                 store(loc, [objectValue(buffer)])
@@ -1707,9 +1870,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             }
             const ref = heap.isBoxedF64(slot) ? intrinsics.getNanId(heap.unboxF64(slot)) : 0
             if (ref) {
-                let into = storedInto.get(key(frame, ref))
-                if (!into) storedInto.set(key(frame, ref), into = new Map())
-                into.set(loc, [undefined, node])
+                mapOf(storedInto, key(frame, ref)).set(loc, [undefined, node])
                 store(loc, valuesAt(frame, ref))
                 return
             }
@@ -1720,23 +1881,22 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     const dumped = new Set<Graph>()
     function enter(unit: Function, context: string, object: number, receiver?: number): number {
-        const k = `${unitKey(unit)}|${context}`
+        const k = `${unitIdentity(unit)}|${context}`
         const known = frameIds.get(k)
         if (known !== undefined) return known
         const signature = context.includes('|') ? context.slice(context.indexOf('|') + 1).split(',').slice(0, -1) : []
         const frame = frames.length
         frameIds.set(k, frame)
-        frames.push({ unit, context, object, receiver, signature, nodes: new Map() })
         const g = host.graphOf(unit)
-        frames[frame].graph = g
+        const facts = unitOf(g)
+        frames.push({ unit, context, object, receiver, signature, graph: g, facts, nodes: new Map() })
         entered.add(key(frame, g.blocks[0].id))
         if (!dumped.has(g) && intrinsics.argv().includes(`vgraph:${unit.name}`)) {
             dumped.add(g)
             console.log(dumpGraph(g))
         }
         if (frame < rootCount && isolated) {
-            const self = receiverOf(g)
-            g.blocks[0].params.forEach((p, i) => flow(frame, p, [p === self ? objectValue(0) : variable({ unit, node: p }, i)]))
+            g.blocks[0].params.forEach((p, i) => flow(frame, p, [p === facts.self ? objectValue(0) : variable({ unit, node: p }, i)]))
         } else if (frame < rootCount) for (const p of g.blocks[0].params) {
             const range = typeInterval(typeOf(getNode(g, p)!))
             flow(frame, p, [range ? rangeValue(range) : floatValue()])
@@ -1750,7 +1910,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (seeded.has(k)) return
         if (!enabled(frame, id)) return
         seeded.add(k)
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const n = getNode(g, id)!
         const known = literalFunction(g, id)
         const cell = n.op === NodeOp.heapHandle ? getLiteral(g, n, 0) as Handle : 0 as Handle
@@ -1776,15 +1936,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             allocations[record].native = true
             for (let i = 0; i + 1 < countIds(n); i += 2) {
                 const loc = access(true, frame, id, record, nameOf(getLiteral(g, n, i) as Handle))
-                if (!locations[loc].forms.includes('init')) locations[loc].forms.push('init')
+                addForm(loc, 'init')
                 const ref = getRef(n, i + 1)
                 if (!ref) {
                     store(loc, [literal(getLiteral(g, n, i + 1))])
                     continue
                 }
-                let into = storedInto.get(key(frame, ref))
-                if (!into) storedInto.set(key(frame, ref), into = new Map())
-                into.set(loc, [undefined, id])
+                mapOf(storedInto, key(frame, ref)).set(loc, [undefined, id])
                 store(loc, valuesAt(frame, ref))
             }
             flow(frame, id, [objectValue(record)])
@@ -1794,7 +1952,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             const params = getBlock(g, getRef(n, 0))!.params
             for (let i = 1; i < countIds(n); i++) {
                 if (getRef(n, i)) changed(key(frame, getRef(n, i)))
-                else flow(frame, params[i - 1], carried(g, params[i - 1]) ? widened([literal(getLiteral(g, n, i))]) : [literal(getLiteral(g, n, i))])
+                else flow(frame, params[i - 1], frames[frame].facts.carried.has(params[i - 1]) ? widened([literal(getLiteral(g, n, i))]) : [literal(getLiteral(g, n, i))])
             }
         }
         if ((n.op === NodeOp.setProp || n.op === NodeOp.store) && getRef(n, 1)) changed(key(frame, getRef(n, 1)))
@@ -1802,9 +1960,9 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (n.op === NodeOp.after && !getRef(n, countIds(n) - 1)) flow(frame, id, [literal(getLiteral(g, n, countIds(n) - 1))])
         if (n.op === NodeOp.ret && !getRef(n, 0)) returned(frame, id, [literal(getLiteral(g, n, 0))])
         if (comparison(n.op)) {
-            if (!Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, comparisonValues(frame, id, n))
+            if (literalOperands(n)) flow(frame, id, comparisonValues(frame, id, n))
         } else if (arithmetic(n) && typeOf(n) !== Types.unknown_number) flow(frame, id, [typedValue(resultType(g, n))])
-        else if (arithmetic(n) && !Array.from({ length: countIds(n) }, (_, i) => getRef(n, i)).some(ref => ref)) flow(frame, id, operandNumbers(frame, id, n))
+        else if (arithmetic(n) && literalOperands(n)) flow(frame, id, operandNumbers(frame, id, n))
         const slice = rt.sliceOf(g, n)
         if (n.op === NodeOp.pstack || slice === rt.Op.slice) {
             const size = slice === rt.Op.slice ? 2 : 3
@@ -1819,9 +1977,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (n.op === NodeOp.call || n.op === NodeOp.static || (n.op === NodeOp.rt && slice === undefined)) invalidate(k)
         if (!unrecorded(valuesAt(frame, id))) changed(k)
     }
-    function receiverOf(g: Graph): number | undefined {
-        return g.blocks[0].params.find(p => isThisParam(getNode(g, p)!))
-    }
     const numeric = new Set<number>()
     function numericUse(g: Graph, user: GraphNode, slot: number): boolean {
         if (user.op === NodeOp.load || user.op === NodeOp.store) return slot === 1 || slot === 2
@@ -1832,40 +1987,6 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (user.op === NodeOp.add && typeOf(user) === Types.unknown_number) return false
         return NumericOps.has(user.op) || user.op === NodeOp.convert
     }
-    const dependencies = new Map<Graph, Map<number, boolean>>()
-    function dependsOn(g: Graph, value: number, param: number): boolean {
-        let byGraph = dependencies.get(g)
-        if (!byGraph) dependencies.set(g, byGraph = new Map())
-        const k = value * nodeSpan + param
-        const known = byGraph.get(k)
-        if (known !== undefined) return known
-        const visited = new Set<number>()
-        const work = [value]
-        let found = false
-        while (work.length && !found) {
-            const id = work.pop()!
-            if (visited.has(id)) continue
-            visited.add(id)
-            if (id === param) found = true
-            const n = getNode(g, id)
-            if (n && (arithmetic(n) || n.op === NodeOp.after || n.op === NodeOp.select)) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) work.push(getRef(n, i))
-        }
-        byGraph.set(k, found)
-        return found
-    }
-    const carriedParams = new Map<Graph, Set<number>>()
-    function carried(g: Graph, param: number): boolean {
-        let known = carriedParams.get(g)
-        if (!known) {
-            carriedParams.set(g, known = new Set())
-            for (const [id, n] of g.nodes) {
-                if (n.op !== NodeOp.apply) continue
-                const params = getBlock(g, getRef(n, 0))?.params ?? []
-                for (let i = 1; i < countIds(n); i++) if (getRef(n, i) && params[i - 1] !== undefined && dependsOn(g, getRef(n, i), params[i - 1])) known.add(params[i - 1])
-            }
-        }
-        return known.has(param)
-    }
     function widened(view: Iterable<number>): number[] {
         return [...view].map(v => {
             const value = values[v]
@@ -1874,37 +1995,13 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             return v
         })
     }
-    const addressParams = new Map<Graph, Set<number>>()
-    function addressRelevant(g: Graph): Set<number> {
-        const known = addressParams.get(g)
-        if (known) return known
-        const out = new Set<number>()
-        const params = g.blocks[0].params
-        const seenIds = new Set<number>()
-        const work: number[] = []
-        for (const n of g.nodes.values()) {
-            if ((n.op === NodeOp.load || n.op === NodeOp.store || n.op === NodeOp.getProp || n.op === NodeOp.setProp) && getRef(n, 2)) work.push(getRef(n, 2))
-            if (rt.sliceOf(g, n) !== undefined && rt.sliceOf(g, n) !== rt.Op.slice && getRef(n, 3)) work.push(getRef(n, 3))
-        }
-        while (work.length) {
-            const id = work.pop()!
-            if (seenIds.has(id)) continue
-            seenIds.add(id)
-            const at = params.indexOf(id)
-            if (at >= 0) out.add(at)
-            const n = getNode(g, id)
-            if (n && (NumericOps.has(n.op) || n.op === NodeOp.after || n.op === NodeOp.convert)) for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) work.push(getRef(n, i))
-        }
-        addressParams.set(g, out)
-        return out
-    }
     function argClass(v: number, exact: boolean): string {
         const value = values[v]
         if (exact && value.form === NumberForm.literal && Number.isInteger(value.literal) && Math.abs(value.literal!) < 4096) return `l${value.literal}`
         switch (value.kind) {
             case ValueKind.undefined: return 'u'
             case ValueKind.string: return 's'
-            case ValueKind.function: return `f${unitKey(value.fn!)}`
+            case ValueKind.function: return `f${unitIdentity(value.fn!)}`
             case ValueKind.object: return `o${allocations[value.allocation!].name}`
             case ValueKind.number:
                 return integral(v) ? 'i' : 'd'
@@ -1917,8 +2014,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             const byClass = new Map<string, number[]>()
             for (const v of operand(caller, call, n, i)) {
                 const c = argClass(v, exact.has(i - first))
-                let list = byClass.get(c)
-                if (!list) byClass.set(c, list = [])
+                const list = listOf(byClass, c)
                 list.push(v)
             }
             if (!byClass.size && getRef(n, i)) return []
@@ -1942,14 +2038,12 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         return combos
     }
     function bind(caller: number, call: number, n: GraphNode, callee: Function, receiver: number | undefined, first: number, closure?: number, given?: number[][]): number[] {
-        const g = host.graphOf(callee)
-        const self = receiverOf(g)
-        const plain = g.blocks[0].params.filter(p => p !== self)
-        verifySetterBinding(frames[caller].graph!, 'analysis', call, n, first, plain.length)
-        const exact = new Set([...addressRelevant(g)].map(i => plain.indexOf(g.blocks[0].params[i])).filter(i => i >= 0))
-        const groups: [string, number[][]][] = given ? [[given.map(list => `${argClass(list[0], false)},`).join(''), given]] : argumentGroups(caller, call, n, first, plain.length, exact)
+        const unit = unitOf(host.graphOf(callee))
+        const { self, plain } = unit
+        verifySetterBinding(frames[caller].graph, 'analysis', call, n, first, plain.length)
+        const groups: [string, number[][]][] = given ? [[given.map(list => `${argClass(list[0], false)},`).join(''), given]] : argumentGroups(caller, call, n, first, plain.length, unit.exact)
         if (!groups.length) return []
-        const site = `${unitKey(frames[caller].unit)}:${call}`
+        const site = `${unitIdentity(frames[caller].unit)}:${call}`
         const program = n.op === NodeOp.static
         const object = closure ?? (receiver !== undefined ? values[receiver].allocation ?? -1 : program ? -1 : frames[caller].object)
         const shallow = object < 0 || allocations[object].depth < maxDepth
@@ -1971,7 +2065,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 shadowed.delete(frame)
                 for (const [node, m, i, loc] of pending ?? []) storeFrom(frame, node, m, i, loc)
             }
-            if (closure !== undefined) for (const [id, m] of g.nodes) if (m.op === NodeOp.callContext) flow(frame, id, [objectValue(closure)])
+            if (closure !== undefined) for (const id of unit.contexts) flow(frame, id, [objectValue(closure)])
             if (self !== undefined && receiver !== undefined) flow(frame, self, [receiver])
             args.forEach((list, i) => flow(frame, plain[i], list))
             if (host.paramCount?.(callee) !== undefined) for (let i = args.length; i < plain.length; i++) flow(frame, plain[i], [Undefined])
@@ -1997,7 +2091,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         const source = getRef(n, 3)
         flow(frame, id, seen(frame, id, target))
         const into = [...seen(frame, id, target)].flatMap(v => objectsOf(frame, target, v))
-        const excluded = rt.assignExcluded(frames[frame].graph!, n).map(key => nameOf(key))
+        const excluded = rt.assignExcluded(frames[frame].graph, n).map(key => nameOf(key))
         for (const v of [...seen(frame, id, source)]) {
             const from = objectsOf(frame, source, v)
             if (!from.length) exposeArgs(frame, n, 2)
@@ -2010,7 +2104,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                     access(false, frame, id, allocation, name)
                     for (const to of into) {
                         const copy = access(true, frame, id, to, name)
-                        if (!locations[copy].forms.includes('prop')) locations[copy].forms.push('prop')
+                        addForm(copy, 'prop')
                         store(copy, [...setOf(contents, loc)])
                     }
                 }
@@ -2018,10 +2112,10 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
     }
     function resolveCall(frame: number, id: number, n: GraphNode): void {
-        const target = getNode(frames[frame].graph!, getRef(n, 1))
+        const target = getNode(frames[frame].graph, getRef(n, 1))
         if (target?.op === NodeOp.syscallTarget) {
             exposeArgs(frame, n, 2)
-            return flow(frame, id, [opaqueValue(frames[frame].graph!, id)])
+            return flow(frame, id, [opaqueValue(frames[frame].graph, id)])
         }
         for (const t of [...seen(frame, id, getRef(n, 1))]) {
             if (values[t].kind === ValueKind.variable) flow(frame, id, [variable({ unit: frames[frame].unit, node: id })])
@@ -2029,11 +2123,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             if (!callee) continue
             if (!host.traceable(callee)) {
                 exposeArgs(frame, n, host.receiverless?.(callee) ? 3 : 2)
-                flow(frame, id, [opaqueValue(frames[frame].graph!, id)])
+                flow(frame, id, [opaqueValue(frames[frame].graph, id)])
                 continue
             }
             const closure = values[t].allocation
-            const g = frames[frame].graph!
+            const g = frames[frame].graph
             let method = getNode(g, getRef(n, 1))
             while (method?.op === NodeOp.after) method = getNode(g, getRef(method, countIds(method) - 1))
             const lookup = method?.op === NodeOp.getProp && !getRef(method, 2) && getRef(method, 1) === getRef(n, 2) ? getLiteral(g, method, 2) as Handle : undefined
@@ -2042,8 +2136,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 if (values[r].kind !== ValueKind.object && values[r].kind !== ValueKind.function && values[r].kind !== ValueKind.string) return false
                 const allocation = values[r].allocation
                 if (lookup === undefined || allocation === undefined) return true
-                const [kind, fn] = member(allocations[allocation].proto, lookup)
-                return kind !== 'method' || fn === callee
+                const accessor = accessorOf(allocations[allocation].proto, lookup)
+                return accessor.kind !== 'method' || accessor.fn === callee
             })
             if (unrecorded(recorded) || !receivers.length) bind(frame, id, n, callee, undefined, 3, closure)
             for (const r of receivers) bind(frame, id, n, callee, r, 3, closure)
@@ -2066,7 +2160,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         if (object.dynamic) return
         object.dynamic = true
         const frame = object.frame!
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const site = getNode(g, object.site.node)!
         resultTyped.add(key(frame, object.site.node))
         bind(frame, object.site.node, site, heap.makePlainObject, undefined, countIds(site), undefined, [])
@@ -2122,7 +2216,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
             if (boundSites.has(k)) continue
             boundSites.add(k)
             const write = user.op === NodeOp.setProp
-            const stored = write ? (getRef(user, 3) ? [...seen(frame, u, getRef(user, 3))] : [literal(getLiteral(frames[frame].graph!, user, 3))]) : [...locs].flatMap(loc => [...setOf(contents, loc)])
+            const stored = write ? (getRef(user, 3) ? [...seen(frame, u, getRef(user, 3))] : [literal(getLiteral(frames[frame].graph, user, 3))]) : [...locs].flatMap(loc => [...setOf(contents, loc)])
             const form = slotForm(stored, write)
             if (form === undefined) continue
             const value = form === 'int' ? [typedValue(Types.i64)] : form === 'float' ? [floatValue()] : word()
@@ -2133,15 +2227,15 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
     }
     function getProperty(frame: number, u: number, user: GraphNode): void {
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const k = indexKey(g, user)
         for (const v of [...seen(frame, u, getRef(user, 1))]) {
             const value = values[v]
             if (value.kind === ValueKind.undefined) continue
             if (value.kind === ValueKind.string && k !== undefined) {
-                const [kind, fn, slot] = member(heap.getPrototypeOf(heap.fromJsString('')), k)
-                if (kind === 'method') {
-                    flow(frame, u, [functionValue(fn!, slot)])
+                const accessor = accessorOf(heap.getPrototypeOf(heap.fromJsString('')), k)
+                if (accessor.kind === 'method') {
+                    flow(frame, u, [functionValue(accessor.fn!, accessor.slot)])
                     continue
                 }
             }
@@ -2161,11 +2255,11 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                     inherit(frame, u, key(frame, getRef(user, 1)), allocation, k, new Set())
                     continue
                 }
-                const [kind, fn, slot] = member(proto, k)
-                if (kind === 'method') flow(frame, u, [functionValue(fn!, slot)])
-                else if (kind === 'getter' && fn && host.traceable(fn)) bind(frame, u, user, fn, v, 2)
+                const accessor = accessorOf(proto, k)
+                if (accessor.kind === 'method') flow(frame, u, [functionValue(accessor.fn!, accessor.slot)])
+                else if (accessor.kind === 'getter' && accessor.fn && host.traceable(accessor.fn)) bind(frame, u, user, accessor.fn, v, 2)
                 else read(frame, u, access(false, frame, u, allocation, nameOf(k)))
-                if (kind === 'field' && absentKey(allocation, k)) flow(frame, u, [Undefined])
+                if (accessor.kind === 'field' && absentKey(allocation, k)) flow(frame, u, [Undefined])
             }
         }
     }
@@ -2189,7 +2283,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
     }
     function setProperty(frame: number, u: number, user: GraphNode): void {
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const k = indexKey(g, user)
         for (const v of [...seen(frame, u, getRef(user, 1))]) for (const allocation of objectsOf(frame, getRef(user, 1), v)) {
             if (dynamicAccess(frame, u, user, allocation)) continue
@@ -2201,7 +2295,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     function process(k: number): void {
         const [frame, id] = parse(k)
-        const g = frames[frame].graph!
+        const g = frames[frame].graph
         const n = getNode(g, id)!
         const evaluate = stale.delete(k)
         const propagate = dirty.delete(k)
@@ -2238,7 +2332,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         }
         if (!propagate) return
         for (const [loc, [T, node]] of storedInto.get(k) ?? []) store(loc, typed(seen(frame, node, id), T))
-        for (const [u, slot] of usersOf(g).get(id) ?? []) {
+        for (const [u, slot] of frames[frame].facts.users.get(id) ?? []) {
             const user = getNode(g, u)!
             const view = seen(frame, u, id)
             if (isolated && numericUse(g, user, slot)) for (const v of view) if (values[v].kind === ValueKind.variable && !values[v].narrow) numeric.add(v)
@@ -2275,7 +2369,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
                 case NodeOp.apply:
                     if (slot > 0 && seeded.has(key(frame, u))) {
                         const param = getBlock(g, getRef(user, 0))!.params[slot - 1]
-                        flow(frame, param, carried(g, param) ? widened(view) : view)
+                        flow(frame, param, frames[frame].facts.carried.has(param) ? widened(view) : view)
                     }
                     break
                 case NodeOp.ret:
@@ -2316,7 +2410,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         for (const v of [...seen(frame, u, getRef(user, at))]) {
             const allocation = values[v].allocation
             if (allocation !== undefined) for (const name of offsetKeys(frame, u, user)) readKey(frame, u, allocation, name)
-            else if (!isZero(v)) flow(frame, u, [opaqueValue(frames[frame].graph!, u)])
+            else if (!isZero(v)) flow(frame, u, [opaqueValue(frames[frame].graph, u)])
         }
     }
     function storeInto(frame: number, u: number, user: GraphNode, at: number): void {
@@ -2342,20 +2436,20 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         return !(impl && host.traceable(impl))
     }
     const rootCount = roots.length
-    if (isolated) allocations.push({ site: { unit: roots[0], node: 0 }, name: isolated.name, depth: 0, context: 'self', proto: isolated.proto, constant: false, escaped: false })
+    if (isolated) allocations.push({ site: { unit: roots[0], node: 0 }, name: isolated.name, depth: 0, proto: isolated.proto, constant: false, escaped: false })
     roots.forEach((root, i) => enter(root, `root${i}`, isolated ? 0 : -1))
     function opaqueCalls(): void {
         frames.forEach((frame, f) => {
             const g = frame.graph
-            if (g) for (const [id, n] of g.nodes) if (n.op === NodeOp.call && seeded.has(key(f, id)) && opaque(f, n, g)) flow(f, id, [opaqueValue(g, id)])
+            for (const id of frame.facts.calls) if (seeded.has(key(f, id)) && opaque(f, getNode(g, id)!, g)) flow(f, id, [opaqueValue(g, id)])
         })
     }
     function undefinedReads(): void {
         frames.forEach((frame, f) => {
             const g = frame.graph
-            if (!g) return
-            for (const [id, n] of g.nodes) {
-                if (n.op !== NodeOp.getProp || !seeded.has(key(f, id))) continue
+            for (const id of frame.facts.gets) {
+                const n = getNode(g, id)!
+                if (!seeded.has(key(f, id))) continue
                 if (![...valuesAt(f, getRef(n, 1))].some(v => values[v].allocation !== undefined)) continue
                 const locs = touched.get(key(f, id))
                 if (!locs?.size) continue
@@ -2382,8 +2476,8 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     frames.forEach((frame, f) => {
         const g = frame.graph
-        if (!g) return
-        for (const [id, n] of g.nodes) {
+        for (const id of [...frame.facts.calls, ...frame.facts.rts]) {
+            const n = getNode(g, id)!
             if (!seeded.has(key(f, id))) continue
             const untraced = n.op === NodeOp.call ? [...valuesAt(f, getRef(n, 1))].flatMap(v => values[v].fn && !host.traceable(values[v].fn!) ? [values[v].fn!] : []) : []
             const blind = opaque(f, n, g)
@@ -2462,8 +2556,7 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
     }
     frames.forEach((frame, f) => {
         const g = frame.graph
-        if (!g) return
-        const self = receiverOf(g)
+        const self = frame.facts.self
         let plain = 0
         const params = g.blocks[0].params.map(p => ({ label: p === self ? 'this' : `p${plain++}`, type: [...valuesAt(f, p)].sort((a, b) => a - b) }))
         const sites = [...callSites.get(f) ?? []].map(k => {
@@ -2483,13 +2576,14 @@ function analyzeValues(roots: Function[], host: AccessHost, isolated?: Isolated)
         frameValues.push({ unit: frame.unit, context: frame.context, receiver: frame.receiver, sites, signature: frame.signature, params, returns: [...returns.get(f) ?? []].sort((a, b) => a - b), boxes, boxedReturn, accesses, slices, nodes: frame.nodes, blocks: new Set(g.blocks.map(b => b.id).filter(b => entered.has(key(f, b)))), selects: liveArms(f, g) })
     })
     const graphs = new Map<Function, Graph>()
-    for (const frame of frames) if (frame.graph) graphs.set(frame.unit, frame.graph)
+    for (const frame of frames) graphs.set(frame.unit, frame.graph)
     frames.forEach((frame, f) => {
         if (!intrinsics.argv().includes(`node-values:${frame.unit.name}`)) return
         const lines = [`NODE-VALUES ${frame.unit.name} <${frame.context}>`]
-        for (const id of frame.graph!.nodes.keys()) lines.push(`  %${id}${seeded.has(key(f, id)) ? '' : ' (unseeded)'}: ${[...valuesAt(f, id)].map(v => JSON.stringify(values[v])).join(' ')}`)
+        for (const id of frame.graph.nodes.keys()) lines.push(`  %${id}${seeded.has(key(f, id)) ? '' : ' (unseeded)'}: ${[...valuesAt(f, id)].map(v => JSON.stringify(values[v])).join(' ')}`)
         console.log(lines.join('\n'))
     })
+    intrinsics.assert(!none.size, 'value-types: the shared empty value set was written')
     if (intrinsics.argv().includes('analysis-stats')) console.log('ANALYSIS-RUN', roots.map(r => r.name).join(','), 'frames', frames.length, 'allocations', allocations.length, 'locations', locations.length, 'values', values.length)
     return { allocations, locations, wordSlots, values, frames: frameValues, graphs, numeric, keyHandles, consulted }
 }
@@ -2542,7 +2636,7 @@ export interface Field {
     forms: string[]
 }
 
-export function fieldAt(types: ValueTypes, allocations: number[], keys: string[]): Field | undefined {
+function fieldAt(types: ValueTypes, allocations: number[], keys: string[]): Field | undefined {
     let current = allocations
     let field: Field | undefined
     for (const key of keys) {
@@ -2576,16 +2670,14 @@ function encapsulationViolations(data: Accesses, host: AccessHost): Set<Handle> 
     if (!host.invariantsOf) return broken
     const byAllocation = new Map<number, Location[]>()
     for (const loc of data.locations) {
-        let list = byAllocation.get(loc.allocation)
-        if (!list) byAllocation.set(loc.allocation, list = [])
+        const list = listOf(byAllocation, loc.allocation)
         list.push(loc)
     }
     const receivers = new Map<number, FrameValues[]>()
     for (const frame of data.frames) for (const v of frame.params.find(p => p.label === 'this')?.type ?? []) {
         const allocation = data.values[v].allocation
         if (allocation === undefined) continue
-        let list = receivers.get(allocation)
-        if (!list) receivers.set(allocation, list = [])
+        const list = listOf(receivers, allocation)
         list.push(frame)
     }
     data.allocations.forEach((allocation, id) => {
@@ -2783,9 +2875,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
     const stateAllocations = new Map<Handle, number[]>()
     objects.forEach((object, id) => {
         if (object.state === undefined) return
-        const list = stateAllocations.get(object.state)
-        if (list) list.push(id)
-        else stateAllocations.set(object.state, [id])
+        listOf(stateAllocations, object.state).push(id)
     })
     if (intrinsics.argv().includes('frames-dump')) frames.forEach((frame, id) => console.log('FRAME', id, frame.unit.name || '<anon>', `<${frame.context}>`, frame.params.map(p => `${p.label}:${formatType({ objects } as ValueTypes, p.type)}`).join(' '), '->', formatType({ objects } as ValueTypes, frame.returns)))
     const fieldStores = new Set<string>()
@@ -2829,7 +2919,7 @@ function floating(T: intrinsics.Types): boolean {
     return T === Types.f64 || T === Types.f32 || T === Types.f16
 }
 
-export function formatType(types: ValueTypes, type: Type): string {
+function formatType(types: ValueTypes, type: Type): string {
     const atoms: string[] = []
     if (type.undefined) atoms.push('undefined')
     for (const literal of type.literals) if (!type.float && !(type.range && Number.isInteger(literal) && within([literal, literal], type.range))) atoms.push(String(literal))
@@ -2862,7 +2952,7 @@ function nullsOnly(type: Type): boolean {
     return !opaqueNumber(type) && type.literals.length === 1 && type.literals[0] === 0
 }
 
-export function representation(type: Type, targetOf = (id: number) => `O${id}`): string {
+function representation(type: Type, targetOf = (id: number) => `O${id}`): string {
     if (type.unknown) return 'any'
     const targets = [...new Set([...type.objects, ...type.closures].map(targetOf))].sort()
     if (type.strings.length) targets.push('str')
@@ -2873,7 +2963,7 @@ export function representation(type: Type, targetOf = (id: number) => `O${id}`):
     return `ptr<${targets.join('|')}>${type.undefined || nullsOnly(type) ? '?' : ''}`
 }
 
-export function typeStats(types: ValueTypes): string {
+function typeStats(types: ValueTypes): string {
     return `TYPES ${types.ms.toFixed(1)}ms frames=${types.frames.length} objects=${types.objects.length}`
 }
 
@@ -2895,9 +2985,7 @@ export function dumpTypes(types: ValueTypes): string {
     })
     const units = new Map<Function, FrameSignature[]>()
     for (const frame of types.frames) {
-        const list = units.get(frame.unit)
-        if (list) list.push(frame)
-        else units.set(frame.unit, [frame])
+        listOf(units, frame.unit).push(frame)
     }
     for (const [unit, frames] of units) {
         const signature = joinedSignature(frames, unionAll)
@@ -2973,7 +3061,6 @@ export interface GenericParam {
 
 export interface Generic {
     name: string
-    ms: number
     params: GenericParam[]
     paths: string[]
     invariants: Invariants
@@ -2988,11 +3075,9 @@ function keyLabel(k: Handle): string {
 function unitNodes(data: Accesses): Map<Function, Map<number, number[]>> {
     const united = new Map<Function, Map<number, Set<number>>>()
     for (const frame of data.frames) {
-        let byNode = united.get(frame.unit)
-        if (!byNode) united.set(frame.unit, byNode = new Map())
+        const byNode = mapOf(united, frame.unit)
         for (const [node, values] of frame.nodes) {
-            let set = byNode.get(node)
-            if (!set) byNode.set(node, set = new Set())
+            const set = setOf(byNode, node)
             for (const v of values) set.add(v)
         }
     }
@@ -3030,8 +3115,7 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
     const nodes = unitNodes(data)
     const byAllocation = new Map<number, number[]>()
     data.locations.forEach((loc, i) => {
-        let list = byAllocation.get(loc.allocation)
-        if (!list) byAllocation.set(loc.allocation, list = [])
+        const list = listOf(byAllocation, loc.allocation)
         list.push(i)
     })
     const paths = new Map<number, string>([[0, '']])
@@ -3109,8 +3193,7 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
     const contentsAt = new Map<string, Set<number>>()
     for (const allocation of order) for (const loc of byAllocation.get(allocation) ?? []) {
         const k = pathOf(allocation, data.locations[loc].key)
-        let set = contentsAt.get(k)
-        if (!set) contentsAt.set(k, set = new Set())
+        const set = setOf(contentsAt, k)
         for (const v of data.locations[loc].values) set.add(v)
     }
     const params = [...names.values()].map(param => ({ name: param, paths: [] as string[] }))
@@ -3181,15 +3264,14 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
                 for (const v of byNode.get(ref) ?? []) {
                     if (data.values[v].kind !== ValueKind.variable || data.numeric.has(baseOf(v))) continue
                     const param = label(v)
-                    let set = divergences.get(param)
-                    if (!set) divergences.set(param, set = new Set())
+                    const set = setOf(divergences, param)
                     set.add(`${unit.name || '<anon>'}:${kind}`)
                 }
             }
         }
     }
     for (const [param, set] of divergences) lines.push(`  diverges ${param}: ${[...set].join(' ')}`)
-    return { name, ms, params, paths: allPaths, invariants, lines }
+    return { name, params, paths: allPaths, invariants, lines }
 }
 
 function divergence(g: Graph, n: GraphNode, slot: number): string | undefined {
@@ -3246,7 +3328,6 @@ export interface Constant {
 }
 
 export interface Instantiations {
-    keys: string[]
     table: Map<string, Instantiation>
     shapes: Map<string, ShapeSignature>
     constantShapes: Map<Handle, string>
@@ -3296,10 +3377,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         }
     }
     const recordParent = types.objects.map((_, i) => i)
-    function findRecord(a: number): number {
-        while (recordParent[a] !== a) a = recordParent[a] = recordParent[recordParent[a]]
-        return a
-    }
+    const findRecord = (a: number) => rootOf(recordParent, a)
     const joinable = (id: number) => {
         const object = types.objects[id]
         if (object.native || object.dynamic || object.name === 'buffer') return false
@@ -3342,16 +3420,14 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const groups = new Map<number, number[]>()
         types.objects.forEach((_, id) => {
             if (!joinable(id)) return
-            let list = groups.get(findRecord(id))
-            if (!list) groups.set(findRecord(id), list = [])
+            const list = listOf(groups, findRecord(id))
             list.push(id)
         })
         for (const members of groups.values()) {
             if (members.length < 2) continue
             const byKey = new Map<string, number[]>()
             for (const id of members) for (const [k, field] of types.objects[id].fields) {
-                let list = byKey.get(k)
-                if (!list) byKey.set(k, list = [])
+                const list = listOf(byKey, k)
                 list.push(...field.type.objects)
             }
             for (const list of byKey.values()) if (joinRecords(list)) changed = true
@@ -3360,8 +3436,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     const recordMembers = new Map<number, number[]>()
     types.objects.forEach((_, id) => {
         if (!joinable(id)) return
-        let list = recordMembers.get(findRecord(id))
-        if (!list) recordMembers.set(findRecord(id), list = [])
+        const list = listOf(recordMembers, findRecord(id))
         list.push(id)
     })
     function keyOf(id: number): string {
@@ -3412,10 +3487,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         return [type, [...forms].filter(form => form !== 'prop' && form !== 'init')]
     }
     const bufferRoot = types.objects.map((_, i) => i)
-    function bufferGroup(a: number): number {
-        while (bufferRoot[a] !== a) a = bufferRoot[a] = bufferRoot[bufferRoot[a]]
-        return a
-    }
+    const bufferGroup = (a: number) => rootOf(bufferRoot, a)
     function joinBuffers(ids: number[]): void {
         for (const id of ids) bufferRoot[bufferGroup(id)] = bufferGroup(ids[0])
     }
@@ -3432,9 +3504,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const groups = new Map<number, number[]>()
         types.objects.forEach((_, id) => {
             if (!raw(id)) return
-            const list = groups.get(bufferGroup(id))
-            if (list) list.push(id)
-            else groups.set(bufferGroup(id), [id])
+            listOf(groups, bufferGroup(id)).push(id)
         })
         return groups
     }
@@ -3509,7 +3579,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const members = entry.members.map(id => types.objects[id])
         const constant = members.find(o => o.constant && o.state !== undefined)
         const fixed = constant ?? members.find(o => o.state !== undefined && dataKeys(o.state).length > 0)
-        const stateOrder = fixed ? dataKeys(fixed.state!).map(k => heap.isString(k) ? heap.stringToJs(k) : heap.describeKey(k) ?? `#${k}`) : []
+        const stateOrder = fixed ? dataKeys(fixed.state!).map(k => keyLabel(k)) : []
         const shared = !constant && object.proto !== undefined ? protoOrders.get(object.proto) : undefined
         const order = shared ?? stateOrder
         if (object.proto !== undefined && stateOrder.length && !protoOrders.has(object.proto)) protoOrders.set(object.proto, stateOrder)
@@ -3530,12 +3600,9 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         let id = referenced.has(reserved) ? undefined : [...shapes].find(([, sig]) => sig.text === text && sig.proto === object.proto)?.[0]
         if (!id) shapes.set(id = reserved, { text, proto: object.proto, fields, members: [] })
         shapes.get(id)!.members.push(...entry.members)
-        let byField = heldBuffers.get(id)
-        if (!byField) heldBuffers.set(id, byField = new Map())
+        const byField = mapOf(heldBuffers, id)
         for (const [k, buffers] of held) {
-            const list = byField.get(k)
-            if (list) list.push(...buffers)
-            else byField.set(k, [...buffers])
+            listOf(byField, k).push(...buffers)
             if (!bufferMembers) joinBuffers(byField.get(k)!)
         }
         if (bufferMembers) layOutShape(id)
@@ -3599,7 +3666,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         for (const [group, at] of freeGroups) if (holderWidths.get(at) === 8) wideGroups.add(group)
         for (const id of shapes.keys()) layOutShape(id)
     }
-    return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].name === 'buffer' || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 
 export interface PlannedUnit {
@@ -3648,8 +3715,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
             if (site.frame === undefined) continue
             outgoing[site.frame].push([site.node, id])
             const k = `${site.frame}|${site.node}`
-            let from = callees.get(k)
-            if (!from) callees.set(k, from = [])
+            const from = listOf(callees, k)
             from.push(id)
         }
     })
@@ -3657,18 +3723,14 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     const atoms = new Map<number, number[]>()
     types.frames.forEach((_, id) => {
         const root = find(id)
-        const members = atoms.get(root)
-        if (members) members.push(id)
-        else atoms.set(root, [id])
+        listOf(atoms, root).push(id)
     })
     const joins: number[][] = []
     const bySite = new Map<string, number[]>()
     types.objects.forEach((object, id) => {
         if (object.constant || object.native || object.frame === undefined) return
         const k = `${find(object.frame)}|${object.site.node}`
-        const list = bySite.get(k)
-        if (list) list.push(id)
-        else bySite.set(k, [id])
+        listOf(bySite, k).push(id)
     })
     for (const list of bySite.values()) if (list.length > 1) joins.push(list)
     for (const members of atoms.values()) {
@@ -3683,8 +3745,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const shape = object.dynamic ? 'heap' : inst.shapeOf(id)
         const frame = object.frame
         if (shape === undefined || frame === undefined) return
-        let list = created.get(find(frame))
-        if (!list) created.set(find(frame), list = [])
+        const list = listOf(created, find(frame))
         list.push(`%${object.site.node}=${shape}`)
     })
     const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = []) => {
@@ -3756,8 +3817,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         let unit = unitOfRoot.get(root)
         if (!unit) {
             unitOfRoot.set(root, unit = { fn: frame.unit, boxes: false, boxedReturn: false, allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), boxedCalls: new Set() })
-            let units = plan.get(frame.unit)
-            if (!units) plan.set(frame.unit, units = [])
+            const units = listOf(plan, frame.unit)
             units.push(unit)
         }
         unit.frames.push(id)
@@ -3771,18 +3831,14 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const merged = new Map<number, Type[]>()
         for (const f of unit.frames) {
             for (const [node, type] of types.frames[f].nodes) {
-                const list = merged.get(node)
-                if (list) list.push(type)
-                else merged.set(node, [type])
+                listOf(merged, node).push(type)
             }
         }
         for (const [node, list] of merged) unit.nodes.set(node, inst.repOf(unionAll(list)))
         const touched = new Map<number, number[]>()
         for (const f of unit.frames) {
             for (const [node, buffers] of types.frames[f].slices) {
-                const list = touched.get(node)
-                if (list) list.push(...buffers)
-                else touched.set(node, [...buffers])
+                listOf(touched, node).push(...buffers)
             }
         }
         touchedOf.set(unit, touched)
@@ -3806,13 +3862,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         unit.signature = joined.signature
     }
     const wordGroup = types.objects.map((_, i) => i)
-    function wordRoot(a: number): number {
-        while (wordGroup[a] !== a) {
-            wordGroup[a] = wordGroup[wordGroup[a]]
-            a = wordGroup[a]
-        }
-        return a
-    }
+    const wordRoot = (a: number) => rootOf(wordGroup, a)
     const accessesOf = (unit: PlannedUnit) => unit.frames.flatMap(f => types.frames[f].accesses)
     for (const unit of unitOfRoot.values()) {
         const first = new Map<number, number>()
@@ -3857,8 +3907,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         for (const site of frame.sites) {
             if (site.frame === undefined) continue
             const caller = unitOfFrame[site.frame]
-            let set = caller.calls.get(site.node)
-            if (!set) caller.calls.set(site.node, set = new Set())
+            const set = setOf(caller.calls, site.node)
             set.add(unitOfFrame[id])
             if (unitOfFrame[id].boxedReturn) caller.boxedCalls.add(site.node)
         }
@@ -3912,9 +3961,7 @@ function nullishReads(types: ValueTypes, units: PlannedUnit[], touchedOf: Map<Pl
     const readers = new Map<number, [number, number][]>()
     const writers = new Map<number, [number, number][]>()
     function add(map: Map<number, [number, number][]>, k: number, item: [number, number]): void {
-        const list = map.get(k)
-        if (list) list.push(item)
-        else map.set(k, [item])
+        listOf(map, k).push(item)
     }
     units.forEach((unit, u) => {
         for (const [node, callees] of unit.calls) for (const callee of callees) callers[index.get(callee)!].push([u, node])
@@ -4072,16 +4119,12 @@ function opaqueNumber(type: Type): boolean {
 
 function congruence(types: ValueTypes, callees: Map<string, number[]>): (a: number) => number {
     const parent = types.frames.map((_, i) => i)
-    function find(a: number): number {
-        while (parent[a] !== a) a = parent[a] = parent[parent[a]]
-        return a
-    }
+    const find = (a: number) => rootOf(parent, a)
     const sitesOf = new Map<number, Map<string, number>>()
     const pending: [number, number][] = []
     for (const [k, list] of callees) {
         const [caller, node] = k.split('|')
-        let sites = sitesOf.get(Number(caller))
-        if (!sites) sitesOf.set(Number(caller), sites = new Map())
+        const sites = mapOf(sitesOf, Number(caller))
         for (const id of list) {
             const site = `${node}|${unitIdentity(types.frames[id].unit)}`
             const known = sites.get(site)
@@ -4124,8 +4167,7 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     const holders = new Map<number, [number, string][]>()
     types.objects.forEach((object, id) => {
         for (const [key, field] of object.fields) for (const inner of field.type.objects) {
-            let list = holders.get(inner)
-            if (!list) holders.set(inner, list = [])
+            const list = listOf(holders, inner)
             list.push([id, key])
         }
     })
@@ -4178,8 +4220,7 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
         const found = owner(id)
         const P = found ? inst.shapeOf(found[0]) : undefined
         const key = found && P !== undefined && fields.get(P)?.get(found[1]) === inst.shapeOf(id) ? `${P}.${found[1]}` : ''
-        let set = keys.get(k)
-        if (!set) keys.set(k, set = new Set())
+        const set = setOf(keys, k)
         set.add(key)
         placed.set(k, [unit, object.site.node])
     })
@@ -4196,8 +4237,7 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
         const [key] = [...set]
         if (set.size !== 1 || !key || !fields.get(key.slice(0, key.indexOf('.')))?.has(key.slice(key.indexOf('.') + 1))) continue
         const [unit, node] = placed.get(k)!
-        let map = sites.get(unit)
-        if (!map) sites.set(unit, map = new Map())
+        const map = mapOf(sites, unit)
         map.set(node, key.slice(key.indexOf('.') + 1))
     }
     return { fields, sites }
@@ -4448,7 +4488,7 @@ function relate(facts: Map<string, Bound>, op: NodeOp, a: Lin, b: Lin, truth: bo
     return true
 }
 
-export function proveInvariants(methods: [string, Function][], ctor: Function, data: Accesses, host: AccessHost, candidates: string[], nodes: Map<Function, Map<number, number[]>>): [string, string][] {
+function proveInvariants(methods: [string, Function][], ctor: Function, data: Accesses, host: AccessHost, candidates: string[], nodes: Map<Function, Map<number, number[]>>): [string, string][] {
     const proven: [string, string][] = []
     for (let i = 0; i < candidates.length; i++) {
         for (let j = i + 1; j < candidates.length; j++) if (holds(candidates[i], candidates[j])) proven.push([candidates[i], candidates[j]])
