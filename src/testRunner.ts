@@ -483,7 +483,7 @@ async function compileEngine() {
 
 let engine: ReturnType<typeof compileEngine> | undefined
 
-async function testEngine(suite = 'heap', argv: string[] = []) {
+async function testEngine(suite = 'heap', argv: string[] = []): Promise<number> {
     const { emitted, loader } = await (engine ??= compileEngine())
     const harness = path.resolve('src/engine/harness.js')
     const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:') || a.startsWith('coverage:'))?.replace(/^(cpu-prof|heap-prof|coverage):/, '')
@@ -491,7 +491,7 @@ async function testEngine(suite = 'heap', argv: string[] = []) {
         fs.mkdirSync(`${prof}.src`, { recursive: true })
         for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
     }
-    return loader.run(harness, emitted.get(harness)!, argv, (exports: any) => exports.runSuite(suite))
+    return loader.run(harness, emitted.get(harness)!, argv, (exports: any) => exports.runSuite(suite)) as Promise<number>
 }
 
 function lineDiff(a: string, b: string) {
@@ -648,6 +648,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     const maxCrashes = given ? Number(given.slice('max-crashes:'.length)) : 3
     let resume: CrashResume | undefined
     let exitCode = 0
+    let failures = 0
+    let killed: string | undefined
     while (true) {
         const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
@@ -658,12 +660,16 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         child.stdio[3]!.on('data', (chunk: string) => {
             const lines = (pending + chunk).split('\n')
             pending = lines.pop()!
-            for (const line of lines) readMark(marks, line)
+            for (const line of lines) {
+                if (line === 'fail') failures++
+                else readMark(marks, line)
+            }
         })
         const [code, signal] = await new Promise<[number | null, string | null]>(resolve => child.on('close', (c, s) => resolve([c, s])))
         const message = crashOf(code, signal)
         if (!message) {
             exitCode = code ?? 128 + ((os.constants.signals as Record<string, number>)[signal!] ?? 0)
+            if (signal) killed = seconds > 0 && Date.now() >= deadline ? `watchdog timeout after ${seconds}s` : `killed by ${signal}`
             break
         }
         let label = marks.suite ?? args[1]
@@ -686,8 +692,17 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         resume = next
     }
     if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
+    if (!exitCode && (failures || crashes.length)) exitCode = 1
+    const problems = [`${failures} failures`, `${crashes.length} crashes`]
+    if (killed) problems.push(killed)
+    console.log(`RESULT ${exitCode ? 'FAILED' : 'ok'}: ${problems.join(', ')}, exit ${exitCode}`)
     if (args[1] === 'all') console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`)
     process.exitCode = exitCode
+}
+
+function report(failures: number): void {
+    if (failures) process.exitCode = 1
+    if (!crashFd) console.log(`RESULT ${failures ? 'FAILED' : 'ok'}: ${failures} failures, exit ${failures ? 1 : 0}`)
 }
 
 export async function main(...args: string[]) {
@@ -705,10 +720,11 @@ export async function main(...args: string[]) {
         const prof = args.find(a => a.startsWith('cpu-prof:'))?.slice('cpu-prof:'.length)
         const heapProf = args.find(a => a.startsWith('heap-prof:'))?.slice('heap-prof:'.length)
         const coverage = args.find(a => a.startsWith('coverage:'))?.slice('coverage:'.length)
-        if (prof || heapProf || coverage) return profiled(prof, heapProf, () => testEngine(args[1], args.slice(1)), coverage)
+        if (prof || heapProf || coverage) return report(await profiled(prof, heapProf, () => testEngine(args[1], args.slice(1)), coverage))
     }
     if (filter === '--engine') {
         if (args[1] === 'all') {
+            let failures = 0
             const hasNativeOption = new Set(['cg', 'containers'])
             const first = crashResume ? Math.max(0, allTestableFiles.indexOf(crashResume.suite)) : 0
             for (const x of allTestableFiles.slice(first)) {
@@ -716,12 +732,13 @@ export async function main(...args: string[]) {
                 if (hasNativeOption.has(x)) a.unshift('native')
                 a.unshift(x)
                 if (!crashResume || crashResume.suite !== x || crashResume.case === 0) console.log(`--- running ${a.join(' ')} ---`)
-                await testEngine(x, a) // let it fail fast
+                failures = await testEngine(x, a) // let it fail fast
             }
+            report(failures)
             if (!crashFd) process.on('beforeExit', () => console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`))
             return
         }
-        return testEngine(args[1], args.slice(1))
+        return report(await testEngine(args[1], args.slice(1)))
     }
 
     const shouldExecute = args[1] === '--reify'
