@@ -2294,18 +2294,55 @@ function valuesFrom(graph: Graph, root: number, conditional: boolean): Set<numbe
     return found
 }
 
+function specializeUnit(program: ProgramGraph, symbol: number, calls: [caller: number, call: number][], touched: Set<number>): number {
+    const specialized = Math.max(...program.units.keys(), ...program.image.functionTargets.values()) + 1
+    program.units.set(specialized, snapshotGraph(program.units.get(symbol)!))
+    program.abi.set(specialized, program.abi.get(symbol) ?? '')
+    for (const set of [program.noInline, program.alwaysInline, program.constructors, program.unplanned, program.tagged]) {
+        if (set.has(symbol)) set.add(specialized)
+    }
+    for (const [caller, call] of calls) {
+        const graph = program.units.get(caller)!
+        const site = getNode(graph, call)!
+        const target = getNode(graph, getRef(site, 1))!
+        const local = addCopy(graph, target, [{ literal: specialized }, ...getOperands(graph, target).slice(1)])
+        putCopy(graph, call, site, withOperand(graph, site, 1, local))
+        touched.add(caller)
+    }
+    return specialized
+}
+
 function expandParams(program: ProgramGraph, touched: Set<number>): void {
     const sites = programCallSites(program)
     const hoisted: string[] = []
     const mems = new Map<number, MemAnalysis>()
-    function fresh(symbol: number, arg: number): boolean {
+    function memOf(symbol: number): MemAnalysis {
         let mem = mems.get(symbol)
         if (!mem) mems.set(symbol, mem = memAnalysis(program.units.get(symbol)!))
-        return !!arg && mem.of(arg).kind === MemFresh
+        return mem
     }
-    for (const callee of freeCallees(program, sites)) {
-        const calls = sites.get(callee)!
-        const graph = program.units.get(callee)!
+    function fresh(symbol: number, arg: number): boolean {
+        return !!arg && memOf(symbol).of(arg).kind === MemFresh
+    }
+    function contextOf(symbol: number): number {
+        const graph = program.units.get(symbol)!
+        return graph.blocks[0].params.findIndex(p => paramLocation(getNode(graph, p)!) === program.target.indirectContextReg)
+    }
+    function onlyContext(symbol: number, context: number, caller: number, call: number): boolean {
+        const graph = program.units.get(caller)!
+        if (countIds(getNode(graph, call)!) - 3 !== program.units.get(symbol)!.blocks[0].params.length) return false
+        return privateArgument(graph, memOf(caller), call, symbol, context)
+    }
+    const free = new Set(freeCallees(program, sites))
+    const callees = [...free]
+    for (const [symbol, calls] of sites) {
+        if (free.has(symbol) || program.noInline.has(symbol) || calls.some(([caller]) => caller === symbol)) continue
+        const context = contextOf(symbol)
+        if (context >= 0 && calls.every(([caller, call]) => onlyContext(symbol, context, caller, call))) callees.push(symbol)
+    }
+    for (const candidate of callees) {
+        const calls = sites.get(candidate)!
+        const graph = program.units.get(candidate)!
         const entry = graph.blocks[0]
         const demanded = valuesFrom(graph, graph.blocks[0].bodyId, false)
         const users = nodeUsers(graph, valuesFrom(graph, graph.blocks[0].bodyId, true))
@@ -2338,11 +2375,15 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         entry.params.forEach((p, i) => {
             if (!calls.every(([symbol, call]) => fresh(symbol, getRef(getNode(program.units.get(symbol)!, call)!, 3 + i)))) return
             const loads: number[] = []
-            if (!users.has(p) || !cover(p, loads) || loads.length - 1 > headroom) return
-            headroom -= loads.length - 1
+            if (!users.has(p) || !cover(p, loads)) return
+            const cost = paramLocation(getNode(graph, p)!) < 0 ? loads.length - 1 : loads.length
+            if (cost > headroom) return
+            headroom -= cost
             chosen.push(...loads)
         })
         if (!chosen.length) continue
+        const callee = free.has(candidate) ? candidate : specializeUnit(program, candidate, calls, touched)
+        const unit = program.units.get(callee)!
         const params = entry.params.slice()
         const copies = calls.map(() => new Map<number, Operand>())
         const by = new Map<number, Operand>()
@@ -2373,13 +2414,219 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
             const param = by.get(load)
             if (typeof param === 'number' && getRef(n, 1) && !getRef(n, 2)) hoistedAt.set(`${getRef(n, 1)}:${getLiteral(graph, n, 2)}`, param)
         }
-        rewriteFactNodes(graph, f => f.op === NodeOp.load && getRef(f, 1) && !getRef(f, 2) ? hoistedAt.get(`${getRef(f, 1)}:${getLiteral(graph, f, 2)}`) : undefined)
-        substitute(graph, by)
-        hoisted.push(`${graph.name}:${chosen.length}`)
+        rewriteFactNodes(unit, f => f.op === NodeOp.load && getRef(f, 1) && !getRef(f, 2) ? hoistedAt.get(`${getRef(f, 1)}:${getLiteral(unit, f, 2)}`) : undefined)
+        substitute(unit, by)
+        hoisted.push(`${unit.name}:${chosen.length}`)
         touched.add(callee)
         for (const [caller] of calls) touched.add(caller)
     }
     if (flags.has('hoist-stats')) console.log('HOISTED', hoisted.join(' '))
+}
+
+const StateFieldTypes = new Set([Types.u8, Types.i8, Types.u16, Types.i16, Types.u32, Types.i32, Types.u64, Types.i64, Types.vm_value])
+
+function privateArgument(graph: Graph, mem: MemAnalysis, call: number, callee: number, index: number): boolean {
+    const arg = getRef(getNode(graph, call)!, 3 + index)
+    if (!arg) return false
+    const value = mem.of(arg)
+    if (value.kind !== MemFresh || value.pos !== 0 || value.pending) return false
+    const flow = mem.flows(value.base, true)
+    return !flow.own && flow.calls.every(([site, at]) => at === index && calledSymbol(graph, getNode(graph, site)!) === callee)
+}
+
+function stateFields(graph: Graph, mem: MemAnalysis, users: Map<number, [user: number, slot: number][]>, arrivals: Arrivals, param: number): [offset: number, type: intrinsics.Types][] | undefined {
+    const fields = new Map<number, intrinsics.Types>()
+    const aliases = new Set<number>([param])
+    const work = [param]
+    while (work.length) {
+        const ptr = work.pop()!
+        for (const [user, slot] of users.get(ptr) ?? []) {
+            const n = getNode(graph, user)!
+            if (slot < firstNonOrderingSlot(n)) continue
+            if ((n.op === NodeOp.load || n.op === NodeOp.store) && slot === 1 && !getRef(n, 2)) {
+                const at = mem.of(ptr).pos
+                if (at === undefined) return
+                const offset = at + getLiteral(graph, n, 2)
+                const T = typeOf(n)
+                if (offset < 0 || !StateFieldTypes.has(T)) return
+                if (fields.has(offset) && fields.get(offset) !== T) return
+                fields.set(offset, T)
+                continue
+            }
+            let alias: number | undefined
+            if (n.op === NodeOp.after && slot === countIds(n) - 1) alias = user
+            if (n.op === NodeOp.add && !getRef(n, 1 - slot)) alias = user
+            if (n.op === NodeOp.apply && slot > 0) alias = getBlock(graph, getRef(n, 0))?.params[slot - 1]
+            if (alias === undefined) return
+            const m = mem.of(alias)
+            if (m.pending || m.base !== param || m.pos === undefined) return
+            if (getNode(graph, alias)!.op === NodeOp.param && (arrivals.get(alias) ?? []).some(a => !a || mem.of(a).base !== param)) return
+            if (aliases.has(alias)) continue
+            aliases.add(alias)
+            work.push(alias)
+        }
+    }
+    const layout = [...fields].sort((a, b) => a[0] - b[0])
+    for (let i = 1; i < layout.length; i++) {
+        if (layout[i - 1][0] + intrinsics.intrinsicBitWidth(layout[i - 1][1]) / 8 > layout[i][0]) return
+    }
+    return layout
+}
+
+function scalarizeMutableState(program: ProgramGraph, touched: Set<number>): Set<number> {
+    const sites = programCallSites(program)
+    const mems = new Map<number, MemAnalysis>()
+    function memOf(symbol: number): MemAnalysis {
+        let mem = mems.get(symbol)
+        if (!mem) mems.set(symbol, mem = memAnalysis(program.units.get(symbol)!))
+        return mem
+    }
+    const promoted: string[] = []
+    const changed = new Set<number>()
+    for (const callee of freeCallees(program, sites)) {
+        const graph = program.units.get(callee)!
+        const entry = graph.blocks[0]
+        if (isJumbo(graph) || !entry.params.length) continue
+        const stores: GraphNode[] = []
+        for (const n of graph.nodes.values()) {
+            if (n.op === NodeOp.store && getRef(n, 1)) stores.push(n)
+        }
+        if (!stores.length) continue
+        const mem = memOf(callee)
+        const written = new Map<number, Set<number>>()
+        for (const n of stores) {
+            const at = mem.of(getRef(n, 1))
+            if (!entry.params.includes(at.base) || at.pos === undefined) continue
+            let offsets = written.get(at.base)
+            if (!offsets) written.set(at.base, offsets = new Set())
+            offsets.add(at.pos + getLiteral(graph, n, 2))
+        }
+        if (!written.size) continue
+        const returns = ownRets(graph)
+        if (!returns.length || returnsFloat(graph)) continue
+        const tails = returns.map(id => getNode(graph, tailOf(graph, getRef(getNode(graph, id)!, 0))))
+        if (tails.some(n => n && (typeRefOf(n) || n.op === NodeOp.record))) continue
+        const hasResult = tails.some(n => n?.op !== NodeOp.void)
+        const calls = sites.get(callee)!
+        const users = nodeUsers(graph, graph.nodes.keys(), true)
+        const arrivals = paramArrivals(graph)
+        const ordinary = entry.params.filter(p => paramLocation(getNode(graph, p)!) < 0).length
+        let index = -1
+        let layout: [offset: number, type: intrinsics.Types][] = []
+        for (let i = 0; i < entry.params.length && index < 0; i++) {
+            const param = entry.params[i]
+            const offsets = written.get(param)
+            if (!offsets) continue
+            const fields = stateFields(graph, mem, users, arrivals, param)
+            if (!fields) continue
+            // XXX: three or more fields are not pareto: Array push/reserve/setIndex states save holePushed −14 but cost arrayTwoKinds +8, restSpread +7
+            if (fields.length > 2) continue
+            const freed = paramLocation(getNode(graph, param)!) < 0 ? 1 : 0
+            if (ordinary - freed + fields.length > program.target.argRegs.length) continue
+            if (offsets.size + (hasResult ? 1 : 0) > program.target.retRegs.length) continue
+            if (!calls.every(([symbol, call]) => privateArgument(program.units.get(symbol)!, memOf(symbol), call, callee, i))) continue
+            index = i
+            layout = fields
+        }
+        if (index < 0) continue
+        const param = entry.params[index]
+        const outputs = layout.filter(([offset]) => written.get(param)!.has(offset))
+        const own = new Set(returns)
+        const nil = addNode(graph, NodeOp.nilEffect, [entry.id])
+        const size = Math.max(...layout.map(([offset, T]) => offset + intrinsics.intrinsicBitWidth(T) / 8))
+        const cell = addNode(graph, NodeOp.pstack, [nil, 0, 0, { literal: size }])
+        let initialized = cell
+        const inputs: number[] = []
+        for (const [offset, T] of layout) {
+            const p = addNode(graph, NodeOp.param, [], T)
+            initialized = addNode(graph, NodeOp.store, [initialized, cell, { literal: offset }, p], T)
+            inputs.push(p)
+        }
+        const state = addNode(graph, NodeOp.after, [initialized, cell])
+        substitute(graph, new Map<number, Operand>([[param, state]]))
+        entry.params = [...entry.params.filter(p => p !== param), ...inputs]
+        for (const b of graph.blocks) {
+            b.bodyId = mapTailPositions(graph, b.bodyId, p => {
+                if (!own.has(p.at)) return p.at
+                const ret = getNode(graph, p.at)!
+                const value = getOperand(graph, ret, 0)
+                const token = addNode(graph, NodeOp.after, [addNode(graph, NodeOp.nilEffect, [b.id]), ...p.tokens, value])
+                const record: Operand[] = hasResult ? [{ literal: 0 }, value] : []
+                for (const [offset, T] of outputs) record.push({ literal: record.length / 2 }, addNode(graph, NodeOp.load, [token, state, { literal: offset }], T))
+                return addCopy(graph, ret, [addNode(graph, NodeOp.record, record), ...getOperands(graph, ret).slice(1)])
+            })
+        }
+        touched.add(callee)
+        changed.add(callee)
+        mems.delete(callee)
+        for (const [symbol, call] of calls) {
+            const caller = program.units.get(symbol)!
+            const n = getNode(caller, call)!
+            const args = getOperands(caller, n)
+            const base = args[3 + index]
+            const token = addNode(caller, NodeOp.after, [args[0], ...args.slice(2)])
+            const loads = layout.map(([offset, T]) => addNode(caller, NodeOp.load, [token, base, { literal: offset }], T))
+            const invoke = addCopy(caller, n, [addNode(caller, NodeOp.after, [token, ...loads]), args[1], args[2], ...args.slice(3).filter((_, i) => i !== index), ...loads])
+            const locations = callLocations(caller, call)
+            if (locations) setCallLocations(caller, invoke, [...locations.filter((_, i) => i !== index), ...loads.map(() => -1)])
+            let updated = invoke
+            outputs.forEach(([offset, T], i) => {
+                const value = addNode(caller, NodeOp.get, [invoke, { literal: i + (hasResult ? 1 : 0) }])
+                updated = addNode(caller, NodeOp.store, [updated, base, { literal: offset }, value], T)
+            })
+            const result = hasResult ? addNode(caller, NodeOp.get, [invoke, { literal: 0 }]) : addNode(caller, NodeOp.void, [])
+            putNode(caller, call, NodeOp.after, [updated, result])
+            touched.add(symbol)
+            mems.delete(symbol)
+        }
+        promoted.push(`${graph.name}:${layout.map(([offset]) => offset).join('/')}`)
+    }
+    if (flags.has('hoist-stats')) console.log('STATE', promoted.join(' '))
+    return changed
+}
+
+function returnedParam(graph: Graph): number {
+    const returns = ownRets(graph)
+    if (!returns.length) return -1
+    const param = tailOf(graph, getRef(getNode(graph, returns[0])!, 0))
+    for (const id of returns) {
+        if (tailOf(graph, getRef(getNode(graph, id)!, 0)) !== param) return -1
+    }
+    return graph.blocks[0].params.indexOf(param)
+}
+
+function forwardReturnedArgs(program: ProgramGraph, touched: Set<number>): void {
+    const forwarding = new Map<number, number>()
+    for (const [symbol, graph] of program.units) {
+        const index = returnedParam(graph)
+        if (index >= 0) forwarding.set(symbol, index)
+    }
+    if (!forwarding.size) return
+    const sites = programCallSites(program)
+    for (const symbol of freeCallees(program, sites)) {
+        const index = forwarding.get(symbol)
+        if (index === undefined) continue
+        for (const [caller, call] of sites.get(symbol)!) {
+            const graph = program.units.get(caller)!
+            const n = getNode(graph, call)!
+            const arg = getOperand(graph, n, 3 + index)
+            const token = addNode(graph, NodeOp.after, [getOperand(graph, n, 0), arg])
+            const invoke = addCopy(graph, n, withOperand(graph, n, 0, token))
+            putCopy(graph, call, n, [invoke, arg], NodeOp.after)
+            touched.add(caller)
+        }
+        const graph = program.units.get(symbol)!
+        function discard(id: number): number {
+            const n = getNode(graph, id)!
+            if (n.op !== NodeOp.after) return addNode(graph, NodeOp.void, [])
+            return addCopy(graph, n, [...getOperands(graph, n).slice(0, -1), discard(getRef(n, countIds(n) - 1))])
+        }
+        for (const id of ownRets(graph)) {
+            const n = getNode(graph, id)!
+            putCopy(graph, id, n, [discard(getRef(n, 0)), ...getOperands(graph, n).slice(1)])
+        }
+        touched.add(symbol)
+    }
 }
 
 const SharedOps = new Set([
@@ -2541,6 +2788,40 @@ function specializeLiteralArgs(program: ProgramGraph, touched: Set<number>): voi
     }
 }
 
+function dropArgBits(mask: number, dead: Set<number>): number {
+    let out = mask & WritesUnknown
+    for (const k of maskArgs(mask)) {
+        if (dead.has(k)) continue
+        let below = 0
+        for (const d of dead) {
+            if (d < k) below++
+        }
+        out |= argBit(k - below)
+    }
+    return out
+}
+
+function dropOutcomeArgs(table: Map<number, [effect: number, mask: number]>, dead: Set<number>): Map<number, [effect: number, mask: number]> {
+    const out = new Map<number, [effect: number, mask: number]>()
+    for (const [value, [effect, mask]] of table) out.set(value, [effect, dropArgBits(mask, dead)])
+    return out
+}
+
+function dropSummaryArgs(graph: Graph, call: GraphNode, dead: Set<number>): void {
+    const target = getRef(call, 1)
+    const n = getNode(graph, target)!
+    if (countIds(n) === 1) return
+    const s = callSummary(graph, call)!
+    let outcomes: CallOutcomes | undefined
+    if (s.outcomes) {
+        const other = s.outcomes.other
+        outcomes = { literals: dropOutcomeArgs(s.outcomes.literals, dead), excluding: dropOutcomeArgs(s.outcomes.excluding, dead), other: other ? [other[0], dropArgBits(other[1], dead)] : undefined }
+    }
+    const summary: CallSummary = { ...s, writes: dropArgBits(s.writes, dead), captures: dropArgBits(s.captures, dead), deepCaptures: dropArgBits(s.deepCaptures, dead), outcomes }
+    const slots = encodeCallSummary(getLiteral(graph, n, 0), summary)
+    putCopy(graph, target, n, slots.map(literal => ({ literal })))
+}
+
 function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
     const sites = programCallSites(program)
     const pruned: string[] = []
@@ -2570,9 +2851,15 @@ function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
         })
         if (!dead.size) continue
         entry.params = entry.params.filter((_, i) => !dead.has(i))
+        const summarized = new Set<string>()
         for (const [symbol, call] of calls) {
             const caller = program.units.get(symbol)!
             const n = getNode(caller, call)!
+            const target = getRef(n, 1)
+            if (!summarized.has(`${symbol}:${target}`)) {
+                summarized.add(`${symbol}:${target}`)
+                dropSummaryArgs(caller, n, dead)
+            }
             const locations = callLocations(caller, call)
             putCopy(caller, call, n, getOperands(caller, n).filter((_, i) => i < 3 || !dead.has(i - 3)))
             if (locations) setCallLocations(caller, call, locations.filter((_, i) => !dead.has(i)))
@@ -3597,11 +3884,29 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
     timed('records', () => recordReturns(program, clock))
     timed('records', () => {
         expandParams(program, touched)
+        forwardReturnedArgs(program, touched)
         shareCallerValues(program, touched)
         specializeLiteralArgs(program, touched)
         pruneDeadArgs(program, touched)
         for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
-        inlineSpecialized(program, touched, clock)
+        const specialized = new Set(touched)
+        touched.clear()
+        const state = scalarizeMutableState(program, touched)
+        if (state.size) {
+            refineProgramEffects(program, touched)
+            for (const symbol of state) {
+                program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+                specialized.add(symbol)
+                touched.delete(symbol)
+            }
+            pruneDeadArgs(program, touched)
+            refineProgramEffects(program, touched)
+            for (const symbol of touched) {
+                program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+                specialized.add(symbol)
+            }
+        }
+        inlineSpecialized(program, specialized, clock)
     })
     prune(program)
     unswitchHot(program, programLevels(program), clock)
@@ -5738,7 +6043,7 @@ function planFrames(types: ValueTypes, plan: ShapePlan, planned: Planned, linker
     for (const [fn, unit] of planned.units) {
         const traced = tracer.graphsOf(fn).traced!
         const proxy = traced.frameProxy
-        if (proxy !== undefined && traced.frames.has(proxy) && !planned.frames.has(proxy)) planned.frames.set(proxy, propertyEval.frameShape(frameSize(sourceOfLinked(fn)!.captured)))
+        if (proxy !== undefined && traced.frames.has(proxy) && !planned.frames.has(proxy)) planned.frames.set(proxy, propertyEval.frameShape(frameSize(sourceOfLinked(fn)!.captured), proxy as intrinsics.Handle))
         for (const [id, n] of traced.graph.nodes) {
             const rep = n.op === NodeOp.callContext ? unit.nodes.get(id) : undefined
             const shape = rep && plannedShape(plan, rep)
@@ -6693,7 +6998,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (T !== undefined) retypeNode(traced.graph, param, T)
         }
         const frameShapes = new Map<u32, intrinsics.Handle>()
-        for (const [proxy, size] of traced.frames) frameShapes.set(proxy, planned.frames.get(proxy) ?? propertyEval.frameShape(size))
+        for (const [proxy, size] of traced.frames) frameShapes.set(proxy, planned.frames.get(proxy) ?? propertyEval.frameShape(size, proxy as intrinsics.Handle))
         for (const [cell, param] of unit.cold ?? []) {
             const frame = planned.frames.get(cell)
             const index = traced.graph.blocks[0].params.indexOf(param)
