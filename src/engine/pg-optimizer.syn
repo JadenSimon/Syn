@@ -1,0 +1,2095 @@
+"use wrapped";
+
+import * as intrinsics from './intrinsics'
+import * as heap from './heap'
+import * as rt from './rt'
+import { Op as RtOp, elementType, opName as rtName } from './rt'
+import { dumpGraph, NumericOps, stronglyConnected, type Graph, type GraphNode } from './lowering2'
+import { countIds, getLiteral, getNode, getRef, isThisParam, NodeOp, typeOf } from './graph-node'
+import * as vf from './value-flow'
+import type { Expr, FlowState, FrameInfo, Guard, Instance, Spec, Summary } from './value-flow'
+import { AllocKind, armIndexOf, armsAt, blockOf, bodyNodes, effect, emptyType, inhabited, keyLabel, predsOf, reaches, retsOf, usersOf, valueTail, type AccessHost, type Accesses, type Allocation, type Block, type FrameSignature, type Location, type Site, type Type, type UnitTypes, type WordAccess } from './value-types'
+
+type Handle = intrinsics.Handle
+
+const Types = intrinsics.Types
+
+let flow: FlowState
+
+const predicateTables = new WeakMap<Summary, Guard[] | null>()
+
+export function predicateGuard(s: Summary, call: GraphNode, ref: number, positive: boolean): Guard {
+    const callee = predicateCallee(s, call)
+    const table = callee ? tableOf(callee) : null
+    if (!table) return vf.noGuard
+    for (let i = 3; i < countIds(call) && (i - 3) * 2 < table.length; i++) {
+        if (getRef(call, i) !== ref) continue
+        const guard = table[(i - 3) * 2 + (positive ? 0 : 1)]
+        if (guard.flags) return guard
+    }
+    return vf.noGuard
+}
+
+function predicateCallee(s: Summary, call: GraphNode): Summary | undefined {
+    const g = s.g
+    const target = getRef(call, 1) ? getNode(g, getRef(call, 1)) : undefined
+    if (!target) return
+    const host = vf.flowState().host
+    let fn: Function | undefined
+    if (target.op === NodeOp.localTarget) fn = host.localFunction(getLiteral(g, target, 0))
+    else if (target.op === NodeOp.heapHandle && !getRef(target, 0) && !s.fresh.has(getLiteral(g, target, 0))) fn = vf.callableOf(getLiteral(g, target, 0))
+    if (!fn || !host.traceable(fn)) return
+    return vf.summaryOf(vf.boundCallee(fn, call))
+}
+
+function tableOf(callee: Summary): Guard[] | null {
+    const known = predicateTables.get(callee)
+    if (known !== undefined) return known
+    const cg = callee.g
+    const ret = cg.blocks.length === 1 && !callee.hasThis && !callee.usesCtx ? getNode(cg, cg.blocks[0].bodyId) : undefined
+    if (ret?.op !== NodeOp.ret || !getRef(ret, 0)) {
+        predicateTables.set(callee, null)
+        return null
+    }
+    const table: Guard[] = []
+    for (const p of cg.blocks[0].params) {
+        for (const positive of [true, false]) {
+            const guard = vf.guardOn(callee, getRef(ret, 0), p, positive, false)
+            table.push(guard.picks.length ? { flags: guard.flags, lo: guard.lo, hi: guard.hi, picks: [] } : guard)
+        }
+    }
+    predicateTables.set(callee, table)
+    return table
+}
+
+interface Bound {
+    param: number
+    recv: number
+    ret: number
+}
+
+interface Relation {
+    index: number
+    length: number
+    below: boolean
+}
+
+interface ProofTable {
+    bound: Bound | undefined
+    proofs: Map<number, boolean>
+    segRoots: Map<number, number>
+    keyRoots: Map<number, Map<number, number>>
+}
+
+interface InvariantDeps {
+    deps: Map<number, number[]>
+    broken: Set<number>
+    skippedKeys: Set<number>
+}
+
+const proofTables = new WeakMap<Summary, ProofTable>()
+const invariantDepsOf = new WeakMap<FlowState, InvariantDeps>()
+
+let lengthKey = 0
+
+function proofsOf(s: Summary): ProofTable {
+    let p = proofTables.get(s)
+    if (!p) proofTables.set(s, p = { bound: undefined, proofs: new Map(), segRoots: new Map(), keyRoots: new Map() })
+    return p
+}
+
+function invariantDeps(): InvariantDeps {
+    const flow = vf.flowState()
+    let c = invariantDepsOf.get(flow)
+    if (!c) invariantDepsOf.set(flow, c = { deps: new Map(), broken: new Set(), skippedKeys: new Set() })
+    return c
+}
+
+export function summarizeBounds(s: Summary, ids: number[], retArgs: number[]): void {
+    const g = s.g
+    const regions = s.regions!
+    const entry = g.blocks[0]
+    const plain = entry.params.filter(p => !isThisParam(getNode(g, p)!))
+    const self = entry.params.find(p => isThisParam(getNode(g, p)!))
+    for (const e of s.selects) {
+        const select = s.exprs[e].node
+        const ru = regions.of.get(select)
+        if (ru === undefined) continue
+        for (let arm = 1; arm <= 2; arm++) {
+            const rel = relationOf(s, getRef(getNode(g, select)!, 0), arm === 1)
+            if (!rel || rel.below) continue
+            const param = plain.indexOf(rel.index)
+            const obj = lengthOwner(s, rel.length)
+            const recv = obj === self && self !== undefined ? -1 : plain.indexOf(obj)
+            if (param < 0 || (recv < 0 && obj !== self)) continue
+            const root = segRoot(s, getRef(getNode(g, rel.length)!, 0))
+            const t = root ? getNode(g, root) : undefined
+            if (t?.op !== NodeOp.nilEffect || getRef(t, 0) !== entry.id) continue
+            const region = vf.childRegion(regions, ru, select, arm)
+            const args: number[] = []
+            const gates: number[] = []
+            const all = s.exprs[s.retExpr].gates!
+            let k = 0
+            for (const id of ids) {
+                if (getNode(g, id)!.op !== NodeOp.ret || s.regionRets.has(id)) continue
+                if (!within(regions, regions.of.get(id) ?? -1, region)) {
+                    args.push(retArgs[k])
+                    gates.push(all[k])
+                }
+                k++
+            }
+            if (args.length === retArgs.length) continue
+            const ret = vf.expr(s, vf.ExprOp.union, 0, 0, 0, 0, args, 0)
+            s.exprs[ret].gates = gates
+            proofsOf(s).bound = { param, recv, ret }
+            return
+        }
+    }
+}
+
+export function refineReturn(callee: Instance, target: number): number {
+    const b = proofTables.get(callee.summary)?.bound
+    if (!b) return callee.ret
+    const flow = vf.flowState()
+    if (flow.slotKind[vf.ownerSlot(target)] !== vf.SlotKind.expr) return callee.ret
+    const from = vf.instOfSlot(target)
+    const node = vf.exprAt(target).node
+    const n = node ? getNode(from.summary.g, node) : undefined
+    if (!n) return callee.ret
+    const args: number[] = []
+    let recv = 0
+    if (n.op === NodeOp.getProp && getRef(n, 2)) {
+        args.push(getRef(n, 2))
+        recv = getRef(n, 1)
+    } else if (n.op === NodeOp.call) {
+        for (let i = 3; i < countIds(n); i++) args.push(getRef(n, i))
+        recv = getRef(n, 2)
+    } else return callee.ret
+    if (b.param >= args.length) return callee.ret
+    const owner = b.recv < 0 ? recv : b.recv < args.length ? args[b.recv] : 0
+    if (!owner || !args[b.param]) return callee.ret
+    if (inBounds(from.summary, node, args[b.param], owner)) return vf.at(callee, b.ret)
+    const proof = invariantBound(from.summary, node, args[b.param], owner)
+    if (!proof) return callee.ret
+    const e = from.summary.exprOf.get(proof[0])
+    if (e === undefined) return callee.ret
+    const slot = vf.at(from, e)
+    for (const origin of flow.slotOrigins[slot]) if (!holdsInvariant(origin, proof[1], proof[2], target, callee.ret)) return callee.ret
+    vf.listen(slot, vf.ListenerKind.invariant, target, proof[1], proof[2], callee.ret)
+    return vf.at(callee, b.ret)
+}
+
+export function recheckBound(origin: number, part: number, key: number, field: number, ret: number): void {
+    if (!holdsInvariant(origin, key, field, part, ret)) unbound(part, ret)
+}
+
+export function repairBounds(): boolean {
+    const c = invariantDepsOf.get(vf.flowState())
+    if (!c) return false
+    for (const key of c.skippedKeys) intrinsics.assert(!vf.flowState().setterKeys.has(key), `value-flow: a store to ${heap.describeKey(key as Handle) ?? key} was taken as plain while proving two reads equal, but that key has a setter`)
+    if (!c.deps.size) return false
+    const flow = vf.flowState()
+    const protos = new Map<number, number[]>()
+    for (const proto of c.deps.keys()) protos.set(proto, [])
+    for (let origin = 1; origin < flow.originKind.length; origin++) {
+        if (!invariantOrigin(origin)) continue
+        protos.get(vf.protoOf(origin))?.push(origin)
+    }
+    let repaired = false
+    for (const [proto, deps] of c.deps) {
+        if (c.broken.has(proto) || encapsulated(proto, protos.get(proto)!)) continue
+        c.broken.add(proto)
+        for (let i = 0; i < deps.length; i += 2) unbound(deps[i], deps[i + 1])
+        repaired = true
+    }
+    return repaired
+}
+
+function invariantOrigin(origin: number): boolean {
+    const kind = vf.flowState().originKind[origin]
+    return kind === vf.OriginKind.fresh || kind === vf.OriginKind.created || kind === vf.OriginKind.static
+}
+
+function holdsInvariant(origin: number, key: number, field: number, part: number, ret: number): boolean {
+    if (!invariantOrigin(origin)) return false
+    const flow = vf.flowState()
+    const proto = vf.protoOf(origin)
+    const c = invariantDeps()
+    if (!proto || c.broken.has(proto)) return false
+    const invariants = flow.host.invariantsOf ? flow.host.invariantsOf(proto) : undefined
+    if (!invariants) return false
+    const a = heap.stringToJs(key as Handle)
+    const b = `${heap.stringToJs(field as Handle)}.length`
+    if (!invariants.pairs.some(([x, y]) => (x === a && y === b) || (x === b && y === a))) return false
+    let deps = c.deps.get(proto)
+    if (!deps) c.deps.set(proto, deps = [])
+    deps.push(part, ret)
+    return true
+}
+
+function encapsulated(proto: number, origins: number[]): boolean {
+    const flow = vf.flowState()
+    const invariants = flow.host.invariantsOf!(proto as Handle)!
+    const inside = (fn: Function) => invariants.closure.has(fn)
+    const writerInside = (w: number) => w >= 0 && inside(flow.instances[Math.floor(w / vf.exprBits)].summary.fn)
+    for (const path of new Set(invariants.pairs.flat())) {
+        let owners = origins
+        for (const name of path.split('.')) {
+            const key = heap.fromJsString(name) as number
+            const next: number[] = []
+            for (const owner of owners) {
+                const f = flow.originFields[owner].get(key)
+                if (f === undefined) continue
+                if (!(flow.fieldWriters.get(f) ?? []).every(writerInside)) return false
+                for (const a of flow.slotOrigins[f]) if (invariantOrigin(a) && !vf.originHostFn(a)) next.push(a)
+            }
+            for (const owned of next) if (!ownedInside(owned, inside)) return false
+            owners = next
+        }
+    }
+    return true
+}
+
+function ownedInside(owned: number, inside: (fn: Function) => boolean): boolean {
+    const flow = vf.flowState()
+    const writers = new Set<Function>()
+    for (const f of flow.originFields[owned].values()) for (const w of flow.fieldWriters.get(f) ?? []) if (w >= 0) writers.add(flow.instances[Math.floor(w / vf.exprBits)].summary.fn)
+    if (!writers.size) return true
+    for (const inst of flow.instances) {
+        if (!inst.summary.hasThis || !writers.has(inst.summary.fn)) continue
+        if (!flow.slotOrigins[vf.paramSlot(inst, -1)].includes(owned)) continue
+        for (const c of inst.callers) if (!inside(vf.instOfSlot(c).summary.fn)) return false
+    }
+    return true
+}
+
+function unbound(part: number, ret: number): void {
+    const flow = vf.flowState()
+    vf.copyEdge(ret, part)
+    const bind = flow.partBind.get(part)
+    if (bind) bind.from = ret
+}
+
+function within(regions: vf.Regions, r: number, target: number): boolean {
+    let at = r
+    while (at >= 0) {
+        vf.charge(1)
+        if (at === target) return true
+        at = vf.regionUp(regions, at)
+    }
+    return false
+}
+
+function lengthOwner(s: Summary, id: number): number {
+    const n = id ? getNode(s.g, id) : undefined
+    if (n?.op !== NodeOp.getProp || getRef(n, 2)) return 0
+    if (!lengthKey) lengthKey = heap.fromJsString('length') as number
+    return getLiteral(s.g, n, 2) === lengthKey ? getRef(n, 1) : 0
+}
+
+function flipped(op: NodeOp, positive: boolean): NodeOp {
+    if (positive) return op
+    return op === NodeOp.lt ? NodeOp.ge : op === NodeOp.le ? NodeOp.gt : op === NodeOp.gt ? NodeOp.le : op === NodeOp.ge ? NodeOp.lt : op
+}
+
+function relationOf(s: Summary, cond: number, yes: boolean): Relation | undefined {
+    const g = s.g
+    const [id, positive] = vf.condition(g, cond, yes)
+    if (!id) return undefined
+    const n = getNode(g, id)!
+    const a = getRef(n, 0)
+    const b = getRef(n, 1)
+    if (!a || !b) return undefined
+    const op = flipped(n.op, positive)
+    if (lengthOwner(s, b)) {
+        if (op === NodeOp.lt) return { index: a, length: b, below: true }
+        if (op === NodeOp.ge || op === NodeOp.gt) return { index: a, length: b, below: false }
+    }
+    if (lengthOwner(s, a)) {
+        if (op === NodeOp.gt) return { index: b, length: a, below: true }
+        if (op === NodeOp.le || op === NodeOp.lt) return { index: b, length: a, below: false }
+    }
+    return undefined
+}
+
+function relationAny(s: Summary, cond: number, yes: boolean): [index: number, bound: number] | undefined {
+    const g = s.g
+    const [id, positive] = vf.condition(g, cond, yes)
+    if (!id) return undefined
+    const n = getNode(g, id)!
+    const a = getRef(n, 0)
+    const b = getRef(n, 1)
+    if (!a || !b) return undefined
+    const op = flipped(n.op, positive)
+    if (op === NodeOp.lt) return [a, b]
+    if (op === NodeOp.gt) return [b, a]
+    return undefined
+}
+
+function inBounds(s: Summary, node: number, index: number, recv: number): boolean {
+    const p = proofsOf(s)
+    const known = p.proofs.get(node)
+    if (known !== undefined) return known
+    const g = s.g
+    const regions = s.regions!
+    if (!lengthKey) lengthKey = heap.fromJsString('length') as number
+    const token = keyRoot(s, getRef(getNode(g, node)!, 0), lengthKey)
+    let proved = false
+    let at = regions.of.get(node) ?? -1
+    while (at >= 0 && !proved) {
+        vf.charge(1)
+        if (regions.depth[at] > 0) {
+            const rel = relationOf(s, getRef(getNode(g, regions.cond[at])!, 0), regions.arm[at] === 1)
+            if (rel?.below && sameValue(s, rel.index, index) && sameValue(s, lengthOwner(s, rel.length), recv) && keyRoot(s, getRef(getNode(g, rel.length)!, 0), lengthKey) === token) proved = true
+        }
+        at = vf.regionUp(regions, at)
+    }
+    p.proofs.set(node, proved)
+    return proved
+}
+
+function literalKey(s: Summary, id: number): number {
+    const n = getNode(s.g, id)
+    return n?.op === NodeOp.getProp && !getRef(n, 2) ? getLiteral(s.g, n, 2) : -1
+}
+
+function invariantBound(s: Summary, node: number, index: number, recv: number): [owner: number, key: number, field: number] | undefined {
+    const g = s.g
+    const regions = s.regions
+    if (!regions) return undefined
+    const field = literalKey(s, recv)
+    if (field < 0) return undefined
+    const owner = getRef(getNode(g, recv)!, 1)
+    let at = regions.of.get(node) ?? -1
+    while (at >= 0) {
+        vf.charge(1)
+        if (regions.depth[at] > 0) {
+            const rel = relationAny(s, getRef(getNode(g, regions.cond[at])!, 0), regions.arm[at] === 1)
+            const key = rel ? literalKey(s, rel[1]) : -1
+            if (rel && key >= 0 && sameValue(s, rel[0], index)) {
+                const m = getNode(g, rel[1])!
+                if (sameValue(s, getRef(m, 1), owner) && keyRoot(s, getRef(m, 0), key) === keyRoot(s, getRef(getNode(g, node)!, 0), key)) return [owner, key, field]
+            }
+        }
+        at = vf.regionUp(regions, at)
+    }
+    return undefined
+}
+
+function sameValue(s: Summary, a: number, ref: number): boolean {
+    if (a === ref) return true
+    if (!a || !ref) return false
+    const g = s.g
+    const m = getNode(g, ref)
+    const n = getNode(g, a)
+    if (m?.op !== NodeOp.getProp || n?.op !== NodeOp.getProp) return false
+    if (!sameValue(s, getRef(m, 1), getRef(n, 1)) || getRef(m, 2) || getRef(n, 2) || getLiteral(g, m, 2) !== getLiteral(g, n, 2)) return false
+    const key = getLiteral(g, m, 2)
+    return keyRoot(s, getRef(m, 0), key) === keyRoot(s, getRef(n, 0), key)
+}
+
+function keyRoot(s: Summary, tok: number, key: number): number {
+    const g = s.g
+    const p = proofsOf(s)
+    let memo = p.keyRoots.get(key)
+    if (!memo) p.keyRoots.set(key, memo = new Map())
+    const path: number[] = []
+    let at = tok
+    let root = 0
+    for (;;) {
+        const known = at ? memo.get(at) : 0
+        if (known !== undefined) {
+            root = known
+            break
+        }
+        const seg = segRoot(s, at)
+        const t = seg ? getNode(g, seg) : undefined
+        const other = t?.op === NodeOp.setProp && !getRef(t, 2) ? getLiteral(g, t, 2) : key
+        if (other === key || heap.keyIndex(other as Handle) !== undefined) {
+            root = seg
+            break
+        }
+        vf.charge(1)
+        invariantDeps().skippedKeys.add(other)
+        path.push(at)
+        at = getRef(t!, 0)
+    }
+    for (const q of path) memo.set(q, root)
+    return root
+}
+
+function segRoot(s: Summary, tok: number): number {
+    const g = s.g
+    const p = proofsOf(s)
+    const path: number[] = []
+    let at = tok
+    let root = 0
+    for (;;) {
+        const known = at ? p.segRoots.get(at) : 0
+        if (known !== undefined) {
+            root = known
+            break
+        }
+        const t = getNode(g, at)
+        const read = t !== undefined && (t.op === NodeOp.getProp || t.op === NodeOp.after || (t.op === NodeOp.rt && vf.pureRt.has(getLiteral(g, t, 1))))
+        if (!read) {
+            root = at
+            break
+        }
+        vf.charge(1)
+        path.push(at)
+        at = getRef(t!, 0)
+    }
+    for (const q of path) p.segRoots.set(q, root)
+    return root
+}
+
+const deferredWrites = new WeakMap<FlowState, Map<number, number[]>>()
+const initializers = new WeakMap<Summary, boolean>()
+
+function hasSetter(proto: Handle, key: Handle): boolean {
+    let at = proto
+    while (at) {
+        const descriptor = heap.getOwnProperty(at, key)
+        if (descriptor) return (heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).flags & heap.PropFlags.has_setter) !== 0
+        at = heap.getPrototypeOf(at)
+    }
+    return false
+}
+
+function selfOf(g: Graph): number {
+    for (const p of g.blocks[0].params) if (isThisParam(getNode(g, p)!)) return p
+    return 0
+}
+
+function initializer(g: Graph, proto: Handle): boolean {
+    const self = selfOf(g)
+    if (!self) return false
+    for (const [id, n] of g.nodes) {
+        if (n.op === NodeOp.call || n.op === NodeOp.static || n.op === NodeOp.inlined) return false
+        if (n.op === NodeOp.rt && rt.sliceOf(g, n) === undefined) return false
+        for (let slot = 0; slot < countIds(n); slot++) {
+            if (getRef(n, slot) !== self) continue
+            if (n.op === NodeOp.setProp && slot === 1 && !getRef(n, 2) && !hasSetter(proto, getLiteral(g, n, 2) as Handle)) continue
+            if (n.op === NodeOp.after && slot === countIds(n) - 1) continue
+            if (n.op === NodeOp.ret && slot === 0) continue
+            return false
+        }
+    }
+    return true
+}
+
+function returnsSelf(g: Graph): boolean {
+    const self = selfOf(g)
+    for (const n of g.nodes.values()) if (n.op === NodeOp.ret && getRef(n, 0) && valueTail(g, getRef(n, 0)) !== self) return false
+    return true
+}
+
+function killedAfter(g: Graph, call: number, allocated: number, key: Handle, proto: Handle, self: boolean, regionOf: (id: number) => number | undefined): boolean {
+    const c = getNode(g, call)
+    if (c?.op !== NodeOp.call || valueTail(g, getRef(c, 2)) !== allocated) return false
+    const objects = self ? [allocated, call] : [allocated]
+    const region = regionOf(call)
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.setProp || getRef(n, 2) || getLiteral(g, n, 2) !== key) continue
+        if (!objects.includes(valueTail(g, getRef(n, 1)))) continue
+        if (regionOf(id) !== region) continue
+        if (unobserved(g, getRef(n, 0), call, objects, proto)) return true
+    }
+    return false
+}
+
+function unobserved(g: Graph, from: number, call: number, objects: number[], proto: Handle): boolean {
+    let reached = false
+    const visited = new Set<number>()
+    const work = [from]
+    while (work.length) {
+        const id = work.pop()!
+        if (!id || visited.has(id)) continue
+        visited.add(id)
+        if (id === call) {
+            reached = true
+            continue
+        }
+        const n = getNode(g, id)
+        if (!n) return false
+        if (n.op === NodeOp.nilEffect) continue
+        if (n.op === NodeOp.after) {
+            for (let i = 0; i < countIds(n) - 1; i++) work.push(getRef(n, i))
+            continue
+        }
+        const escapes = (at: number) => !!getRef(n, at) && objects.includes(valueTail(g, getRef(n, at)))
+        const own = escapes(1)
+        if (n.op === NodeOp.setProp) {
+            if (escapes(3) || (own && (getRef(n, 2) || hasSetter(proto, getLiteral(g, n, 2) as Handle)))) return false
+        } else if (n.op === NodeOp.getProp) {
+            if (own) return false
+        } else if (n.op === NodeOp.store) {
+            if (escapes(3)) return false
+        } else if (n.op === NodeOp.rt && rt.sliceOf(g, n) !== undefined) {
+            if (escapes(4)) return false
+        } else if (n.op !== NodeOp.load && n.op !== NodeOp.pstack) return false
+        work.push(getRef(n, 0))
+    }
+    return reached
+}
+
+export function deferInit(inst: Instance, x: Expr, origin: number, key: number, e: number, valueSlot: number): boolean {
+    if (!initStore(inst, x, origin)) return false
+    const owner = vf.flowState().originOwner[origin]
+    const allocated = allocNodeOf(origin)
+    if (!owner || !allocated || !inst.callers.length) return false
+    for (const slot of inst.callers) {
+        if (!killedBy(slot, origin, key, inst)) return false
+    }
+    const held = heldOf(vf.flowState())
+    let list = held.get(inst.id)
+    if (!list) held.set(inst.id, list = [])
+    list.push(origin, key, e, valueSlot)
+    return true
+}
+
+export function initCallerAdded(inst: Instance, slot: number): void {
+    const held = deferredWrites.get(vf.flowState())?.get(inst.id)
+    if (!held) return
+    const pending = held.splice(0, held.length)
+    for (let i = 0; i < pending.length; i += 4) {
+        if (killedBy(slot, pending[i], pending[i + 1], inst)) {
+            held.push(pending[i], pending[i + 1], pending[i + 2], pending[i + 3])
+            continue
+        }
+        vf.writeField(vf.fieldSlot(pending[i], pending[i + 1]), pending[i + 3], vf.writerId(inst, pending[i + 2]), 'prop', true)
+    }
+}
+
+function heldOf(flow: FlowState): Map<number, number[]> {
+    let held = deferredWrites.get(flow)
+    if (!held) deferredWrites.set(flow, held = new Map())
+    return held
+}
+
+function initStore(inst: Instance, x: Expr, origin: number): boolean {
+    const flow = vf.flowState()
+    const kind = flow.originKind[origin]
+    if (kind !== vf.OriginKind.fresh && kind !== vf.OriginKind.created) return false
+    const s = inst.summary
+    const recv = s.exprs[x.a]
+    if (recv.op !== vf.ExprOp.param || recv.a !== -1) return false
+    let known = initializers.get(s)
+    if (known === undefined) initializers.set(s, known = initializer(s.g, vf.protoOf(origin)))
+    return known
+}
+
+function allocNodeOf(origin: number): number {
+    const flow = vf.flowState()
+    const owner = flow.originOwner[origin]
+    if (!owner) return 0
+    if (flow.originKind[origin] === vf.OriginKind.fresh) return owner.allocNodes.get(flow.originCell[origin]) ?? 0
+    return flow.originNode[origin]
+}
+
+function killedBy(slot: number, origin: number, key: number, inst: Instance): boolean {
+    const owner = vf.flowState().originOwner[origin]!
+    if (vf.instOfSlot(slot).summary !== owner) return false
+    vf.charge(1)
+    const regions = owner.regions
+    const regionOf = (id: number) => regions ? regions.of.get(id) : undefined
+    return killedAfter(owner.g, vf.exprAt(slot).node, allocNodeOf(origin), key as Handle, vf.protoOf(origin), returnsSelf(inst.summary.g), regionOf)
+}
+
+enum ValueKind {
+    undef = 1,
+    int = 2,
+    float = 4,
+    text = 8,
+    other = 16,
+}
+
+interface DynamicView {
+    accesses(visit: (site: number, store: boolean, keyed: boolean, object: number, key: number, value: number) => void): void
+    origins(slot: number): number[]
+    kinds(slot: number): number
+    candidate(origin: number): boolean
+    text(origin: number): boolean
+    allocSlots(origin: number): number[]
+    bind(slot: number, fn: Function, params: intrinsics.Types[]): void
+}
+
+function accessor(view: DynamicView, dynamic: Set<number>, slot: number, store: boolean): [Function, intrinsics.Types[]] | undefined {
+    const kinds = view.kinds(slot)
+    if (kinds & ValueKind.other) return undefined
+    let handles = (kinds & ValueKind.text) !== 0
+    for (const origin of view.origins(slot)) {
+        if (!view.text(origin) && !dynamic.has(origin)) return undefined
+        handles = true
+    }
+    const numbers = (kinds & (ValueKind.int | ValueKind.float)) !== 0
+    if (numbers && (handles || (store && (kinds & ValueKind.undef)))) return undefined
+    if (!numbers) return store ? [heap.setHandleProperty, [Types.u32, Types.u32, Types.u32]] : [heap.getHandleProperty, [Types.u32, Types.u32]]
+    if (kinds & ValueKind.float) return store ? [heap.setFloatProperty, [Types.u32, Types.u32, Types.f64]] : [heap.getFloatProperty, [Types.u32, Types.u32]]
+    return store ? [heap.setIntProperty, [Types.u32, Types.u32, Types.i64]] : [heap.getIntProperty, [Types.u32, Types.u32]]
+}
+
+function markDynamic(view: DynamicView): Set<number> {
+    const dynamic = new Set<number>()
+    const stored = new Map<number, number[]>()
+    const sites: number[] = []
+    const work: number[] = []
+    const mark = (origin: number) => {
+        if (dynamic.has(origin) || !view.candidate(origin)) return
+        dynamic.add(origin)
+        work.push(origin)
+    }
+    view.accesses((site, store, keyed, object, key, value) => {
+        sites.push(site, store ? 1 : 0, object, value)
+        if (store) {
+            for (const origin of view.origins(object)) {
+                let list = stored.get(origin)
+                if (!list) stored.set(origin, list = [])
+                list.push(value)
+            }
+        }
+        if (!keyed) return
+        if (!(view.kinds(key) & ~(ValueKind.int | ValueKind.float)) && !view.origins(key).length) return
+        for (const origin of view.origins(object)) mark(origin)
+    })
+    while (work.length) {
+        const origin = work.pop()!
+        for (const value of stored.get(origin) ?? []) {
+            for (const inner of view.origins(value)) mark(inner)
+        }
+    }
+    if (!dynamic.size) return dynamic
+    for (const origin of dynamic) {
+        for (const slot of view.allocSlots(origin)) view.bind(slot, heap.makePlainObject, [])
+    }
+    for (let i = 0; i < sites.length; i += 4) {
+        if (!view.origins(sites[i + 2]).some(origin => dynamic.has(origin))) continue
+        const chosen = accessor(view, dynamic, sites[i + 3], sites[i + 1] === 1)
+        if (chosen) view.bind(sites[i], chosen[0], chosen[1])
+    }
+    return dynamic
+}
+
+export function bindDynamic(): boolean {
+    const view = dynamicView()
+    vf.flowState().dynamicOrigins = markDynamic(view)
+    return view.bound
+}
+
+function scalarKinds(t: number): number {
+    const f = vf.scalars.flags[t]
+    let out = 0
+    if (f & (vf.ScalarFlag.undef | vf.ScalarFlag.void)) out |= ValueKind.undef
+    if (f & vf.ScalarFlag.int) out |= ValueKind.int
+    if (f & vf.ScalarFlag.float) out |= ValueKind.float
+    if (f & (vf.ScalarFlag.str | vf.ScalarFlag.anyStr)) out |= ValueKind.text
+    if (f & vf.ScalarFlag.unknown) out |= ValueKind.other
+    return out
+}
+
+function dynamicView(): DynamicView & { bound: boolean } {
+    const flow = vf.flowState()
+    const view = {
+        bound: false,
+        accesses: (visit: (site: number, store: boolean, keyed: boolean, object: number, key: number, value: number) => void) => {
+            for (const inst of flow.instances) {
+                if (inst.site) continue
+                const s = inst.summary
+                for (const e of s.owned) {
+                    const x = s.exprs[e]
+                    if (x.op !== vf.ExprOp.member) continue
+                    visit(vf.at(inst, e), false, x.key === vf.dynKey, vf.at(inst, x.a), x.key === vf.dynKey ? vf.at(inst, x.b) : -1, vf.at(inst, e))
+                }
+                for (const e of s.stores) {
+                    const x = s.exprs[e]
+                    if (x.op !== vf.ExprOp.store) continue
+                    visit(vf.storeSlot(inst, e), true, x.key === vf.dynKey, vf.at(inst, x.a), x.key === vf.dynKey ? vf.at(inst, x.args[0]) : -1, vf.at(inst, x.b))
+                }
+            }
+        },
+        origins: (slot: number) => slot < 0 ? [] : flow.slotOrigins[slot],
+        kinds: (slot: number) => slot < 0 ? 0 : scalarKinds(flow.scalar[slot]),
+        candidate: (origin: number) => flow.originKind[origin] === vf.OriginKind.fresh && !vf.isScope(origin) && !vf.originHostFn(origin) && !vf.protoOf(origin),
+        text: (origin: number) => flow.originKind[origin] === vf.OriginKind.str,
+        allocSlots: (origin: number) => {
+            const owner = flow.originOwner[origin]!
+            const node = owner.allocNodes.get(flow.originCell[origin])
+            const e = node === undefined ? undefined : owner.exprOf.get(node)
+            const out: number[] = []
+            if (e === undefined) return out
+            for (const id of flow.originCreators.get(origin) ?? []) {
+                const inst = flow.instances[id]
+                if (inst.summary === owner) out.push(vf.at(inst, e))
+            }
+            return out
+        },
+        bind: (slot: number, fn: Function, params: intrinsics.Types[]) => {
+            const callee = vf.instance(fn, 0, -1, -1)
+            flow.rooted.add(callee)
+            for (let i = 0; i < params.length; i++) vf.addConst(flow.instances[callee].sigs[i], vf.typeRange(params[i]))
+            view.bound = true
+            let list = flow.runtimeBinds.get(slot)
+            if (!list) flow.runtimeBinds.set(slot, list = [])
+            if (!list.includes(callee)) list.push(callee)
+        },
+    }
+    return view
+}
+
+let exported: Export
+
+interface Export {
+    types: Map<string, Type>
+    allocations: Allocation[]
+    allocOf: Map<number, number>
+    locations: Location[]
+    locOf: Map<number, number>
+    frameOf: Map<number, number>
+    framesOf: Map<number, number[]>
+    frames: FrameSignature[]
+    slotTypes: Map<number, Type>
+}
+
+function staticClosure(origin: number): boolean {
+    if (flow.originKind[origin] !== vf.OriginKind.fresh) return false
+    const cell = flow.originCell[origin] as Handle
+    return !heap.isIndirect(cell) || !flow.host.session.templateOf(cell as u32) || flow.host.session.sealed.has(cell)
+}
+
+function addSorted(list: number[], v: number): void {
+    if (list.includes(v)) return
+    let i = list.length
+    while (i > 0 && list[i - 1] > v) i--
+    list.splice(i, 0, v)
+}
+
+function addFunction(type: Type, fn: Function): void {
+    if (type.functions.includes(fn)) return
+    const k = vf.unitKeyOf(fn)
+    let i = type.functions.length
+    while (i > 0 && vf.unitKeyOf(type.functions[i - 1]) > k) i--
+    type.functions.splice(i, 0, fn)
+}
+
+function hullInto(type: Type, lo: number, hi: number): void {
+    type.range = type.range ? [Math.min(type.range[0], lo), Math.max(type.range[1], hi)] : [lo, hi]
+}
+
+function internType(type: Type): Type {
+    const key = `${type.undefined ? 1 : 0}${type.unknown ? 1 : 0}${type.float ? 1 : 0}|${type.literals.join(',')}|${type.range ? type.range.join(':') : ''}|${type.strings.join(',')}|${type.objects.join(',')}|${type.functions.map(vf.unitKeyOf).join(',')}|${type.closures.join(',')}`
+    const known = exported.types.get(key)
+    if (known) return known
+    exported.types.set(key, type)
+    return type
+}
+
+function scalarInto(type: Type, t: number): void {
+    const f = vf.scalars.flags[t]
+    if (f & vf.ScalarFlag.undef) type.undefined = true
+    if (f & vf.ScalarFlag.unknown) type.unknown = true
+    if (f & vf.ScalarFlag.anyStr) addSorted(type.strings, 0)
+    for (const h of vf.scalars.strs[t]) addSorted(type.strings, h)
+    if (f & vf.ScalarFlag.int) {
+        const lo = vf.scalars.lo[t]
+        const hi = vf.scalars.hi[t]
+        if (vf.scalars.nums[t].length) for (const v of vf.scalars.nums[t]) addSorted(type.literals, v)
+        else if (lo === hi) addSorted(type.literals, lo)
+        else hullInto(type, lo, hi)
+    }
+    if (f & vf.ScalarFlag.float) type.float = true
+}
+
+function originInto(type: Type, origin: number, t: number): void {
+    const kind = flow.originKind[origin]
+    if (kind === vf.OriginKind.site) return
+    if (kind === vf.OriginKind.str) {
+        if (!(vf.scalars.flags[t] & (vf.ScalarFlag.str | vf.ScalarFlag.anyStr))) addSorted(type.strings, 0)
+        return
+    }
+    if (kind === vf.OriginKind.fn) return addFunction(type, flow.originFn[origin]!)
+    const fn = vf.originHostFn(origin)
+    if (kind === vf.OriginKind.static && fn) return addFunction(type, fn)
+    if (fn && staticClosure(origin)) return addFunction(type, fn)
+    const allocation = allocationOf(origin)
+    if (!fn) return addSorted(type.objects, allocation)
+    addFunction(type, fn)
+    addSorted(type.closures, allocation)
+}
+
+function typeFrom(t: number, origins: number[]): Type {
+    const type = emptyType()
+    scalarInto(type, t)
+    for (const origin of origins) originInto(type, origin, t)
+    return internType(type)
+}
+
+function slotType(slot: number): Type {
+    const known = exported.slotTypes.get(slot)
+    if (known) return known
+    const type = typeFrom(flow.scalar[slot], flow.slotOrigins[slot])
+    exported.slotTypes.set(slot, type)
+    return type
+}
+
+function specType(spec: Spec, slot: number): Type {
+    if (spec.global) return slotType(slot)
+    return typeFrom(vf.specScalar(spec, slot), vf.specOrigins(spec, slot))
+}
+
+function joinType(into: Type | undefined, b: Type): Type {
+    if (!into || into === b) return b
+    const type = emptyType()
+    type.undefined = into.undefined || b.undefined
+    type.unknown = into.unknown || b.unknown
+    type.float = into.float || b.float
+    for (const t of [into, b]) {
+        for (const v of t.literals) addSorted(type.literals, v)
+        if (t.range) hullInto(type, t.range[0], t.range[1])
+        for (const v of t.strings) addSorted(type.strings, v)
+        for (const v of t.objects) addSorted(type.objects, v)
+        for (const fn of t.functions) addFunction(type, fn)
+        for (const v of t.closures) addSorted(type.closures, v)
+    }
+    return internType(type)
+}
+
+function frameOfInstance(id: number): number | undefined {
+    const inst = flow.instances[id]
+    return exported.frameOf.get(inst.site ? inst.site.id : id)
+}
+
+function siteOfOrigin(origin: number): Site {
+    const owner = flow.originOwner[origin]
+    const kind = flow.originKind[origin]
+    if ((kind === vf.OriginKind.slice || kind === vf.OriginKind.created) && owner) return { unit: owner.fn, node: flow.originNode[origin] }
+    if (kind === vf.OriginKind.fresh) return { unit: owner!.fn, node: owner!.allocNodes.get(flow.originCell[origin]) ?? 0 }
+    const seen = flow.originSeen[origin]
+    if (seen) return { unit: flow.summaryList[Math.floor(seen / 16777216) - 1].fn, node: seen % 16777216 }
+    return { unit: flow.roots[0], node: 0 }
+}
+
+function liveFrames(origin: number): [number[], number] {
+    const creators = flow.originCreators.get(origin) ?? []
+    const frames: number[] = []
+    const seen: number[] = []
+    for (const c of creators) {
+        const inst = flow.instances[c]
+        for (const f of exported.framesOf.get(inst.site ? inst.site.id : c) ?? []) {
+            if (seen.includes(f)) continue
+            seen.push(f)
+            if (allocLive(flow.frames[f], origin)) frames.push(f)
+        }
+    }
+    return [frames, seen.length]
+}
+
+function allocationOf(origin: number): number {
+    const known = exported.allocOf.get(origin)
+    if (known !== undefined) return known
+    const id = exported.allocations.length
+    exported.allocOf.set(origin, id)
+    const kind = flow.originKind[origin]
+    const cell = flow.originCell[origin]
+    const site = siteOfOrigin(origin)
+    const creator = flow.originCreators.get(origin)?.[0] ?? -1
+    const frame = creator >= 0 ? frameOfInstance(creator) : undefined
+    let allocation: Allocation
+    if (kind === vf.OriginKind.static) {
+        const state = heap.deref(cell as Handle)
+        const proto = heap.getPrototypeOf(state)
+        const native = !!heap.getOwnProperty(state, heap.closureCallKey) || heap.isFrameProxy(state)
+        allocation = { site, kind: heap.isArray(state) ? AllocKind.array : AllocKind.object, state, handle: cell as Handle, proto, constant: true, native }
+    } else if (kind === vf.OriginKind.slice) {
+        allocation = { site, frame, kind: AllocKind.buffer, proto: undefined, constant: !flow.originOwner[origin] }
+    } else if (kind === vf.OriginKind.created) {
+        const proto = cell ? heap.deref(cell as Handle) : undefined
+        allocation = { site, frame, kind: AllocKind.object, proto, constant: false }
+    } else if (vf.isScope(origin)) {
+        allocation = { site, frame, kind: AllocKind.scope, handle: cell as Handle, proto: undefined, constant: false, native: true }
+    } else if (vf.originHostFn(origin)) {
+        const state = heap.isIndirect(cell as Handle) ? heap.indirectTarget(cell as Handle) : heap.deref(cell as Handle)
+        const proto = heap.getPrototypeOf(state)
+        allocation = { site, frame, kind: AllocKind.object, state, proto, constant: false, native: true }
+    } else {
+        const state = heap.deref(cell as Handle)
+        const proto = heap.getPrototypeOf(state)
+        allocation = { site, frame, kind: heap.isArray(state) ? AllocKind.array : AllocKind.object, state, proto, constant: false }
+    }
+    if (flow.originCopied.has(origin)) allocation.copied = true
+    if (flow.dynamicOrigins.has(origin)) allocation.dynamic = true
+    const [frames, all] = liveFrames(origin)
+    if (kind !== vf.OriginKind.static && frames.length && (frame === undefined || !frames.includes(frame))) allocation.frame = frames[0]
+    if (frames.length > 1 || frames.length < all) allocation.frames = frames
+    exported.allocations.push(allocation)
+    return id
+}
+
+function allocLive(frame: FrameInfo, origin: number): boolean {
+    const s = frame.inst.summary
+    const node = flow.originKind[origin] === vf.OriginKind.fresh && flow.originOwner[origin] === s ? s.allocNodes.get(flow.originCell[origin]) : undefined
+    if (node === undefined || !s.regions) return true
+    const r = s.regions.of.get(node)
+    const gate = r === undefined ? undefined : s.regions.gateOf.get(r)
+    if (gate === undefined || gate < 0 || s.local![gate] === undefined) return true
+    for (const m of frame.members) if (vf.specScalar(m, vf.at(m.inst, gate)) !== vf.NONE) return true
+    return false
+}
+
+function slotSite(slot: number): Site {
+    const inst = flow.instances[flow.slotOwner[slot]]
+    const owner = inst.site ?? inst
+    return { unit: owner.summary.fn, node: owner.summary.exprs[flow.slotIndex[slot]].node }
+}
+
+const noSite: Site = { unit: () => 0, node: -1 }
+
+function writerSite(w: number): Site {
+    if (w < 0) return noSite
+    const inst = flow.instances[Math.floor(w / vf.exprBits)]
+    return { unit: inst.summary.fn, node: inst.summary.exprs[w % vf.exprBits].node }
+}
+
+function exportLocations(): void {
+    for (let origin = 1; origin < flow.originKind.length; origin++) {
+        const fields = flow.originFields[origin]
+        if (!fields.size) continue
+        const kind = flow.originKind[origin]
+        if (kind === vf.OriginKind.fn || kind === vf.OriginKind.site || kind === vf.OriginKind.str) continue
+        if (kind === vf.OriginKind.fresh && vf.originHostFn(origin) && staticClosure(origin)) continue
+        const allocation = allocationOf(origin)
+        for (const [key, slot] of fields) {
+            const readers: Site[] = []
+            for (const r of flow.fieldReaders.get(slot) ?? []) readers.push(slotSite(r))
+            const writers: Site[] = []
+            for (const w of flow.fieldWriters.get(slot) ?? []) writers.push(writerSite(w))
+            const id = exported.locations.length
+            exported.locOf.set(slot, id)
+            exported.locations.push({ allocation, key, type: slotType(slot), forms: (flow.fieldForms.get(slot) ?? []).slice(), readers, writers, stored: flow.fieldStored.has(slot) })
+        }
+    }
+}
+
+function wordAccessSlots(inst: Instance, x: Expr): number[] {
+    const out: number[] = []
+    const key = vf.slotKey(inst, x.args[1])
+    for (const origin of flow.slotOrigins[vf.at(inst, x.args[0])]) {
+        const fields = flow.originFields[origin]
+        const exact = fields.get(key)
+        if (exact !== undefined && exported.locOf.has(exact)) out.push(exported.locOf.get(exact)!)
+        if (key !== vf.elemKey) continue
+        for (const [k, f] of fields) if (vf.isPosKey(k) && exported.locOf.has(f)) out.push(exported.locOf.get(f)!)
+    }
+    return out
+}
+
+function wordLoadExpr(s: Summary, e: number): Expr | undefined {
+    const x = s.exprs[e]
+    if (x.op !== vf.ExprOp.rt || x.a !== RtOp.sliceRead) return
+    const n = getNode(s.g, x.node)
+    return n && elementType(s.g, n) === Types.vm_value ? x : undefined
+}
+
+function derefParams(s: Summary): Set<number> {
+    const marked = new Uint8Array(s.exprs.length)
+    const work: number[] = []
+    const mark = (e: number) => {
+        if (e < 0 || e >= s.exprs.length || marked[e]) return
+        marked[e] = 1
+        work.push(e)
+    }
+    for (const x of s.exprs) {
+        if (x.op === vf.ExprOp.member || x.op === vf.ExprOp.store) mark(x.a)
+        else if (x.op === vf.ExprOp.call) {
+            mark(x.a)
+            mark(x.b)
+        } else if (x.op === vf.ExprOp.opaque || (x.op === vf.ExprOp.rt && x.a !== RtOp.typeof)) {
+            for (const a of x.args) mark(a)
+        }
+    }
+    while (work.length) {
+        const x = s.exprs[work.pop()!]
+        if (x.op === vf.ExprOp.union) for (const a of x.args) mark(a)
+        else if (x.op === vf.ExprOp.narrow || x.op === vf.ExprOp.pick) mark(x.a)
+    }
+    const out = new Set<number>()
+    for (let e = 0; e < s.exprs.length; e++) if (marked[e] && s.exprs[e].op === vf.ExprOp.param) out.add(s.exprs[e].a)
+    return out
+}
+
+function exportFrame(frame: FrameInfo): FrameSignature {
+    const inst = frame.inst
+    const s = inst.summary
+    const g = s.g
+    const params: { label: string, type: Type, opaque: boolean }[] = []
+    const paramIds = (slot: number) => {
+        let out: Type | undefined
+        for (const m of frame.members) out = joinType(out, specType(m, slot))
+        return out ?? internType(emptyType())
+    }
+    let plain = 0
+    const derefs = derefParams(s)
+    for (const p of g.blocks[0].params) {
+        if (isThisParam(getNode(g, p)!)) params.push({ label: 'this', type: paramIds(vf.paramSlot(inst, -1)), opaque: !derefs.has(-1) })
+        else {
+            params.push({ label: `p${plain}`, type: paramIds(inst.sigs[plain]), opaque: !derefs.has(plain) })
+            plain++
+        }
+    }
+    const accesses: WordAccess[] = []
+    for (const e of s.stores) {
+        const x = s.exprs[e]
+        if (x.op !== vf.ExprOp.rt || x.a !== RtOp.sliceWrite || getNode(g, x.node)!.op !== NodeOp.rt) continue
+        if (elementType(g, getNode(g, x.node)!) !== Types.vm_value) continue
+        accesses.push({ node: x.node, store: true, slots: wordAccessSlots(inst, x) })
+    }
+    for (const r of s.rets) {
+        const x = wordLoadExpr(s, r)
+        if (!x) continue
+        accesses.push({ node: x.node, store: false, slots: wordAccessSlots(inst, x) })
+    }
+    const merges: number[][] = []
+    for (const e of s.owned) {
+        const x = s.exprs[e]
+        if (x.op !== vf.ExprOp.union || !x.node) continue
+        const op = getNode(g, x.node)?.op
+        if (op !== NodeOp.select && op !== NodeOp.param) continue
+        const type = paramIds(vf.at(inst, e))
+        if (type.objects.length > 1) merges.push(type.objects)
+    }
+    return {
+        unit: s.fn, heldStatic: flow.heldStatics.has(inst.id), sites: frame.sites, accesses, params, returns: paramIds(inst.ret), merges,
+    }
+}
+
+function resolveUnit(frames: number[]): UnitTypes {
+    const members = frames.flatMap(f => flow.frames[f].members)
+    const s = members[0].inst.summary
+    const g = s.g
+    const nodes = new Map<number, Type>()
+    const slices = new Map<number, number[]>()
+    for (const [node, e] of s.exprOf) {
+        let out: Type | undefined
+        for (const m of members) out = joinType(out, specType(m, vf.at(m.inst, e)))
+        if (out && inhabited(out)) nodes.set(node, out)
+    }
+    for (let e = 0; e < s.exprs.length; e++) {
+        const x = s.exprs[e]
+        if (x.op !== vf.ExprOp.rt || (x.a !== RtOp.slice && x.a !== RtOp.sliceRead && x.a !== RtOp.sliceWrite)) continue
+        if (getNode(g, x.node)?.op !== NodeOp.rt) continue
+        const touched: number[] = []
+        for (const m of members) {
+            const slot = x.a === RtOp.slice ? vf.at(m.inst, e) : vf.at(m.inst, x.args[0])
+            for (const origin of vf.specOrigins(m, slot)) {
+                if (flow.originKind[origin] !== vf.OriginKind.slice) continue
+                const allocation = allocationOf(origin)
+                if (!touched.includes(allocation)) touched.push(allocation)
+            }
+        }
+        if (touched.length) slices.set(x.node, touched)
+    }
+    const live = (gate: number) => {
+        if (gate < 0) return true
+        for (const m of members) if (vf.specScalar(m, vf.at(m.inst, gate)) !== vf.NONE) return true
+        return false
+    }
+    const memos = members.map(() => new Map<number, boolean>())
+    const impossible = (e: number) => members.every((m, i) => vf.impossibleExpr(m, e, memos[i]))
+    const exits = new Map<number, boolean>()
+    const deadExit = (id: number): boolean => {
+        const known = exits.get(id)
+        if (known !== undefined) return known
+        exits.set(id, false)
+        const n = getNode(g, id)
+        let dead = false
+        if (n?.op === NodeOp.apply) {
+            for (let i = 1; i < countIds(n) && !dead; i++) {
+                const e = getRef(n, i) ? s.exprOf.get(getRef(n, i)) : undefined
+                if (e !== undefined && impossible(e)) dead = true
+            }
+            const block = g.blockIndex.get(getRef(n, 0))
+            if (!dead && block) dead = deadExit(block.bodyId)
+        } else if (n?.op === NodeOp.ret) {
+            const e = getRef(n, 0) ? s.exprOf.get(getRef(n, 0)) : undefined
+            dead = e !== undefined && impossible(e)
+        } else if (n?.op === NodeOp.select) {
+            dead = deadExit(getRef(n, 1)) && deadExit(getRef(n, 2))
+        } else if (n?.op === NodeOp.after) {
+            for (let i = 0; i < countIds(n) && !dead; i++) {
+                const e = getRef(n, i) ? s.exprOf.get(getRef(n, i)) : undefined
+                if (e !== undefined && impossible(e)) dead = true
+            }
+            if (!dead && getRef(n, countIds(n) - 1)) dead = deadExit(getRef(n, countIds(n) - 1))
+        }
+        exits.set(id, dead)
+        return dead
+    }
+    const possible = (x: Expr, i: number) => {
+        const e = x.args[i]
+        const op = s.exprs[e].op
+        if (op !== vf.ExprOp.konst) return !impossible(e)
+        const arm = getRef(getNode(g, x.node)!, i + 1)
+        return !arm || !deadExit(arm)
+    }
+    const blocks = new Set<number>()
+    for (let b = 0; b < g.blocks.length; b++) {
+        if (b === 0 || s.blockGates[b].some(live)) blocks.add(g.blocks[b].id)
+    }
+    const selects = new Map<number, boolean[]>()
+    for (const x of s.exprs) {
+        if (x.op !== vf.ExprOp.union || !x.node || !x.gates || getNode(g, x.node)?.op !== NodeOp.select) continue
+        const arms = x.gates.map((gate, i) => live(gate) && possible(x, i))
+        if (arms.some(a => !a)) selects.set(x.node, arms)
+    }
+    return { nodes, slices, blocks, selects }
+}
+
+export function exportAccesses(): Accesses {
+    flow = vf.flowState()
+    exported = { types: new Map(), allocations: [], allocOf: new Map(), locations: [], locOf: new Map(), frameOf: new Map(), framesOf: new Map(), frames: [], slotTypes: new Map() }
+    vf.buildFrames()
+    flow.frames.forEach((frame, id) => {
+        if (!exported.frameOf.has(frame.inst.id)) exported.frameOf.set(frame.inst.id, id)
+        let list = exported.framesOf.get(frame.inst.id)
+        if (!list) exported.framesOf.set(frame.inst.id, list = [])
+        list.push(id)
+    })
+    for (let origin = 1; origin < flow.originKind.length; origin++) {
+        const kind = flow.originKind[origin]
+        if (kind === vf.OriginKind.fresh && vf.originHostFn(origin) && staticClosure(origin)) continue
+        if (kind === vf.OriginKind.fresh || kind === vf.OriginKind.slice || kind === vf.OriginKind.created || (kind === vf.OriginKind.static && !vf.originHostFn(origin))) allocationOf(origin)
+    }
+    exportLocations()
+    for (const frame of flow.frames) exported.frames.push(exportFrame(frame))
+    const solved = flow
+    const out = exported
+    return {
+        allocations: exported.allocations, locations: exported.locations, frames: exported.frames,
+        resolve: (list: number[]) => vf.withFlow(solved, () => {
+            flow = solved
+            exported = out
+            return resolveUnit(list)
+        }),
+    }
+}
+
+enum GenericKind {
+    number = 1,
+    other = 2,
+}
+
+export interface NodeValues {
+    fns: Function[]
+    protos: intrinsics.Handle[]
+    other: boolean
+}
+
+export interface GenericFlow {
+    sources: (number[] | undefined)[]
+    kinds: Uint8Array
+    params: number[][]
+    names: string[]
+    numeric: number[]
+    self: number
+    fields: Map<number, [string, number][]>
+    objects: Map<number, number[]>
+    values: Map<Function, Map<number, NodeValues>>
+    units: Function[]
+}
+
+export interface GenericShape {
+    params: { name: string, paths: string[] }[]
+    paths: string[]
+    candidates: string[]
+    lines: string[]
+}
+
+function numericUse(g: Graph, user: GraphNode, slot: number): boolean {
+    if (user.op === NodeOp.load || user.op === NodeOp.store) return slot === 1 || slot === 2
+    const slice = rt.sliceOf(g, user)
+    if (slice !== undefined) return slot === 2 || (slot === 3 && slice !== rt.Op.slice)
+    if (user.op === NodeOp.lt || user.op === NodeOp.le || user.op === NodeOp.gt || user.op === NodeOp.ge) return true
+    if (user.op === NodeOp.eq || user.op === NodeOp.ne) return false
+    if (user.op === NodeOp.add && typeOf(user) === Types.unknown_number) return false
+    return NumericOps.has(user.op) || user.op === NodeOp.convert
+}
+
+function close(flow: GenericFlow, sets: Uint32Array, width: number): void {
+    for (const group of stronglyConnected(flow.kinds.keys(), v => flow.sources[v] ?? [])) {
+        const acc = new Uint32Array(width)
+        for (const w of group) {
+            for (let i = 0; i < width; i++) acc[i] |= sets[w * width + i]
+            for (const s of flow.sources[w] ?? []) for (let i = 0; i < width; i++) acc[i] |= sets[s * width + i]
+        }
+        for (const w of group) sets.set(acc, w * width)
+    }
+}
+
+export function genericShape(flow: GenericFlow, numberKey: string, constantIndex: (key: string) => boolean): GenericShape {
+    const syms: number[] = []
+    for (const list of flow.params) for (const slot of list) syms.push(slot)
+    const width = (syms.length + 2 + 31) >> 5
+    const sets = new Uint32Array(flow.kinds.length * width)
+    for (let s = 0; s < flow.kinds.length; s++) sets[s * width] = flow.kinds[s]
+    syms.forEach((slot, k) => {
+        const bit = k + 2
+        sets[slot * width] &= ~3
+        sets[slot * width + (bit >> 5)] |= 1 << (bit & 31)
+    })
+    close(flow, sets, width)
+    const has = (s: number, k: number) => (sets[s * width + ((k + 2) >> 5)] & (1 << ((k + 2) & 31))) !== 0
+    const numeric = new Uint8Array(syms.length)
+    for (const s of flow.numeric) for (let k = 0; k < syms.length; k++) if (has(s, k)) numeric[k] = 1
+    const pathOf = new Map<number, string>([[flow.self, '']])
+    const order = [flow.self]
+    const contents = new Map<string, number[]>()
+    const holdsObjects = new Set<string>()
+    for (let i = 0; i < order.length; i++) {
+        const prefix = pathOf.get(order[i])!
+        const fields = flow.fields.get(order[i]) ?? []
+        const indexed = fields.some(([key]) => key === numberKey)
+        for (const [key, slot] of fields) {
+            const path = `${prefix}${prefix ? '.' : ''}${indexed && constantIndex(key) ? numberKey : key}`
+            let list = contents.get(path)
+            if (!list) contents.set(path, list = [])
+            list.push(slot)
+            for (const inner of flow.objects.get(slot) ?? []) {
+                holdsObjects.add(path)
+                if (pathOf.has(inner)) continue
+                pathOf.set(inner, path)
+                order.push(inner)
+            }
+        }
+    }
+    const parent = syms.map((_, k) => k)
+    const find = (k: number) => {
+        let at = k
+        while (parent[at] !== at) at = parent[at] = parent[parent[at]]
+        return at
+    }
+    const symsAt = (path: string) => {
+        const out: number[] = []
+        for (let k = 0; k < syms.length; k++) if (contents.get(path)!.some(s => has(s, k))) out.push(k)
+        return out
+    }
+    for (const path of contents.keys()) {
+        const vars = symsAt(path).filter(k => !numeric[k])
+        for (const k of vars.slice(1)) parent[find(k)] = find(vars[0])
+    }
+    const names = new Map<number, string>()
+    const params: { name: string, paths: string[] }[] = []
+    for (const [path] of contents) for (const k of symsAt(path)) {
+        if (numeric[k]) continue
+        let name = names.get(find(k))
+        if (name === undefined) {
+            names.set(find(k), name = `T${names.size}`)
+            params.push({ name, paths: [] })
+        }
+        const param = params.find(p => p.name === name)!
+        if (!param.paths.includes(path)) param.paths.push(path)
+    }
+    const kindsAt = (path: string) => contents.get(path)!.reduce((k, s) => k | sets[s * width] & 3, 0)
+    const isNumeric = (path: string) => {
+        const vars = symsAt(path)
+        return !(kindsAt(path) & GenericKind.other) && (!!(kindsAt(path) & GenericKind.number) || vars.length > 0) && vars.every(k => numeric[k])
+    }
+    const candidates = [...contents.keys()].filter(path => {
+        const segments = path.split('.')
+        if (segments.length > 2 || /[[@]/.test(path) || !isNumeric(path)) return false
+        return segments.length === 1 || holdsObjects.has(segments[0])
+    })
+    const label = (k: number) => numeric[k] ? `number(${flow.names[k]})` : names.get(find(k)) ?? flow.names[k]
+    const lines = params.map(p => `  param ${p.name}: ${p.paths.join(' ')}`)
+    lines.push(`  paths ${[...contents.keys()].sort().join(' ')}`)
+    for (const path of contents.keys()) {
+        const kinds = kindsAt(path)
+        const origins = [...new Set(symsAt(path).map(label))]
+        if (kinds & GenericKind.number) origins.push('number')
+        if (kinds & GenericKind.other) origins.push(holdsObjects.has(path) ? 'object' : 'other')
+        lines.push(`  ${path}: ${origins.join(' | ') || 'never'}`)
+    }
+    return { params, paths: [...contents.keys()], candidates, lines }
+}
+
+export function genericFlow(methods: Function[], proto: intrinsics.Handle, host: AccessHost): GenericFlow {
+    return vf.newFlow(methods, host, () => {
+        const self = vf.originOf(vf.OriginKind.created, proto as number, 0, 0, undefined)
+        const params = methods.map(fn => vf.seedRoot(fn, self))
+        vf.solve()
+        return genericView(self, params, methods)
+    })
+}
+
+function scalarKind(t: number): number {
+    const f = vf.scalars.flags[t]
+    const numbers = vf.ScalarFlag.int | vf.ScalarFlag.float
+    return (f & numbers ? GenericKind.number : 0) | (f & ~numbers ? GenericKind.other : 0)
+}
+
+function converts(T0: number): boolean {
+    return T0 >= 0 && T0 !== Types.vm_value && T0 !== Types.unknown && T0 !== Types.void && T0 !== Types.fnptr && T0 !== Types.handle
+}
+
+function objectOrigin(origin: number): boolean {
+    const flow = vf.flowState()
+    const kind = flow.originKind[origin]
+    return (kind === vf.OriginKind.fresh || kind === vf.OriginKind.created || kind === vf.OriginKind.slice || kind === vf.OriginKind.static) && !vf.originHostFn(origin)
+}
+
+function genericView(self: number, params: number[][], methods: Function[]): GenericFlow {
+    const flow = vf.flowState()
+    const selecting = vf.GuardFlag.falsy | vf.GuardFlag.nullish | vf.GuardFlag.isNumber | vf.GuardFlag.isString | vf.GuardFlag.isObject | vf.GuardFlag.isFunction | vf.GuardFlag.isUndefined | vf.GuardFlag.bounded
+    const n = flow.slotKind.length
+    const sources: (number[] | undefined)[] = new Array(n)
+    const kinds = new Uint8Array(n)
+    for (let slot = 0; slot < n; slot++) {
+        const list: number[] = []
+        const ins = flow.slotIns[slot]
+        if (ins) for (const from of ins) list.push(from >= 0 ? from : -from - 1)
+        let t = flow.slotConst[slot]
+        if (flow.slotKind[slot] === vf.SlotKind.expr) {
+            const inst = flow.instances[flow.slotOwner[slot]]
+            const x = inst.summary.exprs[flow.slotIndex[slot]]
+            if (converts(x.type)) {
+                list.length = 0
+                t = vf.unite(t, flow.scalar[slot])
+            } else if (x.op === vf.ExprOp.union) for (const a of x.args) list.push(vf.at(inst, a))
+            else if (x.op === vf.ExprOp.pick || (x.op === vf.ExprOp.narrow && !(x.key & selecting))) list.push(vf.at(inst, x.a))
+            else if (x.op !== vf.ExprOp.member && x.op !== vf.ExprOp.call && !ins) t = vf.unite(t, flow.scalar[slot])
+        }
+        if (list.length) sources[slot] = list
+        kinds[slot] = scalarKind(t) | (flow.slotOrigins[slot].length || flow.slotOpaque[slot] ? GenericKind.other : 0)
+    }
+    const fields = new Map<number, [string, number][]>()
+    const objects = new Map<number, number[]>()
+    for (let origin = 1; origin < flow.originKind.length; origin++) {
+        const list: [string, number][] = []
+        for (const [key, slot] of flow.originFields[origin]) {
+            list.push([vf.keyLabel(key), slot])
+            const inner = flow.slotOrigins[slot].filter(objectOrigin)
+            if (inner.length) objects.set(slot, inner)
+        }
+        if (list.length) fields.set(origin, list)
+    }
+    const numeric: number[] = []
+    const values = new Map<Function, Map<number, NodeValues>>()
+    for (const inst of flow.instances) {
+        const s = inst.summary
+        let byNode = values.get(s.fn)
+        if (!byNode) values.set(s.fn, byNode = new Map())
+        for (const x of s.exprs) {
+            const n = x.node ? getNode(s.g, x.node) : undefined
+            if (!n) continue
+            if (x.op === vf.ExprOp.arith || x.op === vf.ExprOp.cmp) {
+                if (numericUse(s.g, n, 0)) numeric.push(vf.at(inst, x.a))
+                if (numericUse(s.g, n, 1)) numeric.push(vf.at(inst, x.b))
+            }
+            if (x.op !== vf.ExprOp.rt) continue
+            const first = n.op === NodeOp.store ? 1 : 2
+            for (let i = 0; i < x.args.length; i++) if (numericUse(s.g, n, first + i)) numeric.push(vf.at(inst, x.args[i]))
+        }
+        for (const n of s.g.nodes.values()) {
+            if (n.op !== NodeOp.call && n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
+            const ref = getRef(n, 1)
+            const e = ref ? s.exprOf.get(ref) : undefined
+            if (e === undefined) continue
+            const slot = vf.at(inst, e)
+            let v = byNode.get(ref)
+            if (!v) byNode.set(ref, v = { fns: [], protos: [], other: false })
+            if (flow.scalar[slot] !== vf.NONE) v.other = true
+            for (const origin of flow.slotOrigins[slot]) {
+                const fn = flow.originKind[origin] === vf.OriginKind.fn ? flow.originFn[origin] : vf.originFunction(origin)
+                if (!fn) v.other = true
+                else if (!v.fns.includes(fn)) v.fns.push(fn)
+                const proto = vf.protoOf(origin)
+                if (proto && !v.protos.includes(proto)) v.protos.push(proto)
+            }
+        }
+    }
+    const names: string[] = []
+    methods.forEach((fn, m) => params[m].forEach((_, i) => names.push(`?${fn.name || '<anon>'}.p${i}`)))
+    return { sources, kinds, params, names, numeric, self, fields, objects, values, units: flow.summaryList.map(s => s.fn) }
+}
+
+function guardsAt(g: Graph, node: number): [cond: number, positive: boolean][] | undefined {
+    const index = armIndexOf(g)
+    const root = index.nearest.get(node)
+    if (root === undefined) return
+    const known = index.guards.get(root)
+    if (known) return known
+    const out: [number, boolean][] = []
+    for (const [arm, polarity] of armsAt(g, node)!) {
+        let cond = arm
+        let positive = polarity
+        for (let c = getNode(g, cond); c?.op === NodeOp.not && getRef(c, 0); c = getNode(g, cond)) {
+            cond = getRef(c, 0)
+            positive = !positive
+        }
+        if (comparison(getNode(g, cond)?.op ?? NodeOp.literal)) out.push([cond, positive])
+    }
+    index.guards.set(root, out)
+    return out
+}
+
+function comparison(op: NodeOp): boolean {
+    return op === NodeOp.lt || op === NodeOp.le || op === NodeOp.gt || op === NodeOp.ge || op === NodeOp.eq || op === NodeOp.ne
+}
+
+interface Linear {
+    sym: string
+    k: number
+}
+
+interface Interval {
+    lo?: number
+    loStrict?: boolean
+    hi?: number
+    hiStrict?: boolean
+}
+
+interface SymbolicFrame {
+    id: number
+    g: Graph
+    unit: Function
+    param(index: number): Linear | undefined
+    entry(obj: Linear, key: string): Linear | undefined
+    facts: Map<string, Interval>
+    depth: number
+    constructing: boolean
+    values: Map<number, Linear | null>
+    fields: Map<string, Linear | null>
+    children: Map<number, SymbolicFrame | null>
+    loops: Map<string, 'pending' | 'stable' | 'written'>
+}
+
+const maxSymbolicDepth = 8
+
+function sameLinear(a: Linear | undefined, b: Linear | undefined): boolean {
+    return !!a && !!b && a.sym === b.sym && a.k === b.k
+}
+
+function constrain(facts: Map<string, Interval>, a: Linear, b: Linear, rel: '<' | '<=' | '=='): boolean {
+    let x = a.sym
+    let y = b.sym
+    let c = b.k - a.k
+    if (x === y) return rel === '<' ? 0 < c : rel === '<=' ? 0 <= c : c === 0
+    let bound: Interval
+    if (x < y) bound = rel === '<' ? { hi: c, hiStrict: true } : rel === '<=' ? { hi: c } : { lo: c, hi: c }
+    else {
+        ;[x, y] = [y, x]
+        bound = rel === '<' ? { lo: -c, loStrict: true } : rel === '<=' ? { lo: -c } : { lo: -c, hi: -c }
+    }
+    const k = `${x}|${y}`
+    const known = facts.get(k) ?? {}
+    const merged: Interval = { ...known }
+    if (bound.lo !== undefined && (merged.lo === undefined || bound.lo > merged.lo || (bound.lo === merged.lo && bound.loStrict))) {
+        merged.lo = bound.lo
+        merged.loStrict = bound.loStrict
+    }
+    if (bound.hi !== undefined && (merged.hi === undefined || bound.hi < merged.hi || (bound.hi === merged.hi && bound.hiStrict))) {
+        merged.hi = bound.hi
+        merged.hiStrict = bound.hiStrict
+    }
+    facts.set(k, merged)
+    if (merged.lo === undefined || merged.hi === undefined) return true
+    return merged.lo < merged.hi || (merged.lo === merged.hi && !merged.loStrict && !merged.hiStrict)
+}
+
+function relate(facts: Map<string, Interval>, op: NodeOp, a: Linear, b: Linear, truth: boolean): boolean {
+    switch (op) {
+        case NodeOp.lt: return truth ? constrain(facts, a, b, '<') : constrain(facts, b, a, '<=')
+        case NodeOp.le: return truth ? constrain(facts, a, b, '<=') : constrain(facts, b, a, '<')
+        case NodeOp.gt: return truth ? constrain(facts, b, a, '<') : constrain(facts, a, b, '<=')
+        case NodeOp.ge: return truth ? constrain(facts, b, a, '<=') : constrain(facts, a, b, '<')
+        case NodeOp.eq: return truth ? constrain(facts, a, b, '==') : true
+        case NodeOp.ne: return truth ? true : constrain(facts, a, b, '==')
+    }
+    return true
+}
+
+export function proveInvariants(methods: [string, Function][], ctor: Function, valuesAt: (unit: Function, node: number) => NodeValues | undefined, host: AccessHost, candidates: string[]): [string, string][] {
+    const proven: [string, string][] = []
+    const keyHandles = new Map<string, Handle>()
+    for (let i = 0; i < candidates.length; i++) {
+        for (let j = i + 1; j < candidates.length; j++) if (holds(candidates[i], candidates[j])) proven.push([candidates[i], candidates[j]])
+    }
+    return proven
+
+    function labelOf(k: Handle): string {
+        const name = keyLabel(k)
+        keyHandles.set(name, k)
+        return name
+    }
+
+    function holds(a: string, b: string): boolean {
+        let frameIds = 0
+        const fresh = new Map<string, Handle>()
+        function pathOf(obj: Linear): string {
+            return obj.sym.slice(obj.sym.lastIndexOf(':') + 1)
+        }
+        const registry = new Map<number, SymbolicFrame>()
+        const joins = new Map<string, boolean | 'pending'>()
+        function canon(l: Linear): Linear {
+            const at = l.sym.lastIndexOf(':')
+            const path = l.sym.slice(at + 1)
+            if (path !== `self.${b}`) return l
+            const prefix = l.sym.slice(0, at)
+            if (prefix.startsWith('J') && !joinHolds(prefix)) return l
+            return { sym: `${l.sym.slice(0, at + 1)}self.${a}`, k: l.k }
+        }
+        function joinHolds(prefix: string): boolean {
+            const known = joins.get(prefix)
+            if (known !== undefined) return known !== false
+            joins.set(prefix, 'pending')
+            const [, frameId, kind, at] = /^J(\d+)\.([BR])(\d+)$/.exec(prefix)!
+            const frame = registry.get(Number(frameId))!
+            const agree = (f: SymbolicFrame, point: number) => {
+                const x = resolve(f, point, a)
+                const y = resolve(f, point, b)
+                return !!x && !!y && sameLinear(canon(x), canon(y))
+            }
+            let holds = true
+            if (kind === 'B') {
+                const block = frame.g.blocks.find(t => t.id === Number(at))!
+                holds = predsOf(frame.g, block).every(p => refuted(frame, p) || agree(frame, p))
+            } else {
+                const callee = frame.children.get(Number(at))!
+                holds = retsOf(callee.g).every(r => refuted(callee, r) || agree(callee, r))
+            }
+            joins.set(prefix, holds)
+            return holds
+        }
+        function join(frame: SymbolicFrame, kind: string, at: number, obj: Linear, key: string): Linear {
+            return { sym: `J${frame.id}.${kind}${at}:${pathOf(obj)}.${key}`, k: 0 }
+        }
+        function functionsAt(unit: Function, id: number): Function[] | undefined {
+            const values = valuesAt(unit, id)
+            return values && !values.other ? values.fns : undefined
+        }
+        function trapAt(unit: Function, id: number, setter: boolean): Function | undefined {
+            for (const proto of valuesAt(unit, id)?.protos ?? []) {
+                const proxy = heap.getPropertyProxy(proto, heap.indexKey(0 as u32))
+                if (proxy) return host.functionOf((setter ? heap.getProxySetter(proxy) : heap.getProxyGetter(proxy)) as u32)
+            }
+        }
+        function top(fn: Function, constructing: boolean): SymbolicFrame {
+            const g = host.graphOf(fn)
+            const self = g.blocks[0].params.find(p => isThisParam(getNode(g, p)!))
+            return register({
+                id: frameIds++, g, unit: fn, depth: 0, facts: new Map(), constructing,
+                param: index => g.blocks[0].params[index] === self ? { sym: 'self', k: 0 } : { sym: `p${index}`, k: 0 },
+                entry: (obj, key) => {
+                    if (constructing && obj.sym === 'self') return { sym: 'undef', k: 0 }
+                    const state = fresh.get(obj.sym)
+                    if (state !== undefined) {
+                        const addr = heap.getOwnProperty(state, keyHandles.get(key) ?? heap.fromJsString(key))
+                        const slot = addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as Handle : 0 as Handle
+                        return heap.isBoxedF64(slot) ? { sym: '', k: heap.unboxF64(slot) } : { sym: 'undef', k: 0 }
+                    }
+                    return obj.k === 0 && /(^|:)self(\.|$)/.test(obj.sym) ? { sym: `${obj.sym}.${key}`, k: 0 } : undefined
+                },
+                values: new Map(), fields: new Map(), children: new Map(), loops: new Map(),
+            })
+        }
+        function register(frame: SymbolicFrame): SymbolicFrame {
+            registry.set(frame.id, frame)
+            return frame
+        }
+        function child(frame: SymbolicFrame, id: number, fn: Function, receiverSlot: number, first: number): SymbolicFrame | undefined {
+            if (frame.depth >= maxSymbolicDepth || !host.traceable(fn)) return
+            const g = host.graphOf(fn)
+            const n = getNode(frame.g, id)!
+            const self = g.blocks[0].params.find(p => isThisParam(getNode(g, p)!))
+            const plain = g.blocks[0].params.filter(p => p !== self)
+            const facts = factsAt(frame, id)
+            if (!facts) return
+            return register({
+                id: frameIds++, g, unit: fn, depth: frame.depth + 1, facts, constructing: frame.constructing,
+                param: index => {
+                    const p = g.blocks[0].params[index]
+                    const slot = p === self ? receiverSlot : first + plain.indexOf(p)
+                    return slot >= 0 && slot < countIds(n) ? operand(frame, n, slot) : undefined
+                },
+                entry: (obj, key) => walk(frame, getRef(n, 0), obj, key),
+                values: new Map(), fields: new Map(), children: new Map(), loops: new Map(),
+            })
+        }
+        function calleeOf(frame: SymbolicFrame, id: number): SymbolicFrame | null | undefined {
+            if (frame.children.has(id)) return frame.children.get(id)
+            const n = getNode(frame.g, id)!
+            let found: SymbolicFrame | undefined
+            if (n.op === NodeOp.call && getNode(frame.g, getRef(n, 1))?.op !== NodeOp.syscallTarget) {
+                const fns = functionsAt(frame.unit, getRef(n, 1))
+                if (fns?.length === 1) found = child(frame, id, vf.boundCallee(fns[0], n), 2, 3)
+            } else if (n.op === NodeOp.rt && rt.sliceOf(frame.g, n) === undefined) {
+                const impl = rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
+                if (impl) found = child(frame, id, impl, -1, 2)
+            } else if ((n.op === NodeOp.setProp || n.op === NodeOp.getProp) && getRef(n, 2)) {
+                const trap = trapAt(frame.unit, getRef(n, 1), n.op === NodeOp.setProp)
+                if (trap) found = child(frame, id, trap, 1, 2)
+            }
+            frame.children.set(id, found ?? null)
+            return found ?? null
+        }
+        function opaqueCall(frame: SymbolicFrame, n: GraphNode): boolean {
+            if (n.op === NodeOp.call) return getNode(frame.g, getRef(n, 1))?.op !== NodeOp.syscallTarget
+            if (n.op === NodeOp.rt) return rt.sliceOf(frame.g, n) === undefined && !!rt.bindingOf(getLiteral(frame.g, n, 1))?.impl
+            return false
+        }
+        function operand(frame: SymbolicFrame, n: GraphNode, i: number): Linear | undefined {
+            if (!getRef(n, i)) return { sym: '', k: getLiteral(frame.g, n, i) }
+            return value(frame, getRef(n, i))
+        }
+        function value(frame: SymbolicFrame, id: number): Linear | undefined {
+            if (frame.values.has(id)) return frame.values.get(id) ?? undefined
+            frame.values.set(id, null)
+            const result = computeValue(frame, id)
+            frame.values.set(id, result ?? null)
+            return result
+        }
+        function opaque(frame: SymbolicFrame, id: number): Linear {
+            return { sym: `${frame.id}%${id}`, k: 0 }
+        }
+        function computeValue(frame: SymbolicFrame, id: number): Linear | undefined {
+            const g = frame.g
+            const n = getNode(g, id)
+            if (!n) return
+            switch (n.op) {
+                case NodeOp.literal: return { sym: '', k: getLiteral(g, n, 0) }
+                case NodeOp.heapHandle:
+                    if (getRef(n, 0)) return opaque(frame, id)
+                    if (countIds(n) > 1) {
+                        const sym = `f${frame.id}:${id}`
+                        fresh.set(sym, getLiteral(g, n, 1) as Handle)
+                        return { sym, k: 0 }
+                    }
+                    return getLiteral(g, n, 0) ? { sym: `h${getLiteral(g, n, 0)}`, k: 0 } : { sym: 'undef', k: 0 }
+                case NodeOp.param: {
+                    const index = g.blocks[0].params.indexOf(id)
+                    if (index >= 0) return frame.param(index)
+                    const block = g.blocks.find(b => b.params.includes(id))
+                    return block ? blockParam(frame, block, block.params.indexOf(id)) : undefined
+                }
+                case NodeOp.add:
+                case NodeOp.sub: {
+                    const x = operand(frame, n, 0)
+                    const y = operand(frame, n, 1)
+                    if (x && y && y.sym === '') return { sym: x.sym, k: n.op === NodeOp.add ? x.k + y.k : x.k - y.k }
+                    if (x && y && x.sym === '' && n.op === NodeOp.add) return { sym: y.sym, k: x.k + y.k }
+                    return opaque(frame, id)
+                }
+                case NodeOp.getProp: {
+                    if (getRef(n, 2)) return opaque(frame, id)
+                    const obj = operand(frame, n, 1)
+                    return obj && walk(frame, getRef(n, 0), obj, labelOf(getLiteral(g, n, 2) as Handle)) || opaque(frame, id)
+                }
+                case NodeOp.call: {
+                    const callee = calleeOf(frame, id)
+                    if (!callee) return opaque(frame, id)
+                    let result: Linear | undefined
+                    for (const ret of retsOf(callee.g)) {
+                        if (refuted(callee, ret)) continue
+                        const r = getNode(callee.g, ret)!
+                        const v = operand(callee, r, 0)
+                        if (!v || (result && !sameLinear(result, v))) return opaque(frame, id)
+                        result = v
+                    }
+                    return result ?? opaque(frame, id)
+                }
+                case NodeOp.after: return operand(frame, n, countIds(n) - 1)
+                case NodeOp.mem: return operand(frame, n, 0)
+            }
+            return opaque(frame, id)
+        }
+        function before(frame: SymbolicFrame, id: number, obj: Linear, key: string): Linear | undefined {
+            const n = getNode(frame.g, id)!
+            if (n.op === NodeOp.ret || n.op === NodeOp.apply) {
+                const wrapper = n.op === NodeOp.apply ? afterOf(frame.g, id) : getRef(n, 0) ? id : 0
+                const start = n.op === NodeOp.apply ? wrapper : getRef(n, 0)
+                if (start) {
+                    const m = getNode(frame.g, start)!
+                    if (m.op === NodeOp.after) return orderings(frame, m, obj, key)
+                    if (effect(m.op)) return walk(frame, start, obj, key)
+                }
+                const block = blockOf(frame.g, id)
+                return block ? blockEntry(frame, block, obj, key) : undefined
+            }
+            return walk(frame, getRef(n, 0), obj, key)
+        }
+        function orderings(frame: SymbolicFrame, n: GraphNode, obj: Linear, key: string): Linear | undefined {
+            let result: Linear | undefined
+            for (let i = 0; i < countIds(n) - 1; i++) {
+                if (!getRef(n, i)) continue
+                const v = walk(frame, getRef(n, i), obj, key)
+                if (!v || (result && !sameLinear(result, v))) return
+                result = v
+            }
+            return result
+        }
+        function walk(frame: SymbolicFrame, id: number, obj: Linear, key: string): Linear | undefined {
+            const memo = `${id}|${obj.sym}|${obj.k}|${key}`
+            if (frame.fields.has(memo)) return frame.fields.get(memo) ?? undefined
+            frame.fields.set(memo, null)
+            const result = computeWalk(frame, id, obj, key)
+            frame.fields.set(memo, result ?? null)
+            return result
+        }
+        function computeWalk(frame: SymbolicFrame, id: number, obj: Linear, key: string): Linear | undefined {
+            const g = frame.g
+            let at = id
+            for (;;) {
+                const n = getNode(g, at)
+                if (!n) return
+                switch (n.op) {
+                    case NodeOp.nilEffect: {
+                        const block = g.blocks.find(b => b.id === getRef(n, 0))
+                        return block ? blockEntry(frame, block, obj, key) : undefined
+                    }
+                    case NodeOp.setProp:
+                        if (!getRef(n, 2)) {
+                            if (labelOf(getLiteral(g, n, 2) as Handle) === key && sameLinear(operand(frame, n, 1), obj)) return operand(frame, n, 3)
+                            break
+                        }
+                        return calleeField(frame, at, obj, key)
+                    case NodeOp.call:
+                    case NodeOp.rt:
+                        if (calleeOf(frame, at) || opaqueCall(frame, n)) return calleeField(frame, at, obj, key)
+                        break
+                    case NodeOp.getProp:
+                    case NodeOp.load:
+                    case NodeOp.store:
+                    case NodeOp.pstack:
+                        break
+                    case NodeOp.after:
+                        return orderings(frame, n, obj, key)
+                    default:
+                        return
+                }
+                at = getRef(n, 0)
+            }
+        }
+        function calleeField(frame: SymbolicFrame, id: number, obj: Linear, key: string): Linear | undefined {
+            const callee = calleeOf(frame, id)
+            const n = getNode(frame.g, id)!
+            if (!callee) {
+                if (n.op === NodeOp.setProp) return
+                const reaches = !frame.constructing || Array.from({ length: countIds(n) - 1 }, (_, i) => operand(frame, n, i + 1)).some(arg => !!arg && /(^|:)self(\.|$)/.test(arg.sym))
+                return reaches && /(^|:)self(\.|$)/.test(obj.sym) ? { sym: `c${frame.id}.${id}:${pathOf(obj)}.${key}`, k: 0 } : walk(frame, getRef(n, 0), obj, key)
+            }
+            let result: Linear | undefined
+            let differs = false
+            for (const ret of retsOf(callee.g)) {
+                if (refuted(callee, ret)) continue
+                const v = before(callee, ret, obj, key)
+                if (!v) return
+                if (result && !sameLinear(canon(result), canon(v))) differs = true
+                result = v
+            }
+            return differs ? join(frame, 'R', id, obj, key) : result
+        }
+        function blockEntry(frame: SymbolicFrame, block: Block, obj: Linear, key: string): Linear | undefined {
+            if (block === frame.g.blocks[0]) return frame.entry(obj, key)
+            const preds = predsOf(frame.g, block)
+            const edges = backEdges(frame.g)
+            let forward: Linear | undefined
+            let differs = false
+            for (const p of preds) {
+                if (edges.has(p) || refuted(frame, p)) continue
+                const v = before(frame, p, obj, key)
+                if (!v) return
+                if (forward && !sameLinear(canon(forward), canon(v))) differs = true
+                forward = v
+            }
+            const joined = join(frame, 'B', block.id, obj, key)
+            if (differs || !forward) return joined
+            const back = preds.filter(p => edges.has(p))
+            if (!back.length) return forward
+            const memo = `${block.id}|${obj.sym}|${obj.k}|${key}`
+            const state = frame.loops.get(memo)
+            if (state === 'pending') return forward
+            if (state !== undefined) return state === 'stable' ? forward : joined
+            frame.loops.set(memo, 'pending')
+            const fields = new Map(frame.fields)
+            const values = new Map(frame.values)
+            const stable = back.every(p => {
+                if (refuted(frame, p)) return true
+                const v = before(frame, p, obj, key)
+                return !!v && sameLinear(canon(v), canon(forward!))
+            })
+            frame.loops.set(memo, stable ? 'stable' : 'written')
+            if (!stable) {
+                frame.fields = fields
+                frame.values = values
+            }
+            return stable ? forward : joined
+        }
+        function blockParam(frame: SymbolicFrame, block: Block, index: number): Linear | undefined {
+            const preds = predsOf(frame.g, block)
+            const fresh = { sym: `P${frame.id}.${block.id}.${index}`, k: 0 }
+            if (preds.some(p => backEdges(frame.g).has(p))) return fresh
+            let result: Linear | undefined
+            for (const p of preds) {
+                if (refuted(frame, p)) continue
+                const v = operand(frame, getNode(frame.g, p)!, index + 1)
+                if (!v) return
+                if (result && !sameLinear(result, v)) return fresh
+                result = v
+            }
+            return result
+        }
+        function factsAt(frame: SymbolicFrame, id: number): Map<string, Interval> | undefined {
+            const facts = new Map(frame.facts)
+            for (const [cond, positive] of guardsAt(frame.g, id) ?? []) {
+                const c = getNode(frame.g, cond)!
+                const x = operand(frame, c, 0)
+                const y = operand(frame, c, 1)
+                if (!x || !y) continue
+                if (!relate(facts, c.op, canon(x), canon(y), positive)) return
+            }
+            return facts
+        }
+        function refuted(frame: SymbolicFrame, id: number): boolean {
+            return !factsAt(frame, id)
+        }
+        function resolve(frame: SymbolicFrame, at: number, path: string): Linear | undefined {
+            let obj: Linear | undefined = { sym: 'self', k: 0 }
+            for (const key of path.split('.')) {
+                if (!obj) return
+                obj = before(frame, at, obj, key)
+            }
+            return obj
+        }
+        for (const [, fn] of methods) {
+            const frame = top(fn, fn === ctor)
+            const g = frame.g
+            const escapes = (n: GraphNode) => !frame.constructing || Array.from({ length: countIds(n) - 1 }, (_, i) => operand(frame, n, i + 1)).some(arg => !!arg && /(^|:)self(\.|$)/.test(arg.sym))
+            const points = [...retsOf(g), ...[...g.nodes].filter(([id, n]) => opaqueCall(frame, n) && !calleeOf(frame, id) && escapes(n)).map(([id]) => id)]
+            for (const at of points) {
+                const x = resolve(frame, at, a)
+                const y = resolve(frame, at, b)
+                if (x && y && sameLinear(canon(x), canon(y))) continue
+                if (intrinsics.argv().includes('invariant-debug')) console.log('INVARIANT-FAIL', a, b, fn.name, `%${at}`, JSON.stringify(x), JSON.stringify(y))
+                return false
+            }
+        }
+        return true
+    }
+}
+
+function afterOf(g: Graph, id: number): number {
+    for (const [user] of usersOf(g).get(id) ?? []) {
+        const n = getNode(g, user)!
+        if (n.op === NodeOp.after && getRef(n, countIds(n) - 1) === id) return user
+    }
+    return 0
+}
+
+const backEdgeSets = new WeakMap<Graph, Set<number>>()
+function backEdges(g: Graph): Set<number> {
+    const known = backEdgeSets.get(g)
+    if (known) return known
+    const found = new Set<number>()
+    const visited = new Set<number>()
+    const onStack = new Set<number>()
+    function visit(block: Block): void {
+        visited.add(block.id)
+        onStack.add(block.id)
+        for (const id of bodyNodes(g, block.bodyId)) {
+            const n = getNode(g, id)
+            if (n?.op !== NodeOp.apply) continue
+            const target = g.blocks.find(t => t.id === getRef(n, 0))
+            if (!target) continue
+            if (onStack.has(target.id)) found.add(id)
+            else if (!visited.has(target.id)) visit(target)
+        }
+        onStack.delete(block.id)
+    }
+    visit(g.blocks[0])
+    backEdgeSets.set(g, found)
+    return found
+}
+
+const argv = intrinsics.argv()
+
+const exprNames = ['const', 'origin', 'alloc', 'param', 'union', 'member', 'call', 'arith', 'cmp', 'num', 'rt', 'opaque', 'store', 'narrow', 'pick', 'gate', 'typeof']
+
+export function dumpFlow(detail: Set<string>, dumpAll: boolean, out: string[]): void {
+    flow = vf.flowState()
+    for (const inst of flow.instances) {
+        const name = inst.summary.name
+        if (inst.site) continue
+        if (!dumpAll && !detail.has(name)) continue
+        if (argv.includes(`vgraph:${name}`)) out.push(dumpGraph(inst.summary.g))
+        dumpInstance(inst, detail.has(name), out)
+    }
+    const multiplicity = new Map<Summary, number>()
+    for (const inst of flow.instances) multiplicity.set(inst.summary, (multiplicity.get(inst.summary) ?? 0) + 1)
+    const ranked = [...multiplicity].sort((a, b) => b[1] * b[0].exprs.length - a[1] * a[0].exprs.length).slice(0, 12)
+    out.push(`flow instances: ${ranked.map(([s, k]) => `${s.name}x${k}(${s.width}/${s.exprs.length})`).join(' ')}`)
+}
+
+function scalarText(t: number): string {
+    const f = vf.scalars.flags[t]
+    const parts: string[] = []
+    if (f & vf.ScalarFlag.unknown) parts.push('unknown')
+    if (f & vf.ScalarFlag.undef) parts.push('undefined')
+    if (f & vf.ScalarFlag.void) parts.push('void')
+    if (f & vf.ScalarFlag.int) {
+        const lo = vf.scalars.lo[t]
+        const hi = vf.scalars.hi[t]
+        if (vf.scalars.nums[t].length) parts.push(`{${vf.scalars.nums[t].join(',')}}`)
+        else if (lo === hi) parts.push(`${lo}`)
+        else if (lo === 0 && hi === 1) parts.push('bool')
+        else if (lo === 0 && hi === vf.MaxU64) parts.push('u64')
+        else if (lo === vf.MinI64 && hi === vf.MaxI64) parts.push('i64')
+        else if (lo === 0 && hi === 2 ** 32 - 1) parts.push('u32')
+        else parts.push(`${lo}..${hi}`)
+    }
+    if (f & vf.ScalarFlag.float) parts.push('f64')
+    if (f & vf.ScalarFlag.anyStr) parts.push('string')
+    for (const s of vf.scalars.strs[t]) parts.push(JSON.stringify(heap.stringToJs(s as Handle)))
+    return parts.join('|')
+}
+
+const narrowNames = ['truthy', 'falsy', 'nullish', 'defined', 'number', 'string', 'object', 'function', 'undefined', '!number', '!string', '!object', '!function', '!undefined', '', 'nonzero']
+
+function narrowText(x: Expr): string {
+    const parts: string[] = []
+    for (let i = 0; i < narrowNames.length; i++) {
+        if ((x.key & (1 << i)) && narrowNames[i]) parts.push(narrowNames[i])
+    }
+    if (x.key & vf.GuardFlag.bounded) parts.push(`${x.b <= vf.MinI64 ? '' : x.b}..${x.sub >= vf.MaxU64 ? '' : x.sub}`)
+    return parts.join(' ')
+}
+
+function originText(origin: number): string {
+    const kind = flow.originKind[origin]
+    const owner = flow.originOwner[origin]
+    const q = flow.originQual[origin] ? `@${originShort(flow.originQual[origin])}` : ''
+    if (kind === vf.OriginKind.fn) return `fn ${flow.originFn[origin]?.name || '<anon>'}`
+    if (kind === vf.OriginKind.str) return 'string'
+    if (kind === vf.OriginKind.site) return `site ${owner?.name}%${flow.originNode[origin]}${q}`
+    if (kind === vf.OriginKind.slice) return `slice ${owner?.name}%${flow.originNode[origin]}${q}`
+    if (kind === vf.OriginKind.created) return `created ${owner?.name}%${flow.originNode[origin]}${q}`
+    const fn = vf.originHostFn(origin)
+    if (kind === vf.OriginKind.fresh) {
+        if (fn) return `closure ${fn.name || '<anon>'}#${origin}${q}`
+        if (vf.isScope(origin)) return `scope ${owner?.name}#${origin}${q}`
+        return `obj ${owner?.name}#${origin}${q}${protoName(origin)}`
+    }
+    if (fn) return `fn ${fn.name || '<anon>'}`
+    return `static #${origin}${protoName(origin)}`
+}
+
+function originShort(origin: number): string {
+    const kind = flow.originKind[origin]
+    if (kind === vf.OriginKind.site) return `site%${flow.originNode[origin]}`
+    if (kind === vf.OriginKind.fn) return `fn ${flow.originFn[origin]?.name}`
+    return `#${origin}`
+}
+
+function protoName(origin: number): string {
+    const proto = vf.protoOf(origin)
+    return proto ? `<${vf.constructorName(proto)}>` : ''
+}
+
+function slotText(s: number): string {
+    const parts: string[] = []
+    const t = flow.scalar[s]
+    if (t !== vf.NONE) parts.push(scalarText(t))
+    const origins = flow.slotOrigins[s]
+    for (let i = 0; i < origins.length && i < 6; i++) {
+        if (flow.originKind[origins[i]] === vf.OriginKind.str && (vf.scalars.flags[t] & (vf.ScalarFlag.str | vf.ScalarFlag.anyStr))) continue
+        parts.push(originText(origins[i]))
+    }
+    if (origins.length > 6) parts.push(`+${origins.length - 6} origins`)
+    return parts.length ? parts.join(' | ') : 'never'
+}
+
+function keyText(key: number): string {
+    if (key === vf.elemKey) return '[elem]'
+    if (vf.isPosKey(key)) return `[#${vf.posBase - key}]`
+    if (key === vf.dynKey) return '[key]'
+    return heap.describeKey(key as Handle) ?? `#${key}`
+}
+
+function exprText(s: Summary, e: number, depth: number): string {
+    const x = s.exprs[e]
+    if (depth > 4) return `e${e}`
+    switch (x.op) {
+        case vf.ExprOp.konst: return scalarText(x.a)
+        case vf.ExprOp.origin: return originText(x.a)
+        case vf.ExprOp.alloc: return `alloc%${x.node}`
+        case vf.ExprOp.param: return x.a === -1 ? 'this' : x.a === -2 ? 'ctx' : `p${x.a}`
+        case vf.ExprOp.union: return getNode(s.g, x.node)?.op === NodeOp.param ? `param%${x.node}` : `(${x.args.map(a => exprText(s, a, depth + 1)).join(' | ')})`
+        case vf.ExprOp.member: return `${exprText(s, x.a, depth + 1)}${x.key === vf.dynKey ? `[${exprText(s, x.b, depth + 1)}]` : keyText(x.key)}`
+        case vf.ExprOp.call: return `${exprText(s, x.a, depth + 1)}(${x.args.map(a => exprText(s, a, depth + 1)).join(', ')})`
+        case vf.ExprOp.arith: return `${opText(x.key)}(${exprText(s, x.a, depth + 1)}, ${exprText(s, x.b, depth + 1)})`
+        case vf.ExprOp.cmp: return `${opText(x.key)}(${exprText(s, x.a, depth + 1)}, ${exprText(s, x.b, depth + 1)})`
+        case vf.ExprOp.num: return scalarText(x.a)
+        case vf.ExprOp.rt: return `rt.${rtName(x.a)}(${x.args.map(a => exprText(s, a, depth + 1)).join(', ')})`
+        case vf.ExprOp.store: return `${exprText(s, x.a, depth + 1)}${x.key === vf.dynKey ? `[${exprText(s, x.args[0], depth + 1)}]` : keyText(x.key)} := ${exprText(s, x.b, depth + 1)}`
+        case vf.ExprOp.opaque: return `opaque%${x.node}`
+        case vf.ExprOp.narrow: return `narrow(${exprText(s, x.args[0], depth + 1)}, ${narrowText(x)})`
+        case vf.ExprOp.pick: return `pick(${exprText(s, x.args[0], depth + 1)}, ${x.b ? '' : '!'}${keyText(x.key)})`
+    }
+    return exprNames[x.op]
+}
+
+function opText(op: number): string {
+    for (const k of Object.keys(NodeOp)) if ((NodeOp as any)[k] === op) return k
+    return `${op}`
+}
+
+function sigText(inst: Instance): string {
+    const s = inst.summary
+    const parts: string[] = []
+    for (let i = 0; i < s.params; i++) parts.push(`p${i}=${slotText(inst.sigs[i])}`)
+    if (s.hasThis) parts.push(`this=${slotText(vf.paramSlot(inst, -1))}`)
+    if (s.usesCtx) parts.push(`ctx=${slotText(vf.paramSlot(inst, -2))}`)
+    return parts.join(' ')
+}
+
+function dumpInstance(inst: Instance, callers: boolean, out: string[]): void {
+    const s = inst.summary
+    const stores = new Set(s.stores)
+    out.push(`INSTANCE ${s.name}#${inst.id}${inst.qual ? ` @${originText(inst.qual)}` : ''} nodes=${s.g.nodes.size} exprs=${s.exprs.length} callers=${inst.callers.length}`)
+    out.push(`  signature: ${sigText(inst)}`)
+    out.push(`  returns: ${s.rets.map(r => exprText(s, r, 0)).join(' | ') || 'never'} => ${slotText(inst.ret)}`)
+    for (let e = 0; e < s.exprs.length; e++) {
+        const x = s.exprs[e]
+        if (x.op !== vf.ExprOp.alloc && !(x.op === vf.ExprOp.rt && (x.a === RtOp.slice || x.a === RtOp.create))) continue
+        if (s.local![e] < 0) continue
+        for (const a of flow.slotOrigins[vf.at(inst, e)]) {
+            const fields: string[] = []
+            for (const [key, f] of flow.originFields[a]) fields.push(`${keyText(key)}: ${slotText(f)}`)
+            out.push(`  alloc %${x.node} ${originText(a)} { ${fields.join(', ')} }`)
+        }
+    }
+    for (let e = 0; e < s.exprs.length; e++) {
+        const x = s.exprs[e]
+        if (stores.has(e)) {
+            out.push(`  effect %${x.node} ${exprText(s, e, 0)}`)
+            continue
+        }
+        if (s.local![e] < 0) continue
+        const slot = vf.at(inst, e)
+        if (x.op === vf.ExprOp.store) continue
+        else if (x.op === vf.ExprOp.call || x.op === vf.ExprOp.opaque || (x.op === vf.ExprOp.rt && flow.parts.has(slot))) {
+            const callees: string[] = []
+            for (const part of flow.parts.get(slot)?.values() ?? []) {
+                const bind = flow.partBind.get(part)
+                const text = bind ? `${flow.instances[bind.callee].summary.name}#${bind.callee}` : ''
+                if (bind && !callees.includes(text)) callees.push(text)
+            }
+            out.push(`  call %${x.node} ${exprText(s, e, 0)} -> [${callees.join(', ')}]${flow.slotOpaque[slot] ? ' opaque' : ''} => ${slotText(slot)}`)
+        } else if (x.op === vf.ExprOp.member || x.op === vf.ExprOp.rt) out.push(`  open %${x.node} ${exprText(s, e, 0)} => ${slotText(slot)}`)
+        else if (x.op === vf.ExprOp.union && getNode(s.g, x.node)?.op === NodeOp.param) out.push(`  param %${x.node} => ${slotText(slot)}`)
+    }
+    if (!callers) return
+    for (const c of inst.callers) {
+        const from = vf.instOfSlot(c)
+        const x = vf.exprAt(c)
+        out.push(`  caller ${from.summary.name}#${from.id} %${x.node} ${exprText(from.summary, flow.slotIndex[vf.ownerSlot(c)], 0)} args ${x.args.map(a => slotText(vf.at(from, a))).join(', ')}`)
+    }
+}
