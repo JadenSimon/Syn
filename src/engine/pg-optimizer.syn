@@ -4,11 +4,12 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp, elementType, opName as rtName } from './rt'
-import { dumpGraph, NumericOps, stronglyConnected, type Graph, type GraphNode } from './lowering2'
-import { countIds, getLiteral, getNode, getRef, isThisParam, NodeOp, typeOf } from './graph-node'
+import { dumpGraph, firstNonOrderingSlot, NumericOps, stronglyConnected, type Graph, type GraphNode } from './lowering2'
+import { addNode, countIds, getLiteral, getNode, getOperand, getRef, isThisParam, NodeOp, putNode, typeOf, type Operand } from './graph-node'
+import { globals as builtinGlobals } from './builtins'
 import * as vf from './value-flow'
 import type { Expr, FlowState, FrameInfo, Guard, Instance, Spec, Summary } from './value-flow'
-import { AllocKind, armIndexOf, armsAt, blockOf, bodyNodes, effect, emptyType, inhabited, keyLabel, predsOf, reaches, retsOf, usersOf, valueTail, type AccessHost, type Accesses, type Allocation, type Block, type FrameSignature, type Location, type Site, type Type, type UnitTypes, type WordAccess } from './value-types'
+import { AllocKind, armIndexOf, armsAt, blockOf, bodyNodes, effect, emptyType, fixedField, fixedState, inhabited, keyLabel, predsOf, reaches, retsOf, usersOf, valueTail, type AccessHost, type Accesses, type Allocation, type Block, type FrameSignature, type Location, type PlannedUnit, type Site, type Type, type UnitTypes, type ValueTypes, type WordAccess } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -2091,5 +2092,312 @@ function dumpInstance(inst: Instance, callers: boolean, out: string[]): void {
         const from = vf.instOfSlot(c)
         const x = vf.exprAt(c)
         out.push(`  caller ${from.summary.name}#${from.id} %${x.node} ${exprText(from.summary, flow.slotIndex[vf.ownerSlot(c)], 0)} args ${x.args.map(a => slotText(vf.at(from, a))).join(', ')}`)
+    }
+}
+
+export interface SetTest {
+    keys: number[]
+    low: number
+    high: number
+}
+
+export type SetUse = 'construct' | 'lookup' | SetTest
+
+const maxSetKey = 256
+
+function stableMethod(types: ValueTypes, host: AccessHost, proto: Handle | undefined, key: Handle, method: Function): boolean {
+    let at = proto
+    while (at) {
+        if (!fixedField(types, at, key) || !fixedField(types, at, heap.protoSlotKey)) return false
+        const descriptor = heap.getOwnProperty(at, key)
+        if (descriptor) {
+            const property = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+            if (property.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return false
+            return host.functionOf(property.slot0 as u32) === method
+        }
+        at = heap.getPrototypeOf(at)
+    }
+    return false
+}
+
+function smallKeys(values: number[]): boolean {
+    for (const value of values) {
+        if (!Number.isInteger(value) || value < 0 || value >= maxSetKey) return false
+    }
+    return true
+}
+
+function setContents(types: ValueTypes, host: AccessHost, g: Graph, id: number, iterator: Handle): number[] | undefined {
+    const call = getNode(g, id)!
+    const arrayIterator = builtinGlobals.Array.prototype[Symbol.iterator]
+    const array = valueTail(g, getRef(call, 3))
+    const n = getNode(g, array)
+    if (n?.op === NodeOp.heapHandle && !getRef(n, 0)) {
+        const state = heap.deref(getLiteral(g, n, 0) as Handle)
+        const elements = host.constantElements?.(state)
+        if (!elements || elements.length > maxSetKey || !fixedState(types, state) || !elements.every(heap.isBoxedF64)) return
+        if (!stableMethod(types, host, heap.getPrototypeOf(state), iterator, arrayIterator)) return
+        const values = elements.map(heap.unboxF64)
+        return smallKeys(values) ? values : undefined
+    }
+    if (n?.op !== NodeOp.rt || getLiteral(g, n, 1) !== RtOp.arrayLiteral || getRef(n, 2)) return
+    const arrayProto = heap.deref(heap.getPrototypeProperty(heap.deref(host.session.linkFunction(builtinGlobals.Array) as Handle)))
+    if (!stableMethod(types, host, arrayProto, iterator, arrayIterator)) return
+    const size = getLiteral(g, n, 2)
+    if (!Number.isInteger(size) || size < 0 || size > maxSetKey) return
+    const values: number[] = []
+    const elements = new Set<number>()
+    let token = getRef(call, 0)
+    let i = size - 1
+    while (i >= 0) {
+        const element = getNode(g, token)
+        if (element?.op !== NodeOp.rt || getLiteral(g, element, 1) !== RtOp.arrayElement || getRef(element, 2) !== array) return
+        if (getRef(element, 3) || getLiteral(g, element, 3) !== i || getRef(element, 4)) return
+        values.push(getLiteral(g, element, 4))
+        elements.add(token)
+        token = getRef(element, 0)
+        i--
+    }
+    if ((size > 0 && token !== array) || !smallKeys(values)) return
+    for (const [user, slot] of usersOf(g).get(array) ?? []) {
+        if (slot < firstNonOrderingSlot(getNode(g, user)!)) continue
+        if (elements.has(user) && slot === 2) continue
+        if (user === id && slot === 3) continue
+        return
+    }
+    return values
+}
+
+function internKeys(interned: Map<string, number[]>, values: number[]): number[] {
+    const keys = [...new Set(values)].sort((x, y) => x - y)
+    const name = keys.join()
+    const known = interned.get(name)
+    if (known) return known
+    interned.set(name, keys)
+    return keys
+}
+
+function keyWords(keys: number[], base: number, length: number): number[] {
+    const words: number[] = Array(length).fill(0)
+    for (const key of keys) {
+        const at = (key - base) >>> 5
+        words[at] = (words[at] | (1 << ((key - base) & 31))) >>> 0
+    }
+    return words
+}
+
+function onlySets(type: Type | undefined, bits: Map<number, number[]>): boolean {
+    if (!type || type.unknown || type.undefined || type.float || type.range || type.literals.length || type.strings.length || type.functions.length || type.closures.length) return false
+    return type.objects.length > 0 && type.objects.every(o => bits.has(o))
+}
+
+function integerRange(type: Type | undefined): [low: number, high: number] | undefined {
+    if (!type || type.unknown || type.undefined || type.float || type.objects.length || type.strings.length || type.functions.length || type.closures.length) return
+    if (!type.range && !type.literals.length) return
+    let low = type.range ? type.range[0] : Infinity
+    let high = type.range ? type.range[1] : -Infinity
+    for (const literal of type.literals) {
+        if (!Number.isInteger(literal)) return
+        low = Math.min(low, literal)
+        high = Math.max(high, literal)
+    }
+    return [low, high]
+}
+
+function opaqueNode(g: Graph, unit: PlannedUnit, id: number, n: GraphNode, nodes: Map<number, Type>, host: AccessHost): boolean {
+    if (n.op === NodeOp.call) {
+        if (getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) return false
+        const callee = nodes.get(getRef(n, 1))
+        return !unit.calls.has(id) || !callee || callee.unknown || callee.functions.some(fn => !host.traceable(fn))
+    }
+    if (unit.calls.has(id)) return false
+    if (n.op === NodeOp.static) return true
+    if (n.op !== NodeOp.rt) return false
+    const op = getLiteral(g, n, 1)
+    return !rt.shallowOps.has(op) && !rt.allocOps.has(op) && !rt.targetWriteOps.has(op) && rt.sliceOf(g, n) === undefined && op !== RtOp.assign
+}
+
+export function planSmallSets(types: ValueTypes, host: AccessHost, units: Iterable<PlannedUnit>, roots: Function[]): Map<PlannedUnit, Map<number, SetUse>> {
+    const out = new Map<PlannedUnit, Map<number, SetUse>>()
+    if (intrinsics.argv().includes('no-small-sets')) return out
+    const ctor = builtinGlobals.Set
+    if (!types.frames.some(frame => frame.unit === ctor)) return out
+    const has = ctor.prototype.has
+    const hasKey = heap.fromJsString('has')
+    const iterator = host.session.fromJsValue(Symbol.iterator) as Handle
+    const interned = new Map<string, number[]>()
+    const bits = new Map<number, number[]>()
+    const rejected = new Set<number>()
+    for (const frame of types.frames) {
+        if (frame.unit !== ctor) continue
+        const objects = frame.params.find(p => p.label === 'this')?.type.objects ?? []
+        for (const site of frame.sites) {
+            if (site.frame === undefined) continue
+            const g = host.graphOf(site.unit)
+            const call = getNode(g, site.node)!
+            const values = call.op === NodeOp.call && countIds(call) === 4 ? setContents(types, host, g, site.node, iterator) : undefined
+            const known = values && internKeys(interned, values)
+            for (const object of objects) {
+                if (!known || (bits.has(object) && bits.get(object) !== known) || !stableMethod(types, host, types.objects[object].proto, hasKey, has)) rejected.add(object)
+                else bits.set(object, known)
+            }
+        }
+    }
+    for (const object of rejected) bits.delete(object)
+    if (!bits.size) return out
+    const exposed: number[] = []
+    const rootSet = new Set(roots)
+    for (const frame of types.frames) {
+        if (!rootSet.has(frame.unit)) continue
+        for (const id of frame.returns.objects) exposed.push(id)
+        for (const id of frame.returns.closures) exposed.push(id)
+    }
+    const uses: [unit: PlannedUnit, node: number, use: SetUse, objects: number[]][] = []
+    for (const unit of units) {
+        if (unit.fn === ctor || unit.fn === has) continue
+        const g = host.graphOf(unit.fn)
+        const nodes = types.resolve(unit.frames).nodes
+        const aliases = new Map<number, number[]>()
+        for (const [node, type] of nodes) {
+            const objects = type.objects.filter(o => bits.has(o))
+            if (objects.length) aliases.set(node, objects)
+        }
+        for (const [id, n] of g.nodes) {
+            const opaque = opaqueNode(g, unit, id, n, nodes, host)
+            if (opaque) {
+                for (let slot = firstNonOrderingSlot(n); slot < countIds(n); slot++) {
+                    const type = nodes.get(getRef(n, slot))
+                    if (!type) continue
+                    for (const o of type.objects) exposed.push(o)
+                    for (const o of type.closures) exposed.push(o)
+                }
+            }
+            if (!aliases.size || n.op === NodeOp.after || n.op === NodeOp.apply || n.op === NodeOp.select || n.op === NodeOp.ret) continue
+            const involved = new Set<number>()
+            for (let slot = firstNonOrderingSlot(n); slot < countIds(n); slot++) {
+                for (const object of aliases.get(getRef(n, slot)) ?? []) involved.add(object)
+            }
+            if (!involved.size) continue
+            const objects = [...involved]
+            if (n.op === NodeOp.getProp) {
+                const target = nodes.get(id)
+                let called = true
+                for (const [user, slot] of usersOf(g).get(id) ?? []) {
+                    const u = getNode(g, user)!
+                    if (slot >= firstNonOrderingSlot(u) && (u.op !== NodeOp.call || slot !== 1 || getRef(u, 2) !== getRef(n, 1))) called = false
+                }
+                if (called && target && !target.unknown && !target.objects.length && target.functions.length === 1 && target.functions[0] === has) {
+                    uses.push([unit, id, 'lookup', objects])
+                    continue
+                }
+            }
+            const targets = n.op === NodeOp.call && !opaque ? unit.calls.get(id) : undefined
+            if (targets) {
+                let ctors = 0
+                let lookups = 0
+                for (const target of targets) {
+                    if (target.fn === ctor) ctors++
+                    else if (target.fn === has) lookups++
+                }
+                if (ctors === targets.size && onlySets(nodes.get(getRef(n, 2)), bits)) {
+                    uses.push([unit, id, 'construct', objects])
+                    continue
+                }
+                if (lookups === targets.size && onlySets(nodes.get(getRef(n, 2)), bits)) {
+                    const known = bits.get(objects[0])!
+                    const literal = getLiteral(g, n, 3)
+                    const range = getRef(n, 3) ? integerRange(nodes.get(getRef(n, 3))) : Number.isInteger(literal) ? [literal, literal] : undefined
+                    if (range && countIds(n) === 4 && objects.every(o => bits.get(o) === known)) {
+                        uses.push([unit, id, { keys: known, low: range[0], high: range[1] }, objects])
+                        continue
+                    }
+                }
+                if (!ctors && !lookups) continue
+            }
+            for (const object of objects) rejected.add(object)
+        }
+    }
+    const exposing = exposed.slice()
+    const reached = new Set(exposed)
+    while (exposing.length) {
+        const object = types.objects[exposing.pop()!]
+        for (const field of object.fields.values()) {
+            for (const id of field.type.objects.concat(field.type.closures)) {
+                if (reached.has(id)) continue
+                reached.add(id)
+                exposing.push(id)
+            }
+        }
+    }
+    for (const object of bits.keys()) {
+        if (reached.has(object)) rejected.add(object)
+    }
+    const linked = new Map<number, number[][]>()
+    for (const [, , , objects] of uses) {
+        if (objects.length < 2) continue
+        for (const object of objects) {
+            const list = linked.get(object)
+            if (list) list.push(objects)
+            else linked.set(object, [objects])
+        }
+    }
+    const pending = [...rejected]
+    while (pending.length) {
+        for (const objects of linked.get(pending.pop()!) ?? []) {
+            for (const object of objects) {
+                if (rejected.has(object)) continue
+                rejected.add(object)
+                pending.push(object)
+            }
+        }
+    }
+    for (const [unit, node, use, objects] of uses) {
+        if (objects.some(o => rejected.has(o))) continue
+        let nodes = out.get(unit)
+        if (!nodes) out.set(unit, nodes = new Map())
+        nodes.set(node, use)
+    }
+    return out
+}
+
+export function rewriteSmallSets(g: Graph, uses: Map<number, SetUse>, wordsSlot: (words: number[]) => number): void {
+    for (const [id, use] of uses) {
+        const n = getNode(g, id)!
+        const T = typeOf(n)
+        const token = getOperand(g, n, 0)
+        if (use === 'construct') {
+            putNode(g, id, NodeOp.after, [token, getOperand(g, n, 2)], T)
+            continue
+        }
+        if (use === 'lookup') {
+            putNode(g, id, NodeOp.after, [token, { literal: 0 }], T)
+            continue
+        }
+        const keys = use.keys
+        let top = keys.length ? keys[keys.length - 1] : 0
+        const base = top >= 32 && use.low < 0 ? keys[0] : 0
+        if (top - base >= 32 && use.low >= 0) top = Math.max(top, Math.min(use.high, maxSetKey - 1))
+        let length = 1
+        while (length * 32 <= top - base) length *= 2
+        const words = keyWords(keys, base, length)
+        const low = use.low - base
+        const high = use.high - base
+        const input = getOperand(g, n, 3)
+        const value = base ? addNode(g, NodeOp.sub, [input, { literal: base }], Types.u64) : input
+        let word: Operand = { literal: words[0] }
+        if (length > 1) {
+            const pointer = addNode(g, NodeOp.poolEntry, [{ literal: wordsSlot(words) }], Types.u64)
+            const index = addNode(g, NodeOp.ushr, [value, { literal: 3 }], Types.u64)
+            const offset = addNode(g, NodeOp.and, [index, { literal: (length - 1) * 4 }], Types.u64)
+            word = addNode(g, NodeOp.load, [addNode(g, NodeOp.nilEffect, []), pointer, offset], Types.u32)
+        }
+        const bit = addNode(g, NodeOp.and, [addNode(g, NodeOp.ushr, [word, value], Types.u32), { literal: 1 }], Types.bool)
+        if (low >= 0 && high < length * 32) {
+            putNode(g, id, NodeOp.after, [token, bit], T)
+            continue
+        }
+        let bounded: Operand = addNode(g, NodeOp.lt, [value, { literal: length * 32 }], Types.bool)
+        if (!base && low < 0) bounded = addNode(g, NodeOp.and, [bounded, addNode(g, NodeOp.ge, [value, { literal: 0 }], Types.bool)], Types.bool)
+        putNode(g, id, NodeOp.after, [token, addNode(g, NodeOp.and, [bounded, bit], Types.bool)], T)
     }
 }
