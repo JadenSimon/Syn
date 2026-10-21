@@ -5732,7 +5732,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const loop = countedLoop(target)
         if (!loop || !loop.compare) return
         const tail = getNode(g, target.bodyId)!
-        if (getRef(tail, 1) !== loop.selfApps[0]) return
+        let stay = getRef(tail, 1)
+        for (let n = getNode(g, stay); n?.op === NodeOp.after; n = getNode(g, stay)) {
+            for (let i = 0; i < countIds(n) - 1; i++) if (!isUnordered(getRef(n, i))) return
+            stay = getRef(n, countIds(n) - 1)
+        }
+        if (stay !== loop.selfApps[0]) return
         const exit = getNode(g, getRef(tail, 2))
         if (!exit || exit.op !== NodeOp.apply) return
         const bound = loop.bound
@@ -5762,19 +5767,34 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return true
         }
         for (let i = 1; i < countIds(exit); i++) if (!pureFrom(getRef(exit, i))) return
+        const reached = new Set<number>()
+        const work: number[] = []
+        for (let i = 1; i < countIds(exit); i++) work.push(getRef(exit, i))
+        let invariantExit = true
+        while (work.length && invariantExit) {
+            const id = work.pop()!
+            if (!id || reached.has(id)) continue
+            reached.add(id)
+            if (paramSet.has(id)) {
+                if (!loop.invariant.has(id)) invariantExit = false
+                continue
+            }
+            const n = getNode(g, id)!
+            for (let i = 0; i < countIds(n); i++) work.push(getRef(n, i))
+        }
 
         const touched: number[] = []
         for (const [blockId, appId] of loop.entries) {
             const app = getNode(g, appId)!
             const trip = loopTrip(target, loop, app)
-            if (!trip?.span) continue
-            const span = trip.span
-            const count: [number, number] = !trip.shift ? span
-                : [addCopy(g, getNode(g, getRef(back, ivAt + 1))!, [span[0], { literal: trip.shift }], NodeOp.ushr), 0]
+            if (!trip || (!trip.span && !invariantExit)) continue
             const finals = new Map<number, [number, number]>()
             for (let i = 0; i < params.length; i++) finals.set(params[i], applyArg(appId, i))
-            finals.set(params[ivAt], span[0] ? outsideOf(target, app, bound) : [0, applyArg(appId, ivAt)[1] + span[1] * stride])
-            for (const [at, step, of] of accumulators) {
+            const span = trip.span ?? [0, 0]
+            const count: [number, number] = !trip.shift ? span
+                : [addCopy(g, getNode(g, getRef(back, ivAt + 1))!, [span[0], { literal: trip.shift }], NodeOp.ushr), 0]
+            if (trip.span) finals.set(params[ivAt], span[0] ? outsideOf(target, app, bound) : [0, applyArg(appId, ivAt)[1] + span[1] * stride])
+            for (const [at, step, of] of trip.span ? accumulators : []) {
                 const s = outsideOf(target, app, step)
                 const total = !s[0] && s[1] === 1 ? count[0] || addNode(g, NodeOp.literal, [{ literal: count[1] }])
                     : addCopy(g, of, [count[0] || { literal: count[1] }, s[0] || { literal: s[1] }], NodeOp.mul)
@@ -7971,14 +7991,68 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return true
     }
 
+    const unreadRoots = new Map<number, [epoch: number, unread: boolean]>()
+    function unreadRoot(root: number, mem: MemAnalysis): boolean {
+        const known = unreadRoots.get(root)
+        if (known && (known[1] || known[0] === graphEpoch)) return known[1]
+        const op = getNode(g, root)?.op
+        let unread = op === NodeOp.alloca || op === NodeOp.pstack || op === NodeOp.mem
+        const flow = unread ? mem.flows(root, true) : undefined
+        if (flow && (flow.own || flow.calls.length)) unread = false
+        for (const x of unread ? flow!.reached : []) {
+            for (const u of dependents.get(x) ?? []) {
+                const n = getNode(g, u)!
+                if (n.op === NodeOp.load && (getRef(n, 1) === x || getRef(n, 2) === x)) unread = false
+                if (n.op === NodeOp.store && getRef(n, 1) === x && mem.access(n)?.base !== root) unread = false
+                if (!unread) break
+            }
+            if (!unread) break
+        }
+        unreadRoots.set(root, [graphEpoch, unread])
+        return unread
+    }
+    function dropUnreadStores(target: GraphBlock): boolean {
+        const stores = findValues(target.id, NodeOp.store)
+        if (!stores?.length) return false
+        const mem = currentMem()
+        const r = new Map<number, number>()
+        for (const id of stores) {
+            const n = getNode(g, id)!
+            const at = mem.access(n)
+            if (!at || at.kind !== MemFresh || !unreadRoot(at.base, mem)) continue
+            r.set(id, getRef(n, 0) || addNode(g, NodeOp.nilEffect, []))
+        }
+        if (!r.size) return false
+        function resolve(id: number): number {
+            let at = id
+            while (r.has(at)) at = r.get(at)!
+            return at
+        }
+        for (const id of r.keys()) {
+            for (const u of [...(dependents.get(id) ?? [])]) {
+                const n = getNode(g, u)
+                if (!n || r.has(u)) continue
+                const operands = getOperands(g, n)
+                let edited = false
+                for (let i = 0; i < countIds(n); i++) {
+                    if (!r.has(getRef(n, i))) continue
+                    operands[i] = resolve(getRef(n, i))
+                    edited = true
+                }
+                if (edited) putCopy(g, u, n, operands)
+            }
+        }
+        revisitBlock(target)
+        return true
+    }
+
     const unpromotable = new Set<string>()
     function allocations(block: number): number[] {
         return [...(findValues(block, NodeOp.alloca) ?? []), ...(findValues(block, NodeOp.pstack) ?? [])]
     }
 
     function promoteAllocas(target: GraphBlock): boolean {
-        const found = allocations(target.id)
-        if (!found.length) return false
+        if (!allocations(target.id).length) return false
         const keys = new Map<number, string | undefined>()
         function keyOf(id: number): string | undefined {
             if (keys.has(id)) return keys.get(id)
@@ -7991,24 +8065,23 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         let changed = false
         let stored: string[] = []
-        function attempt(key: string): void {
-            let inside = false
-            if (!promoteAlloca(key, keyOf, () => inside = true)) {
-                unpromotable.add(key)
-                if (inside) stored.push(key)
-                return
+        let again = true
+        while (again) {
+            again = false
+            for (const id of allocations(target.id)) {
+                const key = keyOf(id)
+                if (key === undefined || unpromotable.has(key)) continue
+                let inside = false
+                if (!promoteAlloca(key, keyOf, () => inside = true)) {
+                    unpromotable.add(key)
+                    if (inside) stored.push(key)
+                    continue
+                }
+                changed = true
+                again = true
+                for (const k of stored) unpromotable.delete(k)
+                stored = []
             }
-            changed = true
-            const retry = stored
-            stored = []
-            for (const k of retry) {
-                unpromotable.delete(k)
-                attempt(k)
-            }
-        }
-        for (const id of found) {
-            const key = keyOf(id)
-            if (key !== undefined && !unpromotable.has(key)) attempt(key)
         }
         return changed
     }
@@ -10201,6 +10274,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(foldKnownConditions, b)
             step(reduceSelects, b)
             step(forwardMemory, b)
+            step(dropUnreadStores, b)
             step(mergeConstantStores, b)
             step(forwardArrivalLoads, b)
             step(forwardArrivalCalls, b)
@@ -10800,7 +10874,8 @@ function expandPstacks(g: Graph): boolean {
             top = addNode(g, NodeOp.add, [base, getOperand(g, n, 3)])
         }
         const store = addNode(g, NodeOp.store, [token, { literal: cell }, 0, top], Types.u64)
-        putCopy(g, id, n, [store, base], NodeOp.after)
+        const fresh = getRef(n, 2) || getLiteral(g, n, 2) ? base : addNode(g, NodeOp.mem, [base, getOperand(g, n, 3)], Types.u64)
+        putCopy(g, id, n, [store, fresh], NodeOp.after)
     }
     return found
 }
@@ -12425,7 +12500,12 @@ function sharedArmValues(g: Graph, selectId: number, memo: Map<number, { every: 
         for (const m of arm) {
             const n = getNode(g, m)
             if (!n || shared.has(m) || control(n)) continue
-            for (const x of getArgIds(n)) if (x && shared.has(x) && !condition.has(x) && shareable(x)) out.add(x)
+            for (const x of getArgIds(n)) {
+                if (x && shared.has(x) && !condition.has(x) 
+                    && (shareable(x) || getNode(g, x)!.op === NodeOp.select)) {
+                    out.add(x)
+                }
+            }
         }
     }
     return out
@@ -12464,8 +12544,9 @@ function shareArmValues(g: Graph): boolean {
     }
     for (let i = 0; i < g.blocks.length; i++) {
         const b = g.blocks[i]
-        const root = getNode(g, b.bodyId)
-        const shared = root?.op === NodeOp.select ? sharedArmValues(g, b.bodyId, memo) : new Set<number>()
+        const body = getNode(g, b.bodyId)
+        const top = body?.op === NodeOp.ret ? getRef(body, 0) : b.bodyId
+        const shared = getNode(g, top)?.op === NodeOp.select ? sharedArmValues(g, top, memo) : new Set<number>()
         const passed = shared.size ? withDependencies(g, shared) : shared
         if (passed.size) {
             const params = new Set<number>()
