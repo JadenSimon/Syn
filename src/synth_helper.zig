@@ -53,6 +53,7 @@ pub const SynthInstrumenter = struct {
 
     emitting: bool = false,
     transforming: bool = false,
+    needs_computation_symbol: bool = false,
 
     depth: u16 = 1,
 
@@ -96,19 +97,65 @@ pub const SynthInstrumenter = struct {
         try v.selectInstrumentation();
         v.transforming = true;
         try v.visit(ast.nodes.at(ast.start), ast.start);
+        var prefix = parser.NodeList.init(&ast.nodes);
+        if (v.needs_computation_symbol) prefix.appendRef(try v.createComputationSymbolPolyfill());
         if (v.tmp_binding != 0) {
             const stmt = try v.factory.createLetVariable(v.tmp_binding, 0);
             ast.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
-            ast.nodes.at(stmt).next = parser.maybeUnwrapRef(ast.nodes.at(ast.start)) orelse 0;
-            ast.start = try v.factory.cloneNodeRef(ast.start);
-            ast.nodes.at(ast.start).data = stmt;
+            prefix.appendRef(stmt);
         }
+        if (prefix.head != 0) try v.prependStatements(prefix.head, prefix.prev);
 
         var opts: parser.PrinterOptions = printer_opt orelse .{
             .emit_source_map = true,
         };
         opts.replacements = &r;
         return try parser.printWithOptions(ast.*, opts);
+    }
+
+    fn computationKey(self: *@This()) !NodeRef {
+        self.needs_computation_symbol = true;
+        return self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "toComputation");
+    }
+
+    fn createComputationSymbolPolyfill(self: *@This()) !NodeRef {
+        const value = try self.factory.createCallExpression(
+            try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
+            &.{try self.factory.createStringLiteral("toComputation")},
+        );
+        const descriptor = try self.factory.createObjectLiteralExpression(&.{
+            try self.factory.createPropertyAssignment(try self.factory.createIdentifier("value"), value),
+        });
+        const define = try self.factory.createExpressionStatement(try self.factory.createCallExpression(
+            try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Object"), "defineProperty"),
+            &.{try self.factory.createIdentifier("Symbol"), try self.factory.createStringLiteral("toComputation"), descriptor},
+        ));
+        return self.factory.createIfStatement(
+            try self.factory.createPrefixUnaryExpression(.exclamation_token, try self.computationKey()),
+            try self.factory.createBlock(&.{define}),
+            0,
+        );
+    }
+
+    fn prependStatements(self: *@This(), head: NodeRef, tail: NodeRef) !void {
+        const first = maybeUnwrapRef(self.nodes.at(self.ast.start)) orelse 0;
+        var prologue_end: NodeRef = 0;
+        var next = first;
+        while (next != 0) {
+            const node = self.nodes.at(next);
+            if (node.kind != .expression_statement or self.nodes.at(parser.unwrapRef(node)).kind != .string_literal) break;
+            prologue_end = next;
+            next = node.next;
+        }
+        self.nodes.at(tail).next = next;
+        if (prologue_end != 0) {
+            const clone = try self.factory.cloneNodeRef(prologue_end);
+            self.nodes.at(clone).next = head;
+            try self.replacements.put(prologue_end, clone);
+        } else {
+            self.ast.start = try self.factory.cloneNodeRef(self.ast.start);
+            self.nodes.at(self.ast.start).data = head;
+        }
     }
 
     fn deinit(self: *@This()) void {
@@ -541,10 +588,7 @@ pub const SynthInstrumenter = struct {
             try forEachChild(self.nodes, node, self);
             try self.drainRebindings(funcBodyRef(node), 0);
             if (!self.instrumented.contains(ref)) return;
-            const move_key = try self.factory.createCallExpression(
-                try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
-                &.{try self.factory.createStringLiteral("toComputation")},
-            );
+            const move_key = try self.computationKey();
             const captures = self.fns.get(ref) orelse unreachable; // set before transform
 
             if (node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor or node.kind == .constructor) {
@@ -822,10 +866,7 @@ pub const SynthInstrumenter = struct {
                 return;
             }
             const captures = self.fns.get(ref) orelse unreachable;
-            const move_key = try self.factory.createCallExpression(
-                try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Symbol"), "for"),
-                &.{try self.factory.createStringLiteral("toComputation")},
-            );
+            const move_key = try self.computationKey();
             const synth_data = try self.buildSynthDataFn(ref, &captures);
             const assign = try self.factory.createAssignmentStatement(
                 try self.factory.createElementAccessExpression(try self.factory.createKeywordType(.this_keyword), move_key),

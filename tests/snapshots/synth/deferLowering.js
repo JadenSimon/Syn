@@ -1,4 +1,9 @@
 // @filename: main.syn
+if (!Symbol.toComputation) {
+  Object.defineProperty(Symbol, 'toComputation', {
+    value: Symbol.for('toComputation')
+  });
+}
 var __runDefers = d => {
   while (d.length) d.pop()();
 }
@@ -50,7 +55,7 @@ function shadowed() {
   const __defers6 = []
   const name = 'outer'
   __defers6.push(Object.assign(() => log.push(name), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push($1)', [log, name]]
+    [Symbol.toComputation]: () => ['() => $0.push($1)', [log, name]]
   }));
   {
     const name = 'inner'
@@ -116,10 +121,10 @@ function conditional(flag) {
   let __dret12
   const __defers11 = []
   __defers11.push(Object.assign(() => log.push('always'), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(\'always\')', [log]]
+    [Symbol.toComputation]: () => ['() => $0.push(\'always\')', [log]]
   }));
   if (flag) __defers11.push(Object.assign(() => log.push('conditional'), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(\'conditional\')', [log]]
+    [Symbol.toComputation]: () => ['() => $0.push(\'conditional\')', [log]]
   }));
   return (__dret12 = 19 , __runDefers(__defers11) , __dret12)
 }
@@ -131,11 +136,11 @@ function nestedConditional(flag) {
   let __dret14
   const __defers13 = []
   __defers13.push(Object.assign(() => log.push('outer'), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(\'outer\')', [log]]
+    [Symbol.toComputation]: () => ['() => $0.push(\'outer\')', [log]]
   }));
   {
     if (flag) __defers13.push(Object.assign(() => log.push('conditional'), {
-      [Symbol.for('toComputation')]: () => ['() => $0.push(\'conditional\')', [log]]
+      [Symbol.toComputation]: () => ['() => $0.push(\'conditional\')', [log]]
     }));
   }
   return (__dret14 = 20 , __runDefers(__defers13) , __dret14)
@@ -148,13 +153,13 @@ function deferredReturn() {
   let __dret16
   const __defers15 = []
   __defers15.push(Object.assign(() => log.push('outer'), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(\'outer\')', [log]]
+    [Symbol.toComputation]: () => ['() => $0.push(\'outer\')', [log]]
   }));
   __defers15.push(Object.assign(() => {
     log.push('inner');
     return 
   }, {
-    [Symbol.for('toComputation')]: () => ['() => {\n  $0.push(\'inner\');\n  return \n}', [log]]
+    [Symbol.toComputation]: () => ['() => {\n  $0.push(\'inner\');\n  return \n}', [log]]
   }));
   return (__dret16 = 21 , __runDefers(__defers15) , __dret16)
 }
@@ -169,7 +174,7 @@ function deferredVar() {
     var value = 100
     log.push(`${value}`);
   }, {
-    [Symbol.for('toComputation')]: () => ['() => {\n  var value = 100\n  $0.push(`${value}`);\n}', [log]]
+    [Symbol.toComputation]: () => ['() => {\n  var value = 100\n  $0.push(`${value}`);\n}', [log]]
   }));
   return (__dret18 = value , __runDefers(__defers17) , __dret18)
 }
@@ -196,7 +201,7 @@ function shadowedCatch() {
   const __defers20 = []
   const name = 'outer'
   __defers20.push(Object.assign(() => log.push(name), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push($1)', [log, name]]
+    [Symbol.toComputation]: () => ['() => $0.push($1)', [log, name]]
   }));
   try {
     throw new Error('inner')
@@ -216,10 +221,10 @@ function mixedFinally() {
     __fdefers24.push(Object.assign(() => {
       log.push('finally');
     }, {
-      [Symbol.for('toComputation')]: () => ['() => {\n  $0.push(\'finally\');\n}', [log]]
+      [Symbol.toComputation]: () => ['() => {\n  $0.push(\'finally\');\n}', [log]]
     }));
     __defers22.push(Object.assign(() => log.push('plain'), {
-      [Symbol.for('toComputation')]: () => ['() => $0.push(\'plain\')', [log]]
+      [Symbol.toComputation]: () => ['() => $0.push(\'plain\')', [log]]
     }));
     {
       {
@@ -246,7 +251,7 @@ function finallyThrow() {
     __fdefers26.push(Object.assign(() => {
       log.push('finally');
     }, {
-      [Symbol.for('toComputation')]: () => ['() => {\n  $0.push(\'finally\');\n}', [log]]
+      [Symbol.toComputation]: () => ['() => {\n  $0.push(\'finally\');\n}', [log]]
     }));
     throw new Error('finally')
   } finally {
@@ -270,7 +275,7 @@ function shadowedEnum() {
   const __defers27 = []
   const value = 26
   __defers27.push(Object.assign(() => log.push(`${value}`), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(`${$1}`)', [log, value]]
+    [Symbol.toComputation]: () => ['() => $0.push(`${$1}`)', [log, value]]
   }));
   {
     const value = {
@@ -287,7 +292,7 @@ function overriddenReturn() {
   let __dret30
   const __defers29 = []
   __defers29.push(Object.assign(() => log.push('once'), {
-    [Symbol.for('toComputation')]: () => ['() => $0.push(\'once\')', [log]]
+    [Symbol.toComputation]: () => ['() => $0.push(\'once\')', [log]]
   }));
   try {
     return (__dret30 = 27 , __runDefers(__defers29) , __dret30)
@@ -308,7 +313,7 @@ function caughtCleanup() {
     log.push('cleanup');
     if (++c__attempts[0] === 1) throw new Error('cleanup')
   }, {
-    [Symbol.for('toComputation')]: () => ['() => {\n  $0.push(\'cleanup\');\n  if (++$1[0] === 1) throw new Error(\'cleanup\')\n}', [log, c__attempts], ['Error']]
+    [Symbol.toComputation]: () => ['() => {\n  $0.push(\'cleanup\');\n  if (++$1[0] === 1) throw new Error(\'cleanup\')\n}', [log, c__attempts], ['Error']]
   }));
   try {
     return (__dret32 = 29 , __runDefers(__defers31) , __dret32)
@@ -327,7 +332,7 @@ function deferredEval() {
   const __defers33 = []
   const label = 'outer'
   __defers33.push(Object.assign(() => eval("log.push(label)"), {
-    [Symbol.for('toComputation')]: () => ['() => eval("log.push(label)")', [], ['eval']]
+    [Symbol.toComputation]: () => ['() => eval("log.push(label)")', [], ['eval']]
   }));
   {
     const label = 'inner'
@@ -342,7 +347,7 @@ function deferredDeclaration() {
   let __dret36
   const __defers35 = []
   var value = Object.assign(() => 'outer', {
-    [Symbol.for('toComputation')]: () => ['() => \'outer\'', []]
+    [Symbol.toComputation]: () => ['() => \'outer\'', []]
   })
   __defers35.push(Object.assign(() => {
     function value() {
@@ -350,10 +355,10 @@ function deferredDeclaration() {
     }
     log.push(value());
   }, {
-    [Symbol.for('toComputation')]: () => ['() => {\n  function value() {\n    return \'inner\'\n  }\n  $0.push(value());\n}', [log]]
+    [Symbol.toComputation]: () => ['() => {\n  function value() {\n    return \'inner\'\n  }\n  $0.push(value());\n}', [log]]
   }));
   return (__dret36 = Object.assign(() => value(), {
-    [Symbol.for('toComputation')]: () => ['() => $0()', [value]]
+    [Symbol.toComputation]: () => ['() => $0()', [value]]
   }) , __runDefers(__defers35) , __dret36)
 }
 equal(deferredDeclaration()(), 'outer');
