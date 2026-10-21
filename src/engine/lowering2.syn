@@ -976,6 +976,7 @@ const SwappedCmp: Record<number, NodeOp> = {
 export interface LowerGraphOptions {
     target?: lowering.Target
     regBudget?: number
+    returnLocation?: number
     debug?: boolean
     clobbersOf?: (symbol: number) => Set<number> | undefined
     continues?: (symbol: number) => boolean
@@ -10401,6 +10402,7 @@ export interface SignatureHomes {
     argHome: (call: number, index: number) => number
     ret: number
     overflow: () => number
+    accepts: (value: number, register: number) => boolean
 }
 
 export function assignBlockSignatures(
@@ -10515,6 +10517,7 @@ export function assignBlockSignatures(
             const values = [...group, ...group.flatMap(p => arrivals.get(p) ?? [])]
             list = [...new Set([...homes.rank(homes.volatiles.filter(r => values.every(v => homes.safeFor(v).includes(r)))), ...homes.preserved])]
         } else list = [...homes.volatiles, ...homes.preserved]
+        list = list.filter(r => group.every(p => homes.accepts(p, r)))
         if (occupies.get(root)!.has(entry)) {
             const own = g.blocks[0].params.map((p, i) => group.includes(p) ? -1 : homes.arrival[i])
             list = list.filter(r => !own.includes(r))
@@ -11008,7 +11011,7 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
     function narrowed(k: number): Types {
         return k >= 0 && k <= 0xFFFF_FFFF ? Types.u32 : plain(k)
     }
-    function inRegister(n: GraphNode, i: number, value: boolean): Types | undefined {
+    function inRegister(id: number, n: GraphNode, i: number, value: boolean): Types | undefined {
         const k = getLiteral(g, n, i)
         if (BinaryOps.has(n.op) || CompareOps.has(n.op)) {
             if (i > 1) return
@@ -11031,9 +11034,13 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
         }
         if (n.op === NodeOp.select) {
             if (i === 0) return plain(k)
-            return value && !zeroOperand(g, target, n, i) ? plain(k) : undefined
+            if (!value || zeroOperand(g, target, n, i)) return
+            return floats.has(id) ? Types.f64 : plain(k)
         }
-        if (n.op === NodeOp.after) return i === countIds(n) - 1 && value ? plain(k) : undefined
+        if (n.op === NodeOp.after) {
+            if (i !== countIds(n) - 1 || !value) return
+            return floats.has(id) ? Types.f64 : plain(k)
+        }
     }
     for (const b of g.blocks) {
         const tails = new Set<number>()
@@ -11057,7 +11064,7 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
             const n = getNode(g, id)!
             for (let i = 0; i < countIds(n); i++) {
                 if (getRef(n, i)) continue
-                const T = inRegister(n, i, values.has(id))
+                const T = inRegister(id, n, i, values.has(id))
                 if (T === undefined) continue
                 const key = `${T}:${getLiteral(g, n, i)}`
                 let list = sites.get(key)
@@ -11071,7 +11078,7 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
             const T = Number(key.slice(0, key.indexOf(':'))) as Types
             const [first, slot] = list[0]
             const k = getLiteral(g, getNode(g, first)!, slot)
-            const scratch = list.length === 1 && lifts.get(first) === 1
+            const scratch = T !== Types.f64 && list.length === 1 && lifts.get(first) === 1
             const lifted = insertNode(g, makeNode(g, NodeOp.literal, [{ literal: k }], T, scratch ? gn.NodeFlags.scratch : gn.NodeFlags.none))
             for (const [id, i] of list) {
                 let ops = rewrites.get(id)
@@ -14027,6 +14034,12 @@ export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerG
     return lowerPrepared(prepareLowering(_g, opts), opts)
 }
 
+interface RegisterPools {
+    active: number[]
+    saved: number[]
+    scattered: number[]
+}
+
 export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOptions = {}): LowerGraphResult {
     const target = opts.target ?? lowering.hostTarget
     const { g, island, analysis } = prepared
@@ -14069,16 +14082,23 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (target.scratch.indexOf(r) >= 0) continue
         allocatable.push(r)
     }
-    const volatiles: number[] = allocatable.slice(0, budget === Infinity ? allocatable.length : budget)
-    // caller saved non-args first
-    const spread: number[] = []
-    for (const r of volatiles) if (target.argRegs.indexOf(r) < 0) spread.push(r)
-    for (const r of volatiles) if (target.argRegs.indexOf(r) >= 0) spread.push(r)
-    const preserved: number[] = []
-    for (const r of target.calleeSaved) {
-        if (preserved.length >= budget) continue
-        preserved.push(r)
+    const floatArgRegs = target.floatArgRegs ?? []
+    const accepts = (value: number, reg: number) => reg >= target.regCount || lowering.isFloatRegister(target, reg) === floats.has(value)
+    function bank(float: boolean): RegisterPools {
+        const mine = (r: number) => lowering.isFloatRegister(target, r) === float
+        const active = allocatable.filter(mine).slice(0, budget)
+        const saved = target.calleeSaved.filter(mine).slice(0, budget)
+        const args = float ? floatArgRegs : target.argRegs
+        const scattered = [...active.filter(r => args.indexOf(r) < 0), ...active.filter(r => args.indexOf(r) >= 0)]
+        return { active, saved, scattered }
     }
+    const integerPools = bank(false)
+    const floatPools = bank(true)
+    function poolsOf(value: number): RegisterPools {
+        return floats.has(value) ? floatPools : integerPools
+    }
+    const volatiles = [...integerPools.active, ...floatPools.active]
+    const preserved = [...integerPools.saved, ...floatPools.saved]
     const OPEN = 1 << 30
     const OUTGOING_ARGS = 1 << 29
     const INCOMING_ARGS = 1 << 28
@@ -14087,11 +14107,15 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     function isOutgoingArg(h: number): boolean { return h >= OUTGOING_ARGS && h < OPEN }
     function locate(locations: number[], count: number, regs: number[], stack: number): number[] {
         const homes: number[] = []
-        let positional = 0
+        let integer = 0
+        let float = 0
+        let stacked = 0
         for (let i = 0; i < count; i++) {
             const at = locations[i] ?? -1
             if (at >= 0) homes.push(at)
-            else homes.push(positional < regs.length ? regs[positional++] : stack + positional++ - regs.length)
+            else if (at === gn.floatLocation && float < floatArgRegs.length) homes.push(floatArgRegs[float++])
+            else if (at !== gn.floatLocation && integer < regs.length) homes.push(regs[integer++])
+            else homes.push(stack + stacked++)
         }
         return homes
     }
@@ -14100,6 +14124,16 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const fnType = t ? getNode(g, typeRefOf(t)) : undefined
         return fnType?.op === NodeOp.fnType ? gn.fnLocations(fnType) : []
     }
+    function returnHome(location: number): number {
+        if (location >= 0) return location
+        return location === gn.floatLocation ? target.floatRetRegs![0] : target.retRegs[0]
+    }
+    function callReturnHome(call: number): number {
+        const t = getNode(g, getRef(getNode(g, call)!, 1))
+        const fnType = t ? getNode(g, typeRefOf(t)) : undefined
+        return returnHome(fnType?.op === NodeOp.fnType ? gn.fnReturnLocation(fnType) : -1)
+    }
+    const RET = returnHome(opts.returnLocation ?? -1)
     const callHomes = new Map<number, number[]>()
     function argHomes(call: number): number[] {
         let homes = callHomes.get(call)
@@ -14131,7 +14165,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         let s = safeCache.get(v)
         if (s) return s
         const crossed = analysis.crossedCalls.get(v)
-        s = target.callerSaved.filter(r => volatiles.includes(r) && (!crossed || [...crossed].every(c => !clobberOfCall(c).has(r))))
+        s = target.callerSaved.filter(r => accepts(v, r) && volatiles.includes(r) && (!crossed || [...crossed].every(c => !clobberOfCall(c).has(r))))
         safeCache.set(v, s)
         return s
     }
@@ -14139,12 +14173,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     for (const [id, n] of g.nodes) if (n.op === NodeOp.call) for (const r of clobberOfCall(id)) inherited.add(r)
     const needAt = new Map<number, number>()
     for (const [v, calls] of analysis.crossedCalls) {
-        if (safeVolatiles(v).length) continue
+        if (floats.has(v) || safeVolatiles(v).length) continue
         for (const c of calls) needAt.set(c, (needAt.get(c) ?? 0) + 1)
     }
     let needed = 0
     for (const k of needAt.values()) needed = Math.max(needed, k)
-    const pairSlot = analysis.crossedCalls.size && needed % 2 === 0 && needed < preserved.length ? preserved[needed] : -1
+    const pairSlot = analysis.crossedCalls.size && needed % 2 === 0 && needed < integerPools.saved.length ? integerPools.saved[needed] : -1
     function rankHomes(safe: number[]): number[] {
         if (pairSlot < 0) return safe
         return [...safe.filter(r => inherited.has(r)), pairSlot, ...safe.filter(r => !inherited.has(r))]
@@ -14153,13 +14187,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const reusableSlots = new Set<number>()
     const signatures = assignBlockSignatures(g, acrossCall, analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, {
         volatiles, preserved, safeFor: safeVolatiles, rank: rankHomes,
-        arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: target.retRegs[0], overflow: () => takeSlot(),
+        arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: RET, overflow: () => takeSlot(), accepts,
     })
     const CALLEE = target.scratch[1]
     const SWAP = target.scratch[0]
     const SP = target.stackReg
     const LR = target.linkReg
-    const RET = target.retRegs[0]
     const usedPreserved = new Set<number>()
     let callsOut = false
     const tails = new Set<number>()
@@ -14245,9 +14278,13 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const written = new Set<number>()
     const localCalls = new Set<number>()
     function isScratch(r: number): boolean { return target.scratch.indexOf(r) >= 0 }
+    function homeable(id: number, home: number): void {
+        assert(!isScratch(home), `lowering: %${id} would live in scratch register ${home}, which assembler macros and scratch literals overwrite`)
+        assert(accepts(id, home), `lowering: %${id} would live in register ${home}, which belongs to the other register class`)
+    }
     function bind(id: number, reg: number): number {
         if (opts.debug) console.log('home +', id, reg, 'at', materializing, 'over', heldBy.get(reg) ?? '-')
-        assert(!isScratch(reg), `lowering: %${id} would live in scratch register ${reg}, which assembler macros and scratch literals overwrite`)
+        homeable(id, reg)
         written.add(reg)
         homeOf.set(id, reg)
         heldBy.set(reg, id)
@@ -14258,7 +14295,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         return reg
     }
     function place(id: number, home: number): void {
-        assert(!isScratch(home), `lowering: %${id} would live in scratch register ${home}, which assembler macros and scratch literals overwrite`)
+        homeable(id, home)
         if (isSlot(home)) reusableSlots.delete(home)
         homeOf.set(id, home)
         if (isSlot(home)) return
@@ -14372,31 +14409,39 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     }
     let pendingHomes: Set<number> = NOTHING
     function regFor(id: number, want: number): number {
+        const { active, saved, scattered } = poolsOf(id)
         let steering = false
         if (want < 0) {
             want = handedTo.get(id) ?? -1
             steering = want >= 0
             if (steering && sigStats) sigStats.steered++
         }
-        const first = acrossCall.has(id) ? preserved
-            : transient || avoidsArgRegs.has(id) ? spread : volatiles
-        const second = first === preserved ? volatiles : preserved
+        if (want >= 0 && !accepts(id, want)) want = -1
+        const first = acrossCall.has(id) ? saved
+            : transient || avoidsArgRegs.has(id) ? scattered : active
+        const second = first === saved ? active : saved
         if (want >= 0) {
             const willRelease = releases(id, heldBy.get(want) ?? 0)
-            if (!heldBy.has(want) && (first.indexOf(want) >= 0 || first !== preserved)) {
+            if (!heldBy.has(want) && (first.indexOf(want) >= 0 || first !== saved)) {
                 return bind(id, want)
             }
-            if (willRelease && (first.indexOf(want) >= 0 || first !== preserved)) {
+            if (willRelease && (first.indexOf(want) >= 0 || first !== saved)) {
                 return bind(id, want)
             }
         }
         if (steering && sigStats) sigStats.steerFailed++
-        if (first === preserved) {
-            if (want >= 0 && !heldBy.has(want) && safeVolatiles(id).includes(want)) return bind(id, want)
+        if (first === saved) {
+            if (want >= 0 && !heldBy.has(want) && safeVolatiles(id).includes(want)) {
+                return bind(id, want)
+            }
             const homes = currentRegion === rootRegion ? rankHomes(safeVolatiles(id)) : safeVolatiles(id)
-            for (const r of homes) if (!heldBy.has(r) && !pendingHomes.has(r)) return bind(id, r)
+            for (const r of homes) {
+                if (accepts(id, r) && !heldBy.has(r) && !pendingHomes.has(r)) {
+                    return bind(id, r)
+                }
+            }
         }
-        const pools = first === preserved ? [first] : [first, second]
+        const pools = first === saved ? [first] : [first, second]
         let r = unheldIn(pools, pendingHomes)
         if (r < 0) r = freeRegIn(pools, NOTHING)
         if (r < 0) r = freeRegIn([second], NOTHING)
@@ -14419,8 +14464,9 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 return bind(v, safe)
             }
         }
-        const first = acrossCall.has(v) && !stashed.has(v) ? preserved : volatiles
-        const second = first === preserved ? volatiles : preserved
+        const { active, saved } = poolsOf(v)
+        const first = acrossCall.has(v) && !stashed.has(v) ? saved : active
+        const second = first === saved ? active : saved
         const r = freeRegIn([first, second], avoid)
         if (r < 0) throw 'lowering: out of registers'
         transfer(r, home)
@@ -14895,11 +14941,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         }
         for (const s of open) {
             if (s.dst !== OPEN) continue
+            const { active, saved } = poolsOf(feeds.get(s) ?? 0)
             let r = -1
-            for (const c of volatiles) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
-            if (r < 0) for (const c of preserved) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
-            if (r < 0) for (const c of volatiles) if (!claimed.has(c)) { r = c; break }
-            if (r < 0) for (const c of preserved) if (!claimed.has(c)) { r = c; break }
+            for (const c of active) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
+            if (r < 0) for (const c of saved) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
+            if (r < 0) for (const c of active) if (!claimed.has(c)) { r = c; break }
+            if (r < 0) for (const c of saved) if (!claimed.has(c)) { r = c; break }
             if (r < 0) r = takeSlot()
             claimed.add(r)
             if (isPreserved(r)) {
@@ -15066,7 +15113,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 asm.br(reg)
             })
         }
-        const retRegs = syscall ? [target.syscall.retReg] : target.retRegs
+        const result = callReturnHome(id)
+        const retRegs = syscall ? [target.syscall.retReg] : result === target.retRegs[0] ? target.retRegs : [result]
         if (const projections = analysis.callProjections.get(id)) {
             for (const p of projections) {
                 buildCallProjection(p, retRegs)
@@ -15268,14 +15316,19 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     }
 
     function returnValue(site: number, id: number, konst: number): void {
-        if (!id) put(() => asm.movImm(RET, konst))
-        else {
-            const k = getNode(g, id)?.op === NodeOp.literal ? literalValue(g, getNode(g, id)!) : undefined
-            if (k !== undefined) {
-                put(() => asm.movImm(RET, k))
+        if (!id) {
+            noteWrite(RET)
+            put(() => asm.movImm(RET, konst))
+        } else {
+            const n = getNode(g, id)
+            if (n?.op === NodeOp.literal) {
+                const k = literalValue(g, n)
+                const float = typeOf(n) === Types.f64
+                noteWrite(RET)
+                put(() => float ? asm.movF64(RET, k) : asm.movImm(RET, k))
                 return jumpToExit()
             }
-            if (getNode(g, id)?.op === NodeOp.call && !done.has(id)) tails.add(id)
+            if (getNode(g, id)?.op === NodeOp.call && !done.has(id) && callReturnHome(id) === RET) tails.add(id)
             const v = demand(id, konst, RET)
             const src = v ? homeOf.get(v)! : undefined
             finish(site)
@@ -15385,7 +15438,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const last = ordering.length ? getRef(n, ordering[ordering.length - 1]) : 0
             const value = getNode(g, getRef(n, result))
             const returned = value?.op === NodeOp.ret && getRef(value, 0) === last
-            const tail = (value?.op === NodeOp.void || returned) && getNode(g, last)?.op === NodeOp.call && !done.has(last)
+            const tail = getNode(g, last)?.op === NodeOp.call && !done.has(last) && (value?.op === NodeOp.void || (returned && callReturnHome(last) === RET))
             if (tail) tails.add(last)
             const callee = getNode(g, last)?.op === NodeOp.call ? gn.localSymbol(g, getNode(g, getRef(getNode(g, last)!, 1))) : undefined
             if (value?.op === NodeOp.unreachable && ordering.length === 1 && callee !== undefined && opts.endless?.(callee) && !done.has(last)) noreturns.add(last)

@@ -20,7 +20,7 @@ import {
 import {
     addGraphBlock, cloneRefs, copyNode, countIds, countLiterals, createGraph, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, isThisParam, createThisParam, makeNode, type Operand, operandType, recordFields, type RecordField, resultType, setDebugLabel, setGraphBlocks, withNodes,
-    createFnType, fnLocations, fnReturn, paramLocation, type TypeOperand,
+    createFnType, floatLocation, fnLocations, fnReturn, fnReturnLocation, paramLocation, type TypeOperand,
     setRef, setType, typeOf, typeRefOf, typeSlots, NodeFlags, factOf, withFact, machineType,
     insertNode, newId,
     NodeOp,
@@ -30,7 +30,7 @@ import {
     withOperand, retypeNode, isNullishValue, nodeUsers,
     type NodeSpace,
 } from './graph-node'
-import { hostTarget, isSignedType, type Target } from './lowering'
+import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
 import type { CompiledSource } from './trace2'
 import { frameSize, sourcePosition, type EmitResult } from './bytecode-emitter'
@@ -1004,8 +1004,7 @@ interface NativeUnit {
     returnsFloat: boolean
 }
 
-function returnsFloat(graph: Graph): boolean {
-    const floats = floatValues(graph)
+function returnsFloat(graph: Graph, floats = floatValues(graph)): boolean {
     for (const n of graph.nodes.values()) {
         if (n.op !== NodeOp.ret) continue
         if (getRef(n, 0) ? floats.has(getRef(n, 0)) : !Number.isInteger(getLiteral(graph, n, 0))) return true
@@ -2240,11 +2239,11 @@ function callLocations(graph: Graph, call: number): number[] | undefined {
     return locations
 }
 
-function setCallLocations(graph: Graph, call: number, locations: number[]): void {
+function setCallLocations(graph: Graph, call: number, locations: number[], returnLocation?: number): void {
     const target = getRef(getNode(graph, call)!, 1)
     const n = getNode(graph, target)!
     const signature = getNode(graph, typeRefOf(n))
-    const fnType = insertNode(graph, createFnType(graph, signature?.op === NodeOp.fnType ? fnReturn(signature) : typeOf(n), locations))
+    const fnType = insertNode(graph, createFnType(graph, signature?.op === NodeOp.fnType ? fnReturn(signature) : typeOf(n), locations, returnLocation ?? (signature?.op === NodeOp.fnType ? fnReturnLocation(signature) : -1)))
     retypeNode(graph, target, { ref: fnType })
 }
 
@@ -3619,14 +3618,15 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
         }
     }
     const roots = new Set(program.roots.values())
+    const sites = programCallSites(program)
+    const free = new Set(freeCallees(program, sites))
+    const returnLocations = assignRegisterClasses(program, sites, free)
     const symbols = [...program.units.keys()]
     const callees = programCallees(program)
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
     const prepared = new Map<number, PreparedUnit>()
-    for (const symbol of symbols) prepared.set(symbol, clock.timed('lower', () => prepareUnit(program, symbol, roots.has(symbol)), program.units.get(symbol)!.name))
-    const sites = programCallSites(program)
-    const free = new Set(freeCallees(program, sites))
+    for (const symbol of symbols) prepared.set(symbol, clock.timed('lower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol)), program.units.get(symbol)!.name))
     const endless = new Set(symbols.filter(symbol => ![...prepared.get(symbol)!.prepared.g.nodes.values()].some(n => n.op === NodeOp.ret)))
     const continuations = new Set(symbols.filter(symbol => endless.has(symbol) && free.has(symbol) && sites.get(symbol)?.length === 1))
     nonvolatileArgs(program, prepared, continuations)
@@ -3672,9 +3672,10 @@ interface PreparedUnit {
     debug: boolean
     prepared: PreparedLowering
     returnsFloat: boolean
+    returnLocation?: number
 }
 
-function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean): PreparedUnit {
+function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, returnLocation?: number): PreparedUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
@@ -3693,18 +3694,39 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean): Pr
     const float = returnsFloat(graph)
     const prepared = prepareLowering(graph, { debug, target: program.target, poolSlot: value => image.constantSlot(value), poolValue: slot => image.knownValue(slot), floatSlot: value => image.floatSlot(value), staticData })
     if (flags.has('dump-lowerable')) console.log(`--- lowerable ${name} ---\n${dumpGraph(prepared.g)}`)
-    return { name, debug, prepared, returnsFloat: float }
+    return { name, debug, prepared, returnsFloat: float, returnLocation }
 }
 
 function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, clobbersOf: (symbol: number) => Set<number> | undefined, continues?: (symbol: number) => boolean, endless?: (symbol: number) => boolean): NativeUnit {
     const image = program.image
     const { name, debug, prepared } = unit
-    const code = lowerPrepared(prepared, { debug, target: program.target, clobbersOf, continues, endless, nameOf: callee => program.units.get(callee)?.name })
+    const code = lowerPrepared(prepared, { debug, target: program.target, returnLocation: unit.returnLocation, clobbersOf, continues, endless, nameOf: callee => program.units.get(callee)?.name })
     if (debug || flags.has('listings')) {
         console.log(`--- ${name} listing ---\n`, code.listing)
         if (code.island?.length) console.log(`--- ${name} island ---\n` + code.island.map((slot, i) => `  ${i}: pool[${slot}] ${image.labels.get(slot) ?? ''} = 0x${BigInt.asUintN(64, BigInt(image.values[slot])).toString(16)}`).join('\n'))
     }
     return { name, symbol, code, returnsFloat: unit.returnsFloat }
+}
+
+function assignRegisterClasses(program: ProgramGraph, sites: Map<number, [caller: number, call: number][]>, free: Set<number>): Map<number, number> {
+    const returns = new Map<number, number>()
+    if (!program.target.floatArgRegs?.length || !program.target.floatRetRegs?.length) return returns
+    for (const symbol of free) {
+        const graph = program.units.get(symbol)!
+        const floats = floatValues(graph)
+        const params = graph.blocks[0].params
+        const locations = params.map(p => floats.has(p) ? floatLocation : -1)
+        const returnLocation = returnsFloat(graph, floats) ? floatLocation : -1
+        if (returnLocation === -1 && !locations.includes(floatLocation)) continue
+        params.forEach((p, i) => {
+            const n = getNode(graph, p)!
+            intrinsics.assert(paramLocation(n) === -1, `native: ${graph.name} param %${p} is already located before register classes are assigned`)
+            if (locations[i] === floatLocation) putCopy(graph, p, n, [{ literal: floatLocation }])
+        })
+        if (returnLocation !== -1) returns.set(symbol, returnLocation)
+        for (const [caller, call] of sites.get(symbol) ?? []) setCallLocations(program.units.get(caller)!, call, locations, returnLocation)
+    }
+    return returns
 }
 
 function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>): void {
@@ -3760,6 +3782,7 @@ function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUn
         if (!calls?.length || !g) continue
         const params = g.blocks[0].params
         const locations = params.map(p => paramLocation(getNode(g, p)!))
+        const floats = floatValues(g)
         let changed = false
         params.forEach((p, i) => {
             const crossing = calls.every(([caller, call]) => {
@@ -3767,8 +3790,9 @@ function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUn
                 const value = getRef(getNode(unit.g, call)!, 3 + i)
                 return !!value && !!unit.analysis.crossedCalls.get(value)?.has(call) && entryIndex(caller, value) === i
             })
-            if (!crossing || i >= program.target.calleeSaved.length) return
-            locations[i] = program.target.calleeSaved[i]
+            const saved = program.target.calleeSaved.filter(r => isFloatRegister(program.target, r) === floats.has(p))
+            if (!crossing || i >= saved.length) return
+            locations[i] = saved[i]
             putCopy(g, p, getNode(g, p)!, [{ literal: locations[i] }])
             changed = true
         })

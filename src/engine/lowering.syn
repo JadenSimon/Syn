@@ -35,6 +35,8 @@ export interface Target {
     readonly name: string
     readonly argRegs: number[]     // physical regs holding the first N args
     readonly retRegs: number[]
+    readonly floatArgRegs?: number[]
+    readonly floatRetRegs?: number[]
     readonly zeroReg?: number
     readonly stackReg: number
     readonly linkReg?: number
@@ -46,12 +48,17 @@ export interface Target {
     readonly calleeSaved: number[]
     readonly syscall: SyscallConvention
     readonly regCount: number
+    readonly floatRegisterBase?: number
     readonly costs: TargetCosts
     takesImmediate(op: string, imm: number): boolean
     layoutFrame(shape: FrameShape): FrameLayout
     relocate(view: DataView, at: number, pc: bigint, kind: Relocation['kind'], address: bigint): void
     isMoveWide(word: number): boolean
     createAssembler(): Assembler
+}
+
+export function isFloatRegister(target: Target, reg: number): boolean {
+    return target.floatRegisterBase !== undefined && reg >= target.floatRegisterBase && reg < target.regCount
 }
 
 export interface TargetCosts {
@@ -163,11 +170,14 @@ function accessBytes(T: Ty): number {
 
 const XZR = 31
 const SP = 31 // same encoding, disambiguated by instruction
+const FP_BASE = 32
+const REGISTERS = 64
 
 // condition codes
 const COND_EQ = 0, COND_NE = 1, COND_HS = 2, COND_LO = 3
 const COND_HI = 8, COND_LS = 9, COND_GE = 10, COND_LT = 11
 const COND_GT = 12, COND_LE = 13
+const COND_MI = 4, COND_VS = 6, COND_VC = 7
 
 const CondNames: Record<number, string> = {
     0: 'eq', 1: 'ne', 2: 'hs', 3: 'lo', 4: 'mi', 5: 'pl', 6: 'vs', 7: 'vc',
@@ -250,6 +260,10 @@ interface AsmItem {
     extractSourceBits?: number
     bfmDst?: number
     bfmSrc?: number
+    reads?: number[]
+    writes?: number[]
+    memory?: boolean
+    copies?: boolean
 }
 
 interface BitField {
@@ -397,7 +411,25 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         push({ kind: 'cset', word: word >>> 0, text: asm, label: -1, reg: dst, cond })
     }
 
+    function emitFloatZero(reg: number): void {
+        emitCmp(0x1E602008 | (fp(reg) << 5), `fcmp ${dreg(reg)}, #0`, { writes: [], reads: [reg] })
+    }
+
+    function floatBranch(reg: number, label: number, nonzero: boolean): void {
+        emitFloatZero(reg)
+        for (const cond of nonzero ? [COND_GT, COND_MI] : [COND_EQ, COND_VS]) {
+            push({ kind: 'bcond', word: 0, text: '', label, reg: -1, cond })
+        }
+    }
+
     function emitCmpZero(reg: number): void {
+        if (isFloat(reg)) {
+            emitFloatZero(reg)
+            cset(scratchA, COND_VC)
+            floatInsn(0x9A800000 | (XZR << 16) | (COND_NE << 12) | (scratchA << 5) | scratchA,
+                `csel ${x(scratchA)}, ${x(scratchA)}, xzr, ne`, [scratchA], [scratchA])
+            return emitCmpZero(scratchA)
+        }
         push({
             kind: 'insn', word: (0xF1000000 | (reg << 5) | XZR) >>> 0,
             text: `cmp ${x(reg)}, #0`, label: -1, reg: -1, cond: -1, cmpZeroReg: reg,
@@ -421,6 +453,14 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
             loadBase: base, loadOffset: offset, loadBytes: bytes,
         })
+    }
+
+    function accessesMemory(it: AsmItem): boolean {
+        return !!it.memory || it.loadBase !== undefined || it.storeBase !== undefined || it.indexBase !== undefined
+    }
+
+    function writesRegister(it: AsmItem, reg: number): boolean {
+        return it.writes ? it.writes.includes(reg) : (it.word & 31) === reg
     }
 
     function isBranch(kind: string): boolean {
@@ -538,9 +578,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function peephole(): void {
         const values: number[] = []
-        let fresh = 32
+        let fresh = REGISTERS
         function resetMoves(): void {
-            for (let r = 0; r < 32; r++) values[r] = r
+            for (let r = 0; r < REGISTERS; r++) values[r] = r
         }
         resetMoves()
         const constants = new Map<number, number>()
@@ -567,6 +607,15 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         for (let i = 0; i < items.length; i++) {
             const it = items[i]
             if (straight(i)) continue
+            if (it.copies) {
+                const value = values[it.reads![0]]
+                if (values[it.writes![0]] === value) {
+                    items.splice(i--, 1)
+                    continue
+                }
+                values[it.writes![0]] = value
+                continue
+            }
             if (it.moveDst === undefined) {
                 defs.length = 0
                 if (it.kind === 'cbz' || it.kind === 'cbnz' || it.kind === 'bcond') continue
@@ -601,7 +650,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     memory.set(plain, v)
                     continue
                 }
-                if (it.storeBase !== undefined || it.indexBase !== undefined) memory.clear()
+                if (it.memory || it.storeBase !== undefined || it.indexBase !== undefined) memory.clear()
                 if (itemDefs(it, defs)) { for (const d of defs) values[d] = fresh++; continue }
                 resetMoves()
                 memory.clear()
@@ -641,7 +690,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     continue
                 }
                 if (load ? nx.loadBase !== undefined : nx.storeBase !== undefined) return j
-                if (nx.kind !== 'insn' || nx.loadBase !== undefined || nx.storeBase !== undefined || nx.indexBase !== undefined) return -1
+                if (nx.kind !== 'insn' || accessesMemory(nx)) return -1
                 defs.length = 0
                 uses.length = 0
                 if (!itemDefs(nx, defs) || !itemUses(nx, uses)) return -1
@@ -856,7 +905,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                         while (j < items.length && items[j].adjustReg !== base0) {
                             const nx = items[j]
                             if (nx.kind === 'label' && !branchTarget(nx.label)) { j++; continue }
-                            if (nx.kind !== 'insn' || nx.loadBase !== undefined || nx.storeBase !== undefined || nx.indexBase !== undefined) break
+                            if (nx.kind !== 'insn' || accessesMemory(nx)) break
                             defs.length = 0
                             uses.length = 0
                             if (!itemDefs(nx, defs) || !itemUses(nx, uses) || defs.includes(base0!) || uses.includes(base0!)) break
@@ -910,8 +959,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     && (items[i + 1].cselCond === COND_NE || items[i + 1].cselCond === COND_EQ)) {
                     const reg = it.cmpZeroReg
                     let k = i - 1
-                    while (k >= 0 && items[k].kind === 'insn' && !items[k].setsFlags
-                        && (items[k].word & 31) !== reg) k--
+                    while (k >= 0 && items[k].kind === 'insn' && !items[k].setsFlags && !writesRegister(items[k], reg)) k--
                     if (k >= 0 && items[k].kind === 'cset' && items[k].reg === reg) {
                         const sel = items[i + 1]
                         const cc = sel.cselCond === COND_NE ? items[k].cond : items[k].cond ^ 1
@@ -1300,7 +1348,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (it.literalDelta !== undefined) {
                 const delta = it.literalDelta - at * 4
                 if (delta % 4 || delta < -(1 << 20) || delta >= (1 << 20)) throw `aarch64: literal ${it.literalDelta} out of range at ${at * 4}`
-                it.word = (0x58000000 | (((delta >> 2) & 0x7FFFF) << 5) | it.reg) >>> 0
+                it.word = literalLoad(it.reg, delta >> 2)
             }
             if (isBranch(it.kind)) {
                 const target = addrOf.get(it.label)
@@ -1609,6 +1657,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function movImm(dst: number, value: number, narrow = false): void {
+        if (isFloat(dst)) {
+            if (value === 0) return mov(dst, XZR)
+            movImm(scratchA, value, narrow)
+            return mov(dst, scratchA)
+        }
         if (narrow) return movImm32(dst, value)
         let v = value
         if (v < 0) v = v >>> 0 === 0 ? 0 : (v >>> 0) // fall through to 32-bit two's complement
@@ -1663,8 +1716,25 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
     }
 
+    function isFloat(r: number): boolean { return r >= FP_BASE && r < REGISTERS }
+    function fp(r: number): number { return r - FP_BASE }
+    function dreg(r: number): string { return isFloat(r) ? `d${fp(r)}` : badRegister(r) }
+    function encoded(r: number): number { return isFloat(r) ? fp(r) : r }
+    function literalLoad(reg: number, words: number): number {
+        return ((isFloat(reg) ? 0x5C000000 : 0x58000000) | ((words & 0x7FFFF) << 5) | encoded(reg)) >>> 0
+    }
+    function floatInsn(word: number, text: string, writes: number[], reads: number[], memory = false): void {
+        emit(word, text, { writes, reads, memory })
+    }
+    function floatMove(word: number, text: string, dst: number, src: number): void {
+        emit(word, text, { writes: [dst], reads: [src], copies: true })
+    }
     function mov(dst: number, src: number): void {
-        if (dst !== src) push(moveItem(dst, src))
+        if (dst === src) return
+        if (isFloat(dst) && isFloat(src)) floatMove(0x1E604000 | (fp(src) << 5) | fp(dst), `fmov ${dreg(dst)}, ${dreg(src)}`, dst, src)
+        else if (isFloat(dst)) floatMove(0x9E670000 | (src << 5) | fp(dst), `fmov ${dreg(dst)}, ${x(src)}`, dst, src)
+        else if (isFloat(src)) floatMove(0x9E660000 | (fp(src) << 5) | dst, `fmov ${x(dst)}, ${dreg(src)}`, dst, src)
+        else push(moveItem(dst, src))
     }
 
     let macroLabel = 1 << 30
@@ -1870,14 +1940,23 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             `crc32${suffix} ${w(dst)}, ${w(seed)}, ${keyName}`)
     }
 
-    const fpA = 16
-    const fpB = 17
-
-    function dreg(r: number): string {
-        return `d${r}`
-    }
+    const fpA = FP_BASE + 16
+    const fpB = FP_BASE + 17
 
     function movF64(dst: number, value: number): void {
+        if (isFloat(dst)) {
+            if (value === 0 && 1 / value > 0) return mov(dst, XZR)
+            const exponent = Math.floor(Math.log2(Math.abs(value)))
+            const fraction = (Math.abs(value) / 2 ** exponent - 1) * 16
+            if (exponent >= -3 && exponent <= 4 && Number.isInteger(fraction) && fraction >= 0 && fraction < 16) {
+                const imm = (value < 0 ? 128 : 0) | (exponent < 1 ? 64 : 0) | (((exponent + 3) & 3) << 4) | fraction
+                floatInsn(0x1E601000 | (imm << 13) | fp(dst), `fmov ${dreg(dst)}, #${value}`, [dst], [])
+                return
+            }
+            movF64(scratchA, value)
+            mov(dst, scratchA)
+            return
+        }
         const bits = new BigUint64Array(new Float64Array([value]).buffer)[0]
         let first = true
         for (let i = 0; i < 4; i++) {
@@ -1890,33 +1969,17 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (first) movz(dst, 0, 0)
     }
 
-    function toFloat(fp: number, src: number, from: Ty): void {
+    function toFloat(temp: number, src: number, from: Ty): number {
         if (from === Types.f64) {
-            if (holdsFloat(fp, src)) return
-            emit(0x9E670000 | (src << 5) | fp, `fmov ${dreg(fp)}, ${x(src)}`)
-            return
+            if (isFloat(src)) return src
+            mov(temp, src)
+        } else {
+            const wide = accessBytes(from) === 8
+            const signed = isSignedType(from)
+            floatInsn((wide ? 0x9E620000 : 0x1E620000) | (signed ? 0 : 0x10000) | (src << 5) | fp(temp),
+                `${signed ? 'scvtf' : 'ucvtf'} ${dreg(temp)}, ${wide ? x(src) : w(src)}`, [temp], [src])
         }
-        const wide = accessBytes(from) === 8
-        const signed = isSignedType(from)
-        emit((wide ? 0x9E620000 : 0x1E620000) | (signed ? 0 : 0x10000) | (src << 5) | fp,
-            `${signed ? 'scvtf' : 'ucvtf'} ${dreg(fp)}, ${wide ? x(src) : w(src)}`)
-    }
-
-    function holdsFloat(fp: number, src: number): boolean {
-        const copy = (0x9E660000 | (fp << 5) | src) >>> 0
-        const floor = Math.max(0, items.length - 8)
-        for (let at = items.length - 1; at >= floor; at--) {
-            const it = items[at]
-            if (it.word === copy && it.kind === 'insn') return true
-            const defs: number[] = []
-            const uses: number[] = []
-            if (!itemDefs(it, defs) || !itemUses(it, uses) || defs.includes(src)) return false
-        }
-        return false
-    }
-
-    function fromFloat(dst: number, fp: number): void {
-        emit(0x9E660000 | (fp << 5) | dst, `fmov ${x(dst)}, ${dreg(fp)}`)
+        return temp
     }
 
     const FloatOps: Record<string, [word: number, name: string]> = {
@@ -1926,41 +1989,43 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     function floatBinary(op: string, dst: number, a: number, b: number, from: [Ty, Ty]): void {
         const fop = FloatOps[op]
         if (!fop) throw `aarch64: unsupported f64 op '${op}'`
-        toFloat(fpA, a, from[0])
-        toFloat(fpB, b, from[1])
-        emit(fop[0] | (fpB << 16) | (fpA << 5) | fpA, `${fop[1]} ${dreg(fpA)}, ${dreg(fpA)}, ${dreg(fpB)}`)
-        fromFloat(dst, fpA)
+        const left = toFloat(fpA, a, from[0])
+        const right = toFloat(fpB, b, from[1])
+        const result = isFloat(dst) ? dst : fpA
+        floatInsn(fop[0] | (fp(right) << 16) | (fp(left) << 5) | fp(result),
+            `${fop[1]} ${dreg(result)}, ${dreg(left)}, ${dreg(right)}`, [result], [left, right])
+        if (result !== dst) mov(dst, result)
     }
 
-    const FloatConds: Record<string, number> = { eq: COND_EQ, ne: COND_NE, lt: 4, le: COND_LS, gt: COND_GT, ge: COND_GE }
+    const FloatConds: Record<string, number> = { eq: COND_EQ, ne: COND_NE, lt: COND_MI, le: COND_LS, gt: COND_GT, ge: COND_GE }
 
     function floatCompare(op: string, dst: number, a: number, b: number, from: [Ty, Ty]): void {
         const cond = FloatConds[op]
         if (cond === undefined) throw `aarch64: unsupported f64 compare '${op}'`
-        toFloat(fpA, a, from[0])
-        toFloat(fpB, b, from[1])
-        emitCmp(0x1E602000 | (fpB << 16) | (fpA << 5), `fcmp ${dreg(fpA)}, ${dreg(fpB)}`)
+        const left = toFloat(fpA, a, from[0])
+        const right = toFloat(fpB, b, from[1])
+        emitCmp(0x1E602000 | (fp(right) << 16) | (fp(left) << 5), `fcmp ${dreg(left)}, ${dreg(right)}`, { writes: [], reads: [left, right] })
         cset(dst, cond)
     }
 
     function floatNeg(dst: number, a: number): void {
-        toFloat(fpA, a, Types.f64)
-        emit(0x1E614000 | (fpA << 5) | fpA, `fneg ${dreg(fpA)}, ${dreg(fpA)}`)
-        fromFloat(dst, fpA)
+        const src = toFloat(fpA, a, Types.f64)
+        const result = isFloat(dst) ? dst : fpA
+        floatInsn(0x1E614000 | (fp(src) << 5) | fp(result), `fneg ${dreg(result)}, ${dreg(src)}`, [result], [src])
+        if (result !== dst) mov(dst, result)
     }
 
     function convertFloat(dst: number, src: number, from: Ty, to: Ty): void {
         if (from === to) return mov(dst, src)
         if (to === Types.f64) {
-            toFloat(fpA, src, from)
-            fromFloat(dst, fpA)
-            return
+            const result = toFloat(isFloat(dst) ? dst : fpA, src, from)
+            return mov(dst, result)
         }
-        toFloat(fpA, src, Types.f64)
+        const value = toFloat(fpA, src, Types.f64)
         const wide = accessBytes(to) === 8
         const signed = isSignedType(to)
-        emit((wide ? 0x9E780000 : 0x1E780000) | (signed ? 0 : 0x10000) | (fpA << 5) | dst,
-            `${signed ? 'fcvtzs' : 'fcvtzu'} ${wide ? x(dst) : w(dst)}, ${dreg(fpA)}`)
+        floatInsn((wide ? 0x9E780000 : 0x1E780000) | (signed ? 0 : 0x10000) | (fp(value) << 5) | dst,
+            `${signed ? 'fcvtzs' : 'fcvtzu'} ${wide ? x(dst) : w(dst)}, ${dreg(value)}`, [dst], [value])
     }
 
     function redundantU32(src: number): boolean {
@@ -2001,7 +2066,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const [d, a, b] = sel.cselRegs!
         sel.word = ((sel.word & ~(0xF << 12)) | (cond << 12)) >>> 0
         sel.cselCond = cond
-        if (!sel.cselIncrements) sel.text = `csel ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
+        if (isFloat(d)) sel.text = `fcsel ${dreg(d)}, ${dreg(a)}, ${dreg(b)}, ${CondNames[cond]}`
+        else if (!sel.cselIncrements) sel.text = `csel ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
         else if (a === b) sel.text = `cinc ${x(d)}, ${x(a)}, ${CondNames[cond ^ 1]}`
         else sel.text = `csinc ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
     }
@@ -2093,6 +2159,14 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function select(dst: number, cond: number, a: number, b: number): void {
+        if (isFloat(dst)) {
+            const left = toFloat(fpA, a, Types.f64)
+            const right = toFloat(fpB, b, Types.f64)
+            emitCmpZero(cond)
+            emit(0x1E600C00 | (fp(right) << 16) | (COND_NE << 12) | (fp(left) << 5) | fp(dst), `fcsel ${dreg(dst)}, ${dreg(left)}, ${dreg(right)}, ne`,
+                { writes: [dst], reads: [left, right], cselCond: COND_NE, cselRegs: [dst, left, right] })
+            return
+        }
         emitCmpZero(cond)
         // tagged so the peephole can retarget the condition instead of decoding it
         // back out of the encoding
@@ -2103,7 +2177,27 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         })
     }
 
+    function floatMemory(load: boolean, reg: number, address: number, offset: number): void {
+        let word: number
+        let op: string
+        if (fitsScaled(offset, 8)) {
+            word = (load ? 0xFD400000 : 0xFD000000) | ((offset / 8) << 10)
+            op = load ? 'ldr' : 'str'
+        } else if (fitsUnscaled(offset)) {
+            word = (load ? 0xFC400000 : 0xFC000000) | ((offset & 0x1FF) << 12)
+            op = load ? 'ldur' : 'stur'
+        } else {
+            assert(address !== scratchA, 'aarch64: a far FP load or store forms its address in x16, so its base cannot live there')
+            movImm(scratchA, offset)
+            shiftedReg(0x8B000000, 'add', scratchA, address, scratchA)
+            return floatMemory(load, reg, scratchA, 0)
+        }
+        floatInsn(word | (address << 5) | fp(reg), `${op} ${dreg(reg)}, [${base(address)}, #${offset}]`,
+            load ? [reg] : [], load ? [address] : [address, reg], true)
+    }
+
     function load(dst: number, base: number, offset: number, T: Ty): void {
+        if (isFloat(dst)) return floatMemory(true, dst, base, offset)
         const bytes = accessBytes(T)
         const signed = isSignedType(T)
         if (fitsScaled(offset, bytes)) {
@@ -2132,9 +2226,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const t = item.reg
         const n = item.indexBase!
         const m = item.indexReg!
-        item.word = (0x38206800 | (size << 30) | (opc << 22) | (m << 16) | ((shifted ? 1 : 0) << 12)
-            | (n << 5) | t) >>> 0
-        item.text = `${name} ${bytes === 8 || signed ? x(t) : w(t)}, [${base(n)}, ${x(m)}${shifted ? `, lsl #${size}` : ''}]`
+        item.word = (0x38206800 | (isFloat(t) ? 0x04000000 : 0) | (size << 30) | (opc << 22) | (m << 16) | ((shifted ? 1 : 0) << 12)
+            | (n << 5) | encoded(t)) >>> 0
+        item.text = `${name} ${isFloat(t) ? dreg(t) : bytes === 8 || signed ? x(t) : w(t)}, [${base(n)}, ${x(m)}${shifted ? `, lsl #${size}` : ''}]`
     }
 
     function indexed(load: boolean, t: number, n: number, m: number, T: Ty): void {
@@ -2147,6 +2241,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function store(base: number, offset: number, src: number, T: Ty): void {
+        if (isFloat(src)) return floatMemory(false, src, base, offset)
         const bytes = accessBytes(T)
         if (fitsScaled(offset, bytes)) {
             strUnsigned(src, base, offset, bytes)
@@ -2165,6 +2260,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function itemDefs(item: AsmItem, out: number[]): boolean {
         if (item.kind !== 'insn') return false
+        if (item.writes) { out.push(...item.writes); return true }
         if (item.literalDelta !== undefined) { out.push(item.reg); return true }
         if (item.shiftDst !== undefined) { out.push(item.shiftDst); return true }
         if (item.addDst !== undefined) { out.push(item.addDst); return true }
@@ -2190,6 +2286,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
     function itemUses(item: AsmItem, out: number[]): boolean {
         if (item.kind !== 'insn') return false
+        if (item.reads) { out.push(...item.reads); return true }
         if (item.literalDelta !== undefined) return true
         if (item.shiftSrc !== undefined) { out.push(item.shiftSrc); return true }
         if (item.addLeft !== undefined) {
@@ -2234,7 +2331,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     function canReorderOver(item: AsmItem): boolean {
         const defs: number[] = []
         const uses: number[] = []
-        return itemDefs(item, defs) && itemUses(item, uses)
+        return !item.memory && itemDefs(item, defs) && itemUses(item, uses)
     }
     function indexScale(mem: AsmItem): number {
         const bytes = mem.indexBytes ?? 1
@@ -2438,8 +2535,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const twin = items[target + 1]
             if (!twin || twin.word !== moved.word || moved.kind !== 'insn' || twin.kind !== 'insn') continue
             if (twin.relocationKind !== undefined || twin.literalDelta !== undefined) continue
-            if (moved.setsFlags || moved.clobbers || moved.relocationKind !== undefined || moved.literalDelta !== undefined
-                || moved.loadBase !== undefined || moved.storeBase !== undefined || moved.indexBase !== undefined) continue
+            if (accessesMemory(moved) || moved.setsFlags || moved.clobbers || moved.relocationKind !== undefined || moved.literalDelta !== undefined) continue
             const defs: number[] = []
             if (!itemDefs(moved, defs) || (branch.kind !== 'bcond' && defs.includes(branch.reg))) continue
             items.splice(target! + 1, 1)
@@ -2457,8 +2553,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (branch.kind !== 'bcond' && branch.kind !== 'cbz' && branch.kind !== 'cbnz') continue
             if (jump.kind !== 'b' || label.kind !== 'label' || label.label !== branch.label) continue
             if (branch.kind === 'bcond' && branch.cond >= 14) continue
-            if (moved.kind !== 'insn' || moved.setsFlags || moved.clobbers || moved.relocationKind !== undefined
-                || moved.loadBase !== undefined || moved.storeBase !== undefined || moved.indexBase !== undefined) continue
+            if (moved.kind !== 'insn' || moved.setsFlags || moved.clobbers || moved.relocationKind !== undefined || accessesMemory(moved)) continue
             const defs: number[] = []
             if (!itemDefs(moved, defs) || defs.length !== 1) continue
             const r = defs[0]
@@ -3423,9 +3518,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
         },
         jumpIfNonZero: (reg, id) => {
+            if (isFloat(reg)) return floatBranch(reg, id, true)
             push({ kind: 'cbnz', word: 0, text: '', label: id, reg, cond: -1 })
         },
         jumpIfZero: (reg, id) => {
+            if (isFloat(reg)) return floatBranch(reg, id, false)
             push({ kind: 'cbz', word: 0, text: '', label: id, reg, cond: -1 })
         },
         br: (reg: number) => emit(0xD61F0000 | (reg << 5), `br x${reg}`, { clobbers: true }),
@@ -3433,8 +3530,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         loadLiteral: (dst: number, delta: number, debugName?: string) => {
             const name = debugName ? ` ${debugName}` : ''
             push({
-                kind: 'insn', word: (0x58000000 | (((delta >> 3) & 0x7FFFF) << 5) | dst) >>> 0,
-                text: `ldr ${x(dst)}, entry${delta}${name}`, label: -1, reg: dst, cond: -1, literalDelta: delta,
+                kind: 'insn', word: literalLoad(dst, delta >> 3),
+                text: `ldr ${isFloat(dst) ? dreg(dst) : x(dst)}, entry${delta}${name}`, label: -1, reg: dst, cond: -1, literalDelta: delta,
             })
         },
         loadPool: (dst: number, slot: number, debugName?: string) => {
@@ -3574,17 +3671,20 @@ export const aarch64Darwin: Target = {
     argRegs: [0, 1, 2, 3, 4, 5, 6, 7],
     // x8 is also a ret reg but is used to hold an addr for a struct, provided by the caller
     retRegs: [0, 1, 2, 3, 4, 5, 6, 7],
+    floatArgRegs: [32, 33, 34, 35, 36, 37, 38, 39],
+    floatRetRegs: [32, 33, 34, 35, 36, 37, 38, 39],
     zeroReg: 31,
     stackReg: SP,
     linkReg: 30,
     indirectContextReg: 15,
-    allocatable: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
-    scratch: [16, 17], // ip0/ip1, used for immediates and rem
-    volatiles: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 30],
-    callerSaved: [9, 10, 11, 12, 13, 14, 15],
-    calleeSaved: [19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+    allocatable: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+    scratch: [16, 17, 48, 49], // x16/x17 and d16/d17, used by assembler macros
+    volatiles: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 30, 32, 33, 34, 35, 36, 37, 38, 39, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+    callerSaved: [9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+    calleeSaved: [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 44, 45, 46, 47],
     syscall: aarch64DarwinSyscall,
-    regCount: 32,
+    regCount: REGISTERS,
+    floatRegisterBase: FP_BASE,
     costs: {
         inlineLiteral: 0x10000,
         writebackStride: 255,
