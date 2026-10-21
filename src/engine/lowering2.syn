@@ -8,7 +8,7 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots } from './verify'
+import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots, verifyTailEffects } from './verify'
 import {
     addGraphBlock, blockOrder, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -1545,6 +1545,217 @@ function outlinePanics(g: Graph): Graph {
     return g
 }
 
+const Unspeculatable = new Set<NodeOp>([NodeOp.call, NodeOp.store, NodeOp.rt, NodeOp.inlined])
+
+interface BranchingSelect {
+    select: number
+    owner: number
+    slot: number
+    users: [user: number, slot: number][]
+}
+
+function tailEdge(n: GraphNode, i: number): boolean {
+    if (n.op === NodeOp.after) return i === countIds(n) - 1
+    if (n.op === NodeOp.select) return i > 0
+    return n.op === NodeOp.inlined && i === 0
+}
+
+interface ArmRegions {
+    parent: number[]
+    owner: number[]
+    slotOf: number[]
+    regionOf: Map<number, number>
+}
+
+function armRegions(g: Graph, order: number[]): ArmRegions {
+    const parent: number[] = [-1]
+    const depth: number[] = [0]
+    const owner: number[] = [0]
+    const slotOf: number[] = [0]
+    const contexts = new Map<number, number>()
+    const regionOf = new Map<number, number>()
+    if (order.length) regionOf.set(order[order.length - 1], 0)
+    function context(of: number, id: number, i: number): number {
+        const key = id * 64 + i
+        const known = contexts.get(key)
+        if (known !== undefined) return known
+        const c = parent.length
+        parent.push(of)
+        depth.push(depth[of] + 1)
+        owner.push(id)
+        slotOf.push(i)
+        contexts.set(key, c)
+        return c
+    }
+    function lca(x: number, y: number): number {
+        while (depth[x] > depth[y]) x = parent[x]
+        while (depth[y] > depth[x]) y = parent[y]
+        while (x !== y) {
+            x = parent[x]
+            y = parent[y]
+        }
+        return x
+    }
+    for (let k = order.length - 1; k >= 0; k--) {
+        const id = order[k]
+        const n = getNode(g, id)
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        const c = regionOf.get(id)!
+        for (let i = 0; i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (!x) continue
+            const nested = (n.op === NodeOp.select && i > 0) || (n.op === NodeOp.inlined && i === 0)
+            const edge = nested ? context(c, id, i) : c
+            const prev = regionOf.get(x)
+            regionOf.set(x, prev === undefined ? edge : lca(prev, edge))
+        }
+    }
+    return { parent, owner, slotOf, regionOf }
+}
+
+interface TailEffects {
+    order: number[]
+    tail: Map<number, boolean>
+    regions: ArmRegions
+    effectful: Set<number>
+}
+
+function tailEffects(g: Graph, b: GraphBlock): TailEffects | undefined {
+    const order = blockOrder(g, b)
+    const tail = new Map<number, boolean>()
+    tail.set(b.bodyId, true)
+    let offTail = false
+    let effects = false
+    for (let k = order.length - 1; k >= 0; k--) {
+        const id = order[k]
+        const n = getNode(g, id)
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        if (Unspeculatable.has(n.op)) effects = true
+        const on = tail.get(id) === true || n.op === NodeOp.inlined
+        if (n.op === NodeOp.select && !tail.get(id)) offTail = true
+        for (let i = 0; i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (!x) continue
+            tail.set(x, (tail.get(x) ?? true) && on && tailEdge(n, i))
+        }
+    }
+    if (!offTail || !effects) return
+
+    const regions = armRegions(g, order)
+    const { parent, owner, regionOf } = regions
+
+    const marked = new Uint8Array(parent.length)
+    const effectful = new Set<number>()
+    for (const id of order) {
+        const n = getNode(g, id)
+        if (!n || !Unspeculatable.has(n.op)) continue
+        let c = regionOf.get(id)!
+        while (c > 0 && !marked[c]) {
+            marked[c] = 1
+            if (getNode(g, owner[c])!.op === NodeOp.select) effectful.add(owner[c])
+            c = parent[c]
+        }
+    }
+    if (!effectful.size) return
+    return { order, tail, regions, effectful }
+}
+
+function branchingSelects(g: Graph, b: GraphBlock): BranchingSelect[] {
+    const effects = tailEffects(g, b)
+    if (!effects) return []
+    const { order, tail, effectful } = effects
+    const { owner, slotOf, regionOf } = effects.regions
+    const chosen = new Map<number, BranchingSelect>()
+    const bySelect = new Map<number, BranchingSelect>()
+    for (const id of order) {
+        if (!effectful.has(id) || tail.get(id)) continue
+        const c = regionOf.get(id)!
+        if (chosen.has(c)) continue
+        const home = c ? getNode(g, owner[c])! : undefined
+        if (home?.op === NodeOp.select && !tail.get(owner[c])) continue
+        const found: BranchingSelect = { select: id, owner: c ? owner[c] : 0, slot: c ? slotOf[c] : 0, users: [] }
+        chosen.set(c, found)
+        bySelect.set(id, found)
+    }
+    for (const id of order) {
+        const n = getNode(g, id)
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        for (let i = 0; i < countIds(n); i++) {
+            const found = bySelect.get(getRef(n, i))
+            if (found) found.users.push([id, i])
+        }
+    }
+    return [...chosen.values()]
+}
+
+function effectfulSelects(g: Graph): [effectful: Set<number>, offTail: number[]] {
+    const all = new Set<number>()
+    const offTail: number[] = []
+    for (const b of g.blocks) {
+        const effects = tailEffects(g, b)
+        if (!effects) continue
+        for (const id of effects.effectful) {
+            all.add(id)
+            if (!effects.tail.get(id)) offTail.push(id)
+        }
+    }
+    return [all, offTail]
+}
+
+function splitAtSelect(g: Graph, b: GraphBlock, c: BranchingSelect): GraphBlock {
+    const s = getNode(g, c.select)!
+    const operands = getOperands(g, s)
+    const type = valueType(g, s)
+    const blockId = addNode(g, NodeOp.block, [])
+    const token = addNode(g, NodeOp.nilEffect, [blockId])
+    for (const [u, i] of c.users) {
+        const n = getNode(g, u)!
+        if (i >= firstNonOrderingSlot(n)) continue
+        putCopy(g, u, n, withOperand(g, n, i, token))
+    }
+    const arms: Operand[] = [operands[0]]
+    for (let i = 1; i < operands.length; i++) {
+        const arm = operands[i]
+        if (typeof arm !== 'number') {
+            arms.push(addNode(g, NodeOp.apply, [blockId, arm]))
+            continue
+        }
+        const op = getNode(g, arm)!.op
+        if (op === NodeOp.nilEffect || op === NodeOp.void) {
+            arms.push(addNode(g, NodeOp.apply, [blockId, { literal: 0 }]))
+            continue
+        }
+        arms.push(addNode(g, NodeOp.after, [arm, addNode(g, NodeOp.apply, [blockId, arm])]))
+    }
+    putNode(g, c.select, NodeOp.param, [], type)
+    const split = addNode(g, NodeOp.select, arms)
+    let bodyId = b.bodyId
+    if (c.owner) {
+        const o = getNode(g, c.owner)!
+        bodyId = getRef(o, c.slot)
+        putCopy(g, c.owner, o, withOperand(g, o, c.slot, split))
+    } else {
+        b.bodyId = split
+    }
+    const k: GraphBlock = { id: blockId, params: [c.select], bodyId, bodyConst: 0 }
+    addGraphBlock(g, k)
+    return k
+}
+
+function splitBranchingSelects(g: Graph): boolean {
+    const work = g.blocks.slice()
+    let changed = false
+    while (work.length) {
+        const b = work.pop()!
+        const found = branchingSelects(g, b)
+        if (!found.length) continue
+        for (const c of found) work.push(splitAtSelect(g, b, c))
+        work.push(b)
+        changed = true
+    }
+    return changed
+}
+
 export function inlineBlocks(g: Graph) {
     makeTailsUnique(g)
     transformVoids(g)
@@ -1655,6 +1866,27 @@ export function inlineBlocks(g: Graph) {
                 return out
             }
 
+            function armed(from: number): boolean {
+                const order: number[] = []
+                const visited = new Set<number>()
+                let selects = false
+                function visit(id: number): void {
+                    if (visited.has(id) || !reaches(id)) return
+                    visited.add(id)
+                    const n = getNode(g, id)!
+                    if (n.op === NodeOp.select) selects = true
+                    if (id !== site) for (const arg of getArgIds(n)) visit(arg)
+                    order.push(id)
+                }
+                visit(from)
+                if (!selects) return false
+                const { parent, owner, regionOf } = armRegions(g, order)
+                for (let c = regionOf.get(site) ?? 0; c > 0; c = parent[c]) {
+                    if (getNode(g, owner[c])!.op === NodeOp.select) return true
+                }
+                return false
+            }
+
             let parent = 0
             let slot = 0
             let at = block.bodyId
@@ -1701,6 +1933,7 @@ export function inlineBlocks(g: Graph) {
                     bodySlot = slot
                 }
             }
+            assert(at === site || !armed(at), `inlined ${site}: the site sits in a select arm outside the tail of B${block.id}`)
 
             const jumps: number[] = []
             const epoch = nextEpoch(g)
@@ -11906,7 +12139,6 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
 
     const testLast = new Map<number, number>()
     const firstArm = new Map<number, number>()
-    const impure = impureValues(g)
     for (const [header, members] of loopMembers) {
         const select = getGraphBlock(header).bodyId
         const n = getNode(g, select)
@@ -12185,7 +12417,6 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         inArgPos,
         inStatePos,
         returnsAt,
-        impure,
         shouldSpillUntil,
         crossedCalls,
         blockOrder,
@@ -13827,7 +14058,7 @@ export function packageValueGraph(g: Graph, target: lowering.Target, entries?: S
     if (intrinsics.argv().includes('check-creation-order')) checkCreationOrder(g, 'trace', new Set())
     const _bindCallContext: GraphPass = g => bindCallContext(g, target.indirectContextReg)
     const _packageBlocks: GraphPass = g => packageBlocksFINAL(g, entries)
-    g = runPipeline('package', g, target.costs, [_bindCallContext, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks]).graph
+    g = runPipeline('package', g, target.costs, [_bindCallContext, splitBranchingSelects, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks]).graph
     g.form = 'packaged'
     verifyGraph(g, 'package', true)
     return g
@@ -14251,6 +14482,7 @@ export interface PreparedLowering {
     g: Graph
     island?: number[]
     analysis: ReturnType<typeof analyzeValueGraph>
+    effectful: Set<number>
 }
 
 function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number): void {
@@ -14340,7 +14572,9 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     verifyOrderingSlots(g, 'lowerable', firstNonOrderingSlot, id => hollowOrdering(g, id, unordered, hollow))
     let mem: MemAnalysis | undefined
     verifyMemoryOrder(g, 'lowerable', () => mem ??= memAnalysis(g))
-    return { g, island, analysis: analyzeValueGraph(g, opts) }
+    const [effectful, offTail] = effectfulSelects(g)
+    verifyTailEffects(g, 'lowerable', offTail)
+    return { g, island, analysis: analyzeValueGraph(g, opts), effectful }
 }
 
 export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
@@ -14355,7 +14589,7 @@ interface RegisterPools {
 
 export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOptions = {}): LowerGraphResult {
     const target = opts.target ?? lowering.hostTarget
-    const { g, island, analysis } = prepared
+    const { g, island, analysis, effectful } = prepared
     const floats = floatValues(g)
 
     const rootBlock = g.blocks[0]
@@ -14385,7 +14619,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
 
     const acrossCall = analysis.shouldSpillUntil
     const inArgPos = analysis.inArgPos
-    const impure = analysis.impure
     const order = analysis.blockOrder
     const releaseAt = analysis.releaseAt
     const narrowsAt = analysis.narrowsAt
@@ -15469,7 +15702,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         } else if (n.op === NodeOp.select) {
             const taken = getNode(g, getRef(n, 1))?.op === NodeOp.panic ? 2
                 : getNode(g, getRef(n, 2))?.op === NodeOp.panic ? 1 : 0
-            if (!taken && preferBranchless(n)) {
+            if (!taken && preferBranchless(id, n)) {
                 if (!done.has(id)) build(id)
             } else {
                 if (!taken) throw `lowering: effect ${id} branches before the tail\n${errorDump(g)}`
@@ -15580,18 +15813,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         put(() => whenTrue ? asm.jumpIfNonZero(r, target) : asm.jumpIfZero(r, target))
     }
 
-    function preferBranchless(n: GraphNode) {
-        if (countIds(n) !== 3) return false
-        for (let i = 1; i < 3; i++) {
-            const u = getRef(n, i)
-            if (!u || homeOf.has(u) || done.has(u)) continue
-            if (impure.has(u)) return false
-        }
-        return true
+    function preferBranchless(id: number, n: GraphNode) {
+        return countIds(n) === 3 && !effectful.has(id)
     }
 
     function buildSelect(id: number, n: GraphNode, want: number): void {
-        if (preferBranchless(n)) {
+        if (preferBranchless(id, n)) {
             const zero = (i: number) => zeroOperand(g, target, n, i)
             const slots: number[] = []
             for (const i of orderedOperands(id, [0, 1, 2])) {
