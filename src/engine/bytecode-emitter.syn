@@ -76,8 +76,16 @@ type EmitCtx = {
     owner?: ts.Identifier
     privateNames?: Map<string, symbol>
     privateMembers?: Map<string, PrivateName>
+    home?: HomeObject
+    fields?: ts.PropertyDeclaration[]
 }
 const thisSymbol = -3
+const homeSymbol = -6
+
+enum HomeObject {
+    prototype,
+    constructor,
+}
 
 export interface EhRange {
     start: number
@@ -145,8 +153,39 @@ function classPrivateMembers(node: ts.ClassDeclaration | ts.ClassExpression, out
 
 function isFieldDeclaration(member: ts.ClassElement): boolean {
     if (!ts.isPropertyDeclaration(member)) return false
-    if (member.initializer) throw `class field initializers are not supported: ${member.name.getText()}`
+    if (member.initializer && isStaticMember(member)) throw `static class field initializers are not supported: ${member.name.getText()}`
     return true
+}
+
+function initializedFields(node: ts.ClassDeclaration | ts.ClassExpression): ts.PropertyDeclaration[] {
+    const fields: ts.PropertyDeclaration[] = []
+    for (const member of node.members) {
+        if (!isFieldDeclaration(member)) continue
+        const field = member as ts.PropertyDeclaration
+        if (!field.initializer) continue
+        if (ts.isComputedPropertyName(field.name)) throw `computed class field names are not supported: ${field.name.getText()}`
+        fields.push(field)
+    }
+    return fields
+}
+
+function heritageOf(node: ts.ClassDeclaration | ts.ClassExpression): ts.Expression | undefined {
+    const clause = node.heritageClauses?.find(c => c.token === ts.SyntaxKind.ExtendsKeyword)
+    if (!clause) return
+    if (clause.types.length !== 1) throw 'a class extends exactly one base'
+    const base = clause.types[0]
+    if (base.typeArguments?.length) throw 'class heritage type arguments are not supported'
+    return base.expression
+}
+
+function usesSuper(node: ts.Node): boolean {
+    function visit(child: ts.Node): boolean {
+        if (child.kind === ts.SyntaxKind.SuperKeyword) return true
+        if (ts.isClassLike(child)) return false
+        if (ts.isFunctionLike(child) && !ts.isArrowFunction(child)) return false
+        return !!ts.forEachChild(child, visit)
+    }
+    return !!ts.forEachChild(node, visit)
 }
 
 function classMemberName(member: ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration): string | symbol {
@@ -219,7 +258,7 @@ function isNumericExpression(e: ts.Expression): boolean {
 const jumpBytesPerNode = 8
 
 function emitFunction(
-    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration,
+    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.ClassDeclaration | ts.ClassExpression,
     emitCtx: EmitCtx = { outerSymbols: new Map(), outerFolded: new Map() },
 ): EmitResult {
     let jumpWidth: 2 | 4 = sourceNodeCount(fn) * jumpBytesPerNode > 0x7FFF ? 4 : 2
@@ -305,7 +344,14 @@ function emitFunction(
     let nextReg = 0
     let maxReg = 0
     let thisReg: number | undefined = undefined
-    const isConstructor = ts.isConstructorDeclaration(fn)
+    let homeReg: number | undefined = undefined
+    const implicitConstructor = ts.isClassDeclaration(fn) || ts.isClassExpression(fn)
+    const isConstructor = ts.isConstructorDeclaration(fn) || implicitConstructor
+    const derivedConstructor = isConstructor && emitCtx.home !== undefined
+    const forwardsArguments = implicitConstructor && derivedConstructor
+    const parameters = implicitConstructor ? [] : fn.parameters
+    const body = implicitConstructor ? undefined : fn.body
+    const classHomes = new Map<ts.Node, number>()
     let prevOpOffset: number = -1
     let prevStoreOffset: number = -1
     let skipNextLookbehind = false
@@ -1169,6 +1215,7 @@ function emitFunction(
         finish: (load: () => void, store: () => void) => void,
     ) {
         if (target.questionDotToken) throw `optional chaining assignment is not supported`
+        if (target.expression.kind === ts.SyntaxKind.SuperKeyword) throw 'assignment to a super property is not supported'
         const isConstName = target.kind === ts.SyntaxKind.PropertyAccessExpression
 
         emitExpr(target.expression) // acc = object
@@ -1372,6 +1419,10 @@ function emitFunction(
 
     function emitPropertyAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, receiverReg?: number, shouldSpillRecv = true) {
         if (node.questionDotToken) throw `optional chaining is not supported`
+        if (node.expression.kind === ts.SyntaxKind.SuperKeyword) {
+            emitSuperGet(node)
+            return
+        }
 
         emitExpr(node.expression) // acc = object
 
@@ -1901,9 +1952,9 @@ function emitFunction(
         }
         if (isOptionalChainExpression(node)) { emitOptionalChain(node); return }
         if (ts.isParenthesizedExpression(node)) { emitExpr(node.expression); return }
+        if (node.kind === ts.SyntaxKind.SuperKeyword) throw "'super' must be followed by a call or property access"
         if (node.kind === ts.SyntaxKind.ThisKeyword) {
-            if (thisReg !== undefined) { ldar(thisReg); return }
-            if (const scoped = scopedSymbol(thisSymbol)) { emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg); return }
+            if (loadBinding(thisSymbol, thisReg)) return
             // generally should not happen?
             emitLoadConst(lateBoundSlot(getSymbolId(node), "this"))
             return
@@ -1996,6 +2047,7 @@ function emitFunction(
         //     return emitCallArgs(isConstruct ? 'ConstructConst' : 'CallConst', slot, node.arguments ?? [])
         // }
 
+        if (!isConstruct && node.expression.kind === ts.SyntaxKind.SuperKeyword) return emitSuperCall(node as ts.CallExpression)
         if (!isConstruct && ts.isPropertyAccessExpression(node.expression)) {
             const method = privateMember(node.expression.name)?.method
             if (method) return emitPrivateCall(node as ts.CallExpression, method)
@@ -2005,6 +2057,15 @@ function emitFunction(
             const originalRecv = receiverReg
             defer if (originalRecv === receiverReg) freeReg()
 
+            if (node.expression.expression.kind === ts.SyntaxKind.SuperKeyword) {
+                emitSuperGet(node.expression)
+                const rMethod = allocReg()
+                defer freeReg()
+                star(rMethod)
+                emitThis()
+                star(receiverReg)
+                return emitCallArgs('Call', rMethod, node.arguments ?? [], receiverReg)
+            }
             if (isReceiverIdent(node.expression.expression) && !argumentsMayWrite(node.expression.expression as ts.Identifier, node.arguments ?? [])) {
                 freeReg()
                 receiverReg = symToReg.get(getSymbolId(node.expression.expression))!
@@ -2619,19 +2680,36 @@ function emitFunction(
         return hoisted
     }
 
-    function closureCtx(node: ts.FunctionDeclaration | ClassMember | ts.ArrowFunction | ts.FunctionExpression): EmitCtx {
+    function closureCtx(node: ts.FunctionDeclaration | ClassMember | ts.ArrowFunction | ts.FunctionExpression | ts.ClassDeclaration | ts.ClassExpression): EmitCtx {
         const childOuter = new Map<number, OuterSymbol>()
         for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
         for (const [sym] of outerSymbols) {
-            if (sym === thisSymbol) continue
+            if (sym === thisSymbol || sym === homeSymbol) continue
             const scoped = scopedSymbol(sym)
             if (scoped) childOuter.set(sym, scoped)
         }
         if (ts.isArrowFunction(node)) {
-            if (thisReg !== undefined) childOuter.set(thisSymbol, { scopeSlot: -1, reg: thisReg })
-            else if (outerSymbols.has(thisSymbol)) childOuter.set(thisSymbol, scopedSymbol(thisSymbol)!)
+            inheritBinding(childOuter, thisSymbol, thisReg)
+            inheritBinding(childOuter, homeSymbol, homeReg)
+            return { outerSymbols: childOuter, outerFolded: foldedVariables, privateNames, privateMembers, home: emitCtx.home }
         }
         return { outerSymbols: childOuter, outerFolded: foldedVariables, privateNames, privateMembers }
+    }
+
+    function inheritBinding(childOuter: Map<number, OuterSymbol>, sym: number, reg: number | undefined): void {
+        if (reg !== undefined) childOuter.set(sym, { scopeSlot: -1, reg })
+        else if (outerSymbols.has(sym)) childOuter.set(sym, scopedSymbol(sym)!)
+    }
+
+    function loadBinding(sym: number, reg: number | undefined): boolean {
+        if (reg !== undefined) {
+            ldar(reg)
+            return true
+        }
+        const scoped = scopedSymbol(sym)
+        if (!scoped) return false
+        emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+        return true
     }
 
     function emitClass(node: ts.ClassDeclaration | ts.ClassExpression): void {
@@ -2641,7 +2719,86 @@ function emitFunction(
         privateMembers = classPrivateMembers(node, outerPrivateMembers)
         defer privateNames = outerPrivateNames
         defer privateMembers = outerPrivateMembers
-        emitNested(emitClassTemplate(node, member => emitFunction(member, closureCtx(member))))
+        const heritage = heritageOf(node)
+        if (!heritage) {
+            emitNested(emitClassTemplate(node, (member, scope) => emitFunction(member, { ...closureCtx(member), ...scope })))
+            return
+        }
+        const home = classHomes.get(node)
+        if (home === undefined) throw 'class heritage outside of a function body'
+        const cls = allocReg()
+        const parent = allocReg()
+        emitExpr(heritage)
+        star(parent)
+        emitNested(emitClassTemplate(node, (member, scope) => {
+            const ctx = closureCtx(member)
+            ctx.outerSymbols.set(homeSymbol, { scopeSlot: -1, reg: home })
+            return emitFunction(member, { ...ctx, ...scope })
+        }))
+        star(home)
+        star(cls)
+        emitRuntimeCall(RtOp.classHeritage, cls, 2)
+        freeReg()
+        freeReg()
+    }
+
+    function emitThis(): void {
+        if (!loadBinding(thisSymbol, thisReg)) throw "'this' is not bound here"
+    }
+
+    function emitHome(): void {
+        if (emitCtx.home === undefined) throw "'super' is only supported in members of a derived class"
+        if (!loadBinding(homeSymbol, homeReg)) throw "'super' is not bound in this member"
+    }
+
+    function emitSuperBase(): void {
+        emitHome()
+        if (emitCtx.home === HomeObject.prototype) emit2(Op.GetPropertyConst, internString('prototype'))
+        emit1(Op.GetPrototype)
+    }
+
+    function emitSuperGet(node: ts.PropertyAccessExpression | ts.ElementAccessExpression): void {
+        if (node.questionDotToken) throw `optional chaining is not supported`
+        const receiver = allocReg()
+        const key = allocReg()
+        emitThis()
+        star(receiver)
+        if (ts.isPropertyAccessExpression(node)) emitLoadConst(internName(node.name))
+        else emitExpr(node.argumentExpression)
+        star(key)
+        emitSuperBase()
+        emit3(Op.GetSuperProperty, receiver, key)
+        freeReg()
+        freeReg()
+    }
+
+    function emitFieldInitializers(): void {
+        for (const field of emitCtx.fields ?? []) {
+            emitExpr(field.initializer!)
+            const name = field.name
+            let key: number
+            if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name)) key = internName(name)
+            else if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) key = internString(name.text)
+            else throw `unsupported class field name: ${name.getText()}`
+            emit3(Op.SetPropertyConst, thisReg!, key)
+        }
+    }
+
+    function emitSuperConstruct(call: (callee: number) => void): void {
+        const callee = allocReg()
+        emitHome()
+        emit1(Op.GetPrototype)
+        star(callee)
+        call(callee)
+        freeReg()
+        emitFieldInitializers()
+    }
+
+    function emitSuperCall(node: ts.CallExpression): void {
+        if (!isConstructor || thisReg === undefined) throw "'super(...)' is only supported directly in a constructor"
+        const receiver = thisReg
+        emitSuperConstruct(callee => emitCallArgs('Call', callee, node.arguments, receiver))
+        ldar(receiver)
     }
 
     function emitDefaultInit(exp: ts.Expression, reg: number, effectOnly = false) {
@@ -2652,10 +2809,11 @@ function emitFunction(
         patchJump(ph)
     }
 
-    if (!fn.body) throw "function has no body"
+    if (!body && !implicitConstructor) throw "function has no body"
     const declaredHere = new Set<number>()
     const referencedNested = new Set<number>()
     const constSymbols = new Set<number>()
+    const derivedClasses: ts.Node[] = []
     function scanCaptures(node: ts.Node, nested: boolean): void {
         if (ts.isForOfStatement(node) || (ts.isTryStatement(node) && node.finallyBlock)) jumpWidth = 4
         const declared = ts.isVariableDeclaration(node) || ts.isBindingElement(node) || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)
@@ -2665,22 +2823,24 @@ function emitFunction(
             if (isConstSymbol(declared)) constSymbols.add(getSymbolId(declared))
         }
         if (nested && ts.isIdentifier(node)) referencedNested.add(getSymbolId(node))
-        const inner = nested || ts.isFunctionLike(node)
+        if (!nested && (ts.isClassDeclaration(node) || ts.isClassExpression(node)) && heritageOf(node)) derivedClasses.push(node)
+        const inner = nested || ts.isFunctionLike(node) || ts.isPropertyDeclaration(node)
         ts.forEachChild(node, child => scanCaptures(child, child === declared ? nested : inner))
     }
-    ts.forEachChild(fn.body, child => scanCaptures(child, false))
+    if (body) ts.forEachChild(body, child => scanCaptures(child, false))
 
     const paramRegs: number[] = []
-    for (let i = 0; i < fn.parameters.length; i++) {
-        const p = fn.parameters[i]
-        if (p.dotDotDotToken && (i !== fn.parameters.length - 1 || !ts.isIdentifier(p.name))) throw "rest parameters must be a trailing identifier"
+    for (let i = 0; i < parameters.length; i++) {
+        const p = parameters[i]
+        if (p.dotDotDotToken && (i !== parameters.length - 1 || !ts.isIdentifier(p.name))) throw "rest parameters must be a trailing identifier"
         // we have to assign it even if unused
         const reg = allocReg()
         paramRegs.push(reg)
         if (ts.isIdentifier(p.name)) symToReg.set(getSymbolId(p.name), reg)
     }
-    for (let i = 0; i < fn.parameters.length; i++) {
-        const p = fn.parameters[i]
+    const argumentList = forwardsArguments ? allocReg() : undefined
+    for (let i = 0; i < parameters.length; i++) {
+        const p = parameters[i]
         if (!p.initializer) continue
         if (ts.isIdentifier(p.name) && !isReferencedSymbol(p.name)) {
             if (hasEffects(p.initializer)) emitDefaultInit(p.initializer, paramRegs[i], true)
@@ -2689,13 +2849,13 @@ function emitFunction(
         emitDefaultInit(p.initializer, paramRegs[i])
     }
     // `freeReg` pops, so only a run of unused parameters at the end can be given back
-    for (let i = fn.parameters.length-1; i >= 0; i--) {
-        const name = fn.parameters[i].name
+    for (let i = parameters.length-1; i >= 0; i--) {
+        const name = parameters[i].name
         if (!ts.isIdentifier(name) || isReferencedSymbol(name)) break
         freeReg()
     }
-    for (let i = 0; i < fn.parameters.length; i++) {
-        const name = fn.parameters[i].name
+    for (let i = 0; i < parameters.length; i++) {
+        const name = parameters[i].name
         if (ts.isIdentifier(name)) continue
         bindPattern(name)
         ldar(paramRegs[i])
@@ -2727,21 +2887,34 @@ function emitFunction(
         star(reg)
     }
 
+    if (emitCtx.home !== undefined && !outerSymbols.has(homeSymbol) && (implicitConstructor || usesSuper(fn))) {
+        homeReg = allocReg()
+        emitLoadConst(lateBoundSlot(homeSymbol, 'class', ConstantKind.class_))
+        star(homeReg)
+    }
+
     for (const sym of declaredHere) if (sym && referencedNested.has(sym)) capturedRegs.set(sym, allocReg())
+    for (const node of derivedClasses) classHomes.set(node, allocReg())
     const readonlyCaptures: number[] = []
     for (const [sym, reg] of capturedRegs) {
         if (constSymbols.has(sym)) readonlyCaptures.push(reg)
     }
-    if (ts.isBlock(fn.body)) {
-        emitBlock(fn.body)
-    } else {
-        emitExpr(fn.body) // arrow fn
+    if (isConstructor && !derivedConstructor) emitFieldInitializers()
+    if (argumentList !== undefined) {
+        emitSuperConstruct(callee => {
+            ldar(thisReg!)
+            emit3(Op.CallArray, callee, argumentList)
+        })
+    } else if (body && ts.isBlock(body)) {
+        emitBlock(body)
+    } else if (body) {
+        emitExpr(body) // arrow fn
     }
 
     const closed = code.at(-1) === Op.Return || code.at(-1) === Op.ReturnVoid || code.at(-1) === Op.Throw || code.at(-1) === Op.ReThrow
     if (!closed || maxJumpTarget >= code.length) {
         if (isConstructor) ldar(thisReg!)
-        emit1(isConstructor || !ts.isBlock(fn.body) ? Op.Return : Op.ReturnVoid)
+        emit1(body && !isConstructor && ts.isBlock(body) ? Op.ReturnVoid : Op.Return)
     }
 
     assert(constants.length === constantKinds.length)
@@ -2750,9 +2923,9 @@ function emitFunction(
         code,
         constants,
         constantKinds,
-        paramCount: fn.parameters.length,
-        defaults: fn.parameters.some(p => p.initializer !== undefined),
-        rest: fn.parameters.some(p => p.dotDotDotToken !== undefined),
+        paramCount: forwardsArguments ? 1 : parameters.length,
+        defaults: parameters.some(p => p.initializer !== undefined),
+        rest: forwardsArguments || parameters.some(p => p.dotDotDotToken !== undefined),
         registerCount: maxReg,
         lateBound,
         selfSlot,
@@ -2760,7 +2933,7 @@ function emitFunction(
         scopeBindings,
         readonlyCaptures,
         sourceMapping,
-        name: fn.name && ts.isIdentifier(fn.name) ? fn.name.text : undefined,
+        name: !implicitConstructor && fn.name && ts.isIdentifier(fn.name) ? fn.name.text : undefined,
     }
 }
 
@@ -2800,26 +2973,34 @@ function fixupMethodLikeDecl(src: string) {
 }
 
 type ClassMember = ts.ConstructorDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration
+type ClassScope = Pick<EmitCtx, 'home' | 'fields'>
+type MemberEmitter = (member: ClassMember | ts.ClassDeclaration | ts.ClassExpression, scope: ClassScope) => EmitResult
 
-function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitMember: (member: ClassMember) => EmitResult): EmitResult {
-    if (node.heritageClauses?.length) throw 'class heritage is not supported'
+function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitMember: MemberEmitter): EmitResult {
     const ctor = node.members.find(ts.isConstructorDeclaration)
-    const result = ctor ? emitMember(ctor) : defaultConstructorResult()
+    const derived = heritageOf(node) !== undefined
+    const fields = initializedFields(node)
+    const constructorScope: ClassScope = { home: derived ? HomeObject.prototype : undefined, fields }
+    let result: EmitResult
+    if (ctor) result = emitMember(ctor, constructorScope)
+    else if (derived || fields.length) result = emitMember(node, constructorScope)
+    else result = defaultConstructorResult()
     const prototype: Expandos = new Map()
     const expandos: Expandos = new Map()
     for (const member of node.members) {
         if (member === ctor || isFieldDeclaration(member)) continue
         if (isPrivateMember(member)) continue
         const target = isStaticMember(member) ? expandos : prototype
+        const scope: ClassScope = { home: derived ? (isStaticMember(member) ? HomeObject.constructor : HomeObject.prototype) : undefined }
         if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
             const key = classMemberName(member)
             const accessor = (target.get(key) ?? {}) as ClassAccessor
-            if (ts.isGetAccessorDeclaration(member)) accessor.getter = emitMember(member)
-            else accessor.setter = emitMember(member)
+            if (ts.isGetAccessorDeclaration(member)) accessor.getter = emitMember(member, scope)
+            else accessor.setter = emitMember(member, scope)
             target.set(key, accessor)
             continue
         }
-        target.set(classMemberKey(member), emitMember(member as ts.MethodDeclaration))
+        target.set(classMemberKey(member), emitMember(member as ts.MethodDeclaration, scope))
     }
     expandos.set('prototype', prototype)
     result.expandos = expandos
@@ -2830,7 +3011,7 @@ function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): E
     const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
     const privateNames = classPrivateNames(node, undefined)
     const privateMembers = classPrivateMembers(node)
-    return emitClassTemplate(node, member => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames, privateMembers }))
+    return emitClassTemplate(node, (member, scope) => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames, privateMembers, ...scope }))
 }
 
 export function compile(src: string): EmitResult {
@@ -2893,6 +3074,7 @@ const RegOperandCounts: Record<number, number> = {
     [Op.SetProperty]: 2,
     [Op.SetPropertyConst]: 1,
     [Op.SetPropertyImm]: 1,
+    [Op.GetSuperProperty]: 2,
 }
 
 export type CodeInstruction = {
@@ -2992,7 +3174,7 @@ export function createCodeIterator(bytes: readonly u8[]) {
         }
         if (opcode === Op.JumpAcc) inst.readsAcc = true
 
-        if (inst.opcode >= Op.GetProperty && inst.opcode <= Op.SetPropertyImm) {
+        if (inst.opcode >= Op.GetProperty && inst.opcode <= Op.GetSuperProperty) {
             if (inst.opname.startsWith('Get')) {
                 inst.readsAcc = inst.writesAcc = true
             } else {
@@ -3167,7 +3349,7 @@ export function getRegReads(inst: CodeInstruction): number[] {
     if (inst.opcode >= Op.Add && inst.opcode <= Op.Concat) {
         regs.push(...inst.regs)
     }
-    if (inst.opcode >= Op.GetProperty && inst.opcode <= Op.SetPropertyImm) {
+    if (inst.opcode >= Op.GetProperty && inst.opcode <= Op.GetSuperProperty) {
         regs.push(...inst.regs)
     }
     if (inst.opcode === Op.CallArray) regs.push(...inst.regs)
@@ -3412,12 +3594,13 @@ export function finalize(
     heap.finishHeapCell(res)
     if (!result.expandos) return res
     const fn = heap.makeFunction(res)
+    const cls = owner ?? fn
     const v = heap.FunctionBytecode(heap.resolveHeapCell(res))
     for (let i = 0; i < kinds.length; i++) {
         if (kinds[i] !== ConstantKind.class_) continue
-        Intrinsics.store(heap.resolveHeapCell(v.constants), i*8 as u32, tagVmHandle(fn), Types.u64)
+        Intrinsics.store(heap.resolveHeapCell(v.constants), i*8 as u32, tagVmHandle(cls), Types.u64)
     }
-    for (const [key, value] of result.expandos) installExpando(fn, key, value, ctx, compileFn, fromJsValue, fn)
+    for (const [key, value] of result.expandos) installExpando(fn, key, value, ctx, compileFn, fromJsValue, cls)
     return fn
 }
 
@@ -3452,19 +3635,21 @@ function materializeExpando(
     return obj
 }
 
-// this _will_ tag the fn to dedupe compilations
-const ctxSym = Symbol('ctx')
+const compiledSym = Symbol('compiled')
+const convertedSym = Symbol('converted')
 const substitutesSym = Symbol('substitutes')
 const membersSym = Symbol('members')
 interface Ctx {
-    readonly [ctxSym]: unique symbol
+    readonly [compiledSym]: Map<Function, any>
+    readonly [convertedSym]: Map<object, Handle>
     readonly [substitutesSym]: Map<any, any>
     readonly [membersSym]: Map<Function, { compiled: EmitResult, captures: any[], owner: Function }>
     [key: string]: any
 }
 export function createCtx(o: Record<string, any> = {}): Ctx {
     return Object.assign({
-        [ctxSym]: Symbol('ctx brand'),
+        [compiledSym]: new Map(),
+        [convertedSym]: new Map(),
         [substitutesSym]: new Map<any, any>([[intrinsics.Intrinsics, heap.createHeapHandle(hostIntrinsics)]]),
         [membersSym]: new Map(),
         Symbol: heap.symbolConstants,
@@ -3508,21 +3693,33 @@ function bindMembers(ctx: Ctx, owner: Function, holder: any, expandos: Expandos,
     }
 }
 
+function hostHeritage(cls: Function, ctx: Ctx): Handle | undefined {
+    const parent = Object.getPrototypeOf(cls)
+    if (typeof parent !== 'function' || parent === Function.prototype) return
+    return compileJsFn(parent, ctx)
+}
+
 export function compileJsFn(f: Function, ctx: Ctx): any {
-    const key = ctx[ctxSym]
-    const _f = f as any
-    if (const prev = _f[key]) return prev
+    const compiledFns = ctx[compiledSym]
+    if (const prev = compiledFns.get(f)) return prev
     const member = ctx[membersSym].get(f)
     const [compiled, captures] = member ? [member.compiled, member.captures] : compileComputation(f)
     if (compiled.expandos) bindMembers(ctx, f, f, compiled.expandos, captures)
     // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
-    _f[key] = compiled
+    compiledFns.set(f, compiled)
     const scoped = withCaptures(ctx, captures)
-    const proto = _f.prototype
-    if (proto === null || typeof proto !== 'object') return _f[key] = finalize(compiled, scoped, undefined, undefined, member && compileJsFn(member.owner, ctx))
+    const proto = (f as any).prototype
+    if (proto === null || typeof proto !== 'object') {
+        const fn = finalize(compiled, scoped, undefined, undefined, member && compileJsFn(member.owner, ctx))
+        compiledFns.set(f, fn)
+        return fn
+    }
     const finalized = finalize(compiled, scoped)
-    const fn = _f[key] = compiled.expandos ? finalized : heap.makeFunction(finalized)
-    heap.setProperty(fn, heap.prototypeKey, heap.createJsValueConverter(f => compileJsFn(f, ctx))(proto))
+    const fn = compiled.expandos ? finalized : heap.makeFunction(finalized)
+    compiledFns.set(f, fn)
+    const heritage = hostHeritage(f, ctx)
+    if (heritage !== undefined) heap.setPrototypeOf(fn, heap.deref(heritage))
+    heap.setProperty(fn, heap.prototypeKey, heap.convertJsValue({ compileFn: g => compileJsFn(g, ctx), seen: ctx[convertedSym] }, proto))
     return fn
 }
 
@@ -4014,6 +4211,35 @@ function runTest() {
     e2eTest('function spreadCopy(a) { const o = { x: a, y: 2 }; const c = { ...o, ...undefined, z: 3 }; return c.x + c.y * 10 + c.z * 100 }', [4])
     e2eTest('function classInstanceof(a) { class A { get() { return 1 } } const x = new A(); return (x instanceof A ? 10 : 0) + (a instanceof A ? 100 : 0) }', [3])
     e2eTest('function classStaticMixed(a) { class P { constructor(x) { this.x = x } static of(x) { return new P(x) } get() { return this.x + 1 } } return P.of(a).get() }', [8])
+    assert(e2eTest('function classExtends(a) { class A { constructor(x) { this.x = x } get() { return this.x } } class B extends A { constructor(x) { super(x + 1); this.y = 2 } get() { return super.get() * 10 + this.y } } return new B(a).get() }', [3]) === 42)
+    assert(e2eTest('function classImplicitConstructor(a) { class A { constructor(x, y) { this.s = x + y } } class B extends A { twice() { return this.s * 2 } } return new B(a, 5).twice() }', [2]) === 14)
+    assert(e2eTest('function classInstanceofChain(a) { class A {} class B extends A {} class C extends B {} const c = new C(); return (c instanceof A ? 1 : 0) + (c instanceof B ? 2 : 0) + (new A() instanceof C ? 4 : 0) + (new B() instanceof A ? 8 : 0) + a }', [1]) === 12)
+    assert(e2eTest('function classStaticInherit(a) { class A { static triple(x) { return x * 3 } static me() { return this } } class B extends A { static six(x) { return super.triple(x) * 2 } } return B.triple(a) + B.six(a) + (B.me() === B ? 100 : 0) }', [2]) === 118)
+    assert(e2eTest('function classFields(a) { class A { x = 1; constructor(v) { this.v = v + this.x } } class B extends A { y = this.x + 10; constructor(v) { super(v); this.z = this.y * 2 } } const b = new B(a); return b.v * 100 + b.y + b.z }', [3]) === 433)
+    assert(e2eTest('function classFieldsImplicit(a) { class P { n = a * 2; m = this.n + 1 } class Q extends P { k = this.m * 10 } const q = new Q(); return q.n * 1000 + q.k }', [2]) === 4050)
+    assert(e2eTest('function classChainSuper(a) { class A { name() { return 1 } } class B extends A { name() { return super.name() * 10 + 2 } } class C extends B { name() { return super.name() * 10 + 3 } } return new C().name() + a }', [1]) === 124)
+    assert(e2eTest('function classOverride(a) { class A { constructor(v) { this.v = v } get() { return this.v } run() { return this.get() + 1 } } class B extends A { get() { return this.v * 10 } } return new A(a).run() * 1000 + new B(a).run() }', [2]) === 3021)
+    assert(e2eTest('function classSuperArrow(a) { class A { get() { return a } } class B extends A { get() { const f = () => super.get() + 1; return f() * 10 } } return new B().get() }', [4]) === 50)
+    assert(e2eTest('function classSuperProperty(a) { class A { get() { return 5 } } class B extends A { get() { return 7 } both() { return this.get() * 10 + super.get() } } return new B().both() + a }', [1]) === 76)
+    assert(e2eTest('function classExtendsCall(a) { class A { constructor(v) { this.v = v } } class Z { constructor(v) { this.v = v * 100 } } function pick(k) { return k ? A : Z } const M = class extends pick(a > 2) { twice() { return this.v * 2 } }; return new M(a).twice() }', [4]) === 8)
+    assert(e2eTest('function classPolymorphic(a) { class Shape { constructor(s) { this.s = s } area() { return 0 } } class Square extends Shape { area() { return this.s * this.s } } class Twice extends Square { area() { return super.area() * 2 } } const xs = [new Shape(a), new Square(a), new Twice(a)]; let t = 0; for (const x of xs) t = t + x.area(); return t }', [3]) === 27)
+    assert(e2eTest('function classSuperSpread(a) { class A { constructor(x, y) { this.s = x * 10 + y } } class B extends A { constructor(...xs) { super(...xs) } } return new B(a, 2).s }', [3]) === 32)
+    assert(e2eTest('function classHeritageOnce(a) { let n = 0; class A { constructor() { this.k = 1 } get() { return this.k } } function pick() { n = n + 1; return A } class B extends pick() { get() { return super.get() * 10 } } const x = new B(); const y = new B(); return x.get() + y.get() + n * 100 + a }', [1]) === 121)
+    assert(e2eTest('function classHeritageReassign(a) { class A { constructor() { this.k = 1 } get() { return this.k } } class Z { constructor() { this.k = 5 } get() { return 7 } } let M = A; class B extends M { get() { return super.get() * 10 } } M = Z; const b = new B(); return b.get() + (b instanceof A ? 100 : 0) + (b instanceof Z ? 1000 : 0) + a }', [1]) === 111)
+    assert(e2eTest('function classSuperGetter(a) { class A { get v() { return this.k } } class B extends A { constructor() { super(); this.k = a } get v() { return super.v * 10 } } return new B().v }', [4]) === 40)
+    assert(e2eTest('function classStaticSuperGetter(a) { class A { static get v() { return this.k } } class B extends A { static get w() { return super.v * 10 } } B.k = a; return B.w }', [3]) === 30)
+    assert(e2eTest('function classSuperComputed(a) { class A { m1() { return 1 } m2() { return 2 } } class B extends A { pick(i) { return super["m" + i]() * 10 } } return new B().pick(a) }', [2]) === 20)
+    {
+        function setProto(o: any, p: any) {
+            Object.setPrototypeOf(o, p)
+        }
+        const protoCtx = createCtx({ setProto })
+        assert(e2eTest('function classSuperSetPrototype(a) { class A { get() { return 1 } } class X { get() { return 7 } } class B extends A { get() { return super.get() * 10 } } const before = new B().get(); setProto(B.prototype, X.prototype); return before * 100 + new B().get() + a }', [1], null, protoCtx) === 1071)
+        assert(e2eTest('function classSuperConstructorSwap(a) { class A { constructor() { this.k = 1 } } class X { constructor() { this.k = 9 } } class B extends A {} setProto(B, X); return new B().k + a }', [1], null, protoCtx) === 10)
+    }
+    assert(e2eTest('function classSiblingHomes(a) { class A { v() { return 1 } } class B { v() { return 2 } } class X extends A { v() { return super.v() * 10 } } class Y extends B { v() { return super.v() * 100 } } return new X().v() + new Y().v() + a }', [3]) === 213)
+    assert(e2eTest('function classNestedHomes(a) { class A { v() { return 1 } } class B extends A { v() { class C extends A { v() { return super.v() + 4 } } const f = () => super.v() * 10; return new C().v() * 100 + f() } } return new B().v() + a }', [3]) === 513)
+    assert(e2eTest('function classExtendsNull(a) { class N extends null { m() { return a + 1 } } return N.prototype.m() + (N.prototype.toString === undefined ? 10 : 0) }', [2]) === 13)
     e2eTest('function privateGetter(a) { class C { constructor(x) { this.x = x } get #twice() { return this.x * 2 } read() { return this.#twice + 1 } } return new C(a).read() }', [4])
     e2eTest('function privateGetterCapture(a) { const k = a + 1; class C { get #k() { return k } read() { return this.#k * 10 } } return new C().read() }', [2])
     e2eTest('function privateGetterChain(a) { class C { constructor(x) { this.x = x } get #inner() { return this.x + 1 } get #outer() { return this.#inner * 3 } read() { return this.#outer } } return new C(a).read() }', [2])
@@ -4053,6 +4279,9 @@ function runTest() {
         ['function f() { class C { get #v() { return 1 } write() { this.#v = 2 } } return 0 }', 'cannot assign to private member'],
         ['function f() { class C { get #v() { return 1 } bump() { this.#v++ } } return 0 }', 'cannot assign to private member'],
         ['function f() { class C { get #v() { return 1 } bump() { this.#v += 1 } } return 0 }', 'cannot assign to private member'],
+        ['function f() { class C { m() { return super.m() } } return 0 }', "'super' is only supported in members of a derived class"],
+        ['function f() { class A {} class B extends A { m() { super.x = 1 } } return 0 }', 'assignment to a super property is not supported'],
+        ['function f() { class A {} class B extends A { static k = 1 } return 0 }', 'static class field initializers are not supported'],
     ]) {
         let error = ''
         try {
@@ -4065,6 +4294,68 @@ function runTest() {
     e2eTest('function classFromCtx(a) { return new Point(a).value() }', [4], null, createCtx({
         Point: class Point { constructor(public x: number) {} value() { return this.x + 1 } },
     }))
+    {
+        class HostBase {
+            v: number
+            constructor(v: number) {
+                this.v = v
+            }
+            get() {
+                return this.v
+            }
+            static make(v: number) {
+                return new this(v)
+            }
+        }
+        class HostDerived extends HostBase {
+            w = 3
+            constructor(v: number) {
+                super(v + 1)
+            }
+            get() {
+                return super.get() * 10 + this.w
+            }
+        }
+        class HostLeaf extends HostDerived {
+        }
+        const hostCtx = createCtx({ HostBase, HostDerived, HostLeaf })
+        assert(e2eTest('function hostExtends(a) { return new HostDerived(a).get() }', [2], null, hostCtx) === 33)
+        assert(e2eTest('function hostImplicit(a) { const l = new HostLeaf(a); return l.get() + (l instanceof HostBase ? 100 : 0) + (l instanceof HostDerived ? 1000 : 0) }', [2], null, hostCtx) === 1133)
+        assert(e2eTest('function hostStatic(a) { return HostLeaf.make(a).get() }', [4], null, hostCtx) === 53)
+    }
+    {
+        let hostPicks = 0
+        class HostOne {
+            get() {
+                return 1
+            }
+        }
+        class HostTwo {
+            get() {
+                return 2
+            }
+        }
+        function hostPick() {
+            hostPicks = hostPicks + 1
+            return HostOne
+        }
+        let hostParent = HostOne
+        class HostReassigned extends hostParent {
+            get() {
+                return super.get() * 10
+            }
+        }
+        hostParent = HostTwo
+        class HostPicked extends hostPick() {
+            get() {
+                return super.get() * 10 + hostPicks
+            }
+        }
+        const hostCtx = createCtx({ HostOne, HostTwo, HostReassigned, HostPicked })
+        assert(e2eTest('function hostHeritageReassign(a) { const r = new HostReassigned(); return r.get() + (r instanceof HostOne ? 100 : 0) + (r instanceof HostTwo ? 1000 : 0) + a }', [1], null, hostCtx) === 111)
+        assert(e2eTest('function hostHeritageOnce(a) { return new HostPicked().get() + new HostPicked().get() + a }', [1], null, hostCtx) === 23)
+        assert(hostPicks === 1)
+    }
     e2eTest('function destructureArray(a) { const [x, , y] = [a, 0, a + 1]; return x * y }', [3])
     e2eTest('function destructureObject(a) { const { x, y: z } = { x: a, y: 2 }; return x + z }', [3])
     e2eTest('function literalFields(a, b) { const o = { x: a, y: b, z: a + b }; return o.x * 100 + o.y * 10 + o.z }', [1, 2])
