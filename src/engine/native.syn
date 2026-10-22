@@ -493,7 +493,8 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             value = staticNorm(int(0) << BigInt(1), T)
             break
         case NodeOp.unbox:
-            value = T === Types.u32 ? BigInt.asUintN(32, int(0)) >> BigInt(1) : BigInt.asIntN(32, int(0)) >> BigInt(1)
+            if (T === Types.bool) value = int(0) === BigInt(heap.trueWord) ? BigInt(1) : BigInt(0)
+            else value = T === Types.u32 ? BigInt.asUintN(32, int(0)) >> BigInt(1) : BigInt.asIntN(32, int(0)) >> BigInt(1)
             break
         case NodeOp.encode: {
             const ptr = int(0)
@@ -1678,19 +1679,27 @@ rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [ge
 const typeofStrings = 1
 const typeofObjects = 2
 const typeofUndefined = 4
+const typeofBooleans = 8
 
 rt.bind(rt.Op.typeof, {
-    lower: (g, n, ctx) => {
-        const word = getOperand(g, n, 2)
-        const kinds = countIds(n) < 4 ? 0 : getLiteral(g, n, 3)
-        if (kinds & typeofUndefined) {
-            const named = ctx.add(lowerTypeof(g, n, ctx, word, kinds & ~typeofUndefined))
-            const missing = ctx.add(makeNode(g, NodeOp.eq, [word, { literal: heap.undefinedWord }], Types.bool))
-            return makeNode(g, NodeOp.select, [missing, { literal: heap.typeNames.undefined }, named])
-        }
-        return lowerTypeof(g, n, ctx, word, kinds)
-    },
+    lower: (g, n, ctx) => typeofWord(g, n, ctx, getOperand(g, n, 2), countIds(n) < 4 ? 0 : getLiteral(g, n, 3)),
 })
+
+function typeofWord(g: NodeSpace, n: GraphNode, ctx: rt.NativeContext, word: Operand, kinds: number): GraphNode {
+    if (kinds & typeofUndefined) {
+        const named = ctx.add(typeofWord(g, n, ctx, word, kinds & ~typeofUndefined))
+        const missing = ctx.add(makeNode(g, NodeOp.eq, [word, { literal: heap.undefinedWord }], Types.bool))
+        return makeNode(g, NodeOp.select, [missing, { literal: heap.typeNames.undefined }, named])
+    }
+    if (kinds & typeofBooleans) {
+        const named = ctx.add(typeofWord(g, n, ctx, word, kinds & ~typeofBooleans))
+        const no = ctx.add(makeNode(g, NodeOp.eq, [word, { literal: heap.falseWord }], Types.bool))
+        const yes = ctx.add(makeNode(g, NodeOp.eq, [word, { literal: heap.trueWord }], Types.bool))
+        const bool = ctx.add(makeNode(g, NodeOp.or, [no, yes], Types.bool))
+        return makeNode(g, NodeOp.select, [bool, { literal: heap.typeNames.boolean }, named])
+    }
+    return lowerTypeof(g, n, ctx, word, kinds)
+}
 
 function lowerTypeof(g: NodeSpace, n: GraphNode, ctx: rt.NativeContext, word: Operand, kinds: number): GraphNode {
     const tag = ctx.add(makeNode(g, NodeOp.and, [word, { literal: 1 }], Types.u64))
@@ -4633,8 +4642,41 @@ function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined, nodes
     }
     return tags
 }
+function inlineBoolLiterals(g: Graph): void {
+    const values = new Map<number, number>()
+    for (const [id, n] of g.nodes) if (n.op === NodeOp.literal && typeOf(n) === Types.bool) values.set(id, getLiteral(g, n, 0))
+    if (!values.size) return
+    for (const [id, n] of [...g.nodes]) {
+        let operands: Operand[] | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            const value = values.get(getRef(n, i))
+            if (value === undefined) continue
+            operands ??= getOperands(g, n)
+            operands[i] = { literal: value }
+        }
+        if (operands) putCopy(g, id, n, operands)
+    }
+}
+
+export function boolTyped(g: NodeSpace, id: number): boolean {
+    const n = getNode(g, id)
+    return !!n && n.op !== NodeOp.select && resultType(g as Graph, n) === Types.bool
+}
+
+export function boolWordNode(g: NodeSpace, x: number): number {
+    const n = getNode(g, x)!
+    if (n.op === NodeOp.after) {
+        const last = countIds(n) - 1
+        return addNode(g, NodeOp.after, withOperand(g as Graph, n, last, boolWordNode(g, getRef(n, last))))
+    }
+    const yes = addNode(g, NodeOp.literal, [{ literal: heap.trueWord }], Types.vm_value)
+    const no = addNode(g, NodeOp.literal, [{ literal: heap.falseWord }], Types.vm_value)
+    if (n.op === NodeOp.literal) return getLiteral(g, n, 0) ? yes : no
+    return addNode(g, NodeOp.select, [x, yes, no])
+}
+
 function unionWord(rep: Rep): boolean {
-    return rep.kind === 'union' && rep.targets.length > 0 && rep.targets.every(target => target.startsWith('S') || target === 'str')
+    return rep.kind === 'union' && (rep.targets.length > 0 || !!rep.bools) && rep.targets.every(target => target.startsWith('S') || target === 'str')
 }
 
 export type Facts = Map<intrinsics.Handle, Map<string, Codec>>
@@ -7040,6 +7082,11 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
     function abiOf(fn: Function): UnitAbi {
         return reps.abi.get(fn) ?? { mode: constructsOutOfLine(fn) || unitOf(originOf(fn)).stubbed ? 'keep' : 'encoded', returns: Types.u64, tags: [] }
     }
+    function boolNodes(nodes: Map<number, Rep>): Set<number> {
+        const out = new Set<number>()
+        for (const [node, rep] of nodes) if (rep.kind === 'number' && rep.bools && !rep.nullable) out.add(node)
+        return out
+    }
     function numberSigns(nodes: Map<number, Rep>): Map<number, boolean> {
         const out = new Map<number, boolean>()
         for (const [node, rep] of nodes) if (numberName(rep) === 'int' || numberName(rep) === 'i64') out.set(node, numberName(rep) === 'i64')
@@ -7164,6 +7211,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             result, members, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionWord(returned) || undefined,
             stringWord: (isStringRep(returned) && boxedResult) || undefined,
             boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && boxedResult) || undefined,
+            bool: !!returned.bools || undefined,
             decode: (result !== undefined && !isStringRep(returned) && !numeric && !propertyEval.reducedShape(result) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
             target,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
@@ -7204,7 +7252,10 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         function typeofKinds(id: number, x: number): number {
             const rep = nodes.get(x) ?? nodes.get(tailOf(graph, x))!
             const strings = !rep.targets.includes('str') ? 0 : rep.targets.some(target => target !== 'str') ? typeofStrings | typeofObjects : typeofStrings
-            return rep.nullable && !numberTested(id) ? strings | typeofUndefined : strings
+            if (numberTested(id)) return strings
+            const missing = rep.nullable ? typeofUndefined : 0
+            const bools = rep.bools ? typeofBooleans : 0
+            return strings | missing | bools
         }
         function typeofTarget(id: number, x: number): boolean {
             const rep = x ? nodes.get(x) ?? nodes.get(tailOf(graph, x)) : undefined
@@ -7246,9 +7297,35 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             const last = countIds(n) - 1
             return addNode(graph, NodeOp.after, withOperand(graph, n, last, nullishWord(getRef(n, last))))
         }
+        function boolValued(x: Operand): boolean {
+            if (typeof x !== 'number' || !x) return false
+            const value = tailOf(graph, x)
+            const rep = nodes.get(x) ?? nodes.get(value)
+            if (rep) return rep.kind === 'number' && !!rep.bools
+            return boolTyped(graph, value)
+        }
+        function wordLiteral(word: number): number {
+            return addNode(graph, NodeOp.literal, [{ literal: word }], Types.vm_value)
+        }
+        function boolWord(x: number): Operand {
+            return boolWordNode(graph, x)
+        }
+        function wordBools(x: Operand): boolean {
+            const rep = nodes.get(x as number) ?? nodes.get(tailOf(graph, x as number))
+            return !!rep?.bools && unionWord(rep)
+        }
+        function wordTruth(x: number): number {
+            return addNode(graph, NodeOp.unbox, [x], Types.bool)
+        }
+        function wordNumber(x: number): number {
+            if (!wordBools(x)) return unbox(x)
+            const no = addNode(graph, NodeOp.eq, [x, wordLiteral(heap.falseWord)], Types.bool)
+            return addNode(graph, NodeOp.select, [wordTruth(x), { literal: 1 }, addNode(graph, NodeOp.select, [no, { literal: 0 }, unbox(x)])])
+        }
         function toWord(x: Operand): Operand {
             if (typeof x !== 'number') return { literal: x.literal * 2 }
             if (isNullishValue(graph, x) || voided(x)) return nullishWord(x)
+            if (boolValued(x)) return boolWord(x)
             if (union(x) || word(x)) return x
             return stringWord(x) ?? (object(x) ? encode(x) : addNode(graph, NodeOp.box, [x], Types.vm_value))
         }
@@ -7256,20 +7333,33 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (typeof x === 'number' && isNullishValue(graph, x)) return nullishWord(x)
             return object(x) ? encode(x as number) : x
         }
+        function comparedWord(x: Operand): Operand {
+            return boolValued(x) ? boolWord(x as number) : asWord(x)
+        }
         function truthWord(x: Operand): Operand {
             const rep = nodes.get(x as number) ?? nodes.get(tailOf(graph, x as number))
-            const present = addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool)
+            let present = addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool)
+            if (rep?.bools) present = addNode(graph, NodeOp.and, [present, addNode(graph, NodeOp.ne, [x, wordLiteral(heap.falseWord)], Types.bool)], Types.bool)
             if (!rep?.nullable) return present
             const missing = addNode(graph, NodeOp.literal, [{ literal: heap.undefinedWord }], Types.vm_value)
             return addNode(graph, NodeOp.and, [present, addNode(graph, NodeOp.ne, [x, missing], Types.bool)], Types.bool)
         }
+        function truthOf(x: Operand): Operand {
+            if (typeof x !== 'number') return { literal: x.literal ? 1 : 0 }
+            if (boolValued(x)) return x
+            if (isNullishValue(graph, x) || voided(x)) return { literal: 0 }
+            if (union(x) || word(x)) return truthWord(x)
+            return addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool)
+        }
         function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
             if (rep && unionWord(rep)) return toWord(x)
+            if (rep?.tested) return truthOf(x)
             if (shaped && (encodedWord(x) || (pointerOfShapes(rep) && word(x)))) return decode(x as number)
             if (numberName(rep) === 'f64' && typeof x === 'number' && x && !union(x) && (numberName(nodes.get(x)) === 'int' || numberName(nodes.get(x)) === 'i64')) return addNode(graph, NodeOp.convert, [x], Types.f64)
             if (!union(x)) return x
-            if (numberName(rep) === 'f64') return addNode(graph, NodeOp.convert, [unbox(x as number)], Types.f64)
-            if (rep?.kind === 'number') return unbox(x as number)
+            if (numberName(rep) === 'f64') return addNode(graph, NodeOp.convert, [wordNumber(x as number)], Types.f64)
+            if (rep?.kind === 'number' && rep.bools) return wordTruth(x as number)
+            if (rep?.kind === 'number') return wordNumber(x as number)
             if (isStringRep(rep)) return addNode(graph, NodeOp.unbox, [x], Types.u32)
             if (shaped || pointerOfShapes(rep)) return decode(x as number)
             throw `native: ${graph.name} passes union word %${x} into ${into} (${rep?.text ?? 'no rep'})`
@@ -7333,7 +7423,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             } else if (n.op === NodeOp.bitconvert) coerce(id, [0], asWord)
             else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && typeofTarget(id, getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(id, getRef(n, 2)) }])
             else if (n.op === NodeOp.rt) coerce(id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), asWord)
-            else if (n.op === NodeOp.eq || n.op === NodeOp.ne) coerce(id, [0, 1].filter(at => word(getRef(n, 1 - at))), asWord)
+            else if (n.op === NodeOp.eq || n.op === NodeOp.ne) coerce(id, [0, 1].filter(at => word(getRef(n, 1 - at))), comparedWord)
         }
         for (const [id, n] of [...graph.nodes]) {
             if (n.op === NodeOp.select && union(getRef(n, 0))) coerce(id, [0], truthWord)
@@ -7351,11 +7441,11 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             } else if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
                 if (union(getRef(n, 0)) !== union(getRef(n, 1))) coerce(id, [0, 1], toWord)
             } else if (n.op === NodeOp.ret && local?.unit.returns.kind === 'number' && union(getRef(n, 0))) {
-                coerce(id, [0], x => unbox(x as number))
+                coerce(id, [0], x => local!.unit.returns.bools ? wordTruth(x as number) : wordNumber(x as number))
             } else if (UnboxingOps.has(n.op)) {
-                coerce(id, Array.from({ length: countIds(n) }, (_, i) => i).filter(i => union(getRef(n, i))), x => unbox(x as number))
+                coerce(id, Array.from({ length: countIds(n) }, (_, i) => i).filter(i => union(getRef(n, i))), x => wordNumber(x as number))
             } else if (n.op === NodeOp.store && typeOf(n) !== Types.vm_value && union(getRef(n, 3))) {
-                coerce(id, [3], x => unbox(x as number))
+                coerce(id, [3], x => wordNumber(x as number))
             }
         }
         if (!local) return
@@ -7528,6 +7618,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             for (const i of indexes) operands.push(3 + i < passed ? tagOf(operands[3 + i]) : { literal: 0 })
             putCopy(graph, id, getNode(graph, id)!, operands)
         }
+        inlineBoolLiterals(graph)
         for (const [id, truth] of [...graph.nodes]) {
             if (truth.op === NodeOp.select && countIds(truth) === 3 && getRef(truth, 0) && !getRef(truth, 1) && !getRef(truth, 2)) {
                 const a = getLiteral(graph, truth, 1)
@@ -7654,7 +7745,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         verifyTraced(traced, 'resolve:input')
         const result = propertyEval.resolveClosures(traced.graph, session, frameShapes, params, {
             constructed: constructed(plannedUnit, traced.graph), calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, facts, allocationShapes, fixedFacts: fixedShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
-            plannedShapes: local ? plannedNodeShapes(local.nodes) : undefined, plannedUnions: local ? plannedUnions(local.nodes) : undefined, nullable: local ? nullableNodes(local.nodes) : undefined, signed: local ? numberSigns(local.nodes) : undefined,
+            plannedShapes: local ? plannedNodeShapes(local.nodes) : undefined, plannedUnions: local ? plannedUnions(local.nodes) : undefined, nullable: local ? nullableNodes(local.nodes) : undefined, signed: local ? numberSigns(local.nodes) : undefined, bools: local ? boolNodes(local.nodes) : undefined,
             contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: unit.cold,
         })
         functionObjectCalls(result.graph)
@@ -8198,6 +8289,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             verifyResolved(fn, resolved, edges, 'resolve', false)
             const rawCalls = new Set([...resolved.callees].filter(([, unit]) => abiOf(planned.functions.get(unit)!).mode === 'raw').map(([call]) => call))
             realizeCodecs(fn, resolved, params, rawCalls)
+            inlineBoolLiterals(resolved.graph)
             verifyResolved(fn, resolved, edges, 'realizeCodecs', true)
             typePointers(resolved)
             for (const [id, n] of resolved.graph.nodes) {
