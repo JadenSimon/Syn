@@ -22,6 +22,7 @@ import {
     withOperand,
     retypeNode, type TypeOperand, isNullishValue, sameSlotBits, nodeUsers,
     type NodeSpace,
+    armOrBodySlot, orderRegions, childRegion, type RegionTree,
 } from './graph-node'
 
 const Types = intrinsics.Types
@@ -1764,63 +1765,10 @@ function tailEdge(n: GraphNode, i: number): boolean {
     return n.op === NodeOp.inlined && i === 0
 }
 
-interface ArmRegions {
-    parent: number[]
-    owner: number[]
-    slotOf: number[]
-    regionOf: Map<number, number>
-}
-
-function armRegions(g: Graph, order: number[]): ArmRegions {
-    const parent: number[] = [-1]
-    const depth: number[] = [0]
-    const owner: number[] = [0]
-    const slotOf: number[] = [0]
-    const contexts = new Map<number, number>()
-    const regionOf = new Map<number, number>()
-    if (order.length) regionOf.set(order[order.length - 1], 0)
-    function context(of: number, id: number, i: number): number {
-        const key = id * 64 + i
-        const known = contexts.get(key)
-        if (known !== undefined) return known
-        const c = parent.length
-        parent.push(of)
-        depth.push(depth[of] + 1)
-        owner.push(id)
-        slotOf.push(i)
-        contexts.set(key, c)
-        return c
-    }
-    function lca(x: number, y: number): number {
-        while (depth[x] > depth[y]) x = parent[x]
-        while (depth[y] > depth[x]) y = parent[y]
-        while (x !== y) {
-            x = parent[x]
-            y = parent[y]
-        }
-        return x
-    }
-    for (let k = order.length - 1; k >= 0; k--) {
-        const id = order[k]
-        const n = getNode(g, id)
-        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
-        const c = regionOf.get(id)!
-        for (let i = 0; i < countIds(n); i++) {
-            const x = getRef(n, i)
-            if (!x) continue
-            const nested = (n.op === NodeOp.select && i > 0) || (n.op === NodeOp.inlined && i === 0)
-            const edge = nested ? context(c, id, i) : c
-            const prev = regionOf.get(x)
-            regionOf.set(x, prev === undefined ? edge : lca(prev, edge))
-        }
-    }
-    return { parent, owner, slotOf, regionOf }
-}
-
 interface TailEffects {
     order: number[]
     tail: Map<number, boolean>
-    regions: ArmRegions
+    regions: RegionTree
     effectful: Set<number>
 }
 
@@ -1845,18 +1793,18 @@ function tailEffects(g: Graph, b: GraphBlock): TailEffects | undefined {
     }
     if (!offTail || !effects) return
 
-    const regions = armRegions(g, order)
-    const { parent, owner, regionOf } = regions
+    const regions = orderRegions(g, order, armOrBodySlot)
+    const { parent, origin } = regions
 
     const marked = new Uint8Array(parent.length)
     const effectful = new Set<number>()
     for (const id of order) {
         const n = getNode(g, id)
         if (!n || !Unspeculatable.has(n.op)) continue
-        let c = regionOf.get(id)!
+        let c = regions.of.get(id)!
         while (c > 0 && !marked[c]) {
             marked[c] = 1
-            if (getNode(g, owner[c])!.op === NodeOp.select) effectful.add(owner[c])
+            if (getNode(g, origin[c])!.op === NodeOp.select) effectful.add(origin[c])
             c = parent[c]
         }
     }
@@ -1868,16 +1816,16 @@ function branchingSelects(g: Graph, b: GraphBlock): BranchingSelect[] {
     const effects = tailEffects(g, b)
     if (!effects) return []
     const { order, tail, effectful } = effects
-    const { owner, slotOf, regionOf } = effects.regions
+    const { origin, slot } = effects.regions
     const chosen = new Map<number, BranchingSelect>()
     const bySelect = new Map<number, BranchingSelect>()
     for (const id of order) {
         if (!effectful.has(id) || tail.get(id)) continue
-        const c = regionOf.get(id)!
+        const c = effects.regions.of.get(id)!
         if (chosen.has(c)) continue
-        const home = c ? getNode(g, owner[c])! : undefined
-        if (home?.op === NodeOp.select && !tail.get(owner[c])) continue
-        const found: BranchingSelect = { select: id, owner: c ? owner[c] : 0, slot: c ? slotOf[c] : 0, users: [] }
+        const home = c ? getNode(g, origin[c])! : undefined
+        if (home?.op === NodeOp.select && !tail.get(origin[c])) continue
+        const found: BranchingSelect = { select: id, owner: c ? origin[c] : 0, slot: c ? slot[c] : 0, users: [] }
         chosen.set(c, found)
         bySelect.set(id, found)
     }
@@ -2084,9 +2032,9 @@ export function inlineBlocks(g: Graph) {
                 }
                 visit(from)
                 if (!selects) return false
-                const { parent, owner, regionOf } = armRegions(g, order)
-                for (let c = regionOf.get(site) ?? 0; c > 0; c = parent[c]) {
-                    if (getNode(g, owner[c])!.op === NodeOp.select) return true
+                const regions = orderRegions(g, order, armOrBodySlot)
+                for (let c = regions.of.get(site) ?? 0; c > 0; c = regions.parent[c]) {
+                    if (getNode(g, regions.origin[c])!.op === NodeOp.select) return true
                 }
                 return false
             }
@@ -3284,11 +3232,6 @@ interface CoverBase {
 type Cover = Map<number, CoverBase>[]
 function emptyCover(): Cover {
     return [new Map(), new Map(), new Map(), new Map()]
-}
-interface CoverRegion {
-    parent: CoverRegion | undefined
-    depth: number
-    nodes: number[]
 }
 const CoverInert = new Set<NodeOp>([NodeOp.after, NodeOp.apply, NodeOp.ret, NodeOp.panic, NodeOp.unreachable, NodeOp.param, NodeOp.pstack, NodeOp.alloca])
 
@@ -8597,49 +8540,21 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         function scanCover(b: GraphBlock, deep: boolean, onStore?: (id: number, store: GraphNode, cover: Cover) => void): Cover | undefined {
             const order = blockOrder(g, b)
-            const inBlock = new Set(order)
-            const root: CoverRegion = { parent: undefined, depth: 0, nodes: [] }
-            const arms = new Map<string, CoverRegion>()
-            function armOf(select: number, arm: number): CoverRegion {
-                const key = `${select}:${arm}`
-                let region = arms.get(key)
-                if (region) return region
-                const parent = regionOf.get(select) ?? root
-                region = { parent, depth: parent.depth + 1, nodes: [] }
-                arms.set(key, region)
-                return region
-            }
-            function lca(x: CoverRegion | undefined, y: CoverRegion): CoverRegion {
-                if (!x) return y
-                while (x!.depth > y.depth) x = x!.parent
-                while (y.depth > x!.depth) y = y.parent!
-                while (x !== y) {
-                    x = x!.parent
-                    y = y.parent!
-                }
-                return x!
-            }
-            const regionOf = new Map<number, CoverRegion>()
             const branches = !!findValues(b.id, NodeOp.select)?.length
-            if (!branches) for (let k = order.length - 1; k >= 0; k--) root.nodes.push(order[k])
-            for (let k = order.length - 1; branches && k >= 0; k--) {
+            const regions = orderRegions(g, branches ? order : [])
+            const placed = new Map<number, number[]>()
+            let k = order.length - 1
+            while (k >= 0) {
                 const id = order[k]
-                let region = id === b.bodyId ? root : undefined
-                for (const u of dependents.get(id) ?? []) {
-                    const user = regionOf.get(u)
-                    if (!user || !inBlock.has(u)) continue
-                    const n = getNode(g, u)!
-                    if (n.op !== NodeOp.select) {
-                        region = lca(region, user)
-                        continue
-                    }
-                    for (let i = 0; i < countIds(n); i++) {
-                        if (getRef(n, i) === id) region = lca(region, i ? armOf(u, i) : user)
-                    }
-                }
-                if (!region) continue
-                regionOf.set(id, region)
-                region.nodes.push(id)
+                k--
+                const region = branches ? regions.of.get(id) : 0
+                if (region === undefined) continue
+                const list = placed.get(region)
+                if (list) list.push(id)
+                else placed.set(region, [id])
+            }
+            function armOf(select: number, arm: number): number {
+                return childRegion(regions, regions.of.get(select) ?? 0, select, arm)
             }
             function leafOf(id: number): number {
                 for (let n = getNode(g, id); n?.op === NodeOp.after; n = getNode(g, id)) id = getRef(n, countIds(n) - 1)
@@ -8659,7 +8574,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 }
                 return out
             }
-            function scanRegion(region: CoverRegion, value: number, continuation: Cover | undefined): Cover | undefined {
+            function scanRegion(region: number, value: number, continuation: Cover | undefined): Cover | undefined {
                 const leaf = leafOf(value)
                 const tail = getNode(g, leaf)
                 let terminal = 0
@@ -8679,7 +8594,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 } else {
                     cover = continuation && copyCover(continuation)
                 }
-                for (const id of region.nodes) {
+                for (const id of placed.get(region) ?? []) {
                     if (id === terminal) continue
                     const n = getNode(g, id)!
                     if (n.op === NodeOp.select) {
@@ -8701,7 +8616,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 }
                 return cover
             }
-            return scanRegion(root, b.bodyId, emptyCover())
+            return scanRegion(0, b.bodyId, emptyCover())
         }
         function liveHalf(store: GraphNode, cover: Cover): GraphNode {
             let piece = store

@@ -5,7 +5,7 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { BitwiseOps, dumpGraph, type Graph, type GraphNode, NumericOps, typeName } from './lowering2'
-import { addNode, countIds, getLiteral, getNode, getRef, isThisParam, NodeOp, resultType, setRef, typeOf } from './graph-node'
+import { addNode, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, regionUp, resultType, setRef, typeOf, type GraphRegions } from './graph-node'
 import { Op as RtOp, assignExcluded, bindingOf, elementType, opName as rtName, sliceOf } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
@@ -102,7 +102,11 @@ interface Summary {
     width: number
     owned: number[]
     order: Order | undefined
-    regions: Regions | undefined
+    regions: GraphRegions | undefined
+    tested: Set<number>
+    guards: Map<number, Map<number, Guard>>
+    narrowExprs: Map<number, Map<Guard, number>>
+    gateOf: Map<number, number>
     stores: number[]
     cone: number[] | null | undefined
     allocNodes: Map<number, number>
@@ -114,25 +118,6 @@ interface Summary {
     initializer: boolean | undefined
     bound: Bound | undefined
     proofs: pg.ProofScope | undefined
-}
-
-interface Regions {
-    of: Map<number, number>
-    block: Map<number, number>
-    shared: Set<number>
-    parent: number[]
-    depth: number[]
-    cond: number[]
-    arm: number[]
-    children: Map<number, number>
-    roots: number[]
-    link: number[]
-    tested: Set<number>
-    paramBlock: Map<number, number>
-    entries: number[][]
-    guards: Map<number, Map<number, Guard>>
-    narrowExprs: Map<number, Map<Guard, number>>
-    gateOf: Map<number, number>
 }
 
 enum OriginKind {
@@ -964,7 +949,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined,
+        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined,
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -1072,7 +1057,7 @@ function operand(s: Summary, user: number, n: GraphNode, i: number): number {
     const ref = getRef(n, i)
     if (!ref) return konst(s, literalScalar(getLiteral(s.g, n, i)))
     const base = exprOfNode(s, ref)
-    const region = s.regions ? useRegion(s.regions, user, n, i) : -1
+    const region = s.regions ? demandRegion(s.regions, user, n, i) : -1
     return region < 0 ? base : narrowed(s, ref, base, region)
 }
 
@@ -1192,200 +1177,20 @@ enum GuardFlag {
     nonzero = 32768,
 }
 
-function computeRegions(s: Summary): Regions {
+function computeRegions(s: Summary): GraphRegions {
     const g = s.g
-    const regions: Regions = { of: new Map(), block: new Map(), shared: new Set(), parent: [], depth: [], cond: [], arm: [], children: new Map(), roots: [], link: [], tested: new Set(), paramBlock: new Map(), entries: [], guards: new Map(), narrowExprs: new Map(), gateOf: new Map() }
-    for (let b = 0; b < s.g.blocks.length; b++) regions.entries.push([])
-    const selects: number[] = []
-    const indexOf = new Map<number, number>()
-    for (let b = 0; b < g.blocks.length; b++) {
-        indexOf.set(g.blocks[b].id, b)
-        for (const p of g.blocks[b].params) regions.paramBlock.set(p, b)
-    }
-    const exits: number[][] = []
-    const preds = new Uint32Array(g.blocks.length)
-    const orders: number[][] = []
-    for (let b = 0; b < g.blocks.length; b++) {
-        const block = g.blocks[b]
-        const order: number[] = []
-        orders.push(order)
-        if (!block.bodyId) continue
-        const stack: number[] = [block.bodyId]
-        const next: number[] = [0]
-        if (regions.block.has(block.bodyId)) {
-            regions.shared.add(block.bodyId)
-            continue
-        }
-        regions.block.set(block.bodyId, b)
-        while (stack.length) {
-            const id = stack[stack.length - 1]
-            const n = getNode(g, id)
-            const at = next[next.length - 1]
-            if (n && at < countIds(n)) {
-                next[next.length - 1] = at + 1
-                const ref = getRef(n, at)
-                if (!ref) continue
-                const m = getNode(g, ref)
-                if (!m || m.op === NodeOp.block) continue
-                const known = regions.block.get(ref)
-                if (known !== undefined) {
-                    if (known !== b) regions.shared.add(ref)
-                    continue
-                }
-                charge(1)
-                regions.block.set(ref, b)
-                stack.push(ref)
-                next.push(0)
-                continue
-            }
-            stack.pop()
-            next.pop()
-            order.push(id)
-        }
-    }
-    for (let b = 0; b < g.blocks.length; b++) {
-        const root = regions.parent.length
-        regions.parent.push(-1)
-        regions.depth.push(0)
-        regions.cond.push(0)
-        regions.arm.push(0)
-        regions.link.push(-1)
-        regions.roots.push(root)
-        const order = orders[b]
-        const out: number[] = []
-        exits.push(out)
-        for (let k = order.length - 1; k >= 0; k--) {
-            const id = order[k]
-            if (!regions.of.has(id) || regions.shared.has(id)) regions.of.set(id, root)
-            const n = getNode(g, id)!
-            const ru = regions.of.get(id)!
-            if (n.op === NodeOp.select) selects.push(id)
-            if (n.op === NodeOp.apply) {
-                const target = indexOf.get(getRef(n, 0))
-                if (target !== undefined) {
-                    preds[target]++
-                    out.push(target)
-                    out.push(ru)
-                    regions.entries[target].push(id, ru)
-                }
-            }
-            for (let i = 0; i < countIds(n); i++) {
-                const ref = getRef(n, i)
-                if (!ref || regions.block.get(ref) !== b || regions.shared.has(ref)) continue
-                const contribution = n.op === NodeOp.select && (i === 1 || i === 2) ? childRegion(regions, ru, id, i) : ru
-                const known = regions.of.get(ref)
-                regions.of.set(ref, known === undefined ? contribution : lca(regions, known, contribution))
-            }
-        }
-    }
-    const nb = g.blocks.length
-    const order: number[] = []
-    const rpo = new Int32Array(nb).fill(-1)
-    const visited = new Uint8Array(nb)
-    const stack: number[] = [0]
-    const edge: number[] = [0]
-    visited[0] = 1
-    while (stack.length) {
-        const b = stack[stack.length - 1]
-        const k = edge[edge.length - 1]
-        if (k < exits[b].length) {
-            edge[edge.length - 1] = k + 2
-            const t = exits[b][k]
-            if (visited[t]) continue
-            visited[t] = 1
-            stack.push(t)
-            edge.push(0)
-            continue
-        }
-        stack.pop()
-        edge.pop()
-        order.push(b)
-    }
-    order.reverse()
-    for (let i = 0; i < order.length; i++) rpo[order[i]] = i
-    const predLists: number[][] = []
-    for (let b = 0; b < nb; b++) predLists.push([])
-    for (const b of order) {
-        for (let k = 0; k < exits[b].length; k += 2) predLists[exits[b][k]].push(b)
-    }
-    const idom = new Int32Array(nb).fill(-1)
-    idom[0] = 0
-    let changed = true
-    while (changed) {
-        changed = false
-        for (let i = 1; i < order.length; i++) {
-            const b = order[i]
-            let d = -1
-            for (const p of predLists[b]) {
-                charge(1)
-                if (idom[p] < 0) continue
-                if (d < 0) {
-                    d = p
-                    continue
-                }
-                let x = p
-                let y = d
-                while (x !== y) {
-                    while (rpo[x] > rpo[y]) x = idom[x]
-                    while (rpo[y] > rpo[x]) y = idom[y]
-                }
-                d = x
-            }
-            if (d >= 0 && idom[b] !== d) {
-                idom[b] = d
-                changed = true
-            }
-        }
-    }
-    for (let i = 1; i < order.length; i++) {
-        const b = order[i]
-        const d = idom[b]
-        if (d < 0) continue
-        let region = -1
-        let backOnly = true
-        for (const p of predLists[b]) {
-            charge(1)
-            if (p !== d && rpo[p] < rpo[b]) backOnly = false
-        }
-        if (backOnly) {
-            const out = exits[d]
-            for (let k = 0; k < out.length; k += 2) {
-                if (out[k] !== b) continue
-                region = region < 0 ? out[k + 1] : lca(regions, region, out[k + 1])
-            }
-        }
-        regions.link[regions.roots[b]] = region >= 0 ? region : regions.roots[d]
-    }
-    const global = new Map<number, number>()
-    const gdepth: number[] = []
-    for (let b = nb - 1; b >= 0; b--) {
-        const block = g.blocks[b]
-        if (block.bodyId && !global.has(block.bodyId)) global.set(block.bodyId, regions.roots[b])
-        const order = orders[b]
-        for (let k = order.length - 1; k >= 0; k--) {
-            const id = order[k]
-            const ru = global.get(id)
-            if (ru === undefined) continue
-            charge(1)
-            const n = getNode(g, id)!
-            for (let i = 0; i < countIds(n); i++) {
-                const ref = getRef(n, i)
-                if (!ref || !regions.block.has(ref)) continue
-                const contribution = n.op === NodeOp.select && (i === 1 || i === 2) ? childRegion(regions, ru, id, i) : ru
-                const known = global.get(ref)
-                global.set(ref, known === undefined ? contribution : globalLca(regions, gdepth, known, contribution))
-            }
-        }
-    }
-    regions.of = global
+    const regions = graphRegions(g, charge)
     const seenConds = new Set<number>()
-    for (const id of selects) testedRefs(s, regions, getRef(getNode(g, id)!, 0), seenConds)
+    for (const id of regions.blockOf.keys()) {
+        const n = getNode(g, id)!
+        if (n.op === NodeOp.select) testedRefs(s, getRef(n, 0), seenConds)
+    }
     return regions
 }
 
-function testedRefs(s: Summary, regions: Regions, cond: number, seen: Set<number>): void {
+function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
     const g = s.g
-    const out = regions.tested
+    const out = s.tested
     const [id] = pg.condition(g, cond, true)
     const n = id ? getNode(g, id) : undefined
     if (!n || seen.has(id)) return
@@ -1414,76 +1219,6 @@ function testedRefs(s: Summary, regions: Regions, cond: number, seen: Set<number
     }
 }
 
-function childRegion(regions: Regions, parent: number, select: number, arm: number): number {
-    intrinsics.assert(select < 16777216, `value-flow: select ${select} does not fit a region key`)
-    const key = (parent * 16777216 + select) * 4 + arm
-    const known = regions.children.get(key)
-    if (known !== undefined) return known
-    const id = regions.parent.length
-    regions.parent.push(parent)
-    regions.depth.push(regions.depth[parent] + 1)
-    regions.cond.push(select)
-    regions.arm.push(arm)
-    regions.link.push(-1)
-    regions.children.set(key, id)
-    return id
-}
-
-function regionUp(regions: Regions, r: number): number {
-    return regions.depth[r] > 0 ? regions.parent[r] : regions.link[r]
-}
-
-function globalDepth(regions: Regions, memo: number[], r: number): number {
-    const path: number[] = []
-    let at = r
-    while (at >= 0 && memo[at] === undefined) {
-        path.push(at)
-        at = regionUp(regions, at)
-    }
-    let d = at >= 0 ? memo[at] : -1
-    for (let i = path.length - 1; i >= 0; i--) {
-        d++
-        memo[path[i]] = d
-    }
-    return memo[r]
-}
-
-function globalLca(regions: Regions, memo: number[], a: number, b: number): number {
-    let da = globalDepth(regions, memo, a)
-    let db = globalDepth(regions, memo, b)
-    while (da > db) {
-        a = regionUp(regions, a)
-        da--
-    }
-    while (db > da) {
-        b = regionUp(regions, b)
-        db--
-    }
-    while (a !== b) {
-        a = regionUp(regions, a)
-        b = regionUp(regions, b)
-        if (a < 0 || b < 0) return regions.roots[0]
-    }
-    return a
-}
-
-function lca(regions: Regions, a: number, b: number): number {
-    while (regions.depth[a] > regions.depth[b]) a = regions.parent[a]
-    while (regions.depth[b] > regions.depth[a]) b = regions.parent[b]
-    while (a !== b) {
-        a = regions.parent[a]
-        b = regions.parent[b]
-    }
-    return a
-}
-
-function useRegion(regions: Regions, user: number, n: GraphNode, i: number): number {
-    const ru = regions.of.get(user)
-    if (ru === undefined) return -1
-    if (n.op === NodeOp.select && (i === 1 || i === 2)) return childRegion(regions, ru, user, i)
-    return ru
-}
-
 interface Guard {
     flags: number
     lo: number
@@ -1497,10 +1232,10 @@ const deadGuard: Guard = { flags: GuardFlag.truthy | GuardFlag.falsy | GuardFlag
 function narrowed(s: Summary, ref: number, base: number, use: number): number {
     const regions = s.regions!
     if (regions.depth[use] === 0 && regions.link[use] < 0) return base
-    if (!regions.tested.has(ref)) return base
+    if (!s.tested.has(ref)) return base
     const guard = guardAt(s, ref, use)
-    let byGuard = regions.narrowExprs.get(ref)
-    if (!byGuard) regions.narrowExprs.set(ref, byGuard = new Map())
+    let byGuard = s.narrowExprs.get(ref)
+    if (!byGuard) s.narrowExprs.set(ref, byGuard = new Map())
     let e = byGuard.get(guard)
     if (e === undefined) {
         e = guard.flags ? expr(s, ExprOp.narrow, 0, base, guard.lo, guard.flags, [base], guard.hi) : base
@@ -1512,8 +1247,8 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
 
 function guardAt(s: Summary, ref: number, use: number): Guard {
     const regions = s.regions!
-    let guards = regions.guards.get(ref)
-    if (!guards) regions.guards.set(ref, guards = new Map())
+    let guards = s.guards.get(ref)
+    if (!guards) s.guards.set(ref, guards = new Map())
     const owner = regions.paramBlock.get(ref)
     const home = owner !== undefined ? (owner === 0 ? -1 : regions.roots[owner]) : regions.shared.has(ref) ? -1 : regions.of.get(ref) ?? -1
     const path: number[] = []
@@ -1526,7 +1261,7 @@ function guardAt(s: Summary, ref: number, use: number): Guard {
     for (let i = path.length - 1; i >= 0; i--) {
         const r = path[i]
         charge(1)
-        if (regions.depth[r] > 0) guard = meetGuard(guard, guardOn(s, getRef(getNode(s.g, regions.cond[r])!, 0), ref, regions.arm[r] === 1))
+        if (regions.depth[r] > 0) guard = meetGuard(guard, guardOn(s, getRef(getNode(s.g, regions.origin[r])!, 0), ref, regions.slot[r] === 1))
         guards.set(r, guard)
     }
     return guard
@@ -1667,7 +1402,6 @@ function proofScope(s: Summary): pg.ProofScope {
     s.proofs = {
         g: s.g,
         regions,
-        up: r => regionUp(regions, r),
         charge,
         skipKey: key => flow.skippedKeys.add(key),
         proofs: new Map(),
@@ -1719,7 +1453,7 @@ function summarizeBounds(s: Summary, ids: number[], retArgs: number[]): void {
     }
 }
 
-function within(regions: Regions, r: number, target: number): boolean {
+function within(regions: GraphRegions, r: number, target: number): boolean {
     let at = r
     while (at >= 0) {
         charge(1)
@@ -1833,8 +1567,7 @@ function buildSummary(s: Summary): void {
     }
     for (let b = 0; b < g.blocks.length; b++) {
         const gates: number[] = []
-        const entries = regions.entries[b]
-        for (let k = 0; k < entries.length; k += 2) gates.push(nodeGate(s, entries[k]))
+        for (const apply of regions.arrivals[b]) gates.push(nodeGate(s, apply))
         s.blockGates.push(gates)
     }
     if (retArgs.length) summarizeBounds(s, ids, retArgs)
@@ -1850,17 +1583,17 @@ function nodeGate(s: Summary, id: number): number {
 
 function regionGate(s: Summary, r: number): number {
     const regions = s.regions!
-    const known = regions.gateOf.get(r)
+    const known = s.gateOf.get(r)
     if (known !== undefined) return known
     let gate = -1
     if (regions.depth[r] > 0) {
-        const select = getNode(s.g, regions.cond[r])!
+        const select = getNode(s.g, regions.origin[r])!
         const cond = getRef(select, 0)
         const parent = regionGate(s, regions.parent[r])
-        if (cond) gate = expr(s, ExprOp.gate, 0, parent, exprOfNode(s, cond), regions.arm[r], [], 0)
-        else gate = (getLiteral(s.g, select, 0) !== 0) === (regions.arm[r] === 1) ? parent : expr(s, ExprOp.konst, 0, NONE, 0, 0, [], 0)
+        if (cond) gate = expr(s, ExprOp.gate, 0, parent, exprOfNode(s, cond), regions.slot[r], [], 0)
+        else gate = (getLiteral(s.g, select, 0) !== 0) === (regions.slot[r] === 1) ? parent : expr(s, ExprOp.konst, 0, NONE, 0, 0, [], 0)
     } else if (regions.link[r] >= 0) gate = regionGate(s, regions.link[r])
-    regions.gateOf.set(r, gate)
+    s.gateOf.set(r, gate)
     return gate
 }
 
@@ -4020,7 +3753,7 @@ function allocLive(frame: FrameInfo, origin: number): boolean {
     const node = flow.originKind[origin] === OriginKind.fresh && flow.originOwner[origin] === s ? s.allocNodes.get(flow.originCell[origin]) : undefined
     if (node === undefined || !s.regions) return true
     const r = s.regions.of.get(node)
-    const gate = r === undefined ? undefined : s.regions.gateOf.get(r)
+    const gate = r === undefined ? undefined : s.gateOf.get(r)
     if (gate === undefined || gate < 0 || s.local![gate] === undefined) return true
     for (const m of frame.members) if (specScalar(m, at(m.inst, gate)) !== NONE) return true
     return false
