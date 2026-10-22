@@ -195,6 +195,29 @@ function writeRuntimeHeap(at: number, bytes: Uint8Array): void {
     if (!nativeCopier(runtimeHeapBase() + at, src, bytes.byteLength)) throw 'native: failed to copy into the runtime heap'
     heldArgs = outer
 }
+function runtimeBytes(address: number, size: number): Uint8Array {
+    const bytes = new Uint8Array(Math.max(size, 1))
+    if (size && !nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), address, size)) throw 'native: failed to read the runtime heap'
+    return bytes.subarray(0, size)
+}
+function runtimeString(handle: number): string {
+    const cell = new DataView(runtimeBytes(runtimeHeapBase() + handle, heap.HeapString.sizeof).buffer)
+    const length = cell.getUint32(heap.stringLengthOffset, true)
+    const ptr = Number(cell.getBigUint64(heap.stringPtrOffset, true))
+    return new TextDecoder().decode(runtimeBytes(ptr, length))
+}
+function hostResult(raw: any, kind: HostReturn): any {
+    const word = Number(BigInt.asUintN(32, BigInt(raw)))
+    if (kind === 'string') return runtimeString(word)
+    if (!(word & 1)) return (word | 0) >> 1
+    const handle = word >>> 1
+    if (handle === heap.undefinedHandle) return undefined
+    if (handle === heap.nullHandle) return null
+    if (handle === heap.falseHandle) return false
+    if (handle === heap.trueHandle) return true
+    if (word >= heap.pstackWordTag || handle & heap.boxedCellBit) return raw
+    return runtimeString(handle)
+}
 function mirrorRaw(ptr: number): void {
     if (!ptr || mirroredCells.has(ptr)) return
     mirroredCells.add(ptr)
@@ -2481,9 +2504,12 @@ interface ProgramGraph {
     unplanned: Set<number>
     tagged: Set<number>
     abi: Map<number, string>
+    hostReturns: Map<number, HostReturn>
     image: ProgramImage
     target: Target
 }
+
+type HostReturn = 'word' | 'string'
 
 function programCallSites(program: ProgramGraph): Map<number, [caller: number, call: number][]> {
     const sites = new Map<number, [number, number][]>()
@@ -7232,6 +7258,9 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         function unbox(value: number): number {
             return addNode(graph, NodeOp.unbox, [value], Types.i64)
         }
+        function handleOf(value: number): number {
+            return addNode(graph, NodeOp.unbox, [value], Types.u32)
+        }
         function union(x: Operand): boolean {
             if (typeof x !== 'number' || !x) return false
             if (rawCalls.has(tailOf(graph, x))) return false
@@ -7360,7 +7389,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (numberName(rep) === 'f64') return addNode(graph, NodeOp.convert, [wordNumber(x as number)], Types.f64)
             if (rep?.kind === 'number' && rep.bools) return wordTruth(x as number)
             if (rep?.kind === 'number') return wordNumber(x as number)
-            if (isStringRep(rep)) return addNode(graph, NodeOp.unbox, [x], Types.u32)
+            if (isStringRep(rep)) return handleOf(x as number)
             if (shaped || pointerOfShapes(rep)) return decode(x as number)
             throw `native: ${graph.name} passes union word %${x} into ${into} (${rep?.text ?? 'no rep'})`
         }
@@ -7440,6 +7469,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 coerce(id, Array.from({ length: countIds(n) - 1 }, (_, i) => i + 1), toWord)
             } else if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
                 if (union(getRef(n, 0)) !== union(getRef(n, 1))) coerce(id, [0, 1], toWord)
+            } else if (n.op === NodeOp.rt && rt.handleOps.has(getLiteral(graph, n, 1)) && union(getRef(n, 2))) {
+                coerce(id, [2], x => handleOf(x as number))
             } else if (n.op === NodeOp.ret && local?.unit.returns.kind === 'number' && union(getRef(n, 0))) {
                 coerce(id, [0], x => local!.unit.returns.bools ? wordTruth(x as number) : wordNumber(x as number))
             } else if (UnboxingOps.has(n.op)) {
@@ -7798,6 +7829,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         putNode(graph, id, NodeOp.call, [addNode(graph, NodeOp.nilEffect, []), target, { literal: 0 }, lhs, rhs])
     }
     function coerceOperands(graph: Graph, local: UnitPlan, coercions: number[]): void {
+        const compareImpl = rt.bindingOf(rt.Op.compare)!.impl!
         function toNumber(x: Operand): Operand[] {
             const target = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(rt.bindingOf(rt.Op.toNumber)!.impl!) }])
             return [addNode(graph, NodeOp.nilEffect, []), target, { literal: 0 }, x]
@@ -7816,6 +7848,14 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             }
             if (!callees) continue
             local.calls.delete(id)
+            const compares = new Set([...callees].filter(unit => originOf(unit.fn) === compareImpl))
+            if (compares.size) {
+                const target = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(compareImpl) }])
+                const call = addNode(graph, NodeOp.call, [addNode(graph, NodeOp.nilEffect, []), target, { literal: 0 }, getOperand(graph, n, 0), getOperand(graph, n, 1)])
+                local.calls.set(call, compares)
+                putCopy(graph, id, n, [call, addNode(graph, NodeOp.literal, [{ literal: 0 }], Types.f64)])
+                continue
+            }
             const mask = local.unit.coercions.get(id) ?? 0
             const operands = getOperands(graph, n)
             let changed = false
@@ -8970,7 +9010,7 @@ function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan
     const outlined: [Function, Graph][] = []
     const { realizeUnit, plannedUnit } = resolver
     const outline = (name: string) => intern(Object.defineProperty(Object.assign(function cut() {}, { shouldNotInline: true }), 'name', { value: name }))
-    const program: ProgramGraph = { units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), image, target }
+    const program: ProgramGraph = { units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), hostReturns: new Map(), image, target }
     function compileUnit(fn: Function): Graph {
         const unit = unitOf(fn)
         if (flags.has('native-symbols')) console.log('native symbol', unit.symbol!, fn.name || fn.toString().slice(0, 80), plannedUnit(fn) ? 'planned' : 'unplanned')
@@ -9001,6 +9041,7 @@ function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan
         tracer.graphsOf(init)
     }
     tracer.freeze()
+    const rooted = new Set(roots.values())
     let next = 0
     while (next < order.length) {
         const wave = order.slice(next)
@@ -9025,6 +9066,8 @@ function compileProgram(linker: Linker, tracer: Tracer, resolver: Resolver, plan
             if ((originOf(fn) as any).shouldInline) program.alwaysInline.add(symbol)
             if (constructsOutOfLine(fn)) program.constructors.add(symbol)
             if (planned && abi.mode === 'tagged') program.tagged.add(symbol)
+            if (planned && rooted.has(symbol) && unionWord(planned.returns)) program.hostReturns.set(symbol, 'word')
+            else if (planned && rooted.has(symbol) && isStringRep(planned.returns) && !planned.returns.nullable) program.hostReturns.set(symbol, 'string')
             clock.timed('statics', () => resolveHandles(graph, plan.statics), fn.name)
         }
     }
@@ -9266,6 +9309,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         if (name === staticInitName) continue
         const ptr = installed.entries[symbol]
         const float = !!emitted.find(u => u.symbol === symbol)?.returnsFloat
+        const decoded = program.hostReturns.get(symbol)
         result[name] = Object.assign((...args: any[]) => {
             nativeObserver?.(`${name}(${args.join(', ')})`)
             sealCode(installed.page)
@@ -9276,7 +9320,8 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             heldArgs = values
             const raw = nativeInvoker(ptr, argsPtr, args.length)
             heldArgs = outer
-            return float ? floatBits(raw) : raw
+            if (float) return floatBits(raw)
+            return decoded ? hostResult(raw, decoded) : raw
         }, { ptr, codePage: installed.page, image: installed, units: emitted })
     }
     return result
