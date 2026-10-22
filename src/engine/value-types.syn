@@ -3,7 +3,7 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
+import { firstNonOrderingSlot, NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
 import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, resultType, spreadsLast, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
@@ -841,7 +841,7 @@ function truthTested(type: Type): boolean {
     return boolPartners(type) || type.undefined
 }
 
-function truthDemand(g: Graph, types: Map<number, Type>): Set<number> {
+function truthDemand(g: Graph, types: Map<number, Type>, returns: boolean): Set<number> {
     const tested = new Set<number>()
     const candidates: number[] = []
     for (const b of g.blocks.slice(1)) {
@@ -849,6 +849,11 @@ function truthDemand(g: Graph, types: Map<number, Type>): Set<number> {
             const type = types.get(p)
             if (type && truthTested(type)) candidates.push(p)
         }
+    }
+    for (const [id, n] of g.nodes) {
+        if (n.op !== NodeOp.call) continue
+        const type = types.get(id)
+        if (type && truthTested(type)) candidates.push(id)
     }
     if (!candidates.length) return tested
     const users = usersOf(g)
@@ -858,7 +863,8 @@ function truthDemand(g: Graph, types: Map<number, Type>): Set<number> {
     for (const p of candidates) {
         for (const [user, slot] of users.get(p) ?? []) {
             const n = getNode(g, user)!
-            if (n.op === NodeOp.select && slot === 0) continue
+            if (slot < firstNonOrderingSlot(n) || (n.op === NodeOp.select && slot === 0)) continue
+            if (returns && n.op === NodeOp.ret && slot === 0) continue
             const target = n.op === NodeOp.apply && slot > 0 ? getBlock(g, getRef(n, 0))?.params[slot - 1] : undefined
             if (target === undefined) {
                 tested.delete(p)
@@ -1298,7 +1304,7 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, boxed: Map<number, Set<string>> } {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, boxed: Map<number, Set<string>> } {
     const callees = new Map<string, number[]>()
     const outgoing = types.frames.map(() => [] as [node: number, callee: number][])
     types.frames.forEach((frame, id) => {
@@ -1346,11 +1352,10 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
             list.push(`%${object.site.node}=${shape}`)
         }
     })
-    const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = []) => {
+    const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = [], returned = inst.repOf(returns)) => {
         const reps = params.map(param => ({ label: param.label, rep: functionRep(types, inst, param.type) ?? inst.repOf(param.type) }))
         const abis = reps.map(param => `${param.label}: ${param.rep.text}`)
         const made = [...new Set(allocations)].sort()
-        const returned = inst.repOf(returns)
         return { params: reps, returns: returned, signature: `(${abis.join(', ')}) -> ${returned.text}${made.length ? ` new ${made.join(' ')}` : ''}` }
     }
     const joinedOf = (members: number[]) => {
@@ -1434,24 +1439,31 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         }
     })
     const conventionOf = sharedConventions([...unitOfRoot.values()])
+    const truth = { ...inst.repOf({ ...emptyType(), bools: 3 }), text: 'truth', tested: true }
+    const testedOf = new Map<PlannedUnit, Set<number>>()
+    const resolvedOf = new Map<PlannedUnit, Map<number, Type>>()
     for (const unit of unitOfRoot.values()) {
-        const signature = joinedSignature(unit.frames.map(f => types.frames[f]), unionAll)
-        const peers = conventionOf.get(unit) ?? [unit]
-        const returns = unionAll(peers.flatMap(peer => peer.frames.map(f => types.frames[f].returns)))
-        const joined = signatureOf(signature.params, returns, unit.frames.flatMap(f => created.get(f) ?? []))
         const resolved = types.resolve(unit.frames)
         for (const [node, type] of resolved.nodes) unit.nodes.set(node, inst.repOf(type))
-        const tested = truthDemand(graphOf(unit.fn), resolved.nodes)
-        if (tested.size) {
-            const bool = { ...inst.repOf({ ...emptyType(), bools: 3 }), tested: true }
-            for (const param of tested) unit.nodes.set(param, bool)
-        }
+        testedOf.set(unit, truthDemand(graphOf(unit.fn), resolved.nodes, false))
+        resolvedOf.set(unit, resolved.nodes)
         touchedOf.set(unit, resolved.slices)
         for (const b of resolved.blocks) unit.blocks.add(b)
         for (const [select, arms] of resolved.selects) {
             const dead = arms.flatMap((x, i) => x ? [] : [i + 1])
             if (dead.length && dead.length < arms.length) unit.deadArms.set(select, dead)
         }
+    }
+    const truthful = new Set(truthReturns(types, [...unitOfRoot.values()], conventionOf, unitOfFrame, caller => testedOf.get(caller)!, keepsReturn))
+    for (const unit of truthful) for (const f of unit.frames) for (const site of types.frames[f].sites) unitOfFrame[site.frame!].nodes.set(site.node, truth)
+    for (const unit of unitOfRoot.values()) {
+        const g = graphOf(unit.fn)
+        const tested = truthful.has(unit) ? truthDemand(g, resolvedOf.get(unit)!, true) : testedOf.get(unit)!
+        for (const node of tested) if (getNode(g, node)!.op !== NodeOp.call) unit.nodes.set(node, truth)
+        const signature = joinedSignature(unit.frames.map(f => types.frames[f]), unionAll)
+        const peers = conventionOf.get(unit) ?? [unit]
+        const returns = unionAll(peers.flatMap(peer => peer.frames.map(f => types.frames[f].returns)))
+        const joined = signatureOf(signature.params, returns, unit.frames.flatMap(f => created.get(f) ?? []), truthful.has(unit) ? truth : inst.repOf(returns))
         unit.returnsSelf = peers.length === 1 && unit.frames.every(f => {
             const frame = types.frames[f]
             const r = frame.returns
@@ -1522,6 +1534,29 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf))
     for (const [unit, touched] of touchedOf) for (const [node, buffers] of touched) unit.slices.set(node, inst.elementOf(buffers))
     return { inst, plan, boxed }
+}
+
+function truthReturns(types: ValueTypes, units: PlannedUnit[], conventionOf: Map<PlannedUnit, PlannedUnit[]>, unitOfFrame: PlannedUnit[], testedIn: (unit: PlannedUnit) => Set<number>, keepsReturn: (fn: Function) => boolean): PlannedUnit[] {
+    const index = new Map<PlannedUnit, number>()
+    units.forEach((unit, i) => index.set(unit, i))
+    const parent = units.map((_, i) => i)
+    const join = (a: PlannedUnit, b: PlannedUnit) => {
+        parent[rootOf(parent, index.get(a)!)] = rootOf(parent, index.get(b)!)
+    }
+    for (const unit of units) {
+        for (const peer of conventionOf.get(unit) ?? []) join(unit, peer)
+        for (const callees of unit.calls.values()) {
+            const first = [...callees][0]
+            for (const callee of callees) join(first, callee)
+        }
+    }
+    const qualifies = (unit: PlannedUnit) => !keepsReturn(unit.fn) && truthTested(unionAll(unit.frames.map(f => types.frames[f].returns))) && unit.frames.every(f => {
+        const sites = types.frames[f].sites
+        return sites.length > 0 && sites.every(site => site.frame !== undefined && site.operand === undefined && testedIn(unitOfFrame[site.frame]).has(site.node))
+    })
+    const failed = new Set<number>()
+    for (const unit of units) if (!qualifies(unit)) failed.add(rootOf(parent, index.get(unit)!))
+    return units.filter(unit => !failed.has(rootOf(parent, index.get(unit)!)))
 }
 
 function sharedConventions(units: PlannedUnit[]): Map<PlannedUnit, PlannedUnit[]> {
@@ -1997,7 +2032,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
         const read = (id: number) => getNode(g, id)!.op === NodeOp.load || rt.sliceOf(g, getNode(g, id)!) === rt.Op.sliceRead
         const keyed = (id: number) => !moved.has(id) || !read(id) || wide(id)
         return [
-            unitIdentity(unit.fn), unit.boxes, unit.boxedReturn ? view(unit.returns) : '', [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf,
+            unitIdentity(unit.fn), unit.boxes, unit.boxedReturn ? view(unit.returns) : '', [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf, !!unit.returns.tested,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${abiOf(unit)}`,
             byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, Handle>(), k => String(k)),
             [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.coercions, mask => String(mask)), byNode(unit.slices, element => `${elementWidth(element)}${numberName(element) === 'f64' ? 'f' : ''}`), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),

@@ -830,7 +830,7 @@ function foldConstantCalls(program: ProgramGraph, clock: PhaseClock): void {
         }
         if (!folded.size) continue
         replaceFolded(g, folded, tokens)
-        program.units.set(symbol, clock.timed('normalize', () => optimizePackaged(g, program.target), g.name))
+        program.units.set(symbol, clock.optimize(g))
     }
 }
 
@@ -1916,6 +1916,7 @@ interface PhaseClock {
     enterPhase(next: string): string
     timed<T>(next: string, run: () => T, unit?: string): T
     normalize(graph: Graph, opts?: { firstPass?: boolean }): Graph
+    optimize(graph: Graph): Graph
 }
 
 export interface CompileError extends Error {
@@ -1947,6 +1948,7 @@ interface CanonicalGraph {
     key: string
     leaves: number[]
     leafIndex: Map<string, number>
+    leafLabels: (string | undefined)[]
 }
 
 interface CachedNode {
@@ -1966,49 +1968,44 @@ interface CachedGraph {
     nodes: CachedNode[]
     facts: CachedNode[] | undefined
     blocks: GraphBlock[]
-    labels: [number, string][]
+    labels: [number, string, number | undefined][]
 }
 
 const optimizedGraphs = new Map<string, CachedGraph | null>()
+const debugOptimizedGraphs = flags.has('optimized-cache-debug')
 
-function isLeafSlot(n: GraphNode, i: number): boolean {
-    return LeafOps.has(n.op) && i < countIds(n) && (n.op === NodeOp.heapHandle || i === 0)
+function isLeafSlot(n: GraphNode, i: number, literal: number): boolean {
+    if (!LeafOps.has(n.op) || i >= countIds(n)) return false
+    if (n.op !== NodeOp.heapHandle) return i === 0
+    return !heap.fixedHandles.includes(literal as intrinsics.Handle)
+}
+
+function labeledLeaf(graph: Graph, id: number, leafAt: Map<string, number>): number | undefined {
+    const n = getNode(graph, id) ?? graph.facts?.get(id)
+    if (!n || getRef(n, 0)) return
+    const literal = getLiteral(graph, n, 0)
+    if (!isLeafSlot(n, 0, literal)) return
+    return leafAt.get(`${n.op}:${literal}`)
+}
+
+function ascending(ids: number[]): boolean {
+    for (let i = 1; i < ids.length; i++) {
+        if (ids[i - 1] > ids[i]) return false
+    }
+    return true
 }
 
 function canonicalGraph(graph: Graph, tag: string, rename = true): CanonicalGraph {
+    const listed = [...graph.nodes.keys()]
+    const listedFacts = [...graph.facts?.keys() ?? []]
+    const order = [...listed, ...listedFacts].sort((a, b) => a - b)
     const index = new Map<number, number>()
-    const order: number[] = []
-    const stack: number[] = []
-    function visit(root: number): void {
-        stack.push(root)
-        while (stack.length) {
-            const id = stack.pop()!
-            if (!id || index.has(id)) continue
-            const n = getNode(graph, id) ?? graph.facts?.get(id)
-            if (!n) continue
-            index.set(id, order.length)
-            order.push(id)
-            const fact = factOf(n)
-            if (fact) stack.push(fact)
-            for (let i = n.slots.length - 1; i >= 0; i--) {
-                const ref = getRef(n, i)
-                if (ref) stack.push(ref)
-            }
-        }
-    }
-    for (const b of graph.blocks) {
-        visit(b.id)
-        for (const p of b.params) visit(p)
-        visit(b.bodyId)
-    }
-    for (const id of graph.nodes.keys()) {
-        visit(id)
-    }
-    for (const id of graph.facts?.keys() ?? []) {
-        visit(id)
+    for (const id of order) {
+        index.set(id, index.size)
     }
     const leafIndex = new Map<string, number>()
     const leaves: number[] = []
+    const leafLabels: (string | undefined)[] = []
     const lines: string[] = [`${tag}|${graph.form}|${graph.level}|${graph.unswitch}|${graph.root ? index.get(graph.root) : 0}`]
     for (const b of graph.blocks) {
         lines.push(`B ${index.get(b.id)} ${b.params.map(p => index.get(p)).join(' ')} ${b.bodyId ? `%${index.get(b.bodyId)}` : `#${b.bodyConst}`}`)
@@ -2026,7 +2023,7 @@ function canonicalGraph(graph: Graph, tag: string, rename = true): CanonicalGrap
                 continue
             }
             const literal = getLiteral(graph, n, i)
-            if (!literal || !rename || !isLeafSlot(n, i)) {
+            if (!literal || !rename || !isLeafSlot(n, i, literal)) {
                 line += ` #${literal}`
                 continue
             }
@@ -2037,12 +2034,15 @@ function canonicalGraph(graph: Graph, tag: string, rename = true): CanonicalGrap
                 leafIndex.set(leaf, at)
                 leaves.push(literal)
             }
+            if (i === 0) leafLabels[at] ??= getDebugLabel(graph, id)
             line += ` $${at}`
         }
         if (fact) line += ` !${index.get(fact)}`
         lines.push(line)
     }
-    return { key: lines.join('\n'), leaves, leafIndex }
+    if (!ascending(listed)) lines.push(`O ${listed.map(id => index.get(id)).join(' ')}`)
+    if (!ascending(listedFacts)) lines.push(`OF ${listedFacts.map(id => index.get(id)).join(' ')}`)
+    return { key: lines.join('\n'), leaves, leafIndex, leafLabels }
 }
 
 function cacheNode(graph: Graph, id: number, n: GraphNode, leafAt: Map<string, number>, handles: Set<number>): CachedNode | undefined {
@@ -2062,14 +2062,20 @@ function cacheNode(graph: Graph, id: number, n: GraphNode, leafAt: Map<string, n
             continue
         }
         const literal = getLiteral(graph, n, i)
-        if (literal && isLeafSlot(n, i)) {
+        if (literal && isLeafSlot(n, i, literal)) {
             const at = leafAt.get(`${n.op}:${literal}`)
-            if (at === undefined) return
+            if (at === undefined) {
+                if (debugOptimizedGraphs) console.log('CACHE-REJECT leaf', graph.name, id, opName(n.op), i, literal)
+                return
+            }
             kinds[i] = SlotLeaf
             values[i] = at
             continue
         }
-        if (literal && handles.has(literal)) return
+        if (literal && handles.has(literal)) {
+            if (debugOptimizedGraphs) console.log('CACHE-REJECT literal', graph.name, id, opName(n.op), i, literal)
+            return
+        }
         kinds[i] = SlotLiteral
         values[i] = literal
     }
@@ -2102,15 +2108,21 @@ function cacheGraph(canonical: CanonicalGraph, out: Graph): CachedGraph | undefi
     }
     for (const b of out.blocks) ids.add(b.id)
     for (const n of nodes) {
-        if (!refsKnown(n, ids)) return
+        if (!refsKnown(n, ids)) {
+            if (debugOptimizedGraphs) console.log('CACHE-REJECT refs', out.name, n.id, opName(n.op))
+            return
+        }
     }
     for (const n of facts ?? []) {
-        if (!refsKnown(n, ids)) return
+        if (!refsKnown(n, ids)) {
+            if (debugOptimizedGraphs) console.log('CACHE-REJECT refs', out.name, n.id, opName(n.op))
+            return
+        }
     }
-    const labels: [number, string][] = []
+    const labels: CachedGraph['labels'] = []
     for (const id of ids) {
         const label = getDebugLabel(out, id)
-        if (label !== undefined) labels.push([id, label])
+        if (label !== undefined) labels.push([id, label, labeledLeaf(out, id, leafAt)])
     }
     return {
         form: out.form, level: out.level, unswitch: out.unswitch, root: out.root,
@@ -2139,25 +2151,26 @@ function instantiateNode(graph: Graph, cached: CachedNode, remap: Map<number, nu
     return makeNodeFromSlots(cached.op, slots, cached.flags)
 }
 
-function instantiateGraph(input: Graph, cached: CachedGraph, leaves: number[]): Graph {
+function instantiateGraph(input: Graph, cached: CachedGraph, canonical: CanonicalGraph): Graph {
     const remap = new Map<number, number>()
     for (const id of cached.ids) {
         remap.set(id, newId(input))
     }
     const nodes = new Map<number, GraphNode>()
     for (const n of cached.nodes) {
-        nodes.set(remap.get(n.id)!, instantiateNode(input, n, remap, leaves))
+        nodes.set(remap.get(n.id)!, instantiateNode(input, n, remap, canonical.leaves))
     }
     let facts: Map<number, GraphNode> | undefined
     if (cached.facts) {
         facts = new Map()
         for (const n of cached.facts) {
-            facts.set(remap.get(n.id)!, instantiateNode(input, n, remap, leaves))
+            facts.set(remap.get(n.id)!, instantiateNode(input, n, remap, canonical.leaves))
         }
     }
     const blocks = cached.blocks.map(b => ({ id: remap.get(b.id)!, params: b.params.map(p => remap.get(p)!), bodyId: b.bodyId ? remap.get(b.bodyId)! : 0, bodyConst: b.bodyConst }))
-    for (const [id, label] of cached.labels) {
-        setDebugLabel(input, remap.get(id)!, label)
+    for (const [id, label, leaf] of cached.labels) {
+        const current = leaf === undefined ? label : canonical.leafLabels[leaf]
+        if (current !== undefined) setDebugLabel(input, remap.get(id)!, current)
     }
     return createGraph({
         form: cached.form, ids: input.ids, literals: input.literals, nodes, blocks, root: remap.get(cached.root) ?? cached.root,
@@ -2166,17 +2179,96 @@ function instantiateGraph(input: Graph, cached: CachedGraph, leaves: number[]): 
 }
 
 const checkOptimizedGraphs = flags.has('check-optimized-cache')
+const cacheSpecialized = !flags.has('no-specialized-cache')
+
+interface OptimizedCacheStats {
+    calls: number
+    hits: number
+    misses: number
+    blocked: number
+    uncacheable: number
+    keyMs: number
+    runMs: number
+    copyMs: number
+    storeMs: number
+}
+
+const optimizedCacheStats = flags.has('optimized-cache-stats') ? new Map<string, OptimizedCacheStats>() : undefined
+
+function printOptimizedCacheStats(stats: Map<string, OptimizedCacheStats>): void {
+    for (const [tag, counts] of stats) {
+        console.log('optimized cache', tag, JSON.stringify(counts))
+    }
+    let graphs = 0
+    let nodes = 0
+    let operandBytes = 0
+    let keyChars = 0
+    for (const [key, graph] of optimizedGraphs) {
+        keyChars += key.length
+        if (!graph) continue
+        graphs++
+        for (const n of [...graph.nodes, ...graph.facts ?? []]) {
+            nodes++
+            operandBytes += n.kinds.byteLength + n.values.byteLength
+        }
+    }
+    console.log('optimized cache retained', JSON.stringify({ entries: optimizedGraphs.size, graphs, nodes, operandBytes, keyChars }))
+}
+
+if (optimizedCacheStats) process.on('beforeExit', () => printOptimizedCacheStats(optimizedCacheStats))
+
+function optimizedStatsOf(tag: string): OptimizedCacheStats | undefined {
+    if (!optimizedCacheStats) return
+    const known = optimizedCacheStats.get(tag)
+    if (known) return known
+    const stats = { calls: 0, hits: 0, misses: 0, blocked: 0, uncacheable: 0, keyMs: 0, runMs: 0, copyMs: 0, storeMs: 0 }
+    optimizedCacheStats.set(tag, stats)
+    return stats
+}
+
+function cacheOutcome(cached: CachedGraph | null | undefined): string {
+    if (cached === undefined) return 'miss'
+    if (cached === null) return 'blocked'
+    return 'hit'
+}
 
 function optimizeOnce(graph: Graph, tag: string, run: () => Graph): Graph {
+    const stats = optimizedStatsOf(tag)
+    const start = stats ? performance.now() : 0
     const canonical = canonicalGraph(graph, tag)
+    const keyed = stats ? performance.now() : 0
+    if (stats) {
+        stats.calls++
+        stats.keyMs += keyed - start
+    }
     const cached = optimizedGraphs.get(canonical.key)
+    if (debugOptimizedGraphs) console.log('optimized cache', cacheOutcome(cached), tag, graph.name, graph.nodes.size)
     if (cached === undefined) {
         const out = run()
-        optimizedGraphs.set(canonical.key, cacheGraph(canonical, out) ?? null)
+        const ran = stats ? performance.now() : 0
+        const saved = cacheGraph(canonical, out)
+        optimizedGraphs.set(canonical.key, saved ?? null)
+        if (stats) {
+            stats.misses++
+            if (!saved) stats.uncacheable++
+            stats.runMs += ran - keyed
+            stats.storeMs += performance.now() - ran
+        }
         return out
     }
-    if (cached === null) return run()
-    const reused = instantiateGraph(graph, cached, canonical.leaves)
+    if (cached === null) {
+        const out = run()
+        if (stats) {
+            stats.blocked++
+            stats.runMs += performance.now() - keyed
+        }
+        return out
+    }
+    const reused = instantiateGraph(graph, cached, canonical)
+    if (stats) {
+        stats.hits++
+        stats.copyMs += performance.now() - keyed
+    }
     if (checkOptimizedGraphs) {
         const fresh = run()
         const expected = canonicalGraph(fresh, tag, false).key
@@ -2218,7 +2310,12 @@ function createClock(target: Target): PhaseClock {
         if (!opts?.firstPass || target !== hostTarget) return timed('normalize', () => normalizeValueGraph(graph, { ...opts, target }), graph.name)
         return timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeValueGraph(graph, { ...opts, target })), graph.name)
     }
-    return { start, phases, enterPhase, timed, normalize }
+    function optimize(graph: Graph): Graph {
+        return timed('normalize', () => cacheSpecialized && target === hostTarget
+            ? optimizeOnce(graph, 'optimized', () => optimizePackaged(graph, target))
+            : optimizePackaged(graph, target), graph.name)
+    }
+    return { start, phases, enterPhase, timed, normalize, optimize }
 }
 
 function createImage() {
@@ -3316,8 +3413,9 @@ function unswitchHot(program: ProgramGraph, levels: Map<number, number>, clock: 
     for (const symbol of budgetedLoops(program, levels, 0.2)) {
         const graph = program.units.get(symbol)!
         graph.unswitch = 400
-        program.units.set(symbol, clock.timed('normalize', () => optimizePackaged(graph, program.target), graph.name))
-        graph.unswitch = undefined
+        const optimized = clock.optimize(graph)
+        optimized.unswitch = undefined
+        program.units.set(symbol, optimized)
     }
 }
 
@@ -3478,7 +3576,7 @@ function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Tar
         graph.form = undefined
         graph = packageValueGraph(graph, target, entries)
         resolveNumberTypes(graph)
-        return isJumbo(graph) ? graph : optimizePackaged(graph, target)
+        return isJumbo(graph) ? graph : clock.optimize(graph)
     }, graph.name)
 }
 
@@ -4246,7 +4344,7 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
     timed('effects', () => refineProgramEffects(program, refined))
     timed('statics', () => foldStaticLoads(program, refined))
     for (const [symbol, graph] of program.units) {
-        if (graph.form === 'packaged' || refined.has(symbol)) program.units.set(symbol, timed('normalize', () => optimizePackaged(graph, program.target), graph.name))
+        if (graph.form === 'packaged' || refined.has(symbol)) program.units.set(symbol, clock.optimize(graph))
     }
     const touched = new Set<number>()
     timed('statics', () => foldStaticLoads(program, touched))
@@ -7236,7 +7334,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             argShapes: Array.from({ length: paramCount }, (_, i) => shapes.get(i)),
             result, members, nullish: returned.kind === 'undefined' || undefined, returnsReceiver: (receiver && unit.returnsSelf) || undefined, float: boxedFloat || undefined, union: unionWord(returned) || undefined,
             stringWord: (isStringRep(returned) && boxedResult) || undefined,
-            boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && boxedResult) || undefined,
+            boxed: ((numberName(returned) === 'int' || numberName(returned) === 'i64') && boxedResult && !returned.tested) || undefined,
             bool: !!returned.bools || undefined,
             decode: (result !== undefined && !isStringRep(returned) && !numeric && !propertyEval.reducedShape(result) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
             target,
@@ -7378,7 +7476,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (boolValued(x)) return x
             if (isNullishValue(graph, x) || voided(x)) return { literal: 0 }
             if (union(x) || word(x)) return truthWord(x)
-            return addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool)
+            return x
         }
         function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
             if (rep && unionWord(rep)) return toWord(x)
@@ -7433,6 +7531,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             if (!own.has(id)) return
             const value = getRef(n, 0)
             const returns = local?.unit.returns
+            if (returns?.tested) return coerce(id, [0], x => object(x) ? addNode(graph, NodeOp.ne, [x, { literal: 0 }], Types.bool) : truthOf(x))
             const valued = !!returns && returns.kind !== 'never' && returns.kind !== 'undefined' && !unionWord(returns) && abi.mode !== 'tagged' && abi.mode !== 'narrow'
             if (valued && voided(value)) return coerce(id, [0], () => voidValue(value, abi.returns))
             const rawNullish = isNullishValue(graph, value) && returns?.kind === 'number'
@@ -7471,7 +7570,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 if (union(getRef(n, 0)) !== union(getRef(n, 1))) coerce(id, [0, 1], toWord)
             } else if (n.op === NodeOp.rt && rt.handleOps.has(getLiteral(graph, n, 1)) && union(getRef(n, 2))) {
                 coerce(id, [2], x => handleOf(x as number))
-            } else if (n.op === NodeOp.ret && local?.unit.returns.kind === 'number' && union(getRef(n, 0))) {
+            } else if (n.op === NodeOp.ret && local?.unit.returns.kind === 'number' && !local.unit.returns.tested && union(getRef(n, 0))) {
                 coerce(id, [0], x => local!.unit.returns.bools ? wordTruth(x as number) : wordNumber(x as number))
             } else if (UnboxingOps.has(n.op)) {
                 coerce(id, Array.from({ length: countIds(n) }, (_, i) => i).filter(i => union(getRef(n, i))), x => wordNumber(x as number))
@@ -8392,7 +8491,7 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
         if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
         if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
     }
-    const { inst, plan, boxed } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => host.graphOf(fn))
+    const { inst, plan, boxed } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => host.graphOf(fn), fn => linker.constructsOutOfLine(fn) || !!linker.unitOf(linker.originOf(fn)).stubbed || linker.isRoot(fn))
     const boxedConstructions = new Map<intrinsics.Handle, Set<string>>()
     for (const object of types.objects) {
         if (object.state === undefined || !constructed.has(object.state)) continue
@@ -9356,3 +9455,86 @@ const createTraceSession = traceModule.createTraceSession
 const symbolicMemory = traceModule.symbolicMemory
 const fastTraceModule = await import('./fast-trace')
 const normalizeStats: [string, number, boolean][] = []
+
+export async function suite() {
+    const harness = await import('./harness')
+    function graphOf(op: NodeOp, value: number, label?: string): { graph: Graph, value: number, ret: number } {
+        const graph = createGraph({})
+        const root = addNode(graph, NodeOp.block, [])
+        const node = addNode(graph, op, [{ literal: value }])
+        const ret = addNode(graph, NodeOp.ret, [node, root])
+        graph.root = root
+        setGraphBlocks(graph, [{ id: root, params: [], bodyId: ret, bodyConst: 0 }])
+        if (label !== undefined) setDebugLabel(graph, node, label)
+        return { graph, value: node, ret }
+    }
+    function returned(graph: Graph): GraphNode {
+        return getNode(graph, graph.blocks[0].bodyId)!
+    }
+    function test(name: string, run: (tag: string) => void): void {
+        const tag = `cache-test:${name}`
+        harness.test(name, () => {
+            try {
+                run(tag)
+            } finally {
+                for (const key of [...optimizedGraphs.keys()]) {
+                    if (key.startsWith(`${tag}|`)) optimizedGraphs.delete(key)
+                }
+                optimizedCacheStats?.delete(tag)
+            }
+        })
+    }
+    test('cacheFixedHandles', tag => {
+        for (const handle of [heap.undefinedHandle, heap.nullHandle, heap.trueHandle, heap.fromJsString('cached')]) {
+            const input = graphOf(NodeOp.heapHandle, handle)
+            const expected = isNullishValue(input.graph, input.value) ? 1 : 0
+            const out = optimizeOnce(input.graph, tag, () => {
+                putNode(input.graph, input.ret, NodeOp.ret, [{ literal: expected }, input.graph.root])
+                deleteNode(input.graph, input.value)
+                return input.graph
+            })
+            if (getLiteral(out, returned(out), 0) !== expected) harness.fail('cache reused a different fixed handle')
+        }
+    })
+    test('cacheFixedHandleAsLiteral', tag => {
+        const input = graphOf(NodeOp.heapHandle, heap.undefinedHandle)
+        const key = canonicalGraph(input.graph, tag).key
+        const out = optimizeOnce(input.graph, tag, () => {
+            putNode(input.graph, input.ret, NodeOp.ret, [{ literal: 8 }, input.graph.root])
+            deleteNode(input.graph, input.value)
+            return input.graph
+        })
+        if (!optimizedGraphs.get(key) || getLiteral(out, returned(out), 0) !== 8) harness.fail('a field offset must not be mistaken for a fixed handle binding')
+    })
+    test('cacheRebindTargets', tag => {
+        const first = graphOf(NodeOp.localTarget, 11, 'first target')
+        optimizeOnce(first.graph, tag, () => first.graph)
+        const second = graphOf(NodeOp.localTarget, 29, 'second target')
+        const out = optimizeOnce(second.graph, tag, () => second.graph)
+        const value = getRef(returned(out), 0)
+        if (getLiteral(out, getNode(out, value)!, 0) !== 29 || getDebugLabel(out, value) !== 'second target') harness.fail('cached target values and labels must bind to the current compilation')
+    })
+    test('cacheLiteralChanges', tag => {
+        for (const value of [3, 9, 3]) {
+            const input = graphOf(NodeOp.literal, value)
+            const out = optimizeOnce(input.graph, tag, () => input.graph)
+            if (getLiteral(out, getNode(out, getRef(returned(out), 0))!, 0) !== value) harness.fail('cached literals must be part of the key')
+        }
+    })
+    harness.test('cacheGenericCaptures', () => {
+        function reader(offset: number) {
+            return function read(n: u32): number {
+                const map = new Map<number, number>()
+                map.set(n, n + offset)
+                return map.get(n)!
+            }
+        }
+        for (const offset of [2, 7, 11]) {
+            const fn = reader(offset)
+            const read = createNatives({ read: fn }).read
+            for (const n of [0, 4]) {
+                if (Number(read(n)) !== fn(n)) harness.fail('cached generic methods reused a previous capture')
+            }
+        }
+    })
+}
