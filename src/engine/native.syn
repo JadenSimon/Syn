@@ -6794,6 +6794,7 @@ function planFrames(types: ValueTypes, plan: ShapePlan, planned: Planned, linker
     function factsOf(type: Type): Codec[] {
         const rep = plan.inst.repOf(type)
         if (rep.kind === 'number') return [number]
+        if (rep.kind === 'union') return [repFact(plan.shapes, rep, false)!]
         if (rep.kind !== 'pointer') return []
         const out: Codec[] = []
         if (type.strings.length) out.push({ kind: 'ref', shape: propertyEval.stringShape, encoded: false, union: false })
@@ -6840,6 +6841,32 @@ function targetShape(plan: ShapePlan, target: string | undefined): intrinsics.Ha
     return target.startsWith('S') ? plan.shapes.get(target) : undefined
 }
 
+function pointerFact(shape: intrinsics.Handle | undefined, encoded: boolean, union: boolean): Codec {
+    return shape === undefined ? { kind: 'word', encoded } : { kind: 'ref', shape, encoded, union }
+}
+
+function repFact(shapes: Map<string, intrinsics.Handle>, rep: Rep, encoded: boolean): Codec | undefined {
+    const target = rep.targets.length === 1 ? rep.targets[0] : undefined
+    if (rep.kind === 'never') return
+    if (rep.kind === 'undefined') return { kind: 'undefined', encoded }
+    if (numberName(rep) === 'f64') return { kind: 'f64', encoded }
+    if (rep.kind === 'number') return { kind: 'int', encoded, type: rawSlotType(rep, encoded) }
+    if (rep.kind === 'pointer' && target === 'str') return pointerFact(propertyEval.stringShape, false, false)
+    if (rep.kind === 'pointer' && target === 'fn') return { kind: 'word', encoded }
+    if (rep.kind === 'pointer' && target?.startsWith('S') && !(encoded && rep.nullable)) return pointerFact(shapes.get(target), encoded, false)
+    if (pointerOfShapes(rep) && !(encoded && rep.nullable)) {
+        const members = rep.targets.map(t => shapes.get(t)!)
+        return { kind: 'ref', shape: members[0], members, encoded, union: false }
+    }
+    if (rep.kind === 'pointer' && target?.startsWith('clo@') && !rep.nullable) return pointerFact(Number(target.slice('clo@'.length)) as intrinsics.Handle, encoded, false)
+    if (rep.kind === 'union' && target?.startsWith('S')) return shapes.get(target) === undefined ? { kind: 'int', encoded: true } : pointerFact(shapes.get(target), true, true)
+    if (rep.kind === 'union' && rep.targets.length > 1 && rep.targets.every(t => t.startsWith('S'))) {
+        const members = rep.targets.map(t => shapes.get(t)!)
+        return { kind: 'ref', shape: members[0], members, encoded: true, union: true }
+    }
+    return { kind: 'word', encoded: true }
+}
+
 function plannedShape(plan: ShapePlan, rep: Rep): intrinsics.Handle | undefined {
     const target = soleTarget(rep)
     if (rep.kind === 'union') return target?.startsWith('S') ? targetShape(plan, target) : undefined
@@ -6849,7 +6876,8 @@ function plannedShape(plan: ShapePlan, rep: Rep): intrinsics.Handle | undefined 
 }
 
 function plannedMembers(plan: ShapePlan, rep: Rep): intrinsics.Handle[] | undefined {
-    if (rep.kind !== 'pointer' || rep.targets.length < 2 || !pointerOfShapes(rep)) return
+    if (rep.kind !== 'pointer' && rep.kind !== 'union') return
+    if (rep.targets.length < 2 || !rep.targets.every(target => target.startsWith('S'))) return
     return rep.targets.map(target => plan.shapes.get(target)!)
 }
 
@@ -7621,11 +7649,16 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         function rawLoad(id: number): boolean {
             return getNode(graph, id)?.op === NodeOp.load && rawSlice(local?.slices, id)
         }
+        function pointerParam(id: number): boolean {
+            const rep = nodes.get(id)
+            if (getNode(graph, id)?.op !== NodeOp.param || !rep || !pointerOfShapes(rep)) return false
+            return rep.targets.every(target => !propertyEval.reducedShape(plan.shapes.get(target)!))
+        }
         function object(x: Operand): boolean {
             if (typeof x !== 'number') return false
             const value = tailOf(graph, x)
             if (!value || encoded.has(value)) return false
-            if (!shapes.has(value) && !(pointerOfShapes(nodes.get(value)) && (graph.blocks[0].params.includes(value) || rawLoad(value)))) return false
+            if (!shapes.has(value) && !(pointerOfShapes(nodes.get(value)) && rawLoad(value)) && !pointerParam(value)) return false
             if (getNode(graph, value)?.op === NodeOp.alloca) throw `native: ${graph.name} lets stack object %${value} escape as a vm_value`
             return true
         }
@@ -8675,9 +8708,15 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         if (self !== undefined) for (const [node, key] of (unit && plan.embedded.sites.get(unit)) ?? []) embedded.set(node, { parent: self, key })
         return { refinements: plan.embedded.fields, embedded, fixed: plan.fixedFields, bits: plan.bits }
     }
-    function unionParamBases(fn: Function): Map<number, number> {
-        const shaped = new Set(plannedParams(fn).filter(({ rep }) => plannedShape(plan, rep) !== undefined).map(({ index }) => index))
-        return new Map(unionParams(fn).filter(i => shaped.has(i)).map(i => [i, pstack0Base()]))
+    function unionParamBases(fn: Function): Map<number, propertyEval.UnionParam> {
+        const out = new Map<number, propertyEval.UnionParam>()
+        for (const { index, rep } of plannedParams(fn)) {
+            if (!unionWord(rep)) continue
+            const shape = plannedShape(plan, rep)
+            const members = plannedMembers(plan, rep) ?? (shape !== undefined ? [shape] : undefined)
+            if (members) out.set(index, { base: pstack0Base(), members })
+        }
+        return out
     }
     function verifyTraced(traced: Traced, stage: string): void {
         verifyGraph(traced.graph, stage, false)
@@ -8914,25 +8953,8 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
         handles.set(id, shape)
         plannedHandles.add(shape)
     }
-    function pointer(shape: intrinsics.Handle | undefined, encoded: boolean, union: boolean): Codec {
-        return shape === undefined ? { kind: 'word', encoded } : { kind: 'ref', shape, encoded, union }
-    }
     function fact(rep: Rep, encoded: boolean): Codec | undefined {
-        const target = rep.targets.length === 1 ? rep.targets[0] : undefined
-        if (rep.kind === 'never') return
-        if (rep.kind === 'undefined') return { kind: 'undefined', encoded }
-        if (numberName(rep) === 'f64') return { kind: 'f64', encoded }
-        if (rep.kind === 'number') return { kind: 'int', encoded, type: rawSlotType(rep, encoded) }
-        if (rep.kind === 'pointer' && target === 'str') return pointer(propertyEval.stringShape, false, false)
-        if (rep.kind === 'pointer' && target === 'fn') return { kind: 'word', encoded }
-        if (rep.kind === 'pointer' && target?.startsWith('S') && !(encoded && rep.nullable)) return pointer(handles.get(target), encoded, false)
-        if (pointerOfShapes(rep) && !(encoded && rep.nullable)) {
-            const members = rep.targets.map(t => handles.get(t)!)
-            return { kind: 'ref', shape: members[0], members, encoded, union: false }
-        }
-        if (rep.kind === 'pointer' && target?.startsWith('clo@') && !rep.nullable) return pointer(Number(target.slice('clo@'.length)) as intrinsics.Handle, encoded, false)
-        if (rep.kind === 'union' && target?.startsWith('S')) return handles.get(target) === undefined ? { kind: 'int', encoded: true } : pointer(handles.get(target), true, true)
-        return { kind: 'word', encoded: true }
+        return repFact(handles, rep, encoded)
     }
     const embeddings = planEmbeddings(types, inst, plan)
     const embedded = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
