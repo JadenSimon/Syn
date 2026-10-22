@@ -17757,6 +17757,7 @@ pub const Analyzer = struct {
     };
 
     fn analyzeBody(this: *@This(), file: *ParsedFileData, decl: NodeRef, start: NodeRef, comptime is_block: bool) !TypeRef {
+        if (file.flow == null) try this.program.doTopLevelCfa(file, file.ast.start); // XXX: find where we miss this
         const f = file.flow.?;
         const entry = try f.active_nodes.getOrPut(this.allocator(), decl);
         if (entry.found_existing) {
