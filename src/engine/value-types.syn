@@ -4,12 +4,10 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
-import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, resultType, typeOf } from './graph-node'
+import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, resultType, spreadsLast, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
 import * as rt from './rt'
-import { flowAccesses, keyLabel as flowKeyLabel } from './value-flow'
-import { genericFlow, genericShape, proveInvariants } from './pg-optimizer'
 
 type Handle = intrinsics.Handle
 
@@ -41,7 +39,8 @@ export interface Allocation {
 }
 export interface Location {
     allocation: number
-    key: number
+    key: string
+    handle: Handle | undefined
     type: Type
     forms: string[]
     readers: Site[]
@@ -92,6 +91,11 @@ export interface AccessHost {
     isConstructor?(fn: Function): boolean
     freshCells?(fn: Function): { allocations: number[], closures: number[], frames: number[] }
 }
+export function boundCallee(host: AccessHost, fn: Function, call: GraphNode): Function {
+    if (!host.bindTarget || call.op !== NodeOp.call) return fn
+    return host.bindTarget(fn, countIds(call) - 3, spreadsLast(call))
+}
+
 export interface Invariants {
     pairs: [string, string][]
     closure: Set<Function>
@@ -447,7 +451,7 @@ function wordLoad(g: Graph, n: GraphNode): boolean {
     return rt.sliceOf(g, n) === rt.Op.sliceRead && rt.elementType(g, n) === Types.vm_value
 }
 
-function constantIndex(key: string): boolean {
+export function constantIndex(key: string): boolean {
     return /^(\[\d+\]|@-?\d+)$/.test(key)
 }
 
@@ -526,16 +530,6 @@ function unionAll(types: Type[]): Type {
     return { undefined: anyUndefined, unknown: anyUnknown, literals, range, float: anyFloat, objects, functions, closures, strings }
 }
 
-interface NamedLocation {
-    allocation: number
-    key: string
-    type: Type
-    forms: string[]
-    readers: Site[]
-    writers: Site[]
-    stored: boolean
-}
-
 function constructorOf(proto: Handle | undefined, host: AccessHost): Function | undefined {
     const ctor = proto ? heap.getOwnProperty(proto, heap.fromJsString('constructor')) : 0
     return ctor ? host.functionOf(heap.FullPropertyDescriptor(heap.resolveHeapCell(ctor)).slot0 as u32) : undefined
@@ -557,7 +551,7 @@ function receiverOf(frame: FrameSignature): number | undefined {
     return self && self.objects.length === 1 ? self.objects[0] : undefined
 }
 
-function wordSlotsOf(locations: NamedLocation[]): WordSlot[] {
+function wordSlotsOf(locations: Location[]): WordSlot[] {
     const kindsOf = new Map<string, number>()
     const wordSlots: WordSlot[] = []
     const tuples = new Set<number>()
@@ -577,16 +571,12 @@ function wordSlotsOf(locations: NamedLocation[]): WordSlot[] {
     return wordSlots
 }
 
-export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
+export function analyzeTypes(data: Accesses, host: AccessHost): ValueTypes {
     const start = performance.now()
-    const data = flowAccesses(roots, host)
     const objects: ObjectType[] = data.allocations.map(allocation => ({ ...allocation, name: allocationName(allocation, host), fields: new Map(), readers: [] }))
     const keyHandles = new Map<string, Handle>()
-    const locations = data.locations.map(location => {
-        const key = flowKeyLabel(location.key)
-        if (location.key >= 0 && heap.keyIndex(location.key as Handle) === undefined) keyHandles.set(key, location.key as Handle)
-        return { ...location, key }
-    })
+    const locations = data.locations
+    for (const location of locations) if (location.handle !== undefined) keyHandles.set(location.key, location.handle)
     function constructorStore(object: ObjectType, site: Site): boolean {
         const fn = constructorOf(object.proto, host)
         if (fn !== site.unit || !host.isConstructor?.(fn)) return false
@@ -596,7 +586,7 @@ export function analyzeTypes(roots: Function[], host: AccessHost): ValueTypes {
         const block = blockOf(g, site.node)
         return !!block && !repeats(g, block, site.node)
     }
-    const written = (location: NamedLocation) => inhabited(location.type) || location.writers.length > 0
+    const written = (location: Location) => inhabited(location.type) || location.writers.length > 0
     const indexed = new Set(locations.filter(location => (location.key === numberKey || constantIndex(location.key)) && written(location)).map(location => location.allocation))
     const initialWrites: [allocation: number, key: string, node: number][] = []
     for (const location of locations) {
@@ -806,39 +796,6 @@ export function keyLabel(k: Handle): string {
     const index = heap.keyIndex(k)
     if (index !== undefined) return `[${index}]`
     return `!${heap.describeKey(k) ?? ''}#${k}`
-}
-export function analyzeGenerics(name: string, proto: Handle, ctor: Function, host: AccessHost): Generic {
-    const start = performance.now()
-    const methods: [string, Function][] = [['constructor', ctor]]
-    function add(label: string, handle: u32): void {
-        const fn = handle ? host.functionOf(handle) : undefined
-        if (fn && fn !== ctor && host.traceable(fn) && !methods.some(([, m]) => m === fn)) methods.push([label, fn])
-    }
-    for (let k: u32 = 0; k < heap.ownPropertyCount(proto); k++) {
-        const key = heap.ownPropertyKeyAt(proto, k)
-        const addr = heap.getOwnProperty(proto, key)
-        if (!addr) continue
-        const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
-        if (d.flags & heap.PropFlags.has_getter) add(`get ${keyLabel(key)}`, d.slot0)
-        if (d.flags & heap.PropFlags.has_setter) add(`set ${keyLabel(key)}`, d.slot1)
-        if (!(d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter))) add(keyLabel(key), d.slot0)
-    }
-    const trap = heap.getPropertyProxy(proto, heap.indexKey(0 as u32))
-    if (trap) {
-        add('get [index]', heap.getProxyGetter(trap) as u32)
-        add('set [index]', heap.getProxySetter(trap) as u32)
-    }
-    const flow = genericFlow(methods.map(([, fn]) => fn), proto, host)
-    const shape = genericShape(flow, numberKey, constantIndex)
-    const proveStart = performance.now()
-    const invariants = { pairs: proveInvariants(methods, ctor, (unit, node) => flow.values.get(unit)?.get(node), host, shape.candidates), closure: new Set(flow.units) }
-    const proveMs = performance.now() - proveStart
-    const ms = performance.now() - start
-    const lines = [`GENERIC ${name}${shape.params.length ? `<${shape.params.map(p => p.name).join(', ')}>` : ''} ${ms.toFixed(1)}ms units=${flow.units.length}`]
-    lines.push(`  invariants ${proveMs.toFixed(1)}ms candidates=${shape.candidates.join(',')}`)
-    for (const [x, y] of invariants.pairs) lines.push(`  invariant ${x} == ${y}`)
-    lines.push(...shape.lines)
-    return { name, ms, params: shape.params, paths: shape.paths, invariants, lines }
 }
 export interface Instantiation {
     key: string
