@@ -3815,12 +3815,15 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             known.set(id, result)
             return result
         }
-        function scalarCompare(id: number): boolean {
+        function scalarCompare(id: number, condition: number): boolean {
             const n = getNode(g, id)!
             if (!CompareOps.has(n.op)) return false
+            let guarded: Set<number> | undefined
             for (let i = 0; i < countIds(n); i++) {
                 const operand = getNode(g, getRef(n, i))
-                if (operand && operand.op !== NodeOp.param && operand.op !== NodeOp.literal) return false
+                if (!operand || operand.op === NodeOp.param || operand.op === NodeOp.literal) continue
+                guarded ??= cone(condition, new Set())
+                if (!guarded.has(getRef(n, i))) return false
             }
             return true
         }
@@ -3829,12 +3832,14 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const n = getNode(g, id)!
             if (countIds(n) !== 3 || !getRef(n, 0)) continue
             const condition = getRef(n, 0)
-            const either = !getRef(n, 1) && getLiteral(g, n, 1) === 1
+            const truthy = getRef(n, 1) === condition || (!getRef(n, 1) && getLiteral(g, n, 1) === 1)
+            const falsy = getRef(n, 2) === condition || (!getRef(n, 2) && getLiteral(g, n, 2) === 0)
+            if (!truthy && !falsy) continue
+            const either = truthy
             const slot = either ? 2 : 1
-            if (!either && (getRef(n, 2) || getLiteral(g, n, 2) !== 0)) continue
-            const arm = getRef(n, slot)
-            if (!arm && getLiteral(g, n, slot) !== (either ? 0 : 1)) continue
-            if (arm && !scalarCompare(arm)) continue
+            const arm = getRef(n, slot) === condition ? 0 : getRef(n, slot)
+            if (!arm && !(either ? falsy : truthy)) continue
+            if (arm && !scalarCompare(arm, condition)) continue
             if (!booleanValue(condition, 0)) continue
             replacements.set(id, arm ? addNode(g, either ? NodeOp.or : NodeOp.and, [condition, arm], Types.u64) : condition)
         }
@@ -3842,6 +3847,132 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         target.bodyId = replaceAll(target.bodyId, replacements)
         revisitBlock(target)
         return true
+    }
+
+    function foldMembershipTests(target: GraphBlock): boolean {
+        const replacements = new Map<number, number>()
+        for (const op of [NodeOp.or, NodeOp.and]) {
+            const roots = findValues(target.id, op)
+            if (!roots?.length) continue
+            for (const root of roots) {
+                const folded = membershipTest(root, op === NodeOp.or ? NodeOp.eq : NodeOp.ne)
+                if (folded) replacements.set(root, folded)
+            }
+        }
+        if (!replacements.size) return false
+        target.bodyId = replaceAll(target.bodyId, replacements)
+        revisitBlock(target)
+        return true
+    }
+
+    function chainLink(id: number, op: NodeOp, T: Types): boolean {
+        const n = getNode(g, id)
+        return n?.op === op && countIds(n) === 2 && typeOf(n) === T
+    }
+
+    function collectChain(n: GraphNode, leaves: Operand[]): void {
+        for (let i = 0; i < 2; i++) {
+            const ref = getRef(n, i)
+            if (ref && chainLink(ref, n.op, typeOf(n)) && dependents.get(ref)?.size === 1) collectChain(getNode(g, ref)!, leaves)
+            else leaves.push(getOperand(g, n, i))
+        }
+    }
+
+    function memberRange(leaf: Operand, test: NodeOp): [subject: number, lo: number, count: number, cost: number] | undefined {
+        if (typeof leaf !== 'number') return
+        const c = getNode(g, leaf)!
+        if (countIds(c) !== 2 || comparesFloats(g, c)) return
+        const integral = (T: Types) => T <= Types.i64 || T === Types.bool
+        if (c.op === test) {
+            const left = scalarOperand(g, g.nodes, c, 0)
+            const right = scalarOperand(g, g.nodes, c, 1)
+            const side = left === undefined && right !== undefined ? 0 : right === undefined && left !== undefined ? 1 : -1
+            if (side < 0) return
+            const k = side === 0 ? right! : left!
+            if (!Number.isSafeInteger(k) || !integral(operandType(g, c, side))) return
+            return [getRef(c, side), k, 1, 1]
+        }
+        const below = test === NodeOp.eq ? c.op === NodeOp.lt || c.op === NodeOp.le : c.op === NodeOp.ge || c.op === NodeOp.gt
+        if (!below || !getRef(c, 0) || getRef(c, 1)) return
+        const T = operandType(g, c, 0)
+        if (!integral(T) || lowering.isSignedType(T)) return
+        const bound = getLiteral(g, c, 1)
+        const count = c.op === NodeOp.lt || c.op === NodeOp.ge ? bound : bound + 1
+        if (!Number.isSafeInteger(count) || count < 1) return
+        const index = getRef(c, 0)
+        const m = getNode(g, index)!
+        if (typeOf(m) === Types.u64 && countIds(m) === 2 && getRef(m, 0) && integral(operandType(g, m, 0))) {
+            const k = scalarOperand(g, g.nodes, m, 1)
+            if (k !== undefined && Number.isSafeInteger(k) && m.op === NodeOp.sub) return [getRef(m, 0), k, count, 2]
+            if (k !== undefined && Number.isSafeInteger(k) && m.op === NodeOp.add) return [getRef(m, 0), -k, count, 2]
+        }
+        if (m.op === NodeOp.convert && typeOf(m) === Types.u64 && getRef(m, 0) && integral(operandType(g, m, 0))) return [getRef(m, 0), 0, count, 1]
+        return [index, 0, count, 1]
+    }
+
+    function membershipTest(root: number, test: NodeOp): number {
+        const n = getNode(g, root)!
+        if (countIds(n) !== 2) return 0
+        const users = dependents.get(root)
+        if (users?.size === 1 && chainLink([...users][0], n.op, typeOf(n))) return 0
+        const leaves: Operand[] = []
+        collectChain(n, leaves)
+        if (leaves.length < 2) return 0
+        const members = leaves.map(leaf => memberRange(leaf, test))
+        const bySubject = new Map<number, number[]>()
+        for (let i = 0; i < members.length; i++) {
+            const member = members[i]
+            if (!member) continue
+            const indices = bySubject.get(member[0])
+            if (indices) indices.push(i)
+            else bySubject.set(member[0], [i])
+        }
+        const tests = new Map<number, number>()
+        for (const [subject, indices] of bySubject) {
+            if (indices.length < 2) continue
+            indices.sort((i, j) => members[i]![1] - members[j]![1])
+            let start = 0
+            while (start < indices.length) {
+                const lo = members[indices[start]]![1]
+                let hi = lo + members[indices[start]]![2]
+                let cost = members[indices[start]]![3]
+                let end = start + 1
+                while (end < indices.length && members[indices[end]]![1] <= hi) {
+                    hi = Math.max(hi, members[indices[end]]![1] + members[indices[end]]![2])
+                    cost += members[indices[end]]![3]
+                    end++
+                }
+                if (cost > (lo === 0 ? 1 : 2) && Number.isSafeInteger(hi)) {
+                    const tested = rangeTest(subject, lo, hi - lo, test)
+                    for (let k = start; k < end; k++) tests.set(indices[k], tested)
+                }
+                start = end
+            }
+        }
+        if (!tests.size) return 0
+        const kept: Operand[] = []
+        const placed = new Set<number>()
+        for (let i = 0; i < leaves.length; i++) {
+            const tested = tests.get(i)
+            if (tested === undefined) {
+                kept.push(leaves[i])
+                continue
+            }
+            if (placed.has(tested)) continue
+            placed.add(tested)
+            kept.push(tested)
+        }
+        let folded = kept[0]
+        for (let i = 1; i < kept.length; i++) folded = addCopy(g, n, [folded, kept[i]])
+        return typeof folded === 'number' ? folded : 0
+    }
+
+    function rangeTest(subject: number, lo: number, count: number, test: NodeOp): number {
+        let index = subject
+        if (lo > 0) index = addNode(g, NodeOp.sub, [subject, { literal: lo }], Types.u64)
+        else if (lo < 0) index = addNode(g, NodeOp.add, [subject, { literal: -lo }], Types.u64)
+        else if (lowering.isSignedType(resultType(g, getNode(g, subject)!))) index = addNode(g, NodeOp.convert, [subject], Types.u64)
+        return addNode(g, test === NodeOp.eq ? NodeOp.lt : NodeOp.ge, [index, { literal: count }], Types.bool)
     }
 
     function simplifySelect(target: GraphBlock) {
@@ -3870,7 +4001,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             })
         }
         let vanishes: ((value: number, valueLiteral: number, tag: number, tagLiteral: number) => boolean) | undefined
-        function agree(x: number, xk: number, y: number, yk: number, tag: number, depth: number): boolean {
+        function agree(x: number, xk: number, y: number, yk: number, tag: number, held: number, depth: number): boolean {
             if (x && getNode(g, x)!.op === NodeOp.literal) {
                 xk = literalValue(g, getNode(g, x)!)
                 x = 0
@@ -3880,10 +4011,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 y = 0
             }
             if (x === y && (x || xk === yk)) return true
-            if (!x && xk === 0) {
+            if (!x && xk === 0 && held === 0) {
                 vanishes ??= zeroWhenZero(g, b => findInboundApplies(b).map(([, app]) => app))
                 return vanishes(y, yk, tag, 0)
             }
+            if (!x && xk === held && y === tag) return true
+            if (!y && yk === held && x === tag) return true
             if (!x || !y || depth > 3) return false
             const a = getNode(g, x)!
             const b = getNode(g, y)!
@@ -3895,25 +4028,29 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     if (getRef(a, i) !== getRef(b, i) || getLiteral(g, a, i) !== getLiteral(g, b, i)) return false
                     continue
                 }
-                if (!agree(getRef(a, i), getLiteral(g, a, i), getRef(b, i), getLiteral(g, b, i), tag, depth + 1)) return false
+                if (!agree(getRef(a, i), getLiteral(g, a, i), getRef(b, i), getLiteral(g, b, i), tag, held, depth + 1)) return false
             }
             return true
+        }
+        function agreedUnder(n: GraphNode, tag: number, held: number, heldArm: number): number {
+            if (!tag || getNode(g, tag)!.op === NodeOp.after) return 0
+            return agree(getRef(n, heldArm), getLiteral(g, n, heldArm), getRef(n, 3 - heldArm), getLiteral(g, n, 3 - heldArm), tag, held, 0) ? 3 - heldArm : 0
         }
         function agreedArm(n: GraphNode): number {
             if (countIds(n) !== 3 || !getRef(n, 0)) return 0
             const c = getNode(g, getRef(n, 0))!
-            let tag = getRef(n, 0)
-            let zero = 2
-            if ((c.op === NodeOp.eq || c.op === NodeOp.ne) && countIds(c) === 2) {
-                if (comparesFloats(g, c)) return 0
-                const side = !getRef(c, 1) && getLiteral(g, c, 1) === 0 ? 0 : !getRef(c, 0) && getLiteral(g, c, 0) === 0 ? 1 : -1
-                if (side >= 0) {
-                    tag = getRef(c, side)
-                    zero = c.op === NodeOp.eq ? 1 : 2
-                }
+            const compared = (c.op === NodeOp.eq || c.op === NodeOp.ne) && countIds(c) === 2
+            if (compared && comparesFloats(g, c)) return 0
+            const left = compared ? scalarOperand(g, g.nodes, c, 0) : undefined
+            const right = compared ? scalarOperand(g, g.nodes, c, 1) : undefined
+            const side = left === undefined && right !== undefined ? 0 : right === undefined && left !== undefined ? 1 : -1
+            if (side < 0) return agreedUnder(n, getRef(n, 0), 0, 2)
+            const held = side === 0 ? right! : left!
+            if (held !== 0) {
+                const kept = agreedUnder(n, getRef(n, 0), 0, 2)
+                if (kept) return kept
             }
-            if (!tag || getNode(g, tag)!.op === NodeOp.after) return 0
-            return agree(getRef(n, zero), getLiteral(g, n, zero), getRef(n, 3 - zero), getLiteral(g, n, 3 - zero), tag, 0) ? 3 - zero : 0
+            return agreedUnder(n, getRef(c, side), held, c.op === NodeOp.eq ? 1 : 2)
         }
         const r = new Map<number, number>()
         const selects = findValues(target.id, NodeOp.select) ?? []
@@ -11098,6 +11235,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(substituteEqualArguments, b)
             step(specializeApplySite, b)
             step(simplifyBitOperations, b)
+            step(foldMembershipTests, b)
             step(hoistLoopStep, b)
             step(promoteAllocas, b)
             step(deduplicateValues, b)
