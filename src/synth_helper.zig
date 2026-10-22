@@ -834,7 +834,9 @@ pub const SynthInstrumenter = struct {
 
     fn visitClassLike(self: *@This(), node: *const AstNode, ref: NodeRef) !void {
         const isClass = node.kind == .class_declaration or node.kind == .class_expression;
+        const heritage: NodeRef = if (isClass) node.len else 0;
         if (self.emitting) {
+            if (heritage != 0) try self.visit(self.nodes.at(heritage), heritage);
             var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.maybeUnwrapRef(node) orelse 0);
             while (iter.nextRef()) |el| {
                 try self.visit(self.nodes.at(el), el);
@@ -856,6 +858,7 @@ pub const SynthInstrumenter = struct {
         defer self.class_decl_static_block = save_class_decl_static_block;
         self.class_decl_static_block = 0;
 
+        if (heritage != 0) try self.visit(self.nodes.at(heritage), heritage);
         var iter = NodeIterator.init(self.nodes, if (isClass) parser.getRight(node) else parser.maybeUnwrapRef(node) orelse 0);
         while (iter.nextRef()) |el| {
             try self.visit(self.nodes.at(el), el);
