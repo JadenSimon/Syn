@@ -9,7 +9,7 @@ import { addNode, countIds, getLiteral, getNode, getRef, isThisParam, NodeOp, re
 import { Op as RtOp, assignExcluded, bindingOf, elementType, opName as rtName, sliceOf } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import type { GenericFlow, NodeValues } from './pg-optimizer'
+import type { GenericFlow } from './pg-optimizer'
 import { AllocKind, boundCallee, constantIndex, constructedAllocation, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, type AccessHost, type Generic, type Accesses, type Allocation, type FrameSignature, type Location, type Site, type Type, type UnitTypes, type WordAccess } from './value-types'
 
 type Handle = intrinsics.Handle
@@ -130,7 +130,6 @@ interface Regions {
     tested: Set<number>
     paramBlock: Map<number, number>
     entries: number[][]
-    narrows: Map<number, Map<number, number>>
     guards: Map<number, Map<number, Guard>>
     narrowExprs: Map<number, Map<Guard, number>>
     gateOf: Map<number, number>
@@ -170,6 +169,13 @@ enum BindKind {
     rt,
 }
 
+enum FieldWatch {
+    elem,
+    assign,
+    keyed,
+    named,
+}
+
 enum ListenerKind {
     copy,
     member,
@@ -182,7 +188,6 @@ enum ListenerKind {
     narrow,
     pick,
     offset,
-    invariant,
 }
 
 interface Listener {
@@ -211,7 +216,6 @@ interface FlowState {
     host: AccessHost
     roots: Function[]
     strOrigin: number
-    nothing: number
     dynamicOrigins: Set<number>
     spec: SpecState
     frames: FrameInfo[]
@@ -227,15 +231,14 @@ interface FlowState {
     originKind: number[]
     originCell: number[]
     originQual: number[]
-    originFn: (Function | undefined)[]
-    originFnKnown: number[]
+    originFn: (Function | null | undefined)[]
+    originProto: (Handle | undefined)[]
     originOwner: (Summary | undefined)[]
     originNode: number[]
     originIndex: Map<string, number>
     originFields: Map<number, number>[]
-    originFieldListeners: (number[] | undefined)[]
+    fieldWatch: (number[] | undefined)[]
     originPending: (Map<number, number[]> | undefined)[]
-    elemReaders: Map<number, number[]>
     pickWatch: Map<number, number[]>
     freshOwner: Map<number, Summary>
     slotKind: number[]
@@ -251,8 +254,6 @@ interface FlowState {
     queue: number[]
     storeSlots: Map<number, number>
     constSlots: Map<number, number>
-    originSlots: Map<number, number>
-    bound: Map<number, Set<number>>
     missing: number[]
     gateWaits: Map<number, number[]>
     scalar: number[]
@@ -278,11 +279,9 @@ interface FlowState {
     originSeeds: Map<number, number[]>
     seedList: number[]
     setterKeys: Set<number>
-    keyedReads: Map<number, number[]>
-    namedReads: Map<number, number[]>
     runtimeBinds: Map<number, number[]>
     heldWrites: Map<number, number[]>
-    invariants: InvariantDeps
+    skippedKeys: Set<number>
     exported: Export
 }
 
@@ -413,7 +412,17 @@ function unite(a: number, b: number): number {
     return id
 }
 
+const typeRanges: number[] = []
+
 function typeRange(T0: intrinsics.Types): number {
+    const known = typeRanges[T0]
+    if (known !== undefined) return known
+    const t = rangeOf(T0)
+    typeRanges[T0] = t
+    return t
+}
+
+function rangeOf(T0: intrinsics.Types): number {
     if (T0 === Types.bool) return BOOL
     if (T0 === Types.f64 || T0 === Types.f32 || T0 === Types.f16) return FLOAT
     if (T0 === Types.u8) return numScalar(0, 255)
@@ -687,14 +696,14 @@ function originOf(kind: OriginKind, cell: number, qual: number, node: number, ow
     flow.originKind.push(kind)
     flow.originCell.push(cell)
     flow.originQual.push(qual)
-    flow.originFn.push(undefined)
+    flow.originFn.push(kind === OriginKind.static || (kind === OriginKind.fresh && !owner!.scopes.has(cell)) ? undefined : null)
+    flow.originProto.push(undefined)
     flow.originOwner.push(owner)
     flow.originNode.push(node)
     flow.originFields.push(new Map())
-    flow.originFieldListeners.push(undefined)
+    flow.fieldWatch.push(undefined)
     flow.originPending.push(undefined)
     flow.originSeen.push(0)
-    flow.originFnKnown.push(kind === OriginKind.static || (kind === OriginKind.fresh && !owner!.scopes.has(cell)) ? 0 : 1)
     if (kind === OriginKind.static || kind === OriginKind.fresh) flow.seedList.push(id)
     return id
 }
@@ -730,21 +739,18 @@ function constantBuffer(origin: number, s: number, value: Handle): boolean {
 }
 
 function originFunction(origin: number): Function | undefined {
-    if (!flow.originFnKnown[origin]) {
-        flow.originFnKnown[origin] = 1
-        flow.originFn[origin] = callableOf(flow.originCell[origin])
-    }
-    return flow.originFn[origin]
+    const fn = originHostFn(origin)
+    if (!fn || flow.originKind[origin] === OriginKind.fn) return fn
+    return flow.host.traceable(fn) ? fn : undefined
 }
 
 function originHostFn(origin: number): Function | undefined {
-    const kind = flow.originKind[origin]
-    if (kind === OriginKind.fn) return flow.originFn[origin]
-    if (flow.originFnKnown[origin] && flow.originFn[origin]) return flow.originFn[origin]
-    if (kind !== OriginKind.static && (kind !== OriginKind.fresh || isScope(origin))) return undefined
+    const known = flow.originFn[origin]
+    if (known !== undefined) return known ?? undefined
     const cell = flow.originCell[origin]
-    if (cell <= 1 || heap.isString(cell as Handle) || heap.isBoxedF64(cell as Handle)) return undefined
-    return flow.host.functionOf(cell as u32)
+    const fn = cell <= 1 || heap.isString(cell as Handle) || heap.isBoxedF64(cell as Handle) ? undefined : flow.host.functionOf(cell as u32)
+    flow.originFn[origin] = fn ?? null
+    return fn
 }
 
 function callableOf(cell: number): Function | undefined {
@@ -798,36 +804,36 @@ function fieldSlot(origin: number, key: number): number {
     seedField(origin, key, s)
     const pending = flow.originPending[origin]?.get(key)
     if (pending) for (const target of pending) readField(s, target)
-    if (isPosKey(key)) {
-        const readers = flow.elemReaders.get(origin)
-        if (readers) for (const target of readers) readField(s, target)
-    }
-    const listeners = flow.originFieldListeners[origin]
-    if (listeners) for (const assign of listeners) assignField(assign, key, s)
-    if (key >= 0) for (const target of flow.keyedReads.get(origin) ?? []) readField(s, target)
-    if (key === dynKey) {
-        for (const target of flow.keyedReads.get(origin) ?? []) readField(s, target)
-        for (const target of flow.namedReads.get(origin) ?? []) keyedInto(s, target)
-    }
+    const watch = flow.fieldWatch[origin]
+    if (watch) for (let i = 0; i < watch.length; i += 2) fieldSeen(watch[i], watch[i + 1], key, s)
     return s
 }
 
+function watchFields(origin: number, kind: FieldWatch, target: number): void {
+    let list = flow.fieldWatch[origin]
+    if (!list) flow.fieldWatch[origin] = list = []
+    list.push(kind, target)
+    for (const [key, s] of flow.originFields[origin]) fieldSeen(kind, target, key, s)
+}
+
+function fieldSeen(kind: FieldWatch, target: number, key: number, s: number): void {
+    switch (kind) {
+        case FieldWatch.elem: if (isPosKey(key)) readField(s, target)
+        case FieldWatch.assign: assignField(target, key, s)
+        case FieldWatch.keyed: if (key >= 0 || key === dynKey) readField(s, target)
+        case FieldWatch.named: if (key === dynKey) keyedInto(s, target)
+    }
+}
+
 function keyedRead(origin: number, target: number): void {
-    let list = flow.keyedReads.get(origin)
-    if (!list) flow.keyedReads.set(origin, list = [])
-    list.push(target)
     const state = heapState(origin)
     if (state !== undefined && heap.isOrdinaryObject(state)) for (const key of dataKeys(state)) fieldSlot(origin, key as number)
-    for (const [key, s] of flow.originFields[origin]) if (key >= 0 || key === dynKey) readField(s, target)
+    watchFields(origin, FieldWatch.keyed, target)
     addConst(target, UNDEF)
 }
 
 function namedRead(origin: number, target: number): void {
-    let list = flow.namedReads.get(origin)
-    if (!list) flow.namedReads.set(origin, list = [])
-    list.push(target)
-    const keyed = flow.originFields[origin].get(dynKey)
-    if (keyed !== undefined) keyedInto(keyed, target)
+    watchFields(origin, FieldWatch.named, target)
 }
 
 function keyedInto(keyed: number, target: number): void {
@@ -841,7 +847,7 @@ function heapState(origin: number): Handle | undefined {
     if (kind !== OriginKind.fresh || isScope(origin)) return undefined
     const cell = flow.originCell[origin] as Handle
     if (flow.host.session.templateOf(cell as u32)) return heap.deref(cell)
-    if (cell > 1 && !heap.isString(cell) && !heap.isBoxedF64(cell) && flow.host.functionOf(cell as u32)) return heap.isIndirect(cell) ? heap.indirectTarget(cell) : heap.deref(cell)
+    if (originHostFn(origin)) return heap.isIndirect(cell) ? heap.indirectTarget(cell) : heap.deref(cell)
     return undefined
 }
 
@@ -1041,11 +1047,11 @@ function pullMember(s: Summary, e: number, cell: number): void {
         grown.set(local)
         s.local = grown
     }
-    s.local![pulled] = -originSlot(origin) - 1
+    s.local![pulled] = -constSlot(NONE, origin) - 1
     x.a = pulled
     for (const inst of flow.instances) {
         if (inst.summary !== s || (inst.map && !inst.map.has(e))) continue
-        listen(originSlot(origin), ListenerKind.member, at(inst, e), x.key, 0)
+        listen(constSlot(NONE, origin), ListenerKind.member, at(inst, e), x.key, 0)
     }
 }
 
@@ -1188,7 +1194,7 @@ enum GuardFlag {
 
 function computeRegions(s: Summary): Regions {
     const g = s.g
-    const regions: Regions = { of: new Map(), block: new Map(), shared: new Set(), parent: [], depth: [], cond: [], arm: [], children: new Map(), roots: [], link: [], tested: new Set(), paramBlock: new Map(), entries: [], narrows: new Map(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map() }
+    const regions: Regions = { of: new Map(), block: new Map(), shared: new Set(), parent: [], depth: [], cond: [], arm: [], children: new Map(), roots: [], link: [], tested: new Set(), paramBlock: new Map(), entries: [], guards: new Map(), narrowExprs: new Map(), gateOf: new Map() }
     for (let b = 0; b < s.g.blocks.length; b++) regions.entries.push([])
     const selects: number[] = []
     const indexOf = new Map<number, number>()
@@ -1492,10 +1498,6 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
     const regions = s.regions!
     if (regions.depth[use] === 0 && regions.link[use] < 0) return base
     if (!regions.tested.has(ref)) return base
-    let byRegion = regions.narrows.get(ref)
-    if (!byRegion) regions.narrows.set(ref, byRegion = new Map())
-    const known = byRegion.get(use)
-    if (known !== undefined) return known
     const guard = guardAt(s, ref, use)
     let byGuard = regions.narrowExprs.get(ref)
     if (!byGuard) regions.narrowExprs.set(ref, byGuard = new Map())
@@ -1505,7 +1507,6 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
         for (const pick of guard.picks) e = expr(s, ExprOp.pick, 0, e, pick & 1, pick >> 1, [e], 0)
         byGuard.set(guard, e)
     }
-    byRegion.set(use, e)
     return e
 }
 
@@ -1660,12 +1661,6 @@ interface Bound {
     ret: number
 }
 
-interface InvariantDeps {
-    deps: Map<number, number[]>
-    broken: Set<number>
-    skippedKeys: Set<number>
-}
-
 function proofScope(s: Summary): pg.ProofScope {
     if (s.proofs) return s.proofs
     const regions = s.regions!
@@ -1674,7 +1669,7 @@ function proofScope(s: Summary): pg.ProofScope {
         regions,
         up: r => regionUp(regions, r),
         charge,
-        skipKey: key => flow.invariants.skippedKeys.add(key),
+        skipKey: key => flow.skippedKeys.add(key),
         proofs: new Map(),
         segRoots: new Map(),
         keyRoots: new Map(),
@@ -1754,88 +1749,11 @@ function refineReturn(callee: Instance, target: number): number {
     if (b.param >= args.length) return callee.ret
     const owner = b.recv < 0 ? recv : b.recv < args.length ? args[b.recv] : 0
     if (!owner || !args[b.param]) return callee.ret
-    if (pg.inBounds(proofScope(from.summary), node, args[b.param], owner)) return at(callee, b.ret)
-    const proof = pg.invariantBound(proofScope(from.summary), node, args[b.param], owner)
-    if (!proof) return callee.ret
-    const e = from.summary.exprOf.get(proof[0])
-    if (e === undefined) return callee.ret
-    const slot = at(from, e)
-    for (const origin of flow.slotOrigins[slot]) if (!holdsInvariant(origin, proof[1], proof[2], target, callee.ret)) return callee.ret
-    listen(slot, ListenerKind.invariant, target, proof[1], proof[2], callee.ret)
-    return at(callee, b.ret)
+    return pg.inBounds(proofScope(from.summary), node, args[b.param], owner) ? at(callee, b.ret) : callee.ret
 }
 
-function recheckBound(origin: number, part: number, key: number, field: number, ret: number): void {
-    if (!holdsInvariant(origin, key, field, part, ret)) unbound(part, ret)
-}
-
-function repairBounds(): boolean {
-    const c = flow.invariants
-    for (const key of c.skippedKeys) intrinsics.assert(!flow.setterKeys.has(key), `value-flow: a store to ${heap.describeKey(key as Handle) ?? key} was taken as plain while proving two reads equal, but that key has a setter`)
-    if (!c.deps.size) return false
-    const protos = new Map<number, number[]>()
-    for (const proto of c.deps.keys()) protos.set(proto, [])
-    for (let origin = 1; origin < flow.originKind.length; origin++) {
-        if (!invariantOrigin(origin)) continue
-        protos.get(protoOf(origin))?.push(origin)
-    }
-    let repaired = false
-    for (const [proto, deps] of c.deps) {
-        if (c.broken.has(proto) || pg.encapsulated(heapView(), flow.host.invariantsOf!(proto as Handle)!, protos.get(proto)!)) continue
-        c.broken.add(proto)
-        for (let i = 0; i < deps.length; i += 2) unbound(deps[i], deps[i + 1])
-        repaired = true
-    }
-    return repaired
-}
-
-function invariantOrigin(origin: number): boolean {
-    const kind = flow.originKind[origin]
-    return kind === OriginKind.fresh || kind === OriginKind.created || kind === OriginKind.static
-}
-
-function holdsInvariant(origin: number, key: number, field: number, part: number, ret: number): boolean {
-    if (!invariantOrigin(origin)) return false
-    const proto = protoOf(origin)
-    const c = flow.invariants
-    if (!proto || c.broken.has(proto)) return false
-    const invariants = flow.host.invariantsOf ? flow.host.invariantsOf(proto) : undefined
-    if (!invariants) return false
-    const a = heap.stringToJs(key as Handle)
-    const b = `${heap.stringToJs(field as Handle)}.length`
-    if (!invariants.pairs.some(([x, y]) => (x === a && y === b) || (x === b && y === a))) return false
-    let deps = c.deps.get(proto)
-    if (!deps) c.deps.set(proto, deps = [])
-    deps.push(part, ret)
-    return true
-}
-
-function writerFunction(w: number): Function | undefined {
-    return w >= 0 ? flow.instances[Math.floor(w / exprBits)].summary.fn : undefined
-}
-
-function heapView(): pg.HeapView {
-    return {
-        field: (object, key) => flow.originFields[object].get(key),
-        fields: object => flow.originFields[object].values(),
-        writers: field => (flow.fieldWriters.get(field) ?? []).map(writerFunction),
-        objects: field => flow.slotOrigins[field].filter(a => invariantOrigin(a) && !originHostFn(a)),
-        receiverCallers: (object, methods) => {
-            const out: Function[] = []
-            for (const inst of flow.instances) {
-                if (!inst.summary.hasThis || !methods.has(inst.summary.fn)) continue
-                if (!flow.slotOrigins[paramSlot(inst, -1)].includes(object)) continue
-                for (const c of inst.callers) out.push(instOfSlot(c).summary.fn)
-            }
-            return out
-        },
-    }
-}
-
-function unbound(part: number, ret: number): void {
-    copyEdge(ret, part)
-    const bind = flow.partBind.get(part)
-    if (bind) bind.from = ret
+function checkSkippedKeys(): void {
+    for (const key of flow.skippedKeys) intrinsics.assert(!flow.setterKeys.has(key), `value-flow: a store to ${heap.describeKey(key as Handle) ?? key} was taken as plain while proving two reads equal, but that key has a setter`)
 }
 
 function buildSummary(s: Summary): void {
@@ -1987,7 +1905,7 @@ function instance(fn: Function, qual: number, lit: number, litParam: number): nu
     for (const e of s.owned) newSlot(SlotKind.expr, id, e)
     const sigs: number[] = []
     const pinned = s.hasThis && qual > 0 && flow.originKind[qual] !== OriginKind.str ? paramOffset(s, -1) : -1
-    for (let i = 0; i < sigWidth(s); i++) sigs.push(i === pinned ? originSlot(qual) : newSlot(SlotKind.sig, id, i))
+    for (let i = 0; i < sigWidth(s); i++) sigs.push(i === pinned ? constSlot(NONE, qual) : newSlot(SlotKind.sig, id, i))
     const inst: Instance = { id, summary: s, qual, base, sigs, ret: -1, callers: [], lit, litParam, site: undefined, map: undefined }
     inst.ret = s.retExpr >= 0 ? at(inst, s.retExpr) : newSlot(SlotKind.ret, id, 0)
     flow.instances.push(inst)
@@ -2025,10 +1943,10 @@ function layout(s: Summary): Int32Array {
     for (let e = 0; e < n; e++) {
         const x = s.exprs[e]
         if (x.op === ExprOp.store || (x.op === ExprOp.rt && x.a === RtOp.sliceWrite)) {
-            local[e] = -nothingSlot() - 1
+            local[e] = -constSlot(NONE, 0) - 1
             s.stores.push(e)
         } else if (x.op === ExprOp.konst || x.op === ExprOp.num) local[e] = -constSlot(x.a, x.op === ExprOp.konst ? x.sub : 0) - 1
-        else if (x.op === ExprOp.origin) local[e] = -originSlot(x.a) - 1
+        else if (x.op === ExprOp.origin) local[e] = -constSlot(NONE, x.a) - 1
         else if (x.op !== ExprOp.param) {
             local[e] = width++
             s.owned.push(e)
@@ -2057,11 +1975,6 @@ function at(inst: Instance, e: number): number {
     return local < s.width ? inst.base + local : inst.sigs[local - s.width]
 }
 
-function nothingSlot(): number {
-    if (flow.nothing < 0) flow.nothing = newSlot(SlotKind.konst, -1, 0)
-    return flow.nothing
-}
-
 function constSlot(t: number, origin: number): number {
     intrinsics.assert(origin < 4194304, `value-flow: origin ${origin} does not fit a constant-slot key`)
     const key = t * 4194304 + origin
@@ -2071,15 +1984,6 @@ function constSlot(t: number, origin: number): number {
     flow.constSlots.set(key, slot)
     addConst(slot, t)
     if (origin) addOrigin(slot, origin)
-    return slot
-}
-
-function originSlot(origin: number): number {
-    const known = flow.originSlots.get(origin)
-    if (known !== undefined) return known
-    const slot = newSlot(SlotKind.konst, -1, 0)
-    flow.originSlots.set(origin, slot)
-    addOrigin(slot, origin)
     return slot
 }
 
@@ -2269,7 +2173,7 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
 const stringRt = new Set<number>([RtOp.concat, RtOp.toString, RtOp.stringOf])
 
 function stringy(slot: number): boolean {
-    return (scalars.flags[flow.scalar[slot]] & (ScalarFlag.str | ScalarFlag.anyStr)) !== 0 || flow.slotOrigins[slot].some(a => flow.originKind[a] === OriginKind.str)
+    return (scalars.flags[flow.scalar[slot]] & (ScalarFlag.str | ScalarFlag.anyStr)) !== 0 || (flow.originMask[slot] & 2) !== 0
 }
 
 function generic(slot: number): boolean {
@@ -2341,7 +2245,6 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.narrow: if (originPasses(origin, l.key)) addOrigin(l.target, origin)
         case ListenerKind.pick: pickOrigin(l.target, origin, l.key, l.extra)
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
-        case ListenerKind.invariant: recheckBound(origin, l.target, l.key, l.extra, l.e)
     }
 }
 
@@ -2450,7 +2353,9 @@ function protoOf(origin: number): Handle {
     if (kind === OriginKind.str) return heap.getPrototypeOf(flow.originCell[origin] as Handle)
     if (kind === OriginKind.static || kind === OriginKind.fresh) {
         if (isScope(origin)) return 0 as Handle
-        return heap.getPrototypeOf(heap.deref(flow.originCell[origin] as Handle))
+        let proto = flow.originProto[origin]
+        if (proto === undefined) flow.originProto[origin] = proto = heap.getPrototypeOf(heap.deref(flow.originCell[origin] as Handle))
+        return proto
     }
     return 0 as Handle
 }
@@ -2552,10 +2457,7 @@ function resolveMember(origin: number, key: number, target: number, keySlot: num
 
 function elemRead(origin: number, target: number): void {
     readField(fieldSlot(origin, elemKey), target)
-    for (const [key, f] of flow.originFields[origin]) if (isPosKey(key)) copyEdge(f, target)
-    let readers = flow.elemReaders.get(origin)
-    if (!readers) flow.elemReaders.set(origin, readers = [])
-    readers.push(target)
+    watchFields(origin, FieldWatch.elem, target)
 }
 
 function ownLater(origin: number, key: number, target: number): void {
@@ -2677,10 +2579,7 @@ function typedStore(inst: Instance, e: number, valueSlot: number): number {
 
 function assignSource(origin: number, assign: number): void {
     flow.originCopied.add(origin)
-    let list = flow.originFieldListeners[origin]
-    if (!list) flow.originFieldListeners[origin] = list = []
-    list.push(assign)
-    for (const [key, s] of flow.originFields[origin]) assignField(assign, key, s)
+    watchFields(origin, FieldWatch.assign, assign)
 }
 
 function assignField(assign: number, key: number, field: number): void {
@@ -2740,12 +2639,9 @@ function rtSubject(callSlot: number, subject: number): void {
 }
 
 function bindCall(callSlot: number, target: number, recv: number): void {
-    let bound = flow.bound.get(callSlot)
-    if (!bound) flow.bound.set(callSlot, bound = new Set())
     intrinsics.assert(recv < 4194304, `value-flow: origin ${recv} does not fit a call-binding key`)
     const key = target * 4194304 + recv
-    if (bound.has(key)) return
-    bound.add(key)
+    if (flow.parts.get(callSlot)?.has(key)) return
     const x = exprAt(callSlot)
     const inst = instOfSlot(callSlot)
     const fn = boundCallee(flow.host, originFunction(target)!, getNode(inst.summary.g, x.node)!)
@@ -2881,6 +2777,9 @@ function foldCompare(op: NodeOp, a: number, b: number, originsA: number[], origi
         const same = scalars.strs[a][0] === scalars.strs[b][0] || heap.stringToJs(scalars.strs[a][0] as Handle) === heap.stringToJs(scalars.strs[b][0] as Handle)
         return literalScalar(same === equal ? 1 : 0)
     }
+    if (fa === ScalarFlag.str && fb === ScalarFlag.str && onlyStrOrigins(originsA) && onlyStrOrigins(originsB) && distinctStrings(scalars.strs[a], scalars.strs[b])) {
+        return literalScalar(equal ? 0 : 1)
+    }
     const undefA = (fa & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && (fa & (ScalarFlag.undef | ScalarFlag.void)) !== 0 && !originsA.length
     const undefB = (fb & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && (fb & (ScalarFlag.undef | ScalarFlag.void)) !== 0 && !originsB.length
     const definedA = (fa & (ScalarFlag.undef | ScalarFlag.void)) === 0 && (originsA.length > 0 || (fa & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.int | ScalarFlag.float)) !== 0)
@@ -2888,6 +2787,14 @@ function foldCompare(op: NodeOp, a: number, b: number, originsA: number[], origi
     if (undefA && undefB) return literalScalar(equal ? 1 : 0)
     if ((undefA && definedB) || (definedA && undefB)) return literalScalar(equal ? 0 : 1)
     return BOOL
+}
+
+function distinctStrings(a: number[], b: number[]): boolean {
+    for (const x of a) {
+        const text = heap.stringToJs(x as Handle)
+        for (const y of b) if (x === y || heap.stringToJs(y as Handle) === text) return false
+    }
+    return true
 }
 
 function onlyStrOrigins(origins: number[]): boolean {
@@ -3091,7 +2998,6 @@ interface Spec {
     global: boolean
     params: number[]
     paramOrigins: number[][]
-    sigIndex: Map<number, number>
     scalar: number[]
     origins: number[][]
     calls: Map<number, Spec>
@@ -3104,6 +3010,7 @@ interface SpecState {
     grown: Map<Spec, number>
     recursive: Set<number>
     active: Set<number>
+    classes: (string | undefined)[]
 }
 
 interface Arrival {
@@ -3149,10 +3056,8 @@ function callOrder(): [number[], boolean][] {
     return out
 }
 
-function sigIndexOf(inst: Instance): Map<number, number> {
-    const out = new Map<number, number>()
-    for (let i = 0; i < inst.sigs.length; i++) if (flow.slotKind[inst.sigs[i]] === SlotKind.sig) out.set(inst.sigs[i], i)
-    return out
+function sigIndex(spec: Spec, slot: number): number {
+    return flow.slotKind[slot] === SlotKind.sig && flow.slotOwner[slot] === spec.inst.id ? flow.slotIndex[slot] : -1
 }
 
 function globalSpec(inst: Instance): Spec {
@@ -3164,7 +3069,7 @@ function globalSpec(inst: Instance): Spec {
         params.push(flow.scalar[sig])
         paramOrigins.push(flow.slotOrigins[sig])
     }
-    const spec: Spec = { inst, global: true, params, paramOrigins, sigIndex: sigIndexOf(inst), scalar: [], origins: [], calls: new Map(), dead: new Set() }
+    const spec: Spec = { inst, global: true, params, paramOrigins, scalar: [], origins: [], calls: new Map(), dead: new Set() }
     flow.spec.globals.set(inst.id, spec)
     return spec
 }
@@ -3175,8 +3080,8 @@ function specScalar(spec: Spec, slot: number): number {
     if (k >= 0 && k < spec.inst.summary.width && flow.slotKind[slot] === SlotKind.expr) {
         return spec.scalar[k]
     }
-    const i = spec.sigIndex.get(slot)
-    if (i !== undefined) return spec.params[i]
+    const i = sigIndex(spec, slot)
+    if (i >= 0) return spec.params[i]
     if (flow.slotKind[slot] === SlotKind.part && ownsPart(spec, slot)) {
         if (!partLive(spec, slot) || spec.dead.has(slot)) return NONE
         const c = spec.calls.get(slot)
@@ -3191,8 +3096,8 @@ function specOrigins(spec: Spec, slot: number): number[] {
     if (k >= 0 && k < spec.inst.summary.width && flow.slotKind[slot] === SlotKind.expr) {
         return spec.origins[k]
     }
-    const i = spec.sigIndex.get(slot)
-    if (i !== undefined) return spec.paramOrigins[i]
+    const i = sigIndex(spec, slot)
+    if (i >= 0) return spec.paramOrigins[i]
     if (flow.slotKind[slot] === SlotKind.part && ownsPart(spec, slot)) {
         if (!partLive(spec, slot) || spec.dead.has(slot)) return []
         const c = spec.calls.get(slot)
@@ -3422,7 +3327,7 @@ function specOf(inst: Instance, params: number[], paramOrigins: number[][], exac
         if (!exact) memo.set(key, spec)
         return spec
     }
-    const spec: Spec = { inst, global: false, params: joined, paramOrigins: joinedOrigins, sigIndex: sigIndexOf(inst), scalar: [], origins: [], calls: new Map(), dead: new Set() }
+    const spec: Spec = { inst, global: false, params: joined, paramOrigins: joinedOrigins, scalar: [], origins: [], calls: new Map(), dead: new Set() }
     flow.spec.grown.set(spec, grown)
     flow.spec.active.add(inst.id)
     localFix(spec)
@@ -3514,14 +3419,20 @@ function globalArrival(inst: Instance, from: Spec | undefined, part: number): Ar
 }
 
 function originClass(origin: number): string {
+    const known = flow.spec.classes[origin]
+    if (known !== undefined) return known
     const kind = flow.originKind[origin]
-    if (kind === OriginKind.slice) return 'buffer'
-    if (kind === OriginKind.site) return 'site'
-    if (isScope(origin)) return 'Scope'
-    const state = heapState(origin)
-    const name = state !== undefined && heap.isArray(state) ? 'Array' : constructorName(protoOf(origin))
-    const elements = elementClass(origin)
-    return elements ? `${name}<${elements}>` : name
+    let name = 'Scope'
+    if (kind === OriginKind.slice) name = 'buffer'
+    else if (kind === OriginKind.site) name = 'site'
+    else if (!isScope(origin)) {
+        const state = heapState(origin)
+        name = state !== undefined && heap.isArray(state) ? 'Array' : constructorName(protoOf(origin))
+        const elements = elementClass(origin)
+        if (elements) name = `${name}<${elements}>`
+    }
+    flow.spec.classes[origin] = name
+    return name
 }
 
 function elementClass(origin: number): string {
@@ -3726,18 +3637,18 @@ export function flowAccesses(roots: Function[], host: AccessHost): Accesses {
 
 function freshFlow(roots: Function[], host: AccessHost): FlowState {
     return {
-        host, roots, strOrigin: -1, nothing: -1, dynamicOrigins: new Set(),
-        spec: { globals: new Map(), memo: new Map(), grown: new Map(), recursive: new Set(), active: new Set() },
+        host, roots, strOrigin: -1, dynamicOrigins: new Set(),
+        spec: { globals: new Map(), memo: new Map(), grown: new Map(), recursive: new Set(), active: new Set(), classes: [] },
         frames: [],
         unitKeys: new Map(),
         work: 0, traceMs: 0, budget: 0, totalNodes: 0,
         summaries: new Map(), summaryList: [], instances: [], instanceOf: new Map(),
-        originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [undefined], originFnKnown: [1], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], originFieldListeners: [undefined], originPending: [undefined], elemReaders: new Map(), pickWatch: new Map(),
+        originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(),
         freshOwner: new Map(),
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
-        queue: [], storeSlots: new Map(), constSlots: new Map(), originSlots: new Map(), bound: new Map(), missing: [], gateWaits: new Map(),
+        queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), keyedReads: new Map(), namedReads: new Map(), runtimeBinds: new Map(), heldWrites: new Map(), invariants: { deps: new Map(), broken: new Set(), skippedKeys: new Set() },
+        fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(),
         exported: { types: new Map(), allocations: [], allocOf: new Map(), locations: [], locOf: new Map(), frameOf: new Map(), framesOf: new Map(), frames: [], slotTypes: new Map() },
     }
 }
@@ -3808,7 +3719,7 @@ function pullNumberMethods(): boolean {
             if (!numberReceiver(recv)) continue
             const method = numberMethod(proto, target.key)
             const slot = at(inst, e)
-            if (!method || flow.bound.get(slot)?.has(method * 4194304)) continue
+            if (!method || flow.parts.get(slot)?.has(method * 4194304)) continue
             bindCall(slot, method, 0)
             bound = true
         }
@@ -3827,7 +3738,7 @@ function solve(): number {
     settle()
     while (pullNumberMethods()) settle()
     const discovery = performance.now()
-    while (repairBounds()) settle()
+    checkSkippedKeys()
     if (bindDynamic()) settle()
     return discovery
 }
@@ -4384,15 +4295,10 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
     }
     const solved = genericFlow(methods.map(([, fn]) => fn), proto, host)
     const shape = pg.genericShape(solved, numberKey, constantIndex)
-    const proveStart = performance.now()
-    const invariants = { pairs: pg.proveInvariants(methods, ctor, (unit, node) => solved.values.get(unit)?.get(node), host, shape.candidates), closure: new Set(solved.units) }
-    const proveMs = performance.now() - proveStart
     const ms = performance.now() - start
     const lines = [`GENERIC ${name}${shape.params.length ? `<${shape.params.map(p => p.name).join(', ')}>` : ''} ${ms.toFixed(1)}ms units=${solved.units.length}`]
-    lines.push(`  invariants ${proveMs.toFixed(1)}ms candidates=${shape.candidates.join(',')}`)
-    for (const [x, y] of invariants.pairs) lines.push(`  invariant ${x} == ${y}`)
     lines.push(...shape.lines)
-    return { name, ms, params: shape.params, paths: shape.paths, invariants, lines }
+    return { name, ms, params: shape.params, paths: shape.paths, lines }
 }
 
 function scalarKind(t: number): number {
@@ -4445,11 +4351,8 @@ function genericView(self: number, params: number[][], methods: Function[]): Gen
         if (list.length) fields.set(origin, list)
     }
     const numeric: number[] = []
-    const values = new Map<Function, Map<number, NodeValues>>()
     for (const inst of flow.instances) {
         const s = inst.summary
-        let byNode = values.get(s.fn)
-        if (!byNode) values.set(s.fn, byNode = new Map())
         for (const x of s.exprs) {
             const n = x.node ? getNode(s.g, x.node) : undefined
             if (!n) continue
@@ -4461,27 +4364,10 @@ function genericView(self: number, params: number[][], methods: Function[]): Gen
             const first = n.op === NodeOp.store ? 1 : 2
             for (let i = 0; i < x.args.length; i++) if (numericUse(s.g, n, first + i)) numeric.push(at(inst, x.args[i]))
         }
-        for (const n of s.g.nodes.values()) {
-            if (n.op !== NodeOp.call && n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
-            const ref = getRef(n, 1)
-            const e = ref ? s.exprOf.get(ref) : undefined
-            if (e === undefined) continue
-            const slot = at(inst, e)
-            let v = byNode.get(ref)
-            if (!v) byNode.set(ref, v = { fns: [], protos: [], other: false })
-            if (flow.scalar[slot] !== NONE) v.other = true
-            for (const origin of flow.slotOrigins[slot]) {
-                const fn = flow.originKind[origin] === OriginKind.fn ? flow.originFn[origin] : originFunction(origin)
-                if (!fn) v.other = true
-                else if (!v.fns.includes(fn)) v.fns.push(fn)
-                const proto = protoOf(origin)
-                if (proto && !v.protos.includes(proto)) v.protos.push(proto)
-            }
-        }
     }
     const names: string[] = []
     methods.forEach((fn, m) => params[m].forEach((_, i) => names.push(`?${fn.name || '<anon>'}.p${i}`)))
-    return { sources, kinds, params, names, numeric, self, fields, objects, values, units: flow.summaryList.map(s => s.fn) }
+    return { sources, kinds, params, names, numeric, self, fields, objects, units: flow.summaryList.map(s => s.fn) }
 }
 
 const exprNames = ['const', 'origin', 'alloc', 'param', 'union', 'member', 'call', 'arith', 'cmp', 'num', 'rt', 'opaque', 'store', 'narrow', 'pick', 'gate', 'typeof']
