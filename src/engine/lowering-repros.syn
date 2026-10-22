@@ -8,9 +8,13 @@ import { allocate } from './builtins'
 import * as gn from './graph-node'
 import * as native from './native'
 import * as bytecode from './bytecode-emitter'
-import { lowerValueGraph } from './lowering2'
+import { lowerValueGraph, type Graph } from './lowering2'
 import type { Rep } from './value-types'
 import * as rt from './rt'
+import * as heap from './heap'
+import { hostTarget } from './lowering'
+import { createTraceSession } from './trace2'
+import * as propertyEval from './property-eval'
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
@@ -2685,6 +2689,213 @@ export function suite() {
         const load = gn.getNode(g, read)!
         const at = gn.getNode(g, gn.getRef(load, 2))
         if (load.op !== gn.NodeOp.load || gn.typeOf(load) !== Types.f64 || at?.op !== gn.NodeOp.mul || gn.getLiteral(g, at, 1) !== 8) harness.fail('an f64 slice must read raw 8-byte floats')
+    })
+    function rootGraph(params: intrinsics.Types[], body: (g: Graph, root: number, params: number[]) => number): Graph {
+        const g = gn.createGraph({})
+        const root = gn.addNode(g, gn.NodeOp.block, [])
+        const ids = params.map(T => gn.addNode(g, gn.NodeOp.param, [], T))
+        g.root = root
+        const ret = body(g, root, ids)
+        gn.setGraphBlocks(g, [{ id: root, params: ids, bodyId: ret, bodyConst: 0 }])
+        return g
+    }
+    harness.test('retypeValuesStandalone', () => {
+        let load = 0
+        const g = rootGraph([Types.u64, Types.u64], (g, root, [a, b]) => {
+            load = gn.addNode(g, gn.NodeOp.load, [gn.addNode(g, gn.NodeOp.nilEffect, []), b, { literal: 0 }], Types.u64)
+            return gn.addNode(g, gn.NodeOp.ret, [gn.addNode(g, gn.NodeOp.add, [a, load], Types.u64), root])
+        })
+        const [a] = g.blocks[0].params
+        native.retypeValues(g, new Map([[a, Types.i64], [load, Types.ptr]]))
+        if (gn.typeOf(gn.getNode(g, a)!) !== Types.i64 || gn.typeOf(gn.getNode(g, load)!) !== Types.ptr) harness.fail('retypeValues must retype exactly the given values')
+    })
+    harness.test('runtimeCallsStandalone', () => {
+        let select = 0
+        let ne = 0
+        let sum = 0
+        const g = rootGraph([Types.vm_value, Types.vm_value], (g, root, [a, b]) => {
+            ne = gn.addNode(g, gn.NodeOp.ne, [a, b], Types.bool)
+            sum = gn.addNode(g, gn.NodeOp.rt, [gn.addNode(g, gn.NodeOp.nilEffect, []), { literal: rt.Op.addOrConcat }, a, b])
+            select = gn.addNode(g, gn.NodeOp.select, [a, ne, sum])
+            return gn.addNode(g, gn.NodeOp.ret, [select, root])
+        })
+        const linked: rt.Op[] = []
+        const moves = native.runtimeCalls(g, { bound: new Set([select, ne]), compares: new Set(), masks: new Map(), target: op => {
+            linked.push(op)
+            return 1000 + linked.length
+        } })
+        const test = gn.getNode(g, gn.getRef(gn.getNode(g, select)!, 0))
+        if (test?.op !== gn.NodeOp.call || gn.getNode(g, ne)?.op !== gn.NodeOp.eq || gn.getNode(g, sum)?.op !== gn.NodeOp.add) harness.fail('bound selects and compares become runtime calls; unbound addOrConcat becomes add')
+        if (linked.join() !== [rt.Op.strictEqual, rt.Op.truthy].join() || moves.moved.length !== 2 || moves.dropped.join() !== String(select)) harness.fail(`runtimeCalls must report its moved calls: ${JSON.stringify(moves)}`)
+    })
+    harness.test('indexArrayIterationsStandalone', () => {
+        const key = (name: string) => heap.fromJsString(name)
+        const g = gn.createGraph({})
+        const root = gn.addNode(g, gn.NodeOp.block, [])
+        const array = gn.addNode(g, gn.NodeOp.param, [], Types.vm_value)
+        const loop = gn.addNode(g, gn.NodeOp.block, [])
+        const exit = gn.addNode(g, gn.NodeOp.block, [])
+        const tok = gn.addNode(g, gn.NodeOp.nilEffect, [])
+        const symbol = gn.addNode(g, gn.NodeOp.getProp, [tok, array, { literal: heap.fromJsSymbol(Symbol.iterator) }])
+        const made = gn.addNode(g, gn.NodeOp.call, [tok, symbol, array])
+        const next = gn.addNode(g, gn.NodeOp.getProp, [made, made, { literal: key('next') }])
+        const enter = gn.addNode(g, gn.NodeOp.apply, [loop])
+        const inLoop = gn.addNode(g, gn.NodeOp.nilEffect, [loop])
+        const call = gn.addNode(g, gn.NodeOp.call, [inLoop, next, made])
+        const done = gn.addNode(g, gn.NodeOp.getProp, [call, call, { literal: key('done') }])
+        const value = gn.addNode(g, gn.NodeOp.getProp, [call, call, { literal: key('value') }])
+        const select = gn.addNode(g, gn.NodeOp.select, [done, gn.addNode(g, gn.NodeOp.apply, [exit]), gn.addNode(g, gn.NodeOp.apply, [loop])])
+        const ret = gn.addNode(g, gn.NodeOp.ret, [value, exit])
+        g.root = root
+        gn.setGraphBlocks(g, [
+            { id: root, params: [array], bodyId: enter, bodyConst: 0 },
+            { id: loop, params: [], bodyId: select, bodyConst: 0 },
+            { id: exit, params: [], bodyId: ret, bodyConst: 0 },
+        ])
+        const rewritten = native.indexArrayIterations(g, new Map([[symbol, 0 as intrinsics.Handle]]), () => undefined)
+        const read = gn.getNode(g, value)!
+        if (rewritten.length !== 1 || rewritten[0].next !== call || g.blocks[1].params[0] !== rewritten[0].index) harness.fail(`one iteration must be indexed by a new loop param: ${JSON.stringify(rewritten)}`)
+        else if (read.op !== gn.NodeOp.getProp || gn.getRef(read, 1) !== array || gn.getRef(read, 2) !== rewritten[0].index) harness.fail('the iterated value must read the array at the index')
+    })
+    harness.test('residualizeAccessesStandalone', () => {
+        let read = 0
+        const g = rootGraph([Types.vm_value], (g, root, [object]) => {
+            read = gn.addNode(g, gn.NodeOp.getProp, [gn.addNode(g, gn.NodeOp.nilEffect, []), object, { literal: heap.indexKey(3 as u32) }])
+            return gn.addNode(g, gn.NodeOp.ret, [read, root])
+        })
+        const any: Rep = { text: 'any', kind: 'any', targets: [], nullable: true }
+        const checked: number[] = []
+        const out = native.residualizeAccesses(g, { reps: new Map([[g.blocks[0].params[0], any]]), get: { link: () => 4242, returns: Types.vm_value }, check: id => checked.push(id) })
+        const call = gn.getNode(g, read)!
+        const target = gn.getNode(g, gn.getRef(call, 1))!
+        const key = gn.getNode(g, gn.getRef(call, 4))!
+        if (call.op !== gn.NodeOp.call || gn.getLiteral(g, target, 0) !== 4242 || gn.getLiteral(g, key, 0) !== 6) harness.fail('an opaque read must become a getprop call with a boxed index key')
+        if (checked.join() !== String(read) || out.calls.get(read) !== true || !out.words.has(read)) harness.fail(`residualizeAccesses must report its calls and words: ${checked}`)
+    })
+    harness.test('functionObjectsStandalone', () => {
+        const g = rootGraph([Types.u64], (g, root, [p]) => {
+            const code = gn.addNode(g, gn.NodeOp.heapHandle, [{ literal: 77 }])
+            const call = gn.addNode(g, gn.NodeOp.call, [gn.addNode(g, gn.NodeOp.nilEffect, []), gn.addNode(g, gn.NodeOp.heapHandle, [{ literal: 88 }]), { literal: 0 }, p])
+            return gn.addNode(g, gn.NodeOp.ret, [gn.addNode(g, gn.NodeOp.after, [call, code]), root])
+        })
+        const ret = g.blocks[0].bodyId
+        const after = gn.getRef(gn.getNode(g, ret)!, 0)
+        native.functionObjectValues(g, new Map([[after, [1]]]), new Map([[77, 99 as intrinsics.Handle]]))
+        native.functionObjectCalls(g, new Map([[88, 66 as intrinsics.Handle]]))
+        native.substituteConstantParams(g, new Map([[0, { literal: 5 }]]))
+        const object = gn.getNode(g, gn.getRef(gn.getNode(g, after)!, 1))!
+        const call = gn.getNode(g, gn.getRef(gn.getNode(g, after)!, 0))!
+        const target = gn.getNode(g, gn.getRef(call, 1))!
+        const arg = gn.getNode(g, gn.getRef(call, 3))!
+        if (gn.getLiteral(g, object, 0) !== 99 || gn.getLiteral(g, target, 0) !== 66 || arg.op !== gn.NodeOp.literal || gn.getLiteral(g, arg, 0) !== 5) harness.fail('function objects, call code and constant params must follow the given maps')
+    })
+    function unitGraph(name: string, space: Graph | undefined, params: intrinsics.Types[], body: (g: Graph, root: number, params: number[]) => number): Graph {
+        const g = gn.createGraph(space ? { ids: space.ids, literals: space.literals, name } : { name })
+        const root = gn.addNode(g, gn.NodeOp.block, [])
+        const ids = params.map(T => gn.addNode(g, gn.NodeOp.param, [], T))
+        g.root = root
+        const ret = body(g, root, ids)
+        gn.setGraphBlocks(g, [{ id: root, params: ids, bodyId: ret, bodyConst: 0 }])
+        return g
+    }
+    function twoUnits(callee: (g: Graph, root: number, params: number[]) => number, arity: number, args: (g: Graph, x: number) => gn.Operand[]): { program: native.ProgramGraph, caller: Graph, callee: Graph, call: number } {
+        let call = 0
+        const caller = unitGraph('caller', undefined, [Types.u64], (g, root, [x]) => {
+            call = gn.addNode(g, gn.NodeOp.call, [gn.addNode(g, gn.NodeOp.nilEffect, []), gn.addNode(g, gn.NodeOp.localTarget, [{ literal: 2 }], Types.u64), { literal: 0 }, ...args(g, x)])
+            return gn.addNode(g, gn.NodeOp.ret, [call, root])
+        })
+        const unit = unitGraph('callee', caller, Array.from({ length: arity }, () => Types.u64), callee)
+        const program = { units: new Map([[1, caller], [2, unit]]), roots: new Map(), noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), hostReturns: new Map(), image: undefined, target: hostTarget } as any as native.ProgramGraph
+        return { program, caller, callee: unit, call }
+    }
+    harness.test('signatureRewritesStandalone', () => {
+        const touched = new Set<number>()
+        const pruned = twoUnits((g, root, [a]) => gn.addNode(g, gn.NodeOp.ret, [a, root]), 2, (g, x) => [x, { literal: 7 }])
+        native.pruneArgs(pruned.program, 2, new Set([1]), [[1, pruned.call]], touched)
+        if (pruned.callee.blocks[0].params.length !== 1 || gn.countIds(gn.getNode(pruned.caller, pruned.call)!) !== 4) harness.fail('pruneArgs must drop the dead param and its args')
+        const forwarded = twoUnits((g, root, [a]) => gn.addNode(g, gn.NodeOp.ret, [a, root]), 1, (g, x) => [x])
+        native.forwardArg(forwarded.program, 2, 0, [[1, forwarded.call]], touched)
+        const site = gn.getNode(forwarded.caller, forwarded.call)!
+        const returned = gn.getNode(forwarded.callee, gn.getRef(gn.getNode(forwarded.callee, forwarded.callee.blocks[0].bodyId)!, 0))!
+        if (site.op !== gn.NodeOp.after || gn.getRef(site, 1) !== forwarded.caller.blocks[0].params[0] || returned.op !== gn.NodeOp.void) harness.fail('forwardArg must hand the caller its own arg and void the return')
+        let product = 0
+        const shared = twoUnits((g, root, [a, b]) => {
+            product = gn.addNode(g, gn.NodeOp.mul, [a, { literal: 3 }], Types.u64)
+            return gn.addNode(g, gn.NodeOp.ret, [gn.addNode(g, gn.NodeOp.add, [product, b], Types.u64), root])
+        }, 2, (g, x) => [x, { literal: 7 }])
+        const twin = gn.addNode(shared.caller, gn.NodeOp.mul, [shared.caller.blocks[0].params[0], { literal: 3 }], Types.u64)
+        native.shareValues(shared.program, 2, new Map([[product, [twin]]]), [[1, shared.call]], touched)
+        native.bindParams(shared.callee, new Map([[shared.callee.blocks[0].params[1], { literal: 7 }]]))
+        const sum = gn.getNode(shared.callee, gn.getRef(gn.getNode(shared.callee, shared.callee.blocks[0].bodyId)!, 0))!
+        const lifted = shared.callee.blocks[0].params[2]
+        if (gn.getRef(gn.getNode(shared.caller, shared.call)!, 5) !== twin || gn.getRef(sum, 0) !== lifted || gn.getRef(sum, 1) || gn.getLiteral(shared.callee, sum, 1) !== 7) harness.fail('shareValues must pass the twin as a new param; bindParams must fold the literal param')
+        if ([...touched].join() !== '2,1') harness.fail(`rewrites must report touched units: ${[...touched]}`)
+    })
+    harness.test('memoryRewritesStandalone', () => {
+        let load = 0
+        const hoisted = twoUnits((g, root, [p]) => {
+            load = gn.addNode(g, gn.NodeOp.load, [gn.addNode(g, gn.NodeOp.nilEffect, []), p, { literal: 8 }], Types.u64)
+            return gn.addNode(g, gn.NodeOp.ret, [load, root])
+        }, 1, (g, x) => [x])
+        native.hoistParamLoads(hoisted.program, { callee: 2, specialize: false, loads: [load], sites: [[1, hoisted.call]] }, new Set())
+        const copied = gn.getNode(hoisted.caller, gn.getRef(gn.getNode(hoisted.caller, hoisted.call)!, 4))!
+        const end = gn.getNode(hoisted.callee, hoisted.callee.blocks[0].bodyId)!
+        if (copied.op !== gn.NodeOp.load || gn.getRef(copied, 1) !== hoisted.caller.blocks[0].params[0] || gn.getRef(end, 0) !== hoisted.callee.blocks[0].params[1]) harness.fail('hoistParamLoads must move the load into the caller')
+        const state = twoUnits((g, root, [p]) => {
+            const nil = gn.addNode(g, gn.NodeOp.nilEffect, [])
+            const old = gn.addNode(g, gn.NodeOp.load, [nil, p, { literal: 0 }], Types.u64)
+            const stored = gn.addNode(g, gn.NodeOp.store, [old, p, { literal: 0 }, gn.addNode(g, gn.NodeOp.add, [old, { literal: 1 }], Types.u64)], Types.u64)
+            return gn.addNode(g, gn.NodeOp.ret, [gn.addNode(g, gn.NodeOp.after, [stored, gn.addNode(g, gn.NodeOp.void, [])]), root])
+        }, 1, (g, x) => [x])
+        native.scalarizeState(state.program, { callee: 2, index: 0, fields: [[0, Types.u64]], outputs: [[0, Types.u64]], result: false, sites: [[1, state.call]] }, new Set())
+        const scalar = gn.getNode(state.callee, state.callee.blocks[0].params[0])!
+        const record = gn.getNode(state.callee, gn.getRef(gn.getNode(state.callee, state.callee.blocks[0].bodyId)!, 0))!
+        if (state.callee.blocks[0].params.length !== 1 || gn.typeOf(scalar) !== Types.u64 || record.op !== gn.NodeOp.record || gn.getNode(state.caller, state.call)!.op !== gn.NodeOp.after) harness.fail('scalarizeState must pass the field in and out by value')
+        let allocation = 0
+        let store = 0
+        let ret = 0
+        let read = 0
+        const records = twoUnits((g, root) => {
+            const nil = gn.addNode(g, gn.NodeOp.nilEffect, [])
+            allocation = gn.addNode(g, gn.NodeOp.pstack, [nil, 0, 0, { literal: 8 }])
+            store = gn.addNode(g, gn.NodeOp.store, [allocation, allocation, { literal: 0 }, { literal: 5 }], Types.u64)
+            ret = gn.addNode(g, gn.NodeOp.ret, [allocation, root])
+            return ret
+        }, 0, () => [])
+        const caller = records.caller
+        read = gn.addNode(caller, gn.NodeOp.load, [records.call, records.call, { literal: 0 }], Types.u64)
+        gn.setGraphBlocks(caller, [{ ...caller.blocks[0], bodyId: gn.addNode(caller, gn.NodeOp.ret, [read, caller.root]) }])
+        const flow = (source: [number, number][], reads: [number, string][], exits: [number, number][]) => ({ source: new Map(source), reads: new Map(reads), inner: new Map(), stores: new Map(), exits, accessed: new Set<number>() })
+        const own = flow([[allocation, allocation]], [], [[ret, 0]])
+        own.stores.set(`${allocation}/0`, [[store, 0]])
+        own.accessed.add(allocation)
+        native.recordReturn(records.program, { callee: 2, own, allocations: [allocation], layout: new Map([['0', [0, Types.u64]]]), inner: new Map(), callers: [[1, flow([[records.call, records.call]], [[read, '0']], [])]] }, () => new Map(), new Set())
+        const pair = gn.getNode(records.callee, gn.getRef(gn.getNode(records.callee, records.callee.blocks[0].bodyId)!, 0))!
+        const field = gn.getNode(caller, gn.getRef(gn.getNode(caller, read)!, 1))!
+        if (pair.op !== gn.NodeOp.record || field.op !== gn.NodeOp.get || gn.getRef(field, 0) !== records.call) harness.fail('recordReturn must return the fields as a record and read them with get')
+    })
+    harness.test('placeObjectsStandalone', () => {
+        const session = createTraceSession()
+        const runtime = session.enterTrace()
+        defer finally {
+            session.leaveTrace()
+        }
+        const key = heap.fromJsString('x')
+        const layout = heap.makeObject(0 as intrinsics.Handle)
+        heap.setProperty(layout, key, heap.boxF64(0) as intrinsics.Handle)
+        let read = 0
+        const g = gn.createGraph({ ids: runtime.ids, literals: runtime.literals, name: 'placed' })
+        const root = gn.addNode(g, gn.NodeOp.block, [])
+        const object = gn.addNode(g, gn.NodeOp.param, [], Types.u64)
+        read = gn.addNode(g, gn.NodeOp.getProp, [gn.addNode(g, gn.NodeOp.nilEffect, []), object, { literal: key }])
+        const ret = gn.addNode(g, gn.NodeOp.ret, [read, root])
+        g.root = root
+        gn.setGraphBlocks(g, [{ id: root, params: [object], bodyId: ret, bodyConst: 0 }])
+        const codecs: native.Facts = new Map([[layout, new Map<string, native.Codec>([['0', { kind: 'int', encoded: false, type: Types.i64 }]])]])
+        const placed = propertyEval.placeObjects(g, { session, frames: new Map(), params: new Map([[0, layout]]), layouts: { codecs, fixedCodecs: new Set([layout]) } })
+        const value = gn.getNode(placed.graph, gn.getRef(gn.getNode(placed.graph, ret)!, 0))!
+        const load = value.op === gn.NodeOp.after ? gn.getNode(placed.graph, gn.getRef(value, gn.countIds(value) - 1))! : value
+        if (load.op !== gn.NodeOp.load || gn.getRef(load, 1) !== object || gn.getLiteral(placed.graph, load, 2) !== 0 || gn.typeOf(load) !== Types.i64) harness.fail(`a field read of a laid-out param must load at the layout offset: ${gn.opName(load.op)}`)
     })
     harness.test('undefinedOperand', () => {
         const natives: any = native.createNatives({ undefinedOperand })
