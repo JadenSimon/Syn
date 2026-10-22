@@ -42,7 +42,7 @@ import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, ve
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
 import { analyzeGenerics, flowAccesses } from './value-flow'
-import { type AccessHost, keyLabel, constructedAllocation, dereferenceableRep, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type AccessHost, keyLabel, constructedAllocation, dereferenceableRep, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField, snapshotKeys } from './heap-records'
 import type { Constructed } from './property-eval'
 
@@ -6853,6 +6853,177 @@ function plannedMembers(plan: ShapePlan, rep: Rep): intrinsics.Handle[] | undefi
     return rep.targets.map(target => plan.shapes.get(target)!)
 }
 
+function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>, graphOf: (fn: Function) => Graph, fieldKey: (name: string) => intrinsics.Handle | undefined, taggable: (sig: ShapeSignature) => boolean): Map<string, number> {
+    function shapesOf(rep: Rep | undefined): string[] | undefined {
+        if (!rep || rep.targets.length < 2 || !rep.targets.every(target => target.startsWith('S'))) return
+        if (rep.kind !== 'pointer' && (rep.kind !== 'union' || rep.bools)) return
+        return rep.targets
+    }
+    const compared = new Map<string, boolean>()
+    function sameSig(a: string, b: string): boolean {
+        if (a === b) return true
+        const pair = `${a}|${b}`
+        const known = compared.get(pair)
+        if (known !== undefined) return known
+        compared.set(pair, true)
+        const same = sameFields(a, b)
+        compared.set(pair, same)
+        return same
+    }
+    function sameFields(a: string, b: string): boolean {
+        const x = inst.shapes.get(a)
+        const y = inst.shapes.get(b)
+        if (!x || !y || x.proto !== y.proto || x.fields.length !== y.fields.length) return false
+        for (let i = 0; i < x.fields.length; i++) {
+            if (x.fields[i][0] !== y.fields[i][0] || !sameRep(x.fields[i][1], y.fields[i][1])) return false
+        }
+        return true
+    }
+    function sameRep(a: Rep, b: Rep): boolean {
+        if (a.text === b.text) return true
+        if (a.kind !== b.kind || a.nullable !== b.nullable || a.targets.length !== b.targets.length) return false
+        if (a.kind === 'buffer') return !!a.element && !!b.element && sameRep(a.element, b.element)
+        if (a.kind !== 'pointer') return false
+        for (let i = 0; i < a.targets.length; i++) {
+            if (!a.targets[i].startsWith('S') || !b.targets[i].startsWith('S') || !sameSig(a.targets[i], b.targets[i])) return false
+        }
+        return true
+    }
+    function fieldAt(sig: ShapeSignature, key: intrinsics.Handle): number {
+        return sig.fields.findIndex(([name]) => fieldKey(name) === key)
+    }
+    function inherited(sig: ShapeSignature, key: intrinsics.Handle): intrinsics.Handle {
+        const addr = sig.proto ? heap.getPropertyDescriptor(sig.proto, key) : 0
+        return addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as intrinsics.Handle : 0 as intrinsics.Handle
+    }
+    function chain(target: string): string {
+        const protos: intrinsics.Handle[] = []
+        let at = inst.shapes.get(target)!.proto ?? 0 as intrinsics.Handle
+        while (at) {
+            protos.push(at)
+            at = heap.getPrototypeOf(at)
+        }
+        return protos.join(',')
+    }
+    function agreesOn(targets: string[], key: intrinsics.Handle): boolean {
+        const first = inst.shapes.get(targets[0])!
+        const at = fieldAt(first, key)
+        for (const target of targets) {
+            const sig = inst.shapes.get(target)!
+            if (fieldAt(sig, key) !== at) return false
+            if (at < 0 && inherited(sig, key) !== inherited(first, key)) return false
+            for (let i = 0; i <= at; i++) {
+                if (sig.fields[i][0] !== first.fields[i][0] || !sameRep(sig.fields[i][1], first.fields[i][1])) return false
+            }
+        }
+        return true
+    }
+    function agrees(graph: Graph, n: GraphNode, targets: string[]): boolean {
+        if (n.op === NodeOp.rt) return targets.every(target => chain(target) === chain(targets[0]))
+        if (getRef(n, 2)) return false
+        return agreesOn(targets, getLiteral(graph, n, 2) as intrinsics.Handle)
+    }
+    function objectOf(n: GraphNode): number {
+        return n.op === NodeOp.rt ? getRef(n, 2) : getRef(n, 1)
+    }
+    const demanded = new Set<string>()
+    const linked = new Map<string, Set<string>>()
+    function link(targets: string[] | undefined): void {
+        if (!targets) return
+        for (const target of targets) {
+            let set = linked.get(target)
+            if (!set) linked.set(target, set = new Set())
+            for (const other of targets) set.add(other)
+        }
+    }
+    for (const [fn, list] of units) {
+        const graph = graphOf(fn)
+        const owners = new Map<number, number>()
+        for (const b of graph.blocks) for (const p of b.params) owners.set(p, b.id)
+        let applies: Map<number, number[]> | undefined
+        function appliesInto(block: number): number[] {
+            if (!applies) {
+                applies = new Map()
+                for (const [id, n] of graph.nodes) {
+                    if (n.op !== NodeOp.apply) continue
+                    const known = applies.get(getRef(n, 0))
+                    if (known) known.push(id)
+                    else applies.set(getRef(n, 0), [id])
+                }
+            }
+            return applies.get(block) ?? []
+        }
+        for (const unit of list) {
+            function repAt(value: number): Rep | undefined {
+                const id = tailOf(graph, value)
+                const index = graph.blocks[0].params.indexOf(id)
+                return index < 0 ? unit.nodes.get(id) : unit.params[index]?.rep
+            }
+            const seen = new Map<number, boolean>()
+            function tagged(value: number): boolean {
+                const id = tailOf(graph, value)
+                if (!shapesOf(repAt(id))) return true
+                const known = seen.get(id)
+                if (known !== undefined) return known
+                seen.set(id, true)
+                const result = taggedNow(id)
+                seen.set(id, result)
+                return result
+            }
+            function taggedNow(id: number): boolean {
+                const n = getNode(graph, id)
+                if (!n) return false
+                if (n.op === NodeOp.heapHandle) return true
+                if (n.op === NodeOp.param) {
+                    const block = owners.get(id)
+                    if (block === undefined || block === graph.blocks[0].id) return false
+                    const index = getBlock(graph, block)!.params.indexOf(id)
+                    for (const apply of appliesInto(block)) {
+                        if (!tagged(getRef(getNode(graph, apply)!, index + 1))) return false
+                    }
+                    return true
+                }
+                if (n.op === NodeOp.getProp) return dispatched(n)
+                if (n.op !== NodeOp.call) return false
+                const target = getNode(graph, tailOf(graph, getRef(n, 1)))
+                return target?.op === NodeOp.getProp && dispatched(target)
+            }
+            function dispatched(n: GraphNode): boolean {
+                const targets = shapesOf(repAt(objectOf(n)))
+                if (!targets) return false
+                return tagged(objectOf(n)) || !agrees(graph, n, targets)
+            }
+            for (const n of graph.nodes.values()) {
+                const access = n.op === NodeOp.getProp || n.op === NodeOp.setProp || (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.hasPrototype)
+                if (!access) continue
+                const targets = shapesOf(repAt(objectOf(n)))
+                link(targets)
+                if (!targets || agrees(graph, n, targets) || tagged(objectOf(n))) continue
+                for (const target of targets) demanded.add(target)
+            }
+        }
+    }
+    const ids = new Map<string, number>()
+    const placed = new Set<string>()
+    for (const start of [...demanded].sort()) {
+        if (placed.has(start)) continue
+        const component = [start]
+        placed.add(start)
+        for (let i = 0; i < component.length; i++) {
+            for (const other of linked.get(component[i]) ?? []) {
+                if (placed.has(other)) continue
+                placed.add(other)
+                component.push(other)
+            }
+        }
+        const untaggable = component.filter(target => !inst.shapes.has(target) || !taggable(inst.shapes.get(target)!))
+        if (flags.has('plan') && untaggable.length) console.log('SHAPE-TAG-SKIP', component.join(','), 'untaggable', untaggable.join(','))
+        if (untaggable.length) continue
+        for (const target of component.sort()) ids.set(target, ids.size + 1)
+    }
+    return ids
+}
+
 const narrowUndefined = 2 ** 32
 
 const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty])
@@ -8718,10 +8889,17 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
             }
         }
     }
+    const shapeTags = planShapeTags(inst, plan, fn => host.graphOf(fn), fieldKey, sig => sig.members.every(m => {
+        const object = types.objects[m]
+        return !object.constant && !object.native && (object.state === undefined || (!placedStatics.has(object.state) && !constructed.has(object.state)))
+    }))
+    if (flags.has('plan')) for (const [id, tag] of shapeTags) console.log('SHAPE-TAG', id, tag)
     const handles = new Map<string, intrinsics.Handle>()
     const fixedFields = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     for (const [id, sig] of inst.shapes) {
         const shape = heap.makeObject((sig.proto ?? 0) as intrinsics.Handle)
+        const tag = shapeTags.get(id)
+        if (tag !== undefined) heap.setReadonlyProperty(shape, heap.shapeTagKey, heap.boxF64(tag) as intrinsics.Handle)
         for (const [k] of sig.fields) {
             const key = fieldKey(k)
             if (key === undefined) throw `native: planned shape ${id} has no key for ${k}`
@@ -8845,7 +9023,7 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
             const tag = record.tags[at]
             return `${k}${readonly ? '!' : ''}${inner !== undefined ? `{${layoutOf(inner, elements)}}` : ''}${constant !== undefined ? `=${constant}` : ''}${flag ? `^${flag.offset}.${flag.bit}` : ''}${tag ? `?${tag.offset}.${tag.bit}` : ''}`
         })
-        const text = `${sig.proto ?? ''}{${fields.join(',')}}${[...facts.get(handle)!].filter(([path]) => read.has(path) || !path.endsWith('/*')).map(([path, f]) => `${path}:${factClass(path, f)}`).join(',')}`
+        const text = `${sig.proto ?? ''}${shapeTags.get(id) ?? ''}{${fields.join(',')}}${[...facts.get(handle)!].filter(([path]) => read.has(path) || !path.endsWith('/*')).map(([path, f]) => `${path}:${factClass(path, f)}`).join(',')}`
         let layout = layoutIds.get(text)
         if (layout === undefined) layoutIds.set(text, layout = `L${layoutIds.size}`)
         if (flags.has('share-debug')) console.log('SHARE-LAYOUT', id, layout, text)

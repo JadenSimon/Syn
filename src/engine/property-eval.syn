@@ -531,6 +531,10 @@ function resolveProperties(
         const state = snapshotNode(id) ? getLiteral(runtime, snapshotNode(id)!, 1) as Handle : mem.shape
         for (let i = 0; i < mem.keys.length; i++) {
             if (mem.nested[i] !== undefined) continue
+            if (mem.keys[i] === heap.shapeTagKey) {
+                token = storeKey(mem, i, token, { literal: heap.unboxF64(slotAt(mem.shape, heap.shapeTagKey)) }, { literal: 1 })
+                continue
+            }
             if (!heap.getOwnProperty(state, mem.keys[i])) {
                 if (opts.fixedFacts?.has(mem.shape)) token = storeKey(mem, i, token, { literal: 0 }, { literal: 0 })
                 continue
@@ -826,7 +830,7 @@ function resolveProperties(
         const fixed = opts.constructed?.fixed?.get(shape)?.get(key)
         return `field ${fields.offsets[at]} ${reducedShape(shape)} ${readonly(shape)} ${fixed ?? '-'} ${fields.nested[at] ?? '-'}`
     }
-    function agreeOn(id: number, mem: Memory, key: Handle): void {
+    function agrees(mem: Memory, key: Handle): boolean {
         const members = mem.members!
         const first = members[0]
         const expected = placement(first, key)
@@ -835,9 +839,13 @@ function resolveProperties(
         for (const member of members) {
             const other = layout(member)
             const index = other.keys.indexOf(key)
-            const agrees = placement(member, key) === expected && (at < 0 || (sameSlot(fields.flags[at], other.flags[index]) && sameSlot(fields.tags[at], other.tags[index]) && sameCodec(locate(first, String(fields.offsets[at])), locate(member, String(other.offsets[index])))))
-            if (!agrees) unresolvable(`property-eval: %${id} accesses ${heap.describeKey(key)} through a pointer to one of ${members.length} shapes, which lay it out differently`)
+            const same = placement(member, key) === expected && (at < 0 || (sameSlot(fields.flags[at], other.flags[index]) && sameSlot(fields.tags[at], other.tags[index]) && sameCodec(locate(first, String(fields.offsets[at])), locate(member, String(other.offsets[index])))))
+            if (!same) return false
         }
+        return true
+    }
+    function agreeOn(id: number, mem: Memory, key: Handle): void {
+        if (!agrees(mem, key)) unresolvable(`property-eval: %${id} accesses ${heap.describeKey(key)} through a pointer to one of ${mem.members!.length} shapes, which lay it out differently`)
     }
 
     function resolveMemory(id: number, n: GraphNode, mem: Memory): void {
@@ -848,8 +856,13 @@ function resolveProperties(
         const key = getLiteral(runtime, n, 2) as Handle
         const value: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(runtime, n, 3)]
         const keyRef = getRef(n, 2)
-        if (mem.members && keyRef) unresolvable(`property-eval: %${id} uses a computed key through a pointer to one of ${mem.members.length} shapes`)
-        if (mem.members) agreeOn(id, mem, key)
+        if (mem.members && (keyRef || !agrees(mem, key))) {
+            const union = dispatchOf(getRef(n, 1), mem, token)
+            if (!union && keyRef) unresolvable(`property-eval: %${id} uses a computed key through a pointer to one of ${mem.members.length} shapes`)
+            if (!union) agreeOn(id, mem, key)
+            if (n.op === NodeOp.getProp) return resolveUnion(id, n, union!, mem.ptr)
+            return writeUnion(id, n, union!, mem.ptr)
+        }
         const index = keyRef ? undefined : heap.keyIndex(key)
         if (keyRef || index !== undefined) {
             const proxy = heap.getPropertyProxy(mem.shape, keyRef ? intrinsics.getNanFromId(keyRef) as Handle : key)
@@ -1028,7 +1041,8 @@ function resolveProperties(
 
     function resolve(id: number, n: GraphNode): void {
         const union = unions.get(getRef(n, 1))
-        if (union && n.op === NodeOp.getProp) return resolveUnion(id, n, union)
+        if (union && n.op === NodeOp.getProp) return resolveUnion(id, n, union, getRef(n, 1))
+        if (union) return writeUnion(id, n, union, getRef(n, 1))
         const mem = memory.get(getRef(n, 1))
         if (mem) return resolveMemory(id, n, mem)
         const token = getRef(n, 0)
@@ -1086,12 +1100,16 @@ function resolveProperties(
         if (found === numberShape && nullish) return
         return found ?? null
     }
-    interface Union {
+    interface Tag {
         tag: number
+        ids?: number[]
+    }
+    interface Union extends Tag {
         members: Handle[]
     }
     const unions = new Map<number, Union>()
-    const unionTargets = new Map<number, { tag: number, arms: number[] }>()
+    const unionTargets = new Map<number, { union: Tag, arms: number[] }>()
+    const dispatchedObjects = new Map<number, Union>()
     let armOverride: { id: number, shape: Handle } | undefined
     function memberIndex(members: Handle[], shape: Handle): number {
         const exact = members.indexOf(shape)
@@ -1101,6 +1119,10 @@ function resolveProperties(
         if (unions.has(param)) return
         const at = paramSlots.get(param)
         if (!at) return
+        if (at.block === graph.root) {
+            memory.set(param, { ...pointerMemory(param, members[0]), members })
+            return
+        }
         const tag = addNode(out, NodeOp.param, [])
         const block = out.blocks.find(b => b.id === at.block)!
         const position = block.params.length
@@ -1126,7 +1148,7 @@ function resolveProperties(
             if (carried) {
                 const indices = carried.members.map(m => memberIndex(members, m))
                 if (indices.some(i => i < 0)) throw `property-eval: %${apply} carries an unknown union member into %${param}`
-                operands.splice(position + 1, 0, remapTag(carried.tag, indices))
+                operands.splice(position + 1, 0, remapTag(carried, indices))
                 putCopy(out, apply, current, operands)
                 continue
             }
@@ -1141,26 +1163,26 @@ function resolveProperties(
         unions.delete(param)
         memory.set(param, { ...pointerMemory(param, members[0]), members })
     }
-    function remapTag(tag: number, indices: number[]): number {
-        if (indices.every((index, i) => index === i)) return tag
-        return tagSelect(tag, indices.map(index => addNode(out, NodeOp.literal, [{ literal: index }])))
+    function remapTag(union: Tag, indices: number[]): number {
+        if (!union.ids && indices.every((index, i) => index === i)) return union.tag
+        return tagSelect(union, indices.map(index => addNode(out, NodeOp.literal, [{ literal: index }])))
     }
-    function tagSelect(tag: number, arms: number[]): number {
+    function tagSelect(union: Tag, arms: number[]): number {
         let chosen = arms[arms.length - 1]
         for (let i = arms.length - 2; i >= 0; i--) {
-            const test = addNode(out, NodeOp.eq, [tag, { literal: i }], Types.bool)
+            const test = addNode(out, NodeOp.eq, [union.tag, { literal: union.ids ? union.ids[i] : i }], Types.bool)
             const select = newId()
             putNode(out, select, NodeOp.select, [test, arms[i], chosen])
             chosen = select
         }
         return chosen
     }
-    function resolveUnion(id: number, n: GraphNode, union: Union): void {
+    function resolveUnion(id: number, n: GraphNode, union: Union, ptr: number): void {
         const arms: number[] = []
         const shapes: (Handle | null | undefined)[] = []
         let constants = true
         for (const memberShape of union.members) {
-            const member = pointerMemory(getRef(n, 1), memberShape)
+            const member = pointerMemory(ptr, memberShape)
             const arm = newId()
             resolveMemory(arm, n, member)
             arms.push(arm)
@@ -1171,14 +1193,51 @@ function resolveProperties(
             const valueNode = value ? getNode(out, value) : undefined
             if (!valueNode || valueNode.op !== NodeOp.heapHandle || getRef(valueNode, 0)) constants = false
         }
-        const chosen = tagSelect(union.tag, arms)
+        const chosen = tagSelect(union, arms)
         putNode(out, id, NodeOp.after, [getRef(n, 0), chosen])
         const armTags = arms.map(arm => fieldTags.get(arm))
-        if (armTags.every(tag => tag !== undefined)) fieldTags.set(id, tagSelect(union.tag, armTags as number[]))
-        if (constants) unionTargets.set(id, { tag: union.tag, arms: arms.map(a => getRef(getNode(out, a)!, countIds(getNode(out, a)!) - 1)) })
-        if (shapes.every(s => s !== undefined)) joinResult(id, union.tag, shapes as (Handle | null)[])
+        if (armTags.every(tag => tag !== undefined)) fieldTags.set(id, tagSelect(union, armTags as number[]))
+        if (constants) unionTargets.set(id, { union, arms: arms.map(a => getRef(getNode(out, a)!, countIds(getNode(out, a)!) - 1)) })
+        joinArms(id, union, arms, shapes)
     }
-    function joinResult(id: number, tag: number, shapes: (Handle | null)[]): void {
+    function writeUnion(id: number, n: GraphNode, union: Union, ptr: number): void {
+        const arms: number[] = []
+        for (const memberShape of union.members) {
+            const arm = newId()
+            resolveMemory(arm, n, pointerMemory(ptr, memberShape))
+            arms.push(target(arm))
+        }
+        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(union, arms)])
+    }
+    function joinArms(id: number, union: Tag, arms: number[], shapes: (Handle | null | undefined)[]): void {
+        const results = arms.map(arm => memory.get(arm))
+        if (results.some(m => m?.members) && results.every(m => m && !m.decoded && !m.union)) {
+            const members: Handle[] = []
+            for (const m of results) {
+                for (const s of m!.members ?? [m!.shape]) if (memberIndex(members, s) < 0) members.push(s)
+            }
+            memory.set(id, { ...pointerMemory(id, members[0]), members })
+            return
+        }
+        if (shapes.every(s => s !== undefined)) joinResult(id, union, shapes as (Handle | null)[])
+    }
+    function dispatchOf(id: number, mem: Memory, token: number): Union | undefined {
+        const members = mem.members!
+        const ids: number[] = []
+        let offset: number | undefined
+        for (const member of members) {
+            const fields = layout(member)
+            const at = fields.keys.indexOf(heap.shapeTagKey)
+            if (at < 0 || (offset !== undefined && fields.offsets[at] !== offset)) return
+            offset = fields.offsets[at]
+            ids.push(heap.unboxF64(slotAt(member, heap.shapeTagKey)))
+        }
+        const tag = addNode(out, NodeOp.load, [token, mem.ptr, { literal: mem.base + offset! }], Types.u32)
+        const union = { tag, ids, members }
+        dispatchedObjects.set(id, union)
+        return union
+    }
+    function joinResult(id: number, tag: Tag, shapes: (Handle | null)[]): void {
         const members: Handle[] = []
         for (const s of shapes) if (s !== null && memberIndex(members, s) < 0) members.push(s)
         if (!members.length) {
@@ -1277,13 +1336,7 @@ function resolveProperties(
         const known = shape(getRef(n, 2))
         if (known === numberShape || known === stringShape) return []
         if (known === undefined || known === null) return
-        const chain: Handle[] = []
-        let at = heap.getPrototypeOf(known)
-        while (at) {
-            chain.push(at)
-            at = heap.getPrototypeOf(at)
-        }
-        return chain
+        return prototypesOf(known)
     }
     function linkedPrototypeTest(id: number): boolean {
         const n = getNode(source, id)
@@ -1292,19 +1345,52 @@ function resolveProperties(
         shape(object)
         const union = unions.get(object)
         const mem = memory.get(object)
+        if (mem?.members) return membersPrototypeTest(id, n, mem)
         const members: Memory[] = []
         if (mem) members.push(mem)
         for (const member of union?.members ?? []) members.push(pointerMemory(object, member))
-        if (!members.some(m => m.keys.includes(heap.protoSlotKey))) return false
+        if (!union && !members.some(m => m.keys.includes(heap.protoSlotKey))) return false
         const tests: number[] = []
         for (const member of members) tests.push(memberPrototypeTest(n, member))
-        putNode(out, id, NodeOp.after, [getRef(n, 0), union ? tagSelect(union.tag, tests) : tests[0]])
+        putNode(out, id, NodeOp.after, [getRef(n, 0), union ? tagSelect(union, tests) : tests[0]])
         return true
+    }
+    function membersPrototypeTest(id: number, n: GraphNode, mem: Memory): boolean {
+        const members = mem.members!
+        if (members.some(member => layout(member).keys.includes(heap.protoSlotKey))) {
+            agreeOn(id, mem, heap.protoSlotKey)
+            putNode(out, id, NodeOp.after, [getRef(n, 0), memberPrototypeTest(n, mem)])
+            return true
+        }
+        const constant = constantPrototype(n)
+        const answers = new Set<string>()
+        for (const member of members) {
+            const chain = prototypesOf(member)
+            answers.add(constant !== undefined ? String(chain.includes(constant)) : chain.join(','))
+        }
+        if (answers.size < 2) {
+            putNode(out, id, NodeOp.after, [getRef(n, 0), memberPrototypeTest(n, pointerMemory(mem.ptr, members[0]))])
+            return true
+        }
+        const union = dispatchOf(getRef(n, 2), mem, getRef(n, 0))
+        if (!union) throw `property-eval: %${id} tests the prototype of a pointer to one of ${members.length} shapes, whose prototype chains differ`
+        const tests: number[] = []
+        for (const member of members) tests.push(memberPrototypeTest(n, pointerMemory(mem.ptr, member)))
+        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(union, tests)])
+        return true
+    }
+    function prototypesOf(shape: Handle): Handle[] {
+        const chain: Handle[] = []
+        let at = heap.getPrototypeOf(shape)
+        while (at) {
+            chain.push(at)
+            at = heap.getPrototypeOf(at)
+        }
+        return chain
     }
     function memberPrototypeTest(n: GraphNode, mem: Memory): number {
         if (!mem.keys.includes(heap.protoSlotKey)) {
-            const chain: Handle[] = []
-            for (let at = heap.getPrototypeOf(mem.shape); at; at = heap.getPrototypeOf(at)) chain.push(at)
+            const chain = prototypesOf(mem.shape)
             const constant = constantPrototype(n)
             const test = constant !== undefined ? { literal: chain.includes(constant) ? 1 : 0 } : chainSelect(n, chain)
             return typeof test === 'number' ? test : addNode(out, NodeOp.literal, [test])
@@ -1897,7 +1983,7 @@ function resolveProperties(
         const receiverShape = shapeOf(receiver)
         const split = callee ? undefined : unionTargets.get(getRef(n, 1))
         if (split) {
-            const union = unions.get(getRef(n, 2))
+            const union = unions.get(getRef(n, 2)) ?? dispatchedObjects.get(getRef(n, 2)) ?? dispatchedObjects.get(strippedValue(getRef(n, 2)))
             const arms: number[] = []
             const shapes: (Handle | undefined)[] = []
             for (let i = 0; i < split.arms.length; i++) {
@@ -1913,8 +1999,8 @@ function resolveProperties(
                 arms.push(arm)
                 shapes.push(memory.get(arm)?.shape)
             }
-            putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(split.tag, arms)])
-            if (shapes.every(s => s !== undefined)) joinResult(id, split.tag, shapes as Handle[])
+            putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(split.union, arms)])
+            joinArms(id, split.union, arms, shapes)
             return
         }
         if (!callee) return
@@ -2136,7 +2222,7 @@ function resolveProperties(
             return addNode(out, NodeOp.heapHandle, [{ literal: slot }])
         })
         const direct = closureTargets.get(id)
-        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }]) : union ? tagSelect(union.tag, codes) : codes[0]
+        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }]) : union ? tagSelect(union, codes) : codes[0]
         const [context, contextLiteral] = mem ? addressOf(mem) : [getRef(n, 1), 0]
         const target = newId()
         const returns = callReturns.get(id)
