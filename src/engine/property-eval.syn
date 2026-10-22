@@ -64,6 +64,7 @@ export interface CallBinding {
     receiver: boolean
     receiverShape?: Handle
     result?: Handle
+    members?: Handle[]
     nullish?: boolean
     returnsReceiver?: boolean
     union?: boolean
@@ -168,6 +169,7 @@ interface Memory extends Layout {
     decoded?: boolean
     union?: boolean
     owner?: Handle
+    members?: Handle[]
 }
 
 export interface Resolved {
@@ -788,6 +790,44 @@ function resolveProperties(
         bindCall(id, true)
     }
 
+    function sameSlot(a: BitSlot | undefined, b: BitSlot | undefined): boolean {
+        if (!a || !b) return a === b
+        return a.offset === b.offset && a.bit === b.bit && !!a.shared === !!b.shared
+    }
+    function sameCodec(a: native.Codec | undefined, b: native.Codec | undefined): boolean {
+        if (!a || !b) return a === b
+        if (a.kind !== b.kind || a.encoded !== b.encoded) return false
+        if (a.kind === 'int' && b.kind === 'int') return a.type === b.type
+        if (a.kind !== 'ref' || b.kind !== 'ref') return true
+        const x = a.members ?? [a.shape]
+        const y = b.members ?? [b.shape]
+        return a.union === b.union && x.length === y.length && x.every((shape, i) => native.sameLayout(shape, y[i]))
+    }
+    function placement(shape: Handle, key: Handle): string {
+        const addr = heap.getPropertyDescriptor(shape, key)
+        if (!addr) return heap.getPropertyProxy(shape, key) ? 'proxy' : 'absent'
+        const desc = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
+        if (desc.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return `accessor ${desc.slot0} ${desc.slot1}`
+        const fields = layout(shape)
+        const at = fields.keys.indexOf(key)
+        if (at < 0) return fields.keys.includes(heap.protoSlotKey) ? 'linked' : `inherited ${desc.slot0}`
+        const fixed = opts.constructed?.fixed?.get(shape)?.get(key)
+        return `field ${fields.offsets[at]} ${reducedShape(shape)} ${readonly(shape)} ${fixed ?? '-'} ${fields.nested[at] ?? '-'}`
+    }
+    function agreeOn(id: number, mem: Memory, key: Handle): void {
+        const members = mem.members!
+        const first = members[0]
+        const expected = placement(first, key)
+        const fields = layout(first)
+        const at = fields.keys.indexOf(key)
+        for (const member of members) {
+            const other = layout(member)
+            const index = other.keys.indexOf(key)
+            const agrees = placement(member, key) === expected && (at < 0 || (sameSlot(fields.flags[at], other.flags[index]) && sameSlot(fields.tags[at], other.tags[index]) && sameCodec(locate(first, String(fields.offsets[at])), locate(member, String(other.offsets[index])))))
+            if (!agrees) throw `property-eval: %${id} accesses ${heap.describeKey(key)} through a pointer to one of ${members.length} shapes, which lay it out differently`
+        }
+    }
+
     function resolveMemory(id: number, n: GraphNode, mem: Memory): void {
         let token = getRef(n, 0)
         if (mem.pointer && getNode(source, token)?.op === NodeOp.nilEffect && (getRef(getNode(source, token)!, 0) || graph.root) === graph.root) {
@@ -796,6 +836,8 @@ function resolveProperties(
         const key = getLiteral(runtime, n, 2) as Handle
         const value: [number, number] = [getRef(n, 3), getRef(n, 3) ? 0 : getLiteral(runtime, n, 3)]
         const keyRef = getRef(n, 2)
+        if (mem.members && keyRef) throw `property-eval: %${id} uses a computed key through a pointer to one of ${mem.members.length} shapes`
+        if (mem.members) agreeOn(id, mem, key)
         const index = keyRef ? undefined : heap.keyIndex(key)
         if (keyRef || index !== undefined) {
             const proxy = heap.getPropertyProxy(mem.shape, keyRef ? intrinsics.getNanFromId(keyRef) as Handle : key)
@@ -907,7 +949,7 @@ function resolveProperties(
             }
             if (located?.kind === 'ref') {
                 const ptr = located.encoded ? decodeHandle(load, native.pstack0Base()) : load
-                memory.set(id, { ...pointerMemory(ptr, located.shape), decoded: located.encoded, union: located.union })
+                memory.set(id, { ...pointerMemory(ptr, located.shape), decoded: located.encoded, union: located.union, members: located.members })
                 return
             }
             if (located !== undefined) return
@@ -1052,6 +1094,7 @@ function resolveProperties(
         const position = block.params.length
         block.params.push(tag)
         unions.set(param, { tag, members })
+        let untagged = false
         for (const apply of appliesOf(at.block)) {
             const current = getNode(out, apply)!
             const arrival = getRef(getNode(source, apply)!, at.index + 1)
@@ -1061,6 +1104,12 @@ function resolveProperties(
             if (!carried) {
                 arrived = pointerShape(arrival)
                 carried = unions.get(strippedValue(arrival))
+            }
+            if (!carried && memory.get(strippedValue(arrival))?.members) {
+                untagged = true
+                operands.splice(position + 1, 0, { literal: 0 })
+                putCopy(out, apply, current, operands)
+                continue
             }
             if (carried) {
                 const indices = carried.members.map(m => memberIndex(members, m))
@@ -1076,6 +1125,9 @@ function resolveProperties(
             operands.splice(position + 1, 0, { literal: index })
             putCopy(out, apply, current, operands)
         }
+        if (!untagged) return
+        unions.delete(param)
+        memory.set(param, { ...pointerMemory(param, members[0]), members })
     }
     function remapTag(tag: number, indices: number[]): number {
         if (indices.every((index, i) => index === i)) return tag
@@ -1740,7 +1792,7 @@ function resolveProperties(
             strings.add(id)
         }
         if (binding?.location !== undefined && !locations.has(id)) locations.set(id, binding.location)
-        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union)
+        if (binding?.result !== undefined && !memory.has(id)) bindResult(id, binding.result, binding.decode, binding.union, binding.members)
         else if (binding?.float && !unboxed.has(id)) unbox(id, id, binding.decode!)
     }
     const boundCalls = new Set<number>()
@@ -1920,7 +1972,7 @@ function resolveProperties(
     function boundShape(id: number): Handle | undefined {
         return memory.get(id)?.shape ?? (strings.has(id) ? stringShape : numbers.has(id) ? numberShape : undefined)
     }
-    function bindResult(id: number, shape: Handle, decode: number | undefined, union?: boolean): void {
+    function bindResult(id: number, shape: Handle, decode: number | undefined, union?: boolean, members?: Handle[]): void {
         if (shape === stringShape) {
             strings.add(id)
             return
@@ -1930,7 +1982,7 @@ function resolveProperties(
             return
         }
         const ptr = decode !== undefined ? decodeHandle(id, decode) : id
-        memory.set(id, { ...pointerMemory(ptr, shape), decoded: decode !== undefined, union })
+        memory.set(id, { ...pointerMemory(ptr, shape), decoded: decode !== undefined, union, members })
     }
     function evaluate(id: number): void {
         if (!evaluated.has(id)) query(`e${id}`, () => evaluateNow(id))
@@ -2031,11 +2083,12 @@ function resolveProperties(
         const union = mem ? undefined : unions.get(getRef(n, 1))
         if (!mem && !union) continue
         const current = getNode(out, id)!
+        if (mem?.members) agreeOn(id, mem, heap.closureCallKey)
         const codes = (mem ? [mem.shape] : union!.members).map(shape => {
             const addr = heap.getPropertyDescriptor(shape, heap.closureCallKey)
             if (!addr) throw `property-eval: %${id} calls an object without a call slot`
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as Handle
-            if (mem && heap.isBoxedF64(slot)) {
+            if (mem && (heap.isBoxedF64(slot) || mem.members)) {
                 const at = mem.keys.indexOf(heap.closureCallKey)
                 return addNode(out, NodeOp.load, [getRef(current, 0), mem.ptr, { literal: mem.base + mem.offsets[at] }], Types.fnptr)
             }
