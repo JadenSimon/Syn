@@ -507,3 +507,160 @@ export function verifyStringOperands(g: Graph, stage: string, stringy: (x: numbe
         if (why) fail(stage, g, id, `(${n.op === NodeOp.rt ? 'rt typeof' : opName(n.op)}) takes %${getRef(n, at)}, which may be a string: ${why}`)
     }
 }
+
+export function verifyTokenForks(g: Graph, stage: string): void {
+    const forkWrites = new Set<NodeOp>([NodeOp.setProp, NodeOp.store, NodeOp.call])
+    const forkRtWrites = new Set<number>([rt.Op.assign, rt.Op.setPrototypeOf, rt.Op.sliceWrite, rt.Op.arrayElement])
+
+    function forkWrite(g: Graph, n: GraphNode): boolean {
+        if (n.op === NodeOp.rt) return forkRtWrites.has(getLiteral(g, n, 1))
+        return forkWrites.has(n.op)
+    }
+
+    function writeName(g: Graph, n: GraphNode): string {
+        return n.op === NodeOp.rt ? `rt.${rt.opName(getLiteral(g, n, 1))}` : opName(n.op)
+    }
+
+    const armLimit = 32
+
+    function compatibleArms(a: number[], b: number[]): boolean {
+        let i = 0
+        while (i + 1 < a.length && i + 1 < b.length) {
+            if (a[i] !== b[i]) return true
+            if (a[i + 1] !== b[i + 1]) return false
+            i += 2
+        }
+        return true
+    }
+
+    function coversArms(prefix: number[], path: number[]): boolean {
+        if (prefix.length > path.length) return false
+        for (let i = 0; i < prefix.length; i++) {
+            if (prefix[i] !== path[i]) return false
+        }
+        return true
+    }
+
+    function addArms(into: number[][], path: number[]): void {
+        for (const known of into) {
+            if (coversArms(known, path)) return
+        }
+        let k = 0
+        while (k < into.length) {
+            if (coversArms(path, into[k])) into.splice(k, 1)
+            else k++
+        }
+        into.push(path)
+    }
+
+    function coexecute(a: number[][], b: number[][]): boolean {
+        for (const p of a) {
+            for (const q of b) {
+                if (compatibleArms(p, q)) return true
+            }
+        }
+        return false
+    }
+
+    const orders = new Map<number, number[]>()
+    const succs = new Map<number, number[]>()
+    for (const b of g.blocks) {
+        const order = blockOrder(g, b)
+        orders.set(b.id, order)
+        const out: number[] = []
+        for (const id of order) {
+            const n = getNode(g, id)
+            if (n?.op === NodeOp.apply && !out.includes(getRef(n, 0))) out.push(getRef(n, 0))
+        }
+        succs.set(b.id, out)
+    }
+    const avoiding = new Map<number, Set<number>>()
+    function dominates(a: number, b: number): boolean {
+        if (a === b) return true
+        let reach = avoiding.get(a)
+        if (!reach) {
+            reach = new Set<number>()
+            avoiding.set(a, reach)
+            if (g.root !== a) {
+                const work = [g.root]
+                reach.add(g.root)
+                while (work.length) {
+                    for (const next of succs.get(work.pop()!) ?? []) {
+                        if (next === a || reach.has(next)) continue
+                        reach.add(next)
+                        work.push(next)
+                    }
+                }
+            }
+        }
+        return !reach.has(b)
+    }
+
+    for (const b of g.blocks) {
+        const order = orders.get(b.id)!
+        const index = new Map<number, number>()
+        for (let k = 0; k < order.length; k++) index.set(order[k], k)
+        const arms = new Map<number, number[][] | null>()
+        arms.set(b.bodyId, [[]])
+        const forks = new Map<number, number[]>()
+        for (let k = order.length - 1; k >= 0; k--) {
+            const id = order[k]
+            const n = getNode(g, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+            const paths = arms.get(id) ?? null
+            for (let i = 0; i < countIds(n); i++) {
+                const ref = getRef(n, i)
+                if (!ref) continue
+                let known = arms.get(ref)
+                if (known === null) continue
+                if (!paths) {
+                    arms.set(ref, null)
+                    continue
+                }
+                if (!known) arms.set(ref, known = [])
+                for (const path of paths) addArms(known, n.op === NodeOp.select && i > 0 ? [...path, id, i] : path)
+                if (known.length > armLimit) arms.set(ref, null)
+            }
+            if (n.op === NodeOp.nilEffect && getRef(n, 0) && !dominates(getRef(n, 0), b.id)) fail(stage, g, id, `(nil-effect) is the entry token of B${getRef(n, 0)}, which does not dominate B${b.id}`)
+            if (!forkWrite(g, n)) continue
+            const t = getRef(n, 0)
+            if (!t || !getNode(g, t)) fail(stage, g, id, `(${writeName(g, n)}) writes without a token`)
+            const known = forks.get(t)
+            if (known) known.push(id)
+            else forks.set(t, [id])
+        }
+        let stamp = 0
+        const reached = new Map<number, number>()
+        function reaches(from: number, to: number, floor: number): boolean {
+            stamp++
+            const work = [from]
+            while (work.length) {
+                const id = work.pop()!
+                if (id === to) return true
+                const n = getNode(g, id)
+                if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+                for (let i = 0; i < countIds(n); i++) {
+                    const x = getRef(n, i)
+                    const at = x ? index.get(x) : undefined
+                    if (at === undefined || at < floor || reached.get(x) === stamp) continue
+                    reached.set(x, stamp)
+                    work.push(x)
+                }
+            }
+            return false
+        }
+        for (const [t, writes] of forks) {
+            if (writes.length < 2) continue
+            const floor = index.get(t) ?? 0
+            for (let x = 0; x < writes.length; x++) {
+                for (let y = x + 1; y < writes.length; y++) {
+                    const p = arms.get(writes[x])
+                    const q = arms.get(writes[y])
+                    if (!p || !q || !coexecute(p, q)) continue
+                    if (reaches(writes[x], writes[y], floor) || reaches(writes[y], writes[x], floor)) continue
+                    fail(stage, g, writes[y], `(${writeName(g, getNode(g, writes[y])!)}) and %${writes[x]} (${writeName(g, getNode(g, writes[x])!)}) both continue token %${t} unordered on the same path in B${b.id}`)
+                }
+            }
+        }
+    }
+}

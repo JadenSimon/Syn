@@ -8,12 +8,14 @@ import * as harness from './harness'
 import * as rt from './rt'
 import { type Graph, type GraphNode, dumpGraph } from './lowering2'
 import {
-    NodeOp, NodeFlags, addNode, blockOrder, typeSlots as typeSlotsOf, countIds, createGraph, getLiteral, getNode, getOperand, getRef, isThisParam, putNode, setGraphBlocks, typeOf, withNodes,
+    NodeOp, NodeFlags, addNode, blockOrder, typeSlots as typeSlotsOf, copyNode, countIds, createGraph, getLiteral, getNode, getOperand, getRef, isThisParam, putNode, setGraphBlocks, typeOf, withNodes,
     type Operand,
 } from './graph-node'
 import type { FastTraced } from './fast-trace'
 import { globals as builtinGlobals, programStack } from './builtins'
 import { parseNumber } from './builtin/Number'
+import * as optimizer from './program-optimizer'
+import { Kinds, anyKinds, useVersion, usesCallee, versionOf, type Contract, type Host, type Version } from './call-graph'
 
 const Types = intrinsics.Types
 
@@ -225,6 +227,7 @@ interface Dyn {
     thunks: Map<Function, number>
     call: number
     apply: number
+    opt: optimizer.Optimizer | undefined
 }
 
 const signedTypes = new Set<number>([Types.i8, Types.i16, Types.i32])
@@ -234,7 +237,7 @@ const numberTypes = new Set<number>([Types.unknown_number, Types.f64, Types.i64,
 const bitwiseOps = new Set<NodeOp>([NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr])
 const arithOps = new Set<NodeOp>([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.rem, NodeOp.pow])
 const compareOps = new Set<NodeOp>([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge])
-const machineOps = new Set<NodeOp>([NodeOp.crc32, NodeOp.pstack, NodeOp.stackalloc, NodeOp.stackfree, NodeOp.mem, NodeOp.clz])
+const machineOps = new Set<NodeOp>([NodeOp.crc32, NodeOp.pstack, NodeOp.stackalloc, NodeOp.stackfree, NodeOp.mem, NodeOp.clz, NodeOp.alloca])
 const controlOps = new Set<NodeOp>([NodeOp.apply, NodeOp.ret, NodeOp.panic, NodeOp.unreachable, NodeOp.trap])
 const numberResults = new Set<number>([rt.Op.toNumber, rt.Op.compare, rt.Op.handleHash])
 const boolResults = new Set<number>([rt.Op.instanceof])
@@ -344,7 +347,7 @@ function applyGlue(d: Dyn): number {
     })
 }
 
-function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
+function lowerTraced(d: Dyn, fn: Function, traced: FastTraced, routes?: Map<number, optimizer.Route>, contract?: Contract): Graph {
     const src = traced.graph
     const g = withNodes(src, new Map(src.nodes))
     const { linker } = d
@@ -549,7 +552,37 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
         putNode(g, id, NodeOp.call, [getOperand(src, n, 0), target, { literal: 0 }, ...args])
         machine.set(id, Types.u64)
     }
+    function versionCall(id: number, n: GraphNode, route: optimizer.Route): void {
+        const opt = d.opt!
+        const c = route.version.contract
+        const target = getNode(src, getRef(n, 1))!
+        const needsCallee = !optimizer.enabled(opt, 'callee') || usesCallee(opt, c.unit)
+        let callee: Operand = undefinedWord
+        if (needsCallee && target.op === NodeOp.heapHandle) {
+            const cell = getLiteral(src, target, 0)
+            callee = traced.closures.has(cell) ? materialize(cell) : { literal: cellWord(d, cell) }
+        } else if (needsCallee && route.cell) callee = { literal: cellWord(d, route.cell) }
+        const receiver: Operand = getRef(n, 2) ? wordOf(n, 2) : { literal: getLiteral(src, n, 2) ? constantWord(getLiteral(src, n, 2)) : heap.undefinedWord }
+        const args: Operand[] = []
+        for (let k = 1; k < c.params.length; k++) {
+            const slot = k + 2
+            if (slot >= countIds(n)) args.push(undefinedWord)
+            else if (c.params[k].kind === Kinds.int) args.push(machineOf(n, slot, Types.i64))
+            else args.push(wordOf(n, slot))
+        }
+        const local = addNode(g, NodeOp.localTarget, [{ literal: useVersion(opt, route.version) }], Types.u32)
+        const operands: Operand[] = [getOperand(src, n, 0), local, { literal: 0 }, callee, receiver, ...args]
+        if (!c.returnsInt) {
+            putNode(g, id, NodeOp.call, operands)
+            return
+        }
+        const call = addNode(g, NodeOp.call, operands)
+        putNode(g, id, NodeOp.after, [call, addNode(g, NodeOp.bitconvert, [call], Types.i64)])
+        machine.set(id, Types.i64)
+    }
     function lowerCall(id: number, n: GraphNode): void {
+        const route = routes?.get(id)
+        if (route) return versionCall(id, n, route)
         const token = getOperand(src, n, 0)
         const targetRef = getRef(n, 1)
         if (!targetRef) return machineCall(id, n, { literal: getLiteral(src, n, 1) })
@@ -778,7 +811,7 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
     }
     const thisNode = entry.params.find(p => isThisParam(getNode(src, p)!))
     const params: number[] = []
-    for (let i = 0; i < argRegs + 4; i++) params.push(i === 1 && thisNode ? thisNode : addNode(g, NodeOp.param, [], Types.u32))
+    for (let i = 0; i < (contract ? 2 : argRegs + 4); i++) params.push(i === 1 && thisNode ? thisNode : addNode(g, NodeOp.param, [], Types.u32))
     if (thisNode) putNode(g, thisNode, NodeOp.param, [], Types.u32)
     const callee = params[0]
     const argc = params[2]
@@ -788,6 +821,14 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
     let index = 0
     for (const p of entry.params) {
         if (p === thisNode) continue
+        if (contract) {
+            const typed = contract.params[index + 1].kind === Kinds.int
+            putNode(g, p, NodeOp.param, [], typed ? Types.i64 : Types.u32)
+            if (typed) machine.set(p, Types.i64)
+            params.push(p)
+            index++
+            continue
+        }
         const present = addNode(g, NodeOp.lt, [{ literal: index }, argc], Types.bool)
         if (index === rest) {
             const count = addNode(g, NodeOp.select, [addNode(g, NodeOp.gt, [argc, { literal: index }], Types.bool), addNode(g, NodeOp.sub, [argc, { literal: index }], Types.u32), { literal: 0 }])
@@ -811,7 +852,12 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
     const entryParams = new Set(entry.params)
     for (const b of src.blocks) {
         if (b.id === entry.id) continue
-        for (const p of b.params) putNode(g, p, NodeOp.param, [], Types.u32)
+        for (const p of b.params) {
+            const T = d.opt ? typeOf(getNode(src, p)!) : Types.u32
+            const M = T === Types.ptr ? Types.u64 : T === Types.i64 ? T : Types.u32
+            putNode(g, p, NodeOp.param, [], M)
+            if (M !== Types.u32) machine.set(p, M)
+        }
     }
     const ids: number[] = []
     const seen = new Set<number>()
@@ -861,13 +907,17 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
             return
         }
         if (n.op === NodeOp.ret) {
-            putNode(g, id, NodeOp.ret, [wordOf(n, 0), getOperand(src, n, 1)])
+            putNode(g, id, NodeOp.ret, [contract?.returnsInt ? machineOf(n, 0, Types.i64) : wordOf(n, 0), getOperand(src, n, 1)])
             return
         }
         if (n.op === NodeOp.inlined) return
         if (n.op === NodeOp.apply) {
             const operands: Operand[] = [getRef(n, 0)]
-            for (let i = 1; i < countIds(n); i++) operands.push(wordOf(n, i))
+            const targetParams = src.blockIndex.get(getRef(n, 0))?.params ?? []
+            for (let i = 1; i < countIds(n); i++) {
+                const M = machine.get(targetParams[i - 1])
+                operands.push(M !== undefined ? machineOf(n, i, M) : wordOf(n, i))
+            }
             putNode(g, id, NodeOp.apply, operands)
             return
         }
@@ -906,6 +956,24 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
         }
         if (compareOps.has(n.op) || n.op === NodeOp.eq || n.op === NodeOp.ne) {
             lowerCompare(id, n)
+            return
+        }
+        if (n.op === NodeOp.unbox) {
+            const T = typeOf(n)
+            const word = wordOf(n, 0)
+            if (T === Types.bool) putNode(g, id, NodeOp.eq, [word, { literal: heap.trueWord }], Types.bool)
+            else if (T === Types.f64) putNode(g, id, NodeOp.bitconvert, [nativeCall(loose, toBits, [word])], Types.f64)
+            else putNode(g, id, NodeOp.bitconvert, [nativeCall(loose, heap.wordInt, [word])], Types.i64)
+            machine.set(id, T)
+            return
+        }
+        if (n.op === NodeOp.box) {
+            const ref = getRef(n, 0)
+            const T = machine.get(ref)
+            if (T === undefined) fail(`boxes a word at %${id}`)
+            if (T === Types.f64) putFloat(id, ref)
+            else if (T === Types.bool) putNode(g, id, NodeOp.select, [ref, { literal: heap.trueWord }, { literal: heap.falseWord }])
+            else putNode(g, id, NodeOp.call, [loose, nativeTarget(d, g, heap.intWord), { literal: 0 }, ref])
             return
         }
         if (n.op === NodeOp.rt) {
@@ -958,10 +1026,10 @@ function lowerTraced(d: Dyn, fn: Function, traced: FastTraced): Graph {
         if (machineOps.has(n.op)) {
             const T = typeOf(n)
             const operands: Operand[] = []
-            const ordered = n.op === NodeOp.pstack || n.op === NodeOp.stackalloc || n.op === NodeOp.stackfree
+            const ordered = n.op === NodeOp.pstack || n.op === NodeOp.stackalloc || n.op === NodeOp.stackfree || n.op === NodeOp.alloca
             for (let i = 0; i < countIds(n); i++) operands.push(ordered && i === 0 ? getOperand(src, n, 0) : machineOf(n, i, Types.u64))
             putNode(g, id, n.op, operands, T)
-            machine.set(id, n.op === NodeOp.pstack ? Types.u64 : T)
+            machine.set(id, n.op === NodeOp.pstack || n.op === NodeOp.alloca ? Types.u64 : T)
             return
         }
         fail(`has an unsupported ${n.op} node %${id}`)
@@ -987,12 +1055,57 @@ function hostArrayCell(cell: number): boolean {
     return !!cell && heap.isCell(cell as Handle) && cell < heap.runtimeCells && heap.isArray(cell as Handle)
 }
 
-function entryGraph(d: Dyn, name: string, target: number, count: number): number {
+function entryGraph(d: Dyn, name: string, target: number, count: number, fast?: Contract): number {
     return unitGraph(d, glueSymbol(d, `${name}/entry`), `${name}/entry`, count, Types.u64, (g, token, params) => {
-        const words = params.map(p => addNode(g, NodeOp.call, [token, nativeTarget(d, g, heap.intWord), { literal: 0 }, p]))
+        const words = params.map((p, i) => fast?.params[i + 1].kind === Kinds.int ? p : addNode(g, NodeOp.call, [token, nativeTarget(d, g, heap.intWord), { literal: 0 }, p]))
         const local = addNode(g, NodeOp.localTarget, [{ literal: target }], Types.u32)
-        return abiCall(g, token, local, { literal: heap.undefinedWord }, { literal: heap.undefinedWord }, { literal: count }, words, { literal: heap.undefinedWord })
+        if (!fast) return abiCall(g, token, local, { literal: heap.undefinedWord }, { literal: heap.undefinedWord }, { literal: count }, words, { literal: heap.undefinedWord })
+        const call = addNode(g, NodeOp.call, [token, local, { literal: 0 }, { literal: heap.undefinedWord }, { literal: heap.undefinedWord }, ...words])
+        return fast.returnsInt ? addNode(g, NodeOp.call, [call, nativeTarget(d, g, heap.intWord), { literal: 0 }, call]) : call
     })
+}
+
+function optimizerHost(d: Dyn, tracer: native.Tracer, keep: (fn: Function) => boolean): Host {
+    const { linker } = d
+    const unit = (fn: Function | undefined) => fn && keep(fn) && linker.codeOf(fn) ? fn : undefined
+    const cellUnit = (cell: number) => {
+        const linked: any = linker.session.stubFunctions.get(cell as u32)
+        if (linked && (Number.isSafeInteger(linked.__native) || Number.isSafeInteger(linked.__syscall))) return undefined
+        return unit(linker.functionAt(cell))
+    }
+    return {
+        trace: fn => {
+            if (!unit(fn)) return undefined
+            try {
+                return tracer.graphsOf(fn).traced as any as FastTraced
+            } catch {
+                return undefined
+            }
+        },
+        unit: cellUnit,
+        bound: (fn, count) => {
+            try {
+                return linker.boundTarget(fn, count, false)
+            } catch {
+                return undefined
+            }
+        },
+        direct: (traced, n) => {
+            const target = getNode(traced.graph, getRef(n, 1))
+            if (target?.op === NodeOp.localTarget) return unit(linker.functions[getLiteral(traced.graph, target, 0)])
+            if (target?.op !== NodeOp.heapHandle) return undefined
+            const cell = getLiteral(traced.graph, target, 0)
+            if (traced.closures.has(cell)) return linker.closureFunction(cell as u32, 'closure')
+            if (optimizer.perInvocationCell(traced, cell)) return undefined
+            return cellUnit(cell)
+        },
+        symbol: fn => linker.intern(fn),
+        signature: fn => {
+            const compiled = linker.codeOf(fn)?.source.compiled
+            return compiled ? { params: compiled.paramCount, rest: !!compiled.rest } : undefined
+        },
+        version: name => glueSymbol(d, name),
+    }
 }
 
 function initGraph(d: Dyn, calls: [cell: number, symbol: number][], statics: number | undefined): number {
@@ -1012,38 +1125,67 @@ function initGraph(d: Dyn, calls: [cell: number, symbol: number][], statics: num
 
 export function dynProgram(linker: native.Linker, tracer: native.Tracer, image: native.ProgramImage, target: any, clock: native.PhaseClock): native.ProgramGraph {
     const program: native.ProgramGraph = { units: new Map(), roots: new Map(), noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), hostReturns: new Map(), image, target }
-    const d: Dyn = { linker, image, program, thunks: new Map(), call: 0, apply: 0 }
+    const d: Dyn = { linker, image, program, thunks: new Map(), call: 0, apply: 0, opt: undefined }
     for (const fn of glueSources) linker.addUnit(fn)
     d.call = callGlue(d)
     d.apply = applyGlue(d)
     invokeGlue(d)
     const lowered = new Set<Function>()
     const keep = (fn: Function) => !natives.has(fn) && fn !== invoke
+    if (flags.has('dyn-opt')) d.opt = clock.timed('analysis', () => optimizer.createOptimizer(optimizerHost(d, tracer, keep), [...linker.roots.values()].map(symbol => linker.functions[symbol])))
+    const fastRoots = new Map<number, Version>()
+    for (const symbol of linker.roots.values()) {
+        const contract = d.opt && optimizer.enabled(d.opt, 'kinds') ? optimizer.fastContract(d.opt, linker.functions[symbol]) : undefined
+        if (!contract || !contract.params.every(p => p.kind === Kinds.int || p.kind === anyKinds)) continue
+        const version = versionOf(d.opt!, contract)
+        useVersion(d.opt!, version)
+        fastRoots.set(symbol, version)
+    }
     const lower = (fn: Function, unit: native.Unit) => {
-        const graph = clock.timed('resolve', () => lowerTraced(d, fn, unit.traced as any as FastTraced), fn.name)
+        const traced = unit.traced as any as FastTraced
+        const optimized = d.opt ? clock.timed('analysis', () => optimizer.optimizeUnit(d.opt!, traced, undefined), fn.name) : undefined
+        const graph = clock.timed('resolve', () => lowerTraced(d, fn, optimized?.traced ?? traced, optimized?.routes), fn.name)
         if (flags.has(`dyn-debug:${fn.name}`) || flags.has(`dyn-debug`)) console.log(dumpGraph(graph))
         program.units.set(linker.addUnit(fn), graph)
         lowered.add(fn)
     }
-    tracer.traceScheduled(keep, lower)
+    const schedule = () => {
+        tracer.traceScheduled(keep, lower)
+        while (d.opt && d.opt.pending.length) {
+            const version = d.opt.pending.pop()!
+            const fn = version.contract.unit
+            const base = tracer.graphsOf(fn).traced as any as FastTraced
+            const nodes = new Map<number, GraphNode>()
+            for (const [id, n] of base.graph.nodes) nodes.set(id, copyNode(base.graph, n))
+            const optimized = clock.timed('analysis', () => optimizer.optimizeUnit(d.opt!, { ...base, graph: withNodes(base.graph, nodes) }, version.contract), version.name)
+            const graph = clock.timed('resolve', () => lowerTraced(d, fn, optimized.traced, optimized.routes, version.contract), version.name)
+            graph.name = version.name
+            if (flags.has(`dyn-debug:${version.name}`) || flags.has(`dyn-debug`)) console.log(dumpGraph(graph))
+            program.units.set(version.symbol, graph)
+            tracer.traceScheduled(keep, lower)
+        }
+    }
+    schedule()
     let statics: Function | undefined
     let linked = 0
     while (linked !== linker.staticFns.length) {
         linked = linker.staticFns.length
         statics = native.staticInitializerOf(linker, image, () => true)
         linker.link(statics!)
-        tracer.traceScheduled(keep, lower)
+        schedule()
     }
     const calls: [number, number][] = []
     for (const [cell, fn] of linker.callableCells) {
         if (lowered.has(fn)) calls.push([cell, linker.addUnit(fn)])
     }
     for (const [name, symbol] of linker.roots) {
-        const entry = entryGraph(d, name, symbol, linker.codeOf(linker.functions[symbol])!.source.compiled.paramCount)
+        const fast = fastRoots.get(symbol)
+        const entry = entryGraph(d, name, fast ? fast.symbol : symbol, linker.codeOf(linker.functions[symbol])!.source.compiled.paramCount, fast?.contract)
         program.roots.set(name, entry)
         program.hostReturns.set(entry, 'word')
     }
     program.roots.set(native.staticInitName, initGraph(d, calls, statics ? linker.addUnit(statics) : undefined))
+    if (d.opt && flags.has('opt-stats')) optimizer.printStats(d.opt)
     return program
 }
 
