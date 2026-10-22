@@ -6,7 +6,7 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { BitwiseOps, dumpGraph, type Graph, type GraphNode, NumericOps, typeName } from './lowering2'
 import { addNode, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, regionUp, resultType, setRef, typeOf, type GraphRegions } from './graph-node'
-import { Op as RtOp, assignExcluded, bindingOf, elementType, opName as rtName, sliceOf } from './rt'
+import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, opName as rtName, relationalOps, sliceOf } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
 import type { GenericFlow } from './pg-optimizer'
@@ -1841,6 +1841,7 @@ function siteReturn(callee: Instance, from: Instance, x: Expr, callSlot: number,
 
 function wireRt(inst: Instance, x: Expr, slot: number): void {
     const op = x.a
+    if (op === RtOp.toNumber) return
     if (op === RtOp.slice) return addOrigin(slot, created(qualified(OriginKind.slice, 0, inst.qual, x.node, inst.summary), inst))
     if (op === RtOp.sliceRead) return listen(at(inst, x.args[0]), ListenerKind.member, slot, slotKey(inst, x.args[1]), 0)
     if (op === RtOp.create) {
@@ -1918,15 +1919,25 @@ function generic(slot: number): boolean {
     return (scalars.flags[flow.scalar[slot]] & ScalarFlag.anyStr) !== 0
 }
 
-function rtOperands(inst: Instance, x: Expr): number[] {
+function rtOperands(inst: Instance, x: Expr, part: number): number[] {
+    if (coerces(x)) return [flow.slotIndex[part] ? x.b : x.a]
     if (x.op === ExprOp.cmp) return [x.a, x.b]
     if (x.op === ExprOp.union) return [inst.summary.exprOf.get(getRef(getNode(inst.summary.g, x.node)!, 0))!]
     return x.args
 }
 
+function coerces(x: Expr): boolean {
+    if (x.op === ExprOp.arith) return coercingOps.has(x.key)
+    return x.op === ExprOp.cmp && relationalOps.has(x.key)
+}
+
 function watchString(inst: Instance, e: number): void {
     const s = inst.summary
     const x = s.exprs[e]
+    if (coerces(x) || (x.op === ExprOp.rt && x.a === RtOp.toNumber)) {
+        flow.stringSite[at(inst, e)] = 1
+        return
+    }
     if (x.op === ExprOp.cmp && (x.key === NodeOp.eq || x.key === NodeOp.ne)) {
         flow.stringSite[at(inst, e)] = 1
         return
@@ -1942,6 +1953,20 @@ function watchString(inst: Instance, e: number): void {
 function checkString(slot: number): void {
     const inst = instOfSlot(slot)
     const x = exprAt(slot)
+    if (x.op === ExprOp.rt) {
+        if (!numericConversion(at(inst, x.args[0]))) return
+        flow.stringSite[slot] = 0
+        return bindCoercion(inst, slot, x.args[0], 0)
+    }
+    if (coerces(x)) {
+        const a = numericConversion(at(inst, x.a))
+        const b = numericConversion(at(inst, x.b))
+        if (x.op === ExprOp.cmp && a && b) return
+        if (a) bindCoercion(inst, slot, x.a, 0)
+        if (b) bindCoercion(inst, slot, x.b, 1)
+        if ((a && b) || (x.op === ExprOp.cmp && (a || b))) flow.stringSite[slot] = 0
+        return
+    }
     charge(1)
     if (x.op === ExprOp.cmp) {
         const a = at(inst, x.a)
@@ -1961,12 +1986,52 @@ function bindStringRt(inst: Instance, x: Expr, slot: number, op: number): void {
     const impl = bindingOf(op)!.impl!
     const callee = flow.instances[instance(impl, 0, -1, -1)]
     addCaller(callee, slot)
-    const args = rtOperands(inst, x)
+    const args = rtOperands(inst, x, 0)
     for (let i = 0; i < callee.summary.params; i++) {
         if (i < args.length) copyEdge(at(inst, args[i]), callee.sigs[i])
         else addConst(callee.sigs[i], UNDEF)
     }
     flow.partBind.set(partSlot(slot, 0), { callee: callee.id, from: -1, kind: BindKind.rt, target: 0, recv: 0 })
+}
+
+function bindCoercion(inst: Instance, slot: number, operand: number, key: number): void {
+    if (flow.parts.get(slot)?.has(key)) return
+    charge(1)
+    const callee = flow.instances[instance(bindingOf(RtOp.toNumber)!.impl!, 0, -1, -1)]
+    addCaller(callee, slot)
+    copyEdge(at(inst, operand), callee.sigs[0])
+    for (let i = 1; i < callee.summary.params; i++) addConst(callee.sigs[i], UNDEF)
+    flow.partBind.set(partSlot(slot, key), { callee: callee.id, from: -1, kind: BindKind.rt, target: 0, recv: 0 })
+}
+
+function stringsIn(t: number, origins: number[]): boolean {
+    return (scalars.flags[t] & (ScalarFlag.str | ScalarFlag.anyStr)) !== 0 || origins.some(a => flow.originKind[a] === OriginKind.str)
+}
+
+function convertedMembers(t: number, strings: boolean): number {
+    return unite(strings ? unite(FLOAT, I64) : NONE, undefinedMembers(t))
+}
+
+function undefinedMembers(t: number): number {
+    // XXX: policy B: an undefined member reaching a numeric op is assume-unreachable, so it converts to nothing and binds no call. NaN (A) returns FLOAT here and the toNumber binding follows; a trap mode binds a trapping call for these members instead.
+    return NONE
+}
+
+function numericConversion(slot: number): boolean {
+    return convertedMembers(flow.scalar[slot], stringy(slot)) !== NONE
+}
+
+function coercedScalar(slot: number, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+    const t = value(slot)
+    const f = scalars.flags[t]
+    const converted = convertedMembers(t, stringsIn(t, originsOf(slot)))
+    if (converted === NONE && !(f & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.undef | ScalarFlag.void))) return t
+    const numbers = scalar(f & (ScalarFlag.int | ScalarFlag.float | ScalarFlag.unknown), scalars.lo[t], scalars.hi[t], [], scalars.nums[t])
+    return unite(numbers, converted)
+}
+
+function operandNumber(inst: Instance, x: Expr, e: number, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+    return coerces(x) ? coercedScalar(at(inst, e), value, originsOf) : value(at(inst, e))
 }
 
 function deliver(l: Listener, origin: number): void {
@@ -2445,8 +2510,8 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
         case ExprOp.ntype: out = unite(out, ntypeScalar(value(at(inst, x.a)), originsOf(at(inst, x.a)).length > 0))
         case ExprOp.narrow: out = unite(out, filterScalar(value(at(inst, x.a)), x.key, x.b, x.sub))
         case ExprOp.pick: out = unite(out, value(at(inst, x.a)))
-        case ExprOp.arith: out = unite(out, arithScalar(x.key, x.sub, value(at(inst, x.a)), value(at(inst, x.b))))
-        case ExprOp.cmp: out = unite(out, foldCompare(x.key, value(at(inst, x.a)), value(at(inst, x.b)), originsOf(at(inst, x.a)), originsOf(at(inst, x.b))))
+        case ExprOp.arith: out = unite(out, arithScalar(x.key, x.sub, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf)))
+        case ExprOp.cmp: out = unite(out, foldCompare(x.key, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf), originsOf(at(inst, x.a)), originsOf(at(inst, x.b))))
         case ExprOp.rt: out = unite(out, rtScalar(inst, x, value, originsOf))
         case ExprOp.member: if (scalars.flags[value(at(inst, x.a))] & ScalarFlag.unknown) out = unite(out, UNKNOWN)
     }
@@ -2549,6 +2614,7 @@ function onlyStrOrigins(origins: number[]): boolean {
 function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[]): number {
     const op = x.a
     if (op === RtOp.typeof) return typeofScalar(at(inst, x.args[0]), value, originsOf)
+    if (op === RtOp.toNumber) return coercedScalar(at(inst, x.args[0]), value, originsOf)
     if (stringRt.has(op)) return ANYSTR
     if (op === RtOp.addOrConcat) return unite(ANYSTR, I64)
     if (op === RtOp.handleHash || op === RtOp.heapaddr || op === RtOp.handleof || op === RtOp.pstackaddr) return numScalar(0, 2 ** 32 - 1)
@@ -2588,7 +2654,7 @@ function exprUses(slot: number): void {
         scalarUse(at(inst, x.a), slot)
         scalarUse(at(inst, x.b), slot)
     }
-    if (x.op === ExprOp.rt && x.a === RtOp.typeof) scalarUse(at(inst, x.args[0]), slot)
+    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber)) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.member) scalarUse(at(inst, x.a), slot)
 }
 
@@ -2864,6 +2930,10 @@ function partLive(spec: Spec, part: number): boolean {
     const gate = x.gates && (x.op === ExprOp.call || x.op === ExprOp.rt) ? x.gates[0] : -1
     if (gate >= 0 && specScalar(spec, at(inst, gate)) === NONE) return false
     if (bind?.kind === BindKind.call) return specOrigins(spec, at(inst, x.a)).includes(bind.target) && (!bind.recv || specOrigins(spec, at(inst, x.b)).includes(bind.recv))
+    if (bind?.kind === BindKind.rt && (coerces(x) || (x.op === ExprOp.rt && x.a === RtOp.toNumber))) {
+        const operand = at(inst, rtOperands(inst, x, part)[0])
+        return convertedMembers(specScalar(spec, operand), stringsIn(specScalar(spec, operand), specOrigins(spec, operand))) !== NONE
+    }
     if (bind?.kind === BindKind.rt) return !bind.recv || specOrigins(spec, at(inst, x.args[0])).includes(bind.recv)
     if (x.op === ExprOp.member) return specOrigins(spec, at(inst, x.a)).includes(flow.slotIndex[part])
     if (x.op === ExprOp.rt && x.args.length) return specOrigins(spec, at(inst, x.args[0])).includes(flow.slotIndex[part])
@@ -3008,11 +3078,11 @@ function callArgs(spec: Spec, part: number, bind: Bind): [number[], number[][]] 
         origins[i] = a
     }
     if (bind.kind === BindKind.rt) {
-        const args = rtOperands(inst, x)
+        const args = rtOperands(inst, x, part)
         for (let i = 0; i < cs.params; i++) {
             if (i >= args.length) set(i, UNDEF, [])
             else if (i === 0 && bind.recv) set(0, specScalar(spec, at(inst, args[0])), [bind.recv])
-            else if (i === 0 && !bind.target && x.op === ExprOp.rt) set(0, specScalar(spec, at(inst, args[0])), [])
+            else if (i === 0 && !bind.target && x.op === ExprOp.rt && x.a !== RtOp.toNumber) set(0, specScalar(spec, at(inst, args[0])), [])
             else set(i, specScalar(spec, at(inst, args[i])), specOrigins(spec, at(inst, args[i])))
         }
         return [params, origins]
@@ -3336,10 +3406,11 @@ function buildFrames(): void {
         const caller = frameOfSpec.get(from)!
         const owner = callerInstance(part)
         const node = exprAt(part).node
-        const k = `${frame}:${caller}:${node}`
+        const operand = coerces(exprAt(part)) && flow.partBind.get(part)?.kind === BindKind.rt ? flow.slotIndex[part] : undefined
+        const k = `${frame}:${caller}:${node}:${operand}`
         if (recorded.has(k)) continue
         recorded.add(k)
-        flow.frames[frame].sites.push({ unit: owner.summary.fn, node, frame: caller })
+        flow.frames[frame].sites.push({ unit: owner.summary.fn, node, frame: caller, operand })
     }
 }
 
