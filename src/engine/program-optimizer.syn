@@ -51,6 +51,7 @@ interface Writes {
     sealed: Set<string>
     impls: Set<Function>
     seen: number
+    removed: Set<string> | null
 }
 
 export interface Route {
@@ -102,7 +103,7 @@ export function enabled(p: Optimizer, pass: string): boolean {
 
 export function createOptimizer(host: Host, roots: Function[]): Optimizer {
     const disabled = new Set(intrinsics.argv().filter(a => a.startsWith('no-opt:')).map(a => a.slice(7)))
-    const writes: Writes = { keys: new Set(), defined: new Set(), numeric: false, poison: '', hard: '', folded: new Set(), sealed: new Set(), impls: new Set(), seen: 0 }
+    const writes: Writes = { keys: new Set(), defined: new Set(), numeric: false, poison: '', hard: '', folded: new Set(), sealed: new Set(), impls: new Set(), seen: 0, removed: new Set() }
     const p: Optimizer = { ...createProgram(host, roots), summaries: new Map(), layouts: new Map(), generic: new Map(), disabled, planned: false, writes, receivers: new Map(), constructed: new Map() }
     if (enabled(p, 'constants')) indexWrites(p)
     count(p, 'callgraph:units', p.calls.order.length)
@@ -1008,7 +1009,7 @@ function allocationNodes(src: Graph, allocations: Allocations): Map<number, [cel
     return out
 }
 
-function birthsOf(src: Graph, users: Map<number, [user: number, slot: number][]>, id: number, token: number, proto: number, births: Set<number>): [keys: Layout, head: number] {
+function birthsOf(src: Graph, users: Map<number, [user: number, slot: number][]>, id: number, token: number, proto: number, removed: Set<string> | null, births: Set<number>): [keys: Layout, head: number] {
     const keys: Layout = []
     let head = token
     let stepped = true
@@ -1029,7 +1030,7 @@ function birthsOf(src: Graph, users: Map<number, [user: number, slot: number][]>
             if (user !== next || slot !== 0 || n.op !== NodeOp.setProp || getRef(n, 1) !== id || getRef(n, 2)) continue
             const key = getLiteral(src, n, 2)
             const name = keyName(key)
-            if (!name || (proto && lookup(proto, key))) continue
+            if (!name || (proto && lookup(proto, key)) || !removed || removed.has(name)) continue
             births.add(user)
             if (!keys.includes(name)) keys.push(name)
             head = user
@@ -1042,7 +1043,7 @@ function birthsOf(src: Graph, users: Map<number, [user: number, slot: number][]>
 
 type Constructed = (cell: number, call: number) => Layout | undefined
 
-export function localShapes(src: Graph, allocations: Allocations, constructed?: Constructed): LocalShapes {
+export function localShapes(src: Graph, allocations: Allocations, removed: Set<string> | null, constructed?: Constructed): LocalShapes {
     const u = useGraph(src)
     const users = u.users
     const births = new Set<number>()
@@ -1050,7 +1051,7 @@ export function localShapes(src: Graph, allocations: Allocations, constructed?: 
     const siteLayouts = new Map<number, Layout>()
     const allocated = allocationNodes(src, allocations)
     for (const [id, [cell, token]] of allocated) {
-        const [keys, head] = birthsOf(src, users, id, token, heap.getPrototypeOf(heap.deref(cell as Handle)), births)
+        const [keys, head] = birthsOf(src, users, id, token, heap.getPrototypeOf(heap.deref(cell as Handle)), removed, births)
         if (!keys.length) continue
         siteLayouts.set(id, keys)
         born.set(id, head)
@@ -1192,7 +1193,7 @@ function planLayouts(p: Optimizer): void {
     const returns = calleesFirst<Function, Desc | null>(graph, (unit, outer) => {
         const traced = p.host.trace(unit)
         if (!traced) return null
-        const local = localShapes(traced.graph, traced.allocations, (cell, call) => constructedLayout(p, traced, cell, call))
+        const local = localShapes(traced.graph, traced.allocations, removedKeys(p), (cell, call) => constructedLayout(p, traced, cell, call))
         locals.set(unit, [traced.graph, local])
         count(p, 'layouts:sites', local.sites)
         const resolver = makeResolver(traced.graph, local, call => {
@@ -1290,7 +1291,7 @@ function constructedLayout(p: Optimizer, traced: FastTraced, cell: number, call:
     for (const m of g.nodes.values()) {
         if (m.op === NodeOp.ret && strip(g, getRef(m, 0)) !== self) return
     }
-    const [keys] = birthsOf(g, useGraph(g).users, self, entry, proto, new Set())
+    const [keys] = birthsOf(g, useGraph(g).users, self, entry, proto, removedKeys(p), new Set())
     if (!keys.length) return
     byProto.set(proto, keys)
     count(p, 'layouts:constructors')
@@ -1311,11 +1312,15 @@ function demandFacts(p: Optimizer, unit: Function): UnitFacts {
     p.layouts.set(unit, facts)
     const traced = p.host.trace(unit)
     if (!traced) return facts
-    const local = localShapes(traced.graph, traced.allocations, (cell, call) => constructedLayout(p, traced, cell, call))
+    const local = localShapes(traced.graph, traced.allocations, removedKeys(p), (cell, call) => constructedLayout(p, traced, cell, call))
     const out = makeResolver(traced.graph, local, call => callFacts(p, traced, call)).resolve(local.rets)
     if (out && (out.layout || out.params.length)) facts.returns = out
     count(p, 'layouts:demanded')
     return facts
+}
+
+function removedKeys(p: Optimizer): Set<string> | null {
+    return enabled(p, 'constants') ? p.writes.removed : null
 }
 
 function freshReceiver(traced: FastTraced, ref: number): boolean {
@@ -1388,12 +1393,21 @@ function noteWrites(p: Optimizer, fn: Function, traced: FastTraced): void {
         if (name === undefined) hard('defineAccessor')
         else defined(name)
     }
+    function remove(n: GraphNode): void {
+        const name = getRef(n, 3) ? undefined : keyName(getLiteral(src, n, 3))
+        if (name === undefined) w.removed = null
+        else w.removed?.add(name)
+        if (freshReceiver(traced, getRef(n, 2))) return
+        if (name === undefined) hard('deleteProperty')
+        else defined(name)
+    }
     for (const [id, n] of src.nodes) {
         if (n.op === NodeOp.setProp) write(id, n, 1, 2)
         if (n.op !== NodeOp.rt) continue
         const op = getLiteral(src, n, 1)
         if (op === rt.Op.setprop) write(id, n, 2, 3)
         else if (op === rt.Op.defineAccessor) define(n)
+        else if (op === rt.Op.deleteProperty) remove(n)
         else if ((op === rt.Op.assign || op === rt.Op.copyDataProperties || op === rt.Op.setPrototypeOf) && !freshReceiver(traced, getRef(n, 2))) hard(rt.opName(op))
         const impl = rt.bindingOf(op)?.impl
         if (!impl || w.impls.has(impl)) continue
@@ -1625,7 +1639,7 @@ function fieldLayouts(u: Unit): number {
     const params = u.contract ? u.contract.params.map(p => p.layout) : undefined
     const triggered = !!params?.some(p => p) || (p.planned && hasOp(src, callOps)) || allocationNodes(src, u.traced.allocations).size > 0 || receiverCalls(p, u.traced)
     if (!triggered) return 0
-    const local = localShapes(src, u.traced.allocations, (cell, call) => constructedLayout(p, u.traced, cell, call))
+    const local = localShapes(src, u.traced.allocations, removedKeys(p), (cell, call) => constructedLayout(p, u.traced, cell, call))
     const resolver = makeResolver(src, local, call => callFacts(p, u.traced, call))
     const known = new Map<number, Layout | undefined>()
     function layoutOf(ref: number): Layout | undefined {
@@ -2073,7 +2087,7 @@ function walkOrigin(c: Ctx, roots: number[], f: Facts): void {
     function rtArg(user: number, n: GraphNode, slot: number): void {
         const op = getLiteral(c.src, n, 1)
         const impl = rt.bindingOf(op)?.impl
-        if (!impl || sliceSlot(op)) {
+        if (!impl || sliceSlot(op) || rt.isDelete(c.src, n)) {
             escape(`rt:${rt.opName(op)}`)
             return
         }
@@ -2523,6 +2537,13 @@ function kindsSuite() {
     ])
 }
 
+const deleteValue = { x: 7 }
+const deleteTarget: Record<string, { x: number }> = { v: deleteValue, w: deleteValue }
+
+function readKey(o: Record<string, number>, k: string): number {
+    return o[k]
+}
+
 function shapesSuite() {
     function localPair(n: number): number {
         const o = { a: n, b: 3 }
@@ -2621,6 +2642,24 @@ function shapesSuite() {
         keep[0].c = 5
         return o.a + o.b + o.c + Object.keys(o).length
     }
+    function readdA(o: Record<string, number>): void {
+        delete o.a
+        o.a = 3
+    }
+    function deletedField(n: number): number {
+        const o: Record<string, number> = { a: n, b: 2 }
+        readdA(o)
+        return o.a * 10 + o.b + readKey(o, 'a') * 100
+    }
+    function deletedLocal(n: number): number {
+        const o: Record<string, number> = { a: n, b: 2 }
+        delete o.b
+        return o.a + (o.b === undefined ? 10 : 0)
+    }
+    function deletedConstant(n: number): number {
+        delete deleteTarget.v
+        return deleteTarget.w.x + (deleteTarget.v === undefined ? n : 0)
+    }
     function sumFields(p: { a: number, b: number }, n: number): number {
         let total = 0
         for (let i = 0; i < n; i++) total = total + p.a + p.b
@@ -2647,6 +2686,9 @@ function shapesSuite() {
         [protoRead, [2]],
         [aliasArgs, [3]],
         [grown, [2]],
+        [deletedField, [4]],
+        [deletedLocal, [4]],
+        [deletedConstant, [4]],
         [fieldLoop, [5]],
     ])
 }

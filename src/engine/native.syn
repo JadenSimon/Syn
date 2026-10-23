@@ -5534,12 +5534,14 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const shapes = new Map<u32, Map<number, intrinsics.Handle | undefined>>()
         for (const [id, n] of graph.nodes) {
             const assign = n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.assign
-            if (n.op !== NodeOp.setProp && !assign) continue
-            const cell = freshCellOf(traced, getRef(n, assign ? 2 : 1))
+            const removal = rt.isDelete(graph, n)
+            if (n.op !== NodeOp.setProp && !assign && !removal) continue
+            const cell = freshCellOf(traced, getRef(n, assign || removal ? 2 : 1))
             if (cell === undefined) continue
             let writes = shapes.get(cell)
             if (!writes) shapes.set(cell, writes = new Map())
-            writes.set(id, assign || getRef(n, 2) ? undefined : getLiteral(graph, n, 2) as intrinsics.Handle)
+            const keySlot = removal ? 3 : 2
+            writes.set(id, assign || getRef(n, keySlot) ? undefined : getLiteral(graph, n, keySlot) as intrinsics.Handle)
         }
         return shapes
     }
@@ -5567,6 +5569,12 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (!preceding(getRef(n, 0))) return false
             if (!writes?.has(id)) return true
             const key = writes.get(id)
+            if (rt.isDelete(graph, n)) {
+                if (key === undefined) return false
+                const at = keys.indexOf(key)
+                if (at >= 0) keys.splice(at, 1)
+                return true
+            }
             if (key !== undefined) {
                 if (!keys.includes(key)) keys.push(key)
                 return true
@@ -7207,7 +7215,7 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
 
 const narrowUndefined = 2 ** 32
 
-const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty])
+const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty, heap.deleteHandleProperty])
 
 interface TagFlow {
     marked: Map<PlannedUnit, Set<number>>
@@ -8122,17 +8130,19 @@ export interface DynamicAccessRequest {
     reps: Map<number, Rep>
     get?: DynamicTarget
     set?: DynamicTarget
+    remove?: DynamicTarget
     check: (id: number, n: GraphNode, rep: Rep | undefined, host: boolean) => void
 }
 
 export interface DynamicAccesses {
     calls: Map<number, boolean>
+    removals: Set<number>
     words: Set<number>
 }
 
 export function residualizeAccesses(graph: Graph, request: DynamicAccessRequest): DynamicAccesses {
     const { reps, check } = request
-    const out: DynamicAccesses = { calls: new Map(), words: new Set() }
+    const out: DynamicAccesses = { calls: new Map(), removals: new Set(), words: new Set() }
     function repOf(id: number): Rep | undefined {
         return out.words.has(id) ? dynamicWord : reps.get(id)
     }
@@ -8156,10 +8166,12 @@ export function residualizeAccesses(graph: Graph, request: DynamicAccessRequest)
         if (pointerOfShapes(rep)) return addNode(graph, NodeOp.encode, [x, { literal: pstack0Base() }])
         return x
     }
-    for (const [id, n] of [...graph.nodes]) {
-        if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
+    for (const [id, node] of [...graph.nodes]) {
+        const removal = rt.isDelete(graph, node)
+        if (node.op !== NodeOp.getProp && node.op !== NodeOp.setProp && !removal) continue
+        const n = removal ? makeNode(graph, NodeOp.setProp, [getOperand(graph, node, 0), getOperand(graph, node, 2), getOperand(graph, node, 3)]) : node
         const read = n.op === NodeOp.getProp
-        const callee = read ? request.get : request.set
+        const callee = read ? request.get : removal ? request.remove : request.set
         if (!callee) continue
         const object = getRef(n, 1)
         const rep = object ? repOf(object) ?? repOf(tailOf(graph, object)) : undefined
@@ -8167,6 +8179,12 @@ export function residualizeAccesses(graph: Graph, request: DynamicAccessRequest)
         const fnType = insertNode(graph, createFnType(graph, callee.returns))
         const target = addNode(graph, NodeOp.heapHandle, [{ literal: callee.link() }], { ref: fnType })
         const operands: Operand[] = [getRef(n, 0), target, { literal: 0 }, dynamicArg(dynamicObject(getOperand(graph, n, 1))), dynamicArg(dynamicKey(n))]
+        if (removal) {
+            putNode(graph, id, NodeOp.call, operands)
+            out.calls.set(id, false)
+            out.removals.add(id)
+            continue
+        }
         if (!read) operands.push(dynamicArg(getOperand(graph, n, 3)))
         const wanted = repOf(id)
         const decoded = read && !!wanted && !unionWord(wanted) ? dynamicResultType(wanted) : undefined
@@ -8755,16 +8773,17 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const at = pc === undefined || !unit.source ? undefined : sourcePosition(unit.source.compiled, pc)
         return at ? `${at.line + 1}:${at.col + 1}` : ''
     }
-    function dynamicTarget(read: boolean): [PlannedUnit, DynamicTarget] | undefined {
-        const impl = rt.bindingOf(read ? rt.Op.getprop : rt.Op.setprop)!.impl!
+    function dynamicTarget(op: rt.Op): [PlannedUnit, DynamicTarget] | undefined {
+        const impl = rt.bindingOf(op)!.impl!
         const unit = plan.units.get(impl)?.[0]
         if (!unit) return
         return [unit, { link: () => session.linkFunction(impl), returns: abiOf(planned.functions.get(unit)!).returns }]
     }
     function dynamicAccesses(fn: Function, graph: Graph, local: UnitPlan | undefined, bound: Map<number, PlannedUnit>, reasons: Map<number, string>): Set<number> {
         if (!dynamicRound || !local) return new Set()
-        const get = dynamicTarget(true)
-        const set = dynamicTarget(false)
+        const get = dynamicTarget(rt.Op.getprop)
+        const set = dynamicTarget(rt.Op.setprop)
+        const remove = dynamicTarget(rt.Op.deleteProperty)
         function check(id: number, n: GraphNode, rep: Rep | undefined, host: boolean): void {
             const read = n.op === NodeOp.getProp
             const object = getRef(n, 1)
@@ -8781,8 +8800,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             })
             if (native) throw compileError(`${reason}; no dynamic fallback: the object is native (${rep?.text ?? describeValue(graph, object, 1)})`, id)
         }
-        const out = residualizeAccesses(graph, { reps: local.nodes, get: get?.[1], set: set?.[1], check })
-        for (const [call, read] of out.calls) bound.set(call, (read ? get : set)![0])
+        const out = residualizeAccesses(graph, { reps: local.nodes, get: get?.[1], set: set?.[1], remove: remove?.[1], check })
+        for (const [call, read] of out.calls) bound.set(call, (out.removals.has(call) ? remove : read ? get : set)![0])
         for (const id of out.words) local.nodes.set(id, dynamicWord)
         return new Set(out.calls.keys())
     }
@@ -8810,7 +8829,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         for (const [node, shape] of local.unit.allocations) if (shape === 'heap') out.set(node, heap.makePlainObject)
         if (!out.size && ![...local.nodes.values()].some(rep => rep.targets.includes('heap'))) return
         for (const [id, n] of graph.nodes) {
-            if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
+            if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp && !rt.isDelete(graph, n)) continue
             const fn = [...local.calls.get(id) ?? []].map(callee => originOf(callee.fn)).find(fn => runtimeHeapAccessors.has(fn))
             if (fn) {
                 out.set(id, fn)
@@ -9157,8 +9176,9 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             verifyResolved(fn, resolved, edges, 'realizeCodecs', true)
             retypeValues(resolved.graph, pointerTypes(resolved))
             for (const [id, n] of resolved.graph.nodes) {
-                if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
-                const error = compileError(`native: ${fn.name} reads a property of an opaque value: ${describeValue(resolved.graph, getRef(n, 1), 2)}; ${describeAccess(fn, resolved.graph, id, n)}`, id)
+                const removal = rt.isDelete(resolved.graph, n)
+                if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp && !removal) continue
+                const error = removal ? compileError(`native: ${fn.name} deletes a property of an opaque value: ${describeValue(resolved.graph, getRef(n, 2), 2)}`, id) : compileError(`native: ${fn.name} reads a property of an opaque value: ${describeValue(resolved.graph, getRef(n, 1), 2)}; ${describeAccess(fn, resolved.graph, id, n)}`, id)
                 error.dynamic = !dynamicRound
                 throw error
             }
@@ -10071,7 +10091,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const typerRun: TyperRun = { typed, ms: performance.now() - typerStart }
     const { host, genericOf } = createAccessHost(linker, tracer)
     clock.timed('trace', () => tracer.traceProgramUnits())
-    const valueTypes = clock.timed('analysis', () => analyzeTypes(flowAccesses(rootFns, host, dynamicRound), host, rootFns))
+    const deletes = dynamicRound && tracer.units.some(unit => [...unit.traced!.graph.nodes.values()].some(n => rt.isDelete(unit.traced!.graph, n)))
+    const flowRoots = deletes ? [...rootFns, rt.bindingOf(rt.Op.deleteProperty)!.impl!] : rootFns
+    const valueTypes = clock.timed('analysis', () => analyzeTypes(flowAccesses(flowRoots, host, dynamicRound), host, rootFns))
     linker.linkHeldStatics(new Set(valueTypes.frames.filter(frame => frame.heldStatic).map(frame => frame.unit)))
     printAnalysis(valueTypes, genericOf)
     const { plan, planned, reps } = clock.timed('plan', () => {
