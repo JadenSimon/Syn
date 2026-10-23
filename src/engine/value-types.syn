@@ -3,8 +3,8 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { firstNonOrderingSlot, NumericOps, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
-import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, resultType, spreadsLast, typeOf } from './graph-node'
+import { firstNonOrderingSlot, NumericOps, OrderedValues, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
+import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
 import * as rt from './rt'
@@ -877,6 +877,7 @@ export interface Rep {
     bools?: number
     tested?: boolean
     functions?: Function[]
+    inline?: intrinsics.Types[]
 }
 
 function bitValued(type: Type): boolean {
@@ -962,7 +963,8 @@ export interface Instantiations {
     repOf(type: Type): Rep
     elementOf(buffers: number[]): Rep
     shapeOf(allocation: number): string | undefined
-    layOut(tagged: Set<number>): void
+    bufferGroups(): Map<number, number[]>
+    layOut(tagged: Set<number>, inlined?: Map<number, intrinsics.Types[]>): void
 }
 
 export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, joins: number[][] = []): Instantiations {
@@ -1147,6 +1149,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     }
     let bufferMembers: Map<number, number[]> | undefined
     let tagged = new Set<number>()
+    let inlineGroups = new Map<number, intrinsics.Types[]>()
     const wideGroups = new Set<number>()
     const elements = new Map<number, Rep>()
     function elementOf(buffers: number[]): Rep {
@@ -1155,7 +1158,9 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const group = bufferGroup(buffers[0])
         const known = elements.get(group)
         if (known) return known
-        const element = elementRep(bufferMembers.get(group) ?? buffers, wideGroups.has(group))
+        const base = elementRep(bufferMembers.get(group) ?? buffers, wideGroups.has(group))
+        const words = inlineGroups.get(group)
+        const element = !words ? base : { ...base, text: `rec<${base.targets[0]}>`, inline: words }
         elements.set(group, element)
         return element
     }
@@ -1298,9 +1303,10 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (!object.constant || object.state === undefined || !joinable(id) || recordMembers.get(findRecord(id))!.length < 2) return
         constantShapes.set(object.state, shapeId(keyOf(id)))
     })
-    function layOut(observed: Set<number>): void {
+    function layOut(observed: Set<number>, inlined = new Map<number, intrinsics.Types[]>()): void {
         intrinsics.assert(bufferMembers === undefined, 'value-types: elements laid out twice')
         tagged = observed
+        inlineGroups = inlined
         const groups = groupBuffers()
         bufferMembers = groups
         const holderWidths = new Map<string, number>()
@@ -1315,7 +1321,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         for (const [group, at] of freeGroups) if (holderWidths.get(at) === 8) wideGroups.add(group)
         for (const id of shapes.keys()) layOutShape(id)
     }
-    return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 export interface PlannedUnit {
     fn: Function
@@ -1594,9 +1600,294 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
             for (const unit of units) unit.params[i] = { label: unit.params[i].label, rep }
         })
     }
-    inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf))
+    const inlined = intrinsics.argv().some(flag => flag.startsWith('inline-records')) ? inlineRecords(types, inst, [...unitOfRoot.values()], resolvedOf, touchedOf, graphOf) : undefined
+    inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf), intrinsics.argv().includes('inline-records') ? inlined : undefined)
     for (const [unit, touched] of touchedOf) for (const [node, buffers] of touched) unit.slices.set(node, inst.elementOf(buffers))
     return { inst, plan, boxed }
+}
+
+function recordElements(types: ValueTypes, inst: Instantiations, buffers: number[]): { shape: string, words: intrinsics.Types[], elements: Set<number> } | string {
+    let element = emptyType()
+    for (const id of buffers) {
+        const buffer = types.objects[id]
+        if (buffer.kind !== AllocKind.buffer || buffer.constant || buffer.native || buffer.dynamic || buffer.copied) return 'buffer'
+        for (const [k, field] of buffer.fields) {
+            if (k !== numberKey && !constantIndex(k)) continue
+            if (field.forms.some(form => form !== 'vm_value')) return `form:${field.forms.join('|')}`
+            element = union(element, field.type)
+        }
+    }
+    if (element.unknown || element.undefined || element.bools || numericType(element) || element.strings.length || element.functions.length || element.closures.length || !element.objects.length) return 'mixed'
+    let shape: string | undefined
+    for (const id of element.objects) {
+        const object = types.objects[id]
+        if (object.kind !== AllocKind.object || object.constant || object.native || object.dynamic || object.copied || object.function !== undefined) return 'object'
+        const own = inst.shapeOf(id)
+        if (own === undefined || (shape !== undefined && own !== shape)) return 'shapes'
+        shape = own
+    }
+    const sig = inst.shapes.get(shape!)!
+    if (!sig.fields.length || sig.fields.some(([, rep]) => rep.kind !== 'number' || rep.nullable || rep.bit || rep.bools)) return `fields:${sig.text}`
+    return { shape: shape!, words: sig.fields.map(([, rep]) => numberName(rep) === 'f64' ? Types.f64 : Types.u64), elements: new Set(element.objects) }
+}
+
+function exposedObjects(types: ValueTypes): Set<number> {
+    const exposed = new Set<number>()
+    const work: number[] = []
+    const expose = (type: Type) => {
+        for (const id of type.objects) {
+            if (exposed.has(id)) continue
+            exposed.add(id)
+            work.push(id)
+        }
+    }
+    for (const frame of types.frames) {
+        if (frame.sites.some(site => site.frame !== undefined)) continue
+        expose(frame.returns)
+        for (const param of frame.params) expose(param.type)
+    }
+    while (work.length) {
+        for (const field of types.objects[work.pop()!].fields.values()) expose(field.type)
+    }
+    return exposed
+}
+
+function inlineRecords(types: ValueTypes, inst: Instantiations, units: PlannedUnit[], resolvedOf: Map<PlannedUnit, Map<number, Type>>, touchedOf: Map<PlannedUnit, Map<number, number[]>>, graphOf: (fn: Function) => Graph): Map<number, intrinsics.Types[]> {
+    const out = new Map<number, intrinsics.Types[]>()
+    const debug = intrinsics.argv().includes('inline-records-debug')
+    const exposed = exposedObjects(types)
+    const callers = new Map<PlannedUnit, PlannedUnit[]>()
+    for (const unit of units) for (const callees of unit.calls.values()) for (const callee of callees) listOf(callers, callee).push(unit)
+    for (const [group, buffers] of inst.bufferGroups()) {
+        const found = recordElements(types, inst, buffers)
+        const why = typeof found === 'string' ? found : buffers.some(id => exposed.has(id)) || [...found.elements].some(id => exposed.has(id)) ? 'reaches-host' : elementUses(types, units, callers, resolvedOf, touchedOf, graphOf, new Set(buffers), found.elements, found.shape)
+        if (debug) console.log(`INLINE-RECORDS group ${group} [${buffers.join(',')}] ${typeof found === 'string' ? '' : `${found.shape} stride ${8 * found.words.length} `}${why || 'inline'}`)
+        if (!why && typeof found !== 'string') out.set(group, found.words)
+    }
+    return out
+}
+
+function elementUses(types: ValueTypes, units: PlannedUnit[], callers: Map<PlannedUnit, PlannedUnit[]>, resolvedOf: Map<PlannedUnit, Map<number, Type>>, touchedOf: Map<PlannedUnit, Map<number, number[]>>, graphOf: (fn: Function) => Graph, buffers: Set<number>, elements: Set<number>, shape: string): string {
+    const writesGroup = (allocations: number[] | undefined) => !!allocations && allocations.some(id => buffers.has(id))
+    const freshData = (g: Graph, n: GraphNode) => rt.sliceOf(g, getNode(g, valueTail(g, getRef(n, 2)))!) === rt.Op.slice
+    const holders = new Set<number>(buffers)
+    let grew = true
+    while (grew) {
+        grew = false
+        types.objects.forEach((object, id) => {
+            if (holders.has(id) || ![...object.fields.values()].some(field => field.type.objects.some(inner => holders.has(inner)))) return
+            holders.add(id)
+            grew = true
+        })
+    }
+    const pinned = [...holders].some(id => types.objects[id].constant || types.objects[id].native || types.objects[id].dynamic)
+    const unknownCall = (unit: PlannedUnit, g: Graph, id: number, n: GraphNode) => {
+        if (n.op !== NodeOp.call || unit.calls.has(id)) return false
+        if (pinned) return true
+        const nodes = resolvedOf.get(unit)!
+        for (let i = 1; i < countIds(n); i++) {
+            if (getRef(n, i) && nodes.get(getRef(n, i))?.objects.some(object => holders.has(object))) return true
+        }
+        return false
+    }
+    const carriers = new Set<number>(elements)
+    let boxed = true
+    while (boxed) {
+        boxed = false
+        types.objects.forEach((object, id) => {
+            if (carriers.has(id) || object.kind !== AllocKind.object || object.constant || object.native || object.dynamic || object.copied || object.function !== undefined) return
+            if (![...object.fields.values()].some(field => field.type.objects.some(inner => carriers.has(inner)))) return
+            carriers.add(id)
+            boxed = true
+        })
+    }
+    const movers = new Set<PlannedUnit>()
+    const work: PlannedUnit[] = []
+    for (const unit of units) {
+        const g = graphOf(unit.fn)
+        let moves = false
+        for (const [node, allocations] of touchedOf.get(unit)!) {
+            const n = getNode(g, node)!
+            if (rt.sliceOf(g, n) === rt.Op.sliceWrite && writesGroup(allocations) && !freshData(g, n)) moves = true
+        }
+        for (const [id, n] of g.nodes) {
+            if (unknownCall(unit, g, id, n)) moves = true
+        }
+        if (moves) {
+            movers.add(unit)
+            work.push(unit)
+        }
+    }
+    while (work.length) {
+        for (const caller of callers.get(work.pop()!) ?? []) {
+            if (movers.has(caller)) continue
+            movers.add(caller)
+            work.push(caller)
+        }
+    }
+    for (const unit of units) {
+        const g = graphOf(unit.fn)
+        const nodes = resolvedOf.get(unit)!
+        const touched = touchedOf.get(unit)!
+        const users = usersOf(g)
+        const slots = paramSlots(g)
+        const name = `${unit.fn.name || '<anon>'}`
+        const typed = (id: number) => !!nodes.get(id)?.objects.some(object => carriers.has(object))
+        const budget = 64 * g.nodes.size
+        let steps = 0
+        const moving = new Set<number>()
+        for (const [id, n] of g.nodes) {
+            const slice = rt.sliceOf(g, n)
+            if (slice === rt.Op.sliceWrite && writesGroup(touched.get(id))) moving.add(id)
+            else if (slice !== undefined) continue
+            else if (unknownCall(unit, g, id, n)) moving.add(id)
+            else if ([...unit.calls.get(id) ?? []].some(callee => movers.has(callee))) moving.add(id)
+        }
+        const blockMoves = new Map<number, boolean>()
+        function moverIn(block: Block): boolean {
+            const known = blockMoves.get(block.id)
+            if (known !== undefined) return known
+            let found = false
+            for (const id of bodyNodes(g, block.bodyId)) if (moving.has(id)) found = true
+            blockMoves.set(block.id, found)
+            return found
+        }
+        function homeOf(id: number): Block | undefined {
+            const slot = slots.get(id)
+            if (slot) return slot[0]
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.ret) return getBlock(g, getRef(n, 1))
+            const roots = new Set<number>()
+            const seen = new Set<number>()
+            const stack = [id]
+            while (stack.length) {
+                const at = stack.pop()!
+                if (seen.has(at)) continue
+                seen.add(at)
+                const m = getNode(g, at)
+                if (!m) continue
+                if (m.op === NodeOp.nilEffect) roots.add(getRef(m, 0))
+                for (let i = 0; i < firstNonOrderingSlot(m); i++) if (getRef(m, i)) stack.push(getRef(m, i))
+            }
+            if (roots.size === 1) return getBlock(g, [...roots][0])
+            if (roots.size) return
+            const containing = g.blocks.filter(b => bodyNodes(g, b.bodyId).has(id))
+            return containing.length === 1 ? containing[0] : undefined
+        }
+        function reachable(from: Block): Set<number> {
+            const seen = new Set<number>()
+            const stack = successorsOf(g, from)
+            while (stack.length) {
+                const next = stack.pop()!
+                if (seen.has(next.id)) continue
+                seen.add(next.id)
+                stack.push(...successorsOf(g, next))
+            }
+            return seen
+        }
+        function liveAcross(origin: number, x: number): string {
+            const n = getNode(g, x)!
+            const home = homeOf(origin)
+            const at = homeOf(x)
+            if (!home || !at) return `unplaced:${name}%${x}`
+            if (OrderedValues.has(n.op) || n.op === NodeOp.after) {
+                const seen = new Set<number>()
+                const stack: number[] = []
+                for (let i = 0; i < firstNonOrderingSlot(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
+                while (stack.length) {
+                    const id = stack.pop()!
+                    if (id === origin || seen.has(id)) continue
+                    seen.add(id)
+                    if (++steps > budget) return `budget:${name}`
+                    if (moving.has(id)) return `live-across-slot-write:${name}%${origin}@%${id}->%${x}`
+                    const m = getNode(g, id)
+                    if (!m) continue
+                    for (let i = 0; i < firstNonOrderingSlot(m); i++) if (getRef(m, i)) stack.push(getRef(m, i))
+                }
+            } else if (moverIn(at)) return `live-across-slot-write-in-block:${name}%${x}`
+            if (home.id === at.id) return ''
+            if (moverIn(home)) return `live-across-slot-write-after-origin:${name}%${origin}`
+            const after = reachable(home)
+            for (const id of after) {
+                const b = getBlock(g, id)!
+                if (id !== at.id && reachable(b).has(at.id) && moverIn(b)) return `live-across-slot-write-on-path:${name}%${origin}->%${x}`
+            }
+            if (reachable(at).has(at.id) && moverIn(at)) return `live-across-slot-write-in-loop:${name}%${x}`
+            return ''
+        }
+        function constructs(n: GraphNode): boolean {
+            if (getRef(n, 2)) return false
+            const base = valueTail(g, getRef(n, 1))
+            const k = types.keyNames.get(getLiteral(g, n, 2) as Handle)
+            if (allocated.has(base)) return true
+            const objects = nodes.get(base)?.objects ?? []
+            return k !== undefined && objects.length > 0 && objects.every(id => carriers.has(id) && types.objects[id].fields.get(k)?.constructed)
+        }
+        function boxes(n: GraphNode): boolean {
+            const base = valueTail(g, getRef(n, 1))
+            return allocated.has(base) && !!nodes.get(base)?.objects.every(id => carriers.has(id) && !elements.has(id))
+        }
+        function constructedBefore(origin: number, x: number): string {
+            const home = homeOf(origin)
+            if (!home || home.id !== homeOf(x)?.id) return liveAcross(origin, x)
+            const seen = new Set<number>()
+            const stack = [getRef(getNode(g, x)!, 0)]
+            while (stack.length) {
+                const id = stack.pop()!
+                if (!id || seen.has(id)) continue
+                seen.add(id)
+                if (++steps > budget) return `budget:${name}`
+                const m = getNode(g, id)
+                if (!m) continue
+                for (let i = firstNonOrderingSlot(m); i < countIds(m); i++) {
+                    const base = (m.op === NodeOp.getProp || m.op === NodeOp.setProp) && i === 1
+                    if (!base && getRef(m, i) && valueTail(g, getRef(m, i)) === origin) return `aliased-mutation:${name}%${x}`
+                }
+                for (let i = 0; i < firstNonOrderingSlot(m); i++) stack.push(getRef(m, i))
+            }
+            return ''
+        }
+        function nullishOperand(n: GraphNode, slot: number): boolean {
+            if (!getRef(n, slot)) return false
+            const m = getNode(g, valueTail(g, getRef(n, slot)))
+            return m?.op === NodeOp.heapHandle && countIds(m) === 1 && !getRef(m, 0) && heap.isNullishHandle(getLiteral(g, m, 0) as Handle)
+        }
+        const allocated = new Set<number>()
+        types.objects.forEach((object, id) => {
+            if (carriers.has(id) && object.site.unit === unit.fn) allocated.add(object.site.node)
+        })
+        function consumersOf(origin: number, value: number): string {
+            const walk = (o: number, x: number) => !allocated.has(o) ? liveAcross(o, x) : getNode(g, x)!.op === NodeOp.setProp ? constructedBefore(o, x) : ''
+            for (const [u, slot] of users.get(value) ?? []) {
+                const n = getNode(g, u)!
+                if (slot < firstNonOrderingSlot(n)) continue
+                let why = ''
+                if (n.op === NodeOp.after || (n.op === NodeOp.select && slot > 0)) why = consumersOf(origin, u)
+                else if (n.op === NodeOp.eq || n.op === NodeOp.ne) why = nullishOperand(n, 1 - slot) ? '' : `identity-compared:${name}%${u}`
+                else if (n.op === NodeOp.getProp) why = slot === 1 ? walk(origin, u) : `key:${name}%${u}`
+                else if (n.op === NodeOp.setProp && slot === 3) why = boxes(n) ? walk(origin, u) : `stored-into-field:${name}%${u}`
+                else if (n.op === NodeOp.setProp) why = slot !== 1 ? `key:${name}%${u}` : !constructs(n) ? `aliased-mutation:${name}%${u}` : walk(origin, u)
+                else if (n.op === NodeOp.call) why = slot === 1 ? `call-target:${name}%${u}` : walk(origin, u)
+                else if (rt.sliceOf(g, n) === rt.Op.sliceWrite) why = slot === 4 && (touched.get(u) ?? []).every(id => buffers.has(id)) ? walk(origin, u) : `other-buffer:${name}%${u}`
+                else if (n.op === NodeOp.rt && (getLiteral(g, n, 1) === rt.Op.typeof || getLiteral(g, n, 1) === rt.Op.hasPrototype)) why = ''
+                else if (n.op === NodeOp.rt && unit.calls.has(u)) why = walk(origin, u)
+                else if (n.op === NodeOp.ret && slot === 0) why = walk(origin, u)
+                else if (n.op === NodeOp.apply) why = walk(origin, u)
+                else why = `${n.op === NodeOp.rt ? rt.opName(getLiteral(g, n, 1)) : opName(n.op)}:${name}%${u}`
+                if (why) return why
+            }
+            return ''
+        }
+        for (const id of nodes.keys()) {
+            if (!typed(id) || !getNode(g, id)) continue
+            const param = g.blocks[0].params.indexOf(id)
+            const rep = param >= 0 ? unit.params[param]?.rep : unit.nodes.get(id)
+            if (rep && nodes.get(id)!.objects.some(object => elements.has(object)) && (rep.kind !== 'pointer' || rep.encoded || rep.targets.length !== 1 || rep.targets[0] !== shape)) return `rep:${rep.text}@${name}%${id}`
+            const why = consumersOf(id, id)
+            if (why) return why
+        }
+    }
+    return ''
 }
 
 function comparedTargets(g: Graph, repAt: (node: number) => Rep | undefined): string[] {
@@ -2044,6 +2335,7 @@ export function elementTagged(element: Rep): boolean {
 }
 
 export function elementWidth(element: Rep): number {
+    if (element.inline) return 8 * element.inline.length
     if (element.encoded) return 4
     if (elementTagged(element)) return 16
     if (element.kind === 'number' && element.format) return 8
