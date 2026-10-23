@@ -8,7 +8,7 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { verifyGraph, verifyMemoryOrder, verifyOrderingSlots, verifyTailEffects, verifyTokenSelects } from './verify'
+import { verifyGraph, verifyNumberClasses, verifyMemoryOrder, verifyOrderingSlots, verifySlotBounds, verifyTailEffects, verifyTokenSelects } from './verify'
 import {
     addGraphBlock, blockOrder, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -812,6 +812,7 @@ const InverseCompare = new Map<NodeOp, NodeOp>([
 ])
 const UnaryOps = new Set<NodeOp>([NodeOp.neg, NodeOp.not, NodeOp.clz])
 export const NumericOps = new Set<NodeOp>([...BinaryOps, ...CompareOps, ...UnaryOps])
+const ArithOps = new Set<NodeOp>([...BinaryOps, ...UnaryOps])
 
 type Range = [lo: number, hi: number]
 const RangeLimit = 2 ** 53
@@ -1103,6 +1104,20 @@ export function isNumeric(g: Graph, id: number, entry: (param: number) => boolea
 }
 const FloatArith = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.neg])
 export const BitwiseOps = new Set([NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.not])
+
+const NoSlots: number[] = []
+export function integralSlots(g: Graph, n: GraphNode): number[] {
+    if (n.op === NodeOp.load) return [2]
+    if (n.op === NodeOp.store) return [2]
+    if (n.op === NodeOp.pstack) return [3]
+    if (BitwiseOps.has(n.op)) return Array.from({ length: countIds(n) }, (_, i) => i)
+    if (n.op === NodeOp.crc32) return [0, 1]
+    if (n.op === NodeOp.clz) return [0]
+    if (n.op === NodeOp.rt && rt.wordOps.has(getLiteral(g, n, 1))) return [2]
+    if (n.op === NodeOp.pow) return [0, 1] // XXX
+    if (n.op === NodeOp.rem) return [0, 1] // XXX
+    return NoSlots
+}
 
 export function floatValues(g: Graph): Set<number> {
     const floats = new Set<number>()
@@ -12005,6 +12020,10 @@ function pstackFixedSize(g: Graph, n: GraphNode): number {
     return pstackAllocates(g, n) && !getRef(n, 3) ? getLiteral(g, n, 3) : 0
 }
 
+function slotBytes(g: Graph, n: GraphNode): number {
+    return n.op === NodeOp.alloca && !getRef(n, 1) ? getLiteral(g, n, 1) : pstackFixedSize(g, n)
+}
+
 function expandPstacks(g: Graph): boolean {
     let found = false
     for (const [id, n] of [...nodeEntries(g)]) {
@@ -14599,32 +14618,17 @@ export function resolveNumberTypes(g: Graph) {
         if (n.op === NodeOp.ret && (getRef(n, 0) ? floats.has(getRef(n, 0)) : !Number.isInteger(getLiteral(g, n, 0)))) returnsFloat = true
     }
     for (const [id, n] of [...nodeEntries(g)]) {
-        if (n.op === NodeOp.apply) {
-            const params = getBlock(g, getRef(n, 0))?.params ?? []
-            consume(id, n, params.flatMap((p, i) => floats.has(p) ? [i + 1] : []), asFloat)
-        } else if (n.op === NodeOp.select && floats.has(id)) {
-            consume(id, n, Array.from({ length: countIds(n) - 1 }, (_, i) => i + 1), asFloat)
-        } else if (n.op === NodeOp.store) {
-            consume(id, n, [2], asInteger)
-            if (typeOf(n) === Types.f64) consume(id, getNode(g, id)!, [3], asFloat)
-        } else if (n.op === NodeOp.load) {
-            consume(id, n, [2], asInteger)
-        } else if (n.op === NodeOp.pstack) {
-            consume(id, n, [3], asInteger)
-        } else if (n.op === NodeOp.ret && returnsFloat) {
-            consume(id, n, [0], asFloat)
-        } else if (BitwiseOps.has(n.op)) {
-            consume(id, n, Array.from({ length: countIds(n) }, (_, i) => i), asInteger)
-        } else if (n.op === NodeOp.crc32) {
-            consume(id, n, [0, 1], asInteger)
-        } else if (n.op === NodeOp.clz) {
-            consume(id, n, [0], asInteger)
-        } else if (n.op === NodeOp.rt && rt.wordOps.has(getLiteral(g, n, 1))) {
-            consume(id, n, [2], asInteger)
-        } else if (n.op === NodeOp.pow) { // XXX
-            consume(id, n, [0, 1], asInteger)
-        } else if (n.op === NodeOp.rem) { // XXX
-            consume(id, n, [0, 1], asInteger)
+        consume(id, n, integralSlots(g, n), asInteger)
+        const m = getNode(g, id)!
+        if (m.op === NodeOp.apply) {
+            const params = getBlock(g, getRef(m, 0))?.params ?? []
+            consume(id, m, params.flatMap((p, i) => floats.has(p) ? [i + 1] : []), asFloat)
+        } else if (m.op === NodeOp.select && floats.has(id)) {
+            consume(id, m, Array.from({ length: countIds(m) - 1 }, (_, i) => i + 1), asFloat)
+        } else if (m.op === NodeOp.store && typeOf(m) === Types.f64) {
+            consume(id, m, [3], asFloat)
+        } else if (m.op === NodeOp.ret && returnsFloat) {
+            consume(id, m, [0], asFloat)
         }
     }
     for (const [id, n] of nodeEntries(g)) {
@@ -14694,6 +14698,8 @@ export function packageValueGraph(g: Graph, target: lowering.Target, entries?: S
     g = runPipeline('package', g, target.costs, [_bindCallContext, splitBranchingSelects, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks]).graph
     g.form = 'packaged'
     verifyGraph(g, 'package', true)
+    verifyNumberClasses(g, 'package', floatValues(g), integralSlots, undefined)
+    verifySlotBounds(g, 'package', slotBytes)
     return g
 }
 
@@ -15399,6 +15405,7 @@ export interface PreparedLowering {
     island?: number[]
     analysis: ReturnType<typeof analyzeValueGraph>
     effectful: Set<number>
+    floats: Set<number>
 }
 
 function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number): void {
@@ -15491,7 +15498,10 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     const [effectful, offTail] = effectfulSelects(g)
     verifyTailEffects(g, 'lowerable', offTail)
     verifyTokenSelects(g, 'lowerable')
-    return { g, island, analysis: analyzeValueGraph(g, opts), effectful }
+    const floats = floatValues(g)
+    verifyNumberClasses(g, 'lowerable', floats, integralSlots, ArithOps)
+    verifySlotBounds(g, 'lowerable', slotBytes)
+    return { g, island, analysis: analyzeValueGraph(g, opts), effectful, floats }
 }
 
 export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {

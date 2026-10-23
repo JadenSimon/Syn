@@ -38,7 +38,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
+import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyGraph, verifyKeys, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
 import { analyzeGenerics, flowAccesses } from './value-flow'
@@ -4547,6 +4547,10 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const clobbers = new Map<number, Set<number>>()
     const prepared = new Map<number, PreparedUnit>()
     for (const symbol of symbols) prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol)), program.units.get(symbol)!.name))
+    verifyCallClasses('lowerable', new Map([...prepared].map(([symbol, unit]) => [symbol, unit.prepared.g])), symbol => prepared.get(symbol)!.prepared.floats, (g, n) => {
+        const t = getNode(g, getRef(n, 1))
+        return t?.op === NodeOp.localTarget ? getLiteral(g, t, 0) : undefined
+    })
     const endless = new Set(symbols.filter(symbol => ![...allNodes(prepared.get(symbol)!.prepared.g)].some(n => n.op === NodeOp.ret)))
     const continuations = new Set(symbols.filter(symbol => endless.has(symbol) && free.has(symbol) && sites.get(symbol)?.length === 1))
     nonvolatileArgs(program, prepared, continuations)
@@ -4809,6 +4813,7 @@ interface Resolution {
     encoded: Set<number>
     fieldTags: Map<number, number>
     tagWrites: Map<number, Operand>
+    wordWrites: Map<number, number>
     local: UnitPlan | undefined
     callees: Map<number, PlannedUnit>
     dynamic: Set<number>
@@ -4887,12 +4892,13 @@ function sliceSlot(element: Rep | undefined, T: intrinsics.Types): [width: numbe
 interface SliceTags {
     reads: Map<number, number>
     writes: Map<number, Operand>
+    words: Map<number, number>
 }
 export function retypeValues(graph: Graph, types: Map<number, intrinsics.Types>): void {
     for (const [id, T] of types) retypeNode(graph, id, T)
 }
 export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined, nodes: Map<number, Rep> | undefined): SliceTags {
-    const tags: SliceTags = { reads: new Map(), writes: new Map() }
+    const tags: SliceTags = { reads: new Map(), writes: new Map(), words: new Map() }
     function wordTag(word: number, holdsUndefined: boolean): number {
         if (holdsUndefined) return addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool)
         return addNode(graph, NodeOp.literal, [{ literal: 1 }], Types.bool)
@@ -4950,6 +4956,8 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
             } else if (op === rt.Op.sliceRead) putNode(graph, id, NodeOp.load, [token, data, at], type)
             else putNode(graph, id, NodeOp.store, [token, data, at, getOperand(graph, n, 4)], type)
             if (op === rt.Op.sliceRead && element && nullableNumber(rep)) tags.reads.set(id, wordTag(id, !!element.encoded && element.nullable))
+            const value = op === rt.Op.sliceWrite ? getRef(n, 4) : 0
+            if (value && element?.encoded && element.nullable && !isNullishValue(graph, value) && nullableNumber(nodes?.get(value) ?? nodes?.get(tailOf(graph, value)))) tags.words.set(id, value)
             continue
         }
         const tagAt = typeof at === 'number' ? addNode(graph, NodeOp.add, [at, { literal: 8 }], Types.unknown_number) : { literal: at.literal + 8 }
@@ -6237,10 +6245,16 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const blocks = [{ id: rootId, params, bodyId: root, bodyConst: 0 }, ...graph.blocks.filter(b => region.blocks.has(b.id)).map(b => ({ ...b, params: b.params.slice() }))]
         const cold = createGraph({ ids: graph.ids, literals: graph.literals, root: rootId, nodes, blocks, name })
         const frames = new Map<u32, number>()
+        const allocations = new Map<u32, Allocation>()
         for (const n of nodes.values()) {
             if (n.op !== NodeOp.heapHandle || getRef(n, 0)) continue
             const cell = getLiteral(graph, n, 0) as u32
             if (traced.frames.has(cell) && !bound.has(cell)) frames.set(cell, traced.frames.get(cell)!)
+            const allocation = bound.has(cell) ? undefined : traced.allocations?.get(cell)
+            if (!allocation) continue
+            const token = allocation.token === undefined ? undefined : nodes.has(allocation.token) ? allocation.token : entryToken
+            const call = allocation.call !== undefined && nodes.has(allocation.call) ? allocation.call : undefined
+            allocations.set(cell, { token, call })
         }
         const unit = Object.defineProperty(Object.assign(function cold() {}, { shouldNotInline: true }), 'name', { value: name })
         unitOf(unit).cold = bound
@@ -6253,7 +6267,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         const coldUnit = unitOf(unit)
         coldUnit.code = { input: code.input, captures: code.captures, ambient: code.ambient, source: coldSource }
         coldUnit.source = coldSource
-        coldUnit.traced = { graph: cold, frameProxy: undefined, frames }
+        coldUnit.traced = { graph: cold, frameProxy: undefined, frames, allocations }
         units.push(coldUnit)
         const symbol = link(unit)
         let token = plan.frontier[0] ?? nilEffectOf(graph, region.from[k])
@@ -8010,6 +8024,7 @@ export interface CodecRequest {
     tracked: Map<number, boolean>
     fieldTags: Map<number, Operand>
     tagWrites: Map<number, Operand>
+    wordWrites: Map<number, number>
     functionObject?: (cell: number) => intrinsics.Handle | undefined
     floatRecords: Map<number, Rep>
     wordBits: Set<number>
@@ -8133,7 +8148,7 @@ export function realizeFloats(graph: Graph, request: CodecRequest): void {
     function wordOther(word: number): number {
         return addNode(graph, NodeOp.and, [tagged(word), bits(NodeOp.lt, word, heap.pstackBoxWordTag)], Types.bool)
     }
-    function readWord(id: number, n: GraphNode, rep: Rep): void {
+    function readWord(id: number, n: GraphNode, rep: Rep): number {
         const word = addCopy(graph, n)
         if (floatUnion(rep)) {
             loaded.set(id, word)
@@ -8146,6 +8161,7 @@ export function realizeFloats(graph: Graph, request: CodecRequest): void {
         } else {
             putNode(graph, id, NodeOp.convert, [wordFloat(word)], Types.i64)
         }
+        return word
     }
     function boxWord(token: Operand, f: Operand): number {
         const cell = addNode(graph, NodeOp.pstack, [token, 0, 0, { literal: 8 }])
@@ -8172,7 +8188,9 @@ export function realizeFloats(graph: Graph, request: CodecRequest): void {
         if (!live.has(id) || !floatUnion(element) || (n.op !== NodeOp.load && n.op !== NodeOp.store)) continue
         if (element!.encoded) {
             const read = reps.get(id)
-            if (n.op === NodeOp.load && read?.kind === 'number' && !read.nullable && !read.bools) readWord(id, n, read)
+            if (n.op !== NodeOp.load || read?.kind !== 'number' || read.bools) continue
+            const word = readWord(id, n, read)
+            if (read.nullable) request.fieldTags.set(id, addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool))
             continue
         }
         if (n.op === NodeOp.store) {
@@ -8621,13 +8639,17 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
         if (union(x) || word(x)) return truthWord(x)
         return x
     }
+    function integral(x: number): boolean {
+        const name = numberName(reps.get(x))
+        return name === 'int' || name === 'i64' || resultType(graph, getNode(graph, x)!) === Types.i64
+    }
     function arrival(x: Operand, rep: Rep | undefined, shaped: boolean, into: string): Operand {
         if (rep && unionWord(rep)) return toWord(x)
         if (rep?.tested) return truthOf(x)
         const from = typeof x === 'number' && x ? reps.get(x) ?? reps.get(tailOf(graph, x)) : undefined
         if (from?.kind === 'number' && from.nullable && (rep?.kind === 'pointer' || rep?.kind === 'buffer')) return addNode(graph, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }])
         if (shaped && (encodedWord(x) || (pointerOfShapes(rep) && word(x)))) return decode(x as number)
-        if (numberName(rep) === 'f64' && typeof x === 'number' && x && !union(x) && (numberName(reps.get(x)) === 'int' || numberName(reps.get(x)) === 'i64')) return addNode(graph, NodeOp.convert, [x], Types.f64)
+        if (numberName(rep) === 'f64' && typeof x === 'number' && x && !union(x) && integral(x)) return addNode(graph, NodeOp.convert, [x], Types.f64)
         if (!union(x)) return x
         if (rep?.kind === 'undefined') return addNode(graph, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }])
         if (numberName(rep) === 'f64') return addNode(graph, NodeOp.convert, [wordNumber(x as number)], Types.f64)
@@ -8646,8 +8668,9 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
     function storeWord(id: number, n: GraphNode): void {
         const value = getOperand(graph, n, 3)
         const float = typeof value === 'number' && floats.has(tailOf(graph, value))
+        const smallWord = floatUnion(slices.get(id)) && typeof value === 'number' && !!value && (reps.get(value) ?? reps.get(tailOf(graph, value)))?.kind === 'number'
         if (!float && !floatSlot(id, value)) {
-            coerceSlots(graph, id, [3], boxes ? toWord : storedWord)
+            coerceSlots(graph, id, [3], boxes || smallWord ? toWord : storedWord)
             return
         }
         const converted = float ? value : typeof value === 'number' ? addNode(graph, NodeOp.convert, [value], Types.f64) : addNode(graph, NodeOp.literal, [value], Types.f64)
@@ -8748,7 +8771,10 @@ export function realizeTags(graph: Graph, request: CodecRequest): void {
             continue
         }
         const payload = addNode(graph, NodeOp.get, [id, { literal: 0 }])
-        projections.set(id, [returned.float ? addNode(graph, NodeOp.bitconvert, [payload], Types.f64) : T === Types.u64 ? payload : addNode(graph, NodeOp.convert, [payload], T), addNode(graph, NodeOp.get, [id, { literal: 1 }])])
+        const float = returned.float ? addNode(graph, NodeOp.bitconvert, [payload], Types.f64) : 0
+        const integral = numberName(reps.get(id)) === 'int' || numberName(reps.get(id)) === 'i64'
+        const value = !float ? (T === Types.u64 ? payload : addNode(graph, NodeOp.convert, [payload], T)) : integral ? addNode(graph, NodeOp.convert, [float], Types.i64) : float
+        projections.set(id, [value, addNode(graph, NodeOp.get, [id, { literal: 1 }])])
     }
     const tags = new Map<number, Operand>(request.fieldTags)
     const root = graph.blocks[0]
@@ -8832,6 +8858,7 @@ export function realizeTags(graph: Graph, request: CodecRequest): void {
         return typeof a === 'number' ? a === b : typeof b !== 'number' && a.literal === b.literal
     }
     for (const [store, value] of request.tagWrites) coerceSlots(graph, store, [3], () => tagOf(value))
+    for (const [store, value] of request.wordWrites) coerceSlots(graph, store, [3], word => addNode(graph, NodeOp.select, [tagOf(value), word, { literal: heap.undefinedWord }]))
     for (const [id, n] of [...nodeEntries(graph)]) {
         if ((n.op !== NodeOp.eq && n.op !== NodeOp.ne) || countIds(n) !== 2) continue
         if (isNullishValue(graph, getRef(n, 0)) && isNullishValue(graph, getRef(n, 1))) {
@@ -9593,7 +9620,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         plannedFunctionCalls(result.graph)
         const dynamicCalls = dynamicAccesses(fn, result.graph, local, bound, result.fallbacks ?? new Map())
         const fieldTags = new Map([...sliceTags?.reads ?? [], ...result.tags])
-        return { graph: result.graph, shapes: result.shapes, encoded: result.encoded, fieldTags, tagWrites: sliceTags?.writes ?? new Map(), local, callees: bound, dynamic: dynamicCalls }
+        return { graph: result.graph, shapes: result.shapes, encoded: result.encoded, fieldTags, tagWrites: sliceTags?.writes ?? new Map(), wordWrites: sliceTags?.words ?? new Map(), local, callees: bound, dynamic: dynamicCalls }
     }
     function accessPosition(fn: Function, id: number): string {
         const unit = graphsOf(fn)
@@ -9997,7 +10024,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         return {
             reps: values, params: local?.unit.params.map(param => param.rep) ?? [], returns: local?.unit.returns, abi: abiOf(fn), boxes: !!local?.unit.boxes,
             slices, pointers, encoded: resolved.encoded, calls, functionObject: functionObjectOf,
-            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, floatRecords: new Map(), wordBits: new Set(),
+            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, wordWrites: resolved.wordWrites, floatRecords: new Map(), wordBits: new Set(),
         }
     }
     function floatParams(unit: PlannedUnit): number[] {
