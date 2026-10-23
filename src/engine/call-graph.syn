@@ -2,9 +2,13 @@
 "use wrapped";
 
 import * as intrinsics from './intrinsics'
+import * as heap from './heap'
+import * as rt from './rt'
 import type { Graph, GraphNode } from './lowering2'
 import type { FastTraced } from './fast-trace'
-import { NodeOp, NodeFlags, countIds, getBlock, getNode, getRef, isThisParam, nodeUsers } from './graph-node'
+import { NodeOp, NodeFlags, countIds, getBlock, getLiteral, getNode, getRef, isThisParam, nodeUsers } from './graph-node'
+
+type Handle = intrinsics.Handle
 
 export const Kinds = { int: 1, double: 2, string: 4, boolean: 8, undefined: 16, null: 32, object: 64, function: 128 }
 export const anyKinds = 255
@@ -19,6 +23,8 @@ export interface Host {
     symbol(fn: Function): number
     signature(fn: Function): Signature | undefined
     version(name: string): number
+    template(cell: number): boolean
+    runtime(op: number): Function | undefined
 }
 
 export interface Signature {
@@ -86,7 +92,7 @@ export function usesCallee(p: Program, fn: Function): boolean {
     return uses
 }
 
-export function calleeOf(p: Program, traced: FastTraced, n: GraphNode): Function | undefined {
+export function calleeOf(p: { host: Host }, traced: FastTraced, n: GraphNode): Function | undefined {
     if (n.op !== NodeOp.call || (n.flags & NodeFlags.spread)) return
     const unit = p.host.direct(traced, n)
     if (!unit) return
@@ -110,6 +116,379 @@ export function createProgram(host: Host, roots: Function[]): Program {
         return out
     })
     return p
+}
+
+export interface Reach {
+    host: Host
+    units: Function[]
+    hubs: Map<Function, Set<Function>>
+    names: Map<string, Function>
+    sites: Map<Function, Map<number, Function>>
+    flows: Map<Function, [hub: Function, member: Function][]>
+    ids: Map<Function, number>
+}
+
+function hubOf(r: Reach, name: string): Function {
+    const known = r.names.get(name)
+    if (known) return known
+    const hub = Object.defineProperty(function hub() {}, 'name', { value: `hub:${name}` })
+    r.names.set(name, hub)
+    r.hubs.set(hub, new Set())
+    return hub
+}
+
+function keyHub(r: Reach, kind: string, key: number): Function {
+    const name = `${kind}:${key}`
+    const known = r.names.get(name)
+    if (known) return known
+    const hub = hubOf(r, name)
+    if (kind === 'key') {
+        joinHub(r, hub, hubOf(r, 'dynstore'))
+        joinHub(r, hubOf(r, heap.keyIndex(key as Handle) !== undefined ? 'index' : 'keys'), hub)
+    }
+    if (kind === 'get' || kind === 'set') {
+        joinHub(r, hub, hubOf(r, `proxy:${kind}`))
+        joinHub(r, hubOf(r, `${kind}:*`), hub)
+    }
+    if (kind === 'call') joinHub(r, hub, keyHub(r, 'key', key))
+    return hub
+}
+
+function joinHub(r: Reach, hub: Function, member: Function): void {
+    r.hubs.get(hub)!.add(member)
+}
+
+function endHub(r: Reach, fn: Function, end: string): Function {
+    let id = r.ids.get(fn)
+    if (id === undefined) r.ids.set(fn, id = r.ids.size)
+    return hubOf(r, `${end}:${fn.name}#${id}`)
+}
+
+function paramHub(r: Reach, fn: Function, position: number): Function {
+    const hub = endHub(r, fn, `param${position}`)
+    joinHub(r, hub, endHub(r, fn, 'args'))
+    return hub
+}
+
+function nonEmptyHubs(r: Reach): Set<Function> {
+    const out = new Set<Function>()
+    const within = new Map<Function, Function[]>()
+    const work: Function[] = []
+    for (const [hub, members] of r.hubs) {
+        for (const m of members) {
+            if (!r.hubs.has(m)) {
+                if (!out.has(hub)) {
+                    out.add(hub)
+                    work.push(hub)
+                }
+                continue
+            }
+            let list = within.get(m)
+            if (!list) within.set(m, list = [])
+            list.push(hub)
+        }
+    }
+    while (work.length) {
+        for (const outer of within.get(work.pop()!) ?? []) {
+            if (out.has(outer)) continue
+            out.add(outer)
+            work.push(outer)
+        }
+    }
+    return out
+}
+
+const scalarOps = new Set<NodeOp>([
+    NodeOp.literal, NodeOp.void, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.rem, NodeOp.pow, NodeOp.subsat, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr,
+    NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.not, NodeOp.neg, NodeOp.nonzero, NodeOp.typeof, NodeOp.convert, NodeOp.bitconvert, NodeOp.box, NodeOp.clz, NodeOp.crc32,
+    NodeOp.localTarget, NodeOp.syscallTarget, NodeOp.poolEntry, NodeOp.frameAddress, NodeOp.pstack, NodeOp.alloca, NodeOp.stackalloc, NodeOp.stackfree, NodeOp.mem, NodeOp.block, NodeOp.nilEffect,
+])
+const quietOps = new Set<NodeOp>([NodeOp.typeof, NodeOp.eq, NodeOp.ne])
+const scalarRuntime = new Set<number>([
+    rt.Op.addOrConcat, rt.Op.concat, rt.Op.toString, rt.Op.toNumber, rt.Op.typeof, rt.Op.strictEqual, rt.Op.compare, rt.Op.handleHash, rt.Op.create, rt.Op.truthy, rt.Op.ownKeys,
+    rt.Op.handleof, rt.Op.stringOf, rt.Op.heapaddr, rt.Op.pstackaddr, rt.Op.hasPrototype, rt.Op.slice,
+])
+const quietRuntime = new Set<number>([rt.Op.truthy, rt.Op.typeof, rt.Op.strictEqual, rt.Op.handleHash])
+
+export type NumericKey = (fn: Function, traced: FastTraced, ref: number) => boolean
+
+export function discoverReach(host: Host, roots: Function[], numericKey: NumericKey): Reach {
+    const r: Reach = { host, units: [], hubs: new Map(), names: new Map(), sites: new Map(), flows: new Map(), ids: new Map() }
+    r.units = discover(r, roots, numericKey)
+    return r
+}
+
+export function liveUnits(r: Reach, roots: Function[]): Set<Function> {
+    const top = hubOf(r, 'top')
+    const seen = new Set<Function>()
+    const opened = new Set<Function>()
+    const live = new Set<Function>()
+    const work: Function[] = []
+    function reach(fn: Function): void {
+        if (seen.has(fn)) return
+        seen.add(fn)
+        work.push(fn)
+    }
+    function join(hub: Function, member: Function): void {
+        r.hubs.get(hub)!.add(member)
+        if (seen.has(hub)) reach(member)
+    }
+    function open(fn: Function): void {
+        if (opened.has(fn)) return
+        opened.add(fn)
+        join(endHub(r, fn, 'args'), top)
+        join(top, endHub(r, fn, 'ret'))
+    }
+    for (const root of roots) {
+        reach(root)
+        open(root)
+    }
+    while (work.length) {
+        const fn = work.pop()!
+        const members = r.hubs.get(fn)
+        if (members) {
+            for (const m of members) {
+                reach(m)
+                if (!r.hubs.has(m)) open(m)
+            }
+            continue
+        }
+        live.add(fn)
+        for (const [hub, member] of r.flows.get(fn) ?? []) join(hub, member)
+        for (const callee of r.sites.get(fn)?.values() ?? []) reach(callee)
+    }
+    return live
+}
+
+function discover(r: Reach, roots: Function[], numericKey: NumericKey): Function[] {
+    const top = hubOf(r, 'top')
+    joinHub(r, top, hubOf(r, 'dynstore'))
+    joinHub(r, hubOf(r, 'access:*'), hubOf(r, 'get:*'))
+    joinHub(r, hubOf(r, 'access:*'), hubOf(r, 'set:*'))
+    const queued = new Set<Function>()
+    const units: Function[] = []
+    const read = new Set<number>()
+    const deferred = new Map<number, [value: number, hub: Function][]>()
+    const walked = new Set<number>()
+    const cells: number[] = []
+    function unit(fn: Function): void {
+        if (queued.has(fn)) return
+        queued.add(fn)
+        units.push(fn)
+    }
+    function found(value: number, hub: Function): void {
+        if (!value) return
+        const fn = heap.isCell(value as Handle) && heap.isCallable(heap.deref(value as Handle)) ? r.host.unit(value) : undefined
+        if (fn) {
+            joinHub(r, hub, fn)
+            unit(fn)
+        }
+        cells.push(value)
+    }
+    function readKey(key: number): void {
+        if (read.has(key)) return
+        read.add(key)
+        const later = deferred.get(key)
+        if (!later) return
+        deferred.delete(key)
+        for (const [value, hub] of later) found(value, hub)
+    }
+    function member(key: number, value: number, hub: Function): void {
+        if (read.has(key) || key === heap.prototypeKey || heap.keyIndex(key as Handle) !== undefined) {
+            found(value, hub)
+            return
+        }
+        let later = deferred.get(key)
+        if (!later) deferred.set(key, later = [])
+        later.push([value, hub])
+    }
+    function walk(at: number): void {
+        if (!at || walked.has(at) || heap.isOddballHandle(at as Handle) || heap.isBoxedF64(at as Handle)) return
+        walked.add(at)
+        if (heap.isFrameProxy(at as Handle) || heap.isTypeDescriptor(at as Handle)) return
+        if (!heap.isCell(at as Handle)) return
+        const state = heap.deref(at as Handle)
+        if (state !== at) cells.push(state)
+        if (heap.isString(state)) {
+            cells.push(heap.getPrototypeOf(state))
+            return
+        }
+        if (heap.isCallable(state) && r.host.template(at)) return
+        if (heap.isProxy(state)) {
+            found(heap.getProxyGetter(state), hubOf(r, 'proxy:get'))
+            found(heap.getProxySetter(state), hubOf(r, 'proxy:set'))
+            return
+        }
+        if (!heap.isOrdinaryObject(state) && !heap.isCallable(state) && !heap.isArray(state)) return
+        cells.push(heap.getPrototypeOf(state))
+        for (let i: u32 = 0; i < heap.ownPropertyCount(state); i++) {
+            const key = heap.ownPropertyKeyAt(state, i) as number
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.ownPropertyAt(state, i)))
+            if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) {
+                member(key, d.slot0 as number, keyHub(r, 'get', key))
+                member(key, d.slot1 as number, keyHub(r, 'set', key))
+                continue
+            }
+            member(key, d.slot0 as number, keyHub(r, 'key', key))
+        }
+    }
+    function flow(owner: Function, hub: Function, member: Function | undefined): void {
+        if (!member || member === hub) return
+        let list = r.flows.get(owner)
+        if (!list) r.flows.set(owner, list = [])
+        list.push([hub, member])
+    }
+    function classify(fn: Function): void {
+        const sites = new Map<number, Function>()
+        r.sites.set(fn, sites)
+        const traced = r.host.trace(fn)
+        if (!traced) return
+        const g = traced.graph
+        const u = useGraph(g)
+        const sources = new Map<number, Function | undefined>()
+        const concrete = new Map<number, Function | undefined>()
+        function readHub(numeric: boolean): Function {
+            const hub = hubOf(r, numeric ? 'read:index' : 'read:keys')
+            joinHub(r, hub, hubOf(r, numeric ? 'index' : 'keys'))
+            return hub
+        }
+        function sourceOf(id: number): Function | undefined {
+            const n = getNode(g, id)
+            if (!n) return
+            const position = u.positions.get(id)
+            if (position !== undefined) return paramHub(r, fn, position)
+            if (n.op === NodeOp.heapHandle) {
+                if (getRef(n, 0)) return top
+                const cell = getLiteral(g, n, 0)
+                if (!heap.isCell(cell as Handle) || !heap.isCallable(heap.deref(cell as Handle))) return
+                return r.host.unit(cell)
+            }
+            if (n.op === NodeOp.getProp) return getRef(n, 2) ? readHub(numericKey(fn, traced, getRef(n, 2))) : keyHub(r, 'call', getLiteral(g, n, 2))
+            if (n.op === NodeOp.call) {
+                const direct = r.host.direct(traced, n)
+                return direct ? endHub(r, direct, 'ret') : top
+            }
+            if (n.op === NodeOp.static) {
+                const target = valueOf(getRef(n, 0))
+                return target && !r.hubs.has(target) ? endHub(r, target, 'ret') : top
+            }
+            if (n.op === NodeOp.rt) {
+                const op = getLiteral(g, n, 1)
+                const impl = r.host.runtime(op)
+                if (impl) return endHub(r, impl, 'ret')
+                if (scalarRuntime.has(op)) return
+                if (op === rt.Op.getprop) return readHub(!getRef(n, 3) || numericKey(fn, traced, getRef(n, 3)))
+                return top
+            }
+            if (scalarOps.has(n.op)) return
+            return top
+        }
+        function valueOf(ref: number): Function | undefined {
+            const id = strip(g, ref)
+            if (sources.has(id)) return sources.get(id)
+            const hub = sourceOf(id)
+            sources.set(id, hub)
+            return hub
+        }
+        function concreteOf(id: number, n: GraphNode): Function | undefined {
+            if (concrete.has(id)) return concrete.get(id)
+            const callee = calleeOf(r, traced, n)
+            concrete.set(id, callee)
+            return callee
+        }
+        function sinkOf(user: number, slot: number): Function | undefined {
+            const m = getNode(g, user)!
+            if (m.op === NodeOp.call) {
+                if (slot === 1) return
+                const callee = concreteOf(user, m)
+                return callee ? paramHub(r, callee, slot - 2) : top
+            }
+            if (m.op === NodeOp.setProp && slot === 3) return getRef(m, 2) ? hubOf(r, 'dynstore') : keyHub(r, 'key', getLiteral(g, m, 2))
+            if (m.op === NodeOp.ret && slot === 0) return endHub(r, fn, 'ret')
+            if (m.op === NodeOp.static || quietOps.has(m.op)) return
+            if (m.op === NodeOp.rt && quietRuntime.has(getLiteral(g, m, 1))) return
+            return top
+        }
+        for (const [id, n] of g.nodes) {
+            if (n.op === NodeOp.heapHandle && !getRef(n, 0)) {
+                const cell = getLiteral(g, n, 0)
+                const callee = heap.isCell(cell as Handle) && heap.isCallable(heap.deref(cell as Handle)) ? r.host.unit(cell) : undefined
+                if (callee) unit(callee)
+                cells.push(cell)
+                continue
+            }
+            if (n.op === NodeOp.static) {
+                const target = valueOf(getRef(n, 0))
+                if (target && !r.hubs.has(target)) sites.set(id, target)
+                continue
+            }
+            if (n.op === NodeOp.getProp || n.op === NodeOp.setProp) {
+                const keyRef = getRef(n, 2)
+                const get = n.op === NodeOp.getProp
+                if (!keyRef) readKey(getLiteral(g, n, 2))
+                sites.set(id, keyRef ? hubOf(r, get ? 'get:*' : 'set:*') : keyHub(r, get ? 'get' : 'set', getLiteral(g, n, 2)))
+                continue
+            }
+            if (n.op === NodeOp.call) {
+                const direct = r.host.direct(traced, n)
+                if (direct) {
+                    unit(direct)
+                    sites.set(id, direct)
+                    if (concreteOf(id, n) !== direct) flow(fn, endHub(r, direct, 'args'), top)
+                    continue
+                }
+                sites.set(id, valueOf(getRef(n, 1)) ?? top)
+                continue
+            }
+            if (n.op === NodeOp.rt) {
+                const op = getLiteral(g, n, 1)
+                const impl = r.host.runtime(op)
+                if (impl) {
+                    unit(impl)
+                    sites.set(id, impl)
+                    flow(fn, endHub(r, impl, 'args'), top)
+                    continue
+                }
+                if (op === rt.Op.getprop || op === rt.Op.ownKeys) {
+                    sites.set(id, hubOf(r, 'get:*'))
+                    continue
+                }
+                if (op === rt.Op.setprop) {
+                    sites.set(id, hubOf(r, 'set:*'))
+                    continue
+                }
+                if (op !== rt.Op.assign) continue
+                sites.set(id, hubOf(r, 'access:*'))
+                flow(fn, top, hubOf(r, 'keys'))
+            }
+        }
+        for (const [id, n] of g.nodes) {
+            if (n.op === NodeOp.after) continue
+            const value = valueOf(id)
+            if (!value) continue
+            for (const [user, slot] of valueUses(u, id)) {
+                const sink = sinkOf(user, slot)
+                if (sink) flow(fn, sink, value)
+            }
+        }
+    }
+    for (const root of roots) unit(root)
+    let next = 0
+    while (next < units.length || cells.length) {
+        if (cells.length) {
+            walk(cells.pop()!)
+            continue
+        }
+        classify(units[next++])
+    }
+    const filled = nonEmptyHubs(r)
+    for (const [name, hub] of r.names) {
+        if (name.startsWith('read:') && filled.has(hubOf(r, 'get:*'))) joinHub(r, hub, top)
+        if (!name.startsWith('call:')) continue
+        const getters = r.names.get(`get:${name.slice(5)}`)
+        if (getters && filled.has(getters)) joinHub(r, hub, top)
+    }
+    return units
 }
 
 export function buildCallGraph<T>(roots: T[], calleesOf: (unit: T) => [call: number, callee: T][]): CallGraph<T> {

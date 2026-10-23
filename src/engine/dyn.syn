@@ -15,7 +15,7 @@ import type { FastTraced } from './fast-trace'
 import { globals as builtinGlobals, programStack } from './builtins'
 import { parseNumber } from './builtin/Number'
 import * as optimizer from './program-optimizer'
-import { Kinds, anyKinds, useVersion, usesCallee, versionOf, type Contract, type Host, type Version } from './call-graph'
+import { Kinds, anyKinds, discoverReach, liveUnits, strip, useVersion, usesCallee, versionOf, type Contract, type Host, type Version } from './call-graph'
 
 const Types = intrinsics.Types
 
@@ -1103,7 +1103,28 @@ function optimizerHost(d: Dyn, tracer: native.Tracer, keep: (fn: Function) => bo
             return compiled ? { params: compiled.paramCount, rest: !!compiled.rest } : undefined
         },
         version: name => glueSymbol(d, name),
+        template: cell => !!linker.session.templateOf(cell as u32),
+        runtime: op => {
+            const impl = rt.bindingOf(op)?.impl
+            return impl && !natives.has(impl) ? impl : undefined
+        },
     }
+}
+
+function numericKey(traced: FastTraced, ref: number): boolean {
+    const n = getNode(traced.graph, strip(traced.graph, ref))
+    if (!n) return false
+    if (n.op === NodeOp.literal) return typeOf(n) !== Types.bool
+    return arithOps.has(n.op) || bitwiseOps.has(n.op) || n.op === NodeOp.neg || numberTypes.has(typeOf(n))
+}
+
+function culledUnit(d: Dyn, fn: Function): void {
+    const g = createGraph({ name: `${fn.name || 'anonymous'}/culled` })
+    const root = addNode(g, NodeOp.block, [])
+    g.root = root
+    const token = addNode(g, NodeOp.nilEffect, [root])
+    setGraphBlocks(g, [{ id: root, params: [], bodyId: addNode(g, NodeOp.trap, [token, { literal: 3 }]), bodyConst: 0 }])
+    d.program.units.set(d.linker.addUnit(fn), g)
 }
 
 function initGraph(d: Dyn, calls: [cell: number, symbol: number][], statics: number | undefined): number {
@@ -1129,8 +1150,16 @@ export function dynProgram(linker: native.Linker, tracer: native.Tracer, image: 
     d.apply = applyGlue(d)
     invokeGlue(d)
     const lowered = new Set<Function>()
-    const keep = (fn: Function) => !natives.has(fn) && fn !== invoke
-    if (flags.has('dyn-opt')) d.opt = clock.timed('analysis', () => optimizer.createOptimizer(optimizerHost(d, tracer, keep), [...linker.roots.values()].map(symbol => linker.functions[symbol])))
+    const own = (fn: Function) => !natives.has(fn) && fn !== invoke
+    const host = optimizerHost(d, tracer, own)
+    const roots = [...linker.roots.values()].map(symbol => linker.functions[symbol])
+    const extra = [...glueSources, ...[rt.Op.compare, rt.Op.arrayLiteral, rt.Op.arrayElement].map(op => rt.bindingOf(op)!.impl!)]
+    const reach = clock.timed('analysis', () => discoverReach(host, [...roots, ...extra], (fn, traced, ref) => numericKey(traced, ref)))
+    const live = liveUnits(reach, [...roots, ...extra, ...linker.staticFns])
+    const known = new Set(reach.units)
+    const culled = (fn: Function) => known.has(fn) && !live.has(fn)
+    const keep = (fn: Function) => own(fn) && !culled(fn)
+    if (flags.has('dyn-opt')) d.opt = clock.timed('analysis', () => optimizer.createOptimizer(host, roots))
     const fastRoots = new Map<number, Version>()
     for (const symbol of linker.roots.values()) {
         const contract = d.opt && optimizer.enabled(d.opt, 'kinds') ? optimizer.fastContract(d.opt, linker.functions[symbol]) : undefined
@@ -1171,6 +1200,11 @@ export function dynProgram(linker: native.Linker, tracer: native.Tracer, image: 
         statics = native.staticInitializerOf(linker, image, () => true)
         linker.link(statics!)
         schedule()
+    }
+    for (const fn of linker.order) {
+        if (!culled(fn) || !own(fn) || !linker.codeOf(fn)) continue
+        if (flags.has('dyn-report')) console.log(`DYN-CULL ${fn.name || 'anonymous'}`)
+        culledUnit(d, fn)
     }
     const calls: [number, number][] = []
     for (const [cell, fn] of linker.callableCells) {
