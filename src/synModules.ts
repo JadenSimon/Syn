@@ -9,6 +9,7 @@ export interface Reifier {
     __readFile?: (file: string) => string
     __writeFile?: (file: string, text: string) => void
     __readDir?: (dir: string) => string[]
+    __spawnSync?: (command: string, args: string[], env: Record<string, string>) => { status: number | null, signal: string | null, stdout: string, stderr: string }
 }
 
 export type ResolveModule = (from: string, name: string) => [absPath: string, text: string | undefined] | undefined
@@ -32,6 +33,7 @@ function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
         __readFile: reifier.__readFile,
         __writeFile: reifier.__writeFile,
         __readDir: reifier.__readDir,
+        __spawnSync: reifier.__spawnSync,
         console: console,
         performance,
         process,

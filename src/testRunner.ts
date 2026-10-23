@@ -3,7 +3,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import * as os from 'node:os'
 import * as reifiedTypes from './reifiedTypes'
 import { createModuleLoader, runSynScript } from './synModules'
@@ -472,6 +472,10 @@ async function compileEngine() {
         __readFile: (file: string) => fs.readFileSync(file, 'utf8'),
         __writeFile: (file: string, text: string) => fs.writeFileSync(file, text),
         __readDir: (dir: string) => fs.readdirSync(dir),
+        __spawnSync: (command: string, args: string[], env: Record<string, string>) => {
+            const exited = spawnSync(command, args, { env, encoding: 'utf8' })
+            return { status: exited.status, signal: exited.signal, stdout: exited.stdout, stderr: exited.stderr }
+        },
     }
     const loader = createModuleLoader(reifier, (from, name) => {
         let r = path.resolve(path.dirname(from), name)
