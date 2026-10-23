@@ -547,6 +547,7 @@ function resolveProperties(
         putNode(out, id, NodeOp.store, [token, base, { literal: displacement }, stored], word ? Types.vm_value : rawFloat ? Types.f64 : Types.u64)
     }
     const initialized = new Set<Memory>()
+    const pendingInits = new Map<Memory, [holder: Memory, i: number, slot: Handle][]>()
     const initStores: [shape: Handle, path: string, value: number][] = []
     function storeKey(mem: Memory, i: number, token: number, value: Operand, tag: Operand): number {
         const store = newId()
@@ -584,14 +585,28 @@ function resolveProperties(
                 continue
             }
             const slot = slotAt(state, mem.keys[i])
+            const held = homes.get(slot) ?? byHandle.get(slot)
+            if (held && unwritten(held)) {
+                const list = pendingInits.get(held)
+                if (list) list.push([mem, i, slot])
+                else pendingInits.set(held, [[mem, i, slot]])
+                continue
+            }
             const [ref, literal] = operandOf(slot)
             if (holdsAlready(mem, i, ref)) continue
-            token = storeKey(mem, i, token, ref || { literal }, mem.tags[i] ? tagValue(ref, slot ? 1 : 0) : { literal: 1 })
-            if (mem.flags[i]) continue
-            const storedShape = homes.get(slot)?.shape ?? (ref ? memory.get(ref)?.shape : heap.isBoxedF64(slot) ? numberShape : undefined)
-            if (storedShape !== undefined) storeFact(mem.shape, String(mem.offsets[i]), storedShape, ref)
-            else if (ref) initStores.push([mem.shape, String(mem.offsets[i]), ref])
+            token = initSlot(mem, i, token, slot, ref, literal)
         }
+        return token
+    }
+    function unwritten(mem: Memory): boolean {
+        return mem.reduced && !mem.pointer && !mem.address && mem.keys.length === 1 && !slotAt(mem.shape, mem.keys[0])
+    }
+    function initSlot(mem: Memory, i: number, token: number, slot: Handle, ref: number, literal: number): number {
+        token = storeKey(mem, i, token, ref || { literal }, mem.tags[i] ? tagValue(ref, slot ? 1 : 0) : { literal: 1 })
+        if (mem.flags[i]) return token
+        const storedShape = homes.get(slot)?.shape ?? (ref ? memory.get(ref)?.shape : heap.isBoxedF64(slot) ? numberShape : undefined)
+        if (storedShape !== undefined) storeFact(mem.shape, String(mem.offsets[i]), storedShape, ref)
+        else if (ref) initStores.push([mem.shape, String(mem.offsets[i]), ref])
         return token
     }
     function holdsAlready(mem: Memory, i: number, ref: number): boolean {
@@ -907,6 +922,8 @@ function resolveProperties(
         }
         if (mem.members && (keyRef || !agrees(mem, key))) {
             const union = dispatchOf(getRef(n, 1), mem, token)
+            const planned = union ? undefined : opts.answers?.get(getRef(n, 1))
+            if (planned?.shape && !planned.members && memberIndex(mem.members, planned.shape) >= 0) return resolveMemory(id, n, { ...mem, ...pointerMemory(mem.ptr, planned.shape), decoded: mem.decoded, members: undefined })
             if (!union && keyRef) unresolvable(`property-eval: %${id} uses a computed key through a pointer to one of ${mem.members.length} shapes`)
             if (!union) agreeOn(id, mem, key)
             if (n.op === NodeOp.getProp) return resolveUnion(id, n, union!, mem.ptr)
@@ -930,7 +947,10 @@ function resolveProperties(
             const fresh = memory.get(at)
             if (fresh?.reduced && !fresh.pointer && !fresh.address) {
                 fresh.address = value
-                forward.set(id, token)
+                let chained = token
+                for (const [holder, i, slot] of pendingInits.get(fresh) ?? []) chained = initSlot(holder, i, chained, slot, value[0], value[1])
+                pendingInits.delete(fresh)
+                forward.set(id, chained)
                 return
             }
         }
@@ -1267,12 +1287,13 @@ function resolveProperties(
         if (!union.ids && indices.every((index, i) => index === i)) return union.tag
         return tagSelect(union, indices.map(index => addNode(out, NodeOp.literal, [{ literal: index }])))
     }
-    function tagSelect(union: Tag, arms: number[]): number {
+    function tagSelect(union: Tag, arms: number[], guarded = false): number {
         let chosen = arms[arms.length - 1]
         for (let i = arms.length - 2; i >= 0; i--) {
             const test = addNode(out, NodeOp.eq, [union.tag, { literal: union.ids ? union.ids[i] : i }], Types.bool)
             const select = newId()
             putNode(out, select, NodeOp.select, [test, arms[i], chosen])
+            if (guarded) guardedSelects.add(select)
             chosen = select
         }
         return chosen
@@ -1285,6 +1306,7 @@ function resolveProperties(
         for (const memberShape of union.members) {
             const member = pointerMemory(ptr, memberShape)
             const arm = newId()
+            callOrigins.set(arm, callOrigins.get(id) ?? id)
             resolveMemory(arm, n, member)
             arms.push(arm)
             const forwarded = forwardedReads.get(arm)
@@ -1296,7 +1318,7 @@ function resolveProperties(
             else if (memory.has(arm)) targets.push(arm)
             else constants = false
         }
-        const chosen = tagSelect(union, arms)
+        const chosen = tagSelect(union, arms, union.members.some(reducedShape))
         putNode(out, id, NodeOp.after, [getRef(n, 0), chosen])
         const armTags = arms.map(arm => fieldTags.get(arm))
         if (armTags.every(tag => tag !== undefined)) fieldTags.set(id, tagSelect(union, armTags as number[]))
@@ -1307,6 +1329,7 @@ function resolveProperties(
         const arms: number[] = []
         for (const memberShape of union.members) {
             const arm = newId()
+            callOrigins.set(arm, callOrigins.get(id) ?? id)
             resolveMemory(arm, n, pointerMemory(ptr, memberShape))
             arms.push(target(arm))
         }
@@ -1314,7 +1337,7 @@ function resolveProperties(
     }
     function joinArms(id: number, union: Tag, arms: number[], shapes: (Handle | null | undefined)[]): void {
         const results = arms.map(arm => memory.get(arm))
-        if (results.some(m => m?.members) && results.every(m => m && !m.decoded && !m.union)) {
+        if (results.some(m => m?.members) && results.every(m => m && !m.union)) {
             const members: Handle[] = []
             for (const m of results) {
                 for (const s of m!.members ?? [m!.shape]) if (memberIndex(members, s) < 0) members.push(s)
@@ -1541,6 +1564,63 @@ function resolveProperties(
             return
         }
         putNode(out, id, NodeOp.after, [getRef(n, 0), chainSelect(n, chain)])
+    }
+    function membersTypeof(id: number): boolean {
+        const n = getNode(source, id)
+        if (n?.op !== NodeOp.rt || getLiteral(runtime, n, 1) !== RtOp.typeof || !getRef(n, 2)) return false
+        const object = getRef(n, 2)
+        shape(object)
+        const union = unions.get(object)
+        const mem = memory.get(object)
+        const members = union?.members ?? mem?.members
+        if (!members || nullMember(object) !== undefined) return false
+        const names = members.map(member => member === numberShape ? heap.typeNames.number : heap.typeNameOf(member))
+        if (names.every(name => name === names[0])) return false
+        const tag = union ?? dispatchOf(object, mem!, getRef(n, 0))
+        if (!tag) unresolvable(`property-eval: %${id} takes typeof a pointer to one of ${members.length} shapes, which differ on it and carry no tag`)
+        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(tag, names.map(name => addNode(out, NodeOp.heapHandle, [{ literal: name }])))])
+        return true
+    }
+    function presence(id: number, member: Handle, key: Handle): number {
+        if (member === numberShape || member === stringShape) unresolvable(`property-eval: %${id} tests ${heap.describeKey(key)} of a primitive`)
+        if (heap.getOwnProperty(member, key)) unresolvable(`property-eval: %${id} tests own key ${heap.describeKey(key)} of a shape; shapes do not record whether a key is present yet (written after creation, deleted, or joined from an object without it)`)
+        let at = heap.prototypeOf(member)
+        while (at) {
+            if (heap.getOwnProperty(at, key)) return 1
+            if (heap.isProxy(at) && heap.trapsKey(at, key)) unresolvable(`property-eval: %${id} tests ${heap.describeKey(key)}, which an index trap holds`)
+            at = heap.prototypeOf(at)
+        }
+        return 0
+    }
+    function propertyKeyOf(n: GraphNode): Handle | undefined {
+        if (!getRef(n, 3)) return heap.indexKey(getLiteral(runtime, n, 3))
+        let key = getNode(source, getRef(n, 3))
+        while (key?.op === NodeOp.after) key = getNode(source, getRef(key, countIds(key) - 1))
+        if (key?.op !== NodeOp.heapHandle || getRef(key, 0)) return
+        const handle = getLiteral(runtime, key, 0) as Handle
+        if (heap.isBoxedF64(handle)) return heap.indexKey(heap.unboxF64(handle))
+        return heap.isString(handle) || heap.describeKey(handle) !== undefined ? handle : undefined
+    }
+    function propertyTest(id: number): boolean {
+        const n = getNode(source, id)
+        if (n?.op !== NodeOp.rt || getLiteral(runtime, n, 1) !== RtOp.hasProperty || !getRef(n, 2)) return false
+        const key = propertyKeyOf(n)
+        if (key === undefined) unresolvable(`property-eval: %${id} tests a computed key`)
+        const object = getRef(n, 2)
+        const known = shape(object)
+        const union = unions.get(object)
+        const mem = memory.get(object)
+        const members = mem?.members ?? (union ? union.members : known ? [known] : undefined)
+        if (!members) return false
+        const answers = members.map(member => presence(id, member, key))
+        if (answers.every(answer => answer === answers[0])) {
+            putNode(out, id, NodeOp.after, [getRef(n, 0), addNode(out, NodeOp.literal, [{ literal: answers[0] }])])
+            return true
+        }
+        const tag = union ?? dispatchOf(object, mem!, getRef(n, 0))
+        if (!tag) unresolvable(`property-eval: %${id} tests ${heap.describeKey(key)} of a pointer to one of ${members.length} shapes, which differ on it and carry no tag`)
+        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(tag, answers.map(answer => addNode(out, NodeOp.literal, [{ literal: answer }])))])
+        return true
     }
     function decided(id: number): boolean | undefined {
         const n = getNode(source, id)
@@ -2299,7 +2379,7 @@ function resolveProperties(
         if (n.op === NodeOp.getProp) {
             const known = shape(object)
             const objectShape = known === numberShape || stringObject ? null : known
-            const reads = cells.has(object) || snapshotNode(object) ? [] : objectShape ? readsState(n, objectShape) ? [objectShape] : [] : unions.get(object)?.members ?? []
+            const reads = cells.has(object) || snapshotNode(object) ? [] : objectShape ? readsState(n, objectShape) ? [objectShape] : [] : (unions.get(object)?.members ?? []).filter(member => readsState(n, member))
             const field = fieldRead(id)
             if (field) content(field)
             if (!field && !embeddedRead(id)) for (const read of reads) demandPreceding(read, id)
@@ -2372,6 +2452,7 @@ function resolveProperties(
         if (stored !== undefined) storeFact(shape, path, stored, value)
     }
     for (const id of source.nodes.keys()) {
+        if (membersTypeof(id)) continue
         const name = typeofName(id)
         const operand = name !== undefined ? getRef(getNode(source, id)!, 2) : 0
         const absentName = name !== undefined ? nullMember(operand) : undefined
@@ -2381,6 +2462,7 @@ function resolveProperties(
             const present = addNode(out, NodeOp.heapHandle, [{ literal: name }])
             putNode(out, id, NodeOp.select, [missing, absent, present])
         } else if (name !== undefined) putNode(out, id, NodeOp.heapHandle, [{ literal: name }])
+        if (propertyTest(id)) continue
         if (linkedPrototypeTest(id)) continue
         if (unionPrototypeTest(id)) continue
         const chain = prototypeChain(id)
@@ -2392,9 +2474,11 @@ function resolveProperties(
         const union = mem ? undefined : unions.get(getRef(n, 1))
         if (!mem && !union) continue
         const current = getNode(out, id)!
+        if (current.op !== NodeOp.call) continue
         if (mem?.members) agreeOn(id, mem, heap.closureCallKey)
         const codes = (mem ? [mem.shape] : union!.members).map(shape => {
             const addr = heap.getPropertyDescriptor(shape, heap.closureCallKey)
+            if (!addr && union) return addNode(out, NodeOp.unreachable, []) // XXX
             if (!addr) throw `property-eval: %${id} calls an object without a call slot`
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as Handle
             if (mem && (heap.isBoxedF64(slot) || mem.members)) {

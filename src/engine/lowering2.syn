@@ -1322,7 +1322,7 @@ function deduplicate(g: Graph, roots: number[], mergeable: (n: GraphNode) => boo
             changed = true
             return argIds[1]
         }
-        const merge = mergeable(n)
+        const merge = !allocates(g, n) && mergeable(n)
         const key = merge ? nodeKey(g, n, argIds) : ''
         let rep = merge ? representatives.get(key) : undefined
         if (rep === undefined) {
@@ -1817,7 +1817,7 @@ function tailEffects(g: Graph, b: GraphBlock, guarded?: Set<number>): TailEffect
     const effectful = new Set<number>()
     for (const id of order) {
         const n = getNode(g, id)
-        if (!n || !(guarded ? guarded.has(id) : Unspeculatable.has(n.op))) continue
+        if (!n || n.op === NodeOp.param || !(guarded ? guarded.has(id) : Unspeculatable.has(n.op))) continue
         if (guarded) effectful.add(id)
         let c = regions.of.get(id)!
         while (c > 0 && !marked[c]) {
@@ -1855,7 +1855,7 @@ function branchingSelects(g: Graph, b: GraphBlock, guarded?: Set<number>): Branc
             if (found) found.users.push([id, i])
         }
     }
-    return [...chosen.values()]
+    return [...chosen].sort((x, y) => effects.regions.depth[x[0]] - effects.regions.depth[y[0]]).map(([, found]) => found)
 }
 
 function effectfulSelects(g: Graph): [effectful: Set<number>, offTail: number[]] {
@@ -1955,7 +1955,9 @@ function splitSelects(g: Graph, guarded?: Set<number>): boolean {
         const b = work.pop()!
         const found = branchingSelects(g, b, guarded)
         if (!found.length) continue
-        for (const c of found) work.push(splitAtSelect(g, b, c))
+        const made: GraphBlock[] = []
+        for (const c of found) made.push(splitAtSelect(g, b, c))
+        for (let i = made.length - 1; i >= 0; i--) work.push(made[i])
         work.push(b)
         changed = true
     }
@@ -7370,7 +7372,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return inside
         }
         function rewrite(id: number, known: Known): number {
-            if (!known.keys.size) return id
+            if (!id || !known.keys.size) return id
             const r = new Map<number, number>()
             const walked = new Set<number>()
             const rebuilt = new Map<number, number>()
@@ -8404,7 +8406,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         function translate(id: number, env: Env, memo: Map<number, number>): Operand {
             const n = getNode(g, id)!
-            if (n.op === NodeOp.param) return getOperand(g, ...env(id)!)
+            if (n.op === NodeOp.param) {
+                const [app, at] = env(id)!
+                return getOperand(g, app, at)
+            }
             if (n.op === NodeOp.literal) return id
             const known = memo.get(id)
             if (known !== undefined) return known
@@ -11065,7 +11070,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const args = getArgIds(n)
             for (let i = 0; i < args.length; i++) args[i] = number(args[i], b)
             const key = nodeKey(g, n, args)
-            const rep = intern(n.op === NodeOp.alloca ? `alloca:${id}` : isUnordered(id) ? key : `${b.id}|${key}`, id)
+            const rep = intern(allocates(g, n) ? `allocation:${id}` : isUnordered(id) ? key : `${b.id}|${key}`, id)
             classes.set(id, rep)
             return rep
         }
@@ -11957,6 +11962,10 @@ export function pstackRebases(g: NodeSpace, n: GraphNode): boolean {
 
 export function pstackAllocates(g: NodeSpace, n: GraphNode | undefined): boolean {
     return n?.op === NodeOp.pstack && !pstackRebases(g, n) && (!!getRef(n, 3) || getLiteral(g, n, 3) > 0)
+}
+
+function allocates(g: NodeSpace, n: GraphNode): boolean {
+    return n.op === NodeOp.alloca || pstackAllocates(g, n)
 }
 
 function pstackFixedSize(g: Graph, n: GraphNode): number {
@@ -14561,8 +14570,13 @@ export function resolveNumberTypes(g: Graph) {
             consume(id, n, params.flatMap((p, i) => floats.has(p) ? [i + 1] : []), asFloat)
         } else if (n.op === NodeOp.select && floats.has(id)) {
             consume(id, n, Array.from({ length: countIds(n) - 1 }, (_, i) => i + 1), asFloat)
-        } else if (n.op === NodeOp.store && typeOf(n) === Types.f64) {
-            consume(id, n, [3], asFloat)
+        } else if (n.op === NodeOp.store) {
+            consume(id, n, [2], asInteger)
+            if (typeOf(n) === Types.f64) consume(id, getNode(g, id)!, [3], asFloat)
+        } else if (n.op === NodeOp.load) {
+            consume(id, n, [2], asInteger)
+        } else if (n.op === NodeOp.pstack) {
+            consume(id, n, [3], asInteger)
         } else if (n.op === NodeOp.ret && returnsFloat) {
             consume(id, n, [0], asFloat)
         } else if (BitwiseOps.has(n.op)) {
@@ -14571,6 +14585,8 @@ export function resolveNumberTypes(g: Graph) {
             consume(id, n, [0, 1], asInteger)
         } else if (n.op === NodeOp.clz) {
             consume(id, n, [0], asInteger)
+        } else if (n.op === NodeOp.rt && rt.wordOps.has(getLiteral(g, n, 1))) {
+            consume(id, n, [2], asInteger)
         }
     }
     for (const [id, n] of g.nodes) {
@@ -15049,15 +15065,25 @@ function batchLoopGroup(g: Graph, loop: BatchLoop, loops: GraphLoops, ids: [id: 
     const tail = tailOf(g, header.bodyId)
     const staying = demandUntil(g, getRef(getNode(g, tail)!, loop.stay), tail, 0)
     const visiting = demandUntil(g, header.bodyId, tail, 3 - loop.stay)
-    const cells = new Map<number, [id: number, owner: number, counter: number][]>()
+    const cells = new Map<number, [id: number, owner: number, counter: number, stepped: boolean][]>()
     const exiting = new Set<number>()
     for (const [id, owner] of ids.sort((a, b) => a[0] - b[0])) {
         const cell = getLiteral(g, getNode(g, id)!, 1)
-        const counter = owner === header.id ? loop.counter : getBlock(g, owner)!.params.find(p => loop.origin(p) === loop.counter || loop.steps.has(loop.origin(p)))
+        let counter = owner === header.id ? loop.counter : 0
+        let stepped = false
+        if (owner !== header.id) {
+            for (const p of getBlock(g, owner)!.params) {
+                const from = loop.origin(p)
+                if (from !== loop.counter && !loop.steps.has(from)) continue
+                counter = p
+                stepped = from !== loop.counter
+                break
+            }
+        }
         if ((owner === header.id && !staying.has(id)) || !counter) continue
         let list = cells.get(cell)
         if (!list) cells.set(cell, list = [])
-        list.push([id, owner, counter])
+        list.push([id, owner, counter, stepped])
         if (owner === header.id && visiting.has(id)) exiting.add(cell)
     }
     let done = false
@@ -15111,9 +15137,9 @@ function batchLoopGroup(g: Graph, loop: BatchLoop, loops: GraphLoops, ids: [id: 
                 return addCopy(g, n, [...getOperands(g, n), start ? addNode(g, NodeOp.sub, [batch, { literal: start }]) : batch])
             })
         })
-        list.forEach(([id, owner, counter], i) => {
+        list.forEach(([id, owner, counter, stepped], i) => {
             const n = getNode(g, id)!
-            const index = loop.steps.has(loop.origin(counter)) ? addNode(g, NodeOp.sub, [counter, { literal: 1 }]) : counter
+            const index = stepped ? addNode(g, NodeOp.sub, [counter, { literal: 1 }]) : counter
             const slot = addNode(g, NodeOp.add, [carried.get(owner)!, scaled(index)])
             const address = offsets[i] ? addNode(g, NodeOp.add, [slot, { literal: offsets[i] }]) : slot
             putNode(g, id, NodeOp.after, [getOperand(g, n, 0), addNode(g, NodeOp.mem, [address, getOperand(g, n, 3)], Types.u64)])
