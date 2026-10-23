@@ -14777,7 +14777,6 @@ function demotePstacks(g: Graph): boolean {
                         for (const l of loadsFrom.get(into) ?? []) follow(l)
                     } else if (n.op === NodeOp.call) {
                         if (i < 3 || hasArg((callSummary(g, n) ?? unknownCall).captures, i - 3)) escaped = true
-                        else follow(u)
                     } else if (n.op === NodeOp.apply) {
                         const param = getBlock(g, getRef(n, 0))?.params[i - 1]
                         if (param === undefined || headers?.has(getRef(n, 0))) escaped = true
@@ -14847,9 +14846,351 @@ function demotePstacks(g: Graph): boolean {
     return true
 }
 
+type Linear = [param: number, offset: number]
+
+interface BatchLoop {
+    header: GraphBlock
+    members: Set<number>
+    stay: number
+    counter: number
+    stride: number
+    relation: NodeOp
+    bound: [ref: number, literal: number]
+    unsigned: boolean
+    linear: (ref: number, literal: number) => Linear | undefined | null
+}
+
+const BatchInertRoots = new Set<NodeOp>([NodeOp.nilEffect, NodeOp.void, NodeOp.param, NodeOp.literal, NodeOp.block])
+
+function batchable(g: Graph, n: GraphNode): boolean {
+    return n.op === NodeOp.pstack && !getRef(n, 1) && !getRef(n, 2) && !getLiteral(g, n, 2) && !getRef(n, 3) && getLiteral(g, n, 3) > 0
+}
+
+function doomedTail(g: Graph, id: number): boolean {
+    const op = getNode(g, id)!.op
+    return op === NodeOp.panic || op === NodeOp.unreachable || op === NodeOp.trap
+}
+
+function batchLoop(g: Graph, loops: GraphLoops, headerId: number): BatchLoop | undefined {
+    const header = getBlock(g, headerId)!
+    const members = loops.loopMembers.get(headerId)!
+    for (const m of members) {
+        if (m === headerId) continue
+        for (const p of loops.preds.get(m)!) {
+            if (members.has(p)) continue
+            return
+        }
+    }
+    const inside = (id: number) => {
+        const n = getNode(g, id)!
+        return n.op === NodeOp.apply && members.has(getRef(n, 0))
+    }
+    const arrivals = new Map<number, Set<number>>()
+    for (const m of members) {
+        for (const p of tailPositions(g, getBlock(g, m)!.bodyId)) {
+            if (!inside(p.at)) {
+                if (m === headerId || doomedTail(g, p.at)) continue
+                return
+            }
+            const into = getRef(getNode(g, p.at)!, 0)
+            let set = arrivals.get(into)
+            if (!set) arrivals.set(into, set = new Set())
+            set.add(p.at)
+        }
+    }
+    const tail = getNode(g, tailOf(g, header.bodyId))
+    if (tail?.op !== NodeOp.select || countIds(tail) !== 3) return
+    let stay = 0
+    for (let arm = 1; arm <= 2; arm++) {
+        const positions = tailPositions(g, getRef(tail, arm))
+        const staying = positions.filter(p => inside(p.at)).length
+        if (!staying) continue
+        if (stay || staying + positions.filter(p => doomedTail(g, p.at)).length !== positions.length) return
+        stay = arm
+    }
+    if (!stay) return
+    const cond = getNode(g, getRef(tail, 0))
+    if (!cond || !CompareOps.has(cond.op) || comparesFloats(g, cond)) return
+    const params = new Set(header.params)
+    const owners = new Map<number, GraphBlock>()
+    for (const m of members) for (const p of getBlock(g, m)!.params) owners.set(p, getBlock(g, m)!)
+    const known = new Map<number, Linear | undefined>()
+    const open = new Set<number>()
+    const hits: number[] = []
+    let budget = 64 + 32 * members.size
+    function linear(ref: number, literal: number): Linear | undefined | null {
+        if (!ref) return Number.isSafeInteger(literal) ? [0, literal] : undefined
+        if (known.has(ref)) return known.get(ref)
+        if (--budget < 0) return
+        const n = getNode(g, ref)
+        if (!n) return
+        if (n.op === NodeOp.after) return linear(getRef(n, countIds(n) - 1), getLiteral(g, n, countIds(n) - 1))
+        if (n.op === NodeOp.literal) return linear(0, getLiteral(g, n, 0))
+        if ((n.op === NodeOp.add || n.op === NodeOp.sub) && countIds(n) === 2) {
+            const a = linear(getRef(n, 0), getLiteral(g, n, 0))
+            const b = linear(getRef(n, 1), getLiteral(g, n, 1))
+            if (!a || !b || (a[0] && b[0]) || (n.op === NodeOp.sub && b[0])) return
+            const offset = n.op === NodeOp.add ? a[1] + b[1] : a[1] - b[1]
+            return Number.isSafeInteger(offset) ? [a[0] || b[0], offset] : undefined
+        }
+        if (n.op !== NodeOp.param) return
+        if (params.has(ref)) return [ref, 0]
+        const owner = owners.get(ref)
+        if (!owner) return
+        if (open.has(ref)) {
+            hits.push(ref)
+            return null
+        }
+        open.add(ref)
+        const mark = hits.length
+        const at = owner.params.indexOf(ref) + 1
+        let value: Linear | undefined | null = null
+        for (const app of arrivals.get(owner.id) ?? []) {
+            const a = getNode(g, app)!
+            const arg = linear(getRef(a, at), getLiteral(g, a, at))
+            if (arg === null) continue
+            if (!arg || (value && (value[0] !== arg[0] || value[1] !== arg[1]))) {
+                value = undefined
+                break
+            }
+            value = arg
+        }
+        open.delete(ref)
+        const foreign = hits.slice(mark).filter(h => h !== ref)
+        hits.length = mark
+        hits.push(...foreign)
+        if (value === undefined || !foreign.length) known.set(ref, value ?? undefined)
+        return value
+    }
+    const backs = [...arrivals.get(headerId) ?? []]
+    for (let at = 0; at < 2; at++) {
+        const counter = getRef(cond, at)
+        if (!params.has(counter)) continue
+        const bound: [number, number] = [getRef(cond, at ^ 1), getLiteral(g, cond, at ^ 1)]
+        if (bound[0] && !params.has(bound[0])) continue
+        const k = header.params.indexOf(counter) + 1
+        const b = bound[0] ? header.params.indexOf(bound[0]) + 1 : 0
+        let stride: number | undefined
+        let steps = true
+        for (const app of backs) {
+            const n = getNode(g, app)!
+            const next = linear(getRef(n, k), getLiteral(g, n, k))
+            if (!next || next[0] !== counter || next[1] <= 0 || (stride !== undefined && stride !== next[1])) steps = false
+            else stride = next[1]
+            const limit = b ? linear(getRef(n, b), getLiteral(g, n, b)) : undefined
+            if (b && (!limit || limit[0] !== bound[0] || limit[1] !== 0)) steps = false
+            if (!steps) break
+        }
+        if (!steps || stride === undefined) continue
+        let relation = stay === 1 ? cond.op : InverseCompare.get(cond.op)!
+        if (at === 1) relation = SwappedCmp[relation]
+        if (relation !== NodeOp.lt && relation !== NodeOp.le && relation !== NodeOp.ne) return
+        const unsigned = !lowering.isSignedType(operandType(g, cond, 0)) && !lowering.isSignedType(operandType(g, cond, 1))
+        return { header, members, stay, counter, stride, relation, bound, unsigned, linear }
+    }
+}
+
+function batchLoopPstacks(g: Graph): boolean {
+    let any = false
+    for (const n of g.nodes.values()) {
+        if (!batchable(g, n)) continue
+        any = true
+        break
+    }
+    if (!any) return false
+    const loops = graphLoops(g)
+    if (!loops.loopMembers.size) return false
+    const owners = new Map<number, number[]>()
+    const releases = new Map<number, Set<number>>()
+    for (const b of g.blocks) {
+        const seen = new Set<number>()
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const n = getNode(g, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+            if (batchable(g, n)) {
+                const list = owners.get(id)
+                if (list) list.push(b.id)
+                else owners.set(id, [b.id])
+            } else if (n.op === NodeOp.pstack && (getRef(n, 2) || getLiteral(g, n, 2))) {
+                let cells = releases.get(b.id)
+                if (!cells) releases.set(b.id, cells = new Set())
+                cells.add(getLiteral(g, n, 1))
+            }
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    const byHeader = new Map<number, [id: number, block: number][]>()
+    for (const [id, blocks] of owners) {
+        const nest = blocks.length === 1 ? loops.loopsOf.get(blocks[0])! : []
+        if (!nest.length) continue
+        const header = nest[nest.length - 1]
+        const list = byHeader.get(header)
+        if (list) list.push([id, blocks[0]])
+        else byHeader.set(header, [[id, blocks[0]]])
+    }
+    let changed = false
+    for (const [headerId, ids] of byHeader) {
+        const loop = batchLoop(g, loops, headerId)
+        if (loop && batchLoopGroup(g, loop, loops, ids, releases)) changed = true
+    }
+    return changed
+}
+
+function batchTrip(g: Graph, loop: BatchLoop, app: GraphNode, start: number): Operand | undefined {
+    const k = loop.header.params.indexOf(loop.counter) + 1
+    if (getRef(app, k) || getLiteral(g, app, k) !== start) return
+    const shift = Math.log2(loop.stride)
+    if (!Number.isInteger(shift)) return
+    const b = loop.bound[0] ? loop.header.params.indexOf(loop.bound[0]) + 1 : 0
+    const bound: [number, number] = b ? [getRef(app, b), getLiteral(g, app, b)] : [0, loop.bound[1]]
+    if (!bound[0]) {
+        const span = bound[1] - start
+        if (!Number.isSafeInteger(span)) return
+        if (loop.relation === NodeOp.ne) return span >= 0 && span % loop.stride === 0 ? { literal: span / loop.stride } : undefined
+        if (loop.relation === NodeOp.le) return { literal: span < 0 ? 0 : Math.floor(span / loop.stride) + 1 }
+        return { literal: span <= 0 ? 0 : Math.ceil(span / loop.stride) }
+    }
+    if (start !== 0 || loop.relation === NodeOp.le || shift) return
+    if (loop.unsigned) return bound[0]
+    if (loop.relation !== NodeOp.lt) return
+    return addNode(g, NodeOp.select, [addNode(g, NodeOp.gt, [bound[0], { literal: 0 }], Types.bool), bound[0], { literal: 0 }])
+}
+
+function batchLoopGroup(g: Graph, loop: BatchLoop, loops: GraphLoops, ids: [id: number, block: number][], releases: Map<number, Set<number>>): boolean {
+    const header = loop.header
+    const tail = tailOf(g, header.bodyId)
+    const before = demandUntil(g, header.bodyId, tail)
+    const staying = demandUntil(g, getRef(getNode(g, tail)!, loop.stay), tail)
+    const leaving = demandUntil(g, getRef(getNode(g, tail)!, 3 - loop.stay), tail)
+    const entriesOf = () => {
+        const entries: [block: GraphBlock, app: number][] = []
+        for (const p of loops.preds.get(header.id)!) {
+            if (loop.members.has(p)) continue
+            const from = getBlock(g, p)!
+            for (const t of tailPositions(g, from.bodyId)) {
+                const n = getNode(g, t.at)!
+                if (n.op === NodeOp.apply && getRef(n, 0) === header.id) entries.push([from, t.at])
+            }
+        }
+        return entries
+    }
+    const entries = entriesOf()
+    if (!entries.length) return false
+    const k = header.params.indexOf(loop.counter) + 1
+    const first = getNode(g, entries[0][1])!
+    const start = getLiteral(g, first, k)
+    if (getRef(first, k) || !Number.isSafeInteger(start)) return false
+    const cells = new Map<number, [id: number, owner: GraphBlock, counter: number, offset: number][]>()
+    const exiting = new Set<number>()
+    for (const [id, blockId] of ids.sort((a, b) => a[0] - b[0])) {
+        const n = getNode(g, id)!
+        const cell = getLiteral(g, n, 1)
+        const owner = getBlock(g, blockId)!
+        if (owner === header && !before.has(id) && !staying.has(id)) continue
+        let counter = owner === header ? loop.counter : 0
+        let offset = 0
+        for (const q of owner === header ? [] : owner.params) {
+            const v = loop.linear(q, 0)
+            if (!v || v[0] !== loop.counter) continue
+            counter = q
+            offset = v[1]
+            break
+        }
+        if (!counter) continue
+        let released = false
+        for (const m of loop.members) if (releases.get(m)?.has(cell)) released = true
+        if (released) continue
+        let list = cells.get(cell)
+        if (!list) cells.set(cell, list = [])
+        list.push([id, owner, counter, offset])
+        if (owner === header && (before.has(id) || leaving.has(id))) exiting.add(cell)
+    }
+    let done = false
+    for (const [cell, list] of cells) {
+        const entries = entriesOf()
+        const trips: Operand[] = []
+        for (const [, app] of entries) {
+            const trip = batchTrip(g, loop, getNode(g, app)!, start)
+            if (trip === undefined) break
+            if (!exiting.has(cell)) trips.push(trip)
+            else trips.push(typeof trip === 'number' ? addNode(g, NodeOp.add, [trip, { literal: 1 }]) : { literal: trip.literal + 1 })
+        }
+        if (trips.length !== entries.length) continue
+        let width = 0
+        const offsets: number[] = []
+        for (const [id] of list) {
+            offsets.push(width)
+            width += getLiteral(g, getNode(g, id)!, 3)
+        }
+        const scale = Math.log2(width)
+        const scaled = (x: Operand) => Number.isInteger(scale) ? addNode(g, NodeOp.shl, [x, { literal: scale }]) : addNode(g, NodeOp.mul, [x, { literal: width }])
+        const T = typeOf(getNode(g, list[0][0])!)
+        const carried = new Map<number, number>()
+        for (const m of loop.members) {
+            const p = addNode(g, NodeOp.param, [], T)
+            getBlock(g, m)!.params.push(p)
+            carried.set(m, p)
+        }
+        for (const m of loop.members) {
+            const b = getBlock(g, m)!
+            b.bodyId = mapTailPositions(g, b.bodyId, p => {
+                const n = getNode(g, p.at)!
+                if (n.op !== NodeOp.apply || !loop.members.has(getRef(n, 0))) return p.at
+                return addCopy(g, n, [...getOperands(g, n), carried.get(m)!])
+            })
+        }
+        entries.forEach(([from, app], i) => {
+            from.bodyId = mapTailPositions(g, from.bodyId, p => {
+                if (p.at !== app) return p.at
+                const n = getNode(g, p.at)!
+                const roots = tailRoots(g, p).filter(r => r && r !== header.id && !BatchInertRoots.has(getNode(g, r)!.op))
+                const token = roots.length ? addNode(g, NodeOp.after, roots) : addNode(g, NodeOp.nilEffect, [])
+                const trip = trips[i]
+                const bytes: Operand = typeof trip === 'number' ? scaled(trip) : { literal: trip.literal * width }
+                const batch = addNode(g, NodeOp.pstack, [token, { literal: cell }, { literal: 0 }, bytes], T)
+                return addCopy(g, n, [...getOperands(g, n), batch])
+            })
+        })
+        list.forEach(([id, owner, counter, offset], i) => {
+            const n = getNode(g, id)!
+            let index: Operand = counter
+            if (offset + start) index = addNode(g, NodeOp.sub, [index, { literal: offset + start }])
+            if (loop.stride > 1) index = addNode(g, NodeOp.ushr, [index, { literal: Math.log2(loop.stride) }])
+            let address = addNode(g, NodeOp.add, [carried.get(owner.id)!, scaled(index)])
+            if (offsets[i]) address = addNode(g, NodeOp.add, [address, { literal: offsets[i] }])
+            const fresh = addNode(g, NodeOp.mem, [address, getOperand(g, n, 3)], Types.u64)
+            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), fresh])
+            done = true
+        })
+    }
+    return done
+}
+
+function demandUntil(g: Graph, root: number, tail: number): Set<number> {
+    const seen = new Set<number>()
+    const stack = [root]
+    while (stack.length) {
+        const id = stack.pop()!
+        if (!id || seen.has(id)) continue
+        seen.add(id)
+        const n = getNode(g, id)
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        if (id === tail) {
+            stack.push(getRef(n, 0))
+            continue
+        }
+        for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+    }
+    return seen
+}
+
 export function expandValueGraph(g: Graph, target: lowering.Target): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
-    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, expandCodecs, expandPstacks])
+    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, expandCodecs, expandPstacks])
     g = expanded.graph
     if (expanded.changed || g.form === 'packaged') g = optimizePackaged(g, target)
     return g
