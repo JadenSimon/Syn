@@ -15,7 +15,7 @@ import {
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
     printOptimizeStats, pstackAllocates, pstackRebases, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, CapturesAll, argBit, hasArg, maskArgs,
     graphLoops, joinEffects, OrderedValues, firstNonOrderingSlot, stronglyConnected, importFact, mapTailPositions, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
-    isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps,
+    isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes,
 } from './lowering2'
 import {
     addGraphBlock, cloneRefs, copyNode, countIds, countLiterals, createGraph, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -27,7 +27,7 @@ import {
     opName,
     getNode, setNode, hasNode, deleteNode, localSymbol,
     putNode, addNode, putCopy, addCopy,
-    withOperand, retypeNode, isNullishValue, nodeUsers,
+    withOperand, retypeNode, isNullishValue, nodeUsers, recordTypeAt,
     type NodeSpace,
 } from './graph-node'
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
@@ -2752,11 +2752,13 @@ function callLocations(graph: Graph, call: number): number[] | undefined {
     return locations
 }
 
-function setCallLocations(graph: Graph, call: number, locations: number[], returnLocation?: number): void {
+function setCallLocations(graph: Graph, call: number, locations: number[], returnLocation?: number, returns?: TypeOperand): void {
     const target = getRef(getNode(graph, call)!, 1)
     const n = getNode(graph, target)!
     const signature = getNode(graph, typeRefOf(n))
-    const fnType = insertNode(graph, createFnType(graph, signature?.op === NodeOp.fnType ? fnReturn(signature) : typeOf(n), locations, returnLocation ?? (signature?.op === NodeOp.fnType ? fnReturnLocation(signature) : -1)))
+    const retLocation = returnLocation ?? (signature?.op === NodeOp.fnType ? fnReturnLocation(signature) : -1)
+    const retType = returns ?? (signature?.op === NodeOp.fnType ? fnReturn(signature) : typeOf(n))
+    const fnType = insertNode(graph, createFnType(graph, retType, locations, retLocation))
     retypeNode(graph, target, { ref: fnType })
 }
 
@@ -3930,9 +3932,7 @@ export interface RecordReturn {
 }
 
 function layoutRecordType(g: Graph, layout: Map<string, [number, intrinsics.Types]>): number {
-    // XXX: need to add handling floats to returning records
-    const type = insertNode(g, createRecordType(g, [...layout.values()].map(([key, T]) => ({ key, type: T === Types.f64 ? Types.u64 : T }))))
-    return type
+    return insertNode(g, createRecordType(g, [...layout.values()].map(([key, T]) => ({ key, type: T }))))
 }
 function retypeRecord(g: Graph, param: number, type: number): void {
     retypeNode(g, param, { ref: type })
@@ -4000,9 +4000,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
                 for (const [path, [key, T]] of layout) {
                     const [offset, at] = path.split('.').map(Number)
                     const base = at === undefined ? root : innerOf(offset)
-                    const loaded = addNode(g, NodeOp.load, [token, base, { literal: at ?? offset }], T)
-                    const value = T === Types.f64 ? addNode(g, NodeOp.bitconvert, [loaded], Types.u64) : loaded
-                    fields.push({ literal: key }, value)
+                    fields.push({ literal: key }, addNode(g, NodeOp.load, [token, base, { literal: at ?? offset }], T))
                 }
                 operands[slot] = addNode(g, NodeOp.record, fields)
             }
@@ -4017,6 +4015,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
         const callerType = layoutRecordType(cg, layout)
         for (const id of f.source.keys()) {
             const n = getNode(cg, id)!
+            if (n.op === NodeOp.call) setCallLocations(cg, id, callLocations(cg, id) ?? [], undefined, { ref: callerType })
             if (n.op === NodeOp.param) retypeRecord(cg, id, callerType)
             if (n.op !== NodeOp.decode) continue
             for (const [u, slot] of index.users.get(id) ?? []) {
@@ -4029,9 +4028,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
             const n = getNode(cg, load)!
             const [key, T] = layout.get(path)!
             let value = addNode(cg, NodeOp.get, [bases.get(load)!, { literal: key }])
-            if (T === Types.f64) {
-                value = addNode(cg, NodeOp.bitconvert, [value], Types.f64)
-            } else if (intrinsics.intrinsicBitWidth(T) < 64) {
+            if (intrinsics.intrinsicBitWidth(T) < 64) {
                 const converted = addNode(cg, NodeOp.convert, [value], T)
                 value = converted
             }
@@ -4251,7 +4248,6 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
             else callersOf.set(callee, [symbol])
         }
     }
-    const floats = new Set([Types.f16, Types.f32, Types.f64, Types.unknown_number])
     const plans: RecordReturn[] = []
     for (const symbol of live) {
         const callers = callersOf.get(symbol)
@@ -4332,8 +4328,7 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         for (const offsets of groups.values()) if (overlaps(offsets)) conflict = 'overlap'
         const order = (path: string) => path.split('.').map(Number)
         const fields = [...read].sort((a, b) => order(a)[0] - order(b)[0] || (order(a)[1] ?? -1) - (order(b)[1] ?? -1))
-        if (!fields.length || fields.length > program.target.retRegs.length) conflict = `fields=${fields.length}`
-        if (fields.some(o => types.get(o) !== Types.f64 && floats.has(types.get(o)!))) conflict = 'float-field'
+        if (!fields.length || !returnRegisters(program.target, fields.map(o => types.get(o)!))) conflict = `fields=${fields.length}`
         if (conflict) {
             if (debug) console.log(`RECORD-RETURN ${name} blocked ${conflict}`)
             continue
@@ -4545,12 +4540,13 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const sites = programCallSites(program)
     const free = new Set(freeCallees(program, sites))
     const returnLocations = assignRegisterClasses(program, sites, free)
+    const returnRecords = returnedRecords(program, sites)
     const symbols = [...program.units.keys()]
     const callees = programCallees(program)
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
     const prepared = new Map<number, PreparedUnit>()
-    for (const symbol of symbols) prepared.set(symbol, clock.timed('lower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol)), program.units.get(symbol)!.name))
+    for (const symbol of symbols) prepared.set(symbol, clock.timed('lower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol)), program.units.get(symbol)!.name))
     const endless = new Set(symbols.filter(symbol => ![...prepared.get(symbol)!.prepared.g.nodes.values()].some(n => n.op === NodeOp.ret)))
     const continuations = new Set(symbols.filter(symbol => endless.has(symbol) && free.has(symbol) && sites.get(symbol)?.length === 1))
     nonvolatileArgs(program, prepared, continuations)
@@ -4597,9 +4593,10 @@ interface PreparedUnit {
     prepared: PreparedLowering
     returnsFloat: boolean
     returnLocation?: number
+    returnRecord?: intrinsics.Types[]
 }
 
-function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, returnLocation?: number): PreparedUnit {
+function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, returnLocation?: number, returnRecord?: intrinsics.Types[]): PreparedUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
@@ -4618,13 +4615,13 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     const float = returnsFloat(graph)
     const prepared = prepareLowering(graph, { debug, target: program.target, poolSlot: value => image.constantSlot(value), poolValue: slot => image.knownValue(slot), floatSlot: value => image.floatSlot(value), staticData })
     if (flags.has('dump-lowerable')) console.log(`--- lowerable ${name} ---\n${dumpGraph(prepared.g)}`)
-    return { name, debug, prepared, returnsFloat: float, returnLocation }
+    return { name, debug, prepared, returnsFloat: float, returnLocation, returnRecord }
 }
 
 function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, clobbersOf: (symbol: number) => Set<number> | undefined, continues?: (symbol: number) => boolean, endless?: (symbol: number) => boolean): NativeUnit {
     const image = program.image
     const { name, debug, prepared } = unit
-    const code = lowerPrepared(prepared, { debug, target: program.target, returnLocation: unit.returnLocation, clobbersOf, continues, endless, nameOf: callee => program.units.get(callee)?.name })
+    const code = lowerPrepared(prepared, { debug, target: program.target, returnLocation: unit.returnLocation, returnRecord: unit.returnRecord, clobbersOf, continues, endless, nameOf: callee => program.units.get(callee)?.name })
     if (debug || flags.has('listings')) {
         console.log(`--- ${name} listing ---\n`, code.listing)
         if (code.island?.length) console.log(`--- ${name} island ---\n` + code.island.map((slot, i) => `  ${i}: pool[${slot}] ${image.labels.get(slot) ?? ''} = 0x${BigInt.asUintN(64, BigInt(image.values[slot])).toString(16)}`).join('\n'))
@@ -4652,6 +4649,22 @@ function assignRegisterClasses(program: ProgramGraph, sites: Map<number, [caller
         for (const [caller, call] of sites.get(symbol) ?? []) setCallLocations(program.units.get(caller)!, call, locations, returnLocation)
     }
     return returns
+}
+
+function returnedRecords(program: ProgramGraph, sites: Map<number, [caller: number, call: number][]>): Map<number, intrinsics.Types[]> {
+    const records = new Map<number, intrinsics.Types[]>()
+    for (const [symbol, calls] of sites) {
+        for (const [caller, call] of calls) {
+            const graph = program.units.get(caller)!
+            const record = recordTypeAt(graph, call)
+            if (!record) continue
+            const types = recordTypes(graph, record)
+            const known = records.get(symbol)
+            intrinsics.assert(!known || known.join() === types.join(), `native: call sites of ${program.units.get(symbol)!.name} disagree on the returned record`)
+            records.set(symbol, types)
+        }
+    }
+    return records
 }
 
 function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>): void {
