@@ -1125,7 +1125,7 @@ export function floatValues(g: Graph): Set<number> {
     for (const [id, n] of g.nodes) {
         if (n.op !== NodeOp.store && typeSlots(n.op) && typeOf(n) === Types.f64) mark(id)
         if (n.op === NodeOp.literal && !Number.isInteger(literalValue(g, n))) mark(id)
-        if (n.op === NodeOp.call && resultType(g, n) === Types.f64) mark(id)
+        if ((n.op === NodeOp.call || n.op === NodeOp.get) && resultType(g, n) === Types.f64) mark(id)
         if (FloatArith.has(n.op)) {
             for (let i = 0; i < countIds(n); i++) flow(getRef(n, i), id, getLiteral(g, n, i))
         } else if (n.op === NodeOp.select) {
@@ -1140,6 +1140,25 @@ export function floatValues(g: Graph): Set<number> {
     }
     while (pending.length) for (const to of flows.get(pending.pop()!) ?? []) mark(to)
     return floats
+}
+
+const ClasslessFloats = new Set([Types.f16, Types.f32, Types.unknown_number])
+
+export function returnRegisters(target: lowering.Target, types: intrinsics.Types[]): number[] | undefined {
+    const regs: number[] = []
+    let integer = 0
+    let float = 0
+    for (const T of types) {
+        if (ClasslessFloats.has(T)) return
+        const reg = T === Types.f64 ? target.floatRetRegs?.[float++] : target.retRegs[integer++]
+        if (reg === undefined) return
+        regs.push(reg)
+    }
+    return regs
+}
+
+export function recordTypes(g: Graph, t: GraphNode): intrinsics.Types[] {
+    return recordFields(g, t).map(field => typeof field.type === 'number' ? field.type : Types.u64)
 }
 
 function comparesFloats(g: Graph, c: GraphNode): boolean {
@@ -1201,6 +1220,7 @@ export interface LowerGraphOptions {
     target?: lowering.Target
     regBudget?: number
     returnLocation?: number
+    returnRecord?: intrinsics.Types[]
     debug?: boolean
     clobbersOf?: (symbol: number) => Set<number> | undefined
     continues?: (symbol: number) => boolean
@@ -11412,6 +11432,7 @@ export interface SignatureHomes {
     arrival: number[]
     argHome: (call: number, index: number) => number
     ret: (field: number) => number
+    project: (call: number, field: number) => number
     overflow: () => number
     accepts: (value: number, register: number) => boolean
 }
@@ -11491,7 +11512,7 @@ export function assignBlockSignatures(
             } else if (getNode(g, a)?.op === NodeOp.call) {
                 prefer(q, homes.ret(0))
             } else if (projectsCall(g, a)) {
-                prefer(q, homes.ret(getLiteral(g, getNode(g, a)!, 1)))
+                prefer(q, homes.project(getRef(getNode(g, a)!, 0), getLiteral(g, getNode(g, a)!, 1)))
             }
         }
     }
@@ -15559,6 +15580,19 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         return returnHome(fnType?.op === NodeOp.fnType ? gn.fnReturnLocation(fnType) : -1)
     }
     const RET = returnHome(opts.returnLocation ?? -1)
+    const RECORD = opts.returnRecord ? returnRegisters(target, opts.returnRecord) : undefined
+    assert(!opts.returnRecord || RECORD, `lowering: ${g.name ?? 'graph'} returns a record that does not fit the return registers`)
+    function fieldHome(field: number): number {
+        return RECORD ? RECORD[field] : field ? target.retRegs[field] : RET
+    }
+    function callReturnRegs(call: number): number[] {
+        const n = getNode(g, call)!
+        if (getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) return [target.syscall.retReg]
+        const record = gn.recordTypeAt(g, call)
+        if (record) return returnRegisters(target, recordTypes(g, record))!
+        const result = callReturnHome(call)
+        return result === target.retRegs[0] ? target.retRegs : [result]
+    }
     const callHomes = new Map<number, number[]>()
     function argHomes(call: number): number[] {
         let homes = callHomes.get(call)
@@ -15612,7 +15646,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const reusableSlots = new Set<number>()
     const signatures = assignBlockSignatures(g, acrossCall, analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, {
         volatiles, preserved, safeFor: safeVolatiles, rank: rankHomes,
-        arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: field => field ? target.retRegs[field] : RET, overflow: () => takeSlot(), accepts,
+        arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: fieldHome, project: (call, field) => callReturnRegs(call)[field] ?? -1, overflow: () => takeSlot(), accepts,
     })
     const CALLEE = target.scratch[1]
     const SWAP = target.scratch[0]
@@ -16051,7 +16085,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         }
         for (let i = 0; i < countIds(value); i += 2) {
             const field = getRef(value, i + 1)
-            const reg = target.retRegs[getLiteral(g, value, i)]
+            const reg = fieldHome(getLiteral(g, value, i))
             if (field && reg !== undefined && !handedTo.has(field)) handedTo.set(field, reg)
         }
     }
@@ -16540,8 +16574,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 asm.br(reg)
             })
         }
-        const result = callReturnHome(id)
-        const retRegs = syscall ? [target.syscall.retReg] : result === target.retRegs[0] ? target.retRegs : [result]
+        const retRegs = callReturnRegs(id)
         if (const projections = analysis.callProjections.get(id)) {
             for (const p of projections) {
                 buildCallProjection(p, retRegs)
@@ -16730,7 +16763,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         for (let i = 1; i < countIds(n); i += 2) fields.push(i)
         const slots: Handover[] = []
         for (const i of orderedOperands(site, fields)) {
-            const reg = target.retRegs[getLiteral(g, n, i - 1)]
+            const reg = fieldHome(getLiteral(g, n, i - 1))
             assert(reg !== undefined, `Unhandled return slot: ${getLiteral(g, n, i - 1)}`)
             slots.push({ dst: reg, id: getRef(n, i), konst: getLiteral(g, n, i) })
         }
