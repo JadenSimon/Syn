@@ -1230,11 +1230,14 @@ enum GuardFlag {
     notBoolean = 131072,
     notTrue = 262144,
     notFalse = 524288,
+    hasProto = 1048576,
+    lacksProto = 2097152,
 }
 
 function computeRegions(s: Summary): GraphRegions {
     const g = s.g
     const regions = graphRegions(g, charge)
+    s.regions = regions
     const seenConds = new Set<number>()
     for (const id of regions.blockOf.keys()) {
         const n = getNode(g, id)!
@@ -1264,14 +1267,36 @@ function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
         }
         return
     }
+    if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.hasPrototype && getRef(n, 2)) {
+        out.add(getRef(n, 2))
+        return
+    }
+    const block = s.regions ? s.regions.paramBlock.get(id) : undefined
+    if (n.op === NodeOp.param && block) {
+        const index = g.blocks[block].params.indexOf(id)
+        for (const apply of s.regions!.arrivals[block]) {
+            const arg = getRef(getNode(g, apply)!, index + 1)
+            if (arg) testedRefs(s, arg, seen)
+        }
+        return
+    }
     if (!compareOps.has(n.op)) return
     for (let i = 0; i < 2; i++) {
         const r = getRef(n, i)
         if (!r) continue
         out.add(r)
-        const m = getNode(g, r)
+        const m = getNode(g, strippedRef(g, r))
         if (m?.op === NodeOp.rt && getRef(m, 2)) out.add(getRef(m, 2))
     }
+}
+
+function strippedRef(g: Graph, id: number): number {
+    let n = getNode(g, id)
+    while (n?.op === NodeOp.after) {
+        id = getRef(n, countIds(n) - 1)
+        n = getNode(g, id)
+    }
+    return id
 }
 
 interface Guard {
@@ -1279,6 +1304,7 @@ interface Guard {
     lo: number
     hi: number
     picks: number[]
+    protos?: number[]
 }
 
 const noGuard: Guard = { flags: 0, lo: MinI64, hi: MaxU64, picks: [] }
@@ -1295,6 +1321,7 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
     if (e === undefined) {
         e = guard.flags ? expr(s, ExprOp.narrow, 0, base, guard.lo, guard.flags, [base], guard.hi) : base
         for (const pick of guard.picks) e = expr(s, ExprOp.pick, 0, e, pick & 1, pick >> 1, [e], 0)
+        for (const proto of guard.protos ?? []) e = expr(s, ExprOp.narrow, 0, e, Math.abs(proto), proto > 0 ? GuardFlag.hasProto : GuardFlag.lacksProto, [e], 0)
         byGuard.set(guard, e)
     }
     return e
@@ -1334,8 +1361,40 @@ function meetGuard(a: Guard, b: Guard): Guard {
         if (picks.includes(p ^ 1)) return deadGuard
         if (!picks.includes(p)) picks.push(p)
     }
-    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length) return a
-    return { flags, lo, hi, picks }
+    const protos = (a.protos ?? []).slice()
+    for (const p of b.protos ?? []) {
+        if (protos.includes(-p)) return deadGuard
+        if (!protos.includes(p)) protos.push(p)
+    }
+    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length && protos.length === (a.protos ?? []).length) return a
+    return protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
+}
+
+const excludesObjects = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.notObject | GuardFlag.isBoolean
+
+function holdsProto(guard: Guard, proto: number): boolean {
+    if (guard.protos?.includes(proto)) return true
+    return proto < 0 && (guard.flags & excludesObjects) !== 0
+}
+
+function joinGuard(a: Guard, b: Guard): Guard {
+    if (a === deadGuard) return b
+    if (b === deadGuard) return a
+    if (a === noGuard || b === noGuard) return noGuard
+    const flags = a.flags & b.flags
+    const bounded = (flags & GuardFlag.bounded) !== 0
+    const lo = bounded ? Math.min(a.lo, b.lo) : MinI64
+    const hi = bounded ? Math.max(a.hi, b.hi) : MaxU64
+    const picks = a.picks.filter(p => b.picks.includes(p))
+    const protos: number[] = []
+    for (const p of a.protos ?? []) {
+        if (holdsProto(b, p)) protos.push(p)
+    }
+    for (const p of b.protos ?? []) {
+        if (!protos.includes(p) && holdsProto(a, p)) protos.push(p)
+    }
+    if (!flags && !picks.length && !protos.length) return noGuard
+    return protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
 }
 
 function contradicts(flags: number): boolean {
@@ -1352,6 +1411,9 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     const n = getNode(g, id)!
     if (n.op === NodeOp.getProp && !getRef(n, 2) && getRef(n, 1) === ref) return { flags: 0, lo: MinI64, hi: MaxU64, picks: [getLiteral(g, n, 2) * 2 + (positive ? 1 : 0)] }
     if (n.op === NodeOp.call) return calls ? predicateGuard(s, n, ref, positive) : noGuard
+    if (n.op === NodeOp.param) return arrivalGuard(s, id, ref, positive, calls)
+    const proto = protoGuard(s, n, ref, positive)
+    if (proto) return proto
     if (n.op !== NodeOp.eq && n.op !== NodeOp.ne && n.op !== NodeOp.lt && n.op !== NodeOp.le && n.op !== NodeOp.gt && n.op !== NodeOp.ge) return noGuard
     const equal = n.op === NodeOp.eq ? positive : n.op === NodeOp.ne ? !positive : positive
     const a = getRef(n, 0)
@@ -1394,6 +1456,60 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     return { flags: GuardFlag.bounded, lo: Math.ceil(v), hi: MaxU64, picks: [] }
 }
 
+const pendingArrivals = new Set<number>()
+
+function arrivalGuard(s: Summary, param: number, ref: number, positive: boolean, calls: boolean): Guard {
+    const g = s.g
+    const regions = s.regions!
+    const block = regions.paramBlock.get(param)
+    if (!block || pendingArrivals.has(param)) return noGuard
+    if (regions.paramBlock.get(ref) !== 0 && regions.blockOf.get(ref) !== 0) return noGuard
+    const index = g.blocks[block].params.indexOf(param)
+    pendingArrivals.add(param)
+    let joined = deadGuard
+    for (const apply of regions.arrivals[block]) {
+        charge(1)
+        const n = getNode(g, apply)!
+        const arg = getRef(n, index + 1)
+        const truth = literalTruth(g, arg, getLiteral(g, n, index + 1))
+        const own = truth >= 0 ? (truth === 1) === positive ? noGuard : deadGuard : guardOn(s, arg, ref, positive, calls)
+        if (own === deadGuard) continue
+        joined = joinGuard(joined, meetGuard(pathGuard(s, ref, apply), own))
+        if (joined === noGuard) break
+    }
+    pendingArrivals.delete(param)
+    return joined
+}
+
+function pathGuard(s: Summary, ref: number, node: number): Guard {
+    const region = s.regions!.of.get(node)
+    return region === undefined ? noGuard : guardAt(s, ref, region)
+}
+
+function literalTruth(g: Graph, ref: number, literal: number): number {
+    if (!ref) return literal ? 1 : 0
+    const n = getNode(g, strippedRef(g, ref))
+    if (n?.op !== NodeOp.literal || getRef(n, 0)) return -1
+    return getLiteral(g, n, 0) ? 1 : 0
+}
+
+function protoGuard(s: Summary, n: GraphNode, ref: number, positive: boolean): Guard | undefined {
+    const g = s.g
+    let test = n
+    let yes = positive
+    if ((n.op === NodeOp.eq || n.op === NodeOp.ne) && (!getRef(n, 0) || !getRef(n, 1))) {
+        const side = getRef(n, 0) ? 0 : 1
+        if (!getRef(n, side) || getLiteral(g, n, 1 - side) !== 0) return
+        test = getNode(g, strippedRef(g, getRef(n, side)))!
+        yes = n.op === NodeOp.ne ? positive : !positive
+    }
+    if (test.op !== NodeOp.rt || getLiteral(g, test, 1) !== RtOp.hasPrototype || getRef(test, 2) !== ref) return
+    const cell = constantCell(s, getRef(test, 3))
+    if (cell <= 0) return
+    const proto = heap.deref(cell as Handle) as number
+    return { flags: 0, lo: MinI64, hi: MaxU64, picks: [], protos: [yes ? proto : -proto] }
+}
+
 function typeofOf(s: Summary, id: number, ref: number): boolean {
     const n = id ? getNode(s.g, id) : undefined
     return n?.op === NodeOp.rt && getLiteral(s.g, n, 1) === RtOp.typeof && getRef(n, 2) === ref
@@ -1412,7 +1528,7 @@ function predicateGuard(s: Summary, call: GraphNode, ref: number, positive: bool
     for (let i = 3; i < countIds(call) && (i - 3) * 2 < table.length; i++) {
         if (getRef(call, i) !== ref) continue
         const guard = table[(i - 3) * 2 + (positive ? 0 : 1)]
-        if (guard.flags) return guard
+        if (guard.flags || guard.protos) return guard
     }
     return noGuard
 }
@@ -1433,16 +1549,29 @@ function tableOf(callee: Summary): Guard[] | null {
     const known = callee.predicates
     if (known !== undefined) return known
     const cg = callee.g
-    const ret = cg.blocks.length === 1 && !callee.hasThis && !callee.usesCtx ? getNode(cg, cg.blocks[0].bodyId) : undefined
-    if (ret?.op !== NodeOp.ret || !getRef(ret, 0)) {
+    const rets: number[] = []
+    for (const [id, n] of cg.nodes) {
+        if (n.op === NodeOp.ret && !callee.regionRets.has(id)) rets.push(id)
+    }
+    if (callee.usesCtx || !rets.length) {
         callee.predicates = null
         return null
     }
     const table: Guard[] = []
     for (const p of cg.blocks[0].params) {
+        if (isThisParam(getNode(cg, p)!)) continue
         for (const positive of [true, false]) {
-            const guard = guardOn(callee, getRef(ret, 0), p, positive, false)
-            table.push(guard.picks.length ? { flags: guard.flags, lo: guard.lo, hi: guard.hi, picks: [] } : guard)
+            let joined = deadGuard
+            for (const r of rets) {
+                charge(1)
+                const n = getNode(cg, r)!
+                const truth = literalTruth(cg, getRef(n, 0), getLiteral(cg, n, 0))
+                if (truth >= 0 && (truth === 1) !== positive) continue
+                const own = truth >= 0 ? noGuard : guardOn(callee, getRef(n, 0), p, positive, false)
+                joined = joinGuard(joined, meetGuard(pathGuard(callee, p, r), own))
+                if (joined === noGuard) break
+            }
+            table.push(joined.picks.length ? { flags: joined.flags, lo: joined.lo, hi: joined.hi, picks: [], protos: joined.protos } : joined)
         }
     }
     callee.predicates = table
@@ -1846,7 +1975,7 @@ function wireExpr(inst: Instance, x: Expr, slot: number): void {
         case ExprOp.alloc: addOrigin(slot, created(qualified(OriginKind.fresh, x.a, inst.qual, 0, s), inst))
         case ExprOp.union:
             for (const a of x.args) listen(at(inst, a), ListenerKind.copy, slot, 0, 0)
-        case ExprOp.narrow: listen(at(inst, x.a), ListenerKind.narrow, slot, x.key, 0)
+        case ExprOp.narrow: listen(at(inst, x.a), ListenerKind.narrow, slot, x.key, x.b)
         case ExprOp.pick: listen(at(inst, x.a), ListenerKind.pick, slot, x.key, x.b)
         case ExprOp.member:
             listen(at(inst, x.a), ListenerKind.member, slot, x.key, x.key === dynKey ? at(inst, x.b) : 0)
@@ -1982,7 +2111,7 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
     }
     for (let i = x.args.length; i < params; i++) addConst(callee.sigs[i], UNDEF)
     const part = partSlot(slot, subject)
-    const from = stringRt.has(x.a) ? -1 : callee.ret
+    const from = stringRt.has(x.a) || x.a === RtOp.hasPrototype ? -1 : callee.ret
     flow.partBind.set(part, { callee: callee.id, from, kind: BindKind.rt, target: qual, recv: subject })
     if (from >= 0) copyEdge(from, part)
 }
@@ -2140,7 +2269,7 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.rtSubject: rtSubject(l.target, origin)
         case ListenerKind.assignSource: assignSource(origin, l.extra)
         case ListenerKind.assignTarget: assignTarget(l.target, origin)
-        case ListenerKind.narrow: if (originPasses(origin, l.key)) addOrigin(l.target, origin)
+        case ListenerKind.narrow: if (originPasses(origin, l.key, l.extra)) addOrigin(l.target, origin)
         case ListenerKind.pick: pickOrigin(l.target, origin, l.key, l.extra)
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
     }
@@ -2191,12 +2320,14 @@ function recheckPicks(f: number): void {
     list.length = keep
 }
 
-function originPasses(origin: number, flags: number): boolean {
+function originPasses(origin: number, flags: number, proto: number): boolean {
     if (flags & (GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isUndefined | GuardFlag.isBoolean)) return false
     const k = flow.originKind[origin]
     const str = k === OriginKind.str
     const fn = !str && !!originHostFn(origin)
     const obj = !str && !fn
+    if (flags & GuardFlag.hasProto) return chainHas(origin, proto as Handle) !== 0
+    if (flags & GuardFlag.lacksProto) return !obj || chainHas(origin, proto as Handle) !== 1
     if ((flags & GuardFlag.falsy) && !str) return false
     if ((flags & GuardFlag.isString) && !str) return false
     if ((flags & GuardFlag.notString) && str) return false
@@ -2210,6 +2341,7 @@ function originPasses(origin: number, flags: number): boolean {
 function filterScalar(t: number, flags: number, lo: number, hi: number): number {
     let f = scalars.flags[t]
     if (f & ScalarFlag.unknown) return t
+    if (flags & GuardFlag.hasProto) return NONE
     let tlo = scalars.lo[t]
     let thi = scalars.hi[t]
     let strs = scalars.strs[t]
@@ -2256,6 +2388,21 @@ function exprAt(slot: number): Expr {
 
 function instOfSlot(slot: number): Instance {
     return flow.instances[flow.slotOwner[ownerSlot(slot)]]
+}
+
+function chainHas(origin: number, proto: Handle): number {
+    const kind = flow.originKind[origin]
+    const cell = flow.originCell[origin]
+    if (kind === OriginKind.str) return 0
+    if (kind !== OriginKind.created && kind !== OriginKind.static && kind !== OriginKind.fresh) return -1
+    if (!cell || isScope(origin)) return -1
+    if (kind !== OriginKind.created && (heap.isBoxedF64(cell as Handle) || heap.isString(cell as Handle))) return 0
+    let at = protoOf(origin)
+    while (at) {
+        if (at === proto) return 1
+        at = heap.getPrototypeOf(at)
+    }
+    return 0
 }
 
 function protoOf(origin: number): Handle {
@@ -2737,9 +2884,29 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
     if (op === RtOp.toNumber) return coercedScalar(at(inst, x.args[0]), value, originsOf)
     if (stringRt.has(op)) return ANYSTR
     if (wordOps.has(op)) return numScalar(0, 2 ** 32 - 1)
-    if (op === RtOp.hasPrototype || op === RtOp.strictEqual || op === RtOp.truthy || op === RtOp.nullish) return BOOL
+    if (op === RtOp.hasPrototype) return prototypeScalar(inst, x, value, originsOf)
+    if (op === RtOp.strictEqual || op === RtOp.truthy || op === RtOp.nullish) return BOOL
     if (op === RtOp.paramCount || op === RtOp.restIndex) return I64
     return NONE
+}
+
+function prototypeScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+    if (x.args.length < 2) return BOOL
+    const holders = originsOf(at(inst, x.args[1]))
+    if (holders.length !== 1 || value(at(inst, x.args[1])) !== NONE || flow.originKind[holders[0]] !== OriginKind.static || !flow.originCell[holders[0]]) return BOOL
+    const proto = heap.deref(flow.originCell[holders[0]] as Handle)
+    const t = value(at(inst, x.args[0]))
+    if (scalars.flags[t] & ScalarFlag.unknown) return BOOL
+    let yes = false
+    let no = t !== NONE
+    for (const origin of originsOf(at(inst, x.args[0]))) {
+        const has = chainHas(origin, proto)
+        if (has < 0) return BOOL
+        if (has) yes = true
+        else no = true
+    }
+    if (yes && no) return BOOL
+    return yes ? TRUE : no ? FALSE : NONE
 }
 
 function typeofScalar(slot: number, value: (s: number) => number, originsOf: (s: number) => number[]): number {
@@ -2774,7 +2941,7 @@ function exprUses(slot: number): void {
         scalarUse(at(inst, x.a), slot)
         scalarUse(at(inst, x.b), slot)
     }
-    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber)) scalarUse(at(inst, x.args[0]), slot)
+    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype)) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.member) scalarUse(at(inst, x.a), slot)
 }
 
@@ -4285,7 +4452,7 @@ function objectOrigin(origin: number): boolean {
 }
 
 function genericView(self: number, params: number[][], methods: Function[]): GenericFlow {
-    const selecting = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isBoolean | GuardFlag.bounded
+    const selecting = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isBoolean | GuardFlag.bounded | GuardFlag.hasProto
     const n = flow.slotKind.length
     const sources: (number[] | undefined)[] = new Array(n)
     const kinds = new Uint8Array(n)
@@ -4387,6 +4554,8 @@ function narrowText(x: Expr): string {
         if ((x.key & (1 << i)) && narrowNames[i]) parts.push(narrowNames[i])
     }
     if (x.key & GuardFlag.bounded) parts.push(`${x.b <= MinI64 ? '' : x.b}..${x.sub >= MaxU64 ? '' : x.sub}`)
+    if (x.key & GuardFlag.hasProto) parts.push(`proto ${x.b}`)
+    if (x.key & GuardFlag.lacksProto) parts.push(`!proto ${x.b}`)
     return parts.join(' ')
 }
 
