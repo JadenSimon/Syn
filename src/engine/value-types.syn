@@ -56,13 +56,13 @@ export type Interval = [lo: number, hi: number]
 export interface WordAccess {
     node: number
     store: boolean
-    slots: number[]
+    members: number[][]
 }
 
 export interface WordSlot {
     allocation: number
     key: string
-    mixed: boolean
+    kinds: number
 }
 
 export interface UnitTypes {
@@ -553,27 +553,46 @@ function receiverOf(frame: FrameSignature): number | undefined {
 }
 
 function wordSlotsOf(locations: Location[]): WordSlot[] {
-    const kindsOf = new Map<string, number>()
     const wordSlots: WordSlot[] = []
     const tuples = new Set<number>()
     for (const location of locations) if (location.key === numberKey) tuples.add(location.allocation)
     for (const location of locations) {
         const indexed = location.key === numberKey || (constantIndex(location.key) && tuples.has(location.allocation))
-        const key = indexed ? numberKey : location.key
-        const k = `${location.allocation}:${key}`
-        let kinds = kindsOf.get(k) ?? 0
         const type = location.type
+        let kinds = 0
         if (type.literals.length || type.range || type.float) kinds |= 1
         if (type.objects.length || type.strings.length) kinds |= 2
         if (type.bools) kinds |= 4
-        kindsOf.set(k, kinds)
-        wordSlots.push({ allocation: location.allocation, key, mixed: false })
-    }
-    for (const slot of wordSlots) {
-        const kinds = kindsOf.get(`${slot.allocation}:${slot.key}`)!
-        slot.mixed = kinds === 3 || kinds > 4
+        wordSlots.push({ allocation: location.allocation, key: indexed ? numberKey : location.key, kinds })
     }
     return wordSlots
+}
+
+function mixedKinds(kinds: number): boolean {
+    return kinds === 3 || kinds > 4
+}
+
+function copiedWords(g: Graph): Map<number, number[]> {
+    const users = usersOf(g)
+    const out = new Map<number, number[]>()
+    function stores(id: number, into: number[]): boolean {
+        for (const [user, slot] of users.get(id) ?? []) {
+            const n = getNode(g, user)!
+            if (n.op === NodeOp.after && slot < countIds(n) - 1) continue
+            if (n.op === NodeOp.after && stores(user, into)) continue
+            if (rt.sliceOf(g, n) !== rt.Op.sliceWrite || !wordStore(g, n)) return false
+            if (slot === 0) continue
+            if (slot !== 4) return false
+            into.push(user)
+        }
+        return true
+    }
+    for (const [id, n] of nodeEntries(g)) {
+        if (!wordLoad(g, n) || rt.sliceOf(g, n) !== rt.Op.sliceRead) continue
+        const into: number[] = []
+        if (stores(id, into) && into.length) out.set(id, into)
+    }
+    return out
 }
 
 export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]): ValueTypes {
@@ -982,6 +1001,8 @@ export interface Instantiations {
     elementOf(buffers: number[]): Rep
     shapeOf(allocation: number): string | undefined
     bufferGroups(): Map<number, number[]>
+    bufferGroup(allocation: number): number
+    joinBuffers(allocations: number[]): void
     layOut(tagged: Set<number>, inlined?: Map<number, intrinsics.Types[]>): void
 }
 
@@ -1365,12 +1386,11 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         for (const [group, at] of freeGroups) if (holderWidths.get(at) === 8) wideGroups.add(group)
         for (const id of shapes.keys()) layOutShape(id)
     }
-    return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, bufferGroup, joinBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 export interface PlannedUnit {
     fn: Function
-    boxes: boolean
-    boxedReturn: boolean
+    tagged: Set<number>
     allocations: Map<number, string>
     signature: string
     frames: number[]
@@ -1382,7 +1402,6 @@ export interface PlannedUnit {
     blocks: Set<number>
     deadArms: Map<number, number[]>
     calls: Map<number, Set<PlannedUnit>>
-    boxedCalls: Set<number>
     coercions: Map<number, number>
     receivers: Map<number, Rep>
 }
@@ -1418,7 +1437,7 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, boxed: Map<number, Set<string>> } {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, tagged: Map<number, Set<string>> } {
     const callees = new Map<string, number[]>()
     const outgoing = types.frames.map(() => [] as [node: number, callee: number][])
     types.frames.forEach((frame, id) => {
@@ -1476,13 +1495,12 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const joined = joinedSignature(members.map(f => types.frames[f]), unionAll)
         return signatureOf(joined.params, joined.returns, created.get(find(members[0])))
     }
+    const elements = planElements(types, congruent, graphOf)
     let classOf = new Map<number, number>()
     const initial = new Map<string, number>()
-    const mixedAccess = (f: number, store: boolean) => types.frames[f].accesses.some(access => access.store === store && access.slots.some(slot => types.wordSlots[slot].mixed))
     for (const [root, members] of congruent) {
-        const boxes = members.some(f => mixedAccess(f, true))
-        const boxedReturn = members.some(f => mixedAccess(f, false))
-        const k = `${unitIdentity(types.frames[root].unit)}|${joinedOf(members).signature.replace(/\bint\b/g, 'i64')}|${boxes}|${boxedReturn}`
+        const tags = [...new Set(members.flatMap(f => [...elements.frames[f]]))].sort((a, b) => a - b)
+        const k = `${unitIdentity(types.frames[root].unit)}|${joinedOf(members).signature.replace(/\bint\b/g, 'i64')}|${tags.join(',')}`
         if (!initial.has(k)) initial.set(k, initial.size)
         classOf.set(root, initial.get(k)!)
     }
@@ -1534,13 +1552,12 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
-            unitOfRoot.set(root, unit = { fn: frame.unit, boxes: false, boxedReturn: false, allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), boxedCalls: new Set(), coercions: new Map(), receivers: new Map() })
+            unitOfRoot.set(root, unit = { fn: frame.unit, tagged: new Set(), allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), coercions: new Map(), receivers: new Map() })
             const units = listOf(plan, frame.unit)
             units.push(unit)
         }
         unit.frames.push(id)
-        if (mixedAccess(id, true)) unit.boxes = true
-        if (mixedAccess(id, false)) unit.boxedReturn = true
+        for (const node of elements.frames[id]) unit.tagged.add(node)
         unitOfFrame[id] = unit
     })
     types.frames.forEach((frame, id) => {
@@ -1588,37 +1605,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         unit.returns = joined.returns
         unit.signature = joined.signature
     }
-    const wordGroup = types.objects.map((_, i) => i)
-    const wordRoot = (a: number) => rootOf(wordGroup, a)
-    const accessesOf = (unit: PlannedUnit) => unit.frames.flatMap(f => types.frames[f].accesses)
-    for (const unit of unitOfRoot.values()) {
-        const first = new Map<number, number>()
-        for (const access of accessesOf(unit)) {
-            for (const slot of access.slots) {
-                const root = wordRoot(types.wordSlots[slot].allocation)
-                const known = first.get(access.node)
-                if (known === undefined) first.set(access.node, root)
-                else wordGroup[root] = wordRoot(known)
-            }
-        }
-    }
-    const groupKey = (slot: number) => `${wordRoot(types.wordSlots[slot].allocation)}:${types.wordSlots[slot].key}`
-    const mixedGroups = new Set<string>()
-    types.wordSlots.forEach((slot, i) => { if (slot.mixed) mixedGroups.add(groupKey(i)) })
-    const boxed = new Map<number, Set<string>>()
-    types.wordSlots.forEach((slot, i) => {
-        if (!mixedGroups.has(groupKey(i))) return
-        const keys = boxed.get(slot.allocation)
-        if (keys) keys.add(slot.key)
-        else boxed.set(slot.allocation, new Set([slot.key]))
-    })
-    for (const unit of unitOfRoot.values()) {
-        for (const access of accessesOf(unit)) {
-            if (!access.slots.some(slot => mixedGroups.has(groupKey(slot)))) continue
-            if (access.store) unit.boxes = true
-            else unit.boxedReturn = true
-        }
-    }
+    for (const touched of touchedOf.values()) for (const buffers of touched.values()) inst.joinBuffers(buffers)
     const conflicted: [PlannedUnit, number][] = []
     types.objects.forEach((object, id) => {
         if (object.constant || object.native || addressView(object)) return
@@ -1632,11 +1619,6 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         }
     })
     for (const [unit, node] of conflicted) unit.allocations.delete(node)
-    types.frames.forEach((frame, id) => {
-        for (const site of frame.sites) {
-            if (site.frame !== undefined && unitOfFrame[id].boxedReturn) unitOfFrame[site.frame].boxedCalls.add(site.node)
-        }
-    })
     for (const units of plan.values()) {
         const frames = units.flatMap(unit => unit.frames)
         units[0].params.forEach((_, i) => {
@@ -1649,8 +1631,118 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     const inlined = intrinsics.argv().some(flag => flag.startsWith('inline-records')) ? inlineRecords(types, inst, [...unitOfRoot.values()], resolvedOf, touchedOf, graphOf) : undefined
     inst.layOut(nullishReads(types, [...unitOfRoot.values()], touchedOf, graphOf), intrinsics.argv().includes('inline-records') ? inlined : undefined)
     for (const [unit, touched] of touchedOf) for (const [node, buffers] of touched) unit.slices.set(node, inst.elementOf(buffers))
-    return { inst, plan, boxed }
+    if (intrinsics.argv().includes('element-debug')) {
+        for (const line of elements.lines()) console.log(line)
+        for (const unit of unitOfRoot.values()) {
+            const nodes = [...new Set(unit.frames.flatMap(f => types.frames[f].accesses.map(access => access.node)))].sort((a, b) => a - b)
+            if (!nodes.length) continue
+            console.log(`ELEMENT-UNIT ${unit.fn.name || '<anon>'}${unit.signature} ${nodes.map(node => `%${node}:${unit.tagged.has(node) ? 'tagged' : 'raw'}:${unit.nodes.get(node)?.text ?? '-'}`).join(' ')}`)
+        }
+    }
+    return { inst, plan, tagged: elements.tagged }
 }
+
+interface ElementPlan {
+    tagged: Map<number, Set<string>>
+    frames: Set<number>[]
+    lines(): string[]
+}
+
+function planElements(types: ValueTypes, congruent: Map<number, number[]>, graphOf: (fn: Function) => Graph): ElementPlan {
+    const slotRoot = types.wordSlots.map((_, i) => i)
+    const slotGroup = (a: number) => rootOf(slotRoot, a)
+    const joinSlots = (a: number, b: number) => {
+        slotRoot[slotGroup(b)] = slotGroup(a)
+    }
+    const joinKeys = (lists: number[][]) => {
+        const byKey = new Map<string, number>()
+        for (const slots of lists) for (const slot of slots) {
+            joinSlots(slots[0], slot)
+            const first = byKey.get(types.wordSlots[slot].key)
+            if (first === undefined) byKey.set(types.wordSlots[slot].key, slot)
+            else joinSlots(first, slot)
+        }
+    }
+    const byAllocation = new Map<string, number>()
+    types.wordSlots.forEach((slot, i) => {
+        const k = `${slot.allocation}:${slot.key}`
+        const first = byAllocation.get(k)
+        if (first === undefined) byAllocation.set(k, i)
+        else joinSlots(first, i)
+    })
+    const copies = new Map<Function, { reads: Map<number, number[]>, moved: Set<number> }>()
+    const copiesOf = (fn: Function) => {
+        let known = copies.get(fn)
+        if (!known) {
+            const reads = copiedWords(graphOf(fn))
+            copies.set(fn, known = { reads, moved: new Set([...reads.keys(), ...[...reads.values()].flat()]) })
+        }
+        return known
+    }
+    for (const frame of types.frames) {
+        const { reads } = copiesOf(frame.unit)
+        if (!reads.size) continue
+        const byAccess = new Map(frame.accesses.map(access => [access.node, access.members]))
+        for (const [read, stores] of reads) {
+            const from = byAccess.get(read)
+            for (const store of stores) {
+                const into = byAccess.get(store)
+                if (!from || !into) continue
+                from.forEach((slots, i) => {
+                    const both = [...slots, ...into[i] ?? []]
+                    for (const slot of both) joinSlots(both[0], slot)
+                })
+            }
+        }
+    }
+    const shared: number[][][] = []
+    for (const members of congruent.values()) {
+        const nodes = new Map<number, number[][]>()
+        for (const f of members) {
+            const { moved } = copiesOf(types.frames[f].unit)
+            for (const access of types.frames[f].accesses) if (!moved.has(access.node)) listOf(nodes, access.node).push(...access.members.filter(slots => slots.length))
+        }
+        for (const lists of nodes.values()) {
+            joinKeys(lists)
+            if (lists.length) shared.push(lists)
+        }
+    }
+    const groupKinds = new Map<number, number>()
+    types.wordSlots.forEach((slot, i) => groupKinds.set(slotGroup(i), (groupKinds.get(slotGroup(i)) ?? 0) | slot.kinds))
+    const shareRoot = types.wordSlots.map((_, i) => i)
+    const shareGroup = (a: number) => rootOf(shareRoot, slotGroup(a))
+    for (const lists of shared) for (const slots of lists) for (const slot of slots) shareRoot[shareGroup(slot)] = shareGroup(lists[0][0])
+    const mixedShares = new Set<number>()
+    for (const [root, kinds] of groupKinds) if (mixedKinds(kinds)) mixedShares.add(shareGroup(root))
+    const taggedSlot = (slot: number) => mixedShares.has(shareGroup(slot))
+    const tagged = new Map<number, Set<string>>()
+    types.wordSlots.forEach((slot, i) => {
+        if (!taggedSlot(i)) return
+        const keys = tagged.get(slot.allocation)
+        if (keys) keys.add(slot.key)
+        else tagged.set(slot.allocation, new Set([slot.key]))
+    })
+    const frames = types.frames.map(frame => {
+        const { moved } = copiesOf(frame.unit)
+        const nodes = new Set<number>()
+        for (const access of frame.accesses) if (!moved.has(access.node) && access.members.some(slots => slots.some(taggedSlot))) nodes.add(access.node)
+        return nodes
+    })
+    function lines(): string[] {
+        const accessed = new Set(types.frames.flatMap(frame => frame.accesses.flatMap(access => access.members.flat().map(slotGroup))))
+        const groups = new Map<number, string[]>()
+        types.wordSlots.forEach((slot, i) => {
+            if (!accessed.has(slotGroup(i))) return
+            const object = types.objects[slot.allocation]
+            const text = `${object.name}#${slot.allocation}@${object.site.unit.name || '<anon>'}:%${object.site.node}${slot.key === numberKey ? '' : slot.key}`
+            const list = listOf(groups, slotGroup(i))
+            if (!list.includes(text)) list.push(text)
+        })
+        return [...groups].map(([root, members]) => `ELEMENT-GROUP ${root} ${taggedSlot(root) ? 'tagged' : 'raw'} kinds ${groupKinds.get(root)} shared ${shareGroup(root)} members ${members.join(' ')}`)
+    }
+    return { tagged, frames, lines }
+}
+
 
 function recordElements(types: ValueTypes, inst: Instantiations, buffers: number[]): { shape: string, words: intrinsics.Types[], elements: Set<number> } | string {
     let element = emptyType()
@@ -2448,16 +2540,17 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
         const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
         const value = (rep: Rep) => rep.kind === 'number' ? numberText(rep.format) : view(rep)
         const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : value(rep)
-        const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced, unit.boxes || unit.boxedReturn)
+        const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced, unit.tagged.size > 0)
         const entry = g.blocks[0].params
         const wide = (id: number) => unit.slices.has(id) && elementWidth(unit.slices.get(id)!) === 8
         const read = (id: number) => getNode(g, id)!.op === NodeOp.load || rt.sliceOf(g, getNode(g, id)!) === rt.Op.sliceRead
-        const keyed = (id: number) => !moved.has(id) || !read(id) || wide(id)
+        const decoded = (id: number) => unit.tagged.has(id) && read(id) && unit.nodes.get(id)!.kind !== 'union'
+        const keyed = (id: number) => !moved.has(id) || !read(id) || wide(id) || decoded(id)
         return [
-            unitIdentity(unit.fn), unit.boxes, unit.boxedReturn ? view(unit.returns) : '', [...unit.boxedCalls].sort((a, b) => a - b).join(','), unit.returnsSelf, !!unit.returns.tested,
+            unitIdentity(unit.fn), [...unit.tagged].sort((a, b) => a - b).join(','), unit.returnsSelf, !!unit.returns.tested,
             `${unit.params.map((p, i) => `${p.label}:${moved.has(entry[i]) ? opaque(p.rep, true) : value(p.rep)}`).join(',')}->${abiOf(unit)}`,
             byNode(unit.allocations, shape => shapeTarget(shape) ? layoutOf(shape, elements) : shape), byNode(sites.get(unit) ?? new Map<number, Handle>(), k => String(k)),
-            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.coercions, mask => String(mask)), byNode(unit.slices, element => `${elementWidth(element)}${numberName(element) === 'f64' ? 'f' : ''}`), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
+            [...unit.blocks].sort((a, b) => a - b).join(','), byNode(unit.deadArms, arms => arms.join(',')), byNode(unit.coercions, mask => String(mask)), byNode(unit.slices, element => `${elementWidth(element)}${numberName(element) === 'f64' ? 'f' : ''}`), byNode(new Map([...unit.nodes].filter(([id]) => keyed(id)).map(([id, rep]) => [id, decoded(id) ? `dec:${value(rep)}` : moved.has(id) ? `${opaque(rep, entry.includes(id))}${wide(id) ? '8' : ''}` : node(rep)])), x => x),
         ]
     }
     let [classes, count] = intern(unit => parts(unit).join('|'))
