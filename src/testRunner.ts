@@ -496,7 +496,8 @@ async function testEngine(suite = 'heap', argv: string[] = []): Promise<number> 
         fs.mkdirSync(`${prof}.src`, { recursive: true })
         for (const [name, text] of emitted) fs.writeFileSync(path.join(`${prof}.src`, path.basename(name)), text)
     }
-    return loader.run(harness, emitted.get(harness)!, argv, (exports: any) => exports.runSuite(suite)) as Promise<number>
+    const engineArgv = argv.slice(1).filter(a => !/^(baseline|max-crashes):/.test(a))
+    return loader.run(harness, emitted.get(harness)!, engineArgv, (exports: any) => exports.runSuite(suite)) as Promise<number>
 }
 
 function lineDiff(a: string, b: string) {
@@ -647,6 +648,7 @@ interface BaselineSection {
     phases: Record<string, number>
     done: boolean
     since?: number
+    fingerprint?: string
 }
 
 function caseMs(ms: number): number {
@@ -694,7 +696,8 @@ function sectionBody(section: BaselineSection, load: number): string[] {
     const accounted = Object.values(section.phases).reduce((a, b) => a + b, 0)
     const phases = Object.entries({ ...section.phases, setup: Math.max(0, section.ms - accounted) })
     const percents = phases.map(([phase, ms]) => [phase, Math.round(ms * 100 / Math.max(1, section.ms))] as const).filter(x => x[1] > 0)
-    return [`total ${(section.ms / 1000).toFixed(1)}s load ${load}`, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.problems, ...section.cases]
+    const fingerprint = section.fingerprint ? [`fingerprint ${section.fingerprint}`] : []
+    return [`total ${(section.ms / 1000).toFixed(1)}s load ${load}`, ...fingerprint, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.problems, ...section.cases]
 }
 
 function caseResults(body: string[]) {
@@ -702,16 +705,28 @@ function caseResults(body: string[]) {
     const broken = new Map<string, string>()
     const phases = new Map<string, number>()
     let seconds = 0
+    let fingerprint: { compiler: string, roots: string } | undefined
     for (const line of body) {
         const fields = line.split(' ')
         if (fields[0] === 'total') seconds = parseFloat(fields[1])
+        if (fields[0] === 'fingerprint') fingerprint = { compiler: fields[2], roots: fields[4] }
         if (fields[0] === 'phases') {
             for (let i = 1; i + 1 < fields.length; i += 2) phases.set(fields[i], parseFloat(fields[i + 1]))
         }
         if (fields[0] === 'case') cases.set(fields.slice(1, -4).join(' '), [Number(fields[fields.length - 4]), Number(fields[fields.length - 3])])
         if (/^(fail|crash|cut) /.test(line)) broken.set(line.slice(fields[0].length + 1, line.indexOf(': ')), line)
     }
-    return { cases, broken, phases, seconds }
+    return { cases, broken, phases, seconds, fingerprint }
+}
+
+function fingerprintDelta(before: ReturnType<typeof caseResults>, after: ReturnType<typeof caseResults>, changed: number): string {
+    if (!after.fingerprint) return ''
+    if (!before.fingerprint) return ', no baseline fingerprint'
+    const inputs: string[] = []
+    if (before.fingerprint.compiler !== after.fingerprint.compiler) inputs.push('compiler changed')
+    if (before.fingerprint.roots !== after.fingerprint.roots) inputs.push('suite inputs changed')
+    if (inputs.length) return `, ${inputs.join(', ')}`
+    return changed ? ', same compiler and inputs: nondeterminism or environment' : ', same compiler and inputs'
 }
 
 function signed(x: number): string {
@@ -756,7 +771,7 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
     for (const name of before.broken.keys()) {
         if (!after.broken.has(name) && after.cases.has(name)) lines.push(`fixed ${name}`)
     }
-    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${partial ? ', partial run' : ''}`)
+    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${partial ? ', partial run' : ''}`)
     for (const line of lines) console.log(`DELTA ${key}: ${line}`)
 }
 
@@ -765,7 +780,7 @@ function writeBaselines(bodies: Map<string, string[]>): void {
     const kept = baselineSections(file)
     for (const [key, body] of bodies) kept.set(key, body)
     const cpus = os.cpus()
-    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${cpus[0]?.model ?? 'unknown'}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>; fail|crash|cut <case>: <detail>']
+    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${cpus[0]?.model ?? 'unknown'}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>; fail|crash|cut <case>: <detail>; fingerprint compiler <createNatives hash> roots <hash of the roots the suite passes to createNatives>']
     const sections = [...kept.keys()].sort().map(key => [`== ${key}`, ...kept.get(key)!].join('\n') + '\n')
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, [header.join('\n') + '\n', ...sections].join('\n'))
@@ -925,6 +940,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
                     section.since = performance.now()
                 } else if (fields[0] === 'end' && fields.length > 2 && section) {
                     section.cases.push(`case ${fields[1]} ${fields[2]} ${fields[3]} ${fields[4]} ${caseMs(Number(fields[5]))}`)
+                } else if (fields[0] === 'fingerprint' && section) {
+                    section.fingerprint = `compiler ${fields[1]} roots ${fields[2]}`
                 } else if (fields[0] === 'done' && section) {
                     stopClock(section)
                     section.done = true
