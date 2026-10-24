@@ -19,6 +19,7 @@ import {
     addNode,
     withOperand,
     addCopy, retypeNode, insertNode, nodeUsers, getBlock, spreadsLast, allNodes, copyNodes, nodeEntries, nodeIds,
+    heapInterior, heapField, heapFieldCount, typeRefOf, getArgIds, setType,
 } from './graph-node'
 import { snapshotField, snapshotKeys } from './heap-records'
 import { newSymbolId, symbolOf, symbolValue, tagVmHandle, tagVmHandleNode, tagVmScalar, vmHandleNode, vmValue } from './vm'
@@ -195,6 +196,7 @@ interface Memory extends Layout {
     decoded?: boolean
     union?: boolean
     owner?: Handle
+    origin?: number
     members?: Handle[]
     primitives?: Handle[]
     kind?: number
@@ -449,7 +451,7 @@ function resolveProperties(
     }
     function snapshotNode(id: number): GraphNode | undefined {
         const n = getNode(source, id)
-        if (!n || n.op !== NodeOp.heapHandle || countIds(n) !== 2) return
+        if (!n || n.op !== NodeOp.heapHandle || !heapInterior(source, n)) return
         return n
     }
     const homes = new Map<Handle, Memory>()
@@ -474,7 +476,7 @@ function resolveProperties(
             const reduced = reducedShape(handle)
             let ptr = 0
             if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed)
-            mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false }
+            mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false, origin: identity?.op === NodeOp.heapHandle && heapFieldCount(identity) ? id : undefined }
             if (cell !== undefined) homes.set(cell, mem)
         }
         memory.set(id, mem)
@@ -592,7 +594,7 @@ function resolveProperties(
                 else pendingInits.set(held, [[mem, i, slot]])
                 continue
             }
-            const [ref, literal] = operandOf(slot)
+            const [ref, literal] = fieldOperand(id, state, mem.keys[i])
             if (holdsAlready(mem, i, ref)) continue
             token = initSlot(mem, i, token, slot, ref, literal)
         }
@@ -792,8 +794,16 @@ function resolveProperties(
             return mem.address = [at, 0]
         }
         mem.address = [0, 0]
-        if (mem.keys.length) mem.address = operandOf(slotAt(mem.shape, mem.keys[0]))
+        if (mem.keys.length) mem.address = fieldOperand(mem.origin ?? 0, mem.shape, mem.keys[0])
         return mem.address
+    }
+
+    function fieldOperand(id: number, state: Handle, key: Handle): [ref: number, literal: number] {
+        const slot = slotAt(state, key)
+        const n = id && heap.isBoxedF64(slot) ? getNode(source, id) : undefined
+        const field = n?.op === NodeOp.heapHandle ? heapField(source, n, key) : undefined
+        if (field === undefined) return operandOf(slot)
+        return typeof field === 'number' ? [field, 0] : [0, field.literal]
     }
 
     function operandOf(slot: Handle): [ref: number, literal: number] {
@@ -828,15 +838,44 @@ function resolveProperties(
     function inline(id: number, fn: Handle, thisValue: u32, args: u32[], token: number): void {
         const linked = session.stubFunctions.get(fn)
         if (!linked) throw `property-eval: accessor ${fn} for %${id} is not a linked function`
+        const imported = new Map<number, number>()
+        function enter(word: u32): u32 {
+            const ref = symbolOf(word)
+            if (!ref) return word
+            const at = newSymbolId(runtime.tracer)
+            const n = getNode(out, ref)
+            if (n && !typeRefOf(n) && getArgIds(n).every(r => !r)) setNode(runtime, at, copyNode(runtime, n))
+            imported.set(at, ref)
+            return symbolValue(at)
+        }
         const nested = traceModule.trace2(linked, {
             session,
-            inputs: { thisArg: thisValue, args, effect: symbolValue(token) },
+            inputs: { thisArg: enter(thisValue), args: args.map(enter), effect: enter(symbolValue(token)) },
         })
         const traced = nested.graph
-        for (const [nid, n] of nodeEntries(traced)) if (!hasNode(out, nid)) setNode(out, nid, n)
-        for (const b of traced.blocks) if (b.id !== traced.root && !out.blockIndex.has(b.id)) out.blocks.push(b)
+        const fresh = new Map<number, number>()
+        for (const nid of nodeIds(traced)) if (!imported.has(nid)) fresh.set(nid, newId())
+        for (const b of traced.blocks) if (b.id !== traced.root && !fresh.has(b.id)) fresh.set(b.id, newId())
+        function moved(ref: number): number {
+            if (!ref) return ref
+            const to = imported.get(ref) ?? fresh.get(ref)
+            intrinsics.assert(to !== undefined, `property-eval: the inlined accessor of %${id} names %${ref} outside its graph`)
+            return to!
+        }
+        for (const [nid, n] of nodeEntries(traced)) {
+            if (imported.has(nid)) continue
+            const operands = getOperands(traced, n).map(x => typeof x === 'number' ? moved(x) : x)
+            if (n.op === NodeOp.inlined && getLiteral(traced, n, 1) === nid) operands[1] = { literal: fresh.get(nid)! }
+            const copy = copyNode(traced, n, operands)
+            if (typeRefOf(n)) setType(copy, { ref: moved(typeRefOf(n)) })
+            setNode(out, fresh.get(nid)!, copy)
+        }
+        for (const b of traced.blocks) {
+            if (b.id === traced.root) continue
+            out.blocks.push({ id: moved(b.id), params: b.params.map(moved), bodyId: moved(b.bodyId), bodyConst: b.bodyConst })
+        }
         setGraphBlocks(out, out.blocks)
-        const result = symbolOf(nested.result)
+        const result = moved(symbolOf(nested.result))
         if (result) {
             putNode(out, id, NodeOp.inlined, [result, { literal: id }])
             return
@@ -1424,7 +1463,7 @@ function resolveProperties(
         if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
         const cell = getLiteral(runtime, n, 0) as Handle
         let state: Handle | undefined
-        if (countIds(n) > 1) state = snapshotNode(value) ? getLiteral(runtime, n, 1) as Handle : undefined
+        if (heapInterior(source, n)) state = heapInterior(source, n) as Handle
         else if (heap.isIndirect(cell) && !session.sealed.has(cell)) state = heap.indirectTarget(cell)
         return state !== undefined && snapshotKeys(state).length === dataKeys(state).length ? state : undefined
     }
@@ -1668,12 +1707,12 @@ function resolveProperties(
         if (!reads) continue
         for (const value of returned) {
             const n = getNode(source, value)!
-            if (countIds(n) > 1) continue
+            if (heapInterior(source, n)) continue
             const state = returnedState(value)!
             const fields: Operand[] = []
             for (const key of snapshotKeys(state)) {
-                const raw = heap.unboxF64(snapshotField(state, key)!)
-                fields.push({ literal: key }, intrinsics.getNanId(raw) || { literal: raw })
+                const [ref, literal] = fieldOperand(value, state, key)
+                fields.push({ literal: key }, ref || { literal })
             }
             putNode(source, value, NodeOp.record, fields)
             putCopy(out, value, getNode(source, value)!)
@@ -1807,7 +1846,7 @@ function resolveProperties(
             if (!heap.getOwnProperty(state, key)) return null
             const slot = slotAt(state, key)
             if (!heap.isBoxedF64(slot)) return isObjectSlot(slot) ? heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot : undefined
-            const value = heap.boxedNanId(slot)
+            const [value] = fieldOperand(id, state, key)
             return value ? pointerShape(value) : numberShape
         }
         if (n?.op !== NodeOp.param) return
@@ -2409,7 +2448,7 @@ function resolveProperties(
         const snapshot = n.op === NodeOp.getProp && !getRef(n, 2) && !memory.has(object) ? snapshotNode(object) : undefined
         const snapshotKey = snapshot ? heap.getOwnProperty(getLiteral(runtime, snapshot, 1) as Handle, getLiteral(runtime, n, 2) as Handle) : 0
         if (snapshot && snapshotKey && !(heap.FullPropertyDescriptor(heap.resolveHeapCell(snapshotKey)).flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter))) {
-            const [ref, literal] = operandOf(slotAt(getLiteral(runtime, snapshot, 1) as Handle, getLiteral(runtime, n, 2) as Handle))
+            const [ref, literal] = fieldOperand(object, getLiteral(runtime, snapshot, 1) as Handle, getLiteral(runtime, n, 2) as Handle)
             putNode(out, id, NodeOp.after, [getRef(n, 0), ref || { literal }])
             if (ref) forwardedReads.set(id, ref)
             else numbers.add(id)
@@ -2519,7 +2558,7 @@ function resolveProperties(
     }
     for (const [id, value] of unboxed) replaced.set(id, [value, 0])
     for (const [id, n] of nodeEntries(out)) {
-        if (n.op !== NodeOp.heapHandle || getRef(n, 0) || countIds(n) !== 1 || memory.has(id) || replaced.has(id)) continue
+        if (n.op !== NodeOp.heapHandle || getRef(n, 0) || heapInterior(out, n) || memory.has(id) || replaced.has(id)) continue
         const home = homes.get(getLiteral(runtime, n, 0) as Handle)
         if (home && home.ptr) replaced.set(id, addressOf(home))
     }
@@ -2638,7 +2677,7 @@ export function placeObjects(graph: Graph, opts: ObjectRequest): Resolved {
         if (session.sealed.has(cell as Handle)) pointers.set(id, heap.indirectTarget(cell as Handle))
         else if (opts.statics?.has(heap.deref(cell as Handle))) pointers.set(id, heap.deref(cell as Handle))
         if (!heap.isIndirect(cell as Handle) || !session.templateOf(cell)) continue
-        const shape = (countIds(n) > 1 ? getLiteral(graph, n, 1) : heap.indirectTarget(cell as Handle)) as Handle
+        const shape = (heapInterior(graph, n) || heap.indirectTarget(cell as Handle)) as Handle
         objects.set(id, shape)
     }
     const unionPointers = new Map<number, UnionParam>()
