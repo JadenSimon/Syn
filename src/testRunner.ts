@@ -778,6 +778,106 @@ function crashOf(code: number | null, signal: string | null): string | undefined
     return `CRASH signal ${signals[name]} (exit ${128 + signals[name]})`
 }
 
+interface CodeUnit {
+    entry: number
+    size: number
+    bytes: number
+    link: number
+    name: string
+}
+
+function symbolizeCrash(maps: string[], dump: Buffer): string[] {
+    if (dump.length < 320) return [dump.length ? `  crash dump truncated at ${dump.length} bytes` : '  no crash dump']
+    const units: CodeUnit[] = []
+    for (const line of maps) {
+        for (const field of line.split('\t').slice(1)) {
+            const [entry, size, bytes, link, ...name] = field.split(' ')
+            units.push({ entry: parseInt(entry, 16), size: Number(size), bytes: Number(bytes), link: Number(link), name: name.join(' ') })
+        }
+    }
+    units.sort((a, b) => a.entry - b.entry)
+    const unitAt = (address: number): CodeUnit | undefined => {
+        let lo = 0
+        let hi = units.length
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1
+            if (units[mid].entry <= address) lo = mid + 1
+            else hi = mid
+        }
+        const unit = units[lo - 1]
+        return unit && address < unit.entry + unit.size ? unit : undefined
+    }
+    const callerAt = (address: number): CodeUnit | undefined => {
+        const unit = unitAt(address)
+        return unit && address > unit.entry ? unit : undefined
+    }
+    const hex = (address: number) => `0x${address.toString(16)}`
+    const symbol = (address: number): string => {
+        const unit = unitAt(address)
+        return unit ? `${unit.name}+${hex(address - unit.entry)}` : `${hex(address)} (outside native code)`
+    }
+    const word = (at: number) => Number(dump.readBigUInt64LE(at))
+    const signo = dump.readInt32LE(0)
+    const lr = word(288)
+    const top = word(296)
+    const pc = word(304)
+    const stackWord = (address: number): number | undefined => {
+        const at = 320 + address - top
+        return address >= top && at + 8 <= dump.length ? word(at) : undefined
+    }
+    const signal = Object.entries(os.constants.signals).find(([, n]) => n === signo)?.[0] ?? `signal ${signo}`
+    const lines = [`  ${signal} at ${symbol(pc)}, fault address ${hex(word(24))}, sp ${hex(top)}`]
+    const frames = [symbol(pc)]
+    const push = (address: number, how: string) => frames.push(`${symbol(address)}${how}`)
+    let unit = unitAt(pc)
+    let sp: number | undefined = top
+    let lower = top
+    while (frames.length < 256) {
+        const first = frames.length === 1
+        if (unit && sp !== undefined && unit.bytes >= 0) {
+            const entering = first && pc === unit.entry
+            const ret = unit.link >= 0 && !entering ? stackWord(sp + unit.link) : first ? lr : undefined
+            if (ret === undefined) break
+            if (callerAt(ret)) {
+                push(ret, '')
+                sp += entering ? 0 : unit.bytes
+                lower = sp
+                unit = callerAt(ret)
+                continue
+            }
+            if (!first) {
+                push(ret, '')
+                break
+            }
+        }
+        if (first && callerAt(lr)) {
+            push(lr, ' (lr)')
+            unit = callerAt(lr)
+            sp = undefined
+            continue
+        }
+        const known = unit && unit.link >= 0 && unit.bytes >= 0 ? unit : undefined
+        let at = lower + (known ? known.link : 0)
+        while (stackWord(at) !== undefined && !callerAt(stackWord(at)!)) at += 8
+        const ret = stackWord(at)
+        if (ret === undefined) break
+        push(ret, ' (scan)')
+        sp = known ? at - known.link + known.bytes : undefined
+        lower = sp ?? at + 8
+        unit = callerAt(ret)
+    }
+    lines.push(`  backtrace via frame layouts (lr = link register, scan = stack scan, may be stale):`)
+    let i = 0
+    while (i < frames.length) {
+        let j = i
+        while (j + 1 < frames.length && frames[j + 1] === frames[i]) j++
+        lines.push(`    #${i} ${frames[i]}${j > i ? ` (repeated ${j - i + 1} times)` : ''}`)
+        i = j + 1
+    }
+    if (frames.length >= 256) lines.push('    ... truncated')
+    return lines
+}
+
 async function superviseEngine(args: string[], seconds: number): Promise<void> {
     const suites = args[1] === 'all' ? allTestableFiles : [args[1]]
     const deadline = Date.now() + seconds * 1000
@@ -794,11 +894,14 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     const sections = new Map<string, BaselineSection>()
     let section: BaselineSection | undefined
     while (true) {
-        const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
+        const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DUMP_FD: '4', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
-        const child = spawn(process.argv[1], process.argv.slice(2), { stdio: ['inherit', 'inherit', 'inherit', 'pipe'], env })
+        const child = spawn(process.argv[1], process.argv.slice(2), { stdio: ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'], env })
         const marks: CrashMarks = {}
+        const maps: string[] = []
+        const dump: Buffer[] = []
         let pending = ''
+        child.stdio[4]!.on('data', (chunk: Buffer) => dump.push(chunk))
         child.stdio[3]!.setEncoding('utf8')
         child.stdio[3]!.on('data', (chunk: string) => {
             const lines = (pending + chunk).split('\n')
@@ -808,6 +911,10 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
                 if (fields[0] === 'fail') {
                     failures++
                     section?.problems.push(`fail ${marks.caseNumber !== undefined ? marks.caseName : '-'}: ${line.slice(5)}`)
+                    continue
+                }
+                if (fields[0] === 'map') {
+                    maps.push(line)
                     continue
                 }
                 readMark(marks, line)
@@ -846,6 +953,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
             if (marks.suite !== undefined && following) next = { suite: following, case: 0 }
         }
         console.log(`${label} FAILED: ${message}`)
+        if (marks.caseNumber !== undefined) console.log(`  case ${marks.caseLabel}`)
+        for (const line of symbolizeCrash(maps, Buffer.concat(dump))) console.log(line)
         section?.problems.push(`crash ${running}: ${label} ${message}`)
         crashes.push(label)
         if (!next || crashes.length >= maxCrashes) {
