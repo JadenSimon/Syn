@@ -134,6 +134,10 @@ function sealCodePage(ptr: usize, len: usize): u32 {
     return status
 }
 
+function protectPages(ptr: usize, len: usize, prot: u32): u32 {
+    return syscalls.mprotect(ptr, len, prot)
+}
+
 function invokeNative(target: any, args: usize, nargs: usize): usize {
     if (nargs === 0) return target()
     const a0 = Intrinsics.load(args, 0, Types.u64)
@@ -171,13 +175,68 @@ function invokeNative(target: any, args: usize, nargs: usize): usize {
     return 0
 }
 const maxRootArgs = 16
+
+export const RegionKind = { code: 0, heap: 1, pstack: 2, table: 3 }
+
+interface NativeRegion {
+    kind: number
+    index: number
+    base: number
+    size: number
+}
+
+interface Relocation {
+    offset: number
+    region: number
+    scale: number
+}
+
+interface MemoryWrite {
+    at: number
+    bytes: Uint8Array
+    relocations: Relocation[]
+}
+
+const nativeRegions: NativeRegion[] = []
+const heapWrites: MemoryWrite[] = []
+const staticWrites: MemoryWrite[] = []
+const relocatedWords = new Map<number, Relocation>()
+
+function addRegion(kind: number, index: number, base: number, size: number): number {
+    nativeRegions.push({ kind, index, base, size })
+    return nativeRegions.length - 1
+}
+
+function regionAt(address: number): number {
+    for (let id = 0; id < nativeRegions.length; id++) {
+        const region = nativeRegions[id]
+        if (address >= region.base && address < region.base + region.size) return id
+    }
+    throw `native: address 0x${address.toString(16)} is in no native region`
+}
+
+function logWrite(log: MemoryWrite[], at: number, bytes: Uint8Array, relocations: Relocation[]): void {
+    log.push({ at, bytes: bytes.slice(), relocations })
+    for (let word = at - 7; word < at + bytes.length; word++) relocatedWords.delete(word)
+    for (const relocation of relocations) relocatedWords.set(at + relocation.offset, relocation)
+}
+
+function relocatedWord(address: number, size: number): Relocation | undefined | null {
+    const exact = relocatedWords.get(address)
+    if (exact) return size === 8 ? exact : null
+    for (let word = address - 7; word < address + size; word++) if (relocatedWords.has(word)) return null
+}
+
+let heapRegion = -1
+const heapRegionBytes = heap.boxedCellBit + heap.runtimeCells + (1 << 24)
 let runtimeHeapAddress: number | undefined
 export function runtimeHeapBase(): number {
     if (runtimeHeapAddress !== undefined) return runtimeHeapAddress
     getNativeBootstraps()
-    const base = Number(nativeMapper(heap.boxedCellBit + heap.runtimeCells + (1 << 24)))
+    const base = Number(nativeMapper(heapRegionBytes))
     if (!base || base === -1) throw 'native: failed to map the runtime heap'
     runtimeHeapAddress = base
+    heapRegion = addRegion(RegionKind.heap, 0, base, heapRegionBytes)
     writeRuntimeHeap(heap.runtimeCells, new Uint8Array(new Uint32Array([heap.runtimeCells + 8]).buffer))
     for (const handle of heap.fixedHandles) mirrorCell(handle)
     return base
@@ -189,7 +248,8 @@ function vmBytes(ptr: number, size: number): Uint8Array {
     for (let i = 0; i < size; i++) bytes[i] = Intrinsics.load(ptr, i, Types.u8)
     return bytes
 }
-function writeRuntimeHeap(at: number, bytes: Uint8Array): void {
+function writeRuntimeHeap(at: number, bytes: Uint8Array, relocations: Relocation[] = []): void {
+    logWrite(heapWrites, runtimeHeapBase() + at, bytes, relocations)
     const outer = heldArgs
     heldArgs = bytes
     const src = (ts as any).getArrayBufferPtr(bytes.buffer)
@@ -201,21 +261,21 @@ export function runtimeBytes(address: number, size: number): Uint8Array {
     if (size && !nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), address, size)) throw 'native: failed to read the runtime heap'
     return bytes.subarray(0, size)
 }
-function runtimeString(handle: number): string {
-    const cell = new DataView(runtimeBytes(runtimeHeapBase() + handle, heap.HeapString.sizeof).buffer)
+function runtimeString(handle: number, base = runtimeHeapBase()): string {
+    const cell = new DataView(runtimeBytes(base + handle, heap.HeapString.sizeof).buffer)
     const length = cell.getUint32(heap.stringLengthOffset, true)
     const ptr = Number(cell.getBigUint64(heap.stringPtrOffset, true))
     return new TextDecoder().decode(runtimeBytes(ptr, length))
 }
-export function runtimeValue(handle: number): any {
-    const cell = new DataView(runtimeBytes(runtimeHeapBase() + handle, heap.boxValueOffset + 8).buffer)
+export function runtimeValue(handle: number, base = runtimeHeapBase()): any {
+    const cell = new DataView(runtimeBytes(base + handle, heap.boxValueOffset + 8).buffer)
     if (cell.getUint32(0, true) === heap.boxTypeDescriptor) return cell.getFloat64(heap.boxValueOffset, true)
-    return runtimeString(handle)
+    return runtimeString(handle, base)
 }
 
-function hostResult(raw: any, kind: HostReturn): any {
+function hostResult(raw: any, kind: HostReturn, base = runtimeHeapBase()): any {
     const word = Number(BigInt.asUintN(32, BigInt(raw)))
-    if (kind === 'string') return runtimeString(word)
+    if (kind === 'string') return runtimeString(word, base)
     if (!(word & 1)) return (word | 0) >> 1
     const handle = word >>> 1
     if (handle === heap.undefinedHandle) return undefined
@@ -223,7 +283,7 @@ function hostResult(raw: any, kind: HostReturn): any {
     if (handle === heap.falseHandle) return false
     if (handle === heap.trueHandle) return true
     if (word >= heap.pstackWordTag || handle & heap.boxedCellBit) return raw
-    return runtimeValue(handle)
+    return runtimeValue(handle, base)
 }
 function mirrorRaw(ptr: number): void {
     if (!ptr || mirroredCells.has(ptr)) return
@@ -261,16 +321,19 @@ export function mirrorCell(handle: number): void {
         else if (heap.isTypeDescriptor(child as intrinsics.Handle) || heap.isCell(child as intrinsics.Handle)) mirrorValue(child)
         else if (offset === 4) mirrorProperties(child)
     }
+    const relocations: Relocation[] = []
     for (const offset of view.rawOffsets) {
         const raw = Number(data.getBigUint64(offset, true))
         if (!raw) continue
         mirrorRaw(raw)
         data.setBigUint64(offset, BigInt(runtimeHeapBase() + raw), true)
+        relocations.push({ offset, region: heapRegion, scale: 1 })
     }
-    writeRuntimeHeap(handle, bytes)
+    writeRuntimeHeap(handle, bytes, relocations)
 }
 const pstackRegionBytes = 1 << 24
 const pstackCells = new Map<number, number>()
+const pstackRegions = new Map<number, number>()
 function pstackCell(stack: number): number {
     const known = pstackCells.get(stack)
     if (known !== undefined) return known
@@ -280,7 +343,17 @@ function pstackCell(stack: number): number {
     const top = new BigUint64Array([BigInt(cell + 8)])
     if (!nativeCopier(cell, (ts as any).getArrayBufferPtr(top.buffer), 8)) throw `native: failed to seed pstack ${stack}`
     pstackCells.set(stack, cell)
+    pstackRegions.set(stack, addRegion(RegionKind.pstack, stack, cell, pstackRegionBytes))
     return cell
+}
+
+function pstackRegion(stack: number): number {
+    pstackCell(stack)
+    return pstackRegions.get(stack)!
+}
+
+function staticRegion(): number {
+    return pstackRegion(0)
 }
 
 function staticReserve(size: number): number {
@@ -289,7 +362,8 @@ function staticReserve(size: number): number {
     return at
 }
 
-export function staticWrite(at: number, bytes: Uint8Array): void {
+export function staticWrite(at: number, bytes: Uint8Array, relocations: Relocation[] = []): void {
+    logWrite(staticWrites, at, bytes, relocations)
     if (!nativeCopier(at, (ts as any).getArrayBufferPtr(bytes.buffer), bytes.length)) throw 'native: failed to write static memory'
 }
 
@@ -316,18 +390,45 @@ interface StaticTail {
 interface StaticRecord {
     fields: Map<number, StaticValue>
 }
-type StaticValue = bigint | number | StaticTail | StaticRecord
+interface StaticPointer {
+    region: number
+    address: bigint
+}
+type StaticValue = bigint | number | StaticTail | StaticRecord | StaticPointer
+
+interface StaticRegion {
+    base: number
+    bytes: Uint8Array
+    relocations: Map<number, Relocation>
+}
 
 interface StaticContext {
+    image: ProgramImage
     units: Map<number, Graph>
     runtime: Map<number, number>
-    address(cell: intrinsics.Handle): number | undefined
-    static(handle: intrinsics.Handle): bigint | undefined
+    address(cell: intrinsics.Handle): StaticValue | undefined
+    static(handle: intrinsics.Handle): StaticValue | undefined
     readable(address: number, size: number): boolean
     reserve?: (size: number) => number
-    regions: { base: number, bytes: Uint8Array }[]
+    regions: StaticRegion[]
     steps: number
     budget: number
+}
+
+function isStaticPointer(v: StaticValue): v is StaticPointer {
+    return typeof v === 'object' && 'region' in v
+}
+
+function staticPointer(region: number, address: bigint): StaticPointer {
+    return { region, address: BigInt.asUintN(64, address) }
+}
+
+function poolValue(image: ProgramImage, slot: number, value = image.knownValue(slot)): StaticValue | undefined {
+    const relocation = image.slotRelocations.get(slot)
+    if (value === undefined) return
+    if (!relocation) return BigInt(value)
+    if (relocation.scale !== 1) throw `static: pool[${slot}] is a scaled address`
+    return staticPointer(relocation.region, BigInt(value))
 }
 
 const staticStepBudget = 1_000_000
@@ -352,29 +453,45 @@ function staticInt(v: StaticValue, why: string): bigint {
     return v
 }
 
+function staticAddress(v: StaticValue, why: string): bigint {
+    return isStaticPointer(v) ? v.address : staticInt(v, why)
+}
+
 function staticFloat(v: StaticValue): number {
     if (typeof v === 'number') return v
     if (typeof v === 'bigint') return Number(v)
-    throw 'static: a jump is used as a value'
+    throw 'static: a jump, record or address is used as a float'
 }
 
 const staticScratch = new DataView(new ArrayBuffer(8))
 
-function staticMemory(ctx: StaticContext, address: number, size: number): { bytes: Uint8Array, at: number, owned: boolean } {
+function staticMemory(ctx: StaticContext, address: number, size: number): { bytes: Uint8Array, at: number, owned?: StaticRegion } {
     for (const region of ctx.regions) {
-        if (address >= region.base && address + size <= region.base + region.bytes.length) return { bytes: region.bytes, at: address - region.base, owned: true }
+        if (address >= region.base && address + size <= region.base + region.bytes.length) return { bytes: region.bytes, at: address - region.base, owned: region }
     }
     if (!ctx.readable(address, size)) throw `static: reads memory at ${address} that it does not own`
     const bytes = new Uint8Array(size)
     if (!nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), address, size)) throw 'static: failed to read placed memory'
-    return { bytes, at: 0, owned: false }
+    return { bytes, at: 0 }
+}
+
+function ownedRelocation(region: StaticRegion, at: number, size: number): Relocation | undefined | null {
+    const exact = region.relocations.get(at)
+    if (exact) return size === 8 ? exact : null
+    for (let word = at - 7; word < at + size; word++) if (region.relocations.has(word)) return null
 }
 
 function staticLoad(ctx: StaticContext, address: number, T: intrinsics.Types): StaticValue {
     const size = Math.max(1, staticWidth(T) / 8)
-    const { bytes, at } = staticMemory(ctx, address, size)
+    const { bytes, at, owned } = staticMemory(ctx, address, size)
     let raw = BigInt(0)
     for (let i = size - 1; i >= 0; i--) raw = (raw << BigInt(8)) | BigInt(bytes[at + i])
+    const relocation = owned ? ownedRelocation(owned, at, size) : relocatedWord(address, size)
+    if (relocation === null) throw `static: reads part of an address at ${address}`
+    if (relocation) {
+        if (T === Types.f64) throw `static: reads an address at ${address} as a float`
+        return staticPointer(relocation.region, raw)
+    }
     if (T !== Types.f64) return staticNorm(raw, T)
     staticScratch.setBigUint64(0, raw, true)
     return staticScratch.getFloat64(0, true)
@@ -384,10 +501,15 @@ function staticStore(ctx: StaticContext, address: number, value: StaticValue, T:
     const size = Math.max(1, staticWidth(T) / 8)
     const { bytes, at, owned } = staticMemory(ctx, address, size)
     if (!owned) throw `static: writes memory at ${address} that it does not own`
+    for (let word = at - 7; word < at + size; word++) owned.relocations.delete(word)
     let raw: bigint
     if (typeof value === 'number') {
         staticScratch.setFloat64(0, value, true)
         raw = staticScratch.getBigUint64(0, true)
+    } else if (isStaticPointer(value)) {
+        if (size !== 8) throw `static: stores an address into ${size} bytes`
+        raw = value.address
+        owned.relocations.set(at, { offset: at, region: value.region, scale: 1 })
     } else raw = BigInt.asUintN(64, staticInt(value, 'a stored value'))
     for (let i = 0; i < size; i++) bytes[at + i] = Number((raw >> BigInt(i * 8)) & BigInt(255))
 }
@@ -420,11 +542,12 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
     if (!n) throw `static: %${id} is missing`
     const operand = (i: number): StaticValue => getRef(n, i) ? evaluateNode(ctx, graph, getRef(n, i), values) : staticLiteral(getLiteral(graph, n, i))
     const int = (i: number): bigint => staticInt(operand(i), `operand ${i} of ${opName(n.op)} %${id}`)
+    const address = (i: number): bigint => staticAddress(operand(i), `operand ${i} of ${opName(n.op)} %${id}`)
     const T = resultType(graph, n)
     let value: StaticValue
     switch (n.op) {
         case NodeOp.select:
-            value = int(0) ? operand(1) : operand(2)
+            value = address(0) ? operand(1) : operand(2)
             break
         case NodeOp.apply: {
             const args: StaticValue[] = []
@@ -473,7 +596,13 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             }
             const at = ctx.address(cell)
             if (at === undefined) throw `static: %${id} refers to heap value @${cell}, which has no static address`
-            value = BigInt(at)
+            value = at
+            break
+        }
+        case NodeOp.poolEntry: {
+            const pooled = getRef(n, 0) ? undefined : poolValue(ctx.image, getLiteral(graph, n, 0), countIds(n) > 1 ? getLiteral(graph, n, 1) : undefined)
+            if (pooled === undefined) throw `static: %${id} reads a pool entry with no known value`
+            value = pooled
             break
         }
         case NodeOp.static: {
@@ -489,18 +618,18 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             const size = Number(int(3))
             if (!ctx.reserve) throw `static: %${id} allocates`
             const base = ctx.reserve(size)
-            ctx.regions.push({ base, bytes: new Uint8Array(size) })
-            value = BigInt(base)
+            ctx.regions.push({ base, bytes: new Uint8Array(size), relocations: new Map() })
+            value = staticPointer(staticRegion(), BigInt(base))
             break
         }
         case NodeOp.load: {
             operand(0)
-            value = staticLoad(ctx, Number(int(1) + int(2)), typeOf(n))
+            value = staticLoad(ctx, Number(address(1) + int(2)), typeOf(n))
             break
         }
         case NodeOp.store: {
             operand(0)
-            staticStore(ctx, Number(int(1) + int(2)), operand(3), typeOf(n))
+            staticStore(ctx, Number(address(1) + int(2)), operand(3), typeOf(n))
             value = BigInt(0)
             break
         }
@@ -528,12 +657,14 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             else value = T === Types.u32 ? BigInt.asUintN(32, int(0)) >> BigInt(1) : BigInt.asIntN(32, int(0)) >> BigInt(1)
             break
         case NodeOp.encode: {
-            const ptr = int(0)
+            const pointer = operand(0)
+            if (isStaticPointer(pointer) && pointer.region !== staticRegion()) throw `static: %${id} encodes an address outside static memory`
+            const ptr = address(0)
             value = !ptr ? BigInt(heap.undefinedWord) : BigInt.asUintN(32, (ptr - int(1)) * BigInt(2) + BigInt(heap.pstackWordTag + 1))
             break
         }
         case NodeOp.decode:
-            value = int(0) === BigInt(heap.undefinedWord) ? BigInt(0) : ((int(0) >> BigInt(1)) & BigInt((1 << 28) - 1)) + int(1)
+            value = int(0) === BigInt(heap.undefinedWord) ? BigInt(0) : staticPointer(staticRegion(), ((int(0) >> BigInt(1)) & BigInt((1 << 28) - 1)) + int(1))
             break
         case NodeOp.crc32:
             value = BigInt(intrinsics.crc32Bits(Number(BigInt.asUintN(32, int(0))), int(1), intrinsics.intrinsicBitWidth(getLiteral(graph, n, 2))))
@@ -542,7 +673,11 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         case NodeOp.bitconvert: {
             const from = operandType(graph, n, 0)
             const v = operand(0)
-            if (T === Types.f64 && from === Types.f64) value = v
+            if (isStaticPointer(v)) {
+                if (staticWidth(T) !== 64 || staticWidth(from) !== 64 || T === Types.f64 || from === Types.f64) throw `static: %${id} converts an address`
+                value = v
+            }
+            else if (T === Types.f64 && from === Types.f64) value = v
             else if (T === Types.f64 && n.op === NodeOp.convert) value = staticFloat(v)
             else if (from === Types.f64 && n.op === NodeOp.convert) {
                 const whole = Math.trunc(staticFloat(v))
@@ -576,7 +711,7 @@ function evaluateLowered(ctx: StaticContext, graph: Graph, n: GraphNode, values:
         added.push(fresh)
         return fresh
     }
-    const lowered = add(rt.lowerNative(graph, n, { runtimeHeapBase, pstackBase: () => pstackCell(0) + 8, add }))
+    const lowered = add(rt.lowerNative(graph, n, nativeContext(graph, ctx.image, add)))
     defer finally {
         for (const id of added) {
             deleteNode(graph, id)
@@ -593,6 +728,7 @@ function staticLiteral(v: number): StaticValue {
 function evaluateArithmetic(graph: Graph, n: GraphNode, id: number, operand: (i: number) => StaticValue, T: intrinsics.Types): StaticValue {
     const a = operand(0)
     const b = countIds(n) > 1 ? operand(1) : BigInt(0)
+    if (isStaticPointer(a) || isStaticPointer(b)) return pointerArithmetic(n, id, a, b, T)
     const compare = n.op === NodeOp.eq || n.op === NodeOp.ne || n.op === NodeOp.lt || n.op === NodeOp.le || n.op === NodeOp.gt || n.op === NodeOp.ge
     const floating = T === Types.f64 || typeof a === 'number' || typeof b === 'number'
     if (floating) {
@@ -652,23 +788,66 @@ function evaluateArithmetic(graph: Graph, n: GraphNode, id: number, operand: (i:
     throw `static: %${id} is ${opName(n.op)}, which does not evaluate`
 }
 
+function pointerArithmetic(n: GraphNode, id: number, a: StaticValue, b: StaticValue, T: intrinsics.Types): StaticValue {
+    const fail = (): never => { throw `static: %${id} computes ${opName(n.op)} on an address` }
+    const left = isStaticPointer(a) ? a : undefined
+    const right = isStaticPointer(b) ? b : undefined
+    const x = left ? left.address : typeof a === 'bigint' ? a : fail()
+    const y = right ? right.address : typeof b === 'bigint' ? b : fail()
+    const sameRegion = !!left && !!right && left.region === right.region
+    const nullTest = (!left && !x) || (!right && !y)
+    switch (n.op) {
+        case NodeOp.add:
+            if (staticWidth(T) !== 64 || (left && right)) fail()
+            return staticPointer((left ?? right)!.region, x + y)
+        case NodeOp.sub:
+            if (staticWidth(T) !== 64) fail()
+            if (left && !right) return staticPointer(left.region, x - y)
+            if (!sameRegion) fail()
+            return BigInt.asIntN(64, x - y)
+        case NodeOp.eq:
+            return BigInt(x === y ? 1 : 0)
+        case NodeOp.ne:
+            return BigInt(x !== y ? 1 : 0)
+        case NodeOp.lt:
+        case NodeOp.le:
+        case NodeOp.gt:
+        case NodeOp.ge: {
+            if (!sameRegion && !nullTest) fail()
+            if (n.op === NodeOp.lt) return BigInt(x < y ? 1 : 0)
+            if (n.op === NodeOp.le) return BigInt(x <= y ? 1 : 0)
+            if (n.op === NodeOp.gt) return BigInt(x > y ? 1 : 0)
+            return BigInt(x >= y ? 1 : 0)
+        }
+        case NodeOp.and: {
+            if (left && right) fail()
+            const mask = BigInt.asUintN(64, left ? y : x)
+            if (mask < BigInt(4096)) return (left ? x : y) & mask
+            if ((mask | BigInt(4095)) === BigInt.asUintN(64, BigInt(-1)) && staticWidth(T) === 64) return staticPointer((left ?? right)!.region, x & y)
+            return fail()
+        }
+    }
+    return fail()
+}
+
 function evaluateStatics(program: ProgramGraph): void {
     const init = program.roots.get(staticInitName)
     if (flags.has('static-debug')) console.log(`statics init ${init} symbols ${program.image.staticSymbols.join(',')}`)
     if (init === undefined) return
     const image = program.image
     const initGraph = program.units.get(init)!
-    const words = new Map<number, bigint | null>()
-    function evaluateSlot(slot: number): bigint | undefined {
+    const words = new Map<number, StaticValue | null>()
+    function evaluateSlot(slot: number): StaticValue | undefined {
         const known = words.get(slot)
         if (known !== undefined) return known ?? undefined
         words.set(slot, null)
         const ctx: StaticContext = {
+            image,
             units: program.units,
             runtime: image.runtime,
             address: cell => {
                 const slot = image.dataHandles.get(heap.deref(cell))
-                return slot === undefined ? undefined : image.knownValue(slot)
+                return slot === undefined ? undefined : poolValue(image, slot)
             },
             static: handle => {
                 const slot = image.statics.get(handle)
@@ -680,9 +859,10 @@ function evaluateStatics(program: ProgramGraph): void {
             steps: 0,
             budget: staticStepBudget,
         }
-        let word: bigint
+        let word: StaticValue
         try {
-            word = BigInt.asUintN(64, staticInt(evaluateUnit(ctx, image.staticSymbols[slot], []), 'the static result'))
+            word = evaluateUnit(ctx, image.staticSymbols[slot], [])
+            if (!isStaticPointer(word)) word = BigInt.asUintN(64, staticInt(word, 'the static result'))
         } catch (e) {
             const message = e instanceof Error ? e.message : String(e)
             if (!message.startsWith('static:')) throw e
@@ -690,15 +870,17 @@ function evaluateStatics(program: ProgramGraph): void {
             return
         }
         for (const region of ctx.regions) {
-            staticWrite(region.base, region.bytes)
+            staticWrite(region.base, region.bytes, [...region.relocations.values()])
             image.staticRegions.push([region.base, region.bytes.length])
         }
-        const bytes = new BigUint64Array([word])
-        staticWrite(image.staticTable.base + slot * 8, new Uint8Array(bytes.buffer))
+        const pointer = isStaticPointer(word) ? word : undefined
+        const raw = pointer ? pointer.address : word as bigint
+        staticWrite(image.staticTable.base + slot * 8, new Uint8Array(new BigUint64Array([raw]).buffer), pointer ? [{ offset: 0, region: pointer.region, scale: 1 }] : [])
         words.set(slot, word)
-        const address = new BigUint64Array([((word >> BigInt(1)) & BigInt((1 << 28) - 1)) + BigInt(pstackCell(0) + 8)])
-        for (const [at, held] of image.staticFields) if (held === slot) staticWrite(at, new Uint8Array(address.buffer))
-        if (flags.has('static-debug')) console.log(`static ${slot} evaluates to ${word}`)
+        const address = new BigUint64Array([pointer ? raw : ((raw >> BigInt(1)) & BigInt((1 << 28) - 1)) + BigInt(pstackCell(0) + 8)])
+        const held = [{ offset: 0, region: pointer ? pointer.region : staticRegion(), scale: 1 }]
+        for (const [at, field] of image.staticFields) if (field === slot) staticWrite(at, new Uint8Array(address.buffer), held)
+        if (flags.has('static-debug')) console.log(`static ${slot} evaluates to ${raw}`)
         return word
     }
     function literalOperand(n: GraphNode, i: number): number | undefined {
@@ -725,19 +907,27 @@ function evaluateStatics(program: ProgramGraph): void {
     }
     if (!remaining) program.roots.delete(staticInitName)
     for (const graph of program.units.values()) {
-        const known = new Map<number, number>()
+        const known = new Map<number, Operand>()
+        const staticWords = new Map<number, number>()
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op !== NodeOp.static) continue
             const target = getNode(graph, getRef(n, 0))
             const slot = target?.op === NodeOp.heapHandle ? image.statics.get(heap.deref(getLiteral(graph, target, 0) as intrinsics.Handle)) : undefined
             const word = slot === undefined ? undefined : words.get(slot)
-            if (word !== undefined && word !== null) known.set(id, Number(word))
+            if (word === undefined || word === null) continue
+            if (isStaticPointer(word)) {
+                known.set(id, insertNode(graph, relocatedNode(graph, image, word.region, Number(word.address))))
+                continue
+            }
+            known.set(id, { literal: Number(word as bigint) })
+            staticWords.set(id, Number(word as bigint))
         }
         if (!known.size) continue
-        for (const [id, n] of nodeEntries(graph)) {
-            if (n.op !== NodeOp.decode || !known.has(getRef(n, 0)) || getRef(n, 1)) continue
-            const word = known.get(getRef(n, 0))!
-            known.set(id, word === heap.undefinedWord ? 0 : ((word >>> 1) & ((1 << 28) - 1)) + getLiteral(graph, n, 1))
+        for (const [id, n] of [...nodeEntries(graph)]) {
+            if (n.op !== NodeOp.decode || !staticWords.has(getRef(n, 0)) || getRef(n, 1)) continue
+            const word = staticWords.get(getRef(n, 0))!
+            const address = ((word >>> 1) & ((1 << 28) - 1)) + getLiteral(graph, n, 1)
+            known.set(id, word === heap.undefinedWord ? { literal: 0 } : insertNode(graph, relocatedNode(graph, image, staticRegion(), address)))
         }
         for (const [id, n] of [...nodeEntries(graph)]) {
             let ops: Operand[] | undefined
@@ -745,11 +935,24 @@ function evaluateStatics(program: ProgramGraph): void {
                 const value = known.get(getRef(n, i))
                 if (value === undefined) continue
                 ops ??= getOperands(graph, n)
-                ops[i] = { literal: value }
+                ops[i] = value
             }
             if (ops) putCopy(graph, id, n, ops)
         }
     }
+}
+
+function staticOperand(g: Graph, image: ProgramImage, value: StaticValue): Operand {
+    if (isStaticPointer(value)) return insertNode(g, relocatedNode(g, image, value.region, Number(value.address)))
+    return { literal: staticScalar(value)! }
+}
+
+function staticFoldable(value: StaticValue): boolean {
+    return isStaticPointer(value) || staticScalar(value) !== undefined
+}
+
+function staticKey(value: StaticValue): string {
+    return isStaticPointer(value) ? `@${value.region}:${value.address}` : String(value)
 }
 
 function inMirroredString(address: number, size: number): boolean {
@@ -779,15 +982,17 @@ function foldConstantCalls(program: ProgramGraph, clock: PhaseClock): void {
             let constant = true
             for (let i = 3; i < countIds(n); i++) {
                 const arg = getRef(n, i) ? getNode(g, getRef(n, i)) : undefined
-                if (getRef(n, i) && arg?.op !== NodeOp.literal && arg?.op !== NodeOp.heapHandle) constant = false
+                const relocated = arg?.op === NodeOp.poolEntry && countIds(arg) > 1 && !getRef(arg, 0)
+                if (getRef(n, i) && arg?.op !== NodeOp.literal && arg?.op !== NodeOp.heapHandle && !relocated) constant = false
             }
             if (!constant) continue
             const ctx: StaticContext = {
+                image,
                 units: program.units,
                 runtime: image.runtime,
                 address: cell => {
                     const slot = image.dataHandles.get(heap.deref(cell))
-                    return slot === undefined ? undefined : image.knownValue(slot)
+                    return slot === undefined ? undefined : poolValue(image, slot)
                 },
                 static: () => undefined,
                 readable: (address, size) => inStaticRegion(regions, address, size) || inMirroredString(address, size),
@@ -799,7 +1004,7 @@ function foldConstantCalls(program: ProgramGraph, clock: PhaseClock): void {
                 const values = new Map<number, StaticValue>()
                 const args: StaticValue[] = []
                 for (let i = 3; i < countIds(n); i++) args.push(getRef(n, i) ? evaluateNode(ctx, g, getRef(n, i), values) : staticLiteral(getLiteral(g, n, i)))
-                const key = `${callee}:${args.join(',')}`
+                const key = `${callee}:${args.map(staticKey).join(',')}`
                 let result = results.get(key)
                 if (result === undefined) {
                     results.set(key, null)
@@ -814,30 +1019,30 @@ function foldConstantCalls(program: ProgramGraph, clock: PhaseClock): void {
             }
         }
         if (!evaluated.size) continue
-        const projections: [id: number, call: number, value: number][] = []
+        const projections: [id: number, call: number, value: StaticValue][] = []
         const kept = new Set<number>()
         for (const [id, n] of nodeEntries(g)) {
             for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
                 const value = evaluated.get(getRef(n, i))
-                if (value === undefined || staticScalar(value) !== undefined) continue
+                if (value === undefined || staticFoldable(value)) continue
                 const field = n.op === NodeOp.get && !getRef(n, 1) && typeof value === 'object' && 'fields' in value ? value.fields.get(getLiteral(g, n, 1)) : undefined
-                const scalar = field === undefined ? undefined : staticScalar(field)
-                if (scalar === undefined) kept.add(getRef(n, i))
-                else projections.push([id, getRef(n, i), scalar])
+                if (field === undefined || !staticFoldable(field)) kept.add(getRef(n, i))
+                else projections.push([id, getRef(n, i), field])
             }
         }
-        const folded = new Map<number, number>()
+        const folded = new Map<number, Operand>()
         const tokens = new Map<number, Operand>()
         for (const [id, value] of evaluated) {
-            const scalar = staticScalar(value)
-            if (scalar === undefined && kept.has(id)) continue
+            const foldable = staticFoldable(value)
+            if (!foldable && kept.has(id)) continue
             const n = getNode(g, id)!
-            folded.set(id, scalar ?? 0)
+            const operand = foldable ? staticOperand(g, image, value) : { literal: 0 }
+            folded.set(id, operand)
             tokens.set(id, getOperand(g, n, 0))
-            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), { literal: scalar ?? 0 }])
+            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), operand])
         }
         for (const [id, call, value] of projections) {
-            folded.set(id, value)
+            folded.set(id, staticOperand(g, image, value))
             tokens.set(id, tokens.get(call) ?? call)
         }
         if (!folded.size) continue
@@ -852,14 +1057,14 @@ function staticScalar(value: StaticValue): number | undefined {
     return Number(value)
 }
 
-function replaceFolded(g: Graph, folded: Map<number, number>, tokens: Map<number, Operand>): void {
+function replaceFolded(g: Graph, folded: Map<number, Operand>, tokens: Map<number, Operand>): void {
     for (const [id, n] of [...nodeEntries(g)]) {
         let ops: Operand[] | undefined
         for (let i = 0; i < countIds(n); i++) {
             const value = folded.get(getRef(n, i))
             if (value === undefined) continue
             ops ??= getOperands(g, n)
-            ops[i] = i < firstNonOrderingSlot(n) ? tokens.get(getRef(n, i))! : { literal: value }
+            ops[i] = i < firstNonOrderingSlot(n) ? tokens.get(getRef(n, i))! : value
         }
         if (ops) putCopy(g, id, n, ops)
     }
@@ -913,6 +1118,7 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
         const g = program.units.get(symbol)
         if (!g) continue
         const known = new Map<number, number | null>()
+        const pointers = new Map<number, number>()
         const operand = (n: GraphNode, i: number): number | undefined => getRef(n, i) ? constant(getRef(n, i)) : getLiteral(g, n, i)
         function constant(id: number): number | undefined {
             if (known.has(id)) return known.get(id) ?? undefined
@@ -920,6 +1126,7 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
             const n = getNode(g, id)
             let value: number | undefined
             if (n?.op === NodeOp.literal) value = getLiteral(g, n, 0)
+            else if (n?.op === NodeOp.poolEntry && !getRef(n, 0) && countIds(n) > 1) value = getLiteral(g, n, 1)
             else if (n?.op === NodeOp.heapHandle && !getRef(n, 0)) {
                 const handle = heap.deref(getLiteral(g, n, 0) as intrinsics.Handle)
                 const slot = image.dataHandles.get(handle)
@@ -936,26 +1143,30 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
                 const ptr = operand(n, 1), offset = operand(n, 2)
                 const size = Math.max(1, staticWidth(typeOf(n)) / 8)
                 const cell = ptr === undefined ? false : strings.has(ptr - heapBase) && offset !== undefined && offset + size <= heap.HeapString.sizeof
-                if (ptr !== undefined && offset !== undefined && (cell || inStaticRegion(regions, ptr + offset, size))) {
+                const relocation = ptr === undefined || offset === undefined ? undefined : relocatedWord(ptr + offset, size)
+                if (ptr !== undefined && offset !== undefined && relocation !== null && (cell || inStaticRegion(regions, ptr + offset, size))) {
                     const bytes = new Uint8Array(8)
                     if (!nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), ptr + offset, size)) throw 'native: failed to read static memory'
                     const raw = new DataView(bytes.buffer).getBigUint64(0, true)
                     const read = isSignedType(typeOf(n)) ? BigInt.asIntN(size * 8, raw) : BigInt.asUintN(size * 8, raw)
                     if (read <= BigInt(Number.MAX_SAFE_INTEGER) && read >= BigInt(Number.MIN_SAFE_INTEGER)) value = Number(read)
+                    if (value !== undefined && relocation) pointers.set(id, relocation.region)
                 }
             }
             known.set(id, value ?? null)
             return value
         }
-        const folded = new Map<number, number>()
+        const folded = new Map<number, Operand>()
         const tokens = new Map<number, Operand>()
         for (const [id, n] of [...nodeEntries(g)]) {
             if (n.op !== NodeOp.load) continue
             const value = constant(id)
             if (value === undefined) continue
-            folded.set(id, value)
+            const region = pointers.get(id)
+            const operand = region === undefined ? { literal: value } : insertNode(g, relocatedNode(g, image, region, value))
+            folded.set(id, operand)
             tokens.set(id, getOperand(g, n, 0))
-            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), { literal: value }])
+            putNode(g, id, NodeOp.after, [getOperand(g, n, 0), operand])
         }
         if (!folded.size) continue
         touched.add(symbol)
@@ -976,11 +1187,13 @@ export function pstackRelease(stack: number, mark: bigint): void {
     if (!nativeCopier(cell, (ts as any).getArrayBufferPtr(top.buffer), 8)) throw `native: failed to reset pstack ${stack}`
 }
 
-export function seedPstacks(graph: Graph): void {
-    for (const [id, n] of nodeEntries(graph)) {
+function seedPstacks(graph: Graph, image: ProgramImage): void {
+    for (const [id, n] of [...nodeEntries(graph)]) {
         if (n.op !== NodeOp.pstack) continue
         if (getRef(n, 1)) throw `native: pstack %${id} names its stack dynamically`
-        putCopy(graph, id, n, withOperand(graph, n, 1, { literal: pstackCell(getLiteral(graph, n, 1)) }))
+        const stack = getLiteral(graph, n, 1)
+        const cell = insertNode(graph, relocatedNode(graph, image, pstackRegion(stack), pstackCell(stack)))
+        putCopy(graph, id, n, withOperand(graph, n, 1, cell))
     }
 }
 
@@ -1013,6 +1226,7 @@ interface CodePage {
     sealed: boolean
 }
 let writableCodePage: CodePage | undefined
+const codePages: CodePage[] = []
 
 function addPtr(ptr: any, offset: number): any {
     return typeof ptr === 'bigint' ? ptr + BigInt(offset) : ptr + offset
@@ -1027,6 +1241,7 @@ function reserveCode(length: number): { page: CodePage, ptr: any } {
         const ptr = nativeMapper(mappedLength)
         if (!ptr) throw 'failed to map native code page'
         page = { ptr, length: mappedLength, used: 0, sealed: false }
+        codePages.push(page)
         writableCodePage = page
         offset = 0
     }
@@ -1705,7 +1920,7 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>): Map<nu
 
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.stringOf, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
-rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.add, [getOperand(g, n, 2), { literal: ctx.runtimeHeapBase() }], Types.u64) })
+rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => ctx.heapAddress(getOperand(g, n, 2)) })
 rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [getOperand(g, n, 2), { literal: ctx.pstackBase() }]) })
 const typeofStrings = 1
 const typeofObjects = 2
@@ -1743,7 +1958,7 @@ function lowerTypeof(g: NodeSpace, n: GraphNode, ctx: rt.NativeContext, word: Op
     const handled = ctx.add(makeNode(g, NodeOp.select, [tag, ctx.add(makeNode(g, NodeOp.lt, [word, { literal: heap.pstackWordTag }], Types.bool)), { literal: 0 }]))
     const shifted = ctx.add(makeNode(g, NodeOp.convert, [ctx.add(makeNode(g, NodeOp.ushr, [word, { literal: 1 }], Types.u32))], Types.u64))
     const handle = ctx.add(makeNode(g, NodeOp.select, [handled, shifted, { literal: 0 }]))
-    const cell = ctx.add(makeNode(g, NodeOp.add, [handle, { literal: ctx.runtimeHeapBase() }], Types.u64))
+    const cell = ctx.add(ctx.heapAddress(handle))
     const td = ctx.add(makeNode(g, NodeOp.load, [getOperand(g, n, 0), cell, { literal: 0 }], Types.u32))
     const [externalTD, internedTD] = heap.stringTypeDescriptors
     const external = ctx.add(makeNode(g, NodeOp.eq, [td, { literal: externalTD }], Types.bool))
@@ -1759,22 +1974,38 @@ function putRuntimeCall(g: NodeSpace, id: number, target: number, n: GraphNode, 
     setNode(g, id, rt.callOf(g, n, target))
 }
 
-function rewriteTargets(
-    g: Graph,
-    functionHandles: Map<number, number>,
-    dataHandles: Map<number, number>,
-    runtimeTargets: Map<number, number>,
-    statics: Map<number, number>,
-    staticBase: number,
-): Graph {
+function relocatedNode(g: NodeSpace, image: ProgramImage, region: number, value: number, scale = 1): GraphNode {
+    return makeNode(g, NodeOp.poolEntry, [{ literal: image.regionSlot(region, value, scale) }, { literal: value }])
+}
+
+function nativeContext(g: NodeSpace, image: ProgramImage, add: (node: GraphNode) => number): rt.NativeContext {
+    return {
+        heapAddress: handle => {
+            const base = runtimeHeapBase()
+            if (typeof handle !== 'number') return relocatedNode(g, image, heapRegion, base + handle.literal)
+            return makeNode(g, NodeOp.add, [handle, add(relocatedNode(g, image, heapRegion, base))], Types.u64)
+        },
+        pstackBase: () => pstackCell(0) + 8,
+        add,
+    }
+}
+
+function rewriteTargets(g: Graph, image: ProgramImage, init: boolean): Graph {
+    const { functionHandles, dataHandles, runtime: runtimeTargets, statics } = image
+    const staticBase = image.staticTable.base
     const out = withNodes(g, new Map())
+    const table = (): number => addNode(out, NodeOp.poolEntry, [{ literal: image.regionSlot(image.staticTable.region, staticBase) }, { literal: staticBase }])
     for (const [id, n] of nodeEntries(g)) {
         if (n.op === NodeOp.static) {
             const target = getNode(g, getRef(n, 0))
             const slot = target?.op === NodeOp.heapHandle && !getRef(target, 0) ? statics.get(heap.deref(getLiteral(out, target, 0) as intrinsics.Handle)) : undefined
             if (slot === undefined) throw `native: static %${id} in ${g.name ?? 'anonymous graph'} has no slot`
             const token = addNode(out, NodeOp.nilEffect, [])
-            putNode(out, id, NodeOp.load, [token, { literal: staticBase }, { literal: slot * 8 }], Types.u64)
+            putNode(out, id, NodeOp.load, [token, table(), { literal: slot * 8 }], Types.u64)
+            continue
+        }
+        if (init && (n.op === NodeOp.store || n.op === NodeOp.load) && !getRef(n, 1) && getLiteral(g, n, 1) === staticBase) {
+            putCopy(out, id, n, withOperand(out, n, 1, table()))
             continue
         }
         if (n.op === NodeOp.call) {
@@ -1796,7 +2027,7 @@ function rewriteTargets(
                 setNode(out, fresh, node)
                 return fresh
             }
-            const lowered = rt.lowerNative(out, n, { runtimeHeapBase, pstackBase: () => pstackCell(0) + 8, add })
+            const lowered = rt.lowerNative(out, n, nativeContext(out, image, add))
             const token = getNode(g, getRef(n, 0))?.op
             if (token === undefined || token === NodeOp.nilEffect || token === NodeOp.void) {
                 setNode(out, id, lowered)
@@ -1868,6 +2099,55 @@ function patchImage(
     }
 }
 
+interface CapturedRoot {
+    name: string
+    offset: number
+    float: boolean
+    returns?: HostReturn
+}
+
+interface ImageCapture {
+    code: Uint8Array
+    codeRegion: number
+    codeRelocations: Relocation[]
+    roots: CapturedRoot[]
+    init?: number
+    staticFrom: number
+    staticTo: number
+    heapTo: number
+    staticTop: number
+    imports: string[]
+}
+
+interface ImageSegment {
+    offset: number
+    bytes: Uint8Array
+}
+
+interface ImageRegion {
+    kind: number
+    index: number
+    base: number
+    size: number
+    segments: ImageSegment[]
+}
+
+interface ImageRelocation {
+    at: number
+    offset: number
+    target: number
+    scale: number
+}
+
+interface InstalledImage {
+    entries: any[]
+    region: number
+    relocations: Relocation[]
+    page: CodePage
+    image: Uint8Array
+    poolOffset: number
+}
+
 function installImage(
     units: NativeUnit[],
     values: (number | bigint)[],
@@ -1875,7 +2155,8 @@ function installImage(
     stringPoolTargets: Map<number, number>,
     stringBytes: Uint8Array,
     dataRelocations: [at: number, target: number][],
-) {
+    slotRelocations: Map<number, Relocation>,
+): InstalledImage {
     const offsets: number[] = []
     let length = 0
     for (const unit of units) {
@@ -1895,6 +2176,20 @@ function installImage(
         view.setBigUint64(poolOffset + i * 8, BigInt.asUintN(64, BigInt(values[i])), true)
     }
     const reserved = reserveCode(image.byteLength)
+    const region = addRegion(RegionKind.code, 0, Number(reserved.ptr), Math.max(image.byteLength, 1))
+    const pooled = new Map<number, Relocation>(slotRelocations)
+    for (const slot of localPoolTargets.keys()) pooled.set(slot, { offset: slot, region, scale: 1 })
+    for (const slot of stringPoolTargets.keys()) pooled.set(slot, { offset: slot, region, scale: 1 })
+    const relocations: Relocation[] = []
+    for (const [slot, relocation] of pooled) relocations.push({ offset: poolOffset + slot * 8, region: relocation.region, scale: relocation.scale })
+    for (const [at] of dataRelocations) relocations.push({ offset: dataOffset + at, region, scale: 1 })
+    for (const unit of units) {
+        const island = unit.code.island ?? []
+        for (let i = 0; i < island.length; i++) {
+            const relocation = pooled.get(island[i])
+            if (relocation) relocations.push({ offset: offsets[unit.symbol] - (island.length - i) * 8, region: relocation.region, scale: relocation.scale })
+        }
+    }
     if (flags.has('native-map')) for (const unit of units) console.log(`native map 0x${(BigInt(reserved.ptr) + BigInt(offsets[unit.symbol])).toString(16)} +${unit.code.bytes.length} ${unit.name}`)
     patchImage(image, reserved.ptr, units, offsets, poolOffset, localPoolTargets,
         stringPoolTargets, dataOffset, dataRelocations)
@@ -1915,6 +2210,8 @@ function installImage(
     const entries = offsets.map(offset => addPtr(reserved.ptr, offset))
     return {
         entries,
+        region,
+        relocations,
         page: reserved.page,
         image,
         poolOffset,
@@ -2407,8 +2704,12 @@ function createImage() {
     const code = { slot: (cell: number): number => { throw `native: no code for function @${cell}` } }
     const staticRegions: [base: number, size: number][] = []
     const readonlyRegions: [base: number, size: number][] = []
-    const staticTable = { base: 0 }
+    const staticTable = { base: 0, region: -1 }
     const recordBits = new Map<intrinsics.Handle, propertyEval.RecordBits>()
+    const slotRelocations = new Map<number, Relocation>()
+    const regionSlots = new Map<string, number>()
+    const imports: string[] = []
+    const startWrites = staticWrites.length
     function valueSlot(value: PoolValue): number {
         const known = pooled.get(value)
         if (known !== undefined) return known
@@ -2426,6 +2727,19 @@ function createImage() {
         constants.set(value, slot)
         final.set(slot, value)
         labels.set(slot, `0x${value.toString(16)}`)
+        return slot
+    }
+    function regionSlot(region: number, value: number, scale = 1): number {
+        const key = `${region}:${scale}:${value}`
+        const known = regionSlots.get(key)
+        if (known !== undefined) return known
+        const slot = values.length
+        values.push(value)
+        final.set(slot, value)
+        const { kind, index, base } = nativeRegions[region]
+        labels.set(slot, `${['code', 'heap', 'pstack', 'table'][kind]}${kind === RegionKind.pstack ? index : ''}${scale === 1 ? '' : `*${scale}`}+0x${(value - scale * base).toString(16)}`)
+        slotRelocations.set(slot, { offset: slot, region, scale })
+        regionSlots.set(key, slot)
         return slot
     }
     const floatBits = new Map<bigint, number>()
@@ -2487,6 +2801,7 @@ function createImage() {
         values.push(at)
         final.set(slot, at)
         labels.set(slot, label)
+        slotRelocations.set(slot, { offset: slot, region: staticRegion(), scale: 1 })
         addressSlots.set(handle, slot)
         return slot
     }
@@ -2551,6 +2866,7 @@ function createImage() {
         const word = (n: GraphNode, offset: number, width: number) => typeOf(n) === Types.vm_value && !!boxedKeys && (boxedKeys.has(numberKey) || boxedKeys.has(`@${offset / width}`))
         const buffers = new Map<number, Uint8Array>()
         const addresses = new Map<number, number>()
+        const pointers = new Map<number, Relocation[]>()
         const stores: number[] = []
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op === NodeOp.pstack) {
@@ -2567,6 +2883,12 @@ function createImage() {
             const width = intrinsics.intrinsicBitWidth(typeOf(n)) / 8
             const offset = getLiteral(graph, n, 2)
             const view = new DataView(buffers.get(buffer)!.buffer)
+            const pointer = (): void => {
+                const list = pointers.get(buffer)
+                const relocation = { offset, region: staticRegion(), scale: 1 }
+                if (list) list.push(relocation)
+                else pointers.set(buffer, [relocation])
+            }
             if (getRef(n, 3) && storesUndefined(getRef(n, 3))) {
                 if (width === 4) view.setUint32(offset, word(n, offset, width) ? tagVmHandle(heap.undefinedHandle) : heap.undefinedHandle, true)
                 else if (width !== 8) fail(`store %${id} writes undefined into a ${width}-byte slot`)
@@ -2577,13 +2899,22 @@ function createImage() {
                 const nested = target ? undefined : construction(getRef(n, 3))
                 const text = target || nested !== undefined ? undefined : constantString(getRef(n, 3))
                 const object = target || nested !== undefined || text !== undefined ? undefined : staticObject(getRef(n, 3))
-                if (target && width === 8) view.setBigUint64(offset, BigInt(addresses.get(target)!), true)
+                if (target && width === 8) {
+                    view.setBigUint64(offset, BigInt(addresses.get(target)!), true)
+                    pointer()
+                }
                 else if (nested !== undefined && width === 4) view.setUint32(offset, staticWord(nested), true)
-                else if (nested !== undefined && width === 8) view.setBigUint64(offset, BigInt(nested), true)
+                else if (nested !== undefined && width === 8) {
+                    view.setBigUint64(offset, BigInt(nested), true)
+                    pointer()
+                }
                 else if (text !== undefined && width === 8) view.setBigUint64(offset, BigInt(text), true)
                 else if (text !== undefined && width === 4) view.setUint32(offset, word(n, offset, width) ? tagVmHandle(text as intrinsics.Handle) : text, true)
                 else if (object !== undefined && width === 4) view.setUint32(offset, staticWord(object), true)
-                else if (object !== undefined && width === 8) view.setBigUint64(offset, BigInt(object), true)
+                else if (object !== undefined && width === 8) {
+                    view.setBigUint64(offset, BigInt(object), true)
+                    pointer()
+                }
                 else fail(`store %${id} writes a value that is neither an allocation, a construction nor a constant string`)
                 continue
             }
@@ -2594,7 +2925,7 @@ function createImage() {
             else if (word(n, offset, width)) view.setUint32(offset, Number(BigInt.asUintN(32, BigInt(value) * BigInt(2))), true)
             else for (let i = 0; i < width; i++) view.setUint8(offset + i, Number(BigInt.asUintN(8, BigInt(value) >> BigInt(i * 8))))
         }
-        for (const [id, bytes] of buffers) staticWrite(addresses.get(id)!, bytes)
+        for (const [id, bytes] of buffers) staticWrite(addresses.get(id)!, bytes, pointers.get(id))
         const at = placeObject(cell as intrinsics.Handle, id => {
             const allocated = allocation(id)
             return allocated ? addresses.get(allocated) : undefined
@@ -2616,6 +2947,7 @@ function createImage() {
         const at = staticReserve(bytes.length)
         placedObjects.set(target, at)
         const view = new DataView(bytes.buffer)
+        const pointers: Relocation[] = []
         let linked = false
         function setBit(bit: propertyEval.BitSlot): void {
             const byte = bit.offset + (bit.shared ? bit.bit >> 3 : 0)
@@ -2648,7 +2980,10 @@ function createImage() {
                     if (raw) setBit(flag)
                     continue
                 }
-                if (id) view.setBigUint64(offset, BigInt(allocated(id) ?? fail(`field ${heap.stringToJs(keys[i])} holds %${id}, which is not an allocation`)), true)
+                if (id) {
+                    view.setBigUint64(offset, BigInt(allocated(id) ?? fail(`field ${heap.stringToJs(keys[i])} holds %${id}, which is not an allocation`)), true)
+                    pointers.push({ offset, region: staticRegion(), scale: 1 })
+                }
                 else if (Number.isInteger(raw)) view.setBigUint64(offset, BigInt.asUintN(64, BigInt(raw)), true)
                 else fail(`field ${heap.stringToJs(keys[i])} holds ${raw}, which is not an integer`)
                 if (tag) setBit(tag)
@@ -2659,15 +2994,17 @@ function createImage() {
             } else if (slot && heap.isOrdinaryObject(heap.deref(slot))) {
                 const field = holder ? heapField(graph!, holder, keys[i]) : undefined
                 view.setBigUint64(offset, BigInt(placeObject(slot, allocated, fail, graph, typeof field === 'number' ? getNode(graph!, field) : undefined)), true)
+                pointers.push({ offset, region: staticRegion(), scale: 1 })
             } else fail(`field ${heap.stringToJs(keys[i])} holds an unsupported value`)
         }
-        staticWrite(at, bytes)
+        staticWrite(at, bytes, pointers)
         if (!linked) staticRegions.push([at, bytes.length])
         return at
     }
     return {
         values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, staticFields, codeFields, objectCode, code, staticRegions, readonlyRegions, staticTable, recordBits,
-        valueSlot, wordsSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot,
+        slotRelocations, imports, startWrites,
+        valueSlot, wordsSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot, regionSlot,
         knownValue: (slot: number) => final.get(slot),
     }
 }
@@ -4605,7 +4942,7 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
-    const graph = rewriteTargets(unitGraph, image.functionHandles, image.dataHandles, image.runtime, image.statics, image.staticTable.base)
+    const graph = rewriteTargets(unitGraph, image, program.roots.get(staticInitName) === symbol)
     for (const [id, n] of nodeEntries(graph)) {
         if (n.op !== NodeOp.poolEntry || getDebugLabel(graph, id)) continue
         const label = image.labels.get(getLiteral(unitGraph, n, 0))
@@ -4616,9 +4953,20 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     }
     const debug = flagged('lower-debug', name)
     if (debug) console.log('lower native', name)
-    seedPstacks(graph)
+    seedPstacks(graph, image)
     const float = returnsFloat(graph)
-    const prepared = prepareLowering(graph, { debug, target: program.target, poolSlot: value => image.constantSlot(value), poolValue: slot => image.knownValue(slot), floatSlot: value => image.floatSlot(value), staticData })
+    const prepared = prepareLowering(graph, {
+        debug, target: program.target, staticData,
+        poolSlot: value => image.constantSlot(value),
+        poolValue: slot => image.slotRelocations.has(slot) ? undefined : image.knownValue(slot),
+        floatSlot: value => image.floatSlot(value),
+        regionSlot: (address, scale, addend) => image.regionSlot(regionAt(address), scale * address + addend, scale),
+        rebaseSlot: (slot, value) => {
+            const relocation = image.slotRelocations.get(slot)
+            if (relocation === undefined || relocation.scale !== 1) return
+            return image.regionSlot(relocation.region, value)
+        },
+    })
     if (flags.has('dump-lowerable')) console.log(`--- lowerable ${name} ---\n${dumpGraph(prepared.g)}`)
     return { name, debug, prepared, returnsFloat: float, returnLocation, returnRecord }
 }
@@ -5562,7 +5910,10 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         const linked = session.stubFunctions.get(cell) as any
         if (!linked) throw `native: heap handle ${handle} is not a linked function`
         if (isLocalStub(linked)) return functionSlot(linked.__localTarget)
-        if (Number.isSafeInteger(linked.__native)) return image.pointerSlot(linked.__native, `native ${linked.name || linked.__native}`)
+        if (Number.isSafeInteger(linked.__native)) {
+            image.imports.push(linked.name || `${linked.__native}`)
+            return image.pointerSlot(linked.__native, `native ${linked.name || linked.__native}`)
+        }
         const target = intern(linked)
         if (!unitOf(linked).scheduled) {
             discover(linked)
@@ -6633,6 +6984,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                     operands[1] = addNode(graph, NodeOp.localTarget, [{ literal: linked.__localTarget }])
                     operands[2] = { literal: 0 }
                 } else if (Number.isSafeInteger(linked.__native)) {
+                    image.imports.push(linked.name || `${linked.__native}`)
                     operands[1] = { literal: linked.__native }
                     operands[2] = { literal: 0 }
                 }
@@ -11111,13 +11463,31 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const image = program.image
     for (const [slot, symbol] of image.functionTargets) if (program.units.has(symbol)) pooled.set(slot, symbol)
     const installed = installImage(emitted, image.values, pooled,
-        image.byteTargets, new Uint8Array(image.bytes), image.relocations)
+        image.byteTargets, new Uint8Array(image.bytes), image.relocations, image.slotRelocations)
     for (const [at, slot] of image.codeFields) {
         const symbol = image.functionTargets.get(slot)
-        const address = symbol !== undefined && pooled.has(slot) ? installed.entries[symbol] : image.values[slot]
-        staticWrite(at, new Uint8Array(new BigUint64Array([BigInt(address)]).buffer))
+        const linked = symbol !== undefined && pooled.has(slot)
+        const address = linked ? installed.entries[symbol] : image.values[slot]
+        staticWrite(at, new Uint8Array(new BigUint64Array([BigInt(address)]).buffer), linked ? [{ offset: 0, region: installed.region, scale: 1 }] : [])
     }
     const initSymbol = program.roots.get(staticInitName)
+    const capture: ImageCapture = {
+        code: installed.image,
+        codeRegion: installed.region,
+        codeRelocations: installed.relocations,
+        roots: [],
+        staticFrom: image.startWrites,
+        staticTo: staticWrites.length,
+        heapTo: heapWrites.length,
+        staticTop: Number(pstackMark(0)),
+        imports: image.imports,
+    }
+    const codeBase = nativeRegions[installed.region].base
+    if (initSymbol !== undefined) capture.init = Number(installed.entries[initSymbol]) - codeBase
+    for (const [name, symbol] of program.roots) {
+        if (name === staticInitName) continue
+        capture.roots.push({ name, offset: Number(installed.entries[symbol]) - codeBase, float: !!emitted.find(u => u.symbol === symbol)?.returnsFloat, returns: program.hostReturns.get(symbol) })
+    }
     if (initSymbol !== undefined) {
         sealCode(installed.page)
         const none = new BigInt64Array(1)
@@ -11142,7 +11512,346 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
             heldArgs = outer
             if (float) return floatBits(raw)
             return decoded ? hostResult(raw, decoded) : raw
-        }, { ptr, codePage: installed.page, image: installed, units: emitted })
+        }, { ptr, codePage: installed.page, image: installed, units: emitted, capture })
+    }
+    return result
+}
+
+const imageMagic = 'SYNIMAGE'
+const imageVersion = 1
+const ImageSection = { regions: 1, memory: 2, relocations: 3, entries: 4 }
+const EntryFlags = { float: 1, init: 2, word: 4, string: 8 }
+
+function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[]): void {
+    const ranges: [base: bigint, end: bigint, what: string][] = []
+    for (const region of nativeRegions) ranges.push([BigInt(region.base), BigInt(region.base + region.size), `${['code', 'heap', 'pstack', 'table'][region.kind]} region ${region.index}`])
+    for (const [base, size] of traceModule.symbolicRanges) ranges.push([BigInt(base), BigInt(base + size), 'symbolic memory'])
+    const pstack = nativeRegions.filter(region => region.kind === RegionKind.pstack).map(region => BigInt(region.base))
+    const tagged = BigInt(heap.pstackWordTag + 1)
+    const inRange = (value: bigint): string | undefined => {
+        for (const [base, end, what] of ranges) if (value >= base && value < end) return what
+        for (const base of pstack) {
+            const scaled = BigInt.asIntN(64, value) - tagged
+            if (scaled <= -BigInt(2) * base && scaled > -BigInt(2) * (base + BigInt(pstackRegionBytes))) return 'scaled pstack base'
+        }
+    }
+    const relocated = new Set(relocations.map(relocation => `${relocation.at}:${relocation.offset}`))
+    for (let at = 0; at < regions.length; at++) {
+        const region = regions[at]
+        if (region.kind !== RegionKind.code) continue
+        for (const segment of region.segments) {
+            const view = new DataView(segment.bytes.buffer, segment.bytes.byteOffset, segment.bytes.byteLength)
+            for (let i = (8 - segment.offset % 8) % 8; i + 8 <= segment.bytes.length; i += 8) {
+                if (relocated.has(`${at}:${segment.offset + i}`)) continue
+                const what = inRange(view.getBigUint64(i, true))
+                if (what) throw `native: the image code at 0x${region.base.toString(16)} holds an unrelocated address 0x${view.getBigUint64(i, true).toString(16)} of ${what} at +0x${(segment.offset + i).toString(16)}`
+            }
+            const moves = new Map<number, bigint>()
+            for (let i = 0; i + 4 <= segment.bytes.length; i += 4) {
+                const word = view.getUint32(i, true)
+                const top = (word & 0xFF800000) >>> 0
+                const rd = word & 31
+                const shift = BigInt(((word >>> 21) & 3) * 16)
+                const imm = BigInt((word >>> 5) & 0xFFFF)
+                if (top === 0xD2800000) moves.set(rd, imm << shift)
+                else if (top === 0x92800000) moves.set(rd, BigInt.asUintN(64, ~(imm << shift)))
+                else if (top === 0xF2800000) moves.set(rd, ((moves.get(rd) ?? BigInt(0)) & ~(BigInt(0xFFFF) << shift)) | (imm << shift))
+                else continue
+                const what = inRange(moves.get(rd)!)
+                if (what) throw `native: the image materializes an address of ${what} in an instruction at code+0x${i.toString(16)}`
+            }
+        }
+    }
+}
+
+function paintSegments(writes: { offset: number, bytes: Uint8Array }[]): ImageSegment[] {
+    const order = writes.map((write, i) => i).sort((a, b) => writes[a].offset - writes[b].offset || a - b)
+    const groups: number[][] = []
+    let end = -1
+    for (const i of order) {
+        const write = writes[i]
+        if (!groups.length || write.offset > end) groups.push([])
+        groups[groups.length - 1].push(i)
+        end = Math.max(end, write.offset + write.bytes.length)
+    }
+    const segments: ImageSegment[] = []
+    for (const group of groups) {
+        group.sort((a, b) => a - b)
+        let start = Infinity
+        let stop = 0
+        for (const i of group) {
+            start = Math.min(start, writes[i].offset)
+            stop = Math.max(stop, writes[i].offset + writes[i].bytes.length)
+        }
+        const bytes = new Uint8Array(stop - start)
+        for (const i of group) bytes.set(writes[i].bytes, writes[i].offset - start)
+        segments.push({ offset: start, bytes })
+    }
+    return segments
+}
+
+export function serializeImage(natives: Record<string, any>): Uint8Array {
+    const capture: ImageCapture | undefined = Object.values(natives).find(fn => fn?.capture)?.capture
+    if (!capture) throw 'native: these natives carry no image'
+    if (capture.imports.length) throw `native: the image imports host functions (${[...new Set(capture.imports)].join(', ')}), which cannot be serialized yet`
+    const used = new Map<number, number>()
+    const regions: ImageRegion[] = []
+    const relocations: ImageRelocation[] = []
+    const regionIndex = (id: number): number => {
+        const known = used.get(id)
+        if (known !== undefined) return known
+        const { kind, index, base, size } = nativeRegions[id]
+        used.set(id, regions.length)
+        regions.push({ kind, index, base, size, segments: [] })
+        return regions.length - 1
+    }
+    const code = regionIndex(capture.codeRegion)
+    regions[code].segments.push({ offset: 0, bytes: capture.code })
+    for (const relocation of capture.codeRelocations) relocations.push({ at: code, offset: relocation.offset, target: regionIndex(relocation.region), scale: relocation.scale })
+    const writes = new Map<number, { offset: number, bytes: Uint8Array }[]>()
+    const words = new Map<number, Map<number, Relocation>>()
+    function replay(write: MemoryWrite): void {
+        const id = regionAt(write.at)
+        const offset = write.at - nativeRegions[id].base
+        const list = writes.get(id)
+        if (list) list.push({ offset, bytes: write.bytes })
+        else writes.set(id, [{ offset, bytes: write.bytes }])
+        let pointers = words.get(id)
+        if (!pointers) words.set(id, pointers = new Map())
+        for (let word = offset - 7; word < offset + write.bytes.length; word++) pointers.delete(word)
+        for (const relocation of write.relocations) pointers.set(offset + relocation.offset, relocation)
+    }
+    for (let i = 0; i < capture.heapTo; i++) replay(heapWrites[i])
+    for (let i = capture.staticFrom; i < capture.staticTo; i++) replay(staticWrites[i])
+    for (const [stack, id] of pstackRegions) {
+        const base = nativeRegions[id].base
+        const top = stack === 0 ? capture.staticTop : base + 8
+        replay({ at: base, bytes: new Uint8Array(new BigUint64Array([BigInt(top)]).buffer), relocations: [{ offset: 0, region: id, scale: 1 }] })
+    }
+    for (const [id, list] of writes) {
+        const at = regionIndex(id)
+        regions[at].segments.push(...paintSegments(list))
+        for (const [offset, relocation] of words.get(id)!) relocations.push({ at, offset, target: regionIndex(relocation.region), scale: relocation.scale })
+    }
+    verifyImage(regions, relocations)
+    const out: number[] = []
+    const scratch = new DataView(new ArrayBuffer(8))
+    const u32 = (value: number) => {
+        scratch.setUint32(0, value >>> 0, true)
+        for (let i = 0; i < 4; i++) out.push(scratch.getUint8(i))
+    }
+    const u64 = (value: number | bigint) => {
+        scratch.setBigUint64(0, BigInt.asUintN(64, BigInt(value)), true)
+        for (let i = 0; i < 8; i++) out.push(scratch.getUint8(i))
+    }
+    const pad = () => {
+        while (out.length % 8) out.push(0)
+    }
+    const chunks: Uint8Array[] = []
+    const flush = () => {
+        chunks.push(new Uint8Array(out))
+        out.length = 0
+    }
+    const section = (kind: number, count: number) => {
+        u32(kind)
+        u32(count)
+    }
+    for (const c of imageMagic) out.push(c.charCodeAt(0))
+    u32(imageVersion)
+    u32(4)
+    section(ImageSection.regions, regions.length)
+    for (const region of regions) {
+        u32(region.kind)
+        u32(region.index)
+        u64(region.base)
+        u64(region.size)
+    }
+    let segments = 0
+    for (const region of regions) segments += region.segments.length
+    section(ImageSection.memory, segments)
+    for (let at = 0; at < regions.length; at++) {
+        for (const segment of regions[at].segments) {
+            u32(at)
+            u32(0)
+            u64(segment.offset)
+            u64(segment.bytes.length)
+            flush()
+            chunks.push(segment.bytes)
+            const tail = segment.bytes.length % 8
+            if (tail) chunks.push(new Uint8Array(8 - tail))
+        }
+    }
+    section(ImageSection.relocations, relocations.length)
+    for (const relocation of relocations) {
+        u32(relocation.at)
+        u32(relocation.target)
+        u64(relocation.offset)
+        u64(relocation.scale)
+    }
+    const entries = [...capture.roots.map(root => ({ ...root, init: false })), ...(capture.init === undefined ? [] : [{ name: staticInitName, offset: capture.init, float: false, returns: undefined, init: true }])]
+    section(ImageSection.entries, entries.length)
+    for (const entry of entries) {
+        const name = new TextEncoder().encode(entry.name)
+        u64(entry.offset)
+        u32((entry.float ? EntryFlags.float : 0) | (entry.init ? EntryFlags.init : 0) | (entry.returns === 'word' ? EntryFlags.word : 0) | (entry.returns === 'string' ? EntryFlags.string : 0))
+        u32(name.length)
+        for (const byte of name) out.push(byte)
+        pad()
+    }
+    flush()
+    let length = 0
+    for (const chunk of chunks) length += chunk.length
+    if (flags.has('image-stats')) console.log(`IMAGE ${capture.roots.map(root => root.name).join(',')} ${length} bytes, code ${capture.code.length}, ${regions.length} regions, ${segments} segments, ${relocations.length} relocations${capture.init === undefined ? '' : ', init'}`)
+    const bytes = new Uint8Array(length)
+    let at = 0
+    for (const chunk of chunks) {
+        bytes.set(chunk, at)
+        at += chunk.length
+    }
+    return bytes
+}
+
+let nativeProtector: any
+
+export function withRegionsProtected<T>(run: () => T): T {
+    nativeProtector ??= (ts as any).createNativeFn(new Uint8Array(lowerValueGraph(trace2(protectPages).graph, { target: hostTarget }).bytes))
+    const protect = (ptr: any, length: number, prot: number): void => {
+        const status = Number(nativeProtector(ptr, length, prot))
+        if (status !== 0) throw `native: mprotect failed with ${status}`
+    }
+    const data: NativeRegion[] = nativeRegions.filter(region => region.kind !== RegionKind.code)
+    for (const region of data) protect(region.base, align(region.size, 4096), syscalls.PROT_NONE)
+    for (const page of codePages) protect(page.ptr, page.length, syscalls.PROT_NONE)
+    try {
+        return run()
+    } finally {
+        for (const region of data) protect(region.base, align(region.size, 4096), syscalls.PROT_READ | syscalls.PROT_WRITE)
+        for (const page of codePages) protect(page.ptr, page.length, page.sealed ? syscalls.PROT_READ | syscalls.PROT_EXEC : syscalls.PROT_READ | syscalls.PROT_WRITE)
+    }
+}
+
+function segmentAt(segments: ImageSegment[], offset: number): ImageSegment | undefined {
+    let low = 0
+    let high = segments.length - 1
+    while (low <= high) {
+        const middle = (low + high) >> 1
+        const segment = segments[middle]
+        if (offset < segment.offset) high = middle - 1
+        else if (offset >= segment.offset + segment.bytes.length) low = middle + 1
+        else return segment
+    }
+}
+
+export function loadImage(bytes: Uint8Array): Record<string, any> {
+    getNativeBootstraps()
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    let at = 0
+    const u32 = (): number => {
+        const value = view.getUint32(at, true)
+        at += 4
+        return value
+    }
+    const u64 = (): bigint => {
+        const value = view.getBigUint64(at, true)
+        at += 8
+        return value
+    }
+    const align8 = () => {
+        at = (at + 7) & ~7
+    }
+    let magic = ''
+    for (let i = 0; i < imageMagic.length; i++) magic += String.fromCharCode(bytes[at++])
+    if (magic !== imageMagic) throw 'native: not a native image'
+    const version = u32()
+    if (version !== imageVersion) throw `native: image version ${version} is not ${imageVersion}`
+    const sections = u32()
+    const regions: ImageRegion[] = []
+    const relocations: ImageRelocation[] = []
+    const entries: { name: string, offset: number, flags: number }[] = []
+    for (let s = 0; s < sections; s++) {
+        const kind = u32()
+        const count = u32()
+        for (let i = 0; i < count; i++) {
+            if (kind === ImageSection.regions) {
+                const regionKind = u32()
+                const index = u32()
+                const base = Number(u64())
+                const size = Number(u64())
+                regions.push({ kind: regionKind, index, base, size, segments: [] })
+            } else if (kind === ImageSection.memory) {
+                const region = u32()
+                u32()
+                const offset = Number(u64())
+                const length = Number(u64())
+                regions[region].segments.push({ offset, bytes: bytes.slice(at, at + length) })
+                at += length
+                align8()
+            } else if (kind === ImageSection.relocations) {
+                const where = u32()
+                const target = u32()
+                const offset = Number(u64())
+                const scale = Number(BigInt.asIntN(64, u64()))
+                relocations.push({ at: where, offset, target, scale })
+            } else if (kind === ImageSection.entries) {
+                const offset = Number(u64())
+                const flags = u32()
+                const length = u32()
+                const name = new TextDecoder().decode(bytes.subarray(at, at + length))
+                at += length
+                align8()
+                entries.push({ name, offset, flags })
+            } else throw `native: unknown image section ${kind}`
+        }
+    }
+    const bases: number[] = []
+    for (const region of regions) {
+        const slack = region.kind === RegionKind.code ? 4096 : 0
+        const mapped = Number(nativeMapper(align(region.size + slack, 4096)))
+        if (!mapped || mapped === -1) throw 'native: failed to map an image region'
+        bases.push(region.kind === RegionKind.code ? mapped + (region.base & 4095) : mapped)
+    }
+    for (const relocation of relocations) {
+        const segment = segmentAt(regions[relocation.at].segments, relocation.offset)
+        if (!segment || relocation.offset + 8 > segment.offset + segment.bytes.length) throw `native: relocation at ${relocation.offset} is outside the image memory`
+        const word = new DataView(segment.bytes.buffer, segment.bytes.byteOffset + relocation.offset - segment.offset, 8)
+        const delta = BigInt(bases[relocation.target] - regions[relocation.target].base) * BigInt(relocation.scale)
+        word.setBigUint64(0, BigInt.asUintN(64, word.getBigUint64(0, true) + delta), true)
+    }
+    let code = -1
+    for (let i = 0; i < regions.length; i++) {
+        if (regions[i].kind === RegionKind.code) code = i
+        for (const segment of regions[i].segments) {
+            const outer = heldArgs
+            heldArgs = segment.bytes
+            const copied = nativeCopier(bases[i] + segment.offset, addPtr((ts as any).getArrayBufferPtr(segment.bytes.buffer), segment.bytes.byteOffset), segment.bytes.length)
+            heldArgs = outer
+            if (!copied) throw 'native: failed to copy an image segment'
+        }
+    }
+    if (code < 0) throw 'native: the image has no code'
+    const page: CodePage = { ptr: bases[code] - (regions[code].base & 4095), length: align(regions[code].size + 4096, 4096), used: 0, sealed: false }
+    sealCode(page)
+    let heapBase = 0
+    for (let i = 0; i < regions.length; i++) if (regions[i].kind === RegionKind.heap) heapBase = bases[i]
+    const result: Record<string, any> = {}
+    for (const entry of entries) {
+        const ptr = bases[code] + entry.offset
+        if (entry.flags & EntryFlags.init) {
+            const none = new BigInt64Array(1)
+            nativeInvoker(ptr, (ts as any).getArrayBufferPtr(none.buffer), 0)
+            continue
+        }
+        const returns: HostReturn | undefined = entry.flags & EntryFlags.string ? 'string' : entry.flags & EntryFlags.word ? 'word' : undefined
+        result[entry.name] = Object.assign((...args: any[]) => {
+            const values = new BigInt64Array(Math.max(args.length, 1))
+            for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
+            const outer = heldArgs
+            heldArgs = values
+            const raw = nativeInvoker(ptr, (ts as any).getArrayBufferPtr(values.buffer), args.length)
+            heldArgs = outer
+            if (entry.flags & EntryFlags.float) return floatBits(raw)
+            return returns ? hostResult(raw, returns, heapBase) : raw
+        }, { ptr, bases, regions: regions.map((region, i) => ({ kind: region.kind, index: region.index, base: bases[i], size: region.size, original: region.base })) })
     }
     return result
 }
@@ -11152,9 +11861,11 @@ export const staticInitName = '[[Init]]'
 export function staticInitializerOf(linker: Linker, image: ProgramImage, keep: (fn: Function) => boolean): Function | undefined {
     const { staticFns, staticOrder } = linker
     if (!staticFns.length) return
-    const table = Number(nativeMapper(Math.max(staticFns.length * 8, 1 << 12)))
+    const size = Math.max(staticFns.length * 8, 1 << 12)
+    const table = Number(nativeMapper(size))
     if (!table || table === -1) throw 'native: failed to map the static table'
     image.staticTable.base = table
+    image.staticTable.region = addRegion(RegionKind.table, 0, table, size)
     return staticInitializer(staticOrder().filter(slot => keep(staticFns[slot])).map(slot => [staticFns[slot], slot] as [Function, number]), symbolicMemory(table))
 }
 

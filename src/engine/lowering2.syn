@@ -505,6 +505,7 @@ function nonZero(g: Graph, ref: number, literal: number, facts: Facts): boolean 
     const n = getNode(g, ref)
     if (!n) return false
     if (n.op === NodeOp.literal) return getLiteral(g, n, 0) !== 0
+    if (n.op === NodeOp.poolEntry && countIds(n) > 1) return getLiteral(g, n, 1) !== 0
     if (n.op === NodeOp.pstack || n.op === NodeOp.alloca || n.op === NodeOp.frameAddress) return true
     if (n.op === NodeOp.call && callSummary(g, n)?.fresh) return true
     if (n.op === NodeOp.after) return nonZero(g, getRef(n, countIds(n) - 1), getLiteral(g, n, countIds(n) - 1), facts)
@@ -1252,6 +1253,19 @@ export interface LowerGraphOptions {
     poolValue?: (slot: number) => number | undefined
     floatSlot?: (value: number) => number
     staticData?: (bytes: Uint8Array) => number
+    regionSlot?: RegionSlot
+    rebaseSlot?: (slot: number, value: number) => number | undefined
+}
+
+export type RegionSlot = (address: number, scale: number, addend: number) => number
+
+function relocatedAddress(g: NodeSpace, id: number): number | undefined {
+    const n = getNode(g, id)
+    return n?.op === NodeOp.poolEntry && countIds(n) > 1 ? getLiteral(g, n, 1) : undefined
+}
+
+function relocatedLiteral(g: NodeSpace, regionSlot: RegionSlot, address: number, scale = 1, addend = 0): number {
+    return addNode(g, NodeOp.poolEntry, [{ literal: regionSlot(address, scale, addend) }, { literal: scale * address + addend }])
 }
 
 export interface LowerGraphResult {
@@ -3058,6 +3072,7 @@ export function memAnalysis(g: Graph, inbound?: (block: GraphBlock) => number[],
             return own(callSummary(g, n)?.fresh ? MemFresh : MemUnknown)
         }
         if (n.op === NodeOp.literal) return { base: MemAbsolute, pos: getLiteral(g, n, 0), kind: MemPre }
+        if (n.op === NodeOp.poolEntry && countIds(n) > 1) return { base: MemAbsolute, pos: getLiteral(g, n, 1), kind: MemPre }
         if (n.op === NodeOp.poolEntry) return own(MemPre)
         if (IntegerOps.has(n.op)) return own(MemInt)
         if (n.op === NodeOp.add || n.op === NodeOp.sub) return shifted(id, n)
@@ -7743,6 +7758,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const id = stack.pop()!
             const n = id ? getNode(g, id) : undefined
             if (!n || seen.has(id) || n.op === NodeOp.block || n.op === NodeOp.param) continue
+            if (relocatedAddress(g, id) !== undefined) continue
             seen.add(id)
             for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
         }
@@ -10076,6 +10092,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const x = getNode(g, tailOf(g, getRef(n, 0)))
             const y = getNode(g, tailOf(g, getRef(n, 1)))
             if (x?.op === NodeOp.heapHandle && y?.op === NodeOp.heapHandle) return getLiteral(g, x, 0) === getLiteral(g, y, 0)
+            const p = getRef(n, 0) ? relocatedAddress(g, tailOf(g, getRef(n, 0))) : undefined
+            const q = getRef(n, 1) ? relocatedAddress(g, tailOf(g, getRef(n, 1))) : undefined
+            if (p !== undefined && q !== undefined) return p === q
             const a = constantNumber(n, 0)
             const b = constantNumber(n, 1)
             if (a === undefined || b === undefined || !Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 0 || b < 0) return
@@ -10086,8 +10105,15 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (m?.op !== NodeOp.heapHandle || countIds(m) !== 1 || getRef(m, 0)) return
             return getLiteral(g, m, 0)
         }
+        function addressOf(v: Value): number | undefined {
+            if (!v.id) return v.value === 0 ? 0 : undefined
+            return relocatedAddress(g, v.id)
+        }
         function compareConstants(n: GraphNode, a: Value, b: Value): Value | undefined {
             if (a.id || b.id) {
+                const p = addressOf(a)
+                const q = addressOf(b)
+                if (p !== undefined && q !== undefined && (n.op === NodeOp.eq || n.op === NodeOp.ne)) return { id: 0, value: (p === q) === (n.op === NodeOp.eq) ? 1 : 0 }
                 const x = handleOf(a)
                 const y = handleOf(b)
                 if (x === undefined || y === undefined) return
@@ -10147,6 +10173,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return { id: addCopy(g, s, [condition, whenTrue.id || { literal: whenTrue.value }, whenFalse.id || { literal: whenFalse.value }]), value: 0 }
         }
         function nonNullAddress(id: number): boolean {
+            if (relocatedAddress(g, id)) return true
             const m = currentMem().of(id)
             return !m.pending && nonZero(g, m.base, 0, [])
         }
@@ -12024,23 +12051,28 @@ function slotBytes(g: Graph, n: GraphNode): number {
     return n.op === NodeOp.alloca && !getRef(n, 1) ? getLiteral(g, n, 1) : pstackFixedSize(g, n)
 }
 
+function pstackCellOperand(g: Graph, id: number, n: GraphNode): Operand {
+    const cell = getNode(g, getRef(n, 1))
+    if (getRef(n, 1) && (cell?.op !== NodeOp.poolEntry || countIds(cell) < 2)) throw `lowering: pstack %${id} names its stack dynamically`
+    return getOperand(g, n, 1)
+}
+
 function expandPstacks(g: Graph): boolean {
     let found = false
     for (const [id, n] of [...nodeEntries(g)]) {
         if (n.op !== NodeOp.pstack) continue
         found = true
-        if (getRef(n, 1)) throw `lowering: pstack %${id} names its stack dynamically`
         const token = getRef(n, 0)
-        const cell = getLiteral(g, n, 1)
+        const cell = pstackCellOperand(g, id, n)
         const rebases = pstackRebases(g, n)
         const sized = !!getRef(n, 3) || !!getLiteral(g, n, 3)
-        const base: Operand = rebases ? getOperand(g, n, 2) : addNode(g, NodeOp.load, [token, { literal: cell }, 0], Types.u64)
+        const base: Operand = rebases ? getOperand(g, n, 2) : addNode(g, NodeOp.load, [token, cell, 0], Types.u64)
         if (!rebases && !sized) {
             putCopy(g, id, n, [base, base], NodeOp.after)
             continue
         }
         const top: Operand = sized ? addNode(g, NodeOp.add, [base, getOperand(g, n, 3)]) : base
-        const store = addNode(g, NodeOp.store, [token, { literal: cell }, 0, top], Types.u64)
+        const store = addNode(g, NodeOp.store, [token, cell, 0, top], Types.u64)
         const fresh = rebases ? base : addNode(g, NodeOp.mem, [base, getOperand(g, n, 3)], Types.u64)
         putCopy(g, id, n, [store, fresh], NodeOp.after)
     }
@@ -12078,7 +12110,7 @@ function bindCallContext(g: Graph, register: number): void {
     g.blocks[0].params.push(context)
 }
 
-function expandCodecs(g: Graph): boolean {
+function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
     let found = false
     function node(op: NodeOp, ref: Operand, literal: number): number {
         return addNode(g, op, [ref, { literal: literal }])
@@ -12127,7 +12159,7 @@ function expandCodecs(g: Graph): boolean {
         const value = getOperand(g, n, 0)
         const base = getLiteral(g, n, 1)
         assert(!getRef(n, 1) && base >= 0, `lowering: ${opName(n.op)} %${id} needs a constant heap base`)
-        const coded = n.op === NodeOp.decode
+        const coded = regionSlot ? relocatedCodec(g, n, value, base, regionSlot) : n.op === NodeOp.decode
             ? node(NodeOp.add, pstackOffset(node(NodeOp.ushr, value, 1)), base)
             : node(NodeOp.add, node(NodeOp.shl, value, 1), heap.pstackWordTag + 1 - 2 * base)
         // TODO: in debug panic on a null handle instead of UB
@@ -12144,6 +12176,19 @@ function expandCodecs(g: Graph): boolean {
         found = true
     }
     return found
+}
+
+function relocatedCodec(g: Graph, n: GraphNode, value: Operand, base: number, regionSlot: RegionSlot): number {
+    const known = typeof value === 'number' ? getNode(g, value) : undefined
+    const literal = typeof value !== 'number' ? value.literal : known?.op === NodeOp.literal ? getLiteral(g, known, 0) : undefined
+    if (n.op === NodeOp.decode) {
+        if (literal !== undefined && literal !== heap.undefinedWord) return relocatedLiteral(g, regionSlot, base + ((literal >>> 1) & ((1 << 28) - 1)))
+        const offset = addNode(g, NodeOp.convert, [addNode(g, NodeOp.ushr, [value, { literal: 1 }])], Types.u28)
+        return addNode(g, NodeOp.add, [offset, relocatedLiteral(g, regionSlot, base)])
+    }
+    const pointer = known?.op === NodeOp.poolEntry && countIds(known) > 1 ? getLiteral(g, known, 1) : undefined
+    if (pointer !== undefined) return addNode(g, NodeOp.literal, [{ literal: (pointer - base) * 2 + heap.pstackWordTag + 1 }])
+    return addNode(g, NodeOp.add, [addNode(g, NodeOp.shl, [value, { literal: 1 }]), relocatedLiteral(g, regionSlot, base, -2, heap.pstackWordTag + 1)])
 }
 
 interface ArithForm { 
@@ -12306,6 +12351,19 @@ function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
                 made.set(value, lifted)
             }
             setRef(n, slot, lifted)
+        }
+        const pooled = new Map<string, number>()
+        for (const id of seen) {
+            const n = getNode(g, id)!
+            for (let slot = 0; slot < countIds(n); slot++) {
+                const ref = getRef(n, slot)
+                const address = ref ? relocatedAddress(g, ref) : undefined
+                if (address === undefined) continue
+                const key = `${getLiteral(g, getNode(g, ref)!, 0)}:${address}`
+                const first = pooled.get(key)
+                if (first === undefined) pooled.set(key, ref)
+                else if (first !== ref && shared.get(id)! === 1) setRef(n, slot, first)
+            }
         }
     }
 }
@@ -15109,9 +15167,13 @@ function batchLoopGroup(g: Graph, loop: BatchLoop, loops: GraphLoops, ids: [id: 
     const staying = demandUntil(g, getRef(getNode(g, tail)!, loop.stay), tail, 0)
     const visiting = demandUntil(g, header.bodyId, tail, 3 - loop.stay)
     const cells = new Map<number, [id: number, owner: number, counter: number, stepped: boolean][]>()
+    const cellOperands = new Map<number, Operand>()
     const exiting = new Set<number>()
     for (const [id, owner] of ids.sort((a, b) => a[0] - b[0])) {
-        const cell = getLiteral(g, getNode(g, id)!, 1)
+        const n = getNode(g, id)!
+        const operand = pstackCellOperand(g, id, n)
+        const cell = typeof operand === 'number' ? getLiteral(g, getNode(g, operand)!, 1) : operand.literal
+        cellOperands.set(cell, operand)
         let counter = owner === header.id ? loop.counter : 0
         let stepped = false
         if (owner !== header.id) {
@@ -15175,7 +15237,7 @@ function batchLoopGroup(g: Graph, loop: BatchLoop, loops: GraphLoops, ids: [id: 
                 const extra = exiting.has(cell) ? 1 : 0
                 const bytes: Operand = typeof trip !== 'number' ? { literal: (trip.literal + extra) * width }
                     : scaled(extra ? addNode(g, NodeOp.add, [trip, { literal: 1 }]) : trip)
-                const batch = addNode(g, NodeOp.pstack, [token, { literal: cell }, { literal: 0 }, bytes], T)
+                const batch = addNode(g, NodeOp.pstack, [token, cellOperands.get(cell)!, { literal: 0 }, bytes], T)
                 const start = getLiteral(g, n, header.params.indexOf(loop.counter) + 1) * width
                 return addCopy(g, n, [...getOperands(g, n), start ? addNode(g, NodeOp.sub, [batch, { literal: start }]) : batch])
             })
@@ -15207,16 +15269,17 @@ function demandUntil(g: Graph, root: number, tail: number, arm: number): Set<num
     return seen
 }
 
-export function expandValueGraph(g: Graph, target: lowering.Target): Graph {
+export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
-    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, expandCodecs, expandPstacks])
+    const _expandCodecs: GraphPass = g => expandCodecs(g, regionSlot)
+    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, _expandCodecs, expandPstacks])
     g = expanded.graph
     if (expanded.changed || g.form === 'packaged') g = optimizePackaged(g, target)
     return g
 }
 
-export function prepareValueGraph(g: Graph, target: lowering.Target): Graph {
-    g = expandValueGraph(g, target)
+export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
+    g = expandValueGraph(g, target, regionSlot)
     g = runPipeline('shape', g, target.costs, [stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
@@ -15407,7 +15470,7 @@ export interface PreparedLowering {
     floats: Set<number>
 }
 
-function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number): void {
+function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number, regionSlot?: RegionSlot): void {
     const allocas: number[] = []
     for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.alloca) allocas.push(id)
     if (!allocas.length) return
@@ -15475,17 +15538,34 @@ function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number): v
     for (const id of allocas) {
         const contents = constantContents(id)
         if (!contents) continue
-        const address = addNode(g, NodeOp.literal, [{ literal: staticData(contents[0]) }], Types.u64)
+        const at = staticData(contents[0])
+        const address = regionSlot ? relocatedLiteral(g, regionSlot, at) : addNode(g, NodeOp.literal, [{ literal: at }], Types.u64)
         putNode(g, id, NodeOp.after, [getOperand(g, getNode(g, id)!, 0), address])
         for (const s of contents[1]) dropped.set(s, getOperand(g, getNode(g, s)!, 0))
     }
     if (dropped.size) substitute(g, dropped)
 }
 
+function rebaseAddresses(g: Graph, target: lowering.Target, rebaseSlot: (slot: number, value: number) => number | undefined): void {
+    for (const [id, n] of [...nodeEntries(g)]) {
+        if (n.op !== NodeOp.add) continue
+        const at = relocatedAddress(g, getRef(n, 0)) !== undefined ? 0 : relocatedAddress(g, getRef(n, 1)) !== undefined ? 1 : -1
+        if (at < 0) continue
+        const other = getNode(g, getRef(n, 1 - at))
+        const k = getRef(n, 1 - at) ? other?.op === NodeOp.literal ? getLiteral(g, other, 0) : undefined : getLiteral(g, n, 1 - at)
+        if (k === undefined || !Number.isSafeInteger(k) || target.takesImmediate('add', k)) continue
+        const value = relocatedAddress(g, getRef(n, at))! + k
+        const slot = rebaseSlot(getLiteral(g, getNode(g, getRef(n, at))!, 0), value)
+        if (slot === undefined) continue
+        putNode(g, id, NodeOp.poolEntry, [{ literal: slot }, { literal: value }])
+    }
+}
+
 export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): PreparedLowering {
     const target = opts.target ?? lowering.hostTarget
-    const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target)
-    if (opts.staticData) readonlyAllocas(g, opts.staticData)
+    const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target, opts.regionSlot)
+    if (opts.staticData) readonlyAllocas(g, opts.staticData, opts.regionSlot)
+    if (opts.rebaseSlot) rebaseAddresses(g, target, opts.rebaseSlot)
     registerLiterals(g, target)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue, opts.floatSlot) : undefined
     foldPureOrdering(g)

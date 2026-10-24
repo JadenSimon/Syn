@@ -470,7 +470,8 @@ async function compileEngine(argv: string[]) {
         types: reifiedTypes.createTypeNamespace(),
         __reify: undefined,
         __readFile: (file: string) => fs.readFileSync(file, 'utf8'),
-        __writeFile: (file: string, text: string) => fs.writeFileSync(file, text),
+        __writeFile: (file: string, text: string | Uint8Array) => fs.writeFileSync(file, text),
+        __readBytes: (file: string) => new Uint8Array(fs.readFileSync(file)),
         __readDir: (dir: string) => fs.readdirSync(dir),
         __spawnSync: (command: string, args: string[], env: Record<string, string>) => {
             const exited = spawnSync(command, args, { env, encoding: 'utf8' })
