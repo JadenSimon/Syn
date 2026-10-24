@@ -216,6 +216,8 @@ export type EmitResult = {
     defaults?: boolean
     rest?: boolean
     readonlyCaptures?: number[]
+    privateNames?: Map<string, symbol>
+    privateMembers?: Map<string, PrivateName>
 }
 
 function defaultConstructorResult(): EmitResult {
@@ -258,7 +260,7 @@ function isNumericExpression(e: ts.Expression): boolean {
 const jumpBytesPerNode = 8
 
 function emitFunction(
-    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.ConstructorDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.ClassDeclaration | ts.ClassExpression,
+    fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ClassMember | ts.ClassDeclaration | ts.ClassExpression,
     emitCtx: EmitCtx = { outerSymbols: new Map(), outerFolded: new Map() },
 ): EmitResult {
     let jumpWidth: 2 | 4 = sourceNodeCount(fn) * jumpBytesPerNode > 0x7FFF ? 4 : 2
@@ -349,8 +351,9 @@ function emitFunction(
     const isConstructor = ts.isConstructorDeclaration(fn) || implicitConstructor
     const derivedConstructor = isConstructor && emitCtx.home !== undefined
     const forwardsArguments = implicitConstructor && derivedConstructor
-    const parameters = implicitConstructor ? [] : fn.parameters
-    const body = implicitConstructor ? undefined : fn.body
+    const staticBlock = ts.isClassStaticBlockDeclaration(fn)
+    const parameters = implicitConstructor || staticBlock ? [] : fn.parameters
+    const body = implicitConstructor ? undefined : staticBlock ? fn : fn.body
     const classHomes = new Map<ts.Node, number>()
     let prevOpOffset: number = -1
     let prevStoreOffset: number = -1
@@ -2781,6 +2784,7 @@ function emitFunction(
         const heritage = heritageOf(node)
         if (!heritage) {
             emitNested(emitClassTemplate(node, (member, scope) => emitFunction(member, { ...closureCtx(member), ...scope })))
+            emitStaticBlocks(node, member => emitFunction(member, closureCtx(member)))
             return
         }
         const home = classHomes.get(node)
@@ -2789,14 +2793,34 @@ function emitFunction(
         const parent = allocReg()
         emitExpr(heritage)
         star(parent)
-        emitNested(emitClassTemplate(node, (member, scope) => {
+        function emitDerivedMember(member: ClassMember | ts.ClassDeclaration | ts.ClassExpression, scope: ClassScope): EmitResult {
             const ctx = closureCtx(member)
-            ctx.outerSymbols.set(homeSymbol, { scopeSlot: -1, reg: home })
+            ctx.outerSymbols.set(homeSymbol, { scopeSlot: -1, reg: home! })
             return emitFunction(member, { ...ctx, ...scope })
-        }))
+        }
+        emitNested(emitClassTemplate(node, emitDerivedMember))
         star(home)
         star(cls)
         emitRuntimeCall(RtOp.classHeritage, cls, 2)
+        freeReg()
+        freeReg()
+        emitStaticBlocks(node, member => emitDerivedMember(member, { home: HomeObject.constructor }))
+    }
+
+    function emitStaticBlocks(node: ts.ClassDeclaration | ts.ClassExpression, emitBlockFunction: (member: ts.ClassStaticBlockDeclaration) => EmitResult): void {
+        const blocks = node.members.filter(ts.isClassStaticBlockDeclaration)
+        if (!blocks.length) return
+        const cls = allocReg()
+        const callee = allocReg()
+        star(cls)
+        if (ts.isClassDeclaration(node) && node.name) star(symToReg.get(getSymbolId(node.name))!)
+        for (const block of blocks) {
+            emitNested(emitBlockFunction(block))
+            star(callee)
+            ldar(cls)
+            emit4(Op.Call, callee, 0, 0)
+        }
+        ldar(cls)
         freeReg()
         freeReg()
     }
@@ -2883,7 +2907,7 @@ function emitFunction(
         }
         if (nested && ts.isIdentifier(node)) referencedNested.add(getSymbolId(node))
         if (!nested && (ts.isClassDeclaration(node) || ts.isClassExpression(node)) && heritageOf(node)) derivedClasses.push(node)
-        const inner = nested || ts.isFunctionLike(node) || ts.isPropertyDeclaration(node)
+        const inner = nested || ts.isFunctionLike(node) || ts.isPropertyDeclaration(node) || ts.isClassStaticBlockDeclaration(node)
         ts.forEachChild(node, child => scanCaptures(child, child === declared ? nested : inner))
     }
     if (body) ts.forEachChild(body, child => scanCaptures(child, false))
@@ -2922,7 +2946,7 @@ function emitFunction(
     }
 
     const lexicalThis = ts.isArrowFunction(fn) && outerSymbols.has(thisSymbol)
-    if (!lexicalThis && (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || ts.isGetAccessorDeclaration(fn) || ts.isSetAccessorDeclaration(fn) || isConstructor)) {
+    if (!lexicalThis && (usesThisBinding(fn) || ts.isMethodDeclaration(fn) || ts.isGetAccessorDeclaration(fn) || ts.isSetAccessorDeclaration(fn) || staticBlock || isConstructor)) {
         skipNextLookbehind = true
         thisReg = allocReg()
         star(thisReg)
@@ -2964,8 +2988,8 @@ function emitFunction(
             ldar(thisReg!)
             emit3(Op.CallArray, callee, argumentList)
         })
-    } else if (body && ts.isBlock(body)) {
-        emitBlock(body)
+    } else if (body && (ts.isBlock(body) || staticBlock)) {
+        emitBlock(body as ts.Block)
     } else if (body) {
         emitExpr(body) // arrow fn
     }
@@ -2973,7 +2997,7 @@ function emitFunction(
     const closed = code.at(-1) === Op.Return || code.at(-1) === Op.ReturnVoid || code.at(-1) === Op.Throw || code.at(-1) === Op.ReThrow
     if (!closed || maxJumpTarget >= code.length) {
         if (isConstructor) ldar(thisReg!)
-        emit1(body && !isConstructor && ts.isBlock(body) ? Op.ReturnVoid : Op.Return)
+        emit1(body && !isConstructor && (ts.isBlock(body) || staticBlock) ? Op.ReturnVoid : Op.Return)
     }
 
     assert(constants.length === constantKinds.length)
@@ -2992,7 +3016,7 @@ function emitFunction(
         scopeBindings,
         readonlyCaptures,
         sourceMapping,
-        name: !implicitConstructor && fn.name && ts.isIdentifier(fn.name) ? fn.name.text : undefined,
+        name: !implicitConstructor && !staticBlock && fn.name && ts.isIdentifier(fn.name) ? fn.name.text : undefined,
     }
 }
 
@@ -3023,15 +3047,15 @@ function fixupMethodLikeDecl(src: string) {
     if (src.startsWith('(')) return src
     if (src.startsWith('[')) return `function ${src.slice(computedKeyEnd(src))}`
     if (src.startsWith('async')) return src // todo: async method fixup
+    if (src.startsWith('class')) return src
     if (arrowFnPattern.test(src)) {
         const idx = src.indexOf('>')
         return `(${src.slice(0, idx-1)})=${src.slice(idx)}`
     }
-    if (src.startsWith('class')) return src
     return `function ${src}`
 }
 
-type ClassMember = ts.ConstructorDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration
+type ClassMember = ts.ConstructorDeclaration | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.ClassStaticBlockDeclaration
 type ClassScope = Pick<EmitCtx, 'home' | 'fields'>
 type MemberEmitter = (member: ClassMember | ts.ClassDeclaration | ts.ClassExpression, scope: ClassScope) => EmitResult
 
@@ -3048,7 +3072,7 @@ function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitM
     const expandos: Expandos = new Map()
     for (const member of node.members) {
         if (member === ctor || isFieldDeclaration(member)) continue
-        if (isPrivateMember(member)) continue
+        if (isPrivateMember(member) || ts.isClassStaticBlockDeclaration(member)) continue
         const target = isStaticMember(member) ? expandos : prototype
         const scope: ClassScope = { home: derived ? (isStaticMember(member) ? HomeObject.constructor : HomeObject.prototype) : undefined }
         if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
@@ -3066,14 +3090,25 @@ function emitClassTemplate(node: ts.ClassDeclaration | ts.ClassExpression, emitM
     return result
 }
 
-function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression): EmitResult {
+function emitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression, home?: EmitResult): EmitResult {
     const owner = node.name && isReferencedSymbol(node.name) ? node.name : undefined
-    const privateNames = classPrivateNames(node, undefined)
-    const privateMembers = classPrivateMembers(node)
-    return emitClassTemplate(node, (member, scope) => emitFunction(member, { outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames, privateMembers, ...scope }))
+    const privateNames = classPrivateNames(node, home?.privateNames)
+    const privateMembers = classPrivateMembers(node, home?.privateMembers)
+    const ctx = (): EmitCtx => ({ outerSymbols: new Map(), outerFolded: new Map(), owner, privateNames, privateMembers })
+    const result = emitClassTemplate(node, (member, scope) => emitFunction(member, { ...ctx(), ...scope }))
+    for (const [name, entry] of privateMembers) {
+        for (const member of [entry.method, entry.getter, entry.setter]) {
+            if (!member || member.template) continue
+            member.template = emitFunction(member.node, ctx())
+            member.template.name = name
+        }
+    }
+    result.privateNames = privateNames
+    result.privateMembers = privateMembers
+    return result
 }
 
-export function compile(src: string): EmitResult {
+export function compile(src: string, home?: EmitResult): EmitResult {
     const sf = ts.createSourceFile('input.js', fixupMethodLikeDecl(src), ts.ScriptTarget.Latest)
     defer finally {
         disposeSourceFile(sf)
@@ -3081,15 +3116,16 @@ export function compile(src: string): EmitResult {
     const fn = sf.statements[0]
     if (!fn) throw "found no statements in source"
     const exp = unwrapParensOrExpStatement(fn)
+    const ctx: EmitCtx = { outerSymbols: new Map(), outerFolded: new Map(), privateNames: home?.privateNames, privateMembers: home?.privateMembers }
     if (ts.isArrowFunction(exp) || ts.isFunctionExpression(exp)) {
-        return emitFunction(exp)
+        return emitFunction(exp, ctx)
     }
     if (ts.isClassDeclaration(exp) || ts.isClassExpression(exp)) {
-        return emitClassDeclaration(exp)
+        return emitClassDeclaration(exp, home)
     }
     if (!ts.isFunctionDeclaration(fn)) 
         throw "expected the source to be a single function declaration/expression"
-    return emitFunction(fn)
+    return emitFunction(fn, ctx)
 }
 
 export function operandWidth(value: number): 1 | 2 | 4 {
@@ -3368,6 +3404,33 @@ export function memberTemplates(template: EmitResult): EmitResult[] {
     return members
 }
 
+const usedCaptureSets = new Map<any[], Set<number>>()
+export function usedCaptures(result: EmitResult): Set<number> {
+    const known = usedCaptureSets.get(result.constants)
+    if (known) return known
+    const used = new Set<number>()
+    const seen = new Set<EmitResult>()
+    function visit(fn: EmitResult): void {
+        if (seen.has(fn)) return
+        seen.add(fn)
+        for (let i = 0; i < fn.constants.length; i++) {
+            const kind = fn.constantKinds[i]
+            const value = fn.constants[i]
+            if (kind === ConstantKind.nested_function) {
+                visit(value)
+                continue
+            }
+            if (kind !== ConstantKind.late_bound && kind !== ConstantKind.function_ && kind !== ConstantKind.class_) continue
+            if (typeof value !== 'string' || value[0] !== '$' || value[1] === '$') continue
+            used.add(Number(value.slice(1)))
+        }
+        for (const member of memberTemplates(fn)) visit(member)
+    }
+    visit(result)
+    usedCaptureSets.set(result.constants, used)
+    return used
+}
+
 export function frameCaptures(result: EmitResult): FrameCaptures {
     const captures: FrameCaptures = { reads: new Set(), writes: new Set() }
     function visit(fn: EmitResult, frameSlots: Set<number>): void {
@@ -3582,7 +3645,9 @@ export function finalize(
             constants[i] = template
             continue
         }
-        if (kinds[i] === ConstantKind.string || kinds[i] === ConstantKind.private_name || kinds[i] === ConstantKind.symbol) {
+        if (kinds[i] === ConstantKind.private_name) {
+            constants[i] = heap.fromPrivateName(result.constants[i])
+        } else if (kinds[i] === ConstantKind.string || kinds[i] === ConstantKind.symbol) {
             constants[i] = fromJsValue(result.constants[i])
         } else {
             constants[i] = result.constants[i]
@@ -3700,11 +3765,13 @@ const compiledSym = Symbol('compiled')
 const convertedSym = Symbol('converted')
 const substitutesSym = Symbol('substitutes')
 const membersSym = Symbol('members')
+const classesSym = Symbol('classes')
 interface Ctx {
     readonly [compiledSym]: Map<Function, any>
     readonly [convertedSym]: Map<object, Handle>
     readonly [substitutesSym]: Map<any, any>
     readonly [membersSym]: Map<Function, { compiled: EmitResult, captures: any[], owner: Function }>
+    readonly [classesSym]: Map<Function, EmitResult>
     [key: string]: any
 }
 export function createCtx(o: Record<string, any> = {}): Ctx {
@@ -3713,12 +3780,13 @@ export function createCtx(o: Record<string, any> = {}): Ctx {
         [convertedSym]: new Map(),
         [substitutesSym]: new Map<any, any>([[intrinsics.Intrinsics, heap.createHeapHandle(hostIntrinsics)]]),
         [membersSym]: new Map(),
+        [classesSym]: new Map(),
         Symbol: heap.symbolConstants,
         ...builtinGlobals,
     }, o) as any
 }
 const toComputation = Symbol.for('toComputation')
-function computationOf(f: Function): [string, any[]] {
+function computationOf(f: Function): [string, any[], string[]?, Function?] {
     const computation = (f as any)[toComputation]
     return computation ? computation() : [f.toString(), []]
 }
@@ -3734,9 +3802,11 @@ function withCaptures(ctx: Ctx, captures: any[] | undefined): Ctx {
     return scoped
 }
 
-function compileComputation(f: Function): [EmitResult, any[]] {
-    const [source, captures] = computationOf(f)
-    return [compile(source), captures]
+function compileComputation(f: Function, ctx: Ctx): [EmitResult, any[]] {
+    const [source, captures, , home] = computationOf(f)
+    if (!home) return [compile(source), captures]
+    compileJsFn(home, ctx)
+    return [compile(source, ctx[classesSym].get(home)), captures]
 }
 
 function bindMembers(ctx: Ctx, owner: Function, holder: any, expandos: Expandos, captures: any[]): void {
@@ -3764,7 +3834,8 @@ export function compileJsFn(f: Function, ctx: Ctx): any {
     const compiledFns = ctx[compiledSym]
     if (const prev = compiledFns.get(f)) return prev
     const member = ctx[membersSym].get(f)
-    const [compiled, captures] = member ? [member.compiled, member.captures] : compileComputation(f)
+    const [compiled, captures] = member ? [member.compiled, member.captures] : compileComputation(f, ctx)
+    if (compiled.privateNames) ctx[classesSym].set(f, compiled)
     if (compiled.expandos) bindMembers(ctx, f, f, compiled.expandos, captures)
     // for circularity. TODO: need to do something to fixup cycles. like allocating heap handle ahead of time
     compiledFns.set(f, compiled)
@@ -3840,6 +3911,22 @@ function e2eTestPrint(...args: Parameters<typeof e2eTest>) {
     assert(args[0] is string)
     testBytecodeEmit(args[0])
     return e2eTest(...args)
+}
+
+class StaticBlockCounter {
+    #count: number
+
+    constructor(n: number) {
+        this.#count = n
+    }
+
+    static {
+        function bump(this: StaticBlockCounter, k: number): number {
+            this.#count = this.#count + k
+            return this.#count
+        }
+        (StaticBlockCounter.prototype as any).bump = bump
+    }
 }
 
 function runTest() {
@@ -4344,6 +4431,11 @@ function runTest() {
     e2eTest('function privateSetterRecursive(a) { class C { constructor() { this.total = 0 } set #v(n) { if (n) { this.total = this.total + n; this.#v = n - 1 } } sum(n) { this.#v = n; return this.total } } return new C().sum(a) }', [4])
     e2eTest('function privateGetterRecursive(a) { class C { constructor(n) { this.n = n } get #v() { if (!this.n) return 0; this.n = this.n - 1; return this.#v + 2 } read() { return this.#v } } return new C(a).read() }', [3])
     e2eTest('function privateSetterShadow(a) { class C { constructor() { this.x = 0 } set #v(x) { this.x = x } write() { class D { constructor() { this.y = 0 } set #v(x) { this.y = x * 2 } run(o) { o.#v = 5; return this.y } } const d = new D(); d.run(d); this.#v = d.y; return this.x } } return new C().write() + a }', [1])
+    assert(e2eTest('function staticBlockMethod(a) { class O { #a = 1; static { function q() { this.#a = this.#a + a; return this.#a } O.prototype.q = q } } return new O().q() }', [4]) === 5)
+    assert(e2eTest('function staticBlockThis(a) { class O { static { this.k = a * 2 } static get() { return this.k } } return O.get() + 1 }', [4]) === 9)
+    assert(e2eTest('function staticBlockFriend(a) { let peek; class O { #a; constructor(x) { this.#a = x } static { peek = o => o.#a } } return peek(new O(a)) * 10 + peek(new O(2)) }', [3]) === 32)
+    assert(e2eTest('function hostStaticBlock(a) { const c = new StaticBlockCounter(a); return c.bump(2) * 10 + c.bump(1) }', [3], null, createCtx({ StaticBlockCounter })) === 56)
+    assert(e2eTest('function staticBlockOrder(a) { let log = 0; class O { static { log = log * 10 + 1 } static { log = log * 10 + 2 } } return log + a }', [1]) === 13)
     for (const [source, message] of [
         ['function f() { class C { static set #v(x) {} } return 0 }', 'static private members are not supported'],
         ['function f() { class C { static get #v() { return 1 } } return 0 }', 'static private members are not supported'],

@@ -38,6 +38,7 @@ const Frame = struct {
     threshold: u16,
     captures: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
     ambient: std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = .{},
+    private_home: SymbolRef = 0,
 };
 
 // this expects a fresh parsed file (for simplicity)
@@ -66,12 +67,14 @@ pub const SynthInstrumenter = struct {
     escapes: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
     captured: std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = .{},
     this_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
+    exported_bindings: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
 
     symbol_replacements: ?*std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = null,
     dollar_symbols: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
 
     fns: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, void)) = .{},
     ambients: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef)) = .{},
+    private_homes: std.AutoArrayHashMapUnmanaged(NodeRef, SymbolRef) = .{},
     instrumented: std.AutoArrayHashMapUnmanaged(NodeRef, void) = .{},
 
     ignored: ?*const std.AutoArrayHashMapUnmanaged(SymbolRef, void) = null,
@@ -164,11 +167,13 @@ pub const SynthInstrumenter = struct {
         self.fns.deinit(self.alloc);
         for (self.ambients.values()) |*ambient| ambient.deinit(self.alloc);
         self.ambients.deinit(self.alloc);
+        self.private_homes.deinit(self.alloc);
         self.instrumented.deinit(self.alloc);
         self.escapes.deinit(self.alloc);
         self.assigned.deinit(self.alloc);
         self.captured.deinit(self.alloc);
         self.this_symbols.deinit(self.alloc);
+        self.exported_bindings.deinit(self.alloc);
         self.dollar_symbols.deinit(self.alloc);
     }
 
@@ -263,6 +268,7 @@ pub const SynthInstrumenter = struct {
                 try self.captured.put(self.alloc, sym, ref);
                 try self.escapeSymbol(sym);
             }
+            if (self.private_homes.get(ref)) |home| try self.escapeSymbol(home);
         }
     }
 
@@ -366,6 +372,7 @@ pub const SynthInstrumenter = struct {
     }
 
     fn needsCell(self: *@This(), sym_ref: SymbolRef) bool {
+        if (self.exported_bindings.contains(sym_ref)) return false;
         return self.assigned.contains(sym_ref) and self.captured.contains(sym_ref);
     }
 
@@ -419,15 +426,54 @@ pub const SynthInstrumenter = struct {
         }
         const subj = try self.getMicroProgramStr(decl_ref, captured);
         const cap_arr = try self.factory.createArrayLiteralExpression(cap.items);
-        const ambient = self.ambients.get(decl_ref) orelse return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
-        if (ambient.count() == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
+        const home = self.private_homes.get(decl_ref) orelse 0;
+        const ambient_count = if (self.ambients.get(decl_ref)) |ambient| ambient.count() else 0;
+        if (ambient_count == 0 and home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
         var names = std.ArrayListUnmanaged(NodeRef){};
         defer names.deinit(self.alloc);
-        for (ambient.values()) |ref| {
-            try names.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
+        if (ambient_count != 0) {
+            for (self.ambients.get(decl_ref).?.values()) |ref| {
+                try names.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
+            }
         }
         const names_arr = try self.factory.createArrayLiteralExpression(names.items);
-        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr});
+        if (home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr});
+        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr, try self.getCellOrSymbol(home)});
+    }
+
+    fn declaresPrivateName(self: *@This(), class_ref: NodeRef, name: []const u8) bool {
+        var iter = NodeIterator.init(self.nodes, parser.getRight(self.nodes.at(class_ref)));
+        while (iter.next()) |member| {
+            switch (member.kind) {
+                .property_declaration, .method_declaration, .get_accessor, .set_accessor => {},
+                else => continue,
+            }
+            const name_ref = parser.getLeft(member);
+            if (name_ref == 0) continue;
+            const member_name = self.nodes.at(name_ref);
+            if (member_name.kind != .private_identifier) continue;
+            if (std.mem.eql(u8, getSlice(member_name, u8), name)) return true;
+        }
+        return false;
+    }
+
+    fn classifyPrivateName(self: *@This(), node: *const AstNode) !void {
+        const name = getSlice(node, u8);
+        var upper = self.frames.items.len;
+        var i = upper;
+        while (i > 0) {
+            i -= 1;
+            const decl = self.nodes.at(self.frames.items[i].decl_ref);
+            if (decl.kind != .class_declaration and decl.kind != .class_expression) continue;
+            const name_ref = parser.getDeclarationNameRef(decl) orelse 0;
+            const home = if (name_ref != 0) self.binder.getSymbol(name_ref) orelse 0 else 0;
+            var j = i + 1;
+            while (j < upper) : (j += 1) {
+                if (self.frames.items[j].private_home == 0) self.frames.items[j].private_home = home;
+            }
+            if (self.declaresPrivateName(self.frames.items[i].decl_ref, name)) return;
+            upper = i + 1;
+        }
     }
 
     fn buildSynthDataFn(
@@ -695,6 +741,7 @@ pub const SynthInstrumenter = struct {
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
         try self.ambients.put(self.alloc, ref, frame.ambient);
+        if (frame.private_home != 0) try self.private_homes.put(self.alloc, ref, frame.private_home);
     }
 
     // takes into account replacements
@@ -883,6 +930,7 @@ pub const SynthInstrumenter = struct {
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
         try self.ambients.put(self.alloc, ref, frame.ambient);
+        if (frame.private_home != 0) try self.private_homes.put(self.alloc, ref, frame.private_home);
     }
 
     pub fn visit(self: *@This(), node: *const AstNode, ref: NodeRef) anyerror!void {
@@ -985,6 +1033,7 @@ pub const SynthInstrumenter = struct {
             },
 
             .variable_statement => {
+                if (!self.transforming and node.hasFlag(.@"export")) try self.collectForBindings(ref, &self.exported_bindings);
                 const start = self.rebindings.items.len;
                 try forEachChild(self.nodes, node, self);
                 try self.drainRebindings(ref, start);
@@ -1027,6 +1076,7 @@ pub const SynthInstrumenter = struct {
             },
 
             .identifier, .this_keyword => try self.classifyReference(ref),
+            .private_identifier => if (!self.transforming) try self.classifyPrivateName(node),
             .super_keyword => {},
             .export_assignment => {
                 const inner = parser.unwrapRef(node);

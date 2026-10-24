@@ -21398,6 +21398,7 @@ pub const Analyzer = struct {
                     if (comptime suppress_gaps) continue;
                     return error.TODO;
                 },
+                .class_static_block_declaration => {},
                 else => return error.TODO,
             }
         }

@@ -4774,6 +4774,14 @@ export function visitEachChild(node: ts.Node, visitor: (node: ts.Node) => ts.Nod
         }
 
         case SyntaxKind.ClassStaticBlockDeclaration: {
+            if (node instanceof AstNode) {
+                const statements = visitArrayField(node, 'statements')
+                if (isForEachChild) return statements
+                if (statements !== undefined) {
+                    return factory.updateClassStaticBlockDeclaration(node, { kind: SyntaxKind.Block, original: node, statements } as any)
+                }
+                break
+            }
             const body = visitNode((node as ts.ClassStaticBlockDeclaration).body)
             if (isForEachChild) return body
 
