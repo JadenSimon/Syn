@@ -665,6 +665,11 @@ pub fn callNativeFn3(handle: u32, a0: i64, a1: i64, a2: i64) !i64 {
     return @call(.auto, try getNativePtr(fn (i64, i64, i64) callconv(.C) i64, handle), .{ a0, a1, a2 });
 }
 
+pub fn createFastNativeFn(handle: u32) !*js.Value {
+    const ptr = try toNativePtrAddr(handle);
+    return @ptrCast(try js.Function.initNative3(js.getCurrentEnv(), "native", @ptrFromInt(ptr)));
+}
+
 var native_fn_handle_to_ptr: ?*std.AutoHashMapUnmanaged(u32, usize) = null;
 fn mapNativePtr(ptr: usize) !u32 {
     if (native_fn_handle_to_ptr) |m| {

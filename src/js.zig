@@ -708,6 +708,38 @@ pub const Function = opaque {
         return result;
     }
 
+    const Native3 = fn (?*anyopaque, i64, i64, i64) callconv(.C) void;
+    const native3_args = [_]CFunction.CTypeDef{ .{ .ty = .v8_value }, .{ .ty = .int64 }, .{ .ty = .int64 }, .{ .ty = .int64 } };
+    const native3_def = CFunction.CFunctionDef{ .return_type = .{ .ty = .void }, .args = &native3_args, .arg_count = native3_args.len, .uses_options = false };
+
+    fn native3Slow(env: *Env, info: *CallFrame) callconv(.C) ?*Value {
+        const wrap = EnvWrap.getWrap(env) catch return null;
+        var converter = wrap.initConverter();
+        defer converter.deinit();
+        const z = info.get_args(env, 3) catch return null;
+        var args: [3]i64 = undefined;
+        inline for (0..3) |i| {
+            args[i] = converter.fromValue(i64, z[0][i]) catch |e| {
+                if (e == JSError.PendingException) return null;
+                const err = toValue(anyerror, wrap, e) orelse return null;
+                wrap.throw(err) catch |e2| handleThrowErr(e, e2);
+                return null;
+            };
+        }
+        const code: *const Native3 = @alignCast(@ptrCast(z[2]));
+        code(null, args[0], args[1], args[2]);
+        return null;
+    }
+
+    pub fn initNative3(env: *Env, name: []const u8, code: *const anyopaque) !*Function {
+        const fast = try CFunction.init(&native3_def, code);
+        var result: *Function = undefined;
+        const status = napi_create_fastcall_function(env, name.ptr, name.len, &native3Slow, fast, @constCast(code), &result);
+        try checkStatus(status);
+
+        return result;
+    }
+
     pub fn initWithData(name: []const u8, func: anytype, data: ?*anyopaque) !*Function {
         const env = currentEnv;
         const t: Type.Fn = switch (@typeInfo(@TypeOf(func))) {
@@ -845,8 +877,16 @@ const CFunction = opaque {
         restricted = 1 << 3,        // T must be float or double
     };
 
+    const SequenceType = enum(u32) {
+        scalar,
+        sequence,
+        typed_array,
+        array_buffer,
+    };
+
     const CTypeDef = extern struct {
         ty: CType,
+        sequence: SequenceType = .scalar,
         flags: TypeFlag = .none,
     };
 

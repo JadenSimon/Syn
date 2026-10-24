@@ -140,7 +140,7 @@ function protectPages(ptr: usize, len: usize, prot: u32): u32 {
     return syscalls.mprotect(ptr, len, prot)
 }
 
-function invokeNative(target: any, args: usize, nargs: usize): usize {
+function callNative(target: any, args: usize, nargs: usize): usize {
     if (nargs === 0) return target()
     const a0 = Intrinsics.load(args, 0, Types.u64)
     if (nargs === 1) return target(a0)
@@ -176,26 +176,58 @@ function invokeNative(target: any, args: usize, nargs: usize): usize {
     if (nargs === 16) return target(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)
     return 0
 }
+
+intrinsics.tagInline(callNative)
+
+function invokeNative(receiver: usize, target: any, args: usize, nargs: usize): void {
+    Intrinsics.store(args, 0, callNative(target, args, nargs), Types.u64)
+}
 const maxRootArgs = 16
-const rootArgs = new BigInt64Array(maxRootArgs)
+const rootBuffer = new ArrayBuffer(maxRootArgs * 8)
+const rootArgs = new BigInt64Array(rootBuffer)
+const rootWords = new Uint32Array(rootBuffer)
+const rootFloats = new Float64Array(rootBuffer)
 let rootArgsAddress: any
 
-function invokeRoot(ptr: any, args: any[], floats: number): any {
+function wordHigh(arg: any): number {
+    if (typeof arg !== 'number' || !(arg >= 0) || arg > 9007199254740991) return -1
+    const hi = (arg - (arg >>> 0)) / 4294967296
+    if (hi !== hi >>> 0) return -1
+    return hi
+}
+
+function invokeRoot(ptr: any, args: any[], floats: number): void {
     intrinsics.assert(rootParamType === Types.u64, 'native: invokeRoot encodes root params as u64 words')
-    rootArgsAddress ??= (ts as any).getArrayBufferPtr(rootArgs.buffer)
+    rootArgsAddress ??= (ts as any).getArrayBufferPtr(rootBuffer)
     let i = 0
     while (i < args.length) {
+        const arg = args[i]
         if (floats & (1 << i)) {
-            rootArgs[i] = new BigInt64Array(new Float64Array([Number(args[i])]).buffer)[0]
+            rootFloats[i] = typeof arg === 'number' ? arg : Number(arg)
             i++
             continue
         }
-        const word = BigInt(args[i])
-        if (BigInt.asUintN(64, word) !== word) throw new Error(`native: root arg ${i} is ${args[i]}, but root number params are u64`)
+        const hi = wordHigh(arg)
+        if (hi >= 0) {
+            rootWords[i * 2] = arg >>> 0
+            rootWords[i * 2 + 1] = hi
+            i++
+            continue
+        }
+        const word = BigInt(arg)
+        if (BigInt.asUintN(64, word) !== word) throw new Error(`native: root arg ${i} is ${arg}, but root number params are u64`)
         rootArgs[i] = word
         i++
     }
-    return nativeInvoker(ptr, rootArgsAddress, args.length)
+    nativeInvoker(ptr, rootArgsAddress, args.length)
+}
+
+function rootResult(): number | bigint {
+    const lo = rootWords[0]
+    const hi = rootWords[1] | 0
+    const raw = hi * 4294967296 + lo
+    if (raw >= -9007199254740991 && raw <= 9007199254740991) return raw
+    return BigInt(hi) * BigInt(4294967296) + BigInt(lo)
 }
 
 export const RegionKind = { code: 0, heap: 1, pstack: 2, table: 3 }
@@ -311,7 +343,7 @@ function runtimeValue(handle: number, base = runtimeHeapBase()): any {
 }
 
 function hostResult(raw: any, kind: HostReturn, base = runtimeHeapBase()): any {
-    const word = Number(BigInt.asUintN(32, BigInt(raw)))
+    const word = typeof raw === 'number' ? raw >>> 0 : Number(BigInt.asUintN(32, BigInt(raw)))
     if (kind === 'string') return runtimeString(word, base)
     if (!(word & 1)) return (word | 0) >> 1
     const handle = word >>> 1
@@ -1246,10 +1278,15 @@ function codeLine(entry: number | bigint, size: number, frame: { bytes: number, 
     return `${BigInt(entry).toString(16)} ${size} ${frame?.bytes ?? -1} ${frame?.link ?? -1} ${name}`
 }
 
-function bootstrapFn(name: string, code: LowerGraphResult): any {
-    const fn = (ts as any).createNativeFn(new Uint8Array(code.bytes))
-    codeObserver?.(codeLine((ts as any).toNativePtrAddr(fn), code.bytes.length, code.frame, `${name} (bootstrap)`))
-    return fn
+function bootstrapFn(name: string, code: LowerGraphResult, fast = false): any {
+    const fn = fast ? (ts as any).createFastNativeFn(new Uint8Array(code.bytes)) : (ts as any).createNativeFn(new Uint8Array(code.bytes))
+    const ptr = (ts as any).toNativePtrAddr(fn)
+    codeObserver?.(codeLine(ptr, code.bytes.length, code.frame, `${name} (bootstrap)`))
+    if (fast) return fn
+    return (...args: any[]) => {
+        invokeRoot(ptr, args, 0)
+        return rootResult()
+    }
 }
 
 let crashDump: any[] = []
@@ -1356,7 +1393,7 @@ function getNativeBootstraps() {
     nativeMapper = bootstrapFn('mapCodePage', mapper)
     nativeCopier = bootstrapFn('copyCode', copier)
     nativeSealer = bootstrapFn('sealCodePage', sealer)
-    nativeInvoker = bootstrapFn('invokeNative', invoker)
+    nativeInvoker = bootstrapFn('invokeNative', invoker, true)
     nativeProtector = bootstrapFn('protectPages', protector)
     if (flags.has('bootstrap-debug')) {
         console.log('--- listing mapper ---')
@@ -1421,10 +1458,6 @@ function returnsFloat(graph: Graph, floats = floatValues(graph)): boolean {
         if (getRef(n, 0) ? floats.has(getRef(n, 0)) : !Number.isInteger(getLiteral(graph, n, 0))) return true
     }
     return false
-}
-
-function floatBits(raw: any): number {
-    return new Float64Array(new BigInt64Array([BigInt(raw)]).buffer)[0]
 }
 
 function floatParams(graph: Graph): number {
@@ -11680,8 +11713,9 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         result[name] = Object.assign((...args: any[]) => {
             nativeObserver?.(`${name}(${args.join(', ')})`)
             sealCode(installed.page)
-            const raw = invokeRoot(ptr, args, floats)
-            if (float) return floatBits(raw)
+            invokeRoot(ptr, args, floats)
+            if (float) return rootFloats[0]
+            const raw = rootResult()
             return decoded ? hostResult(raw, decoded) : raw
         }, { ptr, codePage: installed.page, image: installed, units: emitted, capture })
     }
@@ -12010,8 +12044,9 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
         }
         const returns: HostReturn | undefined = entry.flags & EntryFlags.string ? 'string' : entry.flags & EntryFlags.word ? 'word' : undefined
         result[entry.name] = Object.assign((...args: any[]) => {
-            const raw = invokeRoot(ptr, args, entry.flags >>> 16)
-            if (entry.flags & EntryFlags.float) return floatBits(raw)
+            invokeRoot(ptr, args, entry.flags >>> 16)
+            if (entry.flags & EntryFlags.float) return rootFloats[0]
+            const raw = rootResult()
             return returns ? hostResult(raw, returns, heapBase) : raw
         }, { ptr, bases, regions: regions.map((region, i) => ({ kind: region.kind, index: region.index, base: bases[i], size: region.size, original: region.base })) })
     }

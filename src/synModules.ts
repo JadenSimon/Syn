@@ -54,6 +54,24 @@ function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
     return ctx
 }
 
+function installSynGlobals(reifier: Reifier, extra: Record<string, unknown>) {
+    const globals = globalThis as any
+    Object.assign(globals, {
+        Type: reifier.types,
+        __reify: reifier.__reify,
+        __readFile: reifier.__readFile,
+        __writeFile: reifier.__writeFile,
+        __readDir: reifier.__readDir,
+        __spawnSync: reifier.__spawnSync,
+        __readBytes: reifier.__readBytes,
+        v8,
+        ...extra,
+    })
+    globals.exports ??= {}
+    vm.runInThisContext(trimmedStacks)
+    return globals
+}
+
 export function runSynScript(text: string, fileName: string, reifier: Reifier) {
     const ctx = createSynContext(reifier, { __filename: fileName })
     const source = '"use strict";\n' + text
@@ -84,7 +102,7 @@ function writeCodeCache(file: string, sourceHash: Buffer, data: Buffer) {
 }
 
 export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts: any, codeCacheDir?: string) {
-    const ctx = createSynContext(reifier, { ts, __argv: [] })
+    const ctx = installSynGlobals(reifier, { ts, __argv: [] })
     const modules = new Map<string, vm.Module>()
     const sources = new Map<string, string>()
     const finished = new Set<vm.Module>()
@@ -160,7 +178,6 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
         sources.set(absPath, source)
         const options: vm.SourceTextModuleOptions = {
             identifier: absPath,
-            context: ctx,
             importModuleDynamically: (async (spec: string, from: vm.Module) => evaluated(await link(spec, from))) as any,
             initializeImportMeta: (meta: any, m) => {
                 meta.filename = m.identifier.replace(/\.js$/, '.syn')
@@ -195,7 +212,7 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
         return new vm.SyntheticModule(exports, function() {
             for (const k of exports) this.setExport(k, ts[k])
             this.setExport('default', ts)
-        }, { context: ctx })
+        })
     }
 
     async function link(spec: string, from: vm.Module): Promise<vm.Module> {

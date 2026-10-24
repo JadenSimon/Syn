@@ -6734,6 +6734,11 @@ export function createNativeFn(source: ArrayBuffer) {
     }, { handle })
 }
 
+export function createFastNativeFn(source: ArrayBuffer) {
+    const handle = api.createExecutableCode(Buffer.from(source))
+    return Object.assign(api.createFastNativeFn(handle), { handle })
+}
+
 export function toNativePtrAddr(fn: Function & { handle: number }): bigint | number {
     return api.toNativePtrAddr(fn.handle)
 }
