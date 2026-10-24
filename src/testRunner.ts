@@ -452,7 +452,7 @@ async function emitEngine(roots: string[]): Promise<EngineCacheEntry> {
     return { inputs, emitted }
 }
 
-async function compileEngine() {
+async function compileEngine(argv: string[]) {
     const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
 
     const roots = files.filter(x => x.isFile() && x.name.endsWith('.syn')).map(x => path.resolve(x.parentPath, x.name)).sort()
@@ -481,14 +481,14 @@ async function compileEngine() {
         let r = path.resolve(path.dirname(from), name)
         if (!path.extname(r)) r = `${r}.js`
         return [r, emitted.get(r)]
-    }, api)
+    }, api, argv.some(a => a.startsWith('coverage:')) ? undefined : path.resolve('out/engine-cache/v8'))
     return { emitted, loader }
 }
 
 let engine: ReturnType<typeof compileEngine> | undefined
 
 async function testEngine(suite = 'heap', argv: string[] = []): Promise<number> {
-    const { emitted, loader } = await (engine ??= compileEngine())
+    const { emitted, loader } = await (engine ??= compileEngine(argv))
     const harness = path.resolve('src/engine/harness.js')
     const prof = argv.find(a => a.startsWith('cpu-prof:') || a.startsWith('heap-prof:') || a.startsWith('coverage:'))?.replace(/^(cpu-prof|heap-prof|coverage):/, '')
     if (prof) {

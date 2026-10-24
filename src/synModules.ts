@@ -1,6 +1,8 @@
 import * as vm from 'node:vm'
 import * as v8 from 'node:v8'
 import * as path from 'node:path'
+import * as fs from 'node:fs'
+import * as crypto from 'node:crypto'
 import { SourceMap } from 'node:module'
 
 export interface Reifier {
@@ -61,8 +63,49 @@ export function runSynScript(text: string, fileName: string, reifier: Reifier) {
     }
 }
 
-export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts: any) {
+function codeCacheRuntime() {
+    const binary = fs.statSync(process.execPath)
+    return `${process.version}\0${process.execPath}\0${binary.size}\0${binary.mtimeMs}\0${v8.cachedDataVersionTag()}\0${process.execArgv.join(' ')}\0`
+}
+
+function codeCacheFile(dir: string, runtime: string, absPath: string, source: string) {
+    const hash = crypto.createHash('sha256')
+    hash.update(`${runtime}${absPath}\0`)
+    hash.update(source)
+    return path.join(dir, `${path.basename(absPath)}.${hash.digest('hex')}.bin`)
+}
+
+function readCodeCache(file: string) {
+    let data: Buffer
+    try {
+        data = fs.readFileSync(file)
+    } catch {
+        return undefined
+    }
+    const payload = data.subarray(32)
+    if (!crypto.createHash('sha256').update(payload).digest().equals(data.subarray(0, 32))) return undefined
+    return payload
+}
+
+function writeCodeCache(file: string, data: Buffer) {
+    const dir = path.dirname(file)
+    fs.mkdirSync(dir, { recursive: true })
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, Buffer.concat([crypto.createHash('sha256').update(data).digest(), data]))
+    fs.renameSync(tmp, file)
+    const prefix = path.basename(file).replace(/[0-9a-f]{64}\.bin$/, '')
+    const stale = fs.readdirSync(dir)
+        .filter(name => name.startsWith(prefix) && name.endsWith('.bin') && name.length === prefix.length + 68)
+        .map(name => path.resolve(dir, name))
+        .map(name => [name, fs.statSync(name, { throwIfNoEntry: false })?.mtimeMs ?? 0] as const)
+        .sort((a, b) => b[1] - a[1])
+        .slice(8)
+    for (const [name] of stale) fs.rmSync(name, { force: true })
+}
+
+export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts: any, codeCacheDir?: string) {
     const ctx = createSynContext(reifier, { ts, __argv: [] })
+    const runtime = codeCacheDir ? codeCacheRuntime() : ''
     const modules = new Map<string, vm.Module>()
     const sources = new Map<string, string>()
     const finished = new Set<vm.Module>()
@@ -136,7 +179,7 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
     function instantiate(absPath: string, text: string): vm.SourceTextModule {
         const source = `let __filename = import.meta.filename; ${readyMarker}\n` + text + finishedMarker
         sources.set(absPath, source)
-        return new vm.SourceTextModule(source, {
+        const options: vm.SourceTextModuleOptions = {
             identifier: absPath,
             context: ctx,
             importModuleDynamically: (async (spec: string, from: vm.Module) => evaluated(await link(spec, from))) as any,
@@ -150,7 +193,20 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
                 }
             },
             lineOffset: -1,
-        })
+        }
+        if (!codeCacheDir) return new vm.SourceTextModule(source, options)
+        const file = codeCacheFile(codeCacheDir, runtime, absPath, source)
+        const cachedData = readCodeCache(file)
+        if (cachedData) {
+            try {
+                return new vm.SourceTextModule(source, { ...options, cachedData })
+            } catch (err) {
+                if ((err as any)?.code !== 'ERR_VM_MODULE_CACHED_DATA_REJECTED') throw err
+            }
+        }
+        const m = new vm.SourceTextModule(source, options)
+        writeCodeCache(file, m.createCachedData())
+        return m
     }
 
     function synthesizeTypescript(): vm.Module {
