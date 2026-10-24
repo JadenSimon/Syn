@@ -63,49 +63,26 @@ export function runSynScript(text: string, fileName: string, reifier: Reifier) {
     }
 }
 
-function codeCacheRuntime() {
-    const binary = fs.statSync(process.execPath)
-    return `${process.version}\0${process.execPath}\0${binary.size}\0${binary.mtimeMs}\0${v8.cachedDataVersionTag()}\0${process.execArgv.join(' ')}\0`
-}
-
-function codeCacheFile(dir: string, runtime: string, absPath: string, source: string) {
-    const hash = crypto.createHash('sha256')
-    hash.update(`${runtime}${absPath}\0`)
-    hash.update(source)
-    return path.join(dir, `${path.basename(absPath)}.${hash.digest('hex')}.bin`)
-}
-
-function readCodeCache(file: string) {
+function readCodeCache(file: string, sourceHash: Buffer) {
     let data: Buffer
     try {
         data = fs.readFileSync(file)
     } catch {
         return undefined
     }
-    const payload = data.subarray(32)
-    if (!crypto.createHash('sha256').update(payload).digest().equals(data.subarray(0, 32))) return undefined
-    return payload
+    if (!data.subarray(0, 32).equals(sourceHash)) return undefined
+    return data.subarray(32)
 }
 
-function writeCodeCache(file: string, data: Buffer) {
-    const dir = path.dirname(file)
-    fs.mkdirSync(dir, { recursive: true })
+function writeCodeCache(file: string, sourceHash: Buffer, data: Buffer) {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     const tmp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, Buffer.concat([crypto.createHash('sha256').update(data).digest(), data]))
+    fs.writeFileSync(tmp, Buffer.concat([sourceHash, data]))
     fs.renameSync(tmp, file)
-    const prefix = path.basename(file).replace(/[0-9a-f]{64}\.bin$/, '')
-    const stale = fs.readdirSync(dir)
-        .filter(name => name.startsWith(prefix) && name.endsWith('.bin') && name.length === prefix.length + 68)
-        .map(name => path.resolve(dir, name))
-        .map(name => [name, fs.statSync(name, { throwIfNoEntry: false })?.mtimeMs ?? 0] as const)
-        .sort((a, b) => b[1] - a[1])
-        .slice(8)
-    for (const [name] of stale) fs.rmSync(name, { force: true })
 }
 
 export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts: any, codeCacheDir?: string) {
     const ctx = createSynContext(reifier, { ts, __argv: [] })
-    const runtime = codeCacheDir ? codeCacheRuntime() : ''
     const modules = new Map<string, vm.Module>()
     const sources = new Map<string, string>()
     const finished = new Set<vm.Module>()
@@ -195,8 +172,9 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
             lineOffset: -1,
         }
         if (!codeCacheDir) return new vm.SourceTextModule(source, options)
-        const file = codeCacheFile(codeCacheDir, runtime, absPath, source)
-        const cachedData = readCodeCache(file)
+        const file = path.join(codeCacheDir, `${path.basename(absPath)}.bin`)
+        const sourceHash = crypto.createHash('sha256').update(source).digest()
+        const cachedData = readCodeCache(file, sourceHash)
         if (cachedData) {
             try {
                 return new vm.SourceTextModule(source, { ...options, cachedData })
@@ -205,7 +183,7 @@ export function createModuleLoader(reifier: Reifier, resolve: ResolveModule, ts:
             }
         }
         const m = new vm.SourceTextModule(source, options)
-        writeCodeCache(file, m.createCachedData())
+        writeCodeCache(file, sourceHash, m.createCachedData())
         return m
     }
 
