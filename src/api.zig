@@ -1,5 +1,5 @@
 const std = @import("std");
-const js = @import("js");
+const js = @import("./js.zig");
 const parser = @import("./parser.zig");
 const Lexer = @import("./lexer.zig").Lexer;
 const Program = @import("./program.zig").Program;
@@ -659,6 +659,10 @@ pub fn callNativeFn(handle: u32, args: js.Array(i64)) !i64 {
         4 => @call(call_mod, try getNativePtr(fn(i64, i64, i64, i64) callconv(.C) i64, handle), .{args.elements[0], args.elements[1], args.elements[2], args.elements[3]}),
         else => error.TooManyArgs,
     };
+}
+
+pub fn callNativeFn3(handle: u32, a0: i64, a1: i64, a2: i64) !i64 {
+    return @call(.auto, try getNativePtr(fn (i64, i64, i64) callconv(.C) i64, handle), .{ a0, a1, a2 });
 }
 
 var native_fn_handle_to_ptr: ?*std.AutoHashMapUnmanaged(u32, usize) = null;

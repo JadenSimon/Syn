@@ -6729,6 +6729,7 @@ export function optimizeVson(source: string, emitVson = false): string {
 export function createNativeFn(source: ArrayBuffer) {
     const handle = api.createExecutableCode(Buffer.from(source))
     return Object.assign((...args: any[]) => {
+        if (args.length <= 3) return api.callNativeFn3(handle, args[0] ?? 0, args[1] ?? 0, args[2] ?? 0)
         return api.callNativeFn(handle, args)
     }, { handle })
 }

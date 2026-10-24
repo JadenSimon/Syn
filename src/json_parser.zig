@@ -249,7 +249,7 @@ fn Parser_(comptime Listener: type, comptime is_json5: bool) type {
 }
 
 const JsValueEmitter = struct {
-    const js = @import("js");
+    const js = @import("./js.zig");
 
     const PartialObject = struct {
         current_prop: ?*js.Value = null,
@@ -369,7 +369,7 @@ const JsValueEmitter = struct {
     }
 };
 
-pub fn parseJson5ToJs(source: []const u8, allocator: std.mem.Allocator) !*@import("js").Value {
+pub fn parseJson5ToJs(source: []const u8, allocator: std.mem.Allocator) !*@import("./js.zig").Value {
     var emitter = JsValueEmitter.initCurrentEnv(allocator);
     const Parser = Parser_(*JsValueEmitter, true);
     var p = try Parser.init(&emitter, .{ .contents = source }, allocator);
