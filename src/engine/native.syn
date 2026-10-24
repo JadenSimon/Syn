@@ -5415,6 +5415,7 @@ export function describe(shape: intrinsics.Handle | undefined): string {
 export interface Arrival {
     rep: Rep
     shaped: boolean
+    observed: boolean
 }
 
 function pointerOfShapes(rep: Rep | undefined): boolean {
@@ -8167,27 +8168,6 @@ interface AbiPositions {
     tagged: Set<string>
 }
 
-function floatJoins(unit: PlannedUnit, graph: Graph, id: number, n: GraphNode, joined: (ref: number) => void): void {
-    const root = graph.blocks[0]
-    const repOf = (x: number) => unit.nodes.get(x) ?? unit.params[root.params.indexOf(x)]?.rep
-    if (n.op === NodeOp.apply) {
-        const params = getBlock(graph, getRef(n, 0))?.params ?? []
-        params.forEach((p, i) => {
-            if (getRef(n, i + 1) && floatUnion(repOf(p))) joined(getRef(n, i + 1))
-        })
-    } else if (n.op === NodeOp.select && floatUnion(repOf(id))) {
-        for (let i = 1; i < countIds(n); i++) if (getRef(n, i)) joined(getRef(n, i))
-    } else if (n.op === NodeOp.ret && getRef(n, 0) && floatUnion(unit.returns)) {
-        joined(getRef(n, 0))
-    } else if (n.op === NodeOp.call) {
-        for (const callee of unit.calls.get(id) ?? []) {
-            callee.params.forEach((param, i) => {
-                if (3 + i < countIds(n) && getRef(n, 3 + i) && floatUnion(param.rep)) joined(getRef(n, 3 + i))
-            })
-        }
-    }
-}
-
 function tagged(tags: TagFlow, unit: PlannedUnit, id: number): boolean {
     const peer = tags.peerOf.get(unit) ?? unit
     return !!tags.marked.get(peer)?.has(id) && !tags.unknown.get(peer)?.has(id) && !!tags.absent.get(peer)?.has(id)
@@ -8364,19 +8344,7 @@ function analyzeTags(plan: ShapePlan, planned: Planned, tracedOf: (unit: Planned
         }
     }
     for (const unit of planned.units.values()) {
-        const graph = tracedOf(unit)
-        for (const [id, n] of nodeEntries(graph)) {
-            if (rt.sliceOf(graph, n) === rt.Op.sliceWrite && (unit.codecs.get(id)?.nullable || unit.codecs.get(id)?.float)) need(unit, getRef(n, 4))
-            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && getRef(n, 2) && nullableNumber(unit.nodes.get(tailOf(graph, getRef(n, 2))))) need(unit, getRef(n, 2))
-            floatJoins(unit, graph, id, n, ref => {
-                if (nullableNumber(unit.nodes.get(tailOf(graph, ref)))) need(unit, ref)
-            })
-            if ((n.op !== NodeOp.eq && n.op !== NodeOp.ne) || countIds(n) !== 2) continue
-            for (const side of [0, 1]) {
-                const ref = getRef(n, side)
-                if (ref && nullableNumber(unit.nodes.get(tailOf(graph, ref))) && !nonzeroLiteral(graph, n, 1 - side)) need(unit, ref)
-            }
-        }
+        for (const id of unit.observed) if (nullableNumber(unit.nodes.get(id))) need(unit, id)
     }
     while (work.length) {
         const [unit, id] = work.pop()!
@@ -8716,6 +8684,7 @@ export interface CodecRequest {
     functionObject?: (cell: number) => intrinsics.Handle | undefined
     floatRecords: Map<number, Rep>
     wordBits: Set<number>
+    observed: Set<number>
 }
 
 function coerceSlots(graph: Graph, id: number, slots: number[], to: (x: Operand, i: number) => Operand): void {
@@ -9349,6 +9318,18 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
         if (fn !== undefined) return fn
         return object(x) ? encodeObject(x as number) : x
     }
+    function collapsedString(id: number): boolean {
+        const element = slices.get(id)
+        return isStringRep(element) && !element!.nullable && !codecs.get(id)?.word
+    }
+    function zeroedString(x: Operand): Operand {
+        if (typeof x !== 'number' || !x) return x
+        if (isNullishValue(graph, x) || voided(x)) return { literal: 0 }
+        const rep = reps.get(x) ?? reps.get(tailOf(graph, x))
+        if (!isStringRep(rep) || !rep!.nullable) return storedWord(x)
+        if (!word(x) || decodedSlotWord(x) !== undefined) return x
+        return addNode(graph, NodeOp.select, [addNode(graph, NodeOp.ne, [x, { literal: heap.undefinedWord }], Types.bool), x, { literal: 0 }])
+    }
     function storedWord(x: Operand): Operand {
         if (typeof x !== 'number' || !x || isNullishValue(graph, x) || union(x)) return asWord(x)
         const rep = reps.get(x) ?? reps.get(tailOf(graph, x))
@@ -9406,7 +9387,7 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
         const float = typeof value === 'number' && floats.has(tailOf(graph, value))
         const smallWord = floatUnion(slices.get(id)) && typeof value === 'number' && !!value && (reps.get(value) ?? reps.get(tailOf(graph, value)))?.kind === 'number'
         if (!float && !floatSlot(id, value)) {
-            coerceSlots(graph, id, [3], codecs.get(id)?.word || smallWord ? toWord : storedWord)
+            coerceSlots(graph, id, [3], collapsedString(id) ? zeroedString : codecs.get(id)?.word || smallWord ? toWord : storedWord)
             return
         }
         const converted = float ? value : typeof value === 'number' ? addNode(graph, NodeOp.convert, [value], Types.f64) : addNode(graph, NodeOp.literal, [value], Types.f64)
@@ -9475,6 +9456,37 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
         } else if (n.op === NodeOp.store && typeOf(n) !== Types.vm_value && union(getRef(n, 3))) {
             coerceSlots(graph, id, [3], x => wordNumber(x as number))
         }
+    }
+}
+
+export function undefinedFloats(graph: Graph, request: CodecRequest): void {
+    const { reps, params, calls, returns, abi, observed } = request
+    const root = graph.blocks[0]
+    const own = new Set(ownRets(graph))
+    function float(rep: Rep | undefined): boolean {
+        return rep?.kind === 'number' && numberName(rep) === 'f64'
+    }
+    function repOf(x: number): Rep | undefined {
+        const index = root.params.indexOf(x)
+        return index < 0 ? reps.get(x) : params[index]
+    }
+    function nan(x: Operand): Operand {
+        if (typeof x !== 'number' || !x || !isNullishValue(graph, x)) return x
+        const n = getNode(graph, x)!
+        if (n.op !== NodeOp.after) return addNode(graph, NodeOp.literal, [{ literal: NaN }], Types.f64)
+        const last = countIds(n) - 1
+        return addNode(graph, NodeOp.after, withOperand(graph, n, last, nan(getRef(n, last))))
+    }
+    for (const [id, n] of [...nodeEntries(graph)]) {
+        if (n.op === NodeOp.select && float(repOf(id)) && !observed.has(id)) coerceSlots(graph, id, Array.from({ length: countIds(n) - 1 }, (_, i) => i + 1), nan)
+        else if (n.op === NodeOp.apply) {
+            const targets = getBlock(graph, getRef(n, 0))?.params ?? []
+            coerceSlots(graph, id, targets.map((p, i) => float(repOf(p)) && !observed.has(p) ? i + 1 : 0).filter(i => i > 0), nan)
+        } else if (n.op === NodeOp.ret && own.has(id) && float(returns) && abi.mode !== 'record' && abi.mode !== 'tagged') coerceSlots(graph, id, [0], nan)
+        else if (n.op === NodeOp.call && calls.get(id)?.params) {
+            const arrivals = calls.get(id)!.params!
+            coerceSlots(graph, id, [...arrivals.keys()].filter(i => float(arrivals.get(i)!.rep) && !arrivals.get(i)!.observed && 3 + i < countIds(n)).map(i => 3 + i), nan)
+        } else if (n.op === NodeOp.store && typeOf(n) === Types.f64) coerceSlots(graph, id, [3], nan)
     }
 }
 
@@ -9663,7 +9675,10 @@ export function realizeTags(graph: Graph, request: CodecRequest): void {
     }
     inlineBoolLiterals(graph)
     for (const [id, truth] of [...nodeEntries(graph)]) {
-        if (truth.op === NodeOp.select && countIds(truth) === 3 && getRef(truth, 0) && !getRef(truth, 1) && !getRef(truth, 2)) {
+        const condition = truth.op === NodeOp.select ? getRef(truth, 0) : 0
+        const tested = condition ? getNode(graph, tailOf(graph, condition)) : undefined
+        const floating = !!condition && (numberName(reps.get(condition) ?? reps.get(tailOf(graph, condition))) === 'f64' || (!!tested && resultType(graph, tested) === Types.f64))
+        if (truth.op === NodeOp.select && countIds(truth) === 3 && condition && !floating && !getRef(truth, 1) && !getRef(truth, 2)) {
             const a = getLiteral(graph, truth, 1)
             const b = getLiteral(graph, truth, 2)
             if ((a === 0 && b === 1) || (a === 1 && b === 0)) putNode(graph, id, a ? NodeOp.ne : NodeOp.eq, [getOperand(graph, truth, 0), { literal: 0 }], Types.bool)
@@ -10073,7 +10088,9 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         for (const [call, unit] of resolved.callees) {
             const callee = planned.functions.get(unit)!
             const shapes = paramShapesOf(callee)
-            out.set(call, new Map(plannedParams(callee).map(({ index, rep }) => [index, { rep, shaped: shapes.has(index) }])))
+            const traced = graphsOf(callee).traced!.graph
+            const plain = traced.blocks[0].params.filter(p => !isThisParam(getNode(traced, p)!))
+            out.set(call, new Map(plannedParams(callee).map(({ index, rep }) => [index, { rep, shaped: shapes.has(index), observed: index >= plain.length || unit.observed.has(plain[index]) }])))
         }
         return out
     }
@@ -10614,7 +10631,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         return {
             reps: values, params: local?.unit.params.map(param => param.rep) ?? [], returns: local?.unit.returns, abi: abiOf(fn), codecs: local?.codecs ?? new Map(),
             slices, pointers, encoded: resolved.encoded, calls, functionObject: functionObjectOf,
-            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, wordWrites: resolved.wordWrites, floatRecords: new Map(), wordBits: new Set(),
+            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, wordWrites: resolved.wordWrites, floatRecords: new Map(), wordBits: new Set(), observed: local?.unit.observed ?? new Set(),
         }
     }
     function floatParams(unit: PlannedUnit): number[] {
@@ -10633,6 +10650,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             verifyResolved(fn, resolved, edges, 'resolve', false)
             const request = codecRequest(fn, resolved, params)
             realizeFloats(resolved.graph, request)
+            undefinedFloats(resolved.graph, request)
             realizeWords(resolved.graph, request)
             if (resolved.local) {
                 const traced = graphsOf(fn).traced!.graph
