@@ -1156,6 +1156,320 @@ export function floatValues(g: Graph): Set<number> {
     return floats
 }
 
+const typeDebugFlags = intrinsics.argv().filter(a => a === 'type-debug' || a.startsWith('type-debug:'))
+const typeDebugOn = typeDebugFlags.length > 0
+const typeRecordOn = typeDebugFlags.length > (typeDebugFlags.includes('type-debug:verify') ? 1 : 0)
+const typeNotes = new Map<number, string[]>()
+const lineage = new Map<number, number>()
+const typeCacheWarnings = new Set<string>()
+const typeScope = new Set<Graph>()
+
+export function typeDebugging(): boolean {
+    return !intrinsics.isNative() && typeDebugOn
+}
+
+export function typeRecording(): boolean {
+    return !intrinsics.isNative() && typeRecordOn
+}
+
+export function debugsTypes(name: string | undefined): boolean {
+    if (!typeRecording()) return false
+    if (typeDebugFlags.includes('type-debug')) return true
+    if (name === undefined) return false
+    const base = name.includes('#') ? name.slice(0, name.indexOf('#')) : name
+    return typeDebugFlags.includes(`type-debug:${name}`) || typeDebugFlags.includes(`type-debug:${base}`)
+}
+
+export function warnTypeCache(name: string | undefined): void {
+    if (typeCacheWarnings.size) return
+    typeCacheWarnings.add(name ?? '')
+    console.log(`type-debug: the optimized-graph cache is bypassed for debugged units (first: ${name ?? '<anonymous>'}); cached graphs are renumbered copies of another unit's graph, so notes cannot follow them`)
+}
+
+export function scopeTypeNotes(g: Graph): boolean {
+    typeScope.clear()
+    if (debugsTypes(g.name)) typeScope.add(g)
+    return typeScope.size > 0
+}
+
+export function resetTypeNotes(): void {
+    typeNotes.clear()
+    lineage.clear()
+}
+
+export function noteLineage(fresh: number, from: number): void {
+    if (fresh !== from && !lineage.has(fresh)) lineage.set(fresh, from)
+}
+
+export interface LineageSnapshot {
+    ids: Set<number>
+    keys: Map<string, number>
+    users: Map<number, number[]>
+    ops: Map<number, NodeOp>
+    refs: Map<number, number[]>
+}
+
+const LineageSkipped = new Set([NodeOp.param, NodeOp.block, NodeOp.nilEffect, NodeOp.literal])
+
+function lineageKey(g: Graph, n: GraphNode, ref: (x: number) => number | undefined): string | undefined {
+    const parts = [String(n.op)]
+    const operands = getOperands(g, n)
+    let i = firstNonOrderingSlot(n)
+    while (i < operands.length) {
+        const x = operands[i]
+        if (typeof x !== 'number') parts.push(`#${x.literal}`)
+        else if (!x) parts.push('0')
+        else {
+            const r = ref(x)
+            if (r === undefined) return undefined
+            parts.push(`%${r}`)
+        }
+        i++
+    }
+    return parts.join(' ')
+}
+
+export function lineageSnapshot(g: Graph): LineageSnapshot {
+    const snapshot: LineageSnapshot = { ids: new Set(), keys: new Map(), users: new Map(), ops: new Map(), refs: new Map() }
+    for (const [id, n] of nodeEntries(g)) {
+        snapshot.ids.add(id)
+        snapshot.ops.set(id, n.op)
+        const refs: number[] = []
+        for (let i = 0; i < countIds(n); i++) refs.push(getRef(n, i))
+        snapshot.refs.set(id, refs)
+        if (LineageSkipped.has(n.op)) continue
+        const key = lineageKey(g, n, x => x)!
+        if (!snapshot.keys.has(key)) snapshot.keys.set(key, id)
+        for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (!x) continue
+            const list = snapshot.users.get(x)
+            if (list) list.push(id)
+            else snapshot.users.set(x, [id])
+        }
+    }
+    return snapshot
+}
+
+export function traceLineage(g: Graph, before: LineageSnapshot): void {
+    const mapped = new Map<number, number>()
+    const resolve = (x: number) => before.ids.has(x) ? x : mapped.get(x)
+    let pending: number[] = []
+    for (const id of nodeIds(g)) if (!before.ids.has(id)) pending.push(id)
+    let progress = true
+    while (progress && pending.length) {
+        progress = false
+        const rest: number[] = []
+        for (const id of pending) {
+            const n = getNode(g, id)!
+            if (LineageSkipped.has(n.op)) {
+                mapped.set(id, id)
+                progress = true
+                continue
+            }
+            const key = lineageKey(g, n, resolve)
+            if (key === undefined) {
+                rest.push(id)
+                continue
+            }
+            progress = true
+            let from = before.keys.get(key)
+            if (from === undefined) {
+                for (let i = firstNonOrderingSlot(n); i < countIds(n) && from === undefined; i++) {
+                    const x = getRef(n, i)
+                    const old = x ? resolve(x) : undefined
+                    if (old === undefined || !before.ids.has(old)) continue
+                    const candidates = (before.users.get(old) ?? []).filter(user => before.ops.get(user) === n.op && before.refs.get(user)!.length === countIds(n))
+                    const dead = candidates.filter(user => !hasNode(g, user))
+                    from = candidates.length === 1 ? candidates[0] : dead.length === 1 ? dead[0] : undefined
+                }
+            }
+            mapped.set(id, from ?? id)
+            if (from !== undefined) noteLineage(id, from)
+        }
+        pending = rest
+    }
+    const work: number[] = []
+    for (const [id, from] of mapped) if (from !== id) work.push(id)
+    for (const id of nodeIds(g)) if (before.ids.has(id)) work.push(id)
+    while (work.length) {
+        const id = work.pop()!
+        const n = getNode(g, id)!
+        const old = before.refs.get(resolve(id) ?? id)
+        if (!old || before.ops.get(resolve(id) ?? id) !== n.op) continue
+        for (let i = 0; i < countIds(n) && i < old.length; i++) {
+            const x = getRef(n, i)
+            if (!x || before.ids.has(x) || mapped.get(x) !== x || !old[i]) continue
+            if (before.ops.get(old[i]) !== getNode(g, x)!.op) continue
+            mapped.set(x, old[i])
+            noteLineage(x, old[i])
+            work.push(x)
+        }
+    }
+}
+
+export function noteType(id: number, note: string): void {
+    const list = typeNotes.get(id)
+    if (!list) typeNotes.set(id, [note])
+    else if (!list.includes(note)) list.push(note)
+}
+
+export function typeHistory(id: number): string[] {
+    const out: string[] = []
+    let at = id
+    let hops = 0
+    while (hops < 16) {
+        for (const note of typeNotes.get(at) ?? []) out.push(hops ? `[%${at}] ${note}` : note)
+        const origin = lineage.get(at)
+        if (origin === undefined) break
+        out.push(`%${at} is a copy of %${origin}`)
+        at = origin
+        hops++
+    }
+    return out
+}
+
+function floatSeed(g: Graph, n: GraphNode): string | undefined {
+    if (n.op !== NodeOp.store && typeSlots(n.op) && typeOf(n) === Types.f64) return 'typed f64'
+    if (n.op === NodeOp.literal && !Number.isInteger(literalValue(g, n))) return `non-integer literal ${literalValue(g, n)}`
+    if ((n.op === NodeOp.call || n.op === NodeOp.get) && resultType(g, n) === Types.f64) return `${opName(n.op)} result type f64`
+    return undefined
+}
+
+function floatInputs(g: Graph, id: number, n: GraphNode, arrivals: () => Map<number, Operand[]>): Operand[] | undefined {
+    if (FloatArith.has(n.op)) return getOperands(g, n)
+    if (n.op === NodeOp.select) return getOperands(g, n).slice(1)
+    if (n.op === NodeOp.after) return [getOperand(g, n, countIds(n) - 1)]
+    if (n.op === NodeOp.param) return arrivals().get(id) ?? []
+    return undefined
+}
+
+function numberOperandText(g: Graph, floats: Set<number>, x: Operand): string {
+    if (typeof x !== 'number') return `#${x.literal}`
+    if (!x) return '#0'
+    const n = getNode(g, x)
+    if (!n) return `%${x} (missing)`
+    return `%${x} ${opName(n.op)}:${typeName(typeSlots(n.op) ? typeOf(n) : resultType(g, n))}${floats.has(x) ? ' float' : ''}`
+}
+
+export function explainNumberClass(g: Graph, floats: Set<number>, root: number, depth = 6): string[] {
+    const lines: string[] = []
+    let arrivalMap: Map<number, Operand[]> | undefined
+    function arrivals(): Map<number, Operand[]> {
+        if (arrivalMap) return arrivalMap
+        const built = new Map<number, Operand[]>()
+        for (const m of allNodes(g)) {
+            if (m.op !== NodeOp.apply) continue
+            const params = getBlock(g, getRef(m, 0))?.params ?? []
+            for (let i = 0; i < params.length; i++) {
+                const list = built.get(params[i])
+                if (list) list.push(getOperand(g, m, i + 1))
+                else built.set(params[i], [getOperand(g, m, i + 1)])
+            }
+        }
+        arrivalMap = built
+        return built
+    }
+    const seen = new Set<number>()
+    function visit(id: number, indent: string, left: number): void {
+        const n = getNode(g, id)
+        if (!n) return
+        const head = `${indent}${numberOperandText(g, floats, id)}`
+        if (seen.has(id)) {
+            lines.push(`${head} (see above)`)
+            return
+        }
+        seen.add(id)
+        const inputs = floatInputs(g, id, n, arrivals)
+        const seed = floatSeed(g, n)
+        const slots = integralSlots(g, n)
+        const integral = slots.length ? ` [integralSlots ${slots.join(',')} force integer operands]` : ''
+        const computed = rt.floatArith.has(n.op) ? ` [an f64 ${opName(n.op)} is only computed by rt.${rt.opName(rt.floatArith.get(n.op)!)}; it stays ${opName(n.op)} here because the plan saw no float operand (no floatKey part)]` : ''
+        const forced = `${integral}${computed}`
+        let next: number[] = []
+        if (floats.has(id) && seed) {
+            lines.push(`${head} <- float seed: ${seed}${forced}`)
+        } else if (floats.has(id)) {
+            const from = (inputs ?? []).find(x => typeof x === 'number' && floats.has(x))
+            const via = n.op === NodeOp.param ? 'block arrival' : `${opName(n.op)} operand`
+            lines.push(`${head} <- float flows in from ${from !== undefined ? numberOperandText(g, floats, from) : 'a non-integer literal'} (${via})${forced}`)
+            if (typeof from === 'number') next = [from]
+        } else if (!inputs) {
+            lines.push(`${head} <- integer: not a float seed, and ${opName(n.op)} does not carry floats (only ${[...FloatArith].map(opName).join('/')}/select/after/params do)${forced}`)
+            for (const x of getOperands(g, n)) if (typeof x === 'number' && x) next.push(x)
+        } else {
+            lines.push(`${head} <- integer: not a float seed, and no float input among ${inputs.map(x => numberOperandText(g, floats, x)).join(', ') || 'no inputs'}${forced}`)
+            for (const x of inputs) if (typeof x === 'number' && x) next.push(x)
+        }
+        for (const note of typeHistory(id)) lines.push(`${indent}    ${note}`)
+        if (left <= 0) return
+        for (const x of next.slice(0, 4)) {
+            const m = getNode(g, x)
+            if (!m || m.op === NodeOp.nilEffect || m.op === NodeOp.block || m.op === NodeOp.localTarget) continue
+            visit(x, `${indent}  `, left - 1)
+        }
+    }
+    visit(root, '', depth)
+    return lines
+}
+
+function signedOperand(g: Graph, x: Operand): boolean {
+    if (typeof x !== 'number') return x.literal < 0
+    const n = getNode(g, x)
+    if (!n) return false
+    const T = typeSlots(n.op) ? typeOf(n) : resultType(g, n)
+    return T === Types.f64 || lowering.isSignedType(T)
+}
+
+function numberTypesOf(g: Graph): Map<number, Types> | undefined {
+    if (!typeScope.size) return undefined
+    const out = new Map<number, Types>()
+    for (const [id, n] of nodeEntries(g)) if (typeSlots(n.op)) out.set(id, typeOf(n))
+    return out
+}
+
+function noteNumberRules(g: Graph, floats: Set<number>, arrivals: Map<number, Operand[]>, before: Map<number, Types>): void {
+    for (const [id, n] of nodeEntries(g)) {
+        const was = before.get(id)
+        if (was === undefined || was === typeOf(n)) continue
+        const signedBy = getOperands(g, n).find(x => signedOperand(g, x))
+        const arrived = (arrivals.get(id) ?? []).find(x => signedOperand(g, x))
+        const why = floats.has(id) ? explainNumberClass(g, floats, id, 0)[0]
+            : was !== Types.unknown_number ? `signed arrival ${arrived === undefined ? '?' : numberOperandText(g, floats, arrived)}`
+            : n.op === NodeOp.sub ? 'a sub of unknown_number is signed'
+            : signedBy !== undefined ? `signed operand ${numberOperandText(g, floats, signedBy)}`
+            : 'unknown_number with no signed operand defaults to u64'
+        noteType(id, `${g.name ?? '<anonymous>'}: resolveNumberTypes ${typeName(was)} -> ${typeName(typeOf(n))}: ${why}`)
+    }
+}
+
+function noteCoercion(g: Graph, floats: Set<number>, id: number, n: GraphNode, slot: number, from: Operand, to: Operand): void {
+    if (!typeScope.size) return
+    const why = integralSlots(g, n).includes(slot) ? `integralSlots of ${opName(n.op)}` : 'float destination'
+    noteType(id, `${g.name ?? '<anonymous>'}: resolveNumberTypes coerced slot ${slot} ${numberOperandText(g, floats, from)} to ${numberOperandText(g, floats, to)} (${why})`)
+}
+
+function verifyNumbersExplained(g: Graph, stage: string, floats: Set<number>, arith: Set<NodeOp> | undefined): void {
+    try {
+        verifyNumberClasses(g, stage, floats, integralSlots, arith)
+    } catch (e) {
+        const node = (e as any)?.node
+        if (typeof node === 'number' && getNode(g, node)) (e as any).message += `\n${explainNumberClass(g, floats, node).join('\n')}`
+        throw e
+    }
+}
+
+export function dumpNumberTypes(g: Graph, floats: Set<number>): string {
+    const lines = [`TYPES lower ${g.name ?? '<anonymous>'}: number classes the lowering sees (floatValues), with provenance`]
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op === NodeOp.nilEffect || n.op === NodeOp.block || n.op === NodeOp.localTarget || n.op === NodeOp.apply || n.op === NodeOp.ret) continue
+        const T = typeSlots(n.op) ? typeOf(n) : resultType(g, n)
+        if (T === Types.void || T === Types.unknown) continue
+        for (const line of explainNumberClass(g, floats, id, 0)) lines.push(`  ${line}`)
+    }
+    return lines.join('\n')
+}
+
 const ClasslessFloats = new Set([Types.f16, Types.f32, Types.unknown_number])
 
 export function returnRegisters(target: lowering.Target, types: intrinsics.Types[]): number[] | undefined {
@@ -14639,12 +14953,14 @@ export function resolveNumberTypes(g: Graph) {
         resolved.set(id, T)
         return T
     }
+    const typedBefore = typeRecording() ? numberTypesOf(g) : undefined
     for (const [id, n] of nodeEntries(g)) {
         if (!typeSlots(n.op)) continue
         const T = resolve(id, n)
         if (typeOf(n) === T) continue
         retypeNode(g, id, T)
     }
+    if (typedBefore) noteNumberRules(g, floats, arrivals, typedBefore)
     function asFloat(x: Operand): Operand {
         if (typeof x !== 'number') {
             if (!x.literal || !Number.isInteger(x.literal)) return x
@@ -14679,6 +14995,7 @@ export function resolveNumberTypes(g: Graph) {
         for (const i of slots) {
             const x = as(operands[i])
             if (x === operands[i]) continue
+            if (typeRecording()) noteCoercion(g, floats, id, n, i, operands[i], x)
             operands[i] = x
             changed = true
         }
@@ -14717,6 +15034,7 @@ function runPipeline(stage: string, g: Graph, costs: lowering.TargetCosts, passe
     const cost = intrinsics.argv().includes('graph-transform-cost')
     const costThreshold = Number(intrinsics.argv().find(x => x.startsWith('perf-thresh:'))?.slice(12) ?? 1)
     const violations = intrinsics.argv().includes('check-creation-order') ? new Set<string>() : undefined
+    const lineageBefore = typeRecording() && scopeTypeNotes(g) ? lineageSnapshot(g) : undefined
     const start = performance.now()
     let changed = false
     let unknown = false
@@ -14746,6 +15064,7 @@ function runPipeline(stage: string, g: Graph, costs: lowering.TargetCosts, passe
         if (g.form) verifyGraph(g, key, true)
     }
     recordPass(`${stage}:(total)`, performance.now() - start, changed ? true : unknown ? undefined : false)
+    if (lineageBefore) traceLineage(g, lineageBefore)
     return { graph: g, changed }
 }
 
@@ -14769,7 +15088,8 @@ export function packageValueGraph(g: Graph, target: lowering.Target, entries?: S
     g = runPipeline('package', g, target.costs, [_bindCallContext, splitBranchingSelects, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks]).graph
     g.form = 'packaged'
     verifyGraph(g, 'package', true)
-    verifyNumberClasses(g, 'package', floatValues(g), integralSlots, undefined)
+    if (typeDebugging()) verifyNumbersExplained(g, 'package', floatValues(g), undefined)
+    else verifyNumberClasses(g, 'package', floatValues(g), integralSlots, undefined)
     verifySlotBounds(g, 'package', slotBytes)
     return g
 }
@@ -15592,7 +15912,8 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     verifyTailEffects(g, 'lowerable', offTail)
     verifyTokenSelects(g, 'lowerable')
     const floats = floatValues(g)
-    verifyNumberClasses(g, 'lowerable', floats, integralSlots, ArithOps)
+    if (typeDebugging()) verifyNumbersExplained(g, 'lowerable', floats, ArithOps)
+    else verifyNumberClasses(g, 'lowerable', floats, integralSlots, ArithOps)
     verifySlotBounds(g, 'lowerable', slotBytes)
     return { g, island, analysis: analyzeValueGraph(g, opts), effectful, floats }
 }
