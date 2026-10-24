@@ -40,6 +40,9 @@ export interface LayoutTable {
     bits?: Map<Handle, RecordBits>
     fixed?: Map<Handle, Map<Handle, Handle>>
     erased?: Map<Handle, Set<Handle>>
+    views?: Map<Handle, Handle[]>
+    codes?: Map<Handle, Handle>
+    absent?: Map<Handle, Map<Handle, boolean>>
 }
 
 export interface Answer {
@@ -1287,7 +1290,12 @@ function resolveProperties(
     let armOverride: { id: number, shape: Handle } | undefined
     function memberIndex(members: Handle[], shape: Handle): number {
         const exact = members.indexOf(shape)
-        return exact >= 0 ? exact : members.findIndex(m => native.sameSnapshotShape(m, shape))
+        if (exact >= 0) return exact
+        const views = opts.layouts.views?.get(shape) ?? []
+        const viewed = members.filter(m => views.includes(m))
+        if (viewed.length > 1) throw `property-eval: closure state @${shape} is viewed as ${viewed.length} members of one union`
+        if (viewed.length) return members.indexOf(viewed[0])
+        return members.findIndex(m => native.sameSnapshotShape(m, shape))
     }
     function unionOf(param: number, members: Handle[]): void {
         if (unions.has(param)) return
@@ -1495,7 +1503,12 @@ function resolveProperties(
         if (getRef(n, 2) && boolValue(getRef(n, 2))) return heap.typeNames.boolean
         const known = getRef(n, 2) ? shape(getRef(n, 2)) : numberShape
         if (known === undefined || known === null) return
-        return known === numberShape ? heap.typeNames.number : heap.typeNameOf(known)
+        return shapeTypeName(known)
+    }
+    function shapeTypeName(shape: Handle): Handle {
+        if (shape === numberShape) return heap.typeNames.number
+        if (heap.getOwnProperty(shape, heap.closureCallKey)) return heap.typeNames.function
+        return heap.typeNameOf(shape)
     }
     function nullMember(id: number): Handle | undefined {
         while (true) {
@@ -1542,7 +1555,7 @@ function resolveProperties(
         const mem = unionMemory(getRef(n, 2))
         if (!mem || mem.members || mem.keys.includes(heap.protoSlotKey)) return false
         const kind = addNode(out, NodeOp.rt, [getRef(n, 0), { literal: RtOp.typeof }, getRef(n, 2)])
-        const name = addNode(out, NodeOp.heapHandle, [{ literal: heap.typeNameOf(mem.shape) }])
+        const name = addNode(out, NodeOp.heapHandle, [{ literal: shapeTypeName(mem.shape) }])
         const present = addNode(out, NodeOp.eq, [kind, name], Types.bool)
         putNode(out, id, NodeOp.after, [getRef(n, 0), addNode(out, NodeOp.select, [present, memberPrototypeTest(n, mem), { literal: 0 }])])
         return true
@@ -1628,16 +1641,21 @@ function resolveProperties(
         const mem = memory.get(object)
         const members = union?.members ?? mem?.members
         if (!members || nullMember(object) !== undefined) return false
-        const names = members.map(member => member === numberShape ? heap.typeNames.number : heap.typeNameOf(member))
+        const names = members.map(shapeTypeName)
         if (names.every(name => name === names[0])) return false
         const tag = union ?? dispatchOf(object, mem!, getRef(n, 0))
         if (!tag) throw `property-eval: %${id} takes typeof a pointer to one of ${members.length} shapes, which differ on it and carry no tag`
         putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(tag, names.map(name => addNode(out, NodeOp.heapHandle, [{ literal: name }])))])
         return true
     }
-    function presence(id: number, member: Handle, key: Handle): number {
+    function presence(id: number, member: Handle, key: Handle): number | undefined {
         if (member === numberShape || member === stringShape) throw `property-eval: %${id} tests ${heap.describeKey(key)} of a primitive`
-        if (heap.getOwnProperty(member, key)) throw `property-eval: %${id} tests own key ${heap.describeKey(key)} of a shape; shapes do not record whether a key is present yet (written after creation, deleted, or joined from an object without it)`
+        if (heap.getOwnProperty(member, key)) {
+            const absent = opts.layouts.absent?.get(member)?.get(key)
+            if (absent === undefined) throw `property-eval: %${id} tests own key ${heap.describeKey(key)} of a shape; shapes do not record whether a key is present yet (written after creation, deleted, or joined from an object without it)`
+            if (absent) throw `property-eval: %${id} tests ${heap.describeKey(key)}, which may be absent and may also hold undefined`
+            return
+        }
         let at = heap.prototypeOf(member)
         while (at) {
             if (heap.getOwnProperty(at, key)) return 1
@@ -1667,14 +1685,25 @@ function resolveProperties(
         const members = mem?.members ?? (union ? union.members : known ? [known] : undefined)
         if (!members) return false
         const answers = members.map(member => presence(id, member, key))
-        if (answers.every(answer => answer === answers[0])) {
-            putNode(out, id, NodeOp.after, [getRef(n, 0), addNode(out, NodeOp.literal, [{ literal: answers[0] }])])
+        if (answers.every(answer => answer !== undefined && answer === answers[0])) {
+            putNode(out, id, NodeOp.after, [getRef(n, 0), addNode(out, NodeOp.literal, [{ literal: answers[0]! }])])
+            return true
+        }
+        const values = answers.map((answer, i) => answer !== undefined ? addNode(out, NodeOp.literal, [{ literal: answer }]) : presentField(n, mem && !mem.members ? mem : pointerMemory(mem?.ptr ?? object, members[i]), key))
+        if (members.length === 1) {
+            putNode(out, id, NodeOp.after, [getRef(n, 0), values[0]])
             return true
         }
         const tag = union ?? dispatchOf(object, mem!, getRef(n, 0))
         if (!tag) throw `property-eval: %${id} tests ${heap.describeKey(key)} of a pointer to one of ${members.length} shapes, which differ on it and carry no tag`
-        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(tag, answers.map(answer => addNode(out, NodeOp.literal, [{ literal: answer }])))])
+        putNode(out, id, NodeOp.after, [getRef(n, 0), tagSelect(tag, values)])
         return true
+    }
+    function presentField(n: GraphNode, mem: Memory, key: Handle): number {
+        const read = addNode(source, NodeOp.getProp, [getRef(n, 0), getRef(n, 2), { literal: key }])
+        putCopy(out, read, getNode(source, read)!)
+        resolveMemory(read, getNode(source, read)!, mem)
+        return addNode(out, NodeOp.ne, [read, undefinedValue()], Types.bool)
     }
     function decided(id: number): boolean | undefined {
         const n = getNode(source, id)
@@ -2528,20 +2557,29 @@ function resolveProperties(
         if (!mem && !union) continue
         const current = getNode(out, id)!
         if (current.op !== NodeOp.call) continue
-        if (mem?.members) agreeOn(id, mem, heap.closureCallKey)
-        const codes = (mem ? [mem.shape] : union!.members).map(shape => {
+        const dispatch = mem?.members && !agrees(mem, heap.closureCallKey) ? dispatchOf(getRef(n, 1), mem, getRef(current, 0)) : undefined
+        if (mem?.members && !dispatch) agreeOn(id, mem, heap.closureCallKey)
+        const chosen = dispatch ?? union
+        const codes = (dispatch ? dispatch.members : mem ? [mem.shape] : union!.members).map(shape => {
             const addr = heap.getPropertyDescriptor(shape, heap.closureCallKey)
-            if (!addr && union) return addNode(out, NodeOp.unreachable, []) // XXX
+            if (!addr && chosen) return addNode(out, NodeOp.unreachable, []) // XXX
             if (!addr) throw `property-eval: %${id} calls an object without a call slot`
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)).slot0 as Handle
+            const code = chosen ? opts.layouts.codes?.get(shape) : undefined
+            if (code !== undefined) return addNode(out, NodeOp.heapHandle, [{ literal: code }])
+            if (!mem && heap.isBoxedF64(slot)) {
+                const fields = layout(shape)
+                return addNode(out, NodeOp.load, [getRef(current, 0), getRef(n, 1), { literal: fields.offsets[fields.keys.indexOf(heap.closureCallKey)] }], Types.fnptr)
+            }
             if (mem && (heap.isBoxedF64(slot) || mem.members)) {
-                const at = mem.keys.indexOf(heap.closureCallKey)
-                return addNode(out, NodeOp.load, [getRef(current, 0), mem.ptr, { literal: mem.base + mem.offsets[at] }], Types.fnptr)
+                const fields = dispatch ? layout(shape) : mem
+                const at = fields.keys.indexOf(heap.closureCallKey)
+                return addNode(out, NodeOp.load, [getRef(current, 0), mem.ptr, { literal: mem.base + fields.offsets[at] }], Types.fnptr)
             }
             return addNode(out, NodeOp.heapHandle, [{ literal: slot }])
         })
         const direct = closureTargets.get(id)
-        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }]) : union ? tagSelect(union, codes) : codes[0]
+        const fnptr = direct !== undefined ? addNode(out, NodeOp.localTarget, [{ literal: direct }]) : chosen ? tagSelect(chosen, codes) : codes[0]
         const [context, contextLiteral] = mem ? addressOf(mem) : [getRef(n, 1), 0]
         const target = newId()
         const returns = callReturns.get(id)

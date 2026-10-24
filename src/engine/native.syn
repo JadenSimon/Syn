@@ -16,7 +16,7 @@ import {
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
     printOptimizeStats, pstackAllocates, pstackRebases, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, CapturesAll, argBit, hasArg, maskArgs,
     graphLoops, joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, stronglyConnected, importFact, mapTailPositions, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
-    isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes,
+    isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
 } from './lowering2'
 import {
@@ -5223,6 +5223,9 @@ interface ShapePlan {
     fixedStatic: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean
     statics: StaticPlacement
     functionObjects: { cells: Map<number, intrinsics.Handle>, functions: Map<Function, intrinsics.Handle> }
+    closureViews: Map<intrinsics.Handle, intrinsics.Handle[]>
+    closureCodes: Map<intrinsics.Handle, intrinsics.Handle>
+    absentKeys: Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>
 }
 type Iterated = intrinsics.Handle | 'entries'
 
@@ -6703,6 +6706,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         applyPrototypes(traced)
         sealStaticClosures(traced)
         spliceTagged(fn, traced)
+        unifySlotTypes(traced.graph)
         dropUnobservedAllocations(traced)
         spliceables.set(fn, { graph: snapshotGraph(traced.graph), allocations: new Map(traced.allocations), frames: traced.frames.size > 0 })
         markAllocations(traced)
@@ -7674,7 +7678,7 @@ function planFrames(types: ValueTypes, plan: ShapePlan, planned: Planned, linker
         }
     }
     for (const [holder, fieldTypes] of held) {
-        const fields = propertyEval.recordLayout(holder, plan.embedded.fields)
+        const fields = propertyEval.recordLayout(holder, plan.embedded.fields, plan.bits)
         for (const [name, list] of fieldTypes) {
             const key = keyOf(name)
             const at = key === undefined ? -1 : fields.keys.indexOf(key)
@@ -7807,7 +7811,11 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
         }
         return true
     }
+    function callable(target: string): boolean {
+        return fieldAt(inst.shapes.get(target)!, heap.closureCallKey) >= 0
+    }
     function agrees(graph: Graph, n: GraphNode, targets: string[]): boolean {
+        if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof) return targets.every(target => callable(target) === callable(targets[0]))
         if (n.op === NodeOp.rt) return targets.every(target => chain(target) === chain(targets[0]))
         if (getRef(n, 2)) return false
         return agreesOn(targets, getLiteral(graph, n, 2) as intrinsics.Handle)
@@ -7884,7 +7892,7 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
                 return tagged(objectOf(n)) || !agrees(graph, n, targets)
             }
             for (const n of allNodes(graph)) {
-                const access = n.op === NodeOp.getProp || n.op === NodeOp.setProp || (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.hasPrototype)
+                const access = n.op === NodeOp.getProp || n.op === NodeOp.setProp || (n.op === NodeOp.rt && (getLiteral(graph, n, 1) === rt.Op.hasPrototype || getLiteral(graph, n, 1) === rt.Op.typeof))
                 if (!access) continue
                 const targets = shapesOf(repAt(objectOf(n)))
                 link(targets)
@@ -9659,7 +9667,7 @@ export function substituteConstantParams(graph: Graph, constants: Map<number, Pa
 function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock) {
     const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget } = linker
     const { graphsOf, reachableNodes } = tracer
-    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values()]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields }
+    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values()]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys }
     function abiOf(fn: Function): UnitAbi {
         return reps.abi.get(fn) ?? { mode: constructsOutOfLine(fn) || unitOf(originOf(fn)).stubbed ? 'keep' : 'encoded', returns: Types.u64, tags: [] }
     }
@@ -10413,15 +10421,38 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
             }
         }
     }
-    const shapeTags = planShapeTags(inst, plan, fn => host.graphOf(fn), fieldKey, sig => sig.members.every(m => !types.objects[m].native))
+    function taggableClosure(m: number): boolean {
+        const object = types.objects[m]
+        return object.kind === AllocKind.object && object.state !== undefined && object.function === undefined && !!heap.getOwnProperty(object.state, heap.closureCallKey) && !heap.isFrameProxy(object.state)
+    }
+    const shapeTags = planShapeTags(inst, plan, fn => host.graphOf(fn), fieldKey, sig => sig.members.every(m => !types.objects[m].native || taggableClosure(m)))
     if (flags.has('plan')) for (const [id, tag] of shapeTags) console.log('SHAPE-TAG', id, tag)
     const handles = new Map<string, intrinsics.Handle>()
     const fixedFields = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     const erasedFields = new Map<intrinsics.Handle, Set<intrinsics.Handle>>()
+    const closureViews = new Map<intrinsics.Handle, intrinsics.Handle[]>()
+    const closureCodes = new Map<intrinsics.Handle, intrinsics.Handle>()
+    const absentKeys = new Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>()
     for (const [id, sig] of inst.shapes) {
         const shape = heap.makeObject((sig.proto ?? 0) as intrinsics.Handle)
         const tag = shapeTags.get(id)
         if (tag !== undefined) heap.setReadonlyProperty(shape, heap.shapeTagKey, heap.boxF64(tag) as intrinsics.Handle)
+        const absent = new Map<intrinsics.Handle, boolean>()
+        for (const k of sig.absent) {
+            const key = fieldKey(k)
+            if (key !== undefined) absent.set(key, sig.nullish.has(k))
+        }
+        absentKeys.set(shape, absent)
+        const codes = new Set<intrinsics.Handle>()
+        for (const m of sig.members) {
+            if (!taggableClosure(m)) continue
+            const state = types.objects[m].state!
+            codes.add(heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(state, heap.closureCallKey))).slot0 as intrinsics.Handle)
+            const views = closureViews.get(state)
+            if (!views) closureViews.set(state, [shape])
+            else if (!views.includes(shape)) views.push(shape)
+        }
+        if (codes.size === 1 && sig.members.every(taggableClosure)) closureCodes.set(shape, [...codes][0])
         for (const [k] of sig.fields) {
             const key = fieldKey(k)
             if (key === undefined) throw `native: planned shape ${id} has no key for ${k}`
@@ -10469,7 +10500,7 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
     for (const [id, tag] of shapeTags) {
         for (const m of inst.shapes.get(id)!.members) {
             const state = types.objects[m].state
-            if (state === undefined || (!placedStatics.has(state) && !constructed.has(state))) continue
+            if (state === undefined || (!placedStatics.has(state) && !constructed.has(state) && !taggableClosure(m))) continue
             const prior = bits.get(state)
             intrinsics.assert(prior?.shapeTag === undefined || prior.shapeTag === tag, `native: state @${state} belongs to planned shapes with different shape tags`)
             bits.set(state, { flags: prior?.flags ?? new Set(), tagged: prior?.tagged ?? new Set(), shapeTag: tag })
@@ -10567,7 +10598,7 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
         functionObjects.cells.set(heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(object.state!, heap.closureCallKey))).slot0, object.handle)
         placedStatics.add(object.state!)
     }
-    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites }, bits, layoutOf, reducedTarget, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, boxed: boxedConstructions }, functionObjects }
+    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites }, bits, layoutOf, reducedTarget, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, boxed: boxedConstructions }, functionObjects, closureViews, closureCodes, absentKeys }
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {
