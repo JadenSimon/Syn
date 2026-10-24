@@ -12231,42 +12231,66 @@ function splitScaledShifts(g: Graph, costs: lowering.TargetCosts): boolean {
     return changed
 }
 
-function splitSharedLiterals(g: Graph, wanted: (id: number) => boolean): void {
-    const users = new Map<number, Map<number, number[]>>()
+function localizeShared(g: Graph): void {
+    const owners = new Map<number, number>()
+    const shared = new Set<number>()
+    const reached: number[][] = []
     for (const b of g.blocks) {
         const seen = new Set<number>()
+        const list: number[] = []
         const stack = [b.bodyId]
         while (stack.length) {
             const id = stack.pop()!
             if (!id || seen.has(id)) continue
             seen.add(id)
             const n = getNode(g, id)
-            if (!n || n.op === NodeOp.block) continue
-            for (let i = 0; i < countIds(n); i++) {
-                const ref = getRef(n, i)
-                if (!ref) continue
-                stack.push(ref)
-                if (!wanted(ref)) continue
-                let byBlock = users.get(ref)
-                if (!byBlock) users.set(ref, byBlock = new Map())
-                const list = byBlock.get(b.id)
-                if (list) list.push(id)
-                else byBlock.set(b.id, [id])
-            }
+            if (!n || n.op === NodeOp.block || n.op === NodeOp.param) continue
+            list.push(id)
+            const owner = owners.get(id)
+            if (owner === undefined) owners.set(id, b.id)
+            else if (owner !== b.id) shared.add(id)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
         }
+        reached.push(list)
     }
-    for (const [literal, byBlock] of users) {
-        if (byBlock.size < 2) continue
-        const original = getNode(g, literal)!
-        for (const list of byBlock.values()) {
-            const copy = addCopy(g, original)
-            for (const user of new Set(list)) {
-                const n = getNode(g, user)!
-                const operands = getOperands(g, n)
-                for (let i = 0; i < countIds(n); i++) if (getRef(n, i) === literal) operands[i] = copy
-                putCopy(g, user, n, operands)
-            }
+    if (!shared.size) return
+    const dirty = new Map<number, boolean>()
+    function isDirty(id: number): boolean {
+        if (!id || !shared.has(id)) return false
+        const known = dirty.get(id)
+        if (known !== undefined) return known
+        const n = getNode(g, id)!
+        let result = false
+        for (let i = 0; !result && i < countIds(n); i++) result = !!getRef(n, i)
+        dirty.set(id, result)
+        if (result) assert(gn.RecomputableOps.has(n.op) || islandLoad(g, n), `lowering: %${id} (${opName(n.op)}) is shared across blocks`)
+        return result
+    }
+    for (let k = 0; k < g.blocks.length; k++) {
+        const b = g.blocks[k]
+        const copies = new Map<number, number>()
+        function local(id: number): number {
+            if (!isDirty(id)) return id
+            const known = copies.get(id)
+            if (known !== undefined) return known
+            const n = getNode(g, id)!
+            const copy = addCopy(g, n, localOperands(n))
+            copies.set(id, copy)
+            return copy
         }
+        function localOperands(n: GraphNode): Operand[] {
+            const operands = getOperands(g, n)
+            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) operands[i] = local(getRef(n, i))
+            return operands
+        }
+        for (const id of reached[k]) {
+            if (shared.has(id)) continue
+            const n = getNode(g, id)!
+            let touched = false
+            for (let i = 0; !touched && i < countIds(n); i++) touched = isDirty(getRef(n, i))
+            if (touched) putCopy(g, id, n, localOperands(n))
+        }
+        b.bodyId = local(b.bodyId)
     }
 }
 
@@ -12321,7 +12345,6 @@ function islandLoads(g: Graph, costs: lowering.TargetCosts, poolSlot: (value: nu
         if (n.op === NodeOp.apply) return floats.has(getBlock(g, getRef(n, 0))?.params[i - 1] ?? 0)
         return (liftableSlot(n.op, i) || n.op === NodeOp.after) && floats.has(id)
     }
-    splitSharedLiterals(g, pooledNode)
     const loads: [id: number, entry: number, type: Types][] = []
     for (const [id, n] of [...nodeEntries(g)]) {
         if (n.op === NodeOp.poolEntry && !getRef(n, 0)) {
@@ -12969,11 +12992,9 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             return c
         }
         let trail: number[] | undefined
-        const scheduled: number[] = []
         function addSeen(id: number) {
             if (state.seen.has(id)) return
             state.seen.add(id)
-            scheduled.push(id)
             trail?.push(id)
         }
         function addDone(id: number) {
@@ -13157,8 +13178,6 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         }
         function scheduleFromBlock(b: GraphBlock) {
             assert(b.bodyId)
-            for (const x of scheduled) state.seen.delete(x)
-            scheduled.length = 0
             for (const p of b.params) {
                 state.live.add(p)
                 state.seen.add(p)
@@ -15983,7 +16002,9 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     if (opts.rebaseSlot) rebaseAddresses(g, target, opts.rebaseSlot)
     registerLiterals(g, target)
     const island = opts.poolSlot ? islandLoads(g, target.costs, opts.poolSlot, opts.poolValue, opts.floatSlot) : undefined
+    localizeShared(g)
     foldPureOrdering(g)
+    verifyGraph(g, 'lowerable', true)
     const unordered = new Map<number, boolean>()
     const hollow = new Map<number, boolean>()
     verifyOrderingSlots(g, 'lowerable', firstNonOrderingSlot, id => hollowOrdering(g, id, unordered, hollow))
@@ -16657,7 +16678,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 throw `lowering: parameter ${id} was released at ${freedAt.get(id)} before rematerializing ${materializing} (freed at ${freedAt.get(materializing)})\n${errorDump(g)}`
             }
             if (done.has(id) && voidValued(id)) return 0
-            if (done.has(id) && islandLoad(g, n!)) done.delete(id)
             if (done.has(id)) {
                 console.log(errorDump(g), id, getNode(g, id))
             }
