@@ -4,22 +4,27 @@
 
 import * as intrinsics from '../intrinsics'
 import { defineGlobal } from './globals'
-import { buildTable, findEntry, writeTable } from './memory'
+import { buildTable, findEntry, tableCapacity, liveIndex, clearHoles, markHole, closeHoles, linkHoles, nextHoles, remapIndex, isHole } from './memory'
 import { readElement, writeElement } from './Array'
 
 const Types = intrinsics.Types
 const Intrinsics = intrinsics.Intrinsics
+const exhausted = 2**32
+
+let iteratorNext: (iterator: SetIterator) => any
+let seek: (set: Set, cursor: SetIterator) => number
 
 export class Set {
     #keyList: any[]
-    get #size(): number {
-        return this.#keyList.length
-    }
-    get size(): number {
-        return this.#size
-    }
     #table: u32
     #mask: u32
+    #removed: number
+    #vacancies: u32
+    #retired: u32
+    #oldestRetired: u32
+    get size(): number {
+        return this.#keyList.length - this.#removed
+    }
 
     constructor(values?: Iterable<any>) {
         const keyList: any[] = []
@@ -37,60 +42,140 @@ export class Set {
         this.#keyList = keyList
         this.#table = buildTable(keyList, keyList.length, capacity)
         this.#mask = capacity - 1
+        this.#removed = 0
+        this.#vacancies = 0
+        this.#retired = 0
+        this.#oldestRetired = 0
     }
 
-    #rehash(capacity: u32): void {
-        this.#table = buildTable(this.#keyList, this.#size, capacity)
+    #rebuild(): void {
+        const length = this.#keyList.length
+        let count = length
+        if (this.#removed) {
+            const holes = closeHoles(this.#table, this.#mask, length, false)
+            if (this.#retired) linkHoles(this.#retired, holes)
+            else this.#oldestRetired = holes
+            this.#retired = holes
+            count = 0
+            for (let i = 0; i < length; i++) {
+                if (isHole(this.#vacancies, i)) continue
+                writeElement(this.#keyList, count, readElement(this.#keyList, i))
+                count++
+            }
+            this.#keyList.length = count
+            this.#removed = 0
+            this.#vacancies = 0
+        }
+        const capacity = tableCapacity(count)
+        this.#table = buildTable(this.#keyList, count, capacity)
         this.#mask = capacity - 1
     }
 
     has(value: any): boolean {
-        return findEntry(this.#keyList, this.#table, this.#mask, value) >= 0
+        return findEntry(this.#keyList, this.#table, this.#mask, value, this.#vacancies) >= 0
     }
 
     add(value: any): this {
-        const found = findEntry(this.#keyList, this.#table, this.#mask, value)
+        const found = findEntry(this.#keyList, this.#table, this.#mask, value, this.#vacancies)
         if (found >= 0) return this
-        const index = this.#size
+        const index = this.#keyList.length
         this.#keyList.push(value)
-        if (this.#size * 2 > this.#mask) this.#rehash(this.#mask ? (this.#mask + 1) * 2 : 8)
+        if (this.#keyList.length * 2 > this.#mask) this.#rebuild()
         else Intrinsics.store(this.#table, (-found - 1) * 4, index + 1, Types.u32)
         return this
     }
 
     delete(value: any): boolean {
-        const index = findEntry(this.#keyList, this.#table, this.#mask, value)
+        const index = findEntry(this.#keyList, this.#table, this.#mask, value, this.#vacancies)
         if (index < 0) return false
-        for (let i = index + 1; i < this.#size; i++) {
-            writeElement(this.#keyList, i - 1, readElement(this.#keyList, i))
-        }
-        this.#keyList.length = this.#size - 1
-        writeTable(this.#keyList, this.#size, this.#mask + 1, this.#table)
+        if (!this.#vacancies) this.#vacancies = clearHoles(this.#table, this.#mask)
+        markHole(this.#vacancies, index)
+        this.#removed++
+        if (this.#removed > 8 && this.#removed * 2 > this.#keyList.length) this.#rebuild()
         return true
     }
 
     clear(): void {
+        const length = this.#keyList.length
+        if (length) {
+            const holes = closeHoles(this.#table, this.#mask, length, true)
+            if (this.#retired) linkHoles(this.#retired, holes)
+            else this.#oldestRetired = holes
+            this.#retired = holes
+        }
         this.#keyList.length = 0
         this.#table = 0
         this.#mask = 0
+        this.#removed = 0
+        this.#vacancies = 0
     }
 
     forEach(fn: (value: any, key: any, set: Set) => void): void {
-        for (let i = 0; i < this.#size; i++) fn(readElement(this.#keyList, i), readElement(this.#keyList, i), this)
+        const cursor = new SetIterator(this, this.#retired)
+        let index = seek(this, cursor)
+        while (index < this.#keyList.length) {
+            const value = readElement(this.#keyList, index)
+            fn(value, value, this)
+            index = seek(this, cursor)
+        }
     }
 
     values() {
-        return this.#keyList[Symbol.iterator]()
+        return new SetIterator(this, this.#retired)
     }
 
     keys() {
-        return this.#keyList[Symbol.iterator]()
+        return new SetIterator(this, this.#retired)
     }
 
     [Symbol.iterator]() {
-        return this.#keyList[Symbol.iterator]()
+        return new SetIterator(this, this.#retired)
+    }
+
+    static {
+        seek = intrinsics.tagInline((set: Set, cursor: SetIterator): number => {
+            let index = cursor.index
+            if (cursor.retired !== set.#retired) {
+                index = remapIndex(cursor.retired ? nextHoles(cursor.retired) : set.#oldestRetired, index)
+                cursor.retired = set.#retired
+            }
+            if (set.#vacancies) index = liveIndex(set.#vacancies, index, set.#keyList.length)
+            cursor.index = index + 1
+            return index
+        })
+        iteratorNext = intrinsics.tagInline((iterator: SetIterator): any => {
+            const set = iterator.set
+            const index = seek(set, iterator)
+            if (index >= set.#keyList.length) {
+                iterator.index = exhausted
+                return { done: true }
+            }
+            return { done: false, value: readElement(set.#keyList, index) }
+        })
     }
 }
+
+class SetIterator {
+    set: Set
+    index: number
+    retired: u32
+
+    constructor(set: Set, retired: u32) {
+        this.set = set
+        this.index = 0
+        this.retired = retired
+    }
+
+    next() {
+        return iteratorNext(this)
+    }
+
+    [Symbol.iterator]() {
+        return this
+    }
+}
+
+intrinsics.tagInline(SetIterator.prototype.next)
 
 defineGlobal(Set)
 
@@ -117,9 +202,69 @@ export async function suite() {
         s.add(n)
         return total + s.size * 10 + (s.has(n) ? 1 : 0)
     }
+    function setDeleteDuringForOf(n: u32): number {
+        const s = new Set<number>()
+        for (let i = 0; i < 12; i++) s.add(i + n)
+        let total = 0
+        for (const value of s) {
+            total = total * 3 + value
+            if (value % 3 === 0) s.delete(value)
+            if (value === n + 4) s.delete(n + 7)
+        }
+        for (const value of s.values()) total = total * 5 + value
+        return total + s.size * 1000
+    }
+    function setDeleteReadd(n: u32): number {
+        const s = new Set<number>()
+        for (let i = 0; i < 6; i++) s.add(i + n)
+        s.delete(n + 2)
+        s.add(n + 2)
+        s.delete(n)
+        s.add(n)
+        let total = 0
+        for (const value of s) total = total * 7 + value
+        return total + s.size
+    }
+    function setClearDuringForOf(n: u32): number {
+        const s = new Set<number>()
+        for (let i = 0; i < 6; i++) s.add(i + n)
+        let total = 0
+        for (const value of s) {
+            total = total * 3 + value
+            if (value === n + 2) {
+                s.clear()
+                s.add(n + 10)
+                s.add(n + 11)
+            }
+        }
+        return total + s.size * 1000
+    }
+    function setCompactDuringForOf(n: u32): number {
+        const s = new Set<number>()
+        for (let i = 0; i < 64; i++) s.add(i)
+        let total = n
+        for (const value of s) {
+            total = (total * 3 + value) % 1000003
+            if (value === 40) {
+                for (let i = 0; i < 40; i++) s.delete(i)
+                for (let i = 100; i < 140; i++) s.add(i)
+            }
+            if (value === 120) for (let i = 41; i < 100; i++) s.delete(i)
+        }
+        let count = 0
+        s.forEach(value => {
+            count = count + value
+            s.delete(value + 1)
+        })
+        return total + s.size * 1000000 + count * 7
+    }
     harness.runCases({ prefix: 'Set', args: true }, [
         [setFromArray, [3]],
         [setFromSet, [2]],
         [setProbeMutation, [0], [7]],
+        [setDeleteDuringForOf, [0], [7]],
+        [setDeleteReadd, [0], [7]],
+        [setClearDuringForOf, [0], [7]],
+        [setCompactDuringForOf, [0], [7]],
     ])
 }
