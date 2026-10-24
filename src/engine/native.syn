@@ -1404,6 +1404,20 @@ function floatBits(raw: any): number {
     return new Float64Array(new BigInt64Array([BigInt(raw)]).buffer)[0]
 }
 
+function hostArgs(args: any[], floats: number): BigInt64Array {
+    const values = new BigInt64Array(Math.max(args.length, 1))
+    for (let i = 0; i < args.length; i++) values[i] = floats & (1 << i) ? new BigInt64Array(new Float64Array([Number(args[i])]).buffer)[0] : BigInt(args[i])
+    return values
+}
+
+function floatParams(graph: Graph): number {
+    let floats = 0
+    graph.blocks[0].params.forEach((p, i) => {
+        if (typeOf(getNode(graph, p)!) === Types.f64) floats = floats | (1 << i)
+    })
+    return floats
+}
+
 function nativeStub(fn: Function, symbol: number, paramCount: number, rest: number): Function {
     const names: string[] = []
     for (let i = 0; i < paramCount; i++) names.push(`arg${i}`)
@@ -2231,6 +2245,7 @@ interface CapturedRoot {
     name: string
     offset: number
     float: boolean
+    floats: number
     returns?: HostReturn
 }
 
@@ -9955,6 +9970,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const bound = new Map<number, PlannedUnit>()
         tracer.foldStatics(traced, plan.fixedStatic)
         if (plannedUnit?.blocks.size) pruneUnentered(traced.graph, plannedUnit, traced.allocations)
+        plannedDivisions(traced.graph, local)
         if (local) plannedRuntimeCalls(traced.graph, local)
         if (flags.has(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...plan.embedded.fields.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
@@ -10025,6 +10041,15 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         plannedFunctionCalls(result.graph)
         const fieldTags = new Map([...sliceTags?.reads ?? [], ...result.tags])
         return { graph: result.graph, shapes: result.shapes, encoded: result.encoded, fieldTags, tagWrites: sliceTags?.writes ?? new Map(), wordWrites: sliceTags?.words ?? new Map(), local, callees: bound }
+    }
+    function plannedDivisions(graph: Graph, local: UnitPlan | undefined): void {
+        for (const [id, n] of [...nodeEntries(graph)]) {
+            if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.div) continue
+            const name = numberName(local?.nodes.get(id))
+            const integral = name === 'int' || name === 'i64'
+            if (typeRecording() && debugsTypes(graph.name)) noteType(id, `plannedDivisions: rt.div is ${integral ? 'proven exact (planned rep ' + name + '), so it divides integers' : 'not proven exact, so it divides as f64'}`)
+            putNode(graph, id, NodeOp.div, [getOperand(graph, n, 2), getOperand(graph, n, 3)], integral ? Types.unknown_number : Types.f64)
+        }
     }
     function plannedRuntimeCalls(graph: Graph, local: UnitPlan): void {
         const compareImpl = rt.bindingOf(rt.Op.compare)!.impl!
@@ -11594,7 +11619,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     if (initSymbol !== undefined) capture.init = Number(installed.entries[initSymbol]) - codeBase
     for (const [name, symbol] of program.roots) {
         if (name === staticInitName) continue
-        capture.roots.push({ name, offset: Number(installed.entries[symbol]) - codeBase, float: !!emitted.find(u => u.symbol === symbol)?.returnsFloat, returns: program.hostReturns.get(symbol) })
+        capture.roots.push({ name, offset: Number(installed.entries[symbol]) - codeBase, float: !!emitted.find(u => u.symbol === symbol)?.returnsFloat, floats: floatParams(program.units.get(symbol)!), returns: program.hostReturns.get(symbol) })
     }
     if (initSymbol !== undefined) {
         sealCode(installed.page)
@@ -11608,11 +11633,11 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         const ptr = installed.entries[symbol]
         const float = !!emitted.find(u => u.symbol === symbol)?.returnsFloat
         const decoded = program.hostReturns.get(symbol)
+        const floats = floatParams(program.units.get(symbol)!)
         result[name] = Object.assign((...args: any[]) => {
             nativeObserver?.(`${name}(${args.join(', ')})`)
             sealCode(installed.page)
-            const values = new BigInt64Array(Math.max(args.length, 1))
-            for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
+            const values = hostArgs(args, floats)
             const argsPtr = (ts as any).getArrayBufferPtr(values.buffer)
             const outer = heldArgs
             heldArgs = values
@@ -11796,12 +11821,12 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
         u64(relocation.offset)
         u64(relocation.scale)
     }
-    const entries = [...capture.roots.map(root => ({ ...root, init: false })), ...(capture.init === undefined ? [] : [{ name: staticInitName, offset: capture.init, float: false, returns: undefined, init: true }])]
+    const entries = [...capture.roots.map(root => ({ ...root, init: false })), ...(capture.init === undefined ? [] : [{ name: staticInitName, offset: capture.init, float: false, floats: 0, returns: undefined, init: true }])]
     section(ImageSection.entries, entries.length)
     for (const entry of entries) {
         const name = new TextEncoder().encode(entry.name)
         u64(entry.offset)
-        u32((entry.float ? EntryFlags.float : 0) | (entry.init ? EntryFlags.init : 0) | (entry.returns === 'word' ? EntryFlags.word : 0) | (entry.returns === 'string' ? EntryFlags.string : 0))
+        u32(((entry.float ? EntryFlags.float : 0) | (entry.init ? EntryFlags.init : 0) | (entry.returns === 'word' ? EntryFlags.word : 0) | (entry.returns === 'string' ? EntryFlags.string : 0)) + entry.floats * 65536)
         u32(name.length)
         for (const byte of name) out.push(byte)
         pad()
@@ -11947,8 +11972,7 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
         }
         const returns: HostReturn | undefined = entry.flags & EntryFlags.string ? 'string' : entry.flags & EntryFlags.word ? 'word' : undefined
         result[entry.name] = Object.assign((...args: any[]) => {
-            const values = new BigInt64Array(Math.max(args.length, 1))
-            for (let i = 0; i < args.length; i++) values[i] = BigInt(args[i])
+            const values = hostArgs(args, entry.flags >>> 16)
             const outer = heldArgs
             heldArgs = values
             const raw = nativeInvoker(ptr, (ts as any).getArrayBufferPtr(values.buffer), args.length)

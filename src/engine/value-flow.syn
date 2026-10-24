@@ -4,8 +4,8 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { BitwiseOps, debugsTypes, dumpGraph, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
-import { addNode, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand } from './graph-node'
+import { BitwiseOps, debugsTypes, dumpGraph, firstNonOrderingSlot, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
+import { addNode, armSlot, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand } from './graph-node'
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
@@ -22,6 +22,7 @@ const MaxI64 = 2 ** 63
 const MaxU64 = 2 ** 64
 const maxStrings = 8
 const maxLiterals = 8
+const maxFactorBits = 52
 const budgetFactor = 40
 
 enum ScalarFlag {
@@ -42,6 +43,7 @@ interface Scalars {
     hi: number[]
     strs: number[][]
     nums: number[][]
+    factor: number[]
     index: Map<string, number>
     unions: Map<number, Map<number, number>>
 }
@@ -116,6 +118,9 @@ interface Summary {
     selects: number[]
     blockGates: number[][]
     regionRets: Map<number, number>
+    remainders: Map<string, number> | undefined
+    priorAsserts: Map<number, number>
+    asserting: Map<number, boolean>
     predicates: Guard[] | null | undefined
     initializer: boolean | undefined
     bound: Bound | undefined
@@ -287,9 +292,9 @@ function isPosKey(key: number): boolean {
 }
 
 let flow: FlowState
-const scalars: Scalars = { flags: [], lo: [], hi: [], strs: [], nums: [], index: new Map(), unions: new Map() }
+const scalars: Scalars = { flags: [], lo: [], hi: [], strs: [], nums: [], factor: [], index: new Map(), unions: new Map() }
 
-function scalar(flags: number, lo: number, hi: number, strs: number[], nums: number[] = []): number {
+function scalar(flags: number, lo: number, hi: number, strs: number[], nums: number[] = [], factor = 1): number {
     if (!(flags & ScalarFlag.int)) {
         lo = 0
         hi = 0
@@ -300,6 +305,15 @@ function scalar(flags: number, lo: number, hi: number, strs: number[], nums: num
         lo = nums[0]
         hi = nums[nums.length - 1]
     }
+    if (nums.length || !(factor > 1)) factor = 1
+    if (factor > 1 && Number.isSafeInteger(lo)) lo = Math.ceil(lo / factor) * factor
+    if (factor > 1 && Number.isSafeInteger(hi)) hi = Math.floor(hi / factor) * factor
+    if (lo > hi) {
+        flags = flags & ~ScalarFlag.int
+        lo = 0
+        hi = 0
+    }
+    if (lo === hi) factor = 1
     if (nums.length === hi - lo + 1) nums = []
     if (lo < 0 && hi > MaxI64) {
         lo = MinI64
@@ -312,7 +326,7 @@ function scalar(flags: number, lo: number, hi: number, strs: number[], nums: num
     }
     if (strs.length) flags = flags | ScalarFlag.str
     else flags = flags & ~ScalarFlag.str
-    const key = `${flags}|${lo}|${hi}|${strs.join(',')}|${nums.join(',')}`
+    const key = `${flags}|${lo}|${hi}|${strs.join(',')}|${nums.join(',')}|${factor}`
     const known = scalars.index.get(key)
     if (known !== undefined) return known
     const id = scalars.flags.length
@@ -321,6 +335,7 @@ function scalar(flags: number, lo: number, hi: number, strs: number[], nums: num
     scalars.hi.push(hi)
     scalars.strs.push(strs)
     scalars.nums.push(nums)
+    scalars.factor.push(factor)
     scalars.index.set(key, id)
     return id
 }
@@ -376,6 +391,46 @@ function literalsOf(t: number): number[] | undefined {
     return undefined
 }
 
+function gcd(a: number, b: number): number {
+    let x = Math.abs(a)
+    let y = Math.abs(b)
+    while (y) {
+        const r = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+function factorOf(t: number): number {
+    if (!(scalars.flags[t] & ScalarFlag.int)) return 0
+    const lits = literalsOf(t)
+    if (!lits) return scalars.factor[t]
+    let f = 0
+    for (const v of lits) f = gcd(f, v)
+    return f
+}
+
+function twos(f: number): number {
+    if (!f) return maxFactorBits
+    let k = 0
+    while (k < maxFactorBits && f % 2 === 0) {
+        f = f / 2
+        k++
+    }
+    return k
+}
+
+function capped(f: number): number {
+    return f > 2 ** maxFactorBits ? 2 ** twos(f) : f
+}
+
+function withFactor(t: number, factor: number): number {
+    if (!(factor > 1) || !(scalars.flags[t] & ScalarFlag.int)) return t
+    if (t === U64 || t === I64) factor = 2 ** twos(factor)
+    return scalar(scalars.flags[t], scalars.lo[t], scalars.hi[t], scalars.strs[t], scalars.nums[t], capped(factor))
+}
+
 function strScalar(h: number): number {
     return scalar(ScalarFlag.str, 0, 0, [h])
 }
@@ -395,9 +450,11 @@ function unite(a: number, b: number): number {
     let lo = 0
     let hi = 0
     let nums: number[] = []
+    let factor = 1
     if ((fa & ScalarFlag.int) && (fb & ScalarFlag.int)) {
         lo = Math.min(scalars.lo[a], scalars.lo[b])
         hi = Math.max(scalars.hi[a], scalars.hi[b])
+        factor = gcd(factorOf(a), factorOf(b))
         const la = literalsOf(a)
         const lb = literalsOf(b)
         if (la && lb) {
@@ -409,10 +466,12 @@ function unite(a: number, b: number): number {
         lo = scalars.lo[a]
         hi = scalars.hi[a]
         nums = scalars.nums[a]
+        factor = scalars.factor[a]
     } else if (fb & ScalarFlag.int) {
         lo = scalars.lo[b]
         hi = scalars.hi[b]
         nums = scalars.nums[b]
+        factor = scalars.factor[b]
     }
     let strs: number[] = []
     if (!(flags & ScalarFlag.anyStr)) {
@@ -420,7 +479,7 @@ function unite(a: number, b: number): number {
         for (const s of scalars.strs[b]) if (!strs.includes(s)) strs.push(s)
         strs.sort((x, y) => x - y)
     }
-    const id = scalar(flags, lo, hi, strs, nums)
+    const id = scalar(flags, lo, hi, strs, nums, factor)
     byHi.set(hi0, id)
     return id
 }
@@ -517,7 +576,49 @@ function truncated(t: number): number {
     return unite(scalar(scalars.flags[t] & ~ScalarFlag.float, scalars.lo[t], scalars.hi[t], scalars.strs[t]), I64)
 }
 
-function arithScalar(op: NodeOp, T0: intrinsics.Types, a0: number, b0: number): number {
+function factorFor(op: NodeOp, a: number, b: number): number {
+    const fa = factorOf(a)
+    const fb = factorOf(b)
+    const k = scalars.lo[b] === scalars.hi[b] ? scalars.lo[b] : -1
+    switch (op) {
+        case NodeOp.add:
+        case NodeOp.sub:
+            return gcd(fa, fb)
+        case NodeOp.neg: return fa
+        case NodeOp.mul: return capped(fa * fb)
+        case NodeOp.shl: return k >= 0 && k <= maxFactorBits ? capped(fa * 2 ** k) : 1
+        case NodeOp.shr:
+        case NodeOp.ushr:
+            return k >= 0 && k <= maxFactorBits && scalars.lo[a] >= 0 && fa % 2 ** k === 0 ? fa / 2 ** k : 1
+        case NodeOp.and: return 2 ** Math.max(twos(fa), twos(fb))
+        case NodeOp.or:
+        case NodeOp.xor:
+            return 2 ** Math.min(twos(fa), twos(fb))
+        case NodeOp.rem: return k ? gcd(fa, k) : 1
+    }
+    return 1
+}
+
+function quotient(a: number, b: number, remainder: number): number {
+    if (scalars.flags[remainder] === ScalarFlag.int && scalars.lo[remainder] === 0 && scalars.hi[remainder] === 0) {
+        if (scalars.lo[a] >= 0 && scalars.lo[b] > 0) return numScalar(0, scalars.hi[a])
+        const m = Math.max(-scalars.lo[a], scalars.hi[a])
+        return wrapped(-m, m)
+    }
+    const divisors = literalsOf(b)
+    if (!divisors) return FLOAT
+    const fa = factorOf(a)
+    let out = NONE
+    for (const d of divisors) {
+        if (!d || fa % d !== 0) return FLOAT
+        const x = scalars.lo[a] / d
+        const y = scalars.hi[a] / d
+        out = unite(out, scalar(ScalarFlag.int, Math.ceil(Math.min(x, y)), Math.floor(Math.max(x, y)), [], [], Math.abs(fa / d)))
+    }
+    return out
+}
+
+function arithScalar(op: NodeOp, T0: intrinsics.Types, a0: number, b0: number, remainder = -1): number {
     const bitwise = BitwiseOps.has(op)
     if ((T0 === Types.f64 || T0 === Types.f32) && !bitwise) return FLOAT
     const a = bitwise ? truncated(opaqueNumber(a0)) : opaqueNumber(a0)
@@ -528,7 +629,7 @@ function arithScalar(op: NodeOp, T0: intrinsics.Types, a0: number, b0: number): 
     let out = NONE
     if ((fa | fb) & ScalarFlag.float) out = FLOAT
     if (out === FLOAT && floatArith.has(op)) return FLOAT
-    if ((fa & ScalarFlag.int) && (fb & ScalarFlag.int)) out = unite(out, interval(op, scalars.lo[a], scalars.hi[a], scalars.lo[b], scalars.hi[b]))
+    if ((fa & ScalarFlag.int) && (fb & ScalarFlag.int)) out = unite(out, remainder >= 0 ? quotient(a, b, remainder) : withFactor(interval(op, scalars.lo[a], scalars.hi[a], scalars.lo[b], scalars.hi[b]), factorFor(op, a, b)))
     if (T0 !== Types.unknown_number && T0 !== Types.u64 && T0 !== Types.i64 && (scalars.flags[out] & ScalarFlag.int)) {
         const bound = typeRange(T0)
         if ((scalars.flags[bound] & ScalarFlag.int) && (scalars.lo[out] < scalars.lo[bound] || scalars.hi[out] > scalars.hi[bound])) out = unite(scalars.flags[out] & ScalarFlag.float ? FLOAT : NONE, bound)
@@ -993,7 +1094,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined,
+        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined,
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -1112,6 +1213,17 @@ const compareOps = new Set<NodeOp>([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, 
 const numberOps = new Set<NodeOp>([NodeOp.load, NodeOp.convert, NodeOp.bitconvert, NodeOp.pstack, NodeOp.stackalloc, NodeOp.mem, NodeOp.crc32, NodeOp.frameAddress, NodeOp.pc, NodeOp.poolEntry])
 const neverOps = new Set<NodeOp>([NodeOp.ret, NodeOp.apply, NodeOp.panic, NodeOp.trap, NodeOp.unreachable, NodeOp.nilEffect, NodeOp.block, NodeOp.store, NodeOp.stackfree])
 
+function remainderAt(s: Summary, id: number, n: GraphNode): number {
+    const region = s.regions?.of.get(id)
+    if (!s.remainders) {
+        s.remainders = new Map()
+        for (const [r, m] of nodeEntries(s.g)) if (m.op === NodeOp.rem) s.remainders.set(`${m.slots[0]},${m.slots[1]}`, r)
+    }
+    const r = s.remainders.get(`${n.slots[2]},${n.slots[3]}`)
+    if (r === undefined || region === undefined) return konst(s, NONE)
+    return narrowed(s, r, exprOfNode(s, r), region)
+}
+
 function orderingCall(g: Graph, id: number): number {
     const n = id ? getNode(g, id) : undefined
     if (n?.op !== NodeOp.after) return 0
@@ -1207,6 +1319,8 @@ function exprOfNode(s: Summary, id: number): number {
         e = keyRef ? expr(s, ExprOp.store, id, obj, value, dynKey, [exprOfNode(s, keyRef)], 0) : expr(s, ExprOp.store, id, obj, value, getLiteral(g, n, 3), [], 0)
     } else if (op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.addOrConcat) {
         e = expr(s, ExprOp.arith, id, operand(s, id, n, 2), operand(s, id, n, 3), NodeOp.add, [], Types.unknown_number)
+    } else if (op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.div) {
+        e = expr(s, ExprOp.arith, id, operand(s, id, n, 2), operand(s, id, n, 3), NodeOp.div, [remainderAt(s, id, n)], Types.unknown_number)
     } else if (op === NodeOp.rt) {
         const args: number[] = []
         for (let i = 2; i < countIds(n); i++) args.push(operand(s, id, n, i))
@@ -1245,11 +1359,12 @@ enum GuardFlag {
     lacksProto = 2097152,
     isFloat = 4194304,
     notFloat = 8388608,
+    multiple = 16777216,
 }
 
 function computeRegions(s: Summary): GraphRegions {
     const g = s.g
-    const regions = graphRegions(g, charge)
+    const regions = graphRegions(g, charge, (n, i, id) => n.op === NodeOp.select ? armSlot(n, i) : i >= firstNonOrderingSlot(n) && priorAssert(s, id, n) !== 0)
     s.regions = regions
     const seenConds = new Set<number>()
     for (const id of regions.blockOf.keys()) {
@@ -1257,6 +1372,61 @@ function computeRegions(s: Summary): GraphRegions {
         if (n.op === NodeOp.select) testedRefs(s, getRef(n, 0), seenConds)
     }
     return regions
+}
+
+function priorAssert(s: Summary, id: number, n: GraphNode): number {
+    const known = s.priorAsserts.get(id)
+    if (known !== undefined) return known
+    s.priorAsserts.set(id, 0)
+    charge(1)
+    let found = 0
+    const end = firstNonOrderingSlot(n)
+    for (let i = 0; i < end && !found; i++) {
+        const r = getRef(n, i)
+        const m = r ? getNode(s.g, r) : undefined
+        if (!m || m.op === NodeOp.block) continue
+        if (m.op !== NodeOp.inlined) found = priorAssert(s, r, m)
+        else found = asserts(s, r, m) ? r : regionAssert(s, m)
+    }
+    s.priorAsserts.set(id, found)
+    return found
+}
+
+function regionAssert(s: Summary, n: GraphNode): number {
+    const seen = new Set<number>()
+    const stack = [getRef(n, 0)]
+    while (stack.length) {
+        const x = stack.pop()!
+        const m = x ? getNode(s.g, x) : undefined
+        if (!m || seen.has(x)) continue
+        seen.add(x)
+        const found = priorAssert(s, x, m)
+        if (found) return found
+        if (m.op === NodeOp.select) for (let i = 1; i < countIds(m); i++) stack.push(getRef(m, i))
+        else if (m.op === NodeOp.after) stack.push(getRef(m, countIds(m) - 1))
+        else if (m.op === NodeOp.ret) stack.push(getRef(m, 0))
+    }
+    return 0
+}
+
+function asserts(s: Summary, id: number, n: GraphNode): boolean {
+    const known = s.asserting.get(id)
+    if (known !== undefined) return known
+    const seen = new Set<number>()
+    const stack = [getRef(n, 0)]
+    let diverges = false
+    while (stack.length && !diverges) {
+        const x = stack.pop()!
+        const m = x ? getNode(s.g, x) : undefined
+        if (!m || seen.has(x)) continue
+        seen.add(x)
+        charge(1)
+        if (m.op === NodeOp.panic || m.op === NodeOp.unreachable || m.op === NodeOp.trap) diverges = true
+        else if (m.op === NodeOp.select) for (let i = 1; i < countIds(m); i++) stack.push(getRef(m, i))
+        else if (m.op === NodeOp.after) stack.push(getRef(m, countIds(m) - 1))
+    }
+    s.asserting.set(id, diverges)
+    return diverges
 }
 
 function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
@@ -1301,6 +1471,7 @@ function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
         const m = getNode(g, strippedRef(g, r))
         if (m?.op === NodeOp.rt && getRef(m, 2)) out.add(getRef(m, 2))
         if (m?.op === NodeOp.typeof && getRef(m, 0)) out.add(getRef(m, 0))
+        if ((m?.op === NodeOp.rem || m?.op === NodeOp.and) && getRef(m, 0)) out.add(getRef(m, 0))
     }
 }
 
@@ -1319,6 +1490,7 @@ interface Guard {
     hi: number
     picks: number[]
     protos?: number[]
+    factor?: number
 }
 
 const noGuard: Guard = { flags: 0, lo: MinI64, hi: MaxU64, picks: [] }
@@ -1336,6 +1508,7 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
         e = guard.flags ? expr(s, ExprOp.narrow, 0, base, guard.lo, guard.flags, [base], guard.hi) : base
         for (const pick of guard.picks) e = expr(s, ExprOp.pick, 0, e, pick & 1, pick >> 1, [e], 0)
         for (const proto of guard.protos ?? []) e = expr(s, ExprOp.narrow, 0, e, Math.abs(proto), proto > 0 ? GuardFlag.hasProto : GuardFlag.lacksProto, [e], 0)
+        if (guard.factor) e = expr(s, ExprOp.narrow, 0, e, guard.factor, GuardFlag.multiple, [e], 0)
         byGuard.set(guard, e)
     }
     return e
@@ -1357,10 +1530,27 @@ function guardAt(s: Summary, ref: number, use: number): Guard {
     for (let i = path.length - 1; i >= 0; i--) {
         const r = path[i]
         charge(1)
-        if (regions.depth[r] > 0) guard = meetGuard(guard, guardOn(s, getRef(getNode(s.g, regions.origin[r])!, 0), ref, regions.slot[r] === 1))
+        const origin = getNode(s.g, regions.origin[r])!
+        if (regions.depth[r] > 0 && origin.op !== NodeOp.select) guard = meetGuard(guard, assertGuard(s, priorAssert(s, regions.origin[r], origin), ref))
+        else if (regions.depth[r] > 0) guard = meetGuard(guard, guardOn(s, getRef(origin, 0), ref, regions.slot[r] === 1))
         guards.set(r, guard)
     }
     return guard
+}
+
+function assertGuard(s: Summary, call: number, ref: number): Guard {
+    let guard = deadGuard
+    for (const [ret, root] of s.regionRets) {
+        if (root !== call) continue
+        const at = s.regions!.of.get(ret)
+        guard = joinGuard(guard, at === undefined ? noGuard : guardAt(s, ref, at))
+    }
+    const prior = priorAssert(s, call, getNode(s.g, call)!)
+    return prior ? meetGuard(guard, assertGuard(s, prior, ref)) : guard
+}
+
+function lcm(a: number, b: number): number {
+    return capped(a / gcd(a, b) * b)
 }
 
 function meetGuard(a: Guard, b: Guard): Guard {
@@ -1379,8 +1569,15 @@ function meetGuard(a: Guard, b: Guard): Guard {
         if (protos.includes(-p)) return deadGuard
         if (!protos.includes(p)) protos.push(p)
     }
-    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length && protos.length === (a.protos ?? []).length) return a
-    return protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
+    const factor = lcm(a.factor ?? 1, b.factor ?? 1)
+    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length && protos.length === (a.protos ?? []).length && factor === (a.factor ?? 1)) return a
+    return guardOf(flags, lo, hi, picks, protos, factor)
+}
+
+function guardOf(flags: number, lo: number, hi: number, picks: number[], protos: number[], factor: number): Guard {
+    const guard: Guard = protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
+    if (factor > 1) guard.factor = factor
+    return guard
 }
 
 const excludesObjects = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.notObject | GuardFlag.isBoolean
@@ -1406,8 +1603,9 @@ function joinGuard(a: Guard, b: Guard): Guard {
     for (const p of b.protos ?? []) {
         if (!protos.includes(p) && holdsProto(a, p)) protos.push(p)
     }
-    if (!flags && !picks.length && !protos.length) return noGuard
-    return protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
+    const factor = gcd(a.factor ?? 1, b.factor ?? 1)
+    if (!flags && !picks.length && !protos.length && factor === 1) return noGuard
+    return guardOf(flags, lo, hi, picks, protos, factor)
 }
 
 function contradicts(flags: number): boolean {
@@ -1435,6 +1633,8 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     const other = a === ref ? 1 : b === ref ? 0 : -1
     if (other < 0) {
         if (n.op !== NodeOp.eq && n.op !== NodeOp.ne) return noGuard
+        const factor = equal ? multipleOf(g, n, ref) : 1
+        if (factor > 1) return guardOf(0, MinI64, MaxU64, [], [], factor)
         const machine = machineTypeofOf(s, a, ref) ? 1 : machineTypeofOf(s, b, ref) ? 0 : -1
         if (machine >= 0) {
             if (getRef(n, machine) || getLiteral(g, n, machine) !== Types.f64) return noGuard
@@ -1473,6 +1673,17 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     if (op === NodeOp.le) return { flags: GuardFlag.bounded, lo: MinI64, hi: Math.floor(v), picks: [] }
     if (op === NodeOp.gt) return { flags: GuardFlag.bounded, lo: Math.floor(v) + 1, hi: MaxU64, picks: [] }
     return { flags: GuardFlag.bounded, lo: Math.ceil(v), hi: MaxU64, picks: [] }
+}
+
+function multipleOf(g: Graph, n: GraphNode, ref: number): number {
+    const side = !getRef(n, 0) && getLiteral(g, n, 0) === 0 ? 1 : !getRef(n, 1) && getLiteral(g, n, 1) === 0 ? 0 : -1
+    if (side < 0 || !getRef(n, side)) return 1
+    const m = getNode(g, strippedRef(g, getRef(n, side)))!
+    if (getRef(m, 0) !== ref || getRef(m, 1)) return 1
+    const k = getLiteral(g, m, 1)
+    if (m.op === NodeOp.rem && Number.isSafeInteger(k)) return capped(Math.abs(k))
+    if (m.op === NodeOp.and && k > 0 && Number.isSafeInteger(k + 1) && ((k + 1) & k) === 0) return k + 1
+    return 1
 }
 
 const pendingArrivals = new Set<number>()
@@ -1825,7 +2036,8 @@ function regionGate(s: Summary, r: number): number {
         const select = getNode(s.g, regions.origin[r])!
         const cond = getRef(select, 0)
         const parent = regionGate(s, regions.parent[r])
-        if (cond) gate = expr(s, ExprOp.gate, 0, parent, exprOfNode(s, cond), regions.slot[r], [], 0)
+        if (select.op !== NodeOp.select) gate = parent
+        else if (cond) gate = expr(s, ExprOp.gate, 0, parent, exprOfNode(s, cond), regions.slot[r], [], 0)
         else gate = (getLiteral(s.g, select, 0) !== 0) === (regions.slot[r] === 1) ? parent : expr(s, ExprOp.konst, 0, NONE, 0, 0, [], 0)
     } else if (regions.link[r] >= 0) gate = regionGate(s, regions.link[r])
     s.gateOf.set(r, gate)
@@ -2415,12 +2627,13 @@ function filterScalar(t: number, flags: number, lo: number, hi: number, global =
         if (hi < thi) thi = hi
     }
     if ((f & ScalarFlag.int) && tlo > thi) f = f & ~ScalarFlag.int
-    const nums = scalars.nums[t].filter(v => v >= tlo && v <= thi && (v !== 0 || !(flags & (GuardFlag.truthy | GuardFlag.nonzero))))
+    const factor = flags & GuardFlag.multiple ? lcm(Math.max(1, factorOf(t)), lo) : scalars.factor[t]
+    const nums = scalars.nums[t].filter(v => v >= tlo && v <= thi && (v !== 0 || !(flags & (GuardFlag.truthy | GuardFlag.nonzero))) && v % factor === 0)
     if (scalars.nums[t].length && !nums.length) f = f & ~ScalarFlag.int
     if (!(f & (ScalarFlag.str | ScalarFlag.anyStr))) strs = []
     if (!f) return NONE
     if (nums.length === 1) return scalar(f, nums[0], nums[0], strs)
-    return scalar(f, tlo, thi, strs, nums)
+    return scalar(f, tlo, thi, strs, nums, factor)
 }
 
 function exprAt(slot: number): Expr {
@@ -2808,7 +3021,7 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
         case ExprOp.ntype: out = unite(out, ntypeScalar(value(at(inst, x.a)), originsOf(at(inst, x.a)).length > 0, global))
         case ExprOp.narrow: out = unite(out, filterScalar(value(at(inst, x.a)), x.key, x.b, x.sub, global))
         case ExprOp.pick: out = unite(out, value(at(inst, x.a)))
-        case ExprOp.arith: out = unite(out, arithScalar(x.key, x.sub, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf)))
+        case ExprOp.arith: out = unite(out, arithScalar(x.key, x.sub, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf), x.args.length ? value(at(inst, x.args[0])) : -1))
         case ExprOp.cmp: out = unite(out, foldCompare(x.key, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf), originsOf(at(inst, x.a)), originsOf(at(inst, x.b))))
         case ExprOp.rt: out = unite(out, rtScalar(inst, x, value, originsOf))
         case ExprOp.member: if (scalars.flags[value(at(inst, x.a))] & ScalarFlag.unknown) out = unite(out, UNKNOWN)
@@ -2984,6 +3197,7 @@ function exprUses(slot: number): void {
         scalarUse(at(inst, x.a), slot)
         scalarUse(at(inst, x.b), slot)
     }
+    if (x.op === ExprOp.arith && x.args.length) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype)) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.member) scalarUse(at(inst, x.a), slot)
 }
@@ -3379,10 +3593,13 @@ function ownedOperands(s: Summary, e: number): number[] {
         case ExprOp.ntype:
             all.push(x.a)
         case ExprOp.gate:
-        case ExprOp.arith:
         case ExprOp.cmp:
             all.push(x.a)
             all.push(x.b)
+        case ExprOp.arith:
+            all.push(x.a)
+            all.push(x.b)
+            for (const a of x.args) all.push(a)
         case ExprOp.member:
             all.push(x.a)
             if (x.key === dynKey) all.push(x.b)
