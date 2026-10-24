@@ -470,7 +470,10 @@ async function compileEngine(argv: string[]) {
         types: reifiedTypes.createTypeNamespace(),
         __reify: undefined,
         __readFile: (file: string) => fs.readFileSync(file, 'utf8'),
-        __writeFile: (file: string, text: string | Uint8Array) => fs.writeFileSync(file, text),
+        __writeFile: (file: string | number, text: string | Uint8Array) => {
+            if (typeof file === 'string') fs.mkdirSync(path.dirname(file), { recursive: true })
+            fs.writeFileSync(file, text)
+        },
         __readBytes: (file: string) => new Uint8Array(fs.readFileSync(file)),
         __readDir: (dir: string) => fs.readdirSync(dir),
         __spawnSync: (command: string, args: string[], env: Record<string, string>) => {
@@ -597,7 +600,7 @@ function startWatchdog(seconds: number, deadline = Date.now() + seconds * 1000, 
     worker.unref()
 }
 
-const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer', 'lowering-repros', 'native']
+const allTestableFiles = ['heap', 'bytecode-emitter', 'trace2', 'cg', 'containers', 'vm', 'maps', 'closures', 'mini-optimizer', 'lowering-repros', 'native', 'profile', 'sampling']
 
 interface CrashResume {
     suite: string
@@ -987,7 +990,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         }
         resume = next
     }
-    const filtered = args.some(a => /^(only|skip|bench)(:|$)/.test(a))
+    const filtered = args.some(a => /^(only|skip|bench|prof|sample)(:|$)/.test(a))
     const bodies = new Map([...sections].map(([key, section]) => [key, sectionBody(section, load)]))
     for (const [key, body] of [...bodies]) {
         if (!reportDeltas(key, baseline.get(key) ?? baseline.get(`CASE ${key.split(' ')[0]}`), body, filtered || !sections.get(key)!.done)) continue

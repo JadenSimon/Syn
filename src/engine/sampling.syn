@@ -1,0 +1,158 @@
+import ts from 'typescript'
+import { hostTarget } from './lowering'
+import { Types } from './intrinsics'
+
+export interface Samples {
+    pcs: number[]
+    dropped: number
+    milliseconds: number
+    intervalMicros: number
+}
+
+function address(view: ArrayBufferView): number {
+    return Number((ts as any).getArrayBufferPtr(view.buffer)) + view.byteOffset
+}
+
+function libc(name: string): any {
+    const asm = hostTarget.createAssembler()
+    asm.movImm(16, Number((ts as any).lookupNativeSymbol(name)))
+    asm.br(16)
+    return (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+}
+
+let activeSampler: any[] | undefined
+
+export function sampleNative(run: () => void, milliseconds: number, intervalMicros: number): Samples {
+    if (activeSampler) throw 'sampling: a sampler is already active'
+    if (process.platform !== 'darwin' || process.arch !== 'arm64') throw 'sampling: native PC sampling currently requires macOS arm64'
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0 || milliseconds > 60000) throw 'sampling: sample-ms must be in (0, 60000]'
+    if (!Number.isInteger(intervalMicros) || intervalMicros < 100 || intervalMicros > 1000000) throw 'sampling: sample-us must be an integer in [100, 1000000]'
+    const capacity = Math.min(1000000, Math.ceil(milliseconds * 1000 / intervalMicros) * 2 + 1024)
+    const samples = new BigUint64Array(capacity + 2)
+    const sigaction = libc('sigaction')
+    const setitimer = libc('setitimer')
+    const getitimer = libc('getitimer')
+    const sigprocmask = libc('sigprocmask')
+    const sigpending = libc('sigpending')
+    const sigwait = libc('sigwait')
+    const previousTimer = new BigInt64Array(4)
+    if (Number(getitimer(0, address(previousTimer))) !== 0) throw 'sampling: getitimer failed'
+    if (previousTimer.some(x => x !== BigInt(0))) throw 'sampling: ITIMER_REAL is already in use'
+
+    const asm = hostTarget.createAssembler()
+    asm.movImm(9, address(samples))
+    asm.load(10, 9, 0, Types.u64)
+    asm.movImm(13, capacity)
+    asm.compare('ge', 11, 10, 13, false)
+    asm.jumpIfNonZero(11, 0)
+    asm.load(12, 2, 48, Types.u64)
+    asm.load(12, 12, 272, Types.u64)
+    asm.binaryImm('shl', 11, 10, 3, false)
+    asm.binary('add', 11, 9, 11, false)
+    asm.store(11, 16, 12, Types.u64)
+    asm.addImm(10, 10, 1)
+    asm.store(9, 0, 10, Types.u64)
+    asm.ret()
+    asm.bindLabel(0)
+    asm.load(10, 9, 8, Types.u64)
+    asm.addImm(10, 10, 1)
+    asm.store(9, 8, 10, Types.u64)
+    asm.ret()
+    const handler = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+    const handlerAddress = Number((ts as any).toNativePtrAddr(handler))
+    const action = new BigUint64Array([BigInt(handlerAddress), BigInt(0x42) << BigInt(32)])
+    const previousAction = new BigUint64Array(2)
+    const alarm = new Uint32Array([1 << 13])
+    const previousMask = new Uint32Array(1)
+    const pending = new Uint32Array(1)
+    const signal = new Uint32Array(1)
+    const stopped = new BigInt64Array(4)
+    const seconds = Math.floor(intervalMicros / 1000000)
+    const micros = intervalMicros % 1000000
+    const timer = new BigInt64Array([BigInt(seconds), BigInt(micros), BigInt(seconds), BigInt(micros)])
+    if (Number(sigprocmask(1, address(alarm), address(previousMask))) !== 0) throw 'sampling: cannot block SIGALRM'
+    if (previousMask[0] & alarm[0]) {
+        sigprocmask(3, address(previousMask), 0)
+        throw 'sampling: SIGALRM is already blocked on this thread'
+    }
+    let installed = false
+    let started = 0
+    let elapsed = 0
+    try {
+        activeSampler = [handler, samples]
+        if (Number(sigaction(14, address(action), address(previousAction))) !== 0) throw 'sampling: sigaction failed'
+        installed = true
+        if (Number(setitimer(0, address(timer), 0)) !== 0) throw 'sampling: setitimer failed'
+        if (Number(sigprocmask(3, address(previousMask), 0)) !== 0) throw 'sampling: cannot unblock SIGALRM'
+        started = performance.now()
+        do { run() } while (performance.now() - started < milliseconds)
+        elapsed = performance.now() - started
+    } finally {
+        setitimer(0, address(stopped), 0)
+        sigprocmask(1, address(alarm), 0)
+        sigpending(address(pending))
+        if (pending[0] & alarm[0]) sigwait(address(alarm), address(signal))
+        if (installed) sigaction(14, address(previousAction), 0)
+        sigprocmask(3, address(previousMask), 0)
+        activeSampler = undefined
+    }
+    const pcs: number[] = []
+    for (let i = 0; i < Number(samples[0]); i++) pcs.push(Number(samples[i + 2] & BigInt('0x0000ffffffffffff')))
+    return { pcs, dropped: Number(samples[1]), milliseconds: elapsed, intervalMicros }
+}
+
+export function suite(): void {
+    if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+        console.log('sampling lifecycle tests require macOS arm64')
+        return
+    }
+    function assert(value: unknown, message: string): void {
+        if (!value) throw new Error(`sampling: ${message}`)
+    }
+    const asm = hostTarget.createAssembler()
+    asm.movImm(9, 100000)
+    asm.bindLabel(0)
+    asm.subImm(9, 9, 1)
+    asm.jumpIfNonZero(9, 0)
+    asm.movImm(0, 1)
+    asm.ret()
+    const bytes = new Uint8Array(asm.bytes())
+    const run = (ts as any).createNativeFn(bytes)
+    const start = Number((ts as any).toNativePtrAddr(run))
+    const getitimer = libc('getitimer')
+    const sigaction = libc('sigaction')
+    const sigprocmask = libc('sigprocmask')
+    const beforeAction = new BigUint64Array(2)
+    const beforeMask = new Uint32Array(1)
+    sigaction(14, 0, address(beforeAction))
+    sigprocmask(1, 0, address(beforeMask))
+    const first = sampleNative(() => run(), 40, 1000)
+    assert(first.pcs.some(pc => pc >= start && pc < start + bytes.length), 'the sampler must capture the interrupted native PC')
+    assert(!first.dropped, 'a short capture must not overflow')
+    const expected = new Error('sampling workload failure')
+    let caught: unknown
+    try { sampleNative(() => { throw expected }, 10, 1000) }
+    catch (e) { caught = e }
+    assert(caught === expected, 'workload exceptions must propagate')
+    const afterAction = new BigUint64Array(2)
+    const afterMask = new Uint32Array(1)
+    const timer = new BigInt64Array(4)
+    sigaction(14, 0, address(afterAction))
+    sigprocmask(1, 0, address(afterMask))
+    getitimer(0, address(timer))
+    assert(beforeAction[0] === afterAction[0] && beforeAction[1] === afterAction[1], 'the original signal handler and flags must be restored')
+    assert(beforeMask[0] === afterMask[0], 'the original signal mask must be restored')
+    assert(timer.every(x => x === BigInt(0)), 'the interval timer must be disabled after an exception')
+    const setitimer = libc('setitimer')
+    const occupied = new BigInt64Array([BigInt(0), BigInt(0), BigInt(60), BigInt(0)])
+    let rejected = false
+    setitimer(0, address(occupied), 0)
+    try {
+        try { sampleNative(() => run(), 10, 1000) }
+        catch (e) { rejected = String(e).includes('already in use') }
+        getitimer(0, address(timer))
+        assert(rejected && timer[2] > BigInt(0), 'an existing timer is rejected and left running')
+    } finally { setitimer(0, address(new BigInt64Array(4)), 0) }
+    assert(sampleNative(() => run(), 200, 100).pcs.length > 0, 'sampling must work again with a capacity beyond the compare-immediate range')
+    console.log('native PC sampling and exception cleanup tests passed')
+}

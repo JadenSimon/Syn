@@ -1,0 +1,426 @@
+export interface Instruction {
+    offset: number
+    word: number
+    text: string
+    reads: string[]
+    writes: string[]
+    samples: number
+    understood: boolean
+    call: boolean
+    labels: string[]
+}
+
+export interface Dependency {
+    from: number
+    to: number
+    register: string
+    merged: boolean
+    loopCarried: boolean
+}
+
+export interface Chain {
+    seed: number
+    instructions: number[]
+    edges: Dependency[]
+}
+
+function registers(text: string): string[] {
+    const regs = [...text.matchAll(/\b(?:[xw](?:[12]?\d|30)|[vdsqh](?:[12]?\d|3[01])|w?sp|fp|lr)\b/g)].map(([r]) => {
+        if (r === 'fp') return 'x29'
+        if (r === 'lr') return 'x30'
+        if (r === 'sp' || r === 'wsp') return 'sp'
+        return `${/[xw]/.test(r[0]) ? 'x' : 'v'}${r.slice(1)}`
+    })
+    return [...new Set(regs)]
+}
+
+function operands(text: string): string[] {
+    const out: string[] = []
+    let depth = 0
+    let start = 0
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '[') depth++
+        else if (text[i] === ']') depth--
+        else if (text[i] === ',' && !depth) {
+            out.push(text.slice(start, i).trim())
+            start = i + 1
+        }
+    }
+    if (start < text.length) out.push(text.slice(start).trim())
+    return out
+}
+
+const alu = new Set(('add sub adds subs adc adcs sbc sbcs and ands orr orn eor eon bic bics lsl lsr asr ror ' +
+    'mov movz movn movk mvn neg negs mul mneg madd msub smull umull smulh umulh sdiv udiv clz cls rbit rev rev16 rev32 ' +
+    'ubfx sbfx ubfiz sbfiz bfi bfxil uxtb uxth uxtw sxtb sxth sxtw extr ' +
+    'csel csinc csinv csneg cset csetm cinc cinv cneg adrp adr ' +
+    'fmov fadd fsub fmul fdiv fneg fabs fsqrt fmadd fmsub fnmadd fnmsub fmax fmin fmaxnm fminnm ' +
+    'fcsel fcvt fcvtzs fcvtzu scvtf ucvtf frintz frintm frintp frintn crc32b crc32h crc32w crc32x crc32cb crc32ch crc32cw crc32cx').split(' '))
+const callerSaved = [...Array.from({ length: 19 }, (_, i) => `x${i}`), 'x30', 'nzcv',
+    ...Array.from({ length: 8 }, (_, i) => `v${i}`), ...Array.from({ length: 16 }, (_, i) => `v${i + 16}`)]
+
+export function instruction(offset: number, word: number, text: string): Instruction {
+    text = text.split('//')[0].trim()
+    const mnemonic = text.split(/\s/, 1)[0]
+    const args = operands(text.slice(mnemonic.length).trim())
+    const destinations = registers(args[0] ?? '')
+    let reads: string[] = []
+    let writes: string[] = []
+    let understood = true
+    const call = mnemonic === 'bl' || mnemonic === 'blr' || mnemonic === 'svc'
+    if (call) {
+        reads = mnemonic === 'blr' ? destinations : []
+        writes = callerSaved
+    } else if (/^(?:ldr|ldur|ldar|ldaxr|ldxr)/.test(mnemonic) || mnemonic === 'ldp' || mnemonic === 'ldpsw') {
+        const pair = mnemonic === 'ldp' || mnemonic === 'ldpsw'
+        writes = registers(args.slice(0, pair ? 2 : 1).join(','))
+        reads = registers(args.slice(pair ? 2 : 1).join(','))
+        const address = args[pair ? 2 : 1] ?? ''
+        if (address.endsWith('!') || args.length > (pair ? 3 : 2)) writes.push(...registers(address.split(',')[0]))
+    } else if (/^(?:str|stur|stlr|stp)/.test(mnemonic)) {
+        reads = registers(args.join(','))
+        const address = args.find(a => a.startsWith('['))
+        if (address && (address.endsWith('!') || args.indexOf(address) < args.length - 1)) writes = registers(address.split(',')[0])
+    } else if (['cmp', 'cmn', 'tst', 'fcmp', 'fcmpe', 'ccmp', 'ccmn', 'fccmp', 'fccmpe'].includes(mnemonic)) {
+        reads = registers(args.join(','))
+        if (mnemonic.includes('cc')) reads.push('nzcv')
+        writes = ['nzcv']
+    } else if (mnemonic.startsWith('b.')) {
+        reads = ['nzcv']
+    } else if (['cbz', 'cbnz', 'tbz', 'tbnz', 'br', 'ret'].includes(mnemonic)) {
+        reads = registers(args[0] ?? (mnemonic === 'ret' ? 'x30' : ''))
+    } else if (alu.has(mnemonic)) {
+        writes = destinations
+        reads = registers(args.slice(1).join(','))
+        if (['movk', 'bfi', 'bfxil'].includes(mnemonic)) reads.push(...destinations)
+        if (/^(?:csel|csinc|csinv|csneg|cset|cinc|cinv|cneg|fcsel|adc|sbc)/.test(mnemonic)) reads.push('nzcv')
+        if (['adds', 'subs', 'adcs', 'sbcs', 'ands', 'bics', 'negs'].includes(mnemonic)) writes.push('nzcv')
+    } else if (!['b', 'nop', 'brk', 'udf', 'dmb', 'dsb', 'isb'].includes(mnemonic)) {
+        understood = false
+        writes = [...callerSaved, ...Array.from({ length: 11 }, (_, i) => `x${i + 19}`), 'sp',
+            ...Array.from({ length: 8 }, (_, i) => `v${i + 8}`)]
+    }
+    return { offset, word: word >>> 0, text, reads: [...new Set(reads)], writes: [...new Set(writes)], samples: 0, understood, call, labels: [] }
+}
+
+export function parseListing(listing: string, words?: number[]): Instruction[] {
+    const out: Instruction[] = []
+    let labels: string[] = []
+    for (const line of listing.split('\n')) {
+        const label = line.match(/^\s*(L\d+):\s*$/)
+        if (label) { labels.push(label[1]); continue }
+        const m = line.match(/^\s*(\d+):\s+([0-9a-fA-F]{8})\s+(.+)$/)
+        if (m) {
+            const i = instruction(Number(m[1]), words?.[Number(m[1]) / 4] ?? parseInt(m[2], 16), m[3])
+            i.labels = labels
+            labels = []
+            out.push(i)
+        }
+    }
+    return out
+}
+
+function signExtend(value: number, bits: number): number {
+    return (value << (32 - bits)) >> (32 - bits)
+}
+
+function branch(i: Instruction): { target?: number, fallthrough: boolean, boundary: boolean } {
+    const word = i.word
+    if ((word & 0xfc000000) >>> 0 === 0x14000000) return { target: i.offset + signExtend(word & 0x3ffffff, 26) * 4, fallthrough: false, boundary: true }
+    if ((word & 0xff000010) >>> 0 === 0x54000000 || (word & 0x7e000000) === 0x34000000) return { target: i.offset + signExtend((word >>> 5) & 0x7ffff, 19) * 4, fallthrough: true, boundary: true }
+    if ((word & 0x7e000000) === 0x36000000) return { target: i.offset + signExtend((word >>> 5) & 0x3fff, 14) * 4, fallthrough: true, boundary: true }
+    const terminal = /^(?:ret|br|brk|udf)\b/.test(i.text)
+    return { fallthrough: !terminal, boundary: terminal || i.call || !i.understood }
+}
+
+interface Block {
+    start: number
+    end: number
+    predecessors: number[]
+    successors: number[]
+    incoming: Map<string, Set<number>>
+    outgoing: Map<string, Set<number>>
+}
+
+function sameDefinitions(a: Map<string, Set<number>>, b: Map<string, Set<number>>): boolean {
+    if (a.size !== b.size) return false
+    for (const [r, defs] of a) {
+        const other = b.get(r)
+        if (!other || defs.size !== other.size || [...defs].some(d => !other.has(d))) return false
+    }
+    return true
+}
+
+export function dependencies(code: Instruction[]): Dependency[][] {
+    if (!code.length) return []
+    const atOffset = new Map(code.map((i, k) => [i.offset, k]))
+    const starts = new Set([0])
+    code.forEach((i, k) => {
+        const b = branch(i)
+        const target = b.target === undefined ? undefined : atOffset.get(b.target)
+        if (target !== undefined) starts.add(target)
+        if (b.boundary && k + 1 < code.length) starts.add(k + 1)
+    })
+    const ordered = [...starts].sort((a, b) => a - b)
+    const blocks: Block[] = ordered.map((start, k) => ({ start, end: ordered[k + 1] ?? code.length, predecessors: [], successors: [], incoming: new Map(), outgoing: new Map() }))
+    const blockOf = new Map<number, number>()
+    blocks.forEach((b, k) => { for (let i = b.start; i < b.end; i++) blockOf.set(i, k) })
+    blocks.forEach((b, k) => {
+        const exit = branch(code[b.end - 1])
+        const target = exit.target === undefined ? undefined : atOffset.get(exit.target)
+        if (target !== undefined) b.successors.push(blockOf.get(target)!)
+        if (exit.fallthrough && k + 1 < blocks.length && !b.successors.includes(k + 1)) b.successors.push(k + 1)
+        for (const next of b.successors) blocks[next].predecessors.push(k)
+    })
+    const live = new Set([0])
+    const pending = [0]
+    while (pending.length) for (const next of blocks[pending.pop()!].successors) {
+        if (!live.has(next)) { live.add(next); pending.push(next) }
+    }
+    const queue: number[] = [...live]
+    const queued = new Set(queue)
+    for (let next = 0; next < queue.length; next++) {
+        const k = queue[next]
+        queued.delete(k)
+        const b = blocks[k]
+        const incoming = new Map<string, Set<number>>()
+        for (const pred of b.predecessors.filter(p => live.has(p))) for (const [r, defs] of blocks[pred].outgoing) {
+            let merged = incoming.get(r)
+            if (!merged) incoming.set(r, merged = new Set())
+            for (const d of defs) merged.add(d)
+        }
+        b.incoming = incoming
+        const outgoing = new Map(incoming)
+        for (let i = b.start; i < b.end; i++) for (const r of code[i].writes) outgoing.set(r, new Set([i]))
+        if (sameDefinitions(outgoing, b.outgoing)) continue
+        b.outgoing = outgoing
+        for (const succ of b.successors) if (!queued.has(succ)) { queued.add(succ); queue.push(succ) }
+    }
+    const edges: Dependency[][] = code.map(() => [])
+    const reachable = new Map<number, Set<number>>()
+    function reaches(from: number, to: number): boolean {
+        let seen = reachable.get(from)
+        if (!seen) {
+            seen = new Set([from])
+            const work = [from]
+            while (work.length) for (const next of blocks[work.pop()!].successors) {
+                if (!seen.has(next)) { seen.add(next); work.push(next) }
+            }
+            reachable.set(from, seen)
+        }
+        return seen.has(to)
+    }
+    for (const b of blocks) {
+        if (!live.has(blockOf.get(b.start)!)) continue
+        const defs = new Map(b.incoming)
+        for (let i = b.start; i < b.end; i++) {
+            for (const r of code[i].reads) {
+                const reaching = defs.get(r)
+                for (const from of reaching ?? []) {
+                    if (code[from].call || !code[from].understood) continue
+                    edges[i].push({ from, to: i, register: r, merged: (reaching?.size ?? 0) > 1,
+                        loopCarried: from >= i && reaches(blockOf.get(i)!, blockOf.get(from)!),
+                    })
+                }
+            }
+            for (const r of code[i].writes) defs.set(r, new Set([i]))
+        }
+    }
+    return edges
+}
+
+export function dependencyChain(code: Instruction[], incoming: Dependency[][], seed: number, depth = 32): Chain {
+    let best: Chain = { seed, instructions: [seed], edges: [] }
+    let frontier = [best]
+    const score = (c: Chain) => c.instructions.reduce((n, i) => n + code[i].samples + (/^ld/.test(code[i].text) ? 1 : 0), 0)
+    for (let step = 1; step < depth && frontier.length; step++) {
+        const next: Chain[] = []
+        for (const chain of frontier) {
+            for (const edge of incoming[chain.instructions[0]]) {
+                if (chain.instructions.includes(edge.from)) continue
+                const extended = { seed, instructions: [edge.from, ...chain.instructions], edges: [edge, ...chain.edges] }
+                next.push(extended)
+                if (extended.instructions.length > best.instructions.length || (extended.instructions.length === best.instructions.length && score(extended) > score(best))) best = extended
+            }
+        }
+        const seen = new Set<string>()
+        frontier = next.sort((a, b) => score(b) - score(a)).filter(c => {
+            const key = c.instructions.join(',')
+            if (seen.has(key)) return false
+            seen.add(key)
+            return true
+        }).slice(0, 32)
+    }
+    return best
+}
+
+interface ProfileInput {
+    directory: string
+    name: string
+    samples: { pcs: number[], dropped: number, milliseconds: number, intervalMicros: number }
+    run: { units?: { name: string, symbol: number, code: { listing: string, bytes: number[], island?: number[], target: { name: string } } }[], image?: { entries: (number | bigint)[], image: Uint8Array } }
+    chains: number
+    depth: number
+}
+
+export function writeNativeProfile(input: ProfileInput): string {
+    const { units, image } = input.run
+    if (!units?.length || !image) throw new Error('prof requires native listing metadata; use it without image-in/image-roundtrip')
+    const histogram = new Map<number, number>()
+    for (const pc of input.samples.pcs) histogram.set(pc, (histogram.get(pc) ?? 0) + 1)
+    let imageOffset = 0
+    const first = units[0]
+    imageOffset = Math.ceil((first.code.island?.length ?? 0) * 8 / 16) * 16
+    const imageBase = Number(image.entries[first.symbol]) - imageOffset
+    const functions = units.map(unit => {
+        const entry = Number(image.entries[unit.symbol])
+        const bytes = new DataView(image.image.buffer, image.image.byteOffset + entry - imageBase, unit.code.bytes.length)
+        const words = Array.from({ length: unit.code.bytes.length / 4 }, (_, k) => bytes.getUint32(k * 4, true))
+        const code = parseListing(unit.code.listing, words)
+        for (const i of code) i.samples = histogram.get(entry + i.offset) ?? 0
+        const total = code.reduce((n, i) => n + i.samples, 0)
+        return { name: unit.name, entry, code, samples: total, target: unit.code.target.name }
+    })
+    const total = input.samples.pcs.length
+    const mapped = functions.reduce((n, f) => n + f.samples, 0)
+    const hottest = functions.flatMap((f, unit) => f.code.map((i, index) => ({ unit, index, samples: i.samples }))).filter(i => i.samples).sort((a, b) => b.samples - a.samples)
+    const analyses = new Map<number, Dependency[][]>()
+    const chains: { unit: number, chain: Chain }[] = []
+    const duplicate = new Set<string>()
+    for (const hot of hottest.slice(0, Math.max(32, input.chains * 8))) {
+        const f = functions[hot.unit]
+        if (!f.target.startsWith('aarch64')) continue
+        let deps = analyses.get(hot.unit)
+        if (!deps) analyses.set(hot.unit, deps = dependencies(f.code))
+        const chain = dependencyChain(f.code, deps, hot.index, input.depth)
+        if (chain.instructions.length < 3) continue
+        const key = `${hot.unit}:${[...chain.instructions].sort((a, b) => a - b).join(',')}`
+        if (duplicate.has(key)) continue
+        duplicate.add(key)
+        chains.push({ unit: hot.unit, chain })
+    }
+    chains.sort((a, b) => {
+        const weight = (c: typeof a) => functions[c.unit].code[c.chain.seed].samples * c.chain.instructions.length
+        return weight(b) - weight(a)
+    })
+    chains.length = Math.min(chains.length, input.chains)
+    const pct = (n: number) => `${(total ? n / total * 100 : 0).toFixed(2)}%`
+    const hex = (n: number) => `0x${n.toString(16)}`
+    const line = (f: typeof functions[number], i: Instruction) => `${String(i.samples).padStart(7)} ${pct(i.samples).padStart(7)} ${hex(f.entry + i.offset)} +${String(i.offset).padStart(5)}: ${i.word.toString(16).padStart(8, '0')}  ${i.text}`
+    const summary = [
+        `Native PC profile: ${input.name}`,
+        `${total} samples in ${input.samples.milliseconds.toFixed(1)}ms; requested interval ${input.samples.intervalMicros}us; ${input.samples.dropped} dropped`,
+        `${mapped} samples (${pct(mapped)}) in this native image; ${total - mapped} outside it`,
+        'Counts are interrupted PCs (self samples), not inclusive stack counts or measured instruction latency.',
+        '', 'Functions (self samples):',
+        ...functions.filter(f => f.samples).sort((a, b) => b.samples - a.samples).map(f => `${String(f.samples).padStart(7)} ${pct(f.samples).padStart(7)} ${hex(f.entry)} ${f.name}`),
+        '', 'Hottest PCs (self samples):',
+        ...hottest.slice(0, 20).map(hot => `${line(functions[hot.unit], functions[hot.unit].code[hot.index])}  ${functions[hot.unit].name}`),
+    ]
+    const listings = [...summary, '', 'Annotated listings (all emitted functions):']
+    for (const f of [...functions].sort((a, b) => b.samples - a.samples)) {
+        listings.push('', `--- ${f.name} @ ${hex(f.entry)} (${f.samples} samples) ---`)
+        for (const i of f.code) {
+            for (const label of i.labels) listings.push(`                                ${label}:`)
+            listings.push(line(f, i))
+        }
+    }
+    const chainLines = [...summary, '',
+        'Memory alias/control dependencies and interprocedural paths are not modeled.',
+        `Search depth ${input.depth}.`, '']
+    for (const { unit, chain } of chains) {
+        const f = functions[unit]
+        const seed = f.code[chain.seed]
+        const loads = chain.instructions.filter(k => /^ld/.test(f.code[k].text)).length
+        chainLines.push(`--- ${f.name}: ${chain.instructions.length} instructions, ${loads} loads; hot PC +${seed.offset}, ${seed.samples} samples (${pct(seed.samples)}) ---`)
+        chain.instructions.forEach((k, at) => {
+            if (at) {
+                const e = chain.edges[at - 1]
+                chainLines.push(`        -- ${e.register}${e.merged ? ' [join]' : ''}${e.loopCarried ? ' [loop-carried]' : ''} -->`)
+            }
+            chainLines.push(`${line(f, f.code[k])}${k === chain.seed ? '  <== sampled seed' : ''}`)
+        })
+        chainLines.push('')
+    }
+    if (!chains.length) chainLines.push('No sampled AArch64 chain of at least three instructions was found.')
+    const directory = input.directory.replace(/\/+$/, '') || '.'
+    const stem = `${directory}/${input.name.replace(/[^\w.-]+/g, '_')}`
+    const write = (file: string, text: string) => (globalThis as any).__writeFile(file, text)
+    write(`${stem}.asm.txt`, listings.join('\n') + '\n')
+    write(`${stem}.chains.txt`, chainLines.join('\n') + '\n')
+    write(`${stem}.json`, JSON.stringify({ name: input.name, ...input.samples, mapped, functions, chains }, null, 2))
+    return `${summary.slice(0, 3).join('\n')}\nListings: ${stem}.asm.txt\nChains: ${stem}.chains.txt\nRaw profile: ${stem}.json`
+}
+
+export function suite(): void {
+    function assert(value: unknown, message: string): void {
+        if (!value) throw new Error(`profile: ${message}`)
+    }
+    function code(rows: [number, string][]): Instruction[] {
+        return rows.map(([word, text], i) => instruction(i * 4, word, text))
+    }
+    const chase = code([
+        [0xf9400009, 'ldr x9, [x0]'],
+        [0x9100412a, 'add x10, x9, #16'],
+        [0xb940014b, 'ldr w11, [x10]'],
+        [0x9100056c, 'add x12, x11, #1'],
+    ])
+    assert(dependencyChain(chase, dependencies(chase), 3).instructions.join() === '0,1,2,3', 'pointer chase must connect loads, address arithmetic, and W/X aliases')
+    const partial = code([[0xd2800029, 'movz x9, #1'], [0xf2a00049, 'movk x9, #2, lsl #16'], [0x9100052a, 'add x10, x9, #1']])
+    assert(dependencyChain(partial, dependencies(partial), 2).instructions.length === 3, 'MOVK must read the previous destination')
+    const overwritten = code([[0x91000409, 'add x9, x0, #1'], [0x52800029, 'mov w9, #1'], [0x9100052a, 'add x10, x9, #1']])
+    assert(dependencyChain(overwritten, dependencies(overwritten), 2).instructions.join() === '1,2', 'a W write replaces the entire X definition')
+    const flags = code([[0x91000409, 'add x9, x0, #1'], [0xf100013f, 'cmp x9, #0'], [0x9a8b114a, 'csel x10, x10, x11, ne'], [0x54000021, 'b.ne L0']])
+    const flagDeps = dependencies(flags)
+    assert(flagDeps[2].some(e => e.from === 1 && e.register === 'nzcv'), 'conditional select reads NZCV')
+    assert(flagDeps[3].some(e => e.from === 1 && e.register === 'nzcv'), 'conditional branch reads NZCV')
+    const conditionalCompare = instruction(0, 0, 'ccmp x9, x10, #0, eq')
+    assert(conditionalCompare.reads.includes('nzcv') && conditionalCompare.writes.includes('nzcv'), 'CCMP reads and replaces flags')
+    const post = instruction(0, 0, 'ldp x9, x10, [sp], #16')
+    assert(post.reads.includes('sp') && post.writes.join() === 'x9,x10,sp', 'load pair post-index updates its base')
+    assert(instruction(0, 0, 'ldr x12, [sp, #8]').writes.join() === 'x12', 'an immediate address offset does not write its base')
+    assert(instruction(0, 0, 'ldr w1, [x9, x0, lsl #2]').writes.join() === 'x1', 'a scaled index does not write its base or index')
+    const pre = instruction(0, 0, 'str x9, [x10, #8]!')
+    assert(pre.reads.includes('x9') && pre.reads.includes('x10') && pre.writes.join() === 'x10', 'store pre-index reads its value and updates its base')
+    assert(!instruction(0, 0, 'add x9, xzr, x10').reads.includes('x31'), 'zero registers are not data dependencies')
+    assert(instruction(0, 0, 'fmov d9, x10').writes.join() === 'v9', 'FP aliases share a register identity')
+    const calls = code([[0xd2800029, 'mov x9, #1'], [0x94000001, 'bl callee'], [0x9100052a, 'add x10, x9, #1']])
+    assert(!dependencies(calls)[2].length, 'calls kill caller-saved definitions; no guessed return dependency')
+    const preserved = code([[0xd2800033, 'mov x19, #1'], [0x94000001, 'bl callee'], [0x9100066a, 'add x10, x19, #1']])
+    assert(dependencies(preserved)[2].some(e => e.from === 0), 'callee-saved definitions survive a call')
+    const diamond = code([[0xb4000060, 'cbz x0, L0'], [0xd2800029, 'mov x9, #1'], [0x14000002, 'b L1'], [0xd2800049, 'mov x9, #2'], [0x9100052a, 'add x10, x9, #1']])
+    const joined = dependencies(diamond)[4]
+    assert(joined.length === 2 && joined.every(e => e.merged) && joined.map(e => e.from).sort().join() === '1,3', 'CFG join retains both reaching definitions')
+    const loop = code([[0xd2800009, 'mov x9, #0'], [0x91000529, 'add x9, x9, #1'], [0xf100113f, 'cmp x9, #4'], [0x54ffffcb, 'b.lt L0']])
+    const loopDeps = dependencies(loop)
+    assert(loopDeps[1].some(e => e.from === 1), 'backedge carries the increment into the next iteration')
+    assert(loopDeps[1].some(e => e.from === 1 && e.loopCarried), 'a genuine loop recurrence is marked')
+    const chain = dependencyChain(loop, loopDeps, 3, 12)
+    assert(new Set(chain.instructions).size === chain.instructions.length, 'loop chains terminate without repeating instructions')
+    const backwardLayout = code([[0x14000003, 'b L0'], [0x9100052a, 'add x10, x9, #1'], [0xd65f03c0, 'ret'], [0xd2800029, 'mov x9, #1'], [0x17fffffd, 'b L1']])
+    assert(dependencies(backwardLayout)[1].some(e => e.from === 3 && !e.loopCarried), 'backward listing order alone does not imply a loop')
+    const deadProducer = code([[0x14000003, 'b L0'], [0xd2800029, 'mov x9, #1'], [0x14000001, 'b L0'], [0x9100052a, 'add x10, x9, #1']])
+    assert(!dependencies(deadProducer)[3].length, 'unreachable blocks do not supply definitions to reachable instructions')
+    assert(!instruction(0, 0, 'mystery x9, x10').understood, 'unrecognized instructions form barriers')
+    const listing = 'L0:\n   0: d2800029  mov x9, #1\n   4: 9100052a  add x10, x9, #1'
+    assert(parseListing(listing, [0xd2800049, 0x9100052a])[0].word === 0xd2800049, 'installed words override pre-relocation words')
+    assert(parseListing(listing)[0].labels.join() === 'L0', 'listings retain branch target labels')
+    const image = new Uint8Array(32)
+    const view = new DataView(image.buffer)
+    view.setUint32(16, 0xd2800029, true)
+    view.setUint32(20, 0x9100052a, true)
+    const files = new Map<string, string>()
+    const write = (globalThis as any).__writeFile
+    try {
+        ;(globalThis as any).__writeFile = (file: string, text: string) => files.set(file, text)
+        writeNativeProfile({ directory: 'profile-test', name: 'relocated', chains: 2, depth: 8,
+            samples: { pcs: [0x1010, 0x1014, 0x1014, 0x9999], dropped: 0, milliseconds: 10, intervalMicros: 1000 },
+            run: { units: [{ name: 'f', symbol: 0, code: { listing, bytes: new Array(8).fill(0), island: [0], target: { name: 'aarch64-darwin' } } }], image: { entries: [0x1010], image } },
+        })
+    } finally { (globalThis as any).__writeFile = write }
+    const report = JSON.parse(files.get('profile-test/relocated.json')!)
+    assert(report.mapped === 3 && report.functions[0].code[1].samples === 2, 'PC attribution accounts for the aligned literal island and outside samples')
+    assert(files.get('profile-test/relocated.asm.txt')!.includes('0x1014'), 'annotated listing contains installed addresses')
+    assert(files.get('profile-test/relocated.asm.txt')!.includes('L0:'), 'annotated listing contains branch labels')
+    console.log('profile instruction, CFG, dependency-chain, and PC attribution tests passed')
+}
