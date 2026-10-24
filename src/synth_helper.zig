@@ -371,6 +371,22 @@ pub const SynthInstrumenter = struct {
         };
     }
 
+    fn visitChildren(self: *@This(), node: *const AstNode) !void {
+        switch (node.kind) {
+            .constructor => {
+                var pit = NodeIterator.init(self.nodes, funcParamsHead(node));
+                while (pit.nextPair()) |p| try self.visit(p[0], p[1]);
+                const body = funcBodyRef(node);
+                if (body != 0) try self.visit(self.nodes.at(body), body);
+            },
+            .spread_assignment => {
+                const inner = parser.unwrapRef(node);
+                try self.visit(self.nodes.at(inner), inner);
+            },
+            else => try forEachChild(self.nodes, node, self),
+        }
+    }
+
     fn needsCell(self: *@This(), sym_ref: SymbolRef) bool {
         if (self.exported_bindings.contains(sym_ref)) return false;
         return self.assigned.contains(sym_ref) and self.captured.contains(sym_ref);
@@ -632,7 +648,7 @@ pub const SynthInstrumenter = struct {
             const save_rebindings = self.rebindings;
             defer self.rebindings = save_rebindings;
             self.rebindings = .{};
-            try forEachChild(self.nodes, node, self);
+            try self.visitChildren(node);
             try self.drainRebindings(funcBodyRef(node), 0);
             if (!self.instrumented.contains(ref)) return;
             const move_key = try self.computationKey();
@@ -941,11 +957,11 @@ pub const SynthInstrumenter = struct {
                 try forEachChild(self.nodes, node, self);
                 return try self.drainRebindings(ref, start);
             }
-            if (node.kind == .arrow_function or node.kind == .function_expression or node.kind == .function_declaration or node.kind == .method_declaration or node.kind == .get_accessor or node.kind == .set_accessor) {
+            if (isFunctionLike(node.kind)) {
                 const save_rebindings = self.rebindings;
                 defer self.rebindings = save_rebindings;
                 self.rebindings = .{};
-                try forEachChild(self.nodes, node, self);
+                try self.visitChildren(node);
                 return try self.drainRebindings(funcBodyRef(node), 0);
             }
             if (node.kind == .shorthand_property_assignment) {
@@ -963,7 +979,7 @@ pub const SynthInstrumenter = struct {
                 return try self.visitClassLike(node, ref);
             }
             if (node.kind != .identifier and node.kind != .this_keyword) {
-                return try forEachChild(self.nodes, node, self);
+                return try self.visitChildren(node);
             }
             if (self.binder.getSymbol(ref)) |sym_ref| {
                 if (sym_ref == 0) return;
@@ -1086,7 +1102,7 @@ pub const SynthInstrumenter = struct {
             .object_literal_expression,
             .class_declaration, .class_expression => try self.visitClassLike(node, ref),
 
-            else => try forEachChild(self.nodes, node, self),
+            else => try self.visitChildren(node),
         }
     }
 };
