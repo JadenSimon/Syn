@@ -2780,6 +2780,7 @@ function createImage() {
     const codeFields: [address: number, slot: number][] = []
     const objectCode = new Map<number, number>()
     const code = { slot: (cell: number): number => { throw `native: no code for function @${cell}` } }
+    const functionObjects = new Map<number, intrinsics.Handle>()
     const staticRegions: [base: number, size: number][] = []
     const readonlyRegions: [base: number, size: number][] = []
     const staticTable = { base: 0, region: -1 }
@@ -2968,7 +2969,7 @@ function createImage() {
                 else pointers.set(buffer, [relocation])
             }
             if (getRef(n, 3) && storesUndefined(getRef(n, 3))) {
-                if (width === 4) view.setUint32(offset, word(n, offset, width) ? tagVmHandle(heap.undefinedHandle) : heap.undefinedHandle, true)
+                if (width === 4) view.setUint32(offset, typeOf(n) === Types.vm_value ? tagVmHandle(heap.undefinedHandle) : heap.undefinedHandle, true)
                 else if (width !== 8) fail(`store %${id} writes undefined into a ${width}-byte slot`)
                 continue
             }
@@ -3067,8 +3068,15 @@ function createImage() {
                 if (tag) setBit(tag)
             } else if (heap.isNullishHandle(slot) && tag) {
                 continue
+            } else if (slot && heap.isString(slot)) {
+                mirrorCell(slot)
+                view.setBigUint64(offset, BigInt(slot), true)
+                if (tag) setBit(tag)
             } else if (slot === heap.undefinedHandle) {
                 continue
+            } else if (slot && functionObjects.has(slot)) {
+                view.setBigUint64(offset, BigInt(placeObject(functionObjects.get(slot)!, allocated, fail)), true)
+                pointers.push({ offset, region: staticRegion(), scale: 1 })
             } else if (slot && heap.isOrdinaryObject(heap.deref(slot))) {
                 const field = holder ? heapField(graph!, holder, keys[i]) : undefined
                 view.setBigUint64(offset, BigInt(placeObject(slot, allocated, fail, graph, typeof field === 'number' ? getNode(graph!, field) : undefined)), true)
@@ -3080,7 +3088,7 @@ function createImage() {
         return at
     }
     return {
-        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, staticFields, codeFields, objectCode, code, staticRegions, readonlyRegions, staticTable, recordBits,
+        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, staticFields, codeFields, objectCode, code, functionObjects, staticRegions, readonlyRegions, staticTable, recordBits,
         slotRelocations, imports, startWrites,
         valueSlot, wordsSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot, regionSlot,
         knownValue: (slot: number) => final.get(slot),
@@ -4300,6 +4308,7 @@ function refineProgramEffects(program: ProgramGraph, refined: Set<number>): void
 function reachUnits(program: ProgramGraph): Set<number> {
     const reached = new Set<number>()
     const reaching = [...program.roots.values()]
+    let indirect = false
     while (reaching.length) {
         const symbol = reaching.pop()!
         if (reached.has(symbol)) continue
@@ -4318,6 +4327,13 @@ function reachUnits(program: ProgramGraph): Set<number> {
                 continue
             }
             if (n.op === NodeOp.static) continue
+            if (n.op === NodeOp.indirectTarget && !indirect) {
+                indirect = true
+                for (const slot of program.image.objectCode.values()) {
+                    const held = program.image.functionTargets.get(slot)
+                    if (held !== undefined) reaching.push(held)
+                }
+            }
             const local = localSymbol(graph, n)
             if (local !== undefined) reaching.push(local)
             if (n.op === NodeOp.rt && program.image.runtime.has(getLiteral(graph, n, 1))) reaching.push(program.image.runtime.get(getLiteral(graph, n, 1))!)
@@ -5980,6 +5996,11 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             const element = heap.getProperty(array, heap.indexKey(i))
             values.push(element && heap.isArray(element) ? engineArrayOf(element) : element)
         }
+        const engine = foldedArray(values)
+        engineArrays.set(array, engine)
+        return engine
+    }
+    function foldedArray(values: intrinsics.Handle[]): intrinsics.Handle {
         const engine = session.fold(copyInto(values.map(heap.createHeapHandle)))
         const target = heap.indirectTarget(engine)
         engineElements.set(target, values)
@@ -5992,12 +6013,40 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (heap.isBoxedF64(value)) setFact(facts, 'construction', target, data, { kind: 'int', encoded: true })
             if (value && heap.isIndirect(value)) setFact(facts, 'construction', target, data, { kind: 'ref', shape: heap.indirectTarget(value), encoded: true, union: false })
         }
-        engineArrays.set(array, engine)
         return engine
     }
     const engineElements = new Map<intrinsics.Handle, intrinsics.Handle[]>()
     function heapValue(cell: intrinsics.Handle): intrinsics.Handle {
         return cell && heap.isArray(cell) ? engineArrayOf(cell) : cell
+    }
+    const companions = new Map<intrinsics.Handle, intrinsics.Handle>()
+    function companionOf(record: intrinsics.Handle): intrinsics.Handle | undefined {
+        const known = companions.get(record)
+        if (known !== undefined) return known
+        if (!heap.isOrdinaryObject(record) || heap.getComputedKeyProxy(record) || heap.hasIndexKeys(heap.prototypeOf(record))) return
+        const values: intrinsics.Handle[] = []
+        for (let i: u32 = 0; i < heap.ownPropertyCount(record); i++) {
+            const index = heap.keyIndex(heap.ownPropertyKeyAt(record, i))
+            if (index === undefined) continue
+            const desc = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.ownPropertyAt(record, i)))
+            if (desc.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
+            while (values.length < index) values.push(heap.undefinedHandle)
+            values[index] = heapValue(desc.slot0 as intrinsics.Handle)
+        }
+        if (!values.length) return
+        const companion = foldedArray(values)
+        companions.set(record, companion)
+        return companion
+    }
+    function companionReads(graph: Graph): void {
+        for (const [id, n] of [...nodeEntries(graph)]) {
+            if (n.op !== NodeOp.getProp || !getRef(n, 2)) continue
+            const object = getNode(graph, strippedAfter(graph, getRef(n, 1)))
+            if (object?.op !== NodeOp.heapHandle || getRef(object, 0)) continue
+            const companion = companionOf(heap.deref(getLiteral(graph, object, 0) as intrinsics.Handle))
+            if (companion === undefined) continue
+            putCopy(graph, id, n, withOperand(graph, n, 1, addNode(graph, NodeOp.heapHandle, [{ literal: companion }])))
+        }
     }
     function engineHeapArrays(graph: Graph): void {
         for (const [id, n] of nodeEntries(graph)) {
@@ -6253,6 +6302,32 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             putNode(graph, id, NodeOp.after, [getRef(n, 0), addNode(graph, NodeOp.literal, [{ literal: found ? 1 : 0 }])])
         }
     }
+    const keyTuples = new Map<intrinsics.Handle, intrinsics.Handle>()
+    function keyTupleOf(record: intrinsics.Handle, keys: intrinsics.Handle[]): intrinsics.Handle {
+        const known = keyTuples.get(record)
+        if (known !== undefined) return known
+        const tuple = foldedArray(keys)
+        keyTuples.set(record, tuple)
+        return tuple
+    }
+    function onlyIterated(graph: Graph, array: number): boolean {
+        const aliases = new Set([array])
+        for (const [id, n] of nodeEntries(graph)) if (n.op === NodeOp.after && aliases.has(strippedAfter(graph, id))) aliases.add(id)
+        const iterator = heap.fromJsSymbol(Symbol.iterator)
+        const props = new Set<number>()
+        for (const [id, n] of nodeEntries(graph)) {
+            if (n.op === NodeOp.getProp && aliases.has(getRef(n, 1)) && !getRef(n, 2) && getLiteral(graph, n, 2) === iterator) props.add(id)
+        }
+        for (const [id, n] of nodeEntries(graph)) {
+            for (let i = 1; i < countIds(n); i++) {
+                if (!aliases.has(getRef(n, i)) || n.op === NodeOp.after) continue
+                if (props.has(id) && i === 1) continue
+                if (n.op === NodeOp.call && i === 2 && props.has(strippedAfter(graph, getRef(n, 1)))) continue
+                return false
+            }
+        }
+        return props.size > 0
+    }
     function ownProperties(traced: FastTraced): void {
         const graph = traced.graph
         const shapes = freshShapes(traced)
@@ -6263,6 +6338,11 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             const keys = keysAt(traced, shapes, getLiteral(graph, target, 0) as u32, getRef(n, 0))
             if (keys === undefined) throw `native: ${graph.name} enumerates an allocation whose keys are not statically known`
             const mode = getLiteral(graph, n, 3)
+            const record = getLiteral(graph, target, 0) as u32
+            if (mode === 0 && !traced.allocations.has(record) && onlyIterated(graph, id)) {
+                putNode(graph, id, NodeOp.after, [getOperand(graph, n, 0), addNode(graph, NodeOp.heapHandle, [{ literal: keyTupleOf(heap.deref(record as intrinsics.Handle), keys) }])])
+                continue
+            }
             const array = addNode(graph, NodeOp.rt, [getRef(n, 0), { literal: rt.Op.arrayLiteral }, { literal: keys.length }])
             let token = array
             for (let i = 0; i < keys.length; i++) {
@@ -7522,6 +7602,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
                 if (flags.has('trace-time')) console.log('TRACETIME', fn.name, (performance.now() - traceStart).toFixed(2), countNodes(traced.graph))
                 lowerPanics(traced.graph)
                 engineHeapArrays(traced.graph)
+                companionReads(traced.graph)
                 ownProperties(traced)
                 ownPresence(traced)
                 outlineCold(fn, code, traced)
@@ -7537,7 +7618,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         units.push(unit)
         return unit
     }
-    return { units, graphsOf, freeze, lowerPanics, engineElements, heapValue, traceProgramUnits, checkInlinedReads, foldStatics, fixedSlot, strippedAfter, reachableNodes }
+    return { units, graphsOf, freeze, lowerPanics, engineElements, heapValue, companions, traceProgramUnits, checkInlinedReads, foldStatics, fixedSlot, strippedAfter, reachableNodes }
 }
 
 type Tracer = ReturnType<typeof createTracer>
@@ -9664,7 +9745,7 @@ export function substituteConstantParams(graph: Graph, constants: Map<number, Pa
     }
 }
 
-function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock) {
+function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number) {
     const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget } = linker
     const { graphsOf, reachableNodes } = tracer
     const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values()]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys }
@@ -9701,6 +9782,12 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
                 const objects = objectRep(rep).targets.map(target => targetShape(plan, target))
                 if (objects.length && objects.every(m => m !== undefined)) answer.objects = objects as intrinsics.Handle[]
             }
+            out.set(node, answer)
+        }
+        for (const [node, rep] of unit.receivers) {
+            if (!isStringRep(rep) || rep.nullable) continue
+            const answer = out.get(node) ?? {}
+            answer.receiver = propertyEval.stringShape
             out.set(node, answer)
         }
         return out
@@ -9797,7 +9884,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const numeric = returned.kind === 'number' && !boxedFloat
         const objects = objectRep(returned)
         const members = numeric ? undefined : plannedMembers(plan, objects)
-        const result = numeric ? propertyEval.numberShape : members?.[0] ?? plannedShape(plan, objects)
+        const result = numeric ? propertyEval.numberShape : isStringRep(returned) ? propertyEval.stringShape : members?.[0] ?? plannedShape(plan, objects)
         const origin = originOf(callee)
         const target = callee === origin && unitOf(origin).restExtras === undefined && unitOf(origin).spreadFixed === undefined ? undefined : site.context !== undefined || site.target.op === NodeOp.localTarget ? link(callee) : session.linkFunction(callee)
         const worded = unionWord(unit.returns) && !unionWord(returned)
@@ -9814,6 +9901,16 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             target,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
         }
+    }
+    function tupleKeys(tuple: intrinsics.Handle, record: intrinsics.Handle): intrinsics.Handle[] | undefined {
+        const keys = tracer.engineElements.get(tuple)
+        if (!keys || !plan.fixedStatic(tuple, heap.indexKey(0))) return
+        for (const key of keys) {
+            if (!heap.isString(key) || !heap.getOwnProperty(record, key) || !plan.fixedStatic(record, key)) return
+            const desc = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(record, key)))
+            if (desc.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
+        }
+        return keys
     }
     function resolveUnit(fn: Function): Resolution {
         const unit = graphsOf(fn)
@@ -9916,7 +10013,7 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
             calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
-            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: unit.cold, forwardedKey,
+            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: unit.cold, forwardedKey, tupleKeys, wordsSlot,
         })
         plannedFunctionCalls(result.graph)
         const fieldTags = new Map([...sliceTags?.reads ?? [], ...result.tags])
@@ -10394,6 +10491,9 @@ function planShapes(types: ValueTypes, linker: Linker, tracer: Tracer, host: Acc
         return index ? heap.indexKey(Number(index[1]) as u32) : types.keyHandles.get(name)
     }
     const fixedStatic = (state: intrinsics.Handle, key: intrinsics.Handle) => fixedField(types, state, key)
+    for (const record of tracer.companions.keys()) {
+        if (!fixedState(types, record)) throw `native: @${record} is read with a computed key through its companion array, but compiled code writes it`
+    }
     const constructed = new Set([...session.sealed].map(cell => heap.indirectTarget(cell)))
     for (const state of constructed) if (fixedState(types, state)) readonlyConstructions.add(state)
     const owned = new Set(constructed)
@@ -11398,6 +11498,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const { plan, planned, reps } = clock.timed('plan', () => {
         const plan = planShapes(valueTypes, linker, tracer, host, genericOf, facts)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
+        for (const [cell, object] of plan.functionObjects.cells) image.functionObjects.set(cell, object)
         const planned = bindPlannedUnits(plan, linker)
         const reps = chooseRepresentations(plan, planned, linker, tracer, host)
         sharePlannedUnits(plan, planned, reps, host)
@@ -11414,7 +11515,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         }
         planned.rewrites.set(unit, graph => rewriteSmallSets(graph, uses, image.wordsSlot))
     }
-    const resolver = createResolver(linker, tracer, plan, planned, reps, facts, clock)
+    const resolver = createResolver(linker, tracer, plan, planned, reps, facts, clock, image.wordsSlot)
     const program = compileProgram(linker, tracer, resolver, plan, image, target, clock)
     if (typeDebug) program.explain = (symbol, param) => {
         const fn = functions[symbol]

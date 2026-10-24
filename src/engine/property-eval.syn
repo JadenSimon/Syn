@@ -56,6 +56,7 @@ export interface Answer {
     objects?: Handle[]
     functions?: Handle[]
     callee?: Handle
+    receiver?: Handle
 }
 
 export interface ObjectRequest {
@@ -76,6 +77,8 @@ export interface ObjectRequest {
     rawReturns?: boolean
     dynamic?: Map<number, Function>
     forwardedKey?: (getter: Handle) => Handle | undefined
+    tupleKeys?: (tuple: Handle, record: Handle) => Handle[] | undefined
+    wordsSlot?: (words: number[]) => number
 }
 
 export interface UnionParam {
@@ -993,6 +996,8 @@ function resolveProperties(
                 readUndefined(id, token)
                 return
             }
+            const tupled = keyRef && n.op === NodeOp.getProp ? tupleKey(keyRef, mem) : undefined
+            if (tupled) return readTupled(id, mem, token, tupled[0], tupled[1])
             if (keyRef) throw `property-eval: %${id} uses a computed key on a memory object without an index trap`
         }
         if (n.op === NodeOp.setProp && readonly(mem.shape)) throw `property-eval: %${id} writes a constructed object, which is placed in read-only memory`
@@ -1134,6 +1139,50 @@ function resolveProperties(
         if (storedShape !== undefined && !dead(id)) storeFact(mem.shape, String(mem.offsets[at]), storedShape, value[0])
     }
 
+    function tupleKey(keyRef: number, mem: Memory): [Operand, Handle[]] | undefined {
+        if (!opts.tupleKeys || mem.base || mem.reduced) return
+        const read = getNode(source, strippedValue(keyRef))
+        if (read?.op !== NodeOp.getProp) return
+        const tuple = getNode(source, strippedValue(getRef(read, 1)))
+        if (tuple?.op !== NodeOp.heapHandle || getRef(tuple, 0)) return
+        const keys = opts.tupleKeys(heap.deref(getLiteral(runtime, tuple, 0) as Handle), mem.shape)
+        if (!keys) return
+        return [getRef(read, 2) || { literal: getLiteral(runtime, read, 2) }, keys]
+    }
+    function readTupled(id: number, mem: Memory, token: number, index: Operand, keys: Handle[]): void {
+        const offsets: number[] = []
+        let codec: native.Codec | undefined
+        for (let i = 0; i < keys.length; i++) {
+            const at = mem.keys.indexOf(keys[i])
+            const plain = at >= 0 && !mem.flags[at] && !mem.tags[at] && mem.nested[at] === undefined && !opts.layouts.fixed?.get(mem.shape)?.has(keys[i]) && !opts.layouts.erased?.get(mem.shape)?.has(keys[i])
+            if (!plain) throw `property-eval: %${id} reads ${heap.describeKey(keys[i])} through a key tuple, but it is not a plain field`
+            const located = locate(mem.shape, String(mem.offsets[at]))
+            if (!located || (i && !sameCodec(codec, located))) throw `property-eval: %${id} reads through a key tuple whose fields lay out differently`
+            codec = located
+            offsets.push(mem.offsets[at])
+        }
+        const table = addNode(out, NodeOp.poolEntry, [{ literal: opts.wordsSlot!(offsets) }], Types.u64)
+        const scaled = typeof index === 'number' ? addNode(out, NodeOp.shl, [index, { literal: 2 }], Types.u64) : { literal: index.literal * 4 }
+        const offset = addNode(out, NodeOp.load, [readonlyToken(), table, scaled], Types.u32)
+        const address = addNode(out, NodeOp.add, [mem.ptr, offset], Types.u64)
+        const rawFloat = codec!.kind === 'f64' && !codec!.encoded
+        const signed = opts.answers?.get(id)?.signed
+        const load = addNode(out, NodeOp.load, [readonlyToken(), address, { literal: 0 }], rawFloat ? Types.f64 : wordCodec(codec) ? Types.vm_value : signed !== undefined ? signed ? Types.i64 : Types.u64 : native.intType(codec) ?? Types.u64)
+        putNode(out, id, NodeOp.after, [token, load])
+        if (rawFloat || codec!.kind === 'int') {
+            numbers.add(id)
+            return
+        }
+        if (codec!.kind === 'ref' && codec!.shape === stringShape) {
+            commit(id, stringShape)
+            return
+        }
+        if (codec!.kind === 'ref') {
+            bindLocated(id, codec!, load)
+            return
+        }
+        throw `property-eval: %${id} reads through a key tuple whose fields hold ${codec!.kind} values`
+    }
     const guardedSelects = new Set<number>()
     function resolveMixed(id: number, n: GraphNode, mem: Memory, token: number): void {
         const objects = { ...mem, primitives: undefined }
@@ -1198,6 +1247,15 @@ function resolveProperties(
         heap.setProperty(heap.prepareWrite(cell), key, slot)
     }
 
+    function wordGetter(id: number, n: GraphNode): void {
+        const addr = heap.getPropertyDescriptor(stringShape, getLiteral(runtime, n, 2) as Handle)
+        const desc = addr ? heap.FullPropertyDescriptor(heap.resolveHeapCell(addr)) : undefined
+        if (!desc || !(desc.flags & heap.PropFlags.has_getter) || opts.answers?.get(id)?.receiver !== stringShape) return
+        const callee = addNode(out, NodeOp.heapHandle, [{ literal: desc.slot0 }])
+        putNode(out, id, NodeOp.call, [getRef(n, 0), callee, getRef(n, 1)])
+        bindCall(id, true)
+        if (!bindings.has(id)) throw `property-eval: %${id} reads a string getter through a union word, but no planned unit takes the word as a string`
+    }
     function resolveString(id: number, n: GraphNode): void {
         if (n.op !== NodeOp.getProp || getRef(n, 2)) throw `property-eval: %${id} is not a named read of a string`
         const addr = heap.getPropertyDescriptor(stringShape, getLiteral(runtime, n, 2) as Handle)
@@ -2506,6 +2564,7 @@ function resolveProperties(
             return
         }
         if (!memory.has(object) && !cells.has(object) && !unions.has(object)) {
+            if (bindings.get(object)?.union && n.op === NodeOp.getProp && !getRef(n, 2)) wordGetter(id, n)
             evaluated.add(id)
             return
         }
