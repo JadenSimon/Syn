@@ -638,6 +638,49 @@ function readMark(marks: CrashMarks, line: string): void {
     }
 }
 
+interface BaselineSection {
+    lines: string[]
+    cases: string[]
+    ms: number
+    phases: Record<string, number>
+    since?: number
+}
+
+function caseMs(ms: number): number {
+    if (ms < 0.5) return 0
+    const scale = 10 ** Math.floor(Math.log10(Math.max(1, ms)))
+    const mantissa = ms / scale
+    if (mantissa < 1.4) return scale
+    if (mantissa < 3.2) return 2 * scale
+    if (mantissa < 7.1) return 5 * scale
+    return 10 * scale
+}
+
+function stopClock(section: BaselineSection | undefined): void {
+    if (section?.since === undefined) return
+    section.ms += performance.now() - section.since
+    section.since = undefined
+}
+
+function writeBaselines(sections: Map<string, BaselineSection>, load: number): void {
+    const cpus = os.cpus()
+    const model = cpus[0]?.model ?? 'unknown'
+    const file = path.resolve('baselines', `${model.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${os.arch()}.txt`)
+    const kept = new Map<string, string>()
+    const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
+    for (const chunk of text.split('\n== ').slice(1)) kept.set(chunk.slice(0, chunk.indexOf('\n')), `== ${chunk.trimEnd()}\n`)
+    for (const [key, section] of sections) {
+        const accounted = Object.values(section.phases).reduce((a, b) => a + b, 0)
+        const phases = Object.entries({ ...section.phases, harness: Math.max(0, section.ms - accounted) })
+        const percents = phases.map(([phase, ms]) => [phase, Math.round(ms * 100 / Math.max(1, section.ms))] as const).filter(x => x[1] > 0)
+        const out = [`== ${key}`, `total ${(section.ms / 1000).toFixed(1)}s load ${load}`, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.lines, ...section.cases]
+        kept.set(key, out.join('\n') + '\n')
+    }
+    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${model}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>']
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, [header.join('\n') + '\n', ...[...kept.keys()].sort().map(key => kept.get(key))].join('\n'))
+}
+
 function crashOf(code: number | null, signal: string | null): string | undefined {
     const signals = os.constants.signals as Record<string, number>
     const name = signal ?? Object.keys(signals).find(k => code !== null && code > 128 && signals[k] === code - 128)
@@ -655,6 +698,9 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     let exitCode = 0
     let failures = 0
     let killed: string | undefined
+    const load = Math.round(os.loadavg()[0])
+    const sections = new Map<string, BaselineSection>()
+    let section: BaselineSection | undefined
     while (true) {
         const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
@@ -666,15 +712,34 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
             const lines = (pending + chunk).split('\n')
             pending = lines.pop()!
             for (const line of lines) {
-                if (line === 'fail') failures++
-                else readMark(marks, line)
+                const fields = line.split('\t')
+                if (fields[0] === 'fail') {
+                    failures++
+                    section?.lines.push(`fail ${line.slice(5)}`)
+                    continue
+                }
+                readMark(marks, line)
+                if (fields[0] === 'suite') {
+                    stopClock(section)
+                    section = sections.get(fields[2]) ?? { lines: [], cases: [], ms: 0, phases: {} }
+                    sections.set(fields[2], section)
+                    section.since = performance.now()
+                } else if (fields[0] === 'end' && fields.length > 2 && section) {
+                    section.cases.push(`case ${fields[1]} ${fields[2]} ${fields[3]} ${fields[4]} ${caseMs(Number(fields[5]))}`)
+                } else if (fields[0] === 'done' && section) {
+                    stopClock(section)
+                    for (const [phase, ms] of Object.entries(JSON.parse(fields[1]) as Record<string, number>)) section.phases[phase] = (section.phases[phase] ?? 0) + ms
+                }
             }
         })
         const [code, signal] = await new Promise<[number | null, string | null]>(resolve => child.on('close', (c, s) => resolve([c, s])))
         const message = crashOf(code, signal)
+        stopClock(section)
         if (!message) {
             exitCode = code ?? 128 + ((os.constants.signals as Record<string, number>)[signal!] ?? 0)
             if (signal) killed = seconds > 0 && Date.now() >= deadline ? `watchdog timeout after ${seconds}s` : `killed by ${signal}`
+            if (killed && marks.caseNumber !== undefined) section?.lines.push(`${killed} in ${marks.caseLabel}`)
+            else if (killed) section?.lines.push(killed)
             break
         }
         let label = marks.suite ?? args[1]
@@ -688,6 +753,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
             if (marks.suite !== undefined && following) next = { suite: following, case: 0 }
         }
         console.log(`${label} FAILED: ${message}`)
+        section?.lines.push(`crash ${label}: ${message}`)
         crashes.push(label)
         if (!next || crashes.length >= maxCrashes) {
             console.log('...max crash count exceeded')
@@ -696,6 +762,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         }
         resume = next
     }
+    if (sections.size && !args.some(a => /^(only|skip|bench)(:|$)/.test(a))) writeBaselines(sections, load)
     if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
     if (!exitCode && (failures || crashes.length)) exitCode = 1
     const problems = [`${failures} failures`, `${crashes.length} crashes`]
