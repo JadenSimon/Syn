@@ -80,6 +80,7 @@ let nativeMapper: any
 let nativeCopier: any
 let nativeSealer: any
 let nativeInvoker: any
+let nativeProtector: any
 let heldArgs: any
 const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64'
 function declareNative(ptr: any, args: number[], returns: number): any {
@@ -228,14 +229,29 @@ function relocatedWord(address: number, size: number): Relocation | undefined | 
     for (let word = address - 7; word < address + size; word++) if (relocatedWords.has(word)) return null
 }
 
+const guardBytes = 1 << 20
+
+function protectNative(ptr: any, length: number, prot: number): void {
+    const status = Number(nativeProtector(ptr, length, prot))
+    if (status !== 0) throw `native: mprotect failed with ${status}`
+}
+
+function mapGuarded(bytes: number): number {
+    getNativeBootstraps()
+    const size = align(bytes, guardBytes)
+    const base = Number(nativeMapper(size + guardBytes))
+    if (!base || base === -1) return 0
+    protectNative(base + size, guardBytes, syscalls.PROT_NONE)
+    return base
+}
+
 let heapRegion = -1
 const heapRegionBytes = heap.boxedCellBit + heap.runtimeCells + (1 << 24)
 let runtimeHeapAddress: number | undefined
 function runtimeHeapBase(): number {
     if (runtimeHeapAddress !== undefined) return runtimeHeapAddress
-    getNativeBootstraps()
-    const base = Number(nativeMapper(heapRegionBytes))
-    if (!base || base === -1) throw 'native: failed to map the runtime heap'
+    const base = mapGuarded(heapRegionBytes)
+    if (!base) throw 'native: failed to map the runtime heap'
     runtimeHeapAddress = base
     heapRegion = addRegion(RegionKind.heap, 0, base, heapRegionBytes)
     writeRuntimeHeap(heap.runtimeCells, new Uint8Array(new Uint32Array([heap.runtimeCells + 8]).buffer))
@@ -338,9 +354,8 @@ const pstackRegions = new Map<number, number>()
 function pstackCell(stack: number): number {
     const known = pstackCells.get(stack)
     if (known !== undefined) return known
-    getNativeBootstraps()
-    const cell = Number(nativeMapper(pstackRegionBytes))
-    if (!cell || cell === -1) throw `native: failed to map pstack ${stack}`
+    const cell = mapGuarded(pstackRegionBytes)
+    if (!cell) throw `native: failed to map pstack ${stack}`
     const top = new BigUint64Array([BigInt(cell + 8)])
     if (!nativeCopier(cell, (ts as any).getArrayBufferPtr(top.buffer), 8)) throw `native: failed to seed pstack ${stack}`
     pstackCells.set(stack, cell)
@@ -1314,10 +1329,12 @@ function getNativeBootstraps() {
     const copier = lowerValueGraph(trace2(copyCode).graph, { target: hostTarget })
     const sealer = lowerValueGraph(trace2(sealCodePage).graph, { target: hostTarget })
     const invoker = lowerValueGraph(trace2(invokeNative).graph, { target: hostTarget })
+    const protector = lowerValueGraph(trace2(protectPages).graph, { target: hostTarget })
     nativeMapper = bootstrapFn('mapCodePage', mapper)
     nativeCopier = bootstrapFn('copyCode', copier)
     nativeSealer = bootstrapFn('sealCodePage', sealer)
     nativeInvoker = bootstrapFn('invokeNative', invoker)
+    nativeProtector = bootstrapFn('protectPages', protector)
     if (flags.has('bootstrap-debug')) {
         console.log('--- listing mapper ---')
         console.log(mapper.listing)
@@ -11865,22 +11882,15 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
     return bytes
 }
 
-let nativeProtector: any
-
 export function withRegionsProtected<T>(run: () => T): T {
-    nativeProtector ??= (ts as any).createNativeFn(new Uint8Array(lowerValueGraph(trace2(protectPages).graph, { target: hostTarget }).bytes))
-    const protect = (ptr: any, length: number, prot: number): void => {
-        const status = Number(nativeProtector(ptr, length, prot))
-        if (status !== 0) throw `native: mprotect failed with ${status}`
-    }
     const data: NativeRegion[] = nativeRegions.filter(region => region.kind !== RegionKind.code)
-    for (const region of data) protect(region.base, align(region.size, 4096), syscalls.PROT_NONE)
-    for (const page of codePages) protect(page.ptr, page.length, syscalls.PROT_NONE)
+    for (const region of data) protectNative(region.base, align(region.size, 4096), syscalls.PROT_NONE)
+    for (const page of codePages) protectNative(page.ptr, page.length, syscalls.PROT_NONE)
     try {
         return run()
     } finally {
-        for (const region of data) protect(region.base, align(region.size, 4096), syscalls.PROT_READ | syscalls.PROT_WRITE)
-        for (const page of codePages) protect(page.ptr, page.length, page.sealed ? syscalls.PROT_READ | syscalls.PROT_EXEC : syscalls.PROT_READ | syscalls.PROT_WRITE)
+        for (const region of data) protectNative(region.base, align(region.size, 4096), syscalls.PROT_READ | syscalls.PROT_WRITE)
+        for (const page of codePages) protectNative(page.ptr, page.length, page.sealed ? syscalls.PROT_READ | syscalls.PROT_EXEC : syscalls.PROT_READ | syscalls.PROT_WRITE)
     }
 }
 
@@ -11960,7 +11970,8 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     const bases: number[] = []
     for (const region of regions) {
         const slack = region.kind === RegionKind.code ? 4096 : 0
-        const mapped = Number(nativeMapper(align(region.size + slack, 4096)))
+        const guarded = region.kind === RegionKind.pstack || region.kind === RegionKind.heap
+        const mapped = guarded ? mapGuarded(region.size) : Number(nativeMapper(align(region.size + slack, 4096)))
         if (!mapped || mapped === -1) throw 'native: failed to map an image region'
         bases.push(region.kind === RegionKind.code ? mapped + (region.base & 4095) : mapped)
     }
