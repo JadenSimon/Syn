@@ -9,24 +9,30 @@ type Ast =
     | { kind: 'class', ranges: Range[], negate: boolean }
     | { kind: 'assert', assertion: Assertion }
     | { kind: 'sequence' | 'choice', children: Ast[] }
-    | { kind: 'repeat', child: Ast, min: number, max: number, lazy: boolean }
+    | { kind: 'repeat', child: Ast, min: number, max: number, lazy: boolean, groups: Range }
+    | { kind: 'group', child: Ast, index: number }
 
 type Instruction =
     | { op: 'match' }
     | { op: 'class', ranges: Range[], negate: boolean, next: number }
     | { op: 'assert', assertion: Assertion, next: number }
     | { op: 'split', first: number, second: number }
+    | { op: 'save', slot: number, next: number }
+    | { op: 'reset', groups: Range, next: number }
+    | { op: 'progress', start: number, next: number }
 
 interface Flags {
     ignoreCase: boolean
     multiline: boolean
     dotAll: boolean
+    global: boolean
 }
 
 interface Program {
     flags: Flags
     instructions: Instruction[]
     entry: number
+    groups: number
 }
 
 const digits: Range[] = [[48, 57]]
@@ -37,10 +43,10 @@ function parseFlags(text: string): Flags {
     const seen = new Set<string>()
     for (const c of text) {
         if (seen.has(c)) throw new SyntaxError(`regex: duplicate flag ${c}`)
-        if (!'ims'.includes(c)) throw new SyntaxError(`regex: unsupported flag ${c}`)
+        if (!'gims'.includes(c)) throw new SyntaxError(`regex: unsupported flag ${c}`)
         seen.add(c)
     }
-    return { ignoreCase: seen.has('i'), multiline: seen.has('m'), dotAll: seen.has('s') }
+    return { ignoreCase: seen.has('i'), multiline: seen.has('m'), dotAll: seen.has('s'), global: seen.has('g') }
 }
 
 function contains(ranges: Range[], c: number, ignoreCase: boolean): boolean {
@@ -76,9 +82,10 @@ function controlEscape(c: string): number | undefined {
     if (c === '0') return 0
 }
 
-function parse(source: string, flags: Flags): Ast {
+function parse(source: string, flags: Flags): [Ast, number] {
     let at = 0
     let depth = 0
+    let groups = 0
     function fail(message: string): never {
         throw new SyntaxError(`regex at ${at}: ${message}`)
     }
@@ -148,15 +155,20 @@ function parse(source: string, flags: Flags): Ast {
     function group(): Ast {
         depth++
         if (depth > 128) return fail('group nesting limit exceeded')
+        let index = 0
         if (source[at] === '?') {
             if (source.slice(at, at + 2) !== '?:') return fail('lookaround and named groups are unsupported')
             at += 2
+        } else {
+            groups++
+            index = groups
         }
         const child = choice()
         if (source[at] !== ')') return fail('unterminated group')
         at++
         depth--
-        return child
+        if (!index) return child
+        return { kind: 'group', child, index }
     }
     function atom(): Ast {
         const c = source[at]
@@ -178,7 +190,7 @@ function parse(source: string, flags: Flags): Ast {
         if (n > 1000) return fail('repetition count limit exceeded')
         return n
     }
-    function quantified(child: Ast): Ast {
+    function quantified(child: Ast, firstGroup: number): Ast {
         const c = source[at]
         if (c !== '*' && c !== '+' && c !== '?' && c !== '{') return child
         if (child.kind === 'assert') return fail('quantified assertion')
@@ -197,11 +209,14 @@ function parse(source: string, flags: Flags): Ast {
         }
         const lazy = source[at] === '?'
         if (lazy) at++
-        return { kind: 'repeat', child, min, max, lazy }
+        return { kind: 'repeat', child, min, max, lazy, groups: [firstGroup + 1, groups] }
     }
     function sequence(): Ast {
         const children: Ast[] = []
-        while (at < source.length && source[at] !== ')' && source[at] !== '|') children.push(quantified(atom()))
+        while (at < source.length && source[at] !== ')' && source[at] !== '|') {
+            const firstGroup = groups
+            children.push(quantified(atom(), firstGroup))
+        }
         if (children.length === 0) return { kind: 'empty' }
         if (children.length === 1) return children[0]
         return { kind: 'sequence', children }
@@ -217,7 +232,16 @@ function parse(source: string, flags: Flags): Ast {
     }
     const result = choice()
     if (at !== source.length) return fail('unmatched closing group')
-    return result
+    return [result, groups]
+}
+
+function nullable(ast: Ast): boolean {
+    if (ast.kind === 'empty' || ast.kind === 'assert') return true
+    if (ast.kind === 'class') return false
+    if (ast.kind === 'group') return nullable(ast.child)
+    if (ast.kind === 'repeat') return ast.min === 0 || nullable(ast.child)
+    if (ast.kind === 'sequence') return ast.children.every(nullable)
+    return ast.children.some(nullable)
 }
 
 function compile(source: string, flagText: string): Program {
@@ -246,6 +270,10 @@ function compile(source: string, flagText: string): Program {
         if (ast.kind === 'empty') return next
         if (ast.kind === 'class') return emit({ op: 'class', ranges: caseFolded(ast.ranges), negate: ast.negate, next })
         if (ast.kind === 'assert') return emit({ op: 'assert', assertion: ast.assertion, next })
+        if (ast.kind === 'group') {
+            const end = emit({ op: 'save', slot: ast.index * 2 + 1, next })
+            return emit({ op: 'save', slot: ast.index * 2, next: build(ast.child, end) })
+        }
         if (ast.kind === 'sequence') {
             for (let i = ast.children.length - 1; i >= 0; i--) next = build(ast.children[i], next)
             return next
@@ -257,17 +285,29 @@ function compile(source: string, flagText: string): Program {
         }
         if (ast.max === Infinity) {
             const loop = emit({ op: 'split', first: next, second: next })
-            const body = build(ast.child, loop)
+            const body = iteration(ast, loop, true)
             instructions[loop] = ast.lazy ? { op: 'split', first: next, second: body } : { op: 'split', first: body, second: next }
             next = loop
         } else {
-            for (let i = ast.min; i < ast.max; i++) next = split(build(ast.child, next), next, ast.lazy)
+            for (let i = ast.min; i < ast.max; i++) next = split(iteration(ast, next, true), next, ast.lazy)
         }
-        for (let i = 0; i < ast.min; i++) next = build(ast.child, next)
+        for (let i = 0; i < ast.min; i++) next = iteration(ast, next, false)
         return next
     }
-    const entry = build(parse(source, flags), 0)
-    return { flags, instructions, entry }
+    function iteration(ast: Extract<Ast, { kind: 'repeat' }>, next: number, optional: boolean): number {
+        if (!optional || !nullable(ast.child)) {
+            const body = build(ast.child, next)
+            if (ast.groups[0] > ast.groups[1]) return body
+            return emit({ op: 'reset', groups: ast.groups, next: body })
+        }
+        const check = emit({ op: 'progress', start: 0, next })
+        const start = emit({ op: 'reset', groups: ast.groups, next: build(ast.child, check) })
+        instructions[check] = { op: 'progress', start, next }
+        return start
+    }
+    const [ast, groups] = parse(source, flags)
+    const entry = build(ast, 0)
+    return { flags, instructions, entry, groups }
 }
 
 function wordTest(c: string): string {
@@ -289,14 +329,23 @@ function classTest(ranges: Range[], negate: boolean): string {
     return negate ? `!${matches}` : matches
 }
 
-function emitSource(program: Program): string {
+interface Path {
+    leaf: number
+    condition: string
+    saves: Map<number, string>
+}
+
+function seedsOf(program: Program): number[] {
     const seeds: number[] = []
     for (const ins of program.instructions) {
         if (ins.op === 'class' && !seeds.includes(ins.next)) seeds.push(ins.next)
     }
-    const clauses = new Map<number, string[]>()
+    return seeds
+}
+
+function pathFinder(program: Program): (pc: number, condition: string) => Path[] {
     let expansions = 0
-    function closure(pc: number, condition: string, path: Set<number>): void {
+    function walk(pc: number, condition: string, saves: Map<number, string>, path: Set<number>, out: Path[]): void {
         if (path.has(pc)) return
         expansions++
         if (expansions > 32768) throw new SyntaxError('regex: epsilon expansion limit exceeded')
@@ -304,20 +353,70 @@ function emitSource(program: Program): string {
         nextPath.add(pc)
         const ins = program.instructions[pc]
         if (ins.op === 'split') {
-            closure(ins.first, condition, nextPath)
-            closure(ins.second, condition, nextPath)
+            walk(ins.first, condition, saves, nextPath, out)
+            walk(ins.second, condition, saves, nextPath, out)
             return
         }
         if (ins.op === 'assert') {
-            closure(ins.next, `(${condition}&&(${assertionTest(program.flags, ins.assertion)}))`, nextPath)
+            walk(ins.next, `(${condition}&&(${assertionTest(program.flags, ins.assertion)}))`, saves, nextPath, out)
             return
         }
-        const list = clauses.get(pc)
-        if (list) list.push(condition)
-        else clauses.set(pc, [condition])
+        if (ins.op === 'progress') {
+            if (!path.has(ins.start)) walk(ins.next, condition, saves, nextPath, out)
+            return
+        }
+        if (ins.op === 'save') {
+            const nextSaves = new Map(saves)
+            nextSaves.set(ins.slot, 'p')
+            walk(ins.next, condition, nextSaves, nextPath, out)
+            return
+        }
+        if (ins.op === 'reset') {
+            const nextSaves = new Map(saves)
+            for (let k = ins.groups[0]; k <= ins.groups[1]; k++) {
+                nextSaves.set(k * 2, '-1')
+                nextSaves.set(k * 2 + 1, '-1')
+            }
+            walk(ins.next, condition, nextSaves, nextPath, out)
+            return
+        }
+        out.push({ leaf: pc, condition, saves })
     }
-    closure(program.entry, '1', new Set())
-    for (const pc of seeds) closure(pc, `s${pc}`, new Set())
+    return (pc, condition) => {
+        const out: Path[] = []
+        walk(pc, condition, new Map(), new Set(), out)
+        return out
+    }
+}
+
+function skipSaves(program: Program, pc: number): number {
+    let ins = program.instructions[pc]
+    while (ins.op === 'save' || ins.op === 'reset') {
+        pc = ins.next
+        ins = program.instructions[pc]
+    }
+    return pc
+}
+
+function emitSource(program: Program): string {
+    if (program.flags.global) return 'function regexTest(text) {\nreturn this.exec(text)!==null;\n}'
+    const seeds: number[] = []
+    for (const ins of program.instructions) {
+        if (ins.op !== 'class') continue
+        const seed = skipSaves(program, ins.next)
+        if (!seeds.includes(seed)) seeds.push(seed)
+    }
+    const paths = pathFinder(program)
+    const clauses = new Map<number, string[]>()
+    function collect(pc: number, condition: string): void {
+        for (const path of paths(pc, condition)) {
+            const list = clauses.get(path.leaf)
+            if (list) list.push(path.condition)
+            else clauses.set(path.leaf, [path.condition])
+        }
+    }
+    collect(program.entry, '1')
+    for (const pc of seeds) collect(pc, `s${pc}`)
     const lines = ['function regexTest(text) {', 'const length=text.length;']
     for (const pc of seeds) lines.push(`let s${pc}=0;`)
     lines.push('for(let p=0;p<=length;p++){')
@@ -329,7 +428,7 @@ function emitSource(program: Program): string {
     for (const pc of seeds) lines.push(`let n${pc}=0;`)
     for (const [pc, conditions] of clauses) {
         const ins = program.instructions[pc]
-        if (ins.op === 'class') lines.push(`if((${conditions.join('||')})&&p<length&&(${classTest(ins.ranges, ins.negate)}))n${ins.next}=1;`)
+        if (ins.op === 'class') lines.push(`if((${conditions.join('||')})&&p<length&&(${classTest(ins.ranges, ins.negate)}))n${skipSaves(program, ins.next)}=1;`)
     }
     for (const pc of seeds) lines.push(`s${pc}=n${pc};`)
     lines.push('}')
@@ -338,15 +437,115 @@ function emitSource(program: Program): string {
     return lines.join('\n')
 }
 
-const matchers = new Map<string, (text: string) => boolean>()
+function emitExec(program: Program): string {
+    const seeds = seedsOf(program)
+    if (seeds.length > 64) throw new SyntaxError('regex: exec state limit exceeded')
+    const paths = pathFinder(program)
+    const slots = [0]
+    for (let k = 1; k <= program.groups; k++) slots.push(k * 2, k * 2 + 1)
+    const sources = seeds.map(pc => paths(pc, `a${pc}`))
+    const entry = paths(program.entry, 'matched===0')
+    let width = entry.length
+    for (const list of sources) {
+        if (list.length > width) width = list.length
+    }
+    const entryKey = seeds.length * width
+    const none = entryKey + width
+    const leaves: number[] = []
+    for (const list of [entry, ...sources]) {
+        for (const path of list) {
+            if (!leaves.includes(path.leaf)) leaves.push(path.leaf)
+        }
+    }
+    const global = program.flags.global
+    const lines = ['function regexExec(text) {', 'const length=text.length;']
+    if (global) {
+        lines.push('const from=this.lastIndex;')
+        lines.push('if(from>length){this.lastIndex=0;return null;}')
+    } else {
+        lines.push('const from=0;')
+    }
+    lines.push('let matched=0;')
+    lines.push('let m1=-1;')
+    for (const k of slots) lines.push(`let m${k}=-1;`)
+    for (const pc of seeds) {
+        lines.push(`let a${pc}=0;`)
+        lines.push(`let r${pc}=0;`)
+        for (const k of slots) lines.push(`let c${pc}_${k}=-1;`)
+    }
+    lines.push('for(let p=from;p<=length;p++){')
+    lines.push('const c=p<length?text.charCodeAt(p):-1;')
+    lines.push('const before=p>0?text.charCodeAt(p-1):-1;')
+    for (const leaf of leaves) {
+        lines.push(`let k${leaf}=${none};`)
+        for (const k of slots) lines.push(`let l${leaf}_${k}=-1;`)
+    }
+    function take(path: Path, key: string, slot: (k: number) => string): void {
+        const copies = slots.map(k => `l${path.leaf}_${k}=${path.saves.get(k) ?? slot(k)};`)
+        lines.push(`if(${path.condition}&&${key}<k${path.leaf}){k${path.leaf}=${key};${copies.join('')}}`)
+    }
+    for (let i = 0; i < seeds.length; i++) {
+        const pc = seeds[i]
+        for (let j = 0; j < sources[i].length; j++) take(sources[i][j], `r${pc}*${width}+${j}`, k => `c${pc}_${k}`)
+    }
+    for (let j = 0; j < entry.length; j++) take(entry[j], `${entryKey + j}`, k => k === 0 ? 'p' : '-1')
+    lines.push(`let cut=${none};`)
+    if (leaves.includes(0)) {
+        const copies = slots.map(k => `m${k}=l0_${k};`)
+        lines.push(`if(k0<${none}){matched=1;cut=k0;m1=p;${copies.join('')}}`)
+    }
+    for (const pc of seeds) {
+        lines.push(`let b${pc}=${none};`)
+        for (const k of slots) lines.push(`let d${pc}_${k}=-1;`)
+    }
+    for (const leaf of leaves) {
+        const ins = program.instructions[leaf]
+        if (ins.op !== 'class') continue
+        const copies = slots.map(k => `d${ins.next}_${k}=l${leaf}_${k};`)
+        lines.push(`if(k${leaf}<cut&&k${leaf}<b${ins.next}&&p<length&&(${classTest(ins.ranges, ins.negate)})){b${ins.next}=k${leaf};${copies.join('')}}`)
+    }
+    for (const pc of seeds) {
+        lines.push(`a${pc}=b${pc}<${none}?1:0;`)
+        for (const k of slots) lines.push(`c${pc}_${k}=d${pc}_${k};`)
+    }
+    for (const pc of seeds) {
+        const earlier = seeds.filter(other => other !== pc).map(other => `(b${other}<b${pc}?1:0)`)
+        lines.push(`r${pc}=${earlier.length ? earlier.join('+') : '0'};`)
+    }
+    const live = seeds.map(pc => `a${pc}===1`)
+    lines.push(`if(matched===1&&!(${live.length ? live.join('||') : 'false'}))break;`)
+    lines.push('}')
+    lines.push(global ? 'if(matched===0){this.lastIndex=0;return null;}' : 'if(matched===0)return null;')
+    if (global) lines.push('this.lastIndex=m1;')
+    const captures = ['text.slice(m0,m1)']
+    for (let k = 1; k <= program.groups; k++) captures.push(`m${k * 2 + 1}>=0?text.slice(m${k * 2},m${k * 2 + 1}):undefined`)
+    lines.push(`const result=[${captures.join(',')}];`)
+    lines.push('result.index=m0;')
+    lines.push('result.input=text;')
+    lines.push('return result;')
+    lines.push('}')
+    return lines.join('\n')
+}
 
-export function compileMatcher(source: string, flags: string): (text: string) => boolean {
-    const key = JSON.stringify([source, flags])
-    const known = matchers.get(key)
+export type Match = (string | undefined)[] & { index: number, input: string }
+
+const generated = new Map<string, Function>()
+
+function generate(emit: (program: Program) => string, source: string, flags: string): Function {
+    const key = JSON.stringify([emit.name, source, flags])
+    const known = generated.get(key)
     if (known) return known
-    const text = emitSource(compile(source, flags))
+    const text = emit(compile(source, flags))
     const fn = new Function(`return (${text})`)()
     Object.defineProperty(fn, Symbol.for('toComputation'), { value: () => [text, []] })
-    matchers.set(key, fn)
+    generated.set(key, fn)
     return fn
+}
+
+export function compileMatcher(source: string, flags: string): (text: string) => boolean {
+    return generate(emitSource, source, flags) as (text: string) => boolean
+}
+
+export function compileExec(source: string, flags: string): (text: string) => Match | null {
+    return generate(emitExec, source, flags) as (text: string) => Match | null
 }

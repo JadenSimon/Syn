@@ -5,19 +5,48 @@
 import * as intrinsics from '../intrinsics'
 import * as heap from '../heap'
 import { bind, Op, rt } from '../rt'
-import { compileMatcher } from '../regex'
+import { compileExec, compileMatcher, type Match } from '../regex'
 import { defineGlobal } from './globals'
+import { substitute } from './String'
 import type { Case } from '../harness'
 
 export class RegExp {
     declare source: string
     declare flags: string
+    declare lastIndex: number
     declare test: (text: string) => boolean
+    declare exec: (text: string) => Match | null
 
     constructor(source?: string, flags?: string) {
         this.source = source === undefined ? '' : source
         this.flags = flags === undefined ? '' : flags
+        this.lastIndex = 0
         this.test = rt.compileRegex(source, flags)
+        this.exec = rt.compileRegexExec(source, flags)
+    }
+
+    // XXX: replacements run as matches are found but ES collects every match first
+    [Symbol.replace](text: string, replacement: any): string {
+        const global = this.flags.includes('g')
+        const template = typeof replacement === 'function' ? '' : `${replacement}`
+        if (global) this.lastIndex = 0
+        let result = ''
+        let next = 0
+        while (true) {
+            const match = this.exec(text)
+            if (match === null) break
+            const matched = match[0] as string
+            const position = match.index
+            const replaced = typeof replacement === 'function' ? `${replacement(...match, position, text)}` : substitute(template, text, position, match)
+            if (position >= next) {
+                result = result + text.slice(next, position) + replaced
+                next = position + matched.length
+            }
+            if (!global) break
+            if (matched.length === 0) this.lastIndex = this.lastIndex + 1
+        }
+        if (next >= text.length) return result
+        return result + text.slice(next)
     }
 }
 
@@ -39,6 +68,10 @@ function stringArg(value: intrinsics.Handle): string {
 
 bind(Op.compileRegex, {
     fold: ([source, flags], ctx) => ctx.fromJsValue(compileMatcher(stringArg(source), stringArg(flags))),
+})
+
+bind(Op.compileRegexExec, {
+    fold: ([source, flags], ctx) => ctx.fromJsValue(compileExec(stringArg(source), stringArg(flags))),
 })
 
 export async function suite() {
@@ -89,8 +122,34 @@ export async function suite() {
             }
         }
     })
+    harness.test('exec-differential', () => {
+        const atoms = ['a', '(a)', '(a|b)', '(a*)', '(?:(a)|b)', '[ab]', '.', '\\b', '^', '$', '(a?)', '()', '(?:a|)', '((a)|(b))', '(a+?)', '(?:(a)|(b\\d))', '(\\S+) ']
+        const texts = ['', 'a', 'b', 'aa', 'ab', 'ba', 'aab', 'abab', 'a1', ' a ', '\na', 'a\n', 'b1ab2 a']
+        for (const left of atoms) {
+            for (const right of atoms) {
+                for (const repeat of ['', '?', '*', '+', '{0,2}', '*?', '+?', '{2}']) {
+                    if (repeat && (left === '^' || left === '$' || left === '\\b')) continue
+                    for (const flags of ['', 'i', 'g', 'gi', 'gm']) {
+                        const source = left + repeat + right
+                        const generated = compileExec(source, flags)
+                        const reference = new HostRegExp(source, flags)
+                        for (const text of texts) {
+                            for (let from = 0; from <= text.length + 1; from++) {
+                                const state = { lastIndex: from }
+                                reference.lastIndex = from
+                                const expected = reference.exec(text)
+                                const actual = generated.call(state, text)
+                                const same = state.lastIndex === reference.lastIndex && (expected === null ? actual === null : actual !== null && actual.index === expected.index && actual.input === text && JSON.stringify([...actual]) === JSON.stringify([...expected]))
+                                check(same, `exec /${source}/${flags} ${JSON.stringify(text)} from ${from}: ${JSON.stringify(actual && [...actual])} vs ${JSON.stringify(expected && [...expected])}`)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
     harness.test('syntax-errors', () => {
-        const invalid = [['(', ''], ['[a', ''], ['[z-a]', ''], ['a{3,2}', ''], ['a**', ''], ['\\', ''], ['(?=a)', ''], ['(a)\\1', ''], ['é', ''], ['a', 'g'], ['a', 'ii'], ['a{1001}', '']]
+        const invalid = [['(', ''], ['[a', ''], ['[z-a]', ''], ['a{3,2}', ''], ['a**', ''], ['\\', ''], ['(?=a)', ''], ['(a)\\1', ''], ['é', ''], ['a', 'y'], ['a', 'ii'], ['a{1001}', '']]
         for (const [source, flags] of invalid) {
             let rejected = false
             try {
@@ -179,6 +238,66 @@ export async function suite() {
         [capturedOther, ...indices],
         [capturedShared, []],
         [capturedMany, []],
+    ])
+    const asm = ['add x1, x2, #4', 'sub w3, w3, #1', 'mov x0, x1', 'ldr x2, [x3, #8]', 'str w4, [sp]', 'cmp w12, w2', 'addw x9 x19', '[12]', '[x]', 'a\n  b\n\tc']
+    const asmIndices = asm.map((_, i) => [i])
+    function replaceGroup(index: u32): string {
+        return asm[index].replace(/^(add|sub)/, '$1s')
+    }
+    function replaceTemplate(index: u32): string {
+        return asm[index].replace(/\[[^\]]*\]$/, `[x${index}, #${index * 8}]`)
+    }
+    function replaceCallback(index: u32): string {
+        return asm[index].replace(/^(\S+) ([xw])\d+,/, (_, op, width) => `${op} ${width === 'w' ? 'w' : 'x'}${index},`)
+    }
+    function replaceGlobal(index: u32): string {
+        return asm[index].replace(/\b([xw])(\d+)\b/g, (name, width, n) => Number(n) === 1 || Number(n) === 2 ? `${width}${index}` : name)
+    }
+    function replaceSpaces(index: u32): string {
+        return asm[index].replace(/\n\s*/g, ' ')
+    }
+    function replaceSpecials(index: u32): string {
+        return asm[index].replace(/[xw](\d)/, '<$&|$$|$1|$2|$`|$\'>')
+    }
+    function replaceEmpty(index: u32): string {
+        return asm[index].replace(/x*/g, '-')
+    }
+    function execIndex(index: u32): number {
+        const match = /^\[(\d+)\]$/.exec(asm[index])
+        return match ? Number(match[1]) * 100 + match.index * 10 + match.length : -1
+    }
+    function execGroups(index: u32): string {
+        const match = /((a)|b)+(c?)/.exec(asm[index] + 'abab')
+        return match ? `${match[0]}:${match[1]}:${match[3]}:${match.index}` : 'none'
+    }
+    function execGlobal(index: u32): number {
+        const regex = /[xw](\d+)/g
+        let total = 0
+        let match = regex.exec(asm[index])
+        while (match) {
+            total = total * 100 + Number(match[1]) * 10 + regex.lastIndex
+            match = regex.exec(asm[index])
+        }
+        return total * 10 + regex.lastIndex
+    }
+    function testGlobal(index: u32): number {
+        const regex = /x/g
+        const first = regex.test(asm[index]) ? 1 : 0
+        const second = regex.test(asm[index]) ? 1 : 0
+        return first * 100 + second * 10 + regex.lastIndex
+    }
+    harness.runCases({ prefix: 'RegExp', args: true }, [
+        [replaceGroup, ...asmIndices],
+        [replaceTemplate, ...asmIndices],
+        [replaceCallback, ...asmIndices],
+        [replaceGlobal, ...asmIndices],
+        [replaceSpaces, ...asmIndices],
+        [replaceSpecials, ...asmIndices],
+        [replaceEmpty, ...asmIndices],
+        [execIndex, ...asmIndices],
+        [execGroups, ...asmIndices],
+        [execGlobal, ...asmIndices],
+        [testGlobal, ...asmIndices],
     ])
     function rejects(fn: Function, reason: string): void {
         let message = ''
