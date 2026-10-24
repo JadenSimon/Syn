@@ -733,16 +733,17 @@ function signed(x: number): string {
     return x > 0 ? `+${x}` : `${x}`
 }
 
-function reportDeltas(key: string, old: string[] | undefined, body: string[], partial: boolean): void {
+function reportDeltas(key: string, old: string[] | undefined, body: string[], partial: boolean): number {
     if (!old) {
         console.log(`DELTAS ${key}: no baseline section`)
-        return
+        return 0
     }
     const before = caseResults(old)
     const after = caseResults(body)
     const lines: string[] = []
     const totals = [0, 0, 0, 0]
     let changed = 0
+    let removed = 0
     for (const [name, [insts, nonMov]] of after.cases) {
         const was = before.cases.get(name)
         if (after.broken.has(name) || before.broken.has(name)) continue
@@ -759,7 +760,9 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
         lines.push(`${name} ${was[0]}/${was[1]} -> ${insts}/${nonMov} (${signed(insts - was[0])})`)
     }
     for (const [name, [insts, nonMov]] of before.cases) {
-        if (!partial && !after.cases.has(name) && !after.broken.has(name)) lines.push(`removed ${name} (was ${insts}/${nonMov})`)
+        if (partial || after.cases.has(name) || after.broken.has(name)) continue
+        lines.push(`removed ${name} (was ${insts}/${nonMov})`)
+        removed++
     }
     for (const [name, line] of after.broken) {
         if (!before.broken.has(name)) lines.push(`new failure ${line}`)
@@ -773,6 +776,8 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
     }
     console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${partial ? ', partial run' : ''}`)
     for (const line of lines) console.log(`DELTA ${key}: ${line}`)
+    if (removed) console.log(`${key} FAILED: ${removed} of ${before.cases.size} baseline cases did not run (${after.cases.size} ran); a suite that drops cases is a failure`)
+    return removed
 }
 
 function writeBaselines(bodies: Map<string, string[]>): void {
@@ -984,7 +989,11 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     }
     const filtered = args.some(a => /^(only|skip|bench)(:|$)/.test(a))
     const bodies = new Map([...sections].map(([key, section]) => [key, sectionBody(section, load)]))
-    for (const [key, body] of bodies) reportDeltas(key, baseline.get(key) ?? baseline.get(`CASE ${key.split(' ')[0]}`), body, filtered || !sections.get(key)!.done)
+    for (const [key, body] of [...bodies]) {
+        if (!reportDeltas(key, baseline.get(key) ?? baseline.get(`CASE ${key.split(' ')[0]}`), body, filtered || !sections.get(key)!.done)) continue
+        failures++
+        bodies.delete(key)
+    }
     if (bodies.size && !filtered) writeBaselines(bodies)
     if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
     if (!exitCode && (failures || crashes.length)) exitCode = 1
