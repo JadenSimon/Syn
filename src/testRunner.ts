@@ -611,6 +611,7 @@ interface CrashMarks {
     suite?: string
     caseNumber?: number
     caseLabel?: string
+    caseName?: string
     step?: string
     eventLabel?: string
 }
@@ -625,6 +626,7 @@ function readMark(marks: CrashMarks, line: string): void {
     } else if (fields[0] === 'case') {
         marks.caseNumber = Number(fields[1])
         marks.caseLabel = fields[2]
+        marks.caseName = fields[3]
         marks.step = undefined
         marks.eventLabel = undefined
     } else if (fields[0] === 'step') {
@@ -639,10 +641,11 @@ function readMark(marks: CrashMarks, line: string): void {
 }
 
 interface BaselineSection {
-    lines: string[]
+    problems: string[]
     cases: string[]
     ms: number
     phases: Record<string, number>
+    done: boolean
     since?: number
 }
 
@@ -662,23 +665,110 @@ function stopClock(section: BaselineSection | undefined): void {
     section.since = undefined
 }
 
-function writeBaselines(sections: Map<string, BaselineSection>, load: number): void {
-    const cpus = os.cpus()
-    const model = cpus[0]?.model ?? 'unknown'
-    const file = path.resolve('baselines', `${model.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${os.arch()}.txt`)
-    const kept = new Map<string, string>()
+function baselineFile(): string {
+    const model = os.cpus()[0]?.model ?? 'unknown'
+    return path.resolve('baselines', `${model.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${os.arch()}.txt`)
+}
+
+function baselineSections(file: string): Map<string, string[]> {
+    const sections = new Map<string, string[]>()
     const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
-    for (const chunk of text.split('\n== ').slice(1)) kept.set(chunk.slice(0, chunk.indexOf('\n')), `== ${chunk.trimEnd()}\n`)
-    for (const [key, section] of sections) {
-        const accounted = Object.values(section.phases).reduce((a, b) => a + b, 0)
-        const phases = Object.entries({ ...section.phases, harness: Math.max(0, section.ms - accounted) })
-        const percents = phases.map(([phase, ms]) => [phase, Math.round(ms * 100 / Math.max(1, section.ms))] as const).filter(x => x[1] > 0)
-        const out = [`== ${key}`, `total ${(section.ms / 1000).toFixed(1)}s load ${load}`, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.lines, ...section.cases]
-        kept.set(key, out.join('\n') + '\n')
+    let body: string[] = []
+    for (const line of text.split('\n')) {
+        const fields = line.split(' ')
+        if (line.startsWith('== ')) {
+            body = []
+            sections.set(line.slice(3), body)
+        } else if (fields[0] === 'CASE') {
+            const at = fields.length - (fields.length > 5 && /^\d+$/.test(fields[fields.length - 3]) ? 3 : 2)
+            const key = `CASE ${fields[1]}`
+            sections.set(key, [...sections.get(key) ?? [], `case ${fields.slice(2, at).join(' ')} ${fields[at]} ${fields[at + 1]} 0 0`])
+        } else if (line) {
+            body.push(line)
+        }
     }
-    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${model}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>']
+    return sections
+}
+
+function sectionBody(section: BaselineSection, load: number): string[] {
+    const accounted = Object.values(section.phases).reduce((a, b) => a + b, 0)
+    const phases = Object.entries({ ...section.phases, setup: Math.max(0, section.ms - accounted) })
+    const percents = phases.map(([phase, ms]) => [phase, Math.round(ms * 100 / Math.max(1, section.ms))] as const).filter(x => x[1] > 0)
+    return [`total ${(section.ms / 1000).toFixed(1)}s load ${load}`, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.problems, ...section.cases]
+}
+
+function caseResults(body: string[]) {
+    const cases = new Map<string, [number, number]>()
+    const broken = new Map<string, string>()
+    const phases = new Map<string, number>()
+    let seconds = 0
+    for (const line of body) {
+        const fields = line.split(' ')
+        if (fields[0] === 'total') seconds = parseFloat(fields[1])
+        if (fields[0] === 'phases') {
+            for (let i = 1; i + 1 < fields.length; i += 2) phases.set(fields[i], parseFloat(fields[i + 1]))
+        }
+        if (fields[0] === 'case') cases.set(fields.slice(1, -4).join(' '), [Number(fields[fields.length - 4]), Number(fields[fields.length - 3])])
+        if (/^(fail|crash|cut) /.test(line)) broken.set(line.slice(fields[0].length + 1, line.indexOf(': ')), line)
+    }
+    return { cases, broken, phases, seconds }
+}
+
+function signed(x: number): string {
+    return x > 0 ? `+${x}` : `${x}`
+}
+
+function reportDeltas(key: string, old: string[] | undefined, body: string[], partial: boolean): void {
+    if (!old) {
+        console.log(`DELTAS ${key}: no baseline section`)
+        return
+    }
+    const before = caseResults(old)
+    const after = caseResults(body)
+    const lines: string[] = []
+    const totals = [0, 0, 0, 0]
+    let changed = 0
+    for (const [name, [insts, nonMov]] of after.cases) {
+        const was = before.cases.get(name)
+        if (after.broken.has(name) || before.broken.has(name)) continue
+        if (!was) {
+            lines.push(`new ${name} ${insts}/${nonMov}`)
+            continue
+        }
+        totals[0] += was[0]
+        totals[1] += was[1]
+        totals[2] += insts
+        totals[3] += nonMov
+        if (was[0] === insts && was[1] === nonMov) continue
+        changed++
+        lines.push(`${name} ${was[0]}/${was[1]} -> ${insts}/${nonMov} (${signed(insts - was[0])})`)
+    }
+    for (const [name, [insts, nonMov]] of before.cases) {
+        if (!partial && !after.cases.has(name) && !after.broken.has(name)) lines.push(`removed ${name} (was ${insts}/${nonMov})`)
+    }
+    for (const [name, line] of after.broken) {
+        if (!before.broken.has(name)) lines.push(`new failure ${line}`)
+    }
+    for (const [phase, pct] of after.phases) {
+        const was = before.phases.get(phase) ?? 0
+        if (!partial && before.seconds >= 5 && after.seconds >= 5 && pct >= 1.5 * was && pct - was >= 3) lines.push(`phase ${phase} ${was}% -> ${pct}%`)
+    }
+    for (const name of before.broken.keys()) {
+        if (!after.broken.has(name) && after.cases.has(name)) lines.push(`fixed ${name}`)
+    }
+    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${partial ? ', partial run' : ''}`)
+    for (const line of lines) console.log(`DELTA ${key}: ${line}`)
+}
+
+function writeBaselines(bodies: Map<string, string[]>): void {
+    const file = baselineFile()
+    const kept = baselineSections(file)
+    for (const [key, body] of bodies) kept.set(key, body)
+    const cpus = os.cpus()
+    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${cpus[0]?.model ?? 'unknown'}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>; fail|crash|cut <case>: <detail>']
+    const sections = [...kept.keys()].sort().map(key => [`== ${key}`, ...kept.get(key)!].join('\n') + '\n')
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, [header.join('\n') + '\n', ...[...kept.keys()].sort().map(key => kept.get(key))].join('\n'))
+    fs.writeFileSync(file, [header.join('\n') + '\n', ...sections].join('\n'))
 }
 
 function crashOf(code: number | null, signal: string | null): string | undefined {
@@ -699,6 +789,8 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     let failures = 0
     let killed: string | undefined
     const load = Math.round(os.loadavg()[0])
+    const compared = args.find(a => a.startsWith('baseline:'))?.slice('baseline:'.length) ?? baselineFile()
+    const baseline = baselineSections(compared)
     const sections = new Map<string, BaselineSection>()
     let section: BaselineSection | undefined
     while (true) {
@@ -715,19 +807,20 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
                 const fields = line.split('\t')
                 if (fields[0] === 'fail') {
                     failures++
-                    section?.lines.push(`fail ${line.slice(5)}`)
+                    section?.problems.push(`fail ${marks.caseNumber !== undefined ? marks.caseName : '-'}: ${line.slice(5)}`)
                     continue
                 }
                 readMark(marks, line)
                 if (fields[0] === 'suite') {
                     stopClock(section)
-                    section = sections.get(fields[2]) ?? { lines: [], cases: [], ms: 0, phases: {} }
+                    section = sections.get(fields[2]) ?? { problems: [], cases: [], ms: 0, phases: {}, done: false }
                     sections.set(fields[2], section)
                     section.since = performance.now()
                 } else if (fields[0] === 'end' && fields.length > 2 && section) {
                     section.cases.push(`case ${fields[1]} ${fields[2]} ${fields[3]} ${fields[4]} ${caseMs(Number(fields[5]))}`)
                 } else if (fields[0] === 'done' && section) {
                     stopClock(section)
+                    section.done = true
                     for (const [phase, ms] of Object.entries(JSON.parse(fields[1]) as Record<string, number>)) section.phases[phase] = (section.phases[phase] ?? 0) + ms
                 }
             }
@@ -735,11 +828,11 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         const [code, signal] = await new Promise<[number | null, string | null]>(resolve => child.on('close', (c, s) => resolve([c, s])))
         const message = crashOf(code, signal)
         stopClock(section)
+        const running = marks.caseNumber !== undefined ? marks.caseName : '-'
         if (!message) {
             exitCode = code ?? 128 + ((os.constants.signals as Record<string, number>)[signal!] ?? 0)
             if (signal) killed = seconds > 0 && Date.now() >= deadline ? `watchdog timeout after ${seconds}s` : `killed by ${signal}`
-            if (killed && marks.caseNumber !== undefined) section?.lines.push(`${killed} in ${marks.caseLabel}`)
-            else if (killed) section?.lines.push(killed)
+            if (killed) section?.problems.push(`cut ${running}: ${killed}`)
             break
         }
         let label = marks.suite ?? args[1]
@@ -753,16 +846,20 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
             if (marks.suite !== undefined && following) next = { suite: following, case: 0 }
         }
         console.log(`${label} FAILED: ${message}`)
-        section?.lines.push(`crash ${label}: ${message}`)
+        section?.problems.push(`crash ${running}: ${label} ${message}`)
         crashes.push(label)
         if (!next || crashes.length >= maxCrashes) {
             console.log('...max crash count exceeded')
+            section?.problems.push(`cut ${running}: max crash count exceeded`)
             exitCode = 128 + Number(message.match(/signal (\d+)/)![1])
             break
         }
         resume = next
     }
-    if (sections.size && !args.some(a => /^(only|skip|bench)(:|$)/.test(a))) writeBaselines(sections, load)
+    const filtered = args.some(a => /^(only|skip|bench)(:|$)/.test(a))
+    const bodies = new Map([...sections].map(([key, section]) => [key, sectionBody(section, load)]))
+    for (const [key, body] of bodies) reportDeltas(key, baseline.get(key) ?? baseline.get(`CASE ${key.split(' ')[0]}`), body, filtered || !sections.get(key)!.done)
+    if (bodies.size && !filtered) writeBaselines(bodies)
     if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
     if (!exitCode && (failures || crashes.length)) exitCode = 1
     const problems = [`${failures} failures`, `${crashes.length} crashes`]
