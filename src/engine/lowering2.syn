@@ -4197,6 +4197,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return res
     }
 
+    function inboundBlocks(target: GraphBlock): [from: GraphBlock, apply: number][] {
+        return findInboundApplies(target).map(([from, apply]) => [getGraphBlock(from), apply])
+    }
+
     function skipAfter(id: number) {
         while (id) {
             const n = getNode(g, id)
@@ -4734,6 +4738,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return summaryEffect(callSummary(g, n) ?? unknownCall, returned)[0]
     }
 
+    const idleResets = new Set<number>()
     const simplifiedOrdering = new Map<number, number>()
     function simplifyOrdering(vid: number, from?: GraphNode): number | undefined {
         simplifiedOrdering.clear()
@@ -4756,8 +4761,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         if (OrderedValues.has(u.op)) {
             const clobbers = u.op === NodeOp.store || u.op === NodeOp.rt || (u.op === NodeOp.call && callEffect(u) > 1)
-            const pure = u.op === NodeOp.load || (u.op === NodeOp.call && !clobbers)
-            const skips = (pure && (from?.op === NodeOp.apply || from?.op === NodeOp.ret)) || (!clobbers && isRead(from))
+            const pure = u.op === NodeOp.load || pstackReadsTop(g, u) || (u.op === NodeOp.call && !clobbers)
+            const skips = (pure && (from?.op === NodeOp.apply || from?.op === NodeOp.ret)) || (!clobbers && isRead(from)) || idleResets.has(vid)
             if (!skips) return vid
         }
         const known = simplifiedOrdering.get(vid)
@@ -4892,6 +4897,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function reduceBlockOrdering(target: GraphBlock): boolean {
         if (!hasOrdering(target)) return false
+        idleResets.clear()
+        defer idleResets.clear()
+        for (const id of findValues(target.id, NodeOp.pstack) ?? []) {
+            if (!pstackRebases(g, getNode(g, id)!)) continue
+            if (pstackResetIdle(g, id, target, findValues, inboundBlocks)) idleResets.add(id)
+        }
         let changed = false
         const epoch = nextEpoch(g)
         const replacements = new Map<number, number>()
@@ -6706,7 +6717,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const effects = new Set<NodeOp>()
         for (const block of chain) {
             for (const op of [NodeOp.call, NodeOp.store, NodeOp.pstack, NodeOp.alloca, NodeOp.rt]) {
-                if (findValues(block.id, op)?.length) effects.add(op)
+                if (findValues(block.id, op)?.some(id => !pstackReadsTop(g, getNode(g, id)))) effects.add(op)
             }
             for (const p of block.params) {
                 const T = typeOf(getNode(g, p)!)
@@ -9292,6 +9303,23 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!at || at.kind !== MemFresh || !unreadRoot(at.base, mem)) continue
             r.set(id, getRef(n, 0) || addNode(g, NodeOp.nilEffect, []))
         }
+        return dropWrites(target, r)
+    }
+
+    function dropIdleResets(target: GraphBlock): boolean {
+        const resets = findValues(target.id, NodeOp.pstack)
+        if (!resets?.length) return false
+        const r = new Map<number, number>()
+        for (const id of resets) {
+            const n = getNode(g, id)!
+            if (!pstackRebases(g, n) || isResultUsed(id)) continue
+            if (!pstackResetIdle(g, id, target, findValues, inboundBlocks)) continue
+            r.set(id, getRef(n, 0) || addNode(g, NodeOp.nilEffect, []))
+        }
+        return dropWrites(target, r)
+    }
+
+    function dropWrites(target: GraphBlock, r: Map<number, number>): boolean {
         if (!r.size) return false
         function resolve(id: number): number {
             let at = id
@@ -11689,7 +11717,24 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     let congruenceEpoch = -1
+    let markers = countMarkers()
+    function countMarkers(): number {
+        let count = 0
+        for (const b of reachableBlocks) {
+            for (const id of findValues(b.id, NodeOp.pstack) ?? []) if (pstackTentative(g, getNode(g, id)!) === PstackMarker) count++
+        }
+        return count
+    }
     function optimize() {
+        for (const b of reachableBlocks) {
+            step(dropIdleResets, b)
+        }
+        const remaining = markers ? countMarkers() : 0
+        if (remaining < markers) {
+            liveParams = undefined
+            for (const b of reachableBlocks) step(pruneUnusedParams, b)
+        }
+        markers = remaining
         for (const b of reachableBlocks) {
             step(eliminateUnusedPureValues, b)
         }
@@ -14357,6 +14402,7 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
                 const u = r ? getNode(g, r) : undefined
                 if (!r || outer(u)) continue
                 if (m.op === NodeOp.after && i < countIds(m) - 1 && here.has(r) && !condition.has(r)) continue
+                if (m.op === NodeOp.alloca && i === 0 && (u!.op === NodeOp.param || here.has(r))) continue
                 if (u!.op === NodeOp.param || (here.has(r) && !condition.has(r)) || hoisted.has(r) || (u!.op === NodeOp.get && here.has(getRef(u!, 0)))) {
                     if (!cutSet.has(r)) {
                         cutSet.add(r)
@@ -14410,6 +14456,7 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
             }
             const ids = getArgIds(m)
             for (let i = m.op === NodeOp.apply ? 1 : 0; i < ids.length; i++) ids[i] = copy(ids[i])
+            if (m.op === NodeOp.alloca && !inside.has(getRef(m, 0))) ids[0] = createNode(g, NodeOp.nilEffect, [])
             const c = addCopy(g, m, withRefs(g, m, ids))
             copies.set(id, c)
             return c
@@ -15564,7 +15611,7 @@ function batchLoopPstacks(g: Graph): boolean {
             seen.add(id)
             const n = getNode(g, id)
             if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
-            if (n.op === NodeOp.pstack && pstackRebases(g, n)) releasing.add(b.id)
+            if (n.op === NodeOp.pstack && pstackRebases(g, n) && !pstackTentative(g, n)) releasing.add(b.id)
             if (pstackFixedSize(g, n)) {
                 const list = owners.get(id)
                 if (list) list.push(b.id)
@@ -15715,10 +15762,247 @@ function demandUntil(g: Graph, root: number, tail: number, arm: number): Set<num
     return seen
 }
 
+export const PstackMark = 2
+export const PstackMarker = 1
+
+export function pstackTentative(g: NodeSpace, n: GraphNode): number {
+    return n.op === NodeOp.pstack && countIds(n) > 4 ? getLiteral(g, n, 4) : 0
+}
+
+const PstackOrdered = new Set<NodeOp>([NodeOp.pstack, NodeOp.call, NodeOp.rt, NodeOp.setProp, NodeOp.alloca])
+
+export function placePstackMarkers(g: Graph, regions: [header: number, stacks: number[]][]): void {
+    const loops = graphLoops(g)
+    for (const [headerId, stacks] of regions) {
+        const members = loops.loopMembers.get(headerId)
+        if (!members || !stacks.length) continue
+        const header = getBlock(g, headerId)!
+        let nil = 0
+        for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.nilEffect && getRef(n, 0) === headerId) nil = id
+        let token = nil || addNode(g, NodeOp.nilEffect, [headerId])
+        const marks: number[] = []
+        for (const stack of stacks) {
+            token = addNode(g, NodeOp.pstack, [token, { literal: stack }, { literal: 0 }, { literal: 0 }, { literal: PstackMark }], Types.u64)
+            marks.push(token)
+        }
+        if (nil) {
+            const placed = new Set(marks)
+            for (const [id, n] of [...nodeEntries(g)]) {
+                if (placed.has(id)) continue
+                if (!PstackOrdered.has(n.op)) continue
+                let ops: Operand[] | undefined
+                for (let i = 0; i < firstNonOrderingSlot(n); i++) {
+                    if (getRef(n, i) !== nil) continue
+                    ops ??= getOperands(g, n)
+                    ops[i] = token
+                }
+                if (ops) putCopy(g, id, n, ops)
+            }
+        }
+        header.bodyId = addNode(g, NodeOp.after, [token, header.bodyId])
+        const latches = new Set<number>()
+        for (const m of members) {
+            for (const p of tailPositions(g, getBlock(g, m)!.bodyId)) {
+                const n = getNode(g, p.at)!
+                if (n.op !== NodeOp.apply || getRef(n, 0) !== headerId || latches.has(p.at)) continue
+                latches.add(p.at)
+                const roots = p.tokens.filter(r => r && r !== headerId && !BatchInertRoots.has(getNode(g, r)!.op))
+                let after = roots.length > 1 ? addNode(g, NodeOp.after, roots) : roots.length ? roots[0] : addNode(g, NodeOp.nilEffect, [m])
+                stacks.forEach((stack, i) => {
+                    after = addNode(g, NodeOp.pstack, [after, { literal: stack }, marks[i], { literal: 0 }, { literal: PstackMarker }], Types.u64)
+                })
+                putCopy(g, p.at, n, [after, addCopy(g, n)], NodeOp.after)
+            }
+        }
+    }
+}
+
+export function pstackReadsTop(g: NodeSpace, n: GraphNode | undefined): boolean {
+    return n?.op === NodeOp.pstack && !pstackRebases(g, n) && !pstackAllocates(g, n)
+}
+
+function pstackSameStack(g: NodeSpace, a: GraphNode, b: GraphNode): boolean {
+    const x = getRef(a, 1)
+    const y = getRef(b, 1)
+    if (!x && !y) return getLiteral(g, a, 1) === getLiteral(g, b, 1)
+    const p = x ? getNode(g, x) : undefined
+    const q = y ? getNode(g, y) : undefined
+    if (p?.op !== NodeOp.poolEntry || q?.op !== NodeOp.poolEntry || countIds(p) !== countIds(q)) return true
+    for (let i = 0; i < countIds(p); i++) {
+        if (getRef(p, i) || getRef(q, i)) return true
+        if (getLiteral(g, p, i) !== getLiteral(g, q, i)) return false
+    }
+    return true
+}
+
+function pstackQuietBlock(g: NodeSpace, reset: number, block: number, valuesOf: (block: number, op: NodeOp) => number[] | undefined, before: Set<number> | undefined): boolean {
+    const r = getNode(g, reset)!
+    for (const id of valuesOf(block, NodeOp.pstack) ?? []) {
+        const n = getNode(g, id)!
+        if (id === reset || before?.has(id) || pstackReadsTop(g, n)) continue
+        if (pstackSameStack(g, n, r)) return false
+    }
+    for (const id of valuesOf(block, NodeOp.call) ?? []) {
+        if (before?.has(id)) continue
+        const n = getNode(g, id)!
+        if (getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) continue
+        const summary = callSummary(g, n)
+        if (!summary || (summary.writes & (WritesStack | WritesUnknown)) !== 0) return false
+    }
+    for (const id of valuesOf(block, NodeOp.rt) ?? []) {
+        if (before?.has(id)) continue
+        if (rt.allocOps.has(getLiteral(g, getNode(g, id)!, 1))) return false
+    }
+    return true
+}
+
+interface PstackResetRegion {
+    blocks: Set<GraphBlock>
+    marks: Map<number, GraphBlock>
+    params: Map<number, GraphBlock>
+    open: boolean
+}
+
+function pstackResetRegion(g: NodeSpace, reset: number, block: GraphBlock, inbound: (block: GraphBlock) => [from: GraphBlock, apply: number][]): PstackResetRegion {
+    const r = getNode(g, reset)!
+    const region: PstackResetRegion = { blocks: new Set(), marks: new Map(), params: new Map(), open: false }
+    const seen = new Set<number>()
+    const work: [GraphBlock, number][] = [[block, getRef(r, 2)]]
+    while (work.length) {
+        const [b, value] = work.pop()!
+        if (!value) {
+            region.open = true
+            continue
+        }
+        if (seen.has(value)) continue
+        seen.add(value)
+        const at = b.params.indexOf(value)
+        if (at < 0) {
+            let id = value
+            let n = getNode(g, id)
+            while (n?.op === NodeOp.after) {
+                id = getRef(n, countIds(n) - 1)
+                n = getNode(g, id)
+            }
+            if (pstackReadsTop(g, n) && pstackSameStack(g, n!, r)) region.marks.set(id, b)
+            else region.open = true
+            continue
+        }
+        region.blocks.add(b)
+        region.params.set(value, b)
+        const arrivals = inbound(b)
+        if (!arrivals.length) region.open = true
+        for (const [from, app] of arrivals) work.push([from, getRef(getNode(g, app)!, at + 1)])
+    }
+    return region
+}
+
+function pstackPrecedents(g: NodeSpace, id: number): Set<number> {
+    const seen = new Set<number>()
+    const work = [id]
+    while (work.length) {
+        const at = work.pop()!
+        if (!at || seen.has(at)) continue
+        const n = getNode(g, at)
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        seen.add(at)
+        for (let i = 0; i < countIds(n); i++) work.push(getRef(n, i))
+    }
+    return seen
+}
+
+export function pstackResetIdle(g: NodeSpace, reset: number, block: GraphBlock, valuesOf: (block: number, op: NodeOp) => number[] | undefined, inbound: (block: GraphBlock) => [from: GraphBlock, apply: number][]): boolean {
+    const region = pstackResetRegion(g, reset, block, inbound)
+    if (region.open) return false
+    for (const b of region.blocks) {
+        if (!pstackQuietBlock(g, reset, b.id, valuesOf, undefined)) return false
+    }
+    for (const [mark, b] of region.marks) {
+        if (region.blocks.has(b)) continue
+        if (!pstackQuietBlock(g, reset, b.id, valuesOf, pstackPrecedents(g, mark))) return false
+    }
+    return true
+}
+
+function resolvePstackMarkers(g: Graph): boolean {
+    const tentative: number[] = []
+    for (const [id, n] of nodeEntries(g)) if (pstackTentative(g, n)) tentative.push(id)
+    if (!tentative.length) return false
+    const owner = new Map<number, GraphBlock>()
+    const byBlock = new Map<number, Map<NodeOp, number[]>>()
+    const inbound = new Map<number, [GraphBlock, number][]>()
+    for (const b of g.blocks) {
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id) continue
+            const n = getNode(g, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+            const prior = owner.get(id)
+            if (prior === b) continue
+            assert(!prior || !pstackAllocates(g, n), `lowering: pstack allocation %${id} is shared by B${prior?.id} and B${b.id}; region resets assume one allocation per execution`)
+            if (prior) continue
+            owner.set(id, b)
+            let ops = byBlock.get(b.id)
+            if (!ops) byBlock.set(b.id, ops = new Map())
+            let ids = ops.get(n.op)
+            if (!ids) ops.set(n.op, ids = [])
+            ids.push(id)
+            if (n.op === NodeOp.apply) {
+                let arrivals = inbound.get(getRef(n, 0))
+                if (!arrivals) inbound.set(getRef(n, 0), arrivals = [])
+                arrivals.push([b, id])
+            }
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    const valuesOf = (block: number, op: NodeOp) => byBlock.get(block)?.get(op)
+    const arrivalsOf = (block: GraphBlock) => inbound.get(block.id) ?? []
+    const kept = new Set<number>()
+    const live = new Set<number>()
+    const dead = new Map<number, GraphBlock>()
+    for (const id of tentative) {
+        const block = owner.get(id)
+        if (!block || pstackTentative(g, getNode(g, id)!) !== PstackMarker) continue
+        const region = pstackResetRegion(g, id, block, arrivalsOf)
+        assert(!region.open && region.marks.size > 0, `lowering: pstack marker %${id} in B${block.id} does not reach its region mark`)
+        const reset = !pstackResetIdle(g, id, block, valuesOf, arrivalsOf)
+        if (debugsGraph('pstack-debug', g)) console.log(`PSTK2 resolve ${g.name ?? '?'} B${block.id} %${id} ${reset ? 'reset' : 'dropped'}`)
+        if (!reset) {
+            for (const [param, b] of region.params) dead.set(param, b)
+            continue
+        }
+        kept.add(id)
+        for (const mark of region.marks.keys()) kept.add(mark)
+        for (const param of region.params.keys()) live.add(param)
+    }
+    const unused = new Map<GraphBlock, number[]>()
+    for (const [param, b] of dead) {
+        if (live.has(param)) continue
+        const list = unused.get(b)
+        if (list) list.push(b.params.indexOf(param))
+        else unused.set(b, [b.params.indexOf(param)])
+    }
+    for (const [b, list] of unused) {
+        const drop = new Set(list)
+        for (const [, app] of arrivalsOf(b)) {
+            const n = getNode(g, app)!
+            putCopy(g, app, n, getOperands(g, n).filter((_, i) => !drop.has(i - 1)))
+        }
+        b.params = b.params.filter((_, i) => !drop.has(i))
+    }
+    for (const id of tentative) {
+        const n = getNode(g, id)!
+        if (kept.has(id)) putCopy(g, id, n, getOperands(g, n, 0, 4))
+        else putCopy(g, id, n, [getOperand(g, n, 0), { literal: 0 }], NodeOp.after)
+    }
+    return true
+}
+
 export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
     const _expandCodecs: GraphPass = g => expandCodecs(g, regionSlot)
-    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, _expandCodecs, expandPstacks])
+    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, resolvePstackMarkers, _expandCodecs, expandPstacks])
     g = expanded.graph
     if (expanded.changed || g.form === 'packaged') g = optimizePackaged(g, target)
     return g

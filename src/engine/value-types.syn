@@ -3,7 +3,7 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { firstNonOrderingSlot, NumericOps, OrderedValues, stronglyConnected, type Graph, type GraphNode, typeName } from './lowering2'
+import { firstNonOrderingSlot, graphLoops, NumericOps, OrderedValues, stronglyConnected, tailPositions, tailRoots, type Graph, type GraphNode, typeName } from './lowering2'
 import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf, allNodes, countNodes, hasNode, nodeEntries, nodeIds, heapInterior, heapField, heapFieldCount } from './graph-node'
 import type { TraceSession } from './trace2'
 import { dataKeys } from './property-eval'
@@ -192,6 +192,10 @@ function useDominators(g: Graph): { idom: Map<number, number>, order: number[] }
         if (!out.length) out.push(0)
         return out
     }
+    return dominatorTree(succs, preds)
+}
+
+function dominatorTree(succs: (v: number) => number[], preds: (v: number) => number[]): { idom: Map<number, number>, order: number[] } {
     const order: number[] = [0]
     const index = new Map<number, number>([[0, 0]])
     const parent: number[] = [0]
@@ -2733,6 +2737,305 @@ function receiverValue(g: Graph, id: number): boolean {
         for (const pred of preds) work.push(getRef(getNode(g, pred)!, index + 1))
     }
     return true
+}
+
+export interface PstackRegion {
+    unit: PlannedUnit
+    header: number
+    call: number
+    reason: string
+    stacks: number[]
+}
+
+interface PstackProgram {
+    types: ValueTypes
+    units: PlannedUnit[]
+    graphOf: (unit: PlannedUnit) => Graph
+    unitOfFrame: Map<number, PlannedUnit>
+    roots: Set<PlannedUnit>
+    holders: Map<number, number[]>
+    escaped: Set<number>
+    resolved: Map<PlannedUnit, Map<number, Type>>
+}
+
+function pstackProgram(types: ValueTypes, units: PlannedUnit[], graphOf: (unit: PlannedUnit) => Graph): PstackProgram {
+    const unitOfFrame = new Map<number, PlannedUnit>()
+    for (const unit of units) for (const f of unit.frames) unitOfFrame.set(f, unit)
+    const roots = new Set<PlannedUnit>()
+    const escaped = new Set<number>()
+    const work: number[] = []
+    const why = new Map<number, string>()
+    let cause = 'root'
+    const escape = (type: Type | undefined) => {
+        if (!type) return
+        for (const id of type.objects) {
+            if (escaped.has(id)) continue
+            escaped.add(id)
+            why.set(id, cause)
+            work.push(id)
+        }
+    }
+    types.frames.forEach((frame, id) => {
+        if (frame.sites.some(site => site.frame !== undefined)) return
+        const unit = unitOfFrame.get(id)
+        if (unit) roots.add(unit)
+        escape(frame.returns)
+        for (const param of frame.params) escape(param.type)
+    })
+    const resolved = new Map<PlannedUnit, Map<number, Type>>()
+    for (const unit of units) {
+        const nodes = types.resolve(unit.frames).nodes
+        resolved.set(unit, nodes)
+        const g = graphOf(unit)
+        for (const [id, n] of nodeEntries(g)) {
+            cause = `${unit.fn.name}%${id}:${opName(n.op)}`
+            if (n.op === NodeOp.setProp || n.op === NodeOp.store) {
+                const target = nodes.get(getRef(n, 1))
+                if (!target || !target.objects.length || target.unknown) escape(nodes.get(getRef(n, 3)))
+            } else if (n.op === NodeOp.rt && rt.sliceOf(g, n) === rt.Op.sliceWrite) {
+                const target = nodes.get(getRef(n, 2))
+                if (!target || !target.objects.length || target.unknown) escape(nodes.get(getRef(n, 4)))
+            } else if (n.op === NodeOp.call && !unit.calls.get(id)?.size && nodes.has(id)) {
+                for (let i = 2; i < countIds(n); i++) escape(nodes.get(getRef(n, i)))
+            }
+        }
+    }
+    const holders = new Map<number, number[]>()
+    types.objects.forEach((object, id) => {
+        for (const field of object.fields.values()) for (const inner of field.type.objects) listOf(holders, inner).push(id)
+    })
+    while (work.length) {
+        const next = work.pop()!
+        cause = `via O${next}`
+        for (const field of types.objects[next].fields.values()) escape(field.type)
+    }
+    if (intrinsics.argv().includes('pstack-why')) for (const [id, c] of why) console.log(`PSTK2 escaped O${id} ${c}`)
+    return { types, units, graphOf, unitOfFrame, roots, holders, escaped, resolved }
+}
+
+function pstackDemand(g: Graph): Map<number, number[]> {
+    const demand = new Map<number, number[]>()
+    for (const b of g.blocks) for (const id of bodyNodes(g, b.bodyId)) listOf(demand, id).push(b.id)
+    return demand
+}
+
+function pstackStaying(g: Graph, members: Set<number>): Set<number> {
+    const seen = new Set<number>()
+    for (const m of members) {
+        for (const p of tailPositions(g, getBlock(g, m)!.bodyId)) {
+            const n = getNode(g, p.at)!
+            if (n.op !== NodeOp.apply || !members.has(getRef(n, 0))) continue
+            const stack = tailRoots(g, p)
+            while (stack.length) {
+                const id = stack.pop()!
+                if (!id || seen.has(id)) continue
+                seen.add(id)
+                const x = getNode(g, id)
+                if (!x || x.op === NodeOp.param) continue
+                for (let i = 0; i < countIds(x); i++) stack.push(getRef(x, i))
+            }
+        }
+    }
+    return seen
+}
+
+function pstackObjectName(types: ValueTypes, id: number): string {
+    const object = types.objects[id]
+    return `O${id}:${object.name}@${object.site.unit.name || '<anon>'}%${object.site.node}`
+}
+
+const PstackObjects = 1
+const PstackBuffers = 2
+
+interface PstackSummary {
+    kinds: number
+    need: number
+    escaped: number
+    witness: number
+}
+
+export function planPstackRegions(types: ValueTypes, units: PlannedUnit[], graphOf: (unit: PlannedUnit) => Graph, debug: boolean): PstackRegion[] {
+    const start = performance.now()
+    const P = pstackProgram(types, units, graphOf)
+    const programmed = performance.now()
+    const succ: number[][] = [[]]
+    const pred: number[][] = [[]]
+    const above: number[] = [0]
+    const node = (up: number): number => {
+        succ.push([])
+        pred.push([])
+        above.push(up)
+        return succ.length - 1
+    }
+    const edge = (a: number, b: number) => {
+        succ[a].push(b)
+        pred[b].push(a)
+    }
+    const unitNode = new Map<PlannedUnit, number>()
+    for (const unit of units) unitNode.set(unit, node(0))
+    const loops: { unit: PlannedUnit, header: number, node: number, depth: number }[] = []
+    const calls: { unit: PlannedUnit, call: number, node: number, loop: number }[] = []
+    const placeOf = new Map<PlannedUnit, Map<number, number>>()
+    const carriedBy = new Map<number, number[]>()
+    for (const unit of units) {
+        const u = unitNode.get(unit)!
+        if (P.roots.has(unit)) edge(0, u)
+        const g = graphOf(unit)
+        const place = new Map<number, number>()
+        placeOf.set(unit, place)
+        const nodeTypes = P.resolved.get(unit)!
+        const nest = graphLoops(g)
+        if (nest.loopMembers.size) {
+            const demand = pstackDemand(g)
+            const depthOf = (header: number) => nest.loopsOf.get(header)!.length
+            const headers = [...nest.loopMembers.keys()].sort((a, b) => depthOf(a) - depthOf(b))
+            const loopNode = new Map<number, number>()
+            for (const header of headers) {
+                let up = u
+                let deepest = 0
+                for (const outer of nest.loopsOf.get(header)!) {
+                    if (outer === header || depthOf(outer) <= deepest) continue
+                    deepest = depthOf(outer)
+                    up = loopNode.get(outer) ?? up
+                }
+                const v = node(up)
+                edge(up, v)
+                loopNode.set(header, v)
+                loops.push({ unit, header, node: v, depth: depthOf(header) })
+                const members = nest.loopMembers.get(header)!
+                for (const id of pstackStaying(g, members)) {
+                    const blocks = demand.get(id)
+                    if (blocks && blocks.every(b => members.has(b))) place.set(id, v)
+                }
+                for (const p of getBlock(g, header)!.params) for (const id of nodeTypes.get(p)?.objects ?? []) listOf(carriedBy, id).push(up)
+            }
+        }
+        for (const [call, callees] of unit.calls) {
+            const loop = place.get(call) ?? u
+            const c = node(loop)
+            edge(loop, c)
+            calls.push({ unit, call, node: c, loop })
+            for (const callee of callees) {
+                const target = unitNode.get(callee)
+                if (target !== undefined) edge(c, target)
+            }
+        }
+    }
+    const { idom, order } = dominatorTree(v => succ[v].slice(), v => pred[v].length ? pred[v] : [0])
+    const depth = new Array<number>(succ.length).fill(1)
+    const parent = new Array<number>(succ.length).fill(0)
+    depth[0] = 0
+    for (const v of order) {
+        if (!v) continue
+        parent[v] = idom.get(v) ?? 0
+        depth[v] = depth[parent[v]] + 1
+    }
+    const lca = (a: number, b: number): number => {
+        if (a < 0) return b
+        if (b < 0) return a
+        while (a !== b) {
+            if (depth[a] >= depth[b]) a = parent[a]
+            else b = parent[b]
+        }
+        return a
+    }
+    const dominates = (v: number, x: number): boolean => {
+        while (depth[x] > depth[v]) x = parent[x]
+        return x === v
+    }
+    const locs: number[][] = []
+    types.objects.forEach((object, id) => {
+        const list: number[] = []
+        if (!object.constant && !object.native) {
+            for (const frame of framesOf(object)) {
+                const unit = P.unitOfFrame.get(frame)
+                const at = unit && object.site.unit === unit.fn ? placeOf.get(unit)!.get(object.site.node) : undefined
+                list.push(at ?? (unit ? unitNode.get(unit)! : 0))
+            }
+        }
+        locs[id] = list.length ? list : [0]
+    })
+    const domOf: number[] = []
+    const holderNeed = (id: number): number => {
+        if (domOf[id] === undefined) domOf[id] = locs[id].reduce((d, x) => lca(d, x), -1)
+        return domOf[id]
+    }
+    const own: PstackSummary[] = succ.map(() => ({ kinds: 0, need: -1, escaped: -1, witness: -1 }))
+    types.objects.forEach((object, id) => {
+        let need = -1
+        for (const holder of P.holders.get(id) ?? []) need = lca(need, holderNeed(holder))
+        for (const up of carriedBy.get(id) ?? []) need = lca(need, up)
+        const kind = object.kind === AllocKind.buffer ? PstackBuffers : object.dynamic ? 0 : PstackObjects
+        for (const x of locs[id]) {
+            const at = own[x]
+            at.kinds |= kind
+            if (P.escaped.has(id) && at.escaped < 0) at.escaped = id
+            if (need < 0) continue
+            const joined = lca(at.need, need)
+            if (joined !== at.need) at.witness = id
+            at.need = joined
+        }
+    })
+    const sccOf = new Array<number>(succ.length).fill(-1)
+    const recursive: boolean[] = []
+    const summary: PstackSummary[] = []
+    const all: number[] = []
+    for (let v = 0; v < succ.length; v++) all.push(v)
+    for (const scc of stronglyConnected(all, v => succ[v])) {
+        const index = summary.length
+        for (const v of scc) sccOf[v] = index
+        const merged: PstackSummary = { kinds: 0, need: -1, escaped: -1, witness: -1 }
+        let cyclic = scc.length > 1
+        const absorb = (part: PstackSummary) => {
+            merged.kinds |= part.kinds
+            if (merged.escaped < 0) merged.escaped = part.escaped
+            const joined = lca(merged.need, part.need)
+            if (joined !== merged.need) merged.witness = part.witness
+            merged.need = joined
+        }
+        for (const v of scc) {
+            absorb(own[v])
+            for (const w of succ[v]) {
+                if (w === v) cyclic = true
+                if (sccOf[w] !== index) absorb(summary[sccOf[w]])
+            }
+        }
+        summary.push(merged)
+        recursive.push(cyclic)
+    }
+    const verdict = (unit: PlannedUnit, v: number): PstackRegion => {
+        const sum = summary[sccOf[v]]
+        const region: PstackRegion = { unit, header: 0, call: 0, reason: '', stacks: [] }
+        if (sum.kinds & PstackObjects) region.stacks.push(0)
+        if (sum.kinds & PstackBuffers) region.stacks.push(1)
+        if (recursive[sccOf[v]]) region.reason = `recursive:${unit.fn.name}`
+        else if (!sum.kinds) region.reason = 'idle'
+        else if (sum.escaped >= 0) region.reason = `escapes:${pstackObjectName(types, sum.escaped)}`
+        else if (sum.need >= 0 && !dominates(v, sum.need)) region.reason = `held:${pstackObjectName(types, sum.witness)}`
+        return region
+    }
+    const out: PstackRegion[] = []
+    const failing = new Map<number, number>()
+    for (const loop of loops) {
+        const region = verdict(loop.unit, loop.node)
+        region.header = loop.header
+        out.push(region)
+        if (region.reason && region.reason !== 'idle') failing.set(loop.node, loop.header)
+        if (debug && region.reason !== 'idle') console.log(`PSTK2 loop ${loop.unit.fn.name || '<anon>'} B${loop.header} depth ${loop.depth} stacks [${region.stacks.join(',')}] ${region.reason || 'reset-ok'}`)
+    }
+    for (const site of calls) {
+        const header = failing.get(site.loop)
+        if (header === undefined) continue
+        const region = verdict(site.unit, site.node)
+        region.header = header
+        region.call = site.call
+        const returned = (P.resolved.get(site.unit)!.get(site.call)?.objects ?? []).find(id => locs[id].some(x => x !== 0))
+        if (!region.reason && returned !== undefined) region.reason = `returns:${pstackObjectName(types, returned)}`
+        out.push(region)
+        if (debug && region.reason !== 'idle') console.log(`PSTK2 call ${site.unit.fn.name || '<anon>'} B${header} %${site.call} -> ${[...site.unit.calls.get(site.call)!].map(c => c.fn.name || '<anon>').join(',')} stacks [${region.stacks.join(',')}] ${region.reason || 'reset-ok'}`)
+    }
+    if (debug) console.log(`PSTK2 time ${(performance.now() - start).toFixed(1)}ms program ${(programmed - start).toFixed(1)}ms units ${units.length} loops ${loops.length} calls ${calls.length} nodes ${succ.length}`)
+    return out
 }
 
 function setOf<K, V>(map: Map<K, Set<V>>, k: K): Set<V> {

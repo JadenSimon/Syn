@@ -14,7 +14,7 @@ import { tagVmHandle, tagVmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
-    printOptimizeStats, pstackAllocates, pstackRebases, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, CapturesAll, argBit, hasArg, maskArgs,
+    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, placePstackMarkers, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, CapturesAll, argBit, hasArg, maskArgs,
     graphLoops, joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, stronglyConnected, importFact, mapTailPositions, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
@@ -45,7 +45,7 @@ import { type CallEdge, verifyAllocationTokens, verifyArrivals, verifyCallClasse
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
 import { analyzeGenerics, flowAccesses } from './value-flow'
-import { type AccessHost, type Location, constantIndex, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type AccessHost, type Location, constantIndex, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, elementTagged, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
 
 type usize = u32
@@ -630,7 +630,10 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         }
         case NodeOp.pstack: {
             operand(0)
-            if (getRef(n, 2) || getLiteral(graph, n, 2)) throw `static: %${id} resets a stack`
+            if (pstackRebases(graph, n)) {
+                value = BigInt(0)
+                break
+            }
             const size = Number(int(3))
             if (!ctx.reserve) throw `static: %${id} allocates`
             const base = ctx.reserve(size)
@@ -1787,7 +1790,7 @@ function noteEffect(graph: Graph, mem: MemAnalysis, id: number, n: GraphNode, ou
     } else if (n.op === NodeOp.pstack) {
         out.self = EffectWrite
         out.writes |= WritesStack
-        if (pstackRebases(graph, n)) out.writes |= WritesUnknown
+        if (pstackRebases(graph, n) && !pstackTentative(graph, n)) out.writes |= WritesUnknown
     } else if (n.op === NodeOp.load) {
         if (out.self < EffectRead) out.self = EffectRead
     } else if (n.op === NodeOp.call) {
@@ -7690,11 +7693,12 @@ interface Planned {
     contexts: Map<Function, intrinsics.Handle>
     rewrites: Map<PlannedUnit, (graph: Graph) => void>
     shared: Map<PlannedUnit, PlannedUnit[]>
+    regions: Map<PlannedUnit, [header: number, stacks: number[]][]>
 }
 
 function bindPlannedUnits(plan: ShapePlan, linker: Linker): Planned {
     const { unitOf, originOf, codeOf } = linker
-    const planned: Planned = { units: new Map(), functions: new Map(), frames: new Map(), contexts: new Map(), rewrites: new Map(), shared: new Map() }
+    const planned: Planned = { units: new Map(), functions: new Map(), frames: new Map(), contexts: new Map(), rewrites: new Map(), shared: new Map(), regions: new Map() }
     const indirect = new Set<PlannedUnit>()
     for (const list of plan.units.values()) {
         for (const unit of list) {
@@ -10032,6 +10036,8 @@ function createResolver(linker: Linker, tracer: Tracer, plan: ShapePlan, planned
             sliceTags = realizeSlices(traced.graph, local?.slices, local?.nodes, local?.tagged)
         }
         const dynamic = local ? runtimeHeapSites(local, traced.graph) : undefined
+        const regions = plannedUnit && planned.regions.get(plannedUnit)
+        if (regions) placePstackMarkers(traced.graph, regions)
         verifyTraced(traced, 'resolve:input')
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
@@ -11486,6 +11492,16 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         const planned = bindPlannedUnits(plan, linker)
         const reps = chooseRepresentations(plan, planned, linker, tracer, host)
         sharePlannedUnits(plan, planned, reps, host)
+        const regions = planPstackRegions(valueTypes, [...planned.units.values()], unit => tracer.graphsOf(planned.functions.get(unit)!).traced!.graph, flags.has('pstack-debug'))
+        const placed = new Map<PlannedUnit, [number, number[]][]>()
+        for (const region of regions) {
+            if (region.reason || region.call) continue
+            const list = placed.get(region.unit)
+            const entry: [number, number[]] = [region.header, region.stacks.map(stack => stack ? programStack : 0)]
+            if (list) list.push(entry)
+            else placed.set(region.unit, [entry])
+        }
+        planned.regions = placed
         freezeFacts(facts, planFrames(valueTypes, plan, planned, linker, tracer, facts))
         return { plan, planned, reps }
     })
