@@ -29,10 +29,10 @@ import {
     opName,
     getNode, setNode, hasNode, deleteNode, localSymbol,
     putNode, addNode, putCopy, addCopy,
-    withOperand, retypeNode, isNullishValue, nodeUsers, recordTypeAt,
+    withOperand, retypeNode, isNullishValue, recordTypeAt,
     type NodeSpace, allNodes, copyNodes, countNodes, nodeEntries, nodeIds,
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
-    FloatUnaryOps, rawSlot, rawContents, internRaw,
+    FloatUnaryOps, rawSlot, rawContents, internRaw, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, indexCheck, checkIndex, primeIndexCheck, dirtyIndex, graphIndex, indexedUsers, useSlot, type GraphIndex,
 } from './graph-node'
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
@@ -1624,8 +1624,8 @@ function liftReturnedHeapValues(graph: Graph): Graph {
     for (const b of out.blocks) {
         const next = replaceAll(b.bodyId)
         if (next[0] === b.bodyId) continue
-        b.bodyId = next[0]
-        b.bodyConst = next[1] as f64
+        setBlockBody(out, b, next[0])
+        setBlockConst(out, b, next[1] as f64)
     }
     return out
 }
@@ -3311,7 +3311,7 @@ function pinnedSymbols(program: ProgramGraph): Set<number> {
 function appendParam(program: ProgramGraph, callee: number, type: TypeOperand, sites: [caller: number, call: number][], argOf: (site: number) => Operand): number {
     const graph = program.units.get(callee)!
     const id = addNode(graph, NodeOp.param, [], type)
-    graph.blocks[0].params.push(id)
+    pushBlockParams(graph, graph.blocks[0], id)
     const location = paramLocation(graph, getNode(graph, id)!)
     sites.forEach(([symbol, call], k) => {
         const caller = program.units.get(symbol)!
@@ -3467,8 +3467,12 @@ export function hoistParamLoads(program: ProgramGraph, request: LoadParamsReques
     }
     rewriteFactNodes(unit, f => f.op === NodeOp.load && getRef(f, 1) && !getRef(f, 2) ? hoistedAt.get(`${getRef(f, 1)}:${getLiteral(unit, f, 2)}`) : undefined)
     substitute(unit, by)
+    dirtyIndex(unit)
     touched.add(callee)
-    for (const [caller] of calls) touched.add(caller)
+    for (const [caller] of calls) {
+        dirtyIndex(program.units.get(caller)!)
+        touched.add(caller)
+    }
     return callee
 }
 
@@ -3505,7 +3509,11 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         const graph = program.units.get(candidate)!
         const entry = graph.blocks[0]
         const demanded = valuesFrom(graph, graph.blocks[0].bodyId, false)
-        const users = nodeUsers(graph, valuesFrom(graph, graph.blocks[0].bodyId, true))
+        const entryValues = valuesFrom(graph, graph.blocks[0].bodyId, true)
+        const index = graphIndex(graph)
+        function entryUsers(id: number): number[] {
+            return [...indexedUsers(index, id)].filter(user => entryValues.has(user))
+        }
         function entryToken(id: number): boolean {
             const n = getNode(graph, id)
             return n?.op === NodeOp.startOf && (countLiterals(n) === 0 || getRef(n, 0) === entry.id)
@@ -3515,14 +3523,14 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
             return entryToken(getRef(load, 0))
         }
         function cover(id: number, loads: number[]): boolean {
-            for (const user of users.get(id) ?? []) {
+            for (const user of entryUsers(id)) {
                 const n = getNode(graph, user)!
                 let slots = 0
                 for (let i = 0; i < countIds(n); i++) if (getRef(n, i) === id) slots++
                 if (slots !== 1) return false
                 if (n.op === NodeOp.load && getRef(n, 1) === id && demanded.has(user) && hoistable(n)) {
                     const inner: number[] = []
-                    const leaves = users.has(user) && cover(user, inner) ? inner : [user]
+                    const leaves = entryUsers(user).length && cover(user, inner) ? inner : [user]
                     for (const leaf of leaves) if (!loads.includes(leaf)) loads.push(leaf)
                 } else if ((n.op === NodeOp.decode || n.op === NodeOp.add) && getRef(n, 0) === id && !getRef(n, 1)) {
                     if (!cover(user, loads)) return false
@@ -3535,7 +3543,7 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         entry.params.forEach((p, i) => {
             if (!calls.every(([symbol, call]) => fresh(symbol, getRef(getNode(program.units.get(symbol)!, call)!, 3 + i)))) return
             const loads: number[] = []
-            if (!users.has(p) || !cover(p, loads)) return
+            if (!entryUsers(p).length || !cover(p, loads)) return
             const cost = paramLocation(graph, getNode(graph, p)!) < 0 ? loads.length - 1 : loads.length
             if (cost > headroom) return
             headroom -= cost
@@ -3559,36 +3567,40 @@ function privateArgument(graph: Graph, mem: MemAnalysis, call: number, callee: n
     return !flow.own && flow.calls.every(([site, at]) => at === index && calledSymbol(graph, getNode(graph, site)!) === callee)
 }
 
-function stateFields(graph: Graph, mem: MemAnalysis, users: Map<number, [user: number, slot: number][]>, arrivals: Arrivals, param: number): [offset: number, type: intrinsics.Types][] | undefined {
+function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, arrivals: Arrivals, param: number): [offset: number, type: intrinsics.Types][] | undefined {
     const fields = new Map<number, intrinsics.Types>()
     const aliases = new Set<number>([param])
     const work = [param]
     while (work.length) {
         const ptr = work.pop()!
-        for (const [user, slot] of users.get(ptr) ?? []) {
+        for (const user of indexedUsers(index, ptr)) {
             const n = getNode(graph, user)!
-            if (slot < firstNonOrderingSlot(n)) continue
-            if ((n.op === NodeOp.load || n.op === NodeOp.store) && slot === 1 && !getRef(n, 2)) {
-                const at = mem.of(ptr).pos
-                if (at === undefined) return
-                const offset = at + getLiteral(graph, n, 2)
-                const T = slotType(typeOf(n))
-                if (offset < 0 || !StateFieldTypes.has(T)) return
-                if (fields.has(offset) && fields.get(offset) !== T) return
-                fields.set(offset, T)
-                continue
+            let nextSlot = useSlot(graph, user, ptr, firstNonOrderingSlot(n))
+            while (nextSlot >= 0) {
+                const slot = nextSlot
+                nextSlot = useSlot(graph, user, ptr, slot + 1)
+                if ((n.op === NodeOp.load || n.op === NodeOp.store) && slot === 1 && !getRef(n, 2)) {
+                    const at = mem.of(ptr).pos
+                    if (at === undefined) return
+                    const offset = at + getLiteral(graph, n, 2)
+                    const T = slotType(typeOf(n))
+                    if (offset < 0 || !StateFieldTypes.has(T)) return
+                    if (fields.has(offset) && fields.get(offset) !== T) return
+                    fields.set(offset, T)
+                    continue
+                }
+                let alias: number | undefined
+                if (n.op === NodeOp.after && slot === countIds(n) - 1) alias = user
+                if (n.op === NodeOp.add && !getRef(n, 1 - slot)) alias = user
+                if (n.op === NodeOp.apply && slot > 0) alias = getBlock(graph, getRef(n, 0))?.params[slot - 1]
+                if (alias === undefined) return
+                const m = mem.of(alias)
+                if (m.pending || m.base !== param || m.pos === undefined) return
+                if (getNode(graph, alias)!.op === NodeOp.param && (arrivals.get(alias) ?? []).some(a => !a || mem.of(a).base !== param)) return
+                if (aliases.has(alias)) continue
+                aliases.add(alias)
+                work.push(alias)
             }
-            let alias: number | undefined
-            if (n.op === NodeOp.after && slot === countIds(n) - 1) alias = user
-            if (n.op === NodeOp.add && !getRef(n, 1 - slot)) alias = user
-            if (n.op === NodeOp.apply && slot > 0) alias = getBlock(graph, getRef(n, 0))?.params[slot - 1]
-            if (alias === undefined) return
-            const m = mem.of(alias)
-            if (m.pending || m.base !== param || m.pos === undefined) return
-            if (getNode(graph, alias)!.op === NodeOp.param && (arrivals.get(alias) ?? []).some(a => !a || mem.of(a).base !== param)) return
-            if (aliases.has(alias)) continue
-            aliases.add(alias)
-            work.push(alias)
         }
     }
     const layout = [...fields].sort((a, b) => a[0] - b[0])
@@ -3625,9 +3637,9 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
     }
     const state = addNode(graph, NodeOp.after, [initialized, cell])
     substitute(graph, new Map<number, Operand>([[param, state]]))
-    entry.params = [...entry.params.filter(p => p !== param), ...inputs]
+    setBlockParams(graph, entry, [...entry.params.filter(p => p !== param), ...inputs])
     for (const b of graph.blocks) {
-        b.bodyId = mapTailPositions(graph, b.bodyId, p => {
+        setBlockBody(graph, b, mapTailPositions(graph, b.bodyId, p => {
             if (!own.has(p.at)) return p.at
             const ret = getNode(graph, p.at)!
             const value = getOperand(graph, ret, 0)
@@ -3635,7 +3647,7 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
             const record: Operand[] = hasResult ? [{ literal: 0 }, value] : []
             for (const [offset, T] of outputs) record.push({ literal: record.length / 2 }, addNode(graph, NodeOp.load, [token, state, { literal: offset }], T))
             return addCopy(graph, ret, [addNode(graph, NodeOp.record, record), ...getOperands(graph, ret).slice(1)])
-        })
+        }))
     }
     touched.add(callee)
     for (const [symbol, call] of calls) {
@@ -3694,7 +3706,7 @@ function scalarizeMutableState(program: ProgramGraph, touched: Set<number>): Set
         if (tails.some(n => n && (typeRefOf(n) || n.op === NodeOp.record))) continue
         const hasResult = tails.some(n => n?.op !== NodeOp.void)
         const calls = sites.get(callee)!
-        const users = nodeUsers(graph, nodeIds(graph), true)
+        const users = graphIndex(graph)
         const arrivals = paramArrivals(graph)
         const ordinary = entry.params.filter(p => paramLocation(graph, getNode(graph, p)!) < 0).length
         let index = -1
@@ -3869,7 +3881,7 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
             twinsAt.push(found)
         }
         if (!candidates.length) continue
-        const users = nodeUsers(graph, values)
+        const users = graphIndex(graph)
         function saving(v: number): { dead: Set<number>, cost: number } {
             const dead = new Set<number>([v])
             const stack = [v]
@@ -3880,7 +3892,7 @@ function shareCallerValues(program: ProgramGraph, touched: Set<number>): void {
                 cost += n.op === NodeOp.call ? 2 + sizeOf(getLiteral(graph, getNode(graph, getRef(n, 1))!, 0)) : SharedOps.has(n.op) ? 1 : 0
                 for (let i = 0; i < countIds(n); i++) {
                     const r = getRef(n, i)
-                    if (!r || dead.has(r) || !values.has(r) || !(users.get(r) ?? []).every(u => dead.has(u))) continue
+                    if (!r || dead.has(r) || !values.has(r) || ![...indexedUsers(users, r)].every(u => !values.has(u) || dead.has(u))) continue
                     dead.add(r)
                     stack.push(r)
                 }
@@ -4016,8 +4028,9 @@ function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
 }
 
 export function pruneArgs(program: ProgramGraph, callee: number, dead: Set<number>, sites: [caller: number, call: number][], touched: Set<number>): void {
-    const entry = program.units.get(callee)!.blocks[0]
-    entry.params = entry.params.filter((_, i) => !dead.has(i))
+    const unit = program.units.get(callee)!
+    const entry = unit.blocks[0]
+    setBlockParams(unit, entry, entry.params.filter((_, i) => !dead.has(i)))
     const summarized = new Set<string>()
     for (const [symbol, call] of sites) {
         const caller = program.units.get(symbol)!
@@ -4348,7 +4361,7 @@ function anchorBlockNil(graph: Graph, b: GraphBlock): void {
         memo.set(id, fresh)
         return fresh
     }
-    b.bodyId = rewrite(b.bodyId)
+    setBlockBody(graph, b, rewrite(b.bodyId))
 }
 
 function siteDepths(graph: Graph): Map<number, number> {
@@ -4545,7 +4558,7 @@ function retypeRecord(g: Graph, param: number, type: number): void {
     retypeNode(g, param, { ref: type })
 }
 
-export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (symbol: number) => Map<number, [number, number][]>, changed: Set<number>): void {
+export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (symbol: number) => GraphIndex, changed: Set<number>): void {
     const g = program.units.get(plan.callee)!
     const { own, layout } = plan
     const type = layoutRecordType(g, layout)
@@ -4581,7 +4594,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
         else rewrites.set(u, [slot])
     }
     for (const b of g.blocks) {
-        b.bodyId = mapTailPositions(g, b.bodyId, p => {
+        setBlockBody(g, b, mapTailPositions(g, b.bodyId, p => {
             const slots = rewrites.get(p.at)
             if (!slots) return p.at
             const user = getNode(g, p.at)!
@@ -4612,7 +4625,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
                 operands[slot] = addNode(g, NodeOp.record, fields)
             }
             return addCopy(g, user, operands)
-        })
+        }))
     }
     for (const [param, ok] of relays) if (ok) retypeRecord(g, param, type)
     changed.add(plan.callee)
@@ -4625,9 +4638,14 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
             if (n.op === NodeOp.call) setCallLocations(cg, id, callLocations(cg, id) ?? [], undefined, { ref: callerType })
             if (n.op === NodeOp.param) retypeRecord(cg, id, callerType)
             if (n.op !== NodeOp.decode) continue
-            for (const [u, slot] of index.users.get(id) ?? []) {
-                const user = getNode(cg, u)!
-                putCopy(cg, u, user, withOperand(cg, user, slot, getRef(n, 0)))
+            for (const u of indexedUsers(index.users, id)) {
+                let nextSlot = useSlot(cg, u, id)
+                while (nextSlot >= 0) {
+                    const slot = nextSlot
+                    nextSlot = useSlot(cg, u, id, slot + 1)
+                    const user = getNode(cg, u)!
+                    putCopy(cg, u, user, withOperand(cg, user, slot, getRef(n, 0)))
+                }
             }
         }
         const bases = new Map([...f.reads.keys()].map(load => [load, getRef(getNode(cg, f.inner.get(load) ?? load)!, 1)]))
@@ -4654,7 +4672,7 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
 function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
     const callSites = countCallSites(program)
     interface Index {
-        users: Map<number, [number, number][]>
+        users: GraphIndex
         owner: Map<number, [block: number, index: number]>
         applies: Map<number, number[]>
         rets: number[]
@@ -4679,7 +4697,7 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         const known = indexes.get(symbol)
         if (known) return known
         const g = program.units.get(symbol)!
-        const index: Index = { users: new Map(), owner: new Map(), applies: new Map(), rets: [], calls: new Map() }
+        const index: Index = { users: graphIndex(g), owner: new Map(), applies: new Map(), rets: [], calls: new Map() }
         for (const b of g.blocks.slice(1)) b.params.forEach((p, i) => index.owner.set(p, [b.id, i]))
         const seen = new Set<number>()
         const stack = g.blocks.map(b => b.bodyId)
@@ -4702,7 +4720,6 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
                 else index.calls.set(callee, [id])
             }
         }
-        index.users = nodeUsers(g, seen, true)
         indexes.set(symbol, index)
         return index
     }
@@ -4737,20 +4754,25 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         const seen = new Set<number>(aliases)
         while (aliases.length) {
             const v = aliases.pop()!
-            for (const [u, slot] of index.users.get(v) ?? []) {
-                const n = getNode(g, u)!
-                if (slot === 0 && ordered.has(n.op)) continue
-                const next = (n.op === NodeOp.after && slot === countIds(n) - 1) || (n.op === NodeOp.decode && slot === 0)
-                if (next) {
-                    if (!seen.has(u)) aliases.push(u)
-                    seen.add(u)
-                    continue
+            for (const u of indexedUsers(index.users, v)) {
+                let nextSlot = useSlot(g, u, v)
+                while (nextSlot >= 0) {
+                    const slot = nextSlot
+                    nextSlot = useSlot(g, u, v, slot + 1)
+                    const n = getNode(g, u)!
+                    if (slot === 0 && ordered.has(n.op)) continue
+                    const next = (n.op === NodeOp.after && slot === countIds(n) - 1) || (n.op === NodeOp.decode && slot === 0)
+                    if (next) {
+                        if (!seen.has(u)) aliases.push(u)
+                        seen.add(u)
+                        continue
+                    }
+                    if (n.op === NodeOp.load && slot === 1 && !getRef(n, 2)) {
+                        loads.push([u, getLiteral(g, n, 2)])
+                        continue
+                    }
+                    return
                 }
-                if (n.op === NodeOp.load && slot === 1 && !getRef(n, 2)) {
-                    loads.push([u, getLiteral(g, n, 2)])
-                    continue
-                }
-                return
             }
         }
         return loads.length ? loads : undefined
@@ -4774,52 +4796,58 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         while (work.length && !f.blocked) {
             const v = work.pop()!
             const source = f.source.get(v)!
-            for (const [u, slot] of index.users.get(v) ?? []) {
-                const n = getNode(g, u)!
-                if (slot === 0 && ordered.has(n.op)) continue
-                if (n.op === NodeOp.after) {
-                    if (slot === countIds(n) - 1) alias(u, source)
-                    continue
-                }
-                if ((n.op === NodeOp.load || (callee && n.op === NodeOp.store)) && slot === 1 && !getRef(n, 2)) {
-                    const offset = getLiteral(g, n, 2)
-                    f.accessed.add(source)
-                    if (n.op === NodeOp.store) {
-                        const key = `${source}/${offset}`
-                        const list = f.stores.get(key)
-                        if (list) list.push([u, getRef(n, 3)])
-                        else f.stores.set(key, [[u, getRef(n, 3)]])
-                    }
-                    const loads = callee ? undefined : pointerLoads(g, index, u)
-                    if (!loads) {
-                        access(f, String(offset), slotType(typeOf(n)))
-                        if (!callee) f.reads.set(u, String(offset))
+            for (const u of indexedUsers(index.users, v)) {
+                let nextSlot = useSlot(g, u, v)
+                while (nextSlot >= 0) {
+                    const slot = nextSlot
+                    nextSlot = useSlot(g, u, v, slot + 1)
+                    const n = getNode(g, u)!
+                    if (slot === 0 && ordered.has(n.op)) continue
+                    if (n.op === NodeOp.after) {
+                        if (slot === countIds(n) - 1) alias(u, source)
                         continue
                     }
-                    for (const [load, at] of loads) {
-                        access(f, `${offset}.${at}`, slotType(typeOf(getNode(g, load)!)))
-                        f.reads.set(load, `${offset}.${at}`)
-                        f.inner.set(load, u)
+                    if ((n.op === NodeOp.load || (callee && n.op === NodeOp.store)) && slot === 1 && !getRef(n, 2)) {
+                        const offset = getLiteral(g, n, 2)
+                        f.accessed.add(source)
+                        if (n.op === NodeOp.store) {
+                            const key = `${source}/${offset}`
+                            const list = f.stores.get(key)
+                            if (list) list.push([u, getRef(n, 3)])
+                            else f.stores.set(key, [[u, getRef(n, 3)]])
+                        }
+                        const loads = callee ? undefined : pointerLoads(g, index, u)
+                        if (!loads) {
+                            access(f, String(offset), slotType(typeOf(n)))
+                            if (!callee) f.reads.set(u, String(offset))
+                            continue
+                        }
+                        for (const [load, at] of loads) {
+                            access(f, `${offset}.${at}`, slotType(typeOf(getNode(g, load)!)))
+                            f.reads.set(load, `${offset}.${at}`)
+                            f.inner.set(load, u)
+                        }
+                        continue
                     }
-                    continue
+                    if (callee && n.op === NodeOp.store && slot === 3 && links?.has(u)) continue
+                    if (n.op === (callee ? NodeOp.encode : NodeOp.decode) && slot === 0) {
+                        alias(u, source)
+                        continue
+                    }
+                    if (n.op === NodeOp.apply && slot > 0 && getRef(n, 0) !== g.root) {
+                        const param = getBlock(g, getRef(n, 0))!.params[slot - 1]
+                        alias(param, param)
+                        f.exits.push([u, slot])
+                        continue
+                    }
+                    if (callee && n.op === NodeOp.ret && slot === 0 && countIds(n) === 1) {
+                        f.exits.push([u, slot])
+                        continue
+                    }
+                    f.blocked = `${opName(n.op)}@${slot}`
+                    break
                 }
-                if (callee && n.op === NodeOp.store && slot === 3 && links?.has(u)) continue
-                if (n.op === (callee ? NodeOp.encode : NodeOp.decode) && slot === 0) {
-                    alias(u, source)
-                    continue
-                }
-                if (n.op === NodeOp.apply && slot > 0 && getRef(n, 0) !== g.root) {
-                    const param = getBlock(g, getRef(n, 0))!.params[slot - 1]
-                    alias(param, param)
-                    f.exits.push([u, slot])
-                    continue
-                }
-                if (callee && n.op === NodeOp.ret && slot === 0 && countIds(n) === 1) {
-                    f.exits.push([u, slot])
-                    continue
-                }
-                f.blocked = `${opName(n.op)}@${slot}`
-                break
+                if (f.blocked) break
             }
         }
         for (const id of f.source.keys()) {
@@ -5085,55 +5113,87 @@ function mergeProgram(program: ProgramGraph): number {
     return aliases.size
 }
 
+function passBoundary(program: ProgramGraph, pass: string): void {
+    for (const graph of program.units.values()) {
+        if (indexCheck) checkIndex(graph, pass)
+        dirtyIndex(graph)
+        if (indexCheck && graph.form) primeIndexCheck(graph)
+    }
+}
+
 function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
     const { timed } = clock
+    const boundary = (pass: string) => passBoundary(program, pass)
+    boundary('(start)')
     timed('statics', () => evaluateStatics(program))
+    boundary('evaluateStatics')
     timed('statics', () => foldConstantCalls(program, clock))
+    boundary('foldConstantCalls')
     prune(program)
     timed('inline', () => mergeProgram(program))
+    boundary('mergeProgram')
     timed('inline', () => inlineProgram(program, clock))
+    boundary('inlineProgram')
     prune(program)
     const refined = new Set<number>()
     timed('effects', () => refineProgramEffects(program, refined))
+    boundary('refineProgramEffects')
     timed('statics', () => foldStaticLoads(program, refined))
+    boundary('foldStaticLoads')
     for (const [symbol, graph] of program.units) {
         if (graph.form === 'packaged' || refined.has(symbol)) program.units.set(symbol, clock.optimize(graph))
     }
+    boundary('optimize')
     const touched = new Set<number>()
     timed('statics', () => foldStaticLoads(program, touched))
+    boundary('foldStaticLoads')
     prune(program)
     timed('records', () => recordReturns(program, clock))
+    boundary('recordReturns')
     timed('records', () => {
         expandParams(program, touched)
+        boundary('expandParams')
         forwardReturnedArgs(program, touched)
+        boundary('forwardReturnedArgs')
         shareCallerValues(program, touched)
+        boundary('shareCallerValues')
         specializeLiteralArgs(program, touched)
+        boundary('specializeLiteralArgs')
         pruneDeadArgs(program, touched)
+        boundary('pruneDeadArgs')
         for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
         const specialized = new Set(touched)
         touched.clear()
         const state = scalarizeMutableState(program, touched)
+        boundary('scalarizeMutableState')
         if (state.size) {
             refineProgramEffects(program, touched)
+            boundary('refineProgramEffects')
             for (const symbol of state) {
                 program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
                 specialized.add(symbol)
                 touched.delete(symbol)
             }
             pruneDeadArgs(program, touched)
+            boundary('pruneDeadArgs')
             refineProgramEffects(program, touched)
+            boundary('refineProgramEffects')
             for (const symbol of touched) {
                 program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
                 specialized.add(symbol)
             }
         }
         inlineSpecialized(program, specialized, clock)
+        boundary('inlineSpecialized')
     })
     prune(program)
     unswitchHot(program, programLevels(program), clock)
+    boundary('unswitchHot')
     prune(program)
     for (const [symbol, level] of programLevels(program)) program.units.get(symbol)!.level = level
-    return timed('inline', () => mergeProgram(program))
+    const merged = timed('inline', () => mergeProgram(program))
+    boundary('mergeProgram')
+    return merged
 }
 
 function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
@@ -7003,12 +7063,12 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (n.op === NodeOp.rt && !getRef(n, 1) && rt.allocOps.has(getLiteral(graph, n, 1))) allocations.push(id)
         }
         if (!allocations.length) return
-        const users = nodeUsers(graph, nodeIds(graph), true)
+        const users = graphIndex(graph)
         const dead = new Set<number>()
         function orderingOnly(id: number): boolean {
-            for (const [u, slot] of users.get(id) ?? []) {
+            for (const u of indexedUsers(users, id)) {
                 if (dead.has(u)) continue
-                if (slot >= firstNonOrderingSlot(getNode(graph, u)!)) return false
+                if (useSlot(graph, u, id, firstNonOrderingSlot(getNode(graph, u)!)) >= 0) return false
             }
             return true
         }
@@ -7016,17 +7076,17 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         for (const id of allocations) {
             const writers: number[] = []
             let observed = false
-            for (const [u, slot] of users.get(id) ?? []) {
+            for (const u of indexedUsers(users, id)) {
                 if (dead.has(u)) continue
                 const m = getNode(graph, u)!
-                if (slot < firstNonOrderingSlot(m)) continue
                 const writes = m.op === NodeOp.rt && !getRef(m, 1) && rt.targetWriteOps.has(getLiteral(graph, m, 1))
-                if (writes && slot === 2 && orderingOnly(u)) {
-                    writers.push(u)
-                    continue
+                let slot = useSlot(graph, u, id, firstNonOrderingSlot(m))
+                while (slot >= 0 && !observed) {
+                    if (writes && slot === 2 && orderingOnly(u)) writers.push(u)
+                    else observed = true
+                    slot = useSlot(graph, u, id, slot + 1)
                 }
-                observed = true
-                break
+                if (observed) break
             }
             if (observed) continue
             dead.add(id)
@@ -7039,7 +7099,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             return at
         }
         for (const id of dead) {
-            for (const [u] of users.get(id) ?? []) {
+            for (const u of indexedUsers(users, id)) {
                 const n = getNode(graph, u)
                 if (!n || dead.has(u)) continue
                 const operands = getOperands(graph, n)
@@ -7057,6 +7117,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
         }
         const live = reachableNodes(graph, traced.allocations)
         for (const id of [...nodeIds(graph)]) if (!live.has(id)) deleteNode(graph, id)
+        dirtyIndex(graph)
     }
     function markAllocations(traced: FastTraced): void {
         const graph = traced.graph
@@ -7175,18 +7236,20 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (setter) putNode(graph, id, NodeOp.call, [getRef(n, 0), valueOf(setter), getOperand(graph, n, 1), getOperand(graph, n, 3)])
         }
         const shapes = freshShapes(traced)
-        let users: Map<number, [number, number][]> | undefined
+        let users: GraphIndex | undefined
         function demanded(id: number, referent: intrinsics.Handle): boolean {
-            users ??= nodeUsers(graph, nodeIds(graph), true)
-            for (const [u, slot] of users.get(id) ?? []) {
+            users ??= graphIndex(graph)
+            for (const u of indexedUsers(users, id)) {
                 const m = getNode(graph, u)!
-                if (slot < firstNonOrderingSlot(m)) continue
                 if (m.op === NodeOp.after) {
-                    if (demanded(u, referent)) return true
+                    if (useSlot(graph, u, id, firstNonOrderingSlot(m)) >= 0 && demanded(u, referent)) return true
                     continue
                 }
-                if (m.op === NodeOp.call && slot === 1) return true
-                if (m.op !== NodeOp.getProp || slot !== 1 || getRef(m, 2)) continue
+                if (m.op === NodeOp.call) {
+                    if (getRef(m, 1) === id && firstNonOrderingSlot(m) <= 1) return true
+                    continue
+                }
+                if (m.op !== NodeOp.getProp || getRef(m, 1) !== id || firstNonOrderingSlot(m) > 1 || getRef(m, 2)) continue
                 const inner = dataSlot(heap.deref(referent), getLiteral(graph, m, 2) as intrinsics.Handle)
                 if (inner !== undefined && (tagged(inner) || (reference(inner) && demanded(u, inner)))) return true
             }
@@ -7220,6 +7283,7 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             foldRead(graph, id, n, valueOf(slot), folded)
         }
         retarget(graph, folded)
+        dirtyIndex(graph)
     }
     function foldStatics(traced: Traced, fixed: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean): void {
         let valueOf: ((slot: intrinsics.Handle) => Operand) | undefined
@@ -8855,12 +8919,12 @@ export function realizeFloats(graph: Graph, request: CodecRequest): void {
         const o = addNode(graph, NodeOp.param, [], otherType(rep))
         const t = addNode(graph, NodeOp.param, [], Types.u64)
         otherMember(o, rep.other!)
-        root.params[i] = f
+        setBlockParam(graph, root, i, f)
         extras.push(o, t)
         putNode(graph, p, NodeOp.record, [{ literal: 0 }, f, { literal: 1 }, o, { literal: 2 }, t])
         converted.set(p, rep)
     })
-    root.params.push(...extras)
+    pushBlockParams(graph, root, ...extras)
     function offset(at: Operand, by: number): Operand {
         return typeof at === 'number' ? addNode(graph, NodeOp.add, [at, { literal: by }], Types.unknown_number) : { literal: at.literal + by }
     }
@@ -9252,10 +9316,10 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
         const rep = reps.get(tailOf(graph, x)) ?? reps.get(x)
         return !!rep && unionWord(rep)
     }
-    let users: Map<number, number[]> | undefined
+    let users: GraphIndex | undefined
     function numberTested(id: number): boolean {
-        users ??= nodeUsers(graph, nodeIds(graph))
-        for (const user of users.get(id) ?? []) {
+        users ??= graphIndex(graph)
+        for (const user of indexedUsers(users, id)) {
             const u = getNode(graph, user)!
             if (u.op !== NodeOp.eq && u.op !== NodeOp.ne) return false
             const other = getNode(graph, getRef(u, getRef(u, 0) === id ? 1 : 0))
@@ -9525,6 +9589,7 @@ export function realizeWords(graph: Graph, request: CodecRequest): void {
             coerceSlots(graph, id, [3], x => wordNumber(x as number))
         }
     }
+    dirtyIndex(graph)
 }
 
 export function undefinedFloats(graph: Graph, request: CodecRequest): void {
@@ -9605,7 +9670,7 @@ export function realizeTags(graph: Graph, request: CodecRequest): void {
     for (const i of abi.tags) {
         const tag = addNode(graph, NodeOp.param, [], Types.bool)
         tags.set(root.params[i], tag)
-        root.params.push(tag)
+        pushBlockParams(graph, root, tag)
     }
     function tagOf(x: Operand): Operand {
         if (typeof x !== 'number' || !x) return { literal: 1 }
@@ -9619,7 +9684,7 @@ export function realizeTags(graph: Graph, request: CodecRequest): void {
             const tag = addNode(graph, NodeOp.param, [], Types.bool)
             tags.set(x, tag)
             const at = block.params.indexOf(x) + 1
-            block.params.push(tag)
+            pushBlockParams(graph, block, tag)
             const slot = block.params.length
             const into = applies.get(block.id)!
             for (const apply of into) putCopy(graph, apply, getNode(graph, apply)!, [...getOperands(graph, getNode(graph, apply)!), { literal: 1 }])
@@ -9905,8 +9970,18 @@ export interface IndexedIteration {
 }
 
 export function indexArrayIterations(graph: Graph, iterations: Map<number, intrinsics.Handle>): IndexedIteration[] {
-    const users = nodeUsers(graph, nodeIds(graph), true)
-    const ordering = (user: number, slot: number): boolean => slot < firstNonOrderingSlot(getNode(graph, user)!)
+    const users = graphIndex(graph)
+    function uses(id: number): [user: number, slot: number][] {
+        const out: [number, number][] = []
+        for (const u of indexedUsers(users, id)) {
+            let slot = useSlot(graph, u, id, firstNonOrderingSlot(getNode(graph, u)!))
+            while (slot >= 0) {
+                out.push([u, slot])
+                slot = useSlot(graph, u, id, slot + 1)
+            }
+        }
+        return out
+    }
     const literalKey = (n: GraphNode | undefined, op: NodeOp, key: intrinsics.Handle) => n?.op === op && !getRef(n, 2) && getLiteral(graph, n, 2) === key
     const blockOf = (id: number): number | undefined => {
         for (let n = getNode(graph, id); n; n = getNode(graph, id)) {
@@ -9928,14 +10003,14 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
         }
     }
     function selfIteration(iterator: number): [prop: number, call: number] | undefined {
-        const uses = (users.get(iterator) ?? []).filter(([u, slot]) => !ordering(u, slot))
-        if (uses.length !== 2) return
-        const prop = uses.find(([u, slot]) => slot === 1 && literalKey(getNode(graph, u), NodeOp.getProp, heap.fromJsSymbol(Symbol.iterator)))?.[0]
-        const call = uses.find(([u, slot]) => slot === 2 && getNode(graph, u)!.op === NodeOp.call)?.[0]
+        const iteratorUses = uses(iterator)
+        if (iteratorUses.length !== 2) return
+        const prop = iteratorUses.find(([u, slot]) => slot === 1 && literalKey(getNode(graph, u), NodeOp.getProp, heap.fromJsSymbol(Symbol.iterator)))?.[0]
+        const call = iteratorUses.find(([u, slot]) => slot === 2 && getNode(graph, u)!.op === NodeOp.call)?.[0]
         if (prop === undefined || call === undefined) return
         const n = getNode(graph, call)!
         if (countIds(n) !== 3 || getRef(n, 1) !== prop) return
-        if ((users.get(prop) ?? []).some(([u, slot]) => !ordering(u, slot) && !(u === call && slot === 1))) return
+        if (uses(prop).some(([u, slot]) => !(u === call && slot === 1))) return
         return [prop, call]
     }
     const loops = graphLoops(graph)
@@ -9944,7 +10019,7 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
         const s = getNode(graph, symbol)
         if (s?.op !== NodeOp.getProp) continue
         const object = getRef(s, 1)
-        const makers = (users.get(symbol) ?? []).filter(([u, slot]) => !ordering(u, slot))
+        const makers = uses(symbol)
         if (makers.length !== 1 || makers[0][1] !== 1) continue
         const made = makers[0][0]
         const make = getNode(graph, made)!
@@ -9955,8 +10030,7 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
         const returnProps: number[] = []
         let nextCalls: number[] = []
         let valid = true
-        for (const [u, slot] of users.get(iterator) ?? []) {
-            if (ordering(u, slot)) continue
+        for (const [u, slot] of uses(iterator)) {
             const n = getNode(graph, u)!
             if (slot === 1 && literalKey(n, NodeOp.getProp, iterationKeys.next)) nextProps.push(u)
             else if (slot === 1 && literalKey(n, NodeOp.getProp, iterationKeys.return)) returnProps.push(u)
@@ -9969,12 +10043,11 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
         const call = nextCalls[0]
         if (!nextProps.includes(getRef(getNode(graph, call)!, 1))) continue
         for (const prop of nextProps) {
-            for (const [u, slot] of users.get(prop) ?? []) if (!ordering(u, slot) && !(u === call && slot === 1)) valid = false
+            for (const [u, slot] of uses(prop)) if (!(u === call && slot === 1)) valid = false
         }
         const done: number[] = []
         const values: number[] = []
-        for (const [u, slot] of users.get(call) ?? []) {
-            if (ordering(u, slot)) continue
+        for (const [u, slot] of uses(call)) {
             const n = getNode(graph, u)!
             if (slot === 1 && literalKey(n, NodeOp.getProp, iterationKeys.done)) done.push(u)
             else if (slot === 1 && literalKey(n, NodeOp.getProp, iterationKeys.value)) values.push(u)
@@ -9988,7 +10061,7 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
         const token = getRef(getNode(graph, call)!, 0)
         const array = field ? addNode(graph, NodeOp.getProp, [getRef(make, 0), object, { literal: field }]) : object
         const index = addNode(graph, NodeOp.param, [])
-        block.params.push(index)
+        pushBlockParams(graph, block, index)
         for (const [app, owner] of owners) {
             const n = getNode(graph, app)!
             if (getRef(n, 0) !== header) continue
@@ -10010,6 +10083,7 @@ export function indexArrayIterations(graph: Graph, iterations: Map<number, intri
             putNode(graph, id, NodeOp.after, [tok, tok])
         }
     }
+    if (out.length) dirtyIndex(graph)
     return out
 }
 
@@ -11414,7 +11488,7 @@ function outlineRegion(graph: Graph, region: CutRegion, plan: CutPlan, returns: 
     const target = addNode(graph, NodeOp.localTarget, [{ literal: symbol }], returns)
     for (const b of graph.blocks) {
         if (region.blocks.has(b.id)) continue
-        b.bodyId = mapTailPositions(graph, b.bodyId, p => {
+        setBlockBody(graph, b, mapTailPositions(graph, b.bodyId, p => {
             const n = getNode(graph, p.at)!
             if (n.op !== NodeOp.apply || getRef(n, 0) !== region.entry) return p.at
             const tokens = [...p.tokens, ...plan.frontier]
@@ -11422,7 +11496,7 @@ function outlineRegion(graph: Graph, region: CutRegion, plan: CutPlan, returns: 
             const args = getOperands(graph, n).slice(1)
             const call = addNode(graph, NodeOp.call, [token, target, { literal: 0 }, ...args, ...plan.liveIns], returns)
             return addNode(graph, NodeOp.ret, [call, b.id])
-        })
+        }))
     }
     setGraphBlocks(graph, graph.blocks.filter(b => !region.blocks.has(b.id)))
     const kept = new Set<number>()
