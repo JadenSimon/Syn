@@ -266,6 +266,7 @@ interface AsmItem {
     writes?: number[]
     memory?: boolean
     copies?: boolean
+    conversionOp?: number
 }
 
 interface BitField {
@@ -578,7 +579,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         it.storeBase = undefined; it.storeOffset = undefined; it.storeBytes = undefined
     }
 
-    function peephole(): void {
+    function reuseValues(reuseFlags = false): void {
         const values: number[] = []
         let fresh = REGISTERS
         function resetMoves(): void {
@@ -587,6 +588,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         resetMoves()
         const constants = new Map<number, number>()
         const memory = new Map<string, number>()
+        const conversions = new Map<string, number>()
+        let comparison: string | undefined
         const constantOf = (key: number) => {
             let v = constants.get(key)
             if (v === undefined) constants.set(key, v = fresh++)
@@ -609,6 +612,16 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         for (let i = 0; i < items.length; i++) {
             const it = items[i]
             if (straight(i)) continue
+            if (reuseFlags && it.setsFlags) {
+                const cmp = plainCompare(it)
+                const key = cmp && cmp[0] !== XZR && cmp[1] !== XZR
+                    ? `${cmp[3]}:${values[cmp[0]]}:${cmp[1] >= 0 ? `r${values[cmp[1]]}` : `i${cmp[2]}`}` : undefined
+                if (key !== undefined && key === comparison) {
+                    items.splice(i--, 1)
+                    continue
+                }
+                comparison = key
+            }
             if (it.copies) {
                 const value = values[it.reads![0]]
                 if (values[it.writes![0]] === value) {
@@ -616,6 +629,21 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     continue
                 }
                 values[it.writes![0]] = value
+                continue
+            }
+            if (it.conversionOp !== undefined && it.writes![0] !== XZR) {
+                const key = `${it.conversionOp}:${values[it.reads![0]]}`
+                const dst = it.writes![0]
+                const seen = conversions.get(key)
+                const from = seen === undefined ? -1 : holder(seen)
+                if (from >= 0) {
+                    if (from === dst) items.splice(i--, 1)
+                    else { items[i] = moveItem(dst, from); values[dst] = seen! }
+                    continue
+                }
+                const value = fresh++
+                values[dst] = value
+                conversions.set(key, value)
                 continue
             }
             if (it.moveDst === undefined) {
@@ -656,6 +684,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 if (itemDefs(it, defs)) { for (const d of defs) values[d] = fresh++; continue }
                 resetMoves()
                 memory.clear()
+                conversions.clear()
+                comparison = undefined
                 continue
             }
             const dst = it.moveDst
@@ -666,7 +696,10 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
             values[dst] = value
         }
+    }
 
+    function peephole(): void {
+        reuseValues()
         let changed = true
         let targets: Set<number> | undefined
         let targetsAt = -1
@@ -1343,6 +1376,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         threadBranches()
         hoistShared()
         hoistArms()
+        reuseValues(true)
+        const targets = new Set(items.filter(it => isBranch(it.kind)).map(it => it.label))
+        for (let i = 0; i < items.length; i++) if (foldGuardedSelect(i, targets)) i--
 
         const addrOf = new Map<number, number>()
         let pc = 0
@@ -2039,8 +2075,10 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const value = toFloat(fpA, src, Types.f64)
         const wide = accessBytes(to) === 8
         const signed = isSignedType(to)
-        floatInsn((wide ? 0x9E780000 : 0x1E780000) | (signed ? 0 : 0x10000) | (fp(value) << 5) | dst,
-            `${signed ? 'fcvtzs' : 'fcvtzu'} ${wide ? x(dst) : w(dst)}, ${dreg(value)}`, [dst], [value])
+        const opcode = (wide ? 0x9E780000 : 0x1E780000) | (signed ? 0 : 0x10000)
+        emit(opcode | (fp(value) << 5) | dst,
+            `${signed ? 'fcvtzs' : 'fcvtzu'} ${wide ? x(dst) : w(dst)}, ${dreg(value)}`,
+            { writes: [dst], reads: [value], conversionOp: opcode })
     }
 
     function redundantU32(src: number): boolean {
@@ -2540,6 +2578,43 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return setup
     }
 
+    function foldGuardedSelect(at: number, targets: Set<number>): boolean {
+        const branch = items[at]
+        if (branch.kind !== 'bcond') return false
+        const next = (from: number) => {
+            while (items[from]?.kind === 'label' && !targets.has(items[from].label)) from++
+            return from
+        }
+        const cmpAt = next(at + 1)
+        const selectAt = next(cmpAt + 1)
+        const cmp = items[cmpAt]
+        const select = items[selectAt]
+        let endAt = selectAt + 1
+        while (items[endAt]?.kind === 'label' && items[endAt].label !== branch.label) endAt++
+        const end = items[endAt]
+        if (branch.cond >= 14 || !cmp || select?.kind !== 'insn' || !select.cselRegs || end?.kind !== 'label'
+            || end.label !== branch.label || select.cselIncrements || select.cselCond === undefined
+            || select.cselRegs?.[0] !== select.cselRegs?.[2] || FalseFlags[select.cselCond] === undefined) return false
+        const plain = plainCompare(cmp)
+        if (!plain || plain[0] === XZR || (plain[1] < 0 && plain[2] > 31)) return false
+        for (let k = endAt + 1; k < items.length; k++) {
+            const next = items[k]
+            if (next.kind === 'label') continue
+            if (next.kind !== 'insn' || next.cselCond !== undefined || next.cond >= 0 || next.clobbers) return false
+            if (next.setsFlags) {
+                if (!plainCompare(next)) return false
+                toCcmp(cmp, select.cselCond, branch.cond ^ 1)
+                inheritDead(cmp, branch)
+                items.splice(at, 1)
+                return true
+            }
+            const defs: number[] = []
+            const uses: number[] = []
+            if (!itemDefs(next, defs) || !itemUses(next, uses)) return false
+        }
+        return false
+    }
+
     function hoistShared(): void {
         const refs = new Map<number, number>()
         const at = new Map<number, number>()
@@ -2820,6 +2895,17 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function readFrom(user: AsmItem, r: number, s: number): boolean {
+        if (isFloat(r) && isFloat(s) && !user.memory && user.reads?.includes(r) && user.reads.length <= 2) {
+            for (let i = 0; i < user.reads.length; i++) if (user.reads[i] === r) renameField(user, i === 0 ? 5 : 16, fp(r), fp(s))
+            let destination = user.writes?.some(isFloat) ?? false
+            user.text = user.text.replace(/\bd\d+\b/g, name => {
+                if (destination) { destination = false; return name }
+                return name === dreg(r) ? dreg(s) : name
+            })
+            user.reads = user.reads.map(v => v === r ? s : v)
+            if (user.cselRegs) user.cselRegs = user.cselRegs.map((v, i) => i > 0 && v === r ? s : v)
+            return true
+        }
         const rn = (word: number) => ((word & ~(0x1F << 5)) | (s << 5)) >>> 0
         if (user.aluName !== undefined && user.addShiftReg === undefined && user.addDst !== undefined
             && user.addLeft !== undefined && user.addRight !== undefined) {
@@ -2873,16 +2959,16 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function forwardCopy(dead: Set<number>): void {
-        const last = items.length - 1
+        const last = items.length - (items[items.length - 1]?.kind === 'cset' ? 2 : 1)
         const user = items[last]
         if (user?.kind !== 'insn') return
         for (const r of dead) {
             for (let at = last - 1; at >= 0; at--) {
                 const move = items[at]
                 if (move.kind !== 'insn') break
-                if (move.moveDst === r) {
-                    const s = move.moveSrc!
-                    if (s === XZR || !noInterference(at + 1, last, r, s) || !readFrom(user, r, s)) break
+                if ((move.moveDst ?? (move.copies ? move.writes![0] : undefined)) === r) {
+                    const s = move.moveSrc ?? move.reads![0]
+                    if (s === XZR || isFloat(r) !== isFloat(s) || !noInterference(at + 1, last, r, s) || !readFrom(user, r, s)) break
                     inheritDead(user, move)
                     items.splice(at, 1)
                     removedWrites.push(r)

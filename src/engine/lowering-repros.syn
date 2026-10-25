@@ -3,12 +3,13 @@
 "use wrapped";
 
 import * as intrinsics from './intrinsics'
+import ts from 'typescript'
 import * as harness from './harness'
 import { allocate } from './builtins'
 import * as gn from './graph-node'
 import * as native from './native'
 import * as bytecode from './bytecode-emitter'
-import { dumpGraph, lowerValueGraph, packageValueGraph, stronglyConnected, type Graph } from './lowering2'
+import { dumpGraph, lowerValueGraph, optimizePackaged, packageValueGraph, stronglyConnected, type Graph } from './lowering2'
 import type { Rep } from './value-types'
 import * as rt from './rt'
 import * as heap from './heap'
@@ -294,6 +295,295 @@ class TallyView {
 
 const mixedMap = new Map<number, number | { a: number }>([[1, 2.5], [2, { a: 7 }]])
 export function suite() {
+    harness.test('forwardFloatCopies', () => {
+        if (!hostTarget.name.startsWith('aarch64')) return
+        const inputs = new Float64Array(2)
+        const output = new BigUint64Array(2)
+        const floats = new Float64Array(output.buffer)
+        const bits = new BigUint64Array(inputs.buffer)
+        const ptr = (v: ArrayBufferView) => Number((ts as any).getArrayBufferPtr(v.buffer)) + v.byteOffset
+        for (const op of ['convert', 'add', 'reverse', 'same', 'neg', 'compare', 'select', 'move', 'bits', 'inplace', 'store']) for (const hazard of ['', 'source', 'entry', 'live', 'bits-source']) {
+            const asm = hostTarget.createAssembler()
+            asm.load(32, 0, 0, Types.f64)
+            asm.load(33, 0, 8, Types.f64)
+            if (op === 'select') asm.compareImm('gt', 10, 2, 0, false)
+            if (hazard === 'entry') { asm.mov(50, 33); asm.jumpIfZero(2, 0) }
+            if (hazard === 'bits-source') { asm.load(9, 0, 0, Types.u64); asm.mov(50, 9) }
+            else asm.mov(50, 32)
+            if (hazard === 'source') asm.mov(32, 33)
+            if (hazard === 'entry') asm.bindLabel(0)
+            if (op === 'convert') asm.convert(9, 50, Types.f64, Types.i64)
+            else if (op === 'compare') asm.floatCompare('eq', 9, 50, 33, [Types.f64, Types.f64])
+            else if (op === 'bits') asm.mov(9, 50)
+            else if (op === 'neg') asm.floatUnary('neg', 51, 50, Types.f64)
+            else if (op === 'reverse') asm.floatBinary('sub', 51, 33, 50, [Types.f64, Types.f64])
+            else if (op === 'select') { asm.select(51, 10, 50, 33); asm.released([{ value: 0, home: 10 }]) }
+            else if (op === 'move') asm.mov(51, 50)
+            else if (op === 'store') asm.store(1, 0, 50, Types.f64)
+            else asm.floatBinary('add', op === 'inplace' ? 50 : 51, 50, op === 'same' ? 50 : 33, [Types.f64, Types.f64])
+            if (hazard !== 'live') asm.released([{ value: 0, home: 50 }])
+            if (op !== 'store') asm.store(1, 0, ['convert', 'compare', 'bits'].includes(op) ? 9 : op === 'inplace' ? 50 : 51, ['convert', 'compare', 'bits'].includes(op) ? Types.u64 : Types.f64)
+            if (hazard === 'live') asm.store(1, 8, 50, Types.f64)
+            asm.movImm(0, 0)
+            asm.ret()
+            const listing = asm.listing()
+            const folded = !hazard && op !== 'store'
+            if (folded === /fmov d18,/.test(listing)) harness.fail(`float forwarding ${op}/${hazard}:\n${listing}`)
+            const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+            for (const value of [-99.75, -0, 0, 1.5, 2 ** 40 + 0.5, NaN]) for (const flag of [0, 1]) {
+                inputs[0] = value
+                inputs[1] = 3.25
+                run(ptr(inputs), ptr(output), flag)
+                const left = hazard === 'entry' && flag === 0 ? inputs[1] : value
+                const expected = op === 'convert' ? BigInt.asUintN(64, Number.isNaN(left) ? BigInt(0) : BigInt(Math.trunc(left)))
+                    : op === 'compare' ? BigInt(left === inputs[1] ? 1 : 0)
+                    : op === 'bits' ? bits[hazard === 'entry' && flag === 0 ? 1 : 0]
+                    : op === 'neg' ? -left : op === 'same' ? left + left
+                    : op === 'reverse' ? inputs[1] - left : op === 'select' ? flag ? left : inputs[1]
+                    : op === 'add' || op === 'inplace' ? left + inputs[1] : left
+                const actual = typeof expected === 'bigint' ? output[0] : floats[0]
+                if (!Object.is(actual, expected)) harness.fail(`float forwarding ${op}/${hazard}(${value},${flag}): ${actual}, expected ${expected}`)
+                const retained = op === 'inplace' ? left + inputs[1] : left
+                if (hazard === 'live' && !Object.is(floats[1], retained)) harness.fail(`float forwarding lost live ${op}(${value}): ${floats[1]}, expected ${retained}`)
+            }
+        }
+        const asm = hostTarget.createAssembler()
+        asm.load(32, 0, 0, Types.f64)
+        asm.mov(9, 32)
+        asm.binaryImm('add', 10, 9, 1, false)
+        asm.released([{ value: 0, home: 9 }])
+        asm.store(1, 0, 10, Types.u64)
+        asm.movImm(0, 0)
+        asm.ret()
+        if (!asm.listing().includes('fmov x9, d0')) harness.fail(`float forwarding crossed register banks:\n${asm.listing()}`)
+        const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+        for (const value of [-0, 0, 1.5, NaN, -Infinity]) {
+            inputs[0] = value
+            run(ptr(inputs), ptr(output))
+            const expected = BigInt.asUintN(64, bits[0] + BigInt(1))
+            if (output[0] !== expected) harness.fail(`float bit transfer(${value}): ${output[0]}, expected ${expected}`)
+        }
+    })
+    harness.test('narrowMaskedLoads', () => {
+        const data = new Uint8Array([0xff, 0x80, 0xab, 0xcd, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x81, 0x23, 0x45, 0x67])
+        const saved = new BigUint64Array(1)
+        const ptr = (v: ArrayBufferView) => Number((ts as any).getArrayBufferPtr(v.buffer)) + v.byteOffset
+        for (const T of [Types.u32, Types.u64]) for (const mask of [0xff, 0xffff, 0xffffffff, 0xfffe]) for (const offset of [0, 1]) for (const shared of [false, true]) {
+            const g = gn.createGraph({})
+            const root = gn.addNode(g, gn.NodeOp.block, [])
+            const input = gn.addNode(g, gn.NodeOp.param, [], Types.ptr)
+            const out = gn.addNode(g, gn.NodeOp.param, [], Types.ptr)
+            const nil = gn.addNode(g, gn.NodeOp.nilEffect, [])
+            const load = gn.addNode(g, gn.NodeOp.load, [nil, input, { literal: offset }], T)
+            const value = gn.addNode(g, gn.NodeOp.and, offset ? [{ literal: mask }, load] : [load, { literal: mask }], Types.u64)
+            const ret = gn.addNode(g, gn.NodeOp.ret, [value, root])
+            const store = gn.addNode(g, gn.NodeOp.store, [nil, out, { literal: 0 }, load], Types.u64)
+            g.root = root
+            gn.setGraphBlocks(g, [{ id: root, params: [input, out], bodyId: shared ? gn.addNode(g, gn.NodeOp.after, [store, ret]) : ret, bodyConst: 0 }])
+            const optimized = optimizePackaged(packageValueGraph(g, hostTarget), hostTarget)
+            const work = [optimized.blocks[0].bodyId]
+            const seen = new Set<number>()
+            while (work.length) {
+                const id = work.pop()!
+                const n = gn.getNode(optimized, id)
+                if (!n || seen.has(id) || n.op === gn.NodeOp.block) continue
+                seen.add(id)
+                const want = shared || mask === 0xfffe ? T : mask === 0xff ? Types.u8 : mask === 0xffff ? Types.u16 : Types.u32
+                if (n.op === gn.NodeOp.load && gn.typeOf(n) !== want) harness.fail(`masked load ${T}/${mask}/${offset}/${shared}:\n${dumpGraph(optimized)}`)
+                for (let i = 0; i < gn.countIds(n); i++) work.push(gn.getRef(n, i))
+            }
+            const code = lowerValueGraph(optimized)
+            const run = (ts as any).createNativeFn(new Uint8Array(code.bytes))
+            let loaded = BigInt(0)
+            for (let i = 0; i < (T === Types.u32 ? 4 : 8); i++) loaded |= BigInt(data[offset + i]) << BigInt(i * 8)
+            const actual = BigInt(run(ptr(data), ptr(saved)))
+            const expected = loaded & BigInt(mask)
+            if (actual !== expected || (shared && saved[0] !== loaded)) harness.fail(`masked load ${T}/${mask}/${offset}/${shared}: ${actual}, expected ${expected}`)
+        }
+    })
+    harness.test('subtractMaskedValue', () => {
+        for (const T of [Types.u64, Types.i64]) for (const mask of [3, 5, 10, 255, 65535, 2 ** 48 - 1, 2 ** 52 - 2, -4, -13]) for (const mode of ['', 'shared', 'other', 'narrow']) {
+            const g = gn.createGraph({})
+            const root = gn.addNode(g, gn.NodeOp.block, [])
+            const x = gn.addNode(g, gn.NodeOp.param, [], T)
+            const y = gn.addNode(g, gn.NodeOp.param, [], T)
+            const out = gn.addNode(g, gn.NodeOp.param, [], Types.ptr)
+            const masked = gn.addNode(g, gn.NodeOp.and, mask === 5 ? [{ literal: mask }, x] : [x, { literal: mask }], mode === 'narrow' ? Types.u32 : T)
+            const sub = gn.addNode(g, gn.NodeOp.sub, [mode === 'other' ? y : x, masked], T)
+            const ret = gn.addNode(g, gn.NodeOp.ret, [sub, root])
+            const nil = gn.addNode(g, gn.NodeOp.nilEffect, [])
+            const store = gn.addNode(g, gn.NodeOp.store, [nil, out, { literal: 0 }, masked], T)
+            g.root = root
+            gn.setGraphBlocks(g, [{ id: root, params: [x, y, out], bodyId: mode === 'shared' ? gn.addNode(g, gn.NodeOp.after, [store, ret]) : ret, bodyConst: 0 }])
+            const optimized = optimizePackaged(packageValueGraph(g, hostTarget), hostTarget)
+            const work = [optimized.blocks[0].bodyId]
+            const seen = new Set<number>()
+            let subtracts = 0
+            while (work.length) {
+                const id = work.pop()!
+                const n = gn.getNode(optimized, id)
+                if (!n || seen.has(id) || n.op === gn.NodeOp.block) continue
+                seen.add(id)
+                if (n.op === gn.NodeOp.sub) subtracts++
+                for (let i = 0; i < gn.countIds(n); i++) work.push(gn.getRef(n, i))
+            }
+            const folded = mode === '' || (mode === 'narrow' && mask >= 0 && mask < 2 ** 32)
+            if (folded !== (subtracts === 0)) harness.fail(`masked subtraction ${mask}/${mode}:\n${dumpGraph(optimized)}`)
+            const code = lowerValueGraph(optimized)
+            const run = (ts as any).createNativeFn(new Uint8Array(code.bytes))
+            const saved = new BigUint64Array(1)
+            const ptr = Number((ts as any).getArrayBufferPtr(saved.buffer))
+            for (const value of [-1099511627899, -255, -1, 0, 1, 255, 65535, 1099511627899]) {
+                const bits = mode === 'narrow' ? BigInt.asUintN(32, BigInt(value) & BigInt(mask)) : BigInt(value) & BigInt(mask)
+                const expected = BigInt.asIntN(64, (mode === 'other' ? BigInt(19) : BigInt(value)) - bits)
+                const actual = BigInt(run(value, 19, ptr))
+                if (actual !== expected || (mode === 'shared' && saved[0] !== BigInt.asUintN(64, bits))) harness.fail(`masked subtraction ${mask}/${mode}(${value}): ${actual}, expected ${expected}`)
+            }
+        }
+    })
+    harness.test('reuseFloatConversions', () => {
+        if (!hostTarget.name.startsWith('aarch64')) return
+        const values = new Float64Array(2)
+        const results = new BigUint64Array(3)
+        const ptr = (v: ArrayBufferView) => Number((ts as any).getArrayBufferPtr(v.buffer)) + v.byteOffset
+        const expected = (value: number, T: intrinsics.Types) => {
+            const bits = T === Types.i32 || T === Types.u32 ? 32 : 64
+            const signed = T === Types.i32 || T === Types.i64
+            const one = BigInt(1)
+            const min = signed ? -(one << BigInt(bits - 1)) : BigInt(0)
+            const max = (one << BigInt(bits - (signed ? 1 : 0))) - one
+            const n = Number.isNaN(value) ? BigInt(0) : value === Infinity ? max : value === -Infinity ? min : BigInt(Math.trunc(value))
+            return BigInt.asUintN(bits, n < min ? min : n > max ? max : n)
+        }
+        for (const T of [Types.i64, Types.u64, Types.i32, Types.u32]) for (const hazard of ['', 'source', 'destination', 'entry', 'type']) {
+            const other = hazard === 'type' ? T === Types.i64 ? Types.u64 : Types.i64 : T
+            const asm = hostTarget.createAssembler()
+            asm.load(32, 0, 0, Types.f64)
+            asm.mov(50, 32)
+            asm.convert(9, 50, Types.f64, T)
+            asm.store(1, 0, 9, Types.u64)
+            if (hazard === 'source') asm.load(50, 0, 8, Types.f64)
+            if (hazard === 'destination') asm.movImm(9, 99)
+            if (hazard === 'entry') { asm.jumpIfZero(2, 0); asm.movImm(9, 99); asm.bindLabel(0) }
+            asm.convert(9, 50, Types.f64, other)
+            asm.store(1, 8, 9, Types.u64)
+            asm.convert(10, 32, Types.f64, T)
+            asm.store(1, 16, 10, Types.u64)
+            asm.movImm(0, 0)
+            asm.ret()
+            const listing = asm.listing()
+            const count = (listing.match(/\bfcvtz[su]\b/g) ?? []).length
+            const required = !hazard ? 1 : hazard === 'source' || hazard === 'type' || hazard === 'entry' ? 3 : 2
+            if (count !== required) harness.fail(`conversion reuse ${T}/${hazard}:\n${listing}`)
+            const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+            for (const value of [-100000.75, -1.8, -0, 0, 1.9, 2 ** 31, 2 ** 32 + 123, 2 ** 40 + 0.5, NaN, Infinity, -Infinity]) for (const flag of [0, 1]) {
+                values[0] = value
+                values[1] = 123.75
+                run(ptr(values), ptr(results), flag)
+                const want = [expected(value, T), expected(hazard === 'source' ? values[1] : value, other), expected(value, T)]
+                if (results.some((v, i) => v !== want[i])) harness.fail(`conversion reuse ${T}/${hazard}(${value}): ${[...results]}, expected ${want}`)
+            }
+        }
+    })
+    harness.test('reuseCompareFlags', () => {
+        if (!hostTarget.name.startsWith('aarch64')) return
+        for (const hazard of ['', 'flags', 'operand', 'entry', 'copy']) {
+            const asm = hostTarget.createAssembler()
+            asm.mov(9, 0)
+            if (hazard === 'entry') asm.jumpIfZero(1, 1)
+            asm.compareImm('lt', 10, 0, 3, false)
+            asm.jumpIfNonZero(10, 0)
+            asm.released([{ value: 0, home: 10 }])
+            if (hazard === 'flags') asm.compareImm('eq', -1, 1, 7, false)
+            if (hazard === 'operand') asm.mov(0, 1)
+            asm.bindLabel(1)
+            asm.compareImm('eq', 11, hazard === 'copy' ? 9 : 0, 3, false)
+            asm.mov(0, 11)
+            asm.released([{ value: 0, home: 11 }])
+            asm.ret()
+            asm.bindLabel(0)
+            asm.movImm(0, 17)
+            asm.ret()
+            const listing = asm.listing()
+            const count = (listing.match(/cmp x(?:0|9), #3/g) ?? []).length
+            if (count !== (!hazard || hazard === 'copy' ? 1 : 2)) harness.fail(`flag reuse ${hazard}:\n${listing}`)
+            const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+            for (const x of [-1, 0, 1, 2, 3, 4, 1000000000]) for (const y of [0, 3, 7]) {
+                const skipped = hazard === 'entry' && y === 0
+                const expected = !skipped && BigInt.asUintN(64, BigInt(x)) < BigInt(3) ? 17 : (hazard === 'operand' && !skipped ? y : x) === 3 ? 1 : 0
+                const actual = Number(run(x, y))
+                if (actual !== expected) harness.fail(`flag reuse ${hazard}(${x},${y}): ${actual}, expected ${expected}`)
+            }
+        }
+    })
+    harness.test('sharedSelectFlags', () => {
+        if (!hostTarget.name.startsWith('aarch64')) return
+        const asm = hostTarget.createAssembler()
+        asm.movF64(32, 11)
+        asm.movF64(33, 22)
+        asm.movImm(13, 31)
+        asm.movImm(14, 47)
+        asm.compareImm('gt', 9, 0, 5, false)
+        asm.select(34, 9, 32, 33)
+        asm.select(10, 9, 13, 14)
+        asm.released([{ value: 0, home: 9 }])
+        asm.store(1, 0, 34, Types.f64)
+        asm.mov(0, 10)
+        asm.ret()
+        const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+        const out = new Float64Array(1)
+        const ptr = Number((ts as any).getArrayBufferPtr(out.buffer))
+        for (const n of [0, 3, 5, 6, 9]) {
+            const actual = Number(run(n, ptr))
+            if (actual !== (n > 5 ? 31 : 47) || out[0] !== (n > 5 ? 11 : 22)) harness.fail(`shared select flags(${n}): ${actual}, ${out[0]}\n${asm.listing()}`)
+        }
+    })
+    harness.test('guardedSelectFlags', () => {
+        if (!hostTarget.name.startsWith('aarch64')) return
+        const conditions: [string, (a: number, b: number) => boolean][] = [
+            ['eq', (a, b) => a === b], ['ne', (a, b) => a !== b],
+            ['lt', (a, b) => a < b], ['ge', (a, b) => a >= b],
+            ['le', (a, b) => a <= b], ['gt', (a, b) => a > b],
+        ]
+        for (const [op, check] of conditions) for (const imm of [-31, 0, 17, 31, 32]) for (const mode of ['imm64', 'imm32', 'reg']) for (const hazard of ['', 'flags', 'value', 'entry']) {
+            const asm = hostTarget.createAssembler()
+            asm.movImm(9, 7)
+            asm.movImm(13, 8)
+            if (mode === 'reg') asm.movImm(14, imm)
+            if (hazard === 'entry') asm.jumpIfZero(3, 1)
+            asm.compare('eq', 10, 0, 1, false)
+            asm.jumpIfZero(10, 0)
+            asm.released([{ value: 0, home: 10 }])
+            asm.bindLabel(1)
+            if (mode === 'reg') asm.compare(op, 11, 2, 14, true)
+            else asm.compareImm(op, 11, 2, imm, true, undefined, mode === 'imm32')
+            asm.select(9, 11, 3, hazard === 'value' ? 13 : 9)
+            asm.released([{ value: 0, home: 11 }])
+            asm.bindLabel(0)
+            if (hazard === 'flags') {
+                asm.compareImm('eq', 12, 0, 1, false, ['lt', false])
+                asm.binaryImm('shl', 12, 12, 8, false)
+                asm.binary('add', 9, 9, 12, false)
+            } else asm.compareImm('eq', -1, 1, 0, false)
+            asm.mov(0, 9)
+            asm.ret()
+            const listing = asm.listing()
+            const folded = !hazard && (mode === 'reg' || imm <= 31)
+            if (folded === /\bb\.ne\b/.test(listing)) harness.fail(`guarded ${op} ${imm} ${mode} ${hazard}:\n${listing}`)
+            const run = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
+            for (const a of [0, 1, 2]) for (const b of [0, 1, 2]) for (const c of [-32, -31, 0, 1, 17, 31, 32]) for (const value of [0, 19]) {
+                const entered = a === b || (hazard === 'entry' && value === 0)
+                let expected = entered ? check(c, imm) ? value : hazard === 'value' ? 8 : 7 : 7
+                if (hazard === 'flags') {
+                    const bits = mode === 'imm32' ? 32 : 64
+                    const carry = a === b ? BigInt.asUintN(bits, BigInt(c)) >= BigInt.asUintN(bits, BigInt(imm)) : a >= b
+                    if (!carry && a === 1) expected += 256
+                }
+                const actual = Number(run(a, b, c, value))
+                if (actual !== expected) harness.fail(`guarded ${op} ${imm} ${mode} ${hazard} (${a},${b},${c},${value}): ${actual}, expected ${expected}`)
+            }
+        }
+    })
     function staticBlockMethod(n: u32): number {
         const tally: any = new Tally(n)
         return tally.bump(2) * 10 + tally.bump(1)

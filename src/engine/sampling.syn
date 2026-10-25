@@ -7,22 +7,44 @@ export interface Samples {
     dropped: number
     milliseconds: number
     intervalMicros: number
+    gated: boolean
 }
 
 function address(view: ArrayBufferView): number {
     return Number((ts as any).getArrayBufferPtr(view.buffer)) + view.byteOffset
 }
 
-function libc(name: string): any {
+function libc(name: string, trailing: number[] = []): any {
     const asm = hostTarget.createAssembler()
+    for (let i = 0; i < trailing.length; i++) asm.movImm(i + 3, trailing[i])
     asm.movImm(16, Number((ts as any).lookupNativeSymbol(name)))
     asm.br(16)
     return (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
 }
 
+function executable(bytes: Uint8Array): { entry: number, release(): void } {
+    const mmap = libc('mmap', [0x1002, -1, 0])
+    const munmap = libc('munmap')
+    const mprotect = libc('mprotect')
+    const memcpy = libc('memcpy')
+    const invalidate = libc('sys_icache_invalidate')
+    const length = Math.ceil(bytes.length / 16384) * 16384
+    const entry = Number(mmap(0, length, 3))
+    if (entry === -1) throw 'sampling: cannot map signal handler'
+    try {
+        memcpy(entry, address(bytes), bytes.length)
+        invalidate(entry, bytes.length)
+        if (Number(mprotect(entry, length, 5)) !== 0) throw 'sampling: cannot seal signal handler'
+    } catch (e) {
+        munmap(entry, length)
+        throw e
+    }
+    return { entry, release: () => { munmap(entry, length) } }
+}
+
 let activeSampler: any[] | undefined
 
-export function sampleNative(run: () => void, milliseconds: number, intervalMicros: number): Samples {
+export function sampleNative(run: () => void, milliseconds: number, intervalMicros: number, gate?: Uint32Array): Samples {
     if (activeSampler) throw 'sampling: a sampler is already active'
     if (process.platform !== 'darwin' || process.arch !== 'arm64') throw 'sampling: native PC sampling currently requires macOS arm64'
     if (!Number.isFinite(milliseconds) || milliseconds <= 0 || milliseconds > 60000) throw 'sampling: sample-ms must be in (0, 60000]'
@@ -40,6 +62,11 @@ export function sampleNative(run: () => void, milliseconds: number, intervalMicr
     if (previousTimer.some(x => x !== BigInt(0))) throw 'sampling: ITIMER_REAL is already in use'
 
     const asm = hostTarget.createAssembler()
+    if (gate) {
+        asm.movImm(14, address(gate))
+        asm.load(14, 14, 0, Types.u32)
+        asm.jumpIfZero(14, 1)
+    }
     asm.movImm(9, address(samples))
     asm.load(10, 9, 0, Types.u64)
     asm.movImm(13, capacity)
@@ -58,8 +85,12 @@ export function sampleNative(run: () => void, milliseconds: number, intervalMicr
     asm.addImm(10, 10, 1)
     asm.store(9, 8, 10, Types.u64)
     asm.ret()
-    const handler = (ts as any).createNativeFn(new Uint8Array(asm.bytes()))
-    const handlerAddress = Number((ts as any).toNativePtrAddr(handler))
+    if (gate) {
+        asm.bindLabel(1)
+        asm.ret()
+    }
+    const handler = executable(new Uint8Array(asm.bytes()))
+    const handlerAddress = handler.entry
     const action = new BigUint64Array([BigInt(handlerAddress), BigInt(0x42) << BigInt(32)])
     const previousAction = new BigUint64Array(2)
     const alarm = new Uint32Array([1 << 13])
@@ -70,16 +101,20 @@ export function sampleNative(run: () => void, milliseconds: number, intervalMicr
     const seconds = Math.floor(intervalMicros / 1000000)
     const micros = intervalMicros % 1000000
     const timer = new BigInt64Array([BigInt(seconds), BigInt(micros), BigInt(seconds), BigInt(micros)])
-    if (Number(sigprocmask(1, address(alarm), address(previousMask))) !== 0) throw 'sampling: cannot block SIGALRM'
+    if (Number(sigprocmask(1, address(alarm), address(previousMask))) !== 0) {
+        handler.release()
+        throw 'sampling: cannot block SIGALRM'
+    }
     if (previousMask[0] & alarm[0]) {
         sigprocmask(3, address(previousMask), 0)
+        handler.release()
         throw 'sampling: SIGALRM is already blocked on this thread'
     }
     let installed = false
     let started = 0
     let elapsed = 0
     try {
-        activeSampler = [handler, samples]
+        activeSampler = [handler, samples, gate]
         if (Number(sigaction(14, address(action), address(previousAction))) !== 0) throw 'sampling: sigaction failed'
         installed = true
         if (Number(setitimer(0, address(timer), 0)) !== 0) throw 'sampling: setitimer failed'
@@ -93,12 +128,13 @@ export function sampleNative(run: () => void, milliseconds: number, intervalMicr
         sigpending(address(pending))
         if (pending[0] & alarm[0]) sigwait(address(alarm), address(signal))
         if (installed) sigaction(14, address(previousAction), 0)
+        handler.release()
         sigprocmask(3, address(previousMask), 0)
         activeSampler = undefined
     }
     const pcs: number[] = []
     for (let i = 0; i < Number(samples[0]); i++) pcs.push(Number(samples[i + 2] & BigInt('0x0000ffffffffffff')))
-    return { pcs, dropped: Number(samples[1]), milliseconds: elapsed, intervalMicros }
+    return { pcs, dropped: Number(samples[1]), milliseconds: elapsed, intervalMicros, gated: !!gate }
 }
 
 export function suite(): void {
@@ -154,5 +190,35 @@ export function suite(): void {
         assert(rejected && timer[2] > BigInt(0), 'an existing timer is rejected and left running')
     } finally { setitimer(0, address(new BigInt64Array(4)), 0) }
     assert(sampleNative(() => run(), 200, 100).pcs.length > 0, 'sampling must work again with a capacity beyond the compare-immediate range')
+    const gate = new Uint32Array(1)
+    assert(!sampleNative(() => run(), 20, 500, gate).pcs.length, 'a disabled gate excludes the workload')
+    gate[0] = 1
+    assert(sampleNative(() => run(), 20, 500, gate).pcs.length > 0, 'an enabled gate samples the workload')
+    const writable = hostTarget.createAssembler()
+    writable.spAdjust(16)
+    writable.store(31, 0, 30, Types.u64)
+    const protect = Number((ts as any).lookupNativeSymbol('pthread_jit_write_protect_np'))
+    writable.movImm(0, 0)
+    writable.movImm(16, protect)
+    writable.blr(16)
+    writable.movImm(9, 1000000)
+    writable.bindLabel(0)
+    writable.subImm(9, 9, 1)
+    writable.jumpIfNonZero(9, 0)
+    writable.movImm(0, 1)
+    writable.movImm(16, protect)
+    writable.blr(16)
+    writable.load(30, 31, 0, Types.u64)
+    writable.spAdjust(-16)
+    writable.ret()
+    const protectedRun = executable(new Uint8Array(writable.bytes()))
+    const entry = hostTarget.createAssembler()
+    entry.movImm(16, protectedRun.entry)
+    entry.br(16)
+    const runWritable = (ts as any).createNativeFn(new Uint8Array(entry.bytes()))
+    try {
+        const captured = sampleNative(() => runWritable(), 100, 100)
+        assert(captured.pcs.some(pc => pc >= protectedRun.entry && pc < protectedRun.entry + writable.bytes().length), 'signals must execute while MAP_JIT pages are writable')
+    } finally { protectedRun.release() }
     console.log('native PC sampling and exception cleanup tests passed')
 }
