@@ -186,8 +186,7 @@ const CondNames: Record<number, string> = {
     8: 'hi', 9: 'ls', 10: 'ge', 11: 'lt', 12: 'gt', 13: 'le', 14: 'al', 15: 'nv',
 }
 
-// One emitted thing. Labels occupy no words, so a peephole can 
-// delete an instruction without invalidating any address or fixup
+// FIXME: organize optionals into groups 
 interface AsmItem {
     kind: 'insn' | 'label' | 'b' | 'cbnz' | 'cbz' | 'cset' | 'bcond'
     word: number
@@ -196,6 +195,8 @@ interface AsmItem {
     reg: number    // for cbnz/cbz/cset
     cond: number   // for cset/bcond
     testBit?: number // final CBZ/CBNZ contraction to TBZ/TBNZ
+    testedSrc?: number
+    testedBits?: bigint
     storeBase?: number
     storeOffset?: number
     storeBytes?: number
@@ -713,25 +714,56 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
         const skippedDefs = new Set<number>()
         const skippedUses = new Set<number>()
+        function accessWidth(bytes: number | undefined): number {
+            return bytes === undefined ? 16 : bytes === 0 ? 8 : bytes
+        }
         function nextAccess(i: number, load: boolean, rn: number): number {
             skippedDefs.clear()
             skippedUses.clear()
             const defs: number[] = []
             const uses: number[] = []
+            const first = items[i]
+            const bytes = load ? first.loadBytes! : first.storeBytes!
+            const offset = load ? first.loadOffset! : first.storeOffset!
+            let passed = 0
             for (let j = i + 1; j < items.length; j++) {
                 const nx = items[j]
                 if (nx.kind === 'label') {
                     if (branchTarget(nx.label)) return -1
                     continue
                 }
-                if (load ? nx.loadBase !== undefined : nx.storeBase !== undefined) return j
-                if (nx.kind !== 'insn' || accessesMemory(nx)) return -1
+                const same = load ? nx.loadBase !== undefined : nx.storeBase !== undefined
+                const at = load ? nx.loadOffset : nx.storeOffset
+                if (same && (load ? nx.loadBase : nx.storeBase) === rn && (load ? nx.loadBytes : nx.storeBytes) === bytes
+                    && Math.abs(at! - offset) === bytes) return j
+                if (nx.kind !== 'insn' || nx.memory || nx.indexBase !== undefined) return -1
+                const access = nx.loadBase !== undefined || nx.storeBase !== undefined
+                if (access) {
+                    if (passed++ === 4) return -1
+                    const disjoint = (nx.loadBase ?? nx.storeBase) === rn
+                        && ((nx.loadOffset ?? nx.storeOffset)! + accessWidth(nx.loadBase !== undefined ? nx.loadBytes : nx.storeBytes) <= offset - bytes
+                            || (nx.loadOffset ?? nx.storeOffset)! >= offset + 2 * bytes)
+                    if (!disjoint && !(load && nx.loadBase !== undefined)) return -1
+                }
                 defs.length = 0
                 uses.length = 0
                 if (!itemDefs(nx, defs) || !itemUses(nx, uses)) return -1
-                if (defs.includes(rn) || uses.includes(rn)) return -1
+                if (defs.includes(rn) || (uses.includes(rn) && !access)) return -1
                 for (const d of defs) skippedDefs.add(d)
                 for (const u of uses) skippedUses.add(u)
+            }
+            return -1
+        }
+        function nextFlagsUse(at: number): number {
+            for (let j = at + 1; j < items.length; j++) {
+                const nx = items[j]
+                if (nx.kind === 'label') {
+                    if (branchTarget(nx.label)) return -1
+                    continue
+                }
+                if (nx.kind === 'bcond' || nx.kind === 'cset' || nx.cselCond !== undefined || (nx.kind === 'insn' && nx.cond >= 0)) return j
+                if (nx.cmpZeroReg !== undefined && nx.cmpZeroReg === items[at].reg) return j
+                if (nx.setsFlags || nx.clobbers || nx.kind === 'b') return -1
             }
             return -1
         }
@@ -741,7 +773,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const bytes = it.loadBytes!
             const [lo, hi] = next.loadOffset! < it.loadOffset! ? [next, it] : [it, next]
             const offset = lo.loadOffset!
-            if (next.loadBytes !== bytes || next.loadBase !== it.loadBase
+            if (next.loadBytes !== bytes || next.loadBase !== it.loadBase || ((it.word ^ next.word) & 0xC00000) !== 0 || ((it.word >>> 22) & 3) !== 1
                 || hi.loadOffset !== offset + bytes || it.reg === it.loadBase || it.reg === next.reg
                 || offset % bytes !== 0 || offset < -64 * bytes || offset > 63 * bytes) return false
             const imm = offset / bytes
@@ -973,6 +1005,64 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 if (invertOverJump(i)) {
                     changed = true
                     continue
+                }
+
+                if (it.testedSrc !== undefined && items[i + 1]?.kind === 'cset' && items[i + 1].cond === COND_NE
+                    && singleBit(it.testedBits!) >= 0 && nextFlagsUse(i + 1) < 0) {
+                    const set = items[i + 1]
+                    const field: AsmItem = { kind: 'insn', word: 0, text: '', label: -1, reg: -1, cond: -1 }
+                    writeField(field, { src: it.testedSrc, dst: set.reg, lsb: singleBit(it.testedBits!), width: 1, pos: 0, signed: false }, undefined)
+                    for (const r of it.deadAfter ?? NO_REGS) if (r !== set.reg) (field.deadAfter ??= new Set()).add(r)
+                    inheritDead(field, set)
+                    items.splice(i, 2, field)
+                    changed = true
+                    continue
+                }
+
+                if (it.cmpZeroReg !== undefined && items[i + 1]?.kind === 'cset' && nextFlagsUse(i + 1) < 0) {
+                    const set = items[i + 1]
+                    const reg = it.cmpZeroReg
+                    if (set.cond === COND_EQ || set.cond === COND_NE) {
+                        let k = i - 1
+                        while (k >= 0 && items[k].kind === 'insn' && !items[k].setsFlags && !items[k].clobbers && !writesRegister(items[k], reg)) k--
+                        if (k >= 0 && items[k].kind === 'cset' && items[k].reg === reg) {
+                            set.cond = set.cond === COND_NE ? items[k].cond : items[k].cond ^ 1
+                            set.word = (0x9A9F07E0 | ((set.cond ^ 1) << 12) | set.reg) >>> 0
+                            set.text = `cset ${x(set.reg)}, ${CondNames[set.cond]}`
+                            inheritDead(set, it)
+                            let read = false
+                            for (let m = k + 1; m < i; m++) {
+                                const reads: number[] = []
+                                if (!itemUses(items[m], reads) || reads.includes(reg)) read = true
+                            }
+                            items.splice(i, 1)
+                            if ((set.deadAfter?.has(reg) || set.reg === reg) && !read) {
+                                removedWrites.push(reg)
+                                items.splice(k, 1)
+                            }
+                            changed = true
+                            continue
+                        }
+                    }
+                    if (set.cond === COND_LT || set.cond === COND_GE) {
+                        const d = set.reg
+                        let j = i + 2
+                        while (j < items.length && items[j].kind === 'label' && !branchTarget(items[j].label)) j++
+                        const br = items[j]
+                        const branches = !!br && (br.kind === 'cbz' || br.kind === 'cbnz') && br.reg === d && !!br.deadAfter?.has(d)
+                        if (set.cond === COND_LT || branches) {
+                            if (set.cond === COND_GE) br.kind = br.kind === 'cbz' ? 'cbnz' : 'cbz'
+                            const sign: AsmItem = {
+                                kind: 'insn', word: ubfm(63, 63, reg, d), text: `lsr ${x(d)}, ${x(reg)}, #63`, label: -1, reg: -1, cond: -1,
+                                shiftDst: d, shiftSrc: reg, shiftAmount: 63, shiftKind: 'lsr',
+                            }
+                            for (const r of it.deadAfter ?? NO_REGS) if (r !== d) (sign.deadAfter ??= new Set()).add(r)
+                            inheritDead(sign, set)
+                            items.splice(i, 2, sign)
+                            changed = true
+                            continue
+                        }
+                    }
                 }
 
                 if (it.kind === 'cset' && i + 1 < items.length) {
@@ -1368,6 +1458,35 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
+    function singleBit(bits: bigint): number {
+        const one = BigInt(1)
+        if (!bits || (bits & (bits - one)) !== BigInt(0)) return -1
+        let bit = 0
+        for (let value = bits; value > one; value >>= one) bit++
+        return bit
+    }
+
+    function fuseTestBranch(at: number): boolean {
+        const branch = items[at]
+        const test = items[at - 1]
+        const bit = singleBit(test.testedBits!)
+        if (bit < 0) return false
+        for (let j = at + 1; j < items.length; j++) {
+            const nx = items[j]
+            if (nx.kind === 'bcond' || nx.kind === 'cset' || nx.cselCond !== undefined || (nx.kind === 'insn' && nx.cond >= 0)) return false
+            if (nx.kind !== 'insn' || nx.setsFlags || nx.clobbers) break
+        }
+        const target = items.findIndex(it => it.kind === 'label' && it.label === branch.label)
+        if (target < 0 || Math.abs(target - at) >= (1 << 13) - 1) return false
+        branch.kind = branch.cond === COND_EQ ? 'cbz' : 'cbnz'
+        branch.cond = -1
+        branch.reg = test.testedSrc!
+        branch.testBit = bit
+        inheritDead(branch, test)
+        items.splice(at - 1, 1)
+        return true
+    }
+
     function resolve(): void {
         if (finished) return
         finished = true
@@ -1387,6 +1506,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (it.kind === 'label') {
                 addrOf.set(it.label, pc)
                 continue
+            }
+            if (i > 0 && it.kind === 'bcond' && (it.cond === COND_EQ || it.cond === COND_NE) && items[i - 1].testedSrc !== undefined
+                && emitterStep(fuseTestBranch, i)) {
+                i--
+                pc--
             }
             if (i > 0 && (it.kind === 'cbz' || it.kind === 'cbnz') && it.deadAfter?.has(it.reg)
                 && (items[i - 1].logicalOp === 'and' || items[i - 1].extractWidth === 1
@@ -2184,10 +2308,12 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const last = items.length - 1
         const sel = items[last]
         const cmp = items[last - 1]
-        if (!sel?.cselRegs || !cmp || cmp.cmpZeroReg === undefined) return false
-        if (sel.cselCond !== COND_EQ && sel.cselCond !== COND_NE) return false
+        const set = sel?.kind === 'cset'
+        if ((!sel?.cselRegs && !set) || !cmp || cmp.cmpZeroReg === undefined) return false
+        const cond = set ? sel.cond : sel.cselCond
+        if (cond !== COND_EQ && cond !== COND_NE) return false
         const t = cmp.cmpZeroReg
-        if (!dead.has(t) || sel.cselRegs[1] === t || sel.cselRegs[2] === t) return false
+        if (!dead.has(t) || (!set && (sel.cselRegs![1] === t || sel.cselRegs![2] === t))) return false
         for (let at = last - 2; at >= 0 && items[at].kind === 'insn'; at--) {
             const mask = items[at]
             const defs: number[] = []
@@ -2203,6 +2329,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             cmp.text = `tst ${x(src)}, #${BigInt.asIntN(64, bits)}`
             cmp.cmpZeroReg = undefined
             cmp.setsFlags = true
+            cmp.testedSrc = src
+            cmp.testedBits = bits
             inheritDead(cmp, mask)
             items.splice(at, 1)
             removedWrites.push(t)
@@ -2221,8 +2349,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             return
         }
         emitCmpZero(cond)
-        // tagged so the peephole can retarget the condition instead of decoding it
-        // back out of the encoding
         push({
             kind: 'insn', word: (0x9A800000 | (b << 16) | (COND_NE << 12) | (a << 5) | dst) >>> 0,
             text: `csel ${x(dst)}, ${x(a)}, ${x(b)}, ne`, label: -1, reg: dst, cond: -1,
@@ -2371,6 +2497,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.storeBase !== undefined) {
             out.push(item.storeBase)
             out.push(item.word & 0x1F)
+            if (!item.storeBytes) out.push(pairSecondReg(item))
             return true
         }
         if (item.cmpLeft !== undefined) {
@@ -3265,7 +3392,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         const r = dead.has(scratchB) ? scratchB : dead.has(scratchA) ? scratchA : -1
         if (r < 0) return
         assert(r === scratchB, 'aarch64: only x17 holds released scratch values; renaming a range into x16 relies on x16 never holding one')
-        const o = r === scratchA ? scratchB : scratchA
+        const o = r
         const last = items.length - 1
         const floor = Math.max(0, last - 8)
         const chain: AsmItem[] = []
