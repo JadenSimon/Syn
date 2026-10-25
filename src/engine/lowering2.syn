@@ -23,6 +23,7 @@ import {
     retypeNode, type TypeOperand, isNullishValue, floatLiteral, sameSlotBits, nodeUsers,
     type NodeSpace,
     armOrBodySlot, orderRegions, childRegion, type RegionTree, allNodes, countNodes, nodeEntries, nodeIds,
+    OrderedValues, ResultUsedFlag, graphIndex, dirtyIndex, indexBlock,
 } from './graph-node'
 
 const Types = intrinsics.Types
@@ -60,6 +61,7 @@ export interface Graph {
     level?: number
     unswitch?: number
     facts?: Map<number, GraphNode>
+    index?: gn.GraphIndex
 }
 
 const FactOps = new Set([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.convert, NodeOp.load, NodeOp.literal])
@@ -1524,9 +1526,7 @@ function comparesFloats(g: Graph, c: GraphNode): boolean {
 const TargetingValues = new Set([
     NodeOp.syscallTarget, NodeOp.localTarget, NodeOp.indirectTarget
 ])
-export const OrderedValues = new Set([
-    NodeOp.load, NodeOp.store, NodeOp.call, NodeOp.pstack, NodeOp.rt, NodeOp.alloca, NodeOp.trap, NodeOp.getProp, NodeOp.setProp
-])
+export { OrderedValues } from './graph-node'
 export function firstNonOrderingSlot(n: GraphNode): number {
     return n.op === NodeOp.after ? countIds(n) - 1 : OrderedValues.has(n.op) ? 1 : 0
 }
@@ -3117,7 +3117,6 @@ export function isJumbo(g: Graph): boolean {
 
 const optimizeRounds = Number(intrinsics.argv().find(a => a.startsWith('optimize-rounds:'))?.slice(16) ?? 0)
 const disabledPasses = new Set(intrinsics.argv().filter(a => a.startsWith('no-pass:')).map(a => a.slice(8)))
-const unswitchScan = intrinsics.argv().includes('unswitch-scan')
 const verifySweeps = intrinsics.argv().includes('verify-sweeps')
 const UnswitchableOps = new Set([NodeOp.eq, NodeOp.ne, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.add, NodeOp.sub, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.not, NodeOp.neg])
 
@@ -3150,7 +3149,6 @@ export function printOptimizeStats(): void {
     optimizeIdle.clear()
 }
 
-const ResultUsedFlag = 1
 const FoldableOps = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.pow, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.convert])
 
 export const MemFresh = 0, MemPre = 1, MemUnknown = 2, MemInt = 3
@@ -3807,13 +3805,18 @@ interface Promotion {
 
 function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     const optimizeStart = performance.now()
-    const dependents = new Map<number, Set<number>>()
-    function recordEdge(from: number, to: number, used: boolean) {
-        if (used) getNode(g, to)!.scratchFlags |= ResultUsedFlag
-        let d = dependents.get(to)
-        if (!d) dependents.set(to, d = new Set())
-        d.add(from)
+    const index = graphIndex(g)
+    defer finally {
+        dirtyIndex(g)
     }
+    const dependents = index.dependents
+    const byOp = index.byOp
+    const successors = index.successors
+    const preds = index.preds
+    const visited = index.visited
+    const reachableBlocks = index.reachableBlocks
+    const inboundVersions = index.inboundVersions
+    const versions = new Map<number, number>()
 
     function isResultUsed(id: number): boolean {
         return (getNode(g, id)!.scratchFlags & ResultUsedFlag) !== 0
@@ -3836,37 +3839,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return b
     }
 
-    const byOp = new Map<number, Map<NodeOp, number[]>>()
-    function indexValue(id: number, op: NodeOp, blockId: number) {
-        let m = byOp.get(blockId)
-        if (!m) byOp.set(blockId, m = new Map())
-        let arr = m.get(op)
-        if (!arr) m.set(op, arr = [])
-        arr.push(id)
-    }
-
     function findValues(blockId: number, op: NodeOp) {
         if (const m = byOp.get(blockId)) {
             return m.get(op)
         }
     }
-
-    interface ArityClosure {
-        id: number
-        support: number[]
-        values: number[]
-        inputs: number[]
-    }
-    interface BlockClosureInfo {
-        block: GraphBlock
-        termOf: Map<number, number>
-        term: (id: number) => number
-        closures: ArityClosure[]
-        closureOf: Map<number, number>
-        byParam: Map<number, number[]>
-        bySupport: Map<string, number[]>
-    }
-    const blockClosureInfo = new Map<number, BlockClosureInfo>()
 
     function operandEdge(n: GraphNode, i: number): number {
         if (i === 0 && n.op === NodeOp.apply) return 0
@@ -3916,98 +3893,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return demanded(g, root, into, new Map())
     }
 
-    function visitBlock(b: GraphBlock) {
-        if (visited.has(b.id)) return
-        reachableBlocks.add(b)
-        visited.set(b.id, visited.size)
-        blockStack.push(b)
-        defer blockStack.pop()
-        visit(b.bodyId, false)
-    }
-
-    const successors = new Map<number, Set<number>>()
-    const preds = new Map<number, Set<number>>()
-    const stack: number[] = []
-    const blockStack: GraphBlock[] = []
-    const visited = new Map<number, number>()
-    const reachableBlocks = new Set<GraphBlock>()
-    const versions = new Map<number, number>()
-    const inboundVersions = new Map<number, number>()
-    function visit(id: number, used: boolean, param?: boolean): void {
-        if (!id) return
-        const n = getNode(g, id)!
-        if (n.op === NodeOp.nilEffect || n.op === NodeOp.void) return
-        const seen = visited.has(id)
-        if (!seen) n.scratchFlags &= ~ResultUsedFlag
-        if (stack.length && !param) {
-            recordEdge(stack[stack.length-1], id, used)
-        }
-        if (seen) return
-        visited.set(id, visited.size)
-
-        const currentBlockId = blockStack[blockStack.length-1].id
-        if (n.op === NodeOp.param) {
-            indexValue(id, NodeOp.param, currentBlockId)
-            return
-        }
-
-        indexValue(id, n.op, currentBlockId)
-        if (!countIds(n)) return
-
-        stack.push(id)
-        defer stack.pop()
-
-        if (n.op === NodeOp.after) {
-            const last = countIds(n) - 1
-            for (let i = 0; i < last; i++) visit(getRef(n, i), false)
-            visit(getRef(n, last), true)
-            return
-        }
-        if (n.op === NodeOp.apply) {
-            let s = successors.get(currentBlockId)
-            if (!s) successors.set(currentBlockId, s = new Set())
-            s.add(getRef(n, 0))
-            s = preds.get(getRef(n, 0))
-            if (!s) preds.set(getRef(n, 0), s = new Set())
-            if (!s.has(currentBlockId)) inboundVersions.set(getRef(n, 0), (inboundVersions.get(getRef(n, 0)) ?? 0) + 1)
-            s.add(currentBlockId)
-            const b = getGraphBlock(getRef(n, 0))
-            for (let i = 1; i < countIds(n); i++) {
-                visit(getRef(n, i), true)
-            }
-            const outer = stack.splice(0)
-            visitBlock(b)
-            stack.push(...outer)
-            return
-        }
-        if (OrderedValues.has(n.op)) {
-            visit(getRef(n, 0), false)
-            for (let i = 1; i < countIds(n); i++) {
-                visit(getRef(n, i), true)
-            }
-            return
-        }
-        for (let i = 0; i < countIds(n); i++) {
-            visit(getRef(n, i), true)
-        }
-    }
-
-    function indexGraph() {
-        dependents.clear()
-        byOp.clear()
-        successors.clear()
-        preds.clear()
-        visited.clear()
-        blockStack.length = 0
-        reachableBlocks.clear()
-        visited.set(0, 0)
-        blockStack.push(g.blocks[0])
-        reachableBlocks.add(g.blocks[0])
-        const bodyId = g.blocks[0].bodyId
-        if (bodyId) visit(bodyId, false)
-    }
-    indexGraph()
-
     function paramLike(value: number): number {
         const n = value ? getNode(g, value) : undefined
         if (!n) return addParam()
@@ -4030,8 +3915,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function cleanBlockData(b: GraphBlock) {
-        blockClosureInfo.delete(b.id)
-
         if (const s = successors.get(b.id)) {
             successors.delete(b.id)
             for (const x of s) {
@@ -4146,16 +4029,15 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!incremental) {
             cleanBlockData(b)
             visited.delete(b.id)
-            visitBlock(b)
+            indexBlock(g, index, b)
             return
         }
-        blockClosureInfo.delete(b.id)
         if (const s = successors.get(b.id)) {
             successors.delete(b.id)
             for (const x of s) preds.get(x)?.delete(b.id)
         }
         visited.delete(b.id)
-        visitBlock(b)
+        indexBlock(g, index, b)
         const ops = byOp.get(b.id)
         if (!ops) return
         const members = new Set<number>()
@@ -5494,54 +5376,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
         }
         return members
-    }
-
-    function leavesLoop(id: number, members: Set<number>): boolean {
-        for (let at = id; at;) {
-            const n = getNode(g, at)
-            if (!n) return false
-            if (n.op === NodeOp.ret || n.op === NodeOp.unreachable || n.op === NodeOp.panic) return true
-            if (n.op === NodeOp.apply) return !members.has(getRef(n, 0))
-            if (n.op !== NodeOp.after) return false
-            at = getRef(n, countIds(n) - 1)
-        }
-        return false
-    }
-
-    function scanUnswitchCandidates(): void {
-        for (const header of reachableBlocks) {
-            if (header === g.blocks[0]) continue
-            const members = loopMembers(header)
-            if (![...(preds.get(header.id) ?? [])].some(p => members.has(p))) continue
-            const invariant = new Map<number, number>()
-            for (let i = 0; i < header.params.length; i++) {
-                const chain = relayChain(header, i, members)
-                if (!chain) continue
-                for (const [id, at] of chain) invariant.set(getGraphBlock(id).params[at], i)
-            }
-            let nodes = 0
-            let selects = 0
-            const conditions = new Set<number>()
-            const exits = new Set<number>()
-            for (const id of members) {
-                for (const ids of byOp.get(id)?.values() ?? []) nodes += ids.length
-                for (const sel of findValues(id, NodeOp.select) ?? []) {
-                    const c = getRef(getNode(g, sel)!, 0)
-                    const cn = getNode(g, c)
-                    const refs = cn ? getArgIds(cn).filter(x => x) : []
-                    const root = invariant.has(c) ? invariant.get(c)!
-                        : cn && cn.op !== NodeOp.param && refs.length && refs.every(x => invariant.has(x)) ? invariant.get(refs[0])! : -1
-                    if (root < 0) continue
-                    selects++
-                    conditions.add(root)
-                    const sn = getNode(g, sel)!
-                    for (let arm = 1; arm < countIds(sn); arm++) {
-                        if (leavesLoop(getRef(sn, arm), members)) exits.add(root)
-                    }
-                }
-            }
-            if (selects) console.log(`UNSWITCH ${g.name} B${header.id} blocks=${members.size} nodes=${nodes} invariants=${new Set(invariant.values()).size} conditions=${conditions.size} selects=${selects} exiting=${exits.size}`)
-        }
     }
 
     let unswitched = false
@@ -11531,191 +11365,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return true
     }
 
-    interface ClosureTerm {
-        param?: number
-        node?: GraphNode
-        args: number[]
-        head: string
-    }
-    const closureTerms = new Map<number, ClosureTerm>()
-    const closureTermIds = new Map<string, number>()
-    let nextClosureTerm = 1
-    function internClosureTerm(key: string, term: ClosureTerm): number {
-        const known = closureTermIds.get(key)
-        if (known !== undefined) return known
-        const id = nextClosureTerm++
-        closureTermIds.set(key, id)
-        closureTerms.set(id, term)
-        return id
-    }
-    function paramClosureTerm(param: number): number {
-        return internClosureTerm(`p${param}`, { param, args: [], head: `p${param}` })
-    }
-    function constantClosureTerm(value: number): number {
-        const key = `c${value}`
-        return internClosureTerm(key, { args: [], head: key })
-    }
-    function opaqueClosureTerm(value: number): number {
-        return internClosureTerm(`o${value}`, { args: [], head: `o${value}` })
-    }
-    function nodeClosureTerm(n: GraphNode, args: number[]): number {
-        const key = `n${nodeKey(g, n, args, true)}`
-        const headArgs = args.map(x => x ? 1 : 0)
-        const head = nodeKey(g, n, headArgs, true)
-        return internClosureTerm(key, { node: n, args, head })
-    }
-
-    function closuresOf(b: GraphBlock): BlockClosureInfo {
-        if (const known = blockClosureInfo.get(b.id)) return known
-        const values = new Set<number>(b.params)
-        for (const ids of byOp.get(b.id)?.values() ?? []) {
-            for (const id of ids) if (isUnordered(id)) values.add(id)
-        }
-        const supportOf = new Map<number, number[]>()
-        for (const p of b.params) {
-            supportOf.set(p, [p])
-        }
-        function support(id: number): number[] {
-            const n = getNode(g, id)!
-            if (n.op === NodeOp.param) return supportOf.get(id)!
-            if (!isUnordered(id)) return []
-            const argIds = getArgIds(n).filter(x => x > 0)
-            if (!argIds.length) return []
-            if (argIds.length === 1) return support(argIds[0])
-            if (const known = supportOf.get(id)) return known
-            const result: number[] = []
-            supportOf.set(id, result)
-            const seen = new Set<number>()
-            for (const arg of argIds) for (const p of support(arg)) seen.add(p)
-            for (const p of seen) result.push(p)
-            return result
-        }
-        const termOf = new Map<number, number>()
-        function term(id: number): number {
-            const known = termOf.get(id)
-            if (known !== undefined) return known
-            const n = getNode(g, id)
-            assert(n)
-            let result: number
-            if (n.op === NodeOp.param) result = paramClosureTerm(id)
-            else if (n.op === NodeOp.literal) result = constantClosureTerm(literalValue(g, n))
-            else if (!isUnordered(id)) result = opaqueClosureTerm(id)
-            else result = nodeClosureTerm(n, getArgIds(n).map(arg => arg ? term(arg) : 0))
-            termOf.set(id, result)
-            return result
-        }
-        for (const id of values) { support(id); term(id) }
-
-        const groups = new Map<string, number[]>()
-        for (const id of values) {
-            const key = support(id).join(',')
-            let group = groups.get(key)
-            if (!group) groups.set(key, group = [])
-            group.push(id)
-        }
-        const closures: ArityClosure[] = []
-        for (const group of groups.values()) {
-            const members = new Set(group)
-            const parent = new Map<number, number>()
-            function root(id: number): number {
-                if (const p = parent.get(id)) {
-                    const r = root(p)
-                    parent.set(id, r)
-                    return r
-                }
-                return id
-            }
-            function join(a: number, c: number): void {
-                const x = root(a)
-                const y = root(c)
-                if (x !== y) parent.set(y, x)
-            }
-            for (const id of group) {
-                if (!id) continue
-                const n = getNode(g, id)!
-                for (const arg of getArgIds(n)) {
-                    if (!arg) continue
-                    if (members.has(arg)) join(id, arg)
-                }
-            }
-            const byRoot = new Map<number, number[]>()
-            for (const id of group) {
-                const r = root(id)
-                let component = byRoot.get(r)
-                if (!component) byRoot.set(r, component = [])
-                component.push(id)
-            }
-            for (const component of byRoot.values()) {
-                closures.push({ id: -1, support: support(component[0]), values: component, inputs: [] })
-            }
-        }
-        closures.sort((a, c) => a.support.length - c.support.length
-            || a.support.map(x => b.params.indexOf(x)).join(',').localeCompare(c.support.map(x => b.params.indexOf(x)).join(','))
-            || a.values[0] - c.values[0])
-        const closureOf = new Map<number, number>()
-        const byParam = new Map<number, number[]>()
-        const bySupport = new Map<string, number[]>()
-        for (let i = 0; i < closures.length; i++) {
-            const closure = closures[i]
-            closure.id = i
-            for (const value of closure.values) closureOf.set(value, i)
-            for (const param of closure.support) {
-                let arr = byParam.get(param)
-                if (!arr) byParam.set(param, arr = [])
-                arr.push(i)
-            }
-            const key = closure.support.join(',')
-            let arr = bySupport.get(key)
-            if (!arr) bySupport.set(key, arr = [])
-            arr.push(i)
-        }
-        for (const closure of closures) {
-            const inputs = new Set<number>()
-            for (const id of closure.values) {
-                const n = getNode(g, id)!
-                for (const arg of getArgIds(n)) {
-                    if (!arg) continue
-                    const input = closureOf.get(arg)
-                    if (input !== undefined && input !== closure.id) inputs.add(input)
-                }
-            }
-            closure.inputs = [...inputs].sort((a, c) => a - c)
-        }
-        const info = { block: b, termOf, term, closures, closureOf, byParam, bySupport }
-        blockClosureInfo.set(b.id, info)
-        return info
-    }
-
-    function dumpArityClosures(): string {
-        const lines = [`--- arity closures for ${g.name ?? '<graph>'} ---`]
-        for (const b of reachableBlocks) {
-            const info = closuresOf(b)
-            lines.push(`B${b.id}(${b.params.map(x => `%${x}`).join(', ')})`)
-            for (const closure of info.closures) {
-                const params = closure.support.map(x => `%${x}`).join(', ')
-                const from = closure.inputs.map(x => `C${x}`).join(', ')
-                const body = closure.values.map(id => `%${id}=${opName(getNode(g, id)!.op)}`).join(' ')
-                lines.push(`  C${closure.id}/${closure.support.length} {${params}}${from ? ` <- ${from}` : ''}: ${body}`)
-            }
-            const roots = new Set<number>()
-            const seen = new Set<number>()
-            function collect(id: number): void {
-                if (!id || seen.has(id)) return
-                seen.add(id)
-                const closure = info.closureOf.get(id)
-                if (closure !== undefined) { roots.add(closure); return }
-                const n = getNode(g, id)
-                if (n) for (const arg of getArgIds(n)) collect(arg)
-            }
-            collect(b.bodyId)
-            const from = [...roots].sort((a, c) => a - c).map(x => `C${x}`).join(', ')
-            lines.push(`  block/${b.params.length} {${b.params.map(x => `%${x}`).join(', ')}}${from ? ` <- ${from}` : ''}`)
-        }
-        return lines.join('\n')
-    }
-
-
-
     function forwardCongruentValues(): boolean {
         const entry = g.blocks[0]
         let candidates = false
@@ -12128,10 +11777,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(closeCountedLoop, b)
         }
         verifySweep()
-        if (intrinsics.argv().includes('closure-debug')
-            || intrinsics.argv().includes(`closure-debug:${g.name}`)) {
-            console.log(dumpArityClosures())
-        }
     }
 
     const maxRounds = optimizeRounds || (countNodes(g) < 50 ? 3 : 2)
@@ -12147,7 +11792,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
     liveParams = undefined
     for (const b of reachableBlocks) step(pruneUnusedParams, b)
-    if (unswitchScan) scanUnswitchCandidates()
     if (!reachableBlocks.size) {
         reachableBlocks.add(g.blocks[0])
         g.blocks[0].bodyId = unreachable()
