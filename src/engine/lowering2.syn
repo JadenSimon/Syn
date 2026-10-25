@@ -653,7 +653,7 @@ function joinEnds(a: End | null, b: End | null): End | null {
     return a === b ? a : undefined
 }
 
-export function hotCold(g: Graph, loops: GraphLoops): HotCold {
+export function hotCold(g: Graph, loops: GraphLoops, costs = lowering.hostTarget.costs): HotCold {
     const out: HotCold = { targets: new Map(), arrivals: new Map(), hotArm: new Map() }
     const positions = new Map<number, TailPosition[]>()
     for (const b of g.blocks) positions.set(b.id, tailPositions(g, b.bodyId))
@@ -709,6 +709,16 @@ export function hotCold(g: Graph, loops: GraphLoops): HotCold {
         const loop = headers.length ? loops.loopMembers.get(headers[headers.length - 1]) : undefined
         const once = g.level === 0 && !headers.length
         const targets = new Map<number, number>()
+        let uses: Map<number, number> | undefined
+        function slowerJoinArm(n: GraphNode): number {
+            const yes = getNode(g, tailOf(g, getRef(n, 1)))
+            const no = getNode(g, tailOf(g, getRef(n, 2)))
+            if (yes?.op !== NodeOp.apply || no?.op !== NodeOp.apply || getRef(yes, 0) !== getRef(no, 0)) return 0
+            uses ??= countUses(g, b.bodyId)
+            const arms = speculatedArms(g, costs, uses, n)
+            if (!arms || arms[0] === arms[1]) return 0
+            return arms[0] > arms[1] ? 1 : 2
+        }
         function walk(id: number, cold: number): void {
             const at = tailOf(g, id)
             const n = getNode(g, at)
@@ -735,6 +745,8 @@ export function hotCold(g: Graph, loops: GraphLoops): HotCold {
                 : (staying && !arm.stays ? 1 : 0) + (arm.end === 'zero' && zeroes < arms.length ? 1 : 0))
             const compared = arms.length === 2 ? coldCompare(getRef(n, 0)) : 0
             if (compared) coldness[compared - 1]++
+            const slow = arms.length === 2 ? slowerJoinArm(n) : 0
+            if (slow) coldness[slow - 1]++
             if (once) coldness.fill(0)
             if (arms.length === 2 && coldness[0] !== coldness[1]) out.hotArm.set(at, coldness[0] < coldness[1] ? 1 : 2)
             for (let i = 1; i < countIds(n); i++) walk(getRef(n, i), cold + coldness[i - 1])
@@ -13279,7 +13291,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
         chains.push(chain)
         chainOf.set(id, chain)
     }
-    const odds = hotCold(g, loops)
+    const odds = hotCold(g, loops, opts?.target?.costs)
     const hotArm = odds.hotArm
     function prefer(from: number, a: number, b: number): number {
         const ca = odds.targets.get(from)?.get(a) ?? Infinity
@@ -14536,6 +14548,206 @@ function isolateSelectArms(g: Graph): Graph {
         visitRegion(g.blocks[i].bodyId)
     }
     return g
+}
+
+const JoinOps = new Set<NodeOp>([NodeOp.apply, NodeOp.after])
+
+function exclusiveCone(g: Graph, uses: Map<number, number>, root: number): Set<number> {
+    const refs = new Map<number, number>()
+    const cone = new Set<number>()
+    const work = root ? [root] : []
+    while (work.length) {
+        const x = work.pop()!
+        const n = getNode(g, x)!
+        if (n.op === NodeOp.param || isArgless(n)) continue
+        const k = (refs.get(x) ?? 0) + 1
+        refs.set(x, k)
+        if (k !== uses.get(x)) continue
+        cone.add(x)
+        for (const y of getArgIds(n)) if (y) work.push(y)
+    }
+    return cone
+}
+
+function armCycles(g: Graph, costs: lowering.TargetCosts, cone: Set<number>, root: number): number {
+    const depths = new Map<number, number>()
+    function depthOf(id: number): number {
+        if (!cone.has(id)) return 0
+        const known = depths.get(id)
+        if (known !== undefined) return known
+        const n = getNode(g, id)!
+        const ids = getArgIds(n)
+        let d = 0
+        for (let i = firstNonOrderingSlot(n); i < ids.length; i++) if (ids[i]) d = Math.max(d, depthOf(ids[i]))
+        if (!JoinOps.has(n.op)) d += latency(costs, n.op)
+        depths.set(id, d)
+        return d
+    }
+    let size = 0
+    for (const id of cone) if (!JoinOps.has(getNode(g, id)!.op)) size++
+    return root ? Math.max(depthOf(root), size / IssueWidth) : 0
+}
+
+function speculatedArms(g: Graph, costs: lowering.TargetCosts, uses: Map<number, number>, n: GraphNode): [yes: number, no: number] | undefined {
+    const cycles: number[] = []
+    for (let i = 1; i < 3; i++) {
+        const cone = exclusiveCone(g, uses, getRef(n, i))
+        for (const id of cone) {
+            const m = getNode(g, id)!
+            if (!JoinOps.has(m.op) && !leavesArm(g, m)) return
+        }
+        cycles.push(armCycles(g, costs, cone, getRef(n, i)))
+    }
+    if (2 * (cycles[0] + cycles[1]) > costs.mispredict) return [cycles[0], cycles[1]]
+}
+
+function costlySelects(g: Graph, costs: lowering.TargetCosts, b: GraphBlock): number[] {
+    const uses = countUses(g, b.bodyId)
+    const tail = new Set<number>()
+    const stack = [b.bodyId]
+    while (stack.length) {
+        const id = stack.pop()!
+        const n = getNode(g, id)
+        if (!n) continue
+        tail.add(id)
+        if (n.op === NodeOp.after) stack.push(getRef(n, countIds(n) - 1))
+        if (n.op === NodeOp.ret) stack.push(getRef(n, 0))
+        if (n.op === NodeOp.select) for (let i = 1; i < countIds(n); i++) stack.push(getRef(n, i))
+    }
+    const found: number[] = []
+    for (const id of blockValues(g, b.bodyId)) {
+        const n = getNode(g, id)!
+        if (n.op !== NodeOp.select || tail.has(id) || countIds(n) !== 3 || !getRef(n, 0)) continue
+        if (typeRefOf(n) || gn.recordTypeRef(g, n)) continue
+        if (speculatedArms(g, costs, uses, n)) found.push(id)
+    }
+    return found
+}
+
+function branchAtSelect(g: Graph, b: GraphBlock, selectId: number): GraphBlock {
+    const select = getNode(g, selectId)!
+    const before = new Set(blockValues(g, selectId))
+    const ordering = (n: GraphNode, i: number) => i < firstNonOrderingSlot(n) || (n.op === NodeOp.alloca && i === 0)
+    const computed = (id: number) => before.has(id) && !isArgless(getNode(g, id)!)
+    const inputs: number[] = [selectId]
+    const passed = new Set<number>(inputs)
+    const lead = new Set<number>()
+    const after = new Set<number>([b.bodyId])
+    const visit = [b.bodyId]
+    while (visit.length) {
+        const n = getNode(g, visit.pop()!)!
+        for (let i = 0; i < countIds(n); i++) {
+            const x = getRef(n, i)
+            if (!x || passed.has(x) || after.has(x)) continue
+            const m = getNode(g, x)!
+            if (m.op === NodeOp.block || isArgless(m)) continue
+            if (ordering(n, i) && computed(x)) {
+                lead.add(x)
+                continue
+            }
+            if (m.op === NodeOp.param || computed(x) || (m.op === NodeOp.get && computed(getRef(m, 0)))) {
+                passed.add(x)
+                inputs.push(x)
+                continue
+            }
+            after.add(x)
+            visit.push(x)
+        }
+    }
+    const r = new Map<number, number>()
+    const params = inputs.map(x => {
+        const n = getNode(g, x)!
+        const p = newId(g)
+        if (n.op === NodeOp.param) putCopy(g, p, n)
+        else putNode(g, p, NodeOp.param, [], valueType(g, n))
+        r.set(x, p)
+        return p
+    })
+    const start = createNode(g, NodeOp.startOf, [])
+    function copy(id: number): number {
+        const known = r.get(id)
+        if (known !== undefined) return known
+        if (!after.has(id)) return id
+        const n = getNode(g, id)!
+        const operands = getOperands(g, n)
+        for (let i = 0; i < operands.length; i++) {
+            const x = operands[i]
+            if (typeof x !== 'number' || !x) continue
+            operands[i] = ordering(n, i) && lead.has(x) ? start : copy(x)
+        }
+        const c = addCopy(g, n, operands)
+        r.set(id, c)
+        return c
+    }
+    const blockId = createNode(g, NodeOp.block, [])
+    const k: GraphBlock = { id: blockId, params, bodyId: copy(b.bodyId), bodyConst: 0 }
+    const arms: Operand[] = [getOperand(g, select, 0)]
+    for (let i = 1; i < 3; i++) arms.push(addNode(g, NodeOp.apply, [blockId, getOperand(g, select, i), ...inputs.slice(1)]))
+    const split = addNode(g, NodeOp.select, arms)
+    setBlockBody(g, b, lead.size ? createNode(g, NodeOp.after, [...lead, split]) : split)
+    addGraphBlock(g, k)
+    return k
+}
+
+function reachesNode(g: Graph, from: number, to: number): boolean {
+    const seen = new Set<number>()
+    const stack = [from]
+    while (stack.length) {
+        const id = stack.pop()!
+        if (id === to) return true
+        const n = id && !seen.has(id) ? getNode(g, id) : undefined
+        if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+        seen.add(id)
+        for (const x of getArgIds(n)) stack.push(x)
+    }
+    return false
+}
+
+function armHome(g: Graph, root: number, selectId: number, memo: ArmDemand): [owner: number, slot: number] | undefined {
+    let id = tailOf(g, root)
+    while (true) {
+        const n = getNode(g, id)!
+        if (n.op !== NodeOp.select) return
+        let slot = 0
+        for (let i = 1; i < countIds(n); i++) {
+            if (!getRef(n, i) || !reachesNode(g, getRef(n, i), selectId)) continue
+            if (slot) return
+            slot = i
+        }
+        if (!slot) return
+        if (demanded(g, getRef(n, slot), new Set(), memo).has(selectId)) return [id, slot]
+        id = tailOf(g, getRef(n, slot))
+    }
+}
+
+function branchCostlySelects(g: Graph, costs: lowering.TargetCosts): boolean {
+    const work = g.blocks.slice()
+    const skipped = new Set<number>()
+    let changed = false
+    while (work.length) {
+        const b = work.pop()!
+        const found = costlySelects(g, costs, b).filter(id => !skipped.has(id))
+        if (!found.length) continue
+        const reach = found.map(id => new Set(blockValues(g, id)))
+        const first = found.find((id, i) => found.every(other => other === id || !reach[i].has(other)))!
+        const memo: ArmDemand = new Map()
+        if (demanded(g, b.bodyId, new Set(), memo).has(first)) {
+            work.push(b, branchAtSelect(g, b, first))
+            changed = true
+            continue
+        }
+        const home = armHome(g, b.bodyId, first, memo)
+        const app = home ? outlineArm(g, countUses(g, b.bodyId), getRef(getNode(g, home[0])!, home[1])) : 0
+        if (!app) {
+            skipped.add(first)
+            work.push(b)
+            continue
+        }
+        setRef(getNode(g, home![0])!, home![1], app)
+        work.push(b, getBlock(g, getRef(getNode(g, app)!, 0))!)
+        changed = true
+    }
+    return changed
 }
 
 function splitTailSelects(g: Graph): Graph {
@@ -16036,7 +16248,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?:
 
 export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     g = expandValueGraph(g, target, regionSlot)
-    g = runPipeline('shape', g, target.costs, [stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, splitScaledShifts, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
@@ -17896,6 +18108,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         for (let i = 0; i < b.params.length; i++) place(b.params[i], homes[i])
         emitTail(b.bodyId, b.bodyConst)
     }
+    const stubStart = code.length
     for (const stub of coldStubs) {
         put(() => asm.bindLabel(stub.label))
         for (const f of stub.code) code.push(f)
@@ -17948,11 +18161,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     if (savesLink) asm.store(SP, layout.link, LR!, Types.u64)
     let released: { value: number, home: number }[] = []
     const inRegister = (value: { value: number, home: number }) => !isSlot(value.home)
-    for (const item of code) {
+    for (let i = 0; i < stubStart; i++) flush(code[i])
+    function flush(item: (typeof code)[number]): void {
         if (typeof item !== 'function') {
             if ('released' in item) {
                 released.push(...item.released)
-                continue
+                return
             }
             const { dst, src, consumed } = item
             if (isSlot(src) && isSlot(dst)) {
@@ -17973,7 +18187,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 if (other) asm.released(kept)
                 released = []
             }
-            continue
+            return
         }
         item()
         if (released.length) {
@@ -18009,6 +18223,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     if (savesLink) asm.load(LR!, SP, layout.link, Types.u64)
     if (layout.bytes) asm.spAdjust(-layout.bytes)
     if (reachesExit || !tailCalls) asm.ret()
+    for (let i = stubStart; i < code.length; i++) flush(code[i])
 
     if (spillStats && spillStats.total) console.log(`SPILLS ${g.name} total=${spillStats.total} again=${spillStats.again}`)
     if (spillStats && evictedOps.size) console.log(`EVICTED ${g.name} ${[...evictedOps].map(([op, n]) => `${op}=${n}`).join(' ')}`)
