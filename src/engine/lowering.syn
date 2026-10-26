@@ -216,6 +216,7 @@ interface AsmItem {
     cselRegs?: number[]  // dst, a, b -- to re-render the text when it does
     literalDelta?: number
     cselIncrements?: boolean // csinc: the false arm is b + 1
+    cselNegates?: boolean
     deadAfter?: Set<number>
     zeroReg?: number
     adjustReg?: number   // for self-modifying `add/sub rn, rn, #imm`
@@ -2264,6 +2265,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         sel.word = ((sel.word & ~(0xF << 12)) | (cond << 12)) >>> 0
         sel.cselCond = cond
         if (isFloat(d)) sel.text = `fcsel ${dreg(d)}, ${dreg(a)}, ${dreg(b)}, ${CondNames[cond]}`
+        else if (sel.cselNegates) sel.text = `cneg ${x(d)}, ${x(a)}, ${CondNames[cond ^ 1]}`
         else if (!sel.cselIncrements) sel.text = `csel ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
         else if (a === b) sel.text = `cinc ${x(d)}, ${x(a)}, ${CondNames[cond ^ 1]}`
         else sel.text = `csinc ${x(d)}, ${x(a)}, ${x(b)}, ${CondNames[cond]}`
@@ -2286,6 +2288,35 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             sel.cselIncrements = true
             retargetSelect(sel, a === t ? sel.cselCond! ^ 1 : sel.cselCond!)
             inheritDead(sel, add)
+            items.splice(at, 1)
+            removedWrites.push(t)
+            return true
+        }
+        return false
+    }
+
+    function negatedSource(item: AsmItem, t: number): [source: number, shift: number] | undefined {
+        if (item.kind !== 'insn' || ((item.word & 0xFFE003E0) >>> 0) !== 0xCB0003E0 || (item.word & 0x1F) !== t) return
+        return [(item.word >>> 16) & 0x1F, (item.word >>> 10) & 0x3F]
+    }
+
+    function negateSelect(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const sel = items[last]
+        if (!sel?.cselRegs || sel.cselIncrements || sel.cselNegates) return false
+        const [d, a, b] = sel.cselRegs
+        if (isFloat(d) || a === b) return false
+        for (const t of [a, b]) {
+            const r = t === a ? b : a
+            if (!dead.has(t)) continue
+            const at = definerOf(last, t)
+            const negated = at < 0 ? undefined : negatedSource(items[at], t)
+            if (!negated || negated[0] !== r || negated[1] || !noInterference(at + 1, last, t, r)) continue
+            sel.word = (0xDA800400 | (r << 16) | (r << 5) | d) >>> 0
+            sel.cselRegs = [d, r, r]
+            sel.cselNegates = true
+            retargetSelect(sel, t === a ? sel.cselCond! ^ 1 : sel.cselCond!)
+            inheritDead(sel, items[at])
             items.splice(at, 1)
             removedWrites.push(t)
             return true
@@ -2765,7 +2796,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         while (items[endAt]?.kind === 'label' && items[endAt].label !== branch.label) endAt++
         const end = items[endAt]
         if (branch.cond >= 14 || !cmp || select?.kind !== 'insn' || !select.cselRegs || end?.kind !== 'label'
-            || end.label !== branch.label || select.cselIncrements || select.cselCond === undefined
+            || end.label !== branch.label || select.cselIncrements || select.cselNegates || select.cselCond === undefined
             || select.cselRegs?.[0] !== select.cselRegs?.[2] || FalseFlags[select.cselCond] === undefined) return false
         const plain = plainCompare(cmp)
         if (!plain || plain[0] === XZR || (plain[1] < 0 && plain[2] > 31)) return false
@@ -3348,6 +3379,59 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
         return false
     }
+    function negateShift(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const shift = items[last]
+        if (shift?.kind !== 'insn' || shift.shiftKind !== 'lsl' || shift.narrow || shift.shiftDst === undefined || shift.shiftSrc === undefined) return false
+        const t = shift.shiftSrc
+        if (!dead.has(t)) return false
+        const at = definerOf(last, t)
+        const negated = at < 0 ? undefined : negatedSource(items[at], t)
+        if (!negated || negated[1] || !noInterference(at + 1, last, t, negated[0])) return false
+        const u = shift.shiftDst
+        const s = negated[0]
+        const k = shift.shiftAmount!
+        shift.word = (0xCB0003E0 | (s << 16) | (k << 10) | u) >>> 0
+        shift.text = `neg ${x(u)}, ${x(s)}, lsl #${k}`
+        shift.shiftDst = undefined
+        shift.shiftSrc = undefined
+        shift.shiftAmount = undefined
+        shift.shiftKind = undefined
+        shift.writes = [u]
+        shift.reads = [s]
+        inheritDead(shift, items[at])
+        items.splice(at, 1)
+        removedWrites.push(t)
+        return true
+    }
+    function negatedOperand(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const add = items[last]
+        if (add?.aluName !== 'add' || add.narrow || add.addDst === undefined || add.addLeft === undefined || add.addRight === undefined) return false
+        for (const t of [add.addRight, add.addLeft]) {
+            const keep = t === add.addRight ? add.addLeft : add.addRight
+            if (keep === t || !dead.has(t)) continue
+            const at = definerOf(last, t)
+            const negated = at < 0 ? undefined : negatedSource(items[at], t)
+            if (!negated || !noInterference(at + 1, last, t, negated[0])) continue
+            const [s, k] = negated
+            const d = add.addDst
+            add.word = (0xCB000000 | (s << 16) | (k << 10) | (keep << 5) | d) >>> 0
+            add.text = `sub ${x(d)}, ${x(keep)}, ${x(s)}${k ? `, lsl #${k}` : ''}`
+            add.addDst = undefined
+            add.addLeft = undefined
+            add.addRight = undefined
+            add.aluBase = undefined
+            add.aluName = undefined
+            add.writes = [d]
+            add.reads = [keep, s]
+            inheritDead(add, items[at])
+            items.splice(at, 1)
+            removedWrites.push(t)
+            return true
+        }
+        return false
+    }
     function insertField(dead: Set<number>): boolean {
         const last = items.length - 1
         const op = items[last]
@@ -3496,6 +3580,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
         // TODO: optionally use CPU feature flags
         incrementSelect(dead)
+        negateSelect(dead)
         constantSelect(dead)
         emitterStep(maskedTest, dead)
         forwardCopy(dead)
@@ -3615,6 +3700,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (emitterStep(fuseFields, dead)) return
         if (extendOperand(dead)) return
         if (invertOperand(dead)) return
+        if (negatedOperand(dead)) return
+        if (negateShift(dead)) return
         if (insertField(dead)) return
 
         for (let maskAt = items.length - 1; maskAt >= 1 && maskAt >= items.length - 2; maskAt--) {

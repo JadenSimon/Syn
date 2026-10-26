@@ -3395,6 +3395,7 @@ export interface CallSummary {
     effect: number
     writes: number
     fresh: boolean
+    discardable?: boolean
     tagged: boolean
     captures: number
     deepCaptures: number
@@ -3411,7 +3412,7 @@ export function encodeCallSummary(g: NodeSpace, symbol: number, s: CallSummary):
 }
 
 export function internCallSummary(g: NodeSpace, s: CallSummary): number {
-    const words = [s.effect, s.writes, s.fresh ? 1 : 0, s.tagged ? 1 : 0, s.captures, s.deepCaptures, s.reads.length, ...s.reads]
+    const words = [s.effect, s.writes, (s.fresh ? 1 : 0) | (s.discardable ? 2 : 0), s.tagged ? 1 : 0, s.captures, s.deepCaptures, s.reads.length, ...s.reads]
     const outcomes = s.outcomes
     if (outcomes) {
         words.push(outcomes.literals.size, outcomes.excluding.size, outcomes.other?.[0] ?? -1, outcomes.other?.[1] ?? 0)
@@ -3441,7 +3442,8 @@ export function callSummary(g: NodeSpace, call: GraphNode): CallSummary | undefi
     return {
         effect: gn.rawAt(g, at, 0),
         writes: gn.rawAt(g, at, 1),
-        fresh: gn.rawAt(g, at, 2) !== 0,
+        fresh: (gn.rawAt(g, at, 2) & 1) !== 0,
+        discardable: (gn.rawAt(g, at, 2) & 2) !== 0,
         tagged: gn.rawAt(g, at, 3) !== 0,
         captures: gn.rawAt(g, at, 4),
         deepCaptures: gn.rawAt(g, at, 5),
@@ -4601,7 +4603,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function agreedArm(n: GraphNode): number {
             if (countIds(n) !== 3 || !getRef(n, 0)) return 0
             const c = getNode(g, getRef(n, 0))!
-            const compared = (c.op === NodeOp.eq || c.op === NodeOp.ne) && countIds(c) === 2
+            const equality = c.op === NodeOp.eq || c.op === NodeOp.ne ? c.op : unsignedZeroTest(c)
+            const compared = equality !== undefined && countIds(c) === 2
             if (compared && comparesFloats(g, c)) return 0
             const left = compared ? scalarOperand(g, c, 0) : undefined
             const right = compared ? scalarOperand(g, c, 1) : undefined
@@ -4613,7 +4616,13 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const kept = agreedUnder(n, getRef(n, 0), 0, 2)
                 if (kept) return kept
             }
-            return agreedUnder(n, getRef(c, side), held, c.op === NodeOp.eq ? 1 : 2)
+            return agreedUnder(n, getRef(c, side), held, equality === NodeOp.eq ? 1 : 2)
+        }
+        function unsignedZeroTest(c: GraphNode): NodeOp | undefined {
+            if (countIds(c) !== 2 || lowering.isSignedType(operandType(g, c, 0)) || lowering.isSignedType(operandType(g, c, 1))) return
+            const op = scalarOperand(g, c, 1) === 0 ? c.op : scalarOperand(g, c, 0) === 0 ? SwappedCmp[c.op] : undefined
+            if (op === NodeOp.gt) return NodeOp.ne
+            if (op === NodeOp.le) return NodeOp.eq
         }
         const r = new Map<number, number>()
         const selects = findValues(target.id, NodeOp.select) ?? []
@@ -5211,8 +5220,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (const id of findValues(target.id, NodeOp.call) ?? []) {
             if (isResultUsed(id)) continue
             const n = getNode(g, id)!
-            const [effect, writes] = summaryEffect(callSummary(g, n) ?? unknownCall)
-            if (effect > EffectRead && (writes & ~WritesStack) !== 0) continue
+            const summary = callSummary(g, n) ?? unknownCall
+            const [effect, writes] = summaryEffect(summary)
+            if (!summary.discardable && effect > EffectRead && (writes & ~WritesStack) !== 0) continue
             replacements.set(id, getRef(n, 0))
         }
         if (!replacements.size) return false
@@ -12454,6 +12464,45 @@ function reduceSignedWindows(g: Graph): boolean {
     return changed
 }
 
+function rangeBound(g: Graph, id: number): [subject: number, bound: number, upper: boolean, type: Types] | undefined {
+    const c = getNode(g, id)!
+    if (!CompareOps.has(c.op) || countIds(c) !== 2) return
+    const side = getRef(c, 0) && scalarOperand(g, c, 1) !== undefined ? 0 : getRef(c, 1) && scalarOperand(g, c, 0) !== undefined ? 1 : -1
+    if (side < 0) return
+    const T = operandType(g, c, side)
+    const signed = lowering.isSignedType(operandType(g, c, 0)) || lowering.isSignedType(operandType(g, c, 1))
+    if (signed !== (T === Types.i64) || (T !== Types.i64 && T !== Types.u64 && T !== Types.u32)) return
+    const k = scalarOperand(g, c, 1 - side)!
+    if (!Number.isSafeInteger(k) || (!signed && k < 0)) return
+    const op = side === 0 ? c.op : SwappedCmp[c.op]
+    if (op === NodeOp.ge) return [getRef(c, side), k, false, T]
+    if (op === NodeOp.gt) return [getRef(c, side), k + 1, false, T]
+    if (op === NodeOp.le) return [getRef(c, side), k, true, T]
+    if (op === NodeOp.lt) return [getRef(c, side), k - 1, true, T]
+}
+
+function reduceRangeChecks(g: Graph): boolean {
+    let index: gn.GraphIndex | undefined
+    let changed = false
+    for (const [id, n] of [...nodeEntries(g)]) {
+        if (n.op !== NodeOp.and || countIds(n) !== 2 || !getRef(n, 0) || !getRef(n, 1)) continue
+        const a = rangeBound(g, getRef(n, 0))
+        if (!a) continue
+        const b = rangeBound(g, getRef(n, 1))
+        if (!b || a[0] !== b[0] || a[2] === b[2] || a[3] !== b[3]) continue
+        const lo = a[2] ? b[1] : a[1]
+        const hi = a[2] ? a[1] : b[1]
+        if (!lo || hi <= lo || hi - lo > 0xFFF) continue
+        index ??= graphIndex(g)
+        if ([...indexedUsers(index, getRef(n, 0))].length !== 1 || [...indexedUsers(index, getRef(n, 1))].length !== 1) continue
+        const offset = getRef(n, 0)
+        putNode(g, offset, NodeOp.sub, [a[0], { literal: lo }], Types.u64)
+        putNode(g, id, NodeOp.le, [offset, { literal: hi - lo }], Types.bool)
+        changed = true
+    }
+    return changed
+}
+
 function splitScaledShifts(g: Graph, costs: lowering.TargetCosts): boolean {
     if (!costs.scaledIndex) return false
     const index = graphIndex(g)
@@ -12818,11 +12867,15 @@ function arithForm(g: Graph, target: lowering.Target, n: GraphNode): ArithForm {
     const swap = !getRef(n, 0) && getRef(n, 1) !== 0
         && (Commutative.has(n.op) || SwappedCmp[n.op] !== undefined)
     const logical = n.op === NodeOp.shr && !lowering.isSignedType(operandType(g, n, 0))
-    const op = swap ? SwappedCmp[n.op] ?? n.op : logical ? NodeOp.ushr : n.op
-    const cmp = CompareOps.has(op)
+    const named = swap ? SwappedCmp[n.op] ?? n.op : logical ? NodeOp.ushr : n.op
     const li = swap ? 1 : 0
     const ri = swap ? 0 : 1
-    const imm = getLiteral(g, n, ri)
+    const k = getLiteral(g, n, ri)
+    const opposite = named === NodeOp.add ? NodeOp.sub : named === NodeOp.sub ? NodeOp.add : undefined
+    const flips = opposite !== undefined && !getRef(n, ri) && k < 0 && !target.takesImmediate(opName(named), k) && target.takesImmediate(opName(opposite), -k)
+    const op = flips ? opposite! : named
+    const cmp = CompareOps.has(op)
+    const imm = flips ? -k : k
     const narrow = !cmp && NarrowableOps.has(op) && typeOf(n) === Types.u32
     const narrowCompare = cmp && (op === NodeOp.eq || op === NodeOp.ne || !signed) && imm > 0x7FFF_FFFF && imm <= 0xFFFF_FFFF
         && zeroExtendedBits(operandType(g, n, li)) <= 32
@@ -12908,12 +12961,19 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
             }
         }
         const rewrites = new Map<number, Operand[]>()
-        for (const [key, list] of sites) {
+        const made = new Map<string, number>()
+        const negates = (key: string) => {
+            const k = Number(key.slice(key.indexOf(':') + 1))
+            return key.startsWith(`${Types.f64}:`) && k < 0 && wideFloat(k) && sites.has(`${Types.f64}:${-k}`)
+        }
+        for (const [key, list] of [...sites].sort(([a], [b]) => Number(negates(a)) - Number(negates(b)))) {
             const T = Number(key.slice(0, key.indexOf(':'))) as Types
             const [first, slot] = list[0]
             const k = getLiteral(g, getNode(g, first)!, slot)
             const scratch = T !== Types.f64 && list.length === 1 && lifts.get(first) === 1
-            const lifted = insertNode(g, makeNode(g, NodeOp.literal, [{ literal: k }], T, scratch ? gn.NodeFlags.scratch : gn.NodeFlags.none))
+            const lifted = negates(key) ? insertNode(g, makeNode(g, NodeOp.neg, [made.get(`${T}:${-k}`)!], T, gn.NodeFlags.none))
+                : insertNode(g, makeNode(g, NodeOp.literal, [{ literal: k }], T, scratch ? gn.NodeFlags.scratch : gn.NodeFlags.none))
+            made.set(key, lifted)
             for (const [id, i] of list) {
                 let ops = rewrites.get(id)
                 if (!ops) rewrites.set(id, ops = getOperands(g, getNode(g, id)!))
@@ -16474,7 +16534,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?:
 
 export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     g = expandValueGraph(g, target, regionSlot)
-    g = runPipeline('shape', g, target.costs, [stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, splitScaledShifts, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
@@ -18080,6 +18140,24 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         throw `lowering3: select ${id} branches in value position`
     }
 
+    function recordTailCall(slots: Handover[]): number {
+        let call = 0
+        for (const slot of slots) {
+            let n = getNode(g, slot.id)
+            const value = n?.op === NodeOp.after && countIds(n) === 2 ? getNode(g, getRef(n, 1)) : undefined
+            if (value?.op === NodeOp.get && getRef(value, 0) === getRef(n!, 0)) n = value
+            if (n?.op === NodeOp.convert && intrinsics.intrinsicBitWidth(typeOf(n)) === 64) {
+                n = getNode(g, getRef(n, 0))
+            }
+            if (n?.op !== NodeOp.get || getRef(n, 1)) return 0
+            const source = getRef(n, 0)
+            if (!source || getNode(g, source)?.op !== NodeOp.call || (call && source !== call)) return 0
+            if (callReturnRegs(source)[getLiteral(g, n, 1)] !== slot.dst) return 0
+            call = source
+        }
+        return done.has(call) ? 0 : call
+    }
+
     function returnRecord(site: number, n: GraphNode): void {
         const outer = materializing
         materializing = site
@@ -18092,8 +18170,10 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             assert(reg !== undefined, `Unhandled return slot: ${getLiteral(g, n, i - 1)}`)
             slots.push({ dst: reg, id: getRef(n, i), konst: getLiteral(g, n, i) })
         }
+        const tail = recordTailCall(slots)
+        if (tail) tails.add(tail)
         handOver(site, slots, [-1, () => {}])
-        jumpToExit()
+        jumpToExit(tail)
     }
 
     function returnValue(site: number, id: number, konst: number): void {
@@ -18373,7 +18453,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     promoteCommonRegionWrites(rootRegion)
     if (returns) assignRegionRegisters(rootRegion, new Set())
 
-    tailCalls = !analysis.frameAllocas && !usedPreserved.size && !slotCount && !callsOut
+    tailCalls = !analysis.frameAllocas && !slotCount
     if (!tailCalls && tails.size) callsOut = true
     const saved = returns ? target.calleeSaved.filter(r => usedPreserved.has(r) && written.has(r)) : []
     for (let i = 0; i < saved.length; i++) savedIndex.set(saved[i], i)
