@@ -1808,7 +1808,7 @@ function capturedBy(flow: Flow, captures: Map<number, number>): boolean {
 
 interface RetEffect { value: number | undefined, self: number, writes: number, calls: CallWrites[], through?: number, excludes?: number }
 
-interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], fresh: boolean, params: Flow[], loaded: Flow[][], returned: Flow[], rets: RetEffect[], reaches: (ParamReach | undefined)[] }
+interface GraphEffects { self: number, callees: number[], writes: number, calls: CallWrites[], traps: boolean, returns: number, fresh: boolean, params: Flow[], loaded: Flow[][], returned: Flow[], rets: RetEffect[], reaches: (ParamReach | undefined)[] }
 
 interface ParamReach { extent: number, calls: [callee: number, arg: number, at: number][] }
 
@@ -1916,6 +1916,8 @@ function noteEffect(graph: Graph, mem: MemAnalysis, id: number, n: GraphNode, ou
         }
     } else if (n.op === NodeOp.rt && !rt.effectOps.has(getLiteral(graph, n, 1)) && !rt.heapOps.has(getLiteral(graph, n, 1))) {
         return
+    } else if (n.op === NodeOp.trap) {
+        return
     } else if (OrderedValues.has(n.op)) {
         const token = getRef(n, 0) ? getNode(graph, getRef(n, 0)) : undefined
         if (!token || token.op === NodeOp.startOf || token.op === NodeOp.void) return
@@ -1952,11 +1954,13 @@ function returnsFresh(effects: GraphEffects, captures: Map<number, number>): boo
 function graphEffects(graph: Graph): GraphEffects {
     let fresh = true
     let returns = 0
+    let traps = false
     const returned: Flow[] = []
     const mem = memAnalysis(graph)
     const whole: RetEffect = { value: undefined, self: EffectNone, writes: 0, calls: [] }
     for (const [id, n] of nodeEntries(graph)) {
         noteEffect(graph, mem, id, n, whole)
+        if (n.op === NodeOp.trap) traps = true
         if (n.op !== NodeOp.ret) continue
         returns++
         const m = getRef(n, 0) ? mem.of(getRef(n, 0)) : undefined
@@ -2074,9 +2078,56 @@ function graphEffects(graph: Graph): GraphEffects {
         }
     }
     return {
-        self: whole.self, callees: whole.calls.map(c => c.callee), writes: whole.writes, calls: whole.calls,
+        self: whole.self, callees: whole.calls.map(c => c.callee), writes: whole.writes, calls: whole.calls, traps, returns,
         fresh: fresh && returns > 0, params, loaded, returned, rets, reaches: graph.blocks[0].params.map(p => paramReach(graph, mem, p)),
     }
+}
+
+function alwaysEnds(graph: Graph, ends: (callee: number) => boolean): boolean {
+    function endsBefore(roots: number[]): boolean {
+        const seen = new Set<number>()
+        const stack = roots.slice()
+        while (stack.length) {
+            const id = stack.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const n = getNode(graph, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block) continue
+            if (n.op === NodeOp.call) {
+                const callee = calledSymbol(graph, n)
+                if (callee !== undefined && ends(callee)) return true
+            }
+            const count = n.op === NodeOp.select ? 1 : countIds(n)
+            for (let i = 0; i < count; i++) stack.push(getRef(n, i))
+        }
+        return false
+    }
+    const positions = new Map<number, TailPosition[]>()
+    for (const b of graph.blocks) positions.set(b.id, tailPositions(graph, b.bodyId))
+    const arrivals = new Map<number, [from: number, p: TailPosition][]>()
+    for (const [from, list] of positions) {
+        for (const p of list) {
+            const n = getNode(graph, p.at)!
+            if (n.op !== NodeOp.apply) continue
+            const known = arrivals.get(getRef(n, 0))
+            if (known) known.push([from, p])
+            else arrivals.set(getRef(n, 0), [[from, p]])
+        }
+    }
+    const doomed = new Set<number>()
+    for (const scc of stronglyConnected(graph.blocks.map(b => b.id), id => (arrivals.get(id) ?? []).map(a => a[0]))) {
+        const id = scc[0]
+        const list = arrivals.get(id)
+        if (scc.length > 1 || id === graph.blocks[0].id || !list) continue
+        if (list.every(([from, p]) => from !== id && (doomed.has(from) || endsBefore(tailRoots(graph, p))))) doomed.add(id)
+    }
+    for (const [id, list] of positions) {
+        if (doomed.has(id)) continue
+        for (const p of list) {
+            if (getNode(graph, p.at)!.op === NodeOp.ret && !endsBefore(tailRoots(graph, p))) return false
+        }
+    }
+    return true
 }
 
 function refineCallEffects(graph: Graph, summaries: Map<number, CallSummary>): boolean {
@@ -2163,13 +2214,26 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>, discard
         outcomes.set(symbol, result)
         return result
     }
+    const traps = new Set<number>()
+    const noreturn = new Set<number>()
+    for (const scc of stronglyConnected(effectsOf.keys(), symbol => effectsOf.get(symbol)?.callees ?? [])) {
+        const inside = new Set(scc)
+        let trapping = false
+        for (const symbol of scc) {
+            const effects = effectsOf.get(symbol)
+            if (!effects) continue
+            if (effects.traps || effects.callees.some(callee => !inside.has(callee) && (!effectsOf.has(callee) || traps.has(callee)))) trapping = true
+            if (!effects.returns || (effects.callees.some(callee => noreturn.has(callee)) && alwaysEnds(units.get(symbol)!, callee => noreturn.has(callee)))) noreturn.add(symbol)
+        }
+        for (const symbol of scc) if (trapping || noreturn.has(symbol)) traps.add(symbol)
+    }
     const out = new Map<number, CallSummary>()
     const reads = readExtents(effectsOf)
     for (const [symbol, effects] of effectsOf) {
         const effect = classes.get(symbol)!
         out.set(symbol, {
             effect, writes: effect === EffectWrite ? masks.get(symbol)! : 0,
-            fresh: returnsFresh(effects, captures), discardable: discardable?.has(symbol), tagged: tagged.has(symbol),
+            fresh: returnsFresh(effects, captures), discardable: discardable?.has(symbol), traps: traps.has(symbol), noreturn: noreturn.has(symbol), tagged: tagged.has(symbol),
             captures: captures.get(symbol)!, deepCaptures: deep.get(symbol)!, reads: reads.get(symbol)!, outcomes: outcomeOf(symbol),
         })
     }
@@ -4514,6 +4578,7 @@ function refineProgramEffects(program: ProgramGraph, refined: Set<number>): void
                 + (outcomes.other ? ` other:${EffectNames[outcomes.other[0]]}` : '') : ''
             const what = (s.effect === EffectWrite ? `writes p${params.join(',p') || ' none'}` : EffectNames[s.effect]) + (cases ? ` returns${cases}` : '')
                 + (s.fresh ? ' returns fresh' : '')
+                + (s.noreturn ? ' noreturn' : s.traps ? ' traps' : '')
                 + (s.captures === CapturesAll ? '' : ` captures ${kept.length ? 'p' + kept.join(',p') : 'none'}`)
             console.log('native effects', what, program.units.get(symbol)?.name || `symbol ${symbol}`)
         }

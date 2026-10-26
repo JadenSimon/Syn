@@ -3405,6 +3405,8 @@ export interface CallSummary {
     writes: number
     fresh: boolean
     discardable?: boolean
+    traps?: boolean
+    noreturn?: boolean
     tagged: boolean
     captures: number
     deepCaptures: number
@@ -3412,16 +3414,24 @@ export interface CallSummary {
     outcomes: CallOutcomes | undefined
 }
 
-export const unknownCall: CallSummary = { effect: EffectWrite, writes: WritesUnknown, fresh: false, tagged: false, captures: CapturesAll, deepCaptures: CapturesAll, reads: [], outcomes: undefined }
+export const unknownCall: CallSummary = { effect: EffectWrite, writes: WritesUnknown, fresh: false, traps: true, tagged: false, captures: CapturesAll, deepCaptures: CapturesAll, reads: [], outcomes: undefined }
 
 const SummaryWords = 7
+const SummaryTraps = 4
+const SummaryNoreturn = 8
+
+function summaryFlags(g: NodeSpace, call: GraphNode): number {
+    const target = getNode(g, getRef(call, 1))
+    if (gn.localSymbol(g, target) === undefined || countIds(target!) === 1) return SummaryTraps
+    return gn.rawAt(g, getLiteral(g, target!, 1), 2)
+}
 
 export function encodeCallSummary(g: NodeSpace, symbol: number, s: CallSummary): Operand[] {
     return [{ literal: symbol }, { literal: internCallSummary(g, s) }]
 }
 
 export function internCallSummary(g: NodeSpace, s: CallSummary): number {
-    const words = [s.effect, s.writes, (s.fresh ? 1 : 0) | (s.discardable ? 2 : 0), s.tagged ? 1 : 0, s.captures, s.deepCaptures, s.reads.length, ...s.reads]
+    const words = [s.effect, s.writes, (s.fresh ? 1 : 0) | (s.discardable ? 2 : 0) | (s.traps ? SummaryTraps : 0) | (s.noreturn ? SummaryNoreturn : 0), s.tagged ? 1 : 0, s.captures, s.deepCaptures, s.reads.length, ...s.reads]
     const outcomes = s.outcomes
     if (outcomes) {
         words.push(outcomes.literals.size, outcomes.excluding.size, outcomes.other?.[0] ?? -1, outcomes.other?.[1] ?? 0)
@@ -3453,6 +3463,8 @@ export function callSummary(g: NodeSpace, call: GraphNode): CallSummary | undefi
         writes: gn.rawAt(g, at, 1),
         fresh: (gn.rawAt(g, at, 2) & 1) !== 0,
         discardable: (gn.rawAt(g, at, 2) & 2) !== 0,
+        traps: (gn.rawAt(g, at, 2) & SummaryTraps) !== 0,
+        noreturn: (gn.rawAt(g, at, 2) & SummaryNoreturn) !== 0,
         tagged: gn.rawAt(g, at, 3) !== 0,
         captures: gn.rawAt(g, at, 4),
         deepCaptures: gn.rawAt(g, at, 5),
@@ -4701,7 +4713,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function isRead(n: GraphNode | undefined) {
-        return n?.op === NodeOp.load || (n?.op === NodeOp.call && callEffect(n) <= 1)
+        return n?.op === NodeOp.load || (n?.op === NodeOp.call && callEffect(n) <= 1 && !mayTrap(n))
+    }
+
+    function mayTrap(n: GraphNode): boolean {
+        return (summaryFlags(g, n) & SummaryTraps) !== 0
     }
 
     function isUnreachable(vid: number) {
@@ -4711,7 +4727,24 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function neverCompletes(vid: number) {
         if (isUnreachable(vid)) return true
         const n = getNode(g, vid)
+        if (n?.op === NodeOp.call) return (summaryFlags(g, n) & SummaryNoreturn) !== 0
         return n?.op === NodeOp.after && isUnreachable(getRef(n, countIds(n) - 1))
+    }
+
+    function ended(parts: number[]): number {
+        if (parts.length === 1 && getNode(g, parts[0])!.op !== NodeOp.call) return parts[0]
+        const flat: number[] = []
+        for (const p of parts) {
+            if (isUnreachable(p)) continue
+            const n = getNode(g, p)!
+            if (n.op !== NodeOp.after || !neverCompletes(p)) {
+                flat.push(p)
+                continue
+            }
+            for (let i = 0; i < countIds(n) - 1; i++) flat.push(getRef(n, i))
+        }
+        if (!flat.length) return unreachable()
+        return createNode(g, NodeOp.after, [...flat, unreachable()])
     }
 
     let _unreachable: number | undefined
@@ -4762,6 +4795,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const expanded = new Set<number>()
         for (const x of values) orderingParts(x, collected, expanded)
         const parts = [...collected]
+        if (parts.some(neverCompletes)) return ended(parts)
         if (!parts.length) return into ?? nil()
         if (parts.length === 1) {
             const v = parts[0]
@@ -4804,6 +4838,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return unreachable(u)
         }
         if (OrderedValues.has(u.op)) {
+            if (u.op === NodeOp.call && mayTrap(u)) return vid
             const clobbers = u.op === NodeOp.store || u.op === NodeOp.rt || (u.op === NodeOp.call && callEffect(u) > 1)
             const pure = u.op === NodeOp.load || pstackReadsTop(g, u) || (u.op === NodeOp.call && !clobbers)
             const skips = (pure && (from?.op === NodeOp.apply || from?.op === NodeOp.ret)) || (!clobbers && isRead(from)) || idleResets.has(vid)
@@ -4850,7 +4885,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             if (r) arr.push(r)
             if (r && isUnreachable(r) && arr.length > 1) return changed ? createNode(g, NodeOp.after, arr) : vid
-            if (changed) return effectsJoin(arr)
+            if (changed || arr.some(neverCompletes)) return effectsJoin(arr)
             const fresh = g.ids.next
             const joined = effectsJoin(arr)
             if (joined < fresh || countIds(getNode(g, joined)!) - 1 < arr.length || !isNilOrVoid(getRef(u, end))) return joined
@@ -4994,7 +5029,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             const orderings = (argIds ?? getArgIds(n)).slice(0, end)
             if (n.op !== NodeOp.after && neverCompletes(orderings[0])) {
-                replacements.set(id, orderings[0])
+                replacements.set(id, ended([orderings[0]]))
                 return
             }
             const isPointlessAfter = n.op === NodeOp.after && orderings.every(isNilOrVoid)
@@ -5123,6 +5158,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const n = getNode(g, id)!
             const summary = callSummary(g, n) ?? unknownCall
             const [effect, writes] = summaryEffect(summary)
+            if (!summary.discardable && summary.traps) continue
             if (!summary.discardable && effect > EffectRead && (writes & ~WritesStack) !== 0) continue
             replacements.set(id, getRef(n, 0))
         }
