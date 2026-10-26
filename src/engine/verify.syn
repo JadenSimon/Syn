@@ -5,7 +5,7 @@
 import * as heap from './heap'
 import * as intrinsics from './intrinsics'
 import * as rt from './rt'
-import { blockOrder, countIds, RecomputableOps, heapFieldCount, heapInterior, rawSlot, rawWords, getBlock, getLiteral, getNode, getRef, machineType, NodeOp, opName, orderRegions, resultType, sameSlotBits, typeOf, typeRefOf, nodeEntries, buildIndex, watchIndex, ResultUsedFlag, type GraphIndex } from './graph-node'
+import { blockOrder, countIds, RecomputableOps, heapFieldCount, heapInterior, rawSlot, rawWords, getBlock, getLiteral, getNode, getRef, machineType, NodeOp, opName, orderRegions, resultType, sameSlotBits, typeOf, typeRefOf, nodeEntries, buildIndex, refreshStale, refreshable, watchIndex, type GraphIndex, GraphKinds, kindOf } from './graph-node'
 import type { Graph, GraphBlock, GraphNode, MemAnalysis } from './lowering2'
 import type { CompileError } from './native'
 
@@ -575,20 +575,26 @@ const indexBuildSites = new WeakMap<GraphIndex, string>()
 const reportedIndexDiffs = new WeakMap<GraphIndex, Set<string>>()
 const reportedLiveIndexes = new WeakSet<GraphIndex>()
 
-function quietIndex(g: Graph, used?: Set<number>): GraphIndex {
-    const saved = new Map<number, u8>()
-    for (const [id, n] of nodeEntries(g)) saved.set(id, n.scratchFlags)
-    const ix = buildIndex(g)
-    for (const [id, n] of nodeEntries(g)) {
-        if (used && n.scratchFlags & ResultUsedFlag) used.add(id)
-        n.scratchFlags = saved.get(id)!
+
+const IsolatedOps = new Set<NodeOp>([...RecomputableOps, NodeOp.type, NodeOp.recordType, NodeOp.fnType, NodeOp.rawbuffer, NodeOp.block])
+const reportedCaptures = new Set<string>()
+
+function checkIsolation(g: Graph, ix: GraphIndex, where: string): void {
+    if (!refreshable(g)) return
+    for (const id of ix.shared) {
+        const n = getNode(g, id)!
+        if (IsolatedOps.has(n.op)) continue
+        const key = `${g.name ?? '?'}:${id}`
+        if (reportedCaptures.has(key)) continue
+        reportedCaptures.add(key)
+        console.log(`index-check capture ${where} ${g.name ?? '?'} %${id} ${opName(n.op)} held by B${ix.visited.get(id)}`)
+        return
     }
-    return ix
 }
 
-function indexDiff(g: Graph, ix: GraphIndex): Map<number, Set<string>> {
-    const used = new Set<number>()
-    const fresh = quietIndex(g, used)
+function indexDiff(g: Graph, ix: GraphIndex, where: string): Map<number, Set<string>> {
+    const fresh = buildIndex(g)
+    checkIsolation(g, fresh, where)
     const kinds = new Map<number, Set<string>>()
     function mark(block: number, kind: string): void {
         let set = kinds.get(block)
@@ -626,7 +632,6 @@ function indexDiff(g: Graph, ix: GraphIndex): Map<number, Set<string>> {
         for (const ids of ops?.values() ?? []) {
             for (const id of ids) {
                 compare(block, 'deps', fresh.dependents.get(id), ix.dependents.get(id))
-                if (used.has(id) !== ((getNode(g, id)!.scratchFlags & ResultUsedFlag) !== 0)) mark(block, 'used')
             }
         }
     }
@@ -640,24 +645,15 @@ function formatIndexDiff(diff: Map<number, Set<string>>): string {
     return out.join(' ')
 }
 
-function staleDiff(g: Graph, ix: GraphIndex): Map<number, Set<string>> {
-    const diff = indexDiff(g, ix)
-    for (const [block, kinds] of [...diff]) {
-        kinds.delete('used')
-        if (!kinds.size) diff.delete(block)
-    }
-    return diff
-}
-
 function verifyReusedIndex(g: Graph, ix: GraphIndex): void {
-    const diff = staleDiff(g, ix)
+    const diff = indexDiff(g, ix, 'reuse')
     if (diff.size) console.log(`index-check stale-read ${g.name ?? '?'} ${new Error().stack?.split('\n').slice(3, 14).map(line => line.trim()).join(' < ') ?? ''} built ${indexBuildSites.get(ix) ?? '?'}: ${formatIndexDiff(diff)}`)
 }
 
 export function verifyLiveIndex(g: Graph, where: string): void {
     const ix = g.index
     if (!ix || ix.stale.size || reportedLiveIndexes.has(ix)) return
-    const diff = staleDiff(g, ix)
+    const diff = indexDiff(g, ix, where)
     if (!diff.size) return
     reportedLiveIndexes.add(ix)
     console.log(`index-check stale-cache ${where} ${g.name ?? '?'} built ${indexBuildSites.get(ix) ?? '?'}: ${formatIndexDiff(diff)}`)
@@ -665,6 +661,17 @@ export function verifyLiveIndex(g: Graph, where: string): void {
 
 function recordIndexBuild(g: Graph, ix: GraphIndex): void {
     indexBuildSites.set(ix, new Error().stack?.split('\n').slice(3, 15).map(line => line.trim()).join(' < ') ?? '')
+}
+
+function rewrotePrimed(g: Graph, ids: Iterable<number>): void {
+    const primed = primedIndexes.get(g)
+    if (!primed) return
+    const wanted = new Set(ids)
+    for (const [block, ops] of primed.byOp) {
+        for (const list of ops.values()) {
+            if (list.some(id => wanted.has(id))) primed.stale.add(block)
+        }
+    }
 }
 
 function dropPrimedIndex(g: Graph): void {
@@ -675,25 +682,23 @@ function stalePrimedBlock(g: Graph, block: number): void {
     primedIndexes.get(g)?.stale.add(block)
 }
 
-export function primeIndexCheck(g: Graph): void {
-    primedIndexes.set(g, quietIndex(g))
+export function primeIndexCheck(g: Graph, where: string): void {
+    const ix = buildIndex(g)
+    checkIsolation(g, ix, where)
+    primedIndexes.set(g, ix)
 }
 
 export function verifyIndex(g: Graph, where: string): void {
     const primed = primedIndexes.get(g)
     if (!primed) return
     primedIndexes.delete(g)
-    const diff = indexDiff(g, primed)
-    const marked = primed.stale.size > 0
-    for (const [block, kinds] of [...diff]) {
-        kinds.delete('used')
-        if (kinds.has('marked') || !kinds.size) diff.delete(block)
-    }
-    if (diff.size) console.log(`index-check ${where} ${g.name ?? '?'} ${marked ? 'unmarked-blocks' : 'miss'}: ${formatIndexDiff(diff)}`)
+    if (primed.stale.size) refreshStale(g, primed)
+    const diff = indexDiff(g, primed, where)
+    if (diff.size) console.log(`index-check ${where} ${g.name ?? '?'} miss: ${formatIndexDiff(diff)}`)
 }
 
 export function verifyMaintainedIndex(g: Graph, ix: GraphIndex, where: string): void {
-    const diff = indexDiff(g, ix)
+    const diff = indexDiff(g, ix, `optimize:${where}`)
     const reported = reportedIndexDiffs.get(ix) ?? new Set<string>()
     const current = new Set<string>()
     const added = new Map<number, Set<string>>()
@@ -711,4 +716,21 @@ export function verifyMaintainedIndex(g: Graph, ix: GraphIndex, where: string): 
     if (added.size) console.log(`index-check optimize:${where} ${g.name ?? '?'} maintained: ${formatIndexDiff(added)}`)
 }
 
-if (indexCheck) watchIndex({ reused: verifyReusedIndex, built: recordIndexBuild, dropped: dropPrimedIndex, staled: stalePrimedBlock })
+const reportedKinds = new WeakMap<Graph, number>()
+
+export function verifyKinds(g: Graph, where: string): void {
+    const reported = reportedKinds.get(g) ?? 0
+    let missing = 0
+    const found: string[] = []
+    for (const [id, n] of nodeEntries(g)) {
+        const kind = kindOf(n.op) & ~g.kinds & ~reported & ~missing
+        if (!kind) continue
+        missing |= kind
+        found.push(`${Object.keys(GraphKinds).find(k => (GraphKinds as any)[k] === kind)} %${id} ${opName(n.op)}`)
+    }
+    if (!missing) return
+    reportedKinds.set(g, reported | missing)
+    console.log(`index-check kinds ${where} ${g.name ?? '?'} unmarked: ${found.join(', ')}`)
+}
+
+if (indexCheck) watchIndex({ reused: verifyReusedIndex, built: recordIndexBuild, dropped: dropPrimedIndex, staled: stalePrimedBlock, rewrote: rewrotePrimed })

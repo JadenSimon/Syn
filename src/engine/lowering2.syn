@@ -8,7 +8,7 @@ import * as lowering from './lowering'
 import { solvePlacements } from './placement-flow'
 import { flattenRecords } from './records'
 import * as rt from './rt'
-import { indexCheck, primeIndexCheck, verifyGraph, verifyIndex, verifyLiveIndex, verifyMaintainedIndex, verifyNumberClasses, verifyMemoryOrder, verifyOrderingSlots, verifySlotBounds, verifyTailEffects, verifyTokenSelects } from './verify'
+import { indexCheck, primeIndexCheck, verifyGraph, verifyIndex, verifyKinds, verifyLiveIndex, verifyMaintainedIndex, verifyNumberClasses, verifyMemoryOrder, verifyOrderingSlots, verifySlotBounds, verifyTailEffects, verifyTokenSelects } from './verify'
 import {
     addGraphBlock, blockOrder, clearOperands, cloneRefs, copyNode, countIds, countLiterals,
     createRecordType, getArgConsts, getArgIds, getBlock, getDebugLabel, getLiteral,
@@ -20,10 +20,10 @@ import {
     getNode, hasNode, deleteNode, setNode,
     addCopy, addNode, putNode, putCopy,
     withOperand,
-    retypeNode, type TypeOperand, isNullishValue, floatLiteral, sameSlotBits, indexedUsers, useSlot,
+    retypeNode, type TypeOperand, isNullishValue, floatLiteral, sameSlotBits, indexedUsers, userCount, indexedPreds, predCount, indexedSuccessors, blockOps, isIndexed, inboundVersion, holderOf, isShared, useSlot,
     type NodeSpace,
     armOrBodySlot, orderRegions, childRegion, type RegionTree, allNodes, countNodes, nodeEntries, nodeIds,
-    OrderedValues, ResultUsedFlag, graphIndex, dirtyIndex, indexBlock, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams,
+    OrderedValues, graphIndex, dirtyIndex, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams,
 } from './graph-node'
 
 const Types = intrinsics.Types
@@ -62,6 +62,7 @@ export interface Graph {
     unswitch?: number
     facts?: Map<number, GraphNode>
     index?: gn.GraphIndex
+    kinds: gn.GraphKinds
 }
 
 const FactOps = new Set([NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.convert, NodeOp.load, NodeOp.literal])
@@ -838,7 +839,8 @@ function recordKeys(g: Graph, id: number): number[] | undefined {
     if (n.op === NodeOp.select) return recordKeys(g, getRef(n, 1))
 }
 
-function detachRecordOrdering(g: Graph): Graph {
+function detachRecordOrdering(g: Graph): boolean {
+    if (!gn.mayHaveKinds(g, gn.GraphKinds.record)) return false
     const owners = new Map<number, number>()
     for (const b of g.blocks) {
         for (const p of b.params) {
@@ -851,12 +853,14 @@ function detachRecordOrdering(g: Graph): Graph {
         if (n.op !== NodeOp.get || getNode(g, getRef(n, 0))?.op !== NodeOp.call) continue
         if (!projections.has(getRef(n, 0)) || getLiteral(g, n, 1) === 0) projections.set(getRef(n, 0), id)
     }
-    if (!owners.size && !projections.size) return g
+    if (!owners.size && !projections.size) return false
     const nils = new Map<number, number>()
+    let changed = false
     function detach(n: GraphNode, i: number) {
         const projection = projections.get(getRef(n, i))
         if (projection !== undefined) {
             setRef(n, i, projection)
+            changed = true
             return
         }
         const owner = owners.get(getRef(n, i))
@@ -864,6 +868,7 @@ function detachRecordOrdering(g: Graph): Graph {
         let nil = nils.get(owner)
         if (!nil) nils.set(owner, nil = createNode(g, NodeOp.startOf, [owner]))
         setRef(n, i, nil)
+        changed = true
     }
     for (const n of [...allNodes(g)]) {
         if (n.op === NodeOp.after) {
@@ -872,7 +877,8 @@ function detachRecordOrdering(g: Graph): Graph {
             detach(n, 0)
         }
     }
-    return g
+    if (changed) dirtyIndex(g)
+    return changed
 }
 
 const BinaryOps = new Set<NodeOp>([
@@ -1898,7 +1904,7 @@ function forEachOperand(g: Graph, vid: number, fn: (n: GraphNode, id: number, id
     return createNode(g, n.op, operands, n)
 }
 
-export function sweepBlocks(g: Graph) {
+export function sweepBlocks(g: Graph): boolean {
     const epoch = nextEpoch(g)
     let seenCount = 0
     function see(n: GraphNode) {
@@ -1937,7 +1943,7 @@ export function sweepBlocks(g: Graph) {
         visit(n, rootBlock.bodyId)
     }
     if (seenCount === countNodes(g)) {
-        return g
+        return false
     }
     const unseen: number[] = []
     for (const [k, v] of nodeEntries(g)) {
@@ -1957,8 +1963,11 @@ export function sweepBlocks(g: Graph) {
     }
     const result = g.blocks.filter(x => hasNode(g, x.id))
     assert(result[0].id === g.root)
+    for (const b of g.blocks) {
+        if (!hasNode(g, b.id)) gn.dirtyBlock(g, b)
+    }
     setGraphBlocks(g, result)
-    return g
+    return true
 }
 
 function operand(g: NodeSpace, n: GraphNode, idx: number) {
@@ -3915,33 +3924,21 @@ interface Promotion {
     touched: Set<GraphBlock>
 }
 
+const freshIndex = intrinsics.argv().includes('fresh-index')
+const freshIndexSteps = intrinsics.argv().includes('fresh-index-steps')
 function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     const optimizeStart = performance.now()
+    if (freshIndex) dirtyIndex(g)
     const index = graphIndex(g)
-    defer finally {
-        dirtyIndex(g)
-    }
-    const dependents = index.dependents
-    const byOp = index.byOp
-    const successors = index.successors
-    const preds = index.preds
-    const visited = index.visited
-    const reachableBlocks = index.reachableBlocks
-    const inboundVersions = index.inboundVersions
     const versions = new Map<number, number>()
 
     function isResultUsed(id: number): boolean {
-        return (getNode(g, id)!.scratchFlags & ResultUsedFlag) !== 0
+        return gn.resultUsed(g, index, id)
     }
 
     function usesForResult(user: number, id: number): boolean {
         const u = getNode(g, user)!
         for (let i = firstNonOrderingSlot(u); i < countIds(u); i++) if (getRef(u, i) === id) return true
-        return false
-    }
-
-    function usedForResult(id: number): boolean {
-        for (const u of dependents.get(id) ?? []) if (usesForResult(u, id)) return true
         return false
     }
 
@@ -3952,9 +3949,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function findValues(blockId: number, op: NodeOp) {
-        if (const m = byOp.get(blockId)) {
-            return m.get(op)
-        }
+        return gn.findValues(index, blockId, op)
     }
 
     function operandEdge(n: GraphNode, i: number): number {
@@ -4022,31 +4017,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function removeBlock(b: GraphBlock) {
-        index.stale.delete(b.id)
-        cleanBlockData(b)
-        reachableBlocks.delete(b)
-    }
-
-    function cleanBlockData(b: GraphBlock) {
-        if (const s = successors.get(b.id)) {
-            successors.delete(b.id)
-            for (const x of s) {
-                if (const p = preds.get(x)) {
-                    p.delete(b.id)
-                }
-            }
-        }
-
-        if (const m = byOp.get(b.id)) {
-            byOp.delete(b.id)
-            for (const arr of m.values()) {
-                for (const id of arr) cleanEdges(id)
-            }
-            function cleanEdges(id: number) {
-                dependents.delete(id)
-                visited.delete(id)
-            }
-        }
+        gn.unindexBlock(g, index, b)
     }
 
     const passVersions = new Map<(b: GraphBlock) => unknown, Map<number, number>>()
@@ -4055,11 +4026,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function touch(b: GraphBlock) {
         graphEpoch++
         versions.set(b.id, (versions.get(b.id) ?? 0) + 1)
-        inboundVersions.set(b.id, (inboundVersions.get(b.id) ?? 0) + 1)
-        if (const p = successors.get(b.id)) {
-            for (const x of p) {
-                inboundVersions.set(x, (inboundVersions.get(x) ?? 0) + 1)
-            }
+        index.inboundVersions.set(b.id, inboundVersion(index, b.id) + 1)
+        for (const x of indexedSuccessors(index, b.id)) {
+            index.inboundVersions.set(x, inboundVersion(index, x) + 1)
         }
     }
     function time(name: string, dur: number) {
@@ -4102,13 +4071,14 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     ])
     const passDebug = debugsGraph('pass-debug', g)
     function step(pass: (b: GraphBlock) => unknown, b: GraphBlock): boolean {
-        if (disabledPasses.has(pass.name) || !reachableBlocks.has(b)) return false
+        if (disabledPasses.has(pass.name) || !isIndexed(index, b)) return false
         if (!optimizeTimers && !passDebug && !indexCheck) return runStep(pass, b)
         const s = performance.now()
         const changed = runStep(pass, b)
         recordPass(pass.name, performance.now() - s, changed)
         if (passDebug && changed) console.log(`--- ${pass.name} changed B${b.id} ---\n${dumpGraph(g)}`)
         if (indexCheck && changed) verifyMaintainedIndex(g, index, `${pass.name}@B${b.id}`)
+        if (indexCheck && changed) verifyKinds(g, `optimize:${pass.name}`)
         return changed
     }
     function runStep(pass: (b: GraphBlock) => unknown, b: GraphBlock): boolean {
@@ -4116,7 +4086,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         let seen = passVersions.get(pass)
         if (!seen) passVersions.set(pass, seen = new Map())
         const version = versions.get(bid) ?? 0
-        const inbound = inboundPasses.has(pass) ? inboundVersions.get(bid) ?? 0 : -1
+        const inbound = inboundPasses.has(pass) ? inboundVersion(index, bid) : -1
         let seenInbound = inboundPassVersions.get(pass)
         if (!seenInbound) inboundPassVersions.set(pass, seenInbound = new Map())
         if (seen.get(bid) === version && (inbound < 0 || seenInbound.get(bid) === inbound)) return false
@@ -4137,65 +4107,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     let didAnyChange = false
-    function revisitBlock(b: GraphBlock, incremental = false) {
-        index.stale.delete(b.id)
+    function revisitBlock(b: GraphBlock) {
         touch(b)
         didAnyChange = true
-        if (!incremental) {
-            cleanBlockData(b)
-            visited.delete(b.id)
-            indexBlock(g, index, b)
-            return
-        }
-        if (const s = successors.get(b.id)) {
-            successors.delete(b.id)
-            for (const x of s) preds.get(x)?.delete(b.id)
-        }
-        visited.delete(b.id)
-        indexBlock(g, index, b)
-        const ops = byOp.get(b.id)
-        if (!ops) return
-        const members = new Set<number>()
-        for (const ids of ops.values()) for (const id of ids) members.add(id)
-        const dropped = new Set<number>()
-        function drop(id: number): void {
-            if (dropped.has(id) || id === b.bodyId || !members.has(id) || dependents.get(id)?.size) return
-            if (getNode(g, id)?.op === NodeOp.param) return
-            dropped.add(id)
-            dependents.delete(id)
-            visited.delete(id)
-            const n = getNode(g, id)
-            for (let i = 0; n && i < countIds(n); i++) {
-                const d = operandEdge(n, i)
-                if (!d) continue
-                const users = dependents.get(d)
-                if (users) {
-                    users.delete(id)
-                    if (!users.size) dependents.delete(d)
-                }
-                const node = getNode(g, d)
-                if (node && node.scratchFlags & ResultUsedFlag && !usedForResult(d)) node.scratchFlags &= ~ResultUsedFlag
-                drop(d)
-            }
-        }
-        for (const id of members) drop(id)
-        if (dropped.size) {
-            for (const [op, ids] of [...ops]) {
-                const kept = ids.filter(id => !dropped.has(id))
-                if (kept.length) ops.set(op, kept)
-                else ops.delete(op)
-            }
-        }
-        for (const id of ops.get(NodeOp.apply) ?? []) {
-            const to = getRef(getNode(g, id)!, 0)
-            let s = successors.get(b.id)
-            if (!s) successors.set(b.id, s = new Set())
-            s.add(to)
-            let p = preds.get(to)
-            if (!p) preds.set(to, p = new Set())
-            if (!p.has(b.id)) inboundVersions.set(to, (inboundVersions.get(to) ?? 0) + 1)
-            p.add(b.id)
-        }
+        gn.dirtyBlock(g, b)
+        if (freshIndexSteps) gn.rebuildIndex(g, index)
+        else gn.refreshBlock(g, index, b)
     }
 
     let factsPending: number[] | undefined
@@ -4285,23 +4202,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function findInboundApplies(target: GraphBlock) {
-        if (target.id === g.root) return []
-        const res: [blockId: number, valId: number][] = []
-        function visit(b: GraphBlock) {
-            const applies = findValues(b.id, NodeOp.apply)!
-            for (const u of applies) {
-                const n = getNode(g, u)!
-                const t = getRef(n, 0)
-                if (t !== target.id) continue
-                res.push([b.id, u])
-            }
-        }
-        const x = preds.get(target.id)
-        if (!x) return res
-        for (const k of x) {
-            visit(getGraphBlock(k))
-        }
-        return res
+        return gn.inboundApplies(g, index, target)
     }
 
     function inboundBlocks(target: GraphBlock): [from: GraphBlock, apply: number][] {
@@ -4322,7 +4223,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function onlyTested(decoded: number): boolean {
-        for (const u of dependents.get(decoded) ?? []) {
+        for (const u of indexedUsers(index, decoded)) {
             const n = getNode(g, u)!
             if (n.op === NodeOp.select && getRef(n, 0) === decoded && getRef(n, 1) !== decoded && getRef(n, 2) !== decoded) continue
             if ((n.op === NodeOp.load || n.op === NodeOp.store) && getArgIds(n).every((x, i) => x !== decoded || i === 1)) continue
@@ -4437,7 +4338,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function collectChain(n: GraphNode, leaves: Operand[]): void {
         for (let i = 0; i < 2; i++) {
             const ref = getRef(n, i)
-            if (ref && chainLink(ref, n.op, typeOf(n)) && dependents.get(ref)?.size === 1) collectChain(getNode(g, ref)!, leaves)
+            if (ref && chainLink(ref, n.op, typeOf(n)) && userCount(index, ref) === 1) collectChain(getNode(g, ref)!, leaves)
             else leaves.push(getOperand(g, n, i))
         }
     }
@@ -4477,8 +4378,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function membershipTest(root: number, test: NodeOp): number {
         const n = getNode(g, root)!
         if (countIds(n) !== 2) return 0
-        const users = dependents.get(root)
-        if (users?.size === 1 && chainLink([...users][0], n.op, typeOf(n))) return 0
+        const users = indexedUsers(index, root)
+        if (users.size === 1 && chainLink([...users][0], n.op, typeOf(n))) return 0
         const leaves: Operand[] = []
         collectChain(n, leaves)
         if (leaves.length < 2) return 0
@@ -4701,7 +4602,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const roots = deduplicate(g, [target.bodyId])
         if (!roots) return false
         setBlockBody(g, target, roots[0])
-        revisitBlock(target, true)
+        revisitBlock(target)
         return true
     }
 
@@ -4726,7 +4627,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function interchangeSelects(target: GraphBlock) {
-        if (!preds.get(target.id)?.has(target.id)) return false
+        if (!indexedPreds(index, target.id).has(target.id)) return false
         if ((findValues(target.id, NodeOp.select)?.length ?? 0) < 2) return false
         const loops = (id: number) => {
             const n = getNode(g, skipAfter(id) ?? 0)
@@ -5014,7 +4915,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function orderedUse(id: number, seen = new Set<number>()): boolean {
         if (seen.has(id)) return false
         seen.add(id)
-        for (const u of dependents.get(id) ?? []) {
+        for (const u of indexedUsers(index, id)) {
             const n = getNode(g, u)
             if (!n) continue
             if (OrderedValues.has(n.op) && getRef(n, 0) === id) return true
@@ -5028,7 +4929,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function hasOrdering(target: GraphBlock): boolean {
         if (findValues(target.id, NodeOp.after)?.length) return true
-        for (const [op, ids] of byOp.get(target.id) ?? []) {
+        for (const [op, ids] of blockOps(index, target.id)) {
             if (!OrderedValues.has(op) || op === NodeOp.alloca) continue
             for (const id of ids) {
                 const token = getRef(getNode(g, id)!, 0)
@@ -5160,10 +5061,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const n = getNode(g, a)
             const v = n ? getRef(n, countIds(n) - 1) : 0
             if (!n || (v && isNilOrVoid(v))) continue
-            for (const u of dependents.get(a) ?? []) if (usesForResult(u, a)) users.add(u)
+            for (const u of indexedUsers(index, a)) if (usesForResult(u, a)) users.add(u)
         }
         if (!users.size) return false
-        for (const ids of byOp.get(target.id)!.values()) for (const id of ids) members.add(id)
+        for (const ids of blockOps(index, target.id).values()) for (const id of ids) members.add(id)
         let changed = false
         const work = [...users]
         for (let k = 0; k < work.length; k++) {
@@ -5203,7 +5104,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             } else {
                 const inner = addCopy(g, n, lifted)
                 putCopy(g, id, n, [...parts, inner], NodeOp.after)
-                for (const u of dependents.get(id) ?? []) if (usesForResult(u, id)) work.push(u)
+                for (const u of indexedUsers(index, id)) if (usesForResult(u, id)) work.push(u)
             }
             changed = true
         }
@@ -5227,7 +5128,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         if (!replacements.size) return false
         setBlockBody(g, target, replaceTransitive(target.bodyId, replacements))
-        revisitBlock(target, true)
+        revisitBlock(target)
         return true
     }
 
@@ -5235,7 +5136,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function workingParams(block: GraphBlock): number {
         let count = 0
         for (const p of block.params) {
-            for (const user of dependents.get(p) ?? []) {
+            for (const user of indexedUsers(index, p)) {
                 if (getNode(g, user)?.op === NodeOp.apply) continue
                 count++
                 break
@@ -5347,8 +5248,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const covered = new Set<number>()
         while (work.length) {
             const next = work.pop()!
-            const s = dependents.get(next)
-            if (!s) continue
+            const s = indexedUsers(index, next)
+            if (!s.size) continue
             let fullyCovered = true
             for (const u of s) {
                 if (!isInvariant(u)) {
@@ -5368,10 +5269,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 while (stack.length) {
                     const x = stack.pop()!
                     if (!invariants.delete(x)) continue
-                    for (const u of dependents.get(x) ?? []) stack.push(u)
+                    for (const u of indexedUsers(index, x)) stack.push(u)
                 }
                 for (const p of covered) {
-                    for (const u of dependents.get(p) ?? []) {
+                    for (const u of indexedUsers(index, p)) {
                         if (invariants.has(u) || loop.selfApps.includes(u)) continue
                         covered.delete(p)
                         dropping.push(p)
@@ -5388,7 +5289,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         for (const x of invariants) {
             if (target.params.includes(x)) continue
-            for (const y of dependents.get(x) ?? []) {
+            for (const y of indexedUsers(index, x)) {
                 if (invariants.has(y) || !usesForResult(y, x)) continue
                 const u = getNode(g, y)!
                 for (let i = 0; i < countIds(u); i++) {
@@ -5483,7 +5384,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const reached = new Set<number>([header.id])
         const work = [header.id]
         while (work.length) {
-            for (const s of successors.get(work.pop()!) ?? []) {
+            for (const s of indexedSuccessors(index, work.pop()!)) {
                 if (reached.has(s)) continue
                 reached.add(s)
                 work.push(s)
@@ -5492,7 +5393,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const members = new Set<number>([header.id])
         work.push(header.id)
         while (work.length) {
-            for (const p of preds.get(work.pop()!) ?? []) {
+            for (const p of indexedPreds(index, work.pop()!)) {
                 if (members.has(p) || !reached.has(p)) continue
                 members.add(p)
                 work.push(p)
@@ -5504,17 +5405,17 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     let unswitched = false
     function unswitchLoop(header: GraphBlock) {
         if (!g.unswitch || unswitched || header === g.blocks[0]) return
-        if (preds.get(header.id)!.size === 1) return
+        if (predCount(index, header.id) === 1) return
         const members = loopMembers(header)
-        if (![...(preds.get(header.id) ?? [])].some(p => members.has(p))) return
+        if (![...indexedPreds(index, header.id)].some(p => members.has(p))) return
         const entries = findInboundApplies(header).filter(([from]) => !members.has(from))
         if (entries.length !== 1) return
-        for (const m of members) if (m !== header.id && [...(preds.get(m) ?? [])].some(p => !members.has(p))) return
+        for (const m of members) if (m !== header.id && [...indexedPreds(index, m)].some(p => !members.has(p))) return
         const owned = new Map<number, number[]>()
         let size = 0
         for (const m of members) {
             const ids: number[] = []
-            for (const list of byOp.get(m)?.values() ?? []) ids.push(...list)
+            for (const list of blockOps(index, m).values()) ids.push(...list)
             owned.set(m, ids)
             size += ids.length
         }
@@ -5553,7 +5454,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (!stays(getRef(n, i))) inside = false
             }
             if (!inside) continue
-            if (!tail && ![...(dependents.get(id) ?? [])].some(u => getNode(g, u)?.op !== NodeOp.apply || members.has(getRef(getNode(g, u)!, 0)))) continue
+            if (!tail && ![...indexedUsers(index, id)].some(u => getNode(g, u)?.op !== NodeOp.apply || members.has(getRef(getNode(g, u)!, 0)))) continue
             const k = keyOf(getRef(n, 0))
             if (k === undefined) continue
             const known = votes.get(k)
@@ -5702,12 +5603,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function relayChain(header: GraphBlock, slot: number, members: Set<number>): Map<number, number> | undefined {
         const chain = relayedChain(header, slot, members)
         if (!chain) return
-        for (const id of chain.keys()) if (id !== header.id) for (const from of preds.get(id)!) if (!members.has(from)) return
+        for (const id of chain.keys()) if (id !== header.id) for (const from of indexedPreds(index, id)) if (!members.has(from)) return
         return chain
     }
 
     function hoistLoopInvariants(target: GraphBlock) {
-        if (target === g.blocks[0] || (preds.get(target.id)?.size ?? 0) < 2) return false
+        if (target === g.blocks[0] || predCount(index, target.id) < 2) return false
         currentMem()
         const members = loopMembers(target)
         if (!members || members.size < 2) return false
@@ -5978,7 +5879,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function sinkReloadedStores(target: GraphBlock): boolean {
-        if (target === g.blocks[0] || (preds.get(target.id)?.size ?? 0) < 2) return false
+        if (target === g.blocks[0] || predCount(index, target.id) < 2) return false
         const members = loopMembers(target)
         const inbound = findInboundApplies(target)
         const entries = inbound.filter(x => !members.has(x[0]))
@@ -6015,7 +5916,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return getRef(entry, at + 1)
         }
         function wrapper(block: number, app: number): number | undefined {
-            for (const u of dependents.get(app) ?? []) {
+            for (const u of indexedUsers(index, app)) {
                 const n = getNode(g, u)!
                 if (n.op === NodeOp.after && countIds(n) === 2 && getRef(n, 1) === app) return u
             }
@@ -6133,10 +6034,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             live.add(p)
             pending.push(p)
         }
-        for (const b of reachableBlocks) {
+        for (const b of g.blocks) {
+            if (!isIndexed(index, b)) continue
             for (const p of b.params) {
                 if (b.bodyId === p) mark(p)
-                for (const id of dependents.get(p) ?? []) {
+                for (const id of indexedUsers(index, p)) {
                     const n = getNode(g, id)!
                     if (n.op !== NodeOp.apply) { mark(p); break }
                 }
@@ -6202,8 +6104,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         let local: Map<number, number> | undefined
         for (let i = 0; i < target.params.length; i++) {
             const p = target.params[i]
-            const users = dependents.get(p)
-            if (!users?.size) continue
+            const users = indexedUsers(index, p)
+            if (!users.size) continue
             const shift = shiftAt(inbound, i)
             if (shift < 0) continue
             const sample = shiftedArg(inbound[0][1], i)!
@@ -6333,7 +6235,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             setBlockBody(g, b, replaceAll(b.bodyId, replacements))
         }
         const forwarded = new Map<number, number>()
-        for (const p of dead) if (dependents.get(p)?.size) forwarded.set(p, addNode(g, NodeOp.literal, [{ literal: 0 }]))
+        for (const p of dead) if (userCount(index, p)) forwarded.set(p, addNode(g, NodeOp.literal, [{ literal: 0 }]))
         const bodyId = forwarded.size ? replaceAll(b.bodyId, forwarded) : b.bodyId
         if (bodyId !== b.bodyId) {
             setBlockBody(g, b, bodyId)
@@ -6396,7 +6298,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!no.size) continue
             const before = guaranteed(target, getRef(n, 0))
             const unordered = !orderedUse(id)
-            const users = [...dependents.get(id) ?? []].map(u => getNode(g, u))
+            const users = [...indexedUsers(index, id)].map(u => getNode(g, u))
             const orderedBefore = (effect: number) => !!users.length && users.every(m => {
                 if (!m || m.op !== NodeOp.after || getRef(m, countIds(m) - 1) !== id) return false
                 for (let i = 0; i < countIds(m) - 1; i++) if (guaranteed(target, getRef(m, i)).has(effect)) return true
@@ -6486,9 +6388,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     const countedLoops = new Map<number, [version: number, inbound: number, loop: CountedLoop | undefined]>()
     function countedLoop(target: GraphBlock): CountedLoop | undefined {
-        if (!preds.get(target.id)?.has(target.id)) return
+        if (!indexedPreds(index, target.id).has(target.id)) return
         const version = versions.get(target.id) ?? 0
-        const inbound = inboundVersions.get(target.id) ?? 0
+        const inbound = inboundVersion(index, target.id)
         const known = countedLoops.get(target.id)
         if (known && known[0] === version && known[1] === inbound) return known[2]
         const selfApps: number[] = []
@@ -6548,7 +6450,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function privateStep(loop: CountedLoop, i: number): boolean {
         for (const app of loop.selfApps) {
-            for (const u of dependents.get(getRef(getNode(g, app)!, i + 1)) ?? []) {
+            for (const u of indexedUsers(index, getRef(getNode(g, app)!, i + 1))) {
                 if (!loop.selfApps.includes(u)) return false
             }
         }
@@ -6639,7 +6541,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const allowed = new Set<number>([getRef(tail, 0), getRef(back, ivAt + 1), ...stores])
         let exits = false
-        for (const u of dependents.get(iv) ?? []) {
+        for (const u of indexedUsers(index, iv)) {
             const n = getNode(g, u)
             if (allowed.has(u)) continue
             if (n?.op !== NodeOp.apply || u === loop.selfApps[0]) return
@@ -6728,7 +6630,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function valueBlock(id: number, op: NodeOp): GraphBlock | undefined {
-        for (const b of reachableBlocks) if (findValues(b.id, op)?.includes(id)) return b
+        for (const b of g.blocks) if (isIndexed(index, b) && findValues(b.id, op)?.includes(id)) return b
     }
 
     function extentRounder(leaf: number): (() => void) | undefined {
@@ -6747,12 +6649,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (n.op !== NodeOp.mem) return
         const base = getNode(g, getRef(n, 0))
         if (base?.op !== NodeOp.load) return
-        for (const a of dependents.get(getRef(n, 0)) ?? []) {
+        for (const a of indexedUsers(index, getRef(n, 0))) {
             const top = getNode(g, a)!
             if (top.op !== NodeOp.add) continue
             const at = getRef(top, 0) === getRef(n, 0) ? 1 : getRef(top, 1) === getRef(n, 0) ? 0 : -1
             if (at < 0 || getRef(top, at) !== getRef(n, 1) || getLiteral(g, top, at) !== getLiteral(g, n, 1)) continue
-            for (const id of dependents.get(a) ?? []) {
+            for (const id of indexedUsers(index, a)) {
                 const store = getNode(g, id)!
                 if (store.op !== NodeOp.store || getRef(store, 3) !== a || getRef(store, 2) || getLiteral(g, store, 2) !== getLiteral(g, base, 2)) continue
                 if (getRef(store, 1) !== getRef(base, 1) || getLiteral(g, store, 1) !== getLiteral(g, base, 1) || getRef(base, 2)) continue
@@ -6798,7 +6700,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             for (const x of chain.slice(1)) dying.add(getRef(getNode(g, x)!, 0))
             const last = chain[chain.length - 1]
             const held: number[] = []
-            for (const x of dying) for (const u of dependents.get(x) ?? []) {
+            for (const x of dying) for (const u of indexedUsers(index, x)) {
                 if (u === last || dying.has(u)) continue
                 const n = getNode(g, u)
                 if (n?.op !== NodeOp.after || stores.has(getRef(n, countIds(n) - 1)) || !slotParts(u).has(last)) return
@@ -6810,7 +6712,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const token = getRef(getNode(g, id)!, 0)
             if (continues(id, token)) return token
             const t = getNode(g, token)
-            if (t?.op !== NodeOp.after || !isNilOrVoid(getRef(t, countIds(t) - 1)) || dependents.get(token)?.size !== 1) return 0
+            if (t?.op !== NodeOp.after || !isNilOrVoid(getRef(t, countIds(t) - 1)) || userCount(index, token) !== 1) return 0
             const parts = cloneRefs(t, 0, countIds(t) - 1)
             for (const prior of parts) {
                 if (!continues(id, prior)) continue
@@ -7236,7 +7138,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const chain: [id: number, from: number][] = []
             const compares: number[] = []
             let valid = true
-            for (const u of dependents.get(p) ?? []) {
+            for (const u of indexedUsers(index, p)) {
                 if (steps.has(u)) continue
                 const n = getNode(g, u)!
                 if (CompareOps.has(n.op) && invariant(n, getRef(n, 0) === p ? 1 : 0)) {
@@ -7250,8 +7152,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             if (!valid || !chain.length) continue
             for (;;) {
-                const uses = dependents.get(chain[chain.length - 1][0])
-                if (!uses || uses.size !== 1) break
+                const uses = indexedUsers(index, chain[chain.length - 1][0])
+                if (uses.size !== 1) break
                 let next = 0
                 for (const u of uses) next = u
                 const from = derivation(getNode(g, next)!, chain[chain.length - 1][0])
@@ -7298,7 +7200,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             let addr = 0
             const memory: [id: number, offset: number][] = []
             function locate(id: number, offset: number): boolean {
-                for (const u of dependents.get(id) ?? []) {
+                for (const u of indexedUsers(index, id)) {
                     const n = getNode(g, u)!
                     if (n.op === NodeOp.add && countIds(n) === 2) {
                         const at = getRef(n, 0) === id ? 1 : 0
@@ -7315,7 +7217,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             if (!closed || !locate(derived, 0)) addr = 0
             const shift = Math.log2(scale)
-            const folded = !addr && Number.isInteger(shift) && [...dependents.get(derived) ?? []].every(u => scaledAccess(u, derived, shift))
+            const folded = !addr && Number.isInteger(shift) && [...indexedUsers(index, derived)].every(u => scaledAccess(u, derived, shift))
             if (folded) continue
             const bias = addr ? replay([0, 0], (id, value) => [id, value])[1] : 0
             function address(value: [number, number], outside: (id: number, value: number) => [number, number]): [number, number] {
@@ -7452,7 +7354,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
         while (const q = work.pop()) {
             const carrier = carriers.get(q)!
-            for (const u of dependents.get(q) ?? []) {
+            for (const u of indexedUsers(index, q)) {
                 if (q === p && u === condId) continue
                 const n = getNode(g, u)!
                 if (q === p && (n.op === NodeOp.load || n.op === NodeOp.store)
@@ -7464,11 +7366,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     if (carrier.stepped) return
                     const s = getLiteral(g, n, 1)
                     if (!Number.isSafeInteger(s) || s <= 0 || (stride && stride !== s)) return
-                    const uses = dependents.get(u)
-                    if (uses?.size !== 1) return
+                    const uses = indexedUsers(index, u)
+                    if (uses.size !== 1) return
                     stride = s
                     steps.push([carrier.block, u])
-                    if (!feed(carrier, u, [...uses!][0], true)) return
+                    if (!feed(carrier, u, [...uses][0], true)) return
                     continue
                 }
                 if (!feed(carrier, q, u, carrier.stepped)) return
@@ -7556,7 +7458,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (findValues(target.id, NodeOp.store)?.length) return
             if (findValues(target.id, NodeOp.call)?.length) return
             const back = getNode(g, backId)!
-            for (const u of dependents.get(bound) ?? []) {
+            for (const u of indexedUsers(index, bound)) {
                 if (u !== condId && u !== backId) return
             }
             const stepId = steps[0][1]
@@ -7565,8 +7467,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const accumulators = new Map<number, number>()
             for (let i = 0; i < params.length; i++) {
                 if (i === at || getRef(back, i + 1) === params[i]) continue
-                const uses = dependents.get(params[i])
-                if (!uses?.size) continue
+                const uses = indexedUsers(index, params[i])
+                if (!uses.size) continue
                 const updateId = getRef(back, i + 1)
                 const update = getNode(g, updateId)
                 if (!update || !accumulating.has(update.op) || typeOf(update) === Types.f64) return
@@ -7575,7 +7477,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 for (const u of uses) {
                     if (u !== updateId && u !== exit) return
                 }
-                if (dependents.get(updateId)?.size !== 1) return
+                if (userCount(index, updateId) !== 1) return
                 accumulators.set(params[i], getRef(update, x))
             }
             const accumulated = new Set<number>(accumulators.keys())
@@ -7735,24 +7637,24 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const stride = loop.steps[at]
             if (!stride || stride <= 0 || stride > costs.writebackStride) continue
 
-            const compares = [...dependents.get(param) ?? []].filter(id => {
+            const compares = [...indexedUsers(index, param)].filter(id => {
                 const n = getNode(g, id)!
                 return n.op === NodeOp.lt && getRef(n, 0) === param
                     && !lowering.isSignedType(operandType(g, n, 0)) && !lowering.isSignedType(operandType(g, n, 1))
             })
             if (compares.length !== 1) continue
             const compareId = compares[0]
-            const loads = [...dependents.get(param) ?? []].filter(id => {
+            const loads = [...indexedUsers(index, param)].filter(id => {
                 const n = getNode(g, id)!
                 return n.op === NodeOp.load && getRef(n, 1) === param && !getRef(n, 2)
             })
             const advancing = loads.find(id => getLiteral(g, getNode(g, id)!, 2) === stride
-                && [...dependents.get(id) ?? []].some(user => CompareOps.has(getNode(g, user)?.op)))
+                && [...indexedUsers(index, id)].some(user => CompareOps.has(getNode(g, user)?.op)))
             if (advancing === undefined) continue
             const allowed = new Set<number>([stepId, compareId, ...loads])
-            if ([...dependents.get(param) ?? []].some(id => !allowed.has(id))) continue
+            if ([...indexedUsers(index, param)].some(id => !allowed.has(id))) continue
 
-            const combine = [...dependents.get(compareId) ?? []].find(id => {
+            const combine = [...indexedUsers(index, compareId)].find(id => {
                 const n = getNode(g, id)!
                 if (n.op !== NodeOp.and) return false
                 const other = getRef(n, 0) === compareId ? getRef(n, 1)
@@ -7868,32 +7770,43 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function mergeBlocks(target: GraphBlock): boolean {
-        const next = successors.get(target.id)
-        return !!next && next.size === 1 && mergeSuccessor(target, getGraphBlock([...next][0]))
+        const absorbed: GraphBlock[] = []
+        let last = target
+        while (true) {
+            const next = indexedSuccessors(index, last.id)
+            if (next.size !== 1) break
+            const b = getGraphBlock([...next][0])
+            if (b === target || !mergeSuccessor(target, last, b)) break
+            absorbed.push(b)
+            last = b
+            if (predCount(index, target.id) > 1) break
+        }
+        if (!absorbed.length) return false
+        for (const b of absorbed) gn.absorbBlock(g, index, target, b)
+        revisitBlock(target)
+        return true
     }
 
-    function mergeSuccessor(target: GraphBlock, b: GraphBlock): boolean {
-        if (b.id === target.id || b.id === g.root || preds.get(b.id)?.size !== 1) return false
+    function mergeSuccessor(target: GraphBlock, last: GraphBlock, b: GraphBlock): boolean {
+        if (b.id === g.root || predCount(index, b.id) !== 1) return false
         const tail = getNode(g, b.bodyId)
         if (!tail || tail.op === NodeOp.panic) return false
         if ((findValues(b.id, NodeOp.apply)?.length ?? 0) > 1) return false
 
-        const paths = applicationPaths(target, b.id)
+        const own = applicationPaths(last, b.id)
+        if (own.length !== 1) return false
+        const ownSite = own[0][own[0].length - 1]
+        if (userCount(index, ownSite) !== Math.min(own[0].length - 1, 1)) return false
+        const paths = last === target ? own : applicationPaths(target, b.id)
         if (paths.length !== 1) return false
         const path = paths[0]
         const site = path[path.length - 1]
         const app = getNode(g, site)!
         if (countIds(app) !== b.params.length + 1) return false
-        if ((dependents.get(site)?.size ?? 0) !== Math.min(path.length - 1, 1)) return false
 
         const merged = inlineApplication(path, b, b.bodyId)
         if (merged === undefined) return false
-
-        removeBlock(b)
         setBlockBody(g, target, replaceAll(target.bodyId, new Map([[site, merged]])))
-        revisitBlock(target)
-        const into = preds.get(target.id)
-        if (into?.size === 1 && !into.has(target.id)) mergeBlocks(getGraphBlock([...into][0]))
         return true
     }
 
@@ -8106,7 +8019,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (filtered.length === 0) return false
         const r = new Map<number, number>()
         for (const x of filtered) {
-            const usages = dependents.get(x) ?? []
+            const usages = indexedUsers(index, x)
             for (const d of usages) {
                 const u = getNode(g, d)!
                 if (!CompareOps.has(u.op)) continue
@@ -8259,7 +8172,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (getRef(n, j) && op !== NodeOp.startOf && op !== NodeOp.void) ordered = true
             }
             if (ordered) continue
-            for (const u of [...dependents.get(id) ?? []]) {
+            for (const u of [...indexedUsers(index, id)]) {
                 const m = getNode(g, u)!
                 if (m.op === NodeOp.block || m.op === NodeOp.apply) continue
                 let operands: Operand[] | undefined
@@ -8306,13 +8219,13 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
     function threadConstantArrivals(target: GraphBlock): boolean {
         if (target.id === g.root) return false
-        const froms = preds.get(target.id)
-        if (!froms || froms.has(target.id)) return false
+        const froms = indexedPreds(index, target.id)
+        if (!froms.size || froms.has(target.id)) return false
         if (findValues(target.id, NodeOp.call)?.length) return false
         if (!target.params.length || !findValues(target.id, NodeOp.select)?.length) return false
         if (blockSize(target, 12) > 12) return false
         const tests = (p: number) => {
-            for (const u of dependents.get(p) ?? []) {
+            for (const u of indexedUsers(index, p)) {
                 const n = getNode(g, u)!
                 if (n.op === NodeOp.select && getRef(n, 0) === p) return true
             }
@@ -8320,7 +8233,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const decides = (p: number) => {
             if (tests(p)) return true
-            for (const u of dependents.get(p) ?? []) {
+            for (const u of indexedUsers(index, p)) {
                 const n = getNode(g, u)!
                 if (!CompareOps.has(n.op) || comparesFloats(g, n)) continue
                 if (getRef(n, 0) && getRef(n, 1)) continue
@@ -8340,7 +8253,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 seen.add(site)
                 const app = getNode(g, site)!
                 if (countIds(app) !== target.params.length + 1) return false
-                if ((dependents.get(site)?.size ?? 0) !== Math.min(path.length - 1, 1)) return false
+                if (userCount(index, site) !== Math.min(path.length - 1, 1)) return false
                 sites.push([from, path])
             }
         }
@@ -8379,8 +8292,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!tail || tail.op !== NodeOp.select || countIds(tail) !== 3) return false
         const at = target.params.indexOf(getRef(tail, 0))
         if (at < 0) return false
-        const froms = preds.get(target.id)
-        if (!froms || froms.has(target.id)) return false
+        const froms = indexedPreds(index, target.id)
+        if (!froms.size || froms.has(target.id)) return false
 
         const sites: [from: GraphBlock, path: number[], arm: number][] = []
         const seen = new Set<number>()
@@ -8393,7 +8306,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 seen.add(site)
                 const app = getNode(g, site)!
                 if (countIds(app) !== target.params.length + 1) return false
-                if ((dependents.get(site)?.size ?? 0) !== Math.min(path.length - 1, 1)) return false
+                if (userCount(index, site) !== Math.min(path.length - 1, 1)) return false
                 const value = constantOf(app, at + 1)
                 if (value === undefined) return false
                 const arm = value ? 1 : 2
@@ -8691,7 +8604,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     let memEpoch = -1
     function currentMem(): MemAnalysis {
         if (!mem || memEpoch !== graphEpoch) {
-            mem = memAnalysis(g, b => findInboundApplies(b).map(x => x[1]), id => dependents.get(id) ?? [])
+            mem = memAnalysis(g, b => findInboundApplies(b).map(x => x[1]), id => indexedUsers(index, id))
             memEpoch = graphEpoch
         }
         return mem
@@ -8727,7 +8640,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return addNode(g, NodeOp.after, [...tokens])
     }
     function quietAnchor(id: number, load: GraphNode): boolean {
-        for (const u of dependents.get(id) ?? []) if (!usesForResult(u, id)) return false
+        for (const u of indexedUsers(index, id)) if (!usesForResult(u, id)) return false
         return quietSince(getRef(load, 0), load)
     }
     function quietSince(token: number, load: GraphNode): boolean {
@@ -9360,7 +9273,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function killable(): boolean {
             const stores = findValues(target.id, NodeOp.store)?.length ?? 0
             let following = 0
-            for (const next of successors.get(target.id) ?? []) following += findValues(next, NodeOp.store)?.length ?? 0
+            for (const next of indexedSuccessors(index, target.id)) following += findValues(next, NodeOp.store)?.length ?? 0
             if (!stores || (stores === 1 && !following)) return false
             const spans = new Map<string, Map<number, number[]>>()
             const own: [number, string, number, number][] = []
@@ -9380,7 +9293,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (mine) own.push([id, key, m.pos, bytes])
             }
             for (const id of findValues(target.id, NodeOp.store) ?? []) add(id, true)
-            for (const next of successors.get(target.id) ?? []) {
+            for (const next of indexedSuccessors(index, target.id)) {
                 for (const id of findValues(next, NodeOp.store) ?? []) add(id, false)
             }
             for (const [id, key, pos, bytes] of own) {
@@ -9445,7 +9358,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return at
         }
         for (const id of r.keys()) {
-            for (const u of [...(dependents.get(id) ?? [])]) {
+            for (const u of [...indexedUsers(index, id)]) {
                 const n = getNode(g, u)
                 if (!n || r.has(u)) continue
                 const operands = getOperands(g, n)
@@ -9484,7 +9397,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!reads) break
         }
         for (const x of reads ? flow!.reached : []) {
-            for (const u of dependents.get(x) ?? []) {
+            for (const u of indexedUsers(index, x)) {
                 const n = getNode(g, u)!
                 const load = n.op === NodeOp.load && (getRef(n, 1) === x || getRef(n, 2) === x)
                 if (!load && (n.op !== NodeOp.store || getRef(n, 1) !== x)) continue
@@ -9540,7 +9453,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return at
         }
         for (const id of r.keys()) {
-            for (const u of [...(dependents.get(id) ?? [])]) {
+            for (const u of [...indexedUsers(index, id)]) {
                 const n = getNode(g, u)
                 if (!n || r.has(u)) continue
                 const operands = getOperands(g, n)
@@ -9668,7 +9581,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const ids = new Set<number>()
         const touched = new Set<GraphBlock>()
         const homes = new Map<number, number>()
-        for (const b of reachableBlocks) {
+        for (const b of g.blocks) {
+            if (!isIndexed(index, b)) continue
             for (const a of allocations(b.id)) {
                 if (keyOf(a) !== key) continue
                 ids.add(a)
@@ -9728,7 +9642,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!n || (n.op !== NodeOp.pstack && n.op !== NodeOp.alloca)) return false
             const k = keyOf(base)
             if (k === undefined || unpromotable.has(k)) return false
-            for (const b of reachableBlocks) {
+            for (const b of g.blocks) {
+                if (!isIndexed(index, b)) continue
                 for (const a of allocations(b.id)) {
                     if (keyOf(a) !== k) continue
                     ids.add(a)
@@ -9780,7 +9695,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             blockOf.set(param, owner.id)
             pending.push(param)
             const at = owner.params.indexOf(param) + 1
-            for (const from of preds.get(owner.id) ?? []) {
+            for (const from of indexedPreds(index, owner.id)) {
                 for (const app of findValues(from, NodeOp.apply) ?? []) {
                     const n = getNode(g, app)!
                     if (getRef(n, 0) !== owner.id) continue
@@ -9805,7 +9720,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         for (const a of [...ids]) if (!alias(a, homes.get(a)!)) return false
         while (pending.length) {
             const a = pending.pop()!
-            for (const u of dependents.get(a) ?? []) {
+            for (const u of indexedUsers(index, a)) {
                 const n = getNode(g, u)!
                 if (n.op === NodeOp.alloca && getRef(n, 0) === a) continue
                 const pointer = (n.op === NodeOp.load || n.op === NodeOp.store) && getRef(n, 1) === a
@@ -9843,7 +9758,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         for (const s of selectors) {
             const n = getNode(g, s)!
-            const home = roots.has(s) ? [...reachableBlocks].find(b => findValues(b.id, NodeOp.select)?.includes(s)) : undefined
+            const home = roots.has(s) ? g.blocks.find(b => isIndexed(index, b) && findValues(b.id, NodeOp.select)?.includes(s)) : undefined
             for (const id of home ? findValues(home.id, NodeOp.store) ?? [] : []) {
                 if (bases.get(getRef(getNode(g, id)!, 1)) === s) return false
             }
@@ -9864,7 +9779,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
         }
         for (const block of pointerSlots.keys()) {
-            for (const from of preds.get(block) ?? []) touched.add(getGraphBlock(from))
+            for (const from of indexedPreds(index, block)) touched.add(getGraphBlock(from))
         }
         const slots = [...slotTypes].sort((x, y) => slotBases[x[0]] - slotBases[y[0]] || slotOffsets[x[0]] - slotOffsets[y[0]])
         for (let i = 1; i < slots.length; i++) {
@@ -9874,7 +9789,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const loads: [GraphBlock, number][] = []
         const stores = new Set<number>()
-        for (const b of reachableBlocks) {
+        for (const b of g.blocks) {
+            if (!isIndexed(index, b)) continue
             for (const id of findValues(b.id, NodeOp.load) ?? []) {
                 if (!aliases.has(getRef(getNode(g, id)!, 1))) continue
                 loads.push([b, id])
@@ -9916,7 +9832,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const list = added.get(b.id)
             if (list) list.push(offset)
             else added.set(b.id, [offset])
-            for (const from of preds.get(b.id) ?? []) {
+            for (const from of indexedPreds(index, b.id)) {
                 const pred = getGraphBlock(from)
                 const seen = new Set<number>()
                 const ok = tailApplies(pred, (app, tokens) => {
@@ -10066,7 +9982,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const b = getGraphBlock(block)
             for (const offset of offsets) pushBlockParams(g, b, entries.get(`${block}:${offset}`)!)
             touched.add(b)
-            for (const from of preds.get(block) ?? []) touched.add(getGraphBlock(from))
+            for (const from of indexedPreds(index, block)) touched.add(getGraphBlock(from))
         }
         const replaced = promotedReplacements({ ids, stores, values, touched })
 
@@ -10179,8 +10095,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!inbound.length) return false
         const byBlock = new Map<number, Map<number, number>>()
         target.params.forEach((p, i) => {
-            const uses = dependents.get(p)
-            if (!uses?.size) return
+            const uses = indexedUsers(index, p)
+            if (!uses.size) return
             for (const u of uses) {
                 const n = getNode(g, u)!
                 if (n.op !== NodeOp.select || getRef(n, 0) !== p || getRef(n, 1) === p || getRef(n, 2) === p) return
@@ -10224,7 +10140,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         let changed = false
         const forwarded = new Map<number, number>()
         function addressesOnly(ref: number, asBase: boolean): boolean {
-            for (const u of dependents.get(ref) ?? []) {
+            for (const u of indexedUsers(index, ref)) {
                 const m = getNode(g, u)
                 if (m?.op !== NodeOp.load && m?.op !== NodeOp.store) return false
                 if (asBase && getRef(m, 1) !== ref) return false
@@ -10312,8 +10228,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             : !getRef(b, j) && getLiteral(g, a, i) === getLiteral(g, b, j)
         const wordOp = (n: GraphNode) => operandType(g, n, 0) <= Types.i64 && operandType(g, n, 1) <= Types.i64
         const soleUser = (id: number, user: number) => {
-            const users = dependents.get(id)
-            return users?.size === 1 && users.has(user)
+            const users = indexedUsers(index, id)
+            return users.size === 1 && users.has(user)
         }
         for (const id of findValues(target.id, NodeOp.add) ?? []) {
             const n = getNode(g, id)!
@@ -10426,8 +10342,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return n?.op === NodeOp.add && countIds(n) === 2 && typeOf(n) === T
         }
         function interior(id: number): boolean {
-            const users = dependents.get(id)
-            return chained(id) && users?.size === 1 && chained([...users][0])
+            const users = indexedUsers(index, id)
+            return chained(id) && users.size === 1 && chained([...users][0])
         }
         function flatten(id: number): number {
             const n = getNode(g, id)!
@@ -10471,7 +10387,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const loop = countedLoop(target)
         if (!loop || loop.entries.length !== 1) return false
         for (const app of loop.selfApps) {
-            for (const u of dependents.get(app) ?? []) if (getNode(g, u)?.op !== NodeOp.select) return false
+            for (const u of indexedUsers(index, app)) if (getNode(g, u)?.op !== NodeOp.select) return false
         }
         const [entryBlock, entryApp] = loop.entries[0]
         const params = target.params
@@ -10507,7 +10423,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             && (m.op === NodeOp.load || m.op === NodeOp.store) && getRef(m, 1) === base && getRef(m, 2) === at
             && getRef(m, 0) !== at && (countIds(m) < 4 || getRef(m, 3) !== at)
         const shape = { pairs: [] as number[], offsets: [] as number[], direct: [] as number[], outbound: [] as number[] }
-        for (const u of dependents.get(offset) ?? []) {
+        for (const u of indexedUsers(index, offset)) {
             const n = getNode(g, u)
             if (!n) return
             if (n.op === NodeOp.apply) {
@@ -10526,7 +10442,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 shape.pairs.push(u)
                 continue
             }
-            for (const w of dependents.get(u) ?? []) {
+            for (const w of indexedUsers(index, u)) {
                 if (!addressed(getNode(g, w), u)) return
             }
             shape.offsets.push(u)
@@ -10563,7 +10479,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const b = getRef(n, 1)
             consider(a, b)
             consider(b, a)
-            for (const w of dependents.get(u) ?? []) {
+            for (const w of indexedUsers(index, u)) {
                 const m = getNode(g, w)
                 if ((m?.op === NodeOp.load || m?.op === NodeOp.store) && getRef(m, 2) === u) {
                     consider(getRef(m, 1), a)
@@ -10633,7 +10549,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             for (const u of shape.offsets) {
                 const n = getNode(g, u)!
                 const at = getRef(n, 0) === pt ? 1 : 0
-                for (const w of dependents.get(u)!) readdress(w, [getRef(n, at), getLiteral(g, n, at)])
+                for (const w of indexedUsers(index, u)) readdress(w, [getRef(n, at), getLiteral(g, n, at)])
             }
             for (const u of shape.direct) readdress(u, [0, 0])
             for (const [from, app] of inbound) {
@@ -10740,7 +10656,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return { id: ref, value: 0 }
         }
         function dissolves(id: number, parent: number): boolean {
-            for (const u of dependents.get(id) ?? []) {
+            for (const u of indexedUsers(index, id)) {
                 if (u === parent) continue
                 const c = getNode(g, u)!
                 if (!CompareOps.has(c.op) || countIds(c) !== 2) return false
@@ -10938,12 +10854,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
         function throughAfter(n: GraphNode, args: Value[]): Value | undefined {
             const a = getNode(g, args[0].id)!
-            if (a.op !== NodeOp.after || dependents.get(args[0].id)?.size !== 1) return
+            if (a.op !== NodeOp.after || userCount(index, args[0].id) !== 1) return
             const last = countIds(a) - 1
             const inner = getRef(a, last)
             const m = inner ? getNode(g, inner) : undefined
             if (!m || (m.op !== NodeOp.add && m.op !== NodeOp.sub) || !getRef(m, 0) || getRef(m, 1) || typeOf(m) !== typeOf(n)) return
-            if (dependents.get(inner)?.size !== 1) return
+            if (userCount(index, inner) !== 1) return
             const c = (m.op === NodeOp.add ? 1 : -1) * getLiteral(g, m, 1) + (n.op === NodeOp.add ? 1 : -1) * args[1].value
             if (!Number.isSafeInteger(c)) return
             const sum = c === 0 ? getRef(m, 0) : addCopy(g, n, [getRef(m, 0), { literal: Math.abs(c) }], c > 0 ? NodeOp.add : NodeOp.sub)
@@ -11051,7 +10967,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     return true
                 }
                 if (depth < 4 && m && (m.op === NodeOp.add || m.op === NodeOp.sub) && countIds(m) === 2) {
-                    if ((dependents.get(v.id)?.size ?? 0) === 1) owned++
+                    if (userCount(index, v.id) === 1) owned++
                     return collect({ id: getRef(m, 0), value: getLiteral(g, m, 0) }, sign, depth + 1)
                         && collect({ id: getRef(m, 1), value: getLiteral(g, m, 1) }, m.op === NodeOp.sub ? -sign : sign, depth + 1)
                 }
@@ -11166,7 +11082,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             return true
         }
         const candidates = new Set<number>()
-        for (const [op, ids] of byOp.get(target.id) ?? []) {
+        for (const [op, ids] of blockOps(index, target.id)) {
             if (!slotsByOp.has(op)) continue
             for (const id of ids) {
                 const n = getNode(g, id)
@@ -11405,7 +11321,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 first ||= getRef(n, 0)
             }
             if (!valid || !first) continue
-            const decodes = [...dependents.get(param) ?? []].some(u => {
+            const decodes = [...indexedUsers(index, param)].some(u => {
                 const n = getNode(g, u)
                 return n?.op === NodeOp.decode && getRef(n, 0) === param && getLiteral(g, n, 1) === base
             })
@@ -11432,7 +11348,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         let own = edits.get(target)
         if (!own) edits.set(target, own = new Map())
         for (const [param, pointer] of decoded) {
-            for (const u of dependents.get(param) ?? []) {
+            for (const u of indexedUsers(index, param)) {
                 const n = getNode(g, u)
                 if (n?.op === NodeOp.decode && getRef(n, 0) === param && getLiteral(g, n, 1) === bases.get(param)) own.set(u, pointer)
             }
@@ -11477,7 +11393,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const exclusiveId = getRef(tail, arm === 1 ? 2 : 1)
         const ex = exclusiveId ? getNode(g, exclusiveId) : undefined
         if (!ex || ex.op === NodeOp.param || ex.op === NodeOp.block || ex.op === NodeOp.literal) return false
-        if (dependents.get(exclusiveId)?.size !== 1) return false
+        if (userCount(index, exclusiveId) !== 1) return false
 
         const [callerId, freeId] = inbound[free]
         const freeApp = getNode(g, freeId)!
@@ -11506,7 +11422,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         const takenOperands = getOperands(g, freeApp)
         const tested = target.params[at]
-        if ([...dependents.get(tested) ?? []].every(u => u === target.bodyId)) takenOperands[at + 1] = { literal }
+        if ([...indexedUsers(index, tested)].every(u => u === target.bodyId)) takenOperands[at + 1] = { literal }
         const taken = addCopy(g, freeApp, takenOperands, NodeOp.apply)
         const cond = getRef(freeApp, at + 1)
         const pick = addCopy(g, tail, arm === 1 ? [cond, taken, lifted] : [cond, lifted, taken], NodeOp.select)
@@ -11547,31 +11463,41 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const literals = findValues(b.id, NodeOp.literal)
         if (!literals) return
         let changed = false
+        const copies = new Map<number, number>()
         for (const id of literals) {
             const u = getNode(g, id)!
             const value = literalValue(g, u)
             const wide = !inlineableLiteral(costs, value)
             const float = typeOf(u) === Types.f64
-            const uses = dependents.get(id) ?? []
-            for (const x of uses) {
+            const uses = indexedUsers(index, id)
+            for (const x of [...uses]) {
                 const n = getNode(g, x)!
                 if (float && n.op === NodeOp.bitconvert) continue
+                const shared = isShared(index, x)
+                if (shared ? !findValues(b.id, n.op)?.includes(x) : holderOf(index, x) !== b.id) continue
                 const ids = getArgIds(n)
+                const operands = shared ? getOperands(g, n) : undefined
+                let folded = false
                 for (let slot = 0; slot < ids.length; slot++) {
                     if (ids[slot] !== id) continue
                     if (wide && liftableSlot(n.op, slot)) continue
-                    setLiteral(g, n, slot, value)
-                    changed = true
+                    if (operands) operands[slot] = { literal: value }
+                    else setLiteral(g, n, slot, value)
+                    folded = true
                 }
+                if (!folded) continue
+                changed = true
+                if (operands) copies.set(x, addCopy(g, n, operands))
             }
         }
+        if (copies.size) setBlockBody(g, b, replaceAll(b.bodyId, copies))
         if (changed) revisitBlock(b)
         return changed
     }
 
     function liftLiterals(b: GraphBlock) {
-        const ops = byOp.get(b.id)
-        if (!ops) return false
+        const ops = blockOps(index, b.id)
+        if (!ops.size) return false
         const counts = new Map<number, number>()
         const visit = (fn: (n: GraphNode, op: NodeOp, slot: number, value: f64) => void) => {
             for (const [op, ids] of ops) {
@@ -11607,7 +11533,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     function forwardCongruentValues(): boolean {
         const entry = g.blocks[0]
         let candidates = false
-        for (const b of reachableBlocks) {
+        for (const b of g.blocks) {
+            if (!isIndexed(index, b)) continue
             if (b !== entry && b.params.length) { candidates = true; break }
         }
         if (!candidates) return false
@@ -11616,7 +11543,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const position = new Map<number, number>()
         function place(b: GraphBlock): void {
             position.set(b.id, -1)
-            for (const s of successors.get(b.id) ?? []) {
+            for (const s of indexedSuccessors(index, b.id)) {
                 if (!position.has(s)) place(getGraphBlock(s))
             }
             order.push(b)
@@ -11752,7 +11679,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const spanEnd: number[] = []
         for (let i = 0; i < order.length; i++) spanEnd.push(-1)
         for (let i = 0; i < order.length; i++) {
-            for (const s of successors.get(order[i].id) ?? []) {
+            for (const s of indexedSuccessors(index, order[i].id)) {
                 const t = position.get(s)!
                 if (t <= i && spanEnd[t] < i) spanEnd[t] = i
             }
@@ -11907,26 +11834,49 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     let markers = countMarkers()
     function countMarkers(): number {
         let count = 0
-        for (const b of reachableBlocks) {
+        for (const b of g.blocks) {
+            if (!isIndexed(index, b)) continue
             for (const id of findValues(b.id, NodeOp.pstack) ?? []) if (pstackTentative(g, getNode(g, id)!) === PstackMarker) count++
         }
         return count
     }
+    function sweepOrder(): GraphBlock[] {
+        const order: GraphBlock[] = []
+        const seen = new Set<number>()
+        const stack = [g.blocks[0].id]
+        while (stack.length) {
+            const id = stack.pop()!
+            if (seen.has(id)) continue
+            seen.add(id)
+            const b = getBlock(g, id)
+            if (!b || !isIndexed(index, b)) continue
+            order.push(b)
+            const applies = findValues(id, NodeOp.apply) ?? []
+            let i = applies.length - 1
+            while (i >= 0) {
+                const to = getRef(getNode(g, applies[i])!, 0)
+                if (!seen.has(to)) stack.push(to)
+                i--
+            }
+        }
+        return order
+    }
+
     function optimize() {
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(dropIdleResets, b)
         }
         const remaining = markers ? countMarkers() : 0
         if (remaining < markers) {
             liveParams = undefined
-            for (const b of reachableBlocks) step(pruneUnusedParams, b)
+            for (const b of sweepOrder()) step(pruneUnusedParams, b)
         }
         markers = remaining
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(eliminateUnusedPureValues, b)
         }
         verifySweep()
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(stripNilAfters, b)
             step(mergeBlocks, b)
             step(absorbConditions, b)
@@ -11945,7 +11895,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(liftBlockSelect, b)
         }
         verifySweep()
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(foldAddresses, b)
             step(deriveIncrementor, b)
             step(widenCountedStores, b)
@@ -11960,7 +11910,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (step(eliminatePassthru, b)) continue
         }
         verifySweep()
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(rotateLoop, b)
             step(advanceLoopLoads, b)
             step(foldBooleanSelects, b)
@@ -11979,12 +11929,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (indexCheck && congruent) verifyMaintainedIndex(g, index, 'forwardCongruentValues')
         verifySweep()
         liveParams = undefined
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(rematerializeOffsets, b)
             step(pruneUnusedParams, b)
         }
         verifySweep()
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(unsignParams, b)
             step(foldValues, b)
             step(foldLiterals, b)
@@ -12002,11 +11952,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             step(deduplicateValues, b)
         }
         verifySweep()
-        for (const b of [...reachableBlocks].reverse()) {
+        for (const b of [...g.blocks].reverse()) {
             step(rebaseAddresses, b)
         }
         verifySweep()
-        for (const b of reachableBlocks) {
+        for (const b of sweepOrder()) {
             step(mergeBlocks, b)
             step(liftCommonEffects, b)
             step(foldBooleanSelects, b)
@@ -12031,12 +11981,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (!didAnyChange) break
     }
     liveParams = undefined
-    for (const b of reachableBlocks) step(pruneUnusedParams, b)
-    if (!reachableBlocks.size) {
-        reachableBlocks.add(g.blocks[0])
+    for (const b of g.blocks) step(pruneUnusedParams, b)
+    if (!index.reachableBlocks.size) {
+        index.reachableBlocks.add(g.blocks[0])
         setBlockBody(g, g.blocks[0], unreachable())
     }
-    setGraphBlocks(g, [...reachableBlocks])
+    setGraphBlocks(g, g.blocks.filter(b => isIndexed(index, b)))
     sweepBlocks(g)
     if (optimizeTimers) time('(total)', performance.now() - optimizeStart)
     return g
@@ -12224,6 +12174,7 @@ export function substitute(g: Graph, by: Map<number, Operand>): void {
         }
         if (operands) putCopy(g, id, n, operands)
     }
+    dirtyIndex(g)
     for (const b of g.blocks) {
         if (!by.has(b.bodyId)) continue
         const body = resolve(b.bodyId)
@@ -12423,10 +12374,12 @@ function reuseSteppedIndex(g: Graph, costs: lowering.TargetCosts): boolean {
             break
         }
     }
+    if (changed) dirtyIndex(g)
     return changed
 }
 
-function reduceConstantMultiplies(g: Graph): void {
+function reduceConstantMultiplies(g: Graph): boolean {
+    let changed = false
     for (const [id, n] of [...nodeEntries(g)]) {
         if (n.op !== NodeOp.mul || typeOf(n) === Types.f64) continue
         const valueAt = getRef(n, 0) && !getRef(n, 1) ? 0
@@ -12437,7 +12390,10 @@ function reduceConstantMultiplies(g: Graph): void {
         const value = getRef(n, valueAt)
         const shifted = addCopy(g, n, [value, { literal: carried }], NodeOp.shl)
         putCopy(g, id, n, [value, shifted], NodeOp.add)
+        changed = true
     }
+    if (changed) dirtyIndex(g)
+    return changed
 }
 
 function signedBound(g: Graph, id: number): [subject: number, bound: number, upper: boolean] | undefined {
@@ -12473,6 +12429,7 @@ function reduceSignedWindows(g: Graph): boolean {
         putNode(g, id, NodeOp.eq, [high, sign], Types.bool)
         changed = true
     }
+    if (changed) dirtyIndex(g)
     return changed
 }
 
@@ -12512,15 +12469,22 @@ function reduceRangeChecks(g: Graph): boolean {
         putNode(g, id, NodeOp.le, [offset, { literal: hi - lo }], Types.bool)
         changed = true
     }
+    if (changed) dirtyIndex(g)
     return changed
 }
 
 function splitScaledShifts(g: Graph, costs: lowering.TargetCosts): boolean {
     if (!costs.scaledIndex) return false
+    const shifts: number[] = []
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op !== NodeOp.shl || !getRef(n, 0) || getRef(n, 1) || typeOf(n) === Types.u32) continue
+        shifts.push(id)
+    }
+    if (!shifts.length) return false
     const index = graphIndex(g)
     let changed = false
-    for (const [id, n] of [...nodeEntries(g)]) {
-        if (n.op !== NodeOp.shl || !getRef(n, 0) || getRef(n, 1) || typeOf(n) === Types.u32) continue
+    for (const id of shifts) {
+        const n = getNode(g, id)!
         const list = [...indexedUsers(index, id)]
         if (list.length < 2) continue
         const shift = getLiteral(g, n, 1)
@@ -12533,6 +12497,7 @@ function splitScaledShifts(g: Graph, costs: lowering.TargetCosts): boolean {
         for (const u of list.slice(1)) setRef(getNode(g, u)!, 2, addCopy(g, n, getOperands(g, n), n.op))
         changed = true
     }
+    if (changed) dirtyIndex(g)
     return changed
 }
 
@@ -12686,6 +12651,7 @@ function islandLoads(g: Graph, costs: lowering.TargetCosts, poolSlot: (value: nu
 }
 
 function stripMem(g: Graph): boolean {
+    if (!gn.mayHave(g, NodeOp.mem)) return false
     const pointers = new Map<number, Operand>()
     for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.mem) pointers.set(id, getOperand(g, n, 0))
     if (!pointers.size) return false
@@ -12728,6 +12694,7 @@ export function pstackExtent(g: Graph, size: Operand): Operand {
 }
 
 function expandPstacks(g: Graph): boolean {
+    if (!gn.mayHave(g, NodeOp.pstack)) return false
     let found = false
     for (const [id, n] of [...nodeEntries(g)]) {
         if (n.op !== NodeOp.pstack) continue
@@ -12746,6 +12713,8 @@ function expandPstacks(g: Graph): boolean {
         const fresh = rebases ? base : addNode(g, NodeOp.mem, [base, getOperand(g, n, 3)], Types.u64)
         putCopy(g, id, n, [store, fresh], NodeOp.after)
     }
+    gn.clearKinds(g, gn.GraphKinds.pstack)
+    if (found) dirtyIndex(g)
     return found
 }
 
@@ -12781,6 +12750,7 @@ function bindCallContext(g: Graph, register: number): void {
 }
 
 function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
+    if (!gn.mayHave(g, NodeOp.box, NodeOp.unbox, NodeOp.encode, NodeOp.decode)) return false
     let found = false
     function node(op: NodeOp, ref: Operand, literal: number): number {
         return addNode(g, op, [ref, { literal: literal }])
@@ -12845,6 +12815,8 @@ function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
         else putNode(g, id, NodeOp.select, [value, coded, { literal: heap.undefinedWord }])
         found = true
     }
+    gn.clearKinds(g, gn.GraphKinds.codec)
+    if (found) dirtyIndex(g)
     return found
 }
 
@@ -12996,7 +12968,7 @@ function registerLiterals(g: Graph, target: lowering.Target): void {
     }
 }
 
-function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
+function shareLiterals(g: Graph, costs: lowering.TargetCosts): boolean {
     const members = g.blocks.map(b => {
         const seen = new Set<number>()
         const stack = [b.bodyId]
@@ -13010,6 +12982,7 @@ function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
         return seen
     })
     const shared = new Map<number, number>()
+    let changed = false
     for (const seen of members) for (const id of seen) shared.set(id, (shared.get(id) ?? 0) + 1)
     for (const seen of members) {
         const counts = new Map<number, number>()
@@ -13036,6 +13009,7 @@ function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
                 made.set(value, lifted)
             }
             setRef(n, slot, lifted)
+            changed = true
         }
         const pooled = new Map<string, number>()
         for (const id of seen) {
@@ -13047,10 +13021,15 @@ function shareLiterals(g: Graph, costs: lowering.TargetCosts): void {
                 const key = `${getLiteral(g, getNode(g, ref)!, 0)}:${address}`
                 const first = pooled.get(key)
                 if (first === undefined) pooled.set(key, ref)
-                else if (first !== ref && shared.get(id)! === 1) setRef(n, slot, first)
+                else if (first !== ref && shared.get(id)! === 1) {
+                    setRef(n, slot, first)
+                    changed = true
+                }
             }
         }
     }
+    if (changed) dirtyIndex(g)
+    return changed
 }
 
 export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
@@ -14321,6 +14300,7 @@ function outlineBlocks(g: Graph): Graph {
             setNode(g, id, getNode(g, createNode(g, NodeOp.apply, operands, a))!)
         }
     }
+    if (merged.size) dirtyIndex(g)
 
     const replacements = new Map<OutlineBlock, Map<number, number>>()
     for (const sites of chosen) {
@@ -14496,6 +14476,7 @@ function shareArmValues(g: Graph): boolean {
                     continue
                 }
                 setRef(n, k, moveRegion(g, sorted(b, params, passed), arm))
+                gn.dirtyBlock(g, b)
                 changed = true
             }
         }
@@ -14825,7 +14806,7 @@ function isolateSelectArms(g: Graph): Graph {
         }
         return visit(arm)
     }
-    function visitRegion(vid: number, shared?: Set<number>) {
+    function visitRegion(b: GraphBlock, vid: number, shared?: Set<number>) {
         selects.clear()
         const active = new Set(shared)
         walk(vid, active)
@@ -14836,14 +14817,15 @@ function isolateSelectArms(g: Graph): Graph {
                 const arm = getRef(u, i)
                 if (!arm) continue
                 const newArm = cloneInterior(arm, active)
+                if (newArm !== arm) gn.dirtyBlock(g, b)
                 setRef(u, i, newArm)
                 rem.push(newArm)
             }
         }
-        for (const x of rem) visitRegion(x, active)
+        for (const x of rem) visitRegion(b, x, active)
     }
     for (let i = 0; i < g.blocks.length; i++) {
-        visitRegion(g.blocks[i].bodyId)
+        visitRegion(g.blocks[i], g.blocks[i].bodyId)
     }
     return g
 }
@@ -15042,6 +15024,7 @@ function branchCostlySelects(g: Graph, costs: lowering.TargetCosts): boolean {
             continue
         }
         setRef(getNode(g, home![0])!, home![1], app)
+        gn.dirtyBlock(g, b)
         work.push(b, getBlock(g, getRef(getNode(g, app)!, 0))!)
         changed = true
     }
@@ -15071,6 +15054,7 @@ function splitTailSelects(g: Graph): Graph {
             }
             const moved = moveRegion(g, [...params].sort((a, b) => currentBlock.params.indexOf(a) - currentBlock.params.indexOf(b)), arm)
             setRef(n, k, moved)
+            gn.dirtyBlock(g, currentBlock)
         }
     }
     for (let i = 0; i < g.blocks.length; i++) {
@@ -15136,6 +15120,7 @@ function outlineHeaderArm(g: Graph, h: GraphBlock, tail: GraphNode, at: number):
     const arm = outlineArm(g, countUses(g, h.bodyId), getRef(tail, at))
     if (!arm) return 0
     setRef(tail, at, arm)
+    gn.dirtyBlock(g, h)
     return getRef(getNode(g, arm)!, 0)
 }
 
@@ -15388,6 +15373,7 @@ export function cloneExits(g: Graph): Graph {
             if (n.op === NodeOp.after) return walk(getRef(n, countIds(n) - 1))
             if (n.op === NodeOp.apply && exits.has(getRef(n, 0))) {
                 putRet(g, id, exits, n, x => x)
+                gn.dirtyBlock(g, b)
                 return
             }
             if (n.op !== NodeOp.select) return
@@ -15397,8 +15383,12 @@ export function cloneExits(g: Graph): Graph {
                 const at = t?.op === NodeOp.apply ? exits.get(getRef(t, 0)) : undefined
                 const returned = at !== undefined && at >= 0 ? getNode(g, getRef(t!, at + 1)) : undefined
                 const outlined = at !== undefined && returned?.op !== NodeOp.call && uses.get(arm) === 1 ? outlineArm(g, uses, arm, exits) : 0
-                if (outlined) setRef(n, i, outlined)
-                else walk(arm)
+                if (!outlined) {
+                    walk(arm)
+                    continue
+                }
+                setRef(n, i, outlined)
+                gn.dirtyBlock(g, b)
             }
         }
         walk(b.bodyId)
@@ -15602,6 +15592,7 @@ export function resolveNumberTypes(g: Graph) {
         if (!floats.has(x)) return x
         return addNode(g, NodeOp.convert, [x], Types.i64)
     }
+    let rewired = false
     function consume(id: number, n: GraphNode, slots: number[], as: (x: Operand) => Operand): void {
         const operands = getOperands(g, n)
         let changed = false
@@ -15612,7 +15603,9 @@ export function resolveNumberTypes(g: Graph) {
             operands[i] = x
             changed = true
         }
-        if (changed) putCopy(g, id, n, operands)
+        if (!changed) return
+        putCopy(g, id, n, operands)
+        rewired = true
     }
     let returnsFloat = false
     for (const n of allNodes(g)) {
@@ -15639,7 +15632,9 @@ export function resolveNumberTypes(g: Graph) {
     for (const [id, n] of nodeEntries(g)) {
         if (n.op !== NodeOp.typeof) continue
         putNode(g, id, NodeOp.literal, [{ literal: operandType(g, n, 0) }])
+        rewired = true
     }
+    if (rewired) dirtyIndex(g)
     return g
 }
 
@@ -15662,7 +15657,7 @@ function runPipeline(stage: string, g: Graph, costs: lowering.TargetCosts, passe
         const nodesBefore = countNodes(g)
         const passStart = performance.now()
         let result: Graph | boolean | void
-        if (indexCheck && g.form) primeIndexCheck(g)
+        if (indexCheck && g.form) primeIndexCheck(g, `before ${key}`)
         try {
             result = pass(g, costs)
         } catch (err) {
@@ -15671,9 +15666,10 @@ function runPipeline(stage: string, g: Graph, costs: lowering.TargetCosts, passe
         }
         const elapsed = performance.now() - passStart
         if (indexCheck) verifyIndex(g, key)
-        if (result !== false) dirtyIndex(g)
+        if (result !== false && !gn.refreshable(g)) dirtyIndex(g)
         if (result && result !== true) g = result
         if (indexCheck) verifyLiveIndex(g, key)
+        if (indexCheck) verifyKinds(g, key)
         const reported = result === true
         changed ||= reported
         unknown ||= typeof result !== 'boolean'
@@ -15891,6 +15887,7 @@ export function unifySlotTypes(g: Graph): boolean {
 }
 
 function demotePstacks(g: Graph): boolean {
+    if (!gn.mayHave(g, NodeOp.pstack)) return false
     const demotable = (n: GraphNode) => pstackFixedSize(g, n) > 0
     let any = false
     for (const n of allNodes(g)) if (demotable(n)) { any = true; break }
@@ -16019,6 +16016,7 @@ function demotePstacks(g: Graph): boolean {
         if (ops) putCopy(g, id, n, ops)
     }
     for (const id of candidates) deleteNode(g, id)
+    dirtyIndex(g)
     return true
 }
 
@@ -16127,6 +16125,7 @@ function batchLoop(g: Graph, loops: GraphLoops, headerId: number): BatchLoop | u
 }
 
 function batchLoopPstacks(g: Graph): boolean {
+    if (!gn.mayHave(g, NodeOp.pstack)) return false
     let any = false
     for (const n of allNodes(g)) {
         if (!pstackFixedSize(g, n)) continue
@@ -16171,6 +16170,7 @@ function batchLoopPstacks(g: Graph): boolean {
         const loop = batchLoop(g, loops, headerId)
         if (loop && batchLoopGroup(g, loop, loops, ids)) changed = true
     }
+    if (changed) dirtyIndex(g)
     return changed
 }
 
@@ -16350,6 +16350,7 @@ export function placePstackMarkers(g: Graph, regions: [header: number, stacks: n
                 putCopy(g, p.at, n, [after, addCopy(g, n)], NodeOp.after)
             }
         }
+        dirtyIndex(g)
     }
 }
 
@@ -16461,6 +16462,7 @@ export function pstackResetIdle(g: NodeSpace, reset: number, block: GraphBlock, 
 }
 
 function resolvePstackMarkers(g: Graph): boolean {
+    if (!gn.mayHave(g, NodeOp.pstack)) return false
     const tentative: number[] = []
     for (const [id, n] of nodeEntries(g)) if (pstackTentative(g, n)) tentative.push(id)
     if (!tentative.length) return false
@@ -16532,6 +16534,7 @@ function resolvePstackMarkers(g: Graph): boolean {
         if (kept.has(id)) putCopy(g, id, n, getOperands(g, n, 0, 4))
         else putCopy(g, id, n, [getOperand(g, n, 0), { literal: 0 }], NodeOp.after)
     }
+    dirtyIndex(g)
     return true
 }
 
@@ -16587,17 +16590,16 @@ function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
     const index = graphIndex(g)
     const bodies = new Set<number>()
     for (const b of g.blocks) bodies.add(b.bodyId)
-    const arrivals = new Map<number, [number, number][]>()
-    for (const n of allNodes(g)) {
-        if (n.op !== NodeOp.apply) continue
-        const block = getBlock(g, getRef(n, 0))
-        if (!block) continue
-        block.params.forEach((p, i) => {
-            const list = arrivals.get(p)
-            const arrival: [number, number] = [getRef(n, i + 1), getLiteral(g, n, i + 1)]
-            if (list) list.push(arrival)
-            else arrivals.set(p, [arrival])
-        })
+    const owners = new Map<number, GraphBlock>()
+    for (const b of g.blocks) for (const p of b.params) owners.set(p, b)
+    function arrivalFits(owner: GraphBlock, at: number): boolean {
+        const inbound = gn.inboundApplies(g, index, owner)
+        if (!inbound.length) return false
+        for (const [, app] of inbound) {
+            const n = getNode(g, app)!
+            if (!fits(getRef(n, at), getLiteral(g, n, at))) return false
+        }
+        return true
     }
     const fitsMemo = new Map<number, boolean>()
     function fits(id: number, k: number): boolean {
@@ -16614,8 +16616,8 @@ function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
         else if (n?.op === NodeOp.or || n?.op === NodeOp.xor) r = fits(getRef(n, 0), getLiteral(g, n, 0)) && fits(getRef(n, 1), getLiteral(g, n, 1))
         else if (n?.op === NodeOp.ushr) r = fits(getRef(n, 0), getLiteral(g, n, 0))
         else if (n?.op === NodeOp.param) {
-            const list = arrivals.get(id) ?? []
-            r = list.length > 0 && list.every(([ref, k]) => fits(ref, k))
+            const owner = owners.get(id)
+            r = !!owner && arrivalFits(owner, owner.params.indexOf(id) + 1)
         }
         fitsMemo.set(id, r)
         return r
@@ -16738,6 +16740,7 @@ function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
         }
         if (ids) putCopy(g, id, n, withRefs(g, n, ids))
     }
+    dirtyIndex(g)
     for (const b of g.blocks) setBlockBody(g, b, target(b.bodyId))
 }
 
