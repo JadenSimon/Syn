@@ -36,6 +36,15 @@ function isConstSymbol(node: ts.Node) {
     return (node as any).isConstSymbol?.() ?? false
 }
 
+function isLexicalDeclarationList(node: ts.VariableDeclarationList): boolean {
+    return (node.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+}
+
+function containsClosure(node: ts.Node): boolean {
+    if (ts.isFunctionLike(node) || ts.isClassExpression(node) || ts.isClassDeclaration(node)) return true
+    return !!ts.forEachChild(node, containsClosure)
+}
+
 function disposeSourceFile(sf: ts.SourceFile) {
     (ts as any).disposeSourceFile(sf)
 }
@@ -65,8 +74,9 @@ export enum ConstantKind {
     symbol,
 }
 
-type ScopeBinding = { slot: number, parentSlot: number }
-type OuterSymbol = { scopeSlot: number, reg: number }
+type ScopeBinding = { slot: number, parentSlot: number, parentReg: number }
+type OuterSymbol = { scopeSlot: number, reg: number, envReg?: number }
+type LoopEnv = { reg: number, fields: number }
 type FoldResultValue = string | number | boolean | undefined | null
 type PrivateMember = { node: ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | ts.MethodDeclaration, template?: EmitResult, compiling?: boolean }
 type PrivateName = { method?: PrivateMember, getter?: PrivateMember, setter?: PrivateMember }
@@ -280,21 +290,81 @@ function emitFunction(
     const lateBound = new Map<number, number>()   // symbol id -> constant slot
     const scopedSymbols = new Map<number, OuterSymbol>()
     const scopeSlots = new Map<number, number>()
+    const envScopeSlots = new Map<number, number>()
     const scopeBindings: ScopeBinding[] = []
     const capturedRegs = new Map<number, number>()
+    const envBindings = new Map<number, OuterSymbol>()
+    const loopEnvs = new Map<ts.Node, LoopEnv>()
 
     function bindScope(outer: OuterSymbol): OuterSymbol {
-        let slot = scopeSlots.get(outer.scopeSlot)
+        const slots = outer.envReg === undefined ? scopeSlots : envScopeSlots
+        const key = outer.envReg === undefined ? outer.scopeSlot : outer.envReg
+        let slot = slots.get(key)
         if (slot === undefined) {
             slot = constants.length
             constants.push(0)
             constantKinds.push(ConstantKind.scope)
-            scopeSlots.set(outer.scopeSlot, slot)
-            scopeBindings.push({ slot, parentSlot: outer.scopeSlot })
+            slots.set(key, slot)
+            scopeBindings.push({ slot, parentSlot: outer.scopeSlot, parentReg: outer.envReg ?? -1 })
         }
         return { scopeSlot: slot, reg: outer.reg }
     }
+    function loadScoped(scoped: OuterSymbol): void {
+        if (scoped.envReg === undefined) {
+            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            return
+        }
+        ldar(scoped.envReg)
+        emit2(Op.GetPropertyImm, scoped.reg)
+    }
+    function storeScoped(scoped: OuterSymbol): void {
+        if (scoped.envReg === undefined) emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
+        else emit3(Op.SetPropertyImm, scoped.envReg, scoped.reg)
+    }
+    function declareBinding(symId: number): void {
+        if (!envBindings.has(symId)) symToReg.set(symId, bindingReg(symId))
+    }
+    function storeBinding(symId: number): void {
+        const env = envBindings.get(symId)
+        if (env) storeScoped(env)
+        else star(symToReg.get(symId)!)
+    }
+    function emitLoopEnv(env: LoopEnv, copied: number[]): void {
+        const savedReg = nextReg
+        const first = nextReg
+        const keys: string[] = []
+        let undef = false
+        for (let i = 0; i < env.fields; i++) {
+            const reg = allocReg()
+            keys.push(`${i}`)
+            if (!copied.includes(i)) continue
+            ldar(env.reg)
+            emit2(Op.GetPropertyImm, i)
+            star(reg)
+        }
+        for (let i = 0; i < env.fields; i++) {
+            if (copied.includes(i)) continue
+            if (!undef) emit1(Op.LdaUndefined)
+            undef = true
+            star(first + i)
+        }
+        emit4(Op.CreateObjectLiteral, internObjectTemplate(keys), first, env.fields)
+        star(env.reg)
+        nextReg = savedReg
+    }
+    function envFieldsOf(name: ts.BindingName, out: number[]): void {
+        if (ts.isIdentifier(name)) {
+            const env = envBindings.get(getSymbolId(name))
+            if (env) out.push(env.reg)
+            return
+        }
+        for (const element of name.elements) {
+            if (!ts.isOmittedExpression(element)) envFieldsOf(element.name, out)
+        }
+    }
     function scopedSymbol(symId: number): OuterSymbol | undefined {
+        const env = envBindings.get(symId)
+        if (env) return env
         const prev = scopedSymbols.get(symId)
         if (prev) return prev
         const outer = outerSymbols.get(symId)
@@ -739,6 +809,7 @@ function emitFunction(
         if (const r = tryFoldExp(node.initializer)) {
             if (r[0] === 'value') {
                 foldedVariables.set(symId, [r[1]])
+                envBindings.delete(symId)
                 return true
             }
         }
@@ -1291,22 +1362,21 @@ function emitFunction(
             const kind = node.operatorToken.kind
             if (kind === ts.SyntaxKind.EqualsToken) {
                 emitExpr(node.right)
-                emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
+                storeScoped(scoped)
                 return
             }
             const jump = logicalAssignmentJump(kind)
             if (jump !== undefined) {
-                const load = () => emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
-                emitLogicalAssignment(jump, load, node.right, () => emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg))
+                emitLogicalAssignment(jump, () => loadScoped(scoped), node.right, () => storeScoped(scoped))
                 return
             }
             const op = compoundBinaryOp(kind)
             emitExpr(node.right)
             const rhs = allocReg(); star(rhs)
-            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            loadScoped(scoped)
             emit2(op, rhs)
             freeReg()
-            emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg)
+            storeScoped(scoped)
             return
         }
         if (isLateBoundSymbol(target)) throw `cannot assign to free variable: ${target.getText()}`
@@ -1683,8 +1753,8 @@ function emitFunction(
         const symId = getSymbolId(operand)
         if (symId === 0) throw `non-lexical identifier: ${operand.getText()}`
         if (const scoped = scopedSymbol(symId)) {
-            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
-            return emitUpdateAcc(isPrefix, increment, () => emit3(Op.StoreFrame, scoped.scopeSlot, scoped.reg))
+            loadScoped(scoped)
+            return emitUpdateAcc(isPrefix, increment, () => storeScoped(scoped))
         }
         const dst = symToReg.get(symId)
         assert(dst !== undefined)
@@ -1745,7 +1815,7 @@ function emitFunction(
         const symId = getSymbolId(node)
         if (symId === 0) throw `non-lexical identifier: ${node.getText()}`
         if (const scoped = scopedSymbol(symId)) {
-            emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+            loadScoped(scoped)
             return
         }
         const reg = symToReg.get(symId)
@@ -2161,7 +2231,7 @@ function emitFunction(
 
     function bindPattern(name: ts.BindingName): void {
         if (ts.isIdentifier(name)) {
-            symToReg.set(getSymbolId(name), bindingReg(getSymbolId(name)))
+            declareBinding(getSymbolId(name))
             return
         }
         for (const element of name.elements) {
@@ -2172,7 +2242,7 @@ function emitFunction(
     }
 
     function assignPattern(name: ts.BindingName): void {
-        if (ts.isIdentifier(name)) { star(symToReg.get(getSymbolId(name))!); return }
+        if (ts.isIdentifier(name)) { storeBinding(getSymbolId(name)); return }
         const value = allocReg(); star(value)
         const excluded: string[] = []
         for (let i = 0; i < name.elements.length; i++) {
@@ -2219,11 +2289,10 @@ function emitFunction(
             if (decl.initializer) emitSideEffect(decl.initializer)
             return
         }
-        const reg = capturedRegs.get(symId) ?? allocReg()
-        symToReg.set(symId, reg)
+        declareBinding(symId)
         if (decl.initializer) emitExpr(decl.initializer)
         else emit1(Op.LdaUndefined)
-        star(reg)
+        storeBinding(symId)
     }
 
     function emitVariableStatement(node: ts.VariableStatement) {
@@ -2289,16 +2358,19 @@ function emitFunction(
         defer labels = saveLabels
         const ctx = enterLabels(-1, true)
         skipNextLookbehind = true
+        const env = loopEnvs.get(node)
 
         if (c && c[0] === 'value') {
             // unconditional
             const bodyTop = code.length
             ctx.continueTarget = bodyTop
+            if (env) emitLoopEnv(env, [])
             emitStatement(node.statement)
             emitJumpTo(Op.Jump, bodyTop)
         } else {
             const toTest = emitJumpPlaceholder(Op.Jump)
             const bodyTop = code.length
+            if (env) emitLoopEnv(env, [])
             emitStatement(node.statement)
             patchJump(toTest)
             for (const p of ctx.continues) patchJump(p) 
@@ -2317,6 +2389,8 @@ function emitFunction(
         skipNextLookbehind = true
 
         const bodyTop = code.length
+        const env = loopEnvs.get(node)
+        if (env) emitLoopEnv(env, [])
         emitStatement(node.statement)
         for (const p of ctx.continues) patchJump(p)
         skipNextLookbehind = true
@@ -2336,6 +2410,12 @@ function emitFunction(
         const savedReg = nextReg
         defer nextReg = savedReg 
 
+        const env = loopEnvs.get(node)
+        const copied: number[] = []
+        if (env && node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+            for (const decl of node.initializer.declarations) envFieldsOf(decl.name, copied)
+        }
+        if (env && copied.length) emitLoopEnv(env, [])
         if (node.initializer) {
             if (ts.isVariableDeclarationList(node.initializer)) {
                 for (const decl of node.initializer.declarations) {
@@ -2345,14 +2425,16 @@ function emitFunction(
                     }
                     const symId = getSymbolId(decl.name)
                     if (symId === 0) throw "binding has no symbol id"
-                    const reg = bindingReg(symId)
-                    symToReg.set(symId, reg)
-                    if (decl.initializer) { emitExpr(decl.initializer); star(reg) }
+                    declareBinding(symId)
+                    if (!decl.initializer) continue
+                    emitExpr(decl.initializer)
+                    storeBinding(symId)
                 }
             } else {
                 emitSideEffect(node.initializer)
             }
         }
+        if (env && copied.length && containsClosure(node.initializer!)) emitLoopEnv(env, copied)
 
         const c = node.condition ? tryFoldExp(node.condition) : undefined
         if (c && c[0] === 'value' && !c[1]) return // for (...; false; ...)
@@ -2365,15 +2447,19 @@ function emitFunction(
 
         if (condAlwaysTrue) {
             const bodyTop = code.length
+            if (env && !copied.length) emitLoopEnv(env, [])
             emitStatement(node.statement)
             for (const p of ctx.continues) patchJump(p) // continue -> update
+            if (env && copied.length) emitLoopEnv(env, copied)
             if (node.incrementor) emitSideEffect(node.incrementor)
             emitJumpTo(Op.Jump, bodyTop)
         } else {
             const toTest = emitJumpPlaceholder(Op.Jump)
             const bodyTop = code.length
+            if (env && !copied.length) emitLoopEnv(env, [])
             emitStatement(node.statement)
             for (const p of ctx.continues) patchJump(p) // continue -> update
+            if (env && copied.length) emitLoopEnv(env, copied)
             if (node.incrementor) emitSideEffect(node.incrementor)
             patchJump(toTest)
             skipNextLookbehind = true
@@ -2426,9 +2512,11 @@ function emitFunction(
         star(step)
         emit1(Op.LdaTrue); star(open)
         const guard = openGuard()
+        const env = loopEnvs.get(node)
+        if (env) emitLoopEnv(env, [])
         ldar(step)
         if (binding) assignPattern(binding)
-        else if (ts.isIdentifier(node.initializer)) star(symToReg.get(getSymbolId(node.initializer))!)
+        else if (ts.isIdentifier(node.initializer)) storeBinding(getSymbolId(node.initializer))
         else throw 'for...of assignment target must be an identifier'
 
         const ctx = enterLabels(top, true)
@@ -2493,9 +2581,8 @@ function emitFunction(
         skipNextLookbehind = true
         const decl = catchClause.variableDeclaration
         if (decl && ts.isIdentifier(decl.name)) {
-            const reg = bindingReg(getSymbolId(decl.name))
-            symToReg.set(getSymbolId(decl.name), reg)
-            star(reg)
+            declareBinding(getSymbolId(decl.name))
+            storeBinding(getSymbolId(decl.name))
         } else if (decl) {
             bindPattern(decl.name)
             assignPattern(decl.name)
@@ -2698,18 +2785,16 @@ function emitFunction(
         }
         if (ts.isFunctionDeclaration(node)) {
             if (!node.name) throw 'nested function declaration has no name'
-            const reg = bindingReg(getSymbolId(node.name))
-            symToReg.set(getSymbolId(node.name), reg)
+            declareBinding(getSymbolId(node.name))
             emitClosure(node)
-            star(reg)
+            storeBinding(getSymbolId(node.name))
             return
         }
         if (ts.isClassDeclaration(node)) {
             if (!node.name) throw 'class declaration has no name'
-            const reg = bindingReg(getSymbolId(node.name))
-            symToReg.set(getSymbolId(node.name), reg)
+            declareBinding(getSymbolId(node.name))
             emitClass(node)
-            star(reg)
+            storeBinding(getSymbolId(node.name))
             return
         }
         if (node.kind === ts.SyntaxKind.EmptyStatement) return
@@ -2732,13 +2817,12 @@ function emitFunction(
         for (const s of statements) {
             if (!ts.isFunctionDeclaration(s) || !s.body) continue
             if (!s.name) throw 'nested function declaration has no name'
-            const reg = bindingReg(getSymbolId(s.name))
-            symToReg.set(getSymbolId(s.name), reg)
+            declareBinding(getSymbolId(s.name))
             const slot = constants.length
             constants.push(undefined)
             constantKinds.push(ConstantKind.nested_function)
             emit2(Op.CreateClosure, slot)
-            star(reg)
+            storeBinding(getSymbolId(s.name))
             hoisted.push([slot, s])
         }
         return hoisted
@@ -2747,6 +2831,7 @@ function emitFunction(
     function closureCtx(node: ts.FunctionDeclaration | ClassMember | ts.ArrowFunction | ts.FunctionExpression | ts.ClassDeclaration | ts.ClassExpression): EmitCtx {
         const childOuter = new Map<number, OuterSymbol>()
         for (const [sym, valueReg] of symToReg) childOuter.set(sym, { scopeSlot: -1, reg: valueReg })
+        for (const [sym, env] of envBindings) childOuter.set(sym, env)
         for (const [sym] of outerSymbols) {
             if (sym === thisSymbol || sym === homeSymbol) continue
             const scoped = scopedSymbol(sym)
@@ -2772,7 +2857,7 @@ function emitFunction(
         }
         const scoped = scopedSymbol(sym)
         if (!scoped) return false
-        emit3(Op.LoadFrame, scoped.scopeSlot, scoped.reg)
+        loadScoped(scoped)
         return true
     }
 
@@ -2815,7 +2900,7 @@ function emitFunction(
         const cls = allocReg()
         const callee = allocReg()
         star(cls)
-        if (ts.isClassDeclaration(node) && node.name) star(symToReg.get(getSymbolId(node.name))!)
+        if (ts.isClassDeclaration(node) && node.name) storeBinding(getSymbolId(node.name))
         for (const block of blocks) {
             emitNested(emitBlockFunction(block))
             star(callee)
@@ -2898,21 +2983,29 @@ function emitFunction(
     const declaredHere = new Set<number>()
     const referencedNested = new Set<number>()
     const constSymbols = new Set<number>()
+    const declaredLoops = new Map<number, ts.Node>()
     const derivedClasses: ts.Node[] = []
-    function scanCaptures(node: ts.Node, nested: boolean): void {
+    function scanCaptures(node: ts.Node, nested: boolean, loop: ts.Node | undefined, lexical: boolean): void {
         if (ts.isForOfStatement(node) || (ts.isTryStatement(node) && node.finallyBlock)) jumpWidth = 4
         const declared = ts.isVariableDeclaration(node) || ts.isBindingElement(node) || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)
             ? node.name : undefined
         if (!nested && declared && ts.isIdentifier(declared)) {
             declaredHere.add(getSymbolId(declared))
             if (isConstSymbol(declared)) constSymbols.add(getSymbolId(declared))
+            const blockScoped = lexical || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)
+            if (loop && blockScoped) declaredLoops.set(getSymbolId(declared), loop)
         }
         if (nested && ts.isIdentifier(node)) referencedNested.add(getSymbolId(node))
         if (!nested && (ts.isClassDeclaration(node) || ts.isClassExpression(node)) && heritageOf(node)) derivedClasses.push(node)
         const inner = nested || ts.isFunctionLike(node) || ts.isPropertyDeclaration(node) || ts.isClassStaticBlockDeclaration(node)
-        ts.forEachChild(node, child => scanCaptures(child, child === declared ? nested : inner))
+        const iteration = ts.isForStatement(node) || ts.isForOfStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)
+        const innerLoop = !nested && iteration ? node : loop
+        let innerLexical = lexical
+        if (ts.isVariableDeclarationList(node)) innerLexical = isLexicalDeclarationList(node)
+        if (ts.isCatchClause(node)) innerLexical = true
+        ts.forEachChild(node, child => scanCaptures(child, child === declared ? nested : inner, innerLoop, innerLexical))
     }
-    if (body) ts.forEachChild(body, child => scanCaptures(child, false))
+    if (body) ts.forEachChild(body, child => scanCaptures(child, false, undefined, false))
 
     const paramRegs: number[] = []
     for (let i = 0; i < parameters.length; i++) {
@@ -2980,7 +3073,21 @@ function emitFunction(
         star(homeReg)
     }
 
-    for (const sym of declaredHere) if (sym && referencedNested.has(sym)) capturedRegs.set(sym, allocReg())
+    for (const sym of declaredHere) {
+        if (!sym || !referencedNested.has(sym)) continue
+        const loop = declaredLoops.get(sym)
+        if (!loop) {
+            capturedRegs.set(sym, allocReg())
+            continue
+        }
+        let env = loopEnvs.get(loop)
+        if (!env) {
+            env = { reg: allocReg(), fields: 0 }
+            loopEnvs.set(loop, env)
+        }
+        envBindings.set(sym, { scopeSlot: -1, reg: env.fields, envReg: env.reg })
+        env.fields++
+    }
     for (const node of derivedClasses) classHomes.set(node, allocReg())
     const readonlyCaptures: number[] = []
     for (const [sym, reg] of capturedRegs) {
@@ -3453,7 +3560,7 @@ export function frameCaptures(result: EmitResult): FrameCaptures {
     }
     function visitNested(nested: EmitResult, frameSlots: Set<number>): void {
         const slots = new Set<number>()
-        for (const b of nested.scopeBindings) if (frameSlots.has(b.parentSlot)) slots.add(b.slot)
+        for (const b of nested.scopeBindings) if (b.parentReg < 0 && frameSlots.has(b.parentSlot)) slots.add(b.slot)
         if (!slots.size) return
         const it = createCodeIterator(nested.code as u8[])
         while (const inst = it.next()) {
@@ -3680,6 +3787,7 @@ export function finalize(
             const binding = heap.ScopeBinding(bindingsPtr + i * heap.ScopeBinding.sizeof)
             binding.slot = result.scopeBindings[i].slot as u32
             binding.parentSlot = result.scopeBindings[i].parentSlot as u32
+            binding.parentReg = result.scopeBindings[i].parentReg as u32
         }
         heap.finishHeapCell(bindings)
     }
