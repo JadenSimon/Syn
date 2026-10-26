@@ -14,7 +14,7 @@ import { dumpGraph, encodeCallSummary, lowerValueGraph, optimizePackaged, packag
 import type { Rep } from './value-types'
 import * as rt from './rt'
 import * as heap from './heap'
-import { hostTarget } from './lowering'
+import { aarch64RegisterEffects, hostTarget } from './lowering'
 import { createTraceSession } from './trace2'
 import * as propertyEval from './property-eval'
 import * as loweringRepros from './lowering-repros'
@@ -248,6 +248,38 @@ function hashedSum(n: number, mask: u32): number {
     for (let i = 0; i < n; i++) total = total + (hashKey(i * 7) & mask)
     return keptHash(total) + n
 }
+
+function highBitsBranch(p: number, i: number): number {
+    const x = Intrinsics.load(p, i * 8, Types.u64)
+    if (x < 0x40000000) return Intrinsics.crc32(0, x, Types.u32)
+    return 7
+}
+;(highBitsBranch as any).shouldNotInline = true
+
+function highBitsFlag(p: number, i: number): boolean {
+    return Intrinsics.load(p, i * 8, Types.u64) >= 0x1000000
+}
+;(highBitsFlag as any).shouldNotInline = true
+
+function highBitsPick(p: number, i: number, a: number, b: number): number {
+    const x = Intrinsics.load(p, i * 8, Types.u64)
+    return (x <= 0xffffffffff ? a : b) + i
+}
+;(highBitsPick as any).shouldNotInline = true
+
+function inHighBand(x: number): boolean {
+    return x <= 0xffffffffff && x >= 0x1000000
+}
+
+function highBitsBetween(p: number, i: number): number {
+    return inHighBand(Intrinsics.load(p, i * 8, Types.u64)) ? 5 : 9
+}
+;(highBitsBetween as any).shouldNotInline = true
+
+function highBitsNarrow(p: number, i: number): boolean {
+    return Intrinsics.load(p, i * 4, Types.u32) > 0xffff
+}
+;(highBitsNarrow as any).shouldNotInline = true
 
 function windowHashed(p: number, i: number): number {
     return hashKey(Intrinsics.load(p, i * 8, Types.i64))
@@ -6634,6 +6666,42 @@ export function suite() {
             if (got.join() !== want.join()) harness.fail(`signed window(${v}): ${got.join()}, expected ${want.join()}`)
             const hash = hashes.get(texts[i])
             if (hash !== undefined && Number(natives.windowHashed(ptr, i)) !== hash) harness.fail(`windowHashed(${v}) = ${natives.windowHashed(ptr, i)}, expected ${hash}`)
+        }
+    })
+    harness.test('registerEffectsFromWords', () => {
+        const cases: [word: number, reads: number[], writes: number[]][] = [
+            [0xf8617809, [0, 1], [9]], [0xeb89fc1f, [0, 9], []], [0x935efd20, [9], [0]], [0xfa500120, [9, 16], []],
+            [0xf2585d3f, [9], []], [0x9a830040, [2, 3], [0]], [0x1ac94be0, [9], [0]], [0x9e620120, [9], [32]],
+            [0x9e660000, [32], [0]], [0xf2bd14a0, [0], [0]], [0xd2a80011, [], [17]], [0x1e602240, [50, 32], []],
+            [0xf85f8063, [3], [3]], [0x9b110520, [9, 17, 1], [0]], [0x5cfff7a0, [], [32]], [0x1e610c00, [32, 33], [32]],
+            [0xfd000592, [12, 50], []], [0xa9409c69, [3], [9, 7]], [0xa9001466, [3, 6, 5], []], [0xa9bd7bf3, [19, 30], []],
+            [0xa8c37bf3, [], [19, 30]], [0xd65f03c0, [30], []],
+        ]
+        for (const [word, reads, writes] of cases) {
+            const effects = aarch64RegisterEffects(word)
+            const text = (list: number[]) => [...list].sort((a, b) => a - b).join()
+            if (!effects || text(effects[0]) !== text(reads) || text(effects[1]) !== text(writes)) harness.fail(`register effects of ${word.toString(16)}: ${effects ? `reads ${effects[0]} writes ${effects[1]}` : 'unknown'}, expected reads ${reads} writes ${writes}`)
+        }
+    })
+    harness.test('unsignedHighBits', () => {
+        const natives: any = native.createNatives({ highBitsBranch, highBitsFlag, highBitsPick, highBitsNarrow, highBitsBetween })
+        for (const [name, mask, use] of [['highBitsBranch', -(2 ** 30), /\bb\.(?:eq|ne)\b/], ['highBitsFlag', -(2 ** 24), /\bcset x\d+, ne\b/], ['highBitsPick', -(2 ** 40), /\bcsel x\d+, x\d+, x\d+, eq\b/], ['highBitsNarrow', -(2 ** 16), /\bcset x\d+, ne\b/], ['highBitsBetween', -(2 ** 40), /\bmovz x16, #256, lsl #16\n.*ccmp x\d+, x16, #0, eq\n.*(?:b\.(?:lo|hs)|csel x\d+, x\d+, x\d+, (?:lo|hs))\b/]] as [string, number, RegExp][]) {
+            const listing: string = natives[name].units.find((unit: any) => unit.name === name).code.listing
+            if (!new RegExp(`tst x\\d+, #${mask}\\n`).test(listing) || !use.test(listing) || /\bmovz? x17\b/.test(listing)) harness.fail(`${name}: an unsigned compare against 2^k must test the high bits with tst #${mask}, not materialize 2^k:\n${listing}`)
+        }
+        const wide = new BigUint64Array(['1073741823', '1073741824', '16777215', '16777216', '1099511627775', '1099511627776', '0', '9223372036854775808', '18446744073709551615'].map(v => BigInt(v)))
+        const wideAt = Number((ts as any).getArrayBufferPtr(wide.buffer))
+        const hashes = new Map([['1073741823', 1172300371], ['16777215', 4089040750], ['16777216', 1996959894], ['0', 0]])
+        for (let i = 0; i < wide.length; i++) {
+            const v = wide[i]
+            const got = [natives.highBitsBranch(wideAt, i), natives.highBitsFlag(wideAt, i), natives.highBitsPick(wideAt, i, 11, 22), natives.highBitsBetween(wideAt, i)].map(Number)
+            const want = [v < BigInt(2 ** 30) ? hashes.get(v.toString()) : 7, v >= BigInt(2 ** 24) ? 1 : 0, (v <= BigInt(2 ** 40 - 1) ? 11 : 22) + i, v <= BigInt(2 ** 40 - 1) && v >= BigInt(2 ** 24) ? 5 : 9]
+            if (got.join() !== want.join()) harness.fail(`unsigned high bits(${v}): ${got.join()}, expected ${want.join()}`)
+        }
+        const narrow = new Uint32Array([0xffff, 0x10000, 0, 0xffffffff])
+        const narrowAt = Number((ts as any).getArrayBufferPtr(narrow.buffer))
+        for (let i = 0; i < narrow.length; i++) {
+            if (Number(natives.highBitsNarrow(narrowAt, i)) !== (narrow[i] > 0xffff ? 1 : 0)) harness.fail(`highBitsNarrow(${narrow[i]}) = ${natives.highBitsNarrow(narrowAt, i)}`)
         }
     })
     harness.test('expensiveSelectArmsBranch', () => {

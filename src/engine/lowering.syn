@@ -6,6 +6,7 @@ import * as intrinsics from './intrinsics'
 const Types = intrinsics.Types
 const assert = intrinsics.assert
 
+const verifiesRegisters = intrinsics.argv().includes('verify-asm-registers')
 const emitterStats = intrinsics.argv().includes('optimize-stats') ? new Map<string, [ms: number, idle: number, calls: number, changes: number]>() : undefined
 
 function emitterStep<T>(pass: (arg: T) => boolean, arg: T): boolean {
@@ -51,7 +52,7 @@ export interface Target {
     readonly regCount: number
     readonly floatRegisterBase?: number
     readonly costs: TargetCosts
-    takesImmediate(op: string, imm: number): boolean
+    takesImmediate(op: string, imm: number, signed?: boolean): boolean
     layoutFrame(shape: FrameShape): FrameLayout
     relocate(view: DataView, at: number, pc: bigint, kind: Relocation['kind'], address: bigint): void
     isMoveWide(word: number): boolean
@@ -1488,9 +1489,17 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
+    function verifyItems(): void {
+        for (const it of items) {
+            itemDefs(it, [])
+            itemUses(it, [])
+        }
+    }
+
     function resolve(): void {
         if (finished) return
         finished = true
+        if (verifiesRegisters) verifyItems()
         peephole()
         mergeTails()
         threadBranches()
@@ -1499,6 +1508,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         reuseValues(true)
         const targets = new Set(items.filter(it => isBranch(it.kind)).map(it => it.label))
         for (let i = 0; i < items.length; i++) if (foldGuardedSelect(i, targets)) i--
+        if (verifiesRegisters) verifyItems()
 
         const addrOf = new Map<number, number>()
         let pc = 0
@@ -2056,6 +2066,15 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function compareImm(op: string, dst: number, a: number, imm: number, signed: boolean, when?: [op: string, signed: boolean], narrow = false): void {
+        const high = signed || when || narrow ? undefined : unsignedHighBits(op, imm)
+        if (high !== undefined) {
+            const bits = BigInt.asUintN(64, -(BigInt(1) << BigInt(high)))
+            const encoded = logicalImmediate(bits)!
+            emitCmp(0xF2000000 | (((encoded >>> 12) & 1) << 22) | (((encoded >>> 6) & 0x3F) << 16) | ((encoded & 0x3F) << 10) | (a << 5) | XZR,
+                `tst ${x(a)}, #${BigInt.asIntN(64, bits)}`, { testedSrc: a, testedBits: bits })
+            if (dst >= 0) cset(dst, op === 'lt' || op === 'le' ? COND_EQ : COND_NE)
+            return
+        }
         let cond = condFor(op, signed)
         if (imm === 0 && !when) cond = cond === COND_HI ? COND_NE : cond === COND_LS ? COND_EQ : cond
         if (when) {
@@ -2438,7 +2457,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         strUnsigned(src, address, 0, bytes)
     }
 
-    function itemDefs(item: AsmItem, out: number[]): boolean {
+    function declaredDefs(item: AsmItem, out: number[]): boolean {
         if (item.kind !== 'insn') return false
         if (item.writes) { out.push(...item.writes); return true }
         if (item.literalDelta !== undefined) { out.push(item.reg); return true }
@@ -2464,7 +2483,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.cmpLeft !== undefined || item.cmpZeroReg !== undefined) return true
         return false
     }
-    function itemUses(item: AsmItem, out: number[]): boolean {
+    function declaredUses(item: AsmItem, out: number[]): boolean {
         if (item.kind !== 'insn') return false
         if (item.reads) { out.push(...item.reads); return true }
         if (item.literalDelta !== undefined) return true
@@ -2509,6 +2528,19 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (item.cmpZeroReg !== undefined) { out.push(item.cmpZeroReg); return true }
         return false
     }
+    function checkedRegisters(item: AsmItem, out: number[], writes: boolean): boolean {
+        const from = out.length
+        const known = writes ? declaredDefs(item, out) : declaredUses(item, out)
+        if (!known) return false
+        const effects = aarch64RegisterEffects(item.word)
+        if (!effects) return true
+        for (const r of effects[writes ? 1 : 0]) {
+            if (out.indexOf(r, from) < 0) throw `aarch64: '${item.text}' (${item.word.toString(16)}) ${writes ? 'writes' : 'reads'} r${r}, but its metadata declares ${writes ? 'writes' : 'reads'} [${out.slice(from).join(', ')}]`
+        }
+        return true
+    }
+    const itemDefs = verifiesRegisters ? (item: AsmItem, out: number[]) => checkedRegisters(item, out, true) : declaredDefs
+    const itemUses = verifiesRegisters ? (item: AsmItem, out: number[]) => checkedRegisters(item, out, false) : declaredUses
     function canReorderOver(item: AsmItem): boolean {
         const defs: number[] = []
         const uses: number[] = []
@@ -2674,8 +2706,16 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return cmp.word === compareImmWord(left, imm, narrow) ? [left, -1, imm, narrow] : undefined
     }
 
+    function highBitsOf(cmp: AsmItem): number | undefined {
+        if (cmp.testedSrc === undefined || cmp.testedBits === undefined || !cmp.setsFlags) return
+        const span = (BigInt(1) << BigInt(64)) - cmp.testedBits
+        if (span < BigInt(2) || (span & (span - BigInt(1))) !== BigInt(0)) return
+        return span.toString(2).length - 1
+    }
+
     function toCcmp(cmp: AsmItem, cond: number, prior: number): AsmItem | undefined {
-        const [left, right, imm, narrow] = plainCompare(cmp)!
+        const high = highBitsOf(cmp)
+        const [left, right, imm, narrow] = high === undefined ? plainCompare(cmp)! : [cmp.testedSrc!, -1, 2 ** high, false]
         const nzcv = FalseFlags[cond]
         let setup: AsmItem | undefined
         let rhs = right
@@ -2687,9 +2727,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (right < 0) {
                 assert(left !== scratchA, 'aarch64: ccmp materializes a wide immediate in x16, so its operand cannot live there')
                 rhs = scratchA
+                const hw = high === undefined ? 0 : Math.floor(high / 16)
+                const part = high === undefined ? imm : 2 ** (high % 16)
                 setup = {
-                    kind: 'insn', word: (0xD2800000 | (imm << 5) | scratchA) >>> 0,
-                    text: `movz ${x(scratchA)}, #${imm}`, label: -1, reg: -1, cond: -1,
+                    kind: 'insn', word: (0xD2800000 | (hw << 21) | (part << 5) | scratchA) >>> 0,
+                    text: `movz ${x(scratchA)}, #${part}${hw ? `, lsl #${hw * 16}` : ''}`, label: -1, reg: -1, cond: -1,
                     constReg: scratchA,
                 }
             }
@@ -2702,6 +2744,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         cmp.cmpRight = undefined
         cmp.cmpZeroReg = undefined
         cmp.cmpImmediate = undefined
+        cmp.testedSrc = undefined
+        cmp.testedBits = undefined
         cmp.cond = prior
         return setup
     }
@@ -2835,7 +2879,8 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
 
         let swap = false
-        if (spent(late.reg) && plainCompare(lateCmp)) swap = false
+        const lateHigh = (late.cond === COND_EQ || late.cond === COND_NE) && !plainCompare(lateCmp) ? highBitsOf(lateCmp) : undefined
+        if (spent(late.reg) && (plainCompare(lateCmp) || lateHigh !== undefined)) swap = false
         else if (at === len - 4 && spent(early.reg) && plainCompare(earlyCmp)) swap = true
         else return false
         if (swap) {
@@ -2844,6 +2889,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const reads: number[] = []
             if (!itemUses(lateCmp, reads) || reads.includes(early.reg)) return false
         }
+        if (!swap && lateHigh !== undefined) late.cond = late.cond === COND_EQ ? COND_LO : COND_HS
         const head = swap ? late : early
         const tail = swap ? early : late
         const keep: AsmItem[] = [swap ? lateCmp : earlyCmp]
@@ -3872,6 +3918,122 @@ function logicalImmediate(value: number | bigint): number | undefined {
     }
 }
 
+export function aarch64RegisterEffects(word: number): [reads: number[], writes: number[]] | undefined {
+    const reads: number[] = []
+    const writes: number[] = []
+    const bits = (at: number, width: number) => (word >>> at) & ((1 << width) - 1)
+    const gp = (list: number[], at: number) => {
+        if (bits(at, 5) !== 31) list.push(bits(at, 5))
+    }
+    const fp = (list: number[], at: number) => list.push(FP_BASE + bits(at, 5))
+    const op0 = bits(25, 4)
+    if ((op0 & 0xE) === 0x8) {
+        const kind = bits(23, 3)
+        if (kind === 5 && bits(29, 2) === 3) gp(reads, 0)
+        if (kind === 6 && bits(29, 2) === 1) gp(reads, 0)
+        if (kind === 7) gp(reads, 16)
+        if (kind >= 2 && kind !== 5) gp(reads, 5)
+        gp(writes, 0)
+        return [reads, writes]
+    }
+    if ((op0 & 0xE) === 0xA) {
+        if (bits(25, 6) === 0x1A || bits(25, 6) === 0x1B) {
+            gp(reads, 0)
+            return [reads, writes]
+        }
+        if (bits(24, 8) === 0x54 || bits(24, 8) === 0xD4 || bits(26, 6) === 0x05) return [reads, writes]
+        if (bits(25, 7) === 0x6B && (bits(21, 4) === 0 || bits(21, 4) === 2)) {
+            gp(reads, 5)
+            return [reads, writes]
+        }
+        return
+    }
+    if ((op0 & 0x5) === 0x4) {
+        const vector = bits(26, 1) === 1
+        const reg = vector ? fp : gp
+        const group = bits(27, 3)
+        if (group === 3 && bits(24, 1) === 0) {
+            if (vector || bits(30, 2) !== 3) reg(writes, 0)
+            return [reads, writes]
+        }
+        if (group === 5) {
+            const load = bits(22, 1) === 1
+            gp(reads, 5)
+            if (bits(23, 1) === 1) gp(writes, 5)
+            reg(load ? writes : reads, 0)
+            reg(load ? writes : reads, 10)
+            return [reads, writes]
+        }
+        if (group !== 7) return
+        const opc = bits(22, 2)
+        if (!vector && bits(30, 2) === 3 && opc === 2) return
+        const load = vector ? (opc & 1) === 1 : opc !== 0
+        gp(reads, 5)
+        if (bits(24, 2) === 0) {
+            if (bits(21, 1) === 1 && bits(10, 2) === 2) gp(reads, 16)
+            else if (bits(21, 1) === 1) return
+            else if (bits(10, 1) === 1) gp(writes, 5)
+        }
+        reg(load ? writes : reads, 0)
+        return [reads, writes]
+    }
+    if ((op0 & 0x7) === 0x5) {
+        if (bits(28, 1) === 0) {
+            gp(reads, 5)
+            gp(reads, 16)
+            gp(writes, 0)
+            return [reads, writes]
+        }
+        const op2 = bits(21, 4)
+        if (op2 === 2) {
+            gp(reads, 5)
+            if (bits(11, 1) === 0) gp(reads, 16)
+            return [reads, writes]
+        }
+        if (op2 !== 0 && op2 !== 4 && op2 !== 6 && op2 < 8) return
+        gp(reads, 5)
+        if (op2 !== 6 || bits(30, 1) === 0) gp(reads, 16)
+        if (op2 >= 8) gp(reads, 10)
+        gp(writes, 0)
+        return [reads, writes]
+    }
+    if ((op0 & 0x7) !== 0x7 || bits(30, 1) !== 0 || bits(29, 1) !== 0) return
+    if (bits(24, 5) === 0x1F) {
+        fp(reads, 5)
+        fp(reads, 16)
+        fp(reads, 10)
+        fp(writes, 0)
+        return [reads, writes]
+    }
+    if (bits(24, 5) !== 0x1E || bits(21, 1) !== 1) return
+    if (bits(10, 6) === 0) {
+        const toFloat = bits(16, 3) === 2 || bits(16, 3) === 3 || bits(16, 3) === 7
+        if (toFloat) gp(reads, 5)
+        else fp(reads, 5)
+        if (toFloat) fp(writes, 0)
+        else gp(writes, 0)
+        return [reads, writes]
+    }
+    if (bits(10, 5) === 0x10) {
+        fp(reads, 5)
+        fp(writes, 0)
+        return [reads, writes]
+    }
+    if (bits(10, 4) === 0x8) {
+        fp(reads, 5)
+        if (bits(3, 1) === 0) fp(reads, 16)
+        return [reads, writes]
+    }
+    if (bits(10, 3) === 0x4) {
+        fp(writes, 0)
+        return [reads, writes]
+    }
+    fp(reads, 5)
+    fp(reads, 16)
+    if (bits(10, 2) !== 1) fp(writes, 0)
+    return [reads, writes]
+}
+
 function aarch64LiteralWords(value: number, narrow: boolean): number {
     if (narrow) {
         const v = Number(BigInt.asUintN(32, BigInt(value)))
@@ -3897,9 +4059,16 @@ function aarch64LiteralWords(value: number, narrow: boolean): number {
     return logicalImmediate(value) !== undefined ? 1 : moves
 }
 
-function aarch64TakesImmediate(op: string, imm: number): boolean {
+function unsignedHighBits(op: string, imm: number): number | undefined {
+    if (imm <= 0xFFF || !Number.isSafeInteger(imm)) return
+    const bound = op === 'lt' || op === 'ge' ? imm : op === 'le' || op === 'gt' ? imm + 1 : 0
+    const k = Math.log2(bound)
+    if (Number.isInteger(k) && k > 0 && k < 64) return k
+}
+
+function aarch64TakesImmediate(op: string, imm: number, signed = true): boolean {
     if (aarch64ShiftedOrLogical.has(op)) return true
-    if (aarch64Compares.has(op)) return imm >= -0xFFF && imm <= 0xFFF
+    if (aarch64Compares.has(op)) return (imm >= -0xFFF && imm <= 0xFFF) || (!signed && unsignedHighBits(op, imm) !== undefined)
     if (op === 'add' || op === 'sub') return arithImmediate(imm) !== undefined
     return false
 }
