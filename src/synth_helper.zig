@@ -55,6 +55,7 @@ pub const SynthInstrumenter = struct {
     emitting: bool = false,
     transforming: bool = false,
     needs_computation_symbol: bool = false,
+    needs_computation_helper: bool = false,
 
     depth: u16 = 1,
 
@@ -102,6 +103,7 @@ pub const SynthInstrumenter = struct {
         try v.visit(ast.nodes.at(ast.start), ast.start);
         var prefix = parser.NodeList.init(&ast.nodes);
         if (v.needs_computation_symbol) prefix.appendRef(try v.createComputationSymbolPolyfill());
+        if (v.needs_computation_helper) prefix.appendRef(try v.createComputationHelper());
         if (v.tmp_binding != 0) {
             const stmt = try v.factory.createLetVariable(v.tmp_binding, 0);
             ast.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
@@ -137,6 +139,19 @@ pub const SynthInstrumenter = struct {
             try self.factory.createPrefixUnaryExpression(.exclamation_token, try self.computationKey()),
             try self.factory.createBlock(&.{define}),
             0,
+        );
+    }
+
+    fn createComputationHelper(self: *@This()) !NodeRef {
+        const store = try self.factory.createAssignmentStatement(
+            try self.factory.createElementAccessExpression(try self.factory.createIdentifier("f"), try self.computationKey()),
+            try self.factory.createIdentifier("c"),
+        );
+        const ret = try self.factory.createReturnStatement(try self.factory.createIdentifier("f"));
+        return self.factory.createFunctionDeclaration(
+            try self.factory.createIdentifier("__computation$"),
+            &.{ try self.factory.createParameter(try self.factory.createIdentifier("f"), 0), try self.factory.createParameter(try self.factory.createIdentifier("c"), 0) },
+            &.{ store, ret },
         );
     }
 
@@ -698,15 +713,10 @@ pub const SynthInstrumenter = struct {
             const synth_data = try self.buildSynthDataFn(ref, &captures);
             switch (node.kind) {
                 .arrow_function, .function_expression => {
-                    const o = try self.factory.createObjectLiteralExpression(&.{
-                        try self.factory.createPropertyAssignment(
-                            try self.factory.createComputedName(move_key),
-                            synth_data,
-                        )
-                    });
+                    self.needs_computation_helper = true;
                     const call = try self.factory.createCallExpression(
-                        try self.factory.createPropertyAccessExpression(try self.factory.createIdentifier("Object"), "assign"),
-                        &.{clone, o},
+                        try self.factory.createIdentifier("__computation$"),
+                        &.{clone, synth_data},
                     );
                     self.nodes.at(call).next = next;
                     try self.replacements.put(ref, call);

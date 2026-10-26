@@ -33,6 +33,7 @@ import {
     type NodeSpace, allNodes, copyNodes, countNodes, nodeEntries, nodeIds,
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
     FloatUnaryOps, rawSlot, rawContents, internRaw, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
+    paramOwner, inboundApplies, indexedValues,
 } from './graph-node'
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
@@ -3397,7 +3398,7 @@ function appendParam(program: ProgramGraph, callee: number, type: TypeOperand, s
         const n = getNode(caller, call)!
         const locations = callLocations(caller, call)
         putCopy(caller, call, n, [...getOperands(caller, n), argOf(k)])
-        dirtyIndex(caller)
+        dirtyValues(caller, [call])
         if (!locations && location < 0) return
         setCallLocations(caller, call, [...locations ?? new Array(countIds(n) - 3).fill(-1), location])
     })
@@ -4779,8 +4780,6 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
     const callSites = countCallSites(program)
     interface Index {
         users: GraphIndex
-        owner: Map<number, [block: number, index: number]>
-        applies: Map<number, number[]>
         rets: number[]
         calls: Map<number, number[]>
     }
@@ -4803,28 +4802,14 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         const known = indexes.get(symbol)
         if (known) return known
         const g = program.units.get(symbol)!
-        const index: Index = { users: graphIndex(g), owner: new Map(), applies: new Map(), rets: [], calls: new Map() }
-        for (const b of g.blocks.slice(1)) b.params.forEach((p, i) => index.owner.set(p, [b.id, i]))
-        const seen = new Set<number>()
-        const stack = g.blocks.map(b => b.bodyId)
-        while (stack.length) {
-            const id = stack.pop()!
-            const n = id ? getNode(g, id) : undefined
-            if (!n || seen.has(id) || n.op === NodeOp.block) continue
-            seen.add(id)
-            for (let i = 0; i < countIds(n); i++) if (getRef(n, i)) stack.push(getRef(n, i))
-            if (n.op === NodeOp.ret) index.rets.push(id)
-            if (n.op === NodeOp.apply) {
-                const list = index.applies.get(getRef(n, 0))
-                if (list) list.push(id)
-                else index.applies.set(getRef(n, 0), [id])
-            }
-            const callee = calledSymbol(g, n)
-            if (callee !== undefined) {
-                const list = index.calls.get(callee)
-                if (list) list.push(id)
-                else index.calls.set(callee, [id])
-            }
+        const users = graphIndex(g)
+        const index: Index = { users, rets: indexedValues(users, NodeOp.ret), calls: new Map() }
+        for (const id of indexedValues(users, NodeOp.call)) {
+            const callee = calledSymbol(g, getNode(g, id)!)
+            if (callee === undefined) continue
+            const list = index.calls.get(callee)
+            if (list) list.push(id)
+            else index.calls.set(callee, [id])
         }
         indexes.set(symbol, index)
         return index
@@ -4842,14 +4827,14 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
             if (seen.has(id)) continue
             seen.add(id)
             const n = getNode(g, id)!
+            const owner = n.op === NodeOp.param ? paramOwner(g, index.users, id) : undefined
             if (pstackAllocates(g, n)) out.push(id)
             else if (n.op === NodeOp.after) work.push(getRef(n, countIds(n) - 1))
             else if (n.op === NodeOp.encode) work.push(getRef(n, 0))
-            else if (n.op === NodeOp.param && index.owner.has(id)) {
-                const [block, at] = index.owner.get(id)!
-                const arrivals = index.applies.get(block) ?? []
+            else if (owner) {
+                const arrivals = inboundApplies(g, index.users, owner[0])
                 if (!arrivals.length) return
-                for (const app of arrivals) work.push(getRef(getNode(g, app)!, at + 1))
+                for (const [, app] of arrivals) work.push(getRef(getNode(g, app)!, owner[1] + 1))
             } else return
         }
         return out
@@ -4957,9 +4942,9 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
             }
         }
         for (const id of f.source.keys()) {
-            const owner = index.owner.get(id)
+            const owner = paramOwner(g, index.users, id)
             if (!owner) continue
-            for (const app of index.applies.get(owner[0]) ?? []) {
+            for (const [, app] of inboundApplies(g, index.users, owner[0])) {
                 if (!f.source.has(getRef(getNode(g, app)!, owner[1] + 1))) f.blocked ??= 'join'
             }
         }
@@ -5467,25 +5452,17 @@ function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUn
         let known = origins.get(caller)
         if (!known) origins.set(caller, known = new Map())
         const g = prepared.get(caller)!.prepared.g
-        const owner = new Map<number, [block: number, index: number]>()
-        for (const b of g.blocks) b.params.forEach((p, i) => owner.set(p, [b.id, i]))
-        const inbound = new Map<number, GraphNode[]>()
-        for (const n of allNodes(g)) {
-            if (n.op !== NodeOp.apply) continue
-            const list = inbound.get(getRef(n, 0))
-            if (list) list.push(n)
-            else inbound.set(getRef(n, 0), [n])
-        }
+        const index = graphIndex(g)
         function resolve(v: number, seen: Set<number>): number {
             if (known!.has(v)) return known!.get(v)!
-            const at = owner.get(v)
+            const at = paramOwner(g, index, v)
             if (!at) return -1
-            if (at[0] === g.root) return at[1]
+            if (at[0].id === g.root) return at[1]
             if (seen.has(v)) return -2
             seen.add(v)
             let found = -2
-            for (const apply of inbound.get(at[0]) ?? []) {
-                const r = resolve(getRef(apply, at[1] + 1), seen)
+            for (const [, apply] of inboundApplies(g, index, at[0])) {
+                const r = resolve(getRef(getNode(g, apply)!, at[1] + 1), seen)
                 if (r === -2) continue
                 if (r < 0 || (found >= 0 && found !== r)) return -1
                 found = r
@@ -6819,8 +6796,6 @@ function createTracer(linker: Linker, image: ProgramImage, facts: Facts, clock: 
             if (n.op === NodeOp.heapHandle && !getRef(n, 0) && identity(getLiteral(graph, n, 0) as u32, n)) hotCells.add(getLiteral(graph, n, 0) as u32)
             nodeRefs(n, reach)
         }
-        const owner = new Map<number, number>()
-        for (const b of graph.blocks) for (const p of b.params) owner.set(p, b.id)
         const constant = new Map<number, boolean>()
         const constantOf = (root: number): boolean => {
             const stack = [root]
