@@ -479,9 +479,61 @@ function lowZeros(g: Graph, ref: number, literal: number, param?: (p: number) =>
         return zeros
     }
     if (n.op === NodeOp.shl && !getRef(n, 1)) return Math.min(64, a() + getLiteral(g, n, 1))
+    if ((n.op === NodeOp.ushr || n.op === NodeOp.shr) && !getRef(n, 1)) return Math.max(0, a() - getLiteral(g, n, 1))
     if (n.op === NodeOp.mul) return Math.min(64, a() + b())
+    if (n.op === NodeOp.mem) return a()
     if (n.op === NodeOp.and) return Math.max(a(), b())
     if (n.op === NodeOp.add || n.op === NodeOp.sub || n.op === NodeOp.or || n.op === NodeOp.xor) return Math.min(a(), b())
+    return 0
+}
+
+function linearTerms(g: Graph, ref: number, literal: number, scale: number, out: Map<number, number>): void {
+    if (!ref) {
+        out.set(0, (out.get(0) ?? 0) + literal * scale)
+        return
+    }
+    const n = getNode(g, ref)!
+    if (n.op === NodeOp.literal) return linearTerms(g, 0, getLiteral(g, n, 0), scale, out)
+    if (n.op === NodeOp.after) return linearTerms(g, getRef(n, countIds(n) - 1), getLiteral(g, n, countIds(n) - 1), scale, out)
+    if (n.op === NodeOp.add || n.op === NodeOp.sub) {
+        linearTerms(g, getRef(n, 0), getLiteral(g, n, 0), scale, out)
+        linearTerms(g, getRef(n, 1), getLiteral(g, n, 1), n.op === NodeOp.sub ? -scale : scale, out)
+        return
+    }
+    if (n.op === NodeOp.shl && !getRef(n, 1) && getLiteral(g, n, 1) < 32) return linearTerms(g, getRef(n, 0), getLiteral(g, n, 0), scale * 2 ** getLiteral(g, n, 1), out)
+    if (n.op === NodeOp.mul && !getRef(n, 1)) return linearTerms(g, getRef(n, 0), getLiteral(g, n, 0), scale * getLiteral(g, n, 1), out)
+    if (n.op === NodeOp.mul && !getRef(n, 0)) return linearTerms(g, getRef(n, 1), getLiteral(g, n, 1), scale * getLiteral(g, n, 0), out)
+    out.set(ref, (out.get(ref) ?? 0) + scale)
+}
+
+function linearForm(g: Graph, terms: [ref: number, literal: number, scale: number][]): Map<number, number> | undefined {
+    const out = new Map<number, number>()
+    for (const [ref, literal, scale] of terms) linearTerms(g, ref, literal, scale, out)
+    for (const [key, k] of [...out]) {
+        if (!Number.isSafeInteger(k)) return
+        if (!k) out.delete(key)
+    }
+    return out
+}
+
+function requestedSize(g: Graph, ref: number): [ref: number, literal: number] | undefined {
+    const n = ref ? getNode(g, ref) : undefined
+    if (n?.op === NodeOp.mem) return [getRef(n, 1), getLiteral(g, n, 1)]
+    if (n && pstackAllocates(g, n)) return [getRef(n, 3), getLiteral(g, n, 3)]
+}
+
+function paddedAllocation(g: Graph, start: Map<number, number>, end: Map<number, number>): number {
+    for (const [leaf, k] of start) {
+        if (k !== 1) continue
+        const size = requestedSize(g, leaf)
+        if (!size) continue
+        const offset = linearForm(g, [[leaf, 0, -1]])!
+        for (const [key, c] of start) offset.set(key, (offset.get(key) ?? 0) + c)
+        if ([...offset].some(([key, c]) => c !== 0 && (key !== 0 || c % PstackGranule !== 0))) continue
+        const rest = linearForm(g, [[leaf, 0, -1], [size[0], size[1], -1]])!
+        for (const [key, c] of end) rest.set(key, (rest.get(key) ?? 0) + c)
+        if ([...rest.values()].every(c => c === 0)) return leaf
+    }
     return 0
 }
 
@@ -1083,13 +1135,11 @@ export function rangeFacts(g: Graph, arrivalsOf: (block: number) => TailPosition
     }
 
     const paramZeros = new Map<number, number>()
-    function zerosOf(p: number): number {
-        const memo = paramZeros.get(p)
-        if (memo !== undefined) return memo
-        const owner = ownerOf(p)
-        if (!owner || owner[0] === g.blocks[0]) return 0
-        const [b, k] = owner
-        paramZeros.set(p, 0)
+    const passZeros = new Map<number, number>()
+    const assumed = new Map<number, number>()
+    let zeroBudget = 0
+    for (const b of g.blocks) zeroBudget += 8 * b.params.length
+    function arrivingZeros(p: number, b: GraphBlock, k: number): number {
         let z = 64
         for (const pos of arrivals(b.id)) {
             const app = getNode(g, pos.at)!
@@ -1098,7 +1148,46 @@ export function rangeFacts(g: Graph, arrivalsOf: (block: number) => TailPosition
             z = Math.min(z, zeros(getRef(app, k + 1), getLiteral(g, app, k + 1)))
             if (!z) break
         }
-        paramZeros.set(p, z)
+        return z
+    }
+    function assume(p: number, z: number | undefined): void {
+        if (z === undefined) assumed.delete(p)
+        else assumed.set(p, z)
+        passZeros.clear()
+    }
+    const assumedReads = new Map<number, number>()
+    let dependentReads = 0
+    function zerosOf(p: number): number {
+        const memo = paramZeros.get(p)
+        if (memo !== undefined) return memo
+        const guess = assumed.get(p) ?? passZeros.get(p)
+        if (guess !== undefined) {
+            dependentReads++
+            if (assumed.has(p)) assumedReads.set(p, assumedReads.get(p)! + 1)
+            return guess
+        }
+        const owner = ownerOf(p)
+        if (!owner || owner[0] === g.blocks[0] || zeroBudget <= 0) return 0
+        zeroBudget--
+        const [b, k] = owner
+        const before = dependentReads
+        assumedReads.set(p, 0)
+        assume(p, 64)
+        const optimistic = arrivingZeros(p, b, k)
+        const cyclic = assumedReads.get(p)!
+        let z = optimistic
+        if (cyclic && optimistic) {
+            assume(p, optimistic)
+            if (arrivingZeros(p, b, k) < optimistic) {
+                assume(p, 0)
+                z = arrivingZeros(p, b, k)
+            }
+        }
+        assume(p, undefined)
+        const own = assumedReads.get(p)!
+        assumedReads.delete(p)
+        if (dependentReads - before > own) passZeros.set(p, z)
+        else paramZeros.set(p, z)
         return z
     }
     function zeros(ref: number, literal: number): number {
@@ -6503,12 +6592,17 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (step <= 0) return
         const increment = getNode(g, getRef(back, ivAt + 1))!
         let width = 0
+        let stepping = false
         for (const id of stores) {
             const n = getNode(g, id)!
             const T = typeOf(n)
             if (T === Types.f64 || T === Types.f32 || T === Types.f16) return
             const bytes = intrinsics.intrinsicBitWidth(T) >> 3
-            if (getRef(n, 2) !== iv || getRef(n, 3) || !loopInvariant(loop, getRef(n, 1)) || bytes !== step || (width && bytes !== width)) return
+            const indexed = getRef(n, 2) === iv && loopInvariant(loop, getRef(n, 1))
+            const stepped = getRef(n, 1) === iv && !getRef(n, 2) && getLiteral(g, n, 2) === 0
+            if ((!indexed && !stepped) || getRef(n, 3) || bytes !== step || (width && bytes !== width)) return
+            if (stepped && stores.length > 1) return
+            stepping = stepped
             width = bytes
         }
         for (let i = 0; i < target.params.length; i++) {
@@ -6527,45 +6621,134 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             for (let i = 0; i < countIds(n); i++) work.push(getRef(n, i))
         }
         const allowed = new Set<number>([getRef(tail, 0), getRef(back, ivAt + 1), ...stores])
+        let exits = false
         for (const u of dependents.get(iv) ?? []) {
             const n = getNode(g, u)
-            if (allowed.has(u) || (n?.op === NodeOp.apply && u !== loop.selfApps[0])) continue
-            return
+            if (allowed.has(u)) continue
+            if (n?.op !== NodeOp.apply || u === loop.selfApps[0]) return
+            exits = true
         }
         let zeros = 64
         for (const [, app] of loop.entries) {
+            if (stores.some(id => fixedSlotRegion(target, loop, getNode(g, app)!, getNode(g, id)!))) return
             const trip = loopTrip(target, loop, getNode(g, app)!)
-            if (!trip) return
-            zeros = Math.min(zeros, trip.zeros)
+            zeros = Math.min(zeros, trip ? trip.zeros : 0)
         }
         let factor = 1
-        while (zeros > 0 && factor * 2 * width <= 8) {
+        while (zeros > 0 && factor * 2 * width <= 16) {
             factor = factor * 2
             zeros--
         }
+        const rounders: (() => void)[] = []
+        if (factor * width < 16 && !exits && loop.entries.every(([, app]) => paddedRegion(target, loop, getNode(g, app)!, stores, width, rounders))) {
+            factor = 16 / width
+            for (const round of rounders) round()
+        }
         if (factor === 1) return
-        const wide = factor * width === 8 ? Types.u64 : factor * width === 4 ? Types.u32 : Types.u16
+        const bytes = factor * width
+        const wide = bytes >= 8 ? Types.u64 : bytes === 4 ? Types.u32 : Types.u16
         const m = 2 ** (width * 8)
         const widened: number[] = []
         for (const id of stores) {
             const value = ((getLiteral(g, getNode(g, id)!, 3) % m) + m) % m
             let replicated = 0
-            for (let k = 0; k < factor; k++) replicated += value * 2 ** (width * 8 * k)
+            for (let k = 0; k < Math.min(factor, 8 / width); k++) replicated += value * 2 ** (width * 8 * k)
             if (!Number.isSafeInteger(replicated)) return
             widened.push(replicated)
         }
         for (let i = 0; i < stores.length; i++) {
             const id = stores[i]
             const n = getNode(g, id)!
-            const copy = copyNode(g, n, [getOperand(g, n, 0), getOperand(g, n, 1), getOperand(g, n, 2), { literal: widened[i] }])
-            setType(copy, wide)
-            setNode(g, id, copy)
+            if (bytes < 16) {
+                const copy = copyNode(g, n, [getOperand(g, n, 0), getOperand(g, n, 1), getOperand(g, n, 2), { literal: widened[i] }])
+                setType(copy, wide)
+                setNode(g, id, copy)
+                continue
+            }
+            const address = stepping ? getOperand(g, n, 1) : addNode(g, NodeOp.add, [getOperand(g, n, 1), iv])
+            const low = copyNode(g, n, [getOperand(g, n, 0), address, { literal: 0 }, { literal: widened[i] }])
+            setType(low, wide)
+            const high = copyNode(g, n, [insertNode(g, low), address, { literal: 8 }, { literal: widened[i] }])
+            setType(high, wide)
+            setNode(g, id, high)
         }
         const operands = getOperands(g, back)
         operands[ivAt + 1] = addCopy(g, increment, [iv, { literal: step * factor }], NodeOp.add)
         putCopy(g, loop.selfApps[0], back, operands)
         revisitBlock(target)
         return true
+    }
+
+    function fixedSlotRegion(target: GraphBlock, loop: CountedLoop, app: GraphNode, store: GraphNode): boolean {
+        const stepped = getRef(store, 1) === target.params[loop.counter]
+        const base = outsideOf(target, app, stepped ? [target.params[loop.counter], 0] : [getRef(store, 1), getLiteral(g, store, 1)])
+        const form = linearForm(g, [[base[0], base[1], 1]])
+        if (!form) return true
+        for (const leaf of form.keys()) if (leaf && slotBytes(g, getNode(g, leaf)!) > 0) return true
+        return false
+    }
+
+    function paddedRegion(target: GraphBlock, loop: CountedLoop, app: GraphNode, stores: number[], width: number, rounders: (() => void)[]): boolean {
+        const cond = loop.compare!
+        if (cond.op !== NodeOp.lt && cond.op !== NodeOp.le) return false
+        if (lowering.isSignedType(operandType(g, cond, 0)) || lowering.isSignedType(operandType(g, cond, 1))) return false
+        const start = outsideOf(target, app, [target.params[loop.counter], 0])
+        const bound = outsideOf(target, app, loop.bound)
+        const reach = cond.op === NodeOp.le ? width : 0
+        for (const id of stores) {
+            const n = getNode(g, id)!
+            const base: [number, number] = getRef(n, 1) === target.params[loop.counter] ? [0, 0] : outsideOf(target, app, [getRef(n, 1), getLiteral(g, n, 1)])
+            const from = linearForm(g, [[base[0], base[1], 1], [start[0], start[1], 1]])
+            const to = linearForm(g, [[base[0], base[1], 1], [bound[0], bound[1], 1], [0, reach, 1]])
+            const span = linearForm(g, [[bound[0], bound[1], 1], [start[0], start[1], -1]])
+            if (!from || !to || !span || [...span.values()].some(k => k % width !== 0)) return false
+            const leaf = paddedAllocation(g, from, to)
+            const round = leaf ? extentRounder(leaf) : undefined
+            if (!round) return false
+            rounders.push(round)
+        }
+        return true
+    }
+
+    function valueBlock(id: number, op: NodeOp): GraphBlock | undefined {
+        for (const b of reachableBlocks) if (findValues(b.id, op)?.includes(id)) return b
+    }
+
+    function extentRounder(leaf: number): (() => void) | undefined {
+        const n = getNode(g, leaf)!
+        if (pstackAllocates(g, n)) {
+            const owner = valueBlock(leaf, NodeOp.pstack)
+            if (!owner) return
+            return () => {
+                const p = getNode(g, leaf)!
+                const operands = getOperands(g, p)
+                operands[3] = pstackExtent(g, getOperand(g, p, 3))
+                putCopy(g, leaf, p, operands)
+                revisitBlock(owner)
+            }
+        }
+        if (n.op !== NodeOp.mem) return
+        const base = getNode(g, getRef(n, 0))
+        if (base?.op !== NodeOp.load) return
+        for (const a of dependents.get(getRef(n, 0)) ?? []) {
+            const top = getNode(g, a)!
+            if (top.op !== NodeOp.add) continue
+            const at = getRef(top, 0) === getRef(n, 0) ? 1 : getRef(top, 1) === getRef(n, 0) ? 0 : -1
+            if (at < 0 || getRef(top, at) !== getRef(n, 1) || getLiteral(g, top, at) !== getLiteral(g, n, 1)) continue
+            for (const id of dependents.get(a) ?? []) {
+                const store = getNode(g, id)!
+                if (store.op !== NodeOp.store || getRef(store, 3) !== a || getRef(store, 2) || getLiteral(g, store, 2) !== getLiteral(g, base, 2)) continue
+                if (getRef(store, 1) !== getRef(base, 1) || getLiteral(g, store, 1) !== getLiteral(g, base, 1) || getRef(base, 2)) continue
+                const owner = valueBlock(id, NodeOp.store)
+                if (!owner) continue
+                return () => {
+                    const operands = getOperands(g, top)
+                    operands[at] = pstackExtent(g, getOperand(g, n, 1))
+                    putCopy(g, a, top, operands)
+                    revisitBlock(owner)
+                }
+            }
+        }
     }
 
     function mergeConstantStores(target: GraphBlock) {
@@ -12420,6 +12603,14 @@ function pstackCellOperand(g: Graph, id: number, n: GraphNode): Operand {
     const cell = getNode(g, getRef(n, 1))
     if (getRef(n, 1) && (cell?.op !== NodeOp.poolEntry || countIds(cell) < 2)) throw `lowering: pstack %${id} names its stack dynamically`
     return getOperand(g, n, 1)
+}
+
+export const PstackGranule = 16
+
+export function pstackExtent(g: Graph, size: Operand): Operand {
+    if (typeof size !== 'number') return { literal: Math.ceil(size.literal / PstackGranule) * PstackGranule }
+    if (2 ** lowZeros(g, size, 0) >= PstackGranule) return size
+    return addNode(g, NodeOp.and, [addNode(g, NodeOp.add, [size, { literal: PstackGranule - 1 }]), { literal: -PstackGranule }])
 }
 
 function expandPstacks(g: Graph): boolean {
