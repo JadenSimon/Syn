@@ -423,7 +423,7 @@ function writeEngineCache(file: string, entry: EngineCacheEntry) {
 }
 
 async function emitEngine(roots: string[]): Promise<EngineCacheEntry> {
-    const prog = api.createProgram(roots, engineCompilerOptions)
+    const prog = await api.createProgramAsync(roots, engineCompilerOptions)
 
     const emitted: Record<string, string> = {}
     const sourceFiles = prog.getSourceFiles().filter(sf => sf.fileName.endsWith('.syn'))
@@ -452,6 +452,13 @@ async function emitEngine(roots: string[]): Promise<EngineCacheEntry> {
     return { inputs, emitted }
 }
 
+let launcher = [process.argv[1]]
+
+function hostCommand(command: string, args: string[]): [string, string[]] {
+    if (command !== process.argv[1]) return [command, args]
+    return [launcher[0], [...launcher.slice(1), ...args]]
+}
+
 async function compileEngine(argv: string[]) {
     const files = await fs.promises.readdir(path.resolve('src/engine'), { recursive: true, withFileTypes: true })
 
@@ -477,7 +484,7 @@ async function compileEngine(argv: string[]) {
         __readBytes: (file: string) => new Uint8Array(fs.readFileSync(file)),
         __readDir: (dir: string) => fs.readdirSync(dir),
         __spawnSync: (command: string, args: string[], env: Record<string, string>) => {
-            const exited = spawnSync(command, args, { env, encoding: 'utf8' })
+            const exited = spawnSync(...hostCommand(command, args), { env, encoding: 'utf8' })
             return { status: exited.status, signal: exited.signal, stdout: exited.stdout, stderr: exited.stderr }
         },
     }
@@ -919,7 +926,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     while (true) {
         const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DUMP_FD: '4', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
-        const child = spawn(process.argv[1], process.argv.slice(2), { stdio: ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'], env })
+        const child = spawn(...hostCommand(process.argv[1], process.argv.slice(2)), { stdio: ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'], env })
         const marks: CrashMarks = {}
         const maps: string[] = []
         const dump: Buffer[] = []
@@ -1064,4 +1071,12 @@ export async function main(...args: string[]) {
         }
         await runTestCase(f, { shouldExecute })
     }
+}
+
+if (require.main === module) {
+    launcher = [process.execPath, ...process.execArgv, process.argv[1]]
+    main(...process.argv.slice(2)).catch(err => {
+        console.error(err)
+        process.exitCode = 1
+    })
 }

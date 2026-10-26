@@ -688,7 +688,7 @@ pub const Wrapped = struct {
 
 pub const Function = opaque {
     extern fn napi_create_function(env: *Env, name: [*]const u8, len: usize, cb: *const anyopaque, data: ?*anyopaque, result: **Function) Status;
-    extern fn napi_create_fastcall_function(env: *Env, name: [*]const u8, len: usize, cb: *const anyopaque, fast_cb: *CFunction, data: ?*anyopaque, result: **Function) Status;
+    const CreateFastcallFn = fn (env: *Env, name: [*]const u8, len: usize, cb: *const anyopaque, fast_cb: *CFunction, data: ?*anyopaque, result: **Function) callconv(.C) Status;
 
     extern fn napi_call_function(env: *Env, recv: ?*Value, func: *Function, argc: usize, argv: [*]const *Value, result: **Value) Status;
 
@@ -702,7 +702,8 @@ pub const Function = opaque {
 
     pub fn initFastcall(env: *Env, name: []const u8, cb: *const NativeFn, fast_cb: *CFunction) !*Function {
         var result: *Function = undefined;
-        const status = napi_create_fastcall_function(env, name.ptr, name.len, cb, fast_cb, null, &result);
+        const create = try hostFn(CreateFastcallFn, "napi_create_fastcall_function");
+        const status = create(env, name.ptr, name.len, cb, fast_cb, null, &result);
         try checkStatus(status);
 
         return result;
@@ -732,9 +733,13 @@ pub const Function = opaque {
     }
 
     pub fn initNative3(env: *Env, name: []const u8, code: *const anyopaque) !*Function {
-        const fast = try CFunction.init(&native3_def, code);
         var result: *Function = undefined;
-        const status = napi_create_fastcall_function(env, name.ptr, name.len, &native3Slow, fast, @constCast(code), &result);
+        const create = hostFn(CreateFastcallFn, "napi_create_fastcall_function") catch {
+            try checkStatus(napi_create_function(env, name.ptr, name.len, &native3Slow, @constCast(code), &result));
+            return result;
+        };
+        const fast = try CFunction.init(&native3_def, code);
+        const status = create(env, name.ptr, name.len, &native3Slow, fast, @constCast(code), &result);
         try checkStatus(status);
 
         return result;
@@ -897,11 +902,12 @@ const CFunction = opaque {
         uses_options: bool,
     };
 
-    extern fn napi_create_cfunction(def: *const CFunctionDef, cb: *const anyopaque, result: **CFunction) Status;
+    const CreateFn = fn (def: *const CFunctionDef, cb: *const anyopaque, result: **CFunction) callconv(.C) Status;
 
     pub fn init(def: *const CFunctionDef, cb: *const anyopaque) !*CFunction {
         var result: *CFunction = undefined;
-        const status = napi_create_cfunction(def, cb, &result);
+        const create = try hostFn(CreateFn, "napi_create_cfunction");
+        const status = create(def, cb, &result);
         try checkStatus(status);
 
         return result;
@@ -2459,12 +2465,27 @@ const ValueConverter = struct {
     }
 };
 
-// I should probably expose this apart of the node binary rather than the addon api
-extern fn napi_wait_for_promise(env: *Env, value: *Value, result: **Value) Status;
+extern "c" fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
+extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
+
+fn hostFn(comptime T: type, comptime name: [:0]const u8) error{UnsupportedHostFunction}!*const T {
+    const S = struct {
+        var sym: ?*anyopaque = null;
+        var once = std.once(resolve);
+        fn resolve() void {
+            sym = dlsym(dlopen(null, 1), name);
+        }
+    };
+    S.once.call();
+    return @ptrCast(@alignCast(S.sym orelse return error.UnsupportedHostFunction));
+}
+
+const WaitForPromiseFn = fn (env: *Env, value: *Value, result: **Value) callconv(.C) Status;
 
 pub fn waitForPromise(value: *Value) !*Value {
     var result: *Value = undefined;
-    const status = napi_wait_for_promise(currentEnv, value, &result);
+    const wait = try hostFn(WaitForPromiseFn, "napi_wait_for_promise");
+    const status = wait(currentEnv, value, &result);
     try checkStatus(status);
 
     return result;

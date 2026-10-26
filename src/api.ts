@@ -5890,7 +5890,19 @@ function isExpressionKind(kind: SyntaxKind) {
     }
 }
 
-export function createProgram(rootNames: readonly string[], options: ts.CompilerOptions & { _emitBuffers?: boolean }, host?: ts.CompilerHost, oldProgram?: ts.Program, configFileParsingDiagnostics?: readonly ts.Diagnostic[]): ts.Program {
+type ProgramOptions = ts.CompilerOptions & { _emitBuffers?: boolean }
+
+export function createProgram(rootNames: readonly string[], options: ProgramOptions, host?: ts.CompilerHost, oldProgram?: ts.Program, configFileParsingDiagnostics?: readonly ts.Diagnostic[]): ts.Program {
+    const pending = beginProgram(rootNames, options, host, true)
+    return pending.finish(waitForPromise(pending.handle))
+}
+
+export async function createProgramAsync(rootNames: readonly string[], options: ProgramOptions, host?: ts.CompilerHost): Promise<ts.Program> {
+    const pending = beginProgram(rootNames, options, host, false)
+    return pending.finish(await pending.handle)
+}
+
+function beginProgram(rootNames: readonly string[], options: ProgramOptions, host: ts.CompilerHost | undefined, blocking: boolean) {
     const h = host ?? createCompilerHost(options)
     const hostHandle = (h as any)._handle
     if (!hostHandle) {
@@ -5925,7 +5937,7 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
         }
     })
 
-    const programHandle = waitForPromise(promise)
+    let programHandle: any
 
     function getSourceFileFromHandle(handle: InternalApiSourceFileHandle) {
         if (!handle._sourceFile) {
@@ -6009,12 +6021,7 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
                     err => console.log('emit failed', internal.fileName, err)
                 )
 
-                // XXX: needed for synthetic .d.ts files
-                if (options.declaration) {
-                    waitForPromise(p)
-                } else {
-                    waitForPromise(p)
-                }
+                if (blocking) waitForPromise(p)
             }
         }
 
@@ -6112,18 +6119,24 @@ export function createProgram(rootNames: readonly string[], options: ts.Compiler
     }
 
     return {
-        _handle: programHandle,
-        emit,
-        getSourceFile,
-        getSourceFiles,
-        getTypeChecker,
-        isSourceFileFromExternalLibrary,
-        getCompilerOptions: () => options,
-        getRootFileNames: () => rootNames,
-        getSourceFileByPath,
-        getReifier,
-        getSemanticDiagnostics,
-    } as any
+        handle: promise,
+        finish(handle: any): ts.Program {
+            programHandle = handle
+            return {
+                _handle: programHandle,
+                emit,
+                getSourceFile,
+                getSourceFiles,
+                getTypeChecker,
+                isSourceFileFromExternalLibrary,
+                getCompilerOptions: () => options,
+                getRootFileNames: () => rootNames,
+                getSourceFileByPath,
+                getReifier,
+                getSemanticDiagnostics,
+            } as any
+        },
+    }
 }
 
 export function findAncestor(node: ts.Node, test: (n: ts.Node) => boolean | undefined | 'quit'): ts.Node | undefined {
@@ -6675,7 +6688,7 @@ function createSystem(): ts.System {
             fs.mkdirSync(path, { recursive: true })
         },
         getExecutingFilePath(): string {
-            return path.resolve(path.dirname(import.meta.filename || __filename), 'lib', 'tsc.js')
+            return path.resolve(path.dirname(__filename), 'lib', 'tsc.js')
         },
         getCurrentDirectory(): string {
             return process.cwd()
