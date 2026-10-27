@@ -6,7 +6,7 @@ import * as heap from './heap'
 import { firstNonOrderingSlot, graphLoops, type GraphLoops, NumericOps, OrderedValues, stronglyConnected, tailPositions, tailRoots, type Graph, type GraphNode, typeName } from './lowering2'
 import { countIds, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf, allNodes, countNodes, hasNode, nodeEntries, nodeIds, heapInterior, heapField, heapFieldCount } from './graph-node'
 import type { TraceSession } from './trace2'
-import { dataKeys } from './property-eval'
+import { dataKeys, reducedShape } from './property-eval'
 import * as rt from './rt'
 
 type Handle = intrinsics.Handle
@@ -898,7 +898,7 @@ export interface Instantiation {
 }
 
 export interface ShapeSignature {
-    text: string
+    name: string
     proto: Handle | undefined
     fields: [string, Rep][]
     members: number[]
@@ -906,11 +906,20 @@ export interface ShapeSignature {
     nullish: Set<string>
 }
 
+export enum RepMember {
+    buffer = 1,
+    string = 2,
+    dynamic = 4,
+    function = 8,
+}
+
 export interface Rep {
-    text: string
     kind: 'any' | 'never' | 'undefined' | 'number' | 'pointer' | 'union' | 'buffer'
     format?: IntFormat
-    targets: string[]
+    forms?: string[]
+    members: number
+    shapes: string[]
+    closure?: Handle
     nullable: boolean
     zero?: boolean
     fresh?: boolean
@@ -1220,7 +1229,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         if (known) return known
         const base = elementRep(bufferMembers.get(group) ?? buffers, wideGroups.has(group))
         const words = inlineGroups.get(group)
-        const element = !words ? base : { ...base, text: `rec<${base.targets[0]}>`, inline: words }
+        const element = !words ? base : { ...base, inline: words }
         elements.set(group, element)
         return element
     }
@@ -1228,12 +1237,13 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         const [type, stored] = elementType(members)
         return !!type && stored.length === 1 && stored[0] === 'vm_value' && falsyCollapsible(repOf(type))
     }
-    function elementText(members: number[]): string {
+    function heldElement(members: number[]): Rep {
         const [type, stored] = elementType(members)
-        if (type && stored.length === 1 && stored[0] === 'vm_value') return repOf(type).text
-        return elementRep(members).text
+        if (type && stored.length === 1 && stored[0] === 'vm_value') return repOf(type)
+        return elementRep(members)
     }
     const heldBuffers = new Map<string, Map<string, number[]>>()
+    const laidOut = new Set<string>()
     function layOutShape(id: string): void {
         const sig = shapes.get(id)!
         const held = heldBuffers.get(id)!
@@ -1241,33 +1251,36 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
             const buffers = held.get(k)
             if (!buffers) return [k, field]
             const element = elementOf(buffers)
-            const text = `buf<${element.text}>${field.nullable ? '?' : ''}`
-            intrinsics.assert(field.element === undefined || field.text === text, `value-types: ${id}.${k} was laid out as ${field.text}, its buffers now need ${text}`)
-            return [k, { ...field, text, element }]
+            intrinsics.assert(!laidOut.has(id) || sameRep(field.element!, element), `value-types: ${id}.${k} was laid out as ${repText(field)}, its buffers now need ${repText({ ...field, element })}`)
+            return [k, { ...field, element }]
         })
+        laidOut.add(id)
     }
     const shapes = new Map<string, ShapeSignature>()
     const protoOrders = new Map<Handle, string[]>()
     const shapeIds = new Map<string, string>()
     const shapePending = new Map<string, string>()
     const referenced = new Set<string>()
+    const createdFields = new Map<string, [string, Rep][]>()
     let nextShape = 0
     function elementRep(members: number[], wide = false): Rep {
         const [type, stored] = elementType(members)
-        if (!type) return { text: 'never', kind: 'never', targets: [], nullable: false }
+        if (!type) return { kind: 'never', members: 0, shapes: [], nullable: false }
         if (stored.length === 1 && stored[0] === 'vm_value') {
             const shown = repOf(type)
             const constant = members.some(id => types.objects[id].constant)
             const inner = falsyCollapsible(shown) && !constant && !members.some(id => tagged.has(id)) ? repOf({ ...type, undefined: false }) : shown
             const free = wide && inner.kind === 'number' && !!inner.format && !inner.nullable
             if ((free || rawElement(inner) || elementTagged(inner) || floatUnion(inner)) && !constant) return inner
-            return { ...inner, text: `enc<${inner.text}>`, encoded: true }
+            return { ...inner, encoded: true }
         }
         if (!stored.length) return repOf(type)
-        const text = stored.sort().join('|')
-        if (text === 'f64' || text === 'f32') return { text, kind: 'number', targets: [], nullable: false }
-        if (/^(bool|[ui](8|16|32|64))$/.test(text)) return { text, kind: 'number', format: { bits: text.endsWith('64') ? 64 : 32, signed: false }, targets: [], nullable: false }
-        return { text, kind: 'any', targets: [], nullable: false }
+        const forms = stored.sort()
+        const form = forms.length === 1 ? forms[0] : undefined
+        if (form === 'f64') return { kind: 'number', members: 0, shapes: [], nullable: false }
+        if (form === 'f32') return { kind: 'number', forms, members: 0, shapes: [], nullable: false }
+        if (form !== undefined && /^(bool|[ui](8|16|32|64))$/.test(form)) return { kind: 'number', forms, format: { bits: form.endsWith('64') ? 64 : 32, signed: false }, members: 0, shapes: [], nullable: false }
+        return { kind: 'any', forms, members: 0, shapes: [], nullable: false }
     }
     function shapeId(key: string): string {
         const known = shapeIds.get(key)
@@ -1306,14 +1319,16 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
             if (buffers.length && buffers.length === type.objects.length) {
                 const nullable = type.undefined || type.literals.includes(0)
                 held.push([k, buffers])
-                fields.push([k, { text: `buf<${elementText(buffers)}>${nullable ? '?' : ''}`, kind: 'buffer', targets: [], nullable }])
-            } else fields.push([k, bitValued(type) ? { ...repOf(type), text: 'u1', bit: true } : repOf(type)])
+                fields.push([k, { kind: 'buffer', element: heldElement(buffers), members: 0, shapes: [], nullable }])
+            } else fields.push([k, bitValued(type) ? { ...repOf(type), bit: true } : repOf(type)])
         }
         if (order.length) fields.sort((x, y) => (order.indexOf(x[0]) + 1 || order.length + 1) - (order.indexOf(y[0]) + 1 || order.length + 1))
-        const text = `${object.name}{${fields.map(([k, r]) => `${k}: ${r.text}`).join(', ')}}`
         shapePending.delete(key)
-        let id = referenced.has(reserved) ? undefined : [...shapes].find(([, sig]) => sig.text === text && sig.proto === object.proto)?.[0]
-        if (!id) shapes.set(id = reserved, { text, proto: object.proto, fields, members: [], absent: new Set(), nullish: new Set() })
+        let id = referenced.has(reserved) ? undefined : [...shapes].find(([known, sig]) => sig.name === object.name && sig.proto === object.proto && sameFields(createdFields.get(known)!, fields))?.[0]
+        if (!id) {
+            shapes.set(id = reserved, { name: object.name, proto: object.proto, fields, members: [], absent: new Set(), nullish: new Set() })
+            createdFields.set(id, fields)
+        }
         const sig = shapes.get(id)!
         sig.members.push(...entry.members)
         for (const k of absent) sig.absent.add(k)
@@ -1341,44 +1356,46 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         return rep
     }
     function repFor(type: Type): Rep {
-        if (type.unknown) return { text: 'any', kind: 'any', targets: [], nullable: false }
+        if (type.unknown) return { kind: 'any', members: 0, shapes: [], nullable: false }
         if (type.bools && !boolPartners(type)) {
             const numbered = repOf(boolNumbers(type))
-            return { ...numbered, text: `bool${type.undefined ? '?' : ''}`, bools: type.bools }
+            return { ...numbered, bools: type.bools }
         }
         const numeric = numericType(type)
         const objects = type.objects.filter(id => !types.objects[id].native && !types.objects[id].dynamic)
-        const targets = [...new Set(objects.map(id => raw(id) ? 'buf' : shapeId(keyOf(id))))].sort()
-        if (type.strings.length) targets.push('str')
-        if (type.objects.some(id => types.objects[id].dynamic)) targets.push('heap')
+        const shapes = [...new Set(objects.filter(id => !raw(id)).map(id => shapeId(keyOf(id))))].sort()
+        let members = objects.some(raw) ? RepMember.buffer : 0
+        if (type.strings.length) members |= RepMember.string
+        if (type.objects.some(id => types.objects[id].dynamic)) members |= RepMember.dynamic
         const known = type.functions.length === 1 && type.closures.every(id => functionObject(types, id))
         const nativeIds = [...known ? [] : type.closures, ...type.objects.filter(id => types.objects[id].native)]
         const natives = [...new Set(nativeIds.map(id => types.objects[id].state))]
         const plain = known || (type.functions.length > 0 && !type.closures.length)
         const nativeShapes = !plain ? [...new Set(nativeIds.map(id => shapeId(keyOf(id))))] : []
-        if (natives.length === 1 && natives[0] !== undefined && !plain && !targets.length) targets.push(`clo@${natives[0]}`)
-        else if (nativeShapes.length) targets.push(...nativeShapes.sort())
-        else if (type.functions.length || natives.length) targets.push('fn')
-        if (targets.length && floatType(type)) {
-            for (const target of targets) if (shapeTarget(target)) addressed.add(target)
+        const closure = natives.length === 1 && natives[0] !== undefined && !plain && !shapes.length && !members ? natives[0] : undefined
+        if (closure === undefined && nativeShapes.length) shapes.push(...nativeShapes.sort())
+        else if (closure === undefined && (type.functions.length || natives.length)) members |= RepMember.function
+        const some = shapes.length > 0 || members !== 0 || closure !== undefined
+        if (some && floatType(type)) {
+            for (const shape of shapes) addressed.add(shape)
             const other = repOf({ ...type, literals: [], range: undefined, float: false })
-            return { text: `union<f64|${other.text}>`, kind: 'union', targets, nullable: type.undefined, float: true, other }
+            return { kind: 'union', members, shapes, closure, nullable: type.undefined, float: true, other }
         }
         if (type.bools) {
-            for (const target of targets) if (shapeTarget(target)) addressed.add(target)
-            return { text: `union<${[...targets, 'bool'].join('|')}>`, kind: 'union', targets, nullable: type.undefined, bools: type.bools }
+            for (const shape of shapes) addressed.add(shape)
+            return { kind: 'union', members, shapes, closure, nullable: type.undefined, bools: type.bools }
         }
-        if (!targets.length && numeric) {
+        if (!some && numeric) {
             const format = floatType(type) ? undefined : intFormat(numberSpan(type)!)
-            return { text: `${numberText(format)}${type.undefined ? '?' : ''}`, kind: 'number', format, targets: [], nullable: type.undefined }
+            return { kind: 'number', format, members: 0, shapes: [], nullable: type.undefined }
         }
-        if (!targets.length) return type.undefined ? { text: 'undefined', kind: 'undefined', targets: [], nullable: true, constant: { handle: heap.undefinedHandle } } : { text: 'never', kind: 'never', targets: [], nullable: false }
+        if (!some) return type.undefined ? { kind: 'undefined', members: 0, shapes: [], nullable: true, constant: { handle: heap.undefinedHandle } } : { kind: 'never', members: 0, shapes: [], nullable: false }
         const nulls = nullsOnly(type)
-        const kinds = type.strings.length > 0 && targets.some(shapeTarget)
-        if (numeric || type.undefined || kinds) for (const target of targets) if (shapeTarget(target)) addressed.add(target)
-        if ((numeric || kinds) && !nulls) return { text: `union<${targets.join('|')}>`, kind: 'union', targets, nullable: type.undefined }
+        const kinds = type.strings.length > 0 && shapes.length > 0
+        if (numeric || type.undefined || kinds) for (const shape of shapes) addressed.add(shape)
+        if ((numeric || kinds) && !nulls) return { kind: 'union', members, shapes, closure, nullable: type.undefined }
         const fresh = !nativeIds.length && !type.functions.length && !type.strings.length && objects.length > 0 && objects.every(id => !types.objects[id].constant && !raw(id))
-        return { text: `ptr<${targets.join('|')}>${nulls ? '|0' : type.undefined ? '?' : ''}`, kind: 'pointer', targets, nullable: type.undefined || nulls, zero: nulls || undefined, fresh }
+        return { kind: 'pointer', members, shapes, closure, nullable: type.undefined || nulls, zero: nulls || undefined, fresh }
     }
     for (const key of table.keys()) if (!owners[table.get(key)!.members[0]] && types.objects[table.get(key)!.members[0]].kind !== AllocKind.buffer && !types.objects[table.get(key)!.members[0]].dynamic) shapeId(key)
     const constantShapes = new Map<Handle, string>()
@@ -1406,11 +1423,16 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
     }
     return { keys, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, bufferGroup, collapses, joinBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (owners[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
+interface PlannedSignature {
+    params: { label: string, rep: Rep }[]
+    returns: Rep
+    made: string[]
+}
+
 export interface PlannedUnit {
     fn: Function
     codecs: Map<number, SlotCodec>
     allocations: Map<number, string>
-    signature: string
     frames: number[]
     params: { label: string, rep: Rep }[]
     returns: Rep
@@ -1442,18 +1464,18 @@ function singleValued(types: ValueTypes, type: Type): boolean {
 
 function functionRep(types: ValueTypes, inst: Instantiations, type: Type): Rep | undefined {
     if (!singleValued(types, type) || !type.functions.length) return
-    return { ...inst.repOf(type), text: `fn@${unitIdentity(type.functions[0])}`, constant: { fn: type.functions[0] } }
+    return { ...inst.repOf(type), constant: { fn: type.functions[0] } }
 }
 
 function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject: (state: Handle) => boolean): Rep | undefined {
     if (!singleValued(types, type)) return
     const rep = inst.repOf(type)
-    if (type.strings.length) return { ...rep, text: `${rep.text}@${type.strings[0]}`, constant: { handle: type.strings[0] as Handle } }
-    if (type.bools) return { ...rep, text: type.bools === 2 ? '#true' : '#false', constant: { literal: type.bools === 2 ? 1 : 0 } }
+    if (type.strings.length) return { ...rep, constant: { handle: type.strings[0] as Handle } }
+    if (type.bools) return { ...rep, constant: { literal: type.bools === 2 ? 1 : 0 } }
     const literal = type.literals[0]
-    if (literal !== undefined && !Number.isNaN(literal)) return { ...rep, text: `#${literal}`, constant: { literal } }
+    if (literal !== undefined && !Number.isNaN(literal)) return { ...rep, constant: { literal } }
     const object = type.objects.length ? types.objects[type.objects[0]] : undefined
-    if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, text: `${rep.text}@${object.handle}`, constant: { handle: object.handle } }
+    if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, constant: { handle: object.handle } }
 }
 
 export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, codecOf: (allocation: number, key: string) => SlotCodec } {
@@ -1505,23 +1527,29 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
             list.push(`%${object.site.node}=${shape}`)
         }
     })
-    const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = [], returned = inst.repOf(returns)) => {
+    const signatureOf = (params: { label: string, type: Type }[], returns: Type, allocations: string[] = [], returned = inst.repOf(returns)): PlannedSignature => {
         const reps = params.map(param => ({ label: param.label, rep: functionRep(types, inst, param.type) ?? inst.repOf(param.type) }))
-        const abis = reps.map(param => `${param.label}: ${param.rep.text}`)
-        const made = [...new Set(allocations)].sort()
-        return { params: reps, returns: returned, signature: `(${abis.join(', ')}) -> ${returned.text}${made.length ? ` new ${made.join(' ')}` : ''}` }
+        return { params: reps, returns: returned, made: [...new Set(allocations)].sort() }
+    }
+    const sameSignature = (a: PlannedSignature, b: PlannedSignature) => {
+        if (a.params.length !== b.params.length || a.made.length !== b.made.length || !sameRep(a.returns, b.returns, true)) return false
+        if (a.made.some((made, i) => made !== b.made[i])) return false
+        return a.params.every((param, i) => param.label === b.params[i].label && sameRep(param.rep, b.params[i].rep, true))
     }
     const joinedOf = (members: number[]) => {
         const joined = joinedSignature(members.map(f => types.frames[f]), unionAll)
         return signatureOf(joined.params, joined.returns, created.get(find(members[0])))
     }
     let classOf = new Map<number, number>()
-    const initial = new Map<string, number>()
+    const initial = new Map<string, { signature: PlannedSignature, id: number }[]>()
+    let classCount = 0
     for (const [root, members] of congruent) {
         const tags = [...new Set(members.flatMap(f => [...storage.frames[f]]))].sort((a, b) => a - b)
-        const k = `${unitIdentity(types.frames[root].unit)}|${joinedOf(members).signature.replace(/\bint\b/g, 'i64')}|${tags.join(',')}`
-        if (!initial.has(k)) initial.set(k, initial.size)
-        classOf.set(root, initial.get(k)!)
+        const joined = joinedOf(members)
+        const known = listOf(initial, `${unitIdentity(types.frames[root].unit)}|${tags.join(',')}`)
+        let entry = known.find(other => sameSignature(other.signature, joined))
+        if (!entry) known.push(entry = { signature: joined, id: classCount++ })
+        classOf.set(root, entry.id)
     }
     const calleesOf = new Map<number, [site: string, callee: number][]>()
     for (const [root, members] of congruent) {
@@ -1571,7 +1599,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
-            unitOfRoot.set(root, unit = { fn: frame.unit, codecs: new Map(), allocations: new Map(), signature: '', frames: [], params: [], returns: { text: 'never', kind: 'never', targets: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set() })
+            unitOfRoot.set(root, unit = { fn: frame.unit, codecs: new Map(), allocations: new Map(), frames: [], params: [], returns: { kind: 'never', members: 0, shapes: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), calls: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set() })
             const units = listOf(plan, frame.unit)
             units.push(unit)
         }
@@ -1588,7 +1616,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         }
     })
     const conventionOf = sharedConventions([...unitOfRoot.values()])
-    const truth = { ...inst.repOf({ ...emptyType(), bools: 3 }), text: 'truth', tested: true }
+    const truth = { ...inst.repOf({ ...emptyType(), bools: 3 }), tested: true }
     const testedOf = new Map<PlannedUnit, Set<number>>()
     const resolvedOf = new Map<PlannedUnit, Map<number, Type>>()
     for (const unit of unitOfRoot.values()) {
@@ -1614,14 +1642,13 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const signature = joinedSignature(unit.frames.map(f => types.frames[f]), unionAll)
         const peers = conventionOf.get(unit) ?? [unit]
         const returns = unionAll(peers.flatMap(peer => peer.frames.map(f => types.frames[f].returns)))
-        const joined = signatureOf(signature.params, returns, unit.frames.flatMap(f => created.get(f) ?? []), truthful.has(unit) ? truth : inst.repOf(returns))
+        const joined = signatureOf(signature.params, returns, [], truthful.has(unit) ? truth : inst.repOf(returns))
         unit.returnsSelf = peers.length === 1 && unit.frames.every(f => {
             const r = types.frames[f].returns
             return r.objects.length > 0 && !r.undefined && !r.strings.length && !r.unknown && !numericType(r) && !r.functions.length && !r.closures.length
         }) && returnsSelf(graphOf(unit.fn))
         unit.params = joined.params
         unit.returns = joined.returns
-        unit.signature = joined.signature
     }
     for (const touched of touchedOf.values()) for (const buffers of touched.values()) inst.joinBuffers(buffers)
     const conflicted: [PlannedUnit, number][] = []
@@ -1663,7 +1690,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         for (const unit of unitOfRoot.values()) {
             const nodes = [...new Set(unit.frames.flatMap(f => types.frames[f].accesses.filter(access => !access.field).map(access => access.node)))].sort((a, b) => a - b)
             if (!nodes.length) continue
-            console.log(`ELEMENT-UNIT ${unit.fn.name || '<anon>'}${unit.signature} ${nodes.map(node => `%${node}:${unit.codecs.get(node)?.text ?? '-'}:${unit.nodes.get(node)?.text ?? '-'}`).join(' ')}`)
+            console.log(`ELEMENT-UNIT ${unit.fn.name || '<anon>'}${unitSignatureText(unit)} ${nodes.map(node => `%${node}:${unit.codecs.get(node)?.text ?? '-'}:${repText(unit.nodes.get(node), '-')}`).join(' ')}`)
         }
     }
     return { inst, plan, codecOf: (allocation, key) => slotCodec(inst.elementOf([allocation]), !!storage.tagged.get(allocation)?.has(key)) }
@@ -1824,7 +1851,7 @@ function recordElements(types: ValueTypes, inst: Instantiations, buffers: number
         shape = own
     }
     const sig = inst.shapes.get(shape!)!
-    if (!sig.fields.length || sig.fields.some(([, rep]) => rep.kind !== 'number' || rep.nullable || rep.bit || rep.bools)) return `fields:${sig.text}`
+    if (!sig.fields.length || sig.fields.some(([, rep]) => rep.kind !== 'number' || rep.nullable || rep.bit || rep.bools)) return `fields:${shapeSignatureText(sig)}`
     return { shape: shape!, words: sig.fields.map(([, rep]) => numberName(rep) === 'f64' ? Types.f64 : Types.u64), elements: new Set(element.objects) }
 }
 
@@ -2079,7 +2106,7 @@ function elementUses(types: ValueTypes, units: PlannedUnit[], callers: Map<Plann
             if (!typed(id) || !getNode(g, id)) continue
             const param = g.blocks[0].params.indexOf(id)
             const rep = param >= 0 ? unit.params[param]?.rep : unit.nodes.get(id)
-            if (rep && nodes.get(id)!.objects.some(object => elements.has(object)) && (rep.kind !== 'pointer' || rep.encoded || rep.targets.length !== 1 || rep.targets[0] !== shape)) return `rep:${rep.text}@${name}%${id}`
+            if (rep && nodes.get(id)!.objects.some(object => elements.has(object)) && (rep.kind !== 'pointer' || rep.encoded || memberCount(rep) !== 1 || rep.shapes[0] !== shape)) return `rep:${repText(rep)}@${name}%${id}`
             const why = consumersOf(id, id)
             if (why) return why
         }
@@ -2093,7 +2120,7 @@ function comparedTargets(g: Graph, repAt: (node: number) => Rep | undefined): st
         if (n.op !== NodeOp.eq && n.op !== NodeOp.ne) continue
         for (let i = 0; i < countIds(n); i++) {
             const rep = getRef(n, i) ? repAt(getRef(n, i)) : undefined
-            if (rep) targets.push(...rep.targets.filter(shapeTarget))
+            if (rep) targets.push(...rep.shapes)
         }
     }
     return targets
@@ -2583,12 +2610,12 @@ function shapeTarget(target: string): boolean {
 }
 
 export function dereferenceableRep(rep: Rep | undefined): boolean {
-    return !!rep && rep.kind === 'pointer' && !rep.nullable && !rep.encoded && rep.targets.length === 1 && shapeTarget(rep.targets[0])
+    return !!rep && rep.kind === 'pointer' && !rep.nullable && !rep.encoded && memberCount(rep) === 1 && rep.shapes.length === 1
 }
 
 function rawElement(element: Rep): boolean {
     if (element.kind === 'number') return (!element.format || element.format.bits === 64) && !element.nullable
-    return element.kind === 'pointer' && element.targets.length > 0 && element.targets.every(shapeTarget) && !element.constant
+    return element.kind === 'pointer' && element.shapes.length > 0 && memberCount(element) === element.shapes.length && !element.constant
 }
 
 export function elementTagged(element: Rep): boolean {
@@ -2625,41 +2652,122 @@ export function elementWidth(element: Rep): number {
 }
 
 export function isStringRep(rep: Rep | undefined): boolean {
-    return rep?.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'str'
+    return rep?.kind === 'pointer' && rep.members === RepMember.string && memberCount(rep) === 1
 }
 
-function movedClass(rep: Rep, param: boolean, reduced: (target: string) => boolean, boxed: boolean): string {
-    if (boxed && isStringRep(rep)) return 'string-word'
-    if (boxed && rep.kind === 'number' && rep.bools) return 'bool-word'
-    if (numberName(rep) === 'int' || (rep.kind === 'undefined' && !param) || isStringRep(rep)) return 'word'
-    if (rep.kind === 'number') return numberText(rep.format)
-    return `${repKey(rep, target => movedTarget(target, reduced))}${rep.fresh ? '!' : ''}`
+export function memberCount(rep: Rep): number {
+    let count = rep.shapes.length
+    if (rep.closure !== undefined) count++
+    let bits = rep.members
+    while (bits) {
+        count += bits & 1
+        bits >>= 1
+    }
+    return count
 }
 
-function movedTarget(target: string, reduced: (target: string) => boolean): string {
-    const kind = shapeTarget(target) ? 'S' : target.startsWith('clo@') ? 'clo' : undefined
-    if (kind === undefined) return target
-    return reduced(target) ? `${kind}R` : kind
+function memberNames(rep: Rep, shape: (id: string) => string, closure: (state: Handle) => string): string[] {
+    const names = rep.shapes.map(shape)
+    if (rep.members & RepMember.buffer) names.push('buf')
+    if (rep.members & RepMember.string) names.push('str')
+    if (rep.members & RepMember.dynamic) names.push('heap')
+    if (rep.closure !== undefined) names.push(closure(rep.closure))
+    if (rep.members & RepMember.function) names.push('fn')
+    return names
 }
 
-export function argumentKey(rep: Rep): string {
-    return repKey(rep.kind === 'pointer' ? { ...rep, nullable: false } : rep, target => target)
+function closureName(state: Handle): string {
+    return `clo@${state}`
 }
 
-function repKey(rep: Rep, target: (target: string) => string): string {
-    const nullable = rep.zero ? '|0' : rep.nullable ? '?' : ''
-    const targets = rep.targets.map(target).join('|')
+export function sameRep(a: Rep, b: Rep, integers = false): boolean {
+    if (a === b) return true
+    if (!!a.encoded !== !!b.encoded || !!a.inline !== !!b.inline || !!a.bit !== !!b.bit || !!a.tested !== !!b.tested) return false
+    if (a.inline) return a.shapes[0] === b.shapes[0]
+    if (a.bit) return true
+    const fn = a.constant?.fn
+    if (fn || b.constant?.fn) return fn === b.constant?.fn
+    if (a.tested) return a.nullable === b.nullable
+    const literal = a.constant?.literal
+    if (literal !== undefined || b.constant?.literal !== undefined) return literal === b.constant?.literal && !!a.bools === !!b.bools && a.nullable === b.nullable
+    if (a.kind !== b.kind) return false
+    if (a.kind !== 'undefined' && a.constant?.handle !== b.constant?.handle) return false
+    if (a.forms || b.forms) return !!a.forms && !!b.forms && a.nullable === b.nullable && a.forms.length === b.forms.length && a.forms.every((form, i) => form === b.forms![i])
+    switch (a.kind) {
+        case 'number': return a.nullable === b.nullable && !!a.bools === !!b.bools && (!!a.bools || (integers ? !a.format === !b.format : numberName(a) === numberName(b)))
+        case 'union': return a.float ? !!b.float && sameRep(a.other!, b.other!, integers) : !b.float && !!a.bools === !!b.bools && sameTargets(a, b)
+        case 'pointer': return a.nullable === b.nullable && !!a.zero === !!b.zero && sameTargets(a, b)
+        case 'buffer': return a.nullable === b.nullable && sameRep(a.element!, b.element!)
+        default: return true
+    }
+}
+
+function sameFields(a: [string, Rep][], b: [string, Rep][]): boolean {
+    return a.length === b.length && a.every(([k, rep], i) => b[i][0] === k && sameRep(rep, b[i][1]))
+}
+
+function sameTargets(a: Rep, b: Rep): boolean {
+    return a.members === b.members && a.closure === b.closure && a.shapes.length === b.shapes.length && a.shapes.every((shape, i) => shape === b.shapes[i])
+}
+
+export function repText(rep: Rep | undefined, missing = 'no rep'): string {
+    if (!rep) return missing
+    if (rep.encoded) return `enc<${repText({ ...rep, encoded: undefined })}>`
+    if (rep.inline) return `rec<${rep.shapes[0]}>`
+    if (rep.bit) return 'u1'
+    if (rep.constant?.fn) return `fn@${rep.constant.fn.name || '<anon>'}`
+    const nullable = rep.nullable ? '?' : ''
+    if (rep.tested) return `truth${nullable}`
+    const literal = rep.constant?.literal
+    if (literal !== undefined) return `${!rep.bools ? `#${literal}` : literal ? '#true' : '#false'}${nullable}`
+    if (rep.constant?.handle !== undefined && rep.kind !== 'undefined') return `${repText({ ...rep, constant: undefined })}@${rep.constant.handle}`
+    if (rep.forms) return `${rep.forms.join('|')}${nullable}`
+    const names = memberNames(rep, id => id, closureName)
+    const targets = names.join('|')
     switch (rep.kind) {
-        case 'number': return `${numberText(rep.format)}${nullable}`
-        case 'pointer': return rep.constant ? rep.text : `ptr<${targets}>${nullable}`
-        case 'union': return `union<${targets}>`
-        case 'buffer': return `buf<${rep.element!.encoded ? `enc<${repKey(rep.element!, target)}>` : repKey(rep.element!, target)}>${nullable}`
-        case 'any': return rep.text
+        case 'number': return `${rep.bools ? 'bool' : numberText(rep.format)}${nullable}`
+        case 'union': return rep.float ? `union<f64|${repText(rep.other!)}>` : `union<${rep.bools ? [...names, 'bool'].join('|') : targets}>`
+        case 'pointer': return `ptr<${targets}>${rep.zero ? '|0' : nullable}`
+        case 'buffer': return `buf<${rep.element ? repText(rep.element) : ''}>${nullable}`
         default: return rep.kind
     }
 }
 
-export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, number> {
+export function shapeSignatureText(sig: ShapeSignature): string {
+    return `${sig.name}{${sig.fields.map(([k, rep]) => `${k}: ${repText(rep)}`).join(', ')}}`
+}
+
+export function unitSignatureText(unit: PlannedUnit): string {
+    const made = [...new Set([...unit.allocations].map(([node, shape]) => `%${node}=${shape}`))].sort()
+    return `(${unit.params.map(param => `${param.label}: ${repText(param.rep)}`).join(', ')}) -> ${repText(unit.returns)}${made.length ? ` new ${made.join(' ')}` : ''}`
+}
+
+function movedClass(rep: Rep, param: boolean, reduced: (shape: string) => boolean, boxed: boolean): string {
+    if (boxed && isStringRep(rep)) return 'string-word'
+    if (boxed && rep.kind === 'number' && rep.bools) return 'bool-word'
+    if (numberName(rep) === 'int' || (rep.kind === 'undefined' && !param) || isStringRep(rep)) return 'word'
+    if (rep.kind === 'number') return numberText(rep.format)
+    return `${repKey(rep, id => reduced(id) ? 'SR' : 'S', state => reducedShape(state) ? 'cloR' : 'clo')}${rep.fresh ? '!' : ''}`
+}
+
+export function argumentKey(rep: Rep): string {
+    return repKey(rep.kind === 'pointer' ? { ...rep, nullable: false } : rep, id => id, closureName)
+}
+
+function repKey(rep: Rep, shape: (id: string) => string, closure: (state: Handle) => string): string {
+    const nullable = rep.zero ? '|0' : rep.nullable ? '?' : ''
+    const targets = memberNames(rep, shape, closure).join('|')
+    switch (rep.kind) {
+        case 'number': return `${numberText(rep.format)}${nullable}`
+        case 'pointer': return !rep.constant ? `ptr<${targets}>${nullable}` : rep.constant.fn ? `fn@${unitIdentity(rep.constant.fn)}` : `ptr<${memberNames(rep, id => id, closureName).join('|')}>${nullable}@${rep.constant.handle}`
+        case 'union': return `union<${targets}>`
+        case 'buffer': return `buf<${rep.element!.encoded ? `enc<${repKey(rep.element!, shape, closure)}>` : repKey(rep.element!, shape, closure)}>${nullable}`
+        case 'any': return rep.forms ? rep.forms.join('|') : 'any'
+        default: return rep.kind
+    }
+}
+
+export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, number> {
     const byNode = <T>(map: Map<number, T>, show: (value: T) => string) => [...map].sort((a, b) => a[0] - b[0]).map(([node, value]) => `%${node}:${show(value)}`).join(' ')
     const units = [...plan.values()].flat()
     const intern = (keyOf: (unit: PlannedUnit) => string): [Map<PlannedUnit, number>, number] => {
@@ -2676,9 +2784,9 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
     const parts = (unit: PlannedUnit) => {
         const g = graphOf(unit.fn)
         const { words: moved, elements } = movesOf(g)
-        const view = (rep: Rep) => `${repKey(rep, target => shapeTarget(target) ? layoutOf(target, elements) : target)}${rep.fresh ? '!' : ''}`
+        const view = (rep: Rep) => `${repKey(rep, id => layoutOf(id, elements), closureName)}${rep.fresh ? '!' : ''}`
         const value = (rep: Rep) => rep.kind === 'number' ? numberText(rep.format) : view(rep)
-        const node = (rep: Rep) => rep.kind === 'pointer' && rep.targets.length === 1 && rep.targets[0] === 'buf' ? 'int' : value(rep)
+        const node = (rep: Rep) => rep.kind === 'pointer' && rep.members === RepMember.buffer && memberCount(rep) === 1 ? 'int' : value(rep)
         const opaque = (rep: Rep, param: boolean) => movedClass(rep, param, reduced, [...unit.codecs.values()].some(codec => codec.word))
         const entry = g.blocks[0].params
         const wide = (id: number) => unit.slices.has(id) && elementWidth(unit.slices.get(id)!) === 8
@@ -2703,7 +2811,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
     return classes
 }
 
-export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (target: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
+export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => string, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => string, graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
     const classes = shareClasses(plan, layoutOf, reduced, sites, abiOf, graphOf)
     const units = [...plan.values()].flat()
     const shared = new Map<PlannedUnit, PlannedUnit>()
