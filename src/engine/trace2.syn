@@ -610,11 +610,72 @@ interface HostWorld {
     memberClasses: Map<bytecode.EmitResult, Function>
     statics: Map<heap.Handle, Function>
     rewrites: heap.Handle[]
+    finalized: Map<bytecode.EmitResult, Finalized[]>
     linkFunction(f: Function): u32
     fromJsValue(v: any): u32
     fillStatic(box: heap.Handle, rebuild: Function): void
     begin(): void
     active: TraceRuntime | undefined
+}
+
+interface Finalized {
+    captures?: any[]
+    globals: any[]
+    fn: u32
+    code: number[]
+}
+
+const lateGlobals = new Map<bytecode.EmitResult, string[]>()
+function lateGlobalsOf(compiled: bytecode.EmitResult): string[] {
+    const known = lateGlobals.get(compiled)
+    if (known) return known
+    const names: string[] = []
+    collectLateGlobals(compiled, names)
+    lateGlobals.set(compiled, names)
+    return names
+}
+
+function collectLateGlobals(compiled: bytecode.EmitResult, names: string[]): void {
+    for (let i = 0; i < compiled.constants.length; i++) {
+        const kind = compiled.constantKinds[i]
+        if (kind === bytecode.ConstantKind.nested_function) collectLateGlobals(compiled.constants[i], names)
+        if (kind !== bytecode.ConstantKind.late_bound) continue
+        const name = compiled.constants[i] as string
+        if (name.startsWith('$') && name[1] !== '$') continue
+        if (!names.includes(name)) names.push(name)
+    }
+    if (compiled.expandos) collectExpandoGlobals(compiled.expandos, names)
+}
+
+function collectExpandoGlobals(expandos: bytecode.Expandos, names: string[]): void {
+    for (const value of expandos.values()) {
+        if (value instanceof Map) {
+            collectExpandoGlobals(value, names)
+            continue
+        }
+        if ('code' in value) {
+            collectLateGlobals(value as bytecode.EmitResult, names)
+            continue
+        }
+        const accessor = value as bytecode.ClassAccessor
+        if (accessor.getter) collectLateGlobals(accessor.getter, names)
+        if (accessor.setter) collectLateGlobals(accessor.setter, names)
+    }
+}
+
+const captureBits = new Float64Array(2)
+const captureWords = new Uint32Array(captureBits.buffer)
+function sameCaptures(a: any[] | undefined, b: any[] | undefined): boolean {
+    if (a === b) return true
+    if (!a || !b || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] === b[i]) continue
+        if (typeof a[i] !== 'number' || typeof b[i] !== 'number') return false
+        captureBits[0] = a[i]
+        captureBits[1] = b[i]
+        if (captureWords[0] !== captureWords[2] || captureWords[1] !== captureWords[3]) return false
+    }
+    return true
 }
 
 const checkHostImage = intrinsics.argv().includes('check-host-image')
@@ -700,6 +761,7 @@ function createHostWorld(): HostWorld {
     const memberClasses = new Map<bytecode.EmitResult, Function>()
     const statics = new Map<heap.Handle, Function>()
     const rewrites: heap.Handle[] = []
+    const finalized = new Map<bytecode.EmitResult, Finalized[]>()
     const states = new Map<any, any[]>()
     const parents = new Map<any, Set<any>>()
     const checked = new Map<any, number>()
@@ -849,7 +911,7 @@ function createHostWorld(): HostWorld {
 
     const world: HostWorld = {
         symbolicDispatch, symbolicJmp, symbolicBranch, symbolicPanic, symbolicProxyGet, symbolicProxySet,
-        intrinsicContext, moduleContext, intrinsicFns, functionStubs, stubFunctions, templates, memberOwners, classMembers, memberClasses, statics, rewrites,
+        intrinsicContext, moduleContext, intrinsicFns, functionStubs, stubFunctions, templates, memberOwners, classMembers, memberClasses, statics, rewrites, finalized,
         linkFunction, fromJsValue, fillStatic, begin, active: undefined,
     }
     for (const value of Object.values(builtinGlobals)) if (typeof value === 'function' && isConstructor(value)) noteMembers(value)
@@ -866,7 +928,6 @@ export function createTraceSession(): TraceSession {
     heap.setStringPrototype(heap.deref(heap.getPrototypeProperty(heap.deref(linkFunction(builtinGlobals.String) as intrinsics.Handle))))
     const compiledSources = new Map<string, CompiledSource>()
     const compiledTemplates = new Map<bytecode.EmitResult, CompiledSource>()
-    const finalizedFunctions = new Map<bytecode.EmitResult, { captures?: any[], fn: u32 }[]>()
     const functionCodes = new Map<Function, FunctionCode>()
     let runtime: TraceRuntime | undefined
     let nodeCache: Map<string, number> | undefined
@@ -939,7 +1000,7 @@ export function createTraceSession(): TraceSession {
         if (!prepared) {
             let emitted = emittedSources.get(code)
             if (!emitted) emittedSources.set(code, emitted = bytecode.compile(code))
-            prepared = prepareSource({ ...emitted, code: emitted.code.slice() })
+            prepared = prepareSource({ ...emitted, code: emitted.code.slice(), origin: emitted })
             native.lruSet(preparedSources, code, prepared, preparedLimit)
         }
         const source = typedCopy(prepared)
@@ -962,7 +1023,7 @@ export function createTraceSession(): TraceSession {
         if (known) return known
         let prepared = native.lruGet(preparedTemplates, template)
         if (!prepared) {
-            prepared = prepareSource({ ...template, code: template.code.slice() })
+            prepared = prepareSource({ ...template, code: template.code.slice(), origin: template.origin ?? template })
             native.lruSet(preparedTemplates, template, prepared, preparedLimit)
         }
         const source = typedCopy(prepared)
@@ -1078,26 +1139,16 @@ export function createTraceSession(): TraceSession {
         return { compiled, codeLen, blocks, captured }
     }
 
-    const captureBits = new Float64Array(2)
-    const captureWords = new Uint32Array(captureBits.buffer)
-    function sameCaptures(a: any[] | undefined, b: any[] | undefined): boolean {
-        if (a === b) return true
-        if (!a || !b || a.length !== b.length) return false
-        for (let i = 0; i < a.length; i++) {
-            if (a[i] === b[i]) continue
-            if (typeof a[i] !== 'number' || typeof b[i] !== 'number') return false
-            captureBits[0] = a[i]
-            captureBits[1] = b[i]
-            if (captureWords[0] !== captureWords[2] || captureWords[1] !== captureWords[3]) return false
-        }
-        return true
-    }
-
     function finalize(compiled: bytecode.EmitResult, captures?: any[]): u32 {
-        let known = finalizedFunctions.get(compiled)
-        if (!known) finalizedFunctions.set(compiled, known = [])
+        const origin = compiled.origin ?? compiled
+        const globals = lateGlobalsOf(origin).map(name => ctx[name])
+        let known = world.finalized.get(origin)
+        if (!known) world.finalized.set(origin, known = [])
         for (const entry of known) {
-            if (sameCaptures(entry.captures, captures)) return entry.fn
+            if (sameCaptures(entry.captures, captures) && sameCaptures(entry.globals, globals)) {
+                refreshCode(entry, compiled.code)
+                return entry.fn
+            }
         }
         traceStats.finalizeMisses++
         const cls = memberClasses.get(compiled)
@@ -1108,9 +1159,21 @@ export function createTraceSession(): TraceSession {
             fromJsValue,
             cls && linkFunction(cls) as intrinsics.Handle,
         )
-        known.push({ captures, fn })
+        known.push({ captures, globals, fn, code: compiled.code })
         noteTemplates(compiled, fn, captures)
         return fn
+    }
+
+    function refreshCode(entry: Finalized, code: number[]): void {
+        const written = entry.code
+        if (written === code) return
+        entry.code = code
+        assert(written.length === code.length, 'trace2: a finalized function changed its code length')
+        const v = heap.FunctionBytecode(heap.resolveHeapCell(heap.functionBytecode(entry.fn as intrinsics.Handle)))
+        const at = heap.resolveHeapCell(v.bytecode)
+        for (let i = 0; i < code.length; i++) {
+            if (written[i] !== code[i]) Intrinsics.store(at, i, code[i], Types.u8)
+        }
     }
 
     function suspendTrace(outer: TraceRuntime): SuspendedTrace {
@@ -1214,7 +1277,6 @@ export function createTraceSession(): TraceSession {
         runtime = undefined
         session.runtime = undefined
         world.active = outerActive
-        finalizedFunctions.clear()
         if (r.suspended) resumeTrace(r.suspended)
     }
 
