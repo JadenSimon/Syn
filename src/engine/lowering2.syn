@@ -1299,6 +1299,124 @@ export function floatValues(g: Graph): Set<number> {
     return floats
 }
 
+function copyWidth(T: Types): number {
+    if (T === Types.u64 || T === Types.i64 || T === Types.usize || T === Types.ptr || T === Types.fnptr) return 8
+    if (T === Types.u32 || T === Types.i32 || T === Types.vm_value) return 4
+    return 0
+}
+
+export function copyValues(g: Graph, floats: Set<number>, crossesCall: (id: number) => boolean): Set<number> {
+    const widths = new Map<number, number>()
+    const candidates = new Set<number>()
+    const entry = new Set(g.blocks[0].params)
+    for (const [id, n] of nodeEntries(g)) {
+        if (floats.has(id) || crossesCall(id)) continue
+        if (n.op === NodeOp.load && copyWidth(typeOf(n))) {
+            candidates.add(id)
+            widths.set(id, copyWidth(typeOf(n)))
+        } else if (n.op === NodeOp.param && !entry.has(id)) {
+            candidates.add(id)
+        }
+    }
+    const accepted = new Set<number>()
+    if (!candidates.size) return accepted
+    const rejected = new Set<number>()
+    const arrivals = new Map<number, number[]>()
+    const arrivesAt = new Map<number, number[]>()
+    const stores: GraphNode[] = []
+    const accesses = new Map<number, GraphNode[]>()
+    const pending: number[] = []
+    function reject(id: number): void {
+        if (!candidates.has(id) || rejected.has(id)) return
+        rejected.add(id)
+        pending.push(id)
+    }
+    for (const [, n] of nodeEntries(g)) {
+        if (n.op === NodeOp.apply) {
+            const block = getBlock(g, getRef(n, 0))
+            if (!block) continue
+            for (let i = 0; i < block.params.length; i++) {
+                const p = block.params[i]
+                const arg = getRef(n, i + 1)
+                if (!candidates.has(p)) {
+                    reject(arg)
+                    continue
+                }
+                const into = arrivals.get(p)
+                if (into) into.push(arg)
+                else arrivals.set(p, [arg])
+                if (!arg) continue
+                const at = arrivesAt.get(arg)
+                if (at) at.push(p)
+                else arrivesAt.set(arg, [p])
+            }
+            continue
+        }
+        if ((n.op === NodeOp.load || n.op === NodeOp.store) && !getRef(n, 2) && !islandLoad(g, n)) {
+            const known = accesses.get(getRef(n, 1))
+            if (known) known.push(n)
+            else accesses.set(getRef(n, 1), [n])
+        }
+        for (let i = firstNonOrderingSlot(n); i < countIds(n); i++) {
+            const ref = getRef(n, i)
+            if (!candidates.has(ref)) continue
+            if (n.op === NodeOp.store && i === 3) stores.push(n)
+            else reject(ref)
+        }
+    }
+    const flowing: number[] = [...widths.keys()]
+    while (flowing.length) {
+        const v = flowing.pop()!
+        const width = widths.get(v)!
+        for (const p of arrivesAt.get(v) ?? []) {
+            const known = widths.get(p)
+            if (known === undefined) {
+                widths.set(p, width)
+                flowing.push(p)
+            } else if (known !== width) {
+                reject(p)
+            }
+        }
+    }
+    for (const id of candidates) {
+        if (!widths.has(id)) reject(id)
+    }
+    for (const [p, args] of arrivals) {
+        for (const arg of args) {
+            if (!candidates.has(arg)) reject(p)
+        }
+    }
+    function pairs(n: GraphNode): boolean {
+        if (getRef(n, 2) || islandLoad(g, n)) return false
+        const width = lowering.accessBytes(typeOf(n))
+        const offset = getLiteral(g, n, 2)
+        for (const m of accesses.get(getRef(n, 1))!) {
+            if (m.op !== n.op || getLiteral(g, m, 1) !== getLiteral(g, n, 1)) continue
+            if (lowering.accessBytes(typeOf(m)) !== width) continue
+            const at = getLiteral(g, m, 2)
+            if (at === offset - width || at === offset + width) return true
+        }
+        return false
+    }
+    for (const n of stores) {
+        const v = getRef(n, 3)
+        if (copyWidth(typeOf(n)) !== widths.get(v) || pairs(n)) reject(v)
+    }
+    for (const id of candidates) {
+        const n = getNode(g, id)!
+        if (n.op === NodeOp.load && pairs(n)) reject(id)
+    }
+    while (pending.length) {
+        const v = pending.pop()!
+        for (const p of arrivesAt.get(v) ?? []) reject(p)
+        for (const arg of arrivals.get(v) ?? []) reject(arg)
+    }
+    for (const id of candidates) {
+        if (!rejected.has(id)) accepted.add(id)
+    }
+    return accepted
+}
+
 const typeDebugFlags = intrinsics.argv().filter(a => a === 'type-debug' || a.startsWith('type-debug:'))
 const typeDebugOn = typeDebugFlags.length > 0
 const typeRecordOn = typeDebugFlags.length > (typeDebugFlags.includes('type-debug:verify') ? 1 : 0)
@@ -16986,6 +17104,18 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         safeCache.set(v, s)
         return s
     }
+    function keepsFloatVolatile(v: number): boolean {
+        const crossed = analysis.crossedCalls.get(v)
+        if (!crossed) return true
+        for (const r of floatPools.active) {
+            if (target.callerSaved.indexOf(r) < 0) continue
+            let kept = true
+            for (const c of crossed) if (clobberOfCall(c).has(r)) kept = false
+            if (kept) return true
+        }
+        return false
+    }
+    if (target.floatRegisterBase !== undefined) for (const id of copyValues(g, floats, v => !keepsFloatVolatile(v))) floats.add(id)
     const inherited = new Set<number>()
     for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.call) for (const r of clobberOfCall(id)) inherited.add(r)
     const needAt = new Map<number, number>()
