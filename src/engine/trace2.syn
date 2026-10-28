@@ -193,6 +193,7 @@ interface TraceRuntime {
     applications: Map<number, number[]>
     startOf?: any
     depth: number
+    suspended: SuspendedTrace | undefined
 }
 
 interface KnownMemory {
@@ -423,7 +424,7 @@ export interface TraceSession {
     reached(fn: Function): boolean
     templateOf(closure: u32): Template | undefined
     finalize(compiled: bytecode.EmitResult, captures?: any[]): u32
-    enterTrace(): TraceRuntime
+    enterTrace(clobber?: boolean): TraceRuntime
     leaveTrace(): void
     constructions: Map<u32, Construction>
     sealed: Set<intrinsics.Handle>
@@ -520,7 +521,28 @@ function createTraceMemory(top: number, window: number) {
             if (low < top) view.fill(0, low - base, window)
             low = top
         },
+        save(): TraceMemoryState {
+            return { low, words: view.slice(low - base) }
+        },
+        restore(state: TraceMemoryState): void {
+            if (low < top) view.fill(0, low - base, window)
+            view.set(state.words, state.low - base)
+            low = state.low
+        },
     }
+}
+
+interface TraceMemoryState {
+    low: number
+    words: Float64Array
+}
+
+interface SuspendedTrace {
+    wrapped: Record<string, any>
+    memory: TraceMemoryState
+    nans: heap.NanCache
+    statics: Map<heap.Handle, f64>
+    rewrites: number
 }
 
 const traceMem = createTraceMemory(intrinsics.heapMaxAddress * 2, 1 << 16)
@@ -1091,8 +1113,33 @@ export function createTraceSession(): TraceSession {
         return fn
     }
 
-    function enterTrace(): TraceRuntime {
+    function suspendTrace(outer: TraceRuntime): SuspendedTrace {
+        const wrapped: Record<string, any> = { ...Intrinsics }
+        Object.assign(Intrinsics, outer.tracer.saved)
+        delete (Intrinsics as any).__traced
+        const boxes = new Map<heap.Handle, f64>()
+        for (const box of statics.keys()) boxes.set(box, heap.unboxF64(box))
+        return { wrapped, memory: traceMem.save(), nans: heap.takeNanCache(), statics: boxes, rewrites: world.rewrites.length }
+    }
+
+    function resumeTrace(suspended: SuspendedTrace): void {
+        const rewrites = world.rewrites
+        let i = rewrites.length - 2
+        while (i >= suspended.rewrites) {
+            heap.FullPropertyDescriptor(heap.resolveHeapCell(rewrites[i])).slot0 = rewrites[i + 1]
+            i -= 2
+        }
+        rewrites.length = suspended.rewrites
+        heap.restoreNanCache(suspended.nans)
+        traceMem.restore(suspended.memory)
+        for (const [box, value] of suspended.statics) heap.setBoxedF64(box, value)
+        Object.assign(Intrinsics, suspended.wrapped)
+        for (const [box, rebuild] of statics) if (!suspended.statics.has(box)) fillStatic(box, rebuild)
+    }
+
+    function enterTrace(clobber = false): TraceRuntime {
         if (!runtime) {
+            const suspended = world.active && !clobber ? suspendTrace(world.active) : undefined
             heap.clearNanCache()
             traceMem.reset()
             nodeCache = new Map()
@@ -1149,6 +1196,7 @@ export function createTraceSession(): TraceSession {
                 memory: new Map(),
                 applications: new Map(),
                 depth: 0,
+                suspended,
             }
             session.runtime = runtime
             outerActive = world.active
@@ -1167,6 +1215,7 @@ export function createTraceSession(): TraceSession {
         session.runtime = undefined
         world.active = outerActive
         finalizedFunctions.clear()
+        if (r.suspended) resumeTrace(r.suspended)
     }
 
     const session: TraceSession = {
@@ -4159,6 +4208,39 @@ export function suite() {
         assert(compiled.capturedMapSet(5) === 0 && compiled.capturedMapHas(5) === 1, 'trace2: a write to a captured Map is not visible to a later native lookup')
     }
     harness.test('testCapturedMapNative', testCapturedMapNative)
+
+    function testNestedTraceSessions() {
+        const table = new Map([[1, 3], [2, 5]])
+        function nestedOuterLookup(key: u32): u32 {
+            return table.get(key) ?? 0
+        }
+        function nestedInnerArith(a: u32, b: u32): u32 {
+            const found = table.get(a) ?? b
+            return found < b ? found + b : found - b
+        }
+        const shape = (g: lowering2.Graph) => lowering2.dumpGraph(g)
+        const control = createTraceSession()
+        control.enterTrace()
+        trace2(nestedOuterLookup, { session: control })
+        const expected = shape(trace2(nestedOuterLookup, { session: control }).graph)
+        control.leaveTrace()
+        const alone = createTraceSession()
+        alone.enterTrace()
+        const innerExpected = shape(trace2(nestedInnerArith, { session: alone }).graph)
+        alone.leaveTrace()
+        const outer = createTraceSession()
+        outer.enterTrace()
+        trace2(nestedOuterLookup, { session: outer })
+        const inner = createTraceSession()
+        inner.enterTrace()
+        const nested = shape(trace2(nestedInnerArith, { session: inner }).graph)
+        inner.leaveTrace()
+        const after = shape(trace2(nestedOuterLookup, { session: outer }).graph)
+        outer.leaveTrace()
+        assert(nested === innerExpected, 'trace2: a trace nested inside a live trace differs from the same trace alone')
+        assert(after === expected, 'trace2: a nested trace changed what the live outer trace produces afterwards')
+    }
+    harness.test('testNestedTraceSessions', testNestedTraceSessions)
 
     {
         function readY(o: { y: u32 }): u32 {
