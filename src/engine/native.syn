@@ -12559,9 +12559,10 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const typerRun: TyperRun = { typed, ms: performance.now() - typerStart }
     const { host, genericOf } = createAccessHost(linker, tracer)
     clock.timed('trace', () => tracer.traceProgramUnits())
-    if (flags.has('spec-candidates')) for (const unit of tracer.units) {
-        const line = specCandidate(unit.fn, unit.traced!.graph)
-        if (line) console.log(line)
+    if (flags.has('spec-candidates')) {
+        const ctx: SpecContext = { functions, graphs: new Map(), predicates: new Map() }
+        for (const unit of tracer.units) if (!ctx.graphs.has(unit.fn)) ctx.graphs.set(unit.fn, unit.traced!.graph)
+        for (const unit of tracer.units) for (const line of specCandidate(ctx, unit.fn, unit.traced!.graph)) console.log(line)
     }
     const accesses = clock.timed('analysis', () => flowAccesses(rootFns, host))
     const valueTypes = clock.timed('analysis', () => analyzeTypes(accesses, host, rootFns))
@@ -12638,14 +12639,61 @@ interface SpecTest {
     kinds: string[]
     arms: number[]
     shared: number
+    fact?: string
+}
+
+interface SpecContext {
+    functions: Function[]
+    graphs: Map<Function, Graph>
+    predicates: Map<Function, string>
 }
 
 const specTestOps = new Set<NodeOp>([NodeOp.eq, NodeOp.ne, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.not, NodeOp.convert, NodeOp.nonzero, NodeOp.select, NodeOp.typeof])
 const specArithOps = new Set<NodeOp>([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.neg, NodeOp.rem, NodeOp.shl, NodeOp.shr, NodeOp.ushr])
+const specLeafOps = new Set<NodeOp>([NodeOp.param, NodeOp.literal, NodeOp.heapHandle, NodeOp.startOf, NodeOp.ret, NodeOp.apply, NodeOp.after, NodeOp.block, NodeOp.localTarget])
 
-function specCandidate(fn: Function, g: Graph): string | undefined {
+function specCallee(ctx: SpecContext, g: Graph, call: GraphNode): Function | undefined {
+    const symbol = localSymbol(g, getNode(g, getRef(call, 1)))
+    return symbol === undefined ? undefined : ctx.functions[symbol]
+}
+
+function predicateBlocker(ctx: SpecContext, fn: Function): string {
+    const known = ctx.predicates.get(fn)
+    if (known !== undefined) return known
+    ctx.predicates.set(fn, 'recursive')
+    const g = ctx.graphs.get(fn)
+    const why = g ? predicateGraphBlocker(ctx, g) : 'no traced graph'
+    ctx.predicates.set(fn, why)
+    return why
+}
+
+function predicateGraphBlocker(ctx: SpecContext, g: Graph): string {
+    for (const n of allNodes(g)) {
+        if (specTestOps.has(n.op) || specArithOps.has(n.op) || specLeafOps.has(n.op)) continue
+        if (n.op === NodeOp.getProp || n.op === NodeOp.get) {
+            const object = getNode(g, getRef(n, 1))
+            if (object?.op === NodeOp.heapHandle || object?.op === NodeOp.static) return 'reads a constant object'
+            continue
+        }
+        if (n.op === NodeOp.rt) {
+            const op = getLiteral(g, n, 1) as rt.Op
+            if (rt.pureOps.has(op) || rt.shallowOps.has(op) || op === rt.Op.instanceof) continue
+            return `rt ${rt.opName(op)}`
+        }
+        if (n.op === NodeOp.call) {
+            const callee = specCallee(ctx, g, n)
+            if (!callee) return 'indirect call'
+            if (predicateBlocker(ctx, callee)) return `calls ${callee.name || '<anon>'}`
+            continue
+        }
+        return opName(n.op)
+    }
+    return ''
+}
+
+function specCandidate(ctx: SpecContext, fn: Function, g: Graph): string[] {
     const entry = g.blocks[0]
-    if (!entry) return
+    if (!entry) return []
     const total = countNodes(g)
     const paramNames = new Map<number, string>()
     entry.params.forEach((p, i) => paramNames.set(p, isThisParam(getNode(g, p)!) ? 'this' : `p${i}`))
@@ -12701,10 +12749,26 @@ function specCandidate(fn: Function, g: Graph): string | undefined {
                 }
                 continue
             }
+            if (n.op === NodeOp.call) {
+                const callee = specCallee(ctx, g, n)
+                const target = getNode(g, getRef(n, 1))
+                const why = callee ? predicateBlocker(ctx, callee) : `indirect ${target ? opName(target.op) : 'literal'}`
+                if (why) {
+                    blocker = `call (${why})`
+                    break
+                }
+                kinds.add(`pred ${callee!.name || '<anon>'}`)
+                let i = 2
+                while (i < countIds(n)) {
+                    work.push(getRef(n, i))
+                    i++
+                }
+                continue
+            }
             if (specArithOps.has(n.op)) kinds.add('arith')
             else if (n.op === NodeOp.typeof) kinds.add('typeof')
             else if (!specTestOps.has(n.op)) {
-                blocker = n.op === NodeOp.call ? 'call' : n.op === NodeOp.load ? 'load' : n.op === NodeOp.inlined ? 'inlined call' : n.op === NodeOp.param ? 'loop or local value' : `op ${n.op}`
+                blocker = n.op === NodeOp.param ? 'loop or local value' : opName(n.op)
                 break
             }
             if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
@@ -12713,7 +12777,7 @@ function specCandidate(fn: Function, g: Graph): string | undefined {
                     const ref = getRef(n, i)
                     const other = ref ? getNode(g, ref) : undefined
                     if (!ref) kinds.add('=== literal')
-                    else if (other?.op === NodeOp.heapHandle && !getRef(other, 0) && (getLiteral(g, other, 0) === 1 || getLiteral(g, other, 0) === 2)) kinds.add('nullish')
+                    else if (isNullishValue(g, ref)) kinds.add('nullish')
                     else if (other?.op === NodeOp.heapHandle) kinds.add('=== constant')
                     i++
                 }
@@ -12726,6 +12790,26 @@ function specCandidate(fn: Function, g: Graph): string | undefined {
         }
         if (!params.size && !blocker) blocker = 'no param'
         return { params: [...params], kinds: [...kinds], blocker }
+    }
+    const constantTest = (cond: number): { text: string, equalArm: number } | undefined => {
+        let at = unwrap(cond)
+        let n = getNode(g, at)
+        let flipped = false
+        while (n?.op === NodeOp.not) {
+            flipped = !flipped
+            at = unwrap(getRef(n, 0))
+            n = getNode(g, at)
+        }
+        if (!n || (n.op !== NodeOp.eq && n.op !== NodeOp.ne) || countIds(n) !== 2) return
+        const sides = [getRef(n, 0), getRef(n, 1)]
+        const k = paramNames.has(unwrap(sides[0])) ? 0 : paramNames.has(unwrap(sides[1])) ? 1 : -1
+        if (k < 0) return
+        const other = sides[1 - k]
+        const node = other ? getNode(g, unwrap(other)) : undefined
+        const value = !other ? `${getLiteral(g, n, 1 - k)}` : isNullishValue(g, other) ? (getLiteral(g, node!, 0) === intrinsics.undefinedHandle ? 'undefined' : 'null') : node?.op === NodeOp.heapHandle && !getRef(node, 0) ? `#${getLiteral(g, node, 0)}` : undefined
+        if (value === undefined) return
+        const equalFirst = (n.op === NodeOp.eq) !== flipped
+        return { text: `${paramNames.get(unwrap(sides[k]))} === ${value}`, equalArm: equalFirst ? 0 : 1 }
     }
     const region = (from: number): Set<number> => {
         const out = new Set<number>()
@@ -12785,18 +12869,27 @@ function specCandidate(fn: Function, g: Graph): string | undefined {
         })
         let shared = 0
         for (const id of arms[0]) if (arms[1].has(id) && !cond.has(id)) shared++
-        tests.push({ depth, params: test.params, kinds: test.kinds, arms: own.map(c => c / total), shared: shared / total })
+        const shares = own.map(c => c / total)
+        const constant = constantTest(getRef(n, 0))
+        let fact: string | undefined
+        if (constant && Math.max(...shares) >= 0.3 && Math.min(...shares) < 0.15) {
+            const equal = constant.equalArm
+            fact = `${constant.text}: equal arm ${Math.round(shares[equal] * 100)}%, other arm ${Math.round(shares[1 - equal] * 100)}%`
+        }
+        tests.push({ depth, params: test.params, kinds: test.kinds, arms: shares, shared: shared / total, fact })
         const next = own[0] >= own[1] ? getRef(n, 1) : getRef(n, 2)
         at = unwrap(next)
         depth++
     }
-    if (!tests.length && !rejected) return
+    if (!tests.length && !rejected) return []
     const split = tests.find(t => total >= 16 && Math.min(...t.arms) >= 0.15)
     const rejoined = tests.length > 0 && Math.max(...tests[0].arms) < 0.15
     const verdict = rejected ? `reject (${rejected})` : split ? 'candidate' : total < 16 ? 'reject (small)' : rejoined ? 'reject (arms rejoin)' : 'reject (guards only)'
     const pct = (x: number) => `${Math.round(x * 100)}%`
     const text = tests.map(t => `d${t.depth} ${t.params.join(',')} ${t.kinds.join('+') || 'test'} arms ${t.arms.map(pct).join('/')} shared ${pct(t.shared)}`).join('; ')
-    return `SPEC ${verdict} ${fn.name || '<anon>'} nodes=${total}${text ? ` ${text}` : ''}`
+    const lines = [`SPEC ${verdict} ${fn.name || '<anon>'} nodes=${total}${text ? ` ${text}` : ''}`]
+    for (const t of tests) if (t.fact) lines.push(`SPEC-FACT ${fn.name || '<anon>'} d${t.depth} ${t.fact}`)
+    return lines
 }
 
 function textHash(text: string): string {
