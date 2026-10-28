@@ -179,6 +179,11 @@ pub const Reifier = struct {
         return try this.allocator.dupeZ(u8, this.out.items);
     }
 
+    pub fn reifyType(this: *@This(), ty: TypeRef) ![:0]u8 {
+        try this.write(ty);
+        return this.finish();
+    }
+
     pub fn reifyExpression(this: *@This(), f: *program.ParsedFileData, node_ref: parser.NodeRef, type_params: parser.NodeRef) ![:0]u8 {
         const ty = try this.analyzer.getType(f, node_ref);
         if (type_params != 0) {

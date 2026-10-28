@@ -2608,6 +2608,7 @@ pub const Program = struct {
             }
 
             fn replaceReifyExpression(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                if (self.replacements.contains(ref)) return;
                 var reifier = Reifier.init(getAllocator(), self.analyzer);
                 const blob = try reifier.reifyExpression(self.file, unwrapRef(n), n.len);
                 const text = try std.fmt.allocPrint(getAllocator(), "Type.__replay({s})", .{blob});
@@ -11328,6 +11329,9 @@ pub const Program = struct {
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
         var factory = parser.Factory{ .nodes = &f.ast.nodes };
         const a = try this.getAnalyzer();
+        var reified_params = ReifiedTypeParams{ .analyzer = a };
+        try reified_params.discover();
+        try reified_params.replaceUses(f, &r);
         var v = Visitor{
             .analyzer = a,
             .file = f,
@@ -11342,6 +11346,7 @@ pub const Program = struct {
         try v.style_visitor.visit(f.ast.nodes.at(start), start);
 
         try v.visit(f.ast.nodes.at(start), start);
+        try reified_params.emit(f, &factory, &r);
 
         if (v.helpers.count() > 0 or v.machine_helpers.count() > 0) {
             const source = f.ast.nodes.at(start);
@@ -12083,6 +12088,285 @@ const ModuleLinkage = struct {
     pub fn addImport(this: *@This(), allocator: std.mem.Allocator, spec: []const u8, module_id: FileRef) !void {
         try this.import_map.put(allocator, getHash(spec), module_id);
         try this.inverse_import_map.put(allocator, module_id, spec);
+    }
+};
+
+const ReifiedTypeParams = struct {
+    const TypeRef = Analyzer.TypeRef;
+    const Function = struct {
+        file: *ParsedFileData,
+        ref: NodeRef,
+        parent: ?usize,
+        params: []const TypeRef = &.{},
+        needed: bool = false,
+    };
+    const Use = struct { file: *ParsedFileData, ref: NodeRef, owner: usize, index: usize };
+    const Call = struct {
+        file: *ParsedFileData,
+        ref: NodeRef,
+        scope: ?usize,
+        owner: ?usize = null,
+        args: []const TypeRef = &.{},
+        resolved: bool = false,
+    };
+
+    analyzer: *Analyzer,
+    functions: std.ArrayListUnmanaged(Function) = .{},
+    uses: std.ArrayListUnmanaged(Use) = .{},
+    calls: std.ArrayListUnmanaged(Call) = .{},
+
+    const helpers =
+        \\function __synTypeCall(types, fn, self) {
+        \\    return (...args) => {
+        \\        const stack = globalThis.__synTypeParams ??= [];
+        \\        stack.push(types);
+        \\        try { return Reflect.apply(fn, self, args); }
+        \\        finally { stack.pop(); }
+        \\    };
+        \\}
+        \\function __synTypeMethod(types, self, key) {
+        \\    return __synTypeCall(types, self[key], self);
+        \\}
+        \\function __synGetTypeParams(id) {
+        \\    const stack = globalThis.__synTypeParams;
+        \\    const types = stack && stack[stack.length - 1];
+        \\    if (!types || types[0] !== id) throw new Error('Missing reified type arguments');
+        \\    return types;
+        \\}
+    ;
+
+    fn discover(self: *@This()) !void {
+        const Scan = struct {
+            state: *ReifiedTypeParams,
+            file: *ParsedFileData,
+            scope: ?usize = null,
+
+            pub fn visit(scan: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
+                const state = scan.state;
+                const prev = scan.scope;
+                defer scan.scope = prev;
+                switch (n.kind) {
+                    .function_declaration, .function_expression, .method_declaration, .arrow_function => {
+                        if (n.extra_data != 0) {
+                            scan.scope = state.functions.items.len;
+                            try state.functions.append(getAllocator(), .{
+                                .file = scan.file,
+                                .ref = ref,
+                                .parent = prev,
+                            });
+                        }
+                    },
+                    .reify_expression => {
+                        if (n.len != 0) return;
+                        const symbol = scan.file.binder.getTypeSymbol(unwrapRef(n)) orelse return;
+                        var scope = scan.scope;
+                        while (scope) |owner| {
+                            const f = &state.functions.items[owner];
+                            var params = NodeIterator.init(&scan.file.ast.nodes, scan.file.ast.nodes.at(f.ref).extra_data);
+                            var index: usize = 0;
+                            while (params.nextRef()) |param| : (index += 1) {
+                                if (scan.file.binder.getTypeSymbol(param) != symbol) continue;
+                                f.needed = true;
+                                try state.uses.append(getAllocator(), .{ .file = scan.file, .ref = ref, .owner = owner, .index = index });
+                                return;
+                            }
+                            scope = f.parent;
+                        }
+                        return;
+                    },
+                    .call_expression => try state.calls.append(getAllocator(), .{ .file = scan.file, .ref = ref, .scope = scan.scope }),
+                    else => {},
+                }
+                try parser.forEachChild(&scan.file.ast.nodes, n, scan);
+            }
+        };
+        var file_index: usize = 0;
+        while (file_index < self.analyzer.program.files.items.len) : (file_index += 1) {
+            const file = self.analyzer.program.files.items[file_index];
+            if (file.is_lib or file.is_declaration) continue;
+            if (!std.mem.endsWith(u8, file.file_name orelse continue, ".syn")) continue;
+            try self.analyzer.program.bindModule(file);
+            var scan = Scan{ .state = self, .file = file };
+            try scan.visit(file.ast.nodes.at(file.ast.start), file.ast.start);
+        }
+        if (self.uses.items.len == 0) return;
+        for (self.functions.items) |*f| {
+            f.params = try self.analyzer.getTypeParams(f.file, f.file.ast.nodes.at(f.ref).extra_data);
+        }
+
+        for (self.calls.items) |*call| {
+            const n = call.file.ast.nodes.at(call.ref);
+            const ty = self.analyzer.getType(call.file, getPackedData(n).left) catch continue;
+            if (self.analyzer.getKindOfRef(ty) != .parameterized) continue;
+            const params = Analyzer.getSlice2(self.analyzer.types.at(ty), TypeRef);
+            if (params.len == 0) continue;
+            for (self.functions.items, 0..) |f, i| {
+                if (f.params[0] != params[0]) continue;
+                call.owner = i;
+                break;
+            }
+        }
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.calls.items) |*call| {
+                const owner = call.owner orelse continue;
+                if (!self.functions.items[owner].needed or call.resolved) continue;
+                const n = call.file.ast.nodes.at(call.ref);
+                const d = getPackedData(n);
+                const ty = try self.analyzer.getType(call.file, d.left);
+                const t = self.analyzer.types.at(ty);
+                var args = std.ArrayListUnmanaged(TypeRef){};
+                if (n.len != 0) {
+                    var it = NodeIterator.init(&call.file.ast.nodes, n.len);
+                    while (it.nextRef()) |arg| try args.append(getAllocator(), try self.analyzer.getType(call.file, arg));
+                    const params = Analyzer.getSlice2(t, TypeRef);
+                    while (args.items.len < params.len) {
+                        try args.append(getAllocator(), self.analyzer.getTypeParamDefault(params[args.items.len]) orelse return error.MissingReifiedTypeArgument);
+                    }
+                } else {
+                    _ = try self.analyzer.inferTypeCallExpParameterizedWithArgs(call.file, t, d.right, &args) orelse return error.CannotInferReifiedTypeArguments;
+                }
+                call.args = args.items;
+                call.resolved = true;
+                for (call.args) |arg| {
+                    if (self.parameterOwner(call.scope, arg)) |p| {
+                        if (!self.functions.items[p[0]].needed) {
+                            self.functions.items[p[0]].needed = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn parameterOwner(self: *@This(), scope: ?usize, ty: TypeRef) ?[2]usize {
+        if (!self.analyzer.isParameterizedRef(ty)) return null;
+        var current = scope;
+        while (current) |owner| {
+            const f = self.functions.items[owner];
+            for (f.params, 0..) |param, i| {
+                if (self.analyzer.types.at(param).slot3 == (ty & ~@intFromEnum(Analyzer.Kind.type_parameter_ref))) return .{ owner, i };
+            }
+            current = f.parent;
+        }
+        return null;
+    }
+
+    fn frameName(self: *@This(), owner: usize) ![]const u8 {
+        const f = self.functions.items[owner];
+        return std.fmt.allocPrint(getAllocator(), "__synTP_{d}_{d}", .{ f.file.id, f.ref });
+    }
+
+    fn text(nodes: *BumpAllocator(AstNode), code: []const u8) !NodeRef {
+        return nodes.push(.{ .kind = .verbatim_node, .data = @intFromPtr(code.ptr), .len = @intCast(code.len) });
+    }
+
+    fn replaceUses(self: *@This(), file: *ParsedFileData, replacements: *std.AutoArrayHashMap(NodeRef, NodeRef)) !void {
+        for (self.uses.items) |use| {
+            if (use.file != file) continue;
+            const code = try std.fmt.allocPrint(getAllocator(), "{s}[{d}]", .{ try self.frameName(use.owner), use.index + 1 });
+            const replacement = try text(&file.ast.nodes, code);
+            file.ast.nodes.at(replacement).next = file.ast.nodes.at(use.ref).next;
+            try replacements.put(use.ref, replacement);
+        }
+    }
+
+    fn prepend(factory: *parser.Factory, replacements: *std.AutoArrayHashMap(NodeRef, NodeRef), original: NodeRef, prefix: NodeRef) !void {
+        const emitted = replacements.get(original) orelse original;
+        const copy = try factory.cloneNodeRef(emitted);
+        factory.nodes.at(prefix).next = copy;
+        try replacements.put(original, prefix);
+    }
+
+    fn emit(self: *@This(), file: *ParsedFileData, factory: *parser.Factory, replacements: *std.AutoArrayHashMap(NodeRef, NodeRef)) !void {
+        var used = false;
+        for (self.functions.items, 0..) |f, owner| {
+            if (f.file != file or !f.needed) continue;
+            used = true;
+            const n = file.ast.nodes.at(f.ref);
+            if (n.hasFlag(.generator)) return error.ReifiedGeneratorNotSupported;
+            const code = try std.fmt.allocPrint(getAllocator(), "const {s} = __synGetTypeParams({d});", .{ try self.frameName(owner), f.params[0] });
+            const capture = try text(&file.ast.nodes, code);
+            const body_ref = if (n.kind == .arrow_function) getPackedData(n).right else n.len;
+            const body = file.ast.nodes.at(replacements.get(body_ref) orelse body_ref);
+            if (body.kind == .block) {
+                var first = parser.maybeUnwrapRef(body) orelse 0;
+                var head = capture;
+                var tail: NodeRef = 0;
+                while (first != 0) {
+                    const stmt = file.ast.nodes.at(first);
+                    if (stmt.kind != .expression_statement or file.ast.nodes.at(unwrapRef(stmt)).kind != .string_literal) break;
+                    const copy = try factory.cloneNodeRef(first);
+                    if (tail != 0) file.ast.nodes.at(tail).next = copy else head = copy;
+                    tail = copy;
+                    first = stmt.next;
+                }
+                if (tail != 0) file.ast.nodes.at(tail).next = capture;
+                file.ast.nodes.at(capture).next = first;
+                const block = try factory.cloneNode(body);
+                file.ast.nodes.at(block).data = head;
+                try replacements.put(body_ref, block);
+            } else {
+                file.ast.nodes.at(capture).next = try factory.createReturnStatement(body_ref);
+                const block = try factory.createBlock(capture);
+                const copy = try factory.cloneNode(n);
+                file.ast.nodes.at(copy).data = parser.toBinaryDataPtrRefs(getPackedData(n).left, block);
+                try replacements.put(f.ref, copy);
+            }
+        }
+        for (self.calls.items) |call| {
+            if (call.file != file or !call.resolved) continue;
+            used = true;
+            const owner = call.owner.?;
+            var descriptors = std.ArrayListUnmanaged(NodeRef){};
+            try descriptors.append(getAllocator(), try factory.createNumericLiteral(self.functions.items[owner].params[0]));
+            for (call.args) |arg| {
+                const code = if (self.parameterOwner(call.scope, arg)) |p|
+                    try std.fmt.allocPrint(getAllocator(), "{s}[{d}]", .{ try self.frameName(p[0]), p[1] + 1 })
+                else blk: {
+                    var reifier = Reifier.init(getAllocator(), self.analyzer);
+                    break :blk try std.fmt.allocPrint(getAllocator(), "Type.__replay({s})", .{try reifier.reifyType(arg)});
+                };
+                try descriptors.append(getAllocator(), try text(&file.ast.nodes, code));
+            }
+            const types = try factory.createArrayLiteralExpression(descriptors.items);
+            const emitted = replacements.get(call.ref) orelse call.ref;
+            const outer = file.ast.nodes.at(emitted);
+            const raw_ref = if (outer.kind == .await_expression) unwrapRef(outer) else emitted;
+            const raw = file.ast.nodes.at(raw_ref);
+            const d = getPackedData(raw);
+            var target = file.ast.nodes.at(d.left);
+            while (target.kind == .parenthesized_expression or target.kind == .non_null_expression or target.kind == .as_expression) {
+                target = file.ast.nodes.at(if (target.kind == .as_expression) getPackedData(target).left else unwrapRef(target));
+            }
+            if (raw.hasFlag(.optional) or target.hasFlag(.optional)) return error.ReifiedOptionalCallNotSupported;
+            const prepare = switch (target.kind) {
+                .property_access_expression, .element_access_expression => blk: {
+                    const member = getPackedData(target);
+                    if (file.ast.nodes.at(member.left).kind == .super_keyword) return error.ReifiedSuperCallNotSupported;
+                    const key = if (target.kind == .element_access_expression) member.right else try factory.createStringLiteral(parser.getSlice(file.ast.nodes.at(member.right), u8));
+                    break :blk try factory.createCallExpression(try factory.createIdentifier("__synTypeMethod"), @as([]const NodeRef, &.{ types, member.left, key }));
+                },
+                else => try factory.createCallExpression(try factory.createIdentifier("__synTypeCall"), @as([]const NodeRef, &.{ types, d.left })),
+            };
+            const wrapped = try factory.cloneNode(raw);
+            file.ast.nodes.at(wrapped).data = parser.toBinaryDataPtrRefs(prepare, d.right);
+            const replacement = if (outer.kind == .await_expression) blk: {
+                const copy = try factory.cloneNode(outer);
+                file.ast.nodes.at(copy).data = wrapped;
+                break :blk copy;
+            } else wrapped;
+            file.ast.nodes.at(replacement).next = file.ast.nodes.at(call.ref).next;
+            try replacements.put(call.ref, replacement);
+        }
+        if (used) {
+            const helper = try text(&file.ast.nodes, helpers);
+            file.ast.nodes.at(helper).extra_data = 1;
+            const first = parser.maybeUnwrapRef(file.ast.nodes.at(file.ast.start)) orelse return;
+            try prepend(factory, replacements, first, helper);
+        }
     }
 };
 
@@ -23765,6 +24049,10 @@ pub const Analyzer = struct {
     }
 
     fn inferTypeCallExpParameterized(this: *@This(), file: *ParsedFileData, n: *const Type, param_start: NodeRef) !?TypeRef {
+        return this.inferTypeCallExpParameterizedWithArgs(file, n, param_start, null);
+    }
+
+    fn inferTypeCallExpParameterizedWithArgs(this: *@This(), file: *ParsedFileData, n: *const Type, param_start: NodeRef, result: ?*std.ArrayListUnmanaged(TypeRef)) !?TypeRef {
         var args = std.ArrayListUnmanaged(TypeRef){};
         defer args.deinit(this.allocator()); // FIXME: tuples may get allocated that ref this!!!
 
@@ -23804,6 +24092,7 @@ pub const Analyzer = struct {
 
         // Type args can be inferred both from the arguments and the expected return type
         const prev_inferred = this.inferred_type_params;
+        defer this.inferred_type_params = prev_inferred;
 
         var should_infer = std.AutoArrayHashMapUnmanaged(u32, TypeRef){};
         defer should_infer.deinit(this.allocator());
@@ -23831,6 +24120,11 @@ pub const Analyzer = struct {
         defer this.follow_parameterized_return_type = save_follow_return_type;
 
         const resolved = try this.resolveWithTypeArgsInferred(n, &inferred);
+        if (result) |out| {
+            for (type_params) |p| {
+                try out.append(this.allocator(), inferred.get(p) orelse this.getTypeParamDefault(p) orelse this.getTypeParamConstraint(p) orelse @intFromEnum(Kind.unknown));
+            }
+        }
 
         return resolved;
     }
