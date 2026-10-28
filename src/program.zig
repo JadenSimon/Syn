@@ -1314,6 +1314,7 @@ pub const Program = struct {
     ambient: Ambient,
 
     analyzer: ?*Analyzer = null,
+    reified_type_params: ?*ReifiedTypeParams = null,
 
     did_load_default_libs: bool = false,
 
@@ -1357,6 +1358,7 @@ pub const Program = struct {
 
     pub fn putFileData(this: *@This(), hash: u64, id: FileRef, parsed: *ParsedFile) !void {
         const items = this.files.items;
+        this.reified_type_params = null;
         const linkage = items[id].linkage;
         items[id].* = ParsedFileData.initFromParsedFile(parsed, linkage);
         items[id].id = id;
@@ -11329,8 +11331,13 @@ pub const Program = struct {
         var r = std.AutoArrayHashMap(NodeRef, NodeRef).init(getAllocator());
         var factory = parser.Factory{ .nodes = &f.ast.nodes };
         const a = try this.getAnalyzer();
-        var reified_params = ReifiedTypeParams{ .analyzer = a };
-        try reified_params.discover();
+        const reified_params = this.reified_type_params orelse blk: {
+            const state = try this.allocator.create(ReifiedTypeParams);
+            state.* = .{ .analyzer = a };
+            try state.discover();
+            this.reified_type_params = state;
+            break :blk state;
+        };
         try reified_params.replaceUses(f, &r);
         var v = Visitor{
             .analyzer = a,
@@ -12110,7 +12117,11 @@ const ReifiedTypeParams = struct {
         resolved: bool = false,
     };
 
+    const Target = struct { file: *ParsedFileData, ref: u32, symbol: bool = false };
+
     analyzer: *Analyzer,
+    targets: std.AutoHashMapUnmanaged(u64, usize) = .{},
+    names: std.AutoHashMapUnmanaged(NodeSymbolHash, std.ArrayListUnmanaged(Target)) = .{},
     functions: std.ArrayListUnmanaged(Function) = .{},
     uses: std.ArrayListUnmanaged(Use) = .{},
     calls: std.ArrayListUnmanaged(Call) = .{},
@@ -12135,6 +12146,63 @@ const ReifiedTypeParams = struct {
         \\}
     ;
 
+    fn nameHash(file: *ParsedFileData, ref: NodeRef) ?NodeSymbolHash {
+        if (ref == 0) return null;
+        const n = file.ast.nodes.at(ref);
+        return switch (n.kind) {
+            .identifier, .string_literal => @truncate(std.hash.Wyhash.hash(0, getSlice(n, u8))),
+            .computed_property_name => nameHash(file, unwrapRef(n)),
+            else => null,
+        };
+    }
+
+    fn addName(self: *@This(), hash: NodeSymbolHash, target: Target) !void {
+        const entry = try self.names.getOrPut(getAllocator(), hash);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        try entry.value_ptr.append(getAllocator(), target);
+    }
+
+    fn candidate(self: *@This(), target: Target, cache: *std.AutoHashMap(u64, bool)) anyerror!bool {
+        if (target.ref == 0 or target.file.is_lib or target.file.is_declaration) return false;
+        const key = (@as(u64, target.file.id) << 33) | (@as(u64, @intFromBool(target.symbol)) << 32) | target.ref;
+        if (cache.get(key)) |known| return known;
+        try cache.put(key, false);
+        const result = try self.candidateInner(target, cache);
+        try cache.put(key, result);
+        return result;
+    }
+
+    fn candidateInner(self: *@This(), target: Target, cache: *std.AutoHashMap(u64, bool)) !bool {
+        const file = target.file;
+        const ref = target.ref;
+        if (target.symbol) {
+            const sym = file.binder.symbols.at(ref);
+            if (sym.hasFlag(.global) or sym.hasFlag(.namespace) or sym.declaration == 0) return false;
+            if (sym.hasFlag(.imported) or (sym.hasFlag(.late_bound) and sym.hasFlag(.local))) {
+                const imported = self.analyzer.program.getFileData(sym.getOrdinal());
+                return self.candidate(.{ .file = imported, .ref = sym.declaration & ~@as(u32, 0b11 << 30), .symbol = sym.declaration >> 30 != 1 }, cache);
+            }
+            if (sym.hasFlag(.late_bound)) return false;
+            return self.candidate(.{ .file = file, .ref = sym.declaration }, cache);
+        }
+        if (self.targets.get((@as(u64, file.id) << 32) | ref)) |owner| return self.functions.items[owner].needed;
+        const n = file.ast.nodes.at(ref);
+        switch (n.kind) {
+            .identifier => return self.candidate(.{ .file = file, .ref = file.binder.getSymbol(ref) orelse return false, .symbol = true }, cache),
+            .variable_declaration, .property_assignment => return self.candidate(.{ .file = file, .ref = getPackedData(n).right }, cache),
+            .parenthesized_expression, .non_null_expression => return self.candidate(.{ .file = file, .ref = unwrapRef(n) }, cache),
+            .as_expression => return self.candidate(.{ .file = file, .ref = getPackedData(n).left }, cache),
+            .property_access_expression, .element_access_expression => {
+                const hash = nameHash(file, getPackedData(n).right) orelse return false;
+                for ((self.names.get(hash) orelse return false).items) |value| {
+                    if (try self.candidate(value, cache)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn discover(self: *@This()) !void {
         const Scan = struct {
             state: *ReifiedTypeParams,
@@ -12154,6 +12222,7 @@ const ReifiedTypeParams = struct {
                                 .ref = ref,
                                 .parent = prev,
                             });
+                            try state.targets.put(getAllocator(), (@as(u64, scan.file.id) << 32) | ref, scan.scope.?);
                         }
                     },
                     .reify_expression => {
@@ -12177,6 +12246,15 @@ const ReifiedTypeParams = struct {
                     .call_expression => try state.calls.append(getAllocator(), .{ .file = scan.file, .ref = ref, .scope = scan.scope }),
                     else => {},
                 }
+                const name = switch (n.kind) {
+                    .function_declaration, .function_expression, .method_declaration, .variable_declaration, .property_assignment => getPackedData(n).left,
+                    .shorthand_property_assignment => unwrapRef(n),
+                    else => 0,
+                };
+                if (nameHash(scan.file, name)) |hash| {
+                    const value = if (n.kind == .shorthand_property_assignment) name else ref;
+                    try state.addName(hash, .{ .file = scan.file, .ref = value });
+                }
                 try parser.forEachChild(&scan.file.ast.nodes, n, scan);
             }
         };
@@ -12188,39 +12266,40 @@ const ReifiedTypeParams = struct {
             try self.analyzer.program.bindModule(file);
             var scan = Scan{ .state = self, .file = file };
             try scan.visit(file.ast.nodes.at(file.ast.start), file.ast.start);
+            var exports = file.binder.exports.symbols.iterator();
+            while (exports.next()) |entry| try self.addName(entry.key_ptr.*, .{ .file = file, .ref = entry.value_ptr.*, .symbol = true });
         }
         if (self.uses.items.len == 0) return;
         for (self.functions.items) |*f| {
-            f.params = try self.analyzer.getTypeParams(f.file, f.file.ast.nodes.at(f.ref).extra_data);
+            if (f.needed) f.params = try self.analyzer.getTypeParams(f.file, f.file.ast.nodes.at(f.ref).extra_data);
         }
-
-        for (self.calls.items) |*call| {
-            const n = call.file.ast.nodes.at(call.ref);
-            const ty = self.analyzer.getType(call.file, getPackedData(n).left) catch continue;
-            if (self.analyzer.getKindOfRef(ty) != .parameterized) continue;
-            const params = Analyzer.getSlice2(self.analyzer.types.at(ty), TypeRef);
-            if (params.len == 0) continue;
-            for (self.functions.items, 0..) |f, i| {
-                if (f.params[0] != params[0]) continue;
-                call.owner = i;
-                break;
-            }
-        }
+        var cache = std.AutoHashMap(u64, bool).init(getAllocator());
+        defer cache.deinit();
         var changed = true;
         while (changed) {
             changed = false;
+            cache.clearRetainingCapacity();
             for (self.calls.items) |*call| {
-                const owner = call.owner orelse continue;
-                if (!self.functions.items[owner].needed or call.resolved) continue;
+                if (call.resolved) continue;
                 const n = call.file.ast.nodes.at(call.ref);
                 const d = getPackedData(n);
+                if (!try self.candidate(.{ .file = call.file, .ref = d.left }, &cache)) continue;
                 const ty = try self.analyzer.getType(call.file, d.left);
+                if (self.analyzer.getKindOfRef(ty) != .parameterized) continue;
                 const t = self.analyzer.types.at(ty);
+                const params = Analyzer.getSlice2(t, TypeRef);
+                if (params.len == 0) continue;
+                for (self.functions.items, 0..) |f, i| {
+                    if (f.needed and f.params[0] == params[0]) {
+                        call.owner = i;
+                        break;
+                    }
+                }
+                _ = call.owner orelse continue;
                 var args = std.ArrayListUnmanaged(TypeRef){};
                 if (n.len != 0) {
                     var it = NodeIterator.init(&call.file.ast.nodes, n.len);
                     while (it.nextRef()) |arg| try args.append(getAllocator(), try self.analyzer.getType(call.file, arg));
-                    const params = Analyzer.getSlice2(t, TypeRef);
                     while (args.items.len < params.len) {
                         try args.append(getAllocator(), self.analyzer.getTypeParamDefault(params[args.items.len]) orelse return error.MissingReifiedTypeArgument);
                     }
@@ -12230,7 +12309,7 @@ const ReifiedTypeParams = struct {
                 call.args = args.items;
                 call.resolved = true;
                 for (call.args) |arg| {
-                    if (self.parameterOwner(call.scope, arg)) |p| {
+                    if (try self.parameterOwner(call.scope, arg)) |p| {
                         if (!self.functions.items[p[0]].needed) {
                             self.functions.items[p[0]].needed = true;
                             changed = true;
@@ -12239,13 +12318,21 @@ const ReifiedTypeParams = struct {
                 }
             }
         }
+        var kept: usize = 0;
+        for (self.calls.items) |call| {
+            if (!call.resolved) continue;
+            self.calls.items[kept] = call;
+            kept += 1;
+        }
+        self.calls.shrinkRetainingCapacity(kept);
     }
 
-    fn parameterOwner(self: *@This(), scope: ?usize, ty: TypeRef) ?[2]usize {
+    fn parameterOwner(self: *@This(), scope: ?usize, ty: TypeRef) !?[2]usize {
         if (!self.analyzer.isParameterizedRef(ty)) return null;
         var current = scope;
         while (current) |owner| {
-            const f = self.functions.items[owner];
+            const f = &self.functions.items[owner];
+            if (f.params.len == 0) f.params = try self.analyzer.getTypeParams(f.file, f.file.ast.nodes.at(f.ref).extra_data);
             for (f.params, 0..) |param, i| {
                 if (self.analyzer.types.at(param).slot3 == (ty & ~@intFromEnum(Analyzer.Kind.type_parameter_ref))) return .{ owner, i };
             }
@@ -12323,7 +12410,7 @@ const ReifiedTypeParams = struct {
             var descriptors = std.ArrayListUnmanaged(NodeRef){};
             try descriptors.append(getAllocator(), try factory.createNumericLiteral(self.functions.items[owner].params[0]));
             for (call.args) |arg| {
-                const code = if (self.parameterOwner(call.scope, arg)) |p|
+                const code = if (try self.parameterOwner(call.scope, arg)) |p|
                     try std.fmt.allocPrint(getAllocator(), "{s}[{d}]", .{ try self.frameName(p[0]), p[1] + 1 })
                 else blk: {
                     var reifier = Reifier.init(getAllocator(), self.analyzer);
