@@ -7,7 +7,7 @@ import { Op as RtOp } from './rt'
 import { firstNonOrderingSlot, type Graph, type GraphNode } from './lowering2'
 import { addNode, countIds, getLiteral, getNode, getOperand, getRef, NodeOp, putNode, regionUp, typeOf, type Operand, type RegionTree, nodeEntries } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
-import { fixedField, fixedState, regionRets, selfOf, usersOf, valueTail, type AccessHost, type PlannedUnit, type Type, type ValueTypes } from './value-types'
+import { constructorOf, cutReadType, emptyType, fixedField, fixedState, inhabited, regionRets, selfOf, usersOf, valueTail, type AccessHost, type Generic, type PlannedUnit, type Type, type ValueTypes } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -551,6 +551,42 @@ function opaqueNode(g: Graph, unit: PlannedUnit, id: number, n: GraphNode, nodes
     return !rt.shallowOps.has(op) && !rt.allocOps.has(op) && !rt.targetWriteOps.has(op) && rt.sliceOf(g, n) === undefined && op !== RtOp.assign
 }
 
+function exposedObjects(types: ValueTypes, host: AccessHost, units: PlannedUnit[], roots: Function[], skip: (fn: Function) => boolean): Set<number> {
+    const exposed: number[] = []
+    const rootSet = new Set(roots)
+    for (const frame of types.frames) {
+        if (!rootSet.has(frame.unit)) continue
+        for (const id of frame.returns.objects) exposed.push(id)
+        for (const id of frame.returns.closures) exposed.push(id)
+    }
+    for (const unit of units) {
+        if (skip(unit.fn)) continue
+        const g = host.graphOf(unit.fn)
+        const nodes = types.resolve(unit.frames).nodes
+        for (const [id, n] of nodeEntries(g)) {
+            if (!opaqueNode(g, unit, id, n, nodes, host)) continue
+            for (let slot = firstNonOrderingSlot(n); slot < countIds(n); slot++) {
+                const type = nodes.get(getRef(n, slot))
+                if (!type) continue
+                for (const o of type.objects) exposed.push(o)
+                for (const o of type.closures) exposed.push(o)
+            }
+        }
+    }
+    const reached = new Set(exposed)
+    while (exposed.length) {
+        const object = types.objects[exposed.pop()!]
+        for (const field of object.fields.values()) {
+            for (const id of field.type.objects.concat(field.type.closures)) {
+                if (reached.has(id)) continue
+                reached.add(id)
+                exposed.push(id)
+            }
+        }
+    }
+    return reached
+}
+
 export function planSmallSets(types: ValueTypes, host: AccessHost, units: Iterable<PlannedUnit>, roots: Function[]): Map<PlannedUnit, Map<number, SetUse>> {
     const out = new Map<PlannedUnit, Map<number, SetUse>>()
     if (intrinsics.argv().includes('no-small-sets')) return out
@@ -579,15 +615,10 @@ export function planSmallSets(types: ValueTypes, host: AccessHost, units: Iterab
     }
     for (const object of rejected) bits.delete(object)
     if (!bits.size) return out
-    const exposed: number[] = []
-    const rootSet = new Set(roots)
-    for (const frame of types.frames) {
-        if (!rootSet.has(frame.unit)) continue
-        for (const id of frame.returns.objects) exposed.push(id)
-        for (const id of frame.returns.closures) exposed.push(id)
-    }
+    const scanned = [...units]
+    const reached = exposedObjects(types, host, scanned, roots, fn => fn === ctor || fn === has)
     const uses: [unit: PlannedUnit, node: number, use: SetUse, objects: number[]][] = []
-    for (const unit of units) {
+    for (const unit of scanned) {
         if (unit.fn === ctor || unit.fn === has) continue
         const g = host.graphOf(unit.fn)
         const nodes = types.resolve(unit.frames).nodes
@@ -598,14 +629,6 @@ export function planSmallSets(types: ValueTypes, host: AccessHost, units: Iterab
         }
         for (const [id, n] of nodeEntries(g)) {
             const opaque = opaqueNode(g, unit, id, n, nodes, host)
-            if (opaque) {
-                for (let slot = firstNonOrderingSlot(n); slot < countIds(n); slot++) {
-                    const type = nodes.get(getRef(n, slot))
-                    if (!type) continue
-                    for (const o of type.objects) exposed.push(o)
-                    for (const o of type.closures) exposed.push(o)
-                }
-            }
             if (!aliases.size || n.op === NodeOp.after || n.op === NodeOp.apply || n.op === NodeOp.select || n.op === NodeOp.ret) continue
             const involved = new Set<number>()
             for (let slot = firstNonOrderingSlot(n); slot < countIds(n); slot++) {
@@ -649,18 +672,6 @@ export function planSmallSets(types: ValueTypes, host: AccessHost, units: Iterab
                 if (!ctors && !lookups) continue
             }
             for (const object of objects) rejected.add(object)
-        }
-    }
-    const exposing = exposed.slice()
-    const reached = new Set(exposed)
-    while (exposing.length) {
-        const object = types.objects[exposing.pop()!]
-        for (const field of object.fields.values()) {
-            for (const id of field.type.objects.concat(field.type.closures)) {
-                if (reached.has(id)) continue
-                reached.add(id)
-                exposing.push(id)
-            }
         }
     }
     for (const object of bits.keys()) {
@@ -733,5 +744,114 @@ export function rewriteSmallSets(g: Graph, uses: Map<number, SetUse>, wordsSlot:
         let bounded: Operand = addNode(g, NodeOp.lt, [value, { literal: length * 32 }], Types.bool)
         if (!base && low < 0) bounded = addNode(g, NodeOp.and, [bounded, addNode(g, NodeOp.ge, [value, { literal: 0 }], Types.bool)], Types.bool)
         putNode(g, id, NodeOp.after, [token, addNode(g, NodeOp.and, [bounded, bit], Types.bool)], T)
+    }
+}
+
+export type MissedLookup = 'false' | 'undefined'
+
+function numbersMeet(a: Type, b: Type): boolean {
+    const numeric = (t: Type) => t.float || t.range !== undefined || t.literals.length > 0
+    if (!numeric(a) || !numeric(b)) return false
+    if (a.float || b.float) return true
+    if (a.range && b.range && a.range[0] <= b.range[1] && b.range[0] <= a.range[1]) return true
+    const inRange = (x: number, t: Type) => t.range !== undefined && Number.isInteger(x) && x >= t.range[0] && x <= t.range[1]
+    for (const x of a.literals) {
+        if (inRange(x, b)) return true
+        if (b.literals.some(y => x === y || (x !== x && y !== y))) return true
+    }
+    for (const y of b.literals) if (inRange(y, a)) return true
+    return false
+}
+
+function stringsMeet(a: Type, b: Type): boolean {
+    if (!a.strings.length || !b.strings.length) return false
+    if (a.strings.includes(0) || b.strings.includes(0)) return true
+    const texts = new Set(a.strings.map(h => heap.stringToJs(h as Handle)))
+    return b.strings.some(h => texts.has(heap.stringToJs(h as Handle)))
+}
+
+function lookupMisses(key: Type, stored: Type): boolean {
+    if (key.unknown || stored.unknown) return false
+    if (key.undefined && stored.undefined) return false
+    if (key.bools & stored.bools) return false
+    if (numbersMeet(key, stored) || stringsMeet(key, stored)) return false
+    const callable = (t: Type) => t.functions.length > 0 || t.closures.length > 0
+    if (callable(key) && (callable(stored) || stored.objects.length)) return false
+    if (callable(stored) && key.objects.length) return false
+    return !key.objects.some(o => stored.objects.includes(o))
+}
+
+export function planMissedLookups(types: ValueTypes, host: AccessHost, units: Iterable<PlannedUnit>, roots: Function[], genericOf: (proto: Handle) => Generic | undefined, taken: Map<PlannedUnit, Map<number, SetUse>>): Map<PlannedUnit, Map<number, MissedLookup>> {
+    const out = new Map<PlannedUnit, Map<number, MissedLookup>>()
+    const set = builtinGlobals.Set
+    const map = builtinGlobals.Map
+    if (!types.frames.some(frame => frame.unit === set || frame.unit === map)) return out
+    const methods = new Map<Function, MissedLookup>([[set.prototype.has, 'false'], [set.prototype.delete, 'false'], [map.prototype.has, 'false'], [map.prototype.get, 'undefined'], [map.prototype.delete, 'false']])
+    const classes = new Map<Handle, boolean>()
+    const builtinClass = (proto: Handle): boolean => {
+        let known = classes.get(proto)
+        if (known === undefined) {
+            const ctor = constructorOf(proto, host)
+            known = ctor === set || ctor === map
+            classes.set(proto, known)
+        }
+        return known
+    }
+    const fieldOf = (objects: number[], key: string): Type | undefined => {
+        const type = cutReadType(types, { ...emptyType(), objects }, [key])
+        return inhabited(type) ? type : undefined
+    }
+    const stored = new Map<number, Type | undefined>()
+    const storedOf = (id: number): Type | undefined => {
+        if (stored.has(id)) return stored.get(id)
+        const object = types.objects[id]
+        const generic = object.proto && !object.constant && builtinClass(object.proto) ? genericOf(object.proto) : undefined
+        const type = generic?.args([id], fieldOf)[0]
+        stored.set(id, type)
+        return type
+    }
+    const scanned = [...units]
+    let exposed: Set<number> | undefined
+    for (const unit of scanned) {
+        const g = host.graphOf(unit.fn)
+        let nodes: Map<number, Type> | undefined
+        for (const [id, targets] of unit.calls) {
+            if (taken.get(unit)?.has(id)) continue
+            let use: MissedLookup | undefined
+            let mixed = false
+            for (const target of targets) {
+                const miss = methods.get(target.fn)
+                if (!miss || (use !== undefined && use !== miss)) mixed = true
+                use = miss
+            }
+            if (mixed || use === undefined) continue
+            const n = getNode(g, id)
+            if (n?.op !== NodeOp.call || countIds(n) !== 4) continue
+            nodes ??= types.resolve(unit.frames).nodes
+            const receiver = nodes.get(getRef(n, 2))
+            if (!receiver || receiver.unknown || receiver.undefined || !receiver.objects.length) continue
+            const key = getRef(n, 3) ? nodes.get(getRef(n, 3)) : { ...emptyType(), literals: [getLiteral(g, n, 3)] }
+            if (!key) continue
+            if (!receiver.objects.every(o => {
+                const within = storedOf(o)
+                return within !== undefined && lookupMisses(key, within)
+            })) continue
+            exposed ??= exposedObjects(types, host, scanned, roots, fn => fn === set || fn === map)
+            if (receiver.objects.some(o => exposed!.has(o))) continue
+            let found = out.get(unit)
+            if (!found) out.set(unit, found = new Map())
+            found.set(id, use)
+        }
+    }
+    return out
+}
+
+export function rewriteMissedLookups(g: Graph, uses: Map<number, MissedLookup>): void {
+    for (const [id, use] of uses) {
+        const n = getNode(g, id)!
+        const T = typeOf(n)
+        const token = getOperand(g, n, 0)
+        const value: Operand = use === 'false' ? { literal: 0 } : addNode(g, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }])
+        putNode(g, id, NodeOp.after, [token, value], T)
     }
 }
