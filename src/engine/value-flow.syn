@@ -2697,10 +2697,22 @@ function originPasses(origin: number, flags: number, proto: number): boolean {
     return true
 }
 
+function unknownKind(flags: number): number {
+    if (flags & GuardFlag.isNumber) return unite(I64, FLOAT)
+    if (flags & GuardFlag.isString) return ANYSTR
+    if (flags & GuardFlag.isBoolean) return BOOL
+    if (flags & (GuardFlag.isUndefined | GuardFlag.nullish)) return UNDEF
+    return UNKNOWN
+}
+
 function filterScalar(t: number, flags: number, lo: number, hi: number, global = false): number {
     let f = scalars.flags[t]
     if ((f & ScalarFlag.unknown) && (flags & GuardFlag.widened)) return unite(I64, FLOAT)
-    if (f & ScalarFlag.unknown) return unite(UNKNOWN, filterScalar(scalar(f & ~ScalarFlag.unknown, scalars.lo[t], scalars.hi[t], scalars.strs[t], scalars.nums[t], scalars.factor[t]), flags, lo, hi, global))
+    if (f & ScalarFlag.unknown) {
+        const known = filterScalar(scalar(f & ~ScalarFlag.unknown, scalars.lo[t], scalars.hi[t], scalars.strs[t], scalars.nums[t], scalars.factor[t]), flags, lo, hi, global)
+        const kind = unknownKind(flags)
+        return unite(known, kind === UNKNOWN ? UNKNOWN : filterScalar(kind, flags, lo, hi, global))
+    }
     if (flags & GuardFlag.hasProto) return NONE
     let tlo = scalars.lo[t]
     let thi = scalars.hi[t]
@@ -4933,6 +4945,7 @@ export interface CutInput {
     base: number
     key: string
     depth: number
+    proto: number
 }
 
 export interface CutScalar {
@@ -5078,18 +5091,18 @@ interface CutRoot {
 
 let cutMemo: Map<Handle, Cut | null> | undefined
 
-function cutInput(kind: CutInputKind, name: string, entry: number, param: number, base: number, key: string, depth: number): number {
+function cutInput(kind: CutInputKind, name: string, entry: number, param: number, base: number, key: string, depth: number, proto = 0): number {
     const inputs = flow.cut!.inputs
-    inputs.push({ kind, name, entry, param, base: base < 0 ? inputs.length : base, key, depth })
+    inputs.push({ kind, name, entry, param, base: base < 0 ? inputs.length : base, key, depth, proto })
     return inputs.length - 1
 }
 
-function seedInput(slot: number, input: number): void {
+function seedInput(slot: number, input: number, proto: Handle = 0 as Handle, scalar = true): void {
     const seed = flow.cut!
     seed.slots.set(slot, input)
-    addConst(slot, UNKNOWN)
+    if (scalar) addConst(slot, UNKNOWN)
     if (seed.inputs[input].depth >= maxReadDepth) return
-    const origin = originOf(OriginKind.created, 0, 0, -(input + 1), undefined)
+    const origin = originOf(OriginKind.created, proto as number, 0, -(input + 1), undefined)
     seed.origins.set(origin, input)
     addOrigin(slot, origin)
 }
@@ -5099,7 +5112,12 @@ function cutField(origin: number, key: number, s: number): void {
     if (parent === undefined) return
     const from = flow.cut!.inputs[parent]
     const label = cutKey(key)
-    seedInput(s, cutInput(CutInputKind.read, `${from.name}${label.startsWith('[') ? '' : '.'}${label}`, from.entry, from.param, parent, label, from.depth + 1))
+    const proto = flow.cut!.proto
+    const own = proto && key > 0 && heap.isPrivateName(key as Handle) && flow.originKind[origin] === OriginKind.created && flow.originCell[origin] === proto
+    const shape = own ? undefined : cutBoundary(origin) && flow.cut!.shapes.get(origin)
+    const shaped = shape !== undefined && (shape.fields.some(f => f.key === label) || shape.cut.entries.some(e => e.label === `get ${label}`))
+    seedInput(s, cutInput(CutInputKind.read, `${from.name}${label.startsWith('[') ? '' : '.'}${label}`, from.entry, from.param, parent, label, from.depth + 1), 0 as Handle, !own && !shaped)
+    if (own) addIn(s, -fieldSlot(originOf(OriginKind.created, proto as number, 0, 0, undefined), key) - 1)
 }
 
 function cutKeyOf(label: string): number {
@@ -5165,12 +5183,44 @@ function cutApplicable(c: Cut, e: number, term: CutTerm): boolean {
     return true
 }
 
+export function cutInstanceField(c: Cut, input: number, classes: (proto: Handle) => Cut | undefined): [Cut, CutTerm] | undefined {
+    const [root, keys] = cutReadChain(c, input)
+    const proto = c.inputs[root].proto
+    if (!proto || keys.length !== 1) return undefined
+    const other = classes(proto as Handle)
+    if (!other) return undefined
+    const field = other.fields.find(f => f.key === keys[0])
+    if (field) return [other, field.term]
+    const getter = other.entries.find(e => e.label === `get ${keys[0]}`)
+    return getter ? [other, getter.ret] : undefined
+}
+
+const materializing: CutTerm[] = []
+
+function refScalar(c: Cut, r: CutRef): number {
+    if (r.filter < 0) return UNKNOWN
+    const filter = c.filters[r.filter]
+    return filterScalar(UNKNOWN, filter.flags, filter.b, filter.sub)
+}
+
+export function cutRefScalar(c: Cut, r: CutRef): CutScalar | undefined {
+    const t = refScalar(c, r)
+    return scalars.flags[t] & ScalarFlag.unknown ? undefined : cutScalar(t)
+}
+
 function cutMaterialize(c: Cut, term: CutTerm, into: number, owner: number, site: number, args: number[] | undefined, link: boolean): void {
     const seed = flow.cut!
     for (const r of term.refs) {
         const input = c.inputs[r.input]
         const p = c.paramOf[r.input]
-        if (p >= 0) {
+        const field = p < 0 ? cutInstanceField(c, r.input, proto => classCut(proto, flow.host) ?? undefined) : undefined
+        if (field) {
+            if (materializing.includes(field[1])) continue
+            materializing.push(field[1])
+            cutMaterialize(field[0], field[1], into, -1, site, undefined, false)
+            materializing.pop()
+        } else if (p >= 0 && owner < 0) addConst(into, UNKNOWN)
+        else if (p >= 0) {
             const slot = cutTypeSlot(owner, p)
             copyEdge(slot, into)
             if (link) copyEdge(into, slot)
@@ -5178,13 +5228,14 @@ function cutMaterialize(c: Cut, term: CutTerm, into: number, owner: number, site
         else if (args && input.kind === CutInputKind.param && input.param >= 0) {
             if (input.param < args.length) copyEdge(args[input.param], into)
             else addConst(into, UNDEF)
-        } else addConst(into, UNKNOWN)
+        } else addConst(into, refScalar(c, r))
     }
     if (term.scalar) addConst(into, scalarOfCut(term.scalar))
     if (term.widened) addConst(into, unite(I64, FLOAT))
     if (term.strings) addConst(into, ANYSTR)
     if (term.opaque) addConst(into, UNKNOWN)
-    if (term.self) addOrigin(into, owner)
+    if (term.self && owner < 0) addConst(into, UNKNOWN)
+    else if (term.self) addOrigin(into, owner)
     for (const fn of term.fns) addOrigin(into, fnOrigin(c.fns[fn]))
     for (const cell of term.statics) addOrigin(into, staticOrigin(c.statics[cell]))
     let id = seed.cuts.indexOf(c)
@@ -5330,9 +5381,12 @@ function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number
     const s = summaryOf(fn)
     const inst = flow.instances[instance(fn, s.hasThis ? recv : 0, -1, -1)]
     flow.rooted.add(inst.id)
+    const rest = flow.host.restOf?.(fn)
     let i = 0
     while (i < s.params) {
-        seedInput(inst.sigs[i], cutInput(CutInputKind.param, `p${i}`, entry, i, -1, '', 0))
+        const packed = rest !== undefined && rest[0] === i
+        const proto = packed ? rest![1] : 0 as Handle
+        seedInput(inst.sigs[i], cutInput(CutInputKind.param, `p${i}`, entry, i, -1, '', 0, proto as number), proto, !packed)
         i++
     }
     if (s.hasThis && !recv) seedInput(paramSlot(inst, -1), cutInput(CutInputKind.param, 'this', entry, -1, -1, '', 0))

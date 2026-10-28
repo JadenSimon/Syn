@@ -46,7 +46,7 @@ import * as typer from './typer'
 import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
-import { analyzeGenerics, classCuts, cutClasses, cutClosure, cutScalarType, type CutTerm, emptyTerm, CutInputKind, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
+import { analyzeGenerics, classCuts, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, type CutTerm, emptyTerm, CutInputKind, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
 import { type AccessHost, type Location, constantIndex, cutArgument, cutCalls, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, memberCount, RepMember, repText, Address, Representation, Storage, representationOf, representationText, sameRepresentation, type BoundaryRepresentation, type ObjectRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
 
@@ -11461,6 +11461,7 @@ function trapStub(space: NodeSpace, name: string, paramCount: number, receiver: 
 
 function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, genericOf: (proto: intrinsics.Handle) => Generic | undefined } {
     const { session, functions, unitOf, originOf, codeOf, closureBody } = linker
+    let arrayProto: intrinsics.Handle | undefined
     const host: AccessHost = {
         session,
         graphOf: fn => tracer.graphsOf(fn).traced!.graph,
@@ -11479,6 +11480,12 @@ function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, g
         bindTarget: (fn, count, spread) => linker.boundTarget(fn, count, spread),
         arityVariants: fn => linker.variantsAllowed(fn),
         identity: fn => linker.identityOf(fn),
+        restOf: fn => {
+            const rest = linker.layoutOfFn(fn).rest
+            if (rest < 0) return undefined
+            arrayProto ??= heap.deref(heap.getPrototypeProperty(heap.deref(session.linkFunction(builtinGlobals.Array) as intrinsics.Handle)))
+            return [rest, arrayProto]
+        },
         freshCells: fn => {
             const traced = tracer.graphsOf(fn).traced!
             const definite: [number, Handle[]][] = []
@@ -11554,8 +11561,11 @@ function extractCuts(functions: Function[]): ProgramCuts {
 }
 
 export function builtinCutText(name: string): string {
-    const ctor = (builtinGlobals as any)[name] as Function
-    for (const cut of extractCuts([ctor]).classes.values()) if (cut.name === name) return cutText(cut)
+    return classCutText((builtinGlobals as any)[name] as Function)
+}
+
+export function classCutText(ctor: Function): string {
+    for (const cut of extractCuts([ctor]).classes.values()) if (cut.name === ctor.name) return cutText(cut)
     return ''
 }
 
@@ -11695,8 +11705,10 @@ function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, loc
     const failed = (why: string): Applied => ({ type: emptyType(), terms: [], bounds: [], failed: why })
     const nothing = (): Applied => ({ type: emptyType(), terms: [], bounds: [], failed: undefined })
     const merge = (a: Applied, b: Applied): Applied => ({ type: cutUnion(a.type, b.type), terms: [...a.terms, ...b.terms], bounds: [...a.bounds, ...b.bounds], failed: a.failed ?? b.failed })
+    const evaluating: CutTerm[] = []
     const termValue = (instance: Bound, term: CutTerm): Applied => {
         const cut = instance.cut
+        const fields: Applied[] = []
         let type = cutScalarType(term.scalar)
         if (term.opaque) return failed(`opaque value in ${cut.name}`)
         if (term.widened) type = cutUnion(type, { ...emptyType(), float: true, range: [-(2 ** 63), 2 ** 63] })
@@ -11707,9 +11719,19 @@ function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, loc
             const p = cut.paramOf[r.input]
             const [root, keys] = cutReadChain(cut, r.input)
             const q = cut.paramOf[root]
+            const field = p < 0 && q < 0 ? cutInstanceField(cut, r.input, proto => cuts.classes.get(proto)) : undefined
+            const bounded = p < 0 && q < 0 && !field ? cutRefScalar(cut, r) : undefined
             if (p >= 0) type = cutUnion(type, instance.args[p])
             else if (q >= 0) type = cutUnion(type, resolveRead(instance.args[q], chain(keys), 0))
-            else return failed(`${cut.name} result depends on ${cut.inputs[r.input].name}`)
+            else if (field && !evaluating.includes(field[1])) {
+                evaluating.push(field[1])
+                const value = termValue({ cut: field[0], args: field[0].params.map(() => ({ ...emptyType(), unknown: true })) }, field[1])
+                evaluating.pop()
+                if (value.failed) return value
+                fields.push(value)
+            } else if (cut.numeric[r.input]) type = cutUnion(type, { ...emptyType(), float: true, range: [-(2 ** 63), 2 ** 63] })
+            else if (bounded) type = cutUnion(type, cutScalarType(bounded))
+            else if (!field) return failed(`${cut.name} result depends on ${cut.inputs[r.input].name}`)
         }
         const plain = term.objects.filter(k => cut.objects[k].proto < 0 && cut.objects[k].kind !== 'closure')
         for (const k of term.objects) {
@@ -11725,7 +11747,9 @@ function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, loc
             }
             bounds.push({ cut: other, args })
         }
-        return { type, terms: plain.length ? [[instance, { ...emptyTerm(), objects: plain }]] : [], bounds, failed: undefined }
+        let out: Applied = { type, terms: plain.length ? [[instance, { ...emptyTerm(), objects: plain }]] : [], bounds, failed: undefined }
+        for (const value of fields) out = merge(out, value)
+        return out
     }
     const callMethod = (receiver: Applied, method: string): Applied => {
         if (receiver.failed) return receiver
