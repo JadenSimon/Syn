@@ -46,7 +46,7 @@ import * as typer from './typer'
 import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
-import { analyzeGenerics, classCuts, cutClasses, cutClosure, CutInputKind, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
+import { analyzeGenerics, classCuts, cutClasses, cutClosure, cutScalarType, type CutTerm, emptyTerm, CutInputKind, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
 import { type AccessHost, type Location, constantIndex, cutArgument, cutCalls, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, memberCount, RepMember, repText, Address, Representation, Storage, representationOf, representationText, sameRepresentation, type BoundaryRepresentation, type ObjectRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
 
@@ -11560,6 +11560,7 @@ interface InstanceCall {
 }
 
 interface ProgramInstance {
+    id: number
     cut: Cut
     args: Type[]
     calls: InstanceCall[]
@@ -11567,6 +11568,20 @@ interface ProgramInstance {
     fed: string | undefined
     stored: Type[]
     reads: [param: number, arg: Type, keys: string[], at: string][]
+    iterated: InstanceCall[]
+}
+
+interface Bound {
+    cut: Cut
+    args: Type[]
+    id?: number
+}
+
+interface Applied {
+    type: Type
+    terms: [Bound, CutTerm][]
+    bounds: Bound[]
+    failed: string | undefined
 }
 
 function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, locations: Location[], print: boolean): void {
@@ -11628,16 +11643,17 @@ function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, loc
         }
         if (!fed && cut.entries.some(entry => entry.label === 'constructor') && !calls.some(call => cut.entries[call.entry].label === 'constructor')) slow.push('constructor not observed')
         const calloutFed = cut.inputs.some((input, i) => cut.paramOf[i] >= 0 && cut.inputs[cutReadChain(cut, i)[0]].kind === CutInputKind.result)
+        const iterated: InstanceCall[] = []
         for (const call of calls) {
             const entry = cut.entries[call.entry]
             const given = call.args.some(a => !['never', 'undefined'].includes(cutTypeText(a, () => 'object')))
-            if (calloutFed && entry.callouts.length && given) slow.push(`callout feeds a type param at .${entry.label} ${call.site.unit.name || '<anon>'}%${call.site.node}`)
+            if (calloutFed && entry.callouts.length && given) iterated.push(call)
         }
         for (const location of locationsOf.get(id) ?? []) {
             const kind = cut.exposed.includes(location.key) ? 'exterior write' : 'write from inlined code'
             for (const writer of location.writers) if (!inCut(cut, writer.unit)) slow.push(`${kind} .${location.key} at ${writer.unit.name || '<anon>'}%${writer.node}`)
         }
-        instances.set(id, { cut, args, calls, slow, fed, stored, reads })
+        instances.set(id, { id, cut, args, calls, slow, fed, stored, reads, iterated })
     })
     let readFed = false
     const resolveRead = (type: Type, keys: string[], depth: number): Type => {
@@ -11669,6 +11685,130 @@ function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, loc
             out = cutUnion(out, resolveRead(field, keys.slice(1), depth + 1))
         }
         return out
+    }
+    const failed = (why: string): Applied => ({ type: emptyType(), terms: [], bounds: [], failed: why })
+    const nothing = (): Applied => ({ type: emptyType(), terms: [], bounds: [], failed: undefined })
+    const merge = (a: Applied, b: Applied): Applied => ({ type: cutUnion(a.type, b.type), terms: [...a.terms, ...b.terms], bounds: [...a.bounds, ...b.bounds], failed: a.failed ?? b.failed })
+    const termValue = (instance: Bound, term: CutTerm): Applied => {
+        const cut = instance.cut
+        let type = cutScalarType(term.scalar)
+        if (term.opaque) return failed(`opaque value in ${cut.name}`)
+        if (term.widened) type = cutUnion(type, { ...emptyType(), float: true, range: [-(2 ** 63), 2 ** 63] })
+        if (term.strings) type = cutUnion(type, { ...emptyType(), strings: [0] })
+        const bounds: Bound[] = term.self && instance.id === undefined ? [instance] : []
+        if (term.self && instance.id !== undefined) type = cutUnion(type, { ...emptyType(), objects: [instance.id] })
+        for (const r of term.refs) {
+            const p = cut.paramOf[r.input]
+            const [root, keys] = cutReadChain(cut, r.input)
+            const q = cut.paramOf[root]
+            if (p >= 0) type = cutUnion(type, instance.args[p])
+            else if (q >= 0) type = cutUnion(type, resolveRead(instance.args[q], chain(keys), 0))
+            else return failed(`${cut.name} result depends on ${cut.inputs[r.input].name}`)
+        }
+        const plain = term.objects.filter(k => cut.objects[k].proto < 0 && cut.objects[k].kind !== 'closure')
+        for (const k of term.objects) {
+            const object = cut.objects[k]
+            if (object.proto < 0) continue
+            const other = cuts.classes.get(cut.protos[object.proto] as intrinsics.Handle)
+            if (!other || object.args.length !== other.params.length) return failed(`${cut.name} returns an unknown ${cut.protoNames[object.proto]}`)
+            const args: Type[] = []
+            for (const arg of object.args) {
+                const value = termValue(instance, arg)
+                if (value.failed) return value
+                args.push(value.terms.length || value.bounds.length ? { ...emptyType(), unknown: true } : value.type)
+            }
+            bounds.push({ cut: other, args })
+        }
+        return { type, terms: plain.length ? [[instance, { ...emptyTerm(), objects: plain }]] : [], bounds, failed: undefined }
+    }
+    const callMethod = (receiver: Applied, method: string): Applied => {
+        if (receiver.failed) return receiver
+        if (receiver.type.unknown || receiver.type.strings.length) return failed(`.${method} on a string or unknown value`)
+        let out = nothing()
+        const bounds: Bound[] = [...receiver.bounds]
+        for (const id of receiver.type.objects) {
+            const instance = instances.get(id)
+            if (!instance) return failed(`.${method} on ${types.objects[id].name}, which has no summary`)
+            if (instance.reads.length || instance.iterated.length) readFed = true
+            bounds.push(instance)
+        }
+        for (const bound of bounds) {
+            const entry = bound.cut.entries.find(e => e.label === method)
+            if (!entry) return failed(`${bound.cut.name} has no entry .${method}`)
+            out = merge(out, termValue(bound, entry.ret))
+        }
+        for (const [instance, term] of receiver.terms) {
+            for (const k of term.objects) {
+                const field = instance.cut.objects[k].fields.find(f => f.key === method)
+                if (!field) return failed(`${instance.cut.name} object without .${method}`)
+                const fns = [...field.term.fns, ...field.term.objects.filter(o => instance.cut.objects[o].kind === 'closure').map(o => instance.cut.objects[o].fn)]
+                if (!fns.length) return failed(`${instance.cut.name} .${method} is not a method`)
+                for (const fn of fns) {
+                    const entry = instance.cut.entries.find(e => e.fn === fn)
+                    if (!entry) return failed(`${instance.cut.name} method .${method} is not an entry`)
+                    out = merge(out, termValue(instance, entry.ret))
+                }
+            }
+        }
+        return out
+    }
+    const readKey = (value: Applied, key: string): Applied => {
+        if (value.failed) return value
+        if (value.bounds.length) return failed(`reads .${key} of a summary instance`)
+        const out0 = nothing()
+        if (value.type.objects.length) out0.type = resolveRead(value.type, [key], 0)
+        let out = out0
+        for (const [instance, term] of value.terms) {
+            for (const k of term.objects) {
+                const field = instance.cut.objects[k].fields.find(f => f.key === key)
+                if (field) out = merge(out, termValue(instance, field.term))
+            }
+        }
+        return out
+    }
+    const iterate = (instance: ProgramInstance, call: InstanceCall): string | undefined => {
+        const cut = instance.cut
+        const entry = cut.entries[call.entry]
+        const results = new Map<number, Applied>()
+        const valueOf = (term: CutTerm): Applied => {
+            let out = nothing()
+            for (const r of term.refs) {
+                const input = cut.inputs[r.input]
+                if (input.kind === CutInputKind.param && input.entry === call.entry && input.param >= 0) out = merge(out, { ...nothing(), type: call.args[input.param] ?? { ...emptyType(), undefined: true } })
+                else if (input.kind === CutInputKind.result && results.has(r.input)) out = merge(out, results.get(r.input)!)
+                else return failed(`callout receiver ${input.name}`)
+            }
+            return out
+        }
+        for (const callout of entry.callouts) {
+            if (callout.args.length) return `callout with arguments in .${entry.label}`
+            const callee = callout.callee.refs.map(r => cutReadChain(cut, r.input))
+            if (callee.length !== 1 || callee[0][1].length !== 1) return `unknown callee in .${entry.label}`
+            const result = callMethod(valueOf(callout.recv), callee[0][1][0])
+            results.set(callout.result, result)
+        }
+        for (let i = 0; i < cut.inputs.length; i++) {
+            const p = cut.paramOf[i]
+            if (p < 0) continue
+            const [root, keys] = cutReadChain(cut, i)
+            if (cut.inputs[root].kind !== CutInputKind.result) continue
+            let value = results.get(root)
+            if (!value) return `callout result ${cut.inputs[root].name} not reached`
+            for (const key of keys) value = readKey(value, key)
+            if (value.failed) return value.failed
+            if (value.terms.length || value.bounds.length) return `${cut.inputs[i].name} is an object without a program allocation`
+            instance.args[p] = cutUnion(instance.args[p], value.type)
+        }
+        return undefined
+    }
+    for (const instance of instances.values()) {
+        for (const call of instance.iterated) {
+            readFed = false
+            const why = iterate(instance, call)
+            const at = `.${instance.cut.entries[call.entry].label} ${call.site.unit.name || '<anon>'}%${call.site.node}`
+            if (why) instance.slow.push(`callout feeds a type param at ${at}: ${why}`)
+            else if (readFed) instance.slow.push(`iterates a read-fed instance at ${at}`)
+        }
     }
     for (const instance of instances.values()) {
         for (const [p, arg, keys, at] of instance.reads) {
@@ -12419,6 +12559,10 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const typerRun: TyperRun = { typed, ms: performance.now() - typerStart }
     const { host, genericOf } = createAccessHost(linker, tracer)
     clock.timed('trace', () => tracer.traceProgramUnits())
+    if (flags.has('spec-candidates')) for (const unit of tracer.units) {
+        const line = specCandidate(unit.fn, unit.traced!.graph)
+        if (line) console.log(line)
+    }
     const accesses = clock.timed('analysis', () => flowAccesses(rootFns, host))
     const valueTypes = clock.timed('analysis', () => analyzeTypes(accesses, host, rootFns))
     linker.linkHeldStatics(new Set(valueTypes.frames.filter(frame => frame.heldStatic).map(frame => frame.unit)))
@@ -12486,6 +12630,173 @@ let rootsObserver: ((fns: Record<string, Function>, opts: CreateNativesOptions) 
 
 export function observeRoots(observer: (fns: Record<string, Function>, opts: CreateNativesOptions) => void): void {
     rootsObserver = observer
+}
+
+interface SpecTest {
+    depth: number
+    params: string[]
+    kinds: string[]
+    arms: number[]
+    shared: number
+}
+
+const specTestOps = new Set<NodeOp>([NodeOp.eq, NodeOp.ne, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.not, NodeOp.convert, NodeOp.nonzero, NodeOp.select, NodeOp.typeof])
+const specArithOps = new Set<NodeOp>([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.neg, NodeOp.rem, NodeOp.shl, NodeOp.shr, NodeOp.ushr])
+
+function specCandidate(fn: Function, g: Graph): string | undefined {
+    const entry = g.blocks[0]
+    if (!entry) return
+    const total = countNodes(g)
+    const paramNames = new Map<number, string>()
+    entry.params.forEach((p, i) => paramNames.set(p, isThisParam(getNode(g, p)!) ? 'this' : `p${i}`))
+    const unwrap = (id: number): number => {
+        let at = id
+        let n = getNode(g, at)
+        while (n && n.op === NodeOp.after) {
+            at = getRef(n, countIds(n) - 1)
+            n = getNode(g, at)
+        }
+        return at
+    }
+    const testOf = (cond: number): { params: string[], kinds: string[], blocker: string | undefined } => {
+        const params = new Set<string>()
+        const kinds = new Set<string>()
+        let blocker: string | undefined
+        const work = [cond]
+        const seen = new Set<number>()
+        while (work.length && !blocker) {
+            const id = work.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            const name = paramNames.get(id)
+            if (name) {
+                params.add(name)
+                if (id === cond) kinds.add('truthy param')
+                continue
+            }
+            const n = getNode(g, id)
+            if (!n) continue
+            if (n.op === NodeOp.literal || n.op === NodeOp.heapHandle || n.op === NodeOp.startOf) continue
+            if (n.op === NodeOp.after) {
+                work.push(getRef(n, countIds(n) - 1))
+                continue
+            }
+            if (n.op === NodeOp.getProp || n.op === NodeOp.get) {
+                kinds.add(n.op === NodeOp.getProp ? 'param field' : 'param element')
+                work.push(getRef(n, 1))
+                if (n.op === NodeOp.get) work.push(getRef(n, 2))
+                continue
+            }
+            if (n.op === NodeOp.rt) {
+                const op = getLiteral(g, n, 1) as rt.Op
+                if (!rt.pureOps.has(op) && !rt.shallowOps.has(op) && op !== rt.Op.instanceof) {
+                    blocker = `rt ${rt.opName(op)}`
+                    break
+                }
+                kinds.add(op === rt.Op.hasPrototype || op === rt.Op.instanceof ? 'instanceof' : rt.opName(op))
+                let i = 2
+                while (i < countIds(n)) {
+                    work.push(getRef(n, i))
+                    i++
+                }
+                continue
+            }
+            if (specArithOps.has(n.op)) kinds.add('arith')
+            else if (n.op === NodeOp.typeof) kinds.add('typeof')
+            else if (!specTestOps.has(n.op)) {
+                blocker = n.op === NodeOp.call ? 'call' : n.op === NodeOp.load ? 'load' : n.op === NodeOp.inlined ? 'inlined call' : n.op === NodeOp.param ? 'loop or local value' : `op ${n.op}`
+                break
+            }
+            if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
+                let i = 0
+                while (i < countIds(n)) {
+                    const ref = getRef(n, i)
+                    const other = ref ? getNode(g, ref) : undefined
+                    if (!ref) kinds.add('=== literal')
+                    else if (other?.op === NodeOp.heapHandle && !getRef(other, 0) && (getLiteral(g, other, 0) === 1 || getLiteral(g, other, 0) === 2)) kinds.add('nullish')
+                    else if (other?.op === NodeOp.heapHandle) kinds.add('=== constant')
+                    i++
+                }
+            } else if (n.op === NodeOp.lt || n.op === NodeOp.le || n.op === NodeOp.gt || n.op === NodeOp.ge) kinds.add('compare')
+            let i = 0
+            while (i < countIds(n)) {
+                work.push(getRef(n, i))
+                i++
+            }
+        }
+        if (!params.size && !blocker) blocker = 'no param'
+        return { params: [...params], kinds: [...kinds], blocker }
+    }
+    const region = (from: number): Set<number> => {
+        const out = new Set<number>()
+        const blocks = new Set<number>()
+        const work = [from]
+        while (work.length) {
+            const id = work.pop()!
+            if (!id || out.has(id)) continue
+            const n = getNode(g, id)
+            if (!n) continue
+            out.add(id)
+            if (n.op === NodeOp.apply) {
+                const target = getBlock(g, getRef(n, 0))
+                if (target && !blocks.has(target.id)) {
+                    blocks.add(target.id)
+                    work.push(target.bodyId)
+                }
+            }
+            let i = n.op === NodeOp.apply ? 1 : 0
+            while (i < countIds(n)) {
+                work.push(getRef(n, i))
+                i++
+            }
+        }
+        return out
+    }
+    const tests: SpecTest[] = []
+    let rejected: string | undefined
+    let at = unwrap(entry.bodyId)
+    let depth = 0
+    while (depth < 4) {
+        let n = getNode(g, at)
+        if (n?.op === NodeOp.apply) {
+            const target = getBlock(g, getRef(n, 0))
+            if (!target) break
+            let i = 0
+            while (i < target.params.length) {
+                const name = paramNames.get(getRef(n, i + 1))
+                if (name) paramNames.set(target.params[i], name)
+                i++
+            }
+            at = unwrap(target.bodyId)
+            n = getNode(g, at)
+        }
+        if (!n || n.op !== NodeOp.select) break
+        const test = testOf(getRef(n, 0))
+        if (test.blocker) {
+            if (!tests.length) rejected = `entry test reads ${test.blocker}`
+            break
+        }
+        const cond = region(getRef(n, 0))
+        const arms = [region(getRef(n, 1)), region(getRef(n, 2))]
+        const own = arms.map((arm, k) => {
+            let count = 0
+            for (const id of arm) if (!arms[1 - k].has(id) && !cond.has(id)) count++
+            return count
+        })
+        let shared = 0
+        for (const id of arms[0]) if (arms[1].has(id) && !cond.has(id)) shared++
+        tests.push({ depth, params: test.params, kinds: test.kinds, arms: own.map(c => c / total), shared: shared / total })
+        const next = own[0] >= own[1] ? getRef(n, 1) : getRef(n, 2)
+        at = unwrap(next)
+        depth++
+    }
+    if (!tests.length && !rejected) return
+    const split = tests.find(t => total >= 16 && Math.min(...t.arms) >= 0.15)
+    const rejoined = tests.length > 0 && Math.max(...tests[0].arms) < 0.15
+    const verdict = rejected ? `reject (${rejected})` : split ? 'candidate' : total < 16 ? 'reject (small)' : rejoined ? 'reject (arms rejoin)' : 'reject (guards only)'
+    const pct = (x: number) => `${Math.round(x * 100)}%`
+    const text = tests.map(t => `d${t.depth} ${t.params.join(',')} ${t.kinds.join('+') || 'test'} arms ${t.arms.map(pct).join('/')} shared ${pct(t.shared)}`).join('; ')
+    return `SPEC ${verdict} ${fn.name || '<anon>'} nodes=${total}${text ? ` ${text}` : ''}`
 }
 
 function textHash(text: string): string {
