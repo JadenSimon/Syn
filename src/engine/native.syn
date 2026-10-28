@@ -46,8 +46,8 @@ import * as typer from './typer'
 import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { planSmallSets, rewriteSmallSets } from './pg-optimizer'
-import { analyzeGenerics, flowAccesses, rootParamType } from './value-flow'
-import { type AccessHost, type Location, constantIndex, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, memberCount, RepMember, repText, Address, Representation, Storage, representationOf, representationText, sameRepresentation, type BoundaryRepresentation, type ObjectRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { analyzeGenerics, classCuts, cutClasses, cutClosure, CutInputKind, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
+import { type AccessHost, type Location, constantIndex, cutArgument, cutCalls, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, type FrameSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, instantiate, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, planUnits, shareClasses, shareUnits, isStringRep, argumentKey, memberCount, RepMember, repText, Address, Representation, Storage, representationOf, representationText, sameRepresentation, type BoundaryRepresentation, type ObjectRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
 
 type usize = u32
@@ -6039,6 +6039,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         return id
     }
     const templateFunctions = new Map<EmitResult, Function>()
+    const stubSources = new Map<Function, EmitResult>()
     function codeOf(fn: Function): Code | undefined {
         const unit = unitOf(fn)
         if (unit.code) return unit.code
@@ -6052,6 +6053,7 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         if (known) return known
         const fn = namedStub(template.compiled.name || `${name}/closure`)
         templateFunctions.set(template.compiled, fn)
+        stubSources.set(fn, template.compiled)
         unitOf(fn).code = {
             input: template.compiled, captures: template.captures,
             source: session.compileTemplate(template.compiled), scope: template.compiled.scopeBindings,
@@ -6364,10 +6366,11 @@ function createLinker(fns: Record<string, Function>, opts: CreateNativesOptions,
         intrinsics.assert(typeof fn === 'function')
         roots.set(name, intern(fn))
     }
-    intrinsics.assert(roots.size > 0)
+    intrinsics.assert(roots.size > 0 || fns === cutWorldRoots)
     for (const fn of Object.values(fns)) discover(fn)
     for (const fn of Object.values(fns)) schedule(fn)
-    return { session, functions, roots, order, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, layoutOfFn, variantsAllowed, variantOf, boundTarget, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, linkHeldStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
+    const identityOf = (fn: Function): unknown => stubSources.get(fn) ?? fn
+    return { session, functions, roots, order, identityOf, discovered, staticFns, unitOf, originOf, intern, constructsOutOfLine, codeOf, layoutOfFn, variantsAllowed, variantOf, boundTarget, closureBody, closureFunction, functionOfCell, discover, schedule, link, linkRuntimeCalls, linkStatics, linkHeldStatics, staticOrder, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, functionSlot, resolveHandles }
 }
 
 type Linker = ReturnType<typeof createLinker>
@@ -11474,6 +11477,8 @@ function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, g
         receiverless: fn => Array.isArray((fn as any).__args),
         paramCount: fn => codeOf(fn)?.source.compiled.paramCount,
         bindTarget: (fn, count, spread) => linker.boundTarget(fn, count, spread),
+        arityVariants: fn => linker.variantsAllowed(fn),
+        identity: fn => linker.identityOf(fn),
         freshCells: fn => {
             const traced = tracer.graphsOf(fn).traced!
             const definite: [number, Handle[]][] = []
@@ -11495,6 +11500,230 @@ function createAccessHost(linker: Linker, tracer: Tracer): { host: AccessHost, g
 }
 
 type Resolver = ReturnType<typeof createResolver>
+interface ProgramCuts {
+    classes: Map<intrinsics.Handle, Cut>
+    picked: Cut | undefined
+    ms: number
+    hits: number
+    misses: number
+    identity: (fn: Function) => unknown
+}
+
+interface CutWorld {
+    session: TraceSession
+    host: AccessHost
+    classes: Map<intrinsics.Handle, Cut | null>
+    picked: Map<string, Cut>
+}
+
+let cutWorld: CutWorld | undefined
+let pendingCuts: (() => void) | undefined
+const cutWorldRoots: Record<string, Function> = {}
+
+function cutWorldOf(): CutWorld {
+    if (cutWorld) return cutWorld
+    const image = createImage()
+    const clock = createClock(hostTarget)
+    const linker = createLinker(cutWorldRoots, {}, image, clock)
+    const tracer = createTracer(linker, image, new Map(), clock)
+    const { host } = createAccessHost(linker, tracer)
+    cutWorld = { session: linker.session, host, classes: new Map(), picked: new Map() }
+    return cutWorld
+}
+
+function extractCuts(functions: Function[]): ProgramCuts {
+    const start = performance.now()
+    const world = cutWorldOf()
+    const host = world.host
+    const protos = cutClasses(functions, host)
+    const missing = protos.filter(proto => !world.classes.has(proto))
+    const wanted = intrinsics.argv().filter(a => a.startsWith('cut-fn:')).flatMap(a => a.slice('cut-fn:'.length).split(','))
+    const picked = [...new Set(functions.filter(fn => fn && wanted.includes(fn.name) && host.traceable(fn)))]
+    const name = picked.map(fn => fn.name).join('+')
+    let pickedCut = picked.length ? world.picked.get(name) : undefined
+    if (missing.length || picked.length && !pickedCut) {
+        world.session.enterTrace()
+        defer finally {
+            world.session.leaveTrace()
+        }
+        classCuts(missing, host, world.classes)
+        if (picked.length && !pickedCut) world.picked.set(name, pickedCut = fnCut(name, picked, host, cutClosure(protos, world.classes)))
+    }
+    const classes = cutClosure(protos, world.classes)
+    return { classes, picked: pickedCut, ms: performance.now() - start, hits: protos.length - missing.length, misses: missing.length, identity: fn => host.identity!(fn) }
+}
+
+interface InstanceCall {
+    entry: number
+    args: Type[]
+    site: Site
+}
+
+interface ProgramInstance {
+    cut: Cut
+    args: Type[]
+    calls: InstanceCall[]
+    slow: string[]
+    fed: string | undefined
+    stored: Type[]
+    reads: [param: number, arg: Type, keys: string[], at: string][]
+}
+
+function programCuts(cuts: ProgramCuts, types: ValueTypes, host: AccessHost, locations: Location[], print: boolean): void {
+    const start = performance.now()
+    const cutOf = (object: ObjectType) => object.proto && !object.native && !object.dynamic && object.kind !== AllocKind.buffer && object.frames?.length !== 0 ? cuts.classes.get(object.proto) : undefined
+    const instances = new Map<number, ProgramInstance>()
+    const positions = new Map<Cut, string[][][]>()
+    const chain = (keys: string[]) => keys.map(key => key === '[n]' ? numberKey : key)
+    const key = (fn: Function): unknown => host.identity!(fn)
+    const keysOf = new Map<Cut, Set<unknown>>()
+    const inCut = (cut: Cut, fn: Function): boolean => {
+        let keys = keysOf.get(cut)
+        if (!keys) keysOf.set(cut, keys = new Set(cut.fns.map(cuts.identity)))
+        return keys.has(key(fn))
+    }
+    const entryOf = new Map<unknown, [Cut, number][]>()
+    for (const cut of cuts.classes.values()) cut.entries.forEach((entry, e) => {
+        const fn = cuts.identity(cut.fns[entry.fn])
+        if (!entryOf.has(fn)) entryOf.set(fn, [])
+        entryOf.get(fn)!.push([cut, e])
+    })
+    const callsOf = new Map<number, InstanceCall[]>()
+    for (const call of cutCalls(types, host, fn => entryOf.has(key(fn)))) {
+        for (const id of call.receivers) {
+            const cut = cutOf(types.objects[id])
+            const hit = cut && entryOf.get(key(call.fn))!.find(([c]) => c === cut)
+            if (!hit || inCut(cut, call.site.unit)) continue
+            if (!callsOf.has(id)) callsOf.set(id, [])
+            callsOf.get(id)!.push({ entry: hit[1], args: call.args, site: call.site })
+        }
+    }
+    const locationsOf = new Map<number, Location[]>()
+    for (const location of locations) {
+        if (!locationsOf.has(location.allocation)) locationsOf.set(location.allocation, [])
+        locationsOf.get(location.allocation)!.push(location)
+    }
+    types.objects.forEach((object, id) => {
+        const cut = cutOf(object)
+        if (!cut) return
+        const calls = callsOf.get(id) ?? []
+        if (!positions.has(cut)) positions.set(cut, cutPositions(cut, cuts.classes))
+        const self = { ...emptyType(), objects: [id] }
+        const fed = object.constant ? 'image' : inCut(cut, object.site.unit) ? `created by ${object.site.unit.name}` : undefined
+        const stored = positions.get(cut)!.map(chains => chains.reduce((type, keys) => cutUnion(type, cutReadType(types, self, keys)), emptyType()))
+        const args = fed ? stored : cut.params.map(() => emptyType())
+        const slow: string[] = []
+        const reads: [number, Type, string[], string][] = []
+        for (const call of calls) {
+            cut.inputs.forEach((input, i) => {
+                const p = cut.paramOf[i]
+                if (p < 0 || input.entry !== call.entry) return
+                const [root, keys] = cutReadChain(cut, i)
+                const base = cut.inputs[root]
+                if (base.kind !== CutInputKind.param || base.entry !== call.entry || base.param < 0) return
+                const arg = call.args[base.param] ?? { ...emptyType(), undefined: true }
+                if (keys.length) reads.push([p, arg, chain(keys), `.${cut.entries[call.entry].label} ${call.site.unit.name || '<anon>'}%${call.site.node}`])
+                else args[p] = cutUnion(args[p], arg)
+            })
+        }
+        if (!fed && cut.entries.some(entry => entry.label === 'constructor') && !calls.some(call => cut.entries[call.entry].label === 'constructor')) slow.push('constructor not observed')
+        const calloutFed = cut.inputs.some((input, i) => cut.paramOf[i] >= 0 && cut.inputs[cutReadChain(cut, i)[0]].kind === CutInputKind.result)
+        for (const call of calls) {
+            const entry = cut.entries[call.entry]
+            const given = call.args.some(a => !['never', 'undefined'].includes(cutTypeText(a, () => 'object')))
+            if (calloutFed && entry.callouts.length && given) slow.push(`callout feeds a type param at .${entry.label} ${call.site.unit.name || '<anon>'}%${call.site.node}`)
+        }
+        for (const location of locationsOf.get(id) ?? []) {
+            const kind = cut.exposed.includes(location.key) ? 'exterior write' : 'write from inlined code'
+            for (const writer of location.writers) if (!inCut(cut, writer.unit)) slow.push(`${kind} .${location.key} at ${writer.unit.name || '<anon>'}%${writer.node}`)
+        }
+        instances.set(id, { cut, args, calls, slow, fed, stored, reads })
+    })
+    let readFed = false
+    const resolveRead = (type: Type, keys: string[], depth: number): Type => {
+        if (!keys.length || depth > 8) return type
+        let out = emptyType()
+        for (const id of type.objects) {
+            const instance = instances.get(id)
+            let hit = false
+            if (instance?.reads.length) readFed = true
+            const getter = instance && (keys[0] === numberKey || constantIndex(keys[0])) ? instance.cut.entries.find(entry => entry.label === 'get [index]') : undefined
+            if (instance && getter) {
+                let element = emptyType()
+                for (const r of getter.ret.refs) {
+                    const p = instance.cut.paramOf[r.input]
+                    if (p >= 0) element = cutUnion(element, instance.args[p])
+                }
+                out = cutUnion(out, resolveRead(element, keys.slice(1), depth + 1))
+                continue
+            }
+            if (instance) positions.get(instance.cut)!.forEach((chains, p) => {
+                for (const chain of chains) {
+                    if (chain.length > keys.length || chain.some((key, k) => key !== keys[k])) continue
+                    out = cutUnion(out, resolveRead(instance.args[p], keys.slice(chain.length), depth + 1))
+                    hit = true
+                }
+            })
+            if (hit) continue
+            const field = cutReadType(types, { ...emptyType(), objects: [id] }, keys.slice(0, 1))
+            out = cutUnion(out, resolveRead(field, keys.slice(1), depth + 1))
+        }
+        return out
+    }
+    for (const instance of instances.values()) {
+        for (const [p, arg, keys, at] of instance.reads) {
+            readFed = false
+            const read = resolveRead(arg, keys, 0)
+            if (readFed) instance.slow.push(`read through a read-fed instance ${keys.join('.')} at ${at}`)
+            else if (arg.objects.length && cutTypeText(read, () => 'object') === 'never') instance.slow.push(`unresolved read ${keys.join('.')} at ${at}`)
+            instance.args[p] = cutUnion(instance.args[p], read)
+        }
+    }
+    const ms = performance.now() - start
+    const named = (id: number): string => {
+        const instance = instances.get(id)
+        if (!instance) return types.objects[id].name
+        return `${instance.cut.name}${instance.args.length ? `<${instance.args.map(a => cutTypeText(a, () => '…')).join(', ')}>` : ''}`
+    }
+    let mismatches = 0
+    let fieldFed = 0
+    let wider = 0
+    let slowCount = 0
+    const lines: string[] = []
+    for (const [id, instance] of instances) {
+        const { cut, args, calls, slow, fed, stored } = instance
+        const object = types.objects[id]
+        const fromSites = args.map(a => cutTypeText(a, named))
+        const fromFields = positions.get(cut)!.map(chains => cutArgument(types, [id], chains, named))
+        const differs = !fed && !slow.length && fromSites.join(', ') !== fromFields.join(', ')
+        const missing = differs && stored.some((type, p) => !cutWithin(type, args[p]))
+        if (missing) mismatches++
+        else if (differs) wider++
+        if (slow.length) slowCount++
+        if (fed) fieldFed++
+        if (!print) continue
+        lines.push(`  ${cut.name}${args.length ? `<${fromSites.join(', ')}>` : ''}  #${id} ${object.site.unit.name || '<anon>'}%${object.site.node}${fed ? `   FROM FIELDS (${fed})` : ''}${differs ? `   ${missing ? 'MISSING' : 'wider'}: fields say <${fromFields.join(', ')}>` : ''}${slow.length ? `   SLOW PATH: ${slow.join('; ')}` : ''}`)
+        for (const call of calls) lines.push(`      .${cut.entries[call.entry].label}(${call.args.map(a => cutTypeText(a, named)).join(', ')})  ${call.site.unit.name || '<anon>'}%${call.site.node}`)
+        const refText = (i: number): string | undefined => {
+            const p = cut.paramOf[i]
+            if (p >= 0 && cut.inputs[i].kind === CutInputKind.param) return cutTypeText(args[p], named)
+            const [root, keys] = cutReadChain(cut, i)
+            const q = cut.paramOf[root]
+            if (cut.inputs[i].kind !== CutInputKind.read || q < 0) return undefined
+            return cutTypeText(resolveRead(args[q], chain(keys), 0), named)
+        }
+        cut.entries.forEach((entry, e) => {
+            const relative = entry.ret.refs.some(r => cut.inputs[r.input].kind === CutInputKind.read && cut.paramOf[cutReadChain(cut, r.input)[0]] >= 0) || entry.ret.objects.some(k => cut.objects[k].fields.some(f => f.term.refs.some(r => cut.inputs[r.input].kind === CutInputKind.read && cut.paramOf[cutReadChain(cut, r.input)[0]] >= 0)))
+            if (relative) lines.push(`      resolved ${entry.label}(): ${cutTermText(cut, entry.ret, e, 0, [], refText)}`)
+        })
+    }
+    if (print) {
+        for (const cut of cuts.classes.values()) console.log(cutText(cut))
+        if (lines.length) console.log(cutDisplay(`CUT INSTANCES\n${lines.join('\n')}`))
+        if (cuts.picked) console.log(cutText(cuts.picked))
+    }
+    console.log(`CUT SUMMARY classes=${cuts.classes.size} instances=${instances.size} slow=${slowCount} fieldFed=${fieldFed} wider=${wider} missing=${mismatches} extract=${cuts.ms.toFixed(1)}ms hits=${cuts.hits} misses=${cuts.misses} program=${ms.toFixed(1)}ms`)
+}
 
 // graph cuts are used for obnoxiously large fns
 const cutLimit = Number(intrinsics.argv().find(a => a.startsWith('cut:'))?.slice(4) ?? 5_000)
@@ -12194,6 +12423,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const valueTypes = clock.timed('analysis', () => analyzeTypes(accesses, host, rootFns))
     linker.linkHeldStatics(new Set(valueTypes.frames.filter(frame => frame.heldStatic).map(frame => frame.unit)))
     printAnalysis(valueTypes, genericOf)
+    if (flags.has('cut-dump') || flags.has('cut-summary')) pendingCuts = () => programCuts(extractCuts([...functions]), valueTypes, host, accesses.locations, flags.has('cut-dump'))
     const { plan, planned, reps } = clock.timed('plan', () => {
         const plan = planShapes(valueTypes, linker, tracer, host, genericOf, facts)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
@@ -12258,19 +12488,35 @@ export function observeRoots(observer: (fns: Record<string, Function>, opts: Cre
     rootsObserver = observer
 }
 
+function textHash(text: string): string {
+    let h = 2166136261
+    let i = 0
+    while (i < text.length) {
+        h = Math.imul(h ^ text.charCodeAt(i), 16777619) >>> 0
+        i++
+    }
+    return h.toString(16)
+}
+
 export function createNatives(fns: Record<string, Function>, opts: CreateNativesOptions = {}) {
     rootsObserver?.(fns, opts)
     nativeObserver?.(`compile ${Object.keys(fns).join(', ')}`)
     getNativeBootstraps()
     const target = hostTarget
     const clock = createClock(target)
+    pendingCuts = undefined
     const program = traceProgram(fns, opts, clock, target)
+    if (flags.has('graph-prints')) for (const [symbol, graph] of program.units) console.log(`GRAPH ${symbol} ${graph.name} ${countNodes(graph)} ${textHash(dumpGraph(graph))}`)
+    if (flags.has('graph-dumps')) for (const [, graph] of program.units) console.log(dumpGraph(graph))
     const { timed } = clock
     const tracedUnits = program.units.size
     const lineageBefore = typeRecording() ? new Map([...program.units].filter(([, graph]) => debugsTypes(graph.name)).map(([symbol, graph]) => [symbol, lineageSnapshot(graph)])) : undefined
     const merged = optimizeProgram(program, clock)
     if (lineageBefore) for (const [symbol, graph] of program.units) if (lineageBefore.has(symbol)) traceLineage(graph, lineageBefore.get(symbol)!)
     const emitted = timed('lower', () => lowerProgram(program, clock))
+    const cutting = pendingCuts
+    pendingCuts = undefined
+    if (cutting) cutting()
     clock.enterPhase('other')
     for (const [phase, ms] of Object.entries(clock.phases)) phaseTotals[phase] = (phaseTotals[phase] ?? 0) + ms
     printOptimizeStats()

@@ -4,7 +4,7 @@
 
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
-import { BitwiseOps, debugsTypes, dumpGraph, firstNonOrderingSlot, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
+import { BitwiseOps, stronglyConnected, debugsTypes, dumpGraph, firstNonOrderingSlot, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
 import { addNode, armSlot, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand, FloatUnaryOps } from './graph-node'
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
@@ -277,6 +277,8 @@ interface FlowState {
     heldWrites: Map<number, number[]>
     skippedKeys: Set<number>
     exported: Export
+    cut: CutSeed | undefined
+    cap: number
 }
 
 const elemKey = -1
@@ -290,6 +292,16 @@ function posKey(i: number): number {
 
 function isPosKey(key: number): boolean {
     return key <= posBase && key > posBase - maxTuple
+}
+
+const typeParamBase = posBase - maxTuple
+
+function typeParamKey(j: number): number {
+    return typeParamBase - j
+}
+
+function isTypeParamKey(key: number): boolean {
+    return key <= typeParamBase && key > typeParamBase - 64
 }
 
 let flow: FlowState
@@ -983,6 +995,7 @@ function fieldSeen(kind: FieldWatch, target: number, key: number, s: number): vo
 }
 
 function keyedRead(origin: number, target: number): void {
+    if (flow.cut?.origins.has(origin)) return readField(fieldSlot(origin, elemKey), target)
     const state = heapState(origin)
     if (state !== undefined && heap.isOrdinaryObject(state)) for (const key of dataKeys(state)) fieldSlot(origin, key as number)
     watchFields(origin, FieldWatch.keyed, target)
@@ -1009,6 +1022,8 @@ function heapState(origin: number): Handle | undefined {
 }
 
 function seedField(origin: number, key: number, s: number): void {
+    if (flow.cut) cutField(origin, key, s)
+    if (flow.cut) cutShapeField(origin, key, s)
     if (key < 0) return
     const definite = flow.originKind[origin] === OriginKind.fresh ? flow.definiteKeys.get(flow.originCell[origin]) : undefined
     if (definite && !definite.includes(key as Handle)) addForm(s, 'void')
@@ -1121,6 +1136,7 @@ function summaryOf(fn: Function): Summary {
     const traceStart = performance.now()
     const g = flow.host.graphOf(fn)
     flow.traceMs += performance.now() - traceStart
+    if (flow.cut && !tracedPrints.has(g)) tracedPrints.set(g, tracedPrint(g))
     const cells = flow.host.freshCells!(fn)
     const fresh = new Set<number>()
     for (const c of cells.allocations) fresh.add(c)
@@ -1136,7 +1152,7 @@ function summaryOf(fn: Function): Summary {
     flow.summaryList.push(s)
     for (const cell of fresh) flow.freshOwner.set(cell, s)
     flow.totalNodes += countNodes(g)
-    flow.budget = budgetFactor * flow.totalNodes
+    flow.budget = Math.min(budgetFactor * flow.totalNodes, flow.cap)
     buildSummary(s)
     return s
 }
@@ -1442,6 +1458,7 @@ enum GuardFlag {
     isFloat = 4194304,
     notFloat = 8388608,
     multiple = 16777216,
+    widened = 33554432,
 }
 
 function computeRegions(s: Summary): GraphRegions {
@@ -2659,6 +2676,7 @@ function recheckPicks(f: number): void {
 }
 
 function originPasses(origin: number, flags: number, proto: number): boolean {
+    if (flags & GuardFlag.widened) return flow.originKind[origin] === OriginKind.str
     if (flags & (GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isUndefined | GuardFlag.isBoolean)) return false
     const k = flow.originKind[origin]
     const str = k === OriginKind.str
@@ -2678,6 +2696,7 @@ function originPasses(origin: number, flags: number, proto: number): boolean {
 
 function filterScalar(t: number, flags: number, lo: number, hi: number, global = false): number {
     let f = scalars.flags[t]
+    if ((f & ScalarFlag.unknown) && (flags & GuardFlag.widened)) return unite(I64, FLOAT)
     if (f & ScalarFlag.unknown) return t
     if (flags & GuardFlag.hasProto) return NONE
     let tlo = scalars.lo[t]
@@ -2717,6 +2736,7 @@ function filterScalar(t: number, flags: number, lo: number, hi: number, global =
     const factor = flags & GuardFlag.multiple ? lcm(Math.max(1, factorOf(t)), lo) : scalars.factor[t]
     const nums = scalars.nums[t].filter(v => v >= tlo && v <= thi && (v !== 0 || !(flags & (GuardFlag.truthy | GuardFlag.nonzero))) && v % factor === 0)
     if (scalars.nums[t].length && !nums.length) f = f & ~ScalarFlag.int
+    if (flags & GuardFlag.widened) return unite(unite(f & (ScalarFlag.int | ScalarFlag.yes | ScalarFlag.no) ? I64 : NONE, f & ScalarFlag.float ? FLOAT : NONE), f & (ScalarFlag.str | ScalarFlag.anyStr) ? ANYSTR : NONE)
     if (!(f & (ScalarFlag.str | ScalarFlag.anyStr))) strs = []
     if (!f) return NONE
     if (nums.length === 1) return scalar(f, nums[0], nums[0], strs)
@@ -3042,6 +3062,7 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     intrinsics.assert(recv < 4194304, `value-flow: origin ${recv} does not fit a call-binding key`)
     const key = target * 4194304 + recv
     if (flow.parts.get(callSlot)?.has(key)) return
+    if (flow.cut && cutApply(callSlot, target, recv, key)) return
     const x = exprAt(callSlot)
     const inst = instOfSlot(callSlot)
     const fn = boundCallee(flow.host, originFunction(target)!, getNode(inst.summary.g, x.node)!)
@@ -3113,10 +3134,15 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
             const truncated = truncatedCompare(inst, x, value)
             out = unite(out, truncated >= 0 ? truncated : foldCompare(x.key, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf), originsOf(at(inst, x.a)), originsOf(at(inst, x.b))))
         }
+        case ExprOp.call: if (rawCallee(value(at(inst, x.a)))) out = unite(out, opaqueScalar(inst.summary, x))
         case ExprOp.rt: out = unite(out, rtScalar(inst, x, value, originsOf))
         case ExprOp.member: if (scalars.flags[value(at(inst, x.a))] & ScalarFlag.unknown) out = unite(out, UNKNOWN)
     }
     return typedScalar(out, x.type)
+}
+
+function rawCallee(t: number): boolean {
+    return (scalars.flags[t] & (ScalarFlag.unknown | ScalarFlag.int | ScalarFlag.float)) !== 0
 }
 
 function admits(t: number, objects: boolean, truthy: boolean): boolean {
@@ -3291,6 +3317,7 @@ function exprUses(slot: number): void {
     if (x.op === ExprOp.arith && x.args.length) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype || x.a === RtOp.trunc)) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.member) scalarUse(at(inst, x.a), slot)
+    if (x.op === ExprOp.call) scalarUse(at(inst, x.a), slot)
 }
 
 function components(n: number, roots: number[], edgesOf: (v: number) => number[], emit: (group: number[], cyclic: boolean, edges: number[][]) => void): void {
@@ -3367,6 +3394,7 @@ function drainScalars(): void {
 
 function updateScalar(s: number): void {
     charge(1)
+    if (flow.cut) cutCallout(s)
     if (flow.stringSite[s]) checkString(s)
     const old = flow.scalar[s]
     let next = unite(old, evalSlot(s, globalValue, globalOrigins, true))
@@ -4092,6 +4120,7 @@ function constructorName(proto: Handle): string {
 function keyLabel(key: number): string {
     if (key === elemKey || key === dynKey) return numberKey
     if (isPosKey(key)) return `@${posBase - key}`
+    if (isTypeParamKey(key)) return `<${typeParamBase - key}>`
     const index = heap.keyIndex(key as Handle)
     if (index !== undefined) return `[${index}]`
     if (heap.isString(key as Handle)) {
@@ -4124,6 +4153,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], originMask: [], stringSite: [],
         fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(),
         exported: { types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), frameOf: new Map(), framesOf: new Map(), frames: [], slotTypes: new Map() },
+        cut: undefined, cap: Infinity,
     }
 }
 
@@ -4831,6 +4861,25 @@ function exportAccesses(): Accesses {
     }
 }
 
+function numericOperands(): number[] {
+    const numeric: number[] = []
+    for (const inst of flow.instances) {
+        const s = inst.summary
+        for (const x of s.exprs) {
+            const n = x.node ? getNode(s.g, x.node) : undefined
+            if (!n) continue
+            if (x.op === ExprOp.arith || x.op === ExprOp.cmp) {
+                if (numericUse(s.g, n, 0)) numeric.push(at(inst, x.a))
+                if (numericUse(s.g, n, 1)) numeric.push(at(inst, x.b))
+            }
+            if (x.op !== ExprOp.rt) continue
+            const first = n.op === NodeOp.store ? 1 : 2
+            for (let i = 0; i < x.args.length; i++) if (numericUse(s.g, n, first + i)) numeric.push(at(inst, x.args[i]))
+        }
+    }
+    return numeric
+}
+
 function numericUse(g: Graph, user: GraphNode, slot: number): boolean {
     if (user.op === NodeOp.load || user.op === NodeOp.store) return slot === 1 || slot === 2
     const slice = sliceOf(g, user)
@@ -4852,7 +4901,366 @@ function genericFlow(methods: Function[], proto: intrinsics.Handle, host: Access
 
 export function analyzeGenerics(name: string, proto: Handle, ctor: Function, host: AccessHost): Generic {
     const start = performance.now()
-    const methods: [string, Function][] = [['constructor', ctor]]
+    const methods = classMethods(proto, ctor, host)
+    const solved = genericFlow(methods.map(([, fn]) => fn), proto, host)
+    const shape = pg.genericShape(solved, numberKey, constantIndex)
+    const ms = performance.now() - start
+    const lines = [`GENERIC ${name}${shape.params.length ? `<${shape.params.map(p => p.name).join(', ')}>` : ''} ${ms.toFixed(1)}ms units=${solved.units.length}`]
+    lines.push(...shape.lines)
+    return { name, ms, params: shape.params, paths: shape.paths, lines }
+}
+
+const maxCutWork = 400000
+const maxReadDepth = 4
+const maxVariantArity = 4
+const maxObjectDepth = 3
+const paramNames = 'TUVWXYZ'
+
+export enum CutInputKind {
+    param,
+    read,
+    result,
+}
+
+export interface CutInput {
+    kind: CutInputKind
+    name: string
+    entry: number
+    param: number
+    base: number
+    key: string
+    depth: number
+}
+
+export interface CutScalar {
+    flags: number
+    lo: number
+    hi: number
+    strs: string[]
+    nums: number[]
+    factor: number
+}
+
+export interface CutFilter {
+    flags: number
+    b: number
+    sub: number
+}
+
+export interface CutRef {
+    input: number
+    filter: number
+}
+
+export interface CutTerm {
+    refs: CutRef[]
+    scalar: CutScalar | undefined
+    self: boolean
+    opaque: boolean
+    widened: boolean
+    strings: boolean
+    statics: number[]
+    fns: number[]
+    objects: number[]
+}
+
+export interface CutField {
+    key: string
+    term: CutTerm
+}
+
+export interface CutObject {
+    fn: number
+    kind: string
+    ordinal: number
+    calls: [fn: number, call: number][]
+    proto: number
+    args: CutTerm[]
+    fields: CutField[]
+}
+
+export interface CutParam {
+    name: string
+    inputs: number[]
+}
+
+export interface CutCallout {
+    callee: CutTerm
+    recv: CutTerm
+    args: CutTerm[]
+    result: number
+}
+
+export interface CutEffect {
+    input: number
+    term: CutTerm
+}
+
+export interface CutBound {
+    param: number
+    owner: number
+    key: string
+    term: CutTerm
+}
+
+export interface CutSite {
+    recv: CutTerm
+    label: string
+    args: CutTerm[]
+}
+
+export interface CutEntry {
+    label: string
+    fn: number
+    params: number
+    ret: CutTerm
+    effects: CutEffect[]
+    callouts: CutCallout[]
+    sites: CutSite[]
+    observes: CutRef[]
+    bound: CutBound | undefined
+    allocates: boolean
+    reasons: string[]
+}
+
+export interface Cut {
+    name: string
+    generator: string
+    key: string
+    fns: Function[]
+    statics: number[]
+    staticNames: string[]
+    protos: number[]
+    protoNames: string[]
+    uses: number[]
+    inputs: CutInput[]
+    params: CutParam[]
+    paramOf: number[]
+    numeric: boolean[]
+    filters: CutFilter[]
+    fields: CutField[]
+    objects: CutObject[]
+    entries: CutEntry[]
+    exposed: string[]
+    through: string[]
+    analyzed: string[]
+    reasons: string[]
+    work: number
+    size: number
+    ms: number
+}
+
+interface CutSeed {
+    inputs: CutInput[]
+    origins: Map<number, number>
+    slots: Map<number, number>
+    proto: Handle
+    shapes: Map<number, CutShape>
+    cuts: Cut[]
+    through: string[]
+}
+
+interface CutShape {
+    cut: Cut
+    fields: CutField[]
+    owner: number
+}
+
+interface CutRoot {
+    label: string
+    fn: Function
+    inst: Instance
+    recv: number
+}
+
+let cutMemo: Map<Handle, Cut | null> | undefined
+
+function cutInput(kind: CutInputKind, name: string, entry: number, param: number, base: number, key: string, depth: number): number {
+    const inputs = flow.cut!.inputs
+    inputs.push({ kind, name, entry, param, base: base < 0 ? inputs.length : base, key, depth })
+    return inputs.length - 1
+}
+
+function seedInput(slot: number, input: number): void {
+    const seed = flow.cut!
+    seed.slots.set(slot, input)
+    addConst(slot, UNKNOWN)
+    if (seed.inputs[input].depth >= maxReadDepth) return
+    const origin = originOf(OriginKind.created, 0, 0, -(input + 1), undefined)
+    seed.origins.set(origin, input)
+    addOrigin(slot, origin)
+}
+
+function cutField(origin: number, key: number, s: number): void {
+    const parent = flow.cut!.origins.get(origin)
+    if (parent === undefined) return
+    const from = flow.cut!.inputs[parent]
+    const label = cutKey(key)
+    seedInput(s, cutInput(CutInputKind.read, `${from.name}${label.startsWith('[') ? '' : '.'}${label}`, from.entry, from.param, parent, label, from.depth + 1))
+}
+
+function cutKeyOf(label: string): number {
+    if (label === '[n]') return elemKey
+    if (label.startsWith('@')) return posKey(Number(label.slice(1)))
+    if (label.startsWith('<') && label.endsWith('>')) return typeParamKey(Number(label.slice(1, -1)))
+    if (label.startsWith('[') && label.endsWith(']')) return heap.indexKey(Number(label.slice(1, -1)) as u32) as number
+    if (label.startsWith('!!')) return heap.fromJsString(label.slice(1)) as number
+    if (label.startsWith('!')) return Number(label.slice(label.lastIndexOf('#') + 1))
+    return heap.fromJsString(label) as number
+}
+
+function cutBoundary(origin: number): Cut | undefined {
+    const seed = flow.cut!
+    const known = seed.shapes.get(origin)
+    if (known) return known.owner === origin && known.fields === known.cut.fields ? known.cut : undefined
+    const other = summaryClass(origin)
+    if (other === undefined || other === seed.proto) return undefined
+    const cut = classCut(other, flow.host)
+    if (!cut || cut.reasons.length) return undefined
+    seed.shapes.set(origin, { cut, fields: cut.fields, owner: origin })
+    return cut
+}
+
+function cutShapeField(origin: number, key: number, s: number): void {
+    if (isTypeParamKey(key)) return
+    if (!flow.cut!.shapes.has(origin) && !cutBoundary(origin)) return
+    const shape = flow.cut!.shapes.get(origin)!
+    const label = cutKey(key)
+    for (const f of shape.fields) {
+        if (f.key === label || (f.key === '[n]' && constantIndex(label))) cutMaterialize(shape.cut, f.term, s, shape.owner, origin, undefined, true)
+    }
+}
+
+function cutTypeSlot(origin: number, j: number): number {
+    return fieldSlot(origin, typeParamKey(j))
+}
+
+export function cutReadChain(c: Cut, input: number): [root: number, keys: string[]] {
+    const keys: string[] = []
+    let i = input
+    while (c.inputs[i].kind === CutInputKind.read) {
+        keys.unshift(c.inputs[i].key)
+        i = c.inputs[i].base
+    }
+    return [i, keys]
+}
+
+function cutApplicable(c: Cut, e: number, term: CutTerm): boolean {
+    for (const r of term.refs) {
+        const input = c.inputs[r.input]
+        if (c.paramOf[r.input] >= 0 || c.numeric[r.input]) continue
+        if (input.kind === CutInputKind.param && input.entry === e && input.param >= 0) continue
+        return false
+    }
+    if (term.fns.length || term.statics.length) return false
+    for (const k of term.objects) {
+        const object = c.objects[k]
+        if (object.kind === 'closure' || object.kind === 'static') return false
+        for (const a of object.args) if (!cutApplicable(c, e, a)) return false
+        for (const f of object.fields) if (!cutApplicable(c, e, f.term)) return false
+    }
+    return true
+}
+
+function cutMaterialize(c: Cut, term: CutTerm, into: number, owner: number, site: number, args: number[] | undefined, link: boolean): void {
+    const seed = flow.cut!
+    for (const r of term.refs) {
+        const input = c.inputs[r.input]
+        const p = c.paramOf[r.input]
+        if (p >= 0) {
+            const slot = cutTypeSlot(owner, p)
+            copyEdge(slot, into)
+            if (link) copyEdge(into, slot)
+        } else if (c.numeric[r.input]) addConst(into, unite(I64, FLOAT))
+        else if (args && input.kind === CutInputKind.param && input.param >= 0) {
+            if (input.param < args.length) copyEdge(args[input.param], into)
+            else addConst(into, UNDEF)
+        } else addConst(into, UNKNOWN)
+    }
+    if (term.scalar) addConst(into, scalarOfCut(term.scalar))
+    if (term.widened) addConst(into, unite(I64, FLOAT))
+    if (term.strings) addConst(into, ANYSTR)
+    if (term.opaque) addConst(into, UNKNOWN)
+    if (term.self) addOrigin(into, owner)
+    for (const fn of term.fns) addOrigin(into, fnOrigin(c.fns[fn]))
+    for (const cell of term.statics) addOrigin(into, staticOrigin(c.statics[cell]))
+    let id = seed.cuts.indexOf(c)
+    if (id < 0) {
+        seed.cuts.push(c)
+        id = seed.cuts.length - 1
+    }
+    for (const k of term.objects) {
+        const object = c.objects[k]
+        if (object.kind === 'closure' || object.kind === 'static') {
+            addConst(into, UNKNOWN)
+            continue
+        }
+        const proto = object.proto >= 0 ? c.protos[object.proto] : 0
+        const origin = originOf(OriginKind.created, proto, 0, -(1000000 + site * 262144 + id * 4096 + k), undefined)
+        addOrigin(into, origin)
+        if (seed.shapes.has(origin)) continue
+        if (object.proto < 0) {
+            seed.shapes.set(origin, { cut: c, fields: object.fields, owner })
+            continue
+        }
+        const inner = cutBoundary(origin)
+        if (!inner) continue
+        object.args.forEach((a, j) => cutMaterialize(c, a, cutTypeSlot(origin, j), owner, site, args, true))
+    }
+}
+
+function cutApply(callSlot: number, target: number, recv: number, key: number): boolean {
+    if (!recv) return false
+    const other = cutBoundary(recv)
+    if (!other) return false
+    const x = exprAt(callSlot)
+    const inst = instOfSlot(callSlot)
+    const fn = boundCallee(flow.host, originFunction(target)!, getNode(inst.summary.g, x.node)!)
+    const e = other.entries.findIndex(entry => other.fns[entry.fn] === fn)
+    if (e < 0) return false
+    const entry = other.entries[e]
+    const readsArgs = other.inputs.some((input, i) => input.entry === e && input.kind === CutInputKind.read && other.paramOf[i] >= 0 && other.paramOf[cutReadChain(other, i)[0]] < 0)
+    if (entry.callouts.length || entry.effects.length || entry.reasons.length || readsArgs || !cutApplicable(other, e, entry.ret)) {
+        const why = `${other.name}.${entry.label}${entry.callouts.length ? ' (callouts)' : entry.effects.length ? ' (writes inputs)' : entry.reasons.length ? ' (slow path)' : readsArgs ? ' (reads arguments)' : ' (returns unsupported)'}`
+        if (!flow.cut!.through.includes(why)) flow.cut!.through.push(why)
+        return false
+    }
+    const args = x.args.map(a => at(inst, a))
+    other.inputs.forEach((input, i) => {
+        if (input.entry !== e || input.kind !== CutInputKind.param || input.param < 0 || other.paramOf[i] < 0) return
+        const slot = cutTypeSlot(recv, other.paramOf[i])
+        if (input.param < args.length) copyEdge(args[input.param], slot)
+        else addConst(slot, UNDEF)
+    })
+    const part = partSlot(callSlot, key)
+    cutMaterialize(other, entry.ret, part, recv, callSlot, args, false)
+    return true
+}
+
+function cutCallout(s: number): void {
+    if (flow.slotKind[s] !== SlotKind.expr || flow.cut!.slots.has(s)) return
+    const inst = flow.instances[flow.slotOwner[s]]
+    const x = inst.summary.exprs[flow.slotIndex[s]]
+    if (x.op !== ExprOp.call || x.a < 0 || !rawCallee(flow.scalar[at(inst, x.a)])) return
+    seedInput(s, cutInput(CutInputKind.result, `r${cutResults()}`, -1, -1, -1, '', 0))
+}
+
+function cutResults(): number {
+    return flow.cut!.inputs.filter(input => input.kind === CutInputKind.result).length
+}
+
+function cutKey(key: number): string {
+    if (key === elemKey || key === dynKey) return '[n]'
+    return keyLabel(key)
+}
+
+function cutKeyMatches(key: number, label: string): boolean {
+    const own = cutKey(key)
+    return own === label || (label === '[n]' && constantIndex(own))
+}
+
+function classMethods(proto: Handle, ctor: Function | undefined, host: AccessHost): [string, Function][] {
+    const methods: [string, Function][] = ctor ? [['constructor', ctor]] : []
     function add(label: string, handle: u32): void {
         const fn = handle ? host.functionOf(handle) : undefined
         if (fn && fn !== ctor && host.traceable(fn) && !methods.some(([, m]) => m === fn)) methods.push([label, fn])
@@ -4871,12 +5279,969 @@ export function analyzeGenerics(name: string, proto: Handle, ctor: Function, hos
         add('get [index]', heap.getProxyGetter(trap) as u32)
         add('set [index]', heap.getProxySetter(trap) as u32)
     }
-    const solved = genericFlow(methods.map(([, fn]) => fn), proto, host)
-    const shape = pg.genericShape(solved, numberKey, constantIndex)
-    const ms = performance.now() - start
-    const lines = [`GENERIC ${name}${shape.params.length ? `<${shape.params.map(p => p.name).join(', ')}>` : ''} ${ms.toFixed(1)}ms units=${solved.units.length}`]
-    lines.push(...shape.lines)
-    return { name, ms, params: shape.params, paths: shape.paths, lines }
+    return methods
+}
+
+function classConstructor(proto: Handle, host: AccessHost): Function | undefined {
+    const addr = heap.getOwnProperty(proto, heap.fromJsString('constructor'))
+    if (!addr) return undefined
+    const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
+    if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return undefined
+    const fn = d.slot0 ? host.functionOf(d.slot0 as u32) : undefined
+    if (!fn || !host.traceable(fn)) return undefined
+    return fn
+}
+
+function classProto(proto: Handle): boolean {
+    if (!proto) return false
+    const root = pg.objectPrototype(flow.host)
+    if (proto === root) return false
+    let parent = heap.getPrototypeOf(proto)
+    while (parent && heap.isProxy(parent)) parent = heap.getPrototypeOf(parent)
+    return !parent || parent === root
+}
+
+function summaryClass(origin: number): Handle | undefined {
+    const kind = flow.originKind[origin]
+    if (kind !== OriginKind.fresh && kind !== OriginKind.created && kind !== OriginKind.static) return undefined
+    const proto = protoOf(origin)
+    if (!classProto(proto) || !classConstructor(proto, flow.host)) return undefined
+    return proto
+}
+
+function arityVariants(fn: Function): [number, Function][] {
+    const out: [number, Function][] = []
+    if (!flow.host.bindTarget || !flow.host.arityVariants?.(fn)) return out
+    let arity = 0
+    while (arity < maxVariantArity) {
+        const variant = flow.host.bindTarget(fn, arity, false)
+        if (variant !== fn && flow.host.traceable(variant)) out.push([arity, variant])
+        arity++
+    }
+    return out
+}
+
+function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number): void {
+    if (roots.some(r => r.fn === fn && r.recv === recv)) return
+    const entry = roots.length
+    const s = summaryOf(fn)
+    const inst = flow.instances[instance(fn, s.hasThis ? recv : 0, -1, -1)]
+    flow.rooted.add(inst.id)
+    let i = 0
+    while (i < s.params) {
+        seedInput(inst.sigs[i], cutInput(CutInputKind.param, `p${i}`, entry, i, -1, '', 0))
+        i++
+    }
+    if (s.hasThis && !recv) seedInput(paramSlot(inst, -1), cutInput(CutInputKind.param, 'this', entry, -1, -1, '', 0))
+    if (s.usesCtx) seedInput(paramSlot(inst, -2), cutInput(CutInputKind.param, 'ctx', entry, -2, -1, '', 0))
+    roots.push({ label, fn, inst, recv })
+}
+
+function cutObject(origin: number): boolean {
+    const kind = flow.originKind[origin]
+    return (kind === OriginKind.fresh || kind === OriginKind.created || kind === OriginKind.slice) && !originHostFn(origin) && !isScope(origin) && !flow.cut!.origins.has(origin)
+}
+
+function interiorOf(self: number): Set<number> {
+    const interior = new Set<number>()
+    if (!self) return interior
+    const queue = [self]
+    let next = 0
+    while (next < queue.length) {
+        const origin = queue[next]
+        next++
+        for (const slot of flow.originFields[origin].values()) {
+            for (const inner of flow.slotOrigins[slot]) {
+                if (inner === self || interior.has(inner) || !cutObject(inner)) continue
+                interior.add(inner)
+                queue.push(inner)
+            }
+        }
+    }
+    return interior
+}
+
+let cutUses: Set<Handle> | undefined
+
+function cutFlow(name: string, generator: string, roots: Function[], host: AccessHost, proto: Handle, seed: (roots: CutRoot[]) => number): Cut {
+    const start = performance.now()
+    const outerUses = cutUses
+    const uses = new Set<Handle>()
+    cutUses = uses
+    defer finally {
+        cutUses = outerUses
+    }
+    return newFlow(roots, host, () => {
+        flow.cut = { inputs: [], origins: new Map(), slots: new Map(), proto, shapes: new Map(), cuts: [], through: [] }
+        flow.cap = maxCutWork
+        const cutRoots: CutRoot[] = []
+        let cut: Cut
+        try {
+            const self = seed(cutRoots)
+            if (typeRecording()) {
+                const out: string[] = []
+                noteFlowTypes(out)
+                console.log(out.join('\n'))
+            }
+            cut = extractCut(name, generator, self, proto, cutRoots)
+        } catch (e) {
+            const message = typeof e === 'string' ? e : e instanceof Error ? e.message : ''
+            if (!message.startsWith('value-flow: ')) throw e
+            const reason = message.startsWith('value-flow: budget exceeded') ? `budget (work ${flow.work})` : message
+            cut = { name, generator, key: '', fns: [], statics: [], staticNames: [], protos: [], protoNames: [], uses: [], inputs: [], params: [], paramOf: [], numeric: [], filters: [], fields: [], objects: [], entries: [], exposed: [], through: [], analyzed: [], reasons: [reason], work: 0, size: 0, ms: 0 }
+        }
+        cut.key = cutFingerprint(name, flow.summaryList.map(s => s.fn))
+        cut.uses = [...uses].filter(p => p !== proto)
+        if (intrinsics.argv().includes('cut-fns')) cut.analyzed = [...new Set(flow.instances.map(inst => inst.summary.name))]
+        cut.work = flow.work
+        cut.size = flow.totalNodes
+        cut.ms = performance.now() - start
+        return cut
+    })
+}
+
+function classCut(proto: Handle, host: AccessHost): Cut | undefined {
+    cutUses?.add(proto)
+    const known = cutMemo?.get(proto)
+    if (known !== undefined) return known ?? undefined
+    const ctor = classConstructor(proto, host)
+    if (!ctor) return undefined
+    cutMemo?.set(proto, null)
+    const cut = cutFlow(ctor.name || '<anon>', 'class', [ctor], host, proto, roots => {
+        const self = originOf(OriginKind.created, proto as number, 0, 0, undefined)
+        for (const [label, fn] of classMethods(proto, ctor, flow.host)) {
+            seedCutRoot(roots, label, fn, self)
+            for (const [arity, variant] of arityVariants(fn)) seedCutRoot(roots, `${label}/${arity}`, variant, self)
+        }
+        solve()
+        return self
+    })
+    cutMemo?.set(proto, cut)
+    return cut
+}
+
+export function cutClasses(functions: Function[], host: AccessHost): Handle[] {
+    const out: Handle[] = []
+    for (const fn of functions) {
+        if (!fn || !host.traceable(fn) || !host.isConstructor?.(fn)) continue
+        const proto = heap.deref(heap.getPrototypeProperty(heap.deref(host.session.linkFunction(fn) as Handle)))
+        if (!proto || out.includes(proto) || classConstructor(proto, host) !== fn) continue
+        out.push(proto)
+    }
+    return out
+}
+
+export function classCuts(protos: Handle[], host: AccessHost, memo: Map<Handle, Cut | null>): void {
+    const outer = cutMemo
+    cutMemo = memo
+    defer finally {
+        cutMemo = outer
+    }
+    for (const proto of protos) classCut(proto, host)
+}
+
+export function cutClosure(protos: Handle[], memo: Map<Handle, Cut | null>): Map<Handle, Cut> {
+    const out = new Map<Handle, Cut>()
+    const work = [...protos]
+    while (work.length) {
+        const proto = work.pop()!
+        const cut = memo.get(proto)
+        if (!cut || out.has(proto)) continue
+        out.set(proto, cut)
+        for (const p of cut.protos) work.push(p as Handle)
+        for (const p of cut.uses) work.push(p as Handle)
+    }
+    return out
+}
+
+export function fnCut(name: string, fns: Function[], host: AccessHost, classes: Map<Handle, Cut>): Cut {
+    const outer = cutMemo
+    cutMemo = new Map(classes)
+    defer finally {
+        cutMemo = outer
+    }
+    return cutFlow(name, 'fns', fns, host, 0 as Handle, roots => {
+        for (const fn of fns) seedCutRoot(roots, fn.name || '<anon>', fn, 0)
+        solve()
+        return 0
+    })
+}
+
+const tracedPrints = new WeakMap<Graph, string>()
+
+function tracedPrint(g: Graph): string {
+    let h = 2166136261
+    for (const [, n] of nodeEntries(g)) h = Math.imul(h ^ n.op, 16777619) >>> 0
+    return h.toString(16)
+}
+
+function cutFingerprint(name: string, fns: Function[]): string {
+    let h = 2166136261
+    const mix = (text: string) => {
+        let i = 0
+        while (i < text.length) {
+            h = Math.imul(h ^ text.charCodeAt(i), 16777619) >>> 0
+            i++
+        }
+    }
+    for (const fn of fns) {
+        mix(`${intrinsics.getComputation(fn)[0]}`)
+        mix(tracedPrints.get(flow.summaries.get(fn)!.g)!)
+    }
+    return `${name}:${h.toString(16)}`
+}
+
+function cutScalar(t: number): CutScalar | undefined {
+    if (t === NONE) return undefined
+    return { flags: scalars.flags[t], lo: scalars.lo[t], hi: scalars.hi[t], strs: scalars.strs[t].map(h => heap.stringToJs(h as Handle)), nums: scalars.nums[t].slice(), factor: scalars.factor[t] }
+}
+
+export function scalarOfCut(c: CutScalar | undefined): number {
+    if (!c) return NONE
+    return scalar(c.flags, c.lo, c.hi, c.strs.map(text => heap.fromJsString(text) as number), c.nums, c.factor)
+}
+
+function emptyTerm(): CutTerm {
+    return { refs: [], scalar: undefined, self: false, opaque: false, widened: false, strings: false, statics: [], fns: [], objects: [] }
+}
+
+function addRef(term: CutTerm, input: number, filter: number): void {
+    if (!term.refs.some(r => r.input === input && r.filter === filter)) term.refs.push({ input, filter })
+}
+
+function mergeTerm(into: CutTerm, from: CutTerm): void {
+    for (const r of from.refs) addRef(into, r.input, r.filter)
+    if (from.scalar) into.scalar = cutScalar(unite(scalarOfCut(into.scalar), scalarOfCut(from.scalar)))
+    into.self = into.self || from.self
+    into.opaque = into.opaque || from.opaque
+    into.widened = into.widened || from.widened
+    into.strings = into.strings || from.strings
+    for (const cell of from.statics) if (!into.statics.includes(cell)) into.statics.push(cell)
+    for (const fn of from.fns) if (!into.fns.includes(fn)) into.fns.push(fn)
+    for (const object of from.objects) if (!into.objects.includes(object)) into.objects.push(object)
+}
+
+function emptyTermOf(term: CutTerm): boolean {
+    return !term.refs.length && !term.scalar && !term.self && !term.opaque && !term.widened && !term.strings && !term.statics.length && !term.fns.length && !term.objects.length
+}
+
+function cutIntOperands(inst: Instance, x: Expr, slot: number): number[] | undefined {
+    if (x.op !== ExprOp.arith || x.args.length || (concatSite(inst, x) && flow.parts.get(slot)?.has(0)) || (x.type !== Types.unknown_number && (x.type >= 0 || x.sub !== Types.unknown_number))) return undefined
+    if (scalars.flags[arithScalar(x.key, x.sub, I64, I64)] & ScalarFlag.float) return undefined
+    const operands: number[] = []
+    if (x.a >= 0) operands.push(at(inst, x.a))
+    if (x.b >= 0) operands.push(at(inst, x.b))
+    return operands
+}
+
+function cutFreshCells(s: Summary): number[] {
+    return [...s.allocNodes.entries()].sort((a, b) => a[1] - b[1]).map(e => e[0])
+}
+
+function cutSiteNodes(s: Summary, kind: OriginKind): number[] {
+    const op = kind === OriginKind.slice ? RtOp.slice : RtOp.create
+    const out: number[] = []
+    for (const x of s.exprs) if (x.op === ExprOp.rt && x.a === op && x.node && !out.includes(x.node)) out.push(x.node)
+    return out
+}
+
+function cutCallNodes(s: Summary): number[] {
+    const out: number[] = []
+    for (const x of s.exprs) if ((x.op === ExprOp.call || x.op === ExprOp.rt) && x.node && !out.includes(x.node)) out.push(x.node)
+    return out
+}
+
+function extractCut(name: string, generator: string, self: number, proto: Handle, roots: CutRoot[]): Cut {
+    const seed = flow.cut!
+    const host = flow.host
+    const n = flow.slotKind.length
+    const fns = flow.summaryList.map(s => s.fn)
+    const statics: number[] = []
+    const staticNames: string[] = []
+    const protos: number[] = []
+    const tableRef = <T>(table: T[], value: T): number => {
+        const known = table.indexOf(value)
+        if (known >= 0) return known
+        table.push(value)
+        return table.length - 1
+    }
+    const filters: CutFilter[] = []
+    const filterOf = new Int32Array(n).fill(-1)
+    const concreteOf = new Map<number, CutFilter>()
+    const local: number[] = new Array(n)
+    const sources: number[][] = new Array(n)
+    const numberTyped = new Uint8Array(n)
+    for (let slot = 0; slot < n; slot++) {
+        const list: number[] = []
+        const ins = flow.slotIns[slot]
+        if (ins) for (const from of ins) list.push(from >= 0 ? from : -from - 1)
+        let t = flow.slotConst[slot]
+        if (flow.slotKind[slot] === SlotKind.expr) {
+            const inst = flow.instances[flow.slotOwner[slot]]
+            const x = inst.summary.exprs[flow.slotIndex[slot]]
+            if (x.type === Types.unknown_number) numberTyped[slot] = 1
+            if (converts(x.type) && x.type !== Types.unknown_number) {
+                list.length = 0
+                t = unite(t, flow.scalar[slot])
+            } else if (x.op === ExprOp.union) for (const a of x.args) list.push(at(inst, a))
+            else if (x.op === ExprOp.pick || x.op === ExprOp.narrow) list.push(at(inst, x.a))
+            else if (x.op !== ExprOp.member && x.op !== ExprOp.call && !ins) t = unite(t, flow.scalar[slot])
+            if (x.op === ExprOp.narrow && (x.key & selecting) && !ins) {
+                const b = x.key & (GuardFlag.hasProto | GuardFlag.lacksProto) ? tableRef(protos, x.b) : x.b
+                let f = filters.findIndex(c => c.flags === x.key && c.b === b && c.sub === x.sub)
+                if (f < 0) {
+                    f = filters.length
+                    filters.push({ flags: x.key, b, sub: x.sub })
+                }
+                filterOf[slot] = f
+            } else if (x.op === ExprOp.narrow && !ins) concreteOf.set(slot, { flags: x.key, b: x.b, sub: x.sub })
+        }
+        sources[slot] = list
+        local[slot] = t
+    }
+    const calleesOf = new Map<number, number[]>()
+    for (const inst of flow.instances) {
+        for (const caller of inst.callers) {
+            const owner = flow.slotOwner[ownerSlot(caller)]
+            if (owner < 0 || !flow.instances[owner]) continue
+            let list = calleesOf.get(owner)
+            if (!list) calleesOf.set(owner, list = [])
+            list.push(inst.id)
+        }
+    }
+    const rootsOf = new Map<number, number[]>()
+    roots.forEach((r, ri) => {
+        const seen = new Set<number>([r.inst.id])
+        const work = [r.inst.id]
+        while (work.length) {
+            const id = work.pop()!
+            let list = rootsOf.get(id)
+            if (!list) rootsOf.set(id, list = [])
+            list.push(ri)
+            for (const callee of calleesOf.get(id) ?? []) {
+                if (seen.has(callee)) continue
+                seen.add(callee)
+                work.push(callee)
+            }
+        }
+    })
+    const writerRoots = (v: number) => {
+        const owner = ownerSlot(v)
+        const kind = flow.slotKind[owner]
+        if (kind !== SlotKind.expr && kind !== SlotKind.sig && kind !== SlotKind.ret) return undefined
+        return rootsOf.get(flow.slotOwner[owner])
+    }
+    const symSlots: number[] = []
+    const symInput: number[] = []
+    const symRoot: (number[] | undefined)[] = []
+    const effectsByRoot: [number, number][][] = roots.map(() => [])
+    const seededSlot = new Map<number, number>()
+    for (const [slot, input] of seed.slots) seededSlot.set(input, slot)
+    for (const [slot, input] of seed.slots) {
+        const info = seed.inputs[input]
+        if (info.kind === CutInputKind.read) {
+            for (const v of sources[slot]) for (const ri of writerRoots(v) ?? []) effectsByRoot[ri].push([input, v])
+            sources[slot] = sources[slot].filter(v => writerRoots(v) === undefined)
+        }
+        let base = info
+        while (base.kind === CutInputKind.read) base = seed.inputs[base.base]
+        symSlots.push(slot)
+        symInput.push(input)
+        symRoot.push(info.entry >= 0 ? [info.entry] : rootsOf.get(flow.slotOwner[seededSlot.get(seed.inputs.indexOf(base)) ?? slot]))
+    }
+    const operandsOf = new Map<number, number[]>()
+    const callsOf = new Map<number, number>()
+    for (let slot = 0; slot < n; slot++) {
+        if (flow.slotKind[slot] !== SlotKind.expr) continue
+        const inst = flow.instances[flow.slotOwner[slot]]
+        const x = inst.summary.exprs[flow.slotIndex[slot]]
+        const operands = cutIntOperands(inst, x, slot)
+        if (operands) operandsOf.set(slot, operands)
+        if (x.op === ExprOp.call && x.a >= 0) callsOf.set(slot, at(inst, x.a))
+    }
+    const usersOf: number[][] = new Array(n)
+    const addUser = (from: number, user: number) => {
+        if (!usersOf[from]) usersOf[from] = []
+        usersOf[from].push(user)
+    }
+    for (let slot = 0; slot < n; slot++) {
+        for (const from of sources[slot]) addUser(from, slot)
+        for (const from of operandsOf.get(slot) ?? []) addUser(from, slot)
+    }
+    for (const [call, target] of callsOf) addUser(target, call)
+    const symbolic = new Uint8Array(n)
+    const reach = [...symSlots]
+    for (const slot of reach) symbolic[slot] = 1
+    while (reach.length) {
+        const slot = reach.pop()!
+        for (const user of usersOf[slot] ?? []) {
+            if (symbolic[user]) continue
+            symbolic[user] = 1
+            reach.push(user)
+        }
+    }
+    const callouts: [slot: number, input: number][] = []
+    for (const [call, target] of callsOf) {
+        const seeded = seed.slots.get(call)
+        if (seeded !== undefined && seed.inputs[seeded].kind === CutInputKind.result) {
+            callouts.push([call, seeded])
+            continue
+        }
+        if (!symbolic[target] || symSlots.includes(call)) continue
+        const input = cutInput(CutInputKind.result, `r${cutResults()}`, -1, -1, -1, '', 0)
+        callouts.push([call, input])
+        symSlots.push(call)
+        symInput.push(input)
+        symRoot.push(rootsOf.get(flow.slotOwner[call]))
+    }
+    const widenedArith = [...operandsOf.keys()].filter(slot => symbolic[slot])
+    const widenOf: number[] = []
+    const widen = filters.length
+    if (widenedArith.length) {
+        const narrowCount = filters.length
+        filters.push({ flags: GuardFlag.widened, b: 0, sub: 0 })
+        let f = 0
+        while (f < narrowCount) {
+            widenOf.push(filters.length)
+            filters.push({ flags: filters[f].flags | GuardFlag.widened, b: filters[f].b, sub: filters[f].sub })
+            f++
+        }
+        while (widenOf.length < filters.length) widenOf.push(widenOf.length)
+    }
+    for (const slot of widenedArith) {
+        sources[slot] = operandsOf.get(slot)!
+        local[slot] = NONE
+        filterOf[slot] = widen
+    }
+    const symCount = symSlots.length
+    const symbolSet = new Set(symSlots)
+    const total = symCount * (1 + filters.length)
+    const width = Math.max(1, (total + 31) >> 5)
+    const bits = new Uint32Array(n * width)
+    const baseOf = (k: number) => k < symCount ? k : (k - symCount) % symCount
+    const filterOfBit = (k: number) => k < symCount ? -1 : Math.floor((k - symCount) / symCount)
+    symSlots.forEach((slot, k) => {
+        bits[slot * width + (k >> 5)] |= 1 << (k & 31)
+        local[slot] = NONE
+    })
+    const closed: number[] = new Array(n)
+    const opaque = new Uint8Array(n)
+    const all: number[] = []
+    for (let slot = 0; slot < n; slot++) all.push(slot)
+    const groups = stronglyConnected(all, v => sources[v])
+    for (const group of groups) {
+        const acc = new Uint32Array(width)
+        let t = NONE
+        let o = 0
+        for (const w of group) {
+            for (let i = 0; i < width; i++) acc[i] |= bits[w * width + i]
+            t = unite(t, local[w])
+            if (!symbolSet.has(w)) o |= flow.slotOpaque[w]
+            const f = group.length === 1 ? filterOf[w] : -1
+            for (const from of sources[w]) {
+                if (f >= 0) {
+                    for (let k = 0; k < total; k++) {
+                        if (!(bits[from * width + (k >> 5)] & (1 << (k & 31)))) continue
+                        const d = k < symCount ? symCount + f * symCount + k : f === widen ? symCount + widenOf[filterOfBit(k)] * symCount + baseOf(k) : k
+                        acc[d >> 5] |= 1 << (d & 31)
+                    }
+                    if (closed[from] !== undefined) t = unite(t, filterScalar(closed[from], filters[f].flags, filters[f].b, filters[f].sub))
+                } else {
+                    for (let i = 0; i < width; i++) acc[i] |= bits[from * width + i]
+                    const c = group.length === 1 ? concreteOf.get(w) : undefined
+                    if (closed[from] !== undefined) t = unite(t, c ? filterScalar(closed[from], c.flags, c.b, c.sub) : closed[from])
+                }
+                if (f !== widen) o |= opaque[from]
+            }
+        }
+        if (group.length > 1 && group.some(w => filterOf[w] === widen)) {
+            const widened = new Uint32Array(width)
+            for (let k = 0; k < total; k++) {
+                if (!(acc[k >> 5] & (1 << (k & 31)))) continue
+                const d = symCount + widenOf[k < symCount ? widen : filterOfBit(k)] * symCount + baseOf(k)
+                widened[d >> 5] |= 1 << (d & 31)
+            }
+            acc.set(widened)
+            t = filterScalar(t, GuardFlag.widened, 0, 0)
+        }
+        if (group.length === 1 && numberTyped[group[0]]) t = typedScalar(t, Types.unknown_number)
+        for (const w of group) {
+            bits.set(acc, w * width)
+            closed[w] = t
+            opaque[w] = o
+        }
+    }
+    const hasBits = (slot: number) => {
+        for (let i = 0; i < width; i++) if (bits[slot * width + i]) return true
+        return false
+    }
+    const eachSymbol = (slot: number, visit: (k: number, f: number) => void) => {
+        for (let bit = 0; bit < total; bit++) {
+            if (bits[slot * width + (bit >> 5)] & (1 << (bit & 31))) visit(baseOf(bit), filterOfBit(bit))
+        }
+    }
+    const arith = new Uint8Array(n)
+    const arithQueue: number[] = []
+    for (let slot = 0; slot < n; slot++) {
+        if (flow.slotKind[slot] !== SlotKind.expr || filterOf[slot] === widen) continue
+        const inst = flow.instances[flow.slotOwner[slot]]
+        const x = inst.summary.exprs[flow.slotIndex[slot]]
+        if (x.op !== ExprOp.arith || x.type !== Types.unknown_number) continue
+        if ((x.a >= 0 && hasBits(at(inst, x.a))) || (x.b >= 0 && hasBits(at(inst, x.b)))) {
+            arith[slot] = 1
+            arithQueue.push(slot)
+        }
+    }
+    while (arithQueue.length) {
+        const slot = arithQueue.pop()!
+        for (const user of usersOf[slot] ?? []) {
+            if (arith[user]) continue
+            arith[user] = 1
+            arithQueue.push(user)
+        }
+    }
+    charge(n)
+    const numeric = new Uint8Array(symCount)
+    for (const slot of numericOperands()) {
+        eachSymbol(slot, (k, f) => {
+            if (f < 0) numeric[k] = 1
+        })
+    }
+    const interior = interiorOf(self)
+    const initFns = new Set(flow.host.session.statics.values())
+    const parent = symSlots.map((_, k) => k)
+    const find = (k: number): number => {
+        let r = k
+        while (parent[r] !== r) r = parent[r]
+        return r
+    }
+    const stored = new Uint8Array(symCount)
+    const storage: number[] = []
+    if (self) for (const slot of flow.originFields[self].values()) storage.push(slot)
+    for (const origin of interior) for (const slot of flow.originFields[origin].values()) storage.push(slot)
+    for (const slot of storage) {
+        let first = -1
+        eachSymbol(slot, (k, f) => {
+            if (numeric[k] || (f >= 0 && (filters[f].flags & GuardFlag.widened))) return
+            stored[k] = 1
+            if (first < 0) first = k
+            else parent[find(k)] = find(first)
+        })
+    }
+    const symOfInput = new Map<number, number>()
+    symInput.forEach((input, k) => symOfInput.set(input, k))
+    const storedBase = (k: number): boolean => {
+        let input = seed.inputs[symInput[k]]
+        while (input.kind === CutInputKind.read) input = seed.inputs[input.base]
+        const base = symOfInput.get(seed.inputs.indexOf(input))
+        return base !== undefined && stored[base] === 1
+    }
+    const params: CutParam[] = []
+    const classOf = new Map<number, number>()
+    const paramOf: number[] = seed.inputs.map(() => -1)
+    const numericOf: boolean[] = seed.inputs.map(() => false)
+    for (const slot of storage) {
+        eachSymbol(slot, k => {
+            if (!stored[k] || classOf.has(find(k))) return
+            const index = params.length
+            classOf.set(find(k), index)
+            params.push({ name: index < paramNames.length ? paramNames[index] : `T${index}`, inputs: [] })
+        })
+    }
+    symSlots.forEach((_, k) => {
+        numericOf[symInput[k]] = numeric[k] === 1
+        if (!stored[k]) return
+        const p = classOf.get(find(k))!
+        paramOf[symInput[k]] = p
+        if (!params[p].inputs.includes(symInput[k])) params[p].inputs.push(symInput[k])
+    })
+    const objects: CutObject[] = []
+    const objectMemo = new Map<string, number>()
+    const fields: CutField[] = []
+    let fieldsReady = false
+    function objectOrdinal(origin: number): number {
+        const owner = flow.originOwner[origin]
+        if (!owner) return -1
+        const kind = flow.originKind[origin]
+        if (kind === OriginKind.fresh) return cutFreshCells(owner).indexOf(flow.originCell[origin])
+        return cutSiteNodes(owner, kind).indexOf(flow.originNode[origin])
+    }
+    function objectOf(origin: number, root: number, reasons: string[], depth: number): number {
+        const memo = `${origin}:${root}`
+        const known = objectMemo.get(memo)
+        if (known !== undefined) return known
+        const index = objects.length
+        const owner = flow.originOwner[origin]
+        const calls: [number, number][] = []
+        let q = flow.originQual[origin]
+        while (q > 0 && flow.originKind[q] === OriginKind.site && flow.originOwner[q]) {
+            calls.unshift([tableRef(fns, flow.originOwner[q]!.fn), cutCallNodes(flow.originOwner[q]!).indexOf(flow.originNode[q])])
+            q = flow.originQual[q]
+        }
+        const closure = originHostFn(origin)
+        const external = owner !== undefined && initFns.has(owner.fn)
+        const kind = flow.originKind[origin] === OriginKind.slice ? 'slice' : closure ? 'closure' : external ? 'static' : 'object'
+        const object: CutObject = { fn: owner ? tableRef(fns, owner.fn) : closure ? tableRef(fns, closure) : -1, kind, ordinal: objectOrdinal(origin), calls, proto: -1, args: [], fields: [] }
+        objects.push(object)
+        objectMemo.set(memo, index)
+        if (!owner && !closure) reasons.push(`ownerless object ${originText(origin)}`)
+        if (closure) return index
+        const other = summaryClass(origin)
+        if (external) {
+            if (other !== undefined) object.proto = tableRef(protos, other as number)
+            return index
+        }
+        if (other !== undefined) {
+            object.proto = tableRef(protos, other as number)
+            object.args = instanceArgs(other, [origin], root, reasons, depth)
+            const typed = other === proto ? params.length : classCut(other, host)?.params.length ?? 0
+            let j = 0
+            while (j < typed) {
+                const slot = flow.originFields[origin].get(typeParamKey(j))
+                while (object.args.length <= j) object.args.push(emptyTerm())
+                if (slot !== undefined && depth < maxObjectDepth) mergeTerm(object.args[j], termOf(slot, root, reasons, depth + 1))
+                j++
+            }
+            return index
+        }
+        if (depth >= maxObjectDepth) return index
+        for (const [key, slot] of flow.originFields[origin]) object.fields.push({ key: cutKey(key), term: termOf(slot, root, reasons, depth + 1) })
+        return index
+    }
+    function instanceArgs(other: Handle, origins: number[], root: number, reasons: string[], depth: number): CutTerm[] {
+        const cut = other === proto ? undefined : classCut(other, host)
+        const otherFields = other === proto ? (fieldsReady ? fields : undefined) : cut?.fields
+        const otherParams = other === proto ? params.length : cut?.params.length ?? 0
+        const otherParamOf = other === proto ? paramOf : cut?.paramOf ?? []
+        const otherObjects = other === proto ? objects : cut?.objects ?? []
+        const args: CutTerm[] = []
+        while (args.length < otherParams) args.push(emptyTerm())
+        if (!otherFields || depth >= maxObjectDepth) {
+            if (!otherFields && other !== proto) reasons.push(`unresolved ${constructorName(other)}`)
+            return args
+        }
+        const match = (list: CutField[], at: number[], level: number) => {
+            for (const f of list) {
+                const slots: number[] = []
+                for (const o of at) for (const [key, slot] of flow.originFields[o]) if (cutKeyMatches(key, f.key)) slots.push(slot)
+                for (const slot of slots) {
+                    for (const r of f.term.refs) {
+                        const p = otherParamOf[r.input]
+                        if (p >= 0) mergeTerm(args[p], termOf(slot, root, reasons, depth + 1))
+                    }
+                    if (level >= maxObjectDepth) continue
+                    const inner = flow.slotOrigins[slot].filter(o => cutObject(o))
+                    for (const index of f.term.objects) {
+                        const object = otherObjects[index]
+                        if (object.proto < 0) {
+                            match(object.fields, inner.filter(o => summaryClass(o) === undefined), level + 1)
+                            continue
+                        }
+                        const innerProto = (cut ? cut.protos : protos)[object.proto] as Handle
+                        const nested = inner.filter(o => summaryClass(o) === innerProto)
+                        if (!nested.length) continue
+                        const nestedArgs = instanceArgs(innerProto, nested, root, reasons, depth + 1)
+                        object.args.forEach((a, j) => {
+                            for (const r of a.refs) {
+                                const p = otherParamOf[r.input]
+                                if (p >= 0 && nestedArgs[j]) mergeTerm(args[p], nestedArgs[j])
+                            }
+                        })
+                    }
+                }
+            }
+        }
+        match(otherFields, origins, 0)
+        return args
+    }
+    function termOf(slot: number, root: number, reasons: string[], depth = 0): CutTerm {
+        const term = emptyTerm()
+        let t = closed[slot] ?? NONE
+        eachSymbol(slot, (k, f) => {
+            const kept = f >= 0 && filters[f].flags === GuardFlag.widened ? -1 : f
+            if (f >= 0 && (filters[f].flags & GuardFlag.widened)) term.widened = true
+            if (stored[k] || numeric[k] || !symRoot[k] || root < 0 || symRoot[k]!.includes(root) || storedBase(k)) {
+                addRef(term, symInput[k], kept)
+                return
+            }
+        })
+        if (scalars.flags[flow.scalar[slot]] & ScalarFlag.anyStr) t = unite(t, ANYSTR)
+        term.scalar = cutScalar(t)
+        term.opaque = opaque[slot] === 1
+        if (arith[slot] === 1) term.widened = true
+        const recv = root >= 0 ? roots[root].recv : self
+        for (const origin of flow.slotOrigins[slot]) {
+            if (seed.origins.has(origin)) continue
+            const kind = flow.originKind[origin]
+            if (self && (origin === recv || origin === self)) term.self = true
+            else if (kind === OriginKind.str) term.strings = true
+            else if (kind === OriginKind.fn) {
+                const fn = tableRef(fns, flow.originFn[origin]!)
+                if (!term.fns.includes(fn)) term.fns.push(fn)
+            } else if (kind === OriginKind.static) {
+                const cell = tableRef(statics, flow.originCell[origin])
+                if (staticNames.length < statics.length) staticNames.push(constructorName(protoOf(origin)))
+                if (!term.statics.includes(cell)) term.statics.push(cell)
+            } else if (cutObject(origin) || (kind === OriginKind.fresh && originHostFn(origin) && !seed.origins.has(origin))) {
+                const object = objectOf(origin, root, reasons, depth)
+                if (!term.objects.includes(object)) term.objects.push(object)
+            } else {
+                const why = `origin ${originText(origin)}`
+                if (!reasons.includes(why)) reasons.push(why)
+            }
+        }
+        return term
+    }
+    const reasons: string[] = []
+    const exposed: string[] = []
+    if (self) for (const [key, slot] of flow.originFields[self]) {
+        fields.push({ key: cutKey(key), term: termOf(slot, -1, reasons) })
+        if (key >= 0 && heap.isString(key as Handle)) exposed.push(propertyLabel(key as Handle))
+    }
+    fieldsReady = true
+    const allocating = new Set<number>()
+    const rising: number[] = []
+    if (self) for (const field of flow.originFields[self].values()) {
+        for (const origin of flow.slotOrigins[field]) {
+            if (flow.originKind[origin] !== OriginKind.slice && flow.originKind[origin] !== OriginKind.created) continue
+            for (const creator of flow.originCreators.get(origin) ?? []) {
+                if (allocating.has(creator)) continue
+                allocating.add(creator)
+                rising.push(creator)
+            }
+        }
+    }
+    while (rising.length) {
+        const id = rising.pop()!
+        for (const caller of flow.instances[id].callers) {
+            const from = instOfSlot(caller).id
+            if (allocating.has(from)) continue
+            allocating.add(from)
+            rising.push(from)
+        }
+    }
+    const boundary: [call: number, other: Handle, label: string][] = []
+    const labelsOf = new Map<Handle, Map<Function, string>>()
+    const labelOf = (other: Handle, fn: Function): string | undefined => {
+        let labels = labelsOf.get(other)
+        if (!labels) {
+            labels = new Map()
+            labelsOf.set(other, labels)
+            for (const [label, method] of classMethods(other, classConstructor(other, host), host)) {
+                labels.set(method, label)
+                for (const [arity, variant] of arityVariants(method)) labels.set(variant, `${label}/${arity}`)
+            }
+        }
+        return labels.get(fn)
+    }
+    for (const [call] of callsOf) {
+        const inst = instOfSlot(call)
+        const x = exprAt(call)
+        if (x.b < 0 || !rootsOf.has(inst.id) || initFns.has(inst.summary.fn)) continue
+        const within = inst.qual && flow.originKind[inst.qual] !== OriginKind.site ? summaryClass(inst.qual) : undefined
+        if (within !== undefined && within !== proto) continue
+        for (const origin of flow.slotOrigins[at(inst, x.b)]) {
+            if (origin === self || interior.has(origin)) continue
+            const owner = flow.originOwner[origin]
+            if (flow.originKind[origin] !== OriginKind.static && (!owner || !initFns.has(owner.fn))) continue
+            const other = summaryClass(origin)
+            if (other === undefined || other === proto) continue
+            let label: string | undefined
+            for (const target of flow.slotOrigins[at(inst, x.a)]) {
+                const fn = flow.originKind[target] === OriginKind.fn ? flow.originFn[target] : originHostFn(target)
+                if (fn) label = label ?? labelOf(other, fn)
+            }
+            if (label !== undefined && !boundary.some(b => b[0] === call)) boundary.push([call, other, label])
+        }
+    }
+    const observesOf = roots.map(() => [] as CutRef[])
+    for (let slot = 0; slot < n; slot++) {
+        if (flow.slotKind[slot] !== SlotKind.expr || filterOf[slot] < 0 || filterOf[slot] === widen) continue
+        const inst = flow.instances[flow.slotOwner[slot]]
+        const x = inst.summary.exprs[flow.slotIndex[slot]]
+        const from = at(inst, x.a)
+        for (let k = 0; k < symCount; k++) {
+            if (!(bits[from * width + (k >> 5)] & (1 << (k & 31)))) continue
+            for (const ri of rootsOf.get(inst.id) ?? []) {
+                if (!stored[k] && symRoot[k] && !symRoot[k]!.includes(ri)) continue
+                const list = observesOf[ri]
+                if (!list.some(r => r.input === symInput[k] && r.filter === filterOf[slot])) list.push({ input: symInput[k], filter: filterOf[slot] })
+            }
+        }
+    }
+    const entries: CutEntry[] = roots.map((r, ri) => {
+        const reasons: string[] = []
+        const effects: CutEffect[] = []
+        for (const [input, v] of effectsByRoot[ri]) {
+            let effect = effects.find(e => e.input === input)
+            if (!effect) {
+                effect = { input, term: emptyTerm() }
+                effects.push(effect)
+            }
+            mergeTerm(effect.term, termOf(v, ri, reasons))
+        }
+        const calloutList: CutCallout[] = []
+        for (const [call, input] of callouts) {
+            const inst = instOfSlot(call)
+            if (!(rootsOf.get(inst.id) ?? []).includes(ri)) continue
+            const x = exprAt(call)
+            const callee = termOf(at(inst, x.a), ri, [])
+            callee.fns = []
+            callee.objects = []
+            callee.statics = []
+            if (emptyTermOf(callee)) callee.opaque = true
+            calloutList.push({ callee, recv: termOf(at(inst, x.b), ri, reasons), args: x.args.map(a => termOf(at(inst, a), ri, reasons)), result: input })
+        }
+        const siteList: CutSite[] = []
+        for (const [call, other, label] of boundary) {
+            const inst = instOfSlot(call)
+            if (!(rootsOf.get(inst.id) ?? []).includes(ri)) continue
+            const x = exprAt(call)
+            siteList.push({ recv: termOf(at(inst, x.b), ri, reasons), label: `${constructorName(other)}.${label}`, args: x.args.map(a => termOf(at(inst, a), ri, reasons)) })
+        }
+        const ret = termOf(r.inst.ret, ri, reasons)
+        const b = r.inst.summary.bound
+        const bound = b ? { param: b.param, owner: b.recv, key: cutKey(b.key), term: termOf(at(r.inst, b.ret), ri, reasons) } : undefined
+        return { label: r.label, fn: tableRef(fns, r.fn), params: r.inst.summary.params, ret, effects, callouts: calloutList, sites: siteList, observes: observesOf[ri], bound, allocates: allocating.has(r.inst.id), reasons }
+    })
+    return { name, generator, key: '', fns, statics, staticNames, protos, protoNames: protos.map(p => constructorName(p as Handle)), uses: [], inputs: seed.inputs, params, paramOf, numeric: numericOf, filters, fields, objects, entries, exposed, through: seed.through, analyzed: [], reasons, work: 0, size: 0, ms: 0 }
+}
+
+export function cutPositions(c: Cut, classes: Map<Handle, Cut>, depth = 0): string[][][] {
+    const out: string[][][] = c.params.map(() => [])
+    if (depth >= maxObjectDepth) return out
+    const walk = (list: CutField[], prefix: string[], level: number) => {
+        for (const f of list) {
+            const key = f.key === '[n]' ? numberKey : f.key
+            for (const r of f.term.refs) {
+                const p = c.paramOf[r.input]
+                if (p >= 0) out[p].push([...prefix, key])
+            }
+            if (level >= maxObjectDepth) continue
+            for (const index of f.term.objects) {
+                const object = c.objects[index]
+                if (object.proto < 0) {
+                    walk(object.fields, [...prefix, key], level + 1)
+                    continue
+                }
+                const inner = classes.get(c.protos[object.proto] as Handle)
+                if (!inner || inner === c) continue
+                const innerPositions = cutPositions(inner, classes, depth + 1)
+                object.args.forEach((a, j) => {
+                    for (const r of a.refs) {
+                        const p = c.paramOf[r.input]
+                        if (p >= 0) for (const chain of innerPositions[j] ?? []) out[p].push([...prefix, key, ...chain])
+                    }
+                })
+            }
+        }
+    }
+    walk(c.fields, [], 0)
+    return out
+}
+
+function cutFilterText(c: Cut, f: number): string {
+    const filter = c.filters[f]
+    const parts: string[] = []
+    let i = 0
+    while (i < narrowNames.length) {
+        if ((filter.flags & (1 << i)) && narrowNames[i]) parts.push(narrowNames[i])
+        i++
+    }
+    if (filter.flags & GuardFlag.bounded) parts.push(`${filter.b <= MinI64 ? '' : filter.b}..${filter.sub >= MaxU64 ? '' : filter.sub}`)
+    if (filter.flags & GuardFlag.hasProto) parts.push(`proto ${c.protoNames[filter.b]}`)
+    if (filter.flags & GuardFlag.lacksProto) parts.push(`!proto ${c.protoNames[filter.b]}`)
+    if (filter.flags & GuardFlag.widened) parts.push('widen')
+    return parts.join(' ')
+}
+
+function cutLocalName(c: Cut, input: CutInput): string {
+    if (input.param === -1) return 'This'
+    if (input.param === -2) return 'Ctx'
+    return String.fromCharCode(65 + input.param)
+}
+
+function cutInputText(c: Cut, input: number, entry: number, named = false): string {
+    const info = c.inputs[input]
+    if (c.paramOf[input] >= 0) return c.params[c.paramOf[input]].name
+    if (c.numeric[input] && !named) return 'number'
+    if (info.kind === CutInputKind.result) return info.name
+    if (info.kind === CutInputKind.param) return info.entry === entry || entry < 0 ? cutLocalName(c, info) : `${c.entries[info.entry].label}.${cutLocalName(c, info)}`
+    return `${cutInputText(c, info.base, entry, true)}${info.key.startsWith('[') ? '' : '.'}${info.key}`
+}
+
+function cutScalarText(s: CutScalar | undefined, widened: boolean): string {
+    if (!s) return ''
+    let t = scalarOfCut(s)
+    if (widened) t = withoutNumbers(t)
+    return t === NONE ? '' : scalarText(t)
+}
+
+export type CutRefText = (input: number) => string | undefined
+
+export function cutTermText(c: Cut, term: CutTerm, entry: number, depth = 0, stack: CutObject[] = [], refText?: CutRefText): string {
+    const parts: string[] = []
+    const add = (text: string) => {
+        if (!parts.includes(text)) parts.push(text)
+    }
+    for (const r of term.refs) {
+        const own = refText?.(r.input)
+        if (own !== undefined) add(own)
+    }
+    for (const r of term.refs) if (refText?.(r.input) === undefined) add(`${cutInputText(c, r.input, entry)}${r.filter >= 0 && c.paramOf[r.input] < 0 && !c.numeric[r.input] ? `?${cutFilterText(c, r.filter)}` : ''}`)
+    if (term.self) add('this')
+    const text = cutScalarText(term.scalar, term.widened)
+    if (text) add(text)
+    if (term.widened) add('number')
+    if (term.strings && !(term.scalar && term.scalar.strs.length)) add('string')
+    if (term.opaque) add('any')
+    for (const cell of term.statics) add(`static ${c.staticNames[cell]}#${cell}`)
+    for (const fn of term.fns) add(`fn ${c.fns[fn].name || '<anon>'}`)
+    for (const index of term.objects) add(cutObjectText(c, c.objects[index], entry, depth, stack, refText))
+    return parts.join(' | ') || 'never'
+}
+
+function cutObjectText(c: Cut, object: CutObject, entry: number, depth: number, stack: CutObject[] = [], refText?: CutRefText): string {
+    if (object.kind === 'closure') return `fn ${c.fns[object.fn].name || '<anon>'}`
+    if (object.kind === 'static') return `static ${object.proto >= 0 ? c.protoNames[object.proto] : 'object'}`
+    if (stack.includes(object)) return '^'
+    if (object.proto >= 0) {
+        const name = c.protoNames[object.proto]
+        return object.args.length ? `${name}<${object.args.map(a => cutTermText(c, a, entry, depth + 1, [], refText)).join(', ')}>` : name
+    }
+    if (depth > 2) return '{…}'
+    return `{${object.fields.map(f => `${f.key}: ${cutTermText(c, f.term, entry, depth + 1, [...stack, object], refText)}`).join(', ')}}`
+}
+
+export function cutText(c: Cut): string {
+    const head = c.params.length ? `<${c.params.map(p => p.name).join(', ')}>` : ''
+    const lines = [`${c.generator === 'class' ? 'class ' : ''}${c.name}${head} {   key=${c.key} fns=${c.fns.length} objects=${c.objects.length} inputs=${c.inputs.length} work=${c.work} nodes=${c.size} ${c.ms.toFixed(1)}ms${c.reasons.length ? ` SLOW PATH: ${c.reasons.join('; ')}` : ''}`]
+    for (const f of c.fields) lines.push(`  ${f.key}: ${cutTermText(c, f.term, -1)}`)
+    c.entries.forEach((e, i) => {
+        const inputs = c.inputs.filter(input => input.kind === CutInputKind.param && input.entry === i && input.param >= 0)
+        const locals = inputs.filter(input => c.paramOf[c.inputs.indexOf(input)] < 0 && !c.numeric[c.inputs.indexOf(input)]).map(input => cutLocalName(c, input))
+        const params = inputs.map(input => cutInputText(c, c.inputs.indexOf(input), i))
+        lines.push(`  ${e.label}${locals.length ? `<${locals.join(', ')}>` : ''}(${params.join(', ')}): ${cutTermText(c, e.ret, i)}${e.allocates ? '   allocates' : ''}${e.reasons.length ? `   SLOW PATH: ${e.reasons.join('; ')}` : ''}`)
+        for (const effect of e.effects) if (!emptyTermOf(effect.term)) lines.push(`      writes ${cutInputText(c, effect.input, i)} ⊇ ${cutTermText(c, effect.term, i)}`)
+        for (const callout of e.callouts) {
+            const recv = callout.recv.refs.length || callout.recv.objects.length || callout.recv.self ? ` this ${cutTermText(c, callout.recv, i)}` : ''
+            lines.push(`      callout ${c.inputs[callout.result].name} = ${cutTermText(c, callout.callee, i)}(${callout.args.map(a => cutTermText(c, a, i)).join(', ')})${recv}`)
+        }
+        const observed: number[] = []
+        for (const r of e.observes) if (!observed.includes(r.input)) observed.push(r.input)
+        if (observed.length) lines.push(`      requires ${observed.map(input => `${cutInputText(c, input, i, true)}?{${e.observes.filter(r => r.input === input).map(r => cutFilterText(c, r.filter)).join(', ')}}`).join(' ')}`)
+        for (const site of e.sites) lines.push(`      site ${cutTermText(c, site.recv, i)} .${site.label.slice(site.label.indexOf('.') + 1)}(${site.args.map(a => cutTermText(c, a, i)).join(', ')})`)
+        if (e.bound) lines.push(`      if ${String.fromCharCode(65 + e.bound.param)} in bounds of ${e.bound.owner < 0 ? 'this' : String.fromCharCode(65 + e.bound.owner)}.${e.bound.key}: ${cutTermText(c, e.bound.term, i)}`)
+    })
+    if (c.exposed.length) lines.push(`  exposed: ${c.exposed.join(', ')}`)
+    if (c.through.length) lines.push(`  analyzed through: ${c.through.join(', ')}`)
+    if (c.analyzed.length) lines.push(`  analyzes: ${c.analyzed.join(' ')}`)
+    lines.push('}')
+    return cutDisplay(lines.join('\n'))
+}
+
+export function cutDisplay(text: string): string {
+    return text.replace(/!\[Symbol\(([^)]*)\)\]#\d+/g, (m: string, d: string) => d.startsWith('#') ? d : `[${d}]`).replace(/!(\[Symbol\.[^\]]*\])#\d+/g, '$1')
 }
 
 function scalarKind(t: number): number {
@@ -4894,8 +6259,9 @@ function objectOrigin(origin: number): boolean {
     return (kind === OriginKind.fresh || kind === OriginKind.created || kind === OriginKind.slice || kind === OriginKind.static) && !originHostFn(origin)
 }
 
+const selecting = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isBoolean | GuardFlag.bounded | GuardFlag.hasProto
+
 function genericView(self: number, params: number[][], methods: Function[]): GenericFlow {
-    const selecting = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isBoolean | GuardFlag.bounded | GuardFlag.hasProto
     const n = flow.slotKind.length
     const sources: (number[] | undefined)[] = new Array(n)
     const kinds = new Uint8Array(n)
@@ -4928,21 +6294,7 @@ function genericView(self: number, params: number[][], methods: Function[]): Gen
         }
         if (list.length) fields.set(origin, list)
     }
-    const numeric: number[] = []
-    for (const inst of flow.instances) {
-        const s = inst.summary
-        for (const x of s.exprs) {
-            const n = x.node ? getNode(s.g, x.node) : undefined
-            if (!n) continue
-            if (x.op === ExprOp.arith || x.op === ExprOp.cmp) {
-                if (numericUse(s.g, n, 0)) numeric.push(at(inst, x.a))
-                if (numericUse(s.g, n, 1)) numeric.push(at(inst, x.b))
-            }
-            if (x.op !== ExprOp.rt) continue
-            const first = n.op === NodeOp.store ? 1 : 2
-            for (let i = 0; i < x.args.length; i++) if (numericUse(s.g, n, first + i)) numeric.push(at(inst, x.args[i]))
-        }
-    }
+    const numeric = numericOperands()
     const names: string[] = []
     methods.forEach((fn, m) => params[m].forEach((_, i) => names.push(`?${fn.name || '<anon>'}.p${i}`)))
     return { sources, kinds, params, names, numeric, self, fields, objects, units: flow.summaryList.map(s => s.fn) }
