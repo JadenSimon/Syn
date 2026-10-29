@@ -1825,6 +1825,24 @@ const Commutative = new Set<NodeOp>([NodeOp.add, NodeOp.mul, NodeOp.and, NodeOp.
 const UnsignedResults = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.ptr])
 const OrderingOps = new Set<NodeOp>([NodeOp.after, NodeOp.startOf])
 const AddressOps = new Set<NodeOp>([NodeOp.pstack, NodeOp.alloca, NodeOp.frameAddress])
+enum AddressUse {
+    inert,
+    escapes,
+    flows,
+    stored,
+    entered,
+}
+
+function addressUse(g: Graph, n: GraphNode, slot: number): AddressUse {
+    if (n.op === NodeOp.load || CompareOps.has(n.op)) return AddressUse.inert
+    if (n.op === NodeOp.store) return slot === 3 ? AddressUse.stored : AddressUse.inert
+    if (n.op === NodeOp.call) return slot < 3 || hasArg((callSummary(g, n) ?? unknownCall).captures, slot - 3) ? AddressUse.escapes : AddressUse.inert
+    if (n.op === NodeOp.apply) return AddressUse.entered
+    if (n.op === NodeOp.encode) return AddressUse.escapes
+    if (n.op === NodeOp.select && slot === 0) return AddressUse.inert
+    if (n.op === NodeOp.after || n.op === NodeOp.select || (PureOps.has(n.op) && !TargetingValues.has(n.op))) return AddressUse.flows
+    return AddressUse.escapes
+}
 function latency(costs: lowering.TargetCosts, op: NodeOp): number {
     if (OrderingOps.has(op)) return 0
     return costs.latency.get(opName(op)) ?? 1
@@ -13371,75 +13389,57 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
     const frameAllocas = layoutAllocas()
 
     function layoutAllocas(): number {
-        expectForm(g, 'layout allocas', 'lowerable', undefined)
-        const allocas: number[] = []
-        for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.alloca) allocas.push(id)
-        if (!allocas.length) return framed()
-        let users: Map<number, [user: number, slot: number][]> | undefined
-        function usesOf(id: number): [user: number, slot: number][] {
-            if (!users) {
-                users = new Map()
-                for (const [user, n] of nodeEntries(g)) {
-                    let i = firstNonOrderingSlot(n)
-                    while (i < countIds(n)) {
-                        const ref = getRef(n, i)
-                        let list = ref ? users.get(ref) : undefined
-                        if (ref && !list) users.set(ref, list = [])
-                        if (list) list.push([user, i])
-                        i++
-                    }
-                }
-            }
-            return users.get(id) ?? []
-        }
+        expectForm(g, 'layout allocas', 'lowerable')
+        if (!gn.mayHaveKinds(g, gn.GraphKinds.alloca)) return 0
+        const ix = graphIndex(g)
         function carriedAround(alloca: number, home: number): boolean {
             const seen = new Set<number>([alloca])
             const work = [alloca]
             while (work.length) {
                 const x = work.pop()!
-                for (const [user, slot] of usesOf(x)) {
+                for (const user of indexedUsers(ix, x)) {
                     const n = getNode(g, user)!
-                    if (n.op === NodeOp.load || CompareOps.has(n.op) || (n.op === NodeOp.select && slot === 0)) continue
-                    if (n.op === NodeOp.store && slot !== 3) continue
-                    if (n.op === NodeOp.store || n.op === NodeOp.encode) return true
-                    if (n.op === NodeOp.call && (slot < 3 || hasArg((callSummary(g, n) ?? unknownCall).captures, slot - 3))) return true
-                    if (n.op === NodeOp.call) continue
-                    if (n.op === NodeOp.apply && getRef(n, 0) === home) return true
-                    const follows = n.op === NodeOp.apply || n.op === NodeOp.after || n.op === NodeOp.select || (PureOps.has(n.op) && !TargetingValues.has(n.op))
-                    if (!follows) return true
-                    const next = n.op === NodeOp.apply ? getBlock(g, getRef(n, 0))?.params[slot - 1] : user
-                    if (next === undefined) return true
-                    if (seen.has(next)) continue
-                    seen.add(next)
-                    work.push(next)
+                    let slot = firstNonOrderingSlot(n)
+                    while (slot < countIds(n)) {
+                        const at = slot
+                        slot++
+                        if (getRef(n, at) !== x) continue
+                        const use = addressUse(g, n, at)
+                        if (use === AddressUse.inert) continue
+                        if (use !== AddressUse.flows && use !== AddressUse.entered) return true
+                        if (use === AddressUse.entered && getRef(n, 0) === home) return true
+                        const next = use === AddressUse.entered ? getBlock(g, getRef(n, 0))?.params[at - 1] : user
+                        if (next === undefined) return true
+                        if (seen.has(next)) continue
+                        seen.add(next)
+                        work.push(next)
+                    }
                 }
             }
             return false
         }
+        const allocas: number[] = []
         for (const b of g.blocks) {
-            if (!loopDepth.get(b.id)) continue
-            const seen = new Set<number>()
-            const pending = [b.bodyId]
-            while (pending.length) {
-                const id = pending.pop()!
-                if (!id || seen.has(id)) continue
-                seen.add(id)
-                const n = getNode(g, id)
-                if (!n || n.op === NodeOp.block || n.op === NodeOp.param) continue
-                if (n.op === NodeOp.alloca && carriedAround(id, b.id)) throw `lowering: alloca %${id} at B${b.id} is still live when the loop evaluates it again`
-                for (let i = 0; i < countIds(n); i++) pending.push(getRef(n, i))
+            const here = gn.findValues(ix, b.id, NodeOp.alloca)
+            if (!here) continue
+            const looped = !!loopDepth.get(b.id)
+            for (const id of here) {
+                if (looped && carriedAround(id, b.id)) throw `lowering: alloca %${id} at B${b.id} is still live when the loop evaluates it again`
+                allocas.push(id)
+            }
+            for (const id of gn.findValues(ix, b.id, NodeOp.ret) ?? []) {
+                let value = getRef(getNode(g, id)!, 0)
+                let m = getNode(g, value)
+                while (m?.op === NodeOp.after) {
+                    value = getRef(m, countIds(m) - 1)
+                    m = getNode(g, value)
+                }
+                if (m?.op === NodeOp.alloca) throw `lowering: alloca %${value} escapes through ret %${id}`
             }
         }
-        for (const [id, n] of nodeEntries(g)) {
-            if (n.op !== NodeOp.ret) continue
-            let value = getRef(n, 0)
-            let m = getNode(g, value)
-            while (m?.op === NodeOp.after) {
-                value = getRef(m, countIds(m) - 1)
-                m = getNode(g, value)
-            }
-            if (getNode(g, value)?.op === NodeOp.alloca) throw `lowering: alloca %${value} escapes through ret %${id}`
-        }
+        gn.clearKinds(g, gn.GraphKinds.alloca)
+        if (!allocas.length) return 0
+        allocas.sort((a, b) => a - b)
         const offsets = new Map<number, number>()
         let reserved = 0
         for (const id of allocas) {
@@ -13455,15 +13455,7 @@ export function analyzeValueGraph(g: Graph, opts?: LowerGraphOptions) {
             putNode(g, id, NodeOp.frameAddress, [{ literal: offsets.get(id)! }, { literal: size }])
         }
         gn.dirtyValues(g, allocas)
-        return framed()
-    }
-
-    function framed(): number {
-        let bytes = 0
-        for (const n of allNodes(g)) {
-            if (n.op === NodeOp.frameAddress) bytes = Math.max(bytes, getLiteral(g, n, 0) + getLiteral(g, n, 1))
-        }
-        return (bytes + 15) & ~15
+        return (reserved + 15) & ~15
     }
     
     const callProjections = new Map<number, number[]>()
@@ -16291,6 +16283,7 @@ export function unifySlotTypes(g: Graph): boolean {
 }
 
 function demotePstacks(g: Graph): boolean {
+    expectForm(g, 'demote pstacks', 'packaged', 'optimized')
     if (!gn.mayHave(g, NodeOp.pstack)) return false
     const demotable = (n: GraphNode) => pstackFixedSize(g, n) > 0
     let any = false
@@ -16335,27 +16328,23 @@ function demotePstacks(g: Graph): boolean {
                 const ordering = firstNonOrderingSlot(n)
                 for (let i = ordering; i < countIds(n) && !escaped; i++) {
                     if (getRef(n, i) !== x) continue
-                    if (n.op === NodeOp.load) continue
-                    if (n.op === NodeOp.store) {
-                        if (i !== 3) continue
+                    const use = addressUse(g, n, i)
+                    if (use === AddressUse.inert) continue
+                    if (use === AddressUse.stored) {
                         if (headers) { escaped = true; break }
                         const target = mem.of(xb, getRef(n, 1))
                         const into = target.base
                         if (into === root || !container(into) || escapes(target.block!, into)) { escaped = true; break }
                         if (mem.flows(target.block!, into, true).calls.some(([call, k]) => hasArg((callSummary(g, getNode(g, call)!) ?? unknownCall).deepCaptures, k))) { escaped = true; break }
                         for (const [l, lb] of loadsFrom.get(into) ?? []) follow(l, lb)
-                    } else if (n.op === NodeOp.call) {
-                        if (i < 3 || hasArg((callSummary(g, n) ?? unknownCall).captures, i - 3)) escaped = true
-                    } else if (n.op === NodeOp.apply) {
+                    } else if (use === AddressUse.entered) {
                         const target = getBlock(g, getRef(n, 0))
                         const param = target?.params[i - 1]
                         if (param === undefined || headers?.has(getRef(n, 0))) escaped = true
                         else follow(param, target!)
-                    } else if (n.op === NodeOp.encode) {
-                        escaped = true
-                    } else if (n.op === NodeOp.after || n.op === NodeOp.select || (PureOps.has(n.op) && !TargetingValues.has(n.op))) {
+                    } else if (use === AddressUse.flows) {
                         follow(u, xb)
-                    } else if (!CompareOps.has(n.op)) {
+                    } else {
                         escaped = true
                     }
                 }
@@ -17305,16 +17294,25 @@ export interface PreparedLowering {
 }
 
 function readonlyAllocas(g: Graph, staticData: (bytes: Uint8Array) => number, regionSlot?: RegionSlot): void {
-    const allocas: number[] = []
-    for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.alloca) allocas.push(id)
-    if (!allocas.length) return
+    expectForm(g, 'readonly allocas', 'lowerable')
+    if (!gn.mayHaveKinds(g, gn.GraphKinds.alloca)) return
     const index = graphIndex(g)
+    const allocas: number[] = []
+    const allocaBlocks: [alloca: number, block: GraphBlock][] = []
+    for (const b of g.blocks) {
+        for (const id of gn.findValues(index, b.id, NodeOp.alloca) ?? []) {
+            allocas.push(id)
+            allocaBlocks.push([id, b])
+        }
+    }
+    if (!allocas.length) {
+        gn.clearKinds(g, gn.GraphKinds.alloca)
+        return
+    }
     const mem = memAnalysis(g, index)
     let floats: Set<number> | undefined
     const accesses = new Map<number, [access: number, block: GraphBlock][]>()
-    const allocaBlocks: [alloca: number, block: GraphBlock][] = []
     for (const b of g.blocks) {
-        for (const id of gn.findValues(index, b.id, NodeOp.alloca) ?? []) allocaBlocks.push([id, b])
         for (const op of [NodeOp.load, NodeOp.store]) {
             for (const id of gn.findValues(index, b.id, op) ?? []) {
                 const n = getNode(g, id)!
