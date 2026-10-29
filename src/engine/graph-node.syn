@@ -3,7 +3,7 @@
 "use wrapped";
 
 import * as intrinsics from './intrinsics'
-import type { Graph, GraphBlock, GraphNode } from './lowering2'
+import type { Graph, GraphBlock, GraphForm, GraphNode } from './lowering2'
 
 const Types = intrinsics.Types
 
@@ -1870,4 +1870,228 @@ function linkedLca(t: RegionTree, memo: number[], a: number, b: number): number 
         if (x < 0 || y < 0) return t.roots[0]
     }
     return x
+}
+
+const graphForms: (GraphForm | undefined)[] = [undefined, 'packaged', 'optimized', 'lowerable']
+const graphHeader = 16
+
+function formIndex(form: GraphForm | undefined): number {
+    if (form === 'packaged') return 1
+    if (form === 'optimized') return 2
+    if (form === 'lowerable') return 3
+    return 0
+}
+
+function nodeWords(nodes: Map<number, GraphNode>): number {
+    let words = 0
+    for (const n of nodes.values()) words += 3 + n.slots.length
+    return words
+}
+
+export interface GraphLayout {
+    words: number
+    floats: number
+    literalFrom: number
+    rawFrom: number
+    interned: number[]
+}
+
+export function graphLayout(g: Graph, literalFrom: number, rawFrom: number): GraphLayout {
+    const interned: number[] = []
+    for (const at of g.literals.interned.values()) {
+        if (at >= rawFrom) interned.push(at)
+    }
+    let words = graphHeader + interned.length + nodeWords(g.nodes) + 1
+    for (const b of g.blocks) words += 3 + b.params.length
+    if (g.facts) words += nodeWords(g.facts)
+    const floats = g.literals.values.length - literalFrom + g.literals.raw.length - rawFrom + g.blocks.length
+    return { words, floats, literalFrom, rawFrom, interned }
+}
+
+export function graphFloatsAt(words: number): number {
+    return (words + 1) & ~1
+}
+
+export function graphBytes(layout: GraphLayout): number {
+    return graphFloatsAt(layout.words) * 4 + layout.floats * 8
+}
+
+function writeNodes(nodes: Map<number, GraphNode>, at: number, word: (at: number, v: number) => void): number {
+    let k = at
+    for (const [id, n] of nodes) {
+        const length = n.slots.length
+        word(k, id)
+        word(k + 1, n.op | n.flags << 8 | n.scratchFlags << 16)
+        word(k + 2, length)
+        k += 3
+        let i = 0
+        while (i < length) {
+            word(k + i, n.slots[i])
+            i++
+        }
+        k += length
+    }
+    return k
+}
+
+export function writeGraph(g: Graph, kind: number, layout: GraphLayout, word: (at: number, v: number) => void, float: (k: number, v: number) => void): void {
+    const literals = g.literals
+    word(0, kind)
+    word(1, layout.words)
+    word(2, g.ids.next)
+    word(3, g.root)
+    word(4, g.epoch)
+    word(5, formIndex(g.form))
+    word(6, g.level === undefined ? 0 : g.level + 1)
+    word(7, g.unswitch === undefined ? 0 : g.unswitch + 1)
+    word(8, literals.values.length)
+    word(9, layout.literalFrom)
+    word(10, literals.raw.length)
+    word(11, layout.rawFrom)
+    word(12, g.blocks.length)
+    word(13, g.kinds)
+    word(14, layout.interned.length)
+    word(15, g.nodes.size)
+    let k = graphHeader
+    for (const at of layout.interned) {
+        word(k, at)
+        k++
+    }
+    for (const b of g.blocks) {
+        word(k, b.id)
+        word(k + 1, b.bodyId)
+        word(k + 2, b.params.length)
+        k += 3
+        for (const p of b.params) {
+            word(k, p)
+            k++
+        }
+    }
+    k = writeNodes(g.nodes, k, word)
+    word(k, g.facts ? g.facts.size + 1 : 0)
+    k++
+    if (g.facts) k = writeNodes(g.facts, k, word)
+    intrinsics.assert(k === layout.words, 'graph: the written graph does not match its layout')
+    if (k & 1) word(k, 0)
+    let f = 0
+    let i = layout.literalFrom
+    while (i < literals.values.length) {
+        float(f, literals.values[i])
+        f++
+        i++
+    }
+    i = layout.rawFrom
+    while (i < literals.raw.length) {
+        float(f, literals.raw[i])
+        f++
+        i++
+    }
+    for (const b of g.blocks) {
+        float(f, b.bodyConst)
+        f++
+    }
+}
+
+function readNodes(read: (at: number) => number, from: number, count: number, into: Map<number, GraphNode>): number {
+    let at = from
+    let k = 0
+    while (k < count) {
+        const id = read(at)
+        const word = read(at + 1)
+        const length = read(at + 2)
+        at += 3
+        const slots = new Uint32Array(length)
+        let i = 0
+        while (i < length) {
+            slots[i] = read(at + i)
+            i++
+        }
+        at += length
+        const n = makeNodeFromSlots((word & 0xff) as NodeOp, slots, ((word >>> 8) & 0xff) as u8)
+        n.scratchFlags = ((word >>> 16) & 0xff) as u8
+        into.set(id, n)
+        k++
+    }
+    return at
+}
+
+function rawKey(raw: number[], at: number): string {
+    return raw.slice(at + 1, at + 1 + raw[at]).join(',')
+}
+
+export function readGraph(read: (at: number) => number, float: (k: number) => number, shared?: Graph): Graph {
+    const literals = shared ? shared.literals : createLiteralPool()
+    const literalCount = read(8)
+    const literalFrom = read(9)
+    const rawCount = read(10)
+    const rawFrom = read(11)
+    intrinsics.assert(literals.values.length === literalFrom && literals.raw.length === rawFrom, 'graph: a read graph extends a literal pool it was not written against')
+    let f = 0
+    let i = literalFrom
+    while (i < literalCount) {
+        const v = float(f)
+        if (!literals.at.has(v)) literals.at.set(v, i)
+        literals.values.push(v)
+        f++
+        i++
+    }
+    i = rawFrom
+    while (i < rawCount) {
+        literals.raw.push(float(f))
+        f++
+        i++
+    }
+    let at = graphHeader
+    const internedCount = read(14)
+    i = 0
+    while (i < internedCount) {
+        const raw = read(at)
+        literals.interned.set(rawKey(literals.raw, raw), raw)
+        at++
+        i++
+    }
+    const blocks: GraphBlock[] = []
+    const blockCount = read(12)
+    i = 0
+    while (i < blockCount) {
+        const id = read(at)
+        const bodyId = read(at + 1)
+        const paramCount = read(at + 2)
+        at += 3
+        const params: number[] = []
+        let k = 0
+        while (k < paramCount) {
+            params.push(read(at + k))
+            k++
+        }
+        at += paramCount
+        blocks.push({ id, params, bodyId, bodyConst: float(f) })
+        f++
+        i++
+    }
+    const nodes = new Map<number, GraphNode>()
+    at = readNodes(read, at, read(15), nodes)
+    const factCount = read(at)
+    let facts: Map<number, GraphNode> | undefined
+    if (factCount) {
+        facts = new Map<number, GraphNode>()
+        readNodes(read, at + 1, factCount - 1, facts)
+    }
+    const ids = shared ? shared.ids : { next: 0 }
+    ids.next = read(2)
+    const level = read(6)
+    const unswitch = read(7)
+    return createGraph({
+        form: graphForms[read(5)],
+        ids,
+        root: read(3),
+        epoch: read(4),
+        literals,
+        blocks,
+        nodes,
+        facts,
+        level: level ? level - 1 : undefined,
+        unswitch: unswitch ? unswitch - 1 : undefined,
+        kinds: read(13) as GraphKinds,
+    })
 }

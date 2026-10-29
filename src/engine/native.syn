@@ -33,7 +33,7 @@ import {
     type NodeSpace, allNodes, someNode, copyNodes, countNodes, nodeEntries, nodeIds,
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
     FloatUnaryOps, rawSlot, rawContents, internRaw, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
-    inboundApplies, indexedValues, findValues, blockOps, holderOf,
+    inboundApplies, indexedValues, findValues, blockOps, holderOf, graphLayout, graphBytes, graphFloatsAt, readGraph, writeGraph,
 } from './graph-node'
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
@@ -2454,6 +2454,15 @@ interface ImageCapture {
     heapTo: number
     staticTop: number
     imports: string[]
+    symbols: ImageSymbol[]
+}
+
+interface ImageSymbol {
+    name: string
+    offset: number
+    size: number
+    frameBytes: number
+    frameLink: number
 }
 
 interface ImageSegment {
@@ -2483,6 +2492,7 @@ interface InstalledImage {
     page: CodePage
     image: Uint8Array
     poolOffset: number
+    symbols: ImageSymbol[]
 }
 
 function installImage(
@@ -2553,6 +2563,7 @@ function installImage(
         page: reserved.page,
         image,
         poolOffset,
+        symbols: units.map(unit => ({ name: unit.name, offset: offsets[unit.symbol], size: unit.code.bytes.length, frameBytes: unit.code.frame?.bytes ?? -1, frameLink: unit.code.frame?.link ?? -1 })),
     }
 }
 
@@ -2961,6 +2972,447 @@ function optimizeOnce(graph: Graph, tag: string, run: () => Graph): Graph {
     return reused
 }
 
+export enum NormalizeKind {
+    first,
+    again,
+    optimize,
+}
+
+export function hostNormalize(g: Graph, kind: NormalizeKind, target: Target): Graph {
+    if (kind === NormalizeKind.optimize) return optimizePackaged(g, target)
+    return normalizeValueGraph(g, { firstPass: kind === NormalizeKind.first, target })
+}
+
+interface PendingNormalize {
+    out: Graph
+    kind: number
+    literalFrom: number
+    rawFrom: number
+    heapMark: number
+    stackMark: number
+    scratchMark: number
+}
+
+let pendingNormalize: PendingNormalize | undefined
+
+function nativeNormalize(phase: u32, kind: u32, inHi: u32, inLo: u32, outHi: u32, outLo: u32, cap: u32): number {
+    if (phase === 0) {
+        const heapTop = heap.resolveHeapCell(heap.runtimeCells)
+        const heapMark = Intrinsics.load(heapTop, 0, Types.u32)
+        const stackMark = Intrinsics.pstack(programStack, 0, 0)
+        const scratchMark = Intrinsics.pstack(0, 0, 0)
+        const input = inHi * 4294967296 + inLo
+        const inputFloats = input + graphFloatsAt(Intrinsics.load(input, 4, Types.u32)) * 4
+        const g = readGraph(at => Intrinsics.load(input, at * 4, Types.u32), k => Intrinsics.load(inputFloats, k * 8, Types.f64))
+        const literalFrom = g.literals.values.length
+        const rawFrom = g.literals.raw.length
+        const out = kind === NormalizeKind.optimize ? optimizePackaged(g, hostTarget) : normalizeValueGraph(g, { firstPass: kind === NormalizeKind.first, target: hostTarget })
+        pendingNormalize = { out, kind, literalFrom, rawFrom, heapMark, stackMark, scratchMark }
+    }
+    const p = pendingNormalize!
+    const layout = graphLayout(p.out, p.literalFrom, p.rawFrom)
+    const bytes = graphBytes(layout)
+    if (bytes > cap) return -bytes
+    const output = outHi * 4294967296 + outLo
+    const outputFloats = output + graphFloatsAt(layout.words) * 4
+    writeGraph(p.out, p.kind, layout, (at, v) => Intrinsics.store(output, at * 4, v, Types.u32), (k, v) => Intrinsics.store(outputFloats, k * 8, v, Types.f64))
+    pendingNormalize = undefined
+    Intrinsics.store(heap.resolveHeapCell(heap.runtimeCells), 0, p.heapMark, Types.u32)
+    Intrinsics.pstack(programStack, p.stackMark, 0)
+    Intrinsics.pstack(0, p.scratchMark, 0)
+    return bytes
+}
+
+const nativeNormalizeOn = flags.has('native-l2')
+const normalizeCheck = flags.has('native-l2-check')
+const normalizeCacheDir = intrinsics.argv().find(a => a.startsWith('l2-cache:'))?.slice('l2-cache:'.length) ?? 'out/engine-cache/native-l2'
+const normalizeGateCapture = flags.has('l2-gate-capture')
+const normalizeRetention = 32
+const hostFs = (globalThis as any).process.getBuiltinModule('node:fs')
+const hostCrypto = (globalThis as any).process.getBuiltinModule('node:crypto')
+
+interface NormalizeTarget {
+    run: (...args: number[]) => number
+    file: string
+    image?: Uint8Array
+    checks: number
+}
+
+let normalizeTarget: NormalizeTarget | null | undefined
+const nativeNormalizeStats = { calls: 0, encodeMs: 0, nativeMs: 0, decodeMs: 0, hostMs: 0, checked: 0, mismatches: 0, inBytes: 0, outBytes: 0, compileMs: 0, gateMs: 0 }
+const gateInputs: Uint8Array[] = []
+
+export function computationKey(roots: Record<string, Function>): string {
+    const seen = new Set<unknown>()
+    const sources = new Set<string>()
+    const walk: unknown[] = Object.values(roots)
+    const methods = (owner: any) => {
+        for (const key of Reflect.ownKeys(owner)) {
+            const d = Object.getOwnPropertyDescriptor(owner, key)!
+            walk.push('value' in d ? d.value : d.get)
+            if (!('value' in d)) walk.push(d.set)
+        }
+    }
+    while (walk.length) {
+        const v = walk.pop()
+        if (v === null || (typeof v !== 'object' && typeof v !== 'function') || seen.has(v)) continue
+        seen.add(v)
+        if (typeof v === 'object') {
+            if (Object.prototype.toString.call(v) === '[object Module]') methods(v)
+            continue
+        }
+        if (!intrinsics.hasComputation(v)) continue
+        const [source, captures, , home] = intrinsics.getComputation(v)
+        sources.add(source)
+        for (const capture of captures) walk.push(capture)
+        walk.push(home)
+        if (typeof (v as any).prototype === 'object') methods((v as any).prototype)
+    }
+    const hash = hostCrypto.createHash('sha1')
+    for (const source of [...sources].sort()) hash.update(source)
+    return hash.digest('hex').slice(0, 16)
+}
+
+function normalizeFailure(message: string): void {
+    console.error(`native-l2 FAILED: ${message}; the host normalize runs`)
+}
+
+let inputBuffer = new ArrayBuffer(1 << 20)
+let inputAddress = 0
+let outputBuffer = new ArrayBuffer(1 << 20)
+let outputAddress = 0
+let scratchBuffer = new ArrayBuffer(1 << 20)
+
+function bufferAddress(buffer: ArrayBuffer): number {
+    return Number((ts as any).getArrayBufferPtr(buffer))
+}
+
+function grown(buffer: ArrayBuffer, bytes: number): ArrayBuffer {
+    if (bytes <= buffer.byteLength) return buffer
+    let size = buffer.byteLength * 2
+    while (size < bytes) size *= 2
+    return new ArrayBuffer(size)
+}
+
+function packGraph(g: Graph, kind: number, literalFrom: number, rawFrom: number, into: ArrayBuffer): ArrayBuffer {
+    const layout = graphLayout(g, literalFrom, rawFrom)
+    const buffer = grown(into, graphBytes(layout))
+    const words = new Uint32Array(buffer)
+    const floats = new Float64Array(buffer, graphFloatsAt(layout.words) * 4, layout.floats)
+    writeGraph(g, kind, layout, (at, v) => {
+        words[at] = v
+    }, (k, v) => {
+        floats[k] = v
+    })
+    return buffer
+}
+
+function packedBytes(buffer: ArrayBuffer): number {
+    const words = new Uint32Array(buffer, 0, 13)
+    return graphFloatsAt(words[1]) * 4 + (words[8] - words[9] + words[10] - words[11] + words[12]) * 8
+}
+
+function unpackGraph(buffer: ArrayBuffer, shared?: Graph): Graph {
+    const words = new Uint32Array(buffer)
+    const floats = new Float64Array(buffer, graphFloatsAt(words[1]) * 4)
+    const g = readGraph(at => words[at], k => floats[k], shared)
+    if (!shared) return g
+    g.name = shared.name
+    g.debugLabels = shared.debugLabels
+    return g
+}
+
+function callNormalize(run: (...args: number[]) => number, kind: number): number {
+    if (!inputAddress) inputAddress = bufferAddress(inputBuffer)
+    if (!outputAddress) outputAddress = bufferAddress(outputBuffer)
+    const call = (phase: number) => Number(run(phase, kind, Math.floor(inputAddress / 4294967296), inputAddress % 4294967296, Math.floor(outputAddress / 4294967296), outputAddress % 4294967296, outputBuffer.byteLength))
+    let bytes = call(0)
+    while (bytes < 0) {
+        outputBuffer = grown(outputBuffer, -bytes)
+        outputAddress = bufferAddress(outputBuffer)
+        bytes = call(1)
+    }
+    return bytes
+}
+
+function packInput(g: Graph, kind: number): void {
+    const before = inputBuffer
+    inputBuffer = packGraph(g, kind, 0, 0, inputBuffer)
+    if (inputBuffer !== before) inputAddress = bufferAddress(inputBuffer)
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): number {
+    const length = Math.min(a.length, b.length)
+    let i = 0
+    while (i < length) {
+        if (a[i] !== b[i]) return i
+        i++
+    }
+    return a.length === b.length ? -1 : length
+}
+
+function gateDir(): string {
+    return `${normalizeCacheDir}/gates/normalize`
+}
+
+function loadGates(): void {
+    if (gateInputs.length || !hostFs.existsSync(gateDir())) return
+    for (const file of hostFs.readdirSync(gateDir()).filter((f: string) => f.endsWith('.bin')).sort()) gateInputs.push(new Uint8Array(hostFs.readFileSync(`${gateDir()}/${file}`)))
+}
+
+function hostReplay(input: Uint8Array): Uint8Array {
+    const g = unpackGraph(input.slice().buffer)
+    const literalFrom = g.literals.values.length
+    const rawFrom = g.literals.raw.length
+    const kind = new Uint32Array(input.buffer, input.byteOffset, 1)[0]
+    scratchBuffer = packGraph(hostNormalize(g, kind, hostTarget), kind, literalFrom, rawFrom, scratchBuffer)
+    return new Uint8Array(scratchBuffer, 0, packedBytes(scratchBuffer)).slice()
+}
+
+function nativeReplay(run: (...args: number[]) => number, input: Uint8Array): Uint8Array {
+    inputBuffer = grown(inputBuffer, input.length)
+    inputAddress = bufferAddress(inputBuffer)
+    new Uint8Array(inputBuffer).set(input)
+    const bytes = callNormalize(run, new Uint32Array(input.buffer, input.byteOffset, 1)[0])
+    return new Uint8Array(outputBuffer, 0, bytes).slice()
+}
+
+function runGates(run: (...args: number[]) => number): string | undefined {
+    const start = performance.now()
+    loadGates()
+    let k = 0
+    while (k < gateInputs.length) {
+        const at = sameBytes(nativeReplay(run, gateInputs[k]), hostReplay(gateInputs[k]))
+        if (at >= 0) return `gate ${k} differs from the host at byte ${at}`
+        k++
+    }
+    nativeNormalizeStats.gateMs += performance.now() - start
+    return undefined
+}
+
+function retainNormalize(target: NormalizeTarget): void {
+    if (!target.image) return
+    hostFs.mkdirSync(normalizeCacheDir, { recursive: true })
+    const temp = `${target.file}.${(globalThis as any).process.pid}.tmp`
+    hostFs.writeFileSync(temp, target.image)
+    hostFs.renameSync(temp, target.file)
+    target.image = undefined
+    console.log(`native-l2 retained ${target.file}`)
+}
+
+function nativeNormalizer(): NormalizeTarget | undefined {
+    if (normalizeTarget !== undefined) return normalizeTarget ?? undefined
+    normalizeTarget = null
+    const start = performance.now()
+    const entries = { nativeNormalize }
+    const file = `${normalizeCacheDir}/normalize-${computationKey(entries)}.img`
+    let natives: any
+    let how = 'cached'
+    if (hostFs.existsSync(file)) {
+        try {
+            natives = loadImage(new Uint8Array(hostFs.readFileSync(file)))
+        } catch (e) {
+            normalizeFailure(`the cached image ${file} does not load: ${String(e).split('\n')[0]}`)
+        }
+    }
+    let image: Uint8Array | undefined
+    if (!natives) {
+        how = 'compiled'
+        natives = createNatives(entries)
+        try {
+            image = serializeImage(natives)
+        } catch (e) {
+            normalizeFailure(`the compiled image does not serialize, so it is not cached: ${String(e).split('\n')[0]}`)
+        }
+    }
+    nativeNormalizeStats.compileMs += performance.now() - start
+    const target: NormalizeTarget = { run: natives.nativeNormalize, file, image, checks: 0 }
+    const failed = runGates(target.run)
+    if (failed) {
+        normalizeFailure(failed)
+        return undefined
+    }
+    if (image && gateInputs.length) retainNormalize(target)
+    if (!image) target.checks = normalizeRetention
+    console.log(`native-l2 normalize ${how} ${(performance.now() - start).toFixed(0)}ms, ${gateInputs.length} gates`)
+    normalizeTarget = target
+    return target
+}
+
+function wordsAround(bytes: Uint8Array, at: number): string {
+    const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length >> 2)
+    const from = Math.max(0, (at >> 2) - 6)
+    return Array.from(words.subarray(from, Math.min(words.length, from + 14))).join(' ')
+}
+
+function bestOf(rounds: number, run: () => number): number {
+    let best = Infinity
+    let k = 0
+    while (k < rounds) {
+        best = Math.min(best, run())
+        k++
+    }
+    return best
+}
+
+function opDelta(actual: Uint8Array, expected: Uint8Array, input: Uint8Array): string {
+    const counts = new Map<string, number>()
+    let decoded: Graph
+    try {
+        decoded = unpackGraph(actual.slice().buffer, unpackGraph(input.slice().buffer))
+    } catch (e) {
+        return `undecodable:${String(e).split('\n')[0].slice(0, 80).replaceAll(' ', '_')}`
+    }
+    for (const n of allNodes(decoded)) counts.set(opName(n.op), (counts.get(opName(n.op)) ?? 0) + 1)
+    for (const n of allNodes(unpackGraph(expected.slice().buffer, unpackGraph(input.slice().buffer)))) counts.set(opName(n.op), (counts.get(opName(n.op)) ?? 0) - 1)
+    const changed = [...counts].filter(([, count]) => count !== 0).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1]) || (x[0] < y[0] ? -1 : 1))
+    return changed.length ? changed.slice(0, 6).map(([op, count]) => `${op}${count > 0 ? '+' : ''}${count}`).join(',') : 'same-ops'
+}
+
+function replayNormalize(dir: string): void {
+    const target = nativeNormalizer()
+    if (!target) return
+    retainNormalize(target)
+    const argv = intrinsics.argv()
+    const from = Number(argv.find(a => a.startsWith('l2-replay-from:'))?.slice(15) ?? 0)
+    const count = Number(argv.find(a => a.startsWith('l2-replay-count:'))?.slice(16) ?? Infinity)
+    const rounds = Number(argv.find(a => a.startsWith('l2-rounds:'))?.slice(10) ?? 1)
+    const results = argv.find(a => a.startsWith('l2-results:'))?.slice(11)
+    const files = hostFs.readdirSync(dir).filter((f: string) => f.endsWith('.bin')).sort().slice(from, from + count)
+    let mismatches = 0
+    let k = from
+    for (const file of files) {
+        const input = new Uint8Array(hostFs.readFileSync(`${dir}/${file}`))
+        const head = new Uint32Array(input.buffer, input.byteOffset, 16)
+        const kind = head[0]
+        if (results) hostFs.appendFileSync(results, `START ${k} ${file}\n`)
+        const expected = hostReplay(input)
+        const actual = nativeReplay(target.run, input)
+        const at = sameBytes(actual, expected)
+        const host = bestOf(rounds, () => {
+            const g = unpackGraph(input.slice().buffer)
+            const start = performance.now()
+            hostNormalize(g, kind, hostTarget)
+            return performance.now() - start
+        })
+        const encode = bestOf(rounds, () => {
+            const g = unpackGraph(input.slice().buffer)
+            const start = performance.now()
+            packInput(g, kind)
+            return performance.now() - start
+        })
+        const native = bestOf(rounds, () => {
+            new Uint8Array(inputBuffer).set(input)
+            const start = performance.now()
+            callNormalize(target.run, kind)
+            return performance.now() - start
+        })
+        const decode = bestOf(rounds, () => {
+            const shared = unpackGraph(input.slice().buffer)
+            const start = performance.now()
+            unpackGraph(outputBuffer, shared)
+            return performance.now() - start
+        })
+        const line = `L2B ${k} ${file} ${kind} ${head[15]} ${input.length} ${actual.length} ${host.toFixed(4)} ${native.toFixed(4)} ${encode.toFixed(4)} ${decode.toFixed(4)} ${at < 0 ? 'ok' : `diff@${at} ${opDelta(actual, expected, input)}`}`
+        if (results) hostFs.appendFileSync(results, `${line}\n`)
+        else console.log(line)
+        k++
+        if (at < 0) continue
+        mismatches++
+        if (!flags.has('l2-replay-dump')) continue
+        console.log(`--- input\n${dumpGraph(unpackGraph(input.slice().buffer))}`)
+        console.log(`--- native\n${dumpGraph(unpackGraph(actual.slice().buffer, unpackGraph(input.slice().buffer)))}`)
+        console.log(`--- host\n${dumpGraph(unpackGraph(expected.slice().buffer, unpackGraph(input.slice().buffer)))}`)
+    }
+    console.log(`L2REPLAY ${files.length - mismatches}/${files.length} identical`)
+}
+
+export function prepareNativeNormalize(): void {
+    const replay = intrinsics.argv().find(a => a.startsWith('l2-replay:'))?.slice('l2-replay:'.length)
+    if (replay) replayNormalize(replay)
+    else if (nativeNormalizeOn) nativeNormalizer()
+}
+
+export function reportNativeNormalize(): void {
+    if (normalizeTarget?.image && normalizeTarget.checks >= normalizeRetention) retainNormalize(normalizeTarget)
+    const s = nativeNormalizeStats
+    if (!s.calls) return
+    console.log(`native-l2 ${s.calls} calls (${(s.inBytes / 1048576).toFixed(1)}MB in, ${(s.outBytes / 1048576).toFixed(1)}MB out): encode ${s.encodeMs.toFixed(0)}ms, native ${s.nativeMs.toFixed(0)}ms, decode ${s.decodeMs.toFixed(0)}ms; checked ${s.checked} (host ${s.hostMs.toFixed(0)}ms, ${s.mismatches} mismatches); load ${s.compileMs.toFixed(0)}ms, gates ${s.gateMs.toFixed(0)}ms`)
+    for (const key of Object.keys(s) as (keyof typeof s)[]) s[key] = 0
+}
+
+let gateCaptures = 0
+
+function captureGate(input: Uint8Array): void {
+    hostFs.mkdirSync(gateDir(), { recursive: true })
+    hostFs.writeFileSync(`${gateDir()}/${(globalThis as any).process.pid}-${gateCaptures++}.bin`, input)
+}
+
+const normalizeCapture = intrinsics.argv().find(a => a.startsWith('l2-capture:'))?.slice('l2-capture:'.length)
+let normalizeCaptures = 0
+
+function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Graph {
+    if (normalizeCapture !== undefined && target === hostTarget) {
+        packInput(graph, kind)
+        hostFs.mkdirSync(normalizeCapture, { recursive: true })
+        hostFs.writeFileSync(`${normalizeCapture}/${(globalThis as any).process.pid}-${String(normalizeCaptures++).padStart(6, '0')}.bin`, new Uint8Array(inputBuffer, 0, packedBytes(inputBuffer)))
+    }
+    const native = target === hostTarget && nativeNormalizeOn ? nativeNormalizer() : undefined
+    if (!native) return hostNormalize(graph, kind, target)
+    const literalFrom = graph.literals.values.length
+    const rawFrom = graph.literals.raw.length
+    const nodes = countNodes(graph)
+    const start = performance.now()
+    packInput(graph, kind)
+    const encoded = performance.now()
+    const inBytes = packedBytes(inputBuffer)
+    const input = normalizeCheck || native.checks < normalizeRetention || normalizeGateCapture ? new Uint8Array(inputBuffer, 0, inBytes).slice() : undefined
+    const bytes = callNormalize(native.run, kind)
+    const called = performance.now()
+    const s = nativeNormalizeStats
+    s.calls++
+    s.encodeMs += encoded - start
+    s.nativeMs += called - encoded
+    s.inBytes += inBytes
+    s.outBytes += bytes
+    if (normalizeGateCapture) captureGate(input!)
+    if (!input || (!normalizeCheck && native.checks >= normalizeRetention)) {
+        const out = unpackGraph(outputBuffer, graph)
+        s.decodeMs += performance.now() - called
+        return out
+    }
+    const actual = new Uint8Array(outputBuffer, 0, bytes).slice()
+    const scratchPool = { values: new Array(literalFrom), at: new Map<number, number>(), raw: graph.literals.raw.slice(), interned: new Map<string, number>() }
+    const decodeStart = performance.now()
+    const decoded = unpackGraph(outputBuffer, createGraph({ ids: { next: 0 }, literals: scratchPool }))
+    const decodeMs = performance.now() - decodeStart
+    s.decodeMs += decodeMs
+    const hostStart = performance.now()
+    const expected = hostNormalize(graph, kind, target)
+    const hostMs = performance.now() - hostStart
+    s.hostMs += hostMs
+    s.checked++
+    scratchBuffer = packGraph(expected, kind, literalFrom, rawFrom, scratchBuffer)
+    const at = sameBytes(actual, new Uint8Array(scratchBuffer, 0, packedBytes(scratchBuffer)))
+    scratchBuffer = packGraph(decoded, kind, literalFrom, rawFrom, scratchBuffer)
+    const roundTrip = sameBytes(actual, new Uint8Array(scratchBuffer, 0, packedBytes(scratchBuffer)))
+    if (at >= 0 || roundTrip >= 0) {
+        s.mismatches++
+        const file = `${normalizeCacheDir}/mismatch/${(globalThis as any).process.pid}-${s.calls}.bin`
+        hostFs.mkdirSync(`${normalizeCacheDir}/mismatch`, { recursive: true })
+        hostFs.writeFileSync(file, input)
+        console.error(`native-l2 MISMATCH kind ${kind} ${graph.name ?? 'anonymous'} (${nodes} nodes) at byte ${at} (${actual.length}/${packedBytes(scratchBuffer)} bytes), decode round trip ${roundTrip}; input ${file}`)
+        if (native.image) {
+            native.image = undefined
+            normalizeTarget = null
+        }
+        return expected
+    }
+    if (native.checks < normalizeRetention) native.checks++
+    if (native.checks === normalizeRetention && native.image && !normalizeCheck) retainNormalize(native)
+    return expected
+}
+
 function createClock(target: Target): PhaseClock {
     const start = performance.now()
     const phases: Record<string, number> = { link: 0, bytecode: 0, typer: 0, cuts: 0, trace: 0, analysis: 0, plan: 0, resolve: 0, normalize: 0, inline: 0, effects: 0, records: 0, lower: 0, statics: 0, other: 0, prepareLower: 0 }
@@ -2989,13 +3441,14 @@ function createClock(target: Target): PhaseClock {
         if (flags.has('norm-log')) console.log('NORM', graph.name ?? '?', countNodes(graph), opts?.firstPass ? 'first' : 'again')
         verifyGraph(graph, 'normalize:input', graph.form !== undefined)
         recordSnapshots(graph)
-        if (!opts?.firstPass || target !== hostTarget) return timed('normalize', () => normalizeValueGraph(graph, { ...opts, target }), graph.name)
-        return timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeValueGraph(graph, { ...opts, target })), graph.name)
+        const kind = opts?.firstPass ? NormalizeKind.first : NormalizeKind.again
+        if (!opts?.firstPass || target !== hostTarget) return timed('normalize', () => normalizeGraph(graph, kind, target), graph.name)
+        return timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeGraph(graph, kind, target)), graph.name)
     }
     function optimize(graph: Graph): Graph {
         return timed('normalize', () => cacheSpecialized && target === hostTarget
-            ? optimizeOnce(graph, 'optimized', () => optimizePackaged(graph, target))
-            : optimizePackaged(graph, target), graph.name)
+            ? optimizeOnce(graph, 'optimized', () => normalizeGraph(graph, NormalizeKind.optimize, target))
+            : normalizeGraph(graph, NormalizeKind.optimize, target), graph.name)
     }
     return { start, phases, enterPhase, timed, normalize, optimize }
 }
@@ -13058,6 +13511,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
         heapTo: heapWrites.length,
         staticTop: Number(pstackMark(0)),
         imports: image.imports,
+        symbols: installed.symbols,
     }
     const codeBase = nativeRegions[installed.region].base
     if (initSymbol !== undefined) capture.init = Number(installed.entries[initSymbol]) - codeBase
@@ -13092,7 +13546,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
 
 const imageMagic = 'SYNIMAGE'
 const imageVersion = 1
-const ImageSection = { regions: 1, memory: 2, relocations: 3, entries: 4 }
+const ImageSection = { regions: 1, memory: 2, relocations: 3, entries: 4, symbols: 5 }
 const EntryFlags = { float: 1, init: 2, word: 4, string: 8 }
 
 function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[]): void {
@@ -13231,7 +13685,7 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
     }
     for (const c of imageMagic) out.push(c.charCodeAt(0))
     u32(imageVersion)
-    u32(4)
+    u32(5)
     section(ImageSection.regions, regions.length)
     for (const region of regions) {
         u32(region.kind)
@@ -13267,6 +13721,17 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
         const name = new TextEncoder().encode(entry.name)
         u64(entry.offset)
         u32(((entry.float ? EntryFlags.float : 0) | (entry.init ? EntryFlags.init : 0) | (entry.returns === 'word' ? EntryFlags.word : 0) | (entry.returns === 'string' ? EntryFlags.string : 0)) + entry.floats * 65536)
+        u32(name.length)
+        for (const byte of name) out.push(byte)
+        pad()
+    }
+    section(ImageSection.symbols, capture.symbols.length)
+    for (const symbol of capture.symbols) {
+        const name = new TextEncoder().encode(symbol.name)
+        u64(symbol.offset)
+        u32(symbol.size)
+        u32(symbol.frameBytes + 1)
+        u32(symbol.frameLink + 1)
         u32(name.length)
         for (const byte of name) out.push(byte)
         pad()
@@ -13334,6 +13799,7 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     const regions: ImageRegion[] = []
     const relocations: ImageRelocation[] = []
     const entries: { name: string, offset: number, flags: number }[] = []
+    const symbols: ImageSymbol[] = []
     for (let s = 0; s < sections; s++) {
         const kind = u32()
         const count = u32()
@@ -13366,6 +13832,16 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
                 at += length
                 align8()
                 entries.push({ name, offset, flags })
+            } else if (kind === ImageSection.symbols) {
+                const offset = Number(u64())
+                const size = u32()
+                const frameBytes = u32() - 1
+                const frameLink = u32() - 1
+                const length = u32()
+                const name = new TextDecoder().decode(bytes.subarray(at, at + length))
+                at += length
+                align8()
+                symbols.push({ name, offset, size, frameBytes, frameLink })
             } else throw `native: unknown image section ${kind}`
         }
     }
@@ -13397,7 +13873,8 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     }
     if (code < 0) throw 'native: the image has no code'
     const starts = entries.map(entry => entry.offset).sort((a, b) => a - b)
-    codeObserver?.(entries.map(entry => codeLine(bases[code] + entry.offset, (starts.find(start => start > entry.offset) ?? regions[code].size) - entry.offset, undefined, entry.name)).join('\t'))
+    if (symbols.length) codeObserver?.(symbols.map(symbol => codeLine(bases[code] + symbol.offset, symbol.size, symbol.frameBytes < 0 ? undefined : { bytes: symbol.frameBytes, link: symbol.frameLink }, symbol.name)).join('\t'))
+    else codeObserver?.(entries.map(entry => codeLine(bases[code] + entry.offset, (starts.find(start => start > entry.offset) ?? regions[code].size) - entry.offset, undefined, entry.name)).join('\t'))
     const page: CodePage = { ptr: bases[code] - (regions[code].base & 4095), length: align(regions[code].size + 4096, 4096), used: 0, sealed: false }
     sealCode(page)
     let heapBase = 0
