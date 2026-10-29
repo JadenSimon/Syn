@@ -5040,9 +5040,16 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     const idleResets = new Set<number>()
     const simplifiedOrdering = new Map<number, number>()
+    let orderingClass = 0
     function simplifyOrdering(vid: number, from?: GraphNode): number | undefined {
         simplifiedOrdering.clear()
         return simplifyOrderingIn(vid, from)
+    }
+    function simplifyOrderingKept(vid: number, from: GraphNode): number | undefined {
+        orderingClass = from.op === NodeOp.apply || from.op === NodeOp.ret ? 1 : isRead(from) ? 2 : 0
+        const r = simplifyOrderingIn(vid, from)
+        orderingClass = 0
+        return r
     }
 
     function simplifyOrderingIn(vid: number, from: GraphNode | undefined): number | undefined {
@@ -5066,10 +5073,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const skips = (pure && (from?.op === NodeOp.apply || from?.op === NodeOp.ret)) || (!clobbers && isRead(from)) || idleResets.has(vid)
             if (!skips) return vid
         }
-        const known = simplifiedOrdering.get(vid)
+        const key = vid * 3 + orderingClass
+        const known = simplifiedOrdering.get(key)
         if (known !== undefined) return known || undefined
         const r = simplifyOrderingStep(vid, u, from)
-        simplifiedOrdering.set(vid, r ?? 0)
+        simplifiedOrdering.set(key, r ?? 0)
         return r
     }
 
@@ -5183,11 +5191,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const replacements = new Map<number, number>()
         const relaxedTo = new Map<number, number>()
         const dropped = new Map<number, number>()
+        simplifiedOrdering.clear()
+        defer simplifiedOrdering.clear()
         function visit(id: number): void {
-            if (!id) return
             let n = getNode(g, id)
             if (!n || !markVisited(n, epoch)) return
-            for (let i = 0; i < countIds(n); i++) visit(getRef(n, i))
 
             let resolved: number[] | undefined
             const priors: number[] = []
@@ -5227,7 +5235,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     argIds[i] = nil()
                     continue
                 }
-                const ordering = n.op === NodeOp.call && callEffect(n) === 0 && !writesBefore(q, new Set()) && !neverCompletes(q) ? undefined : simplifyOrdering(q, from)
+                const ordering = n.op === NodeOp.call && callEffect(n) === 0 && !writesBefore(q, new Set()) && !neverCompletes(q) ? undefined : simplifyOrderingKept(q, from)
                 if (ordering === q || (isNilOrVoid(ordering) && isNilOrVoid(q))) {
                     continue
                 }
@@ -5291,7 +5299,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             putCopy(g, id, n, withRefs(g, n, argIds))
             markVisited(getNode(g, id)!, epoch)
         }
-        visit(target.bodyId)
+        for (const id of blockOrder(g, target)) visit(id)
         if (!changed && !replacements.size) return false
         setBlockBody(g, target, replaceTransitive(target.bodyId, replacements))
         revisitBlock(target)
@@ -16030,9 +16038,10 @@ export function packageValueGraph(g: Graph, target: lowering.Target, entries?: S
     if (intrinsics.argv().includes('check-creation-order')) checkCreationOrder(g, 'trace', new Set())
     const _bindCallContext: GraphPass = g => bindCallContext(g, target.indirectContextReg)
     const _packageBlocks: GraphPass = g => packageBlocksFINAL(g, entries)
-    g = runPipeline('package', g, target.costs, [_bindCallContext, splitBranchingSelects, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks, isolateBlocks]).graph
+    g = runPipeline('package', g, target.costs, [_bindCallContext, splitBranchingSelects, inlineBlocks, sweepBlocks, resolveNumberTypes, detachRecordOrdering, flattenRecords, _packageBlocks, pruneDeadParams, sweepBlocks, isolateBlocks, orderRegionMarks]).graph
     g.form = 'packaged'
     verifyGraph(g, 'package', true)
+    verifyPstackMarks(g, 'package')
     if (typeDebugging()) verifyNumbersExplained(g, 'package', floatValues(g), undefined)
     else verifyNumberClasses(g, 'package', floatValues(g), integralSlots, undefined)
     verifySlotBounds(g, 'package', slotBytes)
@@ -16702,6 +16711,64 @@ export function placePstackMarkers(g: Graph, regions: [header: number, stacks: n
     }
 }
 
+function unorderedRegionPstacks(g: Graph): [mark: number, id: number, block: number][] {
+    const found: [number, number, number][] = []
+    if (!gn.mayHave(g, NodeOp.pstack) || !someNode(g, n => pstackTentative(g, n) === PstackMark)) return found
+    function reaches(from: number, to: number): boolean {
+        const seen = new Set<number>()
+        const work = [from]
+        while (work.length) {
+            const at = work.pop()!
+            if (!at || seen.has(at)) continue
+            seen.add(at)
+            if (at === to) return true
+            const x = getNode(g, at)
+            if (!x || x.op === NodeOp.param || x.op === NodeOp.block) continue
+            for (let i = 0; i < countIds(x); i++) work.push(getRef(x, i))
+        }
+        return false
+    }
+    for (const b of g.blocks) {
+        const marks: number[] = []
+        const others: number[] = []
+        for (const id of blockOrder(g, b)) {
+            const n = getNode(g, id)!
+            if (n.op !== NodeOp.pstack) continue
+            const tentative = pstackTentative(g, n)
+            if (tentative === PstackMark) marks.push(id)
+            else if (!tentative) others.push(id)
+        }
+        for (const mark of marks) {
+            for (const id of others) {
+                if (!pstackSameStack(g, getNode(g, mark)!, getNode(g, id)!)) continue
+                if (reaches(id, mark) || reaches(mark, id)) continue
+                found.push([mark, id, b.id])
+            }
+        }
+    }
+    return found
+}
+
+// XXX: delete this, `placePstackMarkers` shouldn't be creating malformed ordering in the first place
+function orderRegionMarks(g: Graph): boolean {
+    const unordered = unorderedRegionPstacks(g)
+    if (!unordered.length) return false
+    for (const [mark, id] of unordered) {
+        const n = getNode(g, id)!
+        const token = getRef(n, 0)
+        putCopy(g, id, n, [token ? addNode(g, NodeOp.after, [mark, token]) : mark, ...getOperands(g, n, 1)])
+    }
+    gn.dirtyValues(g, unordered.map(([, id]) => id))
+    return true
+}
+
+export function verifyPstackMarks(g: Graph, stage: string): void {
+    const unordered = unorderedRegionPstacks(g)
+    if (!unordered.length) return
+    const [mark, id, block] = unordered[0]
+    throw `verify: ${stage}: ${g.name ?? '<anonymous>'} %${id} (pstack) is unordered with its region mark %${mark} in B${block}`
+}
+
 export function pstackReadsTop(g: NodeSpace, n: GraphNode | undefined): boolean {
     return n?.op === NodeOp.pstack && !pstackRebases(g, n) && !pstackAllocates(g, n)
 }
@@ -16864,6 +16931,7 @@ function resolvePstackMarkers(g: Graph): boolean {
 
 export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
+    verifyPstackMarks(g, 'expand')
     const _expandCodecs: GraphPass = g => expandCodecs(g, regionSlot)
     const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, resolvePstackMarkers, _expandCodecs, expandPstacks])
     g = expanded.graph
