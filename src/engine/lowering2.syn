@@ -3437,6 +3437,12 @@ export function printOptimizeStats(): void {
     optimizeIdle.clear()
 }
 
+const ConvertWords = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.i8, Types.i16, Types.i32, Types.i64, Types.vm_value])
+
+function foldableConvert(from: Types, to: Types): boolean {
+    return (ConvertWords.has(from) || from === Types.f64) && ConvertWords.has(to)
+}
+
 const FoldableOps = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.div, NodeOp.pow, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.lt, NodeOp.le, NodeOp.gt, NodeOp.ge, NodeOp.eq, NodeOp.ne, NodeOp.convert, NodeOp.bitconvert, NodeOp.crc32])
 
 export const MemFresh = 0, MemPre = 1, MemUnknown = 2, MemInt = 3
@@ -10900,6 +10906,32 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!dissolved) return
             return { id: addCopy(g, s, [condition, whenTrue.id || { literal: whenTrue.value }, whenFalse.id || { literal: whenFalse.value }]), value: 0 }
         }
+        function convertedLiteral(from: Types, to: Types, value: number): Value | undefined {
+            if (!Number.isSafeInteger(value)) return
+            const bits = intrinsics.intrinsicBitWidth(to)
+            const signed = lowering.isSignedType(to)
+            if (from === Types.f64) {
+                const low = signed ? -(2 ** (bits - 1)) : 0
+                const high = signed ? 2 ** (bits - 1) - 1 : 2 ** bits - 1
+                if (value < low || value > high) return
+                return { id: 0, value: value + 0 }
+            }
+            const word = BigInt(value)
+            const exact = Number(signed ? BigInt.asIntN(bits, word) : BigInt.asUintN(bits, word))
+            if (!Number.isSafeInteger(exact)) return
+            return { id: 0, value: exact }
+        }
+        function floatConstant(id: number): number | undefined {
+            const m = getNode(g, id)
+            if (m?.op !== NodeOp.convert || typeOf(m) !== Types.f64) return
+            const from = operandType(g, m, 0)
+            const value = constantNumber(m, 0)
+            if (!ConvertWords.has(from) || value === undefined || !Number.isSafeInteger(value)) return
+            const bits = lowering.accessBytes(from) === 8 ? 64 : 32
+            const word = BigInt(value)
+            const exact = Number(lowering.isSignedType(from) ? BigInt.asIntN(bits, word) : BigInt.asUintN(bits, word))
+            return Number.isSafeInteger(exact) ? exact : undefined
+        }
         function signedFold(n: GraphNode, a: number, b: number): Value | undefined {
             const wide = (i: number) => operandType(g, n, i) === Types.i64 || operandType(g, n, i) === Types.u64
             if (!wide(0) || !wide(1) || !Number.isSafeInteger(a) || !Number.isSafeInteger(b)) return
@@ -10920,10 +10952,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         function fold(id: number, n: GraphNode): Value {
             const known = folded.get(id)
             if (known) return known
-            if (n.op === NodeOp.convert) {
-                if (typeOf(n) > Types.u32 || operandType(g, n, 0) > Types.i64) {
-                    return { id, value: 0 }
-                }
+            if (n.op === NodeOp.convert && !foldableConvert(operandType(g, n, 0), typeOf(n))) {
+                return { id, value: 0 }
             }
             if (!markVisited(n, epoch)) {
                 return { id, value: 0 }
@@ -10938,10 +10968,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const constants = args.map(literalArg)
 
             let result: Value | undefined
-            if (n.op === NodeOp.convert && constants.length === 1 && !constants[0].id
-                && Number.isSafeInteger(constants[0].value)) {
-                const bits = intrinsics.intrinsicBitWidth(typeOf(n))
-                result = { id: 0, value: Number(BigInt.asUintN(bits, BigInt(constants[0].value))) }
+            if (n.op === NodeOp.convert && constants.length === 1) {
+                const from = operandType(g, n, 0)
+                const value = constants[0].id ? floatConstant(constants[0].id) : constants[0].value
+                if (value !== undefined) result = convertedLiteral(from, typeOf(n), value) ?? { id, value: 0 }
             }
             if (n.op === NodeOp.bitconvert && !constants[0].id && Number.isSafeInteger(constants[0].value)
                 && typeOf(n) <= Types.i64 && operandType(g, n, 0) <= Types.i64) {
@@ -12749,6 +12779,39 @@ function reduceRangeChecks(g: Graph): boolean {
     }
     if (changed) dirtyIndex(g)
     return changed
+}
+
+function testBranchConjunctions(g: Graph): boolean {
+    let index: gn.GraphIndex | undefined
+    let changed = false
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op !== NodeOp.select || countIds(n) !== 3 || !getRef(n, 0) || !transfers(g, getRef(n, 1)) || !transfers(g, getRef(n, 2))) continue
+        const condition = getRef(n, 0)
+        const c = getNode(g, condition)!
+        if ((c.op !== NodeOp.and && c.op !== NodeOp.or) || countIds(c) !== 2 || !getRef(c, 0) || !getRef(c, 1)) continue
+        const compared = CompareOps.has(getNode(g, getRef(c, 0))!.op) ? 0 : 1
+        const value = getRef(c, 1 - compared)
+        const v = getNode(g, value)!
+        if (!CompareOps.has(getNode(g, getRef(c, compared))!.op) || CompareOps.has(v.op) || v.op === NodeOp.and || v.op === NodeOp.or) continue
+        if (operandType(g, c, 1 - compared) > Types.i64 && operandType(g, c, 1 - compared) !== Types.bool) continue
+        index ??= graphIndex(g)
+        if (userCount(index, condition) !== 1) continue
+        const bit = c.op === NodeOp.and && operandType(g, c, 1 - compared) !== Types.bool ? addNode(g, NodeOp.and, [value, { literal: 1 }], Types.u64) : value
+        const operands = getOperands(g, c)
+        operands[1 - compared] = addNode(g, NodeOp.ne, [bit, { literal: 0 }], Types.bool)
+        putCopy(g, condition, c, operands)
+        changed = true
+    }
+    if (changed) dirtyIndex(g)
+    return changed
+}
+
+function transfers(g: Graph, id: number): boolean {
+    const n = id ? getNode(g, id) : undefined
+    if (!n) return false
+    if (n.op === NodeOp.apply || n.op === NodeOp.ret) return true
+    if (n.op === NodeOp.after) return transfers(g, getRef(n, countIds(n) - 1))
+    return n.op === NodeOp.select && countIds(n) === 3 && transfers(g, getRef(n, 1)) && transfers(g, getRef(n, 2))
 }
 
 function splitScaledShifts(g: Graph, costs: lowering.TargetCosts): boolean {
@@ -16792,7 +16855,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?:
 
 export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
     g = expandValueGraph(g, target, regionSlot)
-    g = runPipeline('shape', g, target.costs, [countdownCopyLoops, stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, splitScaledShifts, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [countdownCopyLoops, stripMem, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, testBranchConjunctions, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
@@ -16927,6 +16990,30 @@ function zeroExtendedBits(T: Types): number {
     if (T === Types.bool) return 1
     if (T === Types.u8 || T === Types.u16 || T === Types.u32 || (T >= Types.u1 && T <= Types.u31)) return intrinsics.intrinsicBitWidth(T)
     return 64
+}
+
+const LowWords = new Set<Types>([Types.u32, Types.i32, Types.vm_value])
+
+function lowWordKind(T: Types): number {
+    if (T === Types.i8 || T === Types.i16 || T === Types.i32) return 2
+    if (T === Types.vm_value || zeroExtendedBits(T) <= 32) return 1
+    return 0
+}
+
+function lowWordCompare(g: Graph, n: GraphNode): boolean {
+    if (!CompareOps.has(n.op) || countIds(n) !== 2 || !getRef(n, 0) || !getRef(n, 1)) return false
+    const kind = lowWordKind(operandType(g, n, 0))
+    return kind !== 0 && kind === lowWordKind(operandType(g, n, 1))
+}
+
+function readsLowWord(g: Graph, user: GraphNode, slot: number): boolean {
+    if (user.op === NodeOp.crc32) return slot === 0 || (slot === 1 && intrinsics.intrinsicBitWidth(getLiteral(g, user, 2)) <= 32)
+    if (user.op === NodeOp.store) return slot === 3 && ConvertWords.has(typeOf(user)) && lowering.accessBytes(typeOf(user)) <= 4
+    return lowWordCompare(g, user)
+}
+
+function lowWord(g: Graph, n: GraphNode): boolean {
+    return (n.op === NodeOp.convert || n.op === NodeOp.bitconvert) && LowWords.has(typeOf(n)) && ConvertWords.has(operandType(g, n, 0))
 }
 
 function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
@@ -17897,6 +17984,23 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         done.add(id)
         return CALLEE
     }
+    function lowWordView(id: number): boolean {
+        const n = getNode(g, id)
+        if (!n || !lowWord(g, n)) return false
+        const users = analysis.usedBy.get(id)
+        if (!users?.length) return false
+        for (const user of users) {
+            const u = getNode(g, user)!
+            let slot = useSlot(g, user, id)
+            if (slot < 0) return false
+            while (slot >= 0) {
+                if (!readsLowWord(g, u, slot)) return false
+                slot = useSlot(g, user, id, slot + 1)
+            }
+        }
+        return true
+    }
+
     function demand(id: number, konst: number, want = -1): number {
         if (!id) throw `lowering: literal ${konst} at %${materializing} needs a register but is not a value [unit: ${g.name ?? '<anonymous>'}]`
         const n = getNode(g, id)
@@ -18008,7 +18112,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const ra = at(a, NOTHING)
             finish()
             const dst = regFor(id, want)
-            const reinterprets = !converts && (T === Types.f64 || U === Types.f64)
+            const reinterprets = T === Types.f64 || U === Types.f64 ? !converts : lowWordView(id)
             put(() => reinterprets ? asm.mov(dst, ra) : asm.convert(dst, ra, T, U))
             return
         }
@@ -18095,7 +18199,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const rb = at(b, guard)
         finish(id)
         const dst = regFor(id, want)
-        put(() => cmp ? asm.compare(opName(op), dst, ra, rb, signed) : asm.binary(opName(op), dst, ra, rb, signed, narrow))
+        const narrowRegisters = cmp && lowWordCompare(g, n) && (lowWordView(getRef(n, li)) || lowWordView(getRef(n, ri)))
+        put(() => cmp ? asm.compare(opName(op), dst, ra, rb, signed, undefined, narrowRegisters) : asm.binary(opName(op), dst, ra, rb, signed, narrow))
     }
 
     function buildAfter(id: number, n: GraphNode, want: number): void {
