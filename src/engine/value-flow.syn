@@ -184,6 +184,7 @@ enum ListenerKind {
     narrow,
     pick,
     offset,
+    confine,
 }
 
 interface Listener {
@@ -279,11 +280,26 @@ interface FlowState {
     runtimeBinds: Map<number, number[]>
     heldWrites: Map<number, number[]>
     skippedKeys: Set<number>
+    holders: Map<number, Set<number>>
+    holderWatch: Map<number, number[]>
+    confinements: Confinement[]
+    confineKeys: Map<string, number>
+    confineSlots: Map<number, number[]>
     exported: Export
     cut: CutSeed | undefined
     cap: number
     why: WhyQuery | undefined
 }
+
+interface Confinement {
+    id: number
+    held: Set<number>
+    reach: number[]
+    open: boolean
+    sinks: [callee: Instance, target: number][]
+}
+
+const maxConfined = 256
 
 interface WhyQuery {
     origin: string
@@ -801,6 +817,8 @@ function markOpaque(s: number): void {
     if (flow.slotOpaque[s]) return
     flow.slotOpaque[s] = 1
     dirtyScalar(s)
+    const confined = flow.confineSlots.get(s)
+    if (confined) for (const id of confined) release(flow.confinements[id])
 }
 
 function originBit(origin: number): number {
@@ -843,6 +861,7 @@ function addOrigin(s: number, origin: number): void {
     flow.slotOrigins[s].push(origin)
     flow.queue.push(s)
     noteOrigin(s, origin)
+    if (flow.slotKind[s] === SlotKind.field) noteHolder(flow.slotOwner[s], origin)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
@@ -2101,7 +2120,8 @@ function refineReturn(callee: Instance, target: number): number {
     if (n.op === NodeOp.getProp && !getRef(n, 2)) {
         const index = heap.keyIndex(getLiteral(from.summary.g, n, 2) as Handle)
         if (index === undefined || b.param !== 0 || b.recv >= 0) return callee.ret
-        return pg.constantInBounds(proofScope(from.summary), node, index, getRef(n, 1), b.key) ? at(callee, b.ret) : callee.ret
+        const calls = pg.constantInBounds(proofScope(from.summary), node, index, getRef(n, 1), b.key)
+        return calls && (!calls.length || confined(from, calls, getRef(n, 1), callee, target)) ? at(callee, b.ret) : callee.ret
     }
     if (n.op === NodeOp.getProp) {
         args.push(getRef(n, 2))
@@ -2113,7 +2133,8 @@ function refineReturn(callee: Instance, target: number): number {
     if (b.param >= args.length) return callee.ret
     const owner = b.recv < 0 ? recv : b.recv < args.length ? args[b.recv] : 0
     if (!owner || !args[b.param]) return callee.ret
-    return pg.inBounds(proofScope(from.summary), node, args[b.param], owner, b.key) ? at(callee, b.ret) : callee.ret
+    const calls = pg.inBounds(proofScope(from.summary), node, args[b.param], owner, b.key)
+    return calls && (!calls.length || confined(from, calls, owner, callee, target)) ? at(callee, b.ret) : callee.ret
 }
 
 function checkSkippedKeys(): void {
@@ -2731,7 +2752,92 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.narrow: if (originPasses(origin, l.key, l.extra)) addOrigin(l.target, origin)
         case ListenerKind.pick: pickOrigin(l.target, origin, l.key, l.extra)
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
+        case ListenerKind.confine: confineOrigin(flow.confinements[l.target], l.key, origin)
     }
+}
+
+function noteHolder(holder: number, origin: number): void {
+    let set = flow.holders.get(origin)
+    if (!set) flow.holders.set(origin, set = new Set())
+    if (set.has(holder)) return
+    set.add(holder)
+    const watch = flow.holderWatch.get(origin)
+    if (watch) for (const id of watch) hold(flow.confinements[id], holder)
+}
+
+function confinable(origin: number): boolean {
+    const kind = flow.originKind[origin]
+    return kind === OriginKind.fresh || kind === OriginKind.slice || kind === OriginKind.site
+}
+
+function confineOrigin(c: Confinement, side: number, origin: number): void {
+    if (c.open) return
+    if (side === 0) return hold(c, origin)
+    if (c.held.has(origin)) release(c)
+}
+
+function hold(c: Confinement, origin: number): void {
+    if (c.open || c.held.has(origin)) return
+    charge(1)
+    if (!confinable(origin) || c.held.size >= maxConfined) return release(c)
+    c.held.add(origin)
+    for (const r of c.reach) {
+        if (flow.slotOriginSet[r]?.has(origin)) return release(c)
+    }
+    let watch = flow.holderWatch.get(origin)
+    if (!watch) flow.holderWatch.set(origin, watch = [])
+    watch.push(c.id)
+    const holders = flow.holders.get(origin)
+    if (holders) for (const holder of [...holders]) hold(c, holder)
+}
+
+function release(c: Confinement): void {
+    if (c.open) return
+    c.open = true
+    for (const [callee, target] of c.sinks) {
+        copyEdge(callee.ret, target)
+        const bind = flow.partBind.get(target)
+        if (bind) bind.from = callee.ret
+    }
+}
+
+function watchConfined(c: Confinement, slot: number, side: number): void {
+    if (flow.slotOpaque[slot]) return release(c)
+    let list = flow.confineSlots.get(slot)
+    if (!list) flow.confineSlots.set(slot, list = [])
+    list.push(c.id)
+    listen(slot, ListenerKind.confine, c.id, side, 0)
+}
+
+function confined(inst: Instance, calls: number[], owner: number, callee: Instance, target: number): boolean {
+    const s = inst.summary
+    const key = `${inst.id}:${owner}:${calls.join(',')}`
+    let id = flow.confineKeys.get(key)
+    if (id === undefined) {
+        id = flow.confinements.length
+        const c: Confinement = { id, held: new Set(), reach: [], open: false, sinks: [] }
+        flow.confinements.push(c)
+        flow.confineKeys.set(key, id)
+        for (const call of calls) {
+            const x = s.exprs[exprOfNode(s, call)]
+            if (x.op !== ExprOp.call) {
+                c.open = true
+                break
+            }
+            c.reach.push(at(inst, x.a))
+            c.reach.push(at(inst, x.b))
+            for (const arg of x.args) c.reach.push(at(inst, arg))
+        }
+        let i = 0
+        while (!c.open && i < c.reach.length) {
+            watchConfined(c, c.reach[i], 1)
+            i++
+        }
+        if (!c.open) watchConfined(c, at(inst, exprOfNode(s, owner)), 0)
+    }
+    const c = flow.confinements[id]
+    if (!c.open) c.sinks.push([callee, target])
+    return !c.open
 }
 
 function pickOrigin(target: number, origin: number, key: number, truthy: number): void {
@@ -4271,7 +4377,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(),
+        fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
         exported: { types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), frameOf: new Map(), framesOf: new Map(), frames: [], slotTypes: new Map() },
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
