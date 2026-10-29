@@ -339,6 +339,7 @@ function composeFields(f: BitField, g: BitField): BitField | undefined {
 
 export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall): Assembler {
     const items: AsmItem[] = []
+    const pendingZeroStores: { tail: AsmItem, end: number }[] = []
     const removedWrites: number[] = []
     const labelRefs = new Map<number, number>()
     const closedLabels = new Set<number>()
@@ -448,10 +449,22 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     function emitStore(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
-        push({
+        const item: AsmItem = {
             kind: 'insn', word: word >>> 0, text: asm, label: -1, reg, cond: -1,
             storeBase: base, storeOffset: offset, storeBytes: bytes,
-        })
+        }
+        push(item)
+        if (reg !== XZR || bytes !== 8 || offset % 8 !== 0) return
+        const previous = items[items.length - 2]
+        if (!isZeroStore(previous) || previous.storeBase !== base) return
+        const pending = pendingZeroStores[pendingZeroStores.length - 1]
+        if (pending?.tail === previous) {
+            pending.tail = item
+            pending.end = items.length
+        } else {
+            if (pendingZeroStores.length === 32) pendingZeroStores.shift()
+            pendingZeroStores.push({ tail: item, end: items.length })
+        }
     }
 
     function emitLoad(word: number, asm: string, reg: number, base: number, offset: number, bytes: number): void {
@@ -992,7 +1005,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                         while (j < items.length && items[j].adjustReg !== base0) {
                             const nx = items[j]
                             if (nx.kind === 'label' && !branchTarget(nx.label)) { j++; continue }
-                            if (nx.kind !== 'insn' || accessesMemory(nx)) break
+                            if (nx.kind !== 'insn') break
                             defs.length = 0
                             uses.length = 0
                             if (!itemDefs(nx, defs) || !itemUses(nx, uses) || defs.includes(base0!) || uses.includes(base0!)) break
@@ -1504,6 +1517,108 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         branch.testBit = bit
         inheritDead(branch, test)
         items.splice(at - 1, 1)
+        return true
+    }
+
+    function fuseArithmeticZeroBranch(dead: Set<number>): boolean {
+        const at = items.length - 1
+        const branch = items[at]
+        if (!branch || (branch.kind !== 'cbz' && branch.kind !== 'cbnz') || branch.testBit !== undefined) return false
+        let reg = branch.reg
+        let cond = branch.kind === 'cbz' ? COND_EQ : COND_NE
+        let before = at - 1
+        const set = items[before]
+        if (set?.kind === 'cset' && set.reg === reg && dead.has(reg)) {
+            if (set.cond !== COND_EQ && set.cond !== COND_NE) return false
+            cond = branch.kind === 'cbz' ? set.cond ^ 1 : set.cond
+            const cmp = items[--before]
+            if (cmp?.cmpZeroReg === undefined) return false
+            reg = cmp.cmpZeroReg
+            before--
+        }
+        const floor = Math.max(0, at - 16)
+        for (; before >= floor; before--) {
+            const it = items[before]
+            if (it.kind !== 'insn' || it.setsFlags || it.clobbers || it.cond >= 0 || it.cselCond !== undefined) return false
+            const defs: number[] = []
+            if (!itemDefs(it, defs)) return false
+            if (defs.includes(reg)) break
+        }
+        if (before < floor) return false
+        const arithmetic = items[before]
+        if ((arithmetic.word & 31) !== reg || reg === XZR) return false
+        const top = arithmetic.word >>> 24
+        if (top !== 0x91 && top !== 0xD1 && top !== 0x8B && top !== 0xCB) return false
+        arithmetic.word = (arithmetic.word | 0x20000000) >>> 0
+        arithmetic.text = arithmetic.text.replace(/^(add|sub)/, '$1s')
+        arithmetic.setsFlags = true
+        if (set?.kind === 'cset') {
+            inheritDead(branch, set)
+            inheritDead(branch, items[at - 2])
+            items.splice(at - 2, 2)
+            removedWrites.push(set.reg)
+        }
+        branch.cond = cond
+        branch.kind = 'bcond'
+        return true
+    }
+
+    function fuseClosedZeroLoop(label: number): boolean {
+        const end = items.length - 1
+        const jump = items[end]
+        const arm = items[end - 1]
+        if (jump?.kind !== 'b' || jump.label !== label || arm?.kind !== 'label'
+            || !closedLabels.has(arm.label) || labelRefs.get(arm.label) !== 1) return false
+        const floor = Math.max(0, end - 32)
+        let at = end - 2
+        for (; at >= floor; at--) {
+            if ((items[at].kind === 'cbnz' || items[at].kind === 'cbz') && items[at].label === arm.label) break
+        }
+        if (at - 4 < floor) return false
+        const branch = items[at]
+        const set = items[at - 1]
+        const cmp = items[at - 2]
+        const header = items[at - 3]
+        const back = items[at - 4]
+        if (set.kind !== 'cset' || set.reg !== branch.reg || !branch.deadAfter?.has(set.reg)
+            || (branch.kind === 'cbnz' ? set.cond : set.cond ^ 1) !== COND_NE
+            || cmp.cmpZeroReg === undefined || header.kind !== 'label' || !closedLabels.has(header.label)
+            || labelRefs.get(header.label) !== 2 || back.kind !== 'b' || back.label !== header.label) return false
+        const reg = cmp.cmpZeroReg
+        if (reg === XZR) return false
+        let before = at - 5
+        for (; before >= floor; before--) {
+            const it = items[before]
+            if (it.kind !== 'insn' || it.setsFlags || it.clobbers || it.cond >= 0 || it.cselCond !== undefined) return false
+            const defs: number[] = []
+            if (!itemDefs(it, defs)) return false
+            if (defs.includes(reg)) break
+        }
+        if (before < floor) return false
+        const arithmetic = items[before]
+        const top = arithmetic.word >>> 24
+        if ((arithmetic.word & 31) !== reg || (top !== 0x91 && top !== 0xD1 && top !== 0x8B && top !== 0xCB)) return false
+        let entryAt = before - 1
+        for (; entryAt >= floor; entryAt--) {
+            const it = items[entryAt]
+            if (it.kind === 'b' && it.label === header.label) break
+            if (it.kind !== 'label' && (it.kind !== 'insn' || it.cond >= 0 || it.cselCond !== undefined || it.clobbers)) return false
+        }
+        if (entryAt < floor || !fallsThroughTo(entryAt, label)) return false
+        const entry = items[entryAt]
+        entry.kind = 'cbz'
+        entry.reg = reg
+        arithmetic.word = (arithmetic.word | 0x20000000) >>> 0
+        arithmetic.text = arithmetic.text.replace(/^(add|sub)/, '$1s')
+        arithmetic.setsFlags = true
+        back.kind = 'bcond'
+        back.cond = COND_NE
+        back.label = label
+        labelRefs.set(header.label, 1)
+        labelRefs.set(arm.label, 0)
+        items.splice(end - 1, 2)
+        items.splice(at - 2, 3)
+        removedWrites.push(set.reg)
         return true
     }
 
@@ -2205,13 +2320,18 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     }
 
     const FloatConds: Record<string, number> = { eq: COND_EQ, ne: COND_NE, lt: COND_MI, le: COND_LS, gt: COND_GT, ge: COND_GE }
+    const SwappedFloatConds: Record<string, number> = { eq: COND_EQ, ne: COND_NE, lt: COND_GT, le: COND_GE, gt: COND_MI, ge: COND_LS }
 
     function floatCompare(op: string, dst: number, a: number, b: number, from: [Ty, Ty]): void {
-        const cond = FloatConds[op]
+        const cond = (a === XZR ? SwappedFloatConds : FloatConds)[op]
         if (cond === undefined) throw `aarch64: unsupported f64 compare '${op}'`
-        const left = toFloat(fpA, a, from[0])
-        const right = toFloat(fpB, b, from[1])
-        emitCmp(0x1E602000 | (fp(right) << 16) | (fp(left) << 5), `fcmp ${dreg(left)}, ${dreg(right)}`, { writes: [], reads: [left, right] })
+        if (a === XZR || b === XZR) {
+            emitFloatZero(a === XZR ? toFloat(fpA, b, from[1]) : toFloat(fpA, a, from[0]))
+        } else {
+            const left = toFloat(fpA, a, from[0])
+            const right = toFloat(fpB, b, from[1])
+            emitCmp(0x1E602000 | (fp(right) << 16) | (fp(left) << 5), `fcmp ${dreg(left)}, ${dreg(right)}`, { writes: [], reads: [left, right] })
+        }
         cset(dst, cond)
     }
 
@@ -3622,7 +3742,115 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
-    function released(values: { value: number, home: number }[]): void {
+    function isZeroStore(it: AsmItem | undefined): boolean {
+        return it?.kind === 'insn' && it.storeBase !== undefined
+            && it.storeOffset !== undefined && it.storeOffset % 8 === 0 && memReg(it, 0) === XZR
+            && (it.storeBytes === 8 || (it.storeBytes === undefined && pairSecondReg(it) === XZR))
+    }
+
+    function compactZeroStores(end: number): boolean {
+        const floor = Math.max(0, items.length - 32)
+        const last = items[end - 1]
+        const rn = last.storeBase!
+        let start = end - 1
+        while (start > floor && isZeroStore(items[start - 1]) && items[start - 1].storeBase === rn) start--
+        if (end - start < 2) return false
+        const offsets = new Set<number>()
+        for (let i = start; i < end; i++) {
+            const it = items[i]
+            offsets.add(it.storeOffset!)
+            if (it.storeBytes === undefined) offsets.add(it.storeOffset! + 8)
+        }
+        const words = [...offsets].sort((a, b) => a - b)
+        const before = items[start - 1]
+        const after = items[end]
+        const trails = after?.kind === 'insn' && after.storeBase === rn && after.storeBytes === 8
+            && after.storeOffset === words[words.length - 1] + 8 && sameClass(after, items[end - 1])
+        const lead = (words.length % 2 === 1 || trails) && before?.kind === 'insn' && before.storeBase === rn && before.storeBytes === 8
+            && before.storeOffset === words[0] - 8 && sameClass(before, items[start])
+        function plan(vector: boolean): AsmItem[] | undefined {
+            const out: AsmItem[] = []
+            for (let i = 0; i < words.length;) {
+                const offset = words[i]
+                const adjacent = words[i + 1] === offset + 8 && !(lead && i === 0)
+                let word: number
+                let text: string
+                let bytes: number
+                let wide = false
+                if (adjacent && vector && offset % 16 === 0 && words[i + 3] === offset + 24 && offset >= -1024 && offset <= 1008) {
+                    bytes = 32
+                    word = 0xAD000000 | (((offset / 16) & 0x7F) << 15) | (fp(fpA) << 10) | (rn << 5) | fp(fpA)
+                    text = `stp q${fp(fpA)}, q${fp(fpA)}, [${base(rn)}, #${offset}]`
+                    wide = true
+                } else if (vector && adjacent && offset % 16 === 0 && fitsScaled(offset, 16)) {
+                    bytes = 16
+                    word = 0x3D800000 | ((offset / 16) << 10) | (rn << 5) | fp(fpA)
+                    text = `str q${fp(fpA)}, [${base(rn)}, #${offset}]`
+                    wide = true
+                } else if (adjacent && offset >= -512 && offset <= 504) {
+                    bytes = 16
+                    word = 0xA9007C1F | (((offset / 8) & 0x7F) << 15) | (rn << 5)
+                    text = `stp xzr, xzr, [${base(rn)}, #${offset}]`
+                } else {
+                    bytes = 8
+                    if (fitsScaled(offset, 8)) {
+                        word = 0xF900001F | ((offset / 8) << 10) | (rn << 5)
+                        text = `str xzr, [${base(rn)}, #${offset}]`
+                    } else if (fitsUnscaled(offset)) {
+                        word = 0xF800001F | ((offset & 0x1FF) << 12) | (rn << 5)
+                        text = `stur xzr, [${base(rn)}, #${offset}]`
+                    } else return
+                }
+                out.push(wide
+                    ? { kind: 'insn', word: word >>> 0, text, label: -1, reg: fpA, cond: -1, memory: true, reads: [rn, fpA], writes: [] }
+                    : { kind: 'insn', word: word >>> 0, text, label: -1, reg: XZR, cond: -1, storeBase: rn, storeOffset: offset, storeBytes: bytes === 16 ? undefined : 8 })
+                i += bytes / 8
+            }
+            return out
+        }
+        let best = plan(false)
+        if (!best) return false
+        let scratchFree = true
+        for (let i = end; i < items.length; i++) {
+            const it = items[i]
+            if (it.clobbers) break
+            if (it.kind === 'label' || isBranch(it.kind)) continue
+            const defs: number[] = [], uses: number[] = []
+            if (!itemUses(it, uses) || !itemDefs(it, defs) || uses.includes(fpA)) { scratchFree = false; break }
+            if (defs.includes(fpA)) break
+        }
+        const wide = scratchFree ? plan(true) : undefined
+        if (wide && wide.length + 1 < best.length) {
+            best = [{ kind: 'insn', word: (0x6F00E400 | fp(fpA)) >>> 0, text: `movi v${fp(fpA)}.2d, #0`,
+                label: -1, reg: fpA, cond: -1, reads: [], writes: [fpA], zeroReg: fpA }, ...wide]
+        }
+        if (best.length > end - start || (best.length === end - start && best.every((it, i) => it.word === items[start + i].word))) {
+            return false
+        }
+        for (let i = start; i < end; i++) inheritDead(best[best.length - 1], items[i])
+        items.splice(start, end - start, ...best)
+        return true
+    }
+
+    function compactPendingZeroStores(): boolean {
+        let changed = false
+        const floor = Math.max(0, items.length - 32)
+        for (let i = pendingZeroStores.length - 1; i >= 0; i--) {
+            const pending = pendingZeroStores[i]
+            let end = Math.min(pending.end, items.length)
+            while (end > floor && items[end - 1] !== pending.tail) end--
+            if (end > floor && emitterStep(compactZeroStores, end)) changed = true
+        }
+        pendingZeroStores.length = 0
+        return changed
+    }
+
+    function released(values: { value: number, home: number }[], label?: number): void {
+        if (label !== undefined) {
+            if (pendingZeroStores.length) compactPendingZeroStores()
+            emitterStep(fuseClosedZeroLoop, label)
+            return
+        }
         const dead = new Set<number>()
         for (const value of values) if (value.home >= 0) dead.add(value.home)
         for (const reg of dead) writebacks.delete(reg)
@@ -3633,6 +3861,11 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
 
         separateScratch(dead)
+        if (pendingZeroStores.length) {
+            const tail = items[items.length - 1]
+            if (compactPendingZeroStores() && items[items.length - 1] !== tail) return
+        }
+        if (emitterStep(fuseArithmeticZeroBranch, dead)) return
         if (scaledConversion(dead)) return
 
         // TODO: optionally use CPU feature flags
@@ -3942,6 +4175,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         },
         releaseLabel: (id) => {
             closedLabels.add(id)
+            released([], id)
         },
         jump: (id) => {
             push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
@@ -4070,6 +4304,10 @@ export function aarch64RegisterEffects(word: number): [reads: number[], writes: 
         if (bits(at, 5) !== 31) list.push(bits(at, 5))
     }
     const fp = (list: number[], at: number) => list.push(FP_BASE + bits(at, 5))
+    if (((word & 0xFFFFFFE0) >>> 0) === 0x6F00E400) {
+        fp(writes, 0)
+        return [reads, writes]
+    }
     const op0 = bits(25, 4)
     if ((op0 & 0xE) === 0x8) {
         const kind = bits(23, 3)
