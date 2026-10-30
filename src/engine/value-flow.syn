@@ -3055,7 +3055,8 @@ function resolveMember(origin: number, key: number, target: number, keySlot: num
         return readField(fieldSlot(origin, elemKey), target)
     }
     const kind = flow.originKind[origin]
-    if (kind === OriginKind.fn || kind === OriginKind.site || kind === OriginKind.slice) {
+    if (kind === OriginKind.fn) return functionMember(origin, key, target)
+    if (kind === OriginKind.site || kind === OriginKind.slice) {
         addConst(target, UNDEF)
         return
     }
@@ -3097,6 +3098,22 @@ function resolveMember(origin: number, key: number, target: number, keySlot: num
     readField(own, target)
     flow.missing.push(target, own)
     if (kind === OriginKind.fresh || kind === OriginKind.created) namedRead(origin, target)
+}
+
+function functionMember(origin: number, key: number, target: number): void {
+    const fn = flow.originFn[origin]!
+    let at = heap.deref(flow.host.session.linkFunction(fn) as Handle)
+    while (key >= 0 && at) {
+        const descriptor = heap.getOwnProperty(at, key as Handle)
+        if (descriptor) {
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+            if (d.flags & heap.PropFlags.has_getter) return virtualCall(target, d.slot0 as Handle, origin, [], [])
+            if (d.flags & heap.PropFlags.has_setter) return addConst(target, UNDEF)
+            return heapValue(d.slot0 as Handle, target, 0, undefined, 0)
+        }
+        at = heap.getPrototypeOf(at)
+    }
+    throw `value-flow: ${fn.name || '<anon>'}.${key >= 0 && heap.isString(key as Handle) ? heap.stringToJs(key as Handle) : key} is not a property of the function`
 }
 
 function elemRead(origin: number, target: number): void {
@@ -4798,9 +4815,11 @@ function layoutPrototype(state: Handle): Handle {
 function allocationOf(origin: number): number {
     const known = flow.exported.allocOf.get(origin)
     if (known !== undefined) return known
+    const kind = flow.originKind[origin]
+    const fn = originHostFn(origin)
+    if (fn && (kind === OriginKind.static || staticClosure(origin))) return functionObject(fn, origin)
     const id = flow.exported.allocations.length
     flow.exported.allocOf.set(origin, id)
-    const kind = flow.originKind[origin]
     const cell = flow.originCell[origin]
     const site = siteOfOrigin(origin)
     const creator = flow.originCreators.get(origin)?.[0] ?? -1
@@ -4843,6 +4862,7 @@ function functionObject(fn: Function, origin: number): number {
     heap.setReadonlyProperty(state, heap.closureCallKey, flow.originCell[origin] as Handle)
     const id = flow.exported.allocations.length
     flow.exported.fnObjects.set(fn, id)
+    flow.exported.allocOf.set(origin, id)
     flow.exported.allocations.push({ site: siteOfOrigin(origin), kind: AllocKind.object, state, handle: heap.makeIndirect(state), proto: heap.getPrototypeOf(state), constant: true, native: true, function: fn })
     const code = emptyType()
     addFunction(code, fn)
@@ -4875,7 +4895,53 @@ function writerSite(w: number): Site {
     return { unit: inst.summary.fn, node: inst.summary.exprs[w % exprBits].node }
 }
 
+const descriptorRt = new Set<number>([RtOp.ownKeys, RtOp.assign, RtOp.copyDataProperties, RtOp.defineAccessor, RtOp.deleteProperty])
+const descriptorBuiltins = new Set<Function>([Object.getOwnPropertyDescriptor, Object.getOwnPropertyDescriptors, Object.defineProperty, Object.defineProperties, Reflect.getOwnPropertyDescriptor, Reflect.defineProperty, Reflect.deleteProperty, Reflect.ownKeys])
+
+function functionOrigin(origin: number): boolean {
+    const kind = flow.originKind[origin]
+    if (kind === OriginKind.fn) return true
+    return (kind === OriginKind.static || kind === OriginKind.fresh) && originHostFn(origin) !== undefined
+}
+
+function holdsFunction(slot: number): boolean {
+    for (const origin of flow.slotOrigins[slot] ?? []) if (functionOrigin(origin)) return true
+    return false
+}
+
+function functionDescriptorsObserved(): boolean {
+    for (const inst of flow.instances) {
+        const exprs = inst.summary.exprs
+        let e = 0
+        while (e < exprs.length) {
+            const x = exprs[e]
+            e++
+            if (x.op === ExprOp.store && x.a >= 0 && holdsFunction(at(inst, x.a))) return true
+            if (x.op === ExprOp.rt && descriptorRt.has(x.a) && x.args.some(a => holdsFunction(at(inst, a)))) return true
+            if (x.op !== ExprOp.call || !x.args.some(a => holdsFunction(at(inst, a)))) continue
+            const callees = flow.slotOrigins[at(inst, x.a)] ?? []
+            if (!callees.length) return true
+            for (const callee of callees) {
+                const fn = originHostFn(callee)
+                if (fn && descriptorBuiltins.has(fn)) return true
+            }
+        }
+    }
+    return false
+}
+
+function staticFunctionData(allocation: number): Handle {
+    const object = flow.exported.allocations[allocation]
+    const held = heap.getPrototypeOf(object.state!)
+    if (held) return held
+    const data = heap.makeObject(0 as Handle)
+    heap.setPrototypeOf(object.state!, data)
+    object.proto = data
+    return data
+}
+
 function exportLocations(): void {
+    const observed = functionDescriptorsObserved()
     for (let origin = 1; origin < flow.originKind.length; origin++) {
         const fields = flow.originFields[origin]
         if (!fields.size) continue
@@ -4883,7 +4949,17 @@ function exportLocations(): void {
         if (kind === OriginKind.fn || kind === OriginKind.site || kind === OriginKind.str) continue
         if (kind === OriginKind.fresh && originHostFn(origin) && staticClosure(origin)) continue
         const allocation = allocationOf(origin)
+        const fnState = flow.exported.allocations[allocation].function ? flow.exported.allocations[allocation].state : undefined
+        const source = fnState === undefined ? undefined : heapState(origin)
         for (const [key, slot] of fields) {
+            const own = source === undefined || key < 0 ? 0 : heap.getOwnProperty(source, key as Handle)
+            const d = own ? heap.FullPropertyDescriptor(heap.resolveHeapCell(own)) : undefined
+            if (d && !observed && !(d.flags & heap.PropFlags.writable)) {
+                const data = staticFunctionData(allocation)
+                if (!heap.getOwnProperty(data, key as Handle)) heap.setDataProperty(data, key as Handle, d.slot0 as Handle, d.flags)
+                continue
+            }
+            if (d && !heap.getOwnProperty(fnState!, key as Handle)) heap.setDataProperty(fnState!, key as Handle, d.slot0 as Handle, d.flags)
             const readers: Site[] = []
             for (const r of flow.fieldReaders.get(slot) ?? []) readers.push(slotSite(r))
             const writers: Site[] = []
