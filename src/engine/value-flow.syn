@@ -129,6 +129,7 @@ interface Summary {
     initializer: boolean | undefined
     bound: Bound | undefined
     proofs: pg.ProofScope | undefined
+    forwards: Map<number, Map<number, Map<number, number>>>
 }
 
 enum OriginKind {
@@ -1153,9 +1154,21 @@ function readField(field: number, target: number): void {
     }
     copyEdge(field, target)
     if (flow.fieldForms.get(field)?.includes('void')) addConst(target, UNDEF)
+    fieldReader(field, target)
+}
+
+function fieldReader(field: number, target: number): void {
     let list = flow.fieldReaders.get(field)
     if (!list) flow.fieldReaders.set(field, list = [])
     list.push(ownerSlot(target))
+}
+
+function forwardedSlot(part: number): number {
+    const slot = ownerSlot(part)
+    if (flow.slotKind[slot] !== SlotKind.expr) return -1
+    const x = exprAt(slot)
+    if (x.op !== ExprOp.member || !x.args.length) return -1
+    return at(instOfSlot(slot), x.args[0])
 }
 
 function writeField(field: number, value: number, writer: number, form: string, stored: boolean): void {
@@ -1239,7 +1252,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined,
+        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, forwards: new Map(),
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -1469,6 +1482,11 @@ function exprOfNode(s: Summary, id: number): number {
         const obj = operand(s, id, n, 1)
         const keyRef = getRef(n, 2)
         e = keyRef ? expr(s, ExprOp.member, id, obj, operand(s, id, n, 2), dynKey, [], 0) : expr(s, ExprOp.member, id, obj, 0, getLiteral(g, n, 2), [], 0)
+        if (!keyRef) {
+            s.exprOf.set(id, e)
+            const forwarded = forwardedRead(s, id, n)
+            if (forwarded >= 0) s.exprs[e].args = [forwarded]
+        }
     } else if (op === NodeOp.setProp) {
         const obj = operand(s, id, n, 1)
         const keyRef = getRef(n, 2)
@@ -1530,6 +1548,62 @@ function exprOfNode(s: Summary, id: number): number {
         e = expr(s, ExprOp.opaque, id, 0, 0, 0, [], 0)
     }
     s.exprOf.set(id, e)
+    return e
+}
+
+function forwardedRead(s: Summary, id: number, n: GraphNode): number {
+    const region = s.regions ? s.regions.of.get(id) : undefined
+    if (region === undefined) return -1
+    return valueAt(s, getRef(n, 0), getRef(n, 1), getLiteral(s.g, n, 2), region)
+}
+
+function valueAt(s: Summary, tok: number, obj: number, key: number, region: number): number {
+    const source = keySource(s, tok, obj, key)
+    if (!source) return -1
+    const t = getNode(s.g, source)!
+    if (t.op === NodeOp.getProp) return narrowed(s, source, exprOfNode(s, source), region)
+    if (t.op === NodeOp.setProp) return operand(s, source, t, 3)
+    return mergedValue(s, source, obj, key)
+}
+
+function keySource(s: Summary, tok: number, obj: number, key: number): number {
+    const g = s.g
+    const t = tok ? getNode(g, tok) : undefined
+    if (!t) return 0
+    charge(1)
+    if (t.op === NodeOp.startOf) return tok
+    if (t.op !== NodeOp.getProp && t.op !== NodeOp.setProp) return 0
+    if (getRef(t, 1) !== obj || getRef(t, 2) || getLiteral(g, t, 2) !== key) return 0
+    return tok
+}
+
+function mergedValue(s: Summary, start: number, obj: number, key: number): number {
+    let byKey = s.forwards.get(obj)
+    if (!byKey) s.forwards.set(obj, byKey = new Map())
+    let memo = byKey.get(key)
+    if (!memo) byKey.set(key, memo = new Map())
+    const known = memo.get(start)
+    if (known !== undefined) return known
+    memo.set(start, -1)
+    const regions = s.regions!
+    const b = regions.blockOf.get(start)
+    if (!b || s.g.blocks[b].id !== getRef(getNode(s.g, start)!, 0)) return -1
+    const scope = proofScope(s)
+    const values: number[] = []
+    const gates: number[] = []
+    for (const apply of regions.arrivals[b]) {
+        const orders = pg.applyOrders(scope, apply)
+        const region = regions.of.get(apply)
+        if (!orders || orders.length !== 1 || region === undefined) return -1
+        const value = valueAt(s, orders[0], obj, key, region)
+        if (value < 0) return -1
+        values.push(value)
+        gates.push(nodeGate(s, apply))
+    }
+    if (!values.length) return -1
+    const e = expr(s, ExprOp.union, 0, 0, 0, 0, values, 0)
+    s.exprs[e].gates = gates
+    memo.set(start, e)
     return e
 }
 
@@ -3070,6 +3144,12 @@ function resolveMember(origin: number, key: number, target: number, keySlot: num
     if (key === dynKey && !scope && (kind === OriginKind.fresh || kind === OriginKind.created || kind === OriginKind.static)) return keyedRead(origin, target)
     if (key < 0 || scope) {
         const own = fieldSlot(origin, key)
+        const forwarded = scope ? forwardedSlot(target) : -1
+        if (forwarded >= 0) {
+            copyEdge(forwarded, target)
+            fieldReader(own, target)
+            return
+        }
         readField(own, target)
         flow.missing.push(target, own)
         return
@@ -3966,6 +4046,7 @@ function ownedOperands(s: Summary, e: number): number[] {
         case ExprOp.member:
             all.push(x.a)
             if (x.key === dynKey) all.push(x.b)
+            for (const a of x.args) all.push(a)
         case ExprOp.call:
             all.push(x.a)
             all.push(x.b)
