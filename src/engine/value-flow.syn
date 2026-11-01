@@ -9,7 +9,7 @@ import { addNode, armSlot, childRegion, countIds, demandRegion, getLiteral, getN
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import { AllocKind, boundCallee, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type FrameSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
+import { AllocKind, boundCallee, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -83,11 +83,6 @@ interface Expr {
     gates: number[] | undefined
 }
 
-interface Order {
-    groups: number[][]
-    users: (number[][] | undefined)[]
-}
-
 interface Summary {
     fn: Function
     id: number
@@ -108,7 +103,6 @@ interface Summary {
     local: Int32Array | undefined
     width: number
     owned: number[]
-    order: Order | undefined
     regions: GraphRegions | undefined
     tested: Set<number>
     guards: Map<number, Map<number, Guard>>
@@ -130,6 +124,10 @@ interface Summary {
     bound: Bound | undefined
     proofs: pg.ProofScope | undefined
     forwards: Map<number, Map<number, Map<number, number>>>
+    kinded: number | undefined
+    classed: number | undefined
+    kindIds: Map<string, number> | undefined
+    kindVecs: number[][]
 }
 
 enum OriginKind {
@@ -186,6 +184,19 @@ enum ListenerKind {
     pick,
     offset,
     confine,
+    classed,
+    kinds,
+}
+
+enum ArgClass {
+    float = 1,
+    number = 2,
+    string = 4,
+    boolean = 8,
+    undefined = 16,
+    object = 32,
+    function = 64,
+    unknown = 128,
 }
 
 interface Listener {
@@ -206,6 +217,7 @@ interface Instance {
     callers: number[]
     lit: number
     litParam: number
+    kinds: number
     site: Instance | undefined
     map: Map<number, number> | undefined
 }
@@ -215,8 +227,10 @@ interface FlowState {
     roots: Function[]
     strOrigin: number
     dynamicOrigins: Set<number>
-    spec: SpecState
-    frames: FrameInfo[]
+    exportedInstances: Exported[]
+    genericSites: Set<number>
+    kindWatch: Map<number, number[]>
+    slotClass: Map<number, number>
     work: number
     traceMs: number
     budget: number
@@ -689,6 +703,7 @@ function truncatedQuotient(a: number, b: number, use: FractionUse): number {
 }
 
 function quotient(a: number, b: number, remainder: number, use: FractionUse): number {
+    if (remainder === NONE) return NONE
     if (scalars.flags[remainder] === ScalarFlag.int && scalars.lo[remainder] === 0 && scalars.hi[remainder] === 0) {
         if (scalars.lo[a] >= 0 && scalars.lo[b] > 0) return numScalar(0, scalars.hi[a])
         const m = Math.max(-scalars.lo[a], scalars.hi[a])
@@ -1252,7 +1267,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], order: undefined, regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, forwards: new Map(),
+        local: undefined, width: 0, owned: [], regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, kinded: undefined, classed: undefined, kindIds: undefined, kindVecs: [], forwards: new Map(),
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -1431,7 +1446,7 @@ function remainderAt(s: Summary, id: number, n: GraphNode): number {
         for (const [r, m] of nodeEntries(s.g)) if (m.op === NodeOp.rem) s.remainders.set(`${m.slots[0]},${m.slots[1]}`, r)
     }
     const r = s.remainders.get(`${n.slots[2]},${n.slots[3]}`)
-    if (r === undefined || region === undefined) return konst(s, NONE)
+    if (r === undefined || region === undefined) return konst(s, UNKNOWN)
     return narrowed(s, r, exprOfNode(s, r), region)
 }
 
@@ -2373,11 +2388,11 @@ function freshReturn(s: Summary, slices: boolean): boolean {
     return found
 }
 
-function instance(fn: Function, qual: number, lit: number, litParam: number): number {
+function instance(fn: Function, qual: number, lit: number, litParam: number, kinds: number = -1): number {
     let byQual = flow.instanceOf.get(fn)
     if (!byQual) flow.instanceOf.set(fn, byQual = new Map())
     intrinsics.assert(lit < 15, `value-flow: literal context ${lit} does not fit an instance key`)
-    const memo = qual * 16 + lit + 1
+    const memo = (qual * 16 + lit + 1) * 65536 + kinds + 1
     const known = byQual.get(memo)
     if (known !== undefined) return known
     const s = summaryOf(fn)
@@ -2389,7 +2404,7 @@ function instance(fn: Function, qual: number, lit: number, litParam: number): nu
     const recv = s.hasThis ? receiverQual(qual) : 0
     const pinned = recv > 0 && flow.originKind[recv] !== OriginKind.str ? paramOffset(s, -1) : -1
     for (let i = 0; i < sigWidth(s); i++) sigs.push(i === pinned ? constSlot(NONE, recv) : newSlot(SlotKind.sig, id, i))
-    const inst: Instance = { id, summary: s, qual, base, sigs, ret: -1, callers: [], lit, litParam, site: undefined, map: undefined }
+    const inst: Instance = { id, summary: s, qual, base, sigs, ret: -1, callers: [], lit, litParam, kinds, site: undefined, map: undefined }
     inst.ret = s.retExpr >= 0 ? at(inst, s.retExpr) : newSlot(SlotKind.ret, id, 0)
     flow.instances.push(inst)
     byQual.set(memo, id)
@@ -2579,7 +2594,7 @@ function siteReturn(callee: Instance, from: Instance, x: Expr, callSlot: number,
     const id = flow.instances.length
     const sigs: number[] = []
     for (let i = 0; i < s.params; i++) sigs.push(i < x.args.length ? at(from, x.args[i]) : constSlot(UNDEF, 0))
-    const site: Instance = { id, summary: s, qual: 0, base: 0, sigs, ret: -1, callers: [callSlot], lit: -1, litParam: -1, site: callee, map: new Map() }
+    const site: Instance = { id, summary: s, qual: 0, base: 0, sigs, ret: -1, callers: [callSlot], lit: -1, litParam: -1, kinds: -1, site: callee, map: new Map() }
     flow.instances.push(site)
     charge(cone.length)
     for (const e of cone) site.map!.set(e, newSlot(SlotKind.expr, id, e))
@@ -2637,8 +2652,15 @@ function addCaller(callee: Instance, slot: number): void {
 
 function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: number, subject: number): void {
     const lit = subject && x.args.length > 1 ? smallLiteral(inst.summary, x.args[1]) : -1
-    const callee = flow.instances[instance(impl, qual, lit, lit < 0 ? -1 : 1)]
+    const s = summaryOf(impl)
+    const kinds = x.op === ExprOp.rt ? rtKinds(inst, x, s, qual, subject) : -1
+    intrinsics.assert(kinds < 255, `value-flow: ${s.name} has too many kind specializations for an rt-binding key`)
+    const key = kinds < 0 ? subject : subject + (kinds + 1) * 2 ** 45
+    if (kinds >= 0 && flow.parts.get(slot)?.has(key)) return
+    if (kinds >= 0 && !rtBound(slot, qual, subject)) watchRtKinds(slot, qual, subject, s)
+    const callee = flow.instances[instance(impl, qual, lit, lit < 0 ? -1 : 1, kinds)]
     addCaller(callee, slot)
+    const classed = kinds >= 0 ? classedParams(s) : 0
     const params = callee.summary.params
     for (let i = 0; i < x.args.length && i < params; i++) {
         if (i === 0 && subject) {
@@ -2650,10 +2672,13 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
             addIn(callee.sigs[0], -at(inst, x.args[0]) - 1)
             continue
         }
-        copyEdge(at(inst, x.args[i]), callee.sigs[i])
+        if (i < 16 && (classed & (1 << i))) {
+            addIn(callee.sigs[i], at(inst, x.args[i]))
+            listen(at(inst, x.args[i]), ListenerKind.classed, callee.sigs[i], 0, 0)
+        } else copyEdge(at(inst, x.args[i]), callee.sigs[i])
     }
     for (let i = x.args.length; i < params; i++) addConst(callee.sigs[i], UNDEF)
-    const part = partSlot(slot, subject)
+    const part = partSlot(slot, key)
     const from = stringRt.has(x.a) || x.a === RtOp.hasPrototype || x.a === RtOp.hasProperty ? -1 : callee.ret
     flow.partBind.set(part, { callee: callee.id, from, kind: BindKind.rt, target: qual, recv: subject })
     if (from >= 0) copyEdge(from, part)
@@ -2826,6 +2851,8 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.pick: pickOrigin(l.target, origin, l.key, l.extra)
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
         case ListenerKind.confine: confineOrigin(flow.confinements[l.target], l.key, origin)
+        case ListenerKind.classed: if (classAdmits(l.target, origin)) addOrigin(l.target, origin)
+        case ListenerKind.kinds: classChanged(l.target, originClass(origin))
     }
 }
 
@@ -3378,23 +3405,248 @@ function rtSubject(callSlot: number, subject: number): void {
     bindRt(inst, x, callSlot, bindingOf(x.a)!.impl!, subject, subject)
 }
 
+function specializationSite(inst: Instance): number {
+    const q = inst.qual
+    if (q <= 0) return 0
+    return specializes(q) ? q : 0
+}
+
+function specializes(origin: number): boolean {
+    const kind = flow.originKind[origin]
+    if (kind === OriginKind.site) return flow.genericSites.has(origin) || (flow.originQual[origin] > 0 && specializes(flow.originQual[origin]))
+    if (kind !== OriginKind.fresh && kind !== OriginKind.created) return false
+    if (isScope(origin) || originHostFn(origin)) return false
+    const proto = protoOf(origin)
+    return !!proto && !!flow.host.specializes?.(proto)
+}
+
+function kindedParams(s: Summary): number {
+    if (s.kinded !== undefined) return s.kinded
+    let mask = 0
+    const seen = new Uint8Array(s.exprs.length)
+    const work: number[] = []
+    for (const x of s.exprs) if (x.op === ExprOp.ntype && x.a >= 0) work.push(x.a)
+    for (const e of returnCone(s) ?? []) work.push(e)
+    while (work.length) {
+        const e = work.pop()!
+        if (seen[e]) continue
+        seen[e] = 1
+        const x = s.exprs[e]
+        if (x.op === ExprOp.param && x.a >= 0 && x.a < 16) mask = mask | (1 << x.a)
+        if (x.op === ExprOp.narrow || x.op === ExprOp.pick) work.push(x.a)
+        if (x.op === ExprOp.union) for (const a of x.args) work.push(a)
+    }
+    s.kinded = mask
+    return mask
+}
+
+function classedParams(s: Summary): number {
+    if (s.classed !== undefined) return s.classed
+    s.classed = 0
+    let mask = 0
+    const seen = new Uint8Array(s.exprs.length)
+    const work: number[] = []
+    for (const x of s.exprs) {
+        if (x.op === ExprOp.rt && x.a === RtOp.typeof && x.args.length) work.push(x.args[0])
+        const callee = staticCallee(s, x)
+        if (!callee) continue
+        const inner = classedParams(callee)
+        let i = 0
+        while (i < x.args.length && i < 16) {
+            if (inner & (1 << i)) work.push(x.args[i])
+            i++
+        }
+    }
+    while (work.length) {
+        const e = work.pop()!
+        if (e < 0 || seen[e]) continue
+        seen[e] = 1
+        const x = s.exprs[e]
+        if (x.op === ExprOp.param && x.a >= 0 && x.a < 16) mask = mask | (1 << x.a)
+        if (x.op === ExprOp.narrow || x.op === ExprOp.pick) work.push(x.a)
+        if (x.op === ExprOp.union) for (const a of x.args) work.push(a)
+    }
+    s.classed = mask
+    return mask
+}
+
+function staticCallee(s: Summary, x: Expr): Summary | undefined {
+    if (x.op === ExprOp.rt) {
+        if (x.a === RtOp.typeof) return
+        const impl = bindingOf(x.a)?.impl
+        return impl && flow.host.binder.traceable(impl) ? summaryOf(impl) : undefined
+    }
+    if (x.op !== ExprOp.call || x.a < 0 || s.exprs[x.a].op !== ExprOp.origin) return
+    const fn = originFunction(s.exprs[x.a].a)
+    const n = getNode(s.g, x.node)
+    if (!fn || !n || !flow.host.binder.traceable(fn)) return
+    return summaryOf(boundCallee(flow.host, fn, n))
+}
+
+function scalarClass(t: number): number {
+    const f = scalars.flags[t]
+    let mask = 0
+    if (f & ScalarFlag.unknown) mask = mask | ArgClass.unknown
+    if (f & FloatFlags) mask = mask | ArgClass.float | ArgClass.number
+    if (f & ScalarFlag.int) mask = mask | ArgClass.number
+    if (f & (ScalarFlag.str | ScalarFlag.anyStr)) mask = mask | ArgClass.string
+    if (f & (ScalarFlag.no | ScalarFlag.yes)) mask = mask | ArgClass.boolean
+    if (f & (ScalarFlag.undef | ScalarFlag.void)) mask = mask | ArgClass.undefined
+    return mask
+}
+
+function originClass(origin: number): number {
+    if (flow.originKind[origin] === OriginKind.str) return ArgClass.string
+    return originHostFn(origin) ? ArgClass.function : ArgClass.object
+}
+
+function slotClassOf(slot: number): number {
+    const known = flow.slotClass.get(slot)
+    if (known !== undefined) return known
+    let mask = scalarClass(flow.scalar[slot])
+    for (const o of flow.slotOrigins[slot]) mask = mask | originClass(o)
+    return mask
+}
+
+function callKinds(inst: Instance, x: Expr, s: Summary, first: number = -1): number {
+    const floats = kindedParams(s)
+    const classed = classedParams(s)
+    if (!floats && !classed) return -1
+    const vec: number[] = []
+    let i = 0
+    while (i < s.params && i < 16) {
+        const bit = 1 << i
+        const m = !(floats & bit) && !(classed & bit) ? 0 : i === 0 && first >= 0 ? first : i < x.args.length ? slotClassOf(at(inst, x.args[i])) : ArgClass.undefined
+        vec.push(((floats & bit) ? m & ArgClass.float : 0) | ((classed & bit) ? m & ~ArgClass.float : 0))
+        i++
+    }
+    const key = vec.join(',')
+    if (!s.kindIds) s.kindIds = new Map()
+    const known = s.kindIds.get(key)
+    if (known !== undefined) return known
+    const id = s.kindVecs.length
+    intrinsics.assert(id < 255, `value-flow: ${s.name} has too many kind specializations for a call-binding key`)
+    s.kindIds.set(key, id)
+    s.kindVecs.push(vec)
+    return id
+}
+
+function watchKinds(callSlot: number, target: number, recv: number, s: Summary): void {
+    const inst = instOfSlot(callSlot)
+    const x = exprAt(callSlot)
+    const watched = kindedParams(s) | classedParams(s)
+    let i = 0
+    while (i < x.args.length && i < 16) {
+        if (watched & (1 << i)) {
+            const slot = at(inst, x.args[i])
+            let list = flow.kindWatch.get(slot)
+            if (!list) {
+                flow.kindWatch.set(slot, list = [])
+                flow.slotClass.set(slot, slotClassOf(slot))
+                listen(slot, ListenerKind.kinds, slot, 0, 0)
+            }
+            list.push(callSlot, target, recv)
+        }
+        i++
+    }
+}
+
+function classChanged(slot: number, bits: number): void {
+    const known = flow.slotClass.get(slot)!
+    if (!(bits & ~known)) return
+    flow.slotClass.set(slot, known | bits)
+    rekind(slot)
+}
+
+function classAdmits(sig: number, origin: number): boolean {
+    const inst = flow.instances[flow.slotOwner[sig]]
+    const m = inst.summary.kindVecs[inst.kinds][flow.slotIndex[sig]]
+    return (m & ArgClass.unknown) !== 0 || (m & originClass(origin)) !== 0
+}
+
+function rekind(slot: number): void {
+    const list = flow.kindWatch.get(slot)!
+    let i = 0
+    while (i < list.length) {
+        if (list[i + 1] < 0) {
+            const x = exprAt(list[i])
+            bindRt(instOfSlot(list[i]), x, list[i], bindingOf(x.a)!.impl!, -2 - list[i + 1], list[i + 2])
+        } else bindCall(list[i], list[i + 1], list[i + 2])
+        i += 3
+    }
+}
+
+function rtKinds(inst: Instance, x: Expr, s: Summary, qual: number, subject: number): number {
+    if (flow.cut) return -1
+    const first = subject || !qual ? (subject ? originClass(subject) : 0) | (x.args.length ? scalarClass(flow.scalar[at(inst, x.args[0])]) : 0) : -1
+    return callKinds(inst, x, s, first)
+}
+
+function rtBound(slot: number, qual: number, subject: number): boolean {
+    const parts = flow.parts.get(slot)
+    if (!parts) return false
+    for (const part of parts.values()) {
+        const bind = flow.partBind.get(part)
+        if (bind && bind.kind === BindKind.rt && bind.target === qual && bind.recv === subject) return true
+    }
+    return false
+}
+
+function watchRtKinds(slot: number, qual: number, subject: number, s: Summary): void {
+    const inst = instOfSlot(slot)
+    const x = exprAt(slot)
+    const watched = kindedParams(s) | classedParams(s)
+    let i = 0
+    while (i < x.args.length && i < 16) {
+        if (watched & (1 << i)) {
+            const arg = at(inst, x.args[i])
+            let list = flow.kindWatch.get(arg)
+            if (!list) {
+                flow.kindWatch.set(arg, list = [])
+                flow.slotClass.set(arg, slotClassOf(arg))
+                listen(arg, ListenerKind.kinds, arg, 0, 0)
+            }
+            list.push(slot, -2 - qual, subject)
+        }
+        i++
+    }
+}
+
+function callBound(callSlot: number, target: number, recv: number): boolean {
+    const parts = flow.parts.get(callSlot)
+    if (!parts) return false
+    for (const part of parts.values()) {
+        const bind = flow.partBind.get(part)
+        if (bind && bind.kind === BindKind.call && bind.target === target && bind.recv === recv) return true
+    }
+    return false
+}
+
 function bindCall(callSlot: number, target: number, recv: number): void {
     intrinsics.assert(recv < 4194304, `value-flow: origin ${recv} does not fit a call-binding key`)
-    const key = target * 4194304 + recv
-    if (flow.parts.get(callSlot)?.has(key)) return
-    if (flow.cut && cutApply(callSlot, target, recv, key)) return
     const x = exprAt(callSlot)
     const inst = instOfSlot(callSlot)
     const fn = boundCallee(flow.host, originFunction(target)!, getNode(inst.summary.g, x.node)!)
     const s = summaryOf(fn)
+    const kinds = flow.cut ? -1 : callKinds(inst, x, s)
+    const key = target * 4194304 + recv + (kinds + 1) * 2 ** 45
+    if (flow.parts.get(callSlot)?.has(key)) return
+    if (kinds >= 0 && !callBound(callSlot, target, recv)) watchKinds(callSlot, target, recv, s)
+    if (flow.cut && cutApply(callSlot, target, recv, key)) return
     const kind = flow.originKind[target]
-    const perSite = s.returnsFresh && (!s.hasThis || s.params > 0) && getNode(inst.summary.g, x.node)?.op !== NodeOp.static
-    const qual = s.hasThis && !perSite ? qualOf(recv) : perSite ? qualified(OriginKind.site, 0, !s.hasThis && kind === OriginKind.fresh ? target : inst.qual, x.node, inst.summary) : !s.hasThis && kind === OriginKind.fresh ? target : 0
-    const callee = flow.instances[instance(fn, qual, -1, -1)]
+    const held = getNode(inst.summary.g, x.node)?.op === NodeOp.static
+    const perSite = s.returnsFresh && (!s.hasThis || s.params > 0) && !held
+    const qual = s.hasThis && !perSite ? qualOf(recv) : perSite ? qualified(OriginKind.site, 0, !s.hasThis && kind === OriginKind.fresh ? target : inst.qual, x.node, inst.summary) : !s.hasThis && kind === OriginKind.fresh ? target : held ? 0 : specializationSite(inst)
+    if (perSite && s.hasThis && recv && specializes(recv)) flow.genericSites.add(qual)
+    const callee = flow.instances[instance(fn, qual, -1, -1, kinds)]
     addCaller(callee, callSlot)
+    const classed = kinds >= 0 ? classedParams(s) : 0
     for (let i = 0; i < s.params; i++) {
-        if (i < x.args.length) copyEdge(at(inst, x.args[i]), callee.sigs[i])
-        else addConst(callee.sigs[i], UNDEF)
+        if (i >= x.args.length) addConst(callee.sigs[i], UNDEF)
+        else if (i < 16 && (classed & (1 << i))) {
+            addIn(callee.sigs[i], at(inst, x.args[i]))
+            listen(at(inst, x.args[i]), ListenerKind.classed, callee.sigs[i], 0, 0)
+        } else copyEdge(at(inst, x.args[i]), callee.sigs[i])
     }
     if (s.hasThis) {
         if (recv) addOrigin(paramSlot(callee, -1), recv)
@@ -3432,6 +3684,7 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
     const ins = flow.slotIns[slot]
     if (ins) for (const from of ins) out = unite(out, value(from >= 0 ? from : -from - 1))
     if (flow.slotOpaque[slot] && flow.slotKind[slot] !== SlotKind.expr) out = unite(out, UNKNOWN)
+    if (flow.slotKind[slot] === SlotKind.sig) return kindedSig(slot, out)
     if (flow.slotKind[slot] !== SlotKind.expr) return out
     const inst = flow.instances[flow.slotOwner[slot]]
     const x = inst.summary.exprs[flow.slotIndex[slot]]
@@ -3459,6 +3712,37 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
         case ExprOp.member: if (scalars.flags[value(at(inst, x.a))] & ScalarFlag.unknown) out = unite(out, UNKNOWN)
     }
     return typedScalar(out, x.type)
+}
+
+function kindedSig(slot: number, t: number): number {
+    const inst = flow.instances[flow.slotOwner[slot]]
+    const i = flow.slotIndex[slot]
+    if (inst.kinds < 0 || i >= 16) return t
+    const m = inst.summary.kindVecs[inst.kinds][i]
+    const bit = 1 << i
+    const old = scalars.flags[t]
+    let f = old
+    let strs = scalars.strs[t]
+    let nums = scalars.nums[t]
+    if ((kindedParams(inst.summary) & bit) && !(m & ArgClass.float) && (f & FloatFlags)) {
+        f = f & ~FloatFlags
+        nums = nums.filter(v => Number.isInteger(v))
+    }
+    if ((classedParams(inst.summary) & bit) && !(m & ArgClass.unknown)) {
+        f = f & ~ScalarFlag.unknown
+        if (!(m & ArgClass.number)) {
+            f = f & ~(ScalarFlag.int | FloatFlags)
+            nums = []
+        }
+        if (!(m & ArgClass.string)) {
+            f = f & ~(ScalarFlag.str | ScalarFlag.anyStr)
+            strs = []
+        }
+        if (!(m & ArgClass.boolean)) f = f & ~(ScalarFlag.no | ScalarFlag.yes)
+        if (!(m & ArgClass.undefined)) f = f & ~(ScalarFlag.undef | ScalarFlag.void)
+    }
+    if (f === old && nums === scalars.nums[t]) return t
+    return scalar(f, scalars.lo[t], scalars.hi[t], strs, nums)
 }
 
 function rawCallee(t: number): boolean {
@@ -3642,57 +3926,6 @@ function exprUses(slot: number): void {
     if (x.op === ExprOp.call) scalarUse(at(inst, x.a), slot)
 }
 
-function components(n: number, roots: number[], edgesOf: (v: number) => number[], emit: (group: number[], cyclic: boolean, edges: number[][]) => void): void {
-    const index = new Int32Array(n).fill(-1)
-    const low = new Int32Array(n)
-    const onStack = new Uint8Array(n)
-    const lists: number[][] = new Array(n)
-    const stack: number[] = []
-    const call: number[] = []
-    const edgeAt: number[] = []
-    let counter = 0
-    const enter = (v: number) => {
-        index[v] = low[v] = counter++
-        stack.push(v)
-        onStack[v] = 1
-        lists[v] = edgesOf(v)
-        call.push(v)
-        edgeAt.push(0)
-    }
-    for (const root of roots) {
-        if (index[root] >= 0) continue
-        enter(root)
-        while (call.length) {
-            const v = call[call.length - 1]
-            const list = lists[v]
-            const k = edgeAt[edgeAt.length - 1]
-            if (k < list.length) {
-                edgeAt[edgeAt.length - 1] = k + 1
-                const w = list[k]
-                if (index[w] < 0) enter(w)
-                else if (onStack[w] && index[w] < low[v]) low[v] = index[w]
-                continue
-            }
-            call.pop()
-            edgeAt.pop()
-            if (call.length) {
-                const u = call[call.length - 1]
-                if (low[v] < low[u]) low[u] = low[v]
-            }
-            if (low[v] !== index[v]) continue
-            const group: number[] = []
-            for (;;) {
-                const w = stack.pop()!
-                onStack[w] = 0
-                group.push(w)
-                if (w === v) break
-            }
-            emit(group, group.length > 1 || list.includes(v), lists)
-            for (const w of group) lists[w] = []
-        }
-    }
-}
-
 function widens(slot: number): boolean {
     if (flow.slotKind[slot] !== SlotKind.expr) return true
     const op = exprAt(slot).op
@@ -3731,43 +3964,12 @@ function updateScalar(s: number): void {
     }
     flow.scalar[s] = next
     dirtyUsers(s)
+    if (flow.kindWatch.has(s)) classChanged(s, scalarClass(next))
     if (old !== NONE) return
     const waiting = flow.gateWaits.get(s)
     if (!waiting) return
     flow.gateWaits.delete(s)
     for (let i = 0; i < waiting.length; i += 2) wireEffect(flow.instances[waiting[i]], waiting[i + 1])
-}
-
-function groupUsers(group: number[], edges: number[][]): number[][] {
-    const local = new Map<number, number>()
-    for (let i = 0; i < group.length; i++) local.set(group[i], i)
-    const users: number[][] = []
-    for (let i = 0; i < group.length; i++) users.push([])
-    for (let i = 0; i < group.length; i++) {
-        for (const d of edges[group[i]]) {
-            const at = local.get(d)
-            if (at !== undefined) users[at].push(i)
-        }
-    }
-    return users
-}
-
-function settleGroup(group: number[], users: number[][], step: (i: number, v: number) => boolean): void {
-    const dirty = new Uint8Array(group.length).fill(1)
-    let pending = group.length
-    while (pending > 0) {
-        for (let i = 0; i < group.length; i++) {
-            if (!dirty[i]) continue
-            dirty[i] = 0
-            pending--
-            if (!step(i, group[i])) continue
-            for (const u of users[i]) {
-                if (dirty[u]) continue
-                dirty[u] = 1
-                pending++
-            }
-        }
-    }
 }
 
 export const rootParamType = Types.u64
@@ -3790,636 +3992,104 @@ function seedRoot(fn: Function, qual: number): number[] {
     return inst.sigs.slice(0, s.params)
 }
 
-interface Spec {
+interface Exported {
     inst: Instance
-    global: boolean
-    params: number[]
-    paramOrigins: number[][]
-    scalar: number[]
-    origins: number[][]
-    calls: Map<number, Spec>
-    dead: Set<number>
+    sites: Site[]
 }
-
-interface SpecState {
-    globals: Map<number, Spec>
-    memo: Map<number, Map<string, Spec>>
-    grown: Map<Spec, number>
-    recursive: Set<number>
-    active: Set<number>
-    classes: (string | undefined)[]
-}
-
-interface Arrival {
-    from: Spec | undefined
-    part: number
-    params: number[]
-    origins: number[][]
-}
-
-const widenAfter = 3
-const directRt = new Set<number>([RtOp.slice, RtOp.create, RtOp.concat, RtOp.toString, RtOp.assign, RtOp.stringOf])
 
 function callerInstance(slot: number): Instance {
     const inst = instOfSlot(slot)
     return inst.site ?? inst
 }
 
-function callOrder(): [number[], boolean][] {
-    const edges = new Map<number, number[]>()
-    for (const [part, bind] of flow.partBind) {
-        const owner = callerInstance(part)
-        if (bind.kind !== BindKind.virtual && owner === instOfSlot(part)) {
-            const [params, origins] = callArgs(globalSpec(owner), part, bind)
-            if (impossibleArgs(flow.instances[bind.callee], params, origins)) continue
-        }
-        const from = owner.id
-        let list = edges.get(from)
-        if (!list) edges.set(from, list = [])
-        list.push(bind.callee)
-        charge(1)
-    }
-    for (const [slot, callees] of flow.runtimeBinds) {
-        const from = callerInstance(slot).id
-        let list = edges.get(from)
-        if (!list) edges.set(from, list = [])
-        for (const callee of callees) list.push(callee)
-    }
-    const out: [number[], boolean][] = []
-    const roots: number[] = []
-    for (const inst of flow.instances) if (!inst.site) roots.push(inst.id)
-    components(flow.instances.length, roots, v => edges.get(v) ?? [], (members, recursive) => out.push([members, recursive]))
-    out.reverse()
-    return out
+function emptySlot(slot: number): boolean {
+    return flow.scalar[slot] === NONE && !flow.slotOrigins[slot].length
 }
 
-function sigIndex(spec: Spec, slot: number): number {
-    return flow.slotKind[slot] === SlotKind.sig && flow.slotOwner[slot] === spec.inst.id ? flow.slotIndex[slot] : -1
-}
-
-function globalSpec(inst: Instance): Spec {
-    const known = flow.spec.globals.get(inst.id)
-    if (known) return known
-    const params: number[] = []
-    const paramOrigins: number[][] = []
-    for (const sig of inst.sigs) {
-        params.push(flow.scalar[sig])
-        paramOrigins.push(flow.slotOrigins[sig])
-    }
-    const spec: Spec = { inst, global: true, params, paramOrigins, scalar: [], origins: [], calls: new Map(), dead: new Set() }
-    flow.spec.globals.set(inst.id, spec)
-    return spec
-}
-
-function specScalar(spec: Spec, slot: number): number {
-    if (spec.global) return flow.scalar[slot]
-    const k = slot - spec.inst.base
-    if (k >= 0 && k < spec.inst.summary.width && flow.slotKind[slot] === SlotKind.expr) {
-        return spec.scalar[k]
-    }
-    const i = sigIndex(spec, slot)
-    if (i >= 0) return spec.params[i]
-    if (flow.slotKind[slot] === SlotKind.part && ownsPart(spec, slot)) {
-        if (!partLive(spec, slot) || spec.dead.has(slot)) return NONE
-        const c = spec.calls.get(slot)
-        if (c && !c.global && flow.partBind.get(slot)!.from >= 0) return specScalar(c, flow.partBind.get(slot)!.from)
-    }
-    return flow.scalar[slot]
-}
-
-function specOrigins(spec: Spec, slot: number): number[] {
-    if (spec.global) return flow.slotOrigins[slot]
-    const k = slot - spec.inst.base
-    if (k >= 0 && k < spec.inst.summary.width && flow.slotKind[slot] === SlotKind.expr) {
-        return spec.origins[k]
-    }
-    const i = sigIndex(spec, slot)
-    if (i >= 0) return spec.paramOrigins[i]
-    if (flow.slotKind[slot] === SlotKind.part && ownsPart(spec, slot)) {
-        if (!partLive(spec, slot) || spec.dead.has(slot)) return []
-        const c = spec.calls.get(slot)
-        if (c && !c.global && flow.partBind.get(slot)!.from >= 0) return specOrigins(c, flow.partBind.get(slot)!.from)
-    }
-    return flow.slotOrigins[slot]
-}
-
-function ownsPart(spec: Spec, part: number): boolean {
-    const owner = flow.slotOwner[part]
-    const k = owner - spec.inst.base
-    return k >= 0 && k < spec.inst.summary.width && flow.slotKind[owner] === SlotKind.expr
-}
-
-function partLive(spec: Spec, part: number): boolean {
-    const owner = flow.slotOwner[part]
-    const inst = spec.inst
-    const x = inst.summary.exprs[flow.slotIndex[owner]]
-    const bind = flow.partBind.get(part)
-    const gate = x.gates && (x.op === ExprOp.call || x.op === ExprOp.rt) ? x.gates[0] : -1
-    if (gate >= 0 && specScalar(spec, at(inst, gate)) === NONE) return false
-    if (bind?.kind === BindKind.call) return specOrigins(spec, at(inst, x.a)).includes(bind.target) && (!bind.recv || specOrigins(spec, at(inst, x.b)).includes(bind.recv))
-    if (bind?.kind === BindKind.rt && coerces(x) && flow.slotIndex[part] === floatKey) return floatOperands(x, at(inst, x.a), at(inst, x.b), s => specScalar(spec, s), s => specOrigins(spec, s))
-    if (bind?.kind === BindKind.rt && coerces(x) && flow.slotIndex[part] === compareKey) return specStringy(spec, at(inst, x.a)) && specStringy(spec, at(inst, x.b))
-    if (bind?.kind === BindKind.rt && (coerces(x) || (x.op === ExprOp.rt && x.a === RtOp.toNumber))) {
-        const operand = at(inst, rtOperands(inst, x, part)[0])
-        return convertedMembers(specScalar(spec, operand), specStringy(spec, operand)) !== NONE
-    }
-    if (bind?.kind === BindKind.rt && concatSite(inst, x)) return specStringy(spec, at(inst, x.a)) || specStringy(spec, at(inst, x.b))
-    if (bind?.kind === BindKind.rt) return !bind.recv || specOrigins(spec, at(inst, x.args[0])).includes(bind.recv)
-    if (x.op === ExprOp.member) return specOrigins(spec, at(inst, x.a)).includes(flow.slotIndex[part])
-    if (x.op === ExprOp.rt && x.args.length) return specOrigins(spec, at(inst, x.args[0])).includes(flow.slotIndex[part])
-    return true
-}
-
-function specStringy(spec: Spec, slot: number): boolean {
-    return stringsIn(specScalar(spec, slot), specOrigins(spec, slot))
-}
-
-function addOrigins(into: number[], from: number[]): number[] {
-    let out = into
-    for (const a of from) {
-        if (out.includes(a)) continue
-        if (out === into) out = into.slice()
-        out.push(a)
-    }
-    return out
-}
-
-function partOrigins(spec: Spec, slot: number, into: number[]): number[] {
-    let out = into
-    const parts = flow.parts.get(slot)
-    if (!parts) return out
-    for (const part of parts.values()) out = addOrigins(out, specOrigins(spec, part))
-    return out
-}
-
-function localOrigins(spec: Spec, x: Expr, slot: number): number[] {
-    const inst = spec.inst
-    switch (x.op) {
-        case ExprOp.union: {
-            let out: number[] = []
-            for (let i = 0; i < x.args.length; i++) {
-                const gate = x.gates ? x.gates[i] ?? -1 : -1
-                if (gate >= 0 && specScalar(spec, at(inst, gate)) === NONE) continue
-                out = addOrigins(out, specOrigins(spec, at(inst, x.args[i])))
-            }
-            return out
-        }
-        case ExprOp.narrow:
-        case ExprOp.pick: {
-            const from = specOrigins(spec, at(inst, x.a))
-            const all = flow.slotOrigins[slot]
-            return from.filter(a => all.includes(a))
-        }
-        case ExprOp.member:
-        case ExprOp.call: return partOrigins(spec, slot, [])
-        case ExprOp.rt: return directRt.has(x.a) ? flow.slotOrigins[slot] : partOrigins(spec, slot, [])
-    }
-    return flow.slotOrigins[slot]
-}
-
-function localFix(spec: Spec): void {
-    const inst = spec.inst
-    const s = inst.summary
-    spec.scalar = new Array(s.width).fill(NONE)
-    spec.origins = []
-    for (let k = 0; k < s.width; k++) spec.origins.push([])
-    const changes = new Uint8Array(s.width)
-    const value = (slot: number) => specScalar(spec, slot)
-    const originsOf = (slot: number) => specOrigins(spec, slot)
-    const step = (i: number, e: number): boolean => {
-        const k = s.local![e]
-        const slot = inst.base + k
-        charge(1)
-        bindLocalCalls(spec, slot)
-        let t = unite(spec.scalar[k], evalSlot(slot, value, originsOf))
-        let origins = addOrigins(spec.origins[k], localOrigins(spec, s.exprs[e], slot))
-        if (t === spec.scalar[k] && origins.length === spec.origins[k].length) return false
-        if (changes[k] < 255) changes[k]++
-        if (changes[k] > widenAfter) {
-            t = unite(t, flow.scalar[slot])
-            origins = addOrigins(origins, flow.slotOrigins[slot])
-        }
-        spec.scalar[k] = t
-        spec.origins[k] = origins
-        return true
-    }
-    const order = orderOf(s)
-    for (let g = 0; g < order.groups.length; g++) {
-        const users = order.users[g]
-        if (users) settleGroup(order.groups[g], users, step)
-        else step(0, order.groups[g][0])
-    }
-}
-
-function orderOf(s: Summary): Order {
-    if (s.order) return s.order
-    const order: Order = { groups: [], users: [] }
-    components(s.exprs.length, s.owned, e => ownedOperands(s, e), (group, cyclic, edges) => {
-        order.groups.push(group)
-        order.users.push(cyclic ? groupUsers(group, edges) : undefined)
-    })
-    s.order = order
-    return order
-}
-
-function ownedOperands(s: Summary, e: number): number[] {
-    const x = s.exprs[e]
-    const all: number[] = []
-    if (x.gates) for (const gate of x.gates) all.push(gate)
-    switch (x.op) {
-        case ExprOp.union:
-        case ExprOp.rt:
-        case ExprOp.opaque:
-            for (const a of x.args) all.push(a)
-        case ExprOp.narrow:
-        case ExprOp.pick:
-        case ExprOp.ntype:
-            all.push(x.a)
-        case ExprOp.gate:
-        case ExprOp.cmp:
-            all.push(x.a)
-            all.push(x.b)
-        case ExprOp.arith:
-            all.push(x.a)
-            all.push(x.b)
-            for (const a of x.args) all.push(a)
-        case ExprOp.member:
-            all.push(x.a)
-            if (x.key === dynKey) all.push(x.b)
-            for (const a of x.args) all.push(a)
-        case ExprOp.call:
-            all.push(x.a)
-            all.push(x.b)
-            for (const a of x.args) all.push(a)
-    }
-    const n = x.op === ExprOp.union && x.node ? getNode(s.g, x.node) : undefined
-    if (n?.op === NodeOp.select) all.push(s.exprOf.get(getRef(n, 0)) ?? -1)
-    const out: number[] = []
-    for (const a of all) if (a >= 0 && s.local![a] >= 0 && s.local![a] < s.width) out.push(a)
-    return out
-}
-
-function callArgs(spec: Spec, part: number, bind: Bind): [number[], number[][]] {
-    const inst = spec.inst
+function deadCall(part: number, bind: Bind): boolean {
+    if (bind.kind === BindKind.virtual || flow.slotKind[part] !== SlotKind.part) return false
+    const inst = instOfSlot(part)
+    if (callerInstance(part) !== inst) return false
     const x = exprAt(part)
     const callee = flow.instances[bind.callee]
     const cs = callee.summary
-    const params: number[] = []
-    const origins: number[][] = []
-    for (const sig of callee.sigs) {
-        params.push(flow.scalar[sig])
-        origins.push(flow.slotOrigins[sig])
-    }
-    const set = (i: number, t: number, a: number[]) => {
-        if (i < 0 || i >= callee.sigs.length || flow.slotKind[callee.sigs[i]] !== SlotKind.sig) return
-        params[i] = t
-        origins[i] = a
-    }
+    const open = (i: number) => i < callee.sigs.length && flow.slotKind[callee.sigs[i]] === SlotKind.sig
     if (bind.kind === BindKind.rt) {
+        if (callee.kinds >= 0 && x.op === ExprOp.rt && rtKinds(inst, x, cs, bind.target, bind.recv) !== callee.kinds) return true
         const args = rtOperands(inst, x, part)
-        for (let i = 0; i < cs.params; i++) {
-            if (i >= args.length) set(i, UNDEF, [])
-            else if (i === 0 && bind.recv) set(0, specScalar(spec, at(inst, args[0])), [bind.recv])
-            else if (i === 0 && !bind.target && x.op === ExprOp.rt && x.a !== RtOp.toNumber) set(0, specScalar(spec, at(inst, args[0])), [])
-            else set(i, specScalar(spec, at(inst, args[i])), specOrigins(spec, at(inst, args[i])))
-        }
-        return [params, origins]
-    }
-    for (let i = 0; i < cs.params; i++) {
-        if (i >= x.args.length) set(i, UNDEF, [])
-        else set(i, specScalar(spec, at(inst, x.args[i])), specOrigins(spec, at(inst, x.args[i])))
-    }
-    if (cs.hasThis) set(paramOffset(cs, -1), bind.kind === BindKind.call ? specScalar(spec, at(inst, x.b)) : NONE, bind.recv ? [bind.recv] : [])
-    if (cs.usesCtx) set(paramOffset(cs, -2), NONE, [bind.target])
-    return [params, origins]
-}
-
-function joinArrivals(inst: Instance, list: Arrival[]): Spec {
-    const params = list[0].params.slice()
-    const paramOrigins = list[0].origins.slice()
-    for (let k = 1; k < list.length; k++) {
-        for (let i = 0; i < params.length; i++) {
-            params[i] = unite(params[i], list[k].params[i])
-            paramOrigins[i] = addOrigins(paramOrigins[i], list[k].origins[i])
-        }
-    }
-    return specOf(inst, params, paramOrigins, true)
-}
-
-function covers(spec: Spec, params: number[], paramOrigins: number[][], exact: boolean): boolean {
-    if (spec.global && !exact) return true
-    for (let i = 0; i < params.length; i++) {
-        if (exact && (spec.params[i] !== params[i] || spec.paramOrigins[i].length !== paramOrigins[i].length)) return false
-        if (unite(spec.params[i], params[i]) !== spec.params[i]) return false
-        for (const a of paramOrigins[i]) if (!spec.paramOrigins[i].includes(a)) return false
-    }
-    return true
-}
-
-function specOf(inst: Instance, params: number[], paramOrigins: number[][], exact: boolean): Spec {
-    if (flow.spec.recursive.has(inst.id) || flow.spec.active.has(inst.id)) return globalSpec(inst)
-    let memo = flow.spec.memo.get(inst.id)
-    if (!memo) flow.spec.memo.set(inst.id, memo = new Map())
-    const key = arrivalClass(inst, { from: undefined, part: -1, params, origins: paramOrigins })
-    const known = memo.get(key)
-    if (known && covers(known, params, paramOrigins, exact)) return known
-    let joined = params
-    let joinedOrigins = paramOrigins
-    if (known && !exact) {
-        joined = params.slice()
-        joinedOrigins = paramOrigins.slice()
-        for (let i = 0; i < joined.length; i++) {
-            joined[i] = unite(joined[i], known.params[i])
-            joinedOrigins[i] = addOrigins(joinedOrigins[i], known.paramOrigins[i])
-        }
-    }
-    let grown = known ? (flow.spec.grown.get(known) ?? 0) + 1 : 0
-    if (grown > widenAfter) {
-        const global = globalSpec(inst)
-        const widened = joined.map((t, i) => unite(sameKinds(global.params[i], t), t))
-        if (known && grown > widenAfter + 1 && covers(known, widened, joinedOrigins, false)) return known
-        joined = widened
-        grown = widenAfter + 1
-    }
-    const spec: Spec = { inst, global: false, params: joined, paramOrigins: joinedOrigins, scalar: [], origins: [], calls: new Map(), dead: new Set() }
-    flow.spec.grown.set(spec, grown)
-    flow.spec.active.add(inst.id)
-    localFix(spec)
-    flow.spec.active.delete(inst.id)
-    memo.set(key, spec)
-    return spec
-}
-
-function sameKinds(t: number, like: number): number {
-    const f = scalars.flags[t] & scalars.flags[like]
-    if (f === scalars.flags[t]) return t
-    const strs = f & (ScalarFlag.str | ScalarFlag.anyStr) ? scalars.strs[t] : []
-    return scalar(f, scalars.lo[t], scalars.hi[t], strs, scalars.nums[t])
-}
-
-function bindLocalCalls(spec: Spec, slot: number): void {
-    const parts = flow.parts.get(slot)
-    if (!parts) return
-    for (const part of parts.values()) {
-        const bind = flow.partBind.get(part)
-        if (!bind || bind.kind === BindKind.virtual) continue
-        if (!partLive(spec, part)) {
-            spec.calls.delete(part)
-            continue
-        }
-        const callee = flow.instances[bind.callee]
-        const [params, origins] = callArgs(spec, part, bind)
-        if (impossibleArgs(callee, params, origins)) {
-            spec.calls.delete(part)
-            spec.dead.add(part)
-            continue
-        }
-        spec.dead.delete(part)
-        spec.calls.set(part, specOf(callee, params, origins, false))
-    }
-}
-
-function nullishOnly(t: number, origins: number[]): boolean {
-    return t !== NONE && (scalars.flags[t] & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && !origins.length
-}
-
-function impossibleExpr(spec: Spec, e: number, memo: Map<number, boolean>): boolean {
-    const known = memo.get(e)
-    if (known !== undefined) return known
-    memo.set(e, false)
-    const inst = spec.inst
-    const s = inst.summary
-    const x = s.exprs[e]
-    let dead = false
-    const operand = (a: number) => a >= 0 && impossibleExpr(spec, a, memo)
-    switch (x.op) {
-        case ExprOp.konst:
-        case ExprOp.origin:
-        case ExprOp.param:
-        case ExprOp.alloc:
-        case ExprOp.union:
-            break
-        case ExprOp.member:
-            dead = operand(x.a) || nullishOnly(specScalar(spec, at(inst, x.a)), specOrigins(spec, at(inst, x.a)))
-            break
-        case ExprOp.call:
-        case ExprOp.rt: {
-            for (const a of x.args) if (operand(a)) dead = true
-            const parts = s.local![e] >= 0 && s.local![e] < s.width ? flow.parts.get(inst.base + s.local![e]) : undefined
-            if (!dead && parts && parts.size) {
-                let all = true
-                for (const part of parts.values()) if (!spec.dead.has(part)) all = false
-                dead = all
+        let i = 0
+        while (i < cs.params && i < args.length) {
+            const slot = at(inst, args[i])
+            const bare = i === 0 && !bind.target && x.op === ExprOp.rt && x.a !== RtOp.toNumber
+            if (i === 0 && bind.recv) {
+                i++
+                continue
             }
-            break
+            if (bare && open(0) && flow.scalar[slot] === NONE) return true
+            if (!bare && open(i) && emptySlot(slot)) return true
+            i++
         }
-        case ExprOp.arith:
-        case ExprOp.cmp:
-            dead = operand(x.a) || operand(x.b)
-            break
-        case ExprOp.narrow:
-        case ExprOp.pick:
-        case ExprOp.ntype:
-            dead = operand(x.a)
-            break
+        let k = cs.params
+        while (k < callee.sigs.length) {
+            if (open(k) && emptySlot(callee.sigs[k])) return true
+            k++
+        }
+        return false
     }
-    memo.set(e, dead)
-    return dead
-}
-
-function impossibleArgs(callee: Instance, params: number[], origins: number[][]): boolean {
-    for (let i = 0; i < params.length; i++) {
-        if (flow.slotKind[callee.sigs[i]] === SlotKind.sig && params[i] === NONE && !origins[i].length) return true
+    if (callee.kinds >= 0 && callKinds(inst, x, cs) !== callee.kinds) return true
+    let i = 0
+    while (i < cs.params && i < x.args.length) {
+        if (open(i) && emptySlot(at(inst, x.args[i]))) return true
+        i++
     }
+    const self = paramOffset(cs, -1)
+    if (cs.hasThis && open(self) && !bind.recv && (bind.kind !== BindKind.call || flow.scalar[at(inst, x.b)] === NONE)) return true
     return false
 }
 
-function globalArrival(inst: Instance, from: Spec | undefined, part: number): Arrival {
-    const spec = globalSpec(inst)
-    return { from, part, params: spec.params, origins: spec.paramOrigins }
-}
-
-function originClass(origin: number): string {
-    const known = flow.spec.classes[origin]
-    if (known !== undefined) return known
-    const kind = flow.originKind[origin]
-    let name = 'Scope'
-    if (kind === OriginKind.slice) name = 'buffer'
-    else if (kind === OriginKind.site) name = 'site'
-    else if (!isScope(origin)) {
-        const state = heapState(origin)
-        name = state !== undefined && heap.isArray(state) ? 'Array' : constructorName(protoOf(origin))
-        const elements = elementClass(origin)
-        if (elements) name = `${name}<${elements}>`
-    }
-    flow.spec.classes[origin] = name
-    return name
-}
-
-function elementClass(origin: number): string {
-    let t = NONE
-    let origins: number[] = []
-    const visit = (owner: number) => {
-        for (const [key, slot] of flow.originFields[owner]) {
-            if (key !== elemKey && !isPosKey(key)) continue
-            t = unite(t, flow.scalar[slot])
-            origins = addOrigins(origins, flow.slotOrigins[slot])
-        }
-    }
-    visit(origin)
-    for (const slot of flow.originFields[origin].values()) for (const a of flow.slotOrigins[slot]) if (flow.originKind[a] === OriginKind.slice) visit(a)
-    if (t === NONE && !origins.length) return ''
-    const f = scalars.flags[t]
-    const parts = new Set<string>()
-    if (f & ScalarFlag.unknown) parts.add('?')
-    if (f & (ScalarFlag.undef | ScalarFlag.void)) parts.add('u')
-    if (f & (ScalarFlag.int | FloatFlags)) parts.add('n')
-    if (f & (ScalarFlag.no | ScalarFlag.yes)) parts.add('b')
-    if (f & (ScalarFlag.str | ScalarFlag.anyStr)) parts.add('s')
-    for (const a of origins) parts.add(flow.originKind[a] === OriginKind.str ? 's' : originHostFn(a) ? 'f' : 'o')
-    return [...parts].sort().join('|')
-}
-
-function classOfValue(t: number, origins: number[]): string {
-    const f = scalars.flags[t]
-    const parts = new Set<string>()
-    if (f & ScalarFlag.unknown) parts.add('?')
-    if (f & (ScalarFlag.undef | ScalarFlag.void)) parts.add('u')
-    if (f & ScalarFlag.int) parts.add('i')
-    if (f & FloatFlags) parts.add('d')
-    if (f & (ScalarFlag.no | ScalarFlag.yes)) parts.add('b')
-    if (f & (ScalarFlag.str | ScalarFlag.anyStr)) parts.add('s')
-    for (const a of origins) {
-        const fn = originHostFn(a)
-        if (flow.originKind[a] === OriginKind.str) parts.add('s')
-        else if (fn) parts.add(`f${flow.host.binder.intern(fn)}`)
-        else parts.add(`o${originClass(a)}`)
-    }
-    if (parts.has('d')) {
-        parts.delete('i')
-        parts.delete('u')
-    }
-    if (parts.has('i')) parts.delete('u')
-    return [...parts].sort().join('|')
-}
-
-function arrivalClass(inst: Instance, a: Arrival): string {
-    const sigs = inst.sigs
-    let key = ''
-    for (let i = 0; i < sigs.length; i++) if (flow.slotKind[sigs[i]] === SlotKind.sig) key += `${classOfValue(a.params[i], a.origins[i])},`
-    return key
-}
-
-interface FrameInfo {
-    inst: Instance
-    members: Spec[]
-    key: string
-    sites: Site[]
-}
-
-function buildFrames(): void {
+function exportInstances(): void {
     const bindsInto = new Map<number, number>()
-    const coneParts = new Map<number, number[]>()
+    const edges = new Map<number, [part: number, callee: number][]>()
+    const edge = (part: number, callee: number) => {
+        const from = callerInstance(part).id
+        let list = edges.get(from)
+        if (!list) edges.set(from, list = [])
+        list.push([part, callee])
+        charge(1)
+    }
     for (const [part, bind] of flow.partBind) {
         bindsInto.set(bind.callee, (bindsInto.get(bind.callee) ?? 0) + 1)
-        const owner = callerInstance(part)
-        if (owner === instOfSlot(part)) continue
-        let list = coneParts.get(owner.id)
-        if (!list) coneParts.set(owner.id, list = [])
-        list.push(part)
+        if (!deadCall(part, bind)) edge(part, bind.callee)
     }
-    const arrivals = new Map<number, Arrival[]>()
-    const built = new Map<number, Spec>()
-    const edges: [Spec, number, Spec][] = []
-    const arrive = (callee: number, a: Arrival) => {
-        charge(1)
-        const fixed = built.get(callee)
-        if (fixed) {
-            edges.push([a.from!, a.part, fixed])
-            return
-        }
-        let list = arrivals.get(callee)
-        if (!list) arrivals.set(callee, list = [])
-        list.push(a)
-    }
-    const leave = (spec: Spec) => {
-        const s = spec.inst.summary
-        for (const e of s.owned) {
-            const slot = spec.inst.base + s.local![e]
-            for (const callee of flow.runtimeBinds.get(slot) ?? []) arrive(callee, globalArrival(flow.instances[callee], spec, slot))
-            const parts = flow.parts.get(slot)
-            if (!parts) continue
-            for (const part of parts.values()) {
-                const bind = flow.partBind.get(part)
-                if (!bind) continue
-                if (!spec.global && !partLive(spec, part)) continue
-                const callee = flow.instances[bind.callee]
-                if (bind.kind === BindKind.virtual) {
-                    arrive(callee.id, globalArrival(callee, spec, part))
-                    continue
-                }
-                const [params, origins] = callArgs(spec, part, bind)
-                if (impossibleArgs(callee, params, origins)) continue
-                arrive(callee.id, { from: spec, part, params, origins })
-            }
-        }
-        for (const e of s.stores) {
-            const slot = flow.storeSlots.get(writerId(spec.inst, e))
-            const bind = slot === undefined ? undefined : flow.partBind.get(slot)
-            if (bind) arrive(bind.callee, globalArrival(flow.instances[bind.callee], spec, slot!))
-            if (slot !== undefined) for (const callee of flow.runtimeBinds.get(slot) ?? []) arrive(callee, globalArrival(flow.instances[callee], spec, slot))
-        }
-        for (const part of coneParts.get(spec.inst.id) ?? []) {
-            const callee = flow.instances[flow.partBind.get(part)!.callee]
-            arrive(callee.id, globalArrival(callee, spec, part))
-        }
-    }
-    const frameOfSpec = new Map<Spec, number>()
-    const order = callOrder()
-    for (const [members, recursive] of order) if (recursive) for (const id of members) flow.spec.recursive.add(id)
+    for (const [slot, callees] of flow.runtimeBinds) for (const callee of callees) edge(slot, callee)
     const forced = (inst: Instance) => flow.rooted.has(inst.id) || flow.heldStatics.has(inst.id) || inst.callers.length > (bindsInto.get(inst.id) ?? 0)
-    for (const [members, recursive] of order) {
-        const specs: Spec[] = []
-        if (!members.some(id => arrivals.has(id) || forced(flow.instances[id]))) continue
-        for (const id of members) {
-            const inst = flow.instances[id]
-            const list = arrivals.get(id) ?? []
-            arrivals.delete(id)
-            if (forced(inst)) list.push(globalArrival(inst, undefined, -1))
-            if (!list.length && !recursive) continue
-            const groups = new Map<string, Arrival[]>()
-            if (recursive) groups.set('*', list)
-            else {
-                for (const a of list) {
-                    const k = arrivalClass(inst, a)
-                    const known = groups.get(k)
-                    if (known) known.push(a)
-                    else groups.set(k, [a])
-                }
-            }
-            for (const [key, group] of groups) {
-                const spec = recursive ? globalSpec(inst) : joinArrivals(inst, group)
-                for (const a of group) if (a.from) edges.push([a.from, a.part, spec])
-                if (frameOfSpec.has(spec)) continue
-                frameOfSpec.set(spec, flow.frames.length)
-                flow.frames.push({ inst, members: [spec], key, sites: [] })
-                specs.push(spec)
-            }
-            if (recursive) built.set(id, globalSpec(inst))
-        }
-        for (const spec of specs) leave(spec)
+    const index = new Map<number, number>()
+    const work: number[] = []
+    const visit = (id: number) => {
+        if (index.has(id)) return
+        index.set(id, flow.exportedInstances.length)
+        flow.exportedInstances.push({ inst: flow.instances[id], sites: [] })
+        work.push(id)
+    }
+    for (const inst of flow.instances) if (!inst.site && forced(inst)) visit(inst.id)
+    while (work.length) {
+        const id = work.pop()!
+        for (const [, callee] of edges.get(id) ?? []) visit(callee)
     }
     const recorded = new Set<string>()
-    for (const [from, part, to] of edges) {
-        const frame = frameOfSpec.get(to)!
-        const caller = frameOfSpec.get(from)!
-        const owner = callerInstance(part)
-        const node = exprAt(part).node
-        const operand = coerces(exprAt(part)) && flow.partBind.get(part)?.kind === BindKind.rt && flow.slotIndex[part] < compareKey ? flow.slotIndex[part] : undefined
-        const k = `${frame}:${caller}:${node}:${operand}`
-        if (recorded.has(k)) continue
-        recorded.add(k)
-        flow.frames[frame].sites.push({ unit: owner.summary.fn, node, frame: caller, operand })
+    for (const [from, list] of edges) {
+        const caller = index.get(from)
+        if (caller === undefined) continue
+        for (const [part, callee] of list) {
+            const to = index.get(callee)!
+            const owner = flow.instances[from]
+            const x = exprAt(part)
+            const operand = coerces(x) && flow.partBind.get(part)?.kind === BindKind.rt && flow.slotIndex[part] < compareKey ? flow.slotIndex[part] : undefined
+            const k = `${to}:${caller}:${x.node}:${operand}`
+            if (recorded.has(k)) continue
+            recorded.add(k)
+            flow.exportedInstances[to].sites.push({ unit: owner.summary.fn, node: x.node, instance: caller, operand })
+        }
     }
 }
 
@@ -4463,8 +4133,10 @@ export function flowAccesses(roots: Function[], host: AccessHost): Accesses {
 function freshFlow(roots: Function[], host: AccessHost): FlowState {
     return {
         host, roots, strOrigin: -1, dynamicOrigins: new Set(),
-        spec: { globals: new Map(), memo: new Map(), grown: new Map(), recursive: new Set(), active: new Set(), classes: [] },
-        frames: [],
+        exportedInstances: [],
+        genericSites: new Set(),
+        kindWatch: new Map(),
+        slotClass: new Map(),
         work: 0, traceMs: 0, budget: 0, totalNodes: 0,
         summaries: new Map(), summaryList: [], instances: [], instanceOf: new Map(),
         originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(),
@@ -4474,7 +4146,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], originMask: [], stringSite: [],
         fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
-        exported: { types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), frameOf: new Map(), framesOf: new Map(), frames: [], slotTypes: new Map() },
+        exported: { types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), instanceIndex: new Map(), instances: [], slotTypes: new Map() },
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
     }
@@ -4594,7 +4266,7 @@ function pullNumberMethods(): boolean {
             if (!numberReceiver(recv)) continue
             const method = numberMethod(proto, target.key)
             const slot = at(inst, e)
-            if (!method || flow.parts.get(slot)?.has(method * 4194304)) continue
+            if (!method || callBound(slot, method, 0)) continue
             bindCall(slot, method, 0)
             bound = true
         }
@@ -4708,9 +4380,8 @@ interface Export {
     fnObjects: Map<Function, number>
     locations: Location[]
     locOf: Map<number, number>
-    frameOf: Map<number, number>
-    framesOf: Map<number, number[]>
-    frames: FrameSignature[]
+    instanceIndex: Map<number, number>
+    instances: InstanceSignature[]
     slotTypes: Map<number, Type>
 }
 
@@ -4800,11 +4471,6 @@ function slotType(slot: number): Type {
     return type
 }
 
-function specType(spec: Spec, slot: number): Type {
-    if (spec.global) return slotType(slot)
-    return typeFrom(specScalar(spec, slot), specOrigins(spec, slot))
-}
-
 function joinType(into: Type | undefined, b: Type): Type {
     if (!into || into === b) return b
     const type = emptyType()
@@ -4857,9 +4523,9 @@ function joinTypes(list: Type[]): Type | undefined {
     return internType(type)
 }
 
-function frameOfInstance(id: number): number | undefined {
+function exportedIndex(id: number): number | undefined {
     const inst = flow.instances[id]
-    return flow.exported.frameOf.get(inst.site ? inst.site.id : id)
+    return flow.exported.instanceIndex.get(inst.site ? inst.site.id : id)
 }
 
 function siteOfOrigin(origin: number): Site {
@@ -4872,19 +4538,17 @@ function siteOfOrigin(origin: number): Site {
     return { unit: flow.roots[0], node: 0 }
 }
 
-function liveFrames(origin: number): [number[], number] {
+function liveInstances(origin: number): [number[], number] {
     const creators = flow.originCreators.get(origin) ?? []
-    const frames: number[] = []
+    const live: number[] = []
     const seen: number[] = []
     for (const c of creators) {
-        const inst = flow.instances[c]
-        for (const f of flow.exported.framesOf.get(inst.site ? inst.site.id : c) ?? []) {
-            if (seen.includes(f)) continue
-            seen.push(f)
-            if (allocLive(flow.frames[f], origin)) frames.push(f)
-        }
+        const f = exportedIndex(c)
+        if (f === undefined || seen.includes(f)) continue
+        seen.push(f)
+        if (allocLive(flow.exportedInstances[f].inst, origin)) live.push(f)
     }
-    return [frames, seen.length]
+    return [live, seen.length]
 }
 
 function layoutPrototype(state: Handle): Handle {
@@ -4902,7 +4566,7 @@ function allocationOf(origin: number): number {
     const cell = flow.originCell[origin]
     const site = siteOfOrigin(origin)
     const creator = flow.originCreators.get(origin)?.[0] ?? -1
-    const frame = creator >= 0 ? frameOfInstance(creator) : undefined
+    const instance = creator >= 0 ? exportedIndex(creator) : undefined
     let allocation: Allocation
     if (kind === OriginKind.static) {
         const state = heap.deref(cell as Handle)
@@ -4910,26 +4574,26 @@ function allocationOf(origin: number): number {
         const native = !!heap.getOwnProperty(state, heap.closureCallKey) || heap.isFrameProxy(state)
         allocation = { site, kind: heap.isArray(state) ? AllocKind.array : AllocKind.object, state, handle: cell as Handle, proto, constant: true, native }
     } else if (kind === OriginKind.slice) {
-        allocation = { site, frame, kind: AllocKind.buffer, proto: undefined, constant: !flow.originOwner[origin] }
+        allocation = { site, instance, kind: AllocKind.buffer, proto: undefined, constant: !flow.originOwner[origin] }
     } else if (kind === OriginKind.created) {
         const proto = cell ? heap.deref(cell as Handle) : undefined
-        allocation = { site, frame, kind: AllocKind.object, proto, constant: false }
+        allocation = { site, instance, kind: AllocKind.object, proto, constant: false }
     } else if (isScope(origin)) {
-        allocation = { site, frame, kind: AllocKind.scope, handle: cell as Handle, proto: undefined, constant: false, native: true }
+        allocation = { site, instance, kind: AllocKind.scope, handle: cell as Handle, proto: undefined, constant: false, native: true }
     } else if (originHostFn(origin)) {
         const state = heap.isIndirect(cell as Handle) ? heap.indirectTarget(cell as Handle) : heap.deref(cell as Handle)
         const proto = layoutPrototype(state)
-        allocation = { site, frame, kind: AllocKind.object, state, proto, constant: false, native: true }
+        allocation = { site, instance, kind: AllocKind.object, state, proto, constant: false, native: true }
     } else {
         const state = heap.deref(cell as Handle)
         const proto = layoutPrototype(state)
-        allocation = { site, frame, kind: heap.isArray(state) ? AllocKind.array : AllocKind.object, state, proto, constant: false }
+        allocation = { site, instance, kind: heap.isArray(state) ? AllocKind.array : AllocKind.object, state, proto, constant: false }
     }
     if (flow.originCopied.has(origin)) allocation.copied = true
     if (flow.dynamicOrigins.has(origin)) allocation.dynamic = true
-    const [frames, all] = liveFrames(origin)
-    if (kind !== OriginKind.static && frames.length && (frame === undefined || !frames.includes(frame))) allocation.frame = frames[0]
-    if (frames.length > 1 || frames.length < all) allocation.frames = frames
+    const [live, all] = liveInstances(origin)
+    if (kind !== OriginKind.static && live.length && (instance === undefined || !live.includes(instance))) allocation.instance = live[0]
+    if (live.length > 1 || live.length < all) allocation.instances = live
     flow.exported.allocations.push(allocation)
     return id
 }
@@ -4949,15 +4613,14 @@ function functionObject(fn: Function, origin: number): number {
     return id
 }
 
-function allocLive(frame: FrameInfo, origin: number): boolean {
-    const s = frame.inst.summary
+function allocLive(inst: Instance, origin: number): boolean {
+    const s = inst.summary
     const node = flow.originKind[origin] === OriginKind.fresh && flow.originOwner[origin] === s ? s.allocNodes.get(flow.originCell[origin]) : undefined
     if (node === undefined || !s.regions) return true
     const r = s.regions.of.get(node)
     const gate = r === undefined ? undefined : s.gateOf.get(r)
     if (gate === undefined || gate < 0 || s.local![gate] === undefined) return true
-    for (const m of frame.members) if (specScalar(m, at(m.inst, gate)) !== NONE) return true
-    return false
+    return flow.scalar[at(inst, gate)] !== NONE
 }
 
 function slotSite(slot: number): Site {
@@ -5050,34 +4713,26 @@ function exportLocations(): void {
     }
 }
 
-function wordAccessSlots(members: Spec[], x: Expr): number[][] {
-    const out: number[][] = []
-    for (const m of members) {
-        const slots: number[] = []
-        const key = slotKey(m.inst, x.args[1])
-        for (const origin of specOrigins(m, at(m.inst, x.args[0]))) {
-            const fields = flow.originFields[origin]
-            const exact = fields.get(key)
-            if (exact !== undefined && flow.exported.locOf.has(exact)) slots.push(flow.exported.locOf.get(exact)!)
-            if (key !== elemKey) continue
-            for (const [k, f] of fields) if (isPosKey(k) && flow.exported.locOf.has(f)) slots.push(flow.exported.locOf.get(f)!)
-        }
-        out.push(slots)
+function wordAccessSlots(inst: Instance, x: Expr): number[] {
+    const slots: number[] = []
+    const key = slotKey(inst, x.args[1])
+    for (const origin of flow.slotOrigins[at(inst, x.args[0])]) {
+        const fields = flow.originFields[origin]
+        const exact = fields.get(key)
+        if (exact !== undefined && flow.exported.locOf.has(exact)) slots.push(flow.exported.locOf.get(exact)!)
+        if (key !== elemKey) continue
+        for (const [k, f] of fields) if (isPosKey(k) && flow.exported.locOf.has(f)) slots.push(flow.exported.locOf.get(f)!)
     }
-    return out
+    return slots
 }
 
-function fieldAccessSlots(members: Spec[], x: Expr): number[][] {
-    const out: number[][] = []
-    for (const m of members) {
-        const slots: number[] = []
-        for (const origin of specOrigins(m, at(m.inst, x.a))) {
-            const field = flow.originFields[origin].get(x.key)
-            if (field !== undefined && flow.exported.locOf.has(field)) slots.push(flow.exported.locOf.get(field)!)
-        }
-        out.push(slots)
+function fieldAccessSlots(inst: Instance, x: Expr): number[] {
+    const slots: number[] = []
+    for (const origin of flow.slotOrigins[at(inst, x.a)]) {
+        const field = flow.originFields[origin].get(x.key)
+        if (field !== undefined && flow.exported.locOf.has(field)) slots.push(flow.exported.locOf.get(field)!)
     }
-    return out
+    return slots
 }
 
 function wordLoadExpr(s: Summary, e: number): Expr | undefined {
@@ -5114,16 +4769,12 @@ function derefParams(s: Summary): Set<number> {
     return out
 }
 
-function exportFrame(frame: FrameInfo): FrameSignature {
-    const inst = frame.inst
+function exportInstance(exported: Exported): InstanceSignature {
+    const inst = exported.inst
     const s = inst.summary
     const g = s.g
     const params: { label: string, type: Type, opaque: boolean }[] = []
-    const paramIds = (slot: number) => {
-        let out: Type | undefined
-        for (const m of frame.members) out = joinType(out, specType(m, slot))
-        return out ?? internType(emptyType())
-    }
+    const paramIds = (slot: number) => slotType(slot)
     let plain = 0
     const derefs = derefParams(s)
     for (const p of g.blocks[0].params) {
@@ -5138,14 +4789,14 @@ function exportFrame(frame: FrameInfo): FrameSignature {
         const x = s.exprs[e]
         if (x.op !== ExprOp.rt || x.a !== RtOp.sliceWrite || getNode(g, x.node)!.op !== NodeOp.rt) continue
         if (elementType(g, getNode(g, x.node)!) !== Types.vm_value) continue
-        accesses.push({ node: x.node, store: true, field: false, members: wordAccessSlots(frame.members, x) })
+        accesses.push({ node: x.node, store: true, field: false, slots: wordAccessSlots(inst, x) })
     }
     const reads = new Set<number>()
     for (let e = 0; e < s.exprs.length; e++) {
         const x = wordLoadExpr(s, e)
         if (!x || reads.has(x.node) || getNode(g, x.node)!.op !== NodeOp.rt) continue
         reads.add(x.node)
-        accesses.push({ node: x.node, store: false, field: false, members: wordAccessSlots(frame.members, x) })
+        accesses.push({ node: x.node, store: false, field: false, slots: wordAccessSlots(inst, x) })
     }
     const fields = new Set<number>()
     for (const x of s.exprs) {
@@ -5153,7 +4804,7 @@ function exportFrame(frame: FrameInfo): FrameSignature {
         const op = getNode(g, x.node)?.op
         if (op !== NodeOp.getProp && op !== NodeOp.setProp) continue
         fields.add(x.node)
-        accesses.push({ node: x.node, store: x.op === ExprOp.store, field: true, members: fieldAccessSlots(frame.members, x) })
+        accesses.push({ node: x.node, store: x.op === ExprOp.store, field: true, slots: fieldAccessSlots(inst, x) })
     }
     const merges: number[][] = []
     for (const e of s.owned) {
@@ -5165,18 +4816,40 @@ function exportFrame(frame: FrameInfo): FrameSignature {
         if (type.objects.length > 1) merges.push(type.objects)
     }
     return {
-        unit: s.fn, heldStatic: flow.heldStatics.has(inst.id), sites: frame.sites, accesses, params, returns: paramIds(inst.ret), merges,
+        unit: s.fn, heldStatic: flow.heldStatics.has(inst.id), sites: exported.sites, accesses, params, returns: paramIds(inst.ret), merges,
     }
 }
 
-function resolveUnit(frames: number[]): UnitTypes {
-    const members = frames.flatMap(f => flow.frames[f].members)
-    const s = members[0].inst.summary
+function impossibleExpr(inst: Instance, e: number, memo: Map<number, boolean>): boolean {
+    const known = memo.get(e)
+    if (known !== undefined) return known
+    memo.set(e, false)
+    const x = inst.summary.exprs[e]
+    const operand = (a: number) => a >= 0 && impossibleExpr(inst, a, memo)
+    let dead = false
+    if (x.op === ExprOp.member) dead = operand(x.a) || nullishOnly(at(inst, x.a))
+    if (x.op === ExprOp.call || x.op === ExprOp.rt) dead = x.args.some(a => a >= 0 && (operand(a) || emptySlot(at(inst, a))))
+    if (x.op === ExprOp.call && x.b >= 0 && emptySlot(at(inst, x.b))) dead = true
+    if (x.op === ExprOp.arith || x.op === ExprOp.cmp) dead = operand(x.a) || operand(x.b)
+    if (x.op === ExprOp.narrow || x.op === ExprOp.pick || x.op === ExprOp.ntype) dead = operand(x.a)
+    if ((x.op === ExprOp.narrow || x.op === ExprOp.pick) && emptySlot(at(inst, e))) dead = true
+    memo.set(e, dead)
+    return dead
+}
+
+function nullishOnly(slot: number): boolean {
+    const t = flow.scalar[slot]
+    return t !== NONE && (scalars.flags[t] & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && !flow.slotOrigins[slot].length
+}
+
+function resolveUnit(list: number[]): UnitTypes {
+    const members = list.map(f => flow.exportedInstances[f].inst)
+    const s = members[0].summary
     const g = s.g
     const nodes = new Map<number, Type>()
     const slices = new Map<number, number[]>()
     for (const [node, e] of s.exprOf) {
-        const out = joinTypes(members.map(m => specType(m, at(m.inst, e))))
+        const out = joinTypes(members.map(m => slotType(at(m, e))))
         if (out && inhabited(out)) nodes.set(node, out)
     }
     for (let e = 0; e < s.exprs.length; e++) {
@@ -5185,8 +4858,8 @@ function resolveUnit(frames: number[]): UnitTypes {
         if (getNode(g, x.node)?.op !== NodeOp.rt) continue
         const touched: number[] = []
         for (const m of members) {
-            const slot = x.a === RtOp.slice ? at(m.inst, e) : at(m.inst, x.args[0])
-            for (const origin of specOrigins(m, slot)) {
+            const slot = x.a === RtOp.slice ? at(m, e) : at(m, x.args[0])
+            for (const origin of flow.slotOrigins[slot]) {
                 if (flow.originKind[origin] !== OriginKind.slice) continue
                 const allocation = allocationOf(origin)
                 if (!touched.includes(allocation)) touched.push(allocation)
@@ -5196,7 +4869,7 @@ function resolveUnit(frames: number[]): UnitTypes {
     }
     const live = (gate: number) => {
         if (gate < 0) return true
-        for (const m of members) if (specScalar(m, at(m.inst, gate)) !== NONE) return true
+        for (const m of members) if (flow.scalar[at(m, gate)] !== NONE) return true
         return false
     }
     const memos = members.map(() => new Map<number, boolean>())
@@ -5250,29 +4923,24 @@ function resolveUnit(frames: number[]): UnitTypes {
     const receivers = new Map<number, Type>()
     for (const x of s.exprs) {
         if (x.op !== ExprOp.member || !x.node || s.exprs[x.a].op !== ExprOp.narrow || getNode(g, x.node)?.op !== NodeOp.getProp) continue
-        const out = joinTypes(members.map(m => specType(m, at(m.inst, x.a))))
+        const out = joinTypes(members.map(m => slotType(at(m, x.a))))
         if (out && inhabited(out)) receivers.set(x.node, out)
     }
     return { nodes, slices, blocks, selects, receivers }
 }
 
-function resolveNode(frame: number, node: number): Type | undefined {
-    const members = flow.frames[frame].members
-    const e = members[0].inst.summary.exprOf.get(node)
+function resolveNode(index: number, node: number): Type | undefined {
+    const inst = flow.exportedInstances[index].inst
+    const e = inst.summary.exprOf.get(node)
     if (e === undefined) return
-    const out = joinTypes(members.map(m => specType(m, at(m.inst, e))))
-    if (out && inhabited(out)) return out
+    const out = slotType(at(inst, e))
+    if (inhabited(out)) return out
 }
 
 function exportAccesses(): Accesses {
     const exported = flow.exported
-    buildFrames()
-    flow.frames.forEach((frame, id) => {
-        if (!exported.frameOf.has(frame.inst.id)) exported.frameOf.set(frame.inst.id, id)
-        let list = exported.framesOf.get(frame.inst.id)
-        if (!list) exported.framesOf.set(frame.inst.id, list = [])
-        list.push(id)
-    })
+    exportInstances()
+    flow.exportedInstances.forEach((entry, id) => exported.instanceIndex.set(entry.inst.id, id))
     for (let origin = 1; origin < flow.originKind.length; origin++) {
         const kind = flow.originKind[origin]
         const fn = originHostFn(origin)
@@ -5283,12 +4951,12 @@ function exportAccesses(): Accesses {
         if (kind === OriginKind.fresh || kind === OriginKind.slice || kind === OriginKind.created || (kind === OriginKind.static && !fn)) allocationOf(origin)
     }
     exportLocations()
-    for (const frame of flow.frames) exported.frames.push(exportFrame(frame))
+    for (const entry of flow.exportedInstances) exported.instances.push(exportInstance(entry))
     const solved = flow
     return {
-        allocations: exported.allocations, locations: exported.locations, frames: exported.frames,
+        allocations: exported.allocations, locations: exported.locations, instances: exported.instances,
         resolve: (list: number[]) => withFlow(solved, () => resolveUnit(list)),
-        typeAt: (frame: number, node: number) => withFlow(solved, () => resolveNode(frame, node)),
+        typeAt: (index: number, node: number) => withFlow(solved, () => resolveNode(index, node)),
     }
 }
 
@@ -6977,7 +6645,7 @@ function noteFlowTypes(out: string[]): void {
         if (!debugsTypes(s.name)) continue
         const stores = new Set(s.stores)
         const label = `flow ${s.name}#${inst.id}${inst.qual ? `@${originShort(inst.qual)}` : ''}`
-        out.push(`TYPES ${label}: value-flow instance (global solve; frames narrow it per caller class)`)
+        out.push(`TYPES ${label}: value-flow instance (global solve)`)
         out.push(`  signature: ${sigText(inst)}`)
         out.push(`  returns: ${s.rets.map(r => exprRef(s, r)).join(' | ') || 'never'} => ${slotText(inst.ret)}`)
         for (const c of inst.callers) {
