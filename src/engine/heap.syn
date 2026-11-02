@@ -453,9 +453,267 @@ export function concatStrings(lhs: Handle, rhs: Handle): Handle {
 
 export function numberToString(bits: u64): Handle {
     const x = Intrinsics.bitconvert(bits, Types.u64, Types.f64)
+    if (x !== x) return valueNames.nan
     const whole = Intrinsics.convert(x, Types.f64, Types.i64)
-    if (Intrinsics.convert(whole, Types.i64, Types.f64) !== x) Intrinsics.panic('numberToString: non-integer numbers are not formatted natively')
-    return integerToString(whole)
+    const magnitude = x < 0 ? 0 - x : x
+    if (Intrinsics.convert(whole, Types.i64, Types.f64) === x && magnitude < 9007199254740992) return integerToString(whole)
+    const negative = Intrinsics.ushr(bits, 63, Types.u64) !== 0
+    const biased = Intrinsics.and(Intrinsics.ushr(bits, 52, Types.u64), 0x7FF, Types.u64)
+    if (biased === 0x7FF) return negative ? valueNames.negativeInfinity : valueNames.infinity
+    return shortestText(bits, negative, biased)
+}
+
+const bigLimbs = 40
+
+function bigSet(big: number, i: number, value: number): void {
+    Intrinsics.store(big, i * 4, Intrinsics.and(value, 0xFFFFFFFF, Types.u64), Types.u32)
+}
+
+function bigAt(big: number, i: number): number {
+    return Intrinsics.load(big, i * 4, Types.u32)
+}
+
+function bigOf(value: number): number {
+    const big = allocate(bigLimbs * 4)
+    let i = 0
+    while (i < bigLimbs) {
+        bigSet(big, i, 0)
+        i++
+    }
+    bigSet(big, 0, value)
+    bigSet(big, 1, Intrinsics.ushr(value, 32, Types.u64))
+    return big
+}
+
+function bigShiftLeft(big: number, bits: number): void {
+    const words = bits >> 5
+    const shift = bits & 31
+    let i = bigLimbs
+    while (i > 0) {
+        i--
+        const from = i - words
+        const high = from >= 0 ? Intrinsics.shl(bigAt(big, from), shift, Types.u64) : 0
+        const low = from > 0 && shift ? Intrinsics.ushr(bigAt(big, from - 1), 32 - shift, Types.u64) : 0
+        bigSet(big, i, Intrinsics.or(high, low, Types.u64))
+    }
+}
+
+function bigMultiply(big: number, factor: number): void {
+    let carry = 0
+    let i = 0
+    while (i < bigLimbs) {
+        const product = Intrinsics.add(Intrinsics.mul(bigAt(big, i), factor, Types.u64), carry, Types.u64)
+        bigSet(big, i, product)
+        carry = Intrinsics.ushr(product, 32, Types.u64)
+        i++
+    }
+}
+
+function bigPower(big: number, exponent: number): void {
+    let left = exponent
+    while (left >= 9) {
+        bigMultiply(big, 1000000000)
+        left = left - 9
+    }
+    while (left > 0) {
+        bigMultiply(big, 10)
+        left = left - 1
+    }
+}
+
+function bigCompare(a: number, b: number): number {
+    let i = bigLimbs
+    while (i > 0) {
+        i--
+        const x = bigAt(a, i)
+        const y = bigAt(b, i)
+        if (x !== y) return x < y ? -1 : 1
+    }
+    return 0
+}
+
+function bigSum(out: number, a: number, b: number): number {
+    let carry = 0
+    let i = 0
+    while (i < bigLimbs) {
+        const sum = Intrinsics.add(Intrinsics.add(bigAt(a, i), bigAt(b, i), Types.u64), carry, Types.u64)
+        bigSet(out, i, sum)
+        carry = Intrinsics.ushr(sum, 32, Types.u64)
+        i++
+    }
+    return out
+}
+
+function bigSubtract(a: number, b: number): void {
+    let borrow = 0
+    let i = 0
+    while (i < bigLimbs) {
+        const x = bigAt(a, i)
+        const y = Intrinsics.add(bigAt(b, i), borrow, Types.u64)
+        bigSet(a, i, Intrinsics.sub(Intrinsics.add(x, 0x100000000, Types.u64), y, Types.u64))
+        borrow = x < y ? 1 : 0
+        i++
+    }
+}
+
+function reachesHigh(sum: number, s: number, even: boolean): boolean {
+    const order = bigCompare(sum, s)
+    return even ? order >= 0 : order > 0
+}
+
+function bitLength(value: number): number {
+    let length = 0
+    let rest = value
+    while (rest !== 0) {
+        rest = Intrinsics.ushr(rest, 1, Types.u64)
+        length++
+    }
+    return length
+}
+
+function writeExponent(data: number, at: number, exponent: number): number {
+    let pos = at
+    Intrinsics.store(data, pos, 101, Types.u8)
+    pos++
+    Intrinsics.store(data, pos, exponent < 0 ? 45 : 43, Types.u8)
+    pos++
+    let magnitude = exponent < 0 ? -exponent : exponent
+    const start = pos
+    do {
+        Intrinsics.store(data, pos, 48 + magnitude % 10, Types.u8)
+        pos++
+        magnitude = Intrinsics.div(magnitude, 10, Types.u64)
+    } while (magnitude !== 0)
+    let lo = start
+    let hi = pos - 1
+    while (lo < hi) {
+        const byte = Intrinsics.load(data, lo, Types.u8)
+        Intrinsics.store(data, lo, Intrinsics.load(data, hi, Types.u8), Types.u8)
+        Intrinsics.store(data, hi, byte, Types.u8)
+        lo++
+        hi--
+    }
+    return pos
+}
+
+function shortestText(bits: u64, negative: boolean, biased: number): Handle {
+    const fraction = Intrinsics.and(bits, 0xFFFFFFFFFFFFF, Types.u64)
+    const f = biased ? Intrinsics.or(fraction, 0x10000000000000, Types.u64) : fraction
+    const e = (biased ? biased : 1) - 1075
+    const even = Intrinsics.and(f, 1, Types.u64) === 0
+    const boundary = biased > 1 && fraction === 0
+    const r = bigOf(f)
+    const s = bigOf(1)
+    const plus = bigOf(1)
+    const minus = bigOf(1)
+    const sum = bigOf(0)
+    if (e >= 0) {
+        bigShiftLeft(r, e + (boundary ? 2 : 1))
+        bigShiftLeft(s, boundary ? 2 : 1)
+        bigShiftLeft(plus, e + (boundary ? 1 : 0))
+        bigShiftLeft(minus, e)
+    } else {
+        bigShiftLeft(r, boundary ? 2 : 1)
+        bigShiftLeft(s, (boundary ? 2 : 1) - e)
+        if (boundary) bigShiftLeft(plus, 1)
+    }
+    const magnitude = e + bitLength(f) - 1
+    let k = magnitude >= 0 ? Intrinsics.ushr(magnitude * 78913, 18, Types.u64) : -Intrinsics.ushr(-magnitude * 78914 + 262143, 18, Types.u64)
+    if (k >= 0) bigPower(s, k)
+    else {
+        bigPower(r, -k)
+        bigPower(plus, -k)
+        bigPower(minus, -k)
+    }
+    while (reachesHigh(bigSum(sum, r, plus), s, even)) {
+        bigMultiply(s, 10)
+        k++
+    }
+    const digits = allocate(24)
+    let count = 0
+    while (true) {
+        bigMultiply(r, 10)
+        bigMultiply(plus, 10)
+        bigMultiply(minus, 10)
+        let digit = 0
+        while (bigCompare(r, s) >= 0) {
+            bigSubtract(r, s)
+            digit++
+        }
+        const low = even ? bigCompare(r, minus) <= 0 : bigCompare(r, minus) < 0
+        const high = reachesHigh(bigSum(sum, r, plus), s, even)
+        if (!low && !high) {
+            Intrinsics.store(digits, count, 48 + digit, Types.u8)
+            count++
+            continue
+        }
+        if (low && high) {
+            const half = bigCompare(bigSum(sum, r, r), s)
+            if (half > 0 || (half === 0 && (digit & 1) === 1)) digit++
+        } else if (high) digit++
+        Intrinsics.store(digits, count, 48 + digit, Types.u8)
+        count++
+        break
+    }
+    const data = allocate(count + 32)
+    let at = 0
+    if (negative) {
+        Intrinsics.store(data, at, 45, Types.u8)
+        at++
+    }
+    let i = 0
+    if (count <= k && k <= 21) {
+        while (i < count) {
+            Intrinsics.store(data, at, Intrinsics.load(digits, i, Types.u8), Types.u8)
+            at++
+            i++
+        }
+        while (i < k) {
+            Intrinsics.store(data, at, 48, Types.u8)
+            at++
+            i++
+        }
+    } else if (0 < k && k <= 21) {
+        while (i < count) {
+            if (i === k) {
+                Intrinsics.store(data, at, 46, Types.u8)
+                at++
+            }
+            Intrinsics.store(data, at, Intrinsics.load(digits, i, Types.u8), Types.u8)
+            at++
+            i++
+        }
+    } else if (-6 < k && k <= 0) {
+        Intrinsics.store(data, at, 48, Types.u8)
+        Intrinsics.store(data, at + 1, 46, Types.u8)
+        at = at + 2
+        let zeros = -k
+        while (zeros > 0) {
+            Intrinsics.store(data, at, 48, Types.u8)
+            at++
+            zeros--
+        }
+        while (i < count) {
+            Intrinsics.store(data, at, Intrinsics.load(digits, i, Types.u8), Types.u8)
+            at++
+            i++
+        }
+    } else {
+        Intrinsics.store(data, at, Intrinsics.load(digits, 0, Types.u8), Types.u8)
+        at++
+        i = 1
+        if (count > 1) {
+            Intrinsics.store(data, at, 46, Types.u8)
+            at++
+        }
+        while (i < count) {
+            Intrinsics.store(data, at, Intrinsics.load(digits, i, Types.u8), Types.u8)
+            at++
+            i++
+        }
+        at = writeExponent(data, at, k - 1)
+    }
+    return externalString(data, at)
 }
 
 function integerToString(whole: number): Handle {
@@ -481,6 +739,9 @@ export const valueNames = {
     true: fromJsString('true'),
     false: fromJsString('false'),
     object: fromJsString('[object Object]'),
+    nan: fromJsString('NaN'),
+    infinity: fromJsString('Infinity'),
+    negativeInfinity: fromJsString('-Infinity'),
 }
 
 export function textOf(value: any): Handle {
