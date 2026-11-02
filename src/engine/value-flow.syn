@@ -5339,6 +5339,7 @@ export interface Cut {
     through: string[]
     analyzed: string[]
     reasons: string[]
+    arity: number
     work: number
     size: number
     ms: number
@@ -5347,6 +5348,7 @@ export interface Cut {
 interface CutSeed {
     inputs: CutInput[]
     origins: Map<number, number>
+    arities: Map<number, number>
     slots: Map<number, number>
     proto: Handle
     shapes: Map<number, CutShape>
@@ -5375,13 +5377,14 @@ function cutInput(kind: CutInputKind, name: string, entry: number, param: number
     return inputs.length - 1
 }
 
-function seedInput(slot: number, input: number, proto: Handle = 0 as Handle, scalar = true): void {
+function seedInput(slot: number, input: number, proto: Handle = 0 as Handle, scalar = true, arity = -1): void {
     const seed = flow.cut!
     seed.slots.set(slot, input)
     if (scalar) addConst(slot, UNKNOWN)
     if (seed.inputs[input].depth >= maxReadDepth) return
     const origin = originOf(OriginKind.created, proto as number, 0, -(input + 1), undefined)
     seed.origins.set(origin, input)
+    if (arity >= 0) seed.arities.set(origin, arity)
     addOrigin(slot, origin)
 }
 
@@ -5414,7 +5417,7 @@ function cutBoundary(origin: number): Cut | undefined {
     if (known) return known.owner === origin && known.fields === known.cut.fields ? known.cut : undefined
     const other = summaryClass(origin)
     if (other === undefined || other === seed.proto) return undefined
-    const cut = classCut(other, flow.host)
+    const cut = classCut(other, flow.host, seed.arities.get(origin) ?? -1)
     if (!cut || cut.reasons.length) return undefined
     seed.shapes.set(origin, { cut, fields: cut.fields, owner: origin })
     return cut
@@ -5654,7 +5657,7 @@ function arityVariants(fn: Function): [number, Function][] {
     return out
 }
 
-function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number): void {
+function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number, arity = -1): void {
     if (roots.some(r => r.fn === fn && r.recv === recv)) return
     const entry = roots.length
     const s = summaryOf(fn)
@@ -5665,7 +5668,8 @@ function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number
     while (i < s.params) {
         const packed = rest !== undefined && rest[0] === i
         const proto = packed ? rest![1] : 0 as Handle
-        seedInput(inst.sigs[i], cutInput(CutInputKind.param, `p${i}`, entry, i, -1, '', 0, proto as number), proto, !packed)
+        if (arity >= 0 && i >= arity && !packed) addConst(inst.sigs[i], UNDEF)
+        else seedInput(inst.sigs[i], cutInput(CutInputKind.param, `p${i}`, entry, i, -1, '', 0, proto as number), proto, !packed, packed ? 0 : -1)
         i++
     }
     if (s.hasThis && !recv) seedInput(paramSlot(inst, -1), cutInput(CutInputKind.param, 'this', entry, -1, -1, '', 0))
@@ -5733,7 +5737,7 @@ function cutFlow(name: string, generator: string, roots: Function[], host: Acces
         cutUses = outerUses
     }
     return newFlow(roots, host, () => {
-        flow.cut = { inputs: [], origins: new Map(), slots: new Map(), proto, shapes: new Map(), cuts: [], through: [] }
+        flow.cut = { inputs: [], origins: new Map(), arities: new Map(), slots: new Map(), proto, shapes: new Map(), cuts: [], through: [] }
         flow.cap = maxCutWork
         const cutRoots: CutRoot[] = []
         let cut: Cut
@@ -5749,7 +5753,7 @@ function cutFlow(name: string, generator: string, roots: Function[], host: Acces
             const message = typeof e === 'string' ? e : e instanceof Error ? e.message : ''
             if (!message.startsWith('value-flow: ')) throw e
             const reason = message.startsWith('value-flow: budget exceeded') ? `budget (work ${flow.work})` : message
-            cut = { name, generator, key: '', fns: [], statics: [], staticNames: [], protos: [], protoNames: [], uses: [], inputs: [], params: [], paramOf: [], numeric: [], filters: [], fields: [], objects: [], entries: [], exposed: [], through: [], analyzed: [], reasons: [reason], work: 0, size: 0, ms: 0 }
+            cut = { name, generator, key: '', fns: [], statics: [], staticNames: [], protos: [], protoNames: [], uses: [], inputs: [], params: [], paramOf: [], numeric: [], filters: [], fields: [], objects: [], entries: [], exposed: [], through: [], analyzed: [], reasons: [reason], arity: -1, work: 0, size: 0, ms: 0 }
         }
         cut.key = cutFingerprint(name, flow.summaryList.map(s => s.fn))
         cut.uses = [...uses].filter(p => p !== proto)
@@ -5761,25 +5765,54 @@ function cutFlow(name: string, generator: string, roots: Function[], host: Acces
     })
 }
 
-function classCut(proto: Handle, host: AccessHost): Cut | undefined {
+const cutArities = new Map<Cut, Map<number, Cut>>()
+
+function classCut(proto: Handle, host: AccessHost, arity = -1): Cut | undefined {
     cutUses?.add(proto)
     const known = cutMemo?.get(proto)
-    if (known !== undefined) return known ?? undefined
+    if (known === null) return undefined
     const ctor = classConstructor(proto, host)
     if (!ctor) return undefined
-    cutMemo?.set(proto, null)
+    const general = known ?? classCutFlow(proto, host, ctor, -1)
+    if (!general || arity < 0 || general.reasons.length || arity >= declaredParams(host, ctor)) return general
+    let variants = cutArities.get(general)
+    if (!variants) cutArities.set(general, variants = new Map())
+    const variant = variants.get(arity)
+    if (variant) return variant
+    const cut = classCutFlow(proto, host, ctor, arity)
+    variants.set(arity, cut)
+    return cut
+}
+
+function declaredParams(host: AccessHost, fn: Function): number {
+    const g = host.binder.graphOf(fn)
+    return host.binder.layoutOfFn(fn).rest >= 0 ? 0 : g.blocks[0].params.filter(p => !isThisParam(getNode(g, p)!)).length
+}
+
+function classCutFlow(proto: Handle, host: AccessHost, ctor: Function, arity: number): Cut {
+    if (arity < 0) cutMemo?.set(proto, null)
     const cut = cutFlow(ctor.name || '<anon>', 'class', [ctor], host, proto, roots => {
         const self = originOf(OriginKind.created, proto as number, 0, 0, undefined)
         for (const [label, fn] of classMethods(proto, ctor, flow.host)) {
-            seedCutRoot(roots, label, fn, self)
-            for (const [arity, variant] of arityVariants(fn)) seedCutRoot(roots, `${label}/${arity}`, variant, self)
+            seedCutRoot(roots, label, fn, self, fn === ctor ? arity : -1)
+            for (const [k, variant] of arityVariants(fn)) seedCutRoot(roots, `${label}/${k}`, variant, self)
         }
         solve()
         seedReturnedMethods(roots, self)
         return self
     })
-    cutMemo?.set(proto, cut)
+    cut.arity = arity
+    if (arity < 0) cutMemo?.set(proto, cut)
     return cut
+}
+
+export function classCutAt(proto: Handle, arity: number, host: AccessHost, memo: Map<Handle, Cut | null>): Cut | undefined {
+    const outer = cutMemo
+    cutMemo = memo
+    defer finally {
+        cutMemo = outer
+    }
+    return classCut(proto, host, arity)
 }
 
 export function cutClasses(functions: Function[], host: AccessHost): Handle[] {
@@ -6196,7 +6229,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
     for (const slot of storage) {
         let first = -1
         eachSymbol(slot, (k, f) => {
-            if (numeric[k] || (f >= 0 && (filters[f].flags & GuardFlag.widened))) return
+            if (numeric[k] || (f >= 0 && (filters[f].flags & (GuardFlag.widened | GuardFlag.isNumber)))) return
             stored[k] = 1
             if (first < 0) first = k
             else parent[find(k)] = find(first)
@@ -6478,7 +6511,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
         const bound = b ? { param: b.param, owner: b.recv, key: cutKey(b.key), term: termOf(at(r.inst, b.ret), ri, reasons) } : undefined
         return { label: r.label, fn: tableRef(fns, r.fn), params: r.inst.summary.params, ret, effects, callouts: calloutList, sites: siteList, observes: observesOf[ri], bound, allocates: allocating.has(r.inst.id), reasons }
     })
-    return { name, generator, key: '', fns, statics, staticNames, protos, protoNames: protos.map(p => constructorName(p as Handle)), uses: [], inputs: seed.inputs, params, paramOf, numeric: numericOf, filters, fields, objects, entries, exposed, through: seed.through, analyzed: [], reasons, work: 0, size: 0, ms: 0 }
+    return { name, generator, key: '', fns, statics, staticNames, protos, protoNames: protos.map(p => constructorName(p as Handle)), uses: [], inputs: seed.inputs, params, paramOf, numeric: numericOf, filters, fields, objects, entries, exposed, through: seed.through, analyzed: [], reasons, arity: -1, work: 0, size: 0, ms: 0 }
 }
 
 export function cutPositions(c: Cut, classes: Map<Handle, Cut>, depth = 0): string[][][] {
@@ -6641,7 +6674,7 @@ function cutObjectText(c: Cut, object: CutObject, entry: number, depth: number, 
 
 export function cutText(c: Cut): string {
     const head = c.params.length ? `<${c.params.map(p => p.name).join(', ')}>` : ''
-    const lines = [`${c.generator === 'class' ? 'class ' : ''}${c.name}${head} {   key=${c.key} fns=${c.fns.length} objects=${c.objects.length} inputs=${c.inputs.length} work=${c.work} nodes=${c.size} ${c.ms.toFixed(1)}ms${c.reasons.length ? ` SLOW PATH: ${c.reasons.join('; ')}` : ''}`]
+    const lines = [`${c.generator === 'class' ? 'class ' : ''}${c.name}${head} {   key=${c.key}${c.arity >= 0 ? ` arity=${c.arity}` : ''} fns=${c.fns.length} objects=${c.objects.length} inputs=${c.inputs.length} work=${c.work} nodes=${c.size} ${c.ms.toFixed(1)}ms${c.reasons.length ? ` SLOW PATH: ${c.reasons.join('; ')}` : ''}`]
     for (const f of c.fields) lines.push(`  ${f.key}: ${cutTermText(c, f.term, -1)}`)
     c.entries.forEach((e, i) => {
         const inputs = c.inputs.filter(input => input.kind === CutInputKind.param && input.entry === i && input.param >= 0)
