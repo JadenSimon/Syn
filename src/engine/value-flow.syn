@@ -110,6 +110,7 @@ interface Summary {
     gateOf: Map<number, number>
     stores: number[]
     cone: number[] | null | undefined
+    siteCone: number[] | null | undefined
     allocNodes: Map<number, number>
     retExpr: number
     selects: number[]
@@ -126,6 +127,7 @@ interface Summary {
     forwards: Map<number, Map<number, Map<number, number>>>
     kinded: number | undefined
     classed: number | undefined
+    identity: number | undefined
     kindIds: Map<string, number> | undefined
     kindVecs: number[][]
 }
@@ -197,6 +199,7 @@ enum ArgClass {
     object = 32,
     function = 64,
     unknown = 128,
+    many = 256,
 }
 
 interface Listener {
@@ -1267,7 +1270,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, kinded: undefined, classed: undefined, kindIds: undefined, kindVecs: [], forwards: new Map(),
+        local: undefined, width: 0, owned: [], regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, siteCone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, kinded: undefined, classed: undefined, identity: undefined, kindIds: undefined, kindVecs: [], forwards: new Map(),
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -2589,6 +2592,87 @@ function returnCone(s: Summary): number[] | null {
     return order
 }
 
+function coneDeps(x: Expr): number[] {
+    if (x.op === ExprOp.member) return [x.a]
+    if (x.op === ExprOp.arith) return [x.a, x.b, ...x.args]
+    if (x.op === ExprOp.cmp) return [x.a, x.b]
+    if (x.op === ExprOp.gate) return x.a >= 0 ? [x.a, x.b] : [x.b]
+    return x.args
+}
+
+function coneInner(x: Expr): boolean {
+    if (x.op === ExprOp.member) return x.key !== dynKey
+    if (x.op === ExprOp.rt) return x.a === RtOp.sliceRead
+    return x.op === ExprOp.narrow || x.op === ExprOp.pick || x.op === ExprOp.union || x.op === ExprOp.arith || x.op === ExprOp.cmp || x.op === ExprOp.gate
+}
+
+function coneLeaf(x: Expr): boolean {
+    return x.op === ExprOp.param || x.op === ExprOp.konst || x.op === ExprOp.num || x.op === ExprOp.origin || x.op === ExprOp.alloc
+}
+
+function siteCone(s: Summary): number[] | null {
+    if (s.siteCone !== undefined) return s.siteCone
+    s.siteCone = null
+    if (s.usesCtx || !s.rets.length) return null
+    const n = s.exprs.length
+    charge(n)
+    const bad = new Uint8Array(n)
+    const users: number[][] = []
+    const work: number[] = []
+    for (let e = 0; e < n; e++) {
+        const x = s.exprs[e]
+        if (coneLeaf(x)) continue
+        if (!coneInner(x)) {
+            bad[e] = 1
+            work.push(e)
+            continue
+        }
+        for (const d of coneDeps(x)) {
+            if (!users[d]) users[d] = []
+            users[d].push(e)
+        }
+    }
+    while (work.length) {
+        const e = work.pop()!
+        for (const u of users[e] ?? []) {
+            if (bad[u]) continue
+            bad[u] = 1
+            work.push(u)
+        }
+    }
+    for (const r of s.rets) if (bad[r]) return null
+    const order: number[] = []
+    const state = new Uint8Array(n)
+    let params = 0
+    for (const r of s.rets) work.push(r)
+    while (work.length) {
+        const e = work[work.length - 1]
+        if (state[e] === 2) {
+            work.pop()
+            continue
+        }
+        const x = s.exprs[e]
+        if (state[e] === 1) {
+            state[e] = 2
+            work.pop()
+            order.push(e)
+            continue
+        }
+        state[e] = 1
+        if (coneLeaf(x)) {
+            if (x.op === ExprOp.param) params++
+            state[e] = 2
+            work.pop()
+            continue
+        }
+        for (const d of coneDeps(x)) if (!state[d]) work.push(d)
+        if (x.gates) for (const g of x.gates) if (g >= 0 && !bad[g] && !state[g]) work.push(g)
+    }
+    if (!params) return null
+    s.siteCone = order
+    return order
+}
+
 function siteReturn(callee: Instance, from: Instance, x: Expr, callSlot: number, into: number, cone: number[]): void {
     const s = callee.summary
     const id = flow.instances.length
@@ -2599,7 +2683,11 @@ function siteReturn(callee: Instance, from: Instance, x: Expr, callSlot: number,
     charge(cone.length)
     for (const e of cone) site.map!.set(e, newSlot(SlotKind.expr, id, e))
     for (const e of cone) exprUses(site.map!.get(e)!)
-    for (const e of cone) wireExpr(site, s.exprs[e], site.map!.get(e)!)
+    for (const e of cone) {
+        const x = s.exprs[e]
+        if (x.op === ExprOp.rt && gated(site, x, e)) continue
+        wireExpr(site, x, site.map!.get(e)!)
+    }
     for (const r of s.rets) copyEdge(at(site, r), into)
 }
 
@@ -2658,7 +2746,8 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
     const key = kinds < 0 ? subject : subject + (kinds + 1) * 2 ** 45
     if (kinds >= 0 && flow.parts.get(slot)?.has(key)) return
     if (kinds >= 0 && !rtBound(slot, qual, subject)) watchRtKinds(slot, qual, subject, s)
-    const callee = flow.instances[instance(impl, qual, lit, lit < 0 ? -1 : 1, kinds)]
+    const own = singleFn(s, kinds, subject ? 1 : 0) ? qualified(OriginKind.site, 0, qual > 0 ? qual : inst.qual, x.node, inst.summary) : qual
+    const callee = flow.instances[instance(impl, own, lit, lit < 0 ? -1 : 1, kinds)]
     addCaller(callee, slot)
     const classed = kinds >= 0 ? classedParams(s) : 0
     const params = callee.summary.params
@@ -2852,7 +2941,7 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
         case ListenerKind.confine: confineOrigin(flow.confinements[l.target], l.key, origin)
         case ListenerKind.classed: if (classAdmits(l.target, origin)) addOrigin(l.target, origin)
-        case ListenerKind.kinds: classChanged(l.target, originClass(origin))
+        case ListenerKind.kinds: classChanged(l.target, deliveredClass(l.target, origin))
     }
 }
 
@@ -3470,6 +3559,25 @@ function classedParams(s: Summary): number {
     return mask
 }
 
+function identityParams(s: Summary): number {
+    if (s.identity !== undefined) return s.identity
+    let mask = 0
+    const seen = new Uint8Array(s.exprs.length)
+    const work: number[] = []
+    for (const x of s.exprs) if ((x.op === ExprOp.call || x.op === ExprOp.member) && x.a >= 0) work.push(x.a)
+    while (work.length) {
+        const e = work.pop()!
+        if (seen[e]) continue
+        seen[e] = 1
+        const x = s.exprs[e]
+        if (x.op === ExprOp.param && x.a >= 0 && x.a < 16) mask = mask | (1 << x.a)
+        if (x.op === ExprOp.narrow || x.op === ExprOp.pick) work.push(x.a)
+        if (x.op === ExprOp.union) for (const a of x.args) work.push(a)
+    }
+    s.identity = mask
+    return mask
+}
+
 function staticCallee(s: Summary, x: Expr): Summary | undefined {
     if (x.op === ExprOp.rt) {
         if (x.a === RtOp.typeof) return
@@ -3505,19 +3613,48 @@ function slotClassOf(slot: number): number {
     if (known !== undefined) return known
     let mask = scalarClass(flow.scalar[slot])
     for (const o of flow.slotOrigins[slot]) mask = mask | originClass(o)
+    if (fnOrigins(slot) > 1) mask = mask | ArgClass.many
     return mask
+}
+
+function fnOrigins(slot: number): number {
+    let n = 0
+    for (const o of flow.slotOrigins[slot]) {
+        if (originHostFn(o)) n++
+        if (n > 1) return n
+    }
+    return n
+}
+
+function deliveredClass(slot: number, origin: number): number {
+    const bits = originClass(origin)
+    if (!(bits & ArgClass.function) || (flow.slotClass.get(slot)! & ArgClass.many)) return bits
+    return fnOrigins(slot) > 1 ? bits | ArgClass.many : bits
+}
+
+function singleFn(s: Summary, kinds: number, from: number): boolean {
+    if (kinds < 0) return false
+    const identity = identityParams(s)
+    const vec = s.kindVecs[kinds]
+    let i = from
+    while (i < vec.length) {
+        if ((identity & (1 << i)) && (vec[i] & (ArgClass.function | ArgClass.many)) === ArgClass.function) return true
+        i++
+    }
+    return false
 }
 
 function callKinds(inst: Instance, x: Expr, s: Summary, first: number = -1): number {
     const floats = kindedParams(s)
     const classed = classedParams(s)
-    if (!floats && !classed) return -1
+    const identity = identityParams(s)
+    if (!floats && !classed && !identity) return -1
     const vec: number[] = []
     let i = 0
     while (i < s.params && i < 16) {
         const bit = 1 << i
-        const m = !(floats & bit) && !(classed & bit) ? 0 : i === 0 && first >= 0 ? first : i < x.args.length ? slotClassOf(at(inst, x.args[i])) : ArgClass.undefined
-        vec.push(((floats & bit) ? m & ArgClass.float : 0) | ((classed & bit) ? m & ~ArgClass.float : 0))
+        const m = !((floats | classed | identity) & bit) ? 0 : i === 0 && first >= 0 ? first : i < x.args.length ? slotClassOf(at(inst, x.args[i])) : ArgClass.undefined
+        vec.push(((floats & bit) ? m & ArgClass.float : 0) | ((classed & bit) ? m & ~(ArgClass.float | ArgClass.many) : 0) | ((identity & bit) ? m & (ArgClass.function | ArgClass.many) : 0))
         i++
     }
     const key = vec.join(',')
@@ -3534,7 +3671,7 @@ function callKinds(inst: Instance, x: Expr, s: Summary, first: number = -1): num
 function watchKinds(callSlot: number, target: number, recv: number, s: Summary): void {
     const inst = instOfSlot(callSlot)
     const x = exprAt(callSlot)
-    const watched = kindedParams(s) | classedParams(s)
+    const watched = kindedParams(s) | classedParams(s) | identityParams(s)
     let i = 0
     while (i < x.args.length && i < 16) {
         if (watched & (1 << i)) {
@@ -3595,7 +3732,7 @@ function rtBound(slot: number, qual: number, subject: number): boolean {
 function watchRtKinds(slot: number, qual: number, subject: number, s: Summary): void {
     const inst = instOfSlot(slot)
     const x = exprAt(slot)
-    const watched = kindedParams(s) | classedParams(s)
+    const watched = kindedParams(s) | classedParams(s) | identityParams(s)
     let i = 0
     while (i < x.args.length && i < 16) {
         if (watched & (1 << i)) {
@@ -3635,7 +3772,7 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     if (flow.cut && cutApply(callSlot, target, recv, key)) return
     const kind = flow.originKind[target]
     const held = getNode(inst.summary.g, x.node)?.op === NodeOp.static
-    const perSite = s.returnsFresh && (!s.hasThis || s.params > 0) && !held
+    const perSite = (s.returnsFresh || singleFn(s, kinds, 0)) && (!s.hasThis || s.params > 0) && !held
     const qual = s.hasThis && !perSite ? qualOf(recv) : perSite ? qualified(OriginKind.site, 0, !s.hasThis && kind === OriginKind.fresh ? target : inst.qual, x.node, inst.summary) : !s.hasThis && kind === OriginKind.fresh ? target : held ? 0 : specializationSite(inst)
     if (perSite && s.hasThis && recv && specializes(recv)) flow.genericSites.add(qual)
     const callee = flow.instances[instance(fn, qual, -1, -1, kinds)]
@@ -3654,8 +3791,9 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     }
     if (s.usesCtx) addOrigin(paramSlot(callee, -2), target)
     const part = partSlot(callSlot, key)
-    const cone = qual === 0 && !s.hasThis ? returnCone(s) : null
-    const from = cone ? callee.ret : refineReturn(callee, part)
+    const refined = refineReturn(callee, part)
+    const cone = refined === callee.ret && (qual === 0 || (s.hasThis && !perSite)) ? siteCone(s) : null
+    const from = cone ? callee.ret : refined
     flow.partBind.set(part, { callee: callee.id, from, kind: BindKind.call, target, recv })
     if (cone) siteReturn(callee, inst, x, callSlot, part, cone)
     else copyEdge(from, part)
@@ -3872,6 +4010,7 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
 function prototypeScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[]): number {
     if (x.args.length < 2) return BOOL
     const holders = originsOf(at(inst, x.args[1]))
+    if (!holders.length && value(at(inst, x.args[1])) === NONE) return NONE
     if (holders.length !== 1 || value(at(inst, x.args[1])) !== NONE || flow.originKind[holders[0]] !== OriginKind.static || !flow.originCell[holders[0]]) return BOOL
     const proto = heap.deref(flow.originCell[holders[0]] as Handle)
     const t = value(at(inst, x.args[0]))
