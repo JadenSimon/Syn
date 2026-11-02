@@ -128,6 +128,7 @@ interface Summary {
     kinded: number | undefined
     classed: number | undefined
     identity: number | undefined
+    classMasks: number[]
     kindIds: Map<string, number> | undefined
     kindVecs: number[][]
 }
@@ -276,6 +277,10 @@ interface FlowState {
     scalarQueue: number[]
     scalarQueued: number[]
     scalarChanges: number[]
+    scalarCyclic: number[]
+    dirtyBy: number[]
+    cycleSeen: number[]
+    cycleStamp: number
     originMask: number[]
     stringSite: number[]
     fieldForms: Map<number, string[]>
@@ -808,6 +813,9 @@ function newSlot(kind: SlotKind, owner: number, index: number): number {
     flow.scalarUsers.push(undefined)
     flow.scalarQueued.push(0)
     flow.scalarChanges.push(0)
+    flow.scalarCyclic.push(0)
+    flow.dirtyBy.push(-1)
+    flow.cycleSeen.push(0)
     flow.originMask.push(0)
     flow.stringSite.push(0)
     dirtyScalar(id)
@@ -828,7 +836,11 @@ function scalarUse(from: number, to: number): void {
 
 function dirtyUsers(s: number): void {
     const users = flow.scalarUsers[s]
-    if (users) for (const u of users) dirtyScalar(u)
+    if (!users) return
+    for (const u of users) {
+        flow.dirtyBy[u] = s
+        dirtyScalar(u)
+    }
 }
 
 function markOpaque(s: number): void {
@@ -1270,7 +1282,7 @@ function summaryOf(fn: Function): Summary {
     const s: Summary = {
         fn, id: flow.summaryList.length + 1, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), konsts: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, rets: [], fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false,
-        local: undefined, width: 0, owned: [], regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, siteCone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, kinded: undefined, classed: undefined, identity: undefined, kindIds: undefined, kindVecs: [], forwards: new Map(),
+        local: undefined, width: 0, owned: [], regions: undefined, tested: new Set(), guards: new Map(), narrowExprs: new Map(), gateOf: new Map(), stores: [], cone: undefined, siteCone: undefined, allocNodes: new Map(), retExpr: -1, selects: [], blockGates: [], regionRets: new Map(), remainders: undefined, fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, kinded: undefined, classed: undefined, identity: undefined, classMasks: [], kindIds: undefined, kindVecs: [], forwards: new Map(),
     }
     flow.summaries.set(fn, s)
     flow.summaryList.push(s)
@@ -3511,10 +3523,21 @@ function specializes(origin: number): boolean {
 
 function kindedParams(s: Summary): number {
     if (s.kinded !== undefined) return s.kinded
+    s.kinded = 0
     let mask = 0
     const seen = new Uint8Array(s.exprs.length)
     const work: number[] = []
-    for (const x of s.exprs) if (x.op === ExprOp.ntype && x.a >= 0) work.push(x.a)
+    for (const x of s.exprs) {
+        if (x.op === ExprOp.ntype && x.a >= 0) work.push(x.a)
+        const callee = staticCallee(s, x)
+        if (!callee) continue
+        const inner = kindedParams(callee)
+        let i = 0
+        while (i < x.args.length && i < 16) {
+            if (inner & (1 << i)) work.push(x.args[i])
+            i++
+        }
+    }
     for (const e of returnCone(s) ?? []) work.push(e)
     while (work.length) {
         const e = work.pop()!
@@ -3533,29 +3556,42 @@ function classedParams(s: Summary): number {
     if (s.classed !== undefined) return s.classed
     s.classed = 0
     let mask = 0
+    const masks: number[] = []
     const seen = new Uint8Array(s.exprs.length)
     const work: number[] = []
     for (const x of s.exprs) {
-        if (x.op === ExprOp.rt && x.a === RtOp.typeof && x.args.length) work.push(x.args[0])
+        if (x.op === ExprOp.rt && x.a === RtOp.typeof && x.args.length) work.push(x.args[0], allClasses)
         const callee = staticCallee(s, x)
         if (!callee) continue
         const inner = classedParams(callee)
         let i = 0
         while (i < x.args.length && i < 16) {
-            if (inner & (1 << i)) work.push(x.args[i])
+            if (inner & (1 << i)) work.push(x.args[i], callee.classMasks[i])
             i++
         }
     }
     while (work.length) {
+        const m = work.pop()!
         const e = work.pop()!
-        if (e < 0 || seen[e]) continue
-        seen[e] = 1
+        if (e < 0) continue
+        const fresh = m & ~seen[e]
+        if (!fresh) continue
+        seen[e] = seen[e] | fresh
         const x = s.exprs[e]
-        if (x.op === ExprOp.param && x.a >= 0 && x.a < 16) mask = mask | (1 << x.a)
-        if (x.op === ExprOp.narrow || x.op === ExprOp.pick) work.push(x.a)
-        if (x.op === ExprOp.union) for (const a of x.args) work.push(a)
+        if (x.op === ExprOp.param && x.a >= 0 && x.a < 16) {
+            mask = mask | (1 << x.a)
+            masks[x.a] = (masks[x.a] ?? 0) | fresh
+        }
+        if (x.op === ExprOp.narrow) work.push(x.a, fresh & narrowClasses(x.key))
+        if (x.op === ExprOp.pick) work.push(x.a, fresh)
+        if (x.op === ExprOp.union) {
+            const fixed = unionConstClasses(s, x)
+            const rest = fixed & ArgClass.unknown ? 0 : fresh & ~fixed
+            for (const a of x.args) work.push(a, rest)
+        }
     }
     s.classed = mask
+    s.classMasks = masks
     return mask
 }
 
@@ -3576,6 +3612,27 @@ function identityParams(s: Summary): number {
     }
     s.identity = mask
     return mask
+}
+
+const allClasses = 255
+
+function narrowClasses(flags: number): number {
+    if (flags & (GuardFlag.nullish | GuardFlag.isUndefined)) return ArgClass.undefined | ArgClass.unknown
+    if (flags & (GuardFlag.truthy | GuardFlag.defined | GuardFlag.notUndefined | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.bounded)) return allClasses & ~ArgClass.undefined
+    return allClasses
+}
+
+function unionConstClasses(s: Summary, x: Expr): number {
+    let fixed = 0
+    for (const a of x.args) {
+        const arm = a >= 0 ? s.exprs[a] : undefined
+        if (arm?.op === ExprOp.konst) fixed = fixed | scalarClass(arm.a)
+    }
+    return fixed
+}
+
+function keptClasses(s: Summary, i: number, m: number): number {
+    return m | (allClasses & ~(s.classMasks[i] ?? 0))
 }
 
 function staticCallee(s: Summary, x: Expr): Summary | undefined {
@@ -3654,7 +3711,7 @@ function callKinds(inst: Instance, x: Expr, s: Summary, first: number = -1): num
     while (i < s.params && i < 16) {
         const bit = 1 << i
         const m = !((floats | classed | identity) & bit) ? 0 : i === 0 && first >= 0 ? first : i < x.args.length ? slotClassOf(at(inst, x.args[i])) : ArgClass.undefined
-        vec.push(((floats & bit) ? m & ArgClass.float : 0) | ((classed & bit) ? m & ~(ArgClass.float | ArgClass.many) : 0) | ((identity & bit) ? m & (ArgClass.function | ArgClass.many) : 0))
+        vec.push(((floats & bit) ? m & ArgClass.float : 0) | ((classed & bit) ? m & s.classMasks[i] & ~(ArgClass.float | ArgClass.many) : 0) | ((identity & bit) ? m & (ArgClass.function | ArgClass.many) : 0))
         i++
     }
     const key = vec.join(',')
@@ -3697,7 +3754,7 @@ function classChanged(slot: number, bits: number): void {
 
 function classAdmits(sig: number, origin: number): boolean {
     const inst = flow.instances[flow.slotOwner[sig]]
-    const m = inst.summary.kindVecs[inst.kinds][flow.slotIndex[sig]]
+    const m = keptClasses(inst.summary, flow.slotIndex[sig], inst.summary.kindVecs[inst.kinds][flow.slotIndex[sig]])
     return (m & ArgClass.unknown) !== 0 || (m & originClass(origin)) !== 0
 }
 
@@ -3866,18 +3923,19 @@ function kindedSig(slot: number, t: number): number {
         f = f & ~FloatFlags
         nums = nums.filter(v => Number.isInteger(v))
     }
-    if ((classedParams(inst.summary) & bit) && !(m & ArgClass.unknown)) {
+    const kept = keptClasses(inst.summary, i, m)
+    if ((classedParams(inst.summary) & bit) && !(kept & ArgClass.unknown)) {
         f = f & ~ScalarFlag.unknown
-        if (!(m & ArgClass.number)) {
+        if (!(kept & ArgClass.number)) {
             f = f & ~(ScalarFlag.int | FloatFlags)
             nums = []
         }
-        if (!(m & ArgClass.string)) {
+        if (!(kept & ArgClass.string)) {
             f = f & ~(ScalarFlag.str | ScalarFlag.anyStr)
             strs = []
         }
-        if (!(m & ArgClass.boolean)) f = f & ~(ScalarFlag.no | ScalarFlag.yes)
-        if (!(m & ArgClass.undefined)) f = f & ~(ScalarFlag.undef | ScalarFlag.void)
+        if (!(kept & ArgClass.boolean)) f = f & ~(ScalarFlag.no | ScalarFlag.yes)
+        if (!(kept & ArgClass.undefined)) f = f & ~(ScalarFlag.undef | ScalarFlag.void)
     }
     if (f === old && nums === scalars.nums[t]) return t
     return scalar(f, scalars.lo[t], scalars.hi[t], strs, nums)
@@ -4071,6 +4129,22 @@ function widens(slot: number): boolean {
     return op !== ExprOp.narrow && op !== ExprOp.pick && op !== ExprOp.arith
 }
 
+function cyclicSlot(s: number): boolean {
+    if (flow.scalarCyclic[s]) return true
+    flow.cycleStamp++
+    const stamp = flow.cycleStamp
+    let at = flow.dirtyBy[s]
+    while (at >= 0 && flow.cycleSeen[at] !== stamp) {
+        if (at === s) {
+            flow.scalarCyclic[s] = 1
+            return true
+        }
+        flow.cycleSeen[at] = stamp
+        at = flow.dirtyBy[at]
+    }
+    return false
+}
+
 function globalValue(slot: number): number {
     return flow.scalar[slot]
 }
@@ -4095,7 +4169,7 @@ function updateScalar(s: number): void {
     if (next === old) return
     if (widens(s) && (scalars.flags[next] & ScalarFlag.int) && (scalars.flags[old] & ScalarFlag.int) && (scalars.lo[next] !== scalars.lo[old] || scalars.hi[next] !== scalars.hi[old])) {
         flow.scalarChanges[s]++
-        if (flow.scalarChanges[s] >= 2) {
+        if (flow.scalarChanges[s] >= 2 && cyclicSlot(s)) {
             const lo = scalars.lo[next] < scalars.lo[old] ? (scalars.lo[old] > 0 ? 0 : MinI64) : scalars.lo[next]
             const hi = scalars.hi[next] > scalars.hi[old] ? (lo < 0 ? MaxI64 : MaxU64) : scalars.hi[next]
             next = unite(next, numScalar(lo, hi))
@@ -4283,7 +4357,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         definiteKeys: new Map(),
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
-        scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], originMask: [], stringSite: [],
+        scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
         fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
         exported: { types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), instanceIndex: new Map(), instances: [], slotTypes: new Map() },
         cut: undefined, cap: Infinity,
