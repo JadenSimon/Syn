@@ -4,10 +4,10 @@ import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp } from './rt'
-import { firstNonOrderingSlot, type Graph, type GraphNode } from './lowering2'
-import { addNode, countIds, getLiteral, getNode, getOperand, getRef, NodeOp, putNode, regionUp, typeOf, type Operand, type RegionTree, nodeEntries } from './graph-node'
+import { countedLoopShape, expectForm, firstNonOrderingSlot, type Graph, type GraphBlock, type GraphNode } from './lowering2'
+import { withNodes, copyNodes, addCopy, addNode, countIds, getLiteral, getNode, getOperand, getRef, NodeOp, putNode, regionUp, within, childRegion, typeOf, type Operand, type RegionTree, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
-import { constructorOf, cutReadType, emptyType, fixedField, fixedState, inhabited, regionRets, selfOf, usersOf, valueTail, type AccessHost, type Generic, type PlannedUnit, type Type, type ValueTypes } from './value-types'
+import { AllocKind, constructorOf, cutReadType, emptyType, fixedField, fixedState, inhabited, regionRets, selfOf, usersOf, valueTail, type AccessHost, type Generic, type PlannedUnit, type Type, type ValueTypes } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -31,6 +31,8 @@ export interface ProofScope {
     guardLengths?: number[]
     arrivalOrders?: Map<number, number[]>
     blockIndex?: Map<number, number>
+    preserves?(node: number, key: number, owner: number): boolean
+    effectKeyRoots?: Map<number, Map<number, Map<number, number>>>
 }
 
 export interface Relation {
@@ -302,7 +304,13 @@ function sameValue(scope: ProofScope, a: number, ref: number): boolean {
 function keyRoot(scope: ProofScope, tok: number, key: number, owner: number, open = false): number {
     const g = scope.g
     const free = privateObject(scope, owner)
-    const memos = free ? scope.privateKeyRoots ??= new Map() : open ? scope.openKeyRoots ??= new Map() : scope.keyRoots
+    let memos = free ? scope.privateKeyRoots ??= new Map() : open ? scope.openKeyRoots ??= new Map() : scope.keyRoots
+    if (scope.preserves) {
+        const owners = scope.effectKeyRoots ??= new Map()
+        let keys = owners.get(owner)
+        if (!keys) owners.set(owner, keys = new Map())
+        memos = keys
+    }
     let memo = memos.get(key)
     if (!memo) memos.set(key, memo = new Map())
     const path: number[] = []
@@ -316,7 +324,8 @@ function keyRoot(scope: ProofScope, tok: number, key: number, owner: number, ope
         }
         const seg = segRoot(scope, at)
         const t = seg ? getNode(g, seg) : undefined
-        if (t?.op === NodeOp.call && (free || open)) {
+        const effectFree = t && firstNonOrderingSlot(t) === 1 && scope.preserves?.(seg, key, owner)
+        if (effectFree || (t?.op === NodeOp.call && (free || open))) {
             scope.charge(1)
             path.push(at)
             at = getRef(t, 0)
@@ -467,6 +476,595 @@ function hasSetter(proto: Handle, key: Handle): boolean {
     return false
 }
 
+function stablePrototype(program: ValueTypes, proto: Handle): boolean {
+    let at = proto
+    while (at) {
+        if (!fixedState(program, at)) return false
+        at = heap.getPrototypeOf(at)
+    }
+    return true
+}
+
+interface InitializationView {
+    nodes: Map<number, Type>
+    users: Map<number, [number, number][]>
+    regions: ReturnType<typeof graphRegions>
+    charge(n: number): boolean
+    index: GraphIndex
+    proof?: ProofScope
+    loops?: InitializationLoop[]
+}
+
+function initializationView(g: Graph, program: ValueTypes, instances: number[]): InitializationView {
+    const nodes = program.resolve(instances).nodes
+    const ids = [...nodeIds(g)]
+    let budget = ids.length * 64 + 256
+    return {
+        nodes,
+        index: graphIndex(g),
+        users: nodeUsers(g, ids),
+        regions: graphRegions(g),
+        charge(n: number): boolean {
+            budget -= n
+            return budget >= 0
+        },
+    }
+}
+
+function plainProperty(g: Graph, n: GraphNode, program: ValueTypes, view: InitializationView, proto: Handle): boolean {
+    if (n.op !== NodeOp.getProp) return false
+    if (getRef(n, 2)) return false
+    const type = view.nodes.get(valueTail(g, getRef(n, 1)))
+    if (!type || type.unknown || type.undefined || type.bools || type.literals.length || type.range || type.float) return false
+    if (type.strings.length || type.functions.length || type.closures.length || !type.objects.length) return false
+    const key = getLiteral(g, n, 2) as Handle
+    for (const id of type.objects) {
+        if (!view.charge(1)) return false
+        const object = program.objects[id]
+        if (object.kind === AllocKind.scope) continue
+        if (heap.keyIndex(key) !== undefined) return false
+        if (object.proto === undefined || object.dynamic || object.native) return false
+        if (!stablePrototype(program, object.proto)) return false
+        const own = object.state === undefined ? undefined : heap.getPropertyDescriptor(object.state, key)
+        const descriptor = own || heap.getPropertyDescriptor(object.proto, key)
+        const getter = descriptor && heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).flags & heap.PropFlags.has_getter
+        if (getter && descriptor !== heap.getPropertyDescriptor(proto, key)) return false
+        const name = program.keyNames.get(key)
+        if (!descriptor && (name === undefined || !object.fields.has(name))) return false
+    }
+    return true
+}
+
+function isArrayPush(g: Graph, n: GraphNode, view: InitializationView): boolean {
+    if (n.op !== NodeOp.call || countIds(n) <= 3 || spreadsLast(n)) return false
+    const type = view.nodes.get(valueTail(g, getRef(n, 1)))
+    return !!type && !type.unknown && type.functions.length === 1 && type.functions[0] === builtinGlobals.Array.prototype.push
+}
+
+function initializationProof(g: Graph, view: InitializationView): ProofScope {
+    if (view.proof) return view.proof
+    const scope: ProofScope = {
+        g, regions: view.regions, arrivals: view.regions.arrivals,
+        charge: view.charge, skipKey: () => {}, proofs: new Map(), segRoots: new Map(), keyRoots: new Map(),
+        preserves(id: number, key: number, owner: number): boolean {
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.rt) {
+                const op = getLiteral(g, n, 1)
+                return op === RtOp.arrayElement || op === RtOp.arrayLiteral || op === RtOp.slice
+            }
+            if (!isArrayPush(g, n, view)) return false
+            const read = view.nodes.get(valueTail(g, owner))
+            const written = view.nodes.get(valueTail(g, getRef(n, 2)))
+            if (!read || !written || read.unknown || written.unknown || !read.objects.length || !written.objects.length) return false
+            return !read.objects.some(object => written.objects.includes(object))
+        },
+    }
+    view.proof = scope
+    return scope
+}
+
+interface InitializationLoop {
+    block: GraphBlock
+    entries: number[]
+    back: number
+    select: number
+    stay: number
+    compare: GraphNode
+    counter: number
+    boundSlot: number
+}
+
+const arrayBoundOps = new Set([NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.shr, NodeOp.ushr, NodeOp.convert, NodeOp.trunc, NodeOp.floor, NodeOp.ceil])
+
+interface ArrayPush {
+    call: number
+    count: number
+}
+
+interface ArrayPresizing {
+    array: number
+    initial: number
+    counter: number
+    start: number
+    clamp: boolean
+    bound: Operand
+    lifted: Set<number>
+    body: ArrayPush[]
+    tail: ArrayPush[]
+}
+
+function arrivalAfters(g: Graph, users: Map<number, [number, number][]>, apply: number): number[] | undefined {
+    const parents = users.get(apply) ?? []
+    if (!parents.length) return
+    const afters: number[] = []
+    for (const [parent, slot] of parents) {
+        const n = getNode(g, parent)!
+        if (n.op !== NodeOp.after || slot !== countIds(n) - 1) return
+        afters.push(parent)
+    }
+    return afters
+}
+
+function blockArrivals(g: Graph, users: Map<number, [number, number][]>, block: number): number[] {
+    return (users.get(block) ?? []).filter(([id, slot]) => slot === 0 && getNode(g, id)?.op === NodeOp.apply).map(([id]) => id)
+}
+
+function arrayAliases(g: Graph, users: Map<number, [number, number][]>, array: number): Set<number> {
+    const aliases = new Set([array])
+    for (const alias of aliases) {
+        for (const [id, slot] of users.get(alias) ?? []) {
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.after && slot === countIds(n) - 1) aliases.add(id)
+        }
+    }
+    return aliases
+}
+
+function arrayOrdering(g: Graph, view: InitializationView, target: number): (id: number) => boolean {
+    const { users, charge } = view
+    const visiting = new Set<number>()
+    const known = new Map<number, boolean>()
+    let assumptions = 0
+    function walk(id: number): boolean {
+        if (!charge(1)) return false
+        if (id === target) return true
+        if (!id) return false
+        const memo = known.get(id)
+        if (memo !== undefined) return memo
+        if (visiting.has(id)) {
+            assumptions++
+            return true
+        }
+        if (visiting.size >= 256) return false
+        const before = assumptions
+        visiting.add(id)
+        const n = getNode(g, id)!
+        let yes = false
+        if (n.op === NodeOp.startOf) {
+            if (getRef(n, 0) === target) yes = true
+            else {
+                const entries = blockArrivals(g, users, getRef(n, 0))
+                yes = entries.length > 0 && entries.every(apply => {
+                    const afters = arrivalAfters(g, users, apply)
+                    return !!afters?.every(after => getArgIds(getNode(g, after)!).slice(0, -1).some(walk))
+                })
+            }
+        } else if (n.op === NodeOp.after) {
+            const orders = getArgIds(n).filter(ref => {
+                const value = getNode(g, ref)
+                return !!value && value.op !== NodeOp.literal && value.op !== NodeOp.param && value.op !== NodeOp.heapHandle && value.op !== NodeOp.void
+            })
+            yes = orders.some(walk)
+        } else if (n.op === NodeOp.select) {
+            yes = walk(getRef(n, 0)) || (walk(getRef(n, 1)) && walk(getRef(n, 2)))
+        } else if (firstNonOrderingSlot(n) === 1) {
+            yes = walk(getRef(n, 0))
+        } else if (n.op !== NodeOp.param && n.op !== NodeOp.block) {
+            yes = getArgIds(n).some(walk)
+        }
+        visiting.delete(id)
+        if (!yes || assumptions === before) known.set(id, yes)
+        return yes
+    }
+    return walk
+}
+
+function arrayPushOrder(g: Graph, view: InitializationView, pushes: ArrayPush[]): ArrayPush[] | undefined {
+    const ordered: ArrayPush[] = []
+    const byCall = new Map(pushes.map(push => [push.call, push]))
+    const precedes = new Map<number, Set<number>>()
+    for (const push of pushes) {
+        const prior = new Set<number>()
+        const seen = new Set<number>()
+        const work = [getRef(getNode(g, push.call)!, 0)]
+        while (work.length) {
+            if (!view.charge(1)) return
+            const id = work.pop()!
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            if (byCall.has(id)) {
+                prior.add(id)
+                continue
+            }
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.after) work.push(...getArgIds(n))
+            else if (firstNonOrderingSlot(n) === 1) work.push(getRef(n, 0))
+        }
+        precedes.set(push.call, prior)
+    }
+    const remaining = new Map(byCall)
+    while (remaining.size) {
+        if (!view.charge(remaining.size)) return
+        const ready = [...remaining.keys()].filter(id => ![...precedes.get(id)!].some(prior => remaining.has(prior)))
+        if (ready.length !== 1) return
+        const next = remaining.get(ready[0])!
+        if (ordered.length && !arrayOrdering(g, view, ordered[ordered.length - 1].call)(getRef(getNode(g, next.call)!, 0))) return
+        ordered.push(next)
+        remaining.delete(next.call)
+    }
+    return ordered
+}
+
+function initializationLoop(g: Graph, view: InitializationView, block: GraphBlock): InitializationLoop | undefined {
+    if (!view.charge(block.params.length + 1)) return
+    const shape = countedLoopShape(g, view.index, block)
+    if (shape?.selfApps.length !== 1) return
+    const select = valueTail(g, block.bodyId)
+    const tail = getNode(g, select)
+    if (tail?.op !== NodeOp.select || countIds(tail) !== 3) return
+    const back = shape.selfApps[0]
+    const stay = valueTail(g, getRef(tail, 1)) === back ? 1 : 2
+    if (valueTail(g, getRef(tail, stay)) !== back) return
+    const [id, positive] = condition(g, getRef(tail, 0), stay === 1)
+    const compare = getNode(g, id)
+    if (!compare) return
+    const op = flipped(compare.op, positive)
+    const boundSlot = op === NodeOp.lt ? 1 : op === NodeOp.gt ? 0 : -1
+    if (boundSlot < 0) return
+    const counter = block.params.indexOf(valueTail(g, getRef(compare, boundSlot ^ 1)))
+    if (counter < 0 || shape.steps[counter] !== 1) return
+    return { block, entries: shape.entries.map(([, apply]) => apply), back, select, stay, compare, counter, boundSlot }
+}
+
+function initializationLoops(g: Graph, view: InitializationView): InitializationLoop[] {
+    if (view.loops) return view.loops
+    const loops: InitializationLoop[] = []
+    for (const block of g.blocks) {
+        const loop = initializationLoop(g, view, block)
+        if (loop) loops.push(loop)
+    }
+    view.loops = loops
+    return loops
+}
+
+function mandatoryOps(g: Graph, view: InitializationView, loop: InitializationLoop): number[] | undefined {
+    const ops: number[] = []
+    const visited = new Set<number>()
+    let mandatory = true
+    function walk(id: number): void {
+        if (!view.charge(1)) mandatory = false
+        if (!id || visited.has(id) || !mandatory) return
+        visited.add(id)
+        const n = getNode(g, id)!
+        if (n.op === NodeOp.startOf && getRef(n, 0) === loop.block.id) return
+        if (n.op === NodeOp.apply) {
+            if (id !== loop.back) mandatory = false
+            return
+        }
+        if (n.op === NodeOp.after) {
+            for (const ref of getArgIds(n)) walk(ref)
+            return
+        }
+        if (firstNonOrderingSlot(n) !== 1) {
+            mandatory = false
+            return
+        }
+        walk(getRef(n, 0))
+        ops.push(id)
+    }
+    walk(getRef(getNode(g, loop.select)!, loop.stay))
+    return mandatory ? ops : undefined
+}
+
+function constant(g: Graph, n: GraphNode, slot: number): number | undefined {
+    const ref = getRef(n, slot)
+    if (!ref) return getLiteral(g, n, slot)
+    const value = getNode(g, valueTail(g, ref))
+    return value?.op === NodeOp.literal ? getLiteral(g, value, 0) : undefined
+}
+
+function arrayType(program: ValueTypes, type: Type | undefined, proto: Handle): boolean {
+    if (!type || type.unknown || type.undefined) return false
+    if (type.bools || type.range || type.float || type.literals.length) return false
+    if (type.strings.length || type.functions.length || type.closures.length) return false
+    if (!type.objects.length) return false
+    return type.objects.every(id => {
+        const object = program.objects[id]
+        return object.proto === proto && !object.dynamic && !object.native
+    })
+}
+
+function planArrayPresizing(g: Graph, host: AccessHost, program: ValueTypes, view: InitializationView): ArrayPresizing[] {
+    const out: ArrayPresizing[] = []
+    const proto = arrayPrototype(host)
+    if (!stablePrototype(program, proto)) return out
+    const { nodes: types, users, regions } = view
+    const isArray = (id: number): boolean => arrayType(program, types.get(valueTail(g, id)), proto)
+    const scope = initializationProof(g, view)
+    for (const [array, allocation] of nodeEntries(g)) {
+        let initial: number
+        if (allocation.op === NodeOp.rt && getLiteral(g, allocation, 1) === RtOp.arrayLiteral && !getRef(allocation, 2)) initial = getLiteral(g, allocation, 2)
+        else if (allocation.op === NodeOp.call && countIds(allocation) === 3) {
+            const callee = getNode(g, valueTail(g, getRef(allocation, 1)))
+            const receiver = getNode(g, getRef(allocation, 2))
+            if (callee?.op !== NodeOp.heapHandle || getRef(callee, 0)) continue
+            if (host.binder.functionOf(getLiteral(g, callee, 0) as u32) !== builtinGlobals.Array) continue
+            if (receiver?.op !== NodeOp.heapHandle || countIds(receiver) < 2) continue
+            const receiverUses = users.get(getRef(allocation, 2)) ?? []
+            if (!receiverUses.every(([user, slot]) => user === array && slot === 2)) continue
+            initial = 0
+        } else continue
+        if (!Number.isSafeInteger(initial) || initial < 0 || !isArray(array)) continue
+        if (!view.charge(users.size)) return out
+        const aliases = arrayAliases(g, users, array)
+        const pushes = new Map<number, ArrayPush>()
+        const seeds = new Set<number>()
+        const observations = new Set<number>()
+        let safe = true
+        for (const alias of aliases) {
+            for (const [id, slot] of users.get(alias) ?? []) {
+                const n = getNode(g, id)!
+                if (slot < firstNonOrderingSlot(n) || (n.op === NodeOp.after && slot === countIds(n) - 1)) continue
+                if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.arrayElement && slot === 2) {
+                    const index = constant(g, n, 3)
+                    if (index === undefined || !Number.isSafeInteger(index) || index < 0 || index >= initial) {
+                        safe = false
+                        break
+                    }
+                    seeds.add(id)
+                    continue
+                }
+                if (n.op === NodeOp.getProp && slot === 1 && plainProperty(g, n, program, view, proto) && types.get(id)?.functions.length === 1 && types.get(id)!.functions[0] === builtinGlobals.Array.prototype.push) continue
+                if (slot === 2 && isArrayPush(g, n, view)) {
+                    pushes.set(id, { call: id, count: countIds(n) - 3 })
+                    continue
+                }
+                observations.add(id)
+            }
+        }
+        if (!safe || !pushes.size) continue
+        const observation = {
+            charge: view.charge,
+            users,
+            permits(id: number, n: GraphNode): boolean {
+                if (pushes.has(id) || seeds.has(id) || observations.has(id)) return true
+                if (n.op === NodeOp.getProp && plainProperty(g, n, program, view, proto)) {
+                    const type = types.get(id)
+                    if (type?.functions.length === 1 && type.functions[0] === builtinGlobals.Array.prototype.push) return true
+                }
+                if (firstNonOrderingSlot(n) !== 1) return false
+                return getArgIds(n).slice(firstNonOrderingSlot(n)).every(ref => !aliases.has(valueTail(g, ref)))
+            },
+        }
+        const orderedAfter = (from: number, target: number) => unobserved(g, from, target, [...aliases], proto, observation)
+        function observedAfter(id: number, target: number): boolean {
+            const n = getNode(g, id)!
+            const from = firstNonOrderingSlot(n) === 1 ? getRef(n, 0) : id
+            return orderedAfter(from, target)
+        }
+        const seedIndices = new Set([...seeds].map(id => constant(g, getNode(g, id)!, 3)!))
+        if (seedIndices.size !== initial) continue
+        const straight = arrayPushOrder(g, view, [...pushes.values()])
+        if (straight && straight.every(push => regions.of.get(push.call) === regions.of.get(array))
+            && [...seeds, array].every(seed => orderedAfter(getRef(getNode(g, straight[0].call)!, 0), seed))
+            && [...observations].every(id => observedAfter(id, straight[straight.length - 1].call))) {
+            out.push({ array, initial, counter: 0, start: 0, clamp: false, bound: { literal: 0 }, lifted: new Set(), body: [], tail: straight })
+            continue
+        }
+        for (const loop of initializationLoops(g, view)) {
+            const { block, select, compare: comparison, stay, boundSlot, counter: index } = loop
+            const counter = block.params[index]
+            let start: number | undefined
+            let entered = true
+            for (const id of loop.entries) {
+                if (!view.charge(1)) return out
+                const value = constant(g, getNode(g, id)!, index + 1)
+                if (value === undefined || !Number.isSafeInteger(value) || value < 0 || (start !== undefined && value !== start)) {
+                    entered = false
+                    break
+                }
+                start = value
+                const afters = arrivalAfters(g, users, id)
+                if (!afters?.every(parent => [...seeds, array].every(seed => orderedAfter(parent, seed)))) {
+                    entered = false
+                    break
+                }
+            }
+            if (!entered) continue
+            const ops = mandatoryOps(g, view, loop)
+            if (!ops) continue
+            const body: ArrayPush[] = []
+            for (const id of ops) {
+                const push = pushes.get(id)
+                if (push) body.push(push)
+            }
+            if (!body.length || body.some(push => !within(regions, regions.of.get(push.call) ?? -1, childRegion(regions, regions.of.get(select)!, select, stay)))) continue
+            const bodyCalls = new Set(body.map(push => push.call))
+            const rest = [...pushes.values()].filter(push => !bodyCalls.has(push.call))
+            const exitRegion = childRegion(regions, regions.of.get(select)!, select, 3 - stay)
+            if (rest.some(push => !within(regions, regions.of.get(push.call) ?? -1, exitRegion))) continue
+            const following = arrayPushOrder(g, view, rest)
+            if (!following) continue
+            const frontier = following.length ? following[following.length - 1].call : 0
+            if ([...observations].some(id => !within(regions, regions.of.get(id) ?? -1, childRegion(regions, regions.of.get(select)!, select, 3 - stay)) || (frontier && !observedAfter(id, frontier)))) continue
+            const bound = getOperand(g, comparison, boundSlot)
+            const boundId = typeof bound === 'number' ? valueTail(g, bound) : 0
+            const boundNode = getNode(g, boundId)
+            let minimum: number | undefined
+            let maximum: number | undefined
+            const boundType = boundId ? types.get(boundId) : undefined
+            if (!boundId) minimum = maximum = (bound as { literal: number }).literal
+            else if (boundNode?.op === NodeOp.literal) minimum = maximum = getLiteral(g, boundNode, 0)
+            else {
+                const range = integerRange(boundType)
+                if (range && range[0] >= 0 && range.every(Number.isSafeInteger)) {
+                    minimum = range[0]
+                    maximum = range[1]
+                }
+            }
+            if (maximum === undefined && lengthRead(g, boundId) && !aliases.has(getRef(boundNode!, 1)) && isArray(getRef(boundNode!, 1)) && plainProperty(g, boundNode!, program, view, proto)) {
+                minimum = 0
+                maximum = 0xffffffff
+            }
+            const perIteration = body.reduce((n, push) => n + push.count, 0)
+            const trailing = following.reduce((n, push) => n + push.count, 0)
+            if (maximum === undefined || !Number.isSafeInteger(maximum)) continue
+            if (maximum < 0 || maximum > 0xffffffff) continue
+            const maximumBytes = (initial + Math.max(0, maximum - start!) * perIteration + trailing) * 8
+            if (!Number.isSafeInteger(maximumBytes)) continue
+            const available = new Map<number, boolean>()
+            const lifted = new Set<number>()
+            function canLift(ref: number, depth = 0): boolean {
+                ref = valueTail(g, ref)
+                if (!ref) return true
+                const known = available.get(ref)
+                if (known !== undefined) return known
+                available.set(ref, false)
+                if (depth > 8 || block.params.includes(ref)) return false
+                const n = getNode(g, ref)!
+                let yes = false
+                if (n.op === NodeOp.literal || n.op === NodeOp.heapHandle) yes = true
+                else if (n.op === NodeOp.param) {
+                    const home = g.blocks[regions.paramBlock.get(ref) ?? -1]
+                    yes = !!home && arrayOrdering(g, view, home.id)(getRef(allocation, 0))
+                } else if (firstNonOrderingSlot(n) === 1) {
+                    if (arrayOrdering(g, view, ref)(getRef(allocation, 0))) yes = true
+                    else if (lengthRead(g, ref) && isArray(getRef(n, 1)) && plainProperty(g, n, program, view, proto) && canLift(getRef(n, 1), depth + 1)) {
+                        const owner = getRef(n, 1)
+                        const key = getLiteral(g, n, 2)
+                        const root = keyRoot(scope, getRef(n, 0), key, owner)
+                        yes = root === keyRoot(scope, getRef(allocation, 0), key, owner)
+                        if (frontier) yes &&= root === keyRoot(scope, getRef(getNode(g, frontier)!, 0), key, owner)
+                        if (yes) lifted.add(ref)
+                    }
+                } else if (arrayBoundOps.has(n.op)) {
+                    yes = getArgIds(n).every(id => {
+                        if (!id) return true
+                        const value = types.get(id) ?? types.get(valueTail(g, id))
+                        if (!value || value.unknown) return false
+                        if (value.objects.length || value.functions.length || value.closures.length) return false
+                        return canLift(id, depth + 1)
+                    })
+                }
+                available.set(ref, yes)
+                return yes
+            }
+            if (!canLift(boundId)) continue
+            out.push({ array, initial, counter, start: start!, clamp: minimum! < start!, bound, lifted, body, tail: following })
+            break
+        }
+    }
+    return out
+}
+
+function rewriteArrayPresizing(g: Graph, plans: ArrayPresizing[]): Map<number, number> {
+    expectForm(g, 'rewriteArrayPresizing', undefined)
+    const indices = new Map<number, number>()
+    function constant(value: number): number {
+        return addNode(g, NodeOp.literal, [{ literal: value }])
+    }
+    function add(value: number, amount: number): number {
+        return amount ? addNode(g, NodeOp.add, [value, { literal: amount }]) : value
+    }
+    for (const plan of plans) {
+        const allocation = getNode(g, plan.array)!
+        let token = getRef(allocation, 0)
+        const lifted = new Map<number, number>()
+        function lift(ref: number): number {
+            ref = valueTail(g, ref)
+            const known = lifted.get(ref)
+            if (known !== undefined) return known
+            const n = getNode(g, ref)!
+            let value = ref
+            if (n.op === NodeOp.getProp && plan.lifted.has(ref)) {
+                const operands = getOperands(g, n)
+                operands[0] = token
+                value = addCopy(g, n, operands)
+                token = value
+            } else if (arrayBoundOps.has(n.op)) {
+                const operands = getOperands(g, n)
+                let i = 0
+                while (i < operands.length) {
+                    if (getRef(n, i)) operands[i] = lift(getRef(n, i))
+                    i++
+                }
+                value = addCopy(g, n, operands)
+            }
+            lifted.set(ref, value)
+            return value
+        }
+        const bound = typeof plan.bound === 'number' ? lift(plan.bound) : constant(plan.bound.literal)
+        let count = bound
+        if (plan.clamp) {
+            const greater = addNode(g, NodeOp.gt, [bound, { literal: plan.start }], Types.bool)
+            count = addNode(g, NodeOp.select, [greater, addNode(g, NodeOp.sub, [bound, { literal: plan.start }]), { literal: 0 }])
+        }
+        const perIteration = plan.body.reduce((n, push) => n + push.count, 0)
+        const trailing = plan.tail.reduce((n, push) => n + push.count, 0)
+        if (perIteration !== 1) count = addNode(g, NodeOp.mul, [count, { literal: perIteration }])
+        const loopLength = add(count, plan.initial - (plan.clamp ? 0 : plan.start * perIteration))
+        putNode(g, plan.array, NodeOp.rt, [token, { literal: RtOp.arrayLiteral }, add(loopLength, trailing)])
+        let offset = plan.initial - plan.start * perIteration
+        const base = plan.body.length ? perIteration === 1 ? plan.counter : addNode(g, NodeOp.mul, [plan.counter, { literal: perIteration }]) : 0
+        for (const push of plan.body) {
+            indices.set(push.call, add(base, offset))
+            offset += push.count
+        }
+        offset = 0
+        for (const push of plan.tail) {
+            indices.set(push.call, add(loopLength, offset))
+            offset += push.count
+        }
+    }
+    if (plans.length) dirtyIndex(g)
+    return indices
+}
+
+export function rewriteInitializations(program: ValueTypes, host: AccessHost): (g: Graph, instances: number[]) => Graph | undefined {
+    return (g, instances) => {
+        expectForm(g, 'rewriteInitializations', undefined)
+        let allocation = false
+        let calls = false
+        for (const [, n] of nodeEntries(g)) {
+            if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.arrayLiteral) allocation = true
+            if (n.op === NodeOp.call) {
+                calls = true
+                const target = getNode(g, valueTail(g, getRef(n, 1)))
+                const receiver = getNode(g, getRef(n, 2))
+                if (target?.op === NodeOp.heapHandle && !getRef(target, 0) && receiver?.op === NodeOp.heapHandle) allocation = true
+            }
+        }
+        if (!allocation || !calls) return
+        const view = initializationView(g, program, instances)
+        const arrays = planArrayPresizing(g, host, program, view)
+        if (!view.charge(0) || !arrays.length) return
+        const graph = withNodes(g, copyNodes(g))
+        const pushes = rewriteArrayPresizing(graph, arrays)
+        for (const [id, index] of pushes) {
+            const n = getNode(graph, id)!
+            let token = getOperand(graph, n, 0)
+            for (let slot = 3; slot < countIds(n); slot++) {
+                const at = slot === 3 ? index : addNode(graph, NodeOp.add, [index, { literal: slot - 3 }])
+                token = addNode(graph, NodeOp.rt, [token, { literal: RtOp.arrayElement }, getOperand(graph, n, 2), at, getOperand(graph, n, slot)])
+            }
+            const length = addNode(graph, NodeOp.add, [index, { literal: countIds(n) - 3 }])
+            putNode(graph, id, NodeOp.after, [token, length])
+        }
+        dirtyIndex(graph)
+        return graph
+    }
+}
+
 export function initializer(g: Graph, proto: Handle): boolean {
     const self = selfOf(g)
     if (!self) return false
@@ -498,39 +1096,64 @@ export function killedAfter(g: Graph, call: number, allocated: number, key: Hand
     return false
 }
 
-function unobserved(g: Graph, from: number, call: number, objects: number[], proto: Handle): boolean {
-    let reached = false
-    const visited = new Set<number>()
-    const work = [from]
-    while (work.length) {
-        const id = work.pop()!
-        if (!id || visited.has(id)) continue
-        visited.add(id)
-        if (id === call) {
-            reached = true
-            continue
+function unobserved(g: Graph, from: number, call: number, objects: number[], proto: Handle, proof?: {
+    charge(n: number): boolean | void
+    permits(id: number, n: GraphNode): boolean
+    users?: Map<number, [number, number][]>
+}): boolean {
+    const known = new Map<number, boolean>()
+    const visiting = new Set<number>()
+    let safe = true
+    let assumptions = 0
+    function walk(id: number): boolean {
+        if (proof?.charge(1) === false) return false
+        if (id === call) return true
+        if (!id || !safe) return false
+        const memo = known.get(id)
+        if (memo !== undefined) return memo
+        if (visiting.has(id)) {
+            assumptions++
+            return true
         }
+        if (visiting.size >= 256) return false
         const n = getNode(g, id)
         if (!n) return false
-        if (n.op === NodeOp.startOf) continue
-        if (n.op === NodeOp.after) {
-            for (let i = 0; i < countIds(n) - 1; i++) work.push(getRef(n, i))
-            continue
+        const before = assumptions
+        visiting.add(id)
+        let reached = false
+        if (n.op === NodeOp.startOf) {
+            const users = proof?.users
+            const arrivals = users ? blockArrivals(g, users, getRef(n, 0)) : []
+            reached = arrivals.length > 0 && arrivals.every(apply => !!arrivalAfters(g, users!, apply)?.every(walk))
+        } else if (n.op === NodeOp.after) {
+            let slot = 0
+            while (slot < countIds(n) - 1) {
+                if (walk(getRef(n, slot))) reached = true
+                slot++
+            }
+        } else if (proof?.permits(id, n)) {
+            reached = walk(getRef(n, 0))
+        } else {
+            const escapes = (at: number) => !!getRef(n, at) && objects.includes(valueTail(g, getRef(n, at)))
+            const own = escapes(1)
+            if (n.op === NodeOp.setProp) {
+                if (escapes(3)) safe = false
+                if (own && (getRef(n, 2) || hasSetter(proto, getLiteral(g, n, 2) as Handle))) safe = false
+            } else if (n.op === NodeOp.getProp) {
+                if (own) safe = false
+            } else if (n.op === NodeOp.store) {
+                if (escapes(3)) safe = false
+            } else if (n.op === NodeOp.rt && rt.sliceOf(g, n) !== undefined) {
+                if (escapes(4)) safe = false
+            } else if (n.op !== NodeOp.load && n.op !== NodeOp.pstack) safe = false
+            if (safe) reached = walk(getRef(n, 0))
         }
-        const escapes = (at: number) => !!getRef(n, at) && objects.includes(valueTail(g, getRef(n, at)))
-        const own = escapes(1)
-        if (n.op === NodeOp.setProp) {
-            if (escapes(3) || (own && (getRef(n, 2) || hasSetter(proto, getLiteral(g, n, 2) as Handle)))) return false
-        } else if (n.op === NodeOp.getProp) {
-            if (own) return false
-        } else if (n.op === NodeOp.store) {
-            if (escapes(3)) return false
-        } else if (n.op === NodeOp.rt && rt.sliceOf(g, n) !== undefined) {
-            if (escapes(4)) return false
-        } else if (n.op !== NodeOp.load && n.op !== NodeOp.pstack) return false
-        work.push(getRef(n, 0))
+        visiting.delete(id)
+        if (!reached || assumptions === before) known.set(id, reached)
+        return reached
     }
-    return reached
+    const reached = walk(from)
+    return safe && reached
 }
 
 export enum ValueKind {
@@ -697,7 +1320,7 @@ function setContents(types: ValueTypes, host: AccessHost, g: Graph, id: number, 
         return smallKeys(values) ? values : undefined
     }
     if (n?.op !== NodeOp.rt || getLiteral(g, n, 1) !== RtOp.arrayLiteral || getRef(n, 2)) return
-    const arrayProto = heap.deref(heap.getPrototypeProperty(heap.deref(host.session.linkFunction(builtinGlobals.Array) as Handle)))
+    const arrayProto = arrayPrototype(host)
     if (!stableMethod(types, host, arrayProto, iterator, arrayIterator)) return
     const size = getLiteral(g, n, 2)
     if (!Number.isInteger(size) || size < 0 || size > maxSetKey) return
