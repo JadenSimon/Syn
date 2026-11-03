@@ -189,6 +189,7 @@ enum ListenerKind {
     confine,
     classed,
     kinds,
+    reads,
 }
 
 enum ArgClass {
@@ -275,6 +276,7 @@ interface FlowState {
     gateWaits: Map<number, number[]>
     scalar: number[]
     scalarUsers: (number[] | undefined)[]
+    originUsers: (number[] | undefined)[]
     scalarQueue: number[]
     scalarQueued: number[]
     scalarChanges: number[]
@@ -839,6 +841,7 @@ function newSlot(kind: SlotKind, owner: number, index: number): number {
     flow.slotOpaque.push(0)
     flow.scalar.push(NONE)
     flow.scalarUsers.push(undefined)
+    flow.originUsers.push(undefined)
     flow.scalarQueued.push(0)
     flow.scalarChanges.push(0)
     flow.scalarCyclic.push(0)
@@ -846,7 +849,6 @@ function newSlot(kind: SlotKind, owner: number, index: number): number {
     flow.cycleSeen.push(0)
     flow.originMask.push(0)
     flow.stringSite.push(0)
-    dirtyScalar(id)
     return id
 }
 
@@ -856,14 +858,27 @@ function dirtyScalar(s: number): void {
     flow.scalarQueue.push(s)
 }
 
-function scalarUse(from: number, to: number): void {
+function scalarUse(from: number, to: number): boolean {
     let users = flow.scalarUsers[from]
     if (!users) flow.scalarUsers[from] = users = []
     users.push(to)
+    return flow.scalar[from] !== NONE
 }
 
-function dirtyUsers(s: number): void {
-    const users = flow.scalarUsers[s]
+function originUse(from: number, to: number): boolean {
+    let users = flow.originUsers[from]
+    if (!users) flow.originUsers[from] = users = []
+    users.push(to)
+    return flow.slotOrigins[from].length > 0
+}
+
+function valueUse(from: number, to: number): boolean {
+    const scalar = scalarUse(from, to)
+    const origins = originUse(from, to)
+    return scalar || origins
+}
+
+function dirtyUsers(users: number[] | undefined, s: number): void {
     if (!users) return
     for (const u of users) {
         flow.dirtyBy[u] = s
@@ -899,7 +914,7 @@ function noteOrigin(s: number, origin: number): void {
     const next = mask | originBit(origin)
     if (next === mask) return
     flow.originMask[s] = next
-    dirtyUsers(s)
+    dirtyUsers(flow.originUsers[s], s)
 }
 
 function addConst(s: number, t: number): void {
@@ -916,8 +931,7 @@ function addIn(s: number, from: number): void {
     if (!ins) flow.slotIns[s] = ins = []
     if (frozen(s) && !flow.step!.ins.has(s)) flow.step!.ins.set(s, ins.length)
     ins.push(from)
-    scalarUse(from >= 0 ? from : -from - 1, s)
-    dirtyScalar(s)
+    if (scalarUse(from >= 0 ? from : -from - 1, s)) dirtyScalar(s)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
@@ -2942,10 +2956,12 @@ function watchString(inst: Instance, e: number): void {
     }
     if (coerces(x) || (x.op === ExprOp.rt && x.a === RtOp.toNumber) || concatSite(inst, x)) {
         flow.stringSite[at(inst, e)] = 1
+        dirtyScalar(at(inst, e))
         return
     }
     if (x.op === ExprOp.cmp && (x.key === NodeOp.eq || x.key === NodeOp.ne)) {
         flow.stringSite[at(inst, e)] = 1
+        dirtyScalar(at(inst, e))
         return
     }
     if (x.op !== ExprOp.union || !x.node || getNode(s.g, x.node)?.op !== NodeOp.select) return
@@ -2953,7 +2969,8 @@ function watchString(inst: Instance, e: number): void {
     if (cond === undefined) return
     const slot = at(inst, e)
     flow.stringSite[slot] = 1
-    scalarUse(at(inst, cond), slot)
+    dirtyScalar(slot)
+    valueUse(at(inst, cond), slot)
 }
 
 function checkString(slot: number): void {
@@ -3077,6 +3094,7 @@ function deliver(l: Listener, origin: number): void {
         case ListenerKind.confine: confineOrigin(flow.confinements[l.target], l.key, origin)
         case ListenerKind.classed: if (classAdmits(l.target, origin)) addOrigin(l.target, origin)
         case ListenerKind.kinds: classChanged(l.target, deliveredClass(l.target, origin))
+        case ListenerKind.reads: dirtyScalar(l.target)
     }
 }
 
@@ -4261,21 +4279,33 @@ function typeofScalar(slot: number, value: (s: number) => number, originsOf: (s:
 function exprUses(slot: number): void {
     const inst = flow.instances[flow.slotOwner[slot]]
     const x = inst.summary.exprs[flow.slotIndex[slot]]
-    if (x.op === ExprOp.union) for (const a of x.args) scalarUse(at(inst, a), slot)
-    if (x.gates) for (const gate of x.gates) if (gate >= 0) scalarUse(at(inst, gate), slot)
+    let arrived = x.op === ExprOp.rt
+    if (x.op === ExprOp.union) {
+        const gates = x.gates ?? []
+        const open: boolean[] = []
+        for (const gate of gates) open.push(gate < 0 || scalarUse(at(inst, gate), slot))
+        for (let i = 0; i < x.args.length; i++) {
+            if (scalarUse(at(inst, x.args[i]), slot) && (open[i] ?? true)) arrived = true
+        }
+    }
     if (x.op === ExprOp.gate) {
-        if (x.a >= 0) scalarUse(at(inst, x.a), slot)
-        scalarUse(at(inst, x.b), slot)
+        const a = x.a < 0 || scalarUse(at(inst, x.a), slot)
+        const b = valueUse(at(inst, x.b), slot)
+        if (a && b) arrived = true
     }
-    if (x.op === ExprOp.ntype || x.op === ExprOp.narrow || x.op === ExprOp.pick) scalarUse(at(inst, x.a), slot)
+    if (x.op === ExprOp.ntype && valueUse(at(inst, x.a), slot)) arrived = true
+    if ((x.op === ExprOp.narrow || x.op === ExprOp.pick) && scalarUse(at(inst, x.a), slot)) arrived = true
     if (x.op === ExprOp.cmp || x.op === ExprOp.arith) {
-        scalarUse(at(inst, x.a), slot)
-        scalarUse(at(inst, x.b), slot)
+        const a = valueUse(at(inst, x.a), slot)
+        const b = valueUse(at(inst, x.b), slot)
+        if (a || b) arrived = true
     }
-    if (x.op === ExprOp.arith && x.args.length) scalarUse(at(inst, x.args[0]), slot)
-    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype || x.a === RtOp.trunc)) scalarUse(at(inst, x.args[0]), slot)
-    if (x.op === ExprOp.member) scalarUse(at(inst, x.a), slot)
-    if (x.op === ExprOp.call) scalarUse(at(inst, x.a), slot)
+    if (x.op === ExprOp.arith && x.args.length && scalarUse(at(inst, x.args[0]), slot)) arrived = true
+    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype)) valueUse(at(inst, x.args[0]), slot)
+    if (x.op === ExprOp.rt && x.a === RtOp.trunc) scalarUse(at(inst, x.args[0]), slot)
+    if (x.op === ExprOp.rt && x.a === RtOp.hasPrototype) for (const a of x.args) listen(at(inst, a), ListenerKind.reads, slot, 0, 0)
+    if ((x.op === ExprOp.member || x.op === ExprOp.call) && scalarUse(at(inst, x.a), slot)) arrived = true
+    if (arrived) dirtyScalar(slot)
 }
 
 function widens(slot: number): boolean {
@@ -4336,7 +4366,7 @@ function updateScalar(s: number): void {
     }
     flow.scalar[s] = next
     if (flow.stringSite[s] === 2 && stringy(s)) addOrigin(s, strOrigin())
-    dirtyUsers(s)
+    dirtyUsers(flow.scalarUsers[s], s)
     if (flow.kindWatch.has(s)) scalarClassChanged(s, scalarClass(old), scalarClass(next))
     if (old !== NONE) return
     const waiting = flow.gateWaits.get(s)
@@ -4519,7 +4549,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         definiteKeys: new Map(),
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
-        scalar: [], scalarUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
+        scalar: [], scalarUsers: [], originUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
         fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
