@@ -28,6 +28,36 @@ Error.prepareStackTrace = (error, frames) => {
 }
 `
 
+const mapUpsert = `
+if (typeof Map.prototype.getOrInsert !== 'function') {
+    const has = Map.prototype.has
+    const get = Map.prototype.get
+    const set = Map.prototype.set
+    Object.defineProperty(Map.prototype, 'getOrInsert', {
+        value: function getOrInsert(key, value) {
+            if (has.call(this, key)) return get.call(this, key)
+            set.call(this, key, value)
+            return value
+        },
+        writable: true,
+        configurable: true,
+    })
+    Object.defineProperty(Map.prototype, 'getOrInsertComputed', {
+        value: function getOrInsertComputed(key, callbackfn) {
+            const found = has.call(this, key)
+            if (typeof callbackfn !== 'function') throw new TypeError('Map.prototype.getOrInsertComputed: callbackfn is not callable')
+            if (found) return get.call(this, key)
+            if (key === 0) key = 0
+            const value = callbackfn(key)
+            set.call(this, key, value)
+            return value
+        },
+        writable: true,
+        configurable: true,
+    })
+}
+`
+
 function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
     ;(globalThis as any).Type = reifier.types
     const ctx = vm.createContext({
@@ -51,6 +81,7 @@ function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
         ...extra,
     })
     vm.runInContext(trimmedStacks, ctx)
+    vm.runInContext(mapUpsert, ctx)
     return ctx
 }
 
@@ -69,6 +100,7 @@ function installSynGlobals(reifier: Reifier, extra: Record<string, unknown>) {
     })
     globals.exports ??= {}
     vm.runInThisContext(trimmedStacks)
+    vm.runInThisContext(mapUpsert)
     return globals
 }
 
