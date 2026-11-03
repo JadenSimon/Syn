@@ -2085,7 +2085,7 @@ pub const Program = struct {
             const Kind = Analyzer.Kind;
             const TypeRef = Analyzer.TypeRef;
 
-            const Helper = enum { style, template, set_attribute, spread_attributes, update_symbol, spread_comp, splice_at, replace, set_slot, set_slot_spread, swap_tree, run_defers };
+            const Helper = enum { style, template, set_attribute, spread_attributes, update_symbol, spread_comp, splice_at, replace, set_slot, set_slot_spread, swap_tree, run_defers, non_null };
 
             const DeferScope = struct {
                 defers_name: []const u8 = &.{},
@@ -2275,6 +2275,12 @@ pub const Program = struct {
                     \\}
                 ;
                 const run_defers = "var __runDefers = d => { while (d.length) d.pop()() }";
+                const non_null =
+                    \\function __nonNull(v, m) {
+                    \\  if (v === undefined || v === null) throw new TypeError(m)
+                    \\  return v
+                    \\}
+                ;
             };
 
             // empty string = no property exists, always use DOM attr
@@ -2497,6 +2503,8 @@ pub const Program = struct {
             replacements: *std.AutoArrayHashMap(NodeRef, NodeRef),
             is_async_ctx: bool = true, // we start in a module
             checked_mode: u2 = 0, // 1 = checked, 2 = wrapped
+            check_non_null: bool = false,
+            direct_non_null: NodeRef = 0,
             should_use_parens: bool = false,
             as_type_node: ?*const AstNode = null,
             run_directive_symbols: std.AutoHashMapUnmanaged(u32, void) = .{},
@@ -2538,6 +2546,7 @@ pub const Program = struct {
                     .set_slot_spread => "__slot_s",
                     .swap_tree => "__swap_tree",
                     .run_defers => "__runDefers",
+                    .non_null => "__nonNull",
                 };
             }
 
@@ -10628,7 +10637,74 @@ pub const Program = struct {
                 return clone;
             }
 
+            fn isNonNullAssertion(self: *const @This(), n: *const AstNode) bool {
+                if (!self.check_non_null) return false;
+                if (!n.hasFlag(.non_null)) return false;
+                return n.kind != .variable_declaration and n.kind != .property_declaration;
+            }
+
+            fn nonNullMessage(self: *@This(), n: *const AstNode) !NodeRef {
+                var writer = try parser.Writer.init(64);
+                var printer = parser.Printer(parser.Writer, .{}).init(self.file.ast, &writer);
+                printer.skip_types = true;
+                try printer.visit(n);
+                try writer.buf.appendSlice(" was nullish");
+                const lit = try self.factory.createStringLiteralAllocated(writer.buf.items);
+                self.nodes.at(lit).flags |= @intFromEnum(parser.StringFlags.cooked) | @intFromEnum(parser.StringFlags.double_quote);
+                return lit;
+            }
+
+            fn lowerNonNull(self: *@This(), n: *const AstNode, ref: NodeRef) !void {
+                try self.visitNode(n, ref);
+                const operand = try self.factory.cloneNodeRef(self.replacements.get(ref) orelse ref);
+                self.nodes.at(operand).next = 0;
+                self.nodes.at(operand).flags &= ~@as(u22, @intFromEnum(NodeFlags.non_null));
+                const message = try self.nonNullMessage(n);
+                const helper = try self.factory.createIdentifier(self.requireHelper(.non_null));
+                const call = try self.factory.createCallExpression(helper, &.{ operand, message });
+                self.nodes.at(call).next = n.next;
+                try self.replacements.put(ref, call);
+            }
+
+            fn nonNullInitializer(self: *const @This(), n: *const AstNode) ?NodeRef {
+                if (!self.check_non_null) return null;
+                const decl_ref = maybeUnwrapRef(n) orelse return null;
+                const decl = self.nodes.at(decl_ref);
+                if (decl.kind != .variable_declaration) return null;
+                if (decl.next != 0) return null;
+                const d = getPackedData(decl);
+                if (d.right == 0) return null;
+                if (self.nodes.at(d.left).kind != .identifier) return null;
+                if (!self.isNonNullAssertion(self.nodes.at(d.right))) return null;
+                return decl_ref;
+            }
+
+            fn lowerNonNullDeclaration(self: *@This(), n: *const AstNode, ref: NodeRef, decl_ref: NodeRef) !void {
+                const d = getPackedData(self.nodes.at(decl_ref));
+                const saved = self.direct_non_null;
+                defer self.direct_non_null = saved;
+                self.direct_non_null = d.right;
+                try parser.forEachChild(self.nodes, n, self);
+
+                const name = getSlice(self.nodes.at(d.left), u8);
+                const is_undefined = try self.factory.createBinaryExpression(try self.factory.createIdentifier(name), .equals_equals_equals_token, try self.factory.createUndefined());
+                const is_null = try self.factory.createBinaryExpression(try self.factory.createIdentifier(name), .equals_equals_equals_token, try self.factory.createNull());
+                const condition = try self.factory.createBinaryExpression(is_undefined, .bar_bar_token, is_null);
+                const err = try self.factory.createNewExpression(try self.factory.createIdentifier("TypeError"), try self.nonNullMessage(self.nodes.at(d.right)));
+                const check = try self.factory.createIfStatement(condition, try self.factory.createThrowStatement(err), 0);
+
+                const stmt = try self.factory.cloneNodeRef(self.replacements.get(ref) orelse ref);
+                self.nodes.at(stmt).next = check;
+                self.nodes.at(check).next = n.next;
+                try self.replacements.put(ref, stmt);
+            }
+
             pub fn visit(self: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
+                if (ref != self.direct_non_null and self.isNonNullAssertion(n)) return self.lowerNonNull(n, ref);
+                return self.visitNode(n, ref);
+            }
+
+            fn visitNode(self: *@This(), n: *const AstNode, ref: NodeRef) anyerror!void {
                 switch (n.kind) {
                     .class_declaration, .class_expression, .get_accessor, .set_accessor, .parameter => {
                         const is_async = self.is_async_ctx;
@@ -11111,6 +11187,8 @@ pub const Program = struct {
                     .variable_statement => {
                         if (try self.maybeInlineExpTransform(n)) |new_ref| {
                             try self.replacements.put(ref, new_ref);
+                        } else if (self.nonNullInitializer(n)) |decl| {
+                            try self.lowerNonNullDeclaration(n, ref, decl);
                         } else {
                             try parser.forEachChild(self.nodes, n, self);
                         }
@@ -11312,6 +11390,7 @@ pub const Program = struct {
                         // if (self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0)) |mode| {
                         //     self.checked_mode = mode;
                         // }
+                        self.check_non_null = self.detectCheckedDirective(maybeUnwrapRef(n) orelse 0) == 2;
                         try parser.forEachChild(self.nodes, n, self);
                     },
                     .block => try self.transformDeferScope(n, ref),
@@ -11411,6 +11490,9 @@ pub const Program = struct {
             }
             if (v.helpers.contains(.run_defers)) {
                 try pushHelper.run(&f.ast.nodes, Visitor.helper_code.run_defers, &helper_head, &helper_tail);
+            }
+            if (v.helpers.contains(.non_null)) {
+                try pushHelper.run(&f.ast.nodes, Visitor.helper_code.non_null, &helper_head, &helper_tail);
             }
             {
                 var it = v.machine_helpers.iterator();
