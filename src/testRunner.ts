@@ -625,6 +625,7 @@ interface CrashMarks {
     caseName?: string
     step?: string
     eventLabel?: string
+    normalizing?: string
 }
 
 function readMark(marks: CrashMarks, line: string): void {
@@ -644,6 +645,8 @@ function readMark(marks: CrashMarks, line: string): void {
         marks.step = fields[1]
     } else if (fields[0] === 'event') {
         marks.eventLabel = fields[1]
+    } else if (fields[0] === 'normalize') {
+        marks.normalizing = fields[1] || undefined
     } else if (fields[0] === 'end') {
         marks.caseNumber = undefined
         marks.step = undefined
@@ -908,7 +911,18 @@ function symbolizeCrash(maps: string[], dump: Buffer): string[] {
     return lines
 }
 
+function prepareNativeNormalize(args: string[]): boolean {
+    if (!args.includes('native-l2')) return true
+    const flags = args.filter(a => /^(native-l2$|l2-cache:)/.test(a))
+    const prepared = spawnSync(...hostCommand(process.argv[1], ['--engine', 'heap', 'in-process', 'timeout:300', 'l2-prepare', ...flags]), { stdio: 'inherit', env: { ...process.env, SYN_CRASH_FD: '', SYN_CRASH_DUMP_FD: '', SYN_CRASH_RESUME: '' } })
+    if (prepared.status === 0) return true
+    console.log(`RESULT FAILED: native-l2 could not prepare the normalize image (${prepared.signal ? `killed by ${prepared.signal}` : `exit ${prepared.status}`}), exit 1`)
+    process.exitCode = 1
+    return false
+}
+
 async function superviseEngine(args: string[], seconds: number): Promise<void> {
+    if (!prepareNativeNormalize(args)) return
     const suites = args[1] === 'all' ? allTestableFiles : [args[1]]
     const deadline = Date.now() + seconds * 1000
     const crashes: string[] = []
@@ -989,6 +1003,12 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         for (const line of symbolizeCrash(maps, Buffer.concat(dump))) console.log(line)
         section?.problems.push(`crash ${running}: ${label} ${message}`)
         crashes.push(label)
+        if (marks.normalizing) {
+            console.log(`native-l2 CRASH: native normalize crashed running the image ${marks.normalizing}; the image is kept for debugging, stopping`)
+            section?.problems.push(`cut ${running}: native normalize crashed`)
+            exitCode = 128 + Number(message.match(/signal (\d+)/)![1])
+            break
+        }
         if (!next || crashes.length >= maxCrashes) {
             console.log('...max crash count exceeded')
             section?.problems.push(`cut ${running}: max crash count exceeded`)
