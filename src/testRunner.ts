@@ -716,6 +716,7 @@ function sectionBody(section: BaselineSection, load: number): string[] {
 function caseResults(body: string[]) {
     const cases = new Map<string, [number, number]>()
     const broken = new Map<string, string>()
+    const skipped = new Set<string>()
     const phases = new Map<string, number>()
     let seconds = 0
     let fingerprint: { compiler: string, roots: string } | undefined
@@ -728,8 +729,9 @@ function caseResults(body: string[]) {
         }
         if (fields[0] === 'case') cases.set(fields.slice(1, -4).join(' '), [Number(fields[fields.length - 4]), Number(fields[fields.length - 3])])
         if (/^(fail|crash|cut) /.test(line)) broken.set(line.slice(fields[0].length + 1, line.indexOf(': ')), line)
+        if (fields[0] === 'skip') skipped.add(line.slice(5, line.indexOf(': ')))
     }
-    return { cases, broken, phases, seconds, fingerprint }
+    return { cases, broken, skipped, phases, seconds, fingerprint }
 }
 
 function fingerprintDelta(before: ReturnType<typeof caseResults>, after: ReturnType<typeof caseResults>, changed: number): string {
@@ -773,7 +775,7 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
         lines.push(`${name} ${was[0]}/${was[1]} -> ${insts}/${nonMov} (${signed(insts - was[0])})`)
     }
     for (const [name, [insts, nonMov]] of before.cases) {
-        if (partial || after.cases.has(name) || after.broken.has(name)) continue
+        if (partial || after.cases.has(name) || after.broken.has(name) || after.skipped.has(name)) continue
         lines.push(`removed ${name} (was ${insts}/${nonMov})`)
         removed++
     }
@@ -787,7 +789,7 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
     for (const name of before.broken.keys()) {
         if (!after.broken.has(name) && after.cases.has(name)) lines.push(`fixed ${name}`)
     }
-    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${partial ? ', partial run' : ''}`)
+    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${after.skipped.size ? `, ${after.skipped.size} skipped` : ''}${partial ? ', partial run' : ''}`)
     for (const line of lines) console.log(`DELTA ${key}: ${line}`)
     if (removed) console.log(`${key} FAILED: ${removed} of ${before.cases.size} baseline cases did not run (${after.cases.size} ran); a suite that drops cases is a failure`)
     return removed
@@ -798,7 +800,7 @@ function writeBaselines(bodies: Map<string, string[]>): void {
     const kept = baselineSections(file)
     for (const [key, body] of bodies) kept.set(key, body)
     const cpus = os.cpus()
-    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${cpus[0]?.model ?? 'unknown'}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>; fail|crash|cut <case>: <detail>; fingerprint compiler <createNatives hash> roots <hash of the roots the suite passes to createNatives>']
+    const header = [`os ${spawnSync('uname', ['-sr'], { encoding: 'utf8' }).stdout.trim()}`, `cpu ${cpus[0]?.model ?? 'unknown'}`, `arch ${os.arch()}`, `cores ${cpus.length}`, 'format: case <name> <insts> <non-mov> <fns> <ms rounded to 1-2-5 steps>; fail|crash|cut|skip <case>: <detail>; fingerprint compiler <createNatives hash> roots <hash of the roots the suite passes to createNatives>']
     const sections = [...kept.keys()].sort().map(key => [`== ${key}`, ...kept.get(key)!].join('\n') + '\n')
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, [header.join('\n') + '\n', ...sections].join('\n'))
@@ -931,6 +933,7 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     let resume: CrashResume | undefined
     let exitCode = 0
     let failures = 0
+    let skipped = 0
     let killed: string | undefined
     const load = Math.round(os.loadavg()[0])
     const compared = args.find(a => a.startsWith('baseline:'))?.slice('baseline:'.length) ?? baselineFile()
@@ -955,6 +958,11 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
                 if (fields[0] === 'fail') {
                     failures++
                     section?.problems.push(`fail ${marks.caseNumber !== undefined ? marks.caseName : '-'}: ${line.slice(5)}`)
+                    continue
+                }
+                if (fields[0] === 'skip') {
+                    skipped++
+                    section?.problems.push(`skip ${fields[1]}: requires ${fields[2]}, host is ${fields[3]}`)
                     continue
                 }
                 if (fields[0] === 'map') {
@@ -1024,10 +1032,11 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         failures++
         bodies.delete(key)
     }
-    if (bodies.size && !filtered) writeBaselines(bodies)
+    if (bodies.size && !filtered && !args.some(a => a.startsWith('gate-host:'))) writeBaselines(bodies)
     if (crashes.length) console.log(`CRASHES ${crashes.length}: ${crashes.join('; ')}`)
     if (!exitCode && (failures || crashes.length)) exitCode = 1
     const problems = [`${failures} failures`, `${crashes.length} crashes`]
+    if (skipped) problems.push(`${skipped} skipped`)
     if (killed) problems.push(killed)
     console.log(`RESULT ${exitCode ? 'FAILED' : 'ok'}: ${problems.join(', ')}, exit ${exitCode}`)
     if (args[1] === 'all') console.log(`TOTAL TIME ${process.uptime().toFixed(3)}s`)
