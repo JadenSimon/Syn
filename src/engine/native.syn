@@ -8335,6 +8335,47 @@ function bindPlannedUnits(plan: ShapePlan, binder: Binder): Planned {
     return planned
 }
 
+function plannedStepBreaks(graph: Graph, n: GraphNode): boolean {
+    if (n.op === NodeOp.call || n.op === NodeOp.getProp || n.op === NodeOp.setProp || n.op === NodeOp.rt || n.op === NodeOp.static) return true
+    return n.op === NodeOp.heapHandle && (!!getRef(n, 0) || !heap.isNullishHandle(getLiteral(graph, n, 0) as intrinsics.Handle))
+}
+
+function stepPlannedUnits(planned: Planned, rewrites: Map<PlannedUnit, (graph: Graph) => void>, graphOf: (unit: PlannedUnit) => Graph): boolean {
+    const steps = new Map<PlannedUnit, (graph: Graph) => void>()
+    const dropped: [PlannedUnit, number][] = []
+    const broken: string[] = []
+    for (const [unit, rewrite] of rewrites) {
+        const before = planned.rewrites.get(unit)
+        const step = (graph: Graph) => {
+            if (before) before(graph)
+            rewrite(graph)
+        }
+        steps.set(unit, step)
+        const name = planned.functions.get(unit)!.name
+        const traced = graphOf(unit)
+        const graph = withNodes(traced, copyNodes(traced))
+        graph.ids = { ...traced.ids }
+        step(graph)
+        for (const [id, n] of nodeEntries(traced)) {
+            const now = getNode(graph, id)
+            if (now === n) continue
+            if (!now) broken.push(`${name} drops %${id}`)
+            else if (typeOf(now) !== typeOf(n)) broken.push(`${name} retypes %${id}`)
+            else if (unit.calls.has(id) && now.op !== n.op) dropped.push([unit, id])
+        }
+        for (const [id, n] of nodeEntries(graph)) {
+            if (id >= traced.ids.next && plannedStepBreaks(graph, n)) broken.push(`${name} adds ${opName(n.op)} %${id}`)
+        }
+    }
+    if (broken.length) {
+        if (flags.has('plan-steps')) console.log(`PLAN-STEP rejected: ${broken.join(', ')}`)
+        return false
+    }
+    for (const [unit, id] of dropped) unit.calls.delete(id)
+    for (const [unit, step] of steps) planned.rewrites.set(unit, step)
+    return true
+}
+
 function sharePlannedUnits(plan: ShapePlan, planned: Planned, reps: Representations, host: AccessHost): void {
     function abiOf(unit: PlannedUnit): string {
         const abi = reps.abi.get(planned.functions.get(unit)!)!
@@ -8694,14 +8735,22 @@ interface TypeTable {
     classes: UnitClass[]
     classOf: Map<PlannedUnit, UnitClass>
     abi: Map<PlannedUnit, Map<number, number>>
-    parent: number[]
+    parent: Map<number, number>
     sharing: Map<number, Set<PlannedUnit>>
+    next: number
+    rows: ValueTypes
+    graphOf: (unit: PlannedUnit) => Graph
 }
 
 function newType(table: TypeTable): number {
-    const type = table.parent.length
-    table.parent.push(type)
-    return type
+    return table.next++
+}
+
+function abiRow(table: TypeTable, unit: PlannedUnit, index: number): number | undefined {
+    if (!unit.instances.length) return
+    if (index < 0) return table.rows.returnRow(unit.instances[0])
+    const param = table.graphOf(unit).blocks[0].params[index]
+    if (param !== undefined) return table.rows.rowAt(unit.instances[0], param)
 }
 
 function nodeType(table: TypeTable, unit: PlannedUnit, id: number): number {
@@ -8715,13 +8764,13 @@ function abiType(table: TypeTable, unit: PlannedUnit, index: number): number {
     let positions = table.abi.get(unit)
     if (!positions) table.abi.set(unit, positions = new Map())
     let type = positions.get(index)
-    if (type === undefined) positions.set(index, type = newType(table))
-    while (table.parent[type] !== type) type = table.parent[type]
+    if (type === undefined) positions.set(index, type = abiRow(table, unit, index) ?? newType(table))
+    while (table.parent.has(type)) type = table.parent.get(type)!
     return type
 }
 
-function typeTable(planned: Planned, shares: Map<PlannedUnit, number>): TypeTable {
-    const table: TypeTable = { classes: [], classOf: new Map(), abi: new Map(), parent: [], sharing: new Map() }
+function typeTable(planned: Planned, shares: Map<PlannedUnit, number>, rows: ValueTypes, graphOf: (unit: PlannedUnit) => Graph): TypeTable {
+    const table: TypeTable = { classes: [], classOf: new Map(), abi: new Map(), parent: new Map(), sharing: new Map(), next: rows.rowCount(), rows, graphOf }
     const byShare = new Map<number, UnitClass>()
     for (const unit of planned.units.values()) {
         const share = shares.get(unit)
@@ -8741,7 +8790,7 @@ function typeTable(planned: Planned, shares: Map<PlannedUnit, number>): TypeTabl
                 for (let i = -1; i < callee.params.length; i++) {
                     const a = abiType(table, list[0], i)
                     const b = abiType(table, callee, i)
-                    if (a !== b) table.parent[b] = a
+                    if (a !== b) table.parent.set(b, a)
                 }
             }
         }
@@ -9043,7 +9092,7 @@ interface Representations {
     tags: TagFlow
 }
 
-function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder, linker: Linker, tracer: Tracer, host: AccessHost): Representations {
+function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder, linker: Linker, tracer: Tracer, host: AccessHost, program: ValueTypes): Representations {
     const { originOf, constructsOutOfLine, isRoot } = binder
     const { staticFns } = linker
     function tracedOf(unit: PlannedUnit): Graph {
@@ -9052,7 +9101,7 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
     function returnTaggable(unit: PlannedUnit): boolean {
         return nullableNumber(unit.returns) && !constructsOutOfLine(planned.functions.get(unit)!)
     }
-    const types = typeTable(planned, shareClasses(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, () => '', fn => binder.graphOf(fn)))
+    const types = typeTable(planned, shareClasses(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, () => '', fn => binder.graphOf(fn)), program, tracedOf)
     joinNullableNumbers(types)
     const tags = analyzeTags(plan, planned, tracedOf, returnTaggable, binder, types)
     for (const shape of plan.shapes.values()) {
@@ -13048,7 +13097,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         for (const [state, layout] of plan.statics.layouts) image.placedLayouts.set(state, layout)
         for (const [cell, object] of plan.functionObjects.cells) image.functionObjects.set(cell, object)
         const planned = bindPlannedUnits(plan, binder)
-        const reps = chooseRepresentations(plan, planned, binder, linker, tracer, host)
+        const reps = chooseRepresentations(plan, planned, binder, linker, tracer, host, valueTypes)
         sharePlannedUnits(plan, planned, reps, host)
         const regions = planPstackRegions(valueTypes, [...planned.units.values()], unit => binder.graphOf(planned.functions.get(unit)!), flags.has('pstack-debug'))
         const placed = new Map<PlannedUnit, [number, number[]][]>()
@@ -13068,21 +13117,10 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const typeDebug = typeDebugging() ? planTypeDebug(valueTypes, accesses.locations, plan, planned, reps, facts) : undefined
     if (typeDebug && typeRecording()) typeDebug.noteUnits()
     const smallSets = clock.timed('plan', () => planSmallSets(valueTypes, host, planned.units.values(), rootFns))
-    for (const [unit, uses] of smallSets) {
-        for (const id of uses.keys()) {
-            unit.calls.delete(id)
-        }
-        planned.rewrites.set(unit, graph => rewriteSmallSets(graph, uses, image.wordsSlot))
-    }
+    const plannedGraph = (unit: PlannedUnit) => binder.graphOf(planned.functions.get(unit)!)
+    stepPlannedUnits(planned, new Map([...smallSets].map(([unit, uses]) => [unit, (graph: Graph) => rewriteSmallSets(graph, uses, image.wordsSlot)])), plannedGraph)
     const missed = flags.has('no-missed-lookups') ? new Map() : clock.timed('plan', () => planMissedLookups(valueTypes, host, planned.units.values(), rootFns, genericOf, smallSets))
-    for (const [unit, uses] of missed) {
-        for (const id of uses.keys()) unit.calls.delete(id)
-        const before = planned.rewrites.get(unit)
-        planned.rewrites.set(unit, graph => {
-            if (before) before(graph)
-            rewriteMissedLookups(graph, uses)
-        })
-    }
+    stepPlannedUnits(planned, new Map([...missed].map(([unit, uses]) => [unit, (graph: Graph) => rewriteMissedLookups(graph, uses)])), plannedGraph)
     const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot)
     const program = compileProgram(binder, linker, tracer, resolver, plan, image, target, clock)
     if (typeDebug) program.explain = (symbol, param) => {
