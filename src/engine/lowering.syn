@@ -2755,6 +2755,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function readsAfter(from: number, r: number): boolean {
         for (let i = from; i < items.length; i++) {
+            if (items[i].kind === 'cset') continue
             const uses: number[] = []
             if (!itemUses(items[i], uses) || uses.includes(r)) return true
         }
@@ -3480,6 +3481,28 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (inner.dst !== field.dst) removedWrites.push(inner.dst)
         return true
     }
+    function extractIndex(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const mem = items[last]
+        const index = mem.indexReg
+        if (mem.kind !== 'insn' || index === undefined || (mem.word & 0x1000) || !dead.has(index)) return false
+        const scale = indexScale(mem)
+        if (!scale || !scalesIndex(mem, index, scale)) return false
+        const maskAt = definerOf(last, index)
+        const outer = maskAt < 0 ? undefined : fieldOf(items[maskAt])
+        if (!outer || outer.dst !== index || outer.src !== index) return false
+        const at = definerOf(maskAt, index)
+        const inner = at < 0 ? undefined : fieldOf(items[at])
+        if (!inner || inner.dst !== index) return false
+        const field = composeFields(inner, outer)
+        if (!field || !field.lsb || field.pos !== scale || field.signed) return false
+        if (!noInterference(at + 1, maskAt, index, field.src) || !noInterference(maskAt + 1, last, index, -1)) return false
+        writeField(items[maskAt], { ...field, pos: 0 }, undefined)
+        encodeIndexed(mem, true)
+        inheritDead(items[maskAt], items[at])
+        items.splice(at, 1)
+        return true
+    }
     function extendOperand(dead: Set<number>): boolean {
         const last = items.length - 1
         const add = items[last]
@@ -3857,6 +3880,84 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return changed
     }
 
+    function foldShiftIntoAdd(addAt: number, dead: Set<number>): boolean {
+        const add = items[addAt]
+        if (add.kind !== 'insn' || add.addDst === undefined
+            || add.addLeft === undefined || add.addRight === undefined) return false
+        let at = addAt - 1
+        for (; at >= 0; at--) {
+            const shift = items[at]
+            if (shift.kind !== 'insn') { at = -1; break }
+            if (shift.shiftKind !== undefined
+                && shift.shiftDst !== undefined && !!shift.narrow === !!add.narrow
+                && shift.shiftSrc !== undefined && shift.shiftAmount !== undefined
+                && shift.shiftAmount > 0 && shift.shiftAmount <= (add.narrow ? 31 : 63)
+                && dead.has(shift.shiftDst)
+                && (add.addLeft === shift.shiftDst || add.addRight === shift.shiftDst)) break
+            if (!canReorderOver(shift)) { at = -1; break }
+        }
+        if (at < 0) return false
+        const shift = items[at]
+        const index = shift.shiftDst!
+        const source = shift.shiftSrc!
+        const baseReg = add.addRight === index ? add.addLeft : add.addRight
+        if (baseReg === index) return false
+        const inverts = ((add.aluBase ?? 0) & 0x200000) !== 0
+        if (inverts && add.addRight !== index) return false
+        if (!noInterference(at + 1, addAt, index, source) || readsAfter(addAt + 1, index)) return false
+        const aluBase = add.aluBase ?? 0x8B000000
+        const shiftType = shift.shiftKind === 'lsr' ? 1 : shift.shiftKind === 'asr' ? 2 : 0
+        add.word = (aluBase | (shiftType << 22) | (source << 16) | (shift.shiftAmount! << 10)
+            | (baseReg << 5) | add.addDst) >>> 0
+        const reg = add.narrow ? w : x
+        add.text = `${add.aluName ?? 'add'} ${reg(add.addDst)}, ${reg(baseReg)}, ${reg(source)},`
+            + ` ${shift.shiftKind} #${shift.shiftAmount}`
+        add.addLeft = baseReg
+        add.addRight = undefined
+        add.addShiftReg = source
+        add.addShiftAmount = shift.shiftAmount
+        items.splice(at, 1)
+        return true
+    }
+
+    function pairIndexedLoad(dead: Set<number>): boolean {
+        const last = items.length - 1
+        const mem = items[last]
+        if (mem.kind !== 'insn' || !mem.indexLoad || mem.indexBytes !== 8 || (mem.word & 0x1000)) return false
+        const value = mem.reg
+        const left = mem.indexBase!
+        const right = mem.indexReg!
+        for (let at = last - 1; at >= 0; at--) {
+            const it = items[at]
+            if (it.kind !== 'insn' && it.kind !== 'cset') return false
+            const sum = it.addDst !== undefined && it.aluName === 'add' && !it.narrow && it.addShiftReg === undefined
+                && ((it.addLeft === left && it.addRight === right) || (it.addLeft === right && it.addRight === left))
+            if (sum) {
+                const address = it.addDst!
+                const tag = items[at + 1]
+                if (address === left || address === right || at + 1 === last) return false
+                if (tag.loadBase !== address || tag.loadOffset !== 8 || tag.loadBytes !== 8 || !sameClass(tag, mem)) return false
+                const word = isFloat(value) ? 0xFD400000 | fp(value) : 0xF9400000 | value
+                const pair: AsmItem = {
+                    kind: 'insn', word: (word | (address << 5)) >>> 0, text: `ldr ${memName(value, 8)}, [${base(address)}, #0]`,
+                    label: -1, reg: value, cond: -1, loadBase: address, loadOffset: 0, loadBytes: 8,
+                }
+                inheritDead(items[last - 1], mem)
+                items.pop()
+                items.splice(at + 1, 0, pair)
+                foldShiftIntoAdd(at, dead)
+                return true
+            }
+            if (it.memory || it.storeBase !== undefined || (it.indexBase !== undefined && !it.indexLoad)) return false
+            if (it.deadAfter?.has(value)) return false
+            const defs: number[] = it.kind === 'cset' ? [it.reg] : []
+            const uses: number[] = []
+            if (it.kind !== 'cset' && (!itemDefs(it, defs) || !itemUses(it, uses))) return false
+            if (defs.includes(left) || defs.includes(right) || defs.includes(value) || uses.includes(value)) return false
+        }
+        return false
+    }
+
     function released(values: { value: number, home: number }[], label?: number): void {
         if (label !== undefined) {
             if (pendingZeroStores.length) compactPendingZeroStores()
@@ -3963,6 +4064,9 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             }
         }
 
+        if (items.length >= 3 && extractIndex(dead)) return
+        if (items.length >= 2 && pairIndexedLoad(dead)) return
+
         if (items.length >= 2) {
             const last = items.length - 1
             const mem = items[last]
@@ -4039,43 +4143,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
 
         for (let addAt = items.length - 1; addAt >= 1 && addAt >= items.length - 2; addAt--) {
-            const add = items[addAt]
-            if (add.kind !== 'insn' || add.addDst === undefined
-                || add.addLeft === undefined || add.addRight === undefined) continue
-            let at = addAt - 1
-            for (; at >= 0; at--) {
-                const shift = items[at]
-                if (shift.kind !== 'insn') { at = -1; break }
-                if (shift.shiftKind !== undefined
-                    && shift.shiftDst !== undefined && !!shift.narrow === !!add.narrow
-                    && shift.shiftSrc !== undefined && shift.shiftAmount !== undefined
-                    && shift.shiftAmount > 0 && shift.shiftAmount <= (add.narrow ? 31 : 63)
-                    && dead.has(shift.shiftDst)
-                    && (add.addLeft === shift.shiftDst || add.addRight === shift.shiftDst)) break
-                if (!canReorderOver(shift)) { at = -1; break }
-            }
-            if (at < 0) continue
-            const shift = items[at]
-            const index = shift.shiftDst!
-            const source = shift.shiftSrc!
-            const baseReg = add.addRight === index ? add.addLeft : add.addRight
-            if (baseReg === index) continue
-            const inverts = ((add.aluBase ?? 0) & 0x200000) !== 0
-            if (inverts && add.addRight !== index) continue
-            if (!noInterference(at + 1, addAt, index, source) || readsAfter(addAt + 1, index)) continue
-            const aluBase = add.aluBase ?? 0x8B000000
-            const shiftType = shift.shiftKind === 'lsr' ? 1 : shift.shiftKind === 'asr' ? 2 : 0
-            add.word = (aluBase | (shiftType << 22) | (source << 16) | (shift.shiftAmount! << 10)
-                | (baseReg << 5) | add.addDst) >>> 0
-            const reg = add.narrow ? w : x
-            add.text = `${add.aluName ?? 'add'} ${reg(add.addDst)}, ${reg(baseReg)}, ${reg(source)},`
-                + ` ${shift.shiftKind} #${shift.shiftAmount}`
-            add.addLeft = baseReg
-            add.addRight = undefined
-            add.addShiftReg = source
-            add.addShiftAmount = shift.shiftAmount
-            items.splice(at, 1)
-            return
+            if (foldShiftIntoAdd(addAt, dead)) return
         }
 
         if (items.length < 3) return
