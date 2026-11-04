@@ -3619,9 +3619,10 @@ export interface CallOutcomes {
 export const EffectNone = 0
 export const EffectRead = 1
 export const EffectWrite = 2
-const ArgBits = 28
+const ArgBits = 24
+export const PstackCount = 4
 export const WritesUnknown = 1 << 30
-export const WritesStack = 1 << 29
+export const WritesStack = (1 << (ArgBits + PstackCount)) - (1 << ArgBits)
 export const CapturesAll = (1 << ArgBits) - 1
 
 export function argBit(k: number): number {
@@ -3654,7 +3655,7 @@ export interface CallSummary {
     outcomes: CallOutcomes | undefined
 }
 
-export const unknownCall: CallSummary = { effect: EffectWrite, writes: WritesUnknown, fresh: false, traps: true, tagged: false, captures: CapturesAll, deepCaptures: CapturesAll, reads: [], outcomes: undefined }
+export const unknownCall: CallSummary = { effect: EffectWrite, writes: WritesUnknown | WritesStack, fresh: false, traps: true, tagged: false, captures: CapturesAll, deepCaptures: CapturesAll, reads: [], outcomes: undefined }
 
 const SummaryWords = 7
 const SummaryTraps = 4
@@ -13145,9 +13146,10 @@ function expandPstacks(g: Graph): boolean {
         const rebases = pstackRebases(g, n)
         const sized = !!getRef(n, 3) || !!getLiteral(g, n, 3)
         const stored = tops.get(token)
-        const base: Operand = rebases ? getOperand(g, n, 2) : stored && stored[0] === key ? stored[1] : addNode(g, NodeOp.load, [token, cell, 0], Types.u64)
+        const known = !rebases && !!stored && stored[0] === key
+        const base: Operand = rebases ? getOperand(g, n, 2) : known ? stored![1] : addNode(g, NodeOp.load, [token, cell, 0], Types.u64)
         if (!rebases && !sized) {
-            putCopy(g, id, n, [base, base], NodeOp.after)
+            putCopy(g, id, n, [known ? token : base, base], NodeOp.after)
             return
         }
         const top: Operand = sized ? addNode(g, NodeOp.add, [base, getOperand(g, n, 3)]) : base
@@ -16854,57 +16856,116 @@ function demandUntil(g: Graph, root: number, tail: number, arm: number): Set<num
 export const PstackMark = 2
 export const PstackMarker = 1
 
+export const PstackWildcard = -1
+export const PstackScratch = 1
+export const PstackHeld = 2
+export const PstackLasting = 3
+
+export function resolvePstackTargets(g: Graph, targets: Map<number, number> | undefined): void {
+    expectForm(g, 'resolvePstackTargets', undefined)
+    let resolved = false
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op !== NodeOp.pstack || getRef(n, 1) || getLiteral(g, n, 1) !== PstackWildcard) continue
+        putCopy(g, id, n, withOperand(g, n, 1, { literal: targets?.get(id) ?? PstackLasting }))
+        resolved = true
+    }
+    if (resolved) dirtyIndex(g)
+}
+
 export function pstackTentative(g: NodeSpace, n: GraphNode): number {
     return n.op === NodeOp.pstack && countIds(n) > 4 ? getLiteral(g, n, 4) : 0
 }
 
-const PstackOrdered = new Set<NodeOp>([NodeOp.pstack, NodeOp.call, NodeOp.rt, NodeOp.setProp, NodeOp.alloca])
+export function placePstackCallMarkers(g: Graph, regions: [header: number, call: number, stacks: number[]][]): void {
+    expectForm(g, 'placePstackCallMarkers', undefined)
+    for (const [, call, stacks] of regions) {
+        const n = getNode(g, call)
+        if (!call || !stacks.length || n?.op !== NodeOp.call || !getRef(n, 0)) continue
+        placeCallMarkers(g, call, n, stacks)
+    }
+}
 
-export function placePstackMarkers(g: Graph, regions: [header: number, stacks: number[]][]): void {
+function placeCallMarkers(g: Graph, call: number, n: GraphNode, stacks: number[]): void {
+    const users: number[] = []
+    const valued: number[] = []
+    for (const [id, x] of nodeEntries(g)) {
+        if (x.op === NodeOp.after && getRef(x, countIds(x) - 1) === call) valued.push(id)
+        for (let i = 0; i < firstNonOrderingSlot(x); i++) {
+            if (getRef(x, i) !== call) continue
+            users.push(id)
+            break
+        }
+    }
+    const marks = pstackMarks(g, getRef(n, 0), stacks, undefined)
+    putCopy(g, call, n, [marks[marks.length - 1], ...getOperands(g, n, 1)])
+    const markers = pstackMarks(g, call, stacks, marks)
+    const after = markers[markers.length - 1]
+    for (const id of users) {
+        const x = getNode(g, id)!
+        const ops = getOperands(g, x)
+        for (let i = 0; i < firstNonOrderingSlot(x); i++) if (getRef(x, i) === call) ops[i] = after
+        putCopy(g, id, x, ops)
+    }
+    for (const id of valued) {
+        const x = getNode(g, id)!
+        const ops = getOperands(g, x)
+        ops.splice(ops.length - 1, 0, after)
+        putCopy(g, id, x, ops)
+    }
+    dirtyIndex(g)
+}
+
+export function placePstackMarkers(g: Graph, regions: [header: number, call: number, stacks: number[]][]): void {
+    expectForm(g, 'placePstackMarkers', undefined)
     const loops = graphLoops(g)
-    for (const [headerId, stacks] of regions) {
+    for (const [headerId, call, stacks] of regions) {
+        if (call) continue
         const members = loops.loopMembers.get(headerId)
         if (!members || !stacks.length) continue
+        const tails: [block: number, at: number, tokens: number[], latch: boolean][] = []
+        for (const b of g.blocks) {
+            for (const p of tailPositions(g, b.bodyId)) {
+                const n = getNode(g, p.at)!
+                if (n.op === NodeOp.apply && getRef(n, 0) === headerId) tails.push([b.id, p.at, p.tokens, members.has(b.id)])
+            }
+        }
+        if (tails.every(([, , , latch]) => latch) || headerId === g.root) continue
         const header = getBlock(g, headerId)!
-        let nil = 0
-        for (const [id, n] of nodeEntries(g)) if (n.op === NodeOp.startOf && getRef(n, 0) === headerId) nil = id
-        let token = nil || addNode(g, NodeOp.startOf, [headerId])
         const marks: number[] = []
         for (const stack of stacks) {
-            token = addNode(g, NodeOp.pstack, [token, { literal: stack }, { literal: 0 }, { literal: 0 }, { literal: PstackMark }], Types.u64)
-            marks.push(token)
+            const p = addNode(g, NodeOp.param, [], Types.u64)
+            pushBlockParams(g, header, p)
+            marks.push(p)
         }
-        if (nil) {
-            const placed = new Set(marks)
-            for (const [id, n] of nodeEntries(g)) {
-                if (placed.has(id)) continue
-                if (!PstackOrdered.has(n.op)) continue
-                let ops: Operand[] | undefined
-                for (let i = 0; i < firstNonOrderingSlot(n); i++) {
-                    if (getRef(n, i) !== nil) continue
-                    ops ??= getOperands(g, n)
-                    ops[i] = token
-                }
-                if (ops) putCopy(g, id, n, ops)
-            }
-        }
-        setBlockBody(g, header, addNode(g, NodeOp.after, [token, header.bodyId]))
-        const latches = new Set<number>()
-        for (const m of members) {
-            for (const p of tailPositions(g, getBlock(g, m)!.bodyId)) {
-                const n = getNode(g, p.at)!
-                if (n.op !== NodeOp.apply || getRef(n, 0) !== headerId || latches.has(p.at)) continue
-                latches.add(p.at)
-                const roots = p.tokens.filter(r => r && r !== headerId && !BatchInertRoots.has(getNode(g, r)!.op))
-                let after = roots.length > 1 ? addNode(g, NodeOp.after, roots) : roots.length ? roots[0] : addNode(g, NodeOp.startOf, [m])
-                stacks.forEach((stack, i) => {
-                    after = addNode(g, NodeOp.pstack, [after, { literal: stack }, marks[i], { literal: 0 }, { literal: PstackMarker }], Types.u64)
-                })
-                putCopy(g, p.at, n, [after, addCopy(g, n)], NodeOp.after)
-            }
+        const placed = new Set<number>()
+        for (const [from, at, tokens, latch] of tails) {
+            if (placed.has(at)) continue
+            placed.add(at)
+            const chain = pstackMarks(g, pstackTailToken(g, from, at, tokens, headerId), stacks, latch ? marks : undefined)
+            const n = getNode(g, at)!
+            putCopy(g, at, n, [chain[chain.length - 1], addCopy(g, n, [...getOperands(g, n), ...(latch ? marks : chain)])], NodeOp.after)
         }
         dirtyIndex(g)
     }
+}
+
+function pstackMarks(g: Graph, token: number, stacks: number[], marks: number[] | undefined): number[] {
+    const chain: number[] = []
+    stacks.forEach((stack, i) => {
+        const mark: Operand = marks ? marks[i] : { literal: 0 }
+        token = addNode(g, NodeOp.pstack, [token, { literal: stack }, mark, { literal: 0 }, { literal: marks ? PstackMarker : PstackMark }], Types.u64)
+        chain.push(token)
+    })
+    return chain
+}
+
+function pstackTailToken(g: Graph, block: number, at: number, tokens: number[], header: number): number {
+    const apply = getNode(g, at)!
+    const args: number[] = []
+    for (let i = 1; i < countIds(apply); i++) if (getRef(apply, i)) args.push(getRef(apply, i))
+    const roots = [...tokens, ...args].filter(r => r && r !== header && !BatchInertRoots.has(getNode(g, r)!.op))
+    if (roots.length > 1) return addNode(g, NodeOp.after, roots)
+    return roots.length ? roots[0] : addNode(g, NodeOp.startOf, [block])
 }
 
 function unorderedRegionPstacks(g: Graph): [mark: number, id: number, block: number][] {
@@ -16932,11 +16993,14 @@ function unorderedRegionPstacks(g: Graph): [mark: number, id: number, block: num
             if (n.op !== NodeOp.pstack) continue
             const tentative = pstackTentative(g, n)
             if (tentative === PstackMark) marks.push(id)
-            else if (!tentative) others.push(id)
+            else others.push(id)
         }
+        if (!marks.length) continue
+        const paths = pstackTailPaths(g, b)
         for (const mark of marks) {
             for (const id of others) {
                 if (!pstackSameStack(g, getNode(g, mark)!, getNode(g, id)!)) continue
+                if (!paths.some(path => path.has(mark) && path.has(id))) continue
                 if (reaches(id, mark) || reaches(mark, id)) continue
                 found.push([mark, id, b.id])
             }
@@ -16949,12 +17013,17 @@ function unorderedRegionPstacks(g: Graph): [mark: number, id: number, block: num
 function orderRegionMarks(g: Graph): boolean {
     const unordered = unorderedRegionPstacks(g)
     if (!unordered.length) return false
+    const before = new Map<number, number[]>()
     for (const [mark, id] of unordered) {
-        const n = getNode(g, id)!
-        const token = getRef(n, 0)
-        putCopy(g, id, n, [token ? addNode(g, NodeOp.after, [mark, token]) : mark, ...getOperands(g, n, 1)])
+        const list = before.get(mark)
+        if (list) list.push(id)
+        else before.set(mark, [id])
     }
-    gn.dirtyValues(g, unordered.map(([, id]) => id))
+    for (const [mark, ids] of before) {
+        const n = getNode(g, mark)!
+        putCopy(g, mark, n, [addNode(g, NodeOp.after, [...ids, getRef(n, 0)].filter(x => x)), ...getOperands(g, n, 1)])
+    }
+    gn.dirtyValues(g, [...before.keys()])
     return true
 }
 
@@ -16962,7 +17031,19 @@ export function verifyPstackMarks(g: Graph, stage: string): void {
     const unordered = unorderedRegionPstacks(g)
     if (!unordered.length) return
     const [mark, id, block] = unordered[0]
-    throw `verify: ${stage}: ${g.name ?? '<anonymous>'} %${id} (pstack) is unordered with its region mark %${mark} in B${block}`
+    throw `verify: ${stage}: ${g.name ?? '<anonymous>'} %${id} (${opName(getNode(g, id)!.op)}) is unordered with its region mark %${mark} in B${block}`
+}
+
+const pstackCellStacks = new Map<number, number>()
+
+export function notePstackCell(stack: number, cell: number): void {
+    pstackCellStacks.set(cell, stack)
+}
+
+export function pstackWrites(g: NodeSpace, n: GraphNode): number {
+    const cell = getRef(n, 1)
+    const stack = cell ? pstackCellStacks.get(getLiteral(g, getNode(g, cell)!, 1)) ?? -1 : getLiteral(g, n, 1)
+    return stack >= 0 && stack < PstackCount ? 1 << (ArgBits + stack) : WritesStack
 }
 
 export function pstackReadsTop(g: NodeSpace, n: GraphNode | undefined): boolean {
@@ -16983,25 +17064,46 @@ function pstackSameStack(g: NodeSpace, a: GraphNode, b: GraphNode): boolean {
     return true
 }
 
-function pstackQuietBlock(g: NodeSpace, reset: number, block: number, valuesOf: (block: number, op: NodeOp) => number[] | undefined, before: Set<number> | undefined): boolean {
+function pstackQuietBlock(g: NodeSpace, reset: number, block: number, valuesOf: (block: number, op: NodeOp) => number[] | undefined, before: Set<number> | undefined, until: Set<number> | undefined): boolean {
     const r = getNode(g, reset)!
+    const skips = (id: number) => before?.has(id) || (until !== undefined && !until.has(id))
     for (const id of valuesOf(block, NodeOp.pstack) ?? []) {
         const n = getNode(g, id)!
-        if (id === reset || before?.has(id) || pstackReadsTop(g, n)) continue
+        if (id === reset || skips(id) || !pstackAllocates(g, n)) continue
         if (pstackSameStack(g, n, r)) return false
     }
     for (const id of valuesOf(block, NodeOp.call) ?? []) {
-        if (before?.has(id)) continue
+        if (skips(id)) continue
         const n = getNode(g, id)!
         if (getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) continue
         const summary = callSummary(g, n)
-        if (!summary || (summary.writes & (WritesStack | WritesUnknown)) !== 0) return false
+        if (!summary || (summary.writes & pstackWrites(g, r)) !== 0) return false
     }
     for (const id of valuesOf(block, NodeOp.rt) ?? []) {
-        if (before?.has(id)) continue
+        if (skips(id)) continue
         if (rt.allocOps.has(getLiteral(g, getNode(g, id)!, 1))) return false
     }
     return true
+}
+
+export interface PstackGrowth {
+    own: number
+    calls: Map<number, number>
+}
+
+function pstackGrowth(g: Graph, out: PstackGrowth | undefined): boolean {
+    if (!out) return false
+    out.own = 0
+    for (const n of allNodes(g)) {
+        if (n.op === NodeOp.pstack && pstackAllocates(g, n)) out.own |= pstackWrites(g, n)
+        if (n.op === NodeOp.rt && rt.allocOps.has(getLiteral(g, n, 1))) out.own |= WritesStack
+        if (n.op !== NodeOp.call) continue
+        const bits = (callSummary(g, n) ?? unknownCall).writes & WritesStack
+        const callee = gn.localSymbol(g, getNode(g, getRef(n, 1)))
+        if (callee === undefined) out.own |= bits
+        else out.calls.set(callee, (out.calls.get(callee) ?? 0) | bits)
+    }
+    return false
 }
 
 interface PstackResetRegion {
@@ -17045,6 +17147,14 @@ function pstackResetRegion(g: NodeSpace, reset: number, block: GraphBlock, inbou
     return region
 }
 
+function pstackTailPaths(g: Graph, b: GraphBlock): Set<number>[] {
+    return tailPositions(g, b.bodyId).map(p => {
+        const reached = new Set<number>()
+        for (const root of [p.at, ...p.tokens]) for (const id of pstackPrecedents(g, root)) reached.add(id)
+        return reached
+    })
+}
+
 function pstackPrecedents(g: NodeSpace, id: number): Set<number> {
     const seen = new Set<number>()
     const work = [id]
@@ -17063,13 +17173,27 @@ export function pstackResetIdle(g: NodeSpace, reset: number, block: GraphBlock, 
     const region = pstackResetRegion(g, reset, block, inbound)
     if (region.open) return false
     for (const b of region.blocks) {
-        if (!pstackQuietBlock(g, reset, b.id, valuesOf, undefined)) return false
+        if (!pstackQuietBlock(g, reset, b.id, valuesOf, undefined, undefined)) return false
     }
     for (const [mark, b] of region.marks) {
         if (region.blocks.has(b)) continue
-        if (!pstackQuietBlock(g, reset, b.id, valuesOf, pstackPrecedents(g, mark))) return false
+        if (!pstackQuietBlock(g, reset, b.id, valuesOf, pstackPrecedents(g, mark), b === block ? pstackPrecedents(g, reset) : undefined)) return false
     }
     return true
+}
+
+function verifyCallRegion(g: Graph, mark: number, reset: number, block: GraphBlock, valuesOf: (block: number, op: NodeOp) => number[] | undefined): void {
+    const r = getNode(g, reset)!
+    const before = pstackPrecedents(g, mark)
+    const inside = pstackPrecedents(g, reset)
+    let paths: Set<number>[] | undefined
+    for (const id of valuesOf(block.id, NodeOp.pstack) ?? []) {
+        const n = getNode(g, id)!
+        if (before.has(id) || inside.has(id) || !pstackAllocates(g, n) || !pstackSameStack(g, n, r)) continue
+        paths ??= pstackTailPaths(g, block)
+        if (!paths.some(path => path.has(reset) && path.has(id))) continue
+        if (!pstackPrecedents(g, id).has(reset)) throw `verify: expand: ${g.name ?? '<anonymous>'} %${id} (pstack) is unordered with the reset %${reset} of mark %${mark} in B${block.id}`
+    }
 }
 
 function resolvePstackMarkers(g: Graph): boolean {
@@ -17096,6 +17220,9 @@ function resolvePstackMarkers(g: Graph): boolean {
             continue
         }
         kept.add(id)
+        for (const [mark, b] of region.marks) {
+            if (b === block) verifyCallRegion(g, mark, id, block, valuesOf)
+        }
         for (const mark of region.marks.keys()) kept.add(mark)
         for (const param of region.params.keys()) live.add(param)
     }
@@ -17119,24 +17246,25 @@ function resolvePstackMarkers(g: Graph): boolean {
     for (const id of tentative) {
         const n = getNode(g, id)!
         if (kept.has(id)) putCopy(g, id, n, getOperands(g, n, 0, 4))
-        else putCopy(g, id, n, [getOperand(g, n, 0), { literal: 0 }], NodeOp.after)
+        else putCopy(g, id, n, [getOperand(g, n, 0), getOperand(g, n, 0)], NodeOp.after)
     }
     gn.dirtyValues(g, rewritten)
     return true
 }
 
-export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
+export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot, grows?: PstackGrowth): Graph {
     expectForm(g, 'expand', 'packaged', 'optimized')
     verifyPstackMarks(g, 'expand')
     const _expandCodecs: GraphPass = g => expandCodecs(g, regionSlot)
-    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, resolvePstackMarkers, _expandCodecs, expandPstacks])
+    const _pstackGrowth: GraphPass = g => pstackGrowth(g, grows)
+    const expanded = runPipeline('expand', g, target.costs, [demotePstacks, batchLoopPstacks, resolvePstackMarkers, _pstackGrowth, _expandCodecs, expandPstacks])
     g = expanded.graph
     if (expanded.changed || g.form === 'packaged') g = optimizePackaged(g, target)
     return g
 }
 
-export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot): Graph {
-    g = expandValueGraph(g, target, regionSlot)
+export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot, grows?: PstackGrowth): Graph {
+    g = expandValueGraph(g, target, regionSlot, grows)
     g = runPipeline('shape', g, target.costs, [countdownCopyLoops, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, testBranchConjunctions, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
@@ -17463,6 +17591,7 @@ function narrowTypes(g: Graph, costs: lowering.TargetCosts): void {
 
 export interface PreparedLowering {
     g: Graph
+    grows: PstackGrowth
     island?: number[]
     analysis: ReturnType<typeof analyzeValueGraph>
     effectful: Set<number>
@@ -17584,7 +17713,8 @@ function rebaseAddresses(g: Graph, target: lowering.Target, rebaseSlot: (slot: n
 
 export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): PreparedLowering {
     const target = opts.target ?? lowering.hostTarget
-    const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target, opts.regionSlot)
+    const grows: PstackGrowth = { own: WritesStack, calls: new Map() }
+    const g = prepareValueGraph(_g.form ? _g : normalizeValueGraph(_g, { target }), target, opts.regionSlot, grows)
     if (opts.staticData) readonlyAllocas(g, opts.staticData, opts.regionSlot)
     if (opts.rebaseSlot) rebaseAddresses(g, target, opts.rebaseSlot)
     registerLiterals(g, target)
@@ -17610,7 +17740,7 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     else verifyNumberClasses(g, 'lowerable', floats, integralSlots, ArithOps)
     verifySlotBounds(g, 'lowerable', slotBytes)
     if (stripMem(g)) dirtyIndex(g)
-    return { g, island, analysis: analyzeValueGraph(g, opts), effectful, floats }
+    return { g, grows, island, analysis: analyzeValueGraph(g, opts), effectful, floats }
 }
 
 export function lowerValueGraph(_g: Graph, opts: LowerGraphOptions = {}): LowerGraphResult {
@@ -18296,7 +18426,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     function demand(id: number, konst: number, want = -1): number {
         if (!id) throw `lowering: literal ${konst} at %${materializing} needs a register but is not a value [unit: ${g.name ?? '<anonymous>'}]`
         const n = getNode(g, id)
-        if (n?.op === NodeOp.void || n?.op === NodeOp.uninitialized) return 0
+        if (n?.op === NodeOp.void || n?.op === NodeOp.uninitialized || (n?.op === NodeOp.startOf && !countIds(n) && !countLiterals(n))) return 0
         if (scratchLiteral(id)) return id
         if (!homeOf.has(id)) {
             if (isParam(g, id)) {

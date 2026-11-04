@@ -14,7 +14,7 @@ import { tagVmHandle, tagVmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
-    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, placePstackMarkers, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, CapturesAll, argBit, hasArg, maskArgs,
+    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackLasting, PstackHeld, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
     graphLoops, joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, stronglyConnected, importFact, mapTailPositions, rewriteFactNodes, substitute, tailOf, tailPositions, tailRoots, tailScalar, valueFacts, type SelectPath, type TailPosition, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     paramSlot, typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
@@ -406,14 +406,32 @@ function mirrorCell(handle: number): void {
 const pstackRegionBytes = 1 << 24
 const pstackCells = new Map<number, number>()
 const pstackRegions = new Map<number, number>()
+let pstackBlock = 0
+function pstackSpan(): number {
+    return align(pstackRegionBytes, guardBytes) + guardBytes
+}
+function mapPstackBlock(): number {
+    getNativeBootstraps()
+    const span = pstackSpan()
+    const base = Number(nativeMapper(span * PstackCount))
+    if (!base || base === -1) return 0
+    let stack = 0
+    while (stack < PstackCount) {
+        protectNative(base + stack * span + span - guardBytes, guardBytes, syscalls.PROT_NONE)
+        stack++
+    }
+    return base
+}
 function pstackCell(stack: number): number {
     const known = pstackCells.get(stack)
     if (known !== undefined) return known
-    const cell = mapGuarded(pstackRegionBytes)
-    if (!cell) throw `native: failed to map pstack ${stack}`
+    if (!pstackBlock) pstackBlock = mapPstackBlock()
+    if (!pstackBlock) throw `native: failed to map pstack ${stack}`
+    const cell = pstackBlock + stack * pstackSpan()
     const top = new BigUint64Array([BigInt(cell + 8)])
     if (!nativeCopier(cell, (ts as any).getArrayBufferPtr(top.buffer), 8)) throw `native: failed to seed pstack ${stack}`
     pstackCells.set(stack, cell)
+    notePstackCell(stack, cell)
     pstackRegions.set(stack, addRegion(RegionKind.pstack, stack, cell, pstackRegionBytes))
     return cell
 }
@@ -1687,7 +1705,7 @@ export interface CreateNativesOptions {
 
 const EffectNames = ['readnone', 'readonly', 'writes']
 
-interface CallWrites { callee: number, args: number[], node: number }
+interface CallWrites { callee: number, args: number[], node: number, ends?: boolean }
 
 function writeTarget(graph: Graph, m: Mem | undefined): number {
     if (!m) return WritesUnknown
@@ -1697,7 +1715,8 @@ function writeTarget(graph: Graph, m: Mem | undefined): number {
 }
 
 function calleeWrites(mask: number | undefined, args: number[]): number {
-    if (mask === undefined || mask & WritesUnknown) return WritesUnknown
+    if (mask === undefined) return WritesUnknown | WritesStack
+    if (mask & WritesUnknown) return WritesUnknown | (mask & WritesStack)
     let out = mask & WritesStack
     for (const j of maskArgs(mask)) out |= args[j] ?? WritesUnknown
     return out
@@ -1810,7 +1829,7 @@ function noteEffect(graph: Graph, mem: MemAnalysis, block: GraphBlock, id: numbe
         out.writes |= writeTarget(graph, mem.access(block, n))
     } else if (n.op === NodeOp.pstack) {
         out.self = EffectWrite
-        out.writes |= WritesStack
+        if (pstackAllocates(graph, n)) out.writes |= pstackWrites(graph, n)
         if (pstackRebases(graph, n) && !pstackTentative(graph, n)) out.writes |= WritesUnknown
     } else if (n.op === NodeOp.load) {
         if (out.self < EffectRead) out.self = EffectRead
@@ -1822,7 +1841,7 @@ function noteEffect(graph: Graph, mem: MemAnalysis, block: GraphBlock, id: numbe
             out.calls.push({ callee, args, node: id })
         } else {
             out.self = EffectWrite
-            out.writes |= WritesUnknown
+            out.writes |= WritesUnknown | WritesStack
         }
     } else if (n.op === NodeOp.rt && !rt.effectOps.has(getLiteral(graph, n, 1)) && !rt.heapOps.has(getLiteral(graph, n, 1))) {
         return
@@ -1833,6 +1852,7 @@ function noteEffect(graph: Graph, mem: MemAnalysis, block: GraphBlock, id: numbe
         if (!token || token.op === NodeOp.startOf || token.op === NodeOp.void) return
         out.self = EffectWrite
         out.writes |= WritesUnknown
+        if (n.op === NodeOp.rt && rt.allocOps.has(getLiteral(graph, n, 1))) out.writes |= WritesStack
     }
 }
 
@@ -1995,8 +2015,15 @@ function graphEffects(graph: Graph): GraphEffects {
             if (n.op === NodeOp.ret) rets.push(...valueAt(id, p.path, n, 0, chain(getBlock(graph, id)!, tailRoots(graph, p))))
         }
     }
+    let grows = 0
+    const onReturn = new Set<number>()
+    for (const r of rets) {
+        grows |= r.writes & WritesStack
+        for (const c of r.calls) onReturn.add(c.node)
+    }
+    for (const c of whole.calls) if (!onReturn.has(c.node)) c.ends = true
     return {
-        self: whole.self, callees: whole.calls.map(c => c.callee), writes: whole.writes, calls: whole.calls, traps, returns,
+        self: whole.self, callees: whole.calls.map(c => c.callee), writes: (whole.writes & ~WritesStack) | grows, calls: whole.calls, traps, returns,
         fresh: fresh && returns > 0, params, loaded, returned, rets, reaches: graph.blocks[0].params.map(p => paramReach(graph, mem, p)),
     }
 }
@@ -2096,7 +2123,9 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>, discard
         for (const call of calls.get(symbol) ?? []) {
             const c = classes.get(call.callee)
             want = Math.max(want, c === undefined ? EffectWrite : c)
-            if (c === undefined || c === EffectWrite) mask |= calleeWrites(c === undefined ? undefined : masks.get(call.callee), call.args)
+            if (c !== undefined && c !== EffectWrite) continue
+            const bits = calleeWrites(c === undefined ? undefined : masks.get(call.callee), call.args)
+            mask |= call.ends ? bits & ~WritesStack : bits
         }
         const captured = captureMask(effectsOf.get(symbol)!, captures)
         const deepCaptured = deepCaptureMask(effectsOf.get(symbol)!, captures, deep)
@@ -2908,23 +2937,27 @@ interface PendingNormalize {
     heapMark: number
     stackMark: number
     scratchMark: number
+    lastingMark: number
+    heldMark: number
 }
 
 let pendingNormalize: PendingNormalize | undefined
 
-function nativeNormalize(phase: u32, kind: u32, inHi: u32, inLo: u32, outHi: u32, outLo: u32, cap: u32): number {
+export function nativeNormalize(phase: u32, kind: u32, inHi: u32, inLo: u32, outHi: u32, outLo: u32, cap: u32): number {
     if (phase === 0) {
         const heapTop = heap.resolveHeapCell(heap.runtimeCells)
         const heapMark = Intrinsics.load(heapTop, 0, Types.u32)
         const stackMark = Intrinsics.pstack(programStack, 0, 0)
         const scratchMark = Intrinsics.pstack(0, 0, 0)
+        const lastingMark = Intrinsics.pstack(PstackLasting, 0, 0)
+        const heldMark = Intrinsics.pstack(PstackHeld, 0, 0)
         const input = inHi * 4294967296 + inLo
         const inputFloats = input + graphFloatsAt(Intrinsics.load(input, 4, Types.u32)) * 4
         const g = readGraph(at => Intrinsics.load(input, at * 4, Types.u32), k => Intrinsics.load(inputFloats, k * 8, Types.f64))
         const literalFrom = g.literals.values.length
         const rawFrom = g.literals.raw.length
         const out = kind === NormalizeKind.optimize ? optimizePackaged(g, hostTarget) : normalizeValueGraph(g, { firstPass: kind === NormalizeKind.first, target: hostTarget })
-        pendingNormalize = { out, kind, literalFrom, rawFrom, heapMark, stackMark, scratchMark }
+        pendingNormalize = { out, kind, literalFrom, rawFrom, heapMark, stackMark, scratchMark, lastingMark, heldMark }
     }
     const p = pendingNormalize!
     const layout = graphLayout(p.out, p.literalFrom, p.rawFrom)
@@ -2937,6 +2970,8 @@ function nativeNormalize(phase: u32, kind: u32, inHi: u32, inLo: u32, outHi: u32
     Intrinsics.store(heap.resolveHeapCell(heap.runtimeCells), 0, p.heapMark, Types.u32)
     Intrinsics.pstack(programStack, p.stackMark, 0)
     Intrinsics.pstack(0, p.scratchMark, 0)
+    Intrinsics.pstack(PstackLasting, p.lastingMark, 0)
+    Intrinsics.pstack(PstackHeld, p.heldMark, 0)
     return bytes
 }
 
@@ -5814,7 +5849,20 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const order = stronglyConnected(symbols, symbol => callees.get(symbol)!)
     const clobbers = new Map<number, Set<number>>()
     const prepared = new Map<number, PreparedUnit>()
-    for (const symbol of symbols) prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol)), program.units.get(symbol)!.name))
+    const grows = new Map<number, number>()
+    for (const scc of order) {
+        for (const symbol of scc) prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol), callee => grows.get(callee)), program.units.get(symbol)!.name))
+        const members = new Set(scc)
+        let shared = 0
+        for (const symbol of scc) {
+            const growth = prepared.get(symbol)!.prepared.grows
+            shared |= growth.own
+            for (const [callee, stacks] of growth.calls) {
+                if (!members.has(callee)) shared |= stacks
+            }
+        }
+        for (const symbol of scc) grows.set(symbol, shared)
+    }
     verifyCallClasses('lowerable', new Map([...prepared].map(([symbol, unit]) => [symbol, unit.prepared.g])), symbol => prepared.get(symbol)!.prepared.floats, (g, n) => {
         const t = getNode(g, getRef(n, 1))
         return t?.op === NodeOp.localTarget ? getLiteral(g, t, 0) : undefined
@@ -5869,7 +5917,7 @@ interface PreparedUnit {
     returnRecord?: intrinsics.Types[]
 }
 
-function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, returnLocation?: number, returnRecord?: intrinsics.Types[]): PreparedUnit {
+function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, returnLocation: number | undefined, returnRecord: intrinsics.Types[] | undefined, growsOf: (callee: number) => number | undefined): PreparedUnit {
     const image = program.image
     const unitGraph = program.units.get(symbol)!
     const name = unitGraph.name ?? ''
@@ -5886,6 +5934,7 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     const debug = flagged('lower-debug', name)
     if (debug) console.log('lower native', name)
     seedPstacks(graph, image)
+    refreshCallGrowth(graph, growsOf)
     const float = returnsFloat(graph)
     const prepared = prepareLowering(graph, {
         debug, target: program.target, staticData,
@@ -5903,6 +5952,23 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     if (lineageBefore) traceLineage(prepared.g, lineageBefore)
     if (debugsTypes(name)) console.log(dumpNumberTypes(prepared.g, prepared.floats))
     return { name, debug, prepared, returnsFloat: float, returnLocation, returnRecord }
+}
+
+function refreshCallGrowth(graph: Graph, growsOf: (callee: number) => number | undefined): void {
+    for (const [, n] of nodeEntries(graph)) {
+        if (n.op !== NodeOp.call) continue
+        const id = getRef(n, 1)
+        const target = getNode(graph, id)
+        const symbol = localSymbol(graph, target)
+        if (symbol === undefined || countIds(target!) !== 2) continue
+        const grows = growsOf(symbol)
+        const summary = callSummary(graph, n)!
+        if (grows === undefined) continue
+        const writes = summary.writes & ~(WritesStack & ~grows)
+        if (writes === summary.writes) continue
+        putCopy(graph, id, target!, [{ literal: symbol }, { literal: internCallSummary(graph, { ...summary, writes }) }])
+        dirtyValues(graph, [id])
+    }
 }
 
 function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, clobbersOf: (symbol: number) => Set<number> | undefined, continues?: (symbol: number) => boolean, endless?: (symbol: number) => boolean): NativeUnit {
@@ -6204,7 +6270,7 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
         const [width, type] = sliceSlot(element, rt.elementType(graph, n))
         const scaled = (at: number): Operand => getRef(n, at) ? addNode(graph, NodeOp.mul, [getRef(n, at), { literal: width }], Types.unknown_number) : { literal: getLiteral(graph, n, at) * width }
         if (op === rt.Op.slice) {
-            putNode(graph, id, NodeOp.pstack, [getOperand(graph, n, 0), { literal: programStack }, { literal: 0 }, scaled(2)])
+            putNode(graph, id, NodeOp.pstack, [getOperand(graph, n, 0), { literal: PstackWildcard }, { literal: 0 }, scaled(2)])
             continue
         }
         const token = getOperand(graph, n, 0)
@@ -8289,12 +8355,13 @@ interface Planned {
     contexts: Map<Function, intrinsics.Handle>
     rewrites: Map<PlannedUnit, (graph: Graph) => void>
     shared: Map<PlannedUnit, PlannedUnit[]>
-    regions: Map<PlannedUnit, [header: number, stacks: number[]][]>
+    regions: Map<PlannedUnit, [header: number, call: number, stacks: number[]][]>
+    targets: Map<PlannedUnit, Map<number, number>>
 }
 
 function bindPlannedUnits(plan: ShapePlan, binder: Binder): Planned {
     const { derive } = binder
-    const planned: Planned = { units: new Map(), functions: new Map(), frames: new Map(), contexts: new Map(), rewrites: new Map(), shared: new Map(), regions: new Map() }
+    const planned: Planned = { units: new Map(), functions: new Map(), frames: new Map(), contexts: new Map(), rewrites: new Map(), shared: new Map(), regions: new Map(), targets: new Map() }
     const indirect = new Set<PlannedUnit>()
     for (const list of plan.units.values()) {
         for (const unit of list) {
@@ -11077,6 +11144,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         if (someNode(traced.graph, n => rt.sliceOf(traced.graph, n) !== undefined)) {
             sliceTags = realizeSlices(traced.graph, local?.slices, local?.nodes, local?.codecs)
         }
+        resolvePstackTargets(traced.graph, plannedUnit && planned.targets.get(plannedUnit))
         const dynamic = local ? runtimeHeapSites(local, traced.graph) : undefined
         const regions = plannedUnit && planned.regions.get(plannedUnit)
         if (regions) placePstackMarkers(traced.graph, regions)
@@ -11084,8 +11152,9 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
             calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
-            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot,
+            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.targets.get(plannedUnit),
         })
+        if (regions) placePstackCallMarkers(result.graph, regions)
         plannedFunctionCalls(result.graph)
         for (const [dispatch, read] of result.dispatches) {
             const rep = local?.nodes.get(read)
@@ -13078,16 +13147,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         const planned = bindPlannedUnits(plan, binder)
         const reps = chooseRepresentations(plan, planned, binder, linker, tracer, host, valueTypes)
         sharePlannedUnits(plan, planned, reps, host)
-        const regions = planPstackRegions(valueTypes, [...planned.units.values()], unit => binder.graphOf(planned.functions.get(unit)!), flags.has('pstack-debug'))
-        const placed = new Map<PlannedUnit, [number, number[]][]>()
-        for (const region of regions) {
-            if (region.reason || region.call) continue
-            const list = placed.get(region.unit)
-            const entry: [number, number[]] = [region.header, region.stacks.map(stack => stack ? programStack : 0)]
-            if (list) list.push(entry)
-            else placed.set(region.unit, [entry])
-        }
-        planned.regions = placed
+        const pstacks = planPstackRegions(valueTypes, [...planned.units.values()], unit => binder.graphOf(planned.functions.get(unit)!), flags.has('pstack-debug'))
+        planned.regions = pstacks.regions
+        planned.targets = pstacks.targets
         freezeFacts(facts, planFrames(valueTypes, plan, planned, binder, tracer, facts))
         return { plan, planned, reps }
     })
@@ -13902,10 +13964,15 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     const image = parseImage(bytes)
     const { regions, entries, symbols } = image
     const bases: number[] = []
+    let stacks = 0
     for (const region of regions) {
         const slack = region.kind === RegionKind.code ? 4096 : 0
-        const guarded = region.kind === RegionKind.pstack || region.kind === RegionKind.heap
-        const mapped = guarded ? mapGuarded(region.size) : Number(nativeMapper(align(region.size + slack, 4096)))
+        const pstack = region.kind === RegionKind.pstack
+        if (pstack && (region.size > pstackSpan() - guardBytes || region.index >= PstackCount)) throw 'native: an image pstack region does not fit the pstack block'
+        if (pstack && !stacks) stacks = mapPstackBlock()
+        if (pstack && !stacks) throw 'native: failed to map the image pstacks'
+        const mapped = pstack ? stacks + region.index * pstackSpan()
+            : region.kind === RegionKind.heap ? mapGuarded(region.size) : Number(nativeMapper(align(region.size + slack, 4096)))
         if (!mapped || mapped === -1) throw 'native: failed to map an image region'
         bases.push(region.kind === RegionKind.code ? mapped + (region.base & 4095) : mapped)
     }
