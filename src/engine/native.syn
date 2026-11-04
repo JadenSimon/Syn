@@ -930,6 +930,7 @@ function evaluateStatics(program: ProgramGraph): void {
             },
             static: handle => {
                 const slot = image.statics.get(handle)
+                if (slot !== undefined) image.sharedStatics.add(slot)
                 return slot === undefined ? undefined : evaluateSlot(slot)
             },
             readable: (address, size) => address >= pstackCell(0) && address + size <= Number(pstackMark(0)) || inMirroredString(address, size),
@@ -957,6 +958,7 @@ function evaluateStatics(program: ProgramGraph): void {
         staticWrite(image.staticTable.base + slot * 8, new Uint8Array(new BigUint64Array([raw]).buffer), pointer ? [{ offset: 0, region: pointer.region, scale: 1 }] : [])
         words.set(slot, word)
         const address = new BigUint64Array([pointer ? raw : ((raw >> BigInt(1)) & BigInt((1 << 28) - 1)) + BigInt(pstackCell(0) + 8)])
+        if (inStaticRegion(image.staticRegions, Number(address[0]), 8)) image.staticObjects.push({ slot, word: pointer ? undefined : Number(raw), address: Number(address[0]) })
         const held = [{ offset: 0, region: pointer ? pointer.region : staticRegion(), scale: 1 }]
         for (const [at, field] of image.staticFields) if (field === slot) staticWrite(at, new Uint8Array(address.buffer), held)
         if (flags.has('static-debug')) console.log(`static ${slot} evaluates to ${raw}`)
@@ -1198,11 +1200,51 @@ function writesStaticMemory(program: ProgramGraph): boolean {
     return false
 }
 
+function readOnlyStatics(program: ProgramGraph): Set<number> {
+    const image = program.image
+    const held = new Set<number>()
+    for (const [, slot] of image.staticFields) held.add(slot)
+    const bases = new Set<number>()
+    const words = new Set<number>()
+    for (const object of image.staticObjects) {
+        if (held.has(object.slot) || image.sharedStatics.has(object.slot)) continue
+        bases.add(object.address)
+        if (object.word !== undefined) words.add(object.word)
+    }
+    if (!bases.size) return bases
+    const escaped = new Set<number>()
+    for (const symbol of reachUnits(program)) {
+        const g = program.units.get(symbol)!
+        const valueOf = (n: GraphNode, i: number): number | undefined => {
+            if (!getRef(n, i)) return getLiteral(g, n, i)
+            const m = getNode(g, getRef(n, i))
+            if (m?.op === NodeOp.literal) return getLiteral(g, m, 0)
+            if (m?.op === NodeOp.poolEntry && !getRef(m, 0) && countIds(m) > 1) return getLiteral(g, m, 1)
+            return undefined
+        }
+        for (const [, n] of nodeEntries(g)) {
+            if (n.op === NodeOp.poolEntry) continue
+            for (let i = 0; i < countIds(n); i++) {
+                const value = valueOf(n, i)
+                if (value === undefined) continue
+                if (words.has(value)) escaped.add(value)
+                if (bases.has(value) && (n.op !== NodeOp.load || i !== 1)) escaped.add(value)
+            }
+        }
+    }
+    for (const object of image.staticObjects) {
+        if (object.word !== undefined && escaped.has(object.word)) escaped.add(object.address)
+    }
+    for (const address of escaped) bases.delete(address)
+    return bases
+}
+
 function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
     const image = program.image
     const regions = constantRegions(program)
     const strings = mirroredStrings
-    if (!regions.length && !strings.size) return
+    const readOnly = readOnlyStatics(program)
+    if (!regions.length && !strings.size && !readOnly.size) return
     const heapBase = strings.size ? runtimeHeapBase() : 0
     for (const symbol of reachUnits(program)) {
         const g = program.units.get(symbol)!
@@ -1233,12 +1275,12 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
                 const size = Math.max(1, staticWidth(typeOf(n)) / 8)
                 const cell = ptr === undefined ? false : strings.has(ptr - heapBase) && offset !== undefined && offset + size <= heap.HeapString.sizeof
                 const relocation = ptr === undefined || offset === undefined ? undefined : relocatedWord(ptr + offset, size)
-                if (ptr !== undefined && offset !== undefined && relocation !== null && (cell || inStaticRegion(regions, ptr + offset, size))) {
+                if (ptr !== undefined && offset !== undefined && relocation !== null && (cell || readOnly.has(ptr) || inStaticRegion(regions, ptr + offset, size))) {
                     const bytes = new Uint8Array(8)
                     if (!nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), ptr + offset, size)) throw 'native: failed to read static memory'
                     const raw = new DataView(bytes.buffer).getBigUint64(0, true)
                     const read = isSignedType(typeOf(n)) ? BigInt.asIntN(size * 8, raw) : BigInt.asUintN(size * 8, raw)
-                    if (read <= BigInt(Number.MAX_SAFE_INTEGER) && read >= BigInt(Number.MIN_SAFE_INTEGER)) value = Number(read)
+                    if (read <= BigInt(Number.MAX_SAFE_INTEGER) && read >= BigInt(Number.MIN_SAFE_INTEGER) && !readOnly.has(Number(read))) value = Number(read)
                     if (value !== undefined && relocation) pointers.set(id, relocation.region)
                 }
             }
@@ -3424,6 +3466,8 @@ function createImage() {
     const functionObjects = new Map<number, intrinsics.Handle>()
     const staticRegions: [base: number, size: number][] = []
     const readonlyRegions: [base: number, size: number][] = []
+    const staticObjects: { slot: number, word: number | undefined, address: number }[] = []
+    const sharedStatics = new Set<number>()
     const staticTable = { base: 0, region: -1 }
     const recordBits = new Map<intrinsics.Handle, propertyEval.RecordBits>()
     const placedLayouts = new Map<intrinsics.Handle, propertyEval.Layout>()
@@ -3756,7 +3800,7 @@ function createImage() {
         return at
     }
     return {
-        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, hostStatics, staticFields, codeFields, objectCode, code, functionObjects, staticRegions, readonlyRegions, staticTable, recordBits, placedLayouts,
+        values, labels, bytes, byteTargets, functionTargets, relocations, functionHandles, dataHandles, runtime, statics, staticSymbols, staticBoxes, hostStatics, staticFields, codeFields, objectCode, code, functionObjects, staticRegions, readonlyRegions, staticObjects, sharedStatics, staticTable, recordBits, placedLayouts,
         slotRelocations, imports, startWrites, literalSlots,
         valueSlot, wordsSlot, pointerSlot, stringSlot, constructionSlot, staticObjectSlot, functionSlot, constantSlot, floatSlot, regionSlot,
         knownValue: (slot: number) => final.get(slot),
