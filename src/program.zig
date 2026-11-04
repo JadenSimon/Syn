@@ -23150,6 +23150,7 @@ pub const Analyzer = struct {
                 return this.createStringLiteralFromNode(file.id, ref, node);
             },
             .numeric_literal => return this.getNumericLiteralType(node, false),
+            .bigint_literal => return @intFromEnum(Kind.bigint),
             .variable_declaration => {
                 if (node.len != 0) {
                     return this.getType(file, node.len);
@@ -26518,6 +26519,7 @@ pub const Analyzer = struct {
                     .boolean => .boolean_keyword,
                     .string => .string_keyword,
                     .number => .number_keyword,
+                    .bigint => .bigint_keyword,
                     .symbol => .symbol_keyword,
                     .object => .object_keyword,
                     .undefined => .undefined_keyword,

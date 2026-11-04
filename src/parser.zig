@@ -8376,6 +8376,7 @@ fn syntaxKindToString(kind: SyntaxKind) []const u8 {
         .accessor_keyword => "accessor",
         .string_keyword => "string",
         .number_keyword => "number",
+        .bigint_keyword => "bigint",
         .boolean_keyword => "boolean",
         .true_keyword => "true",
         .false_keyword => "false",
@@ -12006,6 +12007,10 @@ pub fn _Printer(comptime Sink: type, comptime print_source_map: bool, comptime u
                 .jsx_fragment => {
                     try this._visitLinkedList(maybeUnwrapRef(n) orelse 0, "<>", "</>", "", false);
                     this.print("</>");
+                },
+                .bigint_literal => {
+                    this.print(getSlice(n, u8));
+                    this.print("n");
                 },
                 .numeric_literal => {
                     if (n.data == 0) {
