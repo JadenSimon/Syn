@@ -343,6 +343,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     const removedWrites: number[] = []
     const labelRefs = new Map<number, number>()
     const closedLabels = new Set<number>()
+    let macroLabel = 1 << 30
     let finished = false
 
     const writebacks = new Map<number, AsmItem>()
@@ -1611,6 +1612,148 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
+    function knownArrival(end: number, reg: number): { at: number, flagsKept: boolean, read: boolean } | undefined {
+        const floor = Math.max(0, end - 16)
+        let flagsKept = true
+        let read = false
+        for (let k = end - 1; k >= floor; k--) {
+            const it = items[k]
+            if (it.kind === 'cset') {
+                if (it.reg === reg) return { at: k, flagsKept, read }
+                continue
+            }
+            if (it.kind !== 'insn' || it.clobbers) return
+            const defs: number[] = []
+            const uses: number[] = []
+            if (!itemDefs(it, defs) || !itemUses(it, uses)) return
+            if (defs.includes(reg)) return it.zeroReg === reg || constantOf(it) !== undefined ? { at: k, flagsKept, read } : undefined
+            if (uses.includes(reg)) read = true
+            if (it.setsFlags) flagsKept = false
+        }
+    }
+
+    function constantOf(it: AsmItem): bigint | undefined {
+        if (it.zeroReg !== undefined) return BigInt(0)
+        if (it.constReg === undefined) return
+        const op = it.word & 0x7F800000
+        if (op !== 0x52800000 && op !== 0x12800000) return
+        const bits = it.word >>> 31 ? 64 : 32
+        const value = BigInt((it.word >>> 5) & 0xFFFF) << BigInt(16 * ((it.word >>> 21) & 3))
+        return BigInt.asUintN(bits, op === 0x52800000 ? value : ~value)
+    }
+
+    function comparedFlags(value: bigint, imm: number, narrow: boolean): number {
+        const bits = narrow ? 32 : 64
+        const a = BigInt.asUintN(bits, value)
+        const b = BigInt.asUintN(bits, BigInt(imm))
+        const r = BigInt.asUintN(bits, a - b)
+        const exact = BigInt.asIntN(bits, a) - BigInt.asIntN(bits, b)
+        const n = (r >> BigInt(bits - 1)) === BigInt(1) ? 8 : 0
+        const z = r === BigInt(0) ? 4 : 0
+        const c = a >= b ? 2 : 0
+        const v = exact !== BigInt.asIntN(bits, exact) ? 1 : 0
+        return n | z | c | v
+    }
+
+    function threadKnownBranch(dead: Set<number>): boolean {
+        const at = items.length - 1
+        const branch = items[at]
+        if (branch.kind !== 'cbz' && branch.kind !== 'cbnz') return false
+        let head = at
+        let reg = branch.reg
+        let regDead = false
+        let decide = (value: bigint) => (value === BigInt(0)) === (branch.kind === 'cbz')
+        const set = items[at - 1]
+        const cmp = items[at - 2]
+        const compared = set?.kind === 'cset' && set.reg === branch.reg && cmp?.kind === 'insn' ? plainCompare(cmp) : undefined
+        if (compared && compared[1] < 0 && dead.has(branch.reg)) {
+            head = at - 2
+            reg = compared[0]
+            regDead = reg === branch.reg
+            decide = (value: bigint) => holds(set.cond, comparedFlags(value, compared[2], compared[3])) === (branch.kind === 'cbnz')
+        }
+        if (items[head - 1]?.kind !== 'label') return false
+        let first = head - 1
+        while (first > 0 && items[first - 1].kind === 'label') first--
+        const joins = new Set<number>()
+        for (let k = first; k < head; k++) joins.add(items[k].label)
+        if (joins.has(branch.label)) return false
+        let pending = 0
+        for (const label of joins) pending += labelRefs.get(label) ?? 0
+        let past = -1
+        const after = () => {
+            if (past < 0) {
+                past = macroLabel++
+                push({ kind: 'label', word: 0, text: '', label: past, reg: -1, cond: -1 })
+            }
+            return past
+        }
+        const refer = (label: number) => labelRefs.set(label, (labelRefs.get(label) ?? 0) + 1)
+        const retarget = (jump: AsmItem, label: number) => {
+            labelRefs.set(jump.label, labelRefs.get(jump.label)! - 1)
+            refer(label)
+            jump.label = label
+        }
+        let changed = false
+        const falls = first > 0 && !terminates(items[first - 1])
+        const arrival = falls ? knownArrival(first, reg) : undefined
+        if (arrival && items[arrival.at].kind !== 'cset' && !arrival.read && regDead) {
+            const label = decide(constantOf(items[arrival.at])!) ? branch.label : after()
+            refer(label)
+            items.splice(arrival.at, 1)
+            items.splice(first - 1, 0, { kind: 'b', word: 0, text: `b L${label}`, label, reg: -1, cond: -1 })
+            removedWrites.push(reg)
+            changed = true
+        }
+        const floor = Math.max(0, first - 64)
+        for (let p = first - 1; p >= floor && pending > 0; p--) {
+            const jump = items[p]
+            if (jump.kind !== 'b' || !joins.has(jump.label)) continue
+            pending--
+            const known = knownArrival(p, reg)
+            if (!known) continue
+            const def = items[known.at]
+            const keep = known.read || !regDead
+            if (def.kind === 'cset') {
+                if (keep || !known.flagsKept) continue
+                const whenZero = decide(BigInt(0))
+                const whenOne = decide(BigInt(1))
+                if (whenZero === whenOne) {
+                    retarget(jump, whenOne ? branch.label : after())
+                } else {
+                    retarget(jump, after())
+                    refer(branch.label)
+                    items.splice(p, 0, { kind: 'bcond', word: 0, text: '', label: branch.label, reg: -1, cond: whenOne ? def.cond : def.cond ^ 1 })
+                }
+            } else {
+                retarget(jump, decide(constantOf(def)!) ? branch.label : after())
+                if (keep) {
+                    changed = true
+                    continue
+                }
+            }
+            items.splice(known.at, 1)
+            removedWrites.push(reg)
+            p = known.at
+            changed = true
+        }
+        if (!changed) return false
+        const end = items.lastIndexOf(branch)
+        let start = end - (at - head)
+        while (start > 0 && items[start - 1].kind === 'label') start--
+        let entered = start === 0 || !terminates(items[start - 1])
+        for (const label of joins) if (labelRefs.get(label) || !closedLabels.has(label)) entered = true
+        if (entered) return true
+        labelRefs.set(branch.label, labelRefs.get(branch.label)! - 1)
+        items.splice(start, end - start + 1)
+        const jump = items[start - 1]
+        if (jump.kind === 'b' && jump.label === past && items[start]?.label === past) {
+            labelRefs.set(past, labelRefs.get(past)! - 1)
+            items.splice(start - 1, 1)
+        }
+        return true
+    }
+
     function fuseClosedZeroLoop(label: number): boolean {
         const end = items.length - 1
         const jump = items[end]
@@ -2095,7 +2238,6 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         else push(moveItem(dst, src))
     }
 
-    let macroLabel = 1 << 30
     function pow(dst: number, base: number, exponent: number): void {
         const loop = macroLabel++
         const skip = macroLabel++
@@ -4027,6 +4169,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (compactPendingZeroStores() && items[items.length - 1] !== tail) return
         }
         if (emitterStep(fuseArithmeticZeroBranch, dead)) return
+        if (emitterStep(threadKnownBranch, dead)) return
         if (scaledConversion(dead)) return
 
         // TODO: optionally use CPU feature flags
