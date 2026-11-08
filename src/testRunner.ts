@@ -914,11 +914,11 @@ function symbolizeCrash(maps: string[], dump: Buffer): string[] {
 }
 
 function prepareNativeNormalize(args: string[]): boolean {
-    if (!args.includes('native-l2')) return true
-    const flags = args.filter(a => /^(native-l2$|l2-cache:)/.test(a))
+    if (!args.includes('native-l2') && !args.includes('l2-promote')) return true
+    const flags = args.filter(a => /^(native-l2$|l2-promote$|l2-cache:)/.test(a))
     const prepared = spawnSync(...hostCommand(process.argv[1], ['--engine', 'heap', 'in-process', 'timeout:300', 'l2-prepare', ...flags]), { stdio: 'inherit', env: { ...process.env, SYN_CRASH_FD: '', SYN_CRASH_DUMP_FD: '', SYN_CRASH_RESUME: '' } })
     if (prepared.status === 0) return true
-    console.log(`RESULT FAILED: native-l2 could not prepare the normalize image (${prepared.signal ? `killed by ${prepared.signal}` : `exit ${prepared.status}`}), exit 1`)
+    console.log(`RESULT FAILED: native-l2 could not prepare or promote the normalize image (${prepared.signal ? `killed by ${prepared.signal}` : `exit ${prepared.status}`}), exit 1`)
     process.exitCode = 1
     return false
 }
