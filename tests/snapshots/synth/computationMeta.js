@@ -7,12 +7,6 @@ if (!Symbol.toComputation) {
 const __meta$0 = {
   ambient: ['Math']
 }
-const __meta$1 = {
-  ambient: ['Math']
-}
-const __meta$2 = {
-  ambient: ['Math']
-}
 export function ambientOnly() {
   return Math.max(1, 2)
 }
@@ -33,7 +27,7 @@ export class Both {
     return Math.abs(this.#x)
   }
   static {
-    this.prototype.get[Symbol.toComputation] = () => ['function get() {\n  return Math.abs(this.#x)\n}', [], __meta$1, Both];
-    this[Symbol.toComputation] = () => ['class Both {\n  #x = 1;\n  get() {\n    return Math.abs(this.#x)\n  }\n}', [], __meta$2];
+    this.prototype.get[Symbol.toComputation] = () => ['function get() {\n  return Math.abs(this.#x)\n}', [], __meta$0, Both];
+    this[Symbol.toComputation] = () => ['class Both {\n  #x = 1;\n  get() {\n    return Math.abs(this.#x)\n  }\n}', [], __meta$0];
   }
 }

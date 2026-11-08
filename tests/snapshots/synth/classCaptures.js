@@ -11,18 +11,6 @@ function __computation$(f, c) {
 const __meta$0 = {
   ambient: ['console']
 }
-const __meta$1 = {
-  ambient: ['console']
-}
-const __meta$2 = {
-  ambient: ['console']
-}
-const __meta$3 = {
-  ambient: ['console']
-}
-const __meta$4 = {
-  ambient: ['console']
-}
 function it(name, fn) {}
 function expectEqual(actual, expected, message) {}
 expectEqual[Symbol.toComputation] = () => ['function expectEqual(actual, expected, message) {}', []];
@@ -172,7 +160,7 @@ class Z {
     return __computation$(function() {
       console.log(c__outer[0]);
       return this
-    }, () => ['function() {\n  console.log($0[0]);\n  return this\n}', [c__outer], __meta$2])
+    }, () => ['function() {\n  console.log($0[0]);\n  return this\n}', [c__outer], __meta$0])
   }
   [getValSym]() {
     return c__outer[0]
@@ -185,11 +173,11 @@ class Z {
   }
   static {
     this.prototype.getFn[Symbol.toComputation] = () => ['function getFn() {\n  $0[0] = 6;\n  const f = () => this.z\n  return f\n}', [c__outer]];
-    this.prototype.getFn2[Symbol.toComputation] = () => ['function getFn2() {\n  return function() {\n    console.log($0[0]);\n    return this\n  }\n}', [c__outer], __meta$1];
-    this.getFn2[Symbol.toComputation] = () => ['function getFn2() {\n  return function() {\n    console.log($0[0]);\n    return this\n  }\n}', [c__outer], __meta$3];
+    this.prototype.getFn2[Symbol.toComputation] = () => ['function getFn2() {\n  return function() {\n    console.log($0[0]);\n    return this\n  }\n}', [c__outer], __meta$0];
+    this.getFn2[Symbol.toComputation] = () => ['function getFn2() {\n  return function() {\n    console.log($0[0]);\n    return this\n  }\n}', [c__outer], __meta$0];
     this.prototype[getValSym][Symbol.toComputation] = () => ['function() {\n  return $0[0]\n}', [c__outer]];
     this[getValSym][Symbol.toComputation] = () => ['function() {\n  return $0[0]\n}', [c__outer]];
     Object.getOwnPropertyDescriptor(this.prototype, 'x').get[Symbol.toComputation] = () => ['function x() {\n  return this.e\n}', []];
-    this[Symbol.toComputation] = () => ['class Z {\n  z = 1;\n  e = $0;\n  getFn() {\n    $1[0] = 6;\n    const f = () => this.z\n    return f\n  }\n  getFn2() {\n    return function() {\n      console.log($1[0]);\n      return this\n    }\n  }\n  static getFn2() {\n    return function() {\n      console.log($1[0]);\n      return this\n    }\n  }\n  [getValSym]() {\n    return $1[0]\n  }\n  static [getValSym]() {\n    return $1[0]\n  }\n  get x() {\n    return this.e\n  }\n}', [e, c__outer], __meta$4];
+    this[Symbol.toComputation] = () => ['class Z {\n  z = 1;\n  e = $0;\n  getFn() {\n    $1[0] = 6;\n    const f = () => this.z\n    return f\n  }\n  getFn2() {\n    return function() {\n      console.log($1[0]);\n      return this\n    }\n  }\n  static getFn2() {\n    return function() {\n      console.log($1[0]);\n      return this\n    }\n  }\n  [getValSym]() {\n    return $1[0]\n  }\n  static [getValSym]() {\n    return $1[0]\n  }\n  get x() {\n    return this.e\n  }\n}', [e, c__outer], __meta$0];
   }
 }

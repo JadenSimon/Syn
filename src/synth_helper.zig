@@ -41,6 +41,11 @@ fn deinitNamespaceReads(alloc: std.mem.Allocator, reads: *NamespaceReads) void {
     reads.deinit(alloc);
 }
 
+const NarrowedModule = struct {
+    capture: usize,
+    names: []const []const u8,
+};
+
 const Frame = struct {
     decl_ref: NodeRef,
     kind: SyntaxKind,
@@ -87,6 +92,7 @@ pub const SynthInstrumenter = struct {
     ambients: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef)) = .{},
     namespace_reads: std.AutoArrayHashMapUnmanaged(NodeRef, NamespaceReads) = .{},
     computation_meta: std.ArrayListUnmanaged(NodeRef) = .{},
+    computation_meta_keys: std.StringArrayHashMapUnmanaged(usize) = .{},
     private_homes: std.AutoArrayHashMapUnmanaged(NodeRef, SymbolRef) = .{},
     instrumented: std.AutoArrayHashMapUnmanaged(NodeRef, void) = .{},
 
@@ -198,6 +204,8 @@ pub const SynthInstrumenter = struct {
         for (self.namespace_reads.values()) |*reads| deinitNamespaceReads(self.alloc, reads);
         self.namespace_reads.deinit(self.alloc);
         self.computation_meta.deinit(self.alloc);
+        for (self.computation_meta_keys.keys()) |key| self.alloc.free(key);
+        self.computation_meta_keys.deinit(self.alloc);
         self.private_homes.deinit(self.alloc);
         self.instrumented.deinit(self.alloc);
         self.escapes.deinit(self.alloc);
@@ -486,43 +494,75 @@ pub const SynthInstrumenter = struct {
         decl_ref: NodeRef,
         captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void),
     ) !NodeRef {
+        var key = std.ArrayListUnmanaged(u8){};
+        defer key.deinit(self.alloc);
+        var ambient = std.ArrayListUnmanaged([]const u8){};
+        defer ambient.deinit(self.alloc);
+        if (self.ambients.get(decl_ref)) |refs| {
+            for (refs.values()) |ref| {
+                const name = getSlice(self.nodes.at(ref), u8);
+                try ambient.append(self.alloc, name);
+                try key.appendSlice(self.alloc, name);
+                try key.append(self.alloc, 0);
+            }
+        }
+        var narrowed = std.ArrayListUnmanaged(NarrowedModule){};
+        defer narrowed.deinit(self.alloc);
+        if (self.namespace_reads.get(decl_ref)) |reads| {
+            for (captured.keys(), 0..) |sym, i| {
+                const read = reads.get(sym) orelse continue;
+                const names = read orelse continue;
+                try narrowed.append(self.alloc, .{ .capture = i, .names = names.keys() });
+                try key.writer(self.alloc).print("\x01{d}", .{i});
+                for (names.keys()) |name| {
+                    try key.append(self.alloc, 0);
+                    try key.appendSlice(self.alloc, name);
+                }
+            }
+        }
+        if (key.items.len == 0) return 0;
+        const entry = try self.computation_meta_keys.getOrPut(self.alloc, key.items);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try key.toOwnedSlice(self.alloc);
+            entry.value_ptr.* = self.computation_meta.items.len;
+            try self.computation_meta.append(self.alloc, try self.createComputationMeta(entry.value_ptr.*, ambient.items, narrowed.items));
+        }
+        return try self.computationMetaName(entry.value_ptr.*);
+    }
+
+    fn createComputationMeta(self: *@This(), meta_index: usize, ambient: []const []const u8, narrowed: []const NarrowedModule) !NodeRef {
         var props = std.ArrayListUnmanaged(NodeRef){};
         defer props.deinit(self.alloc);
         var items = std.ArrayListUnmanaged(NodeRef){};
         defer items.deinit(self.alloc);
-        if (self.ambients.get(decl_ref)) |ambient| {
-            for (ambient.values()) |ref| {
-                try items.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
-            }
+        for (ambient) |name| {
+            try items.append(self.alloc, try self.factory.createStringLiteral(name));
         }
         if (items.items.len != 0) {
             const names = try self.factory.createArrayLiteralExpression(items.items);
             try props.append(self.alloc, try self.factory.createPropertyAssignment(try self.factory.createIdentifier("ambient"), names));
         }
         items.clearRetainingCapacity();
-        if (self.namespace_reads.get(decl_ref)) |reads| {
-            for (captured.keys(), 0..) |sym, i| {
-                const read = reads.get(sym) orelse continue;
-                const names = read orelse continue;
-                var name_refs = std.ArrayListUnmanaged(NodeRef){};
-                defer name_refs.deinit(self.alloc);
-                for (names.keys()) |name| {
-                    try name_refs.append(self.alloc, try self.factory.createStringLiteral(name));
-                }
-                const index = try self.factory.createNumericLiteral(@as(usize, i));
-                try items.append(self.alloc, try self.factory.createArrayLiteralExpression(&.{index, try self.factory.createArrayLiteralExpression(name_refs.items)}));
+        for (narrowed) |entry| {
+            var name_refs = std.ArrayListUnmanaged(NodeRef){};
+            defer name_refs.deinit(self.alloc);
+            for (entry.names) |name| {
+                try name_refs.append(self.alloc, try self.factory.createStringLiteral(name));
             }
+            const index = try self.factory.createNumericLiteral(entry.capture);
+            try items.append(self.alloc, try self.factory.createArrayLiteralExpression(&.{index, try self.factory.createArrayLiteralExpression(name_refs.items)}));
         }
         if (items.items.len != 0) {
             const entries = try self.factory.createArrayLiteralExpression(items.items);
             try props.append(self.alloc, try self.factory.createPropertyAssignment(try self.factory.createIdentifier("narrowedModules"), entries));
         }
-        if (props.items.len == 0) return 0;
-        var buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "__meta${d}", .{self.computation_meta.items.len});
         const object = try self.factory.createObjectLiteralExpression(props.items);
-        try self.computation_meta.append(self.alloc, try self.factory.createConstVariable(try self.factory.createIdentifier(name), object));
-        return try self.factory.createIdentifier(name);
+        return try self.factory.createConstVariable(try self.computationMetaName(meta_index), object);
+    }
+
+    fn computationMetaName(self: *@This(), meta_index: usize) !NodeRef {
+        var buf: [32]u8 = undefined;
+        return try self.factory.createIdentifier(try std.fmt.bufPrint(&buf, "__meta${d}", .{meta_index}));
     }
 
     fn declaresPrivateName(self: *@This(), class_ref: NodeRef, name: []const u8) bool {
