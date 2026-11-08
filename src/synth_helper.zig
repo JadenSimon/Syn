@@ -32,12 +32,22 @@ fn isFunctionLike(kind: SyntaxKind) bool {
     };
 }
 
+const NamespaceReads = std.AutoArrayHashMapUnmanaged(SymbolRef, ?std.StringArrayHashMapUnmanaged(void));
+
+fn deinitNamespaceReads(alloc: std.mem.Allocator, reads: *NamespaceReads) void {
+    for (reads.values()) |*names| {
+        if (names.*) |*n| n.deinit(alloc);
+    }
+    reads.deinit(alloc);
+}
+
 const Frame = struct {
     decl_ref: NodeRef,
     kind: SyntaxKind,
     threshold: u16,
     captures: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
     ambient: std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef) = .{},
+    namespace_reads: NamespaceReads = .{},
     private_home: SymbolRef = 0,
 };
 
@@ -75,6 +85,8 @@ pub const SynthInstrumenter = struct {
 
     fns: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, void)) = .{},
     ambients: std.AutoArrayHashMapUnmanaged(NodeRef, std.AutoArrayHashMapUnmanaged(SymbolRef, NodeRef)) = .{},
+    namespace_reads: std.AutoArrayHashMapUnmanaged(NodeRef, NamespaceReads) = .{},
+    computation_meta: std.ArrayListUnmanaged(NodeRef) = .{},
     private_homes: std.AutoArrayHashMapUnmanaged(NodeRef, SymbolRef) = .{},
     instrumented: std.AutoArrayHashMapUnmanaged(NodeRef, void) = .{},
 
@@ -104,6 +116,7 @@ pub const SynthInstrumenter = struct {
         var prefix = parser.NodeList.init(&ast.nodes);
         if (v.needs_computation_symbol) prefix.appendRef(try v.createComputationSymbolPolyfill());
         if (v.needs_computation_helper) prefix.appendRef(try v.createComputationHelper());
+        for (v.computation_meta.items) |stmt| prefix.appendRef(stmt);
         if (v.tmp_binding != 0) {
             const stmt = try v.factory.createLetVariable(v.tmp_binding, 0);
             ast.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
@@ -182,6 +195,9 @@ pub const SynthInstrumenter = struct {
         self.fns.deinit(self.alloc);
         for (self.ambients.values()) |*ambient| ambient.deinit(self.alloc);
         self.ambients.deinit(self.alloc);
+        for (self.namespace_reads.values()) |*reads| deinitNamespaceReads(self.alloc, reads);
+        self.namespace_reads.deinit(self.alloc);
+        self.computation_meta.deinit(self.alloc);
         self.private_homes.deinit(self.alloc);
         self.instrumented.deinit(self.alloc);
         self.escapes.deinit(self.alloc);
@@ -458,18 +474,55 @@ pub const SynthInstrumenter = struct {
         const subj = try self.getMicroProgramStr(decl_ref, captured);
         const cap_arr = try self.factory.createArrayLiteralExpression(cap.items);
         const home = self.private_homes.get(decl_ref) orelse 0;
-        const ambient_count = if (self.ambients.get(decl_ref)) |ambient| ambient.count() else 0;
-        if (ambient_count == 0 and home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
-        var names = std.ArrayListUnmanaged(NodeRef){};
-        defer names.deinit(self.alloc);
-        if (ambient_count != 0) {
-            for (self.ambients.get(decl_ref).?.values()) |ref| {
-                try names.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
+        const meta = try self.hoistComputationMeta(decl_ref, captured);
+        if (meta == 0 and home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr});
+        const meta_slot = if (meta != 0) meta else try self.factory.createUndefined();
+        if (home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, meta_slot});
+        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, meta_slot, try self.getCellOrSymbol(home)});
+    }
+
+    fn hoistComputationMeta(
+        self: *@This(),
+        decl_ref: NodeRef,
+        captured: *const std.AutoArrayHashMapUnmanaged(SymbolRef, void),
+    ) !NodeRef {
+        var props = std.ArrayListUnmanaged(NodeRef){};
+        defer props.deinit(self.alloc);
+        var items = std.ArrayListUnmanaged(NodeRef){};
+        defer items.deinit(self.alloc);
+        if (self.ambients.get(decl_ref)) |ambient| {
+            for (ambient.values()) |ref| {
+                try items.append(self.alloc, try self.factory.createStringLiteral(getSlice(self.nodes.at(ref), u8)));
             }
         }
-        const names_arr = try self.factory.createArrayLiteralExpression(names.items);
-        if (home == 0) return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr});
-        return try self.factory.createArrayLiteralExpression(&.{subj, cap_arr, names_arr, try self.getCellOrSymbol(home)});
+        if (items.items.len != 0) {
+            const names = try self.factory.createArrayLiteralExpression(items.items);
+            try props.append(self.alloc, try self.factory.createPropertyAssignment(try self.factory.createIdentifier("ambient"), names));
+        }
+        items.clearRetainingCapacity();
+        if (self.namespace_reads.get(decl_ref)) |reads| {
+            for (captured.keys(), 0..) |sym, i| {
+                const read = reads.get(sym) orelse continue;
+                const names = read orelse continue;
+                var name_refs = std.ArrayListUnmanaged(NodeRef){};
+                defer name_refs.deinit(self.alloc);
+                for (names.keys()) |name| {
+                    try name_refs.append(self.alloc, try self.factory.createStringLiteral(name));
+                }
+                const index = try self.factory.createNumericLiteral(@as(usize, i));
+                try items.append(self.alloc, try self.factory.createArrayLiteralExpression(&.{index, try self.factory.createArrayLiteralExpression(name_refs.items)}));
+            }
+        }
+        if (items.items.len != 0) {
+            const entries = try self.factory.createArrayLiteralExpression(items.items);
+            try props.append(self.alloc, try self.factory.createPropertyAssignment(try self.factory.createIdentifier("narrowedModules"), entries));
+        }
+        if (props.items.len == 0) return 0;
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "__meta${d}", .{self.computation_meta.items.len});
+        const object = try self.factory.createObjectLiteralExpression(props.items);
+        try self.computation_meta.append(self.alloc, try self.factory.createConstVariable(try self.factory.createIdentifier(name), object));
+        return try self.factory.createIdentifier(name);
     }
 
     fn declaresPrivateName(self: *@This(), class_ref: NodeRef, name: []const u8) bool {
@@ -767,6 +820,7 @@ pub const SynthInstrumenter = struct {
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
         try self.ambients.put(self.alloc, ref, frame.ambient);
+        try self.namespace_reads.put(self.alloc, ref, frame.namespace_reads);
         if (frame.private_home != 0) try self.private_homes.put(self.alloc, ref, frame.private_home);
     }
 
@@ -847,7 +901,17 @@ pub const SynthInstrumenter = struct {
         }
     }
 
-    fn classifyReference(self: *@This(), ref: NodeRef) !void {
+    fn recordNamespaceRead(self: *@This(), frame: *Frame, sym: SymbolRef, member: NodeRef) !void {
+        const entry = try frame.namespace_reads.getOrPut(self.alloc, sym);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        if (entry.value_ptr.*) |*names| {
+            if (member != 0) return try names.put(self.alloc, getSlice(self.nodes.at(member), u8), {});
+            names.deinit(self.alloc);
+            entry.value_ptr.* = null;
+        }
+    }
+
+    fn classifyReference(self: *@This(), ref: NodeRef, member: NodeRef) !void {
         const sym = self.binder.getSymbol(ref) orelse return;
         if (sym == 0) return;
         const s = self.binder.symbols.at(sym);
@@ -886,6 +950,7 @@ pub const SynthInstrumenter = struct {
         }
 
         const is_this = self.nodes.at(ref).kind == .this_keyword;
+        const is_namespace_import = s.hasFlag(.imported) and s.hasFlag(.namespace);
         const depth = s.getScopeDepth();
         for (self.frames.items) |*frame| {
             if (depth < frame.threshold) {
@@ -898,6 +963,7 @@ pub const SynthInstrumenter = struct {
                     }
                 }
                 try frame.captures.put(self.alloc, sym, {});
+                if (is_namespace_import) try self.recordNamespaceRead(frame, sym, member);
                 if (is_this) {
                     try self.this_symbols.put(self.alloc, sym, {});
                 }
@@ -956,6 +1022,7 @@ pub const SynthInstrumenter = struct {
         const frame = self.frames.pop();
         try self.fns.put(self.alloc, ref, frame.captures);
         try self.ambients.put(self.alloc, ref, frame.ambient);
+        try self.namespace_reads.put(self.alloc, ref, frame.namespace_reads);
         if (frame.private_home != 0) try self.private_homes.put(self.alloc, ref, frame.private_home);
     }
 
@@ -1067,7 +1134,7 @@ pub const SynthInstrumenter = struct {
 
             .shorthand_property_assignment => {
                 const inner_ref = parser.unwrapRef(node);
-                try self.classifyReference(inner_ref);
+                try self.classifyReference(inner_ref, 0);
                 if (self.replacements.get(inner_ref)) |v| {
                     _ = self.replacements.swapRemove(inner_ref);
                     const assign = try self.factory.createPropertyAssignment(inner_ref, v);
@@ -1101,7 +1168,15 @@ pub const SynthInstrumenter = struct {
                 try forEachChild(self.nodes, node, self);
             },
 
-            .identifier, .this_keyword => try self.classifyReference(ref),
+            .property_access_expression => {
+                if (self.transforming) return try self.visitChildren(node);
+                const d = getPackedData(node);
+                if (self.nodes.at(d.left).kind != .identifier) return try self.visitChildren(node);
+                try self.classifyReference(d.left, d.right);
+                try self.visit(self.nodes.at(d.right), d.right);
+            },
+
+            .identifier, .this_keyword => try self.classifyReference(ref, 0),
             .private_identifier => if (!self.transforming) try self.classifyPrivateName(node),
             .super_keyword => {},
             .export_assignment => {
