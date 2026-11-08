@@ -393,7 +393,7 @@ function mirrorCell(handle: number): void {
     }
     writeRuntimeHeap(handle, bytes, relocations)
 }
-const pstackRegionBytes = 1 << 24
+export const pstackRegionBytes = Math.floor(heap.pstackWindowBytes / PstackCount / guardBytes) * guardBytes - guardBytes
 const pstackCells = new Map<number, number>()
 const pstackRegions = new Map<number, number>()
 let pstackBlock = 0
@@ -403,6 +403,7 @@ function pstackSpan(): number {
 function mapPstackBlock(): number {
     getNativeBootstraps()
     const span = pstackSpan()
+    intrinsics.assert(span * PstackCount - guardBytes <= heap.pstackWindowBytes, 'native: every pstack byte must be addressable by a pstack word')
     const base = Number(nativeMapper(span * PstackCount))
     if (!base || base === -1) return 0
     let stack = 0
@@ -459,7 +460,7 @@ function staticBox(value: number): number {
 }
 
 function staticWord(at: number): number {
-    return ((at - (pstackCell(0) + 8)) * 2 + heap.pstackWordTag + 1) >>> 0
+    return heap.pstackWord(at - pstack0Base())
 }
 
 interface StaticTail {
@@ -743,11 +744,11 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
             const pointer = operand(0)
             if (isStaticPointer(pointer) && pointer.region !== staticRegion()) throw `static: %${id} encodes an address outside static memory`
             const ptr = address(0)
-            value = !ptr ? BigInt(heap.undefinedWord) : BigInt.asUintN(32, (ptr - int(1)) * BigInt(2) + BigInt(heap.pstackWordTag + 1))
+            value = BigInt(!ptr ? heap.undefinedWord : heap.pstackWord(Number(ptr - int(1))))
             break
         }
         case NodeOp.decode:
-            value = int(0) === BigInt(heap.undefinedWord) ? BigInt(0) : staticPointer(staticRegion(), ((int(0) >> BigInt(1)) & BigInt((1 << 28) - 1)) + int(1))
+            value = int(0) === BigInt(heap.undefinedWord) ? BigInt(0) : staticPointer(staticRegion(), BigInt(heap.pstackOffset(Number(BigInt.asUintN(32, int(0))))) + int(1))
             break
         case NodeOp.crc32:
             value = BigInt(intrinsics.crc32Bits(Number(BigInt.asUintN(32, int(0))), int(1), intrinsics.intrinsicBitWidth(getLiteral(graph, n, 2))))
@@ -969,7 +970,7 @@ function evaluateStatics(program: ProgramGraph): void {
         const raw = pointer ? pointer.address : word as bigint
         staticWrite(image.staticTable.base + slot * 8, new Uint8Array(new BigUint64Array([raw]).buffer), pointer ? [{ offset: 0, region: pointer.region, scale: 1 }] : [])
         words.set(slot, word)
-        const address = new BigUint64Array([pointer ? raw : ((raw >> BigInt(1)) & BigInt((1 << 28) - 1)) + BigInt(pstackCell(0) + 8)])
+        const address = new BigUint64Array([pointer ? raw : BigInt(heap.pstackOffset(Number(BigInt.asUintN(32, raw))) + pstack0Base())])
         if (inStaticRegion(image.staticRegions, Number(address[0]), 8)) image.staticObjects.push({ slot, word: pointer ? undefined : Number(raw), address: Number(address[0]) })
         const held = [{ offset: 0, region: pointer ? pointer.region : staticRegion(), scale: 1 }]
         for (const [at, field] of image.staticFields) if (field === slot) staticWrite(at, new Uint8Array(address.buffer), held)
@@ -1020,7 +1021,7 @@ function evaluateStatics(program: ProgramGraph): void {
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op !== NodeOp.decode || !staticWords.has(getRef(n, 0)) || getRef(n, 1)) continue
             const word = staticWords.get(getRef(n, 0))!
-            const address = ((word >>> 1) & ((1 << 28) - 1)) + getLiteral(graph, n, 1)
+            const address = heap.pstackOffset(word) + getLiteral(graph, n, 1)
             known.set(id, word === heap.undefinedWord ? { literal: 0 } : insertNode(graph, relocatedNode(graph, image, staticRegion(), address)))
         }
         const rewritten: number[] = []
@@ -2995,7 +2996,11 @@ export function computationKey(roots: Record<string, Function>): string {
         if (v === null || (typeof v !== 'object' && typeof v !== 'function') || seen.has(v)) continue
         seen.add(v)
         if (typeof v === 'object') {
-            if (Object.prototype.toString.call(v) === '[object Module]') methods(v)
+            if (Object.prototype.toString.call(v) !== '[object Module]') continue
+            methods(v)
+            for (const [key, value] of Object.entries(v)) {
+                if (value === null || (typeof value !== 'object' && typeof value !== 'function')) sources.add(`${key} = ${String(value)}`)
+            }
             continue
         }
         if (!intrinsics.hasComputation(v)) continue
@@ -9309,11 +9314,13 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
         return memberCount(returned) === 1 && returned.shapes.length === 1 && plannedShape(plan, returned) !== undefined
     }
     const modes = new Map<Function, ReturnMode>()
-    const producing = new Set<Function>()
+    const pending = new Map<Function, number>()
+    const deciding: Function[] = []
+    const passes = new Set<Function>()
     function producesRaw(fn: Function): boolean {
-        if (producing.has(fn)) return false
-        producing.add(fn)
-        defer producing.delete(fn)
+        const index = deciding.length
+        deciding.push(fn)
+        pending.set(fn, index)
         const unit = planned.units.get(fn)!
         const graph = binder.graphOf(fn)
         const arrivals = paramArrivals(graph)
@@ -9326,27 +9333,43 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
             if (n.op === NodeOp.after) return raw(getRef(n, countIds(n) - 1))
             if (n.op === NodeOp.select) return raw(getRef(n, 1)) && raw(getRef(n, 2))
             if (n.op === NodeOp.ret || n.op === NodeOp.inlined) return raw(getRef(n, 0))
-            if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.literal) return true
+            if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.literal || n.op === NodeOp.void) return true
             if (rt.sliceOf(graph, n) === rt.Op.sliceRead) return rawSlice(unit.slices, id)
             if (n.op === NodeOp.heapHandle && !getRef(n, 0)) return heap.isNullishHandle(getLiteral(graph, n, 0) as intrinsics.Handle) || unit.allocations.has(id)
             if (n.op === NodeOp.param) return graph.blocks[0].params.includes(id) || (arrivals.has(id) && arrivals.get(id)!.every(raw))
-            if (n.op === NodeOp.call || n.op === NodeOp.getProp) {
+            if (n.op === NodeOp.call || n.op === NodeOp.getProp || n.op === NodeOp.rt) {
                 const callees = unit.calls.get(id)
-                return !!callees?.size && [...callees].every(callee => modeOf(planned.functions.get(callee)!) === 'raw')
+                return !!callees?.size && [...callees].every(callee => {
+                    const target = planned.functions.get(callee)!
+                    const mode = modeOf(target)
+                    const open = pending.get(target)
+                    if (open !== undefined) pending.set(fn, Math.min(pending.get(fn)!, open))
+                    return open !== undefined || mode === 'raw' || (mode === 'keep' && callee.returns.kind === 'pointer')
+                })
             }
             return false
         }
+        let ok = true
         for (const [id, n] of nodeEntries(graph)) {
-            if (n.op === NodeOp.ret && getRef(n, 0) && !raw(id)) return false
+            if (n.op !== NodeOp.ret || !getRef(n, 0) || raw(id)) continue
+            ok = false
+            break
         }
-        return true
+        if (ok) passes.add(fn)
+        if (pending.get(fn)! < index) return ok
+        const members = deciding.splice(index)
+        const decided = members.every(member => passes.has(member))
+        for (const member of members) pending.delete(member)
+        for (const member of members) modes.set(member, decided ? 'raw' : 'encoded')
+        return decided
     }
     function modeOf(fn: Function): ReturnMode {
         const known = modes.get(fn)
         if (known !== undefined) return known
+        if (pending.has(fn)) return 'raw'
         const unit = planned.units.get(fn)!
         const mode: ReturnMode = constructsOutOfLine(fn) ? 'keep' : returnsTag(unit) ? 'tagged' : floatUnion(unit.returns) ? 'record' : tracer.stateOf(originOf(fn)).stubbed ? 'keep' : agreedPointer(fn) && (!unit.returns.nullable || producesRaw(fn)) ? 'raw' : 'encoded'
-        modes.set(fn, mode)
+        if (!pending.has(fn)) modes.set(fn, mode)
         return mode
     }
     for (const fn of planned.units.keys()) modeOf(fn)
@@ -13721,7 +13744,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
 }
 
 const imageMagic = 'SYNIMAGE'
-const imageVersion = 1
+const imageVersion = 2
 const ImageSection = { regions: 1, memory: 2, relocations: 3, entries: 4, symbols: 5 }
 const EntryFlags = { float: 1, init: 2, word: 4, string: 8 }
 const regionKindNames = ['code', 'heap', 'pstack', 'table']
@@ -13732,14 +13755,8 @@ function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[], cod
     // XXX literal words and immediates are not checked against the heap, and literal words not at all: bases are coarsely aligned (the heap is often exactly 0x300000000), so base + k collides with packed constants; the self-image check catches base-dependent words instead
     for (const region of nativeRegions) (region.kind === RegionKind.heap ? heaps : ranges).push([BigInt(region.base), BigInt(region.base + region.size), `${regionKindNames[region.kind]} region ${region.index}`])
     for (const [base, size] of traceModule.symbolicRanges) ranges.push([BigInt(base), BigInt(base + size), 'symbolic memory'])
-    const pstack = nativeRegions.filter(region => region.kind === RegionKind.pstack).map(region => BigInt(region.base))
-    const tagged = BigInt(heap.pstackWordTag + 1)
     const inRange = (value: bigint): string | undefined => {
         for (const [base, end, what] of ranges) if (value >= base && value < end) return what
-        for (const base of pstack) {
-            const scaled = BigInt.asIntN(64, value) - tagged
-            if (scaled <= -BigInt(2) * base && scaled > -BigInt(2) * (base + BigInt(pstackRegionBytes))) return 'scaled pstack base'
-        }
     }
     const relocated = new Set(relocations.map(relocation => `${relocation.at}:${relocation.offset}`))
     for (let at = 0; at < regions.length; at++) {
@@ -13896,10 +13913,12 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
     }
     section(ImageSection.relocations, relocations.length)
     for (const relocation of relocations) {
+        const { numerator, shift } = scaleParts(relocation.scale)
         u32(relocation.at)
         u32(relocation.target)
         u64(relocation.offset)
-        u64(relocation.scale)
+        u32(numerator)
+        u32(shift)
     }
     const entries = [...capture.roots.map(root => ({ ...root, init: false })), ...(capture.init === undefined ? [] : [{ name: staticInitName, offset: capture.init, float: false, floats: 0, returns: undefined, init: true }])]
     section(ImageSection.entries, entries.length)
@@ -14014,8 +14033,9 @@ function parseImage(bytes: Uint8Array): ParsedImage {
                 const where = u32()
                 const target = u32()
                 const offset = Number(u64())
-                const scale = Number(BigInt.asIntN(64, u64()))
-                relocations.push({ at: where, offset, target, scale })
+                const numerator = Number(BigInt.asIntN(32, BigInt(u32())))
+                const shift = u32()
+                relocations.push({ at: where, offset, target, scale: numerator / 2 ** shift })
             } else if (kind === ImageSection.entries) {
                 const offset = Number(u64())
                 const flags = u32()
@@ -14040,14 +14060,27 @@ function parseImage(bytes: Uint8Array): ParsedImage {
     return { regions, relocations, entries, symbols }
 }
 
+function scaleParts(scale: number): { numerator: number, shift: number } {
+    let numerator = scale
+    let shift = 0
+    while (!Number.isInteger(numerator)) {
+        if (shift === 31) throw `native: relocation scale ${scale} is not a fraction over a power of two`
+        numerator *= 2
+        shift++
+    }
+    if (numerator < -(2 ** 31) || numerator >= 2 ** 31) throw `native: relocation scale ${scale} does not fit an image relocation`
+    return { numerator, shift }
+}
+
 function relocateImage(image: ParsedImage, bases: number[]): void {
     const regions = image.regions
     for (const relocation of image.relocations) {
         const segment = segmentAt(regions[relocation.at].segments, relocation.offset)
         if (!segment || relocation.offset + 8 > segment.offset + segment.bytes.length) throw `native: relocation at ${relocation.offset} is outside the image memory`
         const word = new DataView(segment.bytes.buffer, segment.bytes.byteOffset + relocation.offset - segment.offset, 8)
-        const delta = BigInt(bases[relocation.target] - regions[relocation.target].base) * BigInt(relocation.scale)
-        word.setBigUint64(0, BigInt.asUintN(64, word.getBigUint64(0, true) + delta), true)
+        const delta = (bases[relocation.target] - regions[relocation.target].base) * relocation.scale
+        if (!Number.isSafeInteger(delta)) throw `native: relocation at ${relocation.offset} moves by ${delta}, not a whole number of bytes`
+        word.setBigUint64(0, BigInt.asUintN(64, word.getBigUint64(0, true) + BigInt(delta)), true)
     }
 }
 

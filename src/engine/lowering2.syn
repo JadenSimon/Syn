@@ -13006,10 +13006,10 @@ function pstackCellOperand(g: Graph, id: number, n: GraphNode): Operand {
 
 export const PstackGranule = 16
 
-export function pstackExtent(g: Graph, size: Operand): Operand {
-    if (typeof size !== 'number') return { literal: Math.ceil(size.literal / PstackGranule) * PstackGranule }
-    if (2 ** lowZeros(g, size, 0) >= PstackGranule) return size
-    return addNode(g, NodeOp.and, [addNode(g, NodeOp.add, [size, { literal: PstackGranule - 1 }]), { literal: -PstackGranule }])
+export function pstackExtent(g: Graph, size: Operand, granule = PstackGranule): Operand {
+    if (typeof size !== 'number') return { literal: Math.ceil(size.literal / granule) * granule }
+    if (2 ** lowZeros(g, size, 0) >= granule) return size
+    return addNode(g, NodeOp.and, [addNode(g, NodeOp.add, [size, { literal: granule - 1 }]), { literal: -granule }])
 }
 
 function expandPstacks(g: Graph): boolean {
@@ -13033,7 +13033,7 @@ function expandPstacks(g: Graph): boolean {
             putCopy(g, id, n, [known ? ordering : base, base], NodeOp.after)
             return
         }
-        const top: Operand = sized ? addNode(g, NodeOp.add, [base, getOperand(g, n, 3)]) : base
+        const top: Operand = sized ? addNode(g, NodeOp.add, [base, pstackExtent(g, getOperand(g, n, 3), 1 << heap.pstackWordShift)]) : base
         const store = addNode(g, NodeOp.store, [ordering, cell, 0, top], Types.u64)
         const fresh = rebases ? base : addNode(g, NodeOp.mem, [base, getOperand(g, n, 3)], Types.u64)
         putCopy(g, id, n, [store, fresh], NodeOp.after)
@@ -13090,12 +13090,6 @@ function bindCallContext(g: Graph, register: number): void {
 function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
     if (!gn.mayHave(g, NodeOp.box, NodeOp.unbox, NodeOp.encode, NodeOp.decode)) return false
     const rewritten: number[] = []
-    function node(op: NodeOp, ref: Operand, literal: number): number {
-        return addNode(g, op, [ref, { literal: literal }])
-    }
-    function pstackOffset(ref: number): number {
-        return addNode(g, NodeOp.convert, [ref], Types.u28)
-    }
     const derefs = new Map<number, number[]>()
     const others = new Set<number>()
     for (const [id, n] of nodeEntries(g)) {
@@ -13136,10 +13130,10 @@ function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
         if (n.op !== NodeOp.encode && n.op !== NodeOp.decode) continue
         const value = getOperand(g, n, 0)
         const base = getLiteral(g, n, 1)
-        assert(!getRef(n, 1) && base >= 0, `lowering: ${opName(n.op)} %${id} needs a constant heap base`)
+        assert(!getRef(n, 1) && base >= 0 && base % (1 << heap.pstackWordShift) === 0, `lowering: ${opName(n.op)} %${id} needs a constant, aligned heap base`)
         const coded = regionSlot ? relocatedCodec(g, n, value, base, regionSlot) : n.op === NodeOp.decode
-            ? node(NodeOp.add, pstackOffset(node(NodeOp.ushr, value, 1)), base)
-            : node(NodeOp.add, node(NodeOp.shl, value, 1), heap.pstackWordTag + 1 - 2 * base)
+            ? decodedPstack(g, value, { literal: base })
+            : encodedPstack(g, value, { literal: heap.pstackWordTag + 1 - base / (1 << (heap.pstackWordShift - 1)) })
         // TODO: in debug panic on a null handle instead of UB
         for (const user of others.has(id) ? [] : derefs.get(id) ?? []) {
             const u = getNode(g, user)!
@@ -13159,17 +13153,25 @@ function expandCodecs(g: Graph, regionSlot?: RegionSlot): boolean {
     return rewritten.length > 0
 }
 
+function decodedPstack(g: Graph, word: Operand, base: Operand): number {
+    const offset = addNode(g, NodeOp.convert, [addNode(g, NodeOp.ushr, [word, { literal: 1 }])], Types.u28)
+    return addNode(g, NodeOp.add, [addNode(g, NodeOp.shl, [offset, { literal: heap.pstackWordShift }]), base])
+}
+
+function encodedPstack(g: Graph, pointer: Operand, origin: Operand): number {
+    return addNode(g, NodeOp.add, [addNode(g, NodeOp.ushr, [pointer, { literal: heap.pstackWordShift - 1 }]), origin])
+}
+
 function relocatedCodec(g: Graph, n: GraphNode, value: Operand, base: number, regionSlot: RegionSlot): number {
     const known = typeof value === 'number' ? getNode(g, value) : undefined
     const literal = typeof value !== 'number' ? value.literal : known?.op === NodeOp.literal ? getLiteral(g, known, 0) : undefined
     if (n.op === NodeOp.decode) {
-        if (literal !== undefined && literal !== heap.undefinedWord) return relocatedLiteral(g, regionSlot, base + ((literal >>> 1) & ((1 << 28) - 1)))
-        const offset = addNode(g, NodeOp.convert, [addNode(g, NodeOp.ushr, [value, { literal: 1 }])], Types.u28)
-        return addNode(g, NodeOp.add, [offset, relocatedLiteral(g, regionSlot, base)])
+        if (literal !== undefined && literal !== heap.undefinedWord) return relocatedLiteral(g, regionSlot, base + heap.pstackOffset(literal))
+        return decodedPstack(g, value, relocatedLiteral(g, regionSlot, base))
     }
     const pointer = known?.op === NodeOp.poolEntry && countIds(known) > 1 ? getLiteral(g, known, 1) : undefined
-    if (pointer !== undefined) return addNode(g, NodeOp.literal, [{ literal: (pointer - base) * 2 + heap.pstackWordTag + 1 }])
-    return addNode(g, NodeOp.add, [addNode(g, NodeOp.shl, [value, { literal: 1 }]), relocatedLiteral(g, regionSlot, base, -2, heap.pstackWordTag + 1)])
+    if (pointer !== undefined) return addNode(g, NodeOp.literal, [{ literal: heap.pstackWord(pointer - base) }])
+    return encodedPstack(g, value, relocatedLiteral(g, regionSlot, base, -1 / (1 << (heap.pstackWordShift - 1)), heap.pstackWordTag + 1))
 }
 
 interface ArithForm { 
