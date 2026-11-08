@@ -9,7 +9,7 @@ import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiter
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import { AllocKind, boundCallee, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
+import { AllocKind, boundCallee, FieldForm, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -36,6 +36,7 @@ enum ScalarFlag {
     yes = 256,
     nan = 512,
     inf = 1024,
+    null = 2048,
 }
 
 const FloatFlags = ScalarFlag.float | ScalarFlag.inf | ScalarFlag.nan
@@ -203,6 +204,7 @@ enum ArgClass {
     function = 64,
     unknown = 128,
     many = 256,
+    null = 512,
 }
 
 interface Listener {
@@ -287,7 +289,8 @@ interface FlowState {
     cycleStamp: number
     originMask: number[]
     stringSite: number[]
-    fieldForms: Map<number, string[]>
+    fieldForms: Map<number, number>
+    fieldStoreTypes: Map<number, number[]>
     fieldReaders: Map<number, number[]>
     fieldWriters: Map<number, number[]>
     fieldStored: Set<number>
@@ -437,6 +440,7 @@ function scalar(flags: number, lo: number, hi: number, strs: number[], nums: num
 
 const NONE = scalar(0, 0, 0, [])
 const UNDEF = scalar(ScalarFlag.undef, 0, 0, [])
+const NULL = scalar(ScalarFlag.null, 0, 0, [])
 const UNKNOWN = scalar(ScalarFlag.unknown, 0, 0, [])
 const FLOAT = scalar(ScalarFlag.float, 0, 0, [])
 const F64 = scalar(FloatFlags, 0, 0, [])
@@ -1076,7 +1080,7 @@ function constantBuffer(origin: number, s: number, value: Handle, key: Handle): 
     flow.originSeen[buffer] = flow.originSeen[origin]
     for (let i = 0; i < elements.length; i++) {
         const f = fieldSlot(buffer, elements.length > maxTuple ? elemKey : posKey(i))
-        addForm(f, 'vm_value')
+        addStoreType(f, Types.vm_value)
         heapValue(elements[i], f, 0, undefined, 0)
     }
     addOrigin(s, buffer)
@@ -1207,26 +1211,33 @@ function seedField(origin: number, key: number, s: number): void {
     if (flow.cut) cutShapeField(origin, key, s)
     if (key < 0) return
     const definite = flow.originKind[origin] === OriginKind.fresh ? flow.definiteKeys.get(flow.originCell[origin]) : undefined
-    if (definite && !definite.includes(key as Handle)) addForm(s, 'void')
+    if (definite && !definite.includes(key as Handle)) addForm(s, FieldForm.absent)
     const state = heapState(origin)
     if (state === undefined) return
     const descriptor = heap.getOwnProperty(state, key as Handle)
     if (!descriptor) return
     const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
     if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return
-    addForm(s, 'init')
+    addForm(s, FieldForm.init)
     if (constantBuffer(origin, s, d.slot0 as Handle, key as Handle)) return
     const owner = flow.originOwner[origin]
     const node = owner && flow.originKind[origin] === OriginKind.fresh && heap.isBoxedF64(d.slot0 as Handle) ? getNode(owner.g, owner.allocNodes.get(flow.originCell[origin]) ?? 0) : undefined
     heapValue(d.slot0 as Handle, s, flow.originQual[origin], owner, origin, node && heapField(owner!.g, node, key))
 }
 
-function addForm(field: number, form: string): void {
-    let list = flow.fieldForms.get(field)
-    if (!list) flow.fieldForms.set(field, list = [])
-    if (list.includes(form)) return
+function addForm(field: number, form: FieldForm): void {
+    const forms = flow.fieldForms.get(field) ?? 0
+    if (forms & form) return
     if (frozen(field)) return block(field)
-    list.push(form)
+    flow.fieldForms.set(field, forms | form)
+}
+
+function addStoreType(field: number, type: number): void {
+    let list = flow.fieldStoreTypes.get(field)
+    if (!list) flow.fieldStoreTypes.set(field, list = [])
+    if (list.includes(type)) return
+    if (frozen(field)) return block(field)
+    list.push(type)
 }
 
 function heldStatic(init: Function): number {
@@ -1242,7 +1253,7 @@ function readField(field: number, target: number): void {
         copyEdge(flow.instances[heldStatic(init)].ret, field)
     }
     copyEdge(field, target)
-    if (flow.fieldForms.get(field)?.includes('void')) addConst(target, UNDEF)
+    if ((flow.fieldForms.get(field) ?? 0) & FieldForm.absent) addConst(target, UNDEF)
     fieldReader(field, target)
 }
 
@@ -1260,9 +1271,10 @@ function forwardedSlot(part: number): number {
     return at(instOfSlot(slot), x.args[0])
 }
 
-function writeField(field: number, value: number, writer: number, form: string, stored: boolean): void {
+function writeField(field: number, value: number, writer: number, type: number | undefined, stored: boolean): void {
     copyEdge(value, field)
-    addForm(field, form)
+    if (type === undefined) addForm(field, FieldForm.prop)
+    else addStoreType(field, type)
     if (stored && !flow.fieldStored.has(field) && frozen(field)) block(field)
     else if (stored) flow.fieldStored.add(field)
     let list = flow.fieldWriters.get(field)
@@ -1287,6 +1299,7 @@ function seedFrom(creator: Instance, node: number, s: number): void {
 }
 
 function heapValue(value: Handle, s: number, qual: number, owner: Summary | undefined, seeded: number, field?: Operand): void {
+    if (value === heap.nullHandle) return addConst(s, NULL)
     if (!value || heap.isNullishHandle(value)) return addConst(s, UNDEF)
     const init = flow.host.session.statics.get(value)
     if (init && flow.host.binder.traceable(init)) {
@@ -1566,7 +1579,8 @@ function exprOfNode(s: Summary, id: number): number {
         e = expr(s, ExprOp.union, id, 0, 0, 0, [], 0)
     } else if (op === NodeOp.heapHandle) {
         const cell = getLiteral(g, n, 0)
-        if (heap.isNullishHandle(cell as Handle)) e = konst(s, UNDEF)
+        if (cell === heap.nullHandle) e = konst(s, NULL)
+        else if (heap.isNullishHandle(cell as Handle)) e = konst(s, UNDEF)
         else if (heap.isString(cell as Handle)) e = expr(s, ExprOp.konst, id, strScalar(cell), 0, 0, [], strOrigin())
         else if (s.fresh.has(cell)) {
             e = expr(s, ExprOp.alloc, id, cell, 0, 0, [], 0)
@@ -1745,6 +1759,8 @@ enum GuardFlag {
     notNaN = 67108864,
     onlyNaN = 134217728,
     lacksText = 268435456,
+    isNull = 536870912,
+    notNull = 1073741824,
 }
 
 function computeRegions(s: Summary): GraphRegions {
@@ -1840,7 +1856,7 @@ function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
         }
         return
     }
-    if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.hasPrototype && getRef(n, 2)) {
+    if (n.op === NodeOp.rt && (getLiteral(g, n, 1) === RtOp.hasPrototype || getLiteral(g, n, 1) === RtOp.nullish) && getRef(n, 2)) {
         out.add(getRef(n, 2))
         return
     }
@@ -1973,7 +1989,7 @@ function guardOf(flags: number, lo: number, hi: number, picks: number[], protos:
     return guard
 }
 
-const excludesObjects = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.notObject | GuardFlag.isBoolean
+const excludesObjects = GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isNull | GuardFlag.notObject | GuardFlag.isBoolean
 
 function holdsProto(guard: Guard, proto: number): boolean {
     if (guard.protos?.includes(proto)) return true
@@ -2003,9 +2019,11 @@ function joinGuard(a: Guard, b: Guard): Guard {
 
 function contradicts(flags: number): boolean {
     if ((flags & GuardFlag.truthy) && (flags & GuardFlag.falsy)) return true
-    if ((flags & GuardFlag.nullish) && (flags & (GuardFlag.defined | GuardFlag.truthy | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction))) return true
+    if ((flags & (GuardFlag.nullish | GuardFlag.isUndefined | GuardFlag.isNull)) && (flags & (GuardFlag.defined | GuardFlag.truthy | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction))) return true
+    if ((flags & GuardFlag.isUndefined) && (flags & (GuardFlag.isObject | GuardFlag.notUndefined | GuardFlag.isNull))) return true
+    if ((flags & GuardFlag.isNull) && (flags & (GuardFlag.notNull | GuardFlag.notObject))) return true
     if ((flags & GuardFlag.isFloat) && (flags & GuardFlag.notFloat)) return true
-    if ((flags & GuardFlag.onlyNaN) && (flags & (GuardFlag.notNaN | GuardFlag.truthy | GuardFlag.nullish))) return true
+    if ((flags & GuardFlag.onlyNaN) && (flags & (GuardFlag.notNaN | GuardFlag.truthy | GuardFlag.nullish | GuardFlag.isUndefined | GuardFlag.isNull))) return true
     return false
 }
 
@@ -2020,6 +2038,7 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     if (n.op === NodeOp.param) return arrivalGuard(s, id, ref, positive, calls)
     const proto = protoGuard(s, n, ref, positive)
     if (proto) return proto
+    if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.nullish && getRef(n, 2) === ref) return { flags: positive ? GuardFlag.nullish : GuardFlag.defined, lo: MinI64, hi: MaxU64, picks: [] }
     if (n.op !== NodeOp.eq && n.op !== NodeOp.ne && n.op !== NodeOp.lt && n.op !== NodeOp.le && n.op !== NodeOp.gt && n.op !== NodeOp.ge) return noGuard
     const equal = n.op === NodeOp.eq ? positive : n.op === NodeOp.ne ? !positive : positive
     const a = getRef(n, 0)
@@ -2052,7 +2071,9 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
         return positive ? deadGuard : noGuard
     }
     if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
-        if (otherRef && heap.isNullishHandle(constantCell(s, otherRef) as intrinsics.Handle)) return { flags: equal ? GuardFlag.nullish : GuardFlag.defined, lo: MinI64, hi: MaxU64, picks: [] }
+        const nullish = otherRef ? constantCell(s, otherRef) : -1
+        if (nullish === heap.nullHandle) return { flags: equal ? GuardFlag.isNull : GuardFlag.notNull, lo: MinI64, hi: MaxU64, picks: [] }
+        if (otherRef && heap.isNullishHandle(nullish as intrinsics.Handle)) return { flags: equal ? GuardFlag.isUndefined : GuardFlag.notUndefined, lo: MinI64, hi: MaxU64, picks: [] }
         const text = otherRef ? constantCell(s, otherRef) : -1
         if (!equal && text > 1 && heap.isString(text as intrinsics.Handle)) return { flags: 0, lo: MinI64, hi: MaxU64, picks: [], protos: [-text] }
         const truth = otherRef ? boolLiteral(g, otherRef) : -1
@@ -3058,7 +3079,7 @@ function coercedScalar(slot: number, value: (s: number) => number, originsOf: (s
     const t = value(slot)
     const f = scalars.flags[t]
     const converted = convertedMembers(t, stringsIn(t, originsOf(slot)))
-    if (converted === NONE && !(f & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.undef | ScalarFlag.void | ScalarFlag.no | ScalarFlag.yes))) return t
+    if (converted === NONE && !(f & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null | ScalarFlag.no | ScalarFlag.yes))) return t
     const numbers = scalar(f & (ScalarFlag.int | FloatFlags | ScalarFlag.unknown), scalars.lo[t], scalars.hi[t], [], scalars.nums[t])
     return unite(boolNumbers(scalar(f & (ScalarFlag.no | ScalarFlag.yes), 0, 0, [])), unite(numbers, converted))
 }
@@ -3207,7 +3228,7 @@ function pickRejects(f: number, truthy: number): boolean {
     }
     const objects = flow.slotOrigins[f].length > 0
     const fl = scalars.flags[t]
-    const falsy = !objects && !(fl & ~(ScalarFlag.undef | ScalarFlag.void | ScalarFlag.int | ScalarFlag.no)) && (!(fl & ScalarFlag.int) || (scalars.lo[t] === 0 && scalars.hi[t] === 0))
+    const falsy = !objects && !(fl & ~(ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null | ScalarFlag.int | ScalarFlag.no)) && (!(fl & ScalarFlag.int) || (scalars.lo[t] === 0 && scalars.hi[t] === 0))
     const truthyOnly = !(fl & ~(ScalarFlag.int | ScalarFlag.yes)) && (!(fl & ScalarFlag.int) || scalars.lo[t] > 0 || scalars.hi[t] < 0) && (objects || (fl & (ScalarFlag.int | ScalarFlag.yes)) !== 0)
     return truthy ? falsy && (t !== NONE || objects) : truthyOnly
 }
@@ -3228,7 +3249,7 @@ function recheckPicks(f: number): void {
 
 function originPasses(origin: number, flags: number, proto: number): boolean {
     if (flags & GuardFlag.widened) return flow.originKind[origin] === OriginKind.str
-    if (flags & (GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isUndefined | GuardFlag.isBoolean)) return false
+    if (flags & (GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isUndefined | GuardFlag.isNull | GuardFlag.isBoolean)) return false
     const k = flow.originKind[origin]
     const str = k === OriginKind.str
     const fn = !str && !!originHostFn(origin)
@@ -3250,7 +3271,9 @@ function unknownKind(flags: number): number {
     if (flags & GuardFlag.isNumber) return unite(I64, F64)
     if (flags & GuardFlag.isString) return ANYSTR
     if (flags & GuardFlag.isBoolean) return BOOL
-    if (flags & (GuardFlag.isUndefined | GuardFlag.nullish)) return UNDEF
+    if (flags & GuardFlag.isUndefined) return UNDEF
+    if (flags & GuardFlag.isNull) return NULL
+    if (flags & GuardFlag.nullish) return unite(UNDEF, NULL)
     return UNKNOWN
 }
 
@@ -3268,7 +3291,10 @@ function filterScalar(t: number, flags: number, lo: number, hi: number, global =
     let thi = scalars.hi[t]
     let strs = scalars.strs[t]
     if (flags & (GuardFlag.truthy | GuardFlag.defined | GuardFlag.notUndefined | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.bounded)) f = f & ~(ScalarFlag.undef | ScalarFlag.void)
-    if (flags & (GuardFlag.nullish | GuardFlag.isUndefined)) f = f & (ScalarFlag.undef | ScalarFlag.void)
+    if (flags & (GuardFlag.truthy | GuardFlag.defined | GuardFlag.notNull | GuardFlag.isUndefined | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.notObject | GuardFlag.isFunction | GuardFlag.bounded)) f = f & ~ScalarFlag.null
+    if (flags & GuardFlag.nullish) f = f & (ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null)
+    if (flags & GuardFlag.isUndefined) f = f & (ScalarFlag.undef | ScalarFlag.void)
+    if (flags & GuardFlag.isNull) f = f & ScalarFlag.null
     if (flags & GuardFlag.isBoolean) f = f & (ScalarFlag.no | ScalarFlag.yes)
     if (flags & (GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.notBoolean)) f = f & ~(ScalarFlag.no | ScalarFlag.yes)
     if (flags & (GuardFlag.truthy | GuardFlag.nonzero)) f = f & ~ScalarFlag.no
@@ -3514,7 +3540,7 @@ function initCallerAdded(inst: Instance, slot: number): void {
             held.push(pending[i], pending[i + 1], pending[i + 2], pending[i + 3])
             continue
         }
-        writeField(fieldSlot(pending[i], pending[i + 1]), pending[i + 3], writerId(inst, pending[i + 2]), 'prop', true)
+        writeField(fieldSlot(pending[i], pending[i + 1]), pending[i + 3], writerId(inst, pending[i + 2]), undefined, true)
     }
 }
 
@@ -3576,8 +3602,8 @@ function resolveStore(origin: number, key: number, inst: Instance, e: number, va
     }
     const x = inst.summary.exprs[e]
     if (x.op === ExprOp.store && key >= 0 && receiverQual(inst.qual) === origin && deferInit(inst, x, origin, key, e, valueSlot)) return
-    if (x.op === ExprOp.store) return writeField(fieldSlot(origin, key), valueSlot, writerId(inst, e), 'prop', true)
-    writeField(fieldSlot(origin, key), typedStore(inst, e, valueSlot), writerId(inst, e), typeName(x.type), true)
+    if (x.op === ExprOp.store) return writeField(fieldSlot(origin, key), valueSlot, writerId(inst, e), undefined, true)
+    writeField(fieldSlot(origin, key), typedStore(inst, e, valueSlot), writerId(inst, e), x.type, true)
 }
 
 function typedStore(inst: Instance, e: number, valueSlot: number): number {
@@ -3603,7 +3629,7 @@ function assignField(assign: number, key: number, field: number): void {
 }
 
 function assignTarget(fromField: number, origin: number): void {
-    writeField(fieldSlot(origin, flow.slotIndex[fromField]), fromField, -1, 'prop', false)
+    writeField(fieldSlot(origin, flow.slotIndex[fromField]), fromField, -1, undefined, false)
 }
 
 function callTarget(callSlot: number, target: number): void {
@@ -3726,7 +3752,7 @@ function reachedParams(s: Summary, work: number[]): number {
 
 function classedParams(s: Summary, work: number[], masks: number[]): number {
     let mask = 0
-    const seen = new Uint8Array(s.exprs.length)
+    const seen = new Uint16Array(s.exprs.length)
     while (work.length) {
         const m = work.pop()!
         const e = work.pop()!
@@ -3754,11 +3780,15 @@ function classedParams(s: Summary, work: number[], masks: number[]): number {
     return mask
 }
 
-const allClasses = 255
+const allClasses = 767
 
 function narrowClasses(flags: number): number {
-    if (flags & (GuardFlag.nullish | GuardFlag.isUndefined)) return ArgClass.undefined | ArgClass.unknown
-    if (flags & (GuardFlag.truthy | GuardFlag.defined | GuardFlag.notUndefined | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.bounded)) return allClasses & ~ArgClass.undefined
+    if (flags & GuardFlag.nullish) return ArgClass.undefined | ArgClass.null | ArgClass.unknown
+    if (flags & GuardFlag.isUndefined) return ArgClass.undefined | ArgClass.unknown
+    if (flags & GuardFlag.isNull) return ArgClass.null | ArgClass.unknown
+    if (flags & (GuardFlag.truthy | GuardFlag.defined | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isFunction | GuardFlag.bounded)) return allClasses & ~(ArgClass.undefined | ArgClass.null)
+    if (flags & (GuardFlag.notUndefined | GuardFlag.isObject)) return allClasses & ~ArgClass.undefined
+    if (flags & GuardFlag.notNull) return allClasses & ~ArgClass.null
     return allClasses
 }
 
@@ -3828,6 +3858,7 @@ function scalarClass(t: number): number {
     if (f & (ScalarFlag.str | ScalarFlag.anyStr)) mask = mask | ArgClass.string
     if (f & (ScalarFlag.no | ScalarFlag.yes)) mask = mask | ArgClass.boolean
     if (f & (ScalarFlag.undef | ScalarFlag.void)) mask = mask | ArgClass.undefined
+    if (f & ScalarFlag.null) mask = mask | ArgClass.null
     return mask
 }
 
@@ -4083,6 +4114,7 @@ function kindedSig(slot: number, t: number): number {
         }
         if (!(kept & ArgClass.boolean)) f = f & ~(ScalarFlag.no | ScalarFlag.yes)
         if (!(kept & ArgClass.undefined)) f = f & ~(ScalarFlag.undef | ScalarFlag.void)
+        if (!(kept & ArgClass.null)) f = f & ~ScalarFlag.null
     }
     if (f === old && nums === scalars.nums[t]) return t
     return scalar(f, scalars.lo[t], scalars.hi[t], strs, nums)
@@ -4100,7 +4132,7 @@ function admits(t: number, objects: boolean, truthy: boolean): boolean {
         if ((f & ScalarFlag.int) && !(scalars.lo[t] === 0 && scalars.hi[t] === 0)) return true
         return scalars.strs[t].length > 0
     }
-    if (f & (ScalarFlag.undef | ScalarFlag.void | ScalarFlag.no)) return true
+    if (f & (ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null | ScalarFlag.no)) return true
     if ((f & ScalarFlag.int) && scalars.lo[t] <= 0 && scalars.hi[t] >= 0) return true
     for (const h of scalars.strs[t]) if (heap.stringToJs(h as Handle) === '') return true
     return false
@@ -4169,8 +4201,13 @@ function foldCompare(op: NodeOp, a0: number, b0: number, originsA: number[], ori
     }
     const undefA = (fa & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && (fa & (ScalarFlag.undef | ScalarFlag.void)) !== 0 && !originsA.length
     const undefB = (fb & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && (fb & (ScalarFlag.undef | ScalarFlag.void)) !== 0 && !originsB.length
-    const definedA = (fa & (ScalarFlag.undef | ScalarFlag.void)) === 0 && (originsA.length > 0 || (fa & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.int | FloatFlags | ScalarFlag.no | ScalarFlag.yes)) !== 0)
-    const definedB = (fb & (ScalarFlag.undef | ScalarFlag.void)) === 0 && (originsB.length > 0 || (fb & (ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.int | FloatFlags | ScalarFlag.no | ScalarFlag.yes)) !== 0)
+    const nullA = fa === ScalarFlag.null && !originsA.length
+    const nullB = fb === ScalarFlag.null && !originsB.length
+    const others = ScalarFlag.str | ScalarFlag.anyStr | ScalarFlag.int | FloatFlags | ScalarFlag.no | ScalarFlag.yes
+    const definedA = (fa & (ScalarFlag.undef | ScalarFlag.void)) === 0 && (originsA.length > 0 || (fa & (others | ScalarFlag.null)) !== 0)
+    const definedB = (fb & (ScalarFlag.undef | ScalarFlag.void)) === 0 && (originsB.length > 0 || (fb & (others | ScalarFlag.null)) !== 0)
+    const nonNullA = (fa & ScalarFlag.null) === 0 && (originsA.length > 0 || (fa & (others | ScalarFlag.undef | ScalarFlag.void)) !== 0)
+    const nonNullB = (fb & ScalarFlag.null) === 0 && (originsB.length > 0 || (fb & (others | ScalarFlag.undef | ScalarFlag.void)) !== 0)
     const truths = ScalarFlag.no | ScalarFlag.yes
     const numbers = ScalarFlag.int | FloatFlags | ScalarFlag.unknown | truths
     const ra = scalars.flags[a0]
@@ -4178,8 +4215,8 @@ function foldCompare(op: NodeOp, a0: number, b0: number, originsA: number[], ori
     const boolA = ra !== 0 && (ra & ~truths) === 0 && !originsA.length
     const boolB = rb !== 0 && (rb & ~truths) === 0 && !originsB.length
     if ((boolA && !(rb & numbers)) || (boolB && !(ra & numbers))) return truthScalar(!equal)
-    if (undefA && undefB) return truthScalar(equal)
-    if ((undefA && definedB) || (definedA && undefB)) return truthScalar(!equal)
+    if ((undefA && undefB) || (nullA && nullB)) return truthScalar(equal)
+    if ((undefA && definedB) || (definedA && undefB) || (nullA && nonNullB) || (nonNullA && nullB)) return truthScalar(!equal)
     const numberA = ra !== 0 && (ra & ~(ScalarFlag.int | FloatFlags)) === 0 && !originsA.length
     const numberB = rb !== 0 && (rb & ~(ScalarFlag.int | FloatFlags)) === 0 && !originsB.length
     if ((numberA && !(rb & numbers)) || (numberB && !(ra & numbers))) return truthScalar(!equal)
@@ -4207,9 +4244,22 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
     if (stringRt.has(op)) return ANYSTR
     if (wordOps.has(op)) return numScalar(0, 2 ** 32 - 1)
     if (op === RtOp.hasPrototype) return prototypeScalar(inst, x, value, originsOf)
-    if (op === RtOp.strictEqual || op === RtOp.truthy || op === RtOp.nullish || op === RtOp.hasProperty) return BOOL
+    if (op === RtOp.nullish) return nullishScalar(at(inst, x.args[0]), value, originsOf)
+    if (op === RtOp.strictEqual || op === RtOp.truthy || op === RtOp.hasProperty) return BOOL
     if (op === RtOp.paramCount || op === RtOp.restIndex) return I64
     return NONE
+}
+
+function nullishScalar(slot: number, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+    const t = value(slot)
+    const f = scalars.flags[t]
+    const nullish = ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null
+    const objects = originsOf(slot).length > 0
+    if (t === NONE && !objects) return NONE
+    if (f & ScalarFlag.unknown) return BOOL
+    if ((f & nullish) && !(f & ~nullish) && !objects) return TRUE
+    if (!(f & nullish) && (f || objects)) return FALSE
+    return BOOL
 }
 
 function prototypeScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[]): number {
@@ -4241,6 +4291,7 @@ function typeofScalar(slot: number, value: (s: number) => number, originsOf: (s:
     if (f & (ScalarFlag.str | ScalarFlag.anyStr)) names.push(heap.typeNames.string as number)
     if (f & (ScalarFlag.undef | ScalarFlag.void)) names.push(heap.typeNames.undefined as number)
     if (f & (ScalarFlag.no | ScalarFlag.yes)) names.push(heap.typeNames.boolean as number)
+    if (f & ScalarFlag.null) names.push(heap.typeNames.object as number)
     for (const a of originsOf(slot)) {
         const k = flow.originKind[a]
         const name = (k === OriginKind.str ? heap.typeNames.string : originHostFn(a) ? heap.typeNames.function : heap.typeNames.object) as number
@@ -4275,7 +4326,7 @@ function exprUses(slot: number): void {
         if (a || b) arrived = true
     }
     if (x.op === ExprOp.arith && x.args.length && scalarUse(at(inst, x.args[0]), slot)) arrived = true
-    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype)) valueUse(at(inst, x.args[0]), slot)
+    if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype || x.a === RtOp.nullish)) valueUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && x.a === RtOp.trunc) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && x.a === RtOp.hasPrototype) for (const a of x.args) listen(at(inst, a), ListenerKind.reads, slot, 0, 0)
     if ((x.op === ExprOp.member || x.op === ExprOp.call) && scalarUse(at(inst, x.a), slot)) arrived = true
@@ -4524,7 +4575,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], originUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
+        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
@@ -4703,7 +4754,7 @@ function bindDynamic(): boolean {
 function scalarKinds(t: number): number {
     const f = scalars.flags[t]
     let out = 0
-    if (f & (ScalarFlag.undef | ScalarFlag.void)) out |= pg.ValueKind.undef
+    if (f & (ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null)) out |= pg.ValueKind.undef
     if (f & (ScalarFlag.int | ScalarFlag.no | ScalarFlag.yes)) out |= pg.ValueKind.int
     if (f & FloatFlags) out |= pg.ValueKind.float
     if (f & (ScalarFlag.str | ScalarFlag.anyStr)) out |= pg.ValueKind.text
@@ -4802,7 +4853,7 @@ function hullInto(type: Type, lo: number, hi: number): void {
 }
 
 function internType(type: Type): Type {
-    const key = `${type.undefined ? 1 : 0}${type.unknown ? 1 : 0}${type.float ? 1 : 0}${type.bools}|${type.literals.join(',')}|${type.range ? type.range.join(':') : ''}|${type.strings.join(',')}|${type.objects.join(',')}|${type.functions.map(fn => flow.host.binder.intern(fn)).join(',')}|${type.closures.join(',')}`
+    const key = `${type.undefined ? 1 : 0}${type.null ? 1 : 0}${type.unknown ? 1 : 0}${type.float ? 1 : 0}${type.bools}|${type.literals.join(',')}|${type.range ? type.range.join(':') : ''}|${type.strings.join(',')}|${type.objects.join(',')}|${type.functions.map(fn => flow.host.binder.intern(fn)).join(',')}|${type.closures.join(',')}`
     const known = flow.exported.types.get(key)
     if (known) return known
     flow.exported.types.set(key, type)
@@ -4812,6 +4863,7 @@ function internType(type: Type): Type {
 function scalarInto(type: Type, t: number): void {
     const f = scalars.flags[t]
     if (f & ScalarFlag.undef) type.undefined = true
+    if (f & ScalarFlag.null) type.null = true
     if (f & ScalarFlag.unknown) type.unknown = true
     if (f & ScalarFlag.anyStr) addSorted(type.strings, 0)
     for (const h of scalars.strs[t]) addSorted(type.strings, h)
@@ -4866,6 +4918,7 @@ function joinType(into: Type | undefined, b: Type): Type {
     if (!into || into === b) return b
     const type = emptyType()
     type.undefined = into.undefined || b.undefined
+    type.null = into.null || b.null
     type.unknown = into.unknown || b.unknown
     type.bools = into.bools | b.bools
     type.float = into.float || b.float
@@ -4895,6 +4948,7 @@ function joinTypes(list: Type[]): Type | undefined {
     const functions = new Set<Function>()
     for (const t of distinct) {
         type.undefined ||= t.undefined
+        type.null ||= t.null
         type.unknown ||= t.unknown
         type.float ||= t.float
         type.bools = type.bools | t.bools
@@ -5002,7 +5056,7 @@ function functionObject(fn: Function, origin: number): number {
     flow.exported.allocations.push({ site: siteOfOrigin(origin), kind: AllocKind.object, state, handle: heap.makeIndirect(state), proto: heap.getPrototypeOf(state), constant: true, native: true, function: fn })
     const code = emptyType()
     addFunction(code, fn)
-    flow.exported.locations.push({ allocation: id, key: keyLabel(heap.closureCallKey), handle: heap.closureCallKey, type: internType(code), forms: ['init'], readers: [], writers: [], stored: false })
+    flow.exported.locations.push({ allocation: id, key: keyLabel(heap.closureCallKey), handle: heap.closureCallKey, type: internType(code), forms: FieldForm.init, storeTypes: [], readers: [], writers: [], stored: false })
     return id
 }
 
@@ -5102,7 +5156,7 @@ function exportLocations(): void {
             for (const w of flow.fieldWriters.get(slot) ?? []) if (w < 0 || !retiredInstance(flow.instances[Math.floor(w / exprBits)])) writers.push(writerSite(w))
             const id = flow.exported.locations.length
             flow.exported.locOf.set(slot, id)
-            flow.exported.locations.push({ allocation, key: keyLabel(key), handle: key >= 0 && heap.keyIndex(key as Handle) === undefined ? key as Handle : undefined, type: slotType(slot), forms: (flow.fieldForms.get(slot) ?? []).slice(), readers, writers, stored: flow.fieldStored.has(slot) })
+            flow.exported.locations.push({ allocation, key: keyLabel(key), handle: key >= 0 ? key as Handle : undefined, type: slotType(slot), forms: flow.fieldForms.get(slot) ?? 0, storeTypes: (flow.fieldStoreTypes.get(slot) ?? []).slice(), readers, writers, stored: flow.fieldStored.has(slot) })
         }
     }
 }
@@ -5167,12 +5221,12 @@ function exportInstance(exported: Exported): InstanceSignature {
     const inst = exported.inst
     const s = inst.summary
     const g = s.g
-    const params: { label: string, type: Type, opaque: boolean }[] = []
+    const params: { label: string, type: Type, opaque: boolean, receiver?: boolean }[] = []
     const paramIds = (slot: number) => slotType(slot)
     let plain = 0
     const derefs = derefParams(s)
     for (const p of g.blocks[0].params) {
-        if (isThisParam(getNode(g, p)!)) params.push({ label: 'this', type: paramIds(paramSlot(inst, -1)), opaque: !derefs.has(-1) })
+        if (isThisParam(getNode(g, p)!)) params.push({ label: 'this', type: paramIds(paramSlot(inst, -1)), opaque: !derefs.has(-1), receiver: true })
         else {
             params.push({ label: `p${plain}`, type: paramIds(inst.sigs[plain]), opaque: !derefs.has(plain) })
             plain++
@@ -5233,7 +5287,7 @@ function impossibleExpr(inst: Instance, e: number, memo: Map<number, boolean>): 
 
 function nullishOnly(slot: number): boolean {
     const t = flow.scalar[slot]
-    return t !== NONE && (scalars.flags[t] & ~(ScalarFlag.undef | ScalarFlag.void)) === 0 && !flow.slotOrigins[slot].length
+    return t !== NONE && (scalars.flags[t] & ~(ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null)) === 0 && !flow.slotOrigins[slot].length
 }
 
 function resolveUnit(list: number[]): UnitTypes {
@@ -5550,6 +5604,18 @@ const maxVariantArity = 4
 const maxObjectDepth = 3
 const paramNames = 'TUVWXYZ'
 
+export enum EntryRole {
+    method,
+    getter,
+    setter,
+    constructor,
+    indexGetter,
+    indexSetter,
+    variant,
+    returned,
+    fn,
+}
+
 export enum CutInputKind {
     param,
     read,
@@ -5647,6 +5713,8 @@ export interface CutSite {
 
 export interface CutEntry {
     label: string
+    role: EntryRole
+    key: string
     fn: number
     params: number
     ret: CutTerm
@@ -5706,6 +5774,8 @@ interface CutShape {
 
 interface CutRoot {
     label: string
+    role: EntryRole
+    key: string
     fn: Function
     inst: Instance
     recv: number
@@ -5734,11 +5804,11 @@ function cutField(origin: number, key: number, s: number): void {
     const parent = flow.cut!.origins.get(origin)
     if (parent === undefined) return
     const from = flow.cut!.inputs[parent]
-    const label = cutKey(key)
+    const label = keyLabel(key)
     const proto = flow.cut!.proto
     const own = proto && key > 0 && heap.isPrivateName(key as Handle) && flow.originKind[origin] === OriginKind.created && flow.originCell[origin] === proto
     const shape = own ? undefined : cutBoundary(origin) && flow.cut!.shapes.get(origin)
-    const shaped = shape !== undefined && (shape.fields.some(f => f.key === label) || shape.cut.entries.some(e => e.label === `get ${label}`))
+    const shaped = shape !== undefined && (shape.fields.some(f => f.key === label) || shape.cut.entries.some(e => e.role === EntryRole.getter && e.key === label))
     seedInput(s, cutInput(CutInputKind.read, `${from.name}${label.startsWith('[') ? '' : '.'}${label}`, from.entry, from.param, parent, label, from.depth + 1), 0 as Handle, !own && !shaped)
     if (own) addIn(s, -fieldSlot(originOf(OriginKind.created, proto as number, 0, 0, undefined), key) - 1)
 }
@@ -5759,9 +5829,9 @@ function cutShapeField(origin: number, key: number, s: number): void {
     if (isTypeParamKey(key)) return
     if (!flow.cut!.shapes.has(origin) && !cutBoundary(origin)) return
     const shape = flow.cut!.shapes.get(origin)!
-    const label = cutKey(key)
+    const label = keyLabel(key)
     for (const f of shape.fields) {
-        if (f.key === label || (f.key === '[n]' && constantIndex(label))) cutMaterialize(shape.cut, f.term, s, shape.owner, origin, undefined, true)
+        if (f.key === label || (f.key === numberKey && constantIndex(label))) cutMaterialize(shape.cut, f.term, s, shape.owner, origin, undefined, true)
     }
 }
 
@@ -5806,7 +5876,7 @@ export function cutInstanceField(c: Cut, input: number, classes: (proto: Handle)
     if (!other) return undefined
     const field = other.fields.find(f => f.key === keys[0])
     if (field) return [other, field.term]
-    const getter = other.entries.find(e => e.label === `get ${keys[0]}`)
+    const getter = other.entries.find(e => e.role === EntryRole.getter && e.key === keys[0])
     return getter ? [other, getter.ret] : undefined
 }
 
@@ -5919,35 +5989,38 @@ function cutResults(): number {
     return flow.cut!.inputs.filter(input => input.kind === CutInputKind.result).length
 }
 
-function cutKey(key: number): string {
-    if (key === elemKey || key === dynKey) return '[n]'
-    return keyLabel(key)
-}
-
 function cutKeyMatches(key: number, label: string): boolean {
-    const own = cutKey(key)
-    return own === label || (label === '[n]' && constantIndex(own))
+    const own = keyLabel(key)
+    return own === label || (label === numberKey && constantIndex(own))
 }
 
-function classMethods(proto: Handle, ctor: Function | undefined, host: AccessHost): [string, Function][] {
-    const methods: [string, Function][] = ctor ? [['constructor', ctor]] : []
-    function add(label: string, handle: u32): void {
+interface ClassMethod {
+    label: string
+    role: EntryRole
+    key: string
+    fn: Function
+}
+
+function classMethods(proto: Handle, ctor: Function | undefined, host: AccessHost): ClassMethod[] {
+    const methods: ClassMethod[] = ctor ? [{ label: 'constructor', role: EntryRole.constructor, key: 'constructor', fn: ctor }] : []
+    function add(label: string, role: EntryRole, key: string, handle: u32): void {
         const fn = handle ? host.binder.functionOf(handle) : undefined
-        if (fn && fn !== ctor && host.binder.traceable(fn) && !methods.some(([, m]) => m === fn)) methods.push([label, fn])
+        if (fn && fn !== ctor && host.binder.traceable(fn) && !methods.some(m => m.fn === fn)) methods.push({ label, role, key, fn })
     }
     for (let k: u32 = 0; k < heap.ownPropertyCount(proto); k++) {
         const key = heap.ownPropertyKeyAt(proto, k)
         const addr = heap.getOwnProperty(proto, key)
         if (!addr) continue
         const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(addr))
-        if (d.flags & heap.PropFlags.has_getter) add(`get ${propertyLabel(key)}`, d.slot0)
-        if (d.flags & heap.PropFlags.has_setter) add(`set ${propertyLabel(key)}`, d.slot1)
-        if (!(d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter))) add(propertyLabel(key), d.slot0)
+        const name = propertyLabel(key)
+        if (d.flags & heap.PropFlags.has_getter) add(`get ${name}`, EntryRole.getter, name, d.slot0)
+        if (d.flags & heap.PropFlags.has_setter) add(`set ${name}`, EntryRole.setter, name, d.slot1)
+        if (!(d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter))) add(name, EntryRole.method, name, d.slot0)
     }
     const trap = heap.getPropertyProxy(proto, heap.indexKey(0 as u32))
     if (trap) {
-        add('get [index]', heap.getProxyGetter(trap) as u32)
-        add('set [index]', heap.getProxySetter(trap) as u32)
+        add('get [index]', EntryRole.indexGetter, '', heap.getProxyGetter(trap) as u32)
+        add('set [index]', EntryRole.indexSetter, '', heap.getProxySetter(trap) as u32)
     }
     return methods
 }
@@ -5991,7 +6064,7 @@ function arityVariants(fn: Function): [number, Function][] {
     return out
 }
 
-function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number, arity = -1): void {
+function seedCutRoot(roots: CutRoot[], label: string, role: EntryRole, key: string, fn: Function, recv: number, arity = -1): void {
     if (roots.some(r => r.fn === fn && r.recv === recv)) return
     const entry = roots.length
     const s = summaryOf(fn)
@@ -6008,7 +6081,7 @@ function seedCutRoot(roots: CutRoot[], label: string, fn: Function, recv: number
     }
     if (s.hasThis && !recv) seedInput(paramSlot(inst, -1), cutInput(CutInputKind.param, 'this', entry, -1, -1, '', 0))
     if (s.usesCtx) seedInput(paramSlot(inst, -2), cutInput(CutInputKind.param, 'ctx', entry, -2, -1, '', 0))
-    roots.push({ label, fn, inst, recv })
+    roots.push({ label, role, key, fn, inst, recv })
 }
 
 function seedReturnedMethods(roots: CutRoot[], self: number): void {
@@ -6022,7 +6095,7 @@ function seedReturnedMethods(roots: CutRoot[], self: number): void {
             for (const [key, slot] of flow.originFields[origin]) {
                 for (const target of flow.slotOrigins[slot]) {
                     const fn = flow.originKind[target] === OriginKind.fn ? flow.originFn[target] : flow.originKind[target] === OriginKind.fresh ? originHostFn(target) : undefined
-                    if (fn) seedCutRoot(roots, `${root.label}().${keyLabel(key)}`, fn, origin)
+                    if (fn) seedCutRoot(roots, `${root.label}().${keyLabel(key)}`, EntryRole.returned, '', fn, origin)
                 }
             }
         }
@@ -6119,9 +6192,9 @@ function classCutFlow(proto: Handle, host: AccessHost, ctor: Function, arity: nu
     if (arity < 0) cutMemo?.set(proto, null)
     const cut = cutFlow(ctor.name || '<anon>', 'class', [ctor], host, proto, roots => {
         const self = originOf(OriginKind.created, proto as number, 0, 0, undefined)
-        for (const [label, fn] of classMethods(proto, ctor, flow.host)) {
-            seedCutRoot(roots, label, fn, self, fn === ctor ? arity : -1)
-            for (const [k, variant] of arityVariants(fn)) seedCutRoot(roots, `${label}/${k}`, variant, self)
+        for (const { label, role, key, fn } of classMethods(proto, ctor, flow.host)) {
+            seedCutRoot(roots, label, role, key, fn, self, fn === ctor ? arity : -1)
+            for (const [k, variant] of arityVariants(fn)) seedCutRoot(roots, `${label}/${k}`, EntryRole.variant, '', variant, self)
         }
         solve()
         seedReturnedMethods(roots, self)
@@ -6182,7 +6255,7 @@ export function fnCut(name: string, fns: Function[], host: AccessHost, classes: 
         cutMemo = outer
     }
     return cutFlow(name, 'fns', fns, host, 0 as Handle, roots => {
-        for (const fn of fns) seedCutRoot(roots, fn.name || '<anon>', fn, 0)
+        for (const fn of fns) seedCutRoot(roots, fn.name || '<anon>', EntryRole.fn, '', fn, 0)
         solve()
         return 0
     })
@@ -6638,7 +6711,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
             return index
         }
         if (depth >= maxObjectDepth) return index
-        for (const [key, slot] of flow.originFields[origin]) object.fields.push({ key: cutKey(key), term: termOf(slot, root, reasons, depth + 1) })
+        for (const [key, slot] of flow.originFields[origin]) object.fields.push({ key: keyLabel(key), term: termOf(slot, root, reasons, depth + 1) })
         return index
     }
     function instanceArgs(other: Handle, origins: number[], root: number, reasons: string[], depth: number): CutTerm[] {
@@ -6728,7 +6801,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
     const reasons: string[] = []
     const exposed: string[] = []
     if (self) for (const [key, slot] of flow.originFields[self]) {
-        fields.push({ key: cutKey(key), term: termOf(slot, -1, reasons) })
+        fields.push({ key: keyLabel(key), term: termOf(slot, -1, reasons) })
         if (key >= 0 && heap.isString(key as Handle)) exposed.push(propertyLabel(key as Handle))
     }
     fieldsReady = true
@@ -6753,14 +6826,14 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
             rising.push(from)
         }
     }
-    const boundary: [call: number, other: Handle, label: string][] = []
+    const boundary: [call: number, label: string][] = []
     const labelsOf = new Map<Handle, Map<Function, string>>()
     const labelOf = (other: Handle, fn: Function): string | undefined => {
         let labels = labelsOf.get(other)
         if (!labels) {
             labels = new Map()
             labelsOf.set(other, labels)
-            for (const [label, method] of classMethods(other, classConstructor(other, host), host)) {
+            for (const { label, fn: method } of classMethods(other, classConstructor(other, host), host)) {
                 labels.set(method, label)
                 for (const [arity, variant] of arityVariants(method)) labels.set(variant, `${label}/${arity}`)
             }
@@ -6784,7 +6857,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
                 const fn = flow.originKind[target] === OriginKind.fn ? flow.originFn[target] : originHostFn(target)
                 if (fn) label = label ?? labelOf(other, fn)
             }
-            if (label !== undefined && !boundary.some(b => b[0] === call)) boundary.push([call, other, label])
+            if (label !== undefined && !boundary.some(b => b[0] === call)) boundary.push([call, label])
         }
     }
     const observesOf = roots.map(() => [] as CutRef[])
@@ -6826,16 +6899,16 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
             calloutList.push({ callee, recv: termOf(at(inst, x.b), ri, reasons), args: x.args.map(a => termOf(at(inst, a), ri, reasons)), result: input })
         }
         const siteList: CutSite[] = []
-        for (const [call, other, label] of boundary) {
+        for (const [call, label] of boundary) {
             const inst = instOfSlot(call)
             if (!(rootsOf.get(inst.id) ?? []).includes(ri)) continue
             const x = exprAt(call)
-            siteList.push({ recv: termOf(at(inst, x.b), ri, reasons), label: `${constructorName(other)}.${label}`, args: x.args.map(a => termOf(at(inst, a), ri, reasons)) })
+            siteList.push({ recv: termOf(at(inst, x.b), ri, reasons), label, args: x.args.map(a => termOf(at(inst, a), ri, reasons)) })
         }
         const ret = termOf(r.inst.ret, ri, reasons)
         const b = r.inst.summary.bound
-        const bound = b ? { param: b.param, owner: b.recv, key: cutKey(b.key), term: termOf(at(r.inst, b.ret), ri, reasons) } : undefined
-        return { label: r.label, fn: tableRef(fns, r.fn), params: r.inst.summary.params, ret, effects, callouts: calloutList, sites: siteList, observes: observesOf[ri], bound, allocates: allocating.has(r.inst.id), reasons }
+        const bound = b ? { param: b.param, owner: b.recv, key: keyLabel(b.key), term: termOf(at(r.inst, b.ret), ri, reasons) } : undefined
+        return { label: r.label, role: r.role, key: r.key, fn: tableRef(fns, r.fn), params: r.inst.summary.params, ret, effects, callouts: calloutList, sites: siteList, observes: observesOf[ri], bound, allocates: allocating.has(r.inst.id), reasons }
     })
     return { name, generator, key: '', fns, statics, staticNames, protos, protoNames: protos.map(p => constructorName(p as Handle)), uses: [], inputs: seed.inputs, params, paramOf, numeric: numericOf, filters, fields, objects, entries, exposed, through: seed.through, analyzed: [], reasons, arity: -1, work: 0, size: 0, ms: 0 }
 }
@@ -6845,7 +6918,7 @@ export function cutPositions(c: Cut, classes: Map<Handle, Cut>, depth = 0): stri
     if (depth >= maxObjectDepth) return out
     const walk = (list: CutField[], prefix: string[], level: number) => {
         for (const f of list) {
-            const key = f.key === '[n]' ? numberKey : f.key
+            const key = f.key
             for (const r of f.term.refs) {
                 const p = c.paramOf[r.input]
                 if (p >= 0) out[p].push([...prefix, key])
@@ -6873,10 +6946,6 @@ export function cutPositions(c: Cut, classes: Map<Handle, Cut>, depth = 0): stri
     return out
 }
 
-function cutFieldKey(f: CutField): string {
-    return f.key === '[n]' ? numberKey : f.key
-}
-
 function cutArgs(c: Cut, members: number[], fieldOf: (objects: number[], key: string) => Type | undefined, classOf: (proto: Handle) => Cut | undefined, depth: number): (Type | undefined)[] {
     const out: (Type | undefined)[] = c.params.map(() => undefined)
     if (depth >= maxObjectDepth) return out
@@ -6885,7 +6954,7 @@ function cutArgs(c: Cut, members: number[], fieldOf: (objects: number[], key: st
     }
     const walk = (list: CutField[], at: number[], level: number) => {
         for (const f of list) {
-            const field = fieldOf(at, cutFieldKey(f))
+            const field = fieldOf(at, f.key)
             for (const r of f.term.refs) add(c.paramOf[r.input], field)
             if (level >= maxObjectDepth) continue
             for (const index of f.term.objects) {
@@ -6914,7 +6983,7 @@ export function cutGeneric(c: Cut, classOf: (proto: Handle) => Cut | undefined):
             for (const f of list) {
                 const inner = f.term.objects.map(index => c.objects[index]).filter(object => object.proto < 0 && object.fields.length)
                 if (!inner.length) continue
-                const key = cutFieldKey(f)
+                const key = f.key
                 const next = (fieldOf(at, key)?.objects ?? []).filter(o => !skip(o))
                 for (const o of next) visit(o, [...keys, key])
                 for (const object of inner) walk(object.fields, next, [...keys, key], level + 1)
@@ -7015,7 +7084,7 @@ export function cutText(c: Cut): string {
         const observed: number[] = []
         for (const r of e.observes) if (!observed.includes(r.input)) observed.push(r.input)
         if (observed.length) lines.push(`      requires ${observed.map(input => `${cutInputText(c, input, i, true)}?{${e.observes.filter(r => r.input === input).map(r => cutFilterText(c, r.filter)).join(', ')}}`).join(' ')}`)
-        for (const site of e.sites) lines.push(`      site ${cutTermText(c, site.recv, i)} .${site.label.slice(site.label.indexOf('.') + 1)}(${site.args.map(a => cutTermText(c, a, i)).join(', ')})`)
+        for (const site of e.sites) lines.push(`      site ${cutTermText(c, site.recv, i)} .${site.label}(${site.args.map(a => cutTermText(c, a, i)).join(', ')})`)
         if (e.bound) lines.push(`      if ${String.fromCharCode(65 + e.bound.param)} in bounds of ${e.bound.owner < 0 ? 'this' : String.fromCharCode(65 + e.bound.owner)}.${e.bound.key}: ${cutTermText(c, e.bound.term, i)}`)
     })
     if (c.exposed.length) lines.push(`  exposed: ${c.exposed.join(', ')}`)
@@ -7033,7 +7102,7 @@ function converts(T0: number): boolean {
     return T0 >= 0 && T0 !== Types.vm_value && T0 !== Types.unknown && T0 !== Types.void && T0 !== Types.fnptr && T0 !== Types.handle
 }
 
-const selecting = GuardFlag.notFloat | GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isBoolean | GuardFlag.bounded | GuardFlag.hasProto
+const selecting = GuardFlag.notFloat | GuardFlag.falsy | GuardFlag.nullish | GuardFlag.isNumber | GuardFlag.isString | GuardFlag.isObject | GuardFlag.isFunction | GuardFlag.isUndefined | GuardFlag.isNull | GuardFlag.isBoolean | GuardFlag.bounded | GuardFlag.hasProto
 
 const exprNames = ['const', 'origin', 'alloc', 'param', 'union', 'member', 'call', 'arith', 'cmp', 'num', 'rt', 'opaque', 'store', 'narrow', 'pick', 'gate', 'typeof']
 
@@ -7056,6 +7125,7 @@ function scalarText(t: number): string {
     const parts: string[] = []
     if (f & ScalarFlag.unknown) parts.push('unknown')
     if (f & ScalarFlag.undef) parts.push('undefined')
+    if (f & ScalarFlag.null) parts.push('null')
     if (f & ScalarFlag.void) parts.push('void')
     if (f & ScalarFlag.int) {
         const lo = scalars.lo[t]

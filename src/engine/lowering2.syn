@@ -347,9 +347,10 @@ function decideRelation(g: Graph, facts: Facts, c: Relation): boolean | undefine
     return
 }
 
-function nodeFacts(g: Graph, bodyId: number): Map<number, Facts> {
+function nodeFacts(g: Graph, bodyId: number): Map<number, Facts | undefined> {
     const order: number[] = []
-    const seen = new Set<number>([bodyId])
+    const out = new Map<number, Facts | undefined>()
+    out.set(bodyId, [])
     const stack: number[] = [bodyId]
     const next: number[] = [0]
     while (stack.length) {
@@ -360,8 +361,8 @@ function nodeFacts(g: Graph, bodyId: number): Map<number, Facts> {
             next[next.length - 1] = at + 1
             const ref = getRef(n, at)
             const m = ref ? getNode(g, ref) : undefined
-            if (!m || m.op === NodeOp.block || seen.has(ref)) continue
-            seen.add(ref)
+            if (!m || m.op === NodeOp.block || out.has(ref)) continue
+            out.set(ref, undefined)
             stack.push(ref)
             next.push(0)
             continue
@@ -370,8 +371,6 @@ function nodeFacts(g: Graph, bodyId: number): Map<number, Facts> {
         next.pop()
         order.push(id)
     }
-    const out = new Map<number, Facts>()
-    out.set(bodyId, [])
     for (let k = order.length - 1; k >= 0; k--) {
         const id = order[k]
         const n = getNode(g, id)!
@@ -380,7 +379,7 @@ function nodeFacts(g: Graph, bodyId: number): Map<number, Facts> {
         const arms = n.op === NodeOp.select && countIds(n) === 3 && getRef(n, 0)
         for (let i = 0; i < countIds(n); i++) {
             const ref = getRef(n, i)
-            if (!ref || !seen.has(ref)) continue
+            if (!ref || !out.has(ref)) continue
             const given = arms && i > 0 ? [...facts, [getRef(n, 0), i === 1] as [number, boolean]] : facts
             const known = out.get(ref)
             if (!known) {
@@ -763,6 +762,13 @@ const ArithOps = new Set<NodeOp>([...BinaryOps, ...UnaryOps])
 type Range = [lo: number, hi: number]
 const RangeLimit = 2 ** 53
 const ArrivalShapes = new Set<NodeOp>([NodeOp.param, NodeOp.literal, NodeOp.after, NodeOp.and, NodeOp.or, NodeOp.xor, NodeOp.shl, NodeOp.ushr, NodeOp.add, NodeOp.sub, NodeOp.mul, NodeOp.convert, NodeOp.select])
+
+function comparedValue(g: Graph, id: number, konst: number): [id: number, konst: number] {
+    const m = id ? getNode(g, id) : undefined
+    if (m?.op === NodeOp.literal) return [0, literalValue(g, m)]
+    if (isNullishValue(g, id)) return [0, 0]
+    return [id, id ? 0 : konst]
+}
 
 const RangedTypes = new Set<Types>([Types.u8, Types.u16, Types.u32, Types.u64, Types.ptr, Types.i8, Types.i16, Types.i32, Types.i64, Types.bool])
 
@@ -6465,20 +6471,29 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const known = effects.get(id)
         if (known) return known
         const n = getNode(g, id)!
-        const out = new Set<number>()
-        effects.set(id, out)
+        let out = effects.get(0)!
+        let owned = false
+        const join = (effect: number) => {
+            if (out.has(effect)) return
+            if (!owned) out = new Set(out)
+            owned = true
+            out.add(effect)
+        }
         if (n.op === NodeOp.select) {
-            for (const effect of guaranteedFrom(effects, getRef(n, 0))) out.add(effect)
+            out = guaranteedFrom(effects, getRef(n, 0))
             const yes = guaranteedFrom(effects, getRef(n, 1))
             const no = guaranteedFrom(effects, getRef(n, 2))
-            for (const effect of yes) if (no.has(effect)) out.add(effect)
-        } else if (n) {
+            for (const effect of yes) if (no.has(effect)) join(effect)
+        } else {
             const end = n.op === NodeOp.after ? countIds(n) - 1 : countIds(n)
             for (let i = 0; i < end; i++) {
-                for (const effect of guaranteedFrom(effects, getRef(n, i))) out.add(effect)
+                const from = guaranteedFrom(effects, getRef(n, i))
+                if (!out.size) out = from
+                else for (const effect of from) join(effect)
             }
-            if (OrderedValues.has(n.op)) out.add(id)
+            if (OrderedValues.has(n.op)) join(id)
         }
+        effects.set(id, out)
         return out
     }
 
@@ -8336,6 +8351,27 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
     }
 
+    function arrivalValue(target: GraphBlock, id: number): ((app: GraphNode) => number | undefined) | undefined {
+        const at = target.params.indexOf(id)
+        if (at >= 0) return app => orderedConstant(app, at + 1)
+        const n = id ? getNode(g, id) : undefined
+        if (!n || countIds(n) !== 2) return
+        if (n.op !== NodeOp.and && !CompareOps.has(n.op)) return
+        if (CompareOps.has(n.op) && comparesFloats(g, n)) return
+        if (getRef(n, 0) && getRef(n, 1)) return
+        const side = getRef(n, 0) ? 0 : 1
+        const k = getLiteral(g, n, 1 - side)
+        if (!Number.isSafeInteger(k) || k < 0) return
+        const inner = arrivalValue(target, getRef(n, side))
+        if (!inner) return
+        return app => {
+            const x = inner(app)
+            if (x === undefined || !Number.isSafeInteger(x) || x < 0) return
+            if (n.op === NodeOp.and) return Number(BigInt(x) & BigInt(k))
+            return (side ? CompareEval[n.op](k, x) : CompareEval[n.op](x, k)) ? 1 : 0
+        }
+    }
+
     function stripNilAfters(target: GraphBlock): boolean {
         let changed = false
         for (const id of findValues(target.id, NodeOp.after) ?? []) {
@@ -8399,27 +8435,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         const froms = indexedPreds(index, target.id)
         if (!froms.size || froms.has(target.id)) return false
         if (findValues(target.id, NodeOp.call)?.length) return false
-        if (!target.params.length || !findValues(target.id, NodeOp.select)?.length) return false
-        if (blockSize(target, 12) > 12) return false
-        const tests = (p: number) => {
-            for (const u of indexedUsers(index, p)) {
-                const n = getNode(g, u)!
-                if (n.op === NodeOp.select && getRef(n, 0) === p) return true
-            }
-            return false
-        }
-        const decides = (p: number) => {
-            if (tests(p)) return true
-            for (const u of indexedUsers(index, p)) {
-                const n = getNode(g, u)!
-                if (!CompareOps.has(n.op) || comparesFloats(g, n)) continue
-                if (getRef(n, 0) && getRef(n, 1)) continue
-                if (tests(u)) return true
-            }
-            return false
-        }
-        const deciding = target.params.filter(decides)
-        if (!deciding.length) return false
+        if (!target.params.length || blockSize(target, 12) > 12) return false
+        const decisions = (findValues(target.id, NodeOp.select) ?? []).map(s => arrivalValue(target, getRef(getNode(g, s)!, 0))).filter(d => d !== undefined)
+        if (!decisions.length) return false
         const sites: [from: GraphBlock, path: number[]][] = []
         const seen = new Set<number>()
         for (const k of froms) {
@@ -8435,14 +8453,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
         }
         if (sites.length < 2 || sites.length !== findInboundApplies(target).length) return false
-        const literal = (p: number) => {
-            const at = target.params.indexOf(p) + 1
-            for (const [, path] of sites) {
-                if (orderedConstant(getNode(g, path[path.length - 1])!, at) === undefined) return false
-            }
-            return true
-        }
-        if (!deciding.some(literal)) return false
+        if (!decisions.some(decide => sites.every(([, path]) => decide(getNode(g, path[path.length - 1])!) !== undefined))) return false
         const merged: number[] = []
         for (const [from, path] of sites) {
             const m = inlineApplication(path, target, target.bodyId)
@@ -8465,8 +8476,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         if (target.id === g.root) return false
         const tail = getNode(g, target.bodyId)
         if (!tail || tail.op !== NodeOp.select || countIds(tail) !== 3) return false
-        const at = target.params.indexOf(getRef(tail, 0))
-        if (at < 0) return false
+        const decide = arrivalValue(target, getRef(tail, 0))
+        if (!decide) return false
         const froms = indexedPreds(index, target.id)
         if (!froms.size || froms.has(target.id)) return false
 
@@ -8482,9 +8493,9 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const app = getNode(g, site)!
                 if (countIds(app) !== target.params.length + 1) return false
                 if (userCount(index, site) !== Math.min(path.length - 1, 1)) return false
-                const value = constantOf(app, at + 1)
-                if (value === undefined) return false
-                const arm = value ? 1 : 2
+                const outcome = decide(app)
+                if (outcome === undefined) return false
+                const arm = outcome ? 1 : 2
                 if (!getRef(tail, arm) || chosen.has(arm)) return false
                 chosen.add(arm)
                 sites.push([from, path, getRef(tail, arm)])
@@ -8534,7 +8545,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const args: number[][] = []
             for (let i = 0; i < 2; i++) {
                 const at = sides[i]
-                const arg = at === -2 ? [0, getLiteral(g, cond, i)] : at === -3 ? arrivingLoad(target, from, appId, loads[i]!) : [getRef(app, at + 1), getLiteral(g, app, at + 1)]
+                const raw = at === -2 ? [0, getLiteral(g, cond, i)] : at === -3 ? arrivingLoad(target, from, appId, loads[i]!) : [getRef(app, at + 1), getLiteral(g, app, at + 1)]
+                const arg = raw && comparedValue(g, raw[0], raw[1])
                 if (!arg || (arg[0] && !ArrivalShapes.has(getNode(g, arg[0])!.op))) return
                 args.push(arg)
             }
@@ -8838,19 +8850,40 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return x !== undefined && x === scalarOperand(g, b, j)
     }
     function sameLocation(a: GraphNode, b: GraphNode): boolean {
-        return sameOperand(a, b, 2) && sameBase(a, b)
+        if (sameOperand(a, b, 2) && sameBase(a, b)) return true
+        const delta = displacement(a, b)
+        return delta === 0
     }
     function sameBase(a: GraphNode, b: GraphNode): boolean {
         if (sameOperand(a, b, 1)) return true
         const x = tailOf(g, getRef(a, 1))
         return !!x && x === tailOf(g, getRef(b, 1))
     }
+    function displacement(a: GraphNode, b: GraphNode): number | undefined {
+        const i = scalarOperand(g, a, 2)
+        const j = scalarOperand(g, b, 2)
+        if (i === undefined || j === undefined) return
+        if (sameBase(a, b)) return j - i
+        if (!getRef(a, 1) || !getRef(b, 1)) return
+        const p = tailOf(g, getRef(a, 1))
+        const q = tailOf(g, getRef(b, 1))
+        const offsets = (id: number) => {
+            const op = getNode(g, id)?.op
+            return op === NodeOp.add || op === NodeOp.sub
+        }
+        if (!offsets(p) && !offsets(q)) return
+        const [x, k] = splitConstant(p)
+        const [y, l] = splitConstant(q)
+        if (!x || tailOf(g, x) !== tailOf(g, y)) return
+        return (j + l) - (i + k)
+    }
     const bits = (n: GraphNode) => intrinsics.intrinsicBitWidth(typeOf(n))
     function constantSlice(store: GraphNode, access: GraphNode): number | undefined {
         const constant = scalarOperand(g, store, 3)
         if (constant === undefined || constant < 0 || !Number.isSafeInteger(constant) || typeOf(store) === Types.f64 || typeOf(access) === Types.f64 || lowering.isSignedType(typeOf(access))) return
-        if (getRef(store, 2) || getRef(access, 2) || !sameBase(store, access)) return
-        const delta = getLiteral(g, access, 2) - getLiteral(g, store, 2)
+        if (getRef(store, 2) || getRef(access, 2)) return
+        const delta = displacement(store, access)
+        if (delta === undefined) return
         if (delta < 0 || delta * 8 + bits(access) > bits(store)) return
         return Math.floor(constant / 2 ** (8 * delta)) % 2 ** bits(access)
     }
@@ -10809,12 +10842,15 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!ref) return { id: 0, value: getLiteral(g, n, i) }
             const m = getNode(g, ref)
             if (m && FoldableOps.has(m.op)) return fold(ref, m)
-            if (m?.op === NodeOp.literal && (compare || n.op === NodeOp.convert || n.op === NodeOp.bitconvert || n.op === NodeOp.crc32 || inlineableLiteral(costs, literalValue(g, m)))) return { id: 0, value: literalValue(g, m) }
             if (compare && m?.op === NodeOp.after) {
                 for (let j = 0; j < countIds(m) - 1; j++) if (!isNilOrVoid(getRef(m, j))) lifted.push(getRef(m, j))
                 return operand(m, countIds(m) - 1, true)
             }
-            if (compare && isNullishValue(g, ref)) return { id: 0, value: 0 }
+            if (compare) {
+                const [id, value] = comparedValue(g, ref, 0)
+                return { id, value }
+            }
+            if (m?.op === NodeOp.literal && (n.op === NodeOp.convert || n.op === NodeOp.bitconvert || n.op === NodeOp.crc32 || inlineableLiteral(costs, literalValue(g, m)))) return { id: 0, value: literalValue(g, m) }
             return { id: ref, value: 0 }
         }
 
@@ -10892,14 +10928,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!signed && (a.value < 0 || b.value < 0)) return
             return { id: 0, value: CompareEval[n.op](a.value, b.value) ? 1 : 0 }
         }
-        function armValue(s: GraphNode, i: number): Value {
-            const ref = getRef(s, i)
-            if (!ref) return { id: 0, value: getLiteral(g, s, i) }
-            const m = getNode(g, ref)!
-            if (m.op === NodeOp.literal) return { id: 0, value: literalValue(g, m) }
-            if (isNullishValue(g, ref)) return { id: 0, value: 0 }
-            return { id: ref, value: 0 }
-        }
         function dissolves(id: number, parent: number): boolean {
             for (const u of indexedUsers(index, id)) {
                 if (u === parent) continue
@@ -10918,7 +10946,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const dissolved = dissolving && dissolves(id, parent)
             const results: Value[] = []
             for (let i = 1; i < 3; i++) {
-                const arm = armValue(s, i)
+                const [armId, armKonst] = comparedValue(g, getRef(s, i), getLiteral(g, s, i))
+                const arm = { id: armId, value: armKonst }
                 const nested = arm.id ? getNode(g, arm.id)! : undefined
                 const r = nested?.op === NodeOp.select
                     ? compareArms(n, side, arm.id, id, other, tokens, dissolved, depth + 1)
@@ -11256,14 +11285,6 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
     }
 
     function decideCompares(target: GraphBlock) {
-        function compared(n: GraphNode, i: number): number[] {
-            const ref = getRef(n, i)
-            if (!ref) return [0, getLiteral(g, n, i)]
-            const m = getNode(g, ref)
-            if (m?.op === NodeOp.literal) return [0, literalValue(g, m)]
-            if (isNullishValue(g, ref)) return [0, 0]
-            return [ref, 0]
-        }
         function nonNullAddress(id: number): boolean {
             if (relocatedAddress(g, id)) return true
             const m = currentMem().of(target, id)
@@ -11274,8 +11295,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             for (const id of findValues(target.id, op) ?? []) {
                 const n = getNode(g, id)!
                 if (countIds(n) !== 2 || comparesFloats(g, n)) continue
-                const [a, ak] = compared(n, 0)
-                const [b, bk] = compared(n, 1)
+                const [a, ak] = comparedValue(g, getRef(n, 0), getLiteral(g, n, 0))
+                const [b, bk] = comparedValue(g, getRef(n, 1), getLiteral(g, n, 1))
                 const nonNull = (op === NodeOp.eq || op === NodeOp.ne) && (a ? !b && !bk && nonNullAddress(a) : !!b && !ak && nonNullAddress(b))
                 const known = nonNull ? op === NodeOp.ne : decideCompare(target, n, [a, ak], [b, bk], [])
                 if (known === undefined) continue
@@ -12513,7 +12534,15 @@ function armDemand(g: Graph, id: number, memo: ArmDemand, stop?: Set<number>): {
     for (let i = 1; i < countIds(n) && (!every || every.size); i++) {
         const arm = getRef(n, i) ? demanded(g, getRef(n, i), new Set(), memo, stop) : new Set<number>()
         arms.push(arm)
-        every = every ? new Set([...every].filter(x => arm.has(x))) : arm
+        if (!every) {
+            every = arm
+            continue
+        }
+        const both = new Set<number>()
+        for (const x of every) {
+            if (arm.has(x)) both.add(x)
+        }
+        every = both
     }
     const out = { every: every ?? new Set<number>(), arms }
     memo.set(id, out)
