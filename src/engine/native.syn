@@ -5836,7 +5836,9 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     }, typeDebugging() ? (symbol, x) => explainNumberClass(prepared.get(symbol)!.prepared.g, prepared.get(symbol)!.prepared.floats, x).map(line => `    ${line}`).join('\n') : undefined, typeDebugging() ? (symbol, param) => `abi ${program.abi.get(symbol)?.join(' ') ?? '?'}; ${program.explain?.(symbol, param) ?? 'no plan'}` : undefined)
     const endless = new Set(symbols.filter(symbol => !someNode(prepared.get(symbol)!.prepared.g, n => n.op === NodeOp.ret)))
     const continuations = new Set(symbols.filter(symbol => endless.has(symbol) && free.has(symbol) && sites.get(symbol)?.length === 1))
-    nonvolatileArgs(program, prepared, continuations)
+    const located = preparedSites(prepared)
+    nonvolatileArgs(program, prepared, continuations, located)
+    permuteArgRegisters(program, prepared, continuations, located, order)
     const lowered = new Map<number, NativeUnit>()
     function lower(symbol: number, continues?: (symbol: number) => boolean): NativeUnit {
         const unit = prepared.get(symbol)!
@@ -6006,7 +6008,12 @@ function returnedRecords(program: ProgramGraph, sites: Map<number, [caller: numb
     return records
 }
 
-function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>): void {
+interface PreparedSites {
+    sites: Map<number, [caller: number, call: number, block: GraphBlock][]>
+    entryIndex: (caller: number, value: number, block: GraphBlock) => number
+}
+
+function preparedSites(prepared: Map<number, PreparedUnit>): PreparedSites {
     const sites = new Map<number, [caller: number, call: number, block: GraphBlock][]>()
     for (const [caller, unit] of prepared) {
         const g = unit.prepared.g
@@ -6047,6 +6054,11 @@ function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUn
         known.set(value, r)
         return r
     }
+    return { sites, entryIndex }
+}
+
+function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>, located: PreparedSites): void {
+    const { sites, entryIndex } = located
     for (const symbol of freeCallees(program, programCallSites(program))) {
         if (continuations.has(symbol)) continue
         const calls = sites.get(symbol)
@@ -6070,6 +6082,160 @@ function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUn
             changed = true
         })
         if (!changed) continue
+        for (const [caller, call] of calls) setCallLocations(prepared.get(caller)!.prepared.g, call, locations)
+    }
+}
+
+function locatedRegisters(program: ProgramGraph, locations: number[]): number[] {
+    const regs = program.target.argRegs
+    const out: number[] = []
+    let next = 0
+    for (const at of locations) {
+        if (at >= 0) out.push(at)
+        else if (at === floatLocation) out.push(-1)
+        else out.push(next < regs.length ? regs[next++] : -1)
+    }
+    return out
+}
+
+function entryRegisters(program: ProgramGraph, g: Graph): number[] {
+    return locatedRegisters(program, g.blocks[0].params.map(p => paramLocation(g, getNode(g, p)!)))
+}
+
+function returnRegister(program: ProgramGraph, location: number | undefined): number {
+    if (location === floatLocation) return -1
+    return location !== undefined && location >= 0 ? location : program.target.retRegs[0]
+}
+
+function permuteArgRegisters(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>, located: PreparedSites, order: number[][]): void {
+    const { sites, entryIndex } = located
+    const free = new Set(freeCallees(program, programCallSites(program)))
+    const regs = program.target.argRegs
+    const arrivalsOf = new Map<number, number[]>()
+    function preferred(caller: number, call: number, block: GraphBlock, value: number): number {
+        const unit = prepared.get(caller)!.prepared
+        if (!value || unit.analysis.crossedCalls.get(value)?.size) return -1
+        const n = getNode(unit.g, value)!
+        if (n.op === NodeOp.call) {
+            const signature = getNode(unit.g, typeRefOf(getNode(unit.g, getRef(n, 1))!))
+            const at = signature?.op === NodeOp.fnType ? fnReturnLocation(signature) : -1
+            if (at >= 0) return at
+            return at === floatLocation ? -1 : program.target.retRegs[0]
+        }
+        const source = n.op === NodeOp.get ? getNode(unit.g, getRef(n, 0)) : undefined
+        if (source?.op === NodeOp.call && !getRef(n, 1)) {
+            const record = recordTypeAt(unit.g, getRef(n, 0))
+            const homes = record ? returnRegisters(program.target, recordTypes(unit.g, record)) : undefined
+            return homes?.[getLiteral(unit.g, n, 1)] ?? -1
+        }
+        const i = entryIndex(caller, value, block)
+        if (i < 0) return -1
+        let arrivals = arrivalsOf.get(caller)
+        if (!arrivals) arrivalsOf.set(caller, arrivals = entryRegisters(program, unit.g))
+        return arrivals[i]
+    }
+    function permuteReturnRegister(symbol: number, calls: [caller: number, call: number, block: GraphBlock][]): void {
+        const unit = prepared.get(symbol)!
+        const g = unit.prepared.g
+        if (unit.returnRecord || returnRegister(program, unit.returnLocation) !== program.target.retRegs[0]) return
+        for (const n of allNodes(g)) {
+            if (n.op !== NodeOp.ret) continue
+            const value = getNode(g, getRef(n, 0))
+            if (!value || value.op === NodeOp.call || value.op === NodeOp.param || value.op === NodeOp.select || value.op === NodeOp.after) return
+        }
+        const votes = new Map<number, number>()
+        for (const [caller, call] of calls) {
+            const site = prepared.get(caller)!
+            const analysis = site.prepared.analysis
+            if (analysis.crossedCalls.get(call)?.size) continue
+            for (const user of analysis.usedBy.get(call) ?? []) {
+                const u = getNode(site.prepared.g, user)!
+                if (u.op === NodeOp.ret && getRef(u, 0) === call) {
+                    const r = site.returnRecord ? -1 : returnRegister(program, site.returnLocation)
+                    votes.set(r, (votes.get(r) ?? 0) + 3)
+                }
+                if (u.op !== NodeOp.call) continue
+                const homes = locatedRegisters(program, callLocations(site.prepared.g, user) ?? new Array(countIds(u) - 3).fill(-1))
+                for (let i = 3; i < countIds(u); i++) if (getRef(u, i) === call) votes.set(homes[i - 3], (votes.get(homes[i - 3]) ?? 0) + 1)
+            }
+        }
+        const current = program.target.retRegs[0]
+        let best = current
+        for (const [r, count] of votes) {
+            if (!regs.includes(r)) continue
+            if (count > (votes.get(best) ?? 0)) best = r
+        }
+        if (best === current) return
+        unit.returnLocation = best
+        for (const [caller, call] of calls) {
+            const site = prepared.get(caller)!.prepared.g
+            setCallLocations(site, call, callLocations(site, call) ?? [], best)
+        }
+    }
+    let k = order.length
+    while (k > 0) {
+        k--
+        const scc = order[k]
+        if (scc.length !== 1) continue
+        const symbol = scc[0]
+        if (!free.has(symbol) || continuations.has(symbol)) continue
+        const calls = sites.get(symbol)
+        const g = prepared.get(symbol)?.prepared.g
+        if (!calls?.length || !g) continue
+        permuteReturnRegister(symbol, calls)
+        const params = g.blocks[0].params
+        const open: number[] = []
+        params.forEach((p, i) => {
+            if (paramLocation(g, getNode(g, p)!) === -1) open.push(i)
+        })
+        if (!open.length || open.length > regs.length) continue
+        const taken = new Set(entryRegisters(program, g).filter((r, i) => r >= 0 && !open.includes(i)))
+        const votes = new Map<number, Map<number, number>>()
+        for (const [caller, call, block] of calls) {
+            const n = getNode(prepared.get(caller)!.prepared.g, call)!
+            for (const i of open) {
+                const r = preferred(caller, call, block, getRef(n, 3 + i))
+                if (r < 0 || !regs.includes(r) || taken.has(r)) continue
+                let counts = votes.get(i)
+                if (!counts) votes.set(i, counts = new Map())
+                counts.set(r, (counts.get(r) ?? 0) + 1)
+            }
+        }
+        const defaults = entryRegisters(program, g)
+        let before = 0
+        const ranked: [param: number, reg: number, count: number][] = []
+        for (const [i, counts] of votes) {
+            before += counts.get(defaults[i]) ?? 0
+            for (const [r, count] of counts) ranked.push([i, r, count])
+        }
+        ranked.sort((a, b) => b[2] - a[2])
+        const chosen = new Map<number, number>()
+        const used = new Set(taken)
+        let after = 0
+        for (const [i, r, count] of ranked) {
+            if (chosen.has(i) || used.has(r)) continue
+            chosen.set(i, r)
+            used.add(r)
+            after += count
+        }
+        if (after <= before) continue
+        let fits = true
+        for (const i of open) {
+            if (chosen.has(i)) continue
+            const own = defaults[i]
+            const r = own >= 0 && !used.has(own) ? own : regs.find(x => !used.has(x))
+            if (r === undefined) fits = false
+            if (r === undefined) break
+            chosen.set(i, r)
+            used.add(r)
+        }
+        if (!fits) continue
+        const locations = params.map(p => paramLocation(g, getNode(g, p)!))
+        for (const [i, r] of chosen) {
+            locations[i] = r
+            putCopy(g, params[i], getNode(g, params[i])!, [{ literal: r }])
+        }
+        dirtyValues(g, params)
         for (const [caller, call] of calls) setCallLocations(prepared.get(caller)!.prepared.g, call, locations)
     }
 }
