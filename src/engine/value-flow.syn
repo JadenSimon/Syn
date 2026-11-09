@@ -305,6 +305,7 @@ interface FlowState {
     heldInits: Map<number, Function>
     heldStatics: Set<number>
     rtPending: number[]
+    unboundTests: Set<number>
     keyPending: PendingKey[]
     parts: Map<number, Map<number, number>>
     partBind: Map<number, Bind>
@@ -1879,7 +1880,7 @@ function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
         }
         return
     }
-    if (n.op === NodeOp.rt && (getLiteral(g, n, 1) === RtOp.hasPrototype || getLiteral(g, n, 1) === RtOp.nullish) && getRef(n, 2)) {
+    if (n.op === NodeOp.rt && (getLiteral(g, n, 1) === RtOp.hasPrototype || getLiteral(g, n, 1) === RtOp.instanceof || getLiteral(g, n, 1) === RtOp.nullish) && getRef(n, 2)) {
         out.add(getRef(n, 2))
         return
     }
@@ -2182,11 +2183,34 @@ function protoGuard(s: Summary, n: GraphNode, ref: number, positive: boolean): G
         test = getNode(g, strippedRef(g, getRef(n, side)))!
         yes = n.op === NodeOp.ne ? positive : !positive
     }
-    if (test.op !== NodeOp.rt || getLiteral(g, test, 1) !== RtOp.hasPrototype || getRef(test, 2) !== ref) return
-    const cell = constantCell(s, getRef(test, 3))
-    if (cell <= 0) return
-    const proto = heap.deref(cell as Handle) as number
+    if (test.op !== NodeOp.rt || getRef(test, 2) !== ref) return
+    const proto = testedPrototype(s, test)
+    if (proto <= 0) return
     return { flags: 0, lo: MinI64, hi: MaxU64, picks: [], protos: [yes ? proto : -proto] }
+}
+
+function testedPrototype(s: Summary, test: GraphNode): number {
+    const op = getLiteral(s.g, test, 1)
+    if (op !== RtOp.hasPrototype && op !== RtOp.instanceof) return 0
+    const cell = constantCell(s, getRef(test, 3))
+    if (cell <= 0) return 0
+    return op === RtOp.hasPrototype ? heap.deref(cell as Handle) as number : ordinaryPrototype(heap.deref(cell as Handle))
+}
+
+function instanceofPrototype(s: Summary, x: Expr): number {
+    if (x.op !== ExprOp.rt || x.a !== RtOp.instanceof || x.args.length < 2) return 0
+    return testedPrototype(s, getNode(s.g, x.node)!)
+}
+
+const hasInstanceKey = heap.fromJsSymbol(Symbol.hasInstance)
+
+function ordinaryPrototype(target: Handle): number {
+    if (heap.getPropertyDescriptor(target, hasInstanceKey)) return 0
+    const descriptor = heap.getOwnProperty(target, heap.prototypeKey)
+    if (!descriptor) return 0
+    const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+    if (d.flags & (heap.PropFlags.writable | heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return 0
+    return heap.deref(d.slot0 as Handle)
 }
 
 function typeofOf(s: Summary, id: number, ref: number): boolean {
@@ -3047,6 +3071,11 @@ function wireRt(inst: Instance, x: Expr, slot: number): void {
         if (op !== RtOp.concat) markOpaque(slot)
         return
     }
+    if (instanceofPrototype(inst.summary, x) > 0) {
+        flow.unboundTests.add(slot)
+        if (undecided(flow.scalar[slot])) bindTest(slot)
+        return
+    }
     const s = summaryOf(impl)
     if (s.returnsFresh) return bindRt(inst, x, slot, impl, qualified(OriginKind.site, 0, inst.qual, x.node, inst.summary), 0)
     if (!x.args.length) return bindRt(inst, x, slot, impl, 0, 0)
@@ -3061,6 +3090,17 @@ function bindAllocator(slot: number, op: RtOp): void {
     addCaller(callee, slot)
     for (let i = 0; i < callee.summary.params; i++) addConst(callee.sigs[i], typeRange(Types.u64))
     flow.partBind.set(partSlot(slot, 0), { callee: callee.id, from: -1, kind: BindKind.rt, target: 0, recv: 0 })
+}
+
+function undecided(t: number): boolean {
+    const f = scalars.flags[t]
+    return (f & ScalarFlag.unknown) !== 0 || ((f & ScalarFlag.yes) !== 0 && (f & ScalarFlag.no) !== 0)
+}
+
+function bindTest(slot: number): void {
+    flow.unboundTests.delete(slot)
+    flow.rtPending.push(slot)
+    listen(at(instOfSlot(slot), exprAt(slot).args[0]), ListenerKind.rtSubject, slot, 0, 0)
 }
 
 function bindPendingRt(): boolean {
@@ -3151,7 +3191,7 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
     }
     for (let i = x.args.length; i < params; i++) addConst(callee.sigs[i], UNDEF)
     const part = partSlot(slot, key)
-    const from = stringRt.has(x.a) || x.a === RtOp.hasPrototype || x.a === RtOp.hasProperty ? -1 : callee.ret
+    const from = stringRt.has(x.a) || x.a === RtOp.hasPrototype || x.a === RtOp.hasProperty || instanceofPrototype(inst.summary, x) > 0 ? -1 : callee.ret
     flow.partBind.set(part, { callee: callee.id, from, kind: BindKind.rt, target: qual, recv: subject })
     if (from >= 0) copyEdge(from, part)
 }
@@ -3946,10 +3986,12 @@ function paramDemands(s: Summary): ParamDemands {
     const floatWork: number[] = []
     const classWork: number[] = []
     const identityWork: number[] = []
+    const rooted = new Uint8Array(s.exprs.length)
     for (const x of s.exprs) {
         if (x.op === ExprOp.ntype && x.a >= 0) floatWork.push(x.a)
         if (x.op === ExprOp.rt && x.a === RtOp.typeof && x.args.length) classWork.push(x.args[0], allClasses)
         if ((x.op === ExprOp.call || x.op === ExprOp.member) && x.a >= 0) identityWork.push(x.a)
+        if (!x.args.some(a => paramRooted(s, a, rooted))) continue
         const callee = staticCallee(s, x)
         if (!callee) continue
         const inner = paramDemands(callee)
@@ -3964,6 +4006,18 @@ function paramDemands(s: Summary): ParamDemands {
     const classed = classedParams(s, classWork, classMasks)
     s.demands = { floats: reachedParams(s, floatWork) | returnParams(s), classed, identity: reachedParams(s, identityWork), classMasks }
     return s.demands
+}
+
+function paramRooted(s: Summary, e: number, state: Uint8Array): boolean {
+    if (e < 0) return false
+    if (state[e]) return state[e] !== 2
+    state[e] = 1
+    const x = s.exprs[e]
+    let rooted = x.op === ExprOp.param
+    if (x.op === ExprOp.narrow || x.op === ExprOp.pick) rooted = paramRooted(s, x.a, state)
+    if (x.op === ExprOp.union) rooted = x.args.some(a => paramRooted(s, a, state))
+    state[e] = rooted ? 3 : 2
+    return rooted
 }
 
 function demandedParams(d: ParamDemands): number {
@@ -4073,7 +4127,7 @@ function keptClasses(s: Summary, i: number, m: number): number {
 
 function staticCallee(s: Summary, x: Expr): Summary | undefined {
     if (x.op === ExprOp.rt) {
-        if (x.a === RtOp.typeof) return
+        if (x.a === RtOp.typeof || instanceofPrototype(s, x) > 0) return
         const impl = bindingOf(x.a)?.impl
         return impl && flow.host.binder.traceable(impl) ? summaryOf(impl) : undefined
     }
@@ -4479,6 +4533,10 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
     if (stringRt.has(op)) return ANYSTR
     if (wordOps.has(op)) return numScalar(0, 2 ** 32 - 1)
     if (op === RtOp.hasPrototype) return prototypeScalar(inst, x, value, originsOf)
+    if (op === RtOp.instanceof) {
+        const proto = instanceofPrototype(inst.summary, x)
+        return proto > 0 ? chainScalar(at(inst, x.args[0]), proto as Handle, value, originsOf) : NONE
+    }
     if (op === RtOp.nullish) return nullishScalar(at(inst, x.args[0]), value, originsOf)
     if (op === RtOp.strictEqual || op === RtOp.truthy || op === RtOp.hasProperty) return BOOL
     if (op === RtOp.paramCount || op === RtOp.restIndex) return I64
@@ -4502,12 +4560,15 @@ function prototypeScalar(inst: Instance, x: Expr, value: (s: number) => number, 
     const holders = originsOf(at(inst, x.args[1]))
     if (!holders.length && value(at(inst, x.args[1])) === NONE) return NONE
     if (holders.length !== 1 || value(at(inst, x.args[1])) !== NONE || flow.originKind[holders[0]] !== OriginKind.static || !flow.originCell[holders[0]]) return BOOL
-    const proto = heap.deref(flow.originCell[holders[0]] as Handle)
-    const t = value(at(inst, x.args[0]))
+    return chainScalar(at(inst, x.args[0]), heap.deref(flow.originCell[holders[0]] as Handle), value, originsOf)
+}
+
+function chainScalar(slot: number, proto: Handle, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+    const t = value(slot)
     if (scalars.flags[t] & ScalarFlag.unknown) return BOOL
     let yes = false
     let no = t !== NONE
-    for (const origin of originsOf(at(inst, x.args[0]))) {
+    for (const origin of originsOf(slot)) {
         const has = chainHas(origin, proto)
         if (has < 0) return BOOL
         if (has) yes = true
@@ -4564,6 +4625,10 @@ function exprUses(slot: number): void {
     if (x.op === ExprOp.rt && (x.a === RtOp.typeof || x.a === RtOp.toNumber || x.a === RtOp.hasPrototype || x.a === RtOp.nullish)) valueUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && x.a === RtOp.trunc) scalarUse(at(inst, x.args[0]), slot)
     if (x.op === ExprOp.rt && x.a === RtOp.hasPrototype) for (const a of x.args) listen(at(inst, a), ListenerKind.reads, slot, 0, 0)
+    if (instanceofPrototype(inst.summary, x) > 0) {
+        valueUse(at(inst, x.args[0]), slot)
+        listen(at(inst, x.args[0]), ListenerKind.reads, slot, 0, 0)
+    }
     if ((x.op === ExprOp.member || x.op === ExprOp.call) && scalarUse(at(inst, x.a), slot)) arrived = true
     if (arrived) dirtyScalar(slot)
 }
@@ -4628,6 +4693,7 @@ function updateScalar(s: number): void {
     if (flow.stringSite[s] === 2 && stringy(s)) addOrigin(s, strOrigin())
     dirtyUsers(flow.scalarUsers[s], s)
     if (flow.kindWatch.has(s)) scalarClassChanged(s, scalarClass(old), scalarClass(next))
+    if (flow.unboundTests.has(s) && undecided(next)) bindTest(s)
     if (old !== NONE) return
     const waiting = flow.gateWaits.get(s)
     if (!waiting) return
@@ -4827,7 +4893,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], originUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
+        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], unboundTests: new Set(), keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
