@@ -7,6 +7,7 @@ import ts from 'typescript'
 import * as harness from './harness'
 import { allocate, programStack, programStackTop, stackCount, stackTops } from './builtins'
 import { hashKey, tableCapacity } from './builtin/memory'
+import { write } from './syscalls'
 import * as gn from './graph-node'
 import { stronglyConnected } from './graph-node'
 import * as native from './native'
@@ -2699,6 +2700,92 @@ const pstackReaches = intrinsics.tagNoInline(function pstackReaches(roots: numbe
     }
     return false
 })
+
+const pstackSyscallTouch = intrinsics.tagNoInline(function pstackSyscallTouch(k: u32): number {
+    return (intrinsics.isNative() ? write(2, 0, 0) : 0) + k
+})
+
+function pstackSyscallLoop(n: u32): number {
+    let total = 0
+    let i: u32 = 0
+    while (i < n) {
+        const p = { x: i, y: i + 1 }
+        total = total + pstackSyscallTouch(p.x) + p.y
+        i++
+    }
+    return total
+}
+
+class SlabEdgeIndex {
+    items: number[]
+
+    constructor() {
+        this.items = []
+    }
+
+    append(x: number): void {
+        this.items.push(x)
+    }
+
+    clear(): void {
+        this.items = []
+    }
+
+    rebuild(step: number): void {
+        const next: number[] = []
+        for (const x of this.items) {
+            if (x % step !== 0) next.push(x + step)
+        }
+        this.items = next
+    }
+
+    sum(): number {
+        let total = 0
+        for (const x of this.items) total = total + x
+        return total
+    }
+}
+
+function slabIndexRounds(rounds: u32): number {
+    const index = new SlabEdgeIndex()
+    let total = 0
+    let r: u32 = 0
+    while (r < rounds) {
+        let i: u32 = 0
+        while (i < 64) {
+            index.append(r * 64 + i)
+            i++
+        }
+        index.rebuild(3)
+        total = total + index.sum()
+        if ((r & 3) === 3) index.clear()
+        r++
+    }
+    return total
+}
+
+function slabIndexGrowth(n: u32): number {
+    const index = new SlabEdgeIndex()
+    index.clear()
+    let i: u32 = 0
+    while (i < n) {
+        index.append(i)
+        i++
+    }
+    return index.sum()
+}
+
+function slabLocalTemp(n: u32): number {
+    const tmp: number[] = []
+    let i: u32 = 0
+    while (i < n) {
+        tmp.push(i * 3)
+        i++
+    }
+    let total = 0
+    for (const x of tmp) total = total + x
+    return total
+}
 
 function pstackReachCount(n: u32): number {
     let hits = 0
@@ -13627,6 +13714,15 @@ function storesAfterNoreturn(p: usize, n: u32): u32 {
         const plain = unitListing(natives, 'pstackQuietPlain').replace(/pstackQuietPlain/g, 'F')
         if (scratch !== plain) harness.fail(`repro pstackQuietCall FAILED: pstackQuietScratch must compile like pstackQuietPlain once its point is scalar-replaced; pstackTouch writes memory but allocates on no pstack, so the loop's reset is idle:\n${scratch}\n--- pstackQuietPlain ---\n${plain}`)
     }, 'aarch64')
+    harness.test('pstackSyscallQuiet', () => {
+        const natives: any = native.createNatives({ pstackSyscallLoop })
+        for (const n of [0, 5]) {
+            if (Number(natives.pstackSyscallLoop(n)) !== pstackSyscallLoop(n)) harness.fail(`repro pstackSyscallQuiet FAILED: pstackSyscallLoop(${n}) returned ${natives.pstackSyscallLoop(n)}, expected ${pstackSyscallLoop(n)}`)
+        }
+        const listing: string = natives.pstackSyscallLoop.units.find((unit: any) => unit.name === 'pstackSyscallLoop').code.listing
+        const stores = pstackCellStores(listing)
+        if (stores.length) harness.fail(`repro pstackSyscallQuiet FAILED: pstackSyscallLoop resets a pstack (${stores.join('; ')}), though its callee only makes a syscall, which allocates on no pstack:\n${listing}`)
+    }, 'aarch64')
     harness.test('pstackMarkersQuiet', () => {
         const natives: any = native.createNatives({ pstackReachCount })
         for (const n of [0, 5, 64]) {
@@ -13681,6 +13777,34 @@ function storesAfterNoreturn(p: usize, n: u32): u32 {
         const stores = pstackCellStores(listing)
         if (stores.length) harness.fail(`repro pstackStaleRecursiveCallee FAILED: pstackStaleChainOuter resets a pstack (${stores.join('; ')}), though recursive pstackStaleChain's point is gone once it is lowered; its call to itself must not keep the stale stack bit:\n${listing}`)
     }, 'aarch64')
+    harness.test('slabRebuiltField', () => {
+        const roots: any = { slabIndexRounds, slabIndexGrowth, slabLocalTemp }
+        const natives: any = native.createNatives(roots)
+        const stacks = [0, 1, 2, 3, 4]
+        function measure(name: string, n: number): [pstack: number, live: number, peak: number] {
+            const marks = stacks.map(stack => native.pstackMark(stack))
+            native.resetSlabPeak()
+            const [before] = native.slabBytes()
+            const expected = roots[name](n)
+            const actual = Number(natives[name](n))
+            const grown = stacks.reduce((sum, stack, i) => sum + Number(native.pstackMark(stack) - marks[i]), 0)
+            const [live, peak] = native.slabBytes()
+            stacks.forEach((stack, i) => native.pstackRelease(stack, marks[i]))
+            if (actual !== expected) harness.fail(`repro slabRebuiltField FAILED: ${name}(${n}) returned ${actual}, expected ${expected}`)
+            console.log(`repro slabRebuiltField: ${name}(${n}) pstack ${grown} B, slab live ${Number(live - before)} B, peak ${Number(peak - before)} B`)
+            return [grown, Number(live - before), Number(peak - before)]
+        }
+        const temp = measure('slabLocalTemp', 1000)
+        if (temp[2] !== 0) harness.fail(`repro slabRebuiltField FAILED: slabLocalTemp's array never leaves its frame, so its slices stay on the pstack, but the slab peaked ${temp[2]} B above its start`)
+        const grown = measure('slabIndexGrowth', 1000)
+        if (grown[1] <= 0) harness.fail(`repro slabRebuiltField FAILED: SlabEdgeIndex.items is held by the index and outlives the frames that grow it, so its slices come from the slab, but slab live grew ${grown[1]} B`)
+        if (grown[1] >= grown[2]) harness.fail(`repro slabRebuiltField FAILED: reserve releases the slice it replaces, so slab live (${grown[1]} B) ends below its peak (${grown[2]} B)`)
+        if (grown[1] > 8192) harness.fail(`repro slabRebuiltField FAILED: after 1000 appends slab live holds only the last slice of 1020 elements, but it is ${grown[1]} B`)
+        const few = measure('slabIndexRounds', 64)
+        const many = measure('slabIndexRounds', 512)
+        if (few[1] <= 0 || many[1] <= 0) harness.fail(`repro slabRebuiltField FAILED: the rebuilt items come from the slab, but slab live grew ${few[1]} B and ${many[1]} B`)
+        console.log(`repro slabRebuiltField: per round pstack ${((many[0] - few[0]) / 448).toFixed(1)} B, slab live ${((many[1] - few[1]) / 448).toFixed(1)} B`)
+    })
     harness.test('pstackStringScratch', () => {
         const natives: any = native.createNatives({ pstackLabelled })
         const stacks = [0, 1, 2, 3]

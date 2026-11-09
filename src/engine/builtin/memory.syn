@@ -3,8 +3,8 @@
 "use wrapped";
 
 import * as intrinsics from '../intrinsics'
-import { rt, bind, bindImpl, Op as RtOp } from '../rt'
-import * as syscalls from '../syscalls'
+import { rt, bind, bindShared, Op as RtOp } from '../rt'
+import { mmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANON } from '../syscalls'
 import { readElement } from './Array'
 
 const Intrinsics = intrinsics.Intrinsics
@@ -30,58 +30,62 @@ export function releaseProgramStack(top: u32): void {
 const Types = intrinsics.Types
 
 const chunkBytes = 1 << 16
-const nativeBlocks = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-const hostBlocks = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+const headBytes = 2 * 8 + 32 * 8
+let hostHeads: RawPtr = 0
 
-function freeLists(): number[] {
-    return intrinsics.isNative() ? nativeBlocks : hostBlocks
-}
+const leadingZeros = intrinsics.tagInline(function leadingZeros(value: u32): u32 {
+    return intrinsics.isNative() ? Intrinsics.rt(RtOp.clz32, value) : Math.clz32(value)
+})
 
-function blockClass(bytes: u32): u32 {
-    if (bytes <= 16) return 0
-    return (28 - Math.clz32(bytes - 1)) & 31
-}
+const blockIndex = intrinsics.tagInline(function blockIndex(bytes: u32): u32 {
+    return bytes <= 16 ? 0 : (28 - leadingZeros(bytes - 1)) & 31
+})
 
-function mapChunk(bytes: u32): RawPtr {
-    if (!intrinsics.isNative()) return Intrinsics.alloc(bytes)
-    const ptr = syscalls.mmap(0, bytes, syscalls.PROT_READ | syscalls.PROT_WRITE, syscalls.MAP_PRIVATE | syscalls.MAP_ANON, -1 as any, 0)
-    if ((ptr as any) === -1) throw 'Out of memory'
-    return ptr
-}
+export const blockBytes = intrinsics.tagInline(function blockBytes(bytes: u32): u32 {
+    return 16 << blockIndex(bytes)
+})
 
-function refillBlocks(size: u32): RawPtr {
-    const bytes = size > chunkBytes ? size : chunkBytes
-    const chunk = mapChunk(bytes)
-    const last = chunk + bytes - size
-    let at = chunk
-    while (at < last) {
-        Intrinsics.store(at, 0, at + size, Types.u64)
-        at = at + size
+export const allocateBlock = intrinsics.tagNoInline(function allocateBlock(bytes: u32): RawPtr {
+    const heads = Intrinsics.rt(RtOp.slabHeads) as RawPtr
+    const index = blockIndex(bytes)
+    const size = 16 << index
+    const at = heads + 16 + index * 8
+    let head = Intrinsics.load(at, 0, Types.u64)
+    if (!head) {
+        const span = size > chunkBytes ? size : chunkBytes
+        // XXX: a failed mmap returns -1, and the first write through it faults
+        head = intrinsics.isNative() ? mmap(0, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1 as any, 0) : Intrinsics.alloc(span)
+        const last = head + span - size
+        let block = head
+        while (block < last) {
+            Intrinsics.store(block, 0, block + size, Types.u64)
+            block = block + size
+        }
+        Intrinsics.store(last, 0, 0, Types.u64)
     }
-    Intrinsics.store(last, 0, 0, Types.u64)
-    return chunk
-}
-
-export function allocateBlock(bytes: u32): RawPtr {
-    const lists = freeLists()
-    const index = blockClass(bytes)
-    let head = lists[index]
-    if (!head) head = refillBlocks(16 * 2 ** index)
-    lists[index] = Intrinsics.load(head, 0, Types.u64)
+    Intrinsics.store(at, 0, Intrinsics.load(head, 0, Types.u64), Types.u64)
+    const live = Intrinsics.load(heads, 0, Types.u64) + size
+    Intrinsics.store(heads, 0, live, Types.u64)
+    if (live > Intrinsics.load(heads, 8, Types.u64)) Intrinsics.store(heads, 8, live, Types.u64)
     return head
-}
+})
 
-export function freeBlock(ptr: RawPtr, bytes: u32): void {
-    const lists = freeLists()
-    const index = blockClass(bytes)
-    Intrinsics.store(ptr, 0, lists[index], Types.u64)
-    lists[index] = ptr
-}
+export const freeBlock = intrinsics.tagNoInline(function freeBlock(ptr: RawPtr, bytes: u32): void {
+    if (!ptr) return
+    const heads = Intrinsics.rt(RtOp.slabHeads) as RawPtr
+    const index = blockIndex(bytes)
+    const at = heads + 16 + index * 8
+    Intrinsics.store(ptr, 0, Intrinsics.load(at, 0, Types.u64), Types.u64)
+    Intrinsics.store(at, 0, ptr, Types.u64)
+    Intrinsics.store(heads, 0, Intrinsics.load(heads, 0, Types.u64) - (16 << index), Types.u64)
+})
 
-bindImpl(RtOp.malloc, allocateBlock)
+bind(RtOp.slabHeads, { host: (): RawPtr => hostHeads ||= Intrinsics.alloc(headBytes) })
+bindShared(RtOp.malloc, allocateBlock)
 bind(RtOp.malloc, { host: allocateBlock })
-bindImpl(RtOp.mfree, freeBlock)
+bindShared(RtOp.mfree, freeBlock)
 bind(RtOp.mfree, { host: freeBlock })
+bind(RtOp.sliceFree, { host: (slice: RawPtr, capacity: u32, T: u32): void => undefined })
 
 export const stackTops = intrinsics.tagInline(function stackTops(): usize {
     return Intrinsics.pstack(0, 0, 0) + Intrinsics.pstack(1, 0, 0) + Intrinsics.pstack(2, 0, 0) + Intrinsics.pstack(3, 0, 0) + Intrinsics.pstack(4, 0, 0)

@@ -6,6 +6,7 @@ import type { Allocation, FastTraced } from './fast-trace'
 import { globals as builtinGlobals, markStacks, releaseStacks } from './builtins'
 import { assignOne } from './builtin/Object'
 import { reportPanic } from './builtin/Error'
+import { blockBytes } from './builtin/memory'
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
@@ -223,7 +224,8 @@ function rootResult(): number | bigint {
     return BigInt(hi) * BigInt(4294967296) + BigInt(lo)
 }
 
-export const RegionKind = { code: 0, heap: 1, pstack: 2, table: 3 }
+export const RegionKind = { code: 0, heap: 1, pstack: 2, table: 3, slab: 4 }
+const regionKindNames = ['code', 'heap', 'pstack', 'table', 'slab']
 
 interface NativeRegion {
     kind: number
@@ -425,6 +427,17 @@ function pstackCell(stack: number): number {
     notePstackCell(stack, cell)
     pstackRegions.set(stack, addRegion(RegionKind.pstack, stack, cell, pstackRegionBytes))
     return cell
+}
+
+let slabHeadBlock = 0
+let slabRegion = -1
+function slabHeads(): number {
+    if (slabHeadBlock) return slabHeadBlock
+    const base = Number(nativeMapper(1 << 14))
+    if (!base || base === -1) throw 'native: failed to map the slab heads'
+    slabHeadBlock = base
+    slabRegion = addRegion(RegionKind.slab, 0, base, 1 << 14)
+    return base
 }
 
 function pstackRegion(stack: number): number {
@@ -720,6 +733,19 @@ function evaluateNode(ctx: StaticContext, graph: Graph, id: number, values: Map<
         case NodeOp.call:
         case NodeOp.rt: {
             operand(0)
+            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.malloc) {
+                const size = blockBytes(Number(int(2)))
+                if (!ctx.reserve) throw `static: %${id} allocates`
+                const base = ctx.reserve(size)
+                ctx.regions.push({ base, bytes: new Uint8Array(size), relocations: new Map() })
+                value = staticPointer(staticRegion(), BigInt(base))
+                break
+            }
+            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.mfree) {
+                operand(2)
+                value = BigInt(0)
+                break
+            }
             let symbol: number | undefined
             if (n.op === NodeOp.rt) symbol = ctx.runtime.get(getLiteral(graph, n, 1))
             else symbol = calledSymbol(graph, n)
@@ -1326,6 +1352,22 @@ export function pstackMark(stack: number): bigint {
     return top[0]
 }
 
+function slabCounts(heads: number): [live: bigint, peak: bigint] {
+    const counts = new BigUint64Array(2)
+    if (!nativeCopier((ts as any).getArrayBufferPtr(counts.buffer), heads, 16)) throw 'native: failed to read the slab heads'
+    return [counts[0], counts[1]]
+}
+
+export function slabBytes(): [live: bigint, peak: bigint] {
+    return slabCounts(slabHeads())
+}
+
+export function resetSlabPeak(): void {
+    const [live] = slabBytes()
+    const counts = new BigUint64Array([live])
+    if (!nativeCopier(slabHeads() + 8, (ts as any).getArrayBufferPtr(counts.buffer), 8)) throw 'native: failed to write the slab heads'
+}
+
 export function pstackRelease(stack: number, mark: bigint): void {
     const cell = pstackCell(stack)
     const top = new BigUint64Array([mark])
@@ -1836,7 +1878,7 @@ function noteEffect(graph: Graph, mem: MemAnalysis, block: GraphBlock, id: numbe
             out.calls.push({ callee, args, node: id })
         } else {
             out.self = EffectWrite
-            out.writes |= WritesUnknown | WritesStack
+            out.writes |= getNode(graph, getRef(n, 1))?.op === NodeOp.syscallTarget ? WritesUnknown : WritesUnknown | WritesStack
         }
     } else if (n.op === NodeOp.rt && !rt.effectOps.has(getLiteral(graph, n, 1)) && !rt.heapOps.has(getLiteral(graph, n, 1))) {
         return
@@ -2175,6 +2217,8 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>, discard
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.stringOf, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => ctx.heapAddress(getOperand(g, n, 2)) })
+rt.bindSignature(rt.Op.slabHeads, rt.rt.slabHeads)
+rt.bind(rt.Op.slabHeads, { lower: (g, n, ctx) => ctx.slabHeads() })
 rt.bindSignature(rt.Op.pstackaddr, rt.rt.pstackaddr)
 rt.bind(rt.Op.pstackaddr, { lower: (g, n, ctx) => makeNode(g, NodeOp.decode, [getOperand(g, n, 2), { literal: ctx.pstackBase() }]) })
 rt.bind(rt.Op.clz32, {
@@ -2248,6 +2292,10 @@ function nativeContext(g: NodeSpace, image: ProgramImage, add: (node: GraphNode)
             return makeNode(g, NodeOp.add, [handle, add(relocatedNode(g, image, heapRegion, base))], Types.u64)
         },
         pstackBase: () => pstackCell(0) + 8,
+        slabHeads: () => {
+            const base = slabHeads()
+            return relocatedNode(g, image, slabRegion, base)
+        },
         add,
     }
 }
@@ -2283,6 +2331,18 @@ function rewriteTargets(g: Graph, image: ProgramImage, init: boolean): Graph {
         if (n.op === NodeOp.rt && runtimeTargets.has(getLiteral(out, n, 1))) {
             const target = newId(g)
             putRuntimeCall(out, id, target, n, runtimeTargets.get(getLiteral(out, n, 1))!)
+            continue
+        }
+        if (n.op === NodeOp.rt && rt.bindingOf(getLiteral(out, n, 1))?.shared) {
+            const op = getLiteral(out, n, 1)
+            if (!sharedUnits) throw `native: ${g.name ?? 'anonymous graph'} calls the shared ${rt.opName(op)} before it was compiled`
+            const address = newId(g)
+            setNode(out, address, relocatedNode(out, image, sharedUnits.region, sharedUnits.entries.get(op)!))
+            const signature = newId(g)
+            setNode(out, signature, createFnType(out, rt.signatureOf(op).returns ?? Types.void))
+            const target = newId(g)
+            putNode(out, target, NodeOp.externalTarget, [address], { ref: signature })
+            setNode(out, id, rt.callOf(out, n, target))
             continue
         }
         if (n.op === NodeOp.rt) {
@@ -3320,7 +3380,10 @@ export function prepareNativeNormalize(): boolean {
 export function reportNativeNormalize(): void {
     const s = nativeNormalizeStats
     if (!s.calls) return
-    console.log(`native-l2 ${s.calls} calls (${(s.inBytes / 1048576).toFixed(1)}MB in, ${(s.outBytes / 1048576).toFixed(1)}MB out): encode ${s.encodeMs.toFixed(0)}ms, native ${s.nativeMs.toFixed(0)}ms, decode ${s.decodeMs.toFixed(0)}ms; checked ${s.checked} (host ${s.hostMs.toFixed(0)}ms, ${s.mismatches} mismatches); load ${s.loadMs.toFixed(0)}ms`)
+    const slab = (normalizeTarget?.run as any)?.regions.find((region: { kind: number }) => region.kind === RegionKind.slab)
+    const counts = slab ? slabCounts(slab.base) : undefined
+    const slabText = counts ? `; slab live ${(Number(counts[0]) / 1048576).toFixed(1)}MB, peak ${(Number(counts[1]) / 1048576).toFixed(1)}MB` : ''
+    console.log(`native-l2 ${s.calls} calls (${(s.inBytes / 1048576).toFixed(1)}MB in, ${(s.outBytes / 1048576).toFixed(1)}MB out): encode ${s.encodeMs.toFixed(0)}ms, native ${s.nativeMs.toFixed(0)}ms, decode ${s.decodeMs.toFixed(0)}ms; checked ${s.checked} (host ${s.hostMs.toFixed(0)}ms, ${s.mismatches} mismatches); load ${s.loadMs.toFixed(0)}ms${slabText}`)
     for (const key of Object.keys(s) as (keyof typeof s)[]) s[key] = 0
 }
 
@@ -3488,7 +3551,7 @@ function createImage() {
         values.push(value)
         final.set(slot, value)
         const { kind, index, base } = nativeRegions[region]
-        labels.set(slot, `${['code', 'heap', 'pstack', 'table'][kind]}${kind === RegionKind.pstack ? index : ''}${scale === 1 ? '' : `*${scale}`}+0x${(value - scale * base).toString(16)}`)
+        labels.set(slot, `${regionKindNames[kind]}${kind === RegionKind.pstack ? index : ''}${scale === 1 ? '' : `*${scale}`}+0x${(value - scale * base).toString(16)}`)
         slotRelocations.set(slot, { offset: slot, region, scale })
         regionSlots.set(key, slot)
         return slot
@@ -6366,7 +6429,7 @@ function wordValue(graph: Graph, word: number, rep: Rep | undefined): number | u
     if (!rep!.nullable) return handle
     return addNode(graph, NodeOp.select, [addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool), handle, { literal: 0 }])
 }
-export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined, nodes: Map<number, Rep> | undefined, codecs: Map<number, SlotCodec> | undefined): SliceTags {
+export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined, nodes: Map<number, Rep> | undefined, codecs: Map<number, SlotCodec> | undefined, slab?: boolean): SliceTags {
     const tags: SliceTags = { reads: new Map(), writes: new Map(), words: new Map() }
     function wordTag(word: number, holdsUndefined: boolean): number {
         if (holdsUndefined) return addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool)
@@ -6375,9 +6438,22 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
     for (const [id, n] of nodeEntries(graph)) {
         const op = rt.sliceOf(graph, n)
         if (op === undefined) continue
+        const free = op === rt.Op.sliceFree
         const element = slices?.get(id)
         const [width, type] = sliceSlot(element, rt.elementType(graph, n))
         const scaled = (at: number): Operand => getRef(n, at) ? addNode(graph, NodeOp.mul, [getRef(n, at), { literal: width }], Types.unknown_number) : { literal: getLiteral(graph, n, at) * width }
+        if (free && slab) {
+            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.mfree }, getOperand(graph, n, 2), scaled(3)], rt.signatureOf(rt.Op.mfree).returns)
+            continue
+        }
+        if (free) {
+            putNode(graph, id, NodeOp.after, [getOperand(graph, n, 0)])
+            continue
+        }
+        if (op === rt.Op.slice && slab) {
+            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.malloc }, scaled(2)], rt.signatureOf(rt.Op.malloc).returns)
+            continue
+        }
         if (op === rt.Op.slice) {
             putNode(graph, id, NodeOp.pstack, [getOperand(graph, n, 0), { literal: PstackWildcard }, { literal: 0 }, scaled(2)])
             continue
@@ -11271,7 +11347,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         }
         let sliceTags: SliceTags | undefined
         if (someNode(traced.graph, n => rt.sliceOf(traced.graph, n) !== undefined)) {
-            sliceTags = realizeSlices(traced.graph, local?.slices, local?.nodes, local?.codecs)
+            sliceTags = realizeSlices(traced.graph, local?.slices, local?.nodes, local?.codecs, plannedUnit?.slab)
         }
         resolvePstackTargets(traced.graph, plannedUnit && planned.pstacks.targets.get(plannedUnit))
         const dynamic = local ? runtimeHeapSites(local, traced.graph) : undefined
@@ -13705,11 +13781,43 @@ function textHash(text: string): string {
 export function createNatives(fns: Record<string, Function>, opts: CreateNativesOptions = {}) {
     rootsObserver?.(fns, opts)
     nativeObserver?.(`compile ${Object.keys(fns).join(', ')}`)
+    return compileNatives(fns, opts, true)
+}
+
+interface SharedUnits {
+    region: number
+    entries: Map<number, number>
+}
+
+let sharedUnits: SharedUnits | undefined
+const sharedCode = new Map<number, ImageCapture>()
+
+function sharedUnitsOf(): SharedUnits {
+    if (sharedUnits) return sharedUnits
+    const ops: rt.Op[] = []
+    for (const op of Object.values(rt.Op)) if (typeof op === 'number' && rt.bindingOf(op)?.shared) ops.push(op)
+    const roots: Record<string, Function> = {}
+    for (const op of ops) roots[rt.opName(op)] = rt.bindingOf(op)!.shared!
+    const cuts = pendingCuts
+    const natives = compileNatives(roots, {}, false)
+    pendingCuts = cuts
+    const capture: ImageCapture = natives[rt.opName(ops[0])].capture
+    if (capture.init !== undefined || capture.staticTo > capture.staticFrom) throw 'native: shared units write statics, which programs cannot share'
+    const entries = new Map<number, number>()
+    for (const op of ops) entries.set(op, Number(natives[rt.opName(op)].ptr))
+    sealCode(natives[rt.opName(ops[0])].codePage)
+    sharedCode.set(capture.codeRegion, capture)
+    sharedUnits = { region: capture.codeRegion, entries }
+    return sharedUnits
+}
+
+function compileNatives(fns: Record<string, Function>, opts: CreateNativesOptions, counted: boolean): Record<string, any> {
     getNativeBootstraps()
     const target = hostTarget
     const clock = createClock(target)
     pendingCuts = undefined
     const program = traceProgram(fns, opts, clock, target)
+    if ([...program.units.values()].some(graph => someNode(graph, n => n.op === NodeOp.rt && !!rt.bindingOf(getLiteral(graph, n, 1))?.shared))) sharedUnitsOf()
     if (flags.has('graph-prints')) for (const [symbol, graph] of program.units) console.log(`GRAPH ${symbol} ${graph.name} ${countNodes(graph)} ${textHash(dumpGraph(graph))}`)
     if (flags.has('graph-dumps')) for (const [, graph] of program.units) console.log(dumpGraph(graph))
     const { timed } = clock
@@ -13722,7 +13830,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     pendingCuts = undefined
     if (cutting) timed('cuts', cutting)
     clock.enterPhase('other')
-    for (const [phase, ms] of Object.entries(clock.phases)) phaseTotals[phase] = (phaseTotals[phase] ?? 0) + ms
+    if (counted) for (const [phase, ms] of Object.entries(clock.phases)) phaseTotals[phase] = (phaseTotals[phase] ?? 0) + ms
     printOptimizeStats()
     if (flags.has('trace-stats')) {
         console.log("native phases", { total: performance.now() - clock.start, ...clock.phases })
@@ -13762,11 +13870,13 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     }
     if (flags.has('unit-sizes')) for (const u of emitted) console.log(`UNIT ${u.name || 'anonymous'}:${u.symbol} ${u.code.words.length} ${u.code.words.filter(w => !u.code.target.isMoveWide(w)).length} ${(u.code.island?.length ?? 0) * 8}`)
     const inlined = (tracedUnits - emitted.length - merged ? ` (${tracedUnits - emitted.length - merged} inlined away)` : '') + (merged ? ` (${merged} merged)` : '')
-    emittedTotals.units++
-    emittedTotals.fns += emitted.length
-    emittedTotals.instructions += unitInst
-    emittedTotals.nonMov += nonMov
-    console.log(`native unit ${emitted.length} fns ${unitInst}/${nonMov} instructions/non-mov, ${unitInst * 4 + islandBytes} image bytes (${islandBytes} island)${inlined} [${Math.round(performance.now() - clock.start)}ms]`)
+    if (counted) {
+        emittedTotals.units++
+        emittedTotals.fns += emitted.length
+        emittedTotals.instructions += unitInst
+        emittedTotals.nonMov += nonMov
+        console.log(`native unit ${emitted.length} fns ${unitInst}/${nonMov} instructions/non-mov, ${unitInst * 4 + islandBytes} image bytes (${islandBytes} island)${inlined} [${Math.round(performance.now() - clock.start)}ms]`)
+    }
     const pooled = new Map<number, number>()
     const image = program.image
     for (const [slot, symbol] of image.functionTargets) if (program.units.has(symbol)) pooled.set(slot, symbol)
@@ -13827,9 +13937,8 @@ const imageMagic = 'SYNIMAGE'
 const imageVersion = 2
 const ImageSection = { regions: 1, memory: 2, relocations: 3, entries: 4, symbols: 5 }
 const EntryFlags = { float: 1, init: 2, word: 4, string: 8 }
-const regionKindNames = ['code', 'heap', 'pstack', 'table']
 
-function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[], codeWords: number[], symbols: ImageSymbol[]): void {
+function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[], code: Map<number, { codeWords: number[], symbols: ImageSymbol[] }>): void {
     const ranges: [base: bigint, end: bigint, what: string][] = []
     const heaps: [base: bigint, end: bigint, what: string][] = []
     // XXX literal words and immediates are not checked against the heap, and literal words not at all: bases are coarsely aligned (the heap is often exactly 0x300000000), so base + k collides with packed constants; the self-image check catches base-dependent words instead
@@ -13839,9 +13948,8 @@ function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[], cod
         for (const [base, end, what] of ranges) if (value >= base && value < end) return what
     }
     const relocated = new Set(relocations.map(relocation => `${relocation.at}:${relocation.offset}`))
-    for (let at = 0; at < regions.length; at++) {
+    for (const [at, { codeWords, symbols }] of code) {
         const region = regions[at]
-        if (region.kind !== RegionKind.code) continue
         for (const segment of region.segments) {
             const view = new DataView(segment.bytes.buffer, segment.bytes.byteOffset, segment.bytes.byteLength)
             for (const offset of codeWords) {
@@ -13918,6 +14026,14 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
     const code = regionIndex(capture.codeRegion)
     regions[code].segments.push({ offset: 0, bytes: capture.code })
     for (const relocation of capture.codeRelocations) relocations.push({ at: code, offset: relocation.offset, target: regionIndex(relocation.region), scale: relocation.scale })
+    const verified = new Map<number, { codeWords: number[], symbols: ImageSymbol[] }>([[code, capture]])
+    for (const [id, shared] of sharedCode) {
+        const at = used.get(id)
+        if (at === undefined) continue
+        regions[at].segments.push({ offset: 0, bytes: shared.code })
+        for (const relocation of shared.codeRelocations) relocations.push({ at, offset: relocation.offset, target: regionIndex(relocation.region), scale: relocation.scale })
+        verified.set(at, shared)
+    }
     const writes = new Map<number, { offset: number, bytes: Uint8Array }[]>()
     const words = new Map<number, Map<number, Relocation>>()
     function replay(write: MemoryWrite): void {
@@ -13943,7 +14059,7 @@ export function serializeImage(natives: Record<string, any>): Uint8Array {
         regions[at].segments.push(...paintSegments(list))
         for (const [offset, relocation] of words.get(id)!) relocations.push({ at, offset, target: regionIndex(relocation.region), scale: relocation.scale })
     }
-    verifyImage(regions, relocations, capture.codeWords, capture.symbols)
+    verifyImage(regions, relocations, verified)
     const out: number[] = []
     const scratch = new DataView(new ArrayBuffer(8))
     const u32 = (value: number) => {
@@ -14225,7 +14341,7 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     relocateImage(image, bases)
     let code = -1
     for (let i = 0; i < regions.length; i++) {
-        if (regions[i].kind === RegionKind.code) code = i
+        if (regions[i].kind === RegionKind.code && code < 0) code = i
         for (const segment of regions[i].segments) {
             const outer = heldArgs
             heldArgs = segment.bytes
@@ -14238,8 +14354,10 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
     const starts = entries.map(entry => entry.offset).sort((a, b) => a - b)
     if (symbols.length) codeObserver?.(symbols.map(symbol => codeLine(bases[code] + symbol.offset, symbol.size, symbol.frameBytes < 0 ? undefined : { bytes: symbol.frameBytes, link: symbol.frameLink }, symbol.name)).join('\t'))
     else codeObserver?.(entries.map(entry => codeLine(bases[code] + entry.offset, (starts.find(start => start > entry.offset) ?? regions[code].size) - entry.offset, undefined, entry.name)).join('\t'))
-    const page: CodePage = { ptr: bases[code] - (regions[code].base & 4095), length: align(regions[code].size + 4096, 4096), used: 0, sealed: false }
-    sealCode(page)
+    for (let i = 0; i < regions.length; i++) {
+        if (regions[i].kind !== RegionKind.code) continue
+        sealCode({ ptr: bases[i] - (regions[i].base & 4095), length: align(regions[i].size + 4096, 4096), used: 0, sealed: false })
+    }
     let heapBase = 0
     for (let i = 0; i < regions.length; i++) if (regions[i].kind === RegionKind.heap) heapBase = bases[i]
     const result: Record<string, any> = {}
@@ -14463,7 +14581,7 @@ export async function suite() {
         const unit: ImageSymbol = { name: 'materialize', offset: 16, size: 12, frameBytes: -1, frameLink: -1 }
         function scan(words: number[], relocations: ImageRelocation[], symbols: ImageSymbol[]): string {
             try {
-                verifyImage(regions, relocations, words, symbols)
+                verifyImage(regions, relocations, new Map([[0, { codeWords: words, symbols }]]))
             } catch (e) {
                 return String(e)
             }

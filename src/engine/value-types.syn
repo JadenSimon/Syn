@@ -351,6 +351,7 @@ interface ObjectField extends Field {
     initialized: boolean
     constructed: boolean
     stored: boolean
+    replaced: boolean
 }
 
 export interface Signature<T = Type> {
@@ -698,9 +699,10 @@ export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]
             continue
         }
         if (!written(location) && indexed.has(location.allocation) && (location.key === numberKey || constantIndex(location.key))) continue
-        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, constructed: false }
+        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, constructed: false, replaced: false }
         object.fields.set(location.key, field)
         object.readers.push(...location.readers)
+        if (location.type.objects.length && object.kind !== AllocKind.buffer) field.replaced = location.writers.some(w => w.unit !== object.site.unit && !constructorStore(object, w))
         const writer = location.writers[0]
         if (!writer || !location.writers.every(w => w.unit === writer.unit && w.node === writer.node)) continue
         if (writer.unit === object.site.unit && !(location.forms & FieldForm.init)) initialWrites.push([location.allocation, location.key, writer.node])
@@ -1164,6 +1166,8 @@ export interface Instantiations {
     keyText(allocation: number): string
     bufferGroups(): Map<number, number[]>
     bufferGroup(allocation: number): number
+    recordOf(allocation: number): number
+    ownerOf(allocation: number): number | undefined
     collapses(members: number[]): boolean
     joinBuffers(allocations: number[]): void
     layOut(tagged: Set<number>): void
@@ -1690,7 +1694,7 @@ export function instantiate(types: ValueTypes, genericOf: (proto: Handle) => Gen
         for (const [group, [id, k]] of freeGroups) if ((holderWidths.get(id)!.get(k) ?? 8) === 8) wideGroups.add(group)
         for (const id of shapes.keys()) layOutShape(id)
     }
-    return { keyOf, keyText, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, bufferGroup, collapses, joinBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (ownerOf[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
+    return { keyOf, keyText, table, shapes, constantShapes, addressed, repOf: type => repOf(type), elementOf, bufferGroups: groupBuffers, bufferGroup, recordOf: findRecord, ownerOf: id => ownerOf[id], collapses, joinBuffers, layOut, shapeOf: id => types.objects[id].dynamic || types.objects[id].kind === AllocKind.buffer || (ownerOf[id] !== undefined && !genericFor(id)) ? undefined : shapeId(keyOf(id)) }
 }
 export interface PlannedParam {
     label: string
@@ -1724,6 +1728,7 @@ export interface PlannedUnit {
     receivers: Map<number, Rep>
     observed: Set<number>
     returned: Map<number, Rep>
+    slab: boolean
 }
 
 function instancesOf(object: Allocation): number[] {
@@ -1755,6 +1760,41 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (literal !== undefined && !Number.isNaN(literal)) return { ...rep, constant: { literal } }
     const object = type.objects.length ? types.objects[type.objects[0]] : undefined
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, constant: { handle: object.handle } }
+}
+
+const sliceSlab = 'slab'
+
+function sliceAllocators(types: ValueTypes, inst: Instantiations, graphOf: (fn: Function) => Graph): Set<number> {
+    const slab = new Set<number>()
+    const records = new Set<number>()
+    for (const object of types.objects) for (const field of object.fields.values()) if (field.replaced) for (const id of field.type.objects) records.add(inst.recordOf(id))
+    if (!records.size) return slab
+    const sliceNodes = new Map<Function, [node: number, slice: number][]>()
+    types.instances.forEach((instance, f) => {
+        let nodes = sliceNodes.get(instance.unit)
+        if (!nodes) {
+            const g = graphOf(instance.unit)
+            nodes = []
+            for (const [id, n] of nodeEntries(g)) {
+                const op = rt.sliceOf(g, n)
+                if (op === rt.Op.slice) nodes.push([id, id])
+                else if (op === rt.Op.sliceFree) nodes.push([id, getRef(n, 2)])
+            }
+            sliceNodes.set(instance.unit, nodes)
+        }
+        let picked: boolean | undefined
+        for (const [node, slice] of nodes) {
+            for (const buffer of types.typeAt(f, slice)?.objects ?? []) {
+                const owner = inst.ownerOf(buffer)
+                if (owner === undefined) continue
+                const replaced = records.has(inst.recordOf(owner))
+                intrinsics.assert(picked === undefined || picked === replaced, `value-types: ${instance.unit.name || '<anon>'}%${node} allocates slices for instances on different allocators`)
+                picked = replaced
+            }
+        }
+        if (picked) slab.add(f)
+    })
+    return slab
 }
 
 export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean, memberFacts: MemberFacts): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, codecOf: (allocation: number, key: string) => SlotCodec } {
@@ -1802,6 +1842,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     const storage = planStorage(types, congruent, graphOf)
     fillInstanceArgs(types, genericOf, storage.copiedType)
     const inst = instantiate(types, genericOf, joins, storage.fieldType, storage.copiedType)
+    const slabInstances = sliceAllocators(types, inst, graphOf)
     const madeIds = createInterner()
     const created = new Map<number, number[]>()
     types.objects.forEach((object, id) => {
@@ -1835,7 +1876,8 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
     for (const [root, members] of congruent) {
         const tags = [...new Set(members.flatMap(f => [...storage.instances[f]]))].sort((a, b) => a - b)
         const joined = joinedOf(members)
-        const known = listOf(initial, intern(classKeys, [types.instances[root].unit, ...tags, ...reads.atoms(members)]))
+        const slab = members.some(f => slabInstances.has(f)) ? [sliceSlab] : []
+        const known = listOf(initial, intern(classKeys, [types.instances[root].unit, ...tags, ...reads.atoms(members), ...slab]))
         let entry = known.find(other => sameSignature(other.signature, joined))
         if (!entry) known.push(entry = { signature: joined, id: classCount++ })
         classOf.set(root, entry.id)
@@ -1911,11 +1953,12 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
-            unitOfRoot.set(root, unit = { fn: instance.unit, codecs: new Map(), allocations: new Map(), instances: [], params: [], returns: { kind: 'never', members: 0, shapes: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), nullishTests: new Map(), calls: new Map(), reads: new Map(), equalReads: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set(), returned: new Map() })
+            unitOfRoot.set(root, unit = { fn: instance.unit, codecs: new Map(), allocations: new Map(), instances: [], params: [], returns: { kind: 'never', members: 0, shapes: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), nullishTests: new Map(), calls: new Map(), reads: new Map(), equalReads: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set(), returned: new Map(), slab: false })
             const units = listOf(plan, instance.unit)
             units.push(unit)
         }
         unit.instances.push(id)
+        if (slabInstances.has(id)) unit.slab = true
         unitOfInstance[id] = unit
     })
     const bounded = new Map<PlannedUnit, Map<number, Map<PlannedUnit, [number, number] | undefined>>>()
@@ -3367,6 +3410,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
                 out.push(false)
             }
         }
+        if (unit.slab) out.push(sliceSlab)
         return out
     }
     const index = new Map<PlannedUnit, number>()
@@ -3938,6 +3982,7 @@ export function planPstackRegions(types: ValueTypes, units: PlannedUnit[], graph
         for (const instance of instancesOf(object)) {
             const site = siteNode(object, instance)
             if (!site || !placed(object, site[2], site[1])) continue
+            if (object.kind === AllocKind.buffer && site[0].slab) continue
             const chosen = mapOf(targets, site[0])
             chosen.set(object.site.node, Math.max(chosen.get(object.site.node) ?? PstackScratch, classOf[id]))
         }
@@ -3946,6 +3991,7 @@ export function planPstackRegions(types: ValueTypes, units: PlannedUnit[], graph
     const stacksOf = (object: Allocation, instance: number | undefined): number[] => {
         if (object.kind !== AllocKind.buffer && object.dynamic) return []
         const site = instance === undefined ? undefined : siteNode(object, instance)
+        if (object.kind === AllocKind.buffer && site?.[0].slab) return []
         const chosen = site && targets.get(site[0])?.get(object.site.node)
         if (chosen !== undefined) return [chosen]
         if (object.kind !== AllocKind.buffer) return [PstackFirst]
