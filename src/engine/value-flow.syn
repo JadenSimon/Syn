@@ -5677,10 +5677,19 @@ export interface CutField {
     term: CutTerm
 }
 
+export interface CutGuard {
+    key: string
+    arm: number
+    op: NodeOp | undefined
+    terms: CutTerm[]
+    first: boolean
+}
+
 export interface CutWrite {
     key: string
     term: CutTerm
     fns: number[]
+    guards: CutGuard[]
 }
 
 export interface CutObject {
@@ -6120,6 +6129,18 @@ export function cutScalarType(c: CutScalar | undefined): Type {
     const type = emptyType()
     if (c) scalarInto(type, scalarOfCut(c))
     return type
+}
+
+export function guardAdmits(g: CutGuard, field: number | undefined, operands: (number | undefined)[]): boolean {
+    if (field === undefined) return true
+    if (g.op === undefined) return admits(literalScalar(field), false, g.arm === 1)
+    const refuted = g.arm === 1 ? FALSE : TRUE
+    for (const other of operands) {
+        if (other === undefined) continue
+        const holds = g.first ? foldCompare(g.op, literalScalar(field), literalScalar(other), [], []) : foldCompare(g.op, literalScalar(other), literalScalar(field), [], [])
+        if (holds === refuted) return false
+    }
+    return true
 }
 
 function cutObject(origin: number): boolean {
@@ -6878,12 +6899,77 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
         if (w < 0) continue
         for (const ri of rootsOf.get(Math.floor(w / exprBits)) ?? []) writesOf[ri].push([key, w])
     }
+    const selfRead = (inst: Instance, e: number): string | undefined => {
+        const x = inst.summary.exprs[e]
+        if (x.op !== ExprOp.member || x.key === dynKey || !flow.originFields[self].has(x.key)) return undefined
+        const origins = flow.slotOrigins[at(inst, x.a)]
+        if (origins.length !== 1 || origins[0] !== self) return undefined
+        return keyLabel(x.key)
+    }
+    const guardsOf = (w: number, ri: number): [CutGuard[], string] => {
+        const guards: CutGuard[] = []
+        const marks: string[] = []
+        let inst = flow.instances[Math.floor(w / exprBits)]
+        let x = inst.summary.exprs[w % exprBits]
+        const seen = new Set<number>()
+        while (!seen.has(inst.id)) {
+            seen.add(inst.id)
+            const here = inst
+            const exprs = here.summary.exprs
+            const chain: number[] = []
+            let g = x.gates ? x.gates[0] : -1
+            while (g >= 0 && exprs[g].op === ExprOp.gate) {
+                chain.push(g)
+                g = exprs[g].a
+            }
+            const equal: [number, number][] = []
+            for (const c of chain) {
+                const cond = exprs[exprs[c].b]
+                const equality = exprs[c].key === 1 ? NodeOp.eq : NodeOp.ne
+                if (cond.op === ExprOp.cmp && cond.key === equality) equal.push([cond.a, cond.b])
+            }
+            const operand = (e: number): CutTerm[] => {
+                const terms = [termOf(at(here, e), ri, [])]
+                for (const [a, b] of equal) {
+                    if (a === e) terms.push(termOf(at(here, b), ri, []))
+                    if (b === e) terms.push(termOf(at(here, a), ri, []))
+                }
+                return terms
+            }
+            for (const c of chain) {
+                const gate = exprs[c]
+                const cond = exprs[gate.b]
+                const read = selfRead(here, gate.b)
+                const compare = cond.op === ExprOp.cmp && compareOps.has(cond.key)
+                const left = compare ? selfRead(here, cond.a) : undefined
+                const right = compare ? selfRead(here, cond.b) : undefined
+                if (read !== undefined) guards.push({ key: read, arm: gate.key, op: undefined, terms: [], first: true })
+                else if (left !== undefined) guards.push({ key: left, arm: gate.key, op: cond.key, terms: operand(cond.b), first: true })
+                else if (right !== undefined) guards.push({ key: right, arm: gate.key, op: cond.key, terms: operand(cond.a), first: false })
+                if (read !== undefined || left !== undefined || right !== undefined) marks.push(`${here.id}:${c}`)
+            }
+            if (inst === roots[ri].inst) break
+            const callers: number[] = []
+            for (const c of inst.callers) if ((rootsOf.get(instOfSlot(c).id) ?? []).includes(ri) && !callers.includes(ownerSlot(c))) callers.push(ownerSlot(c))
+            if (callers.length !== 1) break
+            inst = instOfSlot(callers[0])
+            x = exprAt(callers[0])
+        }
+        return [guards, marks.join(' ')]
+    }
     const writeTerms = (ri: number): CutWrite[] => {
         const out: CutWrite[] = []
+        const marksOf: string[] = []
         for (const [key, w] of writesOf[ri]) {
             const label = keyLabel(key)
-            let write = out.find(x => x.key === label)
-            if (!write) out.push(write = { key: label, term: emptyTerm(), fns: [] })
+            const [guards, mark] = guardsOf(w, ri)
+            let index = out.findIndex((x, i) => x.key === label && marksOf[i] === mark)
+            if (index < 0) {
+                index = out.length
+                out.push({ key: label, term: emptyTerm(), fns: [], guards })
+                marksOf.push(mark)
+            }
+            const write = out[index]
             mergeTerm(write.term, termOf(writtenSlot(w), ri, []))
             const fn = tableRef(fns, flow.instances[Math.floor(w / exprBits)].summary.fn)
             if (!write.fns.includes(fn)) write.fns.push(fn)
@@ -7097,6 +7183,13 @@ function cutObjectText(c: Cut, object: CutObject, entry: number, depth: number, 
     return `{${object.fields.map(f => `${f.key}: ${cutTermText(c, f.term, entry, depth + 1, [...stack, object], refText)}`).join(', ')}}`
 }
 
+function cutGuardText(c: Cut, g: CutGuard, entry: number): string {
+    const field = `this.${g.key}`
+    const other = g.terms.map(t => cutTermText(c, t, entry)).join(' = ')
+    const cond = g.op === undefined ? field : g.first ? `${field} ${opName(g.op)} ${other}` : `${other} ${opName(g.op)} ${field}`
+    return `${g.arm === 1 ? ' if ' : ' unless '}${cond}`
+}
+
 export function cutText(c: Cut): string {
     const head = c.params.length ? `<${c.params.map(p => p.name).join(', ')}>` : ''
     const lines = [`${c.generator === 'class' ? 'class ' : ''}${c.name}${head} {   key=${c.key}${c.arity >= 0 ? ` arity=${c.arity}` : ''} fns=${c.fns.length} objects=${c.objects.length} inputs=${c.inputs.length} work=${c.work} nodes=${c.size} ${c.ms.toFixed(1)}ms${c.reasons.length ? ` SLOW PATH: ${c.reasons.join('; ')}` : ''}`]
@@ -7107,7 +7200,7 @@ export function cutText(c: Cut): string {
         const params = inputs.map(input => cutInputText(c, c.inputs.indexOf(input), i))
         lines.push(`  ${e.label}${locals.length ? `<${locals.join(', ')}>` : ''}(${params.join(', ')}): ${cutTermText(c, e.ret, i)}${e.allocates ? '   allocates' : ''}${e.reasons.length ? `   SLOW PATH: ${e.reasons.join('; ')}` : ''}`)
         for (const effect of e.effects) if (!emptyTermOf(effect.term)) lines.push(`      writes ${cutInputText(c, effect.input, i)} ⊇ ${cutTermText(c, effect.term, i)}`)
-        for (const w of e.writes) lines.push(`      sets ${w.key} := ${cutTermText(c, w.term, i)}`)
+        for (const w of e.writes) lines.push(`      sets ${w.key} := ${cutTermText(c, w.term, i)}${w.guards.map(g => cutGuardText(c, g, i)).join('')}`)
         for (const callout of e.callouts) {
             const recv = callout.recv.refs.length || callout.recv.objects.length || callout.recv.self ? ` this ${cutTermText(c, callout.recv, i)}` : ''
             lines.push(`      callout ${c.inputs[callout.result].name} = ${cutTermText(c, callout.callee, i)}(${callout.args.map(a => cutTermText(c, a, i)).join(', ')})${recv}`)
