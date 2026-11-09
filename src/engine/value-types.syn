@@ -7,7 +7,7 @@ import { firstNonOrderingSlot, NumericOps, PstackCount, PstackFirst, PstackWildc
 import { countIds, dominatorTree, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf, allNodes, countNodes, hasNode, nodeEntries, nodeIds, heapInterior, heapField, heapFieldCount, graphLoops, type GraphLoops, graphRegions, type GraphRegions, stronglyConnected, tailOf, tailPositions, tailRoots } from './graph-node'
 import type { TraceSession } from './trace2'
 import type { Binder } from './program-graph'
-import { dataKeys, reducedShape } from './property-eval'
+import { dataKeys, forwardedField, reducedShape } from './property-eval'
 import * as rt from './rt'
 
 type Handle = intrinsics.Handle
@@ -86,6 +86,7 @@ export interface UnitTypes {
 
 export interface Accesses {
     resolve(instances: number[]): UnitTypes
+    equalReads(instances: number[], pure: (node: number) => boolean, crossable: (call: number) => boolean): Map<number, number>
     typeAt(instance: number, node: number): Type | undefined
     rowAt(instance: number, node: number): number | undefined
     returnRow(instance: number): number | undefined
@@ -367,6 +368,7 @@ export interface InstanceSignature extends Signature {
 
 export interface ValueTypes {
     resolve(instances: number[]): UnitTypes
+    equalReads(instances: number[], pure: (node: number) => boolean, crossable: (call: number) => boolean): Map<number, number>
     typeAt(instance: number, node: number): Type | undefined
     rowAt(instance: number, node: number): number | undefined
     returnRow(instance: number): number | undefined
@@ -722,7 +724,7 @@ export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]
     const fieldStores = new Map<Function, Set<number>>()
     for (const location of data.locations) for (const site of location.writers) setOf(fieldStores, site.unit).add(site.node)
     const keyNames = new Map([...keyHandles].map(([name, key]) => [key, name]))
-    return { resolve: data.resolve, typeAt: data.typeAt, rowAt: data.rowAt, returnRow: data.returnRow, rowCount: data.rowCount, ms: performance.now() - start, objects, instances, slots: storageSlotsOf(locations), stateAllocations, keyHandles, keyNames, fieldStores, erasedFields, instanceArgs: [] }
+    return { resolve: data.resolve, equalReads: data.equalReads, typeAt: data.typeAt, rowAt: data.rowAt, returnRow: data.returnRow, rowCount: data.rowCount, ms: performance.now() - start, objects, instances, slots: storageSlotsOf(locations), stateAllocations, keyHandles, keyNames, fieldStores, erasedFields, instanceArgs: [] }
 }
 
 function unobservedFields(data: Accesses, roots: Function[], host: AccessHost): Set<Location> {
@@ -1717,6 +1719,7 @@ export interface PlannedUnit {
     nullishTests: Map<number, Handle[]>
     calls: Map<number, Set<PlannedUnit>>
     reads: Map<number, number>
+    equalReads: Map<number, number>
     coercions: Map<number, number>
     receivers: Map<number, Rep>
     observed: Set<number>
@@ -1754,7 +1757,7 @@ function valueRep(types: ValueTypes, inst: Instantiations, type: Type, oneObject
     if (object?.constant && object.handle && oneObject(object.state!)) return { ...rep, constant: { handle: object.handle } }
 }
 
-export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean, memberFacts: MemberFacts): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, codecOf: (allocation: number, key: string) => SlotCodec } {
+export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean, memberFacts: MemberFacts, inlined: (fn: Function) => boolean): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, codecOf: (allocation: number, key: string) => SlotCodec } {
     const callSiteIds = createInterner()
     const callSites: CallSite[] = []
     const outgoing = types.instances.map(() => [] as [node: number, callee: number][])
@@ -1908,7 +1911,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const root = unitRoot(id)
         let unit = unitOfRoot.get(root)
         if (!unit) {
-            unitOfRoot.set(root, unit = { fn: instance.unit, codecs: new Map(), allocations: new Map(), instances: [], params: [], returns: { kind: 'never', members: 0, shapes: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), nullishTests: new Map(), calls: new Map(), reads: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set(), returned: new Map() })
+            unitOfRoot.set(root, unit = { fn: instance.unit, codecs: new Map(), allocations: new Map(), instances: [], params: [], returns: { kind: 'never', members: 0, shapes: [], nullable: false }, returnsSelf: false, nodes: new Map(), slices: new Map(), blocks: new Set(), deadArms: new Map(), nullishTests: new Map(), calls: new Map(), reads: new Map(), equalReads: new Map(), coercions: new Map(), receivers: new Map(), observed: new Set(), returned: new Map() })
             const units = listOf(plan, instance.unit)
             units.push(unit)
         }
@@ -2033,6 +2036,24 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         }
         intrinsics.assert(!words.size, `value-types: ${unit.fn.name} tags word accesses %${[...words].join(', %')} that touch no buffer`)
     }
+    const forwards = new Map<Function, boolean>()
+    const forwarded = (fn: Function) => {
+        let known = forwards.get(fn)
+        if (known === undefined) forwards.set(fn, known = forwardedField(graphOf(fn)) !== undefined)
+        return known
+    }
+    for (const unit of unitOfRoot.values()) {
+        const pure = (node: number) => [...unit.calls.get(node) ?? []].every(callee => forwarded(callee.fn))
+        const crossable = (call: number) => {
+            const callees = unit.calls.get(call)
+            return !!callees?.size && [...callees].every(callee => inlined(callee.fn))
+        }
+        for (const [read, prior] of types.equalReads(unit.instances, pure, crossable)) {
+            const rep = unit.nodes.get(read)
+            const known = unit.nodes.get(prior)
+            if (!unit.reads.has(read) && rep && known && sameRep(rep, known)) unit.equalReads.set(read, prior)
+        }
+    }
     const variants = new Map<PlannedUnit, Map<string, PlannedUnit>>()
     const boundedUnit = (unit: PlannedUnit, select: number, arm: number) => {
         const byArm = mapOf(variants, unit)
@@ -2043,7 +2064,7 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         deadArms.set(select, [...deadArms.get(select) ?? [], arm].sort((a, b) => a - b))
         const variant: PlannedUnit = {
             ...unit, codecs: new Map(unit.codecs), allocations: new Map(unit.allocations), instances: unit.instances.slice(), params: unit.params.slice(), nodes: new Map(unit.nodes), slices: new Map(unit.slices), blocks: new Set(unit.blocks), deadArms, nullishTests: new Map(unit.nullishTests),
-            calls: new Map(), reads: new Map(unit.reads), coercions: new Map(unit.coercions), receivers: new Map(unit.receivers), observed: new Set(unit.observed), returned: new Map(unit.returned),
+            calls: new Map(), reads: new Map(unit.reads), equalReads: new Map(unit.equalReads), coercions: new Map(unit.coercions), receivers: new Map(unit.receivers), observed: new Set(unit.observed), returned: new Map(unit.returned),
         }
         byArm.set(key, variant)
         listOf(plan, unit.fn).push(variant)
@@ -3326,6 +3347,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
         byNode([...unit.nullishTests].map(([n, handles]): [number, Atom[]] => [n, handles]), out)
         byNode([...unit.coercions].map(([n, mask]): [number, Atom[]] => [n, [mask]]), out)
         byNode([...unit.reads].map(([n, literal]): [number, Atom[]] => [n, [literal]]), out)
+        byNode([...unit.equalReads].map(([n, prior]): [number, Atom[]] => [n, [prior]]), out)
         byNode([...unit.slices].map(([n, element]): [number, Atom[]] => [n, [elementWidth(element), numberName(element) === 'f64']]), out)
         const nodes = [...unit.nodes].filter(([id]) => keyed(id)).sort((a, b) => a[0] - b[0])
         out.push(nodes.length)

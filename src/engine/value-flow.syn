@@ -9,7 +9,7 @@ import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiter
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import { AllocKind, boundCallee, FieldForm, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
+import { AllocKind, boundCallee, FieldForm, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, listOf, mapOf, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -3174,6 +3174,12 @@ function watchConfined(c: Confinement, slot: number, side: number): void {
 }
 
 function confined(inst: Instance, calls: number[], owner: number, callee: Instance, target: number): boolean {
+    const c = confinement(inst, calls, owner)
+    if (!c.open) c.sinks.push([callee, target])
+    return !c.open
+}
+
+function confinement(inst: Instance, calls: number[], owner: number): Confinement {
     const s = inst.summary
     const key = `${inst.id}:${owner}:${calls.join(',')}`
     let id = flow.confineKeys.get(key)
@@ -3199,9 +3205,7 @@ function confined(inst: Instance, calls: number[], owner: number, callee: Instan
         }
         if (!c.open) watchConfined(c, at(inst, exprOfNode(s, owner)), 0)
     }
-    const c = flow.confinements[id]
-    if (!c.open) c.sinks.push([callee, target])
-    return !c.open
+    return flow.confinements[id]
 }
 
 function pickOrigin(target: number, origin: number, key: number, truthy: number): void {
@@ -5402,6 +5406,94 @@ function resolveUnit(list: number[]): UnitTypes {
     return { nodes, slices, blocks, selects, receivers }
 }
 
+interface EqualRead {
+    read: number
+    prior: number
+    owner: number
+    calls: number[]
+    passed: number[]
+}
+
+function settledScope(s: Summary): pg.ProofScope {
+    const base = proofScope(s)
+    const nodes = countNodes(s.g)
+    let work = 0
+    return {
+        g: s.g,
+        regions: base.regions,
+        charge: n => {
+            work += n
+            if (work > budgetFactor * nodes) throw `value-flow: equal reads of ${s.name} exceed their budget (work ${work} > ${budgetFactor} * ${nodes} nodes)`
+        },
+        skipKey: () => {},
+        proofs: new Map(),
+        segRoots: base.segRoots,
+        keyRoots: new Map(),
+        rest: base.rest,
+        arrivals: base.arrivals,
+        setterKeys: flow.setterKeys,
+    }
+}
+
+function equalCandidates(s: Summary, known: Map<Summary, EqualRead[]>): EqualRead[] {
+    const cached = known.get(s)
+    if (cached) return cached
+    const g = s.g
+    const out: EqualRead[] = []
+    known.set(s, out)
+    const groups = new Map<number, Map<number, number[]>>()
+    for (const [node, e] of s.exprOf) {
+        const n = getNode(g, node)
+        if (n?.op !== NodeOp.getProp || getRef(n, 2) || s.exprs[e].op !== ExprOp.member) continue
+        const key = getLiteral(g, n, 2)
+        if (heap.keyIndex(key as Handle) !== undefined) continue
+        listOf(mapOf(groups, key), getRef(n, 1)).push(node)
+    }
+    const modeled = (node: number, op: ExprOp) => {
+        const e = s.exprOf.get(node)
+        return e !== undefined && s.exprs[e].op === op
+    }
+    let scope: pg.ProofScope | undefined
+    for (const owners of groups.values()) {
+        for (const [owner, reads] of owners) {
+            if (reads.length < 2 || !s.exprOf.has(owner)) continue
+            for (const read of reads) {
+                scope ??= settledScope(s)
+                const calls: number[] = []
+                const passed: number[] = []
+                const prior = pg.priorRead(scope, read, calls, passed)
+                if (!prior || !modeled(prior, ExprOp.member)) continue
+                if (calls.every(call => modeled(call, ExprOp.call)) && passed.every(p => modeled(p, ExprOp.member))) out.push({ read, prior, owner, calls, passed })
+            }
+        }
+    }
+    return out
+}
+
+function opaqueRead(inst: Instance, node: number): boolean {
+    const e = inst.summary.exprOf.get(node)!
+    const slot = at(inst, e)
+    if (flow.slotOpaque[slot] || flow.slotOpaque[at(inst, inst.summary.exprs[e].a)]) return true
+    const parts = flow.parts.get(slot)
+    if (!parts) return false
+    for (const part of parts.values()) {
+        if (flow.slotOpaque[part]) return true
+    }
+    return false
+}
+
+function equalReads(list: number[], pure: (node: number) => boolean, crossable: (call: number) => boolean, known: Map<Summary, EqualRead[]>): Map<number, number> {
+    const members = list.map(f => flow.exportedInstances[f].inst)
+    const out = new Map<number, number>()
+    for (const r of equalCandidates(members[0].summary, known)) {
+        if (!r.calls.length || !r.calls.every(crossable) || !pure(r.read) || !pure(r.prior) || !r.passed.every(pure)) continue
+        if (members.some(m => opaqueRead(m, r.read) || opaqueRead(m, r.prior) || r.passed.some(p => opaqueRead(m, p)))) continue
+        if (members.some(m => confinement(m, r.calls, r.owner).open)) continue
+        out.set(r.read, r.prior)
+    }
+    return out
+}
+
 function resolveNode(index: number, node: number): Type | undefined {
     const inst = flow.exportedInstances[index].inst
     const e = inst.summary.exprOf.get(node)
@@ -5582,9 +5674,11 @@ function exportAccesses(): Accesses {
     exportLocations()
     for (const entry of flow.exportedInstances) exported.instances.push(exportInstance(entry))
     const solved = flow
+    const equal = new Map<Summary, EqualRead[]>()
     return {
         allocations: exported.allocations, locations: exported.locations, instances: exported.instances,
         resolve: (list: number[]) => withFlow(solved, () => resolveUnit(list)),
+        equalReads: (list: number[], pure: (node: number) => boolean, crossable: (call: number) => boolean) => withFlow(solved, () => equalReads(list, pure, crossable, equal)),
         typeAt: (index: number, node: number) => withFlow(solved, () => resolveNode(index, node)),
         rowAt: (index: number, node: number) => withFlow(solved, () => rowAt(index, node)),
         returnRow: (index: number) => withFlow(solved, () => returnRow(index)),
