@@ -123,7 +123,8 @@ function pathFacts(g: Graph, path: SelectPath): Facts {
     const facts: Facts = []
     for (const [select, arm] of path) {
         const n = getNode(g, select)!
-        if (countIds(n) === 3 && getRef(n, 0)) facts.push([getRef(n, 0), arm === 1])
+        const cond = getRef(n, 0)
+        if (countIds(n) === 3 && cond) facts.push([tailOf(g, cond) || cond, arm === 1])
     }
     return facts
 }
@@ -7852,26 +7853,49 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function foldKnownConditions(target: GraphBlock): boolean {
         const selects = findValues(target.id, NodeOp.select) ?? []
-        if (selects.length < 2) return false
+        if (!selects.length) return false
         interface Known { keys: Map<string, number>, facts: Facts }
         function keyOf(id: number): string | undefined {
             const n = getNode(g, id)
             if (!n) return
             return n.op === NodeOp.param || n.op === NodeOp.block ? `#${id}` : nodeKey(g, n)
         }
+        function inverseKey(n: GraphNode, operands = getOperands(g, n)): string | undefined {
+            if (!CompareOps.has(n.op) || comparesFloats(g, n)) return
+            return nodeKey(g, copyNode(g, n, operands, InverseCompare.get(n.op)!))
+        }
+        function conjuncts(id: number): number[] | undefined {
+            const n = getNode(g, id)
+            if (n?.op !== NodeOp.and || countIds(n) !== 2) return
+            for (let i = 0; i < 2; i++) {
+                if (!getRef(n, i) || !CompareOps.has(getNode(g, getRef(n, i))!.op)) return
+            }
+            return [getRef(n, 0), getRef(n, 1)]
+        }
+        function entered(n: GraphNode): boolean {
+            for (let i = 0; i < countIds(n); i++) {
+                const m = getRef(n, i) ? getNode(g, getRef(n, i))! : undefined
+                if (m && m.op !== NodeOp.param && !isArgless(m)) return false
+            }
+            return true
+        }
         const conditions = new Set<string>()
         let repeated = false
+        let entering = false
         for (const s of selects) {
             const cond = getRef(getNode(g, s)!, 0)
-            const key = cond ? keyOf(cond) : undefined
-            if (key === undefined) continue
-            if (conditions.has(key)) {
-                repeated = true
-                break
+            if (!cond) continue
+            for (const part of [cond, ...conjuncts(cond) ?? []]) {
+                const key = keyOf(part)
+                if (key === undefined) continue
+                if (conditions.has(key)) repeated = true
+                conditions.add(key)
+                const n = getNode(g, part)!
+                const inverse = inverseKey(n)
+                if (inverse === undefined) continue
+                conditions.add(inverse)
+                if (entered(n)) entering = true
             }
-            conditions.add(key)
-            const n = getNode(g, cond)!
-            if (CompareOps.has(n.op) && !comparesFloats(g, n)) conditions.add(nodeKey(g, copyNode(g, n, getOperands(g, n), InverseCompare.get(n.op)!)))
         }
         const offsetBy = (n: GraphNode, a: number, b: number) => {
             const m = getRef(n, a) ? getNode(g, getRef(n, a)) : undefined
@@ -7884,15 +7908,46 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (offsetBy(n, 0, 1) || offsetBy(n, 1, 0)) offsetCompare = true
             }
         }
-        if (!repeated && !offsetCompare) return false
+        function entryKeys(): Map<string, number> {
+            let known: Map<string, number> | undefined
+            for (const [fromId, appId] of target === g.blocks[0] ? [] : findInboundApplies(target)) {
+                const app = getNode(g, appId)!
+                const at = countIds(app) === target.params.length + 1 ? arrivalAt(tailPositions(g, getGraphBlock(fromId).bodyId), appId) : undefined
+                const arrived = new Map<string, number>()
+                for (const [cond, truth] of at ? pathFacts(g, at.path) : []) {
+                    const c = getNode(g, cond)!
+                    if (!CompareOps.has(c.op) || comparesFloats(g, c)) continue
+                    const operands = getOperands(g, c)
+                    for (let i = 0; i < operands.length; i++) {
+                        const x = getRef(c, i)
+                        if (!x || isArgless(getNode(g, x)!)) continue
+                        let k = 1
+                        while (k < countIds(app) && getRef(app, k) !== x) k++
+                        operands[i] = k < countIds(app) ? target.params[k - 1] : 0
+                    }
+                    if (operands.includes(0)) continue
+                    arrived.set(nodeKey(g, copyNode(g, c, operands)), truth ? 1 : 0)
+                    arrived.set(inverseKey(c, operands)!, truth ? 0 : 1)
+                }
+                const kept = known ? new Map<string, number>() : arrived
+                for (const [key, value] of known ?? []) {
+                    if (arrived.get(key) === value) kept.set(key, value)
+                }
+                known = kept
+                if (!known.size) break
+            }
+            return known ?? new Map()
+        }
+        const entry = entering ? entryKeys() : new Map<string, number>()
+        if (!repeated && !offsetCompare && ![...conditions].some(key => entry.has(key))) return false
         function assume(known: Known, cond: number, value: number): Known {
             const keys = new Map(known.keys)
             const facts: Facts = [...known.facts, [cond, value === 1]]
             const key = keyOf(cond)
             if (key === undefined) return { keys, facts }
             keys.set(key, value)
-            const n = getNode(g, cond)!
-            if (CompareOps.has(n.op) && !comparesFloats(g, n)) keys.set(nodeKey(g, copyNode(g, n, getOperands(g, n), InverseCompare.get(n.op)!)), value ? 0 : 1)
+            const inverse = inverseKey(getNode(g, cond)!)
+            if (inverse !== undefined) keys.set(inverse, value ? 0 : 1)
             return { keys, facts }
         }
         function compared(n: GraphNode, facts: Facts): number | undefined {
@@ -7902,7 +7957,17 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (ranges.below(target, getRef(n, 1), getRef(n, 0), 0, facts)) return n.op === NodeOp.gt || n.op === NodeOp.ge || n.op === NodeOp.ne ? 1 : 0
         }
         function lookup(known: Known, cond: number): number | undefined {
-            if (!cond || !known.keys.size) return
+            if (!cond) return
+            const parts = conjuncts(cond)
+            if (parts) {
+                const a = lookup(known, parts[0])
+                const b = lookup(known, parts[1])
+                if (a === 0 || b === 0) return 0
+                if (a === 1 && b === 1) return 1
+                if (a === undefined && lookup(assume(known, parts[0], 1), parts[1]) === 0) return 0
+                if (b === undefined && lookup(assume(known, parts[1], 1), parts[0]) === 0) return 0
+            }
+            if (!known.keys.size) return
             const key = keyOf(cond)
             const exact = key === undefined ? undefined : known.keys.get(key)
             return exact ?? compared(getNode(g, cond)!, known.facts)
@@ -7994,7 +8059,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             }
             return rewrite(id, known)
         }
-        const body = tails(target.bodyId, { keys: new Map(), facts: [] })
+        const body = tails(target.bodyId, { keys: entry, facts: [] })
         if (body === target.bodyId) return false
         setBlockBody(g, target, body)
         revisitBlock(target)
@@ -8619,16 +8684,17 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 if (!list) tails.set(block, list = tailPositions(g, getGraphBlock(block).bodyId))
                 return list
             }
-            const arrival = (from: number, app: number): TailPosition => {
-                const found = tailsOf(from).filter(p => p.at === app)
-                if (found.length === 1) return found[0]
-                const path = found[0].path.filter(([select, arm]) => found.every(p => p.path.some(([s, a]) => s === select && a === arm)))
-                return { at: app, orderings: found[0].orderings, path }
-            }
-            ranges = rangeFacts(g, block => findInboundApplies(block).map(([from, app]): [GraphBlock, TailPosition] => [getGraphBlock(from), arrival(from, app)]))
+            ranges = rangeFacts(g, block => findInboundApplies(block).map(([from, app]): [GraphBlock, TailPosition] => [getGraphBlock(from), arrivalAt(tailsOf(from), app)!]))
             rangesEpoch = graphEpoch
         }
         return ranges
+    }
+
+    function arrivalAt(positions: TailPosition[], app: number): TailPosition | undefined {
+        const found = positions.filter(p => p.at === app)
+        if (found.length < 2) return found[0]
+        const path = found[0].path.filter(([select, arm]) => found.every(p => p.path.some(([s, a]) => s === select && a === arm)))
+        return { at: app, orderings: found[0].orderings, path }
     }
 
     let mem: MemAnalysis | undefined
