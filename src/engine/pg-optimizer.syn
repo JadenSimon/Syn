@@ -5,7 +5,7 @@ import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp } from './rt'
 import { countedLoopShape, expectForm, firstNonOrderingSlot, type Graph, type GraphBlock, type GraphNode } from './lowering2'
-import { tailOf, withNodes, copyNodes, addCopy, addNode, countIds, getLiteral, getNode, getOperand, getRef, NodeOp, putNode, regionUp, within, childRegion, typeOf, type Operand, type RegionTree, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
+import { tailOf, withNodes, copyNodes, addCopy, addNode, countIds, getLiteral, getNode, getOperand, getRef, NodeOp, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
 import { AllocKind, constructorOf, emptyType, fixedField, fixedState, inhabited, regionRets, selfOf, usersOf, type AccessHost, type PlannedUnit, type Type, type ValueTypes } from './value-types'
 
@@ -15,7 +15,7 @@ const Types = intrinsics.Types
 
 export interface ProofScope {
     g: Graph
-    regions: RegionTree
+    regions: GraphRegions
     charge(n: number): void
     skipKey(key: number): void
     proofs: Map<number, boolean>
@@ -34,6 +34,8 @@ export interface ProofScope {
     preserves?(node: number, key: number, owner: number): boolean
     effectKeyRoots?: Map<number, Map<number, Map<number, number>>>
     setterKeys?: Set<number>
+    writesNoKeys?(node: number): boolean
+    allocatedLength?(call: number, key: number): number
 }
 
 export interface Relation {
@@ -41,6 +43,7 @@ export interface Relation {
     length: number
     key: number
     below: boolean
+    inclusive?: boolean
 }
 
 export const pureRt = new Set<number>([RtOp.typeof, RtOp.toString, RtOp.handleof, RtOp.heapaddr, RtOp.pstackaddr, RtOp.hasPrototype, RtOp.hasProperty, RtOp.nullish, RtOp.paramCount, RtOp.restIndex, RtOp.handleHash, RtOp.stringOf])
@@ -101,7 +104,11 @@ export function relationOf(g: Graph, cond: number, yes: boolean): Relation | und
         const key = getLiteral(g, getNode(g, a)!, 2)
         if (op === NodeOp.gt) return { index: b, length: a, key, below: true }
         if (op === NodeOp.le || op === NodeOp.lt) return { index: b, length: a, key, below: false }
+        return undefined
     }
+    if (fieldOwner(g, b)) return undefined
+    if (op === NodeOp.lt) return { index: a, length: b, key: 0, below: true }
+    if (op === NodeOp.le) return { index: a, length: b, key: 0, below: true, inclusive: true }
     return undefined
 }
 
@@ -109,11 +116,12 @@ export function inBounds(scope: ProofScope, node: number, index: number, recv: n
     const g = scope.g
     return crossingsAt(scope, node, key, recv, (cond, yes, token, open) => {
         const rel = relationOf(g, cond, yes)
+        if (rel?.below && !rel.key) return token === recv && atMost(scope, index, rel.index) && allocatedAbove(scope, rel.length, token, key, !!rel.inclusive)
         if (!rel?.below || rel.key !== key || !atMost(scope, index, rel.index) || !sameValue(scope, fieldOwner(g, rel.length), recv)) return false
         if (keyRoot(scope, getRef(getNode(g, rel.length)!, 0), key, recv, open) !== token) return false
         if (open) scope.guardLengths!.push(rel.length)
         return true
-    })
+    }, token => token === recv && allocatedAbove(scope, index, token, key, true))
 }
 
 export function constantInBounds(scope: ProofScope, node: number, index: number, recv: number, key: number): number[] | undefined {
@@ -132,15 +140,15 @@ export function constantInBounds(scope: ProofScope, node: number, index: number,
 type Holds = (cond: number, yes: boolean, token: number, open: boolean) => boolean
 type Guard = (cond: number, yes: boolean, token: number) => boolean
 
-function crossingsAt(scope: ProofScope, node: number, key: number, recv: number, holds: Holds): number[] | undefined {
-    if (provedAt(scope, node, key, recv, holds, false)) return []
+function crossingsAt(scope: ProofScope, node: number, key: number, recv: number, holds: Holds, unguarded?: (token: number) => boolean): number[] | undefined {
+    if (provedAt(scope, node, key, recv, holds, false, unguarded)) return []
     const memo = scope.openProofs ??= new Map()
     const known = memo.get(node)
     if (known !== undefined) return known ?? undefined
     memo.set(node, null)
     const lengths: number[] = []
     scope.guardLengths = lengths
-    if (!provedAt(scope, node, key, recv, holds, true)) return
+    if (!provedAt(scope, node, key, recv, holds, true, unguarded)) return
     const g = scope.g
     const tok = getRef(getNode(g, node)!, 0)
     const root = keyRoot(scope, tok, key, recv, true)
@@ -207,14 +215,14 @@ export function priorRead(scope: ProofScope, read: number, calls: number[], pass
     return 0
 }
 
-function provedAt(scope: ProofScope, node: number, key: number, recv: number, holds: Holds, open: boolean): boolean {
+function provedAt(scope: ProofScope, node: number, key: number, recv: number, holds: Holds, open: boolean, unguarded?: (token: number) => boolean): boolean {
     const memo = open ? new Map<number, boolean>() : scope.proofs
     const known = memo.get(node)
     if (known !== undefined) return known
     const tok = getRef(getNode(scope.g, node)!, 0)
     const token = keyRoot(scope, tok, key, recv, open)
     const at = (cond: number, yes: boolean, token: number) => holds(cond, yes, token, open)
-    const proved = guardedAt(scope, scope.regions.of.get(node) ?? -1, at, token) || guardedBefore(scope, tok, at, token, new Map())
+    const proved = !!unguarded?.(token) || guardedAt(scope, scope.regions.of.get(node) ?? -1, at, token) || guardedBefore(scope, tok, at, token, new Map())
     memo.set(node, proved)
     return proved
 }
@@ -251,6 +259,7 @@ function guardedBefore(scope: ProofScope, tok: number, holds: Guard, token: numb
         at = getRef(t, 0)
         t = at ? getNode(g, at) : undefined
     }
+    if (t?.op === NodeOp.startOf && getRef(t, 0) !== g.blocks[0].id) return guardedEntry(scope, at, getRef(t, 0), holds, token, seen)
     if (t?.op !== NodeOp.inlined) return false
     const known = seen.get(at)
     if (known !== undefined) return known
@@ -265,6 +274,28 @@ function guardedBefore(scope: ProofScope, tok: number, holds: Guard, token: numb
     }
     seen.set(at, proved)
     return proved
+}
+
+function guardedEntry(scope: ProofScope, start: number, block: number, holds: Guard, token: number, seen: Map<number, boolean>): boolean {
+    const known = seen.get(start)
+    if (known !== undefined) return known
+    seen.set(start, false)
+    const index = blockAt(scope, block)
+    const regions = scope.regions
+    let entered = 0
+    for (const apply of index === undefined ? [] : scope.arrivals?.[index] ?? []) {
+        const from = regions.of.get(apply) ?? -1
+        if (within(regions, from, regions.roots[index!], scope.charge)) continue
+        if (guardedAt(scope, from, holds, token)) {
+            entered++
+            continue
+        }
+        const orders = applyOrders(scope, apply) ?? []
+        if (!orders.length || !orders.every(order => guardedBefore(scope, order, holds, token, seen))) return false
+        entered++
+    }
+    seen.set(start, entered > 0)
+    return entered > 0
 }
 
 function guardedAt(scope: ProofScope, from: number, holds: Guard, token: number): boolean {
@@ -304,6 +335,15 @@ function atMost(scope: ProofScope, index: number, bound: number): boolean {
         at = offsetBase(g, at, NodeOp.sub)
     }
     return false
+}
+
+function allocatedAbove(scope: ProofScope, bound: number, call: number, key: number, inclusive: boolean): boolean {
+    const length = scope.allocatedLength?.(call, key)
+    if (!length) return false
+    if (!inclusive) return atMost(scope, bound, length)
+    const n = getNode(scope.g, length)
+    if (n?.op !== NodeOp.add || getRef(n, 1) || !(getLiteral(scope.g, n, 1) >= 1)) return false
+    return atMost(scope, bound, getRef(n, 0))
 }
 
 function offsetBase(g: Graph, id: number, op: NodeOp): number {
@@ -348,7 +388,7 @@ function keyRoot(scope: ProofScope, tok: number, key: number, owner: number, ope
         const seg = segRoot(scope, at)
         const t = seg ? getNode(g, seg) : undefined
         const effectFree = t && firstNonOrderingSlot(t) === 1 && scope.preserves?.(seg, key, owner)
-        if (effectFree || (t?.op === NodeOp.call && (free || open))) {
+        if (effectFree || (t?.op === NodeOp.call && (free || open) && seg !== owner)) {
             scope.charge(1)
             path.push(at)
             at = getRef(t, 0)
@@ -361,12 +401,14 @@ function keyRoot(scope: ProofScope, tok: number, key: number, owner: number, ope
         }
         const other = t?.op === NodeOp.setProp && !getRef(t, 2) ? getLiteral(g, t, 2) : key
         const accessed = !free && heap.isPrivateName(other as Handle) && !heap.isPrivateName(key as Handle)
-        if (other === key || accessed || heap.keyIndex(other as Handle) !== undefined || scope.setterKeys?.has(other)) {
+        const element = t?.op === NodeOp.setProp && (!!getRef(t, 2) || heap.keyIndex(other as Handle) !== undefined)
+        const keyless = element && heap.keyIndex(key as Handle) === undefined && !!scope.writesNoKeys?.(seg)
+        if (!keyless && (other === key || accessed || element || scope.setterKeys?.has(other))) {
             root = seg
             break
         }
         scope.charge(1)
-        scope.skipKey(other)
+        if (!keyless) scope.skipKey(other)
         path.push(at)
         at = getRef(t!, 0)
     }
@@ -400,23 +442,34 @@ function mergedKeyRoot(scope: ProofScope, start: number, block: number, key: num
     return merged
 }
 
-function arrivalOrders(scope: ProofScope, block: number): number[] | undefined {
-    const g = scope.g
-    if (!scope.arrivals) return
+function blockAt(scope: ProofScope, block: number): number | undefined {
     if (!scope.blockIndex) {
         scope.blockIndex = new Map()
-        g.blocks.forEach((b, i) => scope.blockIndex!.set(b.id, i))
+        scope.g.blocks.forEach((b, i) => scope.blockIndex!.set(b.id, i))
     }
-    const index = scope.blockIndex.get(block)
+    return scope.blockIndex.get(block)
+}
+
+function arrivalOrders(scope: ProofScope, block: number, entered?: Set<number>): number[] | undefined {
+    if (!scope.arrivals) return
+    const index = blockAt(scope, block)
     const applies = index === undefined ? undefined : scope.arrivals[index]
     if (!applies || !applies.length) return
     const out: number[] = []
     for (const apply of applies) {
-        const orders = applyOrders(scope, apply)
+        const orders = applyOrders(scope, apply) ?? enteredOrders(scope, apply, entered ?? new Set([index!]))
         if (!orders || !orders.length) return
         for (const o of orders) out.push(o)
     }
     return out
+}
+
+function enteredOrders(scope: ProofScope, apply: number, entered: Set<number>): number[] | undefined {
+    const home = scope.regions.blockOf.get(apply)
+    if (!home || scope.regions.shared.has(apply) || entered.has(home)) return
+    entered.add(home)
+    scope.charge(1)
+    return arrivalOrders(scope, scope.g.blocks[home].id, entered)
 }
 
 export function applyOrders(scope: ProofScope, apply: number): number[] | undefined {

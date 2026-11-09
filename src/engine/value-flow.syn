@@ -5,11 +5,11 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { BitwiseOps, debugsTypes, dumpGraph, firstNonOrderingSlot, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
-import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, within, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand, FloatUnaryOps, stronglyConnected } from './graph-node'
+import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, within, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand, FloatUnaryOps, stronglyConnected, spreadsLast } from './graph-node'
 import { Op as RtOp, assignExcluded, bindingOf, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import { AllocKind, boundCallee, FieldForm, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, listOf, mapOf, numberKey, regionRets, returnsSelf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
+import { AllocKind, boundCallee, FieldForm, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, listOf, mapOf, numberKey, regionRets, returnsSelf, usersOf, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -118,6 +118,12 @@ interface Summary {
     initializer: boolean | undefined
     bound: Bound | undefined
     proofs: pg.ProofScope | undefined
+    lengthProofs: Map<number, pg.ProofScope> | undefined
+    keyFacts: Map<number, number> | undefined
+    keyless: Set<number> | undefined
+    prover: Instance | undefined
+    facts: Set<number>
+    keyFree: boolean | undefined
     demands: ParamDemands | undefined
     kindIds: Map<string, number> | undefined
     kindVecs: number[][]
@@ -309,12 +315,13 @@ interface FlowState {
     setterKeys: Set<number>
     runtimeBinds: Map<number, number[]>
     heldWrites: Map<number, number[]>
-    skippedKeys: Set<number>
+    plainKeys: Map<number, number>
     holders: Map<number, Set<number>>
     holderWatch: Map<number, number[]>
     confinements: Confinement[]
     confineKeys: Map<string, number>
     confineSlots: Map<number, number[]>
+    lengthFacts: Map<number, LengthFact>
     exported: Export
     cut: CutSeed | undefined
     cap: number
@@ -350,9 +357,20 @@ interface Confinement {
     reach: number[]
     open: boolean
     sinks: [callee: Instance, target: number][]
+    owners?: Summary[]
 }
 
 const maxConfined = 256
+
+interface LengthFact {
+    key: number
+    call: number
+    length: number
+    field: number
+    param: number
+    ctor: Summary
+    fact: number
+}
 
 interface WhyQuery {
     origin: string
@@ -1279,7 +1297,12 @@ function writeField(field: number, value: number, writer: number, type: number |
     else if (stored) flow.fieldStored.add(field)
     let list = flow.fieldWriters.get(field)
     if (!list) flow.fieldWriters.set(field, list = [])
-    if (!list.includes(writer)) list.push(writer)
+    if (list.includes(writer)) return
+    list.push(writer)
+    const fact = flow.lengthFacts.get(field)
+    if (!fact || lengthParam(field, fact.ctor) === fact.param) return
+    flow.lengthFacts.delete(field)
+    release(flow.confinements[fact.fact])
 }
 
 function created(origin: number, inst: Instance): number {
@@ -1364,7 +1387,7 @@ function newSummary(fn: Function, g: Graph, id: number): Summary {
     const s: Summary = {
         fn, id, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false, returnsParam: false,
-        local: undefined, width: 0, owned: [], regions: undefined, guards: new Map(), stores: [], siteCone: undefined, allocNodes: new Map(), retExpr: -1, blockGates: [], regionRets: new Map(), fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, demands: undefined, kindIds: undefined, kindVecs: [],
+        local: undefined, width: 0, owned: [], regions: undefined, guards: new Map(), stores: [], siteCone: undefined, allocNodes: new Map(), retExpr: -1, blockGates: [], regionRets: new Map(), fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, lengthProofs: undefined, keyFacts: undefined, keyless: undefined, prover: undefined, facts: new Set(), keyFree: undefined, demands: undefined, kindIds: undefined, kindVecs: [],
         build: { konsts: new Map(), tested: new Set(), narrowExprs: new Map(), gateOf: new Map(), selects: [], forwards: new Map(), remainders: undefined },
     }
     flow.summaries.set(fn, s)
@@ -2247,21 +2270,202 @@ interface Bound {
 
 function proofScope(s: Summary): pg.ProofScope {
     if (s.proofs) return s.proofs
+    s.proofs = newProofScope(s)
+    return s.proofs
+}
+
+function newProofScope(s: Summary): pg.ProofScope {
     const regions = s.regions!
     const rest = restOf(s.fn)
     const plain = s.g.blocks[0].params.filter(p => !isThisParam(getNode(s.g, p)!))
-    s.proofs = {
+    return {
         g: s.g,
         regions,
         charge,
-        skipKey: key => flow.skippedKeys.add(key),
+        skipKey: key => plainKey(s, key),
         proofs: new Map(),
         segRoots: new Map(),
         keyRoots: new Map(),
         rest: rest ? plain[rest[0]] : undefined,
         arrivals: regions.arrivals,
+        setterKeys: flow.setterKeys,
+        writesNoKeys: node => storeKeyFree(s, node),
     }
-    return s.proofs
+}
+
+function boundScope(s: Summary, origin: number, key: number): pg.ProofScope {
+    const fact = origin > 0 ? allocationLength(s, origin, key) : undefined
+    if (!fact) return proofScope(s)
+    const scopes = s.lengthProofs ??= new Map()
+    const known = scopes.get(origin)
+    if (known) return known
+    const scope = newProofScope(s)
+    scope.allocatedLength = (call, k) => {
+        if (call !== fact.call || k !== fact.key) return 0
+        relyOn(s, fact.fact)
+        return fact.length
+    }
+    scopes.set(origin, scope)
+    return scope
+}
+
+function newFact(): number {
+    const id = flow.confinements.length
+    flow.confinements.push({ id, held: new Set(), reach: [], open: false, sinks: [], owners: [] })
+    return id
+}
+
+function relyOn(s: Summary, fact: number): void {
+    if (s.facts.has(fact)) return
+    s.facts.add(fact)
+    flow.confinements[fact].owners!.push(s)
+}
+
+function plainKey(s: Summary, key: number): void {
+    let id = flow.plainKeys.get(key)
+    if (id === undefined) flow.plainKeys.set(key, id = newFact())
+    relyOn(s, id)
+}
+
+function proven(from: Instance, calls: number[] | undefined, owner: number, callee: Instance, target: number): boolean {
+    if (!calls || (calls.length && !confined(from, calls, owner, callee, target))) return false
+    for (const id of from.summary.facts) {
+        const c = flow.confinements[id]
+        if (!c.open) c.sinks.push([callee, target])
+    }
+    return true
+}
+
+function storeKeyFree(s: Summary, node: number): boolean {
+    const id = keyFact(s, node)
+    if (flow.confinements[id].open) return false
+    if (!s.keyless?.has(node) && !targetKeyless(s, node)) return false
+    relyOn(s, id)
+    return true
+}
+
+function targetKeyless(s: Summary, node: number): boolean {
+    const e = s.exprOf.get(node)
+    if (!s.prover || e === undefined || s.exprs[e].op !== ExprOp.store) return false
+    const slot = at(s.prover, s.exprs[e].a)
+    const origins = flow.slotOrigins[slot]
+    if (flow.slotOpaque[slot] || !origins.length) return false
+    charge(origins.length)
+    return origins.every(keyFreeStore)
+}
+
+function keyFact(s: Summary, node: number): number {
+    const facts = s.keyFacts ??= new Map()
+    let id = facts.get(node)
+    if (id === undefined) facts.set(node, id = newFact())
+    return id
+}
+
+function storeWritesKeys(s: Summary, node: number): void {
+    release(flow.confinements[keyFact(s, node)])
+}
+
+const keyFreeRt = new Set<number>([...pg.pureRt, RtOp.slice, RtOp.sliceRead, RtOp.sliceWrite, RtOp.trunc])
+
+function keyFree(s: Summary): boolean {
+    if (s.keyFree !== undefined) return s.keyFree
+    let free = true
+    for (const x of s.exprs) {
+        charge(1)
+        if (x.op === ExprOp.store || x.op === ExprOp.call || x.op === ExprOp.opaque) free = false
+        else if (x.op === ExprOp.rt && !keyFreeRt.has(x.a)) free = false
+    }
+    s.keyFree = free
+    return free
+}
+
+function keyFreeStore(origin: number): boolean {
+    if (isScope(origin)) return false
+    const proxy = trapOf(origin)
+    if (!proxy) return false
+    const fn = callableOf(flow.host.session.runtime!.objects.intern(heap.getProxySetter(proxy)) as number)
+    return !!fn && keyFree(summaryOf(fn))
+}
+
+function allocationLength(s: Summary, origin: number, key: number): LengthFact | undefined {
+    if (flow.originKind[origin] !== OriginKind.fresh || flow.originOwner[origin] !== s) return
+    const fieldKey = fieldOfKey(origin, key)
+    const field = fieldKey ? flow.originFields[origin].get(fieldKey) : undefined
+    if (field === undefined) return
+    const known = flow.lengthFacts.get(field)
+    if (known) return known.key === key ? known : undefined
+    const g = s.g
+    const users = usersOf(g).get(allocNodeOf(origin)) ?? []
+    if (users.length !== 1 || users[0][1] !== 2) return
+    const call = users[0][0]
+    const c = getNode(g, call)!
+    if (c.op !== NodeOp.call || spreadsLast(c)) return
+    const ctor = predicateCallee(s, c)
+    const state = heapState(origin)
+    if (!ctor || (state !== undefined && heap.getOwnProperty(state, fieldKey as Handle))) return
+    const param = storedParam(ctor, fieldKey)
+    const written = lengthParam(field, ctor)
+    if (param < 0 || (written !== param && written !== -2) || 3 + param >= countIds(c) || !getRef(c, 3 + param)) return
+    const fact: LengthFact = { key, call, length: getRef(c, 3 + param), field, param, ctor, fact: newFact() }
+    flow.lengthFacts.set(field, fact)
+    return fact
+}
+
+function fieldOfKey(origin: number, key: number): number {
+    if (key > 0 && heap.isPrivateName(key as Handle)) return key
+    const state = heapState(origin)
+    if (key <= 0 || (state !== undefined && heap.getOwnProperty(state, key as Handle))) return 0
+    let at = protoOf(origin)
+    while (at) {
+        const descriptor = heap.getOwnProperty(at, key as Handle)
+        if (descriptor) {
+            const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+            const fn = d.flags & heap.PropFlags.has_getter ? callableOf(flow.host.session.runtime!.objects.intern(d.slot0 as Handle) as number) : undefined
+            if (!fn) return 0
+            const getter = summaryOf(fn)
+            const returned = rets(getter)
+            if (returned.length !== 1) return 0
+            const x = getter.exprs[returned[0]]
+            if (x.op !== ExprOp.member || x.key <= 0 || !heap.isPrivateName(x.key as Handle)) return 0
+            const self = getter.exprs[x.a]
+            return self.op === ExprOp.param && self.a === -1 ? x.key : 0
+        }
+        at = heap.getPrototypeOf(at)
+    }
+    return 0
+}
+
+function lengthParam(field: number, ctor: Summary): number {
+    let param = -2
+    for (const w of flow.fieldWriters.get(field) ?? []) {
+        if (w < 0 || flow.instances[Math.floor(w / exprBits)].summary !== ctor) return -1
+        const at = storedValue(ctor, w % exprBits)
+        if (at < 0 || (param >= 0 && at !== param)) return -1
+        param = at
+    }
+    return param
+}
+
+function storedParam(ctor: Summary, key: number): number {
+    let param = -1
+    for (const e of ctor.stores) {
+        charge(1)
+        const x = ctor.exprs[e]
+        if (x.op !== ExprOp.store || x.key !== key) continue
+        const at = storedValue(ctor, e)
+        if (at < 0) continue
+        if (param >= 0 && at !== param) return -1
+        param = at
+    }
+    return param
+}
+
+function storedValue(s: Summary, e: number): number {
+    const x = s.exprs[e]
+    if (x.op !== ExprOp.store || s.exprs[x.a].op !== ExprOp.param || s.exprs[x.a].a !== -1) return -1
+    let v = s.exprs[x.b]
+    while (v.op === ExprOp.narrow || v.op === ExprOp.pick) v = s.exprs[v.a]
+    return v.op === ExprOp.param && v.a >= 0 ? v.a : -1
 }
 
 function summarizeBounds(s: Summary, ids: number[], retArgs: number[]): void {
@@ -2314,13 +2518,14 @@ function refineReturn(callee: Instance, target: number): number {
     const node = exprAt(target).node
     const n = node ? getNode(from.summary.g, node) : undefined
     if (!n) return callee.ret
+    from.summary.prover = from
     const args: number[] = []
     let recv = 0
     if (n.op === NodeOp.getProp && !getRef(n, 2)) {
         const index = heap.keyIndex(getLiteral(from.summary.g, n, 2) as Handle)
         if (index === undefined || b.param !== 0 || b.recv >= 0) return callee.ret
         const calls = pg.constantInBounds(proofScope(from.summary), node, index, getRef(n, 1), b.key)
-        return calls && (!calls.length || confined(from, calls, getRef(n, 1), callee, target)) ? at(callee, b.ret) : callee.ret
+        return proven(from, calls, getRef(n, 1), callee, target) ? at(callee, b.ret) : callee.ret
     }
     if (n.op === NodeOp.getProp) {
         args.push(getRef(n, 2))
@@ -2332,12 +2537,9 @@ function refineReturn(callee: Instance, target: number): number {
     if (b.param >= args.length) return callee.ret
     const owner = b.recv < 0 ? recv : b.recv < args.length ? args[b.recv] : 0
     if (!owner || !args[b.param]) return callee.ret
-    const calls = pg.inBounds(proofScope(from.summary), node, args[b.param], owner, b.key)
-    return calls && (!calls.length || confined(from, calls, owner, callee, target)) ? at(callee, b.ret) : callee.ret
-}
-
-function checkSkippedKeys(): void {
-    for (const key of flow.skippedKeys) intrinsics.assert(!flow.setterKeys.has(key), `value-flow: a store to ${heap.describeKey(key as Handle) ?? key} was taken as plain while proving two reads equal, but that key has a setter`)
+    const origin = b.recv < 0 && callee.summary.hasThis ? receiverQual(callee.qual) : 0
+    const calls = pg.inBounds(boundScope(from.summary, origin, b.key), node, args[b.param], owner, b.key)
+    return proven(from, calls, owner, callee, target) ? at(callee, b.ret) : callee.ret
 }
 
 function buildSummary(s: Summary): void {
@@ -2667,6 +2869,7 @@ function wireEffect(inst: Instance, e: number): void {
 
 function wireStore(inst: Instance, e: number): void {
     const x = inst.summary.exprs[e]
+    if (x.op === ExprOp.store && x.key !== elemKey && isIndexKey(x.key)) watchConfined(flow.confinements[keyFact(inst.summary, x.node)], at(inst, x.a), 1)
     if (x.op === ExprOp.store) listen(at(inst, x.a), ListenerKind.store, inst.id, x.key, at(inst, x.b), e)
     else listen(at(inst, x.args[0]), ListenerKind.store, inst.id, slotKey(inst, x.args[1]), at(inst, x.args[2]), e)
 }
@@ -2881,6 +3084,7 @@ function bindPendingKeys(): boolean {
 
 function bindNamedKeys(p: PendingKey): void {
     const store = p.value >= 0
+    if (store) storeWritesKeys(instOfSlot(p.target).summary, exprAt(p.target).node)
     const keys = heap.namedAccessorKeys(protoOf(p.origin), store ? heap.PropFlags.has_setter : heap.PropFlags.has_getter)
     const equals = bindingOf(RtOp.strictEqual)!.impl!
     let i = 0
@@ -3158,6 +3362,10 @@ function hold(c: Confinement, origin: number): void {
 function release(c: Confinement): void {
     if (c.open) return
     c.open = true
+    for (const s of c.owners ?? []) {
+        s.proofs = undefined
+        s.lengthProofs = undefined
+    }
     for (const [callee, target] of c.sinks) {
         copyEdge(callee.ret, target)
         const bind = flow.partBind.get(target)
@@ -3579,6 +3787,11 @@ function killedBy(slot: number, origin: number, key: number, inst: Instance): bo
 
 function resolveStore(origin: number, key: number, inst: Instance, e: number, valueSlot: number): void {
     const kind = flow.originKind[origin]
+    if (key !== elemKey && isIndexKey(key)) {
+        const node = inst.summary.exprs[e].node
+        if (keyFreeStore(origin)) (inst.summary.keyless ??= new Set()).add(node)
+        else storeWritesKeys(inst.summary, node)
+    }
     if (kind === OriginKind.fn || kind === OriginKind.site || kind === OriginKind.str) return
     const scope = isScope(origin)
     if (key !== elemKey && !scope && isIndexKey(key)) {
@@ -3599,6 +3812,8 @@ function resolveStore(origin: number, key: number, inst: Instance, e: number, va
                 const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
                 if (d.flags & heap.PropFlags.has_setter) {
                     flow.setterKeys.add(key)
+                    const plain = flow.plainKeys.get(key)
+                    if (plain !== undefined) release(flow.confinements[plain])
                     return virtualCall(storeSlot(inst, e), d.slot1 as Handle, origin, [valueSlot], [])
                 }
                 break
@@ -4598,7 +4813,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], scalarUsers: [], originUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), skippedKeys: new Set(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(),
+        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
@@ -4744,7 +4959,6 @@ function solve(): number {
     settle()
     while (pullNumberMethods()) settle()
     const discovery = performance.now()
-    checkSkippedKeys()
     if (bindDynamic()) settle()
     return discovery
 }
