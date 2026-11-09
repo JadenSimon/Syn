@@ -5,7 +5,7 @@ import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp } from './rt'
 import { countedLoopShape, expectForm, firstNonOrderingSlot, type Graph, type GraphBlock, type GraphNode } from './lowering2'
-import { tailOf, withNodes, copyNodes, addCopy, addNode, countIds, countNodes, getBlock, getLiteral, getNode, getOperand, getRef, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
+import { tailOf, withNodes, copyNodes, addCopy, addGraphBlock, addNode, countIds, countNodes, getBlock, getLiteral, getNode, getOperand, getRef, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
 import { AllocKind, constructorOf, emptyType, fixedField, fixedState, inhabited, regionRets, selfOf, usersOf, type AccessHost, type PlannedUnit, type Type, type ValueTypes } from './value-types'
 
@@ -1180,12 +1180,92 @@ function rewriteArrayPresizing(g: Graph, plans: ArrayPresizing[]): Map<number, n
     return indices
 }
 
+interface FilterCount {
+    call: number
+    reads: number[]
+}
+
+function soleFunction(type: Type | undefined, fn: Function): boolean {
+    if (!type || type.unknown || type.undefined || type.null || type.bools || type.range || type.float || type.literals.length) return false
+    if (type.objects.length || type.strings.length) return false
+    return type.functions.length === 1 && type.functions[0] === fn
+}
+
+function inheritedGetter(program: ValueTypes, type: Type, key: Handle, proto: Handle): boolean {
+    const descriptor = heap.getPropertyDescriptor(proto, key)
+    if (!descriptor || !(heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).flags & heap.PropFlags.has_getter)) return false
+    const name = program.keyNames.get(key)
+    return type.objects.every(id => {
+        const object = program.objects[id]
+        const own = object.state === undefined ? undefined : heap.getPropertyDescriptor(object.state, key)
+        if (own && own !== descriptor) return false
+        return name === undefined || !object.fields.has(name)
+    })
+}
+
+function planFilterCounts(g: Graph, host: AccessHost, program: ValueTypes, view: InitializationView, calls: Set<number>, arrays: ArrayPresizing[]): FilterCount[] {
+    const out: FilterCount[] = []
+    const proto = arrayPrototype(host)
+    if (!stablePrototype(program, proto)) return out
+    const lifted = new Set<number>()
+    for (const plan of arrays) for (const id of plan.lifted) lifted.add(id)
+    for (const call of calls) {
+        const n = getNode(g, call)!
+        if (countIds(n) < 4 || spreadsLast(n) || !getRef(n, 2) || !getRef(n, 3)) continue
+        if (!soleFunction(view.nodes.get(tailOf(g, getRef(n, 1))), builtinGlobals.Array.prototype.filter)) continue
+        const receiver = view.nodes.get(tailOf(g, getRef(n, 2)))
+        if (!arrayType(program, receiver, proto) || !inheritedGetter(program, receiver!, heap.arrayLengthKey as Handle, proto)) continue
+        const reads: number[] = []
+        let lengthOnly = true
+        for (const alias of arrayAliases(g, view.users, call)) {
+            for (const [id, slot] of view.users.get(alias) ?? []) {
+                const user = getNode(g, id)!
+                if (slot < firstNonOrderingSlot(user) || (user.op === NodeOp.after && slot === countIds(user) - 1)) continue
+                if (slot === 1 && lengthRead(g, id) && !lifted.has(id) && plainProperty(g, user, program, view, proto)) reads.push(id)
+                else lengthOnly = false
+            }
+        }
+        if (lengthOnly) out.push({ call, reads })
+    }
+    return out
+}
+
+function rewriteFilterCounts(g: Graph, plans: FilterCount[]): void {
+    for (const plan of plans) {
+        const n = getNode(g, plan.call)!
+        const ordering = getOperand(g, n, 0)
+        const array = getRef(n, 2)
+        const loop = addNode(g, NodeOp.block, [])
+        const count = addNode(g, NodeOp.param, [])
+        const index = addNode(g, NodeOp.param, [])
+        const length = addNode(g, NodeOp.getProp, [addNode(g, NodeOp.startOf, [loop]), array, { literal: heap.arrayLengthKey }], Types.unknown_number)
+        const value = addNode(g, NodeOp.getProp, [length, array, index], Types.unknown_number)
+        const missing = addNode(g, NodeOp.heapHandle, [{ literal: heap.undefinedHandle }], Types.unknown_number)
+        const kept = addNode(g, NodeOp.call, [value, getRef(n, 3), missing, value, index, array], Types.unknown_number)
+        const next = addNode(g, NodeOp.add, [index, { literal: 1 }], Types.unknown_number)
+        const more = addNode(g, NodeOp.add, [count, { literal: 1 }], Types.unknown_number)
+        const counted = addNode(g, NodeOp.after, [kept, addNode(g, NodeOp.apply, [loop, more, next])])
+        const skipped = addNode(g, NodeOp.after, [kept, addNode(g, NodeOp.apply, [loop, count, next])])
+        const done = addNode(g, NodeOp.ret, [addNode(g, NodeOp.after, [length, count]), loop])
+        const inside = addNode(g, NodeOp.lt, [index, length], Types.bool)
+        const body = addNode(g, NodeOp.select, [inside, addNode(g, NodeOp.select, [kept, counted, skipped]), done])
+        addGraphBlock(g, { id: loop, params: [count, index], bodyId: body, bodyConst: 0 })
+        const entry = addNode(g, NodeOp.apply, [loop, { literal: 0 }, { literal: 0 }])
+        putNode(g, plan.call, NodeOp.inlined, [typeof ordering === 'number' ? addNode(g, NodeOp.after, [ordering, entry]) : entry, { literal: plan.call }])
+        for (const read of plan.reads) {
+            const r = getNode(g, read)!
+            putNode(g, read, NodeOp.after, [getOperand(g, r, 0), getRef(r, 1)])
+        }
+    }
+}
+
 export function rewriteInitializations(program: ValueTypes, host: AccessHost): (g: Graph, instances: number[]) => Graph | undefined {
     return (g, instances) => {
         expectForm(g, 'rewriteInitializations', undefined)
         let allocation = false
         let calls = false
-        for (const [, n] of nodeEntries(g)) {
+        const counted = new Set<number>()
+        for (const [id, n] of nodeEntries(g)) {
             if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.arrayLiteral) allocation = true
             if (n.op === NodeOp.call) {
                 calls = true
@@ -1193,11 +1273,16 @@ export function rewriteInitializations(program: ValueTypes, host: AccessHost): (
                 const receiver = getNode(g, getRef(n, 2))
                 if (target?.op === NodeOp.heapHandle && !getRef(target, 0) && receiver?.op === NodeOp.heapHandle) allocation = true
             }
+            if (!lengthRead(g, id)) continue
+            const owner = tailOf(g, getRef(n, 1))
+            if (getNode(g, owner)?.op === NodeOp.call) counted.add(owner)
         }
-        if (!allocation || !calls) return
+        const presize = allocation && calls
+        if (!presize && !counted.size) return
         const view = initializationView(g, program, instances)
-        const arrays = planArrayPresizing(g, host, program, view)
-        if (!view.charge(0) || !arrays.length) return
+        const arrays = presize ? planArrayPresizing(g, host, program, view) : []
+        const filters = counted.size ? planFilterCounts(g, host, program, view, counted, arrays) : []
+        if (!view.charge(0) || (!arrays.length && !filters.length)) return
         const graph = withNodes(g, copyNodes(g))
         const pushes = rewriteArrayPresizing(graph, arrays)
         for (const [id, index] of pushes) {
@@ -1210,6 +1295,7 @@ export function rewriteInitializations(program: ValueTypes, host: AccessHost): (
             const length = addNode(graph, NodeOp.add, [index, { literal: countIds(n) - 3 }])
             putNode(graph, id, NodeOp.after, [token, length])
         }
+        rewriteFilterCounts(graph, filters)
         dirtyIndex(graph)
         return graph
     }
