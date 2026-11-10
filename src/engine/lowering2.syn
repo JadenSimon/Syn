@@ -13109,7 +13109,7 @@ function arithForm(g: Graph, target: lowering.Target, n: GraphNode): ArithForm {
     const narrowCompare = cmp && (op === NodeOp.eq || op === NodeOp.ne || !signed) && imm > 0x7FFF_FFFF && imm <= 0xFFFF_FFFF
         && zeroExtendedBits(operandType(g, n, li)) <= 32
     const operandImm = narrowCompare ? imm - 0x1_0000_0000 : imm
-    const immediate = !getRef(n, ri) && target.takesImmediate(opName(op), operandImm, signed)
+    const immediate = !getRef(n, ri) && target.takesImmediate(opName(op), operandImm, signed, narrow)
     const negated = !immediate && op === NodeOp.sub && zeroOperand(g, target, n, li)
     return { op, li, ri, imm, operandImm, signed, narrow, narrowCompare, immediate, negated }
 }
@@ -17765,8 +17765,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         volatiles, preserved, safeFor: safeVolatiles, rank: rankHomes,
         arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: fieldHome, project: (call, field) => callReturnRegs(call)[field] ?? -1, overflow: () => takeSlot(), accepts,
     }, carried, copiedOperand)
-    const CALLEE = target.scratch[1]
     const SWAP = target.scratch[0]
+    const LINK = OPEN + 1
     const SP = target.stackReg
     const LR = target.linkReg
     const usedPreserved = new Set<number>()
@@ -18061,9 +18061,21 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (r < 0) throw 'lowering: out of registers'
         return bind(id, r)
     }
+    function unheldOrFreed(pools: RegisterPools, avoid: Set<number>): number {
+        let r = unheldIn([pools.active, pools.saved], new Set([...avoid, ...pendingHomes]))
+        if (r < 0) r = freeRegIn([pools.active, pools.saved], avoid)
+        if (r < 0) throw 'lowering: out of registers'
+        return r
+    }
+    function temp(avoid: Set<number>): number {
+        const r = unheldOrFreed(integerPools, avoid)
+        noteWrite(r)
+        code.push({ released: [{ value: 0, home: r }] })
+        return r
+    }
     function at(v: number, avoid: Set<number>): number {
         const home = homeOf.get(v)
-        if (home === undefined && scratchLiteral(v)) return scratchValue(v)
+        if (home === undefined && scratchLiteral(v)) return scratchValue(v, avoid)
         if (home === undefined) {
             console.log(errorDump(g), materializing)
             throw `lowering: value ${v} is not live (demanded by %${materializing} = ${opName(getNode(g, materializing)?.op)})`
@@ -18114,7 +18126,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
 
     interface Move { dst: number, src: number }
     function shuffle(moves: Move[], expired?: Map<number, number>): void {
-        const scratch = moves.some(m => isSlot(m.dst)) ? CALLEE : SWAP
         const pending: Move[] = []
         for (const m of moves) if (m.dst !== m.src) pending.push(m)
         while (pending.length) {
@@ -18127,6 +18138,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 if (!blocked) ready = i
             }
             if (ready < 0) {
+                const scratch = moves.some(m => isSlot(m.dst)) ? SLOTS + slotCount++ : SWAP
                 const stuck = pending[0].src
                 assert(!pending.some(m => m.dst === scratch || m.src === scratch), `lowering: a parallel move through ${scratch} also moves ${scratch}`)
                 transfer(scratch, stuck)
@@ -18266,23 +18278,19 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         return !getRef(n, i) || floats.has(getRef(n, i)) ? Types.f64 : operandType(g, n, i)
     }
 
-    let scratchHolder = 0
     function scratchLiteral(id: number): boolean {
         const n = getNode(g, id)
         return !!n && n.op === NodeOp.literal && (n.flags & gn.NodeFlags.scratch) !== 0
     }
-    function scratchValue(id: number): number {
+    function scratchValue(id: number, avoid: Set<number>): number {
         const n = getNode(g, id)!
         const k = literalValue(g, n)
         const narrow = typeOf(n) === Types.u32
-        const float = typeOf(n) === Types.f64
-        assert(!heldBy.has(CALLEE), `lowering: scratch literal %${id} would overwrite %${heldBy.get(CALLEE)} in ${CALLEE}`)
-        assert(!scratchHolder || !homeOf.has(scratchHolder), `lowering: scratch literal %${id} would overwrite scratch literal %${scratchHolder} in ${CALLEE}`)
-        scratchHolder = id
-        put(() => float ? asm.movF64(CALLEE, k) : asm.movImm(CALLEE, k, narrow))
-        homeOf.set(id, CALLEE)
+        assert(typeOf(n) !== Types.f64, `lowering: scratch literal %${id} is a float`)
+        const r = bind(id, unheldOrFreed(integerPools, avoid))
         done.add(id)
-        return CALLEE
+        put(() => asm.movImm(r, k, narrow))
+        return r
     }
     function lowWordView(id: number): boolean {
         const n = getNode(g, id)
@@ -18411,7 +18419,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const a = demand(getRef(n, 0), getLiteral(g, n, 0))
             const ra = at(a, NOTHING)
             finish()
-            const dst = regFor(id, want >= 0 || handedTo.has(id) || isScratch(ra) || !copiedOperand(id) ? want : ra)
+            const dst = regFor(id, want >= 0 || handedTo.has(id) || !copiedOperand(id) ? want : ra)
             const reinterprets = T === Types.f64 || U === Types.f64 ? !converts : lowWordView(id)
             put(() => reinterprets ? asm.mov(dst, ra) : asm.convert(dst, ra, T, U))
             return
@@ -18500,7 +18508,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         finish(id)
         const dst = regFor(id, want)
         const narrowRegisters = cmp && lowWordCompare(g, n) && (lowWordView(getRef(n, li)) || lowWordView(getRef(n, ri)))
-        put(() => cmp ? asm.compare(opName(op), dst, ra, rb, signed, undefined, narrowRegisters) : asm.binary(opName(op), dst, ra, rb, signed, narrow))
+        const rest = op === NodeOp.pow ? temp(new Set([dst, ra, rb])) : -1
+        put(() => cmp ? asm.compare(opName(op), dst, ra, rb, signed, undefined, narrowRegisters) : rest >= 0 ? asm.pow(dst, ra, rb, rest) : asm.binary(opName(op), dst, ra, rb, signed, narrow))
     }
 
     function buildAfter(id: number, n: GraphNode, want: number): void {
@@ -18512,7 +18521,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const src = at(value, NOTHING)
         finish(id)
         const open = want >= 0 && (!held(want) || releases(id, heldBy.get(want)!))
-        const dst = regFor(id, open ? want : isScratch(src) ? -1 : src)
+        const dst = regFor(id, open ? want : src)
         transfer(dst, src)
     }
 
@@ -18523,7 +18532,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const feeds = new Map<Handover, number>()
         let sequenced = false
         const landing = new Set<number>()
-        for (const s of slots) if (s.dst !== OPEN && !isSlot(s.dst)) landing.add(s.dst)
+        for (const s of slots) if (s.dst !== OPEN && s.dst !== LINK && !isSlot(s.dst)) landing.add(s.dst)
         const outerPending = pendingHomes
         defer pendingHomes = outerPending
         const pending = new Set(landing)
@@ -18544,7 +18553,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 const key = `${kind}${isSlot(s.dst) ? ' (dst slot)' : ''}`
                 handoverKinds.set(key, (handoverKinds.get(key) ?? 0) + 1)
             }
-            const want = s.dst === OPEN || isSlot(s.dst) || isScratch(s.dst) ? -1 : s.dst
+            const want = s.dst === OPEN || s.dst === LINK || isSlot(s.dst) ? -1 : s.dst
             if (removed >= 0) pending.add(removed)
             removed = want >= 0 && pending.delete(want) ? want : -1
             pendingHomes = pending
@@ -18604,9 +18613,12 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             s.dst = r
             s.settle!(r)
         }
+        let linkFrom: number | undefined
+        let linkConst: number | undefined
         for (const s of slots) {
-            if (!s.id) { consts.push({ dst: s.dst, src: s.konst, float: !!s.float || (!isSlot(s.dst) && lowering.isFloatRegister(target, s.dst)) }); continue }
-            args.push({ dst: s.dst, src: feeds.get(s)! })
+            if (!s.id && s.dst === LINK) linkConst = s.konst
+            else if (!s.id) consts.push({ dst: s.dst, src: s.konst, float: !!s.float || (!isSlot(s.dst) && lowering.isFloatRegister(target, s.dst)) })
+            else args.push({ dst: s.dst, src: feeds.get(s)! })
         }
         if (opts.debug) {
             console.log('handover', site, slots.map(s => [s.dst, s.id, s.konst]),
@@ -18627,6 +18639,20 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 throw `Missing handover source: %${t}, freed at %${t ? freedAt.get(t) : 'unknown'}`
             }
             if (a.dst === elide && !isSlot(src) && !dsts.has(src)) { landed = src; continue }
+            if (a.dst === elide && isSlot(src)) {
+                linkFrom = src
+                continue
+            }
+            if (a.dst === elide) {
+                const busy = new Set([...dsts, ...landing, ...settled.values()])
+                let r = unheldIn([integerPools.active], new Set([...busy, ...pendingHomes]))
+                if (r < 0) r = freeRegIn([integerPools.active], busy)
+                if (r >= 0) noteWrite(r)
+                landed = r
+                if (r < 0) linkFrom = SLOTS + slotCount++
+                moves.push({ dst: r >= 0 ? r : linkFrom!, src })
+                continue
+            }
             moves.push({ dst: a.dst, src })
         }
         if (sigStats) {
@@ -18682,6 +18708,16 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             else put(() => c.float ? asm.movF64(c.dst, c.src) : asm.movImm(c.dst, c.src))
             if (literal && !heldBy.has(c.dst)) heldBy.set(c.dst, literal)
         }
+        if (linkFrom !== undefined) {
+            transfer(SWAP, linkFrom)
+            landed = SWAP
+        }
+        if (linkConst !== undefined) {
+            const k = linkConst
+            noteWrite(SWAP)
+            put(() => asm.movImm(SWAP, k))
+            landed = SWAP
+        }
         return landed
     }
 
@@ -18706,18 +18742,18 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         for (const i of analysis.operandOrder.get(id) ?? []) {
             if (i === 0) sequenceIdx = slots.length
             if (i === 1 && indirect) {
-                slots.push({ dst: CALLEE, id: getRef(indirect, 0), konst: getLiteral(g, indirect, 0) })
+                slots.push({ dst: LINK, id: getRef(indirect, 0), konst: getLiteral(g, indirect, 0) })
                 continue
             }
             if (i < 3 && (i !== 1 || syscall || local)) continue
             slots.push({
-                dst: i === 1 ? CALLEE : continues ? OPEN : homes[i - 3],
+                dst: i === 1 ? LINK : continues ? OPEN : homes[i - 3],
                 id: getRef(n, i), konst: getLiteral(g, n, i),
                 settle: continues ? (r: number) => { continues[i - 3] = r } : undefined,
             })
         }
         done.add(id)
-        const linkReg = handOver(id, slots, [sequenceIdx, () => effect(getRef(n, 0))], CALLEE)
+        const linkReg = handOver(id, slots, [sequenceIdx, () => effect(getRef(n, 0))], LINK)
         for (const x of volatiles) {
             const v = heldBy.get(x)
             if (v === undefined) continue
@@ -18764,7 +18800,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             put(() => {
                 if (noreturns.has(id)) return asm.br(linkReg)
                 if (!tailCalls || !tails.has(id)) return asm.blr(linkReg)
-                const reg = isPreserved(linkReg) ? CALLEE : linkReg
+                const reg = isPreserved(linkReg) ? SWAP : linkReg
                 if (reg !== linkReg) asm.mov(reg, linkReg)
                 popFrame(region)
                 asm.br(reg)
