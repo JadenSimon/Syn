@@ -24,7 +24,7 @@ import {
     addGraphBlock, cloneRefs, copyNode, countIds, countLiterals, createGraph, createRecordType, getArgIds, getBlock, getDebugLabel, getLiteral,
     getOperand, getOperands, getRef, isThisParam, literalSlot, refSlot, makeNodeFromSlots, createThisParam, makeNode, type Operand, operandType, recordFields, type RecordField, resultType, setDebugLabel, setGraphBlocks, withNodes,
     createFnType, floatLocation, fnLocations, fnReturn, fnReturnLocation, paramLocation, type TypeOperand, ArgForm, argForm, unknownLayout, type Layout, spreadsLast,
-    setRef, setType, typeOf, typeRefOf, typeSlots, NodeFlags, machineType, slotType,
+    setRef, setType, typeOf, typeRefOf, typeSlots, NodeFlags, machineType, slotType, sameSlotBits,
     insertNode, newId, GraphKinds,
     NodeOp,
     opName,
@@ -3864,7 +3864,8 @@ export interface ProgramGraph {
     abi: Map<number, Atom[]>
     returnRecords: Map<number, intrinsics.Types[]>
     signatures: Map<number, Signature>
-    signatureRewrites: [symbol: number, position: number, width: number][]
+    paramPositions: Map<number, number[]>
+    signatureRewrites: [symbol: number, position: number, width: number, written?: number, words?: number][]
     hostReturns: Map<number, HostReturn>
     image: ProgramImage
     target: Target
@@ -3920,9 +3921,10 @@ function pinnedSymbols(program: ProgramGraph): Set<number> {
     return pinned
 }
 
-function appendParam(program: ProgramGraph, callee: number, type: TypeOperand, sites: [caller: number, call: number][], argOf: (site: number) => Operand): number {
+function appendParam(program: ProgramGraph, callee: number, type: TypeOperand, sites: [caller: number, call: number][], argOf: (site: number) => Operand, position = SignatureUnplanned): number {
     const graph = program.units.get(callee)!
     const id = addNode(graph, NodeOp.param, [], type)
+    program.paramPositions.set(callee, [...signaturePositions(program, callee), position])
     pushBlockParams(graph, graph.blocks[0], id)
     const location = paramLocation(graph, getNode(graph, id)!)
     sites.forEach(([symbol, call], k) => {
@@ -4029,6 +4031,8 @@ function specializeUnit(program: ProgramGraph, symbol: number, calls: [caller: n
     if (record) program.returnRecords.set(specialized, record)
     const signature = program.signatures.get(symbol)
     if (signature) program.signatures.set(specialized, signature)
+    const positions = program.paramPositions.get(symbol)
+    if (positions) program.paramPositions.set(specialized, positions.slice())
     for (const set of [program.noInline, program.alwaysInline, program.constructors, program.unplanned, program.tagged]) {
         if (set.has(symbol)) set.add(specialized)
     }
@@ -4058,9 +4062,15 @@ export function hoistParamLoads(program: ProgramGraph, request: LoadParamsReques
     const callee = request.specialize ? specializeUnit(program, candidate, calls, touched) : candidate
     const unit = program.units.get(callee)!
     const params = entry.params.slice()
+    const positions = signaturePositions(program, callee)
     const copies = calls.map(() => new Map<number, Operand>())
     const by = new Map<number, Operand>()
     for (const load of chosen) {
+        let root = load
+        while (getNode(graph, root)!.op !== NodeOp.param) {
+            const n = getNode(graph, root)!
+            root = getRef(n, n.op === NodeOp.load ? 1 : 0)
+        }
         const param = appendParam(program, callee, resultType(graph, getNode(graph, load)!), calls, k => {
             const [symbol, call] = calls[k]
             const caller = program.units.get(symbol)!
@@ -4078,7 +4088,7 @@ export function hoistParamLoads(program: ProgramGraph, request: LoadParamsReques
                 return out
             }
             return copy(load)
-        })
+        }, positions[params.indexOf(root)])
         by.set(load, param)
     }
     substitute(unit, by)
@@ -4182,6 +4192,7 @@ function overlaps(offsets: [number, intrinsics.Types][]): boolean {
 const SignatureFields = 4
 const SignatureReturn = -1
 const SignatureContext = -2
+const SignatureUnplanned = -3
 
 interface PrivateUses {
     fields: Map<number, number[]>
@@ -4302,18 +4313,38 @@ function meetSignatures(program: ProgramGraph, into: number, from: number): void
         program.signatures.delete(into)
         return
     }
-    const meet = (x: SignatureRep, y: SignatureRep | undefined) => x === SignatureRep.fields && y === SignatureRep.fields ? SignatureRep.fields : SignatureRep.object
-    program.signatures.set(into, { returns: meet(a.returns, b.returns), params: a.params.map((rep, i) => meet(rep, b.params[i])), context: meet(a.context, b.context) })
+    const meet = (x: SignatureRep, y: SignatureRep | undefined) => y === undefined || x === SignatureRep.object || y === SignatureRep.object ? SignatureRep.object : x === SignatureRep.written || y === SignatureRep.written ? SignatureRep.written : SignatureRep.fields
+    const union = (x: string[], y: string[] | undefined) => [...new Set([...x, ...y ?? []])].sort()
+    program.signatures.set(into, {
+        returns: meet(a.returns, b.returns),
+        params: a.params.map((rep, i) => meet(rep, b.params[i])),
+        context: meet(a.context, b.context),
+        writes: a.writes.map((keys, i) => union(keys, b.writes[i])),
+        contextWrites: union(a.contextWrites, b.contextWrites),
+    })
+}
+
+function plannedRep(program: ProgramGraph, symbol: number, position: number): SignatureRep | undefined {
+    const planned = program.signatures.get(symbol)
+    return position === SignatureReturn ? planned?.returns : position === SignatureContext ? planned?.context : planned?.params[position]
 }
 
 function signaturePlanned(program: ProgramGraph, symbol: number, position: number): boolean {
-    const planned = program.signatures.get(symbol)
-    const rep = position === SignatureReturn ? planned?.returns : position === SignatureContext ? planned?.context : planned?.params[position]
-    return rep === SignatureRep.fields
+    const rep = plannedRep(program, symbol, position)
+    return rep === SignatureRep.fields || rep === SignatureRep.written
 }
 
-function signaturePosition(program: ProgramGraph, graph: Graph, p: number, i: number): number {
-    return paramLocation(graph, getNode(graph, p)!) === program.target.indirectContextReg ? SignatureContext : i
+function plannedWrites(program: ProgramGraph, symbol: number, position: number): string[] | undefined {
+    if (plannedRep(program, symbol, position) !== SignatureRep.written) return
+    const planned = program.signatures.get(symbol)!
+    return position === SignatureContext ? planned.contextWrites : planned.writes[position]
+}
+
+function signaturePositions(program: ProgramGraph, symbol: number): number[] {
+    const known = program.paramPositions.get(symbol)
+    if (known) return known
+    const graph = program.units.get(symbol)!
+    return graph.blocks[0].params.map((p, i) => paramLocation(graph, getNode(graph, p)!) === program.target.indirectContextReg ? SignatureContext : i)
 }
 
 function signatureSlot(position: number): string {
@@ -4344,7 +4375,7 @@ function expandPrivateParams(program: ProgramGraph, touched: Set<number>, clock:
         let headroom = program.target.argRegs.length - entry.params.filter(p => paramLocation(graph, getNode(graph, p)!) < 0).length
         let loops: GraphLoops | undefined
         const chosen: [index: number, uses: PrivateUses, cell: PrivateCell | undefined][] = []
-        const positions = entry.params.map((p, i) => signaturePosition(program, graph, p, i))
+        const positions = signaturePositions(program, callee)
         entry.params.forEach((p, i) => {
             if (!signaturePlanned(program, callee, positions[i])) return
             const uses = privateFields(graph, index, p)
@@ -4384,7 +4415,7 @@ function expandPrivateParams(program: ProgramGraph, touched: Set<number>, clock:
                     const caller = program.units.get(symbol)!
                     const site = getNode(caller, call)!
                     return addNode(caller, NodeOp.load, [getOperand(caller, site, 0), getOperand(caller, site, 3 + i), { literal: offset }], type)
-                })
+                }, positions[i])
                 params.set(offset, param)
                 for (const load of read ?? []) by.set(load, addNode(graph, NodeOp.after, [getRef(getNode(graph, load)!, 0), param]))
             }
@@ -4499,8 +4530,9 @@ function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, param: n
                     const offset = at + getLiteral(graph, n, 2)
                     const T = slotType(typeOf(n))
                     if (offset < 0 || !StateFieldTypes.has(T)) return
-                    if (fields.has(offset) && fields.get(offset) !== T) return
-                    fields.set(offset, T)
+                    const known = fields.get(offset)
+                    if (known !== undefined && !sameSlotBits(known, T)) return
+                    if (known === undefined) fields.set(offset, T)
                     continue
                 }
                 let alias: number | undefined
@@ -4544,11 +4576,32 @@ export interface StateRequest {
     fields: [offset: number, type: intrinsics.Types][]
     outputs: [offset: number, type: intrinsics.Types][]
     result: boolean
+    width?: number
     sites: [caller: number, call: number][]
+}
+
+function recordWidth(graph: Graph, tails: (GraphNode | undefined)[]): number | undefined {
+    const records = tails.filter(n => n?.op === NodeOp.record)
+    if (!records.length) return tails.some(n => n && typeRefOf(n)) ? undefined : 0
+    if (records.length !== tails.length) return
+    const keys = (n: GraphNode) => getOperands(graph, n).filter((_, i) => i % 2 === 0).map(o => typeof o === 'number' ? -1 : o.literal)
+    const first = keys(records[0]!)
+    if (first.some((key, i) => key !== i)) return
+    if (records.some(n => keys(n!).join() !== first.join())) return
+    return first.length
+}
+
+function extendedRecordType(graph: Graph, call: number, outputs: [offset: number, type: intrinsics.Types][]): TypeOperand {
+    const signature = getNode(graph, typeRefOf(getNode(graph, typedTarget(graph, call))!))!
+    const returned = fnReturn(signature)
+    const fields = typeof returned === 'number' ? [] : recordFields(graph, getNode(graph, returned.ref)!)
+    const width = fields.length
+    return { ref: insertNode(graph, createRecordType(graph, [...fields, ...outputs.map(([, T], i) => ({ key: width + i, type: T }))])) }
 }
 
 export function scalarizeState(program: ProgramGraph, request: StateRequest, touched: Set<number>): void {
     const { callee, index, fields: layout, outputs, result: hasResult, sites: calls } = request
+    const width = request.width ?? 0
     const graph = program.units.get(callee)!
     const entry = graph.blocks[0]
     const param = entry.params[index]
@@ -4564,6 +4617,7 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
         inputs.push(p)
     }
     const state = addNode(graph, NodeOp.after, [initialized, cell])
+    program.paramPositions.set(callee, [...signaturePositions(program, callee).filter((_, i) => i !== index), ...inputs.map(() => SignatureUnplanned)])
     substitute(graph, new Map<number, Operand>([[param, state]]))
     setBlockParams(graph, entry, [...entry.params.filter(p => p !== param), ...inputs])
     for (const b of graph.blocks) {
@@ -4572,15 +4626,18 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
             const ret = getNode(graph, p.at)!
             const value = getOperand(graph, ret, 0)
             const ordering = addNode(graph, NodeOp.after, [addNode(graph, NodeOp.startOf, [b.id]), ...p.orderings, value])
-            const record: Operand[] = hasResult ? [{ literal: 0 }, value] : []
+            const record: Operand[] = width ? getOperands(graph, getNode(graph, tailOf(graph, getRef(ret, 0)))!) : hasResult ? [{ literal: 0 }, value] : []
             for (const [offset, T] of outputs) record.push({ literal: record.length / 2 }, addNode(graph, NodeOp.load, [ordering, state, { literal: offset }], T))
             return addCopy(graph, ret, [addNode(graph, NodeOp.record, record), ...getOperands(graph, ret).slice(1)])
         }))
     }
     graph.form = undefined
     touchUnit(program, touched, callee)
+    const extended = new Map<number, TypeOperand>()
     for (const [symbol, call] of calls) {
         const caller = program.units.get(symbol)!
+        if (width && !extended.has(symbol)) extended.set(symbol, extendedRecordType(caller, call, outputs))
+        const gets = width ? [...indexedUsers(graphIndex(caller), call)].filter(u => getNode(caller, u)!.op === NodeOp.get && getRef(getNode(caller, u)!, 0) === call) : []
         const n = getNode(caller, call)!
         const args = getOperands(caller, n)
         const base = args[3 + index]
@@ -4588,15 +4645,19 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
         const loads = layout.map(([offset, T]) => addNode(caller, NodeOp.load, [ordering, base, { literal: offset }], T))
         const invoke = addCopy(caller, n, [addNode(caller, NodeOp.after, [ordering, ...loads]), args[1], args[2], ...args.slice(3).filter((_, i) => i !== index), ...loads])
         const locations = callLocations(caller, call)
-        if (locations) setCallLocations(caller, invoke, [...locations.filter((_, i) => i !== index), ...loads.map(() => -1)])
+        if (locations || width) setCallLocations(caller, invoke, [...(locations ?? args.slice(3).map(() => -1)).filter((_, i) => i !== index), ...loads.map(() => -1)], undefined, extended.get(symbol))
         let updated = invoke
         outputs.forEach(([offset, T], i) => {
-            const value = addNode(caller, NodeOp.get, [invoke, { literal: i + (hasResult ? 1 : 0) }])
+            const value = addNode(caller, NodeOp.get, [invoke, { literal: width + i + (hasResult ? 1 : 0) }])
             updated = addNode(caller, NodeOp.store, [updated, base, { literal: offset }, value], T)
         })
-        const result = hasResult ? addNode(caller, NodeOp.get, [invoke, { literal: 0 }]) : addNode(caller, NodeOp.void, [])
+        const result = width ? invoke : hasResult ? addNode(caller, NodeOp.get, [invoke, { literal: 0 }]) : addNode(caller, NodeOp.void, [])
         putNode(caller, call, NodeOp.after, [updated, result])
-        dirtyValues(caller, [call])
+        for (const u of gets) {
+            const user = getNode(caller, u)!
+            putCopy(caller, u, user, withOperand(caller, user, 0, invoke))
+        }
+        dirtyValues(caller, [call, ...gets])
         touchUnit(program, touched, symbol)
     }
 }
@@ -4637,30 +4698,35 @@ function scalarizeMutableState(program: ProgramGraph, touched: Set<number>): Set
         const returns = ownRets(graph)
         if (!returns.length || returnsFloat(graph)) continue
         const tails = returns.map(id => getNode(graph, tailOf(graph, getRef(getNode(graph, id)!, 0))))
-        if (tails.some(n => n && (typeRefOf(n) || n.op === NodeOp.record))) continue
-        const hasResult = tails.some(n => n?.op !== NodeOp.void)
+        const width = recordWidth(graph, tails)
+        if (width === undefined) continue
+        const hasResult = !width && tails.some(n => n?.op !== NodeOp.void)
         const calls = sites.get(callee)!
         const ordinary = entry.params.filter(p => paramLocation(graph, getNode(graph, p)!) < 0).length
+        const positions = signaturePositions(program, callee)
         let index = -1
         let layout: [offset: number, type: intrinsics.Types][] = []
         for (let i = 0; i < entry.params.length && index < 0; i++) {
             const param = entry.params[i]
             const offsets = written.get(param)
             if (!offsets) continue
+            if (!plannedWrites(program, callee, positions[i])) continue
             const fields = stateFields(graph, mem, users, param)
             if (!fields) continue
             // XXX: three or more fields are not pareto: Array push/reserve/setIndex states save holePushed −14 but cost arrayTwoKinds +8, restSpread +7
             if (fields.length > 2) continue
             const freed = paramLocation(graph, getNode(graph, param)!) < 0 ? 1 : 0
             if (ordinary - freed + fields.length > program.target.argRegs.length) continue
-            if (offsets.size + (hasResult ? 1 : 0) > program.target.retRegs.length) continue
+            if (offsets.size + width + (hasResult ? 1 : 0) > program.target.retRegs.length) continue
             if (!calls.every(([symbol, call]) => privateArgument(program.units.get(symbol)!, memOf(symbol), call, callee, i))) continue
             index = i
             layout = fields
         }
         if (index < 0) continue
         const param = entry.params[index]
-        scalarizeState(program, { callee, index, fields: layout, outputs: layout.filter(([offset]) => written.get(param)!.has(offset)), result: hasResult, sites: calls }, touched)
+        const outputs = layout.filter(([offset]) => written.get(param)!.has(offset))
+        program.signatureRewrites.push([callee, positions[index], layout.length, outputs.length, outputs.length + width + (hasResult ? 1 : 0)])
+        scalarizeState(program, { callee, index, fields: layout, outputs, result: hasResult, width, sites: calls }, touched)
         changed.add(callee)
         mems.delete(callee)
         for (const [symbol] of calls) mems.delete(symbol)
@@ -4966,6 +5032,7 @@ function pruneDeadArgs(program: ProgramGraph, touched: Set<number>): void {
 export function pruneArgs(program: ProgramGraph, callee: number, dead: Set<number>, sites: [caller: number, call: number][], touched: Set<number>): void {
     const unit = program.units.get(callee)!
     const entry = unit.blocks[0]
+    program.paramPositions.set(callee, signaturePositions(program, callee).filter((_, i) => !dead.has(i)))
     setBlockParams(unit, entry, entry.params.filter((_, i) => !dead.has(i)))
     const summarized = new Set<string>()
     for (const [symbol, call] of sites) {
@@ -5687,7 +5754,7 @@ function callMarksStack(g: Graph, call: number, stack: number): boolean {
     return false
 }
 
-function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
+function recordReturns(program: ProgramGraph, clock: PhaseClock, only?: Set<number>): void {
     const callSites = countCallSites(program)
     interface Index {
         users: GraphIndex
@@ -5875,13 +5942,21 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         }
         return pstackAllocates(g, n) ? id : undefined
     }
-    for (const symbol of live) indexOf(symbol)
     const callersOf = new Map<number, number[]>()
-    for (const symbol of live) {
-        for (const callee of indexOf(symbol).calls.keys()) {
-            const list = callersOf.get(callee)
-            if (list) list.push(symbol)
-            else callersOf.set(callee, [symbol])
+    const calleesOf = new Map<number, number[]>()
+    if (only) {
+        for (const [callee, calls] of programCallSites(program)) {
+            for (const caller of new Set(calls.map(([c]) => c))) {
+                listOf(callersOf, callee).push(caller)
+                listOf(calleesOf, caller).push(callee)
+            }
+        }
+    } else {
+        for (const symbol of live) {
+            for (const callee of indexOf(symbol).calls.keys()) {
+                listOf(callersOf, callee).push(symbol)
+                listOf(calleesOf, symbol).push(callee)
+            }
         }
     }
     const plans: RecordReturn[] = []
@@ -5932,10 +6007,11 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         if (calls.size === theirs.length && !gains) return 'no gain'
         return [{ stack, size, calls }, layout]
     }
-    const order = stronglyConnected(live, symbol => [...indexOf(symbol).calls.keys()].filter(callee => program.units.has(callee)))
+    const order = stronglyConnected(live, symbol => (calleesOf.get(symbol) ?? []).filter(callee => program.units.has(callee)))
     const cyclic = new Set(order.filter(scc => scc.length > 1).flat())
     for (const symbol of order.flat()) {
         const callers = callersOf.get(symbol)
+        if (only && !callers?.some(c => only.has(c))) continue
         if (!callers || !returnsRecords(symbol)) continue
         const p = returnedAllocations(symbol)
         if (!p) continue
@@ -6234,11 +6310,14 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
         step('shareCallerValues', shareCallerValues, touched)
         step('specializeLiteralArgs', specializeLiteralArgs, touched)
         step('pruneDeadArgs', pruneDeadArgs, touched)
-        verifySignatures('records', program.signatureRewrites, (symbol, position) => signaturePlanned(program, symbol, position), SignatureFields, symbol => program.units.get(symbol)?.name || `symbol ${symbol}`, signatureSlot)
+        verifySignatures('records', program.signatureRewrites, (symbol, position) => signaturePlanned(program, symbol, position), (symbol, position) => plannedWrites(program, symbol, position), SignatureFields, program.target.retRegs.length, symbol => program.units.get(symbol)?.name || `symbol ${symbol}`, signatureSlot)
         for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
         const specialized = new Set(touched)
         touched.clear()
+        const logged = program.signatureRewrites.length
         const state = step('scalarizeMutableState', scalarizeMutableState, touched)
+        verifySignatures('state', program.signatureRewrites.slice(logged), (symbol, position) => signaturePlanned(program, symbol, position), (symbol, position) => plannedWrites(program, symbol, position), SignatureFields, program.target.retRegs.length, symbol => program.units.get(symbol)?.name || `symbol ${symbol}`, signatureSlot)
+        const rewritten = new Set(touched)
         if (state.size) {
             step('refineProgramEffects', refineProgramEffects, touched)
             for (const symbol of state) {
@@ -6252,6 +6331,7 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
                 program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
                 specialized.add(symbol)
             }
+            step('recordReturns', recordReturns, clock, rewritten)
         }
         step('inlineSpecialized', inlineSpecialized, specialized, clock)
     })
@@ -9722,12 +9802,15 @@ export type ReturnMode = 'encoded' | 'raw' | 'keep' | 'tagged' | 'narrow' | 'rec
 export enum SignatureRep {
     object,
     fields,
+    written,
 }
 
 export interface Signature {
     returns: SignatureRep
     params: SignatureRep[]
     context: SignatureRep
+    writes: string[][]
+    contextWrites: string[]
 }
 
 export interface UnitAbi {
@@ -9916,19 +9999,49 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
     function signatureRep(rep: Rep): SignatureRep {
         return rep.kind === 'pointer' && !rep.nullable && (objectShapes(plan, rep) !== undefined || addressRep(rep)) ? SignatureRep.fields : SignatureRep.object
     }
-    function contextRep(unit: PlannedUnit): SignatureRep {
+    function contextRep(unit: PlannedUnit): Rep | undefined {
         const traced = tracedOf(unit)
         for (const [id, rep] of unit.nodes) {
-            if (getNode(traced, id)?.op === NodeOp.callContext) return signatureRep(rep)
+            if (getNode(traced, id)?.op === NodeOp.callContext) return rep
         }
-        return SignatureRep.object
+    }
+    const mutable = new Map<string, string[]>()
+    function mutableKeys(rep: Rep): string[] {
+        if (signatureRep(rep) !== SignatureRep.fields) return []
+        if (objectShapes(plan, rep) === undefined) return [numberKey]
+        const memo = String(rep.closure ?? rep.shapes.join())
+        const known = mutable.get(memo)
+        if (known) return known
+        const objects = rep.closure !== undefined ? program.stateAllocations.get(rep.closure) ?? [] : rep.shapes.flatMap(shape => plan.inst.shapes.get(shape)?.members ?? [])
+        const reached = [...objects, ...objects.flatMap(m => [...program.objects[m].fields.values()].flatMap(field => field.type.objects))]
+        const keys = new Set<string>()
+        for (const m of reached) {
+            for (const [k, field] of program.objects[m].fields) {
+                if (field.replaced) keys.add(k)
+            }
+        }
+        const sorted = [...keys].sort()
+        mutable.set(memo, sorted)
+        return sorted
+    }
+    function positionRep(rep: Rep, keys: string[]): SignatureRep {
+        return keys.length ? SignatureRep.written : signatureRep(rep)
     }
     const abi = new Map<Function, UnitAbi>()
     for (const [fn, unit] of planned.units) {
         const k = abiType(types, unit, -1)
         const mode = modes.get(fn) === 'tagged' && narrowable.get(k) && comparedGroups.has(k) ? 'narrow' : modes.get(fn)!
         const returns = mode === 'raw' || (mode === 'tagged' && numberName(unit.returns) === 'f64') ? Types.u64 : words.has(fn) ? Types.vm_value : returnsSlot(fn) && mode !== 'narrow' ? Types.u32 : numberName(unit.returns) === 'f64' ? Types.f64 : machineNumberName(unit.returns) === 'i64' ? Types.i64 : Types.u64
-        const signature = { returns: isRoot(fn) || constructsOutOfLine(fn) ? SignatureRep.object : signatureRep(unit.returns), params: unit.params.map(param => signatureRep(param.rep)), context: contextRep(unit) }
+        const context = contextRep(unit)
+        const writes = unit.params.map(param => mutableKeys(param.rep))
+        const contextWrites = context ? mutableKeys(context) : []
+        const signature = {
+            returns: isRoot(fn) || constructsOutOfLine(fn) ? SignatureRep.object : signatureRep(unit.returns),
+            params: unit.params.map((param, i) => positionRep(param.rep, writes[i])),
+            context: context ? positionRep(context, contextWrites) : SignatureRep.object,
+            writes,
+            contextWrites,
+        }
         abi.set(fn, { mode, returns, tags: paramTags(unit), signature })
         if (flags.has('return-modes')) console.log('RETURN-MODE', fn.name, mode, repText(unit.returns))
     }
@@ -13547,7 +13660,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
     const outlined: [Function, Graph][] = []
     const { realizeUnit, plannedUnit, abiOf } = resolver
     const outline = (name: string) => intern(Object.assign(namedStub(name), { shouldNotInline: true }))
-    const program: ProgramGraph = { binder, units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), returnRecords: new Map(), signatures: new Map(), signatureRewrites: [], hostReturns: new Map(), image, target }
+    const program: ProgramGraph = { binder, units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), returnRecords: new Map(), signatures: new Map(), paramPositions: new Map(), signatureRewrites: [], hostReturns: new Map(), image, target }
     function compileUnit(fn: Function): Graph {
         const unit = unitOf(fn)
         if (flags.has('native-symbols')) console.log('native symbol', unit.symbol!, fn.name || fn.toString().slice(0, 80), plannedUnit(fn) ? 'planned' : 'unplanned')
