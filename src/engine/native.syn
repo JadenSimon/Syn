@@ -15,7 +15,7 @@ import { tagVmHandle, tagVmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, EffectNone, EffectRead, EffectWrite,
-    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
+    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, PstackMark, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
     joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, substitute, tailScalar, valueFacts, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     paramSlot, typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
@@ -35,7 +35,7 @@ import {
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
     FloatUnaryOps, rawSlot, rawContents, internRaw, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
     inboundApplies, indexedValues, findValues, blockOps, holderOf, graphLayout, graphBytes, graphFloatsAt, readGraph, writeGraph, dominatorTree,
-    graphLoops, stronglyConnected, mapTailPositions, tailOf, tailPositions, tailRoots, type SelectPath, type TailPosition,
+    graphLoops, type GraphLoops, stronglyConnected, mapTailPositions, tailOf, tailPositions, tailRoots, type SelectPath, type TailPosition,
 } from './graph-node'
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
@@ -45,7 +45,7 @@ import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
 import * as typer from './typer'
-import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyDistinctNodes, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifyStringCompares, verifyStringOperands } from './verify'
+import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyDistinctNodes, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifySignatures, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { rewriteInitializations, planMissedLookups, planSmallSets, rewriteConstantReads, rewriteEqualReads, rewriteMissedLookups, rewriteSmallSets } from './pg-optimizer'
 import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
@@ -3859,6 +3859,8 @@ export interface ProgramGraph {
     discardable?: Set<number>
     abi: Map<number, Atom[]>
     returnRecords: Map<number, intrinsics.Types[]>
+    signatures: Map<number, Signature>
+    signatureRewrites: [symbol: number, position: number, width: number][]
     hostReturns: Map<number, HostReturn>
     image: ProgramImage
     target: Target
@@ -4021,6 +4023,8 @@ function specializeUnit(program: ProgramGraph, symbol: number, calls: [caller: n
     program.abi.set(specialized, program.abi.get(symbol) ?? [])
     const record = program.returnRecords.get(symbol)
     if (record) program.returnRecords.set(specialized, record)
+    const signature = program.signatures.get(symbol)
+    if (signature) program.signatures.set(specialized, signature)
     for (const set of [program.noInline, program.alwaysInline, program.constructors, program.unplanned, program.tagged]) {
         if (set.has(symbol)) set.add(specialized)
     }
@@ -4161,6 +4165,305 @@ function expandParams(program: ProgramGraph, touched: Set<number>): void {
         hoisted.push(`${program.units.get(callee)!.name}:${chosen.length}`)
     }
     if (flags.has('hoist-stats')) console.log('HOISTED', hoisted.join(' '))
+}
+
+function overlaps(offsets: [number, intrinsics.Types][]): boolean {
+    offsets.sort((a, b) => a[0] - b[0])
+    for (let i = 0; i + 1 < offsets.length; i++) {
+        if (offsets[i][0] + intrinsics.intrinsicBitWidth(offsets[i][1]) / 8 > offsets[i + 1][0]) return true
+    }
+    return false
+}
+
+const SignatureFields = 4
+const SignatureReturn = -1
+const SignatureContext = -2
+
+interface PrivateUses {
+    fields: Map<number, number[]>
+    types: Map<number, intrinsics.Types>
+    boundary?: [user: number, slot: number]
+}
+
+function privateFields(graph: Graph, index: GraphIndex, param: number): PrivateUses | undefined {
+    const fields = new Map<number, number[]>()
+    let boundary: [number, number] | undefined
+    const aliases = new Set<number>([param])
+    const joined: [param: number, block: GraphBlock][] = []
+    const work = [param]
+    while (work.length) {
+        const v = work.pop()!
+        for (const u of indexedUsers(index, v)) {
+            const n = getNode(graph, u)!
+            let slot = useSlot(graph, u, v, firstNonOrderingSlot(n))
+            while (slot >= 0) {
+                const at = slot
+                slot = useSlot(graph, u, v, at + 1)
+                let alias = 0
+                if (n.op === NodeOp.load && at === 1 && !getRef(n, 2)) {
+                    listOf(fields, getLiteral(graph, n, 2)).push(u)
+                    continue
+                }
+                if ((n.op === NodeOp.store && at === 3) || (n.op === NodeOp.call && at >= 3)) {
+                    if (boundary) return
+                    boundary = [u, at]
+                    continue
+                }
+                if (n.op === NodeOp.after) alias = u
+                if (n.op === NodeOp.apply && at > 0 && getRef(n, 0) !== graph.blocks[0].id) {
+                    const target = getBlock(graph, getRef(n, 0))
+                    if (target) {
+                        alias = target.params[at - 1]
+                        joined.push([alias, target])
+                    }
+                }
+                if (!alias) return
+                if (aliases.has(alias)) continue
+                aliases.add(alias)
+                work.push(alias)
+            }
+        }
+    }
+    for (const [alias, block] of joined) {
+        const at = paramSlot(block, alias) + 1
+        for (const [, app] of inboundApplies(graph, index, block)) {
+            if (!aliases.has(getRef(getNode(graph, app)!, at))) return
+        }
+    }
+    const layout: [number, intrinsics.Types][] = []
+    for (const [offset, loads] of fields) {
+        const T = typeOf(getNode(graph, loads[0])!)
+        if (loads.some(load => typeOf(getNode(graph, load)!) !== T)) return
+        layout.push([offset, slotType(T)])
+    }
+    if (overlaps(layout)) return
+    return { fields, types: new Map(layout), boundary }
+}
+
+interface PrivateCell {
+    stack: number
+    size: number
+    layout: Map<number, intrinsics.Types>
+}
+
+function initializedFields(graph: Graph, mem: MemAnalysis, call: number, at: Mem, alone: boolean): Map<number, intrinsics.Types> | undefined {
+    const layout = new Map<number, intrinsics.Types>()
+    const before = valuesFrom(graph, call, true)
+    const reached = mem.flows(at.block!, at.base, false).reached
+    for (const [x, xb] of reached) {
+        for (const u of mem.users(x)) {
+            const n = getNode(graph, u)!
+            if (u === call || reached.has(u) || useSlot(graph, u, x, firstNonOrderingSlot(n)) < 0) continue
+            const initializes = n.op === NodeOp.store && getRef(n, 1) === x && getRef(n, 3) !== x && before.has(u)
+            if (!initializes && alone) return
+            if (!initializes) continue
+            const access = mem.access(xb, n)
+            if (!access || access.base !== at.base || access.pos === undefined) return
+            const T = slotType(typeOf(n))
+            if (layout.has(access.pos) && layout.get(access.pos) !== T) return
+            layout.set(access.pos, T)
+        }
+    }
+    return layout
+}
+
+function privateCell(program: ProgramGraph, mem: MemAnalysis, symbol: number, call: number, index: number): PrivateCell | undefined {
+    const graph = program.units.get(symbol)!
+    const at = mem.of(siteBlock(graph, call), getRef(getNode(graph, call)!, 3 + index))
+    const cell = getNode(graph, at.base)!
+    if (cell.op !== NodeOp.pstack || getRef(cell, 1) || getRef(cell, 3) || pstackTentative(graph, cell)) return
+    const stack = getLiteral(graph, cell, 1)
+    if (callMarksStack(graph, call, stack)) return
+    const layout = initializedFields(graph, mem, call, at, true)
+    if (!layout) return
+    return { stack, size: getLiteral(graph, cell, 3), layout }
+}
+
+function initializesReads(program: ProgramGraph, mem: MemAnalysis, symbol: number, call: number, index: number, types: Map<number, intrinsics.Types>): boolean {
+    const graph = program.units.get(symbol)!
+    const at = mem.of(siteBlock(graph, call), getRef(getNode(graph, call)!, 3 + index))
+    const layout = initializedFields(graph, mem, call, at, false)
+    return !!layout && [...types].every(([offset, T]) => layout.get(offset) === T)
+}
+
+function sameCell(a: PrivateCell, b: PrivateCell): boolean {
+    return a.stack === b.stack && a.size === b.size && a.layout.size === b.layout.size && [...a.layout].every(([offset, T]) => b.layout.get(offset) === T)
+}
+
+function meetSignatures(program: ProgramGraph, into: number, from: number): void {
+    const a = program.signatures.get(into)
+    if (!a) return
+    const b = program.signatures.get(from)
+    if (!b) {
+        program.signatures.delete(into)
+        return
+    }
+    const meet = (x: SignatureRep, y: SignatureRep | undefined) => x === SignatureRep.fields && y === SignatureRep.fields ? SignatureRep.fields : SignatureRep.object
+    program.signatures.set(into, { returns: meet(a.returns, b.returns), params: a.params.map((rep, i) => meet(rep, b.params[i])), context: meet(a.context, b.context) })
+}
+
+function signaturePlanned(program: ProgramGraph, symbol: number, position: number): boolean {
+    const planned = program.signatures.get(symbol)
+    const rep = position === SignatureReturn ? planned?.returns : position === SignatureContext ? planned?.context : planned?.params[position]
+    return rep === SignatureRep.fields
+}
+
+function signaturePosition(program: ProgramGraph, graph: Graph, p: number, i: number): number {
+    return paramLocation(graph, getNode(graph, p)!) === program.target.indirectContextReg ? SignatureContext : i
+}
+
+function signatureSlot(position: number): string {
+    if (position === SignatureReturn) return 'its return'
+    if (position === SignatureContext) return 'its context'
+    return `param ${position}`
+}
+
+function marksStack(graph: Graph, stack: number): boolean {
+    return someNode(graph, n => pstackTentative(graph, n) !== 0 && getLiteral(graph, n, 1) === stack)
+}
+
+function expandPrivateParams(program: ProgramGraph, touched: Set<number>, clock: PhaseClock): void {
+    const sites = programCallSites(program)
+    const mems = new Map<number, MemAnalysis>()
+    function memOf(symbol: number): MemAnalysis {
+        let mem = mems.get(symbol)
+        if (!mem) mems.set(symbol, mem = memAnalysis(program.units.get(symbol)!))
+        return mem
+    }
+    const expanded: string[] = []
+    for (const callee of freeCallees(program, sites)) {
+        const graph = program.units.get(callee)!
+        const entry = graph.blocks[0]
+        if (isJumbo(graph) || !entry.params.length) continue
+        const calls = sites.get(callee)!
+        const index = graphIndex(graph)
+        let headroom = program.target.argRegs.length - entry.params.filter(p => paramLocation(graph, getNode(graph, p)!) < 0).length
+        let loops: GraphLoops | undefined
+        const chosen: [index: number, uses: PrivateUses, cell: PrivateCell | undefined][] = []
+        const positions = entry.params.map((p, i) => signaturePosition(program, graph, p, i))
+        entry.params.forEach((p, i) => {
+            if (!signaturePlanned(program, callee, positions[i])) return
+            const uses = privateFields(graph, index, p)
+            if (!uses || (!uses.fields.size && !uses.boundary)) return
+            if (!calls.every(([symbol, call]) => privateArgument(program.units.get(symbol)!, memOf(symbol), call, callee, i))) return
+            let cell: PrivateCell | undefined
+            if (uses.boundary) {
+                loops ??= graphLoops(graph)
+                if (loops.loopDepth.get(holderOf(index, uses.boundary[0])!)) return
+                const cells = calls.map(([symbol, call]) => privateCell(program, memOf(symbol), symbol, call, i))
+                cell = cells[0]
+                if (!cell || cells.some(other => !other || !sameCell(cell!, other)) || marksStack(graph, cell.stack)) return
+                for (const [offset, T] of uses.types) {
+                    if (cell.layout.get(offset) !== T) return
+                }
+            }
+            if (!uses.boundary && !calls.every(([symbol, call]) => initializesReads(program, memOf(symbol), symbol, call, i, uses.types))) return
+            const count = cell ? cell.layout.size : uses.fields.size
+            if (count > SignatureFields) return
+            const cost = paramLocation(graph, getNode(graph, p)!) < 0 ? count - 1 : count
+            if (cost > headroom) return
+            headroom -= cost
+            chosen.push([i, uses, cell])
+        })
+        if (!chosen.length) continue
+        const from = entry.params.length
+        expanded.push(`${graph.name}:${chosen.map(([i, uses, cell]) => `${i}=${[...uses.fields.keys()].join('/')}${cell ? `+${opName(getNode(graph, uses.boundary![0])!.op)}` : ''}`).join(',')}`)
+        const by = new Map<number, Operand>()
+        for (const [i, uses, cell] of chosen) {
+            const offsets: [number, intrinsics.Types][] = cell ? [...cell.layout] : [...uses.fields].map(([offset, loads]) => [offset, typeOf(getNode(graph, loads[0])!)])
+            const params = new Map<number, number>()
+            for (const [offset, T] of offsets) {
+                const read = uses.fields.get(offset)
+                const type = read ? typeOf(getNode(graph, read[0])!) : T
+                const param = appendParam(program, callee, type, calls, k => {
+                    const [symbol, call] = calls[k]
+                    const caller = program.units.get(symbol)!
+                    const site = getNode(caller, call)!
+                    return addNode(caller, NodeOp.load, [getOperand(caller, site, 0), getOperand(caller, site, 3 + i), { literal: offset }], type)
+                })
+                params.set(offset, param)
+                for (const load of read ?? []) by.set(load, addNode(graph, NodeOp.after, [getRef(getNode(graph, load)!, 0), param]))
+            }
+            program.signatureRewrites.push([callee, positions[i], params.size])
+            if (!cell) continue
+            const [user, slot] = uses.boundary!
+            const n = getNode(graph, user)!
+            const made = addNode(graph, NodeOp.pstack, [getRef(n, 0), { literal: cell.stack }, 0, { literal: cell.size }])
+            let last = made
+            for (const [offset, T] of cell.layout) last = addNode(graph, NodeOp.store, [last, made, { literal: offset }, params.get(offset)!], T)
+            putCopy(graph, user, n, withOperand(graph, n, slot, addNode(graph, NodeOp.after, [last, made])))
+            dirtyValues(graph, [user])
+        }
+        substitute(graph, by)
+        program.units.set(callee, renormalize(graph, clock))
+        extendCallSummaries(program, callee, from, calls)
+        for (const [symbol] of calls) {
+            mems.delete(symbol)
+            touchUnit(program, touched, symbol)
+        }
+        touchUnit(program, touched, callee)
+    }
+    if (flags.has('hoist-stats')) console.log('PRIVATE', expanded.join(' '))
+}
+
+function extendCallSummaries(program: ProgramGraph, callee: number, from: number, sites: [caller: number, call: number][]): void {
+    const graph = program.units.get(callee)!
+    const effects = graphEffects(graph)
+    const captures = new Map<number, number>()
+    const deep = new Map<number, number>()
+    const masks = new Map<number, number>()
+    const classes = new Map<number, number>()
+    const unknown = new Set<number>()
+    for (const call of effects.calls) {
+        const s = callSummary(graph, getNode(graph, call.node)!)
+        if (!s) {
+            unknown.add(call.callee)
+            continue
+        }
+        captures.set(call.callee, (captures.get(call.callee) ?? 0) | s.captures)
+        deep.set(call.callee, (deep.get(call.callee) ?? 0) | s.deepCaptures)
+        masks.set(call.callee, (masks.get(call.callee) ?? 0) | (s.effect === EffectWrite ? s.writes : 0))
+        classes.set(call.callee, Math.max(classes.get(call.callee) ?? EffectNone, s.effect))
+    }
+    for (const symbol of unknown) {
+        captures.delete(symbol)
+        deep.delete(symbol)
+        masks.delete(symbol)
+        classes.delete(symbol)
+    }
+    let added = 0
+    for (let k = from; k < graph.blocks[0].params.length; k++) added |= argBit(k)
+    let effect = effects.self
+    let writes = effects.writes
+    for (const call of effects.calls) {
+        const c = classes.get(call.callee)
+        effect = Math.max(effect, c ?? EffectWrite)
+        if (c !== undefined && c !== EffectWrite) continue
+        const bits = calleeWrites(masks.get(call.callee), call.args)
+        writes |= call.ends ? bits & ~WritesStack : bits
+    }
+    const captured = captureMask(effects, captures) & added
+    const deepCaptured = deepCaptureMask(effects, captures, deep) & added
+    const seen = new Set<string>()
+    for (const [symbol, call] of sites) {
+        const caller = program.units.get(symbol)!
+        const n = getNode(caller, call)!
+        const key = `${symbol}:${getRef(n, 1)}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        extendSummaryArgs(caller, n, effect, captured, deepCaptured, writes & ~(CapturesAll & ~added))
+    }
+}
+
+function extendSummaryArgs(graph: Graph, call: GraphNode, effect: number, captures: number, deep: number, writes: number): void {
+    const target = getRef(call, 1)
+    const n = getNode(graph, target)!
+    if (countIds(n) === 1) return
+    const s = callSummary(graph, call)!
+    const raised = Math.max(s.effect, effect)
+    const summary: CallSummary = { ...s, effect: raised, captures: s.captures | captures, deepCaptures: s.deepCaptures | deep, writes: raised === EffectWrite ? (s.effect === EffectWrite ? s.writes : 0) | writes : s.writes }
+    putCopy(graph, target, n, encodeCallSummary(graph, getLiteral(graph, n, 0), summary))
+    dirtyValues(graph, [target])
 }
 
 const StateFieldTypes = new Set([Types.u8, Types.i8, Types.u16, Types.i16, Types.u32, Types.i32, Types.u64, Types.i64, Types.vm_value])
@@ -5178,6 +5481,13 @@ export interface RecordReturn {
     layout: Map<string, [key: number, T: intrinsics.Types]>
     inner: Map<string, number>
     callers: [number, RecordFlow][]
+    rebuilt?: RebuiltReturn
+}
+
+export interface RebuiltReturn {
+    stack: number
+    size: number
+    calls: Map<number, number[]>
 }
 
 function layoutRecordType(g: Graph, layout: Map<string, [number, intrinsics.Types]>): number {
@@ -5258,6 +5568,10 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
     }
     for (const [param, ok] of relays) if (ok) retypeRecord(g, param, type)
     changed.add(plan.callee)
+    for (const [symbol, calls] of plan.rebuilt?.calls ?? []) {
+        rebuildCalls(program.units.get(symbol)!, calls, layout, plan.rebuilt!, users(symbol))
+        changed.add(symbol)
+    }
     for (const [symbol, f] of plan.callers) {
         const cg = program.units.get(symbol)!
         const index = { users: users(symbol) }
@@ -5301,6 +5615,72 @@ export function recordReturn(program: ProgramGraph, plan: RecordReturn, users: (
         dirtyValues(cg, rewritten)
         changed.add(symbol)
     }
+}
+
+function rebuildCalls(cg: Graph, calls: number[], layout: Map<string, [number, intrinsics.Types]>, rebuilt: RebuiltReturn, index: GraphIndex): void {
+    const type = layoutRecordType(cg, layout)
+    const rewritten: number[] = []
+    for (const call of calls) {
+        const uses: [user: number, slot: number][] = []
+        for (const u of indexedUsers(index, call)) {
+            const n = getNode(cg, u)!
+            let slot = useSlot(cg, u, call, firstNonOrderingSlot(n))
+            while (slot >= 0) {
+                uses.push([u, slot])
+                slot = useSlot(cg, u, call, slot + 1)
+            }
+        }
+        setCallLocations(cg, call, callLocations(cg, call) ?? [], undefined, { ref: type })
+        if (!uses.length) continue
+        const cell = addNode(cg, NodeOp.pstack, [call, { literal: rebuilt.stack }, 0, { literal: rebuilt.size }])
+        let last = cell
+        for (const [path, [key, T]] of layout) {
+            let value = addNode(cg, NodeOp.get, [call, { literal: key }])
+            if (intrinsics.intrinsicBitWidth(T) < 64) value = addNode(cg, NodeOp.convert, [value], T)
+            last = addNode(cg, NodeOp.store, [last, cell, { literal: Number(path) }, value], T)
+        }
+        const object = addNode(cg, NodeOp.after, [last, cell])
+        for (const [u, slot] of uses) {
+            const n = getNode(cg, u)!
+            putCopy(cg, u, n, withOperand(cg, n, slot, object))
+            rewritten.push(u)
+        }
+    }
+    dirtyValues(cg, rewritten)
+}
+
+function accessesFit(g: Graph, mem: MemAnalysis, reached: Map<number, GraphBlock>, layout: Map<string, [number, intrinsics.Types]>): boolean {
+    for (const [x, xb] of reached) {
+        for (const u of mem.users(x)) {
+            const n = getNode(g, u)!
+            if ((n.op !== NodeOp.load && n.op !== NodeOp.store) || getRef(n, 1) !== x) continue
+            const access = mem.access(xb, n)
+            if (!access || access.pos === undefined) return false
+            if (layout.get(String(access.pos))?.[1] !== slotType(typeOf(n))) return false
+        }
+    }
+    return true
+}
+
+function reachesReturn(g: Graph, mem: MemAnalysis, reached: Map<number, GraphBlock>): boolean {
+    for (const [x] of reached) {
+        for (const u of mem.users(x)) {
+            const n = getNode(g, u)!
+            if (n.op === NodeOp.ret && getRef(n, 0) === x) return true
+        }
+    }
+    return false
+}
+
+function callMarksStack(g: Graph, call: number, stack: number): boolean {
+    let id = getRef(getNode(g, call)!, 0)
+    while (id) {
+        const n = getNode(g, id)!
+        if (pstackTentative(g, n) !== PstackMark) return false
+        if (getLiteral(g, n, 1) === stack) return true
+        id = getRef(n, 0)
+    }
+    return false
 }
 
 function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
@@ -5491,13 +5871,6 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         }
         return pstackAllocates(g, n) ? id : undefined
     }
-    function overlaps(offsets: [number, intrinsics.Types][]): boolean {
-        offsets.sort((a, b) => a[0] - b[0])
-        for (let i = 0; i + 1 < offsets.length; i++) {
-            if (offsets[i][0] + intrinsics.intrinsicBitWidth(offsets[i][1]) / 8 > offsets[i + 1][0]) return true
-        }
-        return false
-    }
     for (const symbol of live) indexOf(symbol)
     const callersOf = new Map<number, number[]>()
     for (const symbol of live) {
@@ -5508,9 +5881,58 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         }
     }
     const plans: RecordReturn[] = []
-    for (const symbol of live) {
+    const changed = new Set<number>()
+    function apply(plan: RecordReturn): void {
+        indexes.delete(plan.callee)
+        recordReturn(program, plan, symbol => indexOf(symbol).users, changed)
+        for (const [c] of plan.callers) indexes.delete(c)
+        for (const c of plan.rebuilt?.calls.keys() ?? []) indexes.delete(c)
+        plans.push(plan)
+    }
+    function returnsRecords(symbol: number): boolean {
         const callers = callersOf.get(symbol)
-        if (pinned.has(symbol) || !callers || callers.includes(symbol)) continue
+        return !pinned.has(symbol) && callers !== undefined && !callers.includes(symbol)
+    }
+    function rebuiltReturn(symbol: number, p: number[], own: Flow, theirs: [number, Flow][]): [RebuiltReturn, Map<string, [number, intrinsics.Types]>] | string {
+        if (!signaturePlanned(program, symbol, SignatureReturn)) return 'plan'
+        const g = program.units.get(symbol)!
+        const cells = p.map(id => getNode(g, id)!)
+        if (cells.some(n => getRef(n, 1) || getRef(n, 3) || pstackTentative(g, n))) return 'cell'
+        const stack = Math.max(...cells.map(n => getLiteral(g, n, 1)))
+        const size = Math.max(...cells.map(n => getLiteral(g, n, 3)))
+        const offsets = [...own.accesses].map(([path, T]): [number, intrinsics.Types] => [Number(path), T])
+        if (offsets.length > SignatureFields || overlaps(offsets) || !returnRegisters(program.target, offsets.map(([, T]) => T))) return `fields=${offsets.length}`
+        const layout = new Map<string, [number, intrinsics.Types]>()
+        offsets.forEach(([offset, T], i) => layout.set(String(offset), [i, T]))
+        const calls = new Map<number, number[]>()
+        let gains = false
+        for (const [c, f] of theirs) {
+            if (!f.blocked) {
+                for (const [path, T] of f.accesses) {
+                    if (layout.get(path)?.[1] !== T) return `read ${path}`
+                }
+                continue
+            }
+            const cg = program.units.get(c)!
+            const sites = indexOf(c).calls.get(symbol)!
+            if (sites.some(call => callMarksStack(cg, call, stack))) return 'marked'
+            const mem = memAnalysis(cg, indexOf(c).users)
+            for (const call of sites) {
+                const escape = mem.flows(siteBlock(cg, call), call, false)
+                if (escape.own || escape.calls.length) return `escapes ${cg.name}`
+                if (!accessesFit(cg, mem, escape.reached, layout)) return `access ${cg.name}`
+                if (returnsRecords(c) || !reachesReturn(cg, mem, escape.reached)) gains = true
+            }
+            calls.set(c, sites)
+        }
+        if (calls.size === theirs.length && !gains) return 'no gain'
+        return [{ stack, size, calls }, layout]
+    }
+    const order = stronglyConnected(live, symbol => [...indexOf(symbol).calls.keys()].filter(callee => program.units.has(callee)))
+    const cyclic = new Set(order.filter(scc => scc.length > 1).flat())
+    for (const symbol of order.flat()) {
+        const callers = callersOf.get(symbol)
+        if (!callers || !returnsRecords(symbol)) continue
         const p = returnedAllocations(symbol)
         if (!p) continue
         const name = program.units.get(symbol)!.name || `symbol ${symbol}`
@@ -5518,9 +5940,18 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         const g = program.units.get(symbol)!
         if (!own.blocked && indexOf(symbol).rets.some(([r]) => !own.source.has(getRef(getNode(g, r)!, 0)))) own.blocked = 'other-return'
         const theirs = callers.map(c => [c, flow(c, indexOf(c).calls.get(symbol)!, false)] as [number, Flow])
-        const blocked = own.blocked ?? theirs.find(([, f]) => f.blocked)?.[1].blocked
+        const held = theirs.find(([, f]) => f.blocked)?.[1].blocked
+        const rebuilt = own.blocked || !held || cyclic.has(symbol) ? undefined : rebuiltReturn(symbol, p, own, theirs)
+        const blocked = own.blocked ?? (typeof rebuilt === 'string' ? `${held} rebuild:${rebuilt}` : rebuilt ? undefined : held)
         if (blocked) {
             if (debug) console.log(`RECORD-RETURN ${name} blocked ${blocked}`)
+            continue
+        }
+        if (rebuilt && typeof rebuilt !== 'string') {
+            const [plan, layout] = rebuilt
+            program.signatureRewrites.push([symbol, SignatureReturn, layout.size])
+            if (debug) console.log(`RECORD-RETURN ${name} fields=${[...layout.keys()].join('/')} callers=${callers.map(c => program.units.get(c)!.name || '?').join(',')} rebuilt=${[...plan.calls.keys()].map(c => program.units.get(c)!.name || '?').join(',')}`)
+            apply({ callee: symbol, own, allocations: p, layout, inner: new Map(), callers: theirs.filter(([c]) => !plan.calls.has(c)), rebuilt: plan })
             continue
         }
         const types = new Map(own.accesses)
@@ -5595,12 +6026,7 @@ function recordReturns(program: ProgramGraph, clock: PhaseClock): void {
         const layout = new Map<string, [number, intrinsics.Types]>()
         fields.forEach((o, i) => layout.set(o, [i, types.get(o)!]))
         if (debug) console.log(`RECORD-RETURN ${name} fields=${fields.join('/')} callers=${callers.map(c => program.units.get(c)!.name || '?').join(',')}`)
-        plans.push({ callee: symbol, own, allocations: p, layout, inner, callers: theirs })
-    }
-    const changed = new Set<number>()
-    for (const plan of plans) {
-        indexes.delete(plan.callee)
-        recordReturn(program, plan, symbol => indexOf(symbol).users, changed)
+        apply({ callee: symbol, own, allocations: p, layout, inner, callers: theirs })
     }
     if (flags.has('trace-stats')) console.log('record plans', plans.map(plan => `${program.units.get(plan.callee)!.name}<-${plan.callers.length}`).join(' '))
     const transformed = new Set(plans.map(plan => plan.callee))
@@ -5728,6 +6154,7 @@ function mergeIdenticalUnits(program: ProgramGraph, symbols: number[], callees: 
         else {
             if (flags.has('merge-debug')) console.log('MERGE', program.units.get(scc[0])!.name, '->', program.units.get(canonical)!.name, dumpGraph(program.units.get(scc[0])!), dumpGraph(program.units.get(canonical)!))
             meetPointerTypes(program.units.get(canonical)!, program.units.get(scc[0])!)
+            meetSignatures(program, canonical, scc[0])
             if (program.discardable?.has(scc[0])) program.discardable.add(canonical)
             aliases.set(scc[0], canonical)
         }
@@ -5798,10 +6225,12 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
     timed('records', () => step('recordReturns', recordReturns, clock))
     timed('records', () => {
         step('expandParams', expandParams, touched)
+        step('expandPrivateParams', expandPrivateParams, touched, clock)
         step('forwardReturnedArgs', forwardReturnedArgs, touched)
         step('shareCallerValues', shareCallerValues, touched)
         step('specializeLiteralArgs', specializeLiteralArgs, touched)
         step('pruneDeadArgs', pruneDeadArgs, touched)
+        verifySignatures('records', program.signatureRewrites, (symbol, position) => signaturePlanned(program, symbol, position), SignatureFields, symbol => program.units.get(symbol)?.name || `symbol ${symbol}`, signatureSlot)
         for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
         const specialized = new Set(touched)
         touched.clear()
@@ -9286,10 +9715,22 @@ function joinNullableNumbers(table: TypeTable): void {
 
 export type ReturnMode = 'encoded' | 'raw' | 'keep' | 'tagged' | 'narrow' | 'record'
 
+export enum SignatureRep {
+    object,
+    fields,
+}
+
+export interface Signature {
+    returns: SignatureRep
+    params: SignatureRep[]
+    context: SignatureRep
+}
+
 export interface UnitAbi {
     mode: ReturnMode
     returns: intrinsics.Types
     tags: number[]
+    signature?: Signature
 }
 
 interface Representations {
@@ -9468,12 +9909,23 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
         narrowable.set(k, (narrowable.get(k) ?? true) && fits)
         if (compared.has(fn)) comparedGroups.add(k)
     }
+    function signatureRep(rep: Rep): SignatureRep {
+        return rep.kind === 'pointer' && !rep.nullable && (objectShapes(plan, rep) !== undefined || addressRep(rep)) ? SignatureRep.fields : SignatureRep.object
+    }
+    function contextRep(unit: PlannedUnit): SignatureRep {
+        const traced = tracedOf(unit)
+        for (const [id, rep] of unit.nodes) {
+            if (getNode(traced, id)?.op === NodeOp.callContext) return signatureRep(rep)
+        }
+        return SignatureRep.object
+    }
     const abi = new Map<Function, UnitAbi>()
     for (const [fn, unit] of planned.units) {
         const k = abiType(types, unit, -1)
         const mode = modes.get(fn) === 'tagged' && narrowable.get(k) && comparedGroups.has(k) ? 'narrow' : modes.get(fn)!
         const returns = mode === 'raw' || (mode === 'tagged' && numberName(unit.returns) === 'f64') ? Types.u64 : words.has(fn) ? Types.vm_value : returnsSlot(fn) && mode !== 'narrow' ? Types.u32 : numberName(unit.returns) === 'f64' ? Types.f64 : machineNumberName(unit.returns) === 'i64' ? Types.i64 : Types.u64
-        abi.set(fn, { mode, returns, tags: paramTags(unit) })
+        const signature = { returns: isRoot(fn) || constructsOutOfLine(fn) ? SignatureRep.object : signatureRep(unit.returns), params: unit.params.map(param => signatureRep(param.rep)), context: contextRep(unit) }
+        abi.set(fn, { mode, returns, tags: paramTags(unit), signature })
         if (flags.has('return-modes')) console.log('RETURN-MODE', fn.name, mode, repText(unit.returns))
     }
     return { abi, tags }
@@ -13090,7 +13542,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
     const outlined: [Function, Graph][] = []
     const { realizeUnit, plannedUnit, abiOf } = resolver
     const outline = (name: string) => intern(Object.assign(namedStub(name), { shouldNotInline: true }))
-    const program: ProgramGraph = { binder, units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), returnRecords: new Map(), hostReturns: new Map(), image, target }
+    const program: ProgramGraph = { binder, units: new Map(), roots, noInline: new Set(), alwaysInline: new Set(), constructors: new Set(), unplanned: new Set(), tagged: new Set(), abi: new Map(), returnRecords: new Map(), signatures: new Map(), signatureRewrites: [], hostReturns: new Map(), image, target }
     function compileUnit(fn: Function): Graph {
         const unit = unitOf(fn)
         if (flags.has('native-symbols')) console.log('native symbol', unit.symbol!, fn.name || fn.toString().slice(0, 80), plannedUnit(fn) ? 'planned' : 'unplanned')
@@ -13143,6 +13595,10 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
             program.abi.set(symbol, planned ? [planned.params.length, ...planned.params.map(p => machine(p.rep)), machine(planned.returns), abi.mode] : [false])
             const record = planned ? returnedRecord(abi, planned.returns) : undefined
             if (record) program.returnRecords.set(symbol, record)
+            if (planned && abi.signature) {
+                intrinsics.assert(graph.blocks[0].params.length >= abi.signature.params.length, `native: ${graph.name || 'anonymous'} enters with ${graph.blocks[0].params.length} params, but its signature plans ${abi.signature.params.length}`)
+                program.signatures.set(symbol, abi.signature)
+            }
             if ((originOf(fn) as any).shouldNotInline || program.unplanned.has(symbol)) program.noInline.add(symbol)
             if ((originOf(fn) as any).shouldInline) program.alwaysInline.add(symbol)
             if (constructsOutOfLine(fn)) program.constructors.add(symbol)
