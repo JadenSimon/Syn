@@ -12418,6 +12418,8 @@ export function substitute(g: Graph, by: Map<number, Operand>): void {
     for (const id of by.keys()) deleteNode(g, id)
 }
 
+const LiteralIdBase = 2 ** 40
+
 function rebuildable(g: Graph, id: number): boolean {
     const n = getNode(g, id)
     if (!n) return false
@@ -17693,7 +17695,9 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const n = getNode(g, call)
         if (n?.op !== NodeOp.call) return false
         const i = argHomes(call).indexOf(r)
-        return i >= 0 && getRef(n, i + 3) === v
+        if (i < 0) return false
+        if (getRef(n, i + 3)) return getRef(n, i + 3) === v
+        return v === LiteralIdBase + getLiteral(g, n, i + 3)
     }
     function clobbers(call: number, r: number, v: number): boolean {
         if (!clobberOfCall(call).has(r)) return false
@@ -17836,6 +17840,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         code.push({ dst, src, consumed })
     }
     function noteWrite(dst: number): void {
+        dropLiteral(dst)
         if (dst < SLOTS) written.add(dst)
         if (isPreserved(dst)) {
             usedPreserved.add(dst)
@@ -17855,6 +17860,15 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     const written = new Set<number>()
     const localCalls = new Set<number>()
     function isScratch(r: number): boolean { return target.scratch.indexOf(r) >= 0 }
+    function held(r: number): boolean {
+        const v = heldBy.get(r)
+        return v !== undefined && v < LiteralIdBase
+    }
+    function dropLiteral(r: number): void {
+        const v = heldBy.get(r)
+        if (v === undefined || v < LiteralIdBase) return
+        heldBy.delete(r)
+    }
     function homeable(id: number, home: number): void {
         assert(!isScratch(home), `lowering: %${id} would live in scratch register ${home}, which assembler macros and scratch literals overwrite`)
         assert(accepts(id, home), `lowering: %${id} would live in register ${home}, which belongs to the other register class`)
@@ -17862,6 +17876,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
     function bind(id: number, reg: number): number {
         if (opts.debug) console.log('home +', id, reg, 'at', materializing, 'over', heldBy.get(reg) ?? '-')
         homeable(id, reg)
+        dropLiteral(reg)
         written.add(reg)
         homeOf.set(id, reg)
         heldBy.set(reg, id)
@@ -17876,6 +17891,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (isSlot(home)) reusableSlots.delete(home)
         homeOf.set(id, home)
         if (isSlot(home)) return
+        dropLiteral(home)
         heldBy.set(home, id)
         if (isPreserved(home)) {
             usedPreserved.add(home)
@@ -17914,7 +17930,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         return false
     }
     function unheldIn(pools: number[][], avoid: Set<number>): number {
-        for (const pool of pools) for (const r of pool) if (!heldBy.has(r) && !avoid.has(r)) return r
+        for (const pool of pools) for (const r of pool) if (!held(r) && !avoid.has(r)) return r
         return -1
     }
     const inf = g.ids.next
@@ -17985,6 +18001,14 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         avoidsArgRegs.add(id)
     }
     let pendingHomes: Set<number> = NOTHING
+    function savedHere(r: number): boolean {
+        let region: EmitRegion | undefined = currentRegion
+        while (region) {
+            if (region.writes.has(r)) return true
+            region = region.parent
+        }
+        return false
+    }
     function regFor(id: number, want: number): number {
         const { active, saved, scattered } = poolsOf(id)
         let steering = false
@@ -17999,7 +18023,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const second = first === saved ? active : saved
         if (want >= 0) {
             const willRelease = releases(id, heldBy.get(want) ?? 0)
-            if (!heldBy.has(want) && (first.indexOf(want) >= 0 || first !== saved)) {
+            if (!held(want) && (first.indexOf(want) >= 0 || first !== saved)) {
                 return bind(id, want)
             }
             if (willRelease && (first.indexOf(want) >= 0 || first !== saved)) {
@@ -18008,18 +18032,25 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         }
         if (steering && sigStats) sigStats.steerFailed++
         if (first === saved) {
-            if (want >= 0 && !heldBy.has(want) && safeVolatiles(id).includes(want)) {
+            if (want >= 0 && !held(want) && safeVolatiles(id).includes(want)) {
                 return bind(id, want)
             }
             const homes = currentRegion === rootRegion ? rankHomes(safeVolatiles(id)) : safeVolatiles(id)
             for (const r of homes) {
-                if (accepts(id, r) && !heldBy.has(r) && !pendingHomes.has(r)) {
+                if (accepts(id, r) && !held(r) && !pendingHomes.has(r)) {
                     return bind(id, r)
                 }
             }
         }
         const pools = first === saved ? [first] : [first, second]
         let r = unheldIn(pools, pendingHomes)
+        if (r >= 0 && first !== saved && !written.has(r) && !inherited.has(r)) {
+            for (const c of saved) {
+                if (!written.has(c) || !savedHere(c) || heldBy.has(c) || pendingHomes.has(c)) continue
+                r = c
+                break
+            }
+        }
         if (r < 0) r = freeRegIn(pools, NOTHING)
         if (r < 0) r = freeRegIn([second], NOTHING)
         if (r < 0) throw 'lowering: out of registers'
@@ -18035,7 +18066,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (!isSlot(home)) return home
         if (acrossCall.has(v)) {
             for (const safe of safeVolatiles(v)) {
-                if (heldBy.has(safe) || avoid.has(safe)) continue
+                if (held(safe) || avoid.has(safe)) continue
                 transfer(safe, home)
                 copyOf.set(v, home)
                 return bind(v, safe)
@@ -18475,7 +18506,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (!value) { finish(id); return }
         const src = at(value, NOTHING)
         finish(id)
-        const open = want >= 0 && (!heldBy.has(want) || releases(id, heldBy.get(want)!))
+        const open = want >= 0 && (!held(want) || releases(id, heldBy.get(want)!))
         const dst = regFor(id, open ? want : isScratch(src) ? -1 : src)
         transfer(dst, src)
     }
@@ -18555,8 +18586,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             if (s.dst !== OPEN) continue
             const { active, saved } = poolsOf(feeds.get(s) ?? 0)
             let r = -1
-            for (const c of active) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
-            if (r < 0) for (const c of saved) if (!claimed.has(c) && !heldBy.has(c)) { r = c; break }
+            for (const c of active) if (!claimed.has(c) && !held(c)) { r = c; break }
+            if (r < 0) for (const c of saved) if (!claimed.has(c) && !held(c)) { r = c; break }
             if (r < 0) for (const c of active) if (!claimed.has(c)) { r = c; break }
             if (r < 0) for (const c of saved) if (!claimed.has(c)) { r = c; break }
             if (r < 0) r = takeSlot()
@@ -18634,6 +18665,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         }
         shuffle(shuffled, expired)
         for (const c of consts) {
+            const literal = !c.float && volatiles.includes(c.dst) && Number.isInteger(c.src) && c.src >= 0 && c.src < target.costs.inlineLiteral ? LiteralIdBase + c.src : 0
+            if (literal && heldBy.get(c.dst) === literal) continue
             noteWrite(c.dst)
             if (isSlot(c.dst) && c.src === 0 && target.zeroReg !== undefined) put(() => asm.store(SP, slotOffset(c.dst), target.zeroReg!, Types.u64))
             else if (isSlot(c.dst)) put(() => {
@@ -18642,6 +18675,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 asm.store(SP, slotOffset(c.dst), SWAP, Types.u64)
             })
             else put(() => c.float ? asm.movF64(c.dst, c.src) : asm.movImm(c.dst, c.src))
+            if (literal && !heldBy.has(c.dst)) heldBy.set(c.dst, literal)
         }
         return landed
     }
@@ -18682,6 +18716,10 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         for (const x of volatiles) {
             const v = heldBy.get(x)
             if (v === undefined) continue
+            if (v >= LiteralIdBase) {
+                if (clobbers(id, x, v)) heldBy.delete(x)
+                continue
+            }
             if (rebuildable(g, v)) {
                 if (!clobbers(id, x, v)) continue
                 freeValue(v, id)
