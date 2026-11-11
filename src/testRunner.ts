@@ -662,6 +662,8 @@ interface BaselineSection {
     done: boolean
     since?: number
     fingerprint?: string
+    listed?: ListingsWriter
+    listings?: string
 }
 
 function caseMs(ms: number): number {
@@ -710,7 +712,8 @@ function sectionBody(section: BaselineSection, load: number): string[] {
     const phases = Object.entries({ ...section.phases, setup: Math.max(0, section.ms - accounted) })
     const percents = phases.map(([phase, ms]) => [phase, Math.round(ms * 100 / Math.max(1, section.ms))] as const).filter(x => x[1] > 0)
     const fingerprint = section.fingerprint ? [`fingerprint ${section.fingerprint}`] : []
-    return [`total ${(section.ms / 1000).toFixed(1)}s load ${load}`, ...fingerprint, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.problems, ...section.cases]
+    const listings = section.listings ? [`listings ${section.listings}`] : []
+    return [...listings, `total ${(section.ms / 1000).toFixed(1)}s load ${load}`, ...fingerprint, `phases ${percents.map(([phase, pct]) => `${phase} ${pct}%`).join(' ')}`, ...section.problems, ...section.cases]
 }
 
 function caseResults(body: string[]) {
@@ -720,8 +723,10 @@ function caseResults(body: string[]) {
     const phases = new Map<string, number>()
     let seconds = 0
     let fingerprint: { compiler: string, roots: string } | undefined
+    let listings: string | undefined
     for (const line of body) {
         const fields = line.split(' ')
+        if (fields[0] === 'listings') listings = fields[1]
         if (fields[0] === 'total') seconds = parseFloat(fields[1])
         if (fields[0] === 'fingerprint') fingerprint = { compiler: fields[2], roots: fields[4] }
         if (fields[0] === 'phases') {
@@ -731,7 +736,7 @@ function caseResults(body: string[]) {
         if (/^(fail|crash|cut) /.test(line)) broken.set(line.slice(fields[0].length + 1, line.indexOf(': ')), line)
         if (fields[0] === 'skip') skipped.add(line.slice(5, line.indexOf(': ')))
     }
-    return { cases, broken, skipped, phases, seconds, fingerprint }
+    return { cases, broken, skipped, phases, seconds, fingerprint, listings }
 }
 
 function fingerprintDelta(before: ReturnType<typeof caseResults>, after: ReturnType<typeof caseResults>, changed: number): string {
@@ -759,11 +764,13 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
     const totals = [0, 0, 0, 0]
     let changed = 0
     let removed = 0
+    let added = 0
     for (const [name, [insts, nonMov]] of after.cases) {
         const was = before.cases.get(name)
         if (after.broken.has(name) || before.broken.has(name)) continue
         if (!was) {
             lines.push(`new ${name} ${insts}/${nonMov}`)
+            added++
             continue
         }
         totals[0] += was[0]
@@ -789,7 +796,11 @@ function reportDeltas(key: string, old: string[] | undefined, body: string[], pa
     for (const name of before.broken.keys()) {
         if (!after.broken.has(name) && after.cases.has(name)) lines.push(`fixed ${name}`)
     }
-    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${after.skipped.size ? `, ${after.skipped.size} skipped` : ''}${partial ? ', partial run' : ''}`)
+    const relisted = !partial && before.listings && after.listings && before.listings !== after.listings
+    if (relisted) lines.push(`listings ${before.listings} -> ${after.listings}`)
+    let listingsDelta = ''
+    if (relisted) listingsDelta = changed || added || removed ? ', listings changed' : ', listings changed at equal counts'
+    console.log(`DELTAS ${key}: ${changed} changed, ${totals[0]}/${totals[1]} -> ${totals[2]}/${totals[3]} (${signed(totals[2] - totals[0])}/${signed(totals[3] - totals[1])})${fingerprintDelta(before, after, changed)}${listingsDelta}${after.skipped.size ? `, ${after.skipped.size} skipped` : ''}${partial ? ', partial run' : ''}`)
     for (const line of lines) console.log(`DELTA ${key}: ${line}`)
     if (removed) console.log(`${key} FAILED: ${removed} of ${before.cases.size} baseline cases did not run (${after.cases.size} ran); a suite that drops cases is a failure`)
     return removed
@@ -804,6 +815,291 @@ function writeBaselines(bodies: Map<string, string[]>): void {
     const sections = [...kept.keys()].sort().map(key => [`== ${key}`, ...kept.get(key)!].join('\n') + '\n')
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, [header.join('\n') + '\n', ...sections].join('\n'))
+}
+
+const listingsMagic = 'SYNLIST1'
+const listingsLimit = 1000
+
+type ListedUnit = [name: string, listing: string]
+
+function listingsDir(): string | undefined {
+    const given = process.env.SYN_LISTINGS
+    if (given === 'off') return undefined
+    return given || path.join(os.homedir(), '.syn', 'listings')
+}
+
+function instructionText(line: string, pc: number): number {
+    const prefix = `${String(pc * 4).padStart(4, ' ')}: `
+    const at = prefix.length + 10
+    if (!line.startsWith(prefix) || line.length < at || line[at - 2] !== ' ' || line[at - 1] !== ' ') return -1
+    return /^[0-9a-f]{8}$/.test(line.slice(prefix.length, at - 2)) ? at : -1
+}
+
+class ListingsWriter {
+    strings = new Map<string, number>()
+    body: number[] = [0]
+    cases = 0
+
+    intern(text: string): number {
+        let id = this.strings.get(text)
+        if (id === undefined) {
+            id = this.strings.size
+            this.strings.set(text, id)
+        }
+        return id
+    }
+
+    add(name: string, units: ListedUnit[]): void {
+        this.cases++
+        this.body.push(this.intern(name), units.length)
+        for (const [unit, listing] of units) this.unit(unit, listing)
+    }
+
+    unit(name: string, listing: string): void {
+        const words: number[] = []
+        const texts: number[] = []
+        const extras: number[] = []
+        for (const line of listing.split('\n')) {
+            const at = instructionText(line, words.length)
+            if (at < 0) {
+                extras.push(words.length, this.intern(line))
+                continue
+            }
+            words.push(parseInt(line.slice(at - 10, at - 2), 16))
+            texts.push(this.intern(line.slice(at)))
+        }
+        this.body.push(this.intern(name), words.length)
+        for (const word of words) this.body.push(word)
+        for (const text of texts) this.body.push(text)
+        this.body.push(extras.length / 2)
+        for (const extra of extras) this.body.push(extra)
+    }
+
+    bytes(): Buffer {
+        const texts = [...this.strings.keys()].map(text => Buffer.from(text))
+        const head = 12 + 4 * texts.length
+        const size = texts.reduce((n, text) => n + text.length, 0)
+        const start = head + size + (4 - size % 4) % 4
+        const out = Buffer.alloc(start + 4 * this.body.length)
+        out.write(listingsMagic, 0, 'latin1')
+        out.writeUInt32LE(texts.length, 8)
+        let at = head
+        texts.forEach((text, i) => {
+            out.writeUInt32LE(text.length, 12 + 4 * i)
+            text.copy(out, at)
+            at += text.length
+        })
+        this.body[0] = this.cases
+        this.body.forEach((word, i) => out.writeUInt32LE(word, start + 4 * i))
+        return out
+    }
+}
+
+interface ListedCase {
+    name: string
+    units: { name: string, size: number, listing: string }[]
+}
+
+function readListings(bytes: Buffer): ListedCase[] {
+    if (bytes.toString('latin1', 0, 8) !== listingsMagic) throw new Error(`listings: not a ${listingsMagic} object`)
+    const strings: string[] = []
+    const count = bytes.readUInt32LE(8)
+    let at = 12 + 4 * count
+    while (strings.length < count) {
+        const length = bytes.readUInt32LE(12 + 4 * strings.length)
+        strings.push(bytes.toString('utf8', at, at + length))
+        at += length
+    }
+    at += (4 - at % 4) % 4
+    const next = () => {
+        at += 4
+        return bytes.readUInt32LE(at - 4)
+    }
+    const cases: ListedCase[] = []
+    const caseCount = next()
+    while (cases.length < caseCount) {
+        const listed: ListedCase = { name: strings[next()], units: [] }
+        const unitCount = next()
+        while (listed.units.length < unitCount) {
+            const name = strings[next()]
+            const size = next()
+            const words = new Uint32Array(size)
+            let i = 0
+            while (i < size) {
+                words[i] = next()
+                i++
+            }
+            const texts = at
+            at += 4 * size
+            const lines: string[] = []
+            const extras = next()
+            let extra = at
+            let e = 0
+            i = 0
+            while (i <= size) {
+                while (e < extras && bytes.readUInt32LE(extra) === i) {
+                    lines.push(strings[bytes.readUInt32LE(extra + 4)])
+                    extra += 8
+                    e++
+                }
+                if (i < size) lines.push(`${String(i * 4).padStart(4, ' ')}: ${words[i].toString(16).padStart(8, '0')}  ${strings[bytes.readUInt32LE(texts + 4 * i)]}`)
+                i++
+            }
+            at = extra
+            listed.units.push({ name, size, listing: lines.join('\n') })
+        }
+        cases.push(listed)
+    }
+    return cases
+}
+
+function alive(pid: number): boolean {
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (e: any) {
+        return e.code === 'EPERM'
+    }
+}
+
+function removeFile(file: string): void {
+    try {
+        fs.unlinkSync(file)
+    } catch (e: any) {
+        if (e.code !== 'ENOENT') throw e
+    }
+}
+
+function touchFile(file: string): boolean {
+    const now = new Date()
+    try {
+        fs.utimesSync(file, now, now)
+        return true
+    } catch (e: any) {
+        if (e.code === 'ENOENT') return false
+        throw e
+    }
+}
+
+function lockListings(dir: string): () => void {
+    const lock = path.join(dir, 'lock')
+    const mine = path.join(dir, `.${process.pid}.lock`)
+    const deadline = Date.now() + 30_000
+    const pause = new Int32Array(new SharedArrayBuffer(4))
+    fs.writeFileSync(mine, String(process.pid))
+    try {
+        while (true) {
+            try {
+                fs.linkSync(mine, lock)
+                return () => fs.unlinkSync(lock)
+            } catch (e: any) {
+                if (e.code !== 'EEXIST') throw e
+            }
+            let holder = 0
+            try {
+                holder = Number(fs.readFileSync(lock, 'utf8'))
+            } catch (e: any) {
+                if (e.code !== 'ENOENT') throw e
+                continue
+            }
+            if (!alive(holder)) {
+                removeFile(lock)
+                continue
+            }
+            if (Date.now() > deadline) throw new Error(`listings: ${lock} has been held by pid ${holder} for over 30s`)
+            Atomics.wait(pause, 0, 0, 5)
+        }
+    } finally {
+        fs.unlinkSync(mine)
+    }
+}
+
+function cleanListings(dir: string, limit: number): number {
+    const names = fs.readdirSync(dir)
+    for (const name of names) {
+        const writer = /^\.(\d+)\./.exec(name)
+        if (writer && !alive(Number(writer[1]))) removeFile(path.join(dir, name))
+    }
+    const objects = names.filter(name => /^[0-9a-f]{64}$/.test(name))
+    if (objects.length <= limit) return 0
+    const aged: [number, string][] = []
+    for (const name of objects) {
+        const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false })
+        if (stat) aged.push([stat.mtimeMs, name])
+    }
+    aged.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1))
+    const doomed = aged.slice(0, Math.floor(objects.length / 2))
+    for (const [, name] of doomed) removeFile(path.join(dir, name))
+    return doomed.length
+}
+
+export function storeListings(dir: string, bytes: Buffer, limit = listingsLimit): { hash: string, written: boolean, cleaned: number } {
+    const hash = crypto.createHash('sha256').update(bytes).digest('hex')
+    const file = path.join(dir, hash)
+    if (touchFile(file)) return { hash, written: false, cleaned: 0 }
+    fs.mkdirSync(dir, { recursive: true })
+    const release = lockListings(dir)
+    try {
+        if (touchFile(file)) return { hash, written: false, cleaned: 0 }
+        const temp = path.join(dir, `.${process.pid}.${hash}`)
+        fs.writeFileSync(temp, bytes)
+        fs.renameSync(temp, file)
+        return { hash, written: true, cleaned: cleanListings(dir, limit) }
+    } finally {
+        release()
+    }
+}
+
+function loadListings(dir: string, given: string | undefined): ListedCase[] {
+    if (!given) throw 'listings: expected a hash'
+    const found = /^[0-9a-f]{64}$/.test(given) ? [given] : fs.readdirSync(dir).filter(name => /^[0-9a-f]{64}$/.test(name) && name.startsWith(given))
+    if (found.length !== 1) throw `listings: ${found.length ? `${found.length} objects start with` : 'no object for'} ${given} in ${dir}`
+    return readListings(fs.readFileSync(path.join(dir, found[0])))
+}
+
+function caseText(listed: ListedCase): string {
+    const size = listed.units.reduce((n, unit) => n + unit.size, 0)
+    return `case ${listed.name}: ${listed.units.length} units, ${size} instructions\n` + listed.units.map(unit => `--- ${unit.name || '<anonymous>'} listing ---\n${unit.listing}\n`).join('')
+}
+
+function listingsCommand(command: string | undefined, args: string[]): void {
+    const dir = listingsDir()
+    if (!dir) throw 'listings: SYN_LISTINGS is off'
+    if (command === 'show') {
+        const cases = loadListings(dir, args[0]).filter(listed => args[1] === undefined || listed.name === args[1])
+        if (!cases.length) throw `listings: no case ${args[1]} in ${args[0]}`
+        for (const listed of cases) process.stdout.write(caseText(listed))
+        return
+    }
+    if (command !== 'diff') throw 'usage: --listings show <hash> [case] | --listings diff <hash> <hash> [case]'
+    const left = new Map(loadListings(dir, args[0]).map(listed => [listed.name, listed]))
+    const right = new Map(loadListings(dir, args[1]).map(listed => [listed.name, listed]))
+    const texts = [new Map<string, string>(), new Map<string, string>()]
+    const summary: string[] = []
+    for (const name of new Set([...left.keys(), ...right.keys()])) {
+        if (args[2] !== undefined && name !== args[2]) continue
+        const sides = [left.get(name), right.get(name)]
+        const rendered = sides.map(listed => listed ? caseText(listed) : '')
+        if (rendered[0] === rendered[1]) continue
+        const sizes = sides.map(listed => listed ? `${listed.units.reduce((n, unit) => n + unit.size, 0)}` : '-')
+        summary.push(`${!sides[0] ? 'added' : !sides[1] ? 'removed' : 'changed'} ${name} ${sizes[0]} -> ${sizes[1]}`)
+        texts[0].set(name, rendered[0])
+        texts[1].set(name, rendered[1])
+    }
+    console.log(`listings diff: ${summary.length} cases differ`)
+    for (const line of summary) console.log(line)
+    if (!summary.length) return
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'listings-'))
+    try {
+        const files = texts.map((side, i) => {
+            const file = path.join(scratch, String(i))
+            fs.writeFileSync(file, [...side.values()].join(''))
+            return file
+        })
+        spawnSync('diff', ['-u', '-F', '^case ', '--label', args[0], '--label', args[1], ...files], { stdio: 'inherit' })
+    } finally {
+        fs.rmSync(scratch, { recursive: true, force: true })
+    }
 }
 
 function crashOf(code: number | null, signal: string | null): string | undefined {
@@ -938,7 +1234,10 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
     const compared = args.find(a => a.startsWith('baseline:'))?.slice('baseline:'.length) ?? baselineFile()
     const baseline = baselineSections(compared)
     const sections = new Map<string, BaselineSection>()
+    const store = listingsDir()
     let section: BaselineSection | undefined
+    let caseUnits: ListedUnit[] = []
+    let outsideUnits: ListedUnit[] = []
     while (true) {
         const env: Record<string, string> = { ...process.env, SYN_CRASH_FD: '3', SYN_CRASH_DUMP_FD: '4', SYN_CRASH_DEADLINE: String(seconds > 0 ? deadline : 0), SYN_CRASH_PPID: String(process.pid) }
         if (resume) env.SYN_CRASH_RESUME = JSON.stringify(resume)
@@ -968,14 +1267,24 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
                     maps.push(line)
                     continue
                 }
+                const units = marks.caseNumber !== undefined ? caseUnits : outsideUnits
+                if (fields[0] === 'listing') {
+                    for (const unit of JSON.parse(fields[1]) as ListedUnit[]) units.push(unit)
+                    continue
+                }
                 readMark(marks, line)
                 if (fields[0] === 'suite') {
                     stopClock(section)
-                    section = sections.get(fields[2]) ?? { problems: [], cases: [], ms: 0, phases: {}, done: false }
+                    section = sections.get(fields[2]) ?? { problems: [], cases: [], ms: 0, phases: {}, done: false, listed: store ? new ListingsWriter() : undefined }
                     sections.set(fields[2], section)
                     section.since = performance.now()
+                    caseUnits = []
+                    outsideUnits = []
+                } else if (fields[0] === 'case') {
+                    caseUnits = []
                 } else if (fields[0] === 'end' && fields.length > 2 && section) {
                     section.cases.push(`case ${fields[1]} ${fields[2]} ${fields[3]} ${fields[4]} ${caseMs(Number(fields[5]))}`)
+                    section.listed?.add(fields[1], units)
                 } else if (fields[0] === 'fingerprint' && section) {
                     section.fingerprint = `compiler ${fields[1]} roots ${fields[2]}`
                 } else if (fields[0] === 'done' && section) {
@@ -1024,6 +1333,19 @@ async function superviseEngine(args: string[], seconds: number): Promise<void> {
         }
         resume = next
     }
+    for (const [key, section] of sections) {
+        if (!section.listed) continue
+        const started = performance.now()
+        try {
+            const bytes = section.listed.bytes()
+            const stored = storeListings(store!, bytes)
+            section.listings = stored.hash
+            console.log(`LISTINGS ${key} ${stored.hash} ${section.listed.cases} cases, ${bytes.length} bytes, ${stored.written ? 'written' : 'exists'}${stored.cleaned ? `, cleaned ${stored.cleaned} oldest objects` : ''} [${(performance.now() - started).toFixed(1)}ms]`)
+        } catch (e) {
+            console.log(`LISTINGS ${key} FAILED: ${e}`)
+            failures++
+        }
+    }
     const filtered = args.some(a => /^(only|skip|bench|prof|sample)(:|$)/.test(a))
     const bodies = new Map([...sections].map(([key, section]) => [key, sectionBody(section, load)]))
     for (const [key, body] of [...bodies]) {
@@ -1048,6 +1370,7 @@ function report(failures: number): void {
 }
 
 export async function main(...args: string[]) {
+    if (args[0] === '--listings') return listingsCommand(args[1], args.slice(2))
     const files = await gatherTestCases()
     const filter = args[0]
     if (filter === '--engine') {
