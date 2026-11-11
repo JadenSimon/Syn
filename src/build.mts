@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 import ts from 'typescript'
 
@@ -54,11 +55,13 @@ function compileTs() {
 const zigArchs: Record<string, string> = { arm64: 'aarch64', x64: 'x86_64' }
 const zigOses: Record<string, string> = { darwin: 'macos', linux: 'linux-gnu' }
 
-async function newestMtime(dir: string, ext: string) {
-    const files = (await fs.readdir(dir)).filter(f => f.endsWith(ext))
-    const stats = await Promise.all(files.map(f => fs.stat(path.resolve(dir, f))))
+async function sourcesKey(dir: string, ext: string, config: string) {
+    const files = (await fs.readdir(dir)).filter(f => f.endsWith(ext)).sort()
+    const contents = await Promise.all(files.map(f => fs.readFile(path.resolve(dir, f))))
+    const hash = createHash('sha256').update(config)
+    files.forEach((f, i) => hash.update(f).update(contents[i]))
 
-    return Math.max(...stats.map(s => s.mtimeMs))
+    return hash.digest('hex')
 }
 
 async function compileZig() {
@@ -66,12 +69,14 @@ async function compileZig() {
     await fs.mkdir(path.dirname(outfile), { recursive: true })
     await fs.writeFile(path.resolve('out', 'api.zig.js'), `process.dlopen(module, require('node:path').resolve(__dirname, 'node', 'api.node'))\n`)
 
-    const built = await fs.stat(outfile).then(s => s.mtimeMs, () => 0)
-    if (built > await newestMtime('src', '.zig')) return
-
     const arch = zigArchs[process.arch]
     const os = zigOses[process.platform]
     if (!arch || !os) throw new Error(`No Zig target for ${process.platform}-${process.arch}`)
+
+    const keyfile = `${outfile}.key`
+    const key = await sourcesKey('src', '.zig', `${arch}-${os} ${process.env.OPT_MODE ?? ''}`)
+    const built = await fs.readFile(keyfile, 'utf8').catch(() => '')
+    if (built === key && await fs.stat(outfile).then(() => true, () => false)) return
 
     const args = ['build-lib', '-dynamic', '-fallow-shlib-undefined', '-lc', '-target', `${arch}-${os}`]
     if (process.env.OPT_MODE) args.push('-O', process.env.OPT_MODE)
@@ -81,6 +86,7 @@ async function compileZig() {
     await run(zig, [...args, 'src/api.zig', `-femit-bin=${outfile}`], { maxBuffer: 64 * 1024 * 1024 }).catch(e => {
         throw new Error(`Failed to compile src/api.zig with ${zig}\n${e.stderr ?? e.message}`)
     })
+    await fs.writeFile(keyfile, key)
 }
 
 async function getSyntaxKinds() {
