@@ -2335,7 +2335,7 @@ function effectfulSelects(g: Graph): [effectful: Set<number>, offTail: number[]]
     return [all, offTail]
 }
 
-function splitAtSelect(g: Graph, b: GraphBlock, c: BranchingSelect): GraphBlock {
+function splitAtSelect(g: Graph, b: GraphBlock, c: BranchingSelect, shared: Set<number>): GraphBlock {
     const s = getNode(g, c.select)!
     const operands = getOperands(g, s)
     const type = valueType(g, s)
@@ -2368,7 +2368,7 @@ function splitAtSelect(g: Graph, b: GraphBlock, c: BranchingSelect): GraphBlock 
         arms.push(addNode(g, NodeOp.after, [arm, addNode(g, NodeOp.apply, [blockId, arm])]))
     }
     putNode(g, c.select, NodeOp.param, [], type)
-    const split = addNode(g, NodeOp.select, arms)
+    const split = insertNode(g, makeNode(g, NodeOp.select, arms, Types.u64, (s.flags & gn.NodeFlags.tail_only) as u8))
     let bodyId = b.bodyId
     if (c.owner) {
         const o = getNode(g, c.owner)!
@@ -2377,13 +2377,34 @@ function splitAtSelect(g: Graph, b: GraphBlock, c: BranchingSelect): GraphBlock 
     } else {
         setBlockBody(g, b, split)
     }
-    reorderContinuation(g, b, operands, bodyId, token)
+    reorderContinuation(g, b, operands, bodyId, token, shared)
     const k: GraphBlock = { id: blockId, params: [c.select], bodyId, bodyConst: 0 }
     addGraphBlock(g, k)
     return k
 }
 
-function reorderContinuation(g: Graph, b: GraphBlock, split: Operand[], bodyId: number, token: number): void {
+function sharedValues(g: Graph): Set<number> {
+    const reached = new Map<number, number>()
+    const shared = new Set<number>()
+    for (const b of g.blocks) {
+        const seen = new Set<number>()
+        const stack = [b.bodyId]
+        while (stack.length) {
+            const x = stack.pop()!
+            if (!x || seen.has(x) || shared.has(x)) continue
+            const n = getNode(g, x)
+            if (!n || n.op === NodeOp.block) continue
+            seen.add(x)
+            const first = reached.get(x)
+            if (first === undefined) reached.set(x, b.id)
+            else if (first !== b.id) shared.add(x)
+            for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
+        }
+    }
+    return shared
+}
+
+function reorderContinuation(g: Graph, b: GraphBlock, split: Operand[], bodyId: number, token: number, shared: Set<number>): void {
     const before = new Set<number>()
     const pending: number[] = []
     for (const x of split) if (typeof x === 'number') pending.push(x)
@@ -2399,7 +2420,7 @@ function reorderContinuation(g: Graph, b: GraphBlock, split: Operand[], bodyId: 
     pending.push(bodyId)
     while (pending.length) {
         const id = pending.pop()!
-        if (!id || seen.has(id) || before.has(id)) continue
+        if (!id || seen.has(id) || before.has(id) || shared.has(id)) continue
         seen.add(id)
         const n = getNode(g, id)
         if (!n || n.op === NodeOp.block) continue
@@ -2413,7 +2434,7 @@ function reorderContinuation(g: Graph, b: GraphBlock, split: Operand[], bodyId: 
                 ops[i] = token
                 continue
             }
-            if (i < ordering && before.has(x) && (m!.op !== NodeOp.startOf || countLiterals(m!) > 0)) {
+            if (i < ordering && (before.has(x) || shared.has(x)) && (m!.op !== NodeOp.startOf || countLiterals(m!) > 0)) {
                 ops ??= getOperands(g, n)
                 ops[i] = joinEffects(g, [x, token])
                 continue
@@ -2459,12 +2480,14 @@ function splitBranchingSelects(g: Graph): boolean {
 function splitSelects(g: Graph, guarded?: Set<number>): boolean {
     const work = dominatorsFirst(g).reverse()
     let changed = false
+    let shared: Set<number> | undefined
     while (work.length) {
         const b = work.pop()!
         const found = branchingSelects(g, b, guarded)
         if (!found.length) continue
         const made: GraphBlock[] = []
-        for (const c of found) made.push(splitAtSelect(g, b, c))
+        shared ??= sharedValues(g)
+        for (const c of found) made.push(splitAtSelect(g, b, c, shared))
         for (let i = made.length - 1; i >= 0; i--) work.push(made[i])
         work.push(b)
         changed = true
@@ -4062,6 +4085,15 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return gn.findValues(index, blockId, op)
     }
 
+    function armBound(block: GraphBlock, cache: Map<number, Set<number>>): Set<number> {
+        const known = cache.get(block.id)
+        if (known) return known
+        const flagged = findValues(block.id, NodeOp.select)?.some(id => gn.tailOnly(getNode(g, id)!))
+        const found = flagged ? armOnlyValues(g, block.bodyId) : new Set<number>()
+        cache.set(block.id, found)
+        return found
+    }
+
     function operandEdge(n: GraphNode, i: number): number {
         if (i === 0 && n.op === NodeOp.apply) return 0
         const ref = getRef(n, i)
@@ -5339,6 +5371,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         let bases: Set<number> | undefined
         const dereferenced = () => bases ??= dereferencedBases(target.bodyId, entering, dereferencedBases(getGraphBlock(entryBlock).bodyId, x => x, new Set()))
+        const armOnly = new Map<number, Set<number>>()
         function isInvariant(id: number): boolean {
             if (isNilOrVoid(id)) return true
             if (invariants.has(id)) return true
@@ -5351,6 +5384,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (n.op === NodeOp.store || n.op === NodeOp.call || n.op === NodeOp.pstack) return false
             if (TargetingValues.has(n.op)) return false
             required ??= demandOf(target.bodyId)
+            if (!required.has(id) && armBound(target, armOnly).has(id)) return false
             if (!leavesArm(g, n) && !required.has(id) && !fieldOfDereferenced(target, n, dereferenced(), entering)) return false
             if (n.op === NodeOp.load) {
                 if (calls.some(x => mem!.clobbers(target, x, target, n))) return false
@@ -5890,6 +5924,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         let bases: Set<number> | undefined
         const dereferenced = () => bases ??= dereferencedBases(target.bodyId, entering, dereferencedBases(getGraphBlock(entryBlock).bodyId, x => x, new Set()))
+        const armOnly = new Map<number, Set<number>>()
         function canHoist(block: GraphBlock, id: number): boolean {
             if (!id || invariant.has(id)) return true
             const known = hoistable.get(id)
@@ -5898,6 +5933,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const load = n.op === NodeOp.load
             required ??= demandOf(target.bodyId)
             let ok = (load || n.op === NodeOp.literal || n.op === NodeOp.convert || BinaryOps.has(n.op)) && (leavesArm(g, n) || required.has(id) || fieldOfDereferenced(block, n, dereferenced(), entering))
+            if (ok && !required.has(id) && armBound(block, armOnly).has(id)) ok = false
             for (let i = load ? 1 : 0; ok && i < countIds(n); i++) {
                 ok = canHoist(block, getRef(n, i))
                 if (reloads.has(getRef(n, i))) ok = false
@@ -6448,6 +6484,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             differ.push(i)
         }
         if (!differ.length && !isUnordered(getRef(n, 0))) return false
+        if (differ.length && gn.tailOnly(n)) return false
 
         const operands = getOperands(g, yes)
         for (const at of differ) operands[at] = addCopy(g, n, [getOperand(g, n, 0), getOperand(g, yes, at), getOperand(g, no, at)], NodeOp.select)
@@ -12441,6 +12478,35 @@ function rebuildable(g: Graph, id: number): boolean {
     const n = getNode(g, id)
     if (!n) return false
     return n.op === NodeOp.literal || n.op === NodeOp.frameAddress || gn.localSymbol(g, n) !== undefined
+}
+
+export function armOnlyValues(g: Graph, root: number): Set<number> {
+    const outside = new Set<number>()
+    const arms: number[] = []
+    const stack = [root]
+    while (stack.length) {
+        const x = stack.pop()!
+        if (!x || outside.has(x)) continue
+        const n = getNode(g, x)
+        if (!n || n.op === NodeOp.block) continue
+        outside.add(x)
+        if (n.op === NodeOp.select && gn.tailOnly(n)) {
+            stack.push(getRef(n, 0))
+            for (let i = 1; i < countIds(n); i++) arms.push(getRef(n, i))
+            continue
+        }
+        for (const y of getArgIds(n)) stack.push(y)
+    }
+    const inside = new Set<number>()
+    while (arms.length) {
+        const x = arms.pop()!
+        if (!x || outside.has(x) || inside.has(x)) continue
+        const n = getNode(g, x)
+        if (!n || n.op === NodeOp.block) continue
+        inside.add(x)
+        for (const y of getArgIds(n)) arms.push(y)
+    }
+    return inside
 }
 
 type ArmDemand = Map<number, { every: Set<number>, arms: Set<number>[] }>
