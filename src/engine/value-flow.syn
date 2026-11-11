@@ -214,12 +214,9 @@ enum ArgClass {
     null = 512,
 }
 
-interface Listener {
-    kind: ListenerKind
-    target: number
-    key: number
-    extra: number
-    e: number
+interface Chain {
+    next: number[]
+    last: number[]
 }
 
 interface Instance {
@@ -273,27 +270,30 @@ interface FlowState {
     slotOwner: number[]
     slotIndex: number[]
     slotOrigins: number[][]
-    slotOriginSet: (Set<number> | undefined)[]
+    slotOriginSet: Set<number>
     slotSent: number[]
-    slotListeners: (Listener[] | undefined)[]
-    slotIns: (number[] | undefined)[]
+    listeners: Chain
+    listenKind: ListenerKind[]
+    listenTarget: number[]
+    listenKey: number[]
+    listenExtra: number[]
+    ins: Chain
+    inFrom: number[]
     slotConst: number[]
-    slotOpaque: number[]
+    slotOpaque: Set<number>
     queue: number[]
     storeSlots: Map<number, number>
     constSlots: Map<number, number>
     missing: number[]
     gateWaits: Map<number, number[]>
     scalar: number[]
-    scalarUsers: (number[] | undefined)[]
-    originUsers: (number[] | undefined)[]
+    users: Chain
+    userSlot: number[]
     scalarQueue: number[]
     scalarQueued: number[]
-    scalarChanges: number[]
-    scalarCyclic: number[]
+    scalarChanges: Map<number, number>
+    scalarCyclic: Set<number>
     dirtyBy: number[]
-    cycleSeen: number[]
-    cycleStamp: number
     originMask: number[]
     stringSite: number[]
     fieldForms: Map<number, number>
@@ -308,7 +308,8 @@ interface FlowState {
     rtPending: number[]
     unboundTests: Set<number>
     keyPending: PendingKey[]
-    parts: Map<number, Map<number, number>>
+    parts: Chain
+    partSlots: number[]
     partBind: Map<number, Bind>
     rooted: Set<number>
     originCreators: Map<number, number[]>
@@ -860,26 +861,23 @@ function charge(n: number): void {
     if (!step && flow.work - flow.stepWork > flow.budget) throw `value-flow: budget exceeded (work ${flow.work - flow.stepWork} > ${budgetFactor} * ${flow.totalNodes} nodes)\n${new Error().stack}`
 }
 
+const noOrigins: number[] = []
+
 function newSlot(kind: SlotKind, owner: number, index: number): number {
     const id = flow.slotKind.length
     flow.slotKind.push(kind)
     flow.slotOwner.push(owner)
     flow.slotIndex.push(index)
-    flow.slotOrigins.push([])
-    flow.slotOriginSet.push(undefined)
+    flow.slotOrigins.push(noOrigins)
     flow.slotSent.push(0)
-    flow.slotListeners.push(undefined)
-    flow.slotIns.push(undefined)
+    flow.listeners.last.push(-1)
+    flow.ins.last.push(-1)
     flow.slotConst.push(NONE)
-    flow.slotOpaque.push(0)
     flow.scalar.push(NONE)
-    flow.scalarUsers.push(undefined)
-    flow.originUsers.push(undefined)
+    flow.users.last.push(-1)
+    flow.parts.last.push(-1)
     flow.scalarQueued.push(0)
-    flow.scalarChanges.push(0)
-    flow.scalarCyclic.push(0)
     flow.dirtyBy.push(-1)
-    flow.cycleSeen.push(0)
     flow.originMask.push(0)
     flow.stringSite.push(0)
     return id
@@ -892,28 +890,24 @@ function dirtyScalar(s: number): void {
 }
 
 function scalarUse(from: number, to: number): boolean {
-    let users = flow.scalarUsers[from]
-    if (!users) flow.scalarUsers[from] = users = []
-    users.push(to)
+    chained(flow.users, from)
+    flow.userSlot.push(to)
     return flow.scalar[from] !== NONE
 }
 
-function originUse(from: number, to: number): boolean {
-    let users = flow.originUsers[from]
-    if (!users) flow.originUsers[from] = users = []
-    users.push(to)
-    return flow.slotOrigins[from].length > 0
-}
-
 function valueUse(from: number, to: number): boolean {
-    const scalar = scalarUse(from, to)
-    const origins = originUse(from, to)
-    return scalar || origins
+    chained(flow.users, from)
+    flow.userSlot.push(-to - 1)
+    return flow.scalar[from] !== NONE || flow.slotOrigins[from].length > 0
 }
 
-function dirtyUsers(users: number[] | undefined, s: number): void {
-    if (!users) return
-    for (const u of users) {
+function dirtyUsers(s: number, onlyOrigins: boolean): void {
+    let e = chainFirst(flow.users, s)
+    while (e >= 0) {
+        const user = flow.userSlot[e]
+        e = chainAfter(flow.users, s, e)
+        if (user >= 0 && onlyOrigins) continue
+        const u = user >= 0 ? user : -user - 1
         flow.dirtyBy[u] = s
         dirtyScalar(u)
     }
@@ -928,9 +922,9 @@ function block(s: number): void {
 }
 
 function markOpaque(s: number): void {
-    if (flow.slotOpaque[s]) return
+    if (flow.slotOpaque.has(s)) return
     if (frozen(s)) return block(s)
-    flow.slotOpaque[s] = 1
+    flow.slotOpaque.add(s)
     dirtyScalar(s)
     const confined = flow.confineSlots.get(s)
     if (confined) for (const id of confined) release(flow.confinements[id])
@@ -947,7 +941,7 @@ function noteOrigin(s: number, origin: number): void {
     const next = mask | originBit(origin)
     if (next === mask) return
     flow.originMask[s] = next
-    dirtyUsers(flow.originUsers[s], s)
+    dirtyUsers(s, true)
 }
 
 function addConst(s: number, t: number): void {
@@ -960,36 +954,69 @@ function addConst(s: number, t: number): void {
 }
 
 function addIn(s: number, from: number): void {
-    let ins = flow.slotIns[s]
-    if (!ins) flow.slotIns[s] = ins = []
-    if (frozen(s) && !flow.step!.ins.has(s)) flow.step!.ins.set(s, ins.length)
-    ins.push(from)
+    if (frozen(s) && !flow.step!.ins.has(s)) flow.step!.ins.set(s, flow.ins.last[s])
+    chained(flow.ins, s)
+    flow.inFrom.push(from)
     if (scalarUse(from >= 0 ? from : -from - 1, s)) dirtyScalar(s)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
+const originSpan = 4194304
+
+function hasOrigin(s: number, origin: number): boolean {
+    return flow.slotOriginSet.has(s * originSpan + origin)
+}
+
 function addOrigin(s: number, origin: number): void {
-    let set = flow.slotOriginSet[s]
-    if (!set) flow.slotOriginSet[s] = set = new Set()
-    if (set.has(origin)) return
+    if (hasOrigin(s, origin)) return
     if (frozen(s)) {
         if (stepsFlag) console.log(`BLOCK origin ${whySlotText(s)} += ${originText(origin)}`)
         return block(s)
     }
-    set.add(origin)
+    flow.slotOriginSet.add(s * originSpan + origin)
     if (flow.why && whyTracks(flow.why, origin)) flow.why.causes.set(s * 4194304 + origin, flow.why.from)
-    flow.slotOrigins[s].push(origin)
+    if (flow.slotOrigins[s] === noOrigins) flow.slotOrigins[s] = [origin]
+    else flow.slotOrigins[s].push(origin)
     flow.queue.push(s)
     noteOrigin(s, origin)
     if (flow.slotKind[s] === SlotKind.field) noteHolder(flow.slotOwner[s], origin)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
-function listen(s: number, kind: ListenerKind, target: number, key: number, extra: number, e: number = 0): void {
-    let list = flow.slotListeners[s]
-    if (!list) flow.slotListeners[s] = list = []
-    const l: Listener = { kind, target, key, extra, e }
-    list.push(l)
+function chained(c: Chain, owner: number): number {
+    const e = c.next.length
+    const last = c.last[owner]
+    if (last < 0) c.next.push(e)
+    else {
+        c.next.push(c.next[last])
+        c.next[last] = e
+    }
+    c.last[owner] = e
+    return e
+}
+
+function chainFirst(c: Chain, owner: number): number {
+    const last = c.last[owner]
+    if (last < 0) return -1
+    return c.next[last]
+}
+
+function chainAfter(c: Chain, owner: number, e: number): number {
+    if (e === c.last[owner]) return -1
+    return c.next[e]
+}
+
+function chainTruncate(c: Chain, owner: number, last: number): void {
+    if (last >= 0) c.next[last] = chainFirst(c, owner)
+    c.last[owner] = last
+}
+
+function listen(s: number, kind: ListenerKind, target: number, key: number, extra: number): void {
+    const l = chained(flow.listeners, s)
+    flow.listenKind.push(kind)
+    flow.listenTarget.push(target)
+    flow.listenKey.push(key)
+    flow.listenExtra.push(extra)
     const origins = flow.slotOrigins[s]
     const sent = flow.slotSent[s]
     const why = flow.why
@@ -1021,13 +1048,22 @@ function copyEdge(from: number, to: number): void {
     listen(from, ListenerKind.copy, to, 0, 0)
 }
 
+function partOf(target: number, key: number): number {
+    let e = chainFirst(flow.parts, target)
+    while (e >= 0) {
+        const part = flow.partSlots[e]
+        if (flow.slotIndex[part] === key) return part
+        e = chainAfter(flow.parts, target, e)
+    }
+    return -1
+}
+
 function partSlot(target: number, key: number): number {
-    let byKey = flow.parts.get(target)
-    if (!byKey) flow.parts.set(target, byKey = new Map())
-    const known = byKey.get(key)
-    if (known !== undefined) return known
+    const known = partOf(target, key)
+    if (known >= 0) return known
     const p = newSlot(SlotKind.part, target, key)
-    byKey.set(key, p)
+    chained(flow.parts, target)
+    flow.partSlots.push(p)
     copyEdge(p, target)
     return p
 }
@@ -1055,10 +1091,13 @@ function drain(): void {
         while (flow.slotSent[s] < origins.length) {
             const origin = origins[flow.slotSent[s]]
             flow.slotSent[s]++
-            const list = flow.slotListeners[s]
-            if (!list) continue
+            let l = chainFirst(flow.listeners, s)
+            if (l < 0) continue
             if (flow.why) flow.why.from = s
-            for (let i = 0; i < list.length; i++) deliver(list[i], origin)
+            while (l >= 0) {
+                deliver(l, origin)
+                l = chainAfter(flow.listeners, s, l)
+            }
             if (flow.why) flow.why.from = -1
         }
     }
@@ -1070,6 +1109,7 @@ function originOf(kind: OriginKind, cell: number, qual: number, node: number, ow
     const known = flow.originIndex.get(k)
     if (known !== undefined) return known
     const id = flow.originKind.length
+    intrinsics.assert(id < originSpan, `value-flow: origin ${id} does not fit below ${originSpan}`)
     flow.originIndex.set(k, id)
     flow.originKind.push(kind)
     flow.originCell.push(cell)
@@ -2389,7 +2429,7 @@ function targetKeyless(s: Summary, node: number): boolean {
     if (!s.prover || e === undefined || s.exprs[e].op !== ExprOp.store) return false
     const slot = at(s.prover, s.exprs[e].a)
     const origins = flow.slotOrigins[slot]
-    if (flow.slotOpaque[slot] || !origins.length) return false
+    if (flow.slotOpaque.has(slot) || !origins.length) return false
     charge(origins.length)
     return origins.every(keyFreeStore)
 }
@@ -2910,8 +2950,8 @@ function wireEffect(inst: Instance, e: number): void {
 function wireStore(inst: Instance, e: number): void {
     const x = inst.summary.exprs[e]
     if (x.op === ExprOp.store && x.key !== elemKey && isIndexKey(x.key)) watchConfined(flow.confinements[keyFact(inst.summary, x.node)], at(inst, x.a), 1)
-    if (x.op === ExprOp.store) listen(at(inst, x.a), ListenerKind.store, inst.id, x.key, at(inst, x.b), e)
-    else listen(at(inst, x.args[0]), ListenerKind.store, inst.id, slotKey(inst, x.args[1]), at(inst, x.args[2]), e)
+    if (x.op === ExprOp.store) listen(at(inst, x.a), ListenerKind.store, writerId(inst, e), x.key, at(inst, x.b))
+    else listen(at(inst, x.args[0]), ListenerKind.store, writerId(inst, e), slotKey(inst, x.args[1]), at(inst, x.args[2]))
 }
 
 function wireExpr(inst: Instance, x: Expr, slot: number): void {
@@ -3194,7 +3234,7 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
     const kinds = x.op === ExprOp.rt ? rtKinds(inst, x, s, qual, subject) : -1
     intrinsics.assert(kinds < 255, `value-flow: ${s.name} has too many kind specializations for an rt-binding key`)
     const key = kinds < 0 ? subject : subject + (kinds + 1) * 2 ** 45
-    if (kinds >= 0 && flow.parts.get(slot)?.has(key)) return
+    if (kinds >= 0 && partOf(slot, key) >= 0) return
     if (kinds >= 0 && !hasBinding(slot, BindKind.rt, qual, subject)) watchKinds(slot, -2 - qual, subject, s)
     const own = singleFn(s, kinds, subject ? 1 : 0) ? qualified(OriginKind.site, 0, qual > 0 ? qual : inst.qual, x.node, inst.summary) : qual
     const callee = flow.instances[instance(impl, own, lit, lit < 0 ? -1 : 1, kinds)]
@@ -3320,7 +3360,7 @@ function checkString(slot: number): void {
 }
 
 function bindStringRt(inst: Instance, x: Expr, slot: number, op: number, key: number): void {
-    if (flow.parts.get(slot)?.has(key)) return
+    if (partOf(slot, key) >= 0) return
     const impl = bindingOf(op)!.impl!
     const callee = flow.instances[instance(impl, 0, -1, -1)]
     addCaller(callee, slot)
@@ -3336,7 +3376,7 @@ function bindStringRt(inst: Instance, x: Expr, slot: number, op: number, key: nu
 }
 
 function bindCoercion(inst: Instance, slot: number, operand: number, key: number): void {
-    if (flow.parts.get(slot)?.has(key)) return
+    if (partOf(slot, key) >= 0) return
     charge(1)
     const callee = flow.instances[instance(bindingOf(RtOp.toNumber)!.impl!, 0, -1, -1)]
     addCaller(callee, slot)
@@ -3383,25 +3423,28 @@ function floatOperands(x: Expr, a: number, b: number, value: (s: number) => numb
     return ((fa | fb) & FloatFlags) !== 0
 }
 
-function deliver(l: Listener, origin: number): void {
+function deliver(l: number, origin: number): void {
     charge(1)
-    switch (l.kind) {
-        case ListenerKind.copy: addOrigin(l.target, origin)
-        case ListenerKind.member: resolveMember(origin, l.key, partSlot(l.target, origin), l.extra)
-        case ListenerKind.store: resolveStore(origin, l.key, flow.instances[l.target], l.e, l.extra)
-        case ListenerKind.callTarget: callTarget(l.target, origin)
-        case ListenerKind.callRecv: callRecv(l.target, origin)
-        case ListenerKind.rtSubject: rtSubject(l.target, origin)
-        case ListenerKind.assignSource: assignSource(origin, l.extra)
-        case ListenerKind.assignTarget: assignTarget(l.target, origin)
-        case ListenerKind.narrow: if (originPasses(origin, l.key, l.extra)) addOrigin(l.target, origin)
-        case ListenerKind.pick: pickOrigin(l.target, origin, l.key, l.extra)
-        case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(l.target, origin)
-        case ListenerKind.confine: confineOrigin(flow.confinements[l.target], l.key, origin)
-        case ListenerKind.classed: if (classAdmits(l.target, origin)) addOrigin(l.target, origin)
-        case ListenerKind.kinds: classChanged(l.target, deliveredClass(l.target, origin))
-        case ListenerKind.reads: dirtyScalar(l.target)
-        case ListenerKind.method: methodArrived(l.target, l.extra, origin)
+    const target = flow.listenTarget[l]
+    const key = flow.listenKey[l]
+    const extra = flow.listenExtra[l]
+    switch (flow.listenKind[l]) {
+        case ListenerKind.copy: addOrigin(target, origin)
+        case ListenerKind.member: resolveMember(origin, key, partSlot(target, origin), extra)
+        case ListenerKind.store: resolveStore(origin, key, flow.instances[Math.floor(target / exprBits)], target % exprBits, extra)
+        case ListenerKind.callTarget: callTarget(target, origin)
+        case ListenerKind.callRecv: callRecv(target, origin)
+        case ListenerKind.rtSubject: rtSubject(target, origin)
+        case ListenerKind.assignSource: assignSource(origin, extra)
+        case ListenerKind.assignTarget: assignTarget(target, origin)
+        case ListenerKind.narrow: if (originPasses(origin, key, extra)) addOrigin(target, origin)
+        case ListenerKind.pick: pickOrigin(target, origin, key, extra)
+        case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(target, origin)
+        case ListenerKind.confine: confineOrigin(flow.confinements[target], key, origin)
+        case ListenerKind.classed: if (classAdmits(target, origin)) addOrigin(target, origin)
+        case ListenerKind.kinds: classChanged(target, deliveredClass(target, origin))
+        case ListenerKind.reads: dirtyScalar(target)
+        case ListenerKind.method: methodArrived(target, extra, origin)
     }
 }
 
@@ -3431,7 +3474,7 @@ function hold(c: Confinement, origin: number): void {
     if (!confinable(origin) || c.held.size >= maxConfined) return release(c)
     c.held.add(origin)
     for (const r of c.reach) {
-        if (flow.slotOriginSet[r]?.has(origin)) return release(c)
+        if (hasOrigin(r, origin)) return release(c)
     }
     let watch = flow.holderWatch.get(origin)
     if (!watch) flow.holderWatch.set(origin, watch = [])
@@ -3455,7 +3498,7 @@ function release(c: Confinement): void {
 }
 
 function watchConfined(c: Confinement, slot: number, side: number): void {
-    if (flow.slotOpaque[slot]) return release(c)
+    if (flow.slotOpaque.has(slot)) return release(c)
     let list = flow.confineSlots.get(slot)
     if (!list) flow.confineSlots.set(slot, list = [])
     list.push(c.id)
@@ -3513,13 +3556,13 @@ function boolLiteral(g: Graph, id: number): number {
 
 function pickRejects(f: number, truthy: number): boolean {
     let t = flow.slotConst[f]
-    const ins = flow.slotIns[f]
-    if (ins) {
-        for (const from of ins) {
-            const slot = from >= 0 ? from : -from - 1
-            if (flow.slotKind[slot] !== SlotKind.konst || flow.slotIns[slot]?.length) return false
-            t = unite(t, flow.slotConst[slot])
-        }
+    let e = chainFirst(flow.ins, f)
+    while (e >= 0) {
+        const from = flow.inFrom[e]
+        const slot = from >= 0 ? from : -from - 1
+        if (flow.slotKind[slot] !== SlotKind.konst || flow.ins.last[slot] >= 0) return false
+        t = unite(t, flow.slotConst[slot])
+        e = chainAfter(flow.ins, f, e)
     }
     const objects = flow.slotOrigins[f].length > 0
     const fl = scalars.flags[t]
@@ -4301,11 +4344,11 @@ function rtKinds(inst: Instance, x: Expr, s: Summary, qual: number, subject: num
 }
 
 function hasBinding(slot: number, kind: BindKind, target: number, recv: number): boolean {
-    const parts = flow.parts.get(slot)
-    if (!parts) return false
-    for (const part of parts.values()) {
-        const bind = flow.partBind.get(part)
+    let e = chainFirst(flow.parts, slot)
+    while (e >= 0) {
+        const bind = flow.partBind.get(flow.partSlots[e])
         if (bind && bind.kind === kind && bind.target === target && bind.recv === recv) return true
+        e = chainAfter(flow.parts, slot, e)
     }
     return false
 }
@@ -4318,7 +4361,7 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     const s = summaryOf(fn)
     const kinds = flow.cut ? -1 : callKinds(inst, x, s)
     const key = target * 4194304 + recv + (kinds + 1) * 2 ** 45
-    if (flow.parts.get(callSlot)?.has(key)) return
+    if (partOf(callSlot, key) >= 0) return
     if (kinds >= 0 && !hasBinding(callSlot, BindKind.call, target, recv)) watchKinds(callSlot, target, recv, s)
     if (flow.cut && cutApply(callSlot, target, recv, key)) return
     const kind = flow.originKind[target]
@@ -4357,7 +4400,7 @@ function fillMissing(): boolean {
     for (let i = 0; i < missing.length; i += 2) {
         const target = missing[i]
         const own = missing[i + 1]
-        if (flow.slotIns[own]?.length || flow.slotConst[own] !== NONE) continue
+        if (flow.ins.last[own] >= 0 || flow.slotConst[own] !== NONE) continue
         addConst(target, UNDEF)
         filled = true
     }
@@ -4370,14 +4413,18 @@ function globalOrigins(slot: number): number[] {
 
 function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: number) => number[] = globalOrigins, global = false): number {
     let out = flow.slotConst[slot]
-    const ins = flow.slotIns[slot]
-    if (ins) for (const from of ins) out = unite(out, value(from >= 0 ? from : -from - 1))
-    if (flow.slotOpaque[slot] && flow.slotKind[slot] !== SlotKind.expr) out = unite(out, UNKNOWN)
+    let e = chainFirst(flow.ins, slot)
+    while (e >= 0) {
+        const from = flow.inFrom[e]
+        out = unite(out, value(from >= 0 ? from : -from - 1))
+        e = chainAfter(flow.ins, slot, e)
+    }
+    if (flow.slotOpaque.has(slot) && flow.slotKind[slot] !== SlotKind.expr) out = unite(out, UNKNOWN)
     if (flow.slotKind[slot] === SlotKind.sig) return kindedSig(slot, out)
     if (flow.slotKind[slot] !== SlotKind.expr) return out
     const inst = flow.instances[flow.slotOwner[slot]]
     const x = inst.summary.exprs[flow.slotIndex[slot]]
-    if (flow.slotOpaque[slot]) out = unite(out, opaqueScalar(inst.summary, x))
+    if (flow.slotOpaque.has(slot)) out = unite(out, opaqueScalar(inst.summary, x))
     switch (x.op) {
         case ExprOp.union:
             for (let i = 0; i < x.args.length; i++) {
@@ -4668,16 +4715,15 @@ function widens(slot: number): boolean {
 }
 
 function cyclicSlot(s: number): boolean {
-    if (flow.scalarCyclic[s]) return true
-    flow.cycleStamp++
-    const stamp = flow.cycleStamp
+    if (flow.scalarCyclic.has(s)) return true
+    const seen = new Set<number>()
     let at = flow.dirtyBy[s]
-    while (at >= 0 && flow.cycleSeen[at] !== stamp) {
+    while (at >= 0 && !seen.has(at)) {
         if (at === s) {
-            flow.scalarCyclic[s] = 1
+            flow.scalarCyclic.add(s)
             return true
         }
-        flow.cycleSeen[at] = stamp
+        seen.add(at)
         at = flow.dirtyBy[at]
     }
     return false
@@ -4706,8 +4752,9 @@ function updateScalar(s: number): void {
     let next = unite(old, evalSlot(s, globalValue, globalOrigins, true))
     if (next === old) return
     if (widens(s) && (scalars.flags[next] & ScalarFlag.int) && (scalars.flags[old] & ScalarFlag.int) && (scalars.lo[next] !== scalars.lo[old] || scalars.hi[next] !== scalars.hi[old])) {
-        flow.scalarChanges[s]++
-        if (flow.scalarChanges[s] >= 2 && cyclicSlot(s)) {
+        const changes = (flow.scalarChanges.get(s) ?? 0) + 1
+        flow.scalarChanges.set(s, changes)
+        if (changes >= 2 && cyclicSlot(s)) {
             const lo = scalars.lo[next] < scalars.lo[old] ? (scalars.lo[old] > 0 ? 0 : MinI64) : scalars.lo[next]
             const hi = scalars.hi[next] > scalars.hi[old] ? (lo < 0 ? MaxI64 : MaxU64) : scalars.hi[next]
             const wide = numScalar(lo, hi)
@@ -4720,7 +4767,7 @@ function updateScalar(s: number): void {
     }
     flow.scalar[s] = next
     if (flow.stringSite[s] === 2 && stringy(s)) addOrigin(s, strOrigin())
-    dirtyUsers(flow.scalarUsers[s], s)
+    dirtyUsers(s, false)
     if (flow.kindWatch.has(s)) scalarClassChanged(s, scalarClass(old), scalarClass(next))
     if (flow.unboundTests.has(s) && undecided(next)) bindTest(s)
     if (old !== NONE) return
@@ -4919,10 +4966,10 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(),
         freshOwner: new Map(),
         definiteKeys: new Map(),
-        slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: [], slotSent: [], slotListeners: [], slotIns: [], slotConst: [], slotOpaque: [],
+        slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: new Set(), slotSent: [], listeners: { next: [], last: [] }, listenKind: [], listenTarget: [], listenKey: [], listenExtra: [], ins: { next: [], last: [] }, inFrom: [], slotConst: [], slotOpaque: new Set(),
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
-        scalar: [], scalarUsers: [], originUsers: [], scalarQueue: [], scalarQueued: [], scalarChanges: [], scalarCyclic: [], dirtyBy: [], cycleSeen: [], cycleStamp: 0, originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], unboundTests: new Set(), keyPending: [], parts: new Map(), partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
+        scalar: [], users: { next: [], last: [] }, userSlot: [], scalarQueue: [], scalarQueued: [], scalarChanges: new Map(), scalarCyclic: new Set(), dirtyBy: [], originMask: [], stringSite: [],
+        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], unboundTests: new Set(), keyPending: [], parts: { next: [], last: [] }, partSlots: [], partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
@@ -4991,7 +5038,7 @@ function newFlow<R>(roots: Function[], host: AccessHost, run: () => R): R {
 }
 
 function numberReceiver(slot: number): boolean {
-    if (flow.slotOrigins[slot].length || flow.slotOpaque[slot]) return false
+    if (flow.slotOrigins[slot].length || flow.slotOpaque.has(slot)) return false
     const f = scalars.flags[flow.scalar[slot]]
     return f !== 0 && (f & ~(ScalarFlag.int | FloatFlags)) === 0
 }
@@ -5800,11 +5847,11 @@ function equalCandidates(s: Summary, known: Map<Summary, EqualRead[]>): EqualRea
 function opaqueRead(inst: Instance, node: number): boolean {
     const e = inst.summary.exprOf.get(node)!
     const slot = at(inst, e)
-    if (flow.slotOpaque[slot] || flow.slotOpaque[at(inst, inst.summary.exprs[e].a)]) return true
-    const parts = flow.parts.get(slot)
-    if (!parts) return false
-    for (const part of parts.values()) {
-        if (flow.slotOpaque[part]) return true
+    if (flow.slotOpaque.has(slot) || flow.slotOpaque.has(at(inst, inst.summary.exprs[e].a))) return true
+    let entry = chainFirst(flow.parts, slot)
+    while (entry >= 0) {
+        if (flow.slotOpaque.has(flow.partSlots[entry])) return true
+        entry = chainAfter(flow.parts, slot, entry)
     }
     return false
 }
@@ -5847,9 +5894,8 @@ const maxStepAttempts = 8
 function slotWithin(a: number, b: number): boolean {
     if (a === b) return true
     if (unite(flow.scalar[b], flow.scalar[a]) !== flow.scalar[b]) return false
-    if (flow.slotOpaque[a] && !flow.slotOpaque[b]) return false
-    const set = flow.slotOriginSet[b]
-    for (const origin of flow.slotOrigins[a]) if (!set?.has(origin)) return false
+    if (flow.slotOpaque.has(a) && !flow.slotOpaque.has(b)) return false
+    for (const origin of flow.slotOrigins[a]) if (!hasOrigin(b, origin)) return false
     return true
 }
 
@@ -5960,7 +6006,7 @@ function resolveReplacement(fn: Function, g: Graph, start: number): boolean {
             flow.retired.add(id)
             id++
         }
-        for (const [slot, length] of step.ins) flow.slotIns[slot]!.length = length
+        for (const [slot, last] of step.ins) chainTruncate(flow.ins, slot, last)
         flow.keyPending.length = step.keys
         for (const [k, origin] of flow.originIndex) if (origin >= step.origins) flow.originIndex.delete(k)
         for (const field of grown) flow.originFields[flow.slotOwner[field]].delete(flow.slotIndex[field])
@@ -6000,19 +6046,28 @@ function exportAccesses(): Accesses {
     }
     exportLocations()
     for (const entry of flow.exportedInstances) exported.instances.push(exportInstance(entry))
-    const solved = flow
+    let solved: FlowState | undefined = flow
     const equal = new Map<Summary, EqualRead[]>()
     return {
         allocations: exported.allocations, locations: exported.locations, instances: exported.instances,
-        resolve: (list: number[]) => withFlow(solved, () => resolveUnit(list)),
-        equalReads: (list: number[], pure: (node: number) => boolean) => withFlow(solved, () => equalReads(list, pure, equal)),
-        typeAt: (index: number, node: number) => withFlow(solved, () => resolveNode(index, node)),
-        rowAt: (index: number, node: number) => withFlow(solved, () => rowAt(index, node)),
-        returnRow: (index: number) => withFlow(solved, () => returnRow(index)),
-        rowCount: () => solved.slotKind.length,
-        replace: (fn: Function, graph: Graph) => withFlow(solved, () => replaceUnit(fn, graph)),
-        refresh: () => withFlow(solved, exportAccesses),
+        resolve: (list: number[]) => withFlow(solvedFlow(solved), () => resolveUnit(list)),
+        equalReads: (list: number[], pure: (node: number) => boolean) => withFlow(solvedFlow(solved), () => equalReads(list, pure, equal)),
+        typeAt: (index: number, node: number) => withFlow(solvedFlow(solved), () => resolveNode(index, node)),
+        rowAt: (index: number, node: number) => withFlow(solvedFlow(solved), () => rowAt(index, node)),
+        returnRow: (index: number) => withFlow(solvedFlow(solved), () => returnRow(index)),
+        rowCount: () => solvedFlow(solved).slotKind.length,
+        replace: (fn: Function, graph: Graph) => withFlow(solvedFlow(solved), () => replaceUnit(fn, graph)),
+        refresh: () => withFlow(solvedFlow(solved), exportAccesses),
+        release: () => {
+            solved = undefined
+            equal.clear()
+        },
     }
+}
+
+function solvedFlow(solved: FlowState | undefined): FlowState {
+    if (!solved) throw 'value-flow: a query reached the analysis after its release'
+    return solved
 }
 
 function numericOperands(): number[] {
@@ -6819,7 +6874,7 @@ function emptyTermOf(term: CutTerm): boolean {
 }
 
 function cutIntOperands(inst: Instance, x: Expr, slot: number): number[] | undefined {
-    if (x.op !== ExprOp.arith || x.args.length || (concatSite(inst, x) && flow.parts.get(slot)?.has(0)) || (x.type !== Types.unknown_number && (x.type >= 0 || x.sub !== Types.unknown_number))) return undefined
+    if (x.op !== ExprOp.arith || x.args.length || (concatSite(inst, x) && partOf(slot, 0) >= 0) || (x.type !== Types.unknown_number && (x.type >= 0 || x.sub !== Types.unknown_number))) return undefined
     if (scalars.flags[arithScalar(x.key, x.sub, I64, I64)] & FloatFlags) return undefined
     const operands: number[] = []
     if (x.a >= 0) operands.push(at(inst, x.a))
@@ -6866,8 +6921,13 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
     const numberTyped = new Uint8Array(n)
     for (let slot = 0; slot < n; slot++) {
         const list: number[] = []
-        const ins = flow.slotIns[slot]
-        if (ins) for (const from of ins) list.push(from >= 0 ? from : -from - 1)
+        const fed = flow.ins.last[slot] >= 0
+        let e = chainFirst(flow.ins, slot)
+        while (e >= 0) {
+            const from = flow.inFrom[e]
+            list.push(from >= 0 ? from : -from - 1)
+            e = chainAfter(flow.ins, slot, e)
+        }
         let t = flow.slotConst[slot]
         if (flow.slotKind[slot] === SlotKind.expr) {
             const inst = flow.instances[flow.slotOwner[slot]]
@@ -6883,8 +6943,8 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
                     list.push(at(inst, x.args[i]))
                 }
             } else if (x.op === ExprOp.pick || x.op === ExprOp.narrow) list.push(at(inst, x.a))
-            else if (x.op !== ExprOp.member && x.op !== ExprOp.call && !ins) t = unite(t, flow.scalar[slot])
-            if (x.op === ExprOp.narrow && (x.key & selecting) && !ins) {
+            else if (x.op !== ExprOp.member && x.op !== ExprOp.call && !fed) t = unite(t, flow.scalar[slot])
+            if (x.op === ExprOp.narrow && (x.key & selecting) && !fed) {
                 const b = x.key & (GuardFlag.hasProto | GuardFlag.lacksProto) ? tableRef(protos, x.b) : x.b
                 let f = filters.findIndex(c => c.flags === x.key && c.b === b && c.sub === x.sub)
                 if (f < 0) {
@@ -6892,7 +6952,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
                     filters.push({ flags: x.key, b, sub: x.sub })
                 }
                 filterOf[slot] = f
-            } else if (x.op === ExprOp.narrow && !ins) concreteOf.set(slot, { flags: x.key, b: x.b, sub: x.sub })
+            } else if (x.op === ExprOp.narrow && !fed) concreteOf.set(slot, { flags: x.key, b: x.b, sub: x.sub })
         }
         sources[slot] = list
         local[slot] = t
@@ -7046,7 +7106,7 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
         for (const w of group) {
             for (let i = 0; i < width; i++) acc[i] |= bits[w * width + i]
             t = unite(t, local[w])
-            if (!symbolSet.has(w)) o |= flow.slotOpaque[w]
+            if (!symbolSet.has(w) && flow.slotOpaque.has(w)) o = 1
             const f = group.length === 1 ? filterOf[w] : -1
             for (const from of sources[w]) {
                 if (f >= 0) {
@@ -7869,8 +7929,8 @@ function exprRef(s: Summary, e: number): string {
 function floatPartText(inst: Instance, e: number): string {
     const x = inst.summary.exprs[e]
     if (x.op !== ExprOp.arith || !floatArith.has(x.key)) return ''
-    const part = flow.parts.get(at(inst, e))?.get(floatKey)
-    if (part === undefined) return ` (no floatKey part: no float operand was seen, so no rt.${rtName(floatArith.get(x.key)!)} call)`
+    const part = partOf(at(inst, e), floatKey)
+    if (part < 0) return ` (no floatKey part: no float operand was seen, so no rt.${rtName(floatArith.get(x.key)!)} call)`
     return ` (a float operand reaches it: the floatKey part binds rt.${rtName(floatArith.get(x.key)!)} and its return flows in => ${slotText(part)})`
 }
 
@@ -7965,14 +8025,16 @@ function dumpInstance(inst: Instance, callers: boolean, out: string[]): void {
         if (s.local![e] < 0) continue
         const slot = at(inst, e)
         if (x.op === ExprOp.store) continue
-        else if (x.op === ExprOp.call || x.op === ExprOp.opaque || (x.op === ExprOp.rt && flow.parts.has(slot))) {
+        else if (x.op === ExprOp.call || x.op === ExprOp.opaque || (x.op === ExprOp.rt && flow.parts.last[slot] >= 0)) {
             const callees: string[] = []
-            for (const part of flow.parts.get(slot)?.values() ?? []) {
-                const bind = flow.partBind.get(part)
+            let entry = chainFirst(flow.parts, slot)
+            while (entry >= 0) {
+                const bind = flow.partBind.get(flow.partSlots[entry])
                 const text = bind ? `${flow.instances[bind.callee].summary.name}#${bind.callee}` : ''
                 if (bind && !callees.includes(text)) callees.push(text)
+                entry = chainAfter(flow.parts, slot, entry)
             }
-            out.push(`  call %${x.node} ${exprText(s, e, 0)} -> [${callees.join(', ')}]${flow.slotOpaque[slot] ? ' opaque' : ''} => ${slotText(slot)}`)
+            out.push(`  call %${x.node} ${exprText(s, e, 0)} -> [${callees.join(', ')}]${flow.slotOpaque.has(slot) ? ' opaque' : ''} => ${slotText(slot)}`)
         } else if (x.op === ExprOp.member || x.op === ExprOp.rt) out.push(`  open %${x.node} ${exprText(s, e, 0)} => ${slotText(slot)}`)
         else if (x.op === ExprOp.union && getNode(s.g, x.node)?.op === NodeOp.param) out.push(`  param %${x.node} => ${slotText(slot)}`)
     }
