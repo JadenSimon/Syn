@@ -3508,7 +3508,7 @@ function createImage() {
     const codeFields: [address: number, slot: number][] = []
     const objectCode = new Map<number, number>()
     const code = { slot: (cell: number): number => { throw `native: no code for function @${cell}` } }
-    const functionObjects = new Map<number, intrinsics.Handle>()
+    const functionObjects = { of: (cell: number): intrinsics.Handle | undefined => { throw `native: no function objects are planned for @${cell}` } }
     const staticRegions: [base: number, size: number][] = []
     const readonlyRegions: [base: number, size: number][] = []
     const staticObjects: { slot: number, word: number | undefined, address: number }[] = []
@@ -3672,7 +3672,7 @@ function createImage() {
             const handle = getLiteral(graph, n, 0) as intrinsics.Handle
             if (!handle || heap.isString(handle)) return
             if (!heap.isOrdinaryObject(heap.deref(handle)) && !heap.isCallable(heap.deref(handle))) return
-            return placeObject(functionObjects.get(handle) ?? handle, () => undefined, fail, fields)
+            return placeObject(functionObjects.of(handle) ?? handle, () => undefined, fail, fields)
         }
         const planned = codecs(cell)
         const codecOf = planned?.slot
@@ -3830,8 +3830,8 @@ function createImage() {
                 if (tag) setBit(tag)
             } else if (slot === heap.undefinedHandle) {
                 continue
-            } else if (slot && functionObjects.has(slot)) {
-                view.setBigUint64(offset, BigInt(placeObject(functionObjects.get(slot)!, allocated, fail, fields)), true)
+            } else if (slot && functionObjects.of(slot) !== undefined) {
+                view.setBigUint64(offset, BigInt(placeObject(functionObjects.of(slot)!, allocated, fail, fields)), true)
                 pointers.push({ offset, region: staticRegion(), scale: 1 })
             } else if (slot && heap.isArray(heap.deref(slot))) {
                 const shared = sharedArrays.get(heap.isIndirect(slot) ? heap.indirectTarget(slot) : slot) ?? fail(`field ${heap.stringToJs(keys[i])} holds a host array with no engine Array`)
@@ -12524,7 +12524,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         const at = pc === undefined || !source ? undefined : sourcePosition(source.compiled, pc)
         return `%${id} ${opName(n.op)} ${key}` + (at ? ` at ${at.line + 1}:${at.col + 1}` : '')
     }
-    return { abiOf, realizeUnit, paramShapesOf, plannedUnit: (fn: Function) => planned.units.get(fn) }
+    return { abiOf, realizeUnit, paramShapesOf, functionObjectOf, plannedUnit: (fn: Function) => planned.units.get(fn) }
 }
 
 function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: AccessHost, genericOf: (proto: intrinsics.Handle) => Generic | undefined, facts: Facts, members: MemberFacts): ShapePlan {
@@ -12546,9 +12546,33 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         const n = getNode(traced.graph, site.node)
         return !!n && tracer.fixedSlot(traced, n, fixedStatic) !== undefined
     }
+    function placeable(state: intrinsics.Handle): boolean {
+        const ids = types.stateAllocations.get(state) ?? []
+        return !owned.has(state) && !ids.some(id => types.objects[id].native) && heap.isOrdinaryObject(state) && !heap.isArray(state) && !heap.isCallable(state)
+    }
     for (const [state, ids] of types.stateAllocations) {
-        if (owned.has(state) || ids.some(id => types.objects[id].native) || !heap.isOrdinaryObject(state) || heap.isArray(state) || heap.isCallable(state)) continue
+        if (!placeable(state)) continue
         if (!fixedState(types, state) || ids.some(id => types.objects[id].readers.some(site => !folds(site)))) placedStatics.add(state)
+    }
+    const held: number[] = []
+    for (const state of [...constructed, ...placedStatics]) held.push(...types.stateAllocations.get(state) ?? [])
+    const walked = new Set<number>()
+    while (held.length) {
+        const id = held.pop()!
+        if (walked.has(id)) continue
+        walked.add(id)
+        for (const field of types.objects[id].fields.values()) {
+            for (const inner of field.type.objects) {
+                const object = types.objects[inner]
+                if (object.kind === AllocKind.buffer) {
+                    held.push(inner)
+                    continue
+                }
+                if (object.state === undefined || placedStatics.has(object.state) || !placeable(object.state)) continue
+                placedStatics.add(object.state)
+                held.push(...types.stateAllocations.get(object.state)!)
+            }
+        }
     }
     const { inst, plan, codecOf } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => binder.graphOf(fn), fn => binder.constructsOutOfLine(fn) || !!tracer.stateOf(binder.originOf(fn)).stubbed || binder.isRoot(fn), members)
     const constructionBuffers = new Map<intrinsics.Handle, number[]>()
@@ -14139,7 +14163,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         const plan = planShapes(valueTypes, binder, tracer, host, genericOf, facts, members)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
         for (const [state, layout] of plan.statics.layouts) image.placedLayouts.set(state, layout)
-        for (const [cell, object] of plan.functionObjects.cells) image.functionObjects.set(cell, object)
         const planned = bindPlannedUnits(plan, binder)
         const reps = chooseRepresentations(plan, planned, binder, tracer, host, valueTypes)
         sharePlannedUnits(plan, planned, reps, host)
@@ -14162,6 +14185,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     stepPlannedUnits(planned, new Map([...planned.units.values()].filter(unit => unit.equalReads.size).map(unit => [unit, (graph: Graph) => rewriteEqualReads(graph, unit.equalReads)])), plannedGraph)
     if (!typeDebug && !flags.has('cut-dump')) accesses.release()
     const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot)
+    image.functionObjects.of = resolver.functionObjectOf
     const program = compileProgram(binder, linker, tracer, resolver, plan, image, target, clock)
     if (typeDebug) program.explain = (symbol, param) => {
         const fn = functions[symbol]
