@@ -1575,6 +1575,30 @@ export function recordTypes(g: Graph, t: GraphNode): intrinsics.Types[] {
     return recordFields(g, t).map(field => typeof field.type === 'number' ? field.type : Types.u64)
 }
 
+function returnHome(target: lowering.Target, location: number): number {
+    if (location >= 0) return location
+    return location === gn.floatLocation ? target.floatRetRegs![0] : target.retRegs[0]
+}
+
+function callReturnRegisters(g: Graph, target: lowering.Target, call: number): number[] {
+    const callee = getNode(g, getRef(getNode(g, call)!, 1))
+    if (callee?.op === NodeOp.syscallTarget) return [target.syscall.retReg]
+    const record = gn.recordTypeAt(g, call)
+    if (record) return returnRegisters(target, recordTypes(g, record)) ?? []
+    const fnType = callee ? getNode(g, typeRefOf(callee)) : undefined
+    const result = returnHome(target, fnType?.op === NodeOp.fnType ? gn.fnReturnLocation(fnType) : -1)
+    return result === target.retRegs[0] ? target.retRegs : [result]
+}
+
+function returnsInPlace(g: Graph, target: lowering.Target, call: number, homes: number[], count: number): boolean {
+    const regs = callReturnRegisters(g, target, call)
+    if (gn.recordTypeAt(g, call) && regs.length !== count) return false
+    for (let k = 0; k < count; k++) {
+        if (regs[k] === undefined || regs[k] !== homes[k]) return false
+    }
+    return true
+}
+
 function filledArm(g: Graph, n: GraphNode): number {
     if (countIds(n) !== 3) return 0
     if (getNode(g, getRef(n, 1))?.op === NodeOp.uninitialized) return 2
@@ -17780,6 +17804,140 @@ function rebaseAddresses(g: Graph, target: lowering.Target, rebaseSlot: (slot: n
     }
 }
 
+function returnCalls(g: Graph, target: lowering.Target, location: number | undefined, record: intrinsics.Types[] | undefined): boolean {
+    const homes = record ? returnRegisters(target, record) : [returnHome(target, location ?? -1), ...target.retRegs.slice(1)]
+    if (!homes) return false
+    let ix: gn.GraphIndex | undefined
+    const bodies: [GraphBlock, number][] = []
+    for (const b of g.blocks) {
+        const body = walk(b.bodyId, [])
+        if (body !== b.bodyId) bodies.push([b, body])
+    }
+    for (const [b, body] of bodies) setBlockBody(g, b, body)
+    return bodies.length > 0
+
+    function walk(id: number, path: number[]): number {
+        const n = getNode(g, id)
+        if (n?.op === NodeOp.select) {
+            let ids: number[] | undefined
+            for (let i = 1; i < countIds(n); i++) {
+                const arm = walk(getRef(n, i), [...path, id])
+                if (arm === getRef(n, i)) continue
+                ids ??= cloneRefs(n)
+                ids[i] = arm
+            }
+            return ids ? addCopy(g, n, withRefs(g, n, ids)) : id
+        }
+        const chain: number[] = []
+        let leaf = id
+        let m = n
+        while (m?.op === NodeOp.after) {
+            chain.push(leaf)
+            leaf = getRef(m, countIds(m) - 1)
+            m = getNode(g, leaf)
+        }
+        if (m?.op !== NodeOp.select) return returned(id, [...path, ...chain, leaf])
+        let out = walk(leaf, [...path, ...chain])
+        if (out === leaf) return id
+        while (chain.length) {
+            const c = getNode(g, chain.pop()!)!
+            const ids = cloneRefs(c)
+            ids[countIds(c) - 1] = out
+            out = addCopy(g, c, withRefs(g, c, ids))
+        }
+        return out
+    }
+
+    function returned(head: number, line: number[]): number {
+        const leaf = getNode(g, line[line.length - 1])
+        const structure = new Set<number>(line)
+        const orderings: number[] = []
+        for (const x of line.slice(line.indexOf(head))) {
+            const a = getNode(g, x)!
+            if (a.op === NodeOp.after) orderings.push(...cloneRefs(a, 0, countIds(a) - 1))
+        }
+        let template = leaf
+        let args: Map<number, number> | undefined
+        if (leaf?.op === NodeOp.apply) {
+            const into = getBlock(g, getRef(leaf, 0))!
+            template = getNode(g, into.bodyId)
+            args = new Map()
+            for (let i = 0; i < into.params.length; i++) args.set(into.params[i], getRef(leaf, i + 1))
+        }
+        if (template?.op !== NodeOp.ret || !getRef(template, 0)) return head
+        const passed = new Set<number>()
+        function follow(id: number): number {
+            if (args) {
+                if (!args.get(id) || passed.has(id)) return 0
+                passed.add(id)
+                id = args.get(id)!
+            }
+            let a = getNode(g, id)
+            while (a?.op === NodeOp.after) {
+                structure.add(id)
+                orderings.push(...cloneRefs(a, 0, countIds(a) - 1))
+                id = getRef(a, countIds(a) - 1)
+                a = getNode(g, id)
+            }
+            return id
+        }
+        const value = getRef(template, 0)
+        const own = !args || args.has(value)
+        const shape = own ? follow(value) : value
+        const s = getNode(g, shape)
+        let calls: number[] = []
+        if (s?.op === NodeOp.call && !record && own) calls = [shape]
+        if (s?.op === NodeOp.record) calls = recordedCall(s)
+        if (s?.op === NodeOp.void && !record) {
+            const parts = new Set<number>()
+            const expanded = new Set<number>()
+            for (const x of orderings) gn.orderingParts(g, x, parts, expanded)
+            for (const x of expanded) structure.add(x)
+            for (const x of parts) if (getNode(g, x)?.op === NodeOp.call) calls.unshift(x)
+        }
+        if (!calls.length || (args && passed.size !== args.size)) return head
+        ix ??= graphIndex(g)
+        const words = s!.op === NodeOp.record ? countIds(s!) / 2 : 1
+        const call = calls.find(c => returns(c, structure, words))
+        if (!call) return head
+        const ret = addCopy(g, template, withOperand(g, template, 0, call))
+        const kept = gn.afterOrderings(g, orderings, call)
+        return kept.length ? addNode(g, NodeOp.after, [...kept, ret]) : ret
+
+        function recordedCall(r: GraphNode): number[] {
+            let call = 0
+            for (let i = 1; i < countIds(r); i += 2) {
+                const get = follow(getRef(r, i))
+                const a = getNode(g, get)
+                if (a?.op !== NodeOp.get || getRef(a, 1) || getLiteral(g, a, 1) !== getLiteral(g, r, i - 1)) return []
+                if (call && getRef(a, 0) !== call) return []
+                call = getRef(a, 0)
+                structure.add(get)
+            }
+            if (own) structure.add(shape)
+            if (record && countIds(r) !== 2 * homes!.length) return []
+            return call ? [call] : []
+        }
+    }
+
+    function returns(call: number, structure: Set<number>, words: number): boolean {
+        const n = getNode(g, call)!
+        if (n.op !== NodeOp.call || getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) return false
+        if (!returnsInPlace(g, target, call, homes!, words)) return false
+        const seen = new Set<number>([call])
+        const work = [call]
+        while (work.length) {
+            for (const u of indexedUsers(ix!, work.pop()!)) {
+                if (seen.has(u)) continue
+                if (!structure.has(u)) return false
+                seen.add(u)
+                work.push(u)
+            }
+        }
+        return true
+    }
+}
+
 export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): PreparedLowering {
     const target = opts.target ?? lowering.hostTarget
     const grows: PstackGrowth = { own: WritesStack, calls: new Map() }
@@ -17795,6 +17953,10 @@ export function prepareLowering(_g: Graph, opts: LowerGraphOptions = {}): Prepar
     foldPureOrdering(g)
     sweepBlocks(g)
     dirtyIndex(g)
+    if (returnCalls(g, target, opts.returnLocation, opts.returnRecord)) {
+        sweepBlocks(g)
+        dirtyIndex(g)
+    }
     verifyGraph(g, 'lowerable', true)
     const unordered = new Map<number, boolean>()
     const hollow = new Map<number, boolean>()
@@ -17892,28 +18054,15 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         const fnType = t ? getNode(g, typeRefOf(t)) : undefined
         return fnType?.op === NodeOp.fnType ? gn.fnLocations(fnType) : []
     }
-    function returnHome(location: number): number {
-        if (location >= 0) return location
-        return location === gn.floatLocation ? target.floatRetRegs![0] : target.retRegs[0]
-    }
-    function callReturnHome(call: number): number {
-        const t = getNode(g, getRef(getNode(g, call)!, 1))
-        const fnType = t ? getNode(g, typeRefOf(t)) : undefined
-        return returnHome(fnType?.op === NodeOp.fnType ? gn.fnReturnLocation(fnType) : -1)
-    }
-    const RET = returnHome(opts.returnLocation ?? -1)
+    const RET = returnHome(target, opts.returnLocation ?? -1)
     const RECORD = opts.returnRecord ? returnRegisters(target, opts.returnRecord) : undefined
     assert(!opts.returnRecord || RECORD, `lowering: ${g.name ?? 'graph'} returns a record that does not fit the return registers`)
+    const RETURNS = RECORD ?? [RET, ...target.retRegs.slice(1)]
     function fieldHome(field: number): number {
-        return RECORD ? RECORD[field] : field ? target.retRegs[field] : RET
+        return RETURNS[field]
     }
     function callReturnRegs(call: number): number[] {
-        const n = getNode(g, call)!
-        if (getNode(g, getRef(n, 1))?.op === NodeOp.syscallTarget) return [target.syscall.retReg]
-        const record = gn.recordTypeAt(g, call)
-        if (record) return returnRegisters(target, recordTypes(g, record))!
-        const result = callReturnHome(call)
-        return result === target.retRegs[0] ? target.retRegs : [result]
+        return callReturnRegisters(g, target, call)
     }
     const callHomes = new Map<number, number[]>()
     function argHomes(call: number): number[] {
@@ -19236,24 +19385,6 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         throw `lowering3: select ${id} branches in value position`
     }
 
-    function recordTailCall(slots: Handover[]): number {
-        let call = 0
-        for (const slot of slots) {
-            let n = getNode(g, slot.id)
-            const value = n?.op === NodeOp.after && countIds(n) === 2 ? getNode(g, getRef(n, 1)) : undefined
-            if (value?.op === NodeOp.get && getRef(value, 0) === getRef(n!, 0)) n = value
-            if (n?.op === NodeOp.convert && intrinsics.intrinsicBitWidth(typeOf(n)) === 64) {
-                n = getNode(g, getRef(n, 0))
-            }
-            if (n?.op !== NodeOp.get || getRef(n, 1)) return 0
-            const source = getRef(n, 0)
-            if (!source || getNode(g, source)?.op !== NodeOp.call || (call && source !== call)) return 0
-            if (callReturnRegs(source)[getLiteral(g, n, 1)] !== slot.dst) return 0
-            call = source
-        }
-        return done.has(call) ? 0 : call
-    }
-
     function returnRecord(site: number, n: GraphNode): void {
         const outer = materializing
         materializing = site
@@ -19266,10 +19397,8 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             assert(reg !== undefined, `Unhandled return slot: ${getLiteral(g, n, i - 1)}`)
             slots.push({ dst: reg, id: getRef(n, i), konst: getLiteral(g, n, i) })
         }
-        const tail = recordTailCall(slots)
-        if (tail) tails.add(tail)
         handOver(site, slots, [-1, () => {}])
-        jumpToExit(tail)
+        jumpToExit()
     }
 
     function returnValue(site: number, id: number, konst: number): void {
@@ -19286,12 +19415,14 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 put(() => float ? asm.movF64(RET, k) : asm.movImm(RET, k))
                 return jumpToExit()
             }
-            if (getNode(g, id)?.op === NodeOp.call && !done.has(id) && callReturnHome(id) === RET) tails.add(id)
-            const v = demand(id, konst, RET)
+            const inPlace = n?.op === NodeOp.call && !done.has(id) && returnsInPlace(g, target, id, RETURNS, RECORD?.length ?? 1)
+            assert(!RECORD || inPlace, `lowering: ${g.name ?? 'graph'} returns its record from %${id}, which is not a call that leaves that record in the return registers`)
+            if (inPlace) tails.add(id)
+            const v = demand(id, konst, RETURNS[0])
             const src = v ? homeOf.get(v)! : undefined
             finish(site)
             if (v) {
-                transfer(RET, src!, { value: v, home: src! })
+                transfer(RETURNS[0], src!, { value: v, home: src! })
             }
         }
         jumpToExit(id)
@@ -19388,13 +19519,9 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             const ordering = orderingOperands(id, n)
             const last = ordering.length ? getRef(n, ordering[ordering.length - 1]) : 0
             const value = getNode(g, getRef(n, result))
-            const returned = value?.op === NodeOp.ret && getRef(value, 0) === last
-            const tail = getNode(g, last)?.op === NodeOp.call && !done.has(last) && (value?.op === NodeOp.void || (returned && callReturnHome(last) === RET))
-            if (tail) tails.add(last)
             const callee = getNode(g, last)?.op === NodeOp.call ? gn.localSymbol(g, getNode(g, getRef(getNode(g, last)!, 1))) : undefined
             if (value?.op === NodeOp.unreachable && ordering.length === 1 && callee !== undefined && opts.endless?.(callee) && !done.has(last)) noreturns.add(last)
-            for (const i of ordering) if (!returned || !tail || getRef(n, i) !== last) effect(getRef(n, i))
-            if (tail && !returned) return jumpToExit(last)
+            for (const i of ordering) effect(getRef(n, i))
             if (noreturns.has(last)) return finish(getRef(n, result))
             emitTail(getRef(n, result), getLiteral(g, n, result))
             return
