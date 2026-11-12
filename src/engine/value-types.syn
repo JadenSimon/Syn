@@ -93,11 +93,26 @@ export interface Accesses {
     rowCount(): number
     replace(fn: Function, graph: Graph): boolean
     refresh(): Accesses
+    extend(): Accesses
+    shadow(check: (fresh: Accesses, map: ExportMap) => void): void
     release(): void
     contextKeys(): ContextKeys
     allocations: Allocation[]
     locations: Location[]
     instances: InstanceSignature[]
+    changes: AccessChanges | undefined
+}
+
+export interface AccessChanges {
+    instances: number[]
+    allocations: number[]
+    locations: number[]
+}
+
+export interface ExportMap {
+    instances: (number | undefined)[]
+    allocations: (number | undefined)[]
+    locations: (number | undefined)[]
 }
 
 export const numberKey = '[number]'
@@ -413,6 +428,7 @@ export interface ValueTypes {
     fieldStores: Map<Function, Set<number>>
     erasedFields: Map<number, Set<string>>
     instanceArgs: (Type | undefined)[][]
+    extend(data: Accesses): ValueTypes
 }
 
 export interface Field {
@@ -659,17 +675,19 @@ function storageSlotsOf(locations: Location[]): StorageSlot[] {
     const slots: StorageSlot[] = []
     const tuples = new Set<number>()
     for (const location of locations) if (location.key === numberKey) tuples.add(location.allocation)
-    for (const location of locations) {
-        const indexed = location.key === numberKey || (constantIndex(location.key) && tuples.has(location.allocation))
-        const type = location.type
-        let kinds = 0
-        if (type.literals.length || type.range || type.float) kinds |= 1
-        if (type.objects.length || type.closures.length || type.functions.length) kinds |= 2
-        if (type.bools) kinds |= 4
-        if (type.strings.length) kinds |= 8
-        slots.push({ allocation: location.allocation, key: indexed ? numberKey : location.key, kinds, type })
-    }
+    for (const location of locations) slots.push(storageSlot(location, tuples.has(location.allocation)))
     return slots
+}
+
+function storageSlot(location: Location, tuple: boolean): StorageSlot {
+    const indexed = location.key === numberKey || (constantIndex(location.key) && tuple)
+    const type = location.type
+    let kinds = 0
+    if (type.literals.length || type.range || type.float) kinds |= 1
+    if (type.objects.length || type.closures.length || type.functions.length) kinds |= 2
+    if (type.bools) kinds |= 4
+    if (type.strings.length) kinds |= 8
+    return { allocation: location.allocation, key: indexed ? numberKey : location.key, kinds, type }
 }
 
 function mixedKinds(kinds: number): boolean {
@@ -700,104 +718,349 @@ function copiedWords(g: Graph): Map<number, number[]> {
     return out
 }
 
-export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]): ValueTypes {
-    const start = performance.now()
-    const objects: ObjectType[] = data.allocations.map(allocation => ({ ...allocation, name: allocationName(allocation, host), fields: new Map(), readers: [] }))
-    const keyHandles = new Map<string, Handle>()
-    const locations = data.locations
-    for (const location of locations) if (location.handle !== undefined) keyHandles.set(location.key, location.handle)
-    function constructorStore(object: ObjectType, site: Site): boolean {
-        const fn = constructorOf(object.proto, host)
-        if (fn !== site.unit || !host.isConstructor?.(fn)) return false
-        const g = host.binder.graphOf(fn)
-        const n = getNode(g, site.node)
-        if (n?.op !== NodeOp.setProp || !receiverValue(g, getRef(n, 1))) return false
-        const block = blockOf(g, site.node)
-        return !!block && !repeats(g, block, site.node)
-    }
-    const written = (location: Location) => inhabited(location.type) || location.writers.length > 0
-    const indexed = new Set(locations.filter(location => (location.key === numberKey || constantIndex(location.key)) && written(location)).map(location => location.allocation))
-    const initialWrites: [allocation: number, key: string, node: number][] = []
-    const erased = unobservedFields(data, roots, host)
-    const erasedFields = new Map<number, Set<string>>()
-    for (const location of locations) {
-        const object = objects[location.allocation]
-        if (erased.has(location)) {
-            let keys = erasedFields.get(location.allocation)
-            if (!keys) erasedFields.set(location.allocation, keys = new Set())
-            keys.add(location.key)
-            continue
-        }
-        if (!written(location) && indexed.has(location.allocation) && (location.key === numberKey || constantIndex(location.key))) continue
-        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, initial: false, constructed: false, replaced: false }
-        object.fields.set(location.key, field)
-        object.readers.push(...location.readers)
-        if (object.kind !== AllocKind.buffer) field.replaced = location.writers.some(w => w.unit !== object.site.unit && !constructorStore(object, w))
-        const writer = location.writers[0]
-        if (!writer || !location.writers.every(w => w.unit === writer.unit && w.node === writer.node)) continue
-        if (writer.unit === object.site.unit && !(location.forms & FieldForm.init)) initialWrites.push([location.allocation, location.key, writer.node])
-        field.constructed = constructorStore(object, writer)
-    }
-    const contained = new Set(objects.flatMap(object => [...object.fields.values()].flatMap(field => field.type.objects)))
-    for (const [id, key, node] of initialWrites) {
-        const object = objects[id]
-        const g = host.binder.graphOf(object.site.unit)
-        const block = blockOf(g, node)
-        if (!block || block !== blockOf(g, object.site.node)) continue
-        const field = object.fields.get(key)!
-        field.initial = true
-        field.initialized = object.fields.size === 1 && !contained.has(id)
-    }
-    const instances: InstanceSignature[] = data.instances
-    const stateAllocations = new Map<Handle, number[]>()
-    objects.forEach((object, id) => {
-        if (object.state === undefined) return
-        listOf(stateAllocations, object.state).push(id)
-    })
-    if (intrinsics.argv().includes('instances-dump')) instances.forEach((instance, id) => console.log('INSTANCE', id, instance.unit.name || '<anon>', instance.heldStatic ? '<static>' : '<>', instance.params.map(p => `${p.label}:${formatType({ objects } as ValueTypes, p.type)}`).join(' '), '->', formatType({ objects } as ValueTypes, instance.returns)))
-    const fieldStores = new Map<Function, Set<number>>()
-    for (const location of data.locations) for (const site of location.writers) setOf(fieldStores, site.unit).add(site.node)
-    const keyNames = new Map([...keyHandles].map(([name, key]) => [key, name]))
-    return { resolve: data.resolve, equalReads: data.equalReads, typeAt: data.typeAt, rowAt: data.rowAt, returnRow: data.returnRow, rowCount: data.rowCount, contextKeys: data.contextKeys, ms: performance.now() - start, objects, instances, slots: storageSlotsOf(locations), stateAllocations, keyHandles, keyNames, fieldStores, erasedFields, instanceArgs: [] }
+interface TypesState {
+    data: Accesses
+    host: AccessHost
+    roots: Function[]
+    objects: ObjectType[]
+    fieldsOf: number[][]
+    locations: number
+    exposed: Set<number>
+    contained: Map<number, number>
+    erasedFields: Map<number, Set<string>>
+    keyHandles: Map<string, Handle>
+    stateAllocations: Map<Handle, number[]>
+    fieldStores: Map<Function, Set<number>>
+    slots: StorageSlot[]
 }
 
-function unobservedFields(data: Accesses, roots: Function[], host: AccessHost): Set<Location> {
+export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]): ValueTypes {
+    const start = performance.now()
+    const state: TypesState = { data, host, roots, objects: [], fieldsOf: [], locations: 0, exposed: new Set(), contained: new Map(), erasedFields: new Map(), keyHandles: new Map(), stateAllocations: new Map(), fieldStores: new Map(), slots: [] }
+    for (let id = 0; id < data.allocations.length; id++) state.fieldsOf.push([])
+    const fresh = takeLocations(state)
+    state.exposed = exposedObjects(state)
+    const initial = new Map<number, [key: string, node: number][]>()
+    for (let id = 0; id < data.allocations.length; id++) state.objects.push(objectTypeOf(state, id, initial))
+    for (const object of state.objects) contain(state, object, 1, undefined)
+    applyInitial(state, initial)
+    state.objects.forEach((object, id) => {
+        if (object.state === undefined) return
+        listOf(state.stateAllocations, object.state).push(id)
+    })
+    for (const l of fresh) for (const site of data.locations[l].writers) setOf(state.fieldStores, site.unit).add(site.node)
+    state.slots = storageSlotsOf(data.locations)
+    return typesOf(state, start)
+}
+
+function extendTypes(state: TypesState, data: Accesses): ValueTypes {
+    const start = performance.now()
+    const changes = data.changes
+    if (!changes) throw 'value-types: an extension needs the changes its export made'
+    state.data = data
+    const known = state.objects.length
+    const rebuild = new Set<number>(changes.allocations)
+    for (let id = known; id < data.allocations.length; id++) {
+        state.fieldsOf.push([])
+        rebuild.add(id)
+    }
+    const fresh = takeLocations(state)
+    for (const l of changes.locations) rebuild.add(data.locations[l].allocation)
+    for (const l of fresh) rebuild.add(data.locations[l].allocation)
+    if (changes.instances.some(i => state.roots.includes(data.instances[i].unit))) {
+        const exposed = exposedObjects(state)
+        for (const id of exposed) if (!state.exposed.has(id)) rebuild.add(id)
+        for (const id of state.exposed) if (!exposed.has(id)) rebuild.add(id)
+        state.exposed = exposed
+    } else {
+        const work: number[] = []
+        for (const l of fresh) {
+            if (!state.exposed.has(data.locations[l].allocation)) continue
+            for (const inner of data.locations[l].type.objects) {
+                if (state.exposed.has(inner)) continue
+                state.exposed.add(inner)
+                work.push(inner)
+            }
+        }
+        for (const id of exposeFrom(state, state.exposed, work)) rebuild.add(id)
+    }
+    const initial = new Map<number, [key: string, node: number][]>()
+    const before = new Map<number, boolean>()
+    for (const id of [...rebuild].sort((a, b) => a - b)) {
+        const old = id < known ? state.objects[id] : undefined
+        if (old) contain(state, old, -1, before)
+        const object = objectTypeOf(state, id, initial)
+        contain(state, object, 1, before)
+        if (old && old.state !== object.state) throw `value-types: allocation ${id} changed its state in an extension`
+        if (id < state.objects.length) state.objects[id] = object
+        else state.objects.push(object)
+    }
+    for (const [id, had] of before) {
+        if (had === state.contained.has(id) || rebuild.has(id) || id >= state.objects.length) continue
+        state.objects[id] = objectTypeOf(state, id, initial)
+    }
+    applyInitial(state, initial)
+    for (let id = known; id < state.objects.length; id++) {
+        const object = state.objects[id]
+        if (object.state !== undefined) listOf(state.stateAllocations, object.state).push(id)
+    }
+    for (const l of changes.locations) for (const site of data.locations[l].writers) setOf(state.fieldStores, site.unit).add(site.node)
+    for (const l of fresh) for (const site of data.locations[l].writers) setOf(state.fieldStores, site.unit).add(site.node)
+    const tupled = (id: number) => state.fieldsOf[id].some(l => data.locations[l].key === numberKey)
+    for (const l of fresh) state.slots.push(storageSlot(data.locations[l], tupled(data.locations[l].allocation)))
+    for (const id of new Set(fresh.map(l => data.locations[l].allocation))) for (const l of state.fieldsOf[id]) state.slots[l] = storageSlot(data.locations[l], tupled(id))
+    return typesOf(state, start)
+}
+
+function typesOf(state: TypesState, start: number): ValueTypes {
+    const data = state.data
+    const objects = state.objects
+    if (intrinsics.argv().includes('instances-dump')) data.instances.forEach((instance, id) => console.log('INSTANCE', id, instance.unit.name || '<anon>', instance.heldStatic ? '<static>' : '<>', instance.params.map(p => `${p.label}:${formatType({ objects } as ValueTypes, p.type)}`).join(' '), '->', formatType({ objects } as ValueTypes, instance.returns)))
+    const keyNames = new Map([...state.keyHandles].map(([name, key]) => [key, name]))
+    return {
+        resolve: data.resolve, equalReads: data.equalReads, typeAt: data.typeAt, rowAt: data.rowAt, returnRow: data.returnRow, rowCount: data.rowCount, contextKeys: data.contextKeys, ms: performance.now() - start,
+        objects, instances: data.instances, slots: state.slots, stateAllocations: state.stateAllocations, keyHandles: state.keyHandles, keyNames, fieldStores: state.fieldStores, erasedFields: state.erasedFields, instanceArgs: [],
+        extend: (next: Accesses) => extendTypes(state, next),
+    }
+}
+
+export function reflowDifferences(ext: ValueTypes, fresh: ValueTypes, map: ExportMap): string[] {
+    const out: string[] = []
+    const fns = new Map<Function, number>()
+    const fnKey = (fn: Function) => {
+        let k = fns.get(fn)
+        if (k === undefined) fns.set(fn, k = fns.size)
+        return k
+    }
+    const ids = (list: number[], mapped: boolean) => (mapped ? list.map(id => map.allocations[id] ?? -1 - id) : list.slice()).sort((a, b) => a - b).join(',')
+    const typeKey = (t: Type, mapped: boolean) => `${t.undefined}|${t.null}|${t.unknown}|${t.float}|${t.bools}|${t.literals.join(',')}|${t.range ? t.range.join(':') : ''}|${t.strings.join(',')}|${t.functions.map(fnKey).join(',')}|${ids(t.objects, mapped)}|${ids(t.closures, mapped)}`
+    const instanceKey = (i: number | undefined, mapped: boolean) => i === undefined ? '' : mapped ? String(map.instances[i] ?? `x${i}`) : String(i)
+    const siteKey = (site: Site, mapped: boolean) => `${fnKey(site.unit)}:${site.node}:${instanceKey(site.instance, mapped)}:${site.operand ?? ''}:${site.dead ? site.dead.join('/') : ''}`
+    const sitesKey = (sites: Site[], mapped: boolean) => sites.map(site => siteKey(site, mapped)).join(' ')
+    const facts = (field: ObjectField) => `${field.initialized} ${field.initial} ${field.constructed} ${field.replaced}`
+    const seen = new Set<number>()
+    ext.objects.forEach((object, a) => {
+        const b = map.allocations[a]
+        if (b === undefined) {
+            if (object.fields.size) out.push(`object ${a} ${object.name} has no rebuilt counterpart`)
+            return
+        }
+        seen.add(b)
+        const other = fresh.objects[b]
+        const label = `object ${a}/${b} ${object.name}`
+        if (!other) {
+            out.push(`${label} is missing from the rebuilt types`)
+            return
+        }
+        if (object.name !== other.name || object.kind !== other.kind || object.constant !== other.constant || object.native !== other.native || object.dynamic !== other.dynamic || object.copied !== other.copied || object.function !== other.function) out.push(`${label} flags`)
+        if (!object.function && (object.state !== other.state || object.handle !== other.handle || object.proto !== other.proto)) out.push(`${label} state`)
+        if (siteKey(object.site, true) !== siteKey(other.site, false)) out.push(`${label} site`)
+        if (instanceKey(object.instance, true) !== instanceKey(other.instance, false)) out.push(`${label} instance`)
+        const instances = (list: number[] | undefined, mapped: boolean) => list === undefined ? '-' : list.map(i => instanceKey(i, mapped)).join(',')
+        if (instances(object.instances, true) !== instances(other.instances, false)) out.push(`${label} instances`)
+        if (sitesKey(object.readers, true) !== sitesKey(other.readers, false)) out.push(`${label} readers`)
+        if ([...object.fields.keys()].join(',') !== [...other.fields.keys()].join(',')) out.push(`${label} keys ${[...object.fields.keys()].join(',')} / ${[...other.fields.keys()].join(',')}`)
+        for (const [key, field] of object.fields) {
+            const theirs = other.fields.get(key)
+            if (!theirs) continue
+            if (typeKey(field.type, true) !== typeKey(theirs.type, false)) out.push(`${label}.${key} type`)
+            if (field.forms !== theirs.forms || field.storeTypes.join(',') !== theirs.storeTypes.join(',') || field.stored !== theirs.stored) out.push(`${label}.${key} forms`)
+            if (facts(field) !== facts(theirs)) out.push(`${label}.${key} facts ${facts(field)} / ${facts(theirs)}`)
+        }
+        const erased = (types: ValueTypes, id: number) => [...(types.erasedFields.get(id) ?? [])].sort().join(',')
+        if (erased(ext, a) !== erased(fresh, b)) out.push(`${label} erased ${erased(ext, a)} / ${erased(fresh, b)}`)
+    })
+    fresh.objects.forEach((object, b) => {
+        if (!seen.has(b) && object.fields.size) out.push(`rebuilt object ${b} ${object.name} has no extended counterpart`)
+    })
+    const signed = new Set<number>()
+    ext.instances.forEach((sig, i) => {
+        const j = map.instances[i]
+        if (j === undefined) {
+            out.push(`instance ${i} ${sig.unit.name} has no rebuilt counterpart`)
+            return
+        }
+        signed.add(j)
+        const theirs = fresh.instances[j]
+        const label = `instance ${i}/${j} ${sig.unit.name}`
+        if (sig.unit !== theirs.unit || sig.heldStatic !== theirs.heldStatic) out.push(`${label} unit`)
+        if (sitesKey(sig.sites, true) !== sitesKey(theirs.sites, false)) out.push(`${label} sites ${sitesKey(sig.sites, true)} / ${sitesKey(theirs.sites, false)}`)
+        if (typeKey(sig.returns, true) !== typeKey(theirs.returns, false)) out.push(`${label} returns`)
+        const params = (list: { label: string, type: Type, opaque?: boolean, receiver?: boolean }[], mapped: boolean) => list.map(p => `${p.label}:${typeKey(p.type, mapped)}:${p.opaque}:${p.receiver}`).join(' ')
+        if (params(sig.params, true) !== params(theirs.params, false)) out.push(`${label} params`)
+        if (sig.merges.map(m => ids(m, true)).join(';') !== theirs.merges.map(m => ids(m, false)).join(';')) out.push(`${label} merges`)
+        const accesses = (list: StorageAccess[], mapped: boolean) => list.map(a => `${a.node}:${a.store}:${a.field}:${a.slots.map(l => mapped ? map.locations[l] ?? `x${l}` : l).join(',')}`).join(' ')
+        if (accesses(sig.accesses, true) !== accesses(theirs.accesses, false)) out.push(`${label} accesses`)
+    })
+    fresh.instances.forEach((sig, j) => {
+        if (!signed.has(j)) out.push(`rebuilt instance ${j} ${sig.unit.name} has no extended counterpart`)
+    })
+    const slotted = new Set<number>()
+    ext.slots.forEach((slot, l) => {
+        const m = map.locations[l]
+        if (m === undefined) {
+            out.push(`slot ${l} has no rebuilt counterpart`)
+            return
+        }
+        slotted.add(m)
+        const theirs = fresh.slots[m]
+        if ((map.allocations[slot.allocation] ?? -1) !== theirs.allocation || slot.key !== theirs.key || slot.kinds !== theirs.kinds || typeKey(slot.type, true) !== typeKey(theirs.type, false)) out.push(`slot ${l}/${m} ${slot.key}`)
+    })
+    fresh.slots.forEach((slot, m) => {
+        if (!slotted.has(m)) out.push(`rebuilt slot ${m} ${slot.key} has no extended counterpart`)
+    })
+    const stores = (types: ValueTypes) => [...types.fieldStores].map(([fn, nodes]) => `${fnKey(fn)}:${[...nodes].sort((a, b) => a - b).join(',')}`).sort().join(' ')
+    if (stores(ext) !== stores(fresh)) out.push('field stores')
+    const handles = (types: ValueTypes) => [...types.keyHandles].map(([k, h]) => `${k}=${h}`).join(' ')
+    if (handles(ext) !== handles(fresh)) out.push('key handles')
+    const names = (types: ValueTypes) => [...types.keyNames].map(([h, k]) => `${h}=${k}`).sort().join(' ')
+    if (names(ext) !== names(fresh)) out.push('key names')
+    for (const [state, list] of ext.stateAllocations) {
+        if (list.some(id => ext.objects[id].function)) continue
+        if (ids(list, true) !== ids(fresh.stateAllocations.get(state) ?? [], false)) out.push(`state allocations ${state}`)
+    }
+    return out
+}
+
+function takeLocations(state: TypesState): number[] {
+    const fresh: number[] = []
+    const locations = state.data.locations
+    while (state.locations < locations.length) {
+        const l = state.locations
+        const location = locations[l]
+        state.fieldsOf[location.allocation].push(l)
+        if (location.handle !== undefined) state.keyHandles.set(location.key, location.handle)
+        fresh.push(l)
+        state.locations++
+    }
+    return fresh
+}
+
+function exposedObjects(state: TypesState): Set<number> {
+    const data = state.data
     const exposed = new Set<number>()
     data.instances.forEach((instance, i) => {
-        if (!roots.includes(instance.unit)) return
-        const graph = host.binder.graphOf(instance.unit)
+        if (!state.roots.includes(instance.unit)) return
+        const graph = state.host.binder.graphOf(instance.unit)
         const nodes = data.resolve([i]).nodes
         for (const n of allNodes(graph)) {
             if (n.op !== NodeOp.ret) continue
             for (const id of nodes.get(getRef(n, 1))?.objects ?? []) exposed.add(id)
         }
     })
-    const fieldsOf = new Map<number, Location[]>()
-    for (const location of data.locations) listOf(fieldsOf, location.allocation).push(location)
-    const work = [...exposed]
+    exposeFrom(state, exposed, [...exposed])
+    return exposed
+}
+
+function exposeFrom(state: TypesState, exposed: Set<number>, work: number[]): number[] {
+    const out = work.slice()
     while (work.length) {
         const id = work.pop()!
-        for (const location of fieldsOf.get(id) ?? []) {
-            for (const inner of location.type.objects) {
+        for (const l of state.fieldsOf[id] ?? []) {
+            for (const inner of state.data.locations[l].type.objects) {
                 if (exposed.has(inner)) continue
                 exposed.add(inner)
                 work.push(inner)
+                out.push(inner)
             }
         }
     }
-    const erased = new Set<Location>()
-    for (const [id, locations] of fieldsOf) {
-        const allocation = data.allocations[id]
-        if (exposed.has(id) || allocation.kind !== AllocKind.object || allocation.function) continue
-        if (allocation.constant || allocation.native || allocation.dynamic || allocation.copied) continue
-        if (allocation.state !== undefined && heap.isCallable(allocation.state)) continue
-        const erasable = (location: Location) => !location.readers.length && location.handle !== undefined && (heap.isString(location.handle) || heap.isPrivateName(location.handle))
-        const unread = locations.filter(erasable)
-        if (!locations.some(location => location.writers.length && !erasable(location))) continue
-        for (const location of unread) erased.add(location)
-    }
-    return erased
+    return out
 }
+
+function indexedKey(key: string): boolean {
+    return key === numberKey || constantIndex(key)
+}
+
+function writtenLocation(location: Location): boolean {
+    return inhabited(location.type) || location.writers.length > 0
+}
+
+function erasableLocation(location: Location): boolean {
+    return !location.readers.length && location.handle !== undefined && (heap.isString(location.handle) || heap.isPrivateName(location.handle))
+}
+
+function erasedLocations(state: TypesState, id: number): number[] | undefined {
+    const ids = state.fieldsOf[id]
+    const allocation = state.data.allocations[id]
+    if (!ids.length || state.exposed.has(id) || allocation.kind !== AllocKind.object || allocation.function) return undefined
+    if (allocation.constant || allocation.native || allocation.dynamic || allocation.copied) return undefined
+    if (allocation.state !== undefined && heap.isCallable(allocation.state)) return undefined
+    const locations = state.data.locations
+    if (!ids.some(l => locations[l].writers.length && !erasableLocation(locations[l]))) return undefined
+    return ids.filter(l => erasableLocation(locations[l]))
+}
+
+function constructorStore(host: AccessHost, object: ObjectType, site: Site): boolean {
+    const fn = constructorOf(object.proto, host)
+    if (fn !== site.unit || !host.isConstructor?.(fn)) return false
+    const g = host.binder.graphOf(fn)
+    const n = getNode(g, site.node)
+    if (n?.op !== NodeOp.setProp || !receiverValue(g, getRef(n, 1))) return false
+    const block = blockOf(g, site.node)
+    return !!block && !repeats(g, block, site.node)
+}
+
+function objectTypeOf(state: TypesState, id: number, initial: Map<number, [key: string, node: number][]>): ObjectType {
+    const data = state.data
+    const host = state.host
+    const allocation = data.allocations[id]
+    const object: ObjectType = { ...allocation, name: allocationName(allocation, host), fields: new Map(), readers: [] }
+    const ids = state.fieldsOf[id]
+    const erased = erasedLocations(state, id)
+    let indexed = false
+    for (const l of ids) if (indexedKey(data.locations[l].key) && writtenLocation(data.locations[l])) indexed = true
+    let keys: Set<string> | undefined
+    const writes: [key: string, node: number][] = []
+    for (const l of ids) {
+        const location = data.locations[l]
+        if (erased && erased.includes(l)) {
+            if (!keys) keys = new Set()
+            keys.add(location.key)
+            continue
+        }
+        if (!writtenLocation(location) && indexed && indexedKey(location.key)) continue
+        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, initial: false, constructed: false, replaced: false }
+        object.fields.set(location.key, field)
+        object.readers.push(...location.readers)
+        if (object.kind !== AllocKind.buffer) field.replaced = location.writers.some(w => w.unit !== object.site.unit && !constructorStore(host, object, w))
+        const writer = location.writers[0]
+        if (!writer || !location.writers.every(w => w.unit === writer.unit && w.node === writer.node)) continue
+        if (writer.unit === object.site.unit && !(location.forms & FieldForm.init)) writes.push([location.key, writer.node])
+        field.constructed = constructorStore(host, object, writer)
+    }
+    if (keys) state.erasedFields.set(id, keys)
+    else state.erasedFields.delete(id)
+    if (writes.length) initial.set(id, writes)
+    else initial.delete(id)
+    return object
+}
+
+function contain(state: TypesState, object: ObjectType, delta: number, before: Map<number, boolean> | undefined): void {
+    for (const field of object.fields.values()) {
+        for (const id of field.type.objects) {
+            if (before && !before.has(id)) before.set(id, state.contained.has(id))
+            const count = (state.contained.get(id) ?? 0) + delta
+            if (count) state.contained.set(id, count)
+            else state.contained.delete(id)
+        }
+    }
+}
+
+function applyInitial(state: TypesState, initial: Map<number, [key: string, node: number][]>): void {
+    for (const [id, writes] of initial) {
+        const object = state.objects[id]
+        const g = state.host.binder.graphOf(object.site.unit)
+        for (const [key, node] of writes) {
+            const block = blockOf(g, node)
+            if (!block || block !== blockOf(g, object.site.node)) continue
+            const field = object.fields.get(key)!
+            field.initial = true
+            field.initialized = object.fields.size === 1 && !state.contained.has(id)
+        }
+    }
+}
+
 export function initOnly(object: ObjectType, k: string | undefined): boolean {
     if (k === undefined) return true
     const field = object.fields.get(k)
