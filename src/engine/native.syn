@@ -48,9 +48,10 @@ import * as typer from './typer'
 import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, verifyArrivals, verifyCallClasses, verifyCodecs, verifyDistinctNodes, verifyGraph, verifyIndex, verifyKeys, verifyKinds, verifyLiveIndex, verifyNumericUses, verifyReturns, verifySignatures, verifyStringCompares, verifyStringOperands } from './verify'
 import { AllocKind } from './value-types'
 import { rewriteInitializations, planMissedLookups, planSmallSets, rewriteConstantReads, rewriteEqualReads, rewriteMissedLookups, rewriteSmallSets } from './pg-optimizer'
-import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut } from './value-flow'
+import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut, dropHook } from './value-flow'
 import { type AccessHost, type Accesses, type Location, constantIndex, constantLiteral, cutArgument, cutCalls, listOf, mapOf, setOf, receiverValue, type MemberFacts, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, formText, inhabited, initOnly, type InstanceSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, intFormatOf, machineNumberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, type PstackPlan, planUnits, shareClasses, shareUnits, isStringRep, addressRep, sameArgument, memberCount, createInterner, intern, type Atom, RepMember, repText, returnProjects, Representation, representationOf, sameRepresentation, type BoundaryRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
+import { analyzeLifetimes, exitOrdering, type Lifetimes } from './lifetime'
 import { createBinder, isLocalStub, namedStub, type Binder, type Code, type Unit } from './program-graph'
 
 type usize = u32
@@ -3580,7 +3581,7 @@ function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Grap
 
 function createClock(target: Target): PhaseClock {
     const start = performance.now()
-    const phases: Record<string, number> = { link: 0, bytecode: 0, typer: 0, cuts: 0, trace: 0, analysis: 0, plan: 0, resolve: 0, normalize: 0, inline: 0, effects: 0, records: 0, lower: 0, statics: 0, other: 0, prepareLower: 0, initializations: 0 }
+    const phases: Record<string, number> = { link: 0, bytecode: 0, typer: 0, cuts: 0, trace: 0, analysis: 0, plan: 0, resolve: 0, normalize: 0, inline: 0, effects: 0, records: 0, lower: 0, statics: 0, other: 0, prepareLower: 0, initializations: 0, lifetime: 0, drops: 0 }
     let phase = 'other'
     let last = start
     function enterPhase(next: string): string {
@@ -11927,7 +11928,7 @@ function substituteValues(graph: Graph, values: Map<number, Operand>): void {
     }
 }
 
-function transformInitializations(accesses: Accesses, types: ValueTypes, host: AccessHost, tracer: Tracer): boolean {
+function transformInitializations(accesses: Accesses, types: ValueTypes, host: AccessHost, tracer: Tracer): Set<Function> {
     const instances = new Map<Function, number[]>()
     types.instances.forEach((instance, i) => {
         const list = instances.get(instance.unit)
@@ -11940,15 +11941,111 @@ function transformInitializations(accesses: Accesses, types: ValueTypes, host: A
         const graph = rewrite(host.binder.graphOf(fn), ids)
         if (graph) rewritten.set(fn, graph)
     }
-    let accepted = false
+    const accepted = new Set<Function>()
     for (const [fn, graph] of rewritten) {
         if (!accesses.replace(fn, graph)) continue
         const state = tracer.stateOf(fn)
         state.traced = { ...state.traced!, graph }
         host.binder.unitOf(fn).graph = graph
-        accepted = true
+        accepted.add(fn)
     }
     return accepted
+}
+
+function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): number {
+    const key = { literal: heap.fromJsSymbol(Symbol.drop) }
+    const fields = new Map<Function, number[]>()
+    const exits = new Map<Function, Map<number, Map<number, number[]>>>()
+    const units = new Set<Function>()
+    for (const end of ends.fields) {
+        listOf(fields, end.unit).push(end.write)
+        units.add(end.unit)
+    }
+    for (const end of ends.locals) {
+        units.add(end.unit)
+        for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push(end.value)
+    }
+    let placed = 0
+    const refuse = (fn: Function, why: string) => {
+        let count = fields.get(fn)?.length ?? 0
+        for (const end of ends.locals) {
+            if (end.unit === fn) count++
+        }
+        ends.refused.set(why, (ends.refused.get(why) ?? 0) + count)
+    }
+    for (const fn of units) {
+        if (rewritten.has(fn)) {
+            refuse(fn, 'end sits in a function the initializations pass rewrote in this compile')
+            continue
+        }
+        const source = host.binder.graphOf(fn)
+        const graph = withNodes(source, copyNodes(source))
+        let count = 0
+        const drop = (order: number, value: number): number => {
+            const method = addNode(graph, NodeOp.getProp, [order, value, key])
+            count++
+            return addNode(graph, NodeOp.call, [method, method, value])
+        }
+        for (const write of fields.get(fn) ?? []) {
+            const n = getNode(graph, write)!
+            const old = addNode(graph, NodeOp.getProp, [getOperand(graph, n, 0), getOperand(graph, n, 1), getOperand(graph, n, 2)])
+            putCopy(graph, write, n, withOperand(graph, n, 0, drop(old, old)))
+        }
+        for (const [block, tails] of exits.get(fn) ?? []) {
+            const b = getBlock(graph, block)!
+            let tail = 0
+            setBlockBody(graph, b, mapTailPositions(graph, b.bodyId, p => {
+                const values = tails.get(tail)
+                tail++
+                if (!values) return p.at
+                let order = exitOrdering(graph, p)
+                for (const value of values) order = drop(order, value)
+                const n = getNode(graph, p.at)!
+                if (n.op !== NodeOp.ret) return addNode(graph, NodeOp.after, [order, p.at])
+                let result = getOperand(graph, n, 0)
+                let inner = typeof result === 'number' ? getNode(graph, result) : undefined
+                while (inner && inner.op === NodeOp.after) {
+                    result = getOperand(graph, inner, countIds(inner) - 1)
+                    inner = typeof result === 'number' ? getNode(graph, result) : undefined
+                }
+                return addCopy(graph, n, withOperand(graph, n, 0, addNode(graph, NodeOp.after, [order, result])))
+            }))
+        }
+        dirtyIndex(graph)
+        if (!accesses.replace(fn, graph)) {
+            refuse(fn, 'end needs a call the analysis only accepts by widening a type it already gave out')
+            continue
+        }
+        const state = tracer.stateOf(fn)
+        state.traced = { ...state.traced!, graph }
+        host.binder.unitOf(fn).graph = graph
+        placed += count
+    }
+    return placed
+}
+
+const enum HookWork { none, frees, other }
+
+function hookWork(proto: intrinsics.Handle, host: AccessHost): HookWork {
+    const fn = dropHook(proto, host)
+    if (!fn) return HookWork.none
+    const g = host.binder.graphOf(fn)
+    for (const n of allNodes(g)) {
+        if (!OrderedValues.has(n.op)) continue
+        if (rt.sliceOf(g, n) === rt.Op.sliceFree) continue
+        if (n.op !== NodeOp.getProp || getRef(n, 2) || !receiverValue(g, getRef(n, 1))) return HookWork.other
+        const descriptor = heap.getPropertyDescriptor(proto, getLiteral(g, n, 2) as intrinsics.Handle)
+        if (descriptor && (heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).flags & heap.PropFlags.has_getter)) return HookWork.other
+    }
+    return HookWork.frees
+}
+
+function printDrops(ends: Lifetimes, placed: number): void {
+    if (!flags.has('drops')) return
+    let refused = 0
+    for (const count of ends.refused.values()) refused += count
+    console.log(`DROPS placed ${placed} (${ends.locals.length} locals, ${ends.fields.length} field writes), refused ${refused}, ${ends.work} steps`)
+    for (const [why, count] of [...ends.refused].sort((a, b) => b[1] - a[1])) console.log(`DROPS refused ${count}: ${why}`)
 }
 
 function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number) {
@@ -14396,9 +14493,32 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     let accesses = clock.timed('analysis', () => flowAccesses(rootFns, host))
     let valueTypes = clock.timed('analysis', () => analyzeTypes(accesses, host, rootFns))
     const rewritten = clock.timed('initializations', () => transformInitializations(accesses, valueTypes, host, tracer))
-    if (rewritten) {
+    if (rewritten.size) {
         accesses = clock.timed('analysis', () => accesses.refresh())
         valueTypes = clock.timed('analysis', () => analyzeTypes(accesses, host, rootFns))
+    }
+    const slabbed = new Set<number>()
+    for (const object of valueTypes.objects) {
+        for (const field of object.fields.values()) {
+            if (!field.replaced) continue
+            for (const id of field.type.objects) slabbed.add(id)
+        }
+    }
+    const hooks = new Map<intrinsics.Handle, HookWork>()
+    const hooked = (id: number): boolean => {
+        const object = valueTypes.objects[id]
+        if (object.constant || object.state === undefined) return false
+        const proto = heap.getPrototypeOf(object.state)
+        let known = hooks.get(proto)
+        if (known === undefined) hooks.set(proto, known = hookWork(proto, host))
+        return known === HookWork.other || (known === HookWork.frees && slabbed.has(id))
+    }
+    const ends = clock.timed('lifetime', () => analyzeLifetimes(valueTypes, accesses.locations, host, hooked))
+    const placed = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer))
+    printDrops(ends, placed)
+    if (placed) {
+        accesses = clock.timed('drops', () => accesses.refresh())
+        valueTypes = clock.timed('drops', () => analyzeTypes(accesses, host, rootFns))
     }
     linker.linkHeldStatics(new Set(valueTypes.instances.filter(instance => instance.heldStatic).map(instance => instance.unit)))
     if (flags.has('types')) console.log(dumpTypes(valueTypes))

@@ -1,0 +1,705 @@
+"use wrapped";
+
+import * as rt from './rt'
+import { expectForm, type Graph } from './lowering2'
+import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, NodeOp, nodeEntries, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
+import { constructorOf, FieldForm, listOf, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Type, type ValueTypes } from './value-types'
+
+export interface LocalEnd {
+    unit: Function
+    value: number
+    exits: [block: number, tail: number][]
+}
+
+export interface FieldEnd {
+    unit: Function
+    write: number
+}
+
+export interface Lifetimes {
+    locals: LocalEnd[]
+    fields: FieldEnd[]
+    refused: Map<string, number>
+    work: number
+}
+
+interface Body {
+    g: Graph
+    instances: number[]
+    held: Map<number, number[]>
+    nodes: Map<number, number[]>
+    nest: GraphLoops
+    idom: Map<number, number>
+    homes: Map<number, number>
+    captured: Map<number, number[]>
+    owned: Map<number, number[]>
+    leaked: Set<number>
+    context: number[]
+}
+
+interface Region {
+    blocks: Set<number>
+    exits: [block: number, tail: number][]
+}
+
+interface Ending {
+    end: LocalEnd
+    own: number[]
+    alive: number[]
+}
+
+const workPerNode = 256
+
+function refsOf(type: Type): number[] {
+    if (!type.closures.length) return type.objects
+    return [...type.objects, ...type.closures]
+}
+
+function objectsOnly(type: Type): boolean {
+    return type.objects.length > 0 && !type.undefined && !type.null && !type.unknown && !type.bools && !type.literals.length && !type.range && !type.float && !type.functions.length && !type.closures.length && !type.strings.length
+}
+
+export function exitOrdering(g: Graph, p: TailPosition): number {
+    const found = p.orderings.slice()
+    const n = getNode(g, p.at)!
+    if (n.op === NodeOp.ret) {
+        const value = getNode(g, getRef(n, 0))
+        if (value && value.op === NodeOp.after) {
+            const last = countIds(value) - 1
+            let i = 0
+            while (i < last) {
+                if (getRef(value, i)) found.push(getRef(value, i))
+                i++
+            }
+            const inner = getNode(g, getRef(value, last))
+            if (inner && OrderedValues.has(inner.op)) found.push(getRef(value, last))
+        } else if (value && OrderedValues.has(value.op)) {
+            found.push(getRef(n, 0))
+        }
+    }
+    return found.length === 1 ? found[0] : 0
+}
+
+export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean): Lifetimes {
+    const out: Lifetimes = { locals: [], fields: [], refused: new Map(), work: 0 }
+    const wanted = types.objects.map((_, id) => hooked(id))
+    if (!wanted.includes(true)) return out
+    const instancesOf = new Map<Function, number[]>()
+    let size = 0
+    types.instances.forEach((instance, id) => {
+        listOf(instancesOf, instance.unit).push(id)
+        size += countNodes(host.binder.graphOf(instance.unit))
+    })
+    const budget = workPerNode * size
+    const charge = (n: number) => {
+        out.work += n
+        if (out.work > budget) throw `lifetime: ${out.work} steps passed the budget of ${budget} for a program of ${size} nodes`
+    }
+    const refuse = (why: string) => {
+        out.refused.set(why, (out.refused.get(why) ?? 0) + 1)
+    }
+    const holders = new Map<number, Location[]>()
+    const fieldsOf = new Map<number, Map<number, Location>>()
+    for (const location of locations) {
+        for (const inner of refsOf(location.type)) listOf(holders, inner).push(location)
+        if (location.handle === undefined) continue
+        let byKey = fieldsOf.get(location.allocation)
+        if (!byKey) fieldsOf.set(location.allocation, byKey = new Map())
+        byKey.set(location.handle as number, location)
+    }
+    const handed = new Map<number, Set<Function>>()
+    const returnedBy = new Map<number, number[]>()
+    const callers = new Map<Function, Set<Function>>()
+    const calls = new Map<Function, Map<number, Function[]>>()
+    types.instances.forEach((instance, id) => {
+        for (const param of instance.params) {
+            for (const o of refsOf(param.type)) setOf(handed, o).add(instance.unit)
+        }
+        for (const o of refsOf(instance.returns)) listOf(returnedBy, o).push(id)
+        for (const site of instance.sites) {
+            if (site.instance === undefined) continue
+            setOf(callers, instance.unit).add(site.unit)
+            let byNode = calls.get(site.unit)
+            if (!byNode) calls.set(site.unit, byNode = new Map())
+            const targets = listOf(byNode, site.node)
+            if (!targets.includes(instance.unit)) targets.push(instance.unit)
+        }
+    })
+    const touching = new Map<number, Set<Function>>()
+    function touchers(object: number): Set<Function> {
+        const known = touching.get(object)
+        if (known) return known
+        const found = new Set<Function>(handed.get(object))
+        found.add(types.objects[object].site.unit)
+        for (const f of returnedBy.get(object) ?? []) {
+            for (const site of types.instances[f].sites) found.add(site.unit)
+        }
+        for (const location of holders.get(object) ?? []) {
+            for (const site of location.readers) found.add(site.unit)
+            charge(location.readers.length)
+        }
+        touching.set(object, found)
+        return found
+    }
+    const bodies = new Map<Function, Body>()
+
+    function homeOf(body: Body, id: number): number | undefined {
+        const known = body.homes.get(id)
+        if (known !== undefined) return known || undefined
+        const walked: number[] = []
+        let at = id
+        let home = 0
+        while (at) {
+            const seen = body.homes.get(at)
+            if (seen !== undefined) {
+                home = seen
+                break
+            }
+            const n = getNode(body.g, at)
+            if (!n) break
+            if (n.op === NodeOp.startOf) {
+                home = countIds(n) ? getRef(n, 0) : 0
+                break
+            }
+            if (n.op !== NodeOp.after && !OrderedValues.has(n.op)) break
+            walked.push(at)
+            at = getRef(n, 0)
+        }
+        for (const w of walked) body.homes.set(w, home)
+        return home || undefined
+    }
+
+    function bodyOf(fn: Function): Body {
+        const known = bodies.get(fn)
+        if (known) return known
+        const g = host.binder.graphOf(fn)
+        expectForm(g, 'lifetimes', undefined)
+        const instances = instancesOf.get(fn) ?? []
+        const held = new Map<number, number[]>()
+        const nodes = new Map<number, number[]>()
+        const context: number[] = []
+        charge(countNodes(g) * (instances.length + 2))
+        for (const [id, n] of nodeEntries(g)) {
+            let found: number[] | undefined
+            for (const f of instances) {
+                const type = types.typeAt(f, id)
+                if (!type) continue
+                for (const o of refsOf(type)) {
+                    if (!found) held.set(id, found = [])
+                    if (found.includes(o)) continue
+                    found.push(o)
+                    listOf(nodes, o).push(id)
+                }
+            }
+            if (found && n.op === NodeOp.callContext) context.push(...found)
+        }
+        const nest = graphLoops(g)
+        const { idom } = dominatorTree(v => v ? nest.tailTargets.get(v)!.slice() : [g.root], v => v === g.root ? [0] : nest.preds.get(v)!)
+        const body: Body = { g, instances, held, nodes, nest, idom, homes: new Map(), captured: new Map(), owned: new Map(), leaked: new Set(), context }
+        for (const b of g.blocks) {
+            const own: number[] = []
+            const seen = new Set<number>()
+            const work = [b.bodyId]
+            while (work.length) {
+                const id = work.pop()!
+                if (!id || seen.has(id)) continue
+                seen.add(id)
+                const n = getNode(g, id)
+                if (!n) continue
+                listOf(body.captured, id).push(b.id)
+                if (n.op === NodeOp.param || n.op === NodeOp.block || n.op === NodeOp.startOf) continue
+                if (OrderedValues.has(n.op) && homeOf(body, id) !== b.id) continue
+                own.push(id)
+                let i = 0
+                while (i < countIds(n)) {
+                    work.push(getRef(n, i))
+                    i++
+                }
+            }
+            body.owned.set(b.id, own)
+        }
+        const users = usersOf(g)
+        const resolved = calls.get(fn)
+        for (const [id, list] of held) {
+            for (const [u, slot] of users.get(id) ?? []) {
+                const n = getNode(g, u)!
+                let leaks = false
+                if (n.op === NodeOp.call && slot >= 2 && !resolved?.has(u) && instances.some(f => types.typeAt(f, u) !== undefined)) leaks = true
+                if ((n.op === NodeOp.setProp || n.op === NodeOp.store) && slot === 3 && !held.get(getRef(n, 1))?.length) leaks = true
+                if (rt.sliceOf(g, n) === rt.Op.sliceWrite && slot === 4 && !held.get(getRef(n, 2))?.length) leaks = true
+                if (!leaks) continue
+                for (const o of list) body.leaked.add(o)
+            }
+        }
+        bodies.set(fn, body)
+        return body
+    }
+
+    function dominates(body: Body, a: number, b: number): boolean {
+        let at = b
+        while (at) {
+            if (at === a) return true
+            at = body.idom.get(at) ?? 0
+        }
+        return false
+    }
+
+    function sourceHome(body: Body, source: number): number | undefined {
+        const n = getNode(body.g, source)!
+        if (OrderedValues.has(n.op)) return homeOf(body, source)
+        const blocks = body.captured.get(source)
+        if (!blocks?.length) return undefined
+        let home = blocks[0]
+        for (const b of blocks) {
+            while (home && !dominates(body, home, b)) home = body.idom.get(home) ?? 0
+        }
+        return home || undefined
+    }
+
+    function reaches(body: Body, roots: number[], target: number, home: number, strict: boolean): boolean {
+        const g = body.g
+        const seen = new Set<number>()
+        const work = roots.slice()
+        while (work.length) {
+            const id = work.pop()!
+            if (!id || seen.has(id)) continue
+            if (id === target) return true
+            seen.add(id)
+            const n = getNode(g, id)
+            if (!n || n.op === NodeOp.param || n.op === NodeOp.block || n.op === NodeOp.startOf) continue
+            if (OrderedValues.has(n.op) && homeOf(body, id) !== home) continue
+            if (strict && n.op === NodeOp.select) {
+                work.push(getRef(n, 0))
+                continue
+            }
+            let i = 0
+            while (i < countIds(n)) {
+                work.push(getRef(n, i))
+                i++
+            }
+        }
+        return false
+    }
+
+    function regionOf(body: Body, source: number): Region | string {
+        const g = body.g
+        const home = sourceHome(body, source)
+        if (home === undefined) return 'has no block of its own'
+        const positions = tailPositions(g, getBlock(g, home)!.bodyId)
+        charge(positions.length * (body.owned.get(home)?.length ?? 0))
+        const creates: boolean[] = []
+        const outside = new Set<number>()
+        const work: number[] = []
+        for (const p of positions) {
+            const roots = tailRoots(g, p)
+            const always = reaches(body, roots, source, home, true)
+            if (!always && reaches(body, roots, source, home, false)) return 'is created on a condition'
+            creates.push(always)
+            const n = getNode(g, p.at)!
+            if (!always && n.op === NodeOp.apply) work.push(getRef(n, 0))
+        }
+        while (work.length) {
+            const b = work.pop()!
+            if (b === home || outside.has(b) || !dominates(body, home, b)) continue
+            outside.add(b)
+            for (const t of body.nest.tailTargets.get(b)!) work.push(t)
+        }
+        const blocks = new Set<number>([home])
+        for (const b of g.blocks) {
+            if (!outside.has(b.id) && dominates(body, home, b.id)) blocks.add(b.id)
+        }
+        const exits: [number, number][] = []
+        for (const b of blocks) {
+            const leaves = b === home ? positions : tailPositions(g, getBlock(g, b)!.bodyId)
+            let i = 0
+            while (i < leaves.length) {
+                const p = leaves[i]
+                const n = getNode(g, p.at)!
+                const leaving = n.op === NodeOp.ret || (n.op === NodeOp.apply && (getRef(n, 0) === home || !blocks.has(getRef(n, 0))))
+                if (leaving && (b !== home || creates[i])) {
+                    if (!exitOrdering(g, p)) return 'leaves where nothing is ordered'
+                    exits.push([b, i])
+                }
+                i++
+            }
+        }
+        if (!exits.length) return 'never leaves its block'
+        return { blocks, exits }
+    }
+
+    function holdersOf(own: number[], owner: number): number[] | string {
+        const alive = own.slice()
+        let i = 0
+        while (i < alive.length) {
+            if (types.objects[alive[i]].constant) return 'is held by an object that is never freed'
+            for (const location of holders.get(alive[i]) ?? []) {
+                if (i < own.length && owner && location.handle === owner) continue
+                if (!alive.includes(location.allocation)) alive.push(location.allocation)
+            }
+            charge(1)
+            i++
+        }
+        return alive
+    }
+
+    function leaks(alive: number[]): boolean {
+        for (const o of alive) {
+            for (const fn of touchers(o)) {
+                if (!instancesOf.has(fn)) continue
+                if (bodyOf(fn).leaked.has(o)) return true
+            }
+        }
+        return false
+    }
+
+    function operandHolds(body: Body, id: number, alive: number[]): boolean {
+        const n = getNode(body.g, id)!
+        let i = 0
+        while (i < countIds(n)) {
+            const list = body.held.get(getRef(n, i))
+            if (list && list.some(o => alive.includes(o))) return true
+            i++
+        }
+        return false
+    }
+
+    function localEnd(fn: Function, source: number, ended: Set<number>): Ending | string {
+        const body = bodyOf(fn)
+        const own = body.held.get(source)
+        if (!own || operandHolds(body, source, own)) return ''
+        for (const f of body.instances) {
+            const type = types.typeAt(f, source)
+            if (type && !objectsOnly(type)) return 'may be absent'
+        }
+        for (const o of own) {
+            if (!wanted[o]) return 'shares its value with an object that has no hook'
+            if (ended.has(o)) return 'ends at a field write'
+        }
+        const alive = holdersOf(own, 0)
+        if (typeof alive === 'string') return alive
+        if (operandHolds(body, source, alive)) return 'is read from an object that holds it'
+        for (const f of body.instances) {
+            const instance = types.instances[f]
+            if (refsOf(instance.returns).some(o => alive.includes(o))) return alive.length > own.length ? 'is held by an object that is returned' : 'is returned'
+            for (const param of instance.params) {
+                if (refsOf(param.type).some(o => alive.includes(o))) return alive.length > own.length ? 'is held by an object that is passed in' : 'is passed in'
+            }
+        }
+        if (body.context.some(o => alive.includes(o))) return 'is held by an object the closure captures'
+        if (leaks(alive)) return 'reaches a call or a store the analysis cannot see'
+        const region = regionOf(body, source)
+        if (typeof region === 'string') return region
+        for (const o of alive) {
+            for (const id of body.nodes.get(o) ?? []) {
+                if (id === source) continue
+                const n = getNode(body.g, id)!
+                if (n.op === NodeOp.param) return 'is carried between blocks'
+                if (own.includes(o) && !operandHolds(body, id, alive)) return 'has a second source'
+                for (const b of body.captured.get(id) ?? []) {
+                    if (!region.blocks.has(b)) return own.includes(o) ? 'is used outside its region' : 'is held by an object used outside its region'
+                }
+            }
+        }
+        return { end: { unit: fn, value: source, exits: region.exits }, own, alive }
+    }
+
+    function heldByAnother(found: Ending[], at: number): boolean {
+        charge(found.length)
+        let i = 0
+        while (i < found.length) {
+            if (i !== at && found[i].own.some(o => found[at].alive.includes(o))) return true
+            i++
+        }
+        return false
+    }
+
+    const reaching = new Map<Function, Set<Function>>()
+    function reachersOf(fn: Function): Set<Function> {
+        const known = reaching.get(fn)
+        if (known) return known
+        const found = new Set<Function>()
+        const work = [fn]
+        while (work.length) {
+            const next = work.pop()!
+            for (const caller of callers.get(next) ?? []) {
+                if (found.has(caller)) continue
+                found.add(caller)
+                work.push(caller)
+            }
+            charge(1)
+        }
+        reaching.set(fn, found)
+        return found
+    }
+
+    function followers(body: Body, at: number, home: number, stop: number): [follows: Set<number>, later: Set<number>] {
+        const g = body.g
+        const users = usersOf(g)
+        const own = new Set(body.owned.get(home))
+        const follows = new Set<number>()
+        const work = [at]
+        while (work.length) {
+            const id = work.pop()!
+            for (const [u] of users.get(id) ?? []) {
+                if (follows.has(u) || !own.has(u)) continue
+                follows.add(u)
+                work.push(u)
+            }
+        }
+        const later = new Set<number>()
+        const entered: number[] = []
+        for (const p of tailPositions(g, getBlock(g, home)!.bodyId)) {
+            if (p.at !== at && !follows.has(p.at) && !tailRoots(g, p).some(r => r === at || follows.has(r))) continue
+            follows.add(p.at)
+            const n = getNode(g, p.at)!
+            if (n.op === NodeOp.apply) entered.push(getRef(n, 0))
+        }
+        while (entered.length) {
+            const b = entered.pop()!
+            if (b === stop || later.has(b)) continue
+            later.add(b)
+            for (const t of body.nest.tailTargets.get(b)!) entered.push(t)
+        }
+        charge(follows.size + later.size)
+        return [follows, later]
+    }
+
+    function heldAcross(body: Body, at: number, alive: number[]): boolean {
+        const g = body.g
+        const home = homeOf(body, at)
+        if (home === undefined) return true
+        const [follows, later] = followers(body, at, home, 0)
+        const known = [new Map<number, boolean>(), new Map<number, boolean>()]
+        const fresh = (id: number, same: boolean): boolean => {
+            const n = getNode(g, id)!
+            if (n.op === NodeOp.param) return false
+            if (OrderedValues.has(n.op)) {
+                if (follows.has(id)) return true
+                const from = homeOf(body, id)
+                return !same && from !== undefined && later.has(from)
+            }
+            const memo = known[same ? 1 : 0]
+            const seen = memo.get(id)
+            if (seen !== undefined) return seen
+            let any = false
+            let stale = false
+            let i = 0
+            while (i < countIds(n) && !stale) {
+                const x = getRef(n, i)
+                const list = x ? body.held.get(x) : undefined
+                if (list && list.some(o => alive.includes(o))) {
+                    if (!fresh(x, same)) stale = true
+                    any = true
+                }
+                i++
+            }
+            memo.set(id, any && !stale)
+            return any && !stale
+        }
+        const stale = (id: number, same: boolean): boolean => {
+            const n = getNode(g, id)!
+            let i = 0
+            while (i < countIds(n)) {
+                const x = getRef(n, i)
+                const list = x ? body.held.get(x) : undefined
+                if (list && list.some(o => alive.includes(o)) && !fresh(x, same)) return true
+                i++
+            }
+            return false
+        }
+        for (const id of follows) {
+            if (stale(id, true)) return true
+        }
+        for (const b of later) {
+            const members = body.owned.get(b)!
+            charge(members.length)
+            for (const id of members) {
+                if (!follows.has(id) && stale(id, false)) return true
+            }
+        }
+        return false
+    }
+
+    function settled(holder: number, key: number): boolean {
+        const object = types.objects[holder]
+        const ctor = constructorOf(object.proto, host)
+        if (!ctor || !host.isConstructor?.(ctor) || !instancesOf.has(ctor)) return false
+        const location = fieldsOf.get(holder)!.get(key)!
+        const body = bodyOf(ctor)
+        const g = body.g
+        const positions = tailPositions(g, getBlock(g, g.root)!.bodyId)
+        for (const w of location.writers) {
+            if (w.unit !== ctor) continue
+            const n = getNode(g, w.node)
+            if (!n || n.op !== NodeOp.setProp || !receiverValue(g, getRef(n, 1)) || homeOf(body, w.node) !== g.root) continue
+            if (!positions.every(p => reaches(body, tailRoots(g, p), w.node, g.root, true))) continue
+            let early = false
+            let at = getRef(n, 0)
+            while (at && !early) {
+                const x = getNode(g, at)!
+                if (x.op === NodeOp.startOf) break
+                if (!OrderedValues.has(x.op)) early = true
+                if (x.op !== NodeOp.getProp) {
+                    let i = x.op === NodeOp.setProp ? 3 : 1
+                    while (i < countIds(x)) {
+                        if (getRef(x, i) && receiverValue(g, getRef(x, i))) early = true
+                        i++
+                    }
+                }
+                at = getRef(x, 0)
+            }
+            if (!early) return true
+        }
+        return false
+    }
+
+    function fieldEnd(fn: Function, write: number): number[] | string {
+        const body = bodyOf(fn)
+        const g = body.g
+        const n = getNode(g, write)!
+        if (n.op !== NodeOp.setProp || getRef(n, 2)) return 'is not a store to a named field'
+        const key = getLiteral(g, n, 2) as number
+        const targets = body.held.get(getRef(n, 1))
+        if (!targets) return 'is never reached'
+        for (const f of body.instances) {
+            const type = types.typeAt(f, getRef(n, 1))
+            if (type && type.unknown) return 'stores through an unknown holder'
+        }
+        const old: number[] = []
+        for (const h of targets) {
+            const location = fieldsOf.get(h)?.get(key)
+            if (!location) return 'stores to a field its holder does not have'
+            if (!objectsOnly(location.type) || (location.forms & FieldForm.absent)) return 'replaces a value that may be absent'
+            for (const o of location.type.objects) {
+                if (!wanted[o]) return 'replaces a value that may have no hook'
+                if (!old.includes(o)) old.push(o)
+            }
+            const object = types.objects[h]
+            if (object.site.unit === fn) return 'stores where its holder is allocated'
+            if (constructorOf(object.proto, host) === fn && receiverValue(g, getRef(n, 1))) return 'is the first store of its constructor'
+            if (!settled(h, key)) return 'may run before a constructor sets the field'
+        }
+        const alive = holdersOf(old, key)
+        if (typeof alive === 'string') return `replaces a value that ${alive}`
+        if (leaks(alive)) return 'replaces a value that reaches a call or a store the analysis cannot see'
+        for (const o of old) {
+            let store = 0
+            let storer: Function | undefined
+            for (const location of holders.get(o) ?? []) {
+                if (location.handle !== key) continue
+                let seen = false
+                for (const w of location.writers) {
+                    if (w.node < 0) continue
+                    const writer = bodyOf(w.unit)
+                    const x = getNode(writer.g, w.node)!
+                    if (x.op !== NodeOp.setProp) return 'replaces a value stored by something other than a field store'
+                    if (!writer.held.get(getRef(x, 3))?.includes(o)) continue
+                    seen = true
+                    if (store && (store !== w.node || storer !== w.unit)) return 'replaces a value that more than one store puts in a field'
+                    if (store) continue
+                    store = w.node
+                    storer = w.unit
+                    const made = makerOf(o, w.unit)
+                    if (!made || !madeAt(writer, w.unit, getRef(x, 3), made)) return 'replaces a value that is not made where it is stored'
+                    const from = sourceHome(writer, made)
+                    const to = homeOf(writer, w.node)
+                    if (from === undefined || to === undefined || !dominates(writer, from, to)) return 'replaces a value stored away from where it is made'
+                    if (followers(writer, w.node, to, from)[1].has(to)) return 'replaces a value stored in a loop it is made outside of'
+                }
+                if (!seen) return 'replaces a value that reaches a field through no store the analysis lists'
+            }
+        }
+        if (heldAcross(body, write, alive)) return 'replaces a value its own function still uses'
+        const above = reachersOf(fn)
+        const seen = new Set<Function>()
+        for (const o of alive) {
+            for (const user of touchers(o)) {
+                if (seen.has(user) || !above.has(user) || !instancesOf.has(user)) continue
+                seen.add(user)
+                const frame = bodyOf(user)
+                if (!alive.some(x => frame.nodes.has(x))) continue
+                for (const [node, callees] of calls.get(user) ?? []) {
+                    if (!callees.some(t => t === fn || above.has(t))) continue
+                    if (heldAcross(frame, node, alive)) return 'replaces a value a caller still uses'
+                }
+            }
+        }
+        return old
+    }
+
+    function makerOf(object: number, fn: Function): number {
+        const made = types.objects[object]
+        if (made.site.unit === fn) return made.site.node
+        let node = 0
+        for (const f of made.instances ?? (made.instance === undefined ? [] : [made.instance])) {
+            for (const site of types.instances[f].sites) {
+                if (site.unit !== fn || (node && site.node !== node)) return 0
+                node = site.node
+            }
+        }
+        return node
+    }
+
+    function madeAt(body: Body, fn: Function, value: number, made: number): boolean {
+        let at = tailOf(body.g, value)
+        while (at !== made) {
+            const n = getNode(body.g, at)!
+            if (n.op !== NodeOp.call) return false
+            for (const callee of calls.get(fn)?.get(at) ?? []) {
+                if (!returnsSelf(host.binder.graphOf(callee))) return false
+            }
+            if (!calls.get(fn)?.has(at)) return false
+            at = tailOf(body.g, getRef(n, 2))
+        }
+        return true
+    }
+
+    const ended = new Set<number>()
+    const writes = new Map<Function, Set<number>>()
+    for (const location of locations) {
+        if (location.handle === undefined || !location.type.objects.some(o => wanted[o])) continue
+        for (const w of location.writers) {
+            if (w.node >= 0 && instancesOf.has(w.unit)) setOf(writes, w.unit).add(w.node)
+        }
+    }
+    for (const [fn, nodes] of writes) {
+        for (const write of nodes) {
+            const end = fieldEnd(fn, write)
+            if (typeof end === 'string') {
+                refuse(`field write ${end}`)
+                continue
+            }
+            for (const o of end) ended.add(o)
+            out.fields.push({ unit: fn, write })
+        }
+    }
+    const sources = new Map<Function, Set<number>>()
+    types.objects.forEach((object, id) => {
+        if (wanted[id] && instancesOf.has(object.site.unit)) setOf(sources, object.site.unit).add(object.site.node)
+    })
+    types.instances.forEach(instance => {
+        if (!instance.returns.objects.some(o => wanted[o])) return
+        for (const site of instance.sites) {
+            if (site.instance !== undefined) setOf(sources, site.unit).add(site.node)
+        }
+    })
+    for (const [fn, nodes] of sources) {
+        const found: Ending[] = []
+        for (const source of nodes) {
+            const end = localEnd(fn, source, ended)
+            if (typeof end !== 'string') found.push(end)
+            else if (end) refuse(`local ${end}`)
+        }
+        while (found.length) {
+            let at = 0
+            while (at < found.length && heldByAnother(found, at)) at++
+            if (at === found.length) {
+                for (const _ of found) refuse('local is held by an object that it holds')
+                break
+            }
+            out.locals.push(found[at].end)
+            found.splice(at, 1)
+        }
+    }
+    return out
+}

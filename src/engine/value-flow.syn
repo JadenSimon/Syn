@@ -1134,11 +1134,34 @@ function seedPending(): void {
     while (flow.seedList.length) {
         const origin = flow.seedList.pop()!
         if (flow.originKind[origin] === OriginKind.static && originHostFn(origin)) continue
+        if (flow.originKind[origin] === OriginKind.fresh) seedDrop(origin)
         const state = heapState(origin)
         if (state === undefined || (!heap.isOrdinaryObject(state) && !originHostFn(origin))) continue
         const keys = dataKeys(state)
         charge(keys.length)
         for (const key of keys) fieldSlot(origin, key as number)
+    }
+}
+
+export function dropHook(proto: Handle, host: AccessHost): Function | undefined {
+    const descriptor = proto ? heap.getPropertyDescriptor(proto, dropKey) : 0
+    if (!descriptor) return undefined
+    const d = heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor))
+    if (d.flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) return undefined
+    const fn = host.binder.functionOf(host.session.runtime!.objects.intern(d.slot0 as Handle) as u32)
+    return fn && host.binder.traceable(fn) ? fn : undefined
+}
+
+function seedDrop(origin: number): void {
+    const fn = dropHook(protoOf(origin), flow.host)
+    if (!fn) return
+    const s = summaryOf(fn)
+    const callee = flow.instances[instance(fn, s.hasThis ? qualOf(origin) : 0, -1, -1)]
+    if (s.hasThis) addOrigin(paramSlot(callee, -1), origin)
+    let i = 0
+    while (i < s.params) {
+        addConst(callee.sigs[i], UNDEF)
+        i++
     }
 }
 
@@ -2263,6 +2286,7 @@ function instanceofPrototype(s: Summary, x: Expr): number {
 }
 
 const hasInstanceKey = heap.fromJsSymbol(Symbol.hasInstance)
+const dropKey = heap.fromJsSymbol(Symbol.drop)
 
 function ordinaryPrototype(target: Handle): number {
     if (heap.getPropertyDescriptor(target, hasInstanceKey)) return 0
@@ -4116,6 +4140,16 @@ function paramDemands(s: Summary): ParamDemands {
     return s.demands
 }
 
+function sameDemands(a: ParamDemands, b: ParamDemands): boolean {
+    if (a.floats !== b.floats || a.classed !== b.classed || a.identity !== b.identity) return false
+    let i = 0
+    while (i < a.classMasks.length || i < b.classMasks.length) {
+        if (a.classMasks[i] !== b.classMasks[i]) return false
+        i++
+    }
+    return true
+}
+
 function paramRooted(s: Summary, e: number, state: Uint8Array): boolean {
     if (e < 0) return false
     if (state[e]) return state[e] !== 2
@@ -5590,9 +5624,9 @@ function exportLocations(): void {
             }
             if (d && !heap.getOwnProperty(fnState!, key as Handle)) heap.setDataProperty(fnState!, key as Handle, d.slot0 as Handle, d.flags)
             const readers: Site[] = []
-            for (const r of flow.fieldReaders.get(slot) ?? []) if (!retiredInstance(flow.instances[flow.slotOwner[r]])) readers.push(slotSite(r))
+            for (const r of flow.fieldReaders.get(slot) ?? []) if (reachedInstance(flow.instances[flow.slotOwner[r]])) readers.push(slotSite(r))
             const writers: Site[] = []
-            for (const w of flow.fieldWriters.get(slot) ?? []) if (w < 0 || !retiredInstance(flow.instances[Math.floor(w / exprBits)])) writers.push(writerSite(w))
+            for (const w of flow.fieldWriters.get(slot) ?? []) if (w < 0 || reachedInstance(flow.instances[Math.floor(w / exprBits)])) writers.push(writerSite(w))
             const id = flow.exported.locations.length
             flow.exported.locOf.set(slot, id)
             flow.exported.locations.push({ allocation, key: keyLabel(key), handle: key >= 0 ? key as Handle : undefined, type: slotType(slot), forms: flow.fieldForms.get(slot) ?? 0, storeTypes: (flow.fieldStoreTypes.get(slot) ?? []).slice(), readers, writers, stored: flow.fieldStored.has(slot) })
@@ -5980,6 +6014,12 @@ function retiredInstance(inst: Instance): boolean {
     return flow.retired.has((inst.site ?? inst).id)
 }
 
+function reachedInstance(inst: Instance): boolean {
+    const whole = inst.site ?? inst
+    if (flow.retired.has(whole.id)) return false
+    return whole.callers.length > 0 || flow.rooted.has(whole.id) || flow.heldStatics.has(whole.id)
+}
+
 function retiredOrigin(origin: number): boolean {
     const creators = flow.originCreators.get(origin)
     return !!creators?.length && creators.every(id => flow.retired.has(id))
@@ -6003,10 +6043,15 @@ function resolveReplacement(fn: Function, g: Graph, start: number): boolean {
     let attempts = 0
     while (attempts < maxStepAttempts) {
         attempts++
-        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(), ins: new Map(), start, nodes: nodes + countNodes(g), keys: flow.keyPending.length }
+        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(), ins: new Map(), start, nodes: nodes + countNodes(g) * olds.length, keys: flow.keyPending.length }
         flow.step = step
         const s = newSummary(fn, g, old.id)
         intrinsics.assert(sigWidth(s) === sigWidth(old), `value-flow: ${old.name} changed its signature in a rewrite`)
+        if (old.kindIds) {
+            s.kindIds = old.kindIds
+            s.kindVecs = old.kindVecs
+        }
+        const demands = old.demands !== undefined && !sameDemands(paramDemands(s), old.demands)
         const owned: number[] = []
         let origin = 1
         while (origin < step.origins) {
@@ -6023,7 +6068,7 @@ function resolveReplacement(fn: Function, g: Graph, start: number): boolean {
         const grown = frozenOriginFields(step)
         const fields = grown.length > 0
         const dynamics = changesDynamics(step)
-        const widened = returns || fields || dynamics
+        const widened = returns || fields || dynamics || demands
         flow.step = undefined
         nodes = step.nodes
         if (stepsFlag) console.log(`STEP ${old.name} attempt ${attempts}: ret ${returns} fields ${fields} keyed ${dynamics} new ${flow.instances.length - step.instances} work ${flow.work - start} nodes ${nodes} blocked ${[...new Set(step.blocked)].slice(0, 6).map(whySlotText).join('; ')}`)
