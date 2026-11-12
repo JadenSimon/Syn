@@ -4,7 +4,7 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { firstNonOrderingSlot, NumericOps, PstackCount, PstackFirst, PstackWildcard, type Graph, type GraphNode, typeName } from './lowering2'
-import { countIds, dominatorTree, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf, allNodes, countNodes, hasNode, nodeEntries, nodeIds, heapInterior, heapField, heapFieldCount, graphLoops, type GraphLoops, graphRegions, type GraphRegions, stronglyConnected, tailOf, tailPositions, tailRoots } from './graph-node'
+import { countIds, orderingReaches, dominatorTree, getBlock, getLiteral, getNode, getRef, isThisParam, NodeOp, nodeUsers, opName, resultType, spreadsLast, typeOf, allNodes, countNodes, hasNode, nodeEntries, nodeIds, heapInterior, heapField, heapFieldCount, graphLoops, type GraphLoops, graphRegions, type GraphRegions, stronglyConnected, tailOf, tailPositions, tailRoots } from './graph-node'
 import type { TraceSession } from './trace2'
 import type { Binder } from './program-graph'
 import { dataKeys, forwardedField, reducedShape } from './property-eval'
@@ -376,6 +376,7 @@ export interface ObjectType extends Allocation {
 
 interface ObjectField extends Field {
     initialized: boolean
+    initial: boolean
     constructed: boolean
     stored: boolean
     replaced: boolean
@@ -727,7 +728,7 @@ export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]
             continue
         }
         if (!written(location) && indexed.has(location.allocation) && (location.key === numberKey || constantIndex(location.key))) continue
-        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, constructed: false, replaced: false }
+        const field: ObjectField = { type: location.type, forms: location.forms, storeTypes: location.storeTypes, stored: location.stored, initialized: false, initial: false, constructed: false, replaced: false }
         object.fields.set(location.key, field)
         object.readers.push(...location.readers)
         if (object.kind !== AllocKind.buffer) field.replaced = location.writers.some(w => w.unit !== object.site.unit && !constructorStore(object, w))
@@ -739,10 +740,12 @@ export function analyzeTypes(data: Accesses, host: AccessHost, roots: Function[]
     const contained = new Set(objects.flatMap(object => [...object.fields.values()].flatMap(field => field.type.objects)))
     for (const [id, key, node] of initialWrites) {
         const object = objects[id]
-        if (object.fields.size !== 1 || contained.has(id)) continue
         const g = host.binder.graphOf(object.site.unit)
         const block = blockOf(g, node)
-        if (block && block === blockOf(g, object.site.node)) object.fields.get(key)!.initialized = true
+        if (!block || block !== blockOf(g, object.site.node)) continue
+        const field = object.fields.get(key)!
+        field.initial = true
+        field.initialized = object.fields.size === 1 && !contained.has(id)
     }
     const instances: InstanceSignature[] = data.instances
     const stateAllocations = new Map<Handle, number[]>()
@@ -3151,11 +3154,11 @@ function congruence(types: ValueTypes, callSites: CallSite[]): (a: number) => nu
 
 export interface Embeddings {
     fields: Map<string, Map<string, string>>
-    sites: Map<PlannedUnit, Map<number, string>>
+    sites: Map<PlannedUnit, Map<number, [field: string, holder: number | undefined]>>
     within: Map<number, number>
 }
 
-export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Map<Function, PlannedUnit[]>): Embeddings {
+export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Map<Function, PlannedUnit[]>, graphOf: (fn: Function) => Graph, allocatedAt: (fn: Function, node: number) => number | undefined, firstField: (shape: string) => string | undefined): Embeddings {
     const holders = new Map<number, [number, string][]>()
     types.objects.forEach((object, id) => {
         for (const [key, field] of object.fields) for (const inner of field.type.objects) {
@@ -3166,18 +3169,32 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     const returned = new Set(types.instances.flatMap(instance => instance.returns.objects.filter(id => receiverOf(instance) !== id)))
     const sameSite = (a: number, b: number) => types.objects[a].site.unit === types.objects[b].site.unit && types.objects[a].site.node === types.objects[b].site.node
     const onlyObjects = (t: Type) => !nullableType(t) && !t.strings.length && !t.unknown && !numericType(t) && !t.functions.length && !t.closures.length && t.objects.length > 0
-    function owner(inner: number): [number, string] | undefined {
+    function createdWith(holder: number, key: string, inner: number): boolean {
+        const outer = types.objects[holder]
+        const site = types.objects[inner].site
+        const field = outer.fields.get(key)
+        if (!field?.initial || (field.forms & FieldForm.absent) || site.unit !== outer.site.unit) return false
+        const shape = inst.shapeOf(holder)
+        if (shape === undefined || firstField(shape) === key) return false
+        const at = allocatedAt(site.unit, outer.site.node)
+        const from = allocatedAt(site.unit, site.node)
+        if (at === undefined || from === undefined) return false
+        const g = graphOf(site.unit)
+        return at === from || orderingReaches(g, at, from) || orderingReaches(g, from, at)
+    }
+    function owner(inner: number): [number, string, number | undefined] | undefined {
         const object = types.objects[inner]
         if (object.constant || object.native || object.kind === AllocKind.buffer || returned.has(inner)) return
         const holding = holders.get(inner) ?? []
-        const held = holding.filter(([id]) => instancesOf(object).some(instance => receiverOf(types.instances[instance]) === id))
+        const receives = (id: number) => instancesOf(object).some(instance => receiverOf(types.instances[instance]) === id)
+        const held = holding.filter(([id, key]) => receives(id) || createdWith(id, key, inner))
         if (held.length !== 1) return
         const [parent, key] = held[0]
         const outer = types.objects[parent]
         if (outer.constant || outer.native || (holding.length > 1 && !outer.fields.get(key)?.constructed)) return
         const type = outer.fields.get(key)!.type
         if (!onlyObjects(type) || !type.objects.every(id => sameSite(id, inner))) return
-        return [parent, key]
+        return [parent, key, receives(parent) ? undefined : outer.site.node]
     }
     const fields = new Map<string, Map<string, string>>()
     for (const [holderShape, sig] of inst.shapes) {
@@ -3204,7 +3221,7 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
     const placements = createInterner()
     const placed: { unit: PlannedUnit, node: number, embeds: Set<number>, objects: [inner: number, holder: number][] }[] = []
     const embedIds = createInterner()
-    const embeds: [holderShape: string, field: string][] = []
+    const embeds: [holderShape: string, field: string, holder: number | undefined][] = []
     types.objects.forEach((object, id) => {
         for (const instance of instancesOf(object)) {
             const unit = unitOfInstance.get(instance)
@@ -3213,10 +3230,11 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
             if (at === placed.length) placed.push({ unit, node: object.site.node, embeds: new Set(), objects: [] })
             const found = owner(id)
             const holderShape = found ? inst.shapeOf(found[0]) : undefined
+            if (found && holderShape !== undefined && found[2] !== undefined && !unit.allocations.has(found[2])) fields.get(holderShape)?.delete(found[1])
             let embed = -1
             if (found && holderShape !== undefined && fields.get(holderShape)?.get(found[1]) === inst.shapeOf(id)) {
-                embed = intern(embedIds, [holderShape, found[1]])
-                if (embed === embeds.length) embeds.push([holderShape, found[1]])
+                embed = intern(embedIds, [holderShape, found[1], found[2]])
+                if (embed === embeds.length) embeds.push([holderShape, found[1], found[2]])
                 placed[at].objects.push([id, found[0]])
             }
             placed[at].embeds.add(embed)
@@ -3230,15 +3248,15 @@ export function planEmbeddings(types: ValueTypes, inst: Instantiations, plan: Ma
             fields.get(holderShape)?.delete(field)
         }
     }
-    const sites = new Map<PlannedUnit, Map<number, string>>()
+    const sites = new Map<PlannedUnit, Map<number, [string, number | undefined]>>()
     const within = new Map<number, number>()
     for (const place of placed) {
         const [embed] = [...place.embeds]
         if (place.embeds.size !== 1 || embed < 0) continue
-        const [holderShape, field] = embeds[embed]
+        const [holderShape, field, holder] = embeds[embed]
         if (!fields.get(holderShape)?.has(field)) continue
-        mapOf(sites, place.unit).set(place.node, field)
-        for (const [inner, holder] of place.objects) within.set(inner, holder)
+        mapOf(sites, place.unit).set(place.node, [field, holder])
+        for (const [inner, outer] of place.objects) within.set(inner, outer)
     }
     return { fields, sites, within }
 }
@@ -3599,7 +3617,7 @@ export function sameArgument(a: Rep, b: Rep): boolean {
     return x.length === y.length && x.every((atom, i) => atom === y[i])
 }
 
-export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => number, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => Atom[], graphOf: (fn: Function) => Graph): Map<PlannedUnit, number> {
+export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => number, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, [Handle, number | undefined]>>, abiOf: (unit: PlannedUnit) => Atom[], graphOf: (fn: Function) => Graph): Map<PlannedUnit, number> {
     const byNode = (entries: [number, Atom[]][], out: Atom[]) => {
         out.push(entries.length)
         for (const [node, atoms] of entries.sort((a, b) => a[0] - b[0])) out.push(node, ...atoms)
@@ -3639,7 +3657,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
         if (floatUnion(unit.returns)) view(unit.returns, out)
         byNode([...unit.allocations].map(([n, shape]): [number, Atom[]] => [n, [shape === undefined ? undefined : layoutOf(shape, elements)]]), out)
         const site = sites.get(unit)
-        if (site) byNode([...site].map(([n, k]): [number, Atom[]] => [n, [k as number]]), out)
+        if (site) byNode([...site].map(([n, [k, holder]]): [number, Atom[]] => [n, [k as number, holder]]), out)
         else out.push(0)
         const blocks = [...unit.blocks].sort((a, b) => a - b)
         out.push(blocks.length, ...blocks)
@@ -3687,7 +3705,7 @@ export function shareClasses(plan: Map<Function, PlannedUnit[]>, layoutOf: (shap
     return classes
 }
 
-export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => number, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, Handle>>, abiOf: (unit: PlannedUnit) => Atom[], graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
+export function shareUnits(plan: Map<Function, PlannedUnit[]>, layoutOf: (shape: string, elements: ElementReads) => number, reduced: (shape: string) => boolean, sites: Map<PlannedUnit, Map<number, [Handle, number | undefined]>>, abiOf: (unit: PlannedUnit) => Atom[], graphOf: (fn: Function) => Graph): Map<PlannedUnit, PlannedUnit> {
     const classes = shareClasses(plan, layoutOf, reduced, sites, abiOf, graphOf)
     const units = [...plan.values()].flat()
     const shared = new Map<PlannedUnit, PlannedUnit>()

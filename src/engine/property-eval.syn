@@ -19,7 +19,7 @@ import {
     addNode,
     withOperand,
     addCopy, retypeNode, insertNode, nodeUsers, getBlock, spreadsLast, allNodes, someNode, copyNodes, nodeEntries, nodeIds, makeNode, isThisParam, NodeFlags,
-    heapInterior, heapField, heapFieldCount, typeRefOf, getArgIds, setType, pushBlockParams, setBlockBody,
+    heapInterior, heapField, heapFieldCount, typeRefOf, getArgIds, setType, pushBlockParams, setBlockBody, orderingReaches,
 } from './graph-node'
 import { snapshotField, snapshotKeys } from './heap-records'
 import { symbolOf, symbolValue, tagVmHandle, tagVmHandleNode, tagVmScalar, vmHandleNode, vmValue } from './vm'
@@ -322,7 +322,7 @@ function resolveProperties(
     const byHandle = new Map<Handle, Memory>()
     let initToken = 0
     let allocToken: number | undefined
-    function heapAllocate(size: number, zeroed: BitSlot[], stack: number): number {
+    function heapAllocate(size: number, zeroed: BitSlot[], stack: number, fields: Layout): number {
         let token = allocToken
         if (token === undefined) {
             if (!initToken) {
@@ -330,7 +330,20 @@ function resolveProperties(
             }
             token = initToken
         }
-        const ptr = addNode(out, NodeOp.pstack, [token, { literal: stack }, 0, { literal: size }])
+        const operands: Operand[] = [token, { literal: stack }, 0, { literal: size }]
+        const regions: Operand[] = []
+        function inlineRegions(of: Layout, base: number): void {
+            for (let i = 0; i < of.nested.length; i++) {
+                const inner = of.nested[i]
+                if (inner === undefined) continue
+                const within = layout(inner)
+                if (of.offsets[i] && within.size) regions.push({ literal: base + of.offsets[i] }, { literal: within.size })
+                inlineRegions(within, base + of.offsets[i])
+            }
+        }
+        inlineRegions(fields, 0)
+        if (regions.length) operands.push({ literal: 0 }, ...regions)
+        const ptr = addNode(out, NodeOp.pstack, operands)
         let last = ptr
         for (const slot of zeroed) last = addNode(out, NodeOp.store, [last, ptr, { literal: slot.offset }, { literal: 0 }], bitWord(slot))
         if (allocToken !== undefined) allocToken = last
@@ -487,7 +500,7 @@ function resolveProperties(
         if (!mem) {
             const reduced = reducedShape(handle)
             let ptr = 0
-            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst)
+            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst, fields)
             mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false, origin: identity?.op === NodeOp.heapHandle && heapFieldCount(identity) ? id : undefined }
             if (cell !== undefined) homes.set(cell, mem)
         }
@@ -496,22 +509,19 @@ function resolveProperties(
         return mem
     }
     const placed = new Map<number, number[]>()
-    for (const [id, handle] of objects) {
-        if (opts.embedded?.has(id)) continue
-        const node = getNode(source, id)
-        const at = node?.op === NodeOp.heapHandle && !getRef(node, 0) ? opts.allocations?.get(getLiteral(runtime, node, 0) as u32)?.token : undefined
-        intrinsics.assert(at === undefined || hasNode(source, at), `property-eval: allocation token %${at} of %${id} is not in the graph`)
-        if (at === undefined) {
-            materialize(id, handle)
-            continue
-        }
-        const group = placed.get(at)
-        if (group) group.push(id, handle)
-        else placed.set(at, [id, handle])
+    const holds = new Map<number, number[]>()
+    for (const [id, { parent }] of opts.embedded ?? []) {
+        const list = holds.get(parent)
+        if (list) list.push(id)
+        else holds.set(parent, [id])
     }
     const embeddedMemory = new Set<Memory>()
-    for (const [id, { parent, key }] of opts.embedded ?? []) {
-        const owner = memory.get(parent)
+    const embeddedAt = new Map<number, Memory>()
+    function embeddedMemoryOf(id: number): Memory {
+        const known = embeddedAt.get(id)
+        if (known) return known
+        const { parent, key } = opts.embedded!.get(id)!
+        const owner = opts.embedded!.has(parent) ? embeddedMemoryOf(parent) : memory.get(parent)
         if (!owner) throw `property-eval: %${id} is embedded in %${parent}, which has no memory`
         const at = owner.keys.indexOf(key)
         const inner = at < 0 ? undefined : owner.nested[at]
@@ -521,7 +531,43 @@ function resolveProperties(
         const mem = { ...layout(inner), ptr: owner.ptr, base: owner.base + owner.offsets[at], shape: inner, reduced: false, pointer, address: pointer ? [id, 0] as [number, number] : undefined }
         memory.set(id, mem)
         embeddedMemory.add(mem)
+        embeddedAt.set(id, mem)
+        return mem
     }
+    function embeddedWithin(id: number, into: number[]): void {
+        for (const inner of holds.get(id) ?? []) {
+            embeddedMemoryOf(inner)
+            into.push(inner)
+            embeddedWithin(inner, into)
+        }
+    }
+    function allocatedAt(id: number): number | undefined {
+        const node = getNode(source, id)
+        return node?.op === NodeOp.heapHandle && !getRef(node, 0) ? opts.allocations?.get(getLiteral(runtime, node, 0) as u32)?.token : undefined
+    }
+    function placementOf(id: number): number | undefined {
+        let at = allocatedAt(id)
+        for (const inner of holds.get(id) ?? []) {
+            const first = placementOf(inner)
+            if (at === undefined || first === at) continue
+            if (first !== undefined && !orderingReaches(graph, at, first) && !orderingReaches(graph, first, at)) throw `property-eval: %${inner} is embedded in %${id}, but their allocations are not ordered in one block`
+            if (first === undefined || orderingReaches(graph, at, first)) at = first
+        }
+        return at
+    }
+    for (const [id, handle] of objects) {
+        if (opts.embedded?.has(id)) continue
+        const at = placementOf(id)
+        intrinsics.assert(at === undefined || hasNode(source, at), `property-eval: allocation token %${at} of %${id} is not in the graph`)
+        if (at === undefined) {
+            materialize(id, handle)
+            continue
+        }
+        const group = placed.get(at)
+        if (group) group.push(id, handle)
+        else placed.set(at, [id, handle])
+    }
+    for (const [id, { parent }] of opts.embedded ?? []) if (memory.has(parent)) embeddedMemoryOf(id)
     const fieldTags = new Map<number, number>()
     const presentReads = new Set<number>()
     function readBit(token: number, base: number, displacement: number, slot: BitSlot): number {
@@ -648,9 +694,14 @@ function resolveProperties(
         let final = at
         try {
             for (let i = 0; i < group.length; i += 2) materialize(group[i], group[i + 1] as Handle)
+            const members: number[] = []
             for (let i = 0; i < group.length; i += 2) {
-                const mem = memory.get(group[i])!
-                if (!mem.pointer && !mem.reduced && !initialized.has(mem)) allocToken = initChain(group[i], mem, allocToken!)
+                members.push(group[i])
+                embeddedWithin(group[i], members)
+            }
+            for (const id of members) {
+                const mem = memory.get(id)!
+                if (!mem.pointer && !mem.reduced && !initialized.has(mem)) allocToken = initChain(id, mem, allocToken!)
             }
         } finally {
             final = allocToken!
@@ -678,6 +729,7 @@ function resolveProperties(
             }
         }
     }
+    for (const id of opts.embedded?.keys() ?? []) embeddedMemoryOf(id)
     let users = nodeUsers(source, nodeIds(source))
     function callUsers(value: number, from: number): number[] {
         const found: number[] = []

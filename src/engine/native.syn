@@ -15,7 +15,7 @@ import { tagVmHandle, tagVmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, indirectReach, EffectNone, EffectRead, EffectWrite,
-    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, PstackMark, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
+    printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, inlineRegions, inlineRegionAt, PstackMark, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
     joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, substitute, tailScalar, valueFacts, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     paramSlot, typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
@@ -4647,16 +4647,23 @@ function extendSummaryArgs(graph: Graph, call: GraphNode, effect: number, captur
 
 const StateFieldTypes = new Set([Types.u8, Types.i8, Types.u16, Types.i16, Types.u32, Types.i32, Types.u64, Types.i64, Types.vm_value])
 
-function privateArgument(graph: Graph, mem: MemAnalysis, call: number, callee: number, index: number): boolean {
+function privateArgument(graph: Graph, mem: MemAnalysis, call: number, callee: number, index: number, regions: [start: number, end: number][] = []): boolean {
     const arg = getRef(getNode(graph, call)!, 3 + index)
     if (!arg) return false
     const value = mem.of(siteBlock(graph, call), arg)
     if (value.kind !== MemFresh || value.pos !== 0 || value.pending) return false
-    const flow = mem.flows(value.block!, value.base, true)
+    const flow = mem.flows(value.block!, value.base, true, regions.length > 0)
     return !flow.own && flow.calls.every(([site, at]) => at === index && calledSymbol(graph, getNode(graph, site)!) === callee)
 }
 
-function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, param: number): [offset: number, type: intrinsics.Types][] | undefined {
+function argumentRegions(graph: Graph, mem: MemAnalysis, call: number, index: number): [start: number, end: number][] {
+    const arg = getRef(getNode(graph, call)!, 3 + index)
+    const value = mem.of(siteBlock(graph, call), arg)
+    const regions = arg && value.pos === 0 ? inlineRegions(graph, getNode(graph, value.base)) : []
+    return regions.filter(inner => !regions.some(outer => outer !== inner && outer[0] <= inner[0] && inner[1] <= outer[1]))
+}
+
+function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, param: number, regions: [start: number, end: number][], moves: [node: number, start: number, pos: number][]): [offset: number, type: intrinsics.Types][] | undefined {
     const fields = new Map<number, intrinsics.Types>()
     const aliases = new Set<number>([param])
     const work: [number, GraphBlock][] = [[param, graph.blocks[0]]]
@@ -4672,6 +4679,11 @@ function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, param: n
                     const at = mem.of(block, ptr).pos
                     if (at === undefined) return
                     const offset = at + getLiteral(graph, n, 2)
+                    const region = inlineRegionAt(regions, offset)
+                    if (region) {
+                        moves.push([user, region[0], offset])
+                        continue
+                    }
                     const T = slotType(typeOf(n))
                     if (offset < 0 || !StateFieldTypes.has(T)) return
                     const known = fields.get(offset)
@@ -4691,6 +4703,12 @@ function stateFields(graph: Graph, mem: MemAnalysis, index: GraphIndex, param: n
                 if (alias === undefined) return
                 const m = mem.of(into, alias)
                 if (m.pending || m.base !== param || m.pos === undefined) return
+                const region = inlineRegionAt(regions, m.pos)
+                if (region) {
+                    if (n.op !== NodeOp.add) return
+                    moves.push([user, region[0], m.pos])
+                    continue
+                }
                 if (getNode(graph, alias)!.op === NodeOp.param && arrivingElsewhere(graph, mem, index, into, alias, param)) return
                 if (aliases.has(alias)) continue
                 aliases.add(alias)
@@ -4722,6 +4740,7 @@ export interface StateRequest {
     result: boolean
     width?: number
     sites: [caller: number, call: number][]
+    moves?: [node: number, start: number, pos: number][]
 }
 
 function recordWidth(graph: Graph, tails: (GraphNode | undefined)[]): number | undefined {
@@ -4761,6 +4780,22 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
         inputs.push(p)
     }
     const state = addNode(graph, NodeOp.after, [initialized, cell])
+    const moves = request.moves ?? []
+    const starts = [...new Set(moves.map(([, start]) => start))]
+    while (inputs.length < layout.length + starts.length) inputs.push(addNode(graph, NodeOp.param, [], Types.u64))
+    for (const [id, start, pos] of moves) {
+        const n = getNode(graph, id)!
+        const pointer = inputs[layout.length + starts.indexOf(start)]
+        if (n.op === NodeOp.add) {
+            putCopy(graph, id, n, [pointer, { literal: pos - start }])
+            continue
+        }
+        const operands = getOperands(graph, n)
+        operands[1] = pointer
+        operands[2] = { literal: pos - start }
+        putCopy(graph, id, n, operands)
+    }
+    dirtyValues(graph, moves.map(([id]) => id))
     program.paramPositions.set(callee, [...signaturePositions(program, callee).filter((_, i) => i !== index), ...inputs.map(() => SignatureUnplanned)])
     substitute(graph, new Map<number, Operand>([[param, state]]))
     setBlockParams(graph, entry, [...entry.params.filter(p => p !== param), ...inputs])
@@ -4787,9 +4822,10 @@ export function scalarizeState(program: ProgramGraph, request: StateRequest, tou
         const base = args[3 + index]
         const ordering = addNode(caller, NodeOp.after, [args[0], ...args.slice(2)])
         const loads = layout.map(([offset, T]) => addNode(caller, NodeOp.load, [ordering, base, { literal: offset }], T))
-        const invoke = addCopy(caller, n, [addNode(caller, NodeOp.after, [ordering, ...loads]), args[1], args[2], ...args.slice(3).filter((_, i) => i !== index), ...loads])
+        const passed: Operand[] = [...loads, ...starts.map(start => addNode(caller, NodeOp.add, [base, { literal: start }]))]
+        const invoke = addCopy(caller, n, [addNode(caller, NodeOp.after, [ordering, ...loads]), args[1], args[2], ...args.slice(3).filter((_, i) => i !== index), ...passed])
         const locations = callLocations(caller, call)
-        if (locations || width) setCallLocations(caller, invoke, [...(locations ?? args.slice(3).map(() => -1)).filter((_, i) => i !== index), ...loads.map(() => -1)], undefined, extended.get(symbol))
+        if (locations || width) setCallLocations(caller, invoke, [...(locations ?? args.slice(3).map(() => -1)).filter((_, i) => i !== index), ...passed.map(() => -1)], undefined, extended.get(symbol))
         let updated = invoke
         outputs.forEach(([offset, T], i) => {
             const value = addNode(caller, NodeOp.get, [invoke, { literal: width + i + (hasResult ? 1 : 0) }])
@@ -4850,31 +4886,43 @@ function scalarizeMutableState(program: ProgramGraph, touched: Set<number>): Set
         const positions = signaturePositions(program, callee)
         let index = -1
         let layout: [offset: number, type: intrinsics.Types][] = []
+        let split: [node: number, start: number, pos: number][] = []
         for (let i = 0; i < entry.params.length && index < 0; i++) {
             const param = entry.params[i]
             const offsets = written.get(param)
             if (!offsets) continue
             if (!plannedWrites(program, callee, positions[i])) continue
-            const fields = stateFields(graph, mem, users, param)
+            let fields = stateFields(graph, mem, users, param, [], [])
+            let regions: [start: number, end: number][] = []
+            const moves: [node: number, start: number, pos: number][] = []
+            if (!fields || fields.length > 2) {
+                regions = calls.length ? argumentRegions(program.units.get(calls[0][0])!, memOf(calls[0][0]), calls[0][1], i) : []
+                if (!regions.length) continue
+                if (calls.some(([symbol, call]) => argumentRegions(program.units.get(symbol)!, memOf(symbol), call, i).join() !== regions.join())) continue
+                fields = stateFields(graph, mem, users, param, regions, moves)
+            }
             if (!fields) continue
+            const passed = fields.length + new Set(moves.map(([, start]) => start)).size
+            const returned = fields.filter(([offset]) => offsets.has(offset)).length
             // XXX: three or more fields are not pareto: Array push/reserve/setIndex states save holePushed −14 but cost arrayTwoKinds +8, restSpread +7
-            if (fields.length > 2) continue
+            if (!returned || passed > 2) continue
             const freed = paramLocation(graph, getNode(graph, param)!) < 0 ? 1 : 0
-            if (ordinary - freed + fields.length > program.target.argRegs.length) continue
-            if (offsets.size + width + (hasResult ? 1 : 0) > program.target.retRegs.length) continue
-            if (!calls.every(([symbol, call]) => privateArgument(program.units.get(symbol)!, memOf(symbol), call, callee, i))) continue
+            if (ordinary - freed + passed > program.target.argRegs.length) continue
+            if (returned + width + (hasResult ? 1 : 0) > program.target.retRegs.length) continue
+            if (!calls.every(([symbol, call]) => privateArgument(program.units.get(symbol)!, memOf(symbol), call, callee, i, regions))) continue
             index = i
             layout = fields
+            split = moves
         }
         if (index < 0) continue
         const param = entry.params[index]
         const outputs = layout.filter(([offset]) => written.get(param)!.has(offset))
         program.signatureRewrites.push([callee, positions[index], layout.length, outputs.length, outputs.length + width + (hasResult ? 1 : 0)])
-        scalarizeState(program, { callee, index, fields: layout, outputs, result: hasResult, width, sites: calls }, touched)
+        scalarizeState(program, { callee, index, fields: layout, outputs, result: hasResult, width, sites: calls, moves: split }, touched)
         changed.add(callee)
         mems.delete(callee)
         for (const [symbol] of calls) mems.delete(symbol)
-        promoted.push(`${graph.name}:${layout.map(([offset]) => offset).join('/')}`)
+        promoted.push(`${graph.name}:${[...layout.map(([offset]) => offset), ...new Set(split.map(([, start]) => `[${start}]`))].join('/')}`)
     }
     if (flags.has('hoist-stats')) console.log('STATE', promoted.join(' '))
     return changed
@@ -6999,7 +7047,7 @@ interface Traced {
 }
 interface PlannedEmbeddings {
     fields: Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>
-    sites: Map<PlannedUnit, Map<number, intrinsics.Handle>>
+    sites: Map<PlannedUnit, Map<number, [intrinsics.Handle, number | undefined]>>
     within: Map<number, number>
 }
 
@@ -12481,7 +12529,10 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
     function embeddedSites(unit: PlannedUnit | undefined, graph: Graph): Map<number, { parent: number, key: intrinsics.Handle }> {
         const embedded = new Map<number, { parent: number, key: intrinsics.Handle }>()
         const self = thisParamOf(graph)
-        if (self !== undefined) for (const [node, key] of (unit && plan.embedded.sites.get(unit)) ?? []) embedded.set(node, { parent: self, key })
+        for (const [node, [key, holder]] of (unit && plan.embedded.sites.get(unit)) ?? []) {
+            const parent = holder ?? self
+            if (parent !== undefined) embedded.set(node, { parent, key })
+        }
         return embedded
     }
     function unionParamBases(fn: Function): Map<number, propertyEval.UnionParam> {
@@ -12849,9 +12900,6 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
     function fact(rep: Rep, encoded: boolean): Codec | undefined {
         return repFact(handles, rep, encoded)
     }
-    const embeddings = planEmbeddings(types, inst, plan)
-    const embedded = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
-    for (const [P, byKey] of embeddings.fields) embedded.set(handles.get(P)!, new Map([...byKey].map(([k, I]) => [types.keyHandles.get(k)!, handles.get(I)!])))
     for (const [id, sig] of inst.shapes) {
         const planned = propertyEval.dataKeys(handles.get(id)!).filter(key => key !== heap.shapeTagKey)
         for (const m of sig.members) {
@@ -12887,6 +12935,19 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             bits.set(state, { flags: prior?.flags ?? new Set(), tagged: prior?.tagged ?? new Set(), shapeTag: tag })
         }
     }
+    function allocatedAt(fn: Function, node: number): number | undefined {
+        const graph = binder.graphOf(fn)
+        const n = getNode(graph, node)
+        return n?.op === NodeOp.heapHandle && !getRef(n, 0) ? tracer.tracedOf(fn).allocations?.get(getLiteral(graph, n, 0) as u32)?.token : undefined
+    }
+    function firstField(shape: string): string | undefined {
+        const layout = propertyEval.recordLayout(handles.get(shape)!, undefined, bits)
+        const at = layout.offsets.findIndex((offset, i) => offset === 0 && !layout.flags[i])
+        return at < 0 ? undefined : types.keyNames.get(layout.keys[at])
+    }
+    const embeddings = planEmbeddings(types, inst, plan, fn => binder.graphOf(fn), allocatedAt, firstField)
+    const embedded = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
+    for (const [P, byKey] of embeddings.fields) embedded.set(handles.get(P)!, new Map([...byKey].map(([k, I]) => [types.keyHandles.get(k)!, handles.get(I)!])))
     for (const [id, sig] of inst.shapes) {
         const known = new Map<string, Codec>()
         const fields = propertyEval.recordLayout(handles.get(id)!, embedded, bits)
@@ -12988,9 +13049,9 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
     }
     const staticFields: StaticFields = (state, offset) => locate(facts, staticShape(state), String(offset))
     if (flags.has('plan')) for (const [P, byKey] of embeddings.fields) console.log('EMBED', P, [...byKey].map(([k, I]) => `${k}=${I}`).join(' '))
-    if (flags.has('plan')) for (const [unit, byNode] of embeddings.sites) console.log('EMBED-SITE', unit.fn.name, [...byNode].map(([n, k]) => `%${n}.${k}`).join(' '))
-    const sites = new Map<PlannedUnit, Map<number, intrinsics.Handle>>()
-    for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, k]) => [node, types.keyHandles.get(k)!])))
+    if (flags.has('plan')) for (const [unit, byNode] of embeddings.sites) console.log('EMBED-SITE', unit.fn.name, [...byNode].map(([n, [k, holder]]) => `%${n}.${k}${holder === undefined ? '' : ` in %${holder}`}`).join(' '))
+    const sites = new Map<PlannedUnit, Map<number, [intrinsics.Handle, number | undefined]>>()
+    for (const [unit, byNode] of embeddings.sites) sites.set(unit, new Map([...byNode].map(([node, [k, holder]]) => [node, [types.keyHandles.get(k)!, holder]])))
     const functionObjects = { cells: new Map<number, intrinsics.Handle>(), functions: new Map<Function, intrinsics.Handle>() }
     for (const object of types.objects) {
         if (object.function === undefined || object.handle === undefined) continue

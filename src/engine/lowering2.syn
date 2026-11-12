@@ -3408,7 +3408,7 @@ export interface MemAnalysis {
     disjoint(aIn: GraphBlock, a: GraphNode, bIn: GraphBlock, b: GraphNode): boolean
     covers(block: GraphBlock, outer: GraphNode, inner: GraphNode): boolean
     clobbers(callIn: GraphBlock, call: number, loadIn: GraphBlock, load: GraphNode, returned?: number): boolean
-    flows(block: GraphBlock, root: number, viaReturn: boolean): MemFlow
+    flows(block: GraphBlock, root: number, viaReturn: boolean, outside?: boolean): MemFlow
     users(id: number): Iterable<number>
 }
 export interface MemFlow { own: boolean, calls: [call: number, arg: number, block: GraphBlock][], reached: Map<number, GraphBlock> }
@@ -3871,10 +3871,13 @@ export function memAnalysis(g: Graph, given?: gn.GraphIndex): MemAnalysis {
         return 0
     }
     const flowCache = new Map<number, MemFlow>()
-    function flows(block: GraphBlock, root: number, viaReturn: boolean): MemFlow {
+    const outsideFlowCache = new Map<number, MemFlow>()
+    function flows(block: GraphBlock, root: number, viaReturn: boolean, outside = false): MemFlow {
         const key = viaReturn ? -root : root
-        const known = flowCache.get(key)
+        const cache = outside ? outsideFlowCache : flowCache
+        const known = cache.get(key)
         if (known) return known
+        const regions = outside ? inlineRegions(g, getNode(g, root)) : []
         const seen = new Map<number, GraphBlock>([[root, block]])
         const holders = new Set<number>()
         const flow: MemFlow = { own: false, calls: [], reached: seen }
@@ -3929,13 +3932,13 @@ export function memAnalysis(g: Graph, given?: gn.GraphIndex): MemAnalysis {
                 } else if (OrderedValues.has(n.op) && !usedPastToken(n, x)) {
                     continue
                 } else if (!CompareOps.has(n.op)) {
-                    if (PureOps.has(n.op)) onward(u, xb)
-                    else flow.own = true
+                    if (!PureOps.has(n.op)) flow.own = true
+                    else if (!regions.length || of(xb, u).base !== root || !inlineRegionAt(regions, of(xb, u).pos)) onward(u, xb)
                 }
                 if (flow.own) break
             }
         }
-        flowCache.set(key, flow)
+        cache.set(key, flow)
         return flow
     }
     function escaped(block: GraphBlock, root: number): boolean {
@@ -9737,7 +9740,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 continue
             }
             let inside = false
-            const result = promoteAlloca(key, keyOf, () => inside = true, batch)
+            let regions: [start: number, end: number][] = []
+            let result = promoteAlloca(key, keyOf, () => inside = true, batch, regions)
+            if (!result) {
+                regions = inlineRegions(g, getNode(g, id))
+                if (regions.length) result = promoteAlloca(key, keyOf, () => inside = true, batch, regions)
+            }
             if (result === 'settle') {
                 settle()
                 continue
@@ -9799,7 +9807,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         return rewritten
     }
 
-    function promoteAlloca(key: string, keyOf: (id: number) => string | undefined, storedInside: () => void, batch: Promotion): boolean | 'settle' | Map<number, number> {
+    function promoteAlloca(key: string, keyOf: (id: number) => string | undefined, storedInside: () => void, batch: Promotion, regions: [start: number, end: number][]): boolean | 'settle' | Map<number, number> {
+        const split = regions.length > 0
         const ids = new Set<number>()
         const touched = new Set<GraphBlock>()
         const homes = new Map<number, number>()
@@ -9937,6 +9946,13 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             pending.push(id)
             return arrival(getRef(n, 1), id, block) && arrival(getRef(n, 2), id, block)
         }
+        const kept: [start: number, end: number][] = []
+        function keep(a: number, offset: number): boolean {
+            const region = inlineRegionAt(regions, aliases.get(a)! + offset)
+            if (!region) return false
+            if (!kept.includes(region)) kept.push(region)
+            return true
+        }
         for (const a of ids) if (!alias(a, homes.get(a)!)) return false
         while (pending.length) {
             const a = pending.pop()!
@@ -9946,11 +9962,11 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                 const pointer = (n.op === NodeOp.load || n.op === NodeOp.store) && getRef(n, 1) === a
                 if (!pointer && tokenUse(n, a)) continue
                 if (n.op === NodeOp.add || (n.op === NodeOp.after && getRef(n, countIds(n) - 1) === a)) {
-                    if (!alias(u, blockOf.get(a)!)) return false
+                    if (!alias(u, blockOf.get(a)!) && !keep(a, 0)) return false
                     continue
                 }
                 if (n.op === NodeOp.select && getRef(n, 0) !== a) {
-                    if (!selectRoot(u, blockOf.get(a)!)) return false
+                    if (split ? !keep(a, 0) : !selectRoot(u, blockOf.get(a)!)) return false
                     continue
                 }
                 if (n.op === NodeOp.apply) {
@@ -9958,6 +9974,10 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     if (!target || target === g.blocks[0]) return false
                     for (let i = 1; i < countIds(n); i++) {
                         if (getRef(n, i) !== a) continue
+                        if (split) {
+                            if (!alias(target.params[i - 1], target.id) && !keep(a, 0)) return false
+                            continue
+                        }
                         if (!alias(target.params[i - 1], target.id) && !mergeRoot(target, target.params[i - 1])) return false
                         passTo(target, i - 1)
                     }
@@ -9967,14 +9987,27 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     const into = getNode(g, mem.of(getGraphBlock(blockOf.get(a)!), getRef(n, 1)).base)
                     if (into?.op === NodeOp.pstack || into?.op === NodeOp.alloca) storedInside()
                 }
-                if (!pointer || getRef(n, 2)) return false
-                if (n.op === NodeOp.store && getRef(n, 3) === a) return false
+                if (!pointer || getRef(n, 2) || (n.op === NodeOp.store && getRef(n, 3) === a)) {
+                    if (!keep(a, 0)) return false
+                    continue
+                }
                 const offset = slotOf(a, getLiteral(g, n, 2))
                 const known = slotTypes.get(offset)
                 const T = gn.machineType(typeOf(n))
-                if (known !== undefined && !sameSlotBits(known, T)) return false
+                if (known !== undefined && !sameSlotBits(known, T)) {
+                    if (!keep(a, getLiteral(g, n, 2))) return false
+                    continue
+                }
                 slotTypes.set(offset, known !== undefined && lowering.isSignedType(known) ? known : T)
             }
+        }
+        for (const [slot, T] of [...slotTypes]) {
+            if (!kept.length) break
+            if (inlineRegionAt(kept, slotOffsets[slot])) {
+                slotTypes.delete(slot)
+                continue
+            }
+            if (inlineRegionAt(kept, slotOffsets[slot] + (intrinsics.intrinsicBitWidth(T) >> 3) - 1)) return false
         }
         for (const s of selectors) {
             const n = getNode(g, s)!
@@ -10007,21 +10040,92 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             const next = slots[i][0]
             if (slotBases[prev] === slotBases[next] && slotOffsets[prev] + (intrinsics.intrinsicBitWidth(T) >> 3) > slotOffsets[next]) return false
         }
+        function trim(replaced: Map<number, number>): boolean {
+            const allocation = ids.values().next().value!
+            let start = Infinity
+            let end = 0
+            for (const region of kept) {
+                start = Math.min(start, region[0])
+                end = Math.max(end, region[1])
+            }
+            const shifted = new Set<number>([allocation])
+            const work = [allocation]
+            const moved = new Map<number, number>()
+            while (work.length) {
+                const a = work.pop()!
+                for (const u of indexedUsers(index, a)) {
+                    if (stores.has(u) || values.has(u)) continue
+                    const n = getNode(g, u)!
+                    const operands = getOperands(g, n)
+                    if ((n.op === NodeOp.load || n.op === NodeOp.store) && operands[1] === a) {
+                        operands[2] = { literal: getLiteral(g, n, 2) - start }
+                        moved.set(u, addCopy(g, n, operands))
+                        continue
+                    }
+                    if (tokenUse(n, a)) continue
+                    if (n.op === NodeOp.after && operands[operands.length - 1] === a) {
+                        if (shifted.has(u)) continue
+                        shifted.add(u)
+                        work.push(u)
+                        continue
+                    }
+                    if (n.op === NodeOp.apply) {
+                        const target = getGraphBlock(getRef(n, 0))
+                        for (let i = 1; i < operands.length; i++) {
+                            const param = target.params[i - 1]
+                            if (operands[i] !== a || shifted.has(param)) continue
+                            shifted.add(param)
+                            work.push(param)
+                        }
+                        continue
+                    }
+                    if (n.op !== NodeOp.add) return false
+                    const at = aliases.get(u)! - start
+                    moved.set(u, at ? addCopy(g, n, [a, { literal: at }]) : a)
+                }
+            }
+            for (const param of shifted) {
+                if (getNode(g, param)!.op !== NodeOp.param) continue
+                const owner = getGraphBlock(blockOf.get(param)!)
+                const at = owner.params.indexOf(param) + 1
+                for (const [, app] of findInboundApplies(owner)) {
+                    if (!shifted.has(getRef(getNode(g, app)!, at))) return false
+                }
+            }
+            const n = getNode(g, allocation)!
+            const operands = getOperands(g, n, 0, 4)
+            operands[3] = { literal: end - start }
+            for (const region of regions) {
+                if (region[0] <= start || region[1] > end) continue
+                if (operands.length === 4) operands.push({ literal: 0 })
+                operands.push({ literal: region[0] - start }, { literal: region[1] - region[0] })
+            }
+            moved.set(allocation, addCopy(g, n, operands))
+            for (const [id, to] of moved) replaced.set(id, to)
+            for (const id of shifted) touched.add(getGraphBlock(blockOf.get(id)!))
+            return true
+        }
+        function promotes(n: GraphNode): boolean {
+            return !getRef(n, 2) && slotTypes.has(slotOf(getRef(n, 1), getLiteral(g, n, 2)))
+        }
         const loads: [GraphBlock, number][] = []
         const stores = new Set<number>()
         for (const b of g.blocks) {
             if (!isIndexed(index, b)) continue
             for (const id of findValues(b.id, NodeOp.load) ?? []) {
                 if (!aliases.has(getRef(getNode(g, id)!, 1))) continue
+                if (split && !promotes(getNode(g, id)!)) continue
                 loads.push([b, id])
                 touched.add(b)
             }
             for (const id of findValues(b.id, NodeOp.store) ?? []) {
                 if (!aliases.has(getRef(getNode(g, id)!, 1))) continue
+                if (split && !promotes(getNode(g, id)!)) continue
                 stores.add(id)
                 touched.add(b)
             }
         }
+        if (split && !kept.length) return false
 
         function tailTokens(n: GraphNode, tokens: number[]): number[] {
             const next = tokens.slice()
@@ -10188,7 +10292,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             values.set(id, value)
         }
 
-        if (!added.size && !pointerSlots.size) {
+        if (!split && !added.size && !pointerSlots.size) {
             for (const id of ids) if (batch.ids.has(id)) return 'settle'
             for (const id of stores) if (batch.stores.has(id)) return 'settle'
             for (const id of ids) batch.ids.add(id)
@@ -10204,7 +10308,8 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             touched.add(b)
             for (const from of indexedPreds(index, block)) touched.add(getGraphBlock(from))
         }
-        const replaced = promotedReplacements({ ids, stores, values, touched })
+        const replaced = promotedReplacements({ ids: split ? new Set() : ids, stores, values, touched })
+        if (split && !trim(replaced) && !loads.length && !stores.size) return false
 
         function rewriteTail(b: GraphBlock): number {
             function walk(id: number, tokens: number[]): number {
@@ -16835,6 +16940,30 @@ export function resolvePstackTargets(g: Graph, targets: Map<number, number> | un
 
 export function pstackTentative(g: NodeSpace, n: GraphNode): number {
     return n.op === NodeOp.pstack && countIds(n) > 4 ? getLiteral(g, n, 4) : 0
+}
+
+export function inlineRegions(g: NodeSpace, n: GraphNode | undefined): [start: number, end: number][] {
+    const regions: [number, number][] = []
+    if (n?.op !== NodeOp.pstack) return regions
+    let i = 5
+    while (i + 1 < countIds(n)) {
+        const start = getLiteral(g, n, i)
+        regions.push([start, start + getLiteral(g, n, i + 1)])
+        i += 2
+    }
+    return regions
+}
+
+export function inlineRegionAt(regions: [start: number, end: number][], pos: number | undefined): [start: number, end: number] | undefined {
+    if (pos === undefined) return
+    let found: [start: number, end: number] | undefined
+    let i = 0
+    while (i < regions.length) {
+        const region = regions[i]
+        if (pos >= region[0] && pos < region[1] && (!found || region[0] >= found[0])) found = region
+        i++
+    }
+    return found
 }
 
 export function placePstackCallMarkers(g: Graph, regions: [header: number, call: number, stacks: number[]][]): void {
