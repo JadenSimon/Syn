@@ -1117,6 +1117,157 @@ function planArrayPresizing(g: Graph, host: AccessHost, program: ValueTypes, vie
     return out
 }
 
+interface ArrayFill {
+    array: number
+    writes: number[]
+    whole: boolean
+}
+
+function sameOperand(g: Graph, a: Operand, b: Operand): boolean {
+    if (typeof a === 'number' && typeof b === 'number') return tailOf(g, a) === tailOf(g, b)
+    if (typeof a === 'number' || typeof b === 'number') return false
+    return a.literal === b.literal
+}
+
+function fillLoop(g: Graph, view: InitializationView, write: number): InitializationLoop | undefined {
+    const at = view.regions.blockOf.get(write)
+    const region = view.regions.of.get(write)
+    if (at === undefined || region === undefined) return
+    for (const loop of initializationLoops(g, view)) {
+        if (loop.block !== g.blocks[at]) continue
+        const select = view.regions.of.get(loop.select)
+        if (select === undefined || !within(view.regions, region, childRegion(view.regions, select, loop.select, loop.stay))) return
+        return loop
+    }
+    return
+}
+
+function loopStart(g: Graph, loop: InitializationLoop): Operand | undefined {
+    let start: Operand | undefined
+    for (const entry of loop.entries) {
+        const value = getOperand(g, getNode(g, entry)!, loop.counter + 1)
+        if (start !== undefined && !sameOperand(g, start, value)) return
+        start = value
+    }
+    return start
+}
+
+function writtenBelow(g: Graph, view: InitializationView, loop: InitializationLoop, write: number, count: Operand): boolean {
+    const key = tailOf(g, getRef(getNode(g, write)!, 2))
+    if (!integerRange(view.nodes.get(key))) return false
+    if (typeof count !== 'number' && !Number.isInteger(count.literal)) return false
+    if (typeof count === 'number' && !integerRange(view.nodes.get(tailOf(g, count)))) return false
+    const counter = loop.block.params[loop.counter]
+    const bound = getOperand(g, loop.compare, loop.boundSlot)
+    const start = loopStart(g, loop)
+    if (start === undefined) return false
+    if (key === counter) {
+        const low = typeof start === 'number' ? integerRange(view.nodes.get(tailOf(g, start)))?.[0] : start.literal
+        if (low === undefined || !(low >= 0)) return false
+        if (sameOperand(g, bound, count)) return true
+        return typeof bound !== 'number' && typeof count !== 'number' && bound.literal <= count.literal
+    }
+    const index = getNode(g, key)
+    if (index?.op !== NodeOp.sub || tailOf(g, getRef(index, 0)) !== counter || !getRef(index, 1)) return false
+    const offset = tailOf(g, getRef(index, 1))
+    if (typeof start !== 'number' || tailOf(g, start) !== offset || typeof count !== 'number') return false
+    const length = getNode(g, tailOf(g, count))
+    if (length?.op !== NodeOp.sub || !getRef(length, 1) || tailOf(g, getRef(length, 1)) !== offset) return false
+    return sameOperand(g, bound, getOperand(g, length, 0))
+}
+
+function validLength(g: Graph, view: InitializationView, count: Operand): boolean {
+    if (typeof count !== 'number') return Number.isInteger(count.literal) && count.literal >= 0 && count.literal <= 0xffffffff
+    const range = integerRange(view.nodes.get(tailOf(g, count)))
+    return !!range && range[0] >= 0 && range[1] <= 0xffffffff
+}
+
+function wholeFill(g: Graph, view: InitializationView, loop: InitializationLoop, array: number, writes: number[], reads: Set<number>, count: Operand): boolean {
+    const { regions } = view
+    if (!validLength(g, view, count)) return false
+    if (regions.blockOf.get(array) === regions.blockOf.get(loop.select)) return false
+    const exit = childRegion(regions, regions.of.get(loop.select)!, loop.select, 3 - loop.stay)
+    for (const id of reads) {
+        if (!within(regions, regions.of.get(id) ?? -1, exit)) return false
+    }
+    const ops = mandatoryOps(g, view, loop)
+    if (!ops) return false
+    const counter = loop.block.params[loop.counter]
+    const start = loopStart(g, loop)
+    const fromZero = start !== undefined && typeof start !== 'number' && start.literal === 0
+    const toCount = sameOperand(g, getOperand(g, loop.compare, loop.boundSlot), count)
+    return writes.some(write => {
+        if (!ops.includes(write)) return false
+        if (tailOf(g, getRef(getNode(g, write)!, 2)) !== counter) return true
+        return fromZero && toCount
+    })
+}
+
+function planArrayFills(g: Graph, host: AccessHost, program: ValueTypes, view: InitializationView): ArrayFill[] {
+    const out: ArrayFill[] = []
+    const proto = arrayPrototype(host)
+    if (!stablePrototype(program, proto)) return out
+    const { users, regions } = view
+    for (const [array, allocation] of nodeEntries(g)) {
+        if (allocation.op !== NodeOp.call || countIds(allocation) !== 4 || spreadsLast(allocation)) continue
+        const callee = getNode(g, tailOf(g, getRef(allocation, 1)))
+        const receiver = getNode(g, getRef(allocation, 2))
+        if (callee?.op !== NodeOp.heapHandle || getRef(callee, 0)) continue
+        if (host.binder.functionOf(getLiteral(g, callee, 0) as u32) !== builtinGlobals.Array) continue
+        if (receiver?.op !== NodeOp.heapHandle || countIds(receiver) < 2) continue
+        if (!(users.get(getRef(allocation, 2)) ?? []).every(([user, slot]) => user === array && slot === 2)) continue
+        if (!arrayType(program, view.nodes.get(array), proto)) continue
+        if (!view.charge(users.size)) return out
+        const aliases = arrayAliases(g, users, array)
+        const writes: number[] = []
+        const reads = new Set<number>()
+        const others: number[] = []
+        for (const alias of aliases) {
+            for (const [id, slot] of users.get(alias) ?? []) {
+                const n = getNode(g, id)!
+                if (slot < firstNonOrderingSlot(n) || (n.op === NodeOp.after && slot === countIds(n) - 1)) continue
+                if (n.op === NodeOp.setProp && slot === 1 && getRef(n, 2)) writes.push(id)
+                else if (n.op === NodeOp.getProp && slot === 1 && getRef(n, 2) && integerRange(view.nodes.get(tailOf(g, getRef(n, 2))))) reads.add(id)
+                else if (n.op === NodeOp.getProp && slot === 1 && lengthRead(g, id) && plainProperty(g, n, program, view, proto)) reads.add(id)
+                else others.push(id)
+            }
+        }
+        if (!writes.length) continue
+        const loop = fillLoop(g, view, writes[0])
+        if (!loop) continue
+        const count = getOperand(g, allocation, 3)
+        if (writes.some(write => fillLoop(g, view, write) !== loop || !writtenBelow(g, view, loop, write, count))) continue
+        const exit = childRegion(regions, regions.of.get(loop.select)!, loop.select, 3 - loop.stay)
+        if (others.some(id => firstNonOrderingSlot(getNode(g, id)!) !== 1 || !within(regions, regions.of.get(id) ?? -1, exit))) continue
+        const written = new Set(writes)
+        const observation = {
+            charge: view.charge,
+            users,
+            permits(id: number, n: GraphNode): boolean {
+                if (written.has(id) || reads.has(id)) return true
+                if (firstNonOrderingSlot(n) !== 1) return false
+                return getArgIds(n).slice(1).every(ref => !aliases.has(tailOf(g, ref)))
+            },
+        }
+        if (!writes.every(write => unobserved(g, getRef(getNode(g, write)!, 0), array, [...aliases], proto, observation))) continue
+        out.push({ array, writes, whole: wholeFill(g, view, loop, array, writes, reads, count) })
+    }
+    return out
+}
+
+function rewriteArrayFills(g: Graph, plans: ArrayFill[]): void {
+    for (const plan of plans) {
+        if (plan.whole) {
+            const allocation = getNode(g, plan.array)!
+            putNode(g, plan.array, NodeOp.rt, [getOperand(g, allocation, 0), { literal: RtOp.arrayLiteral }, getOperand(g, allocation, 3)])
+        }
+        for (const write of plan.writes) {
+            const n = getNode(g, write)!
+            putNode(g, write, NodeOp.rt, [getOperand(g, n, 0), { literal: RtOp.arrayElement }, getOperand(g, n, 1), getOperand(g, n, 2), getOperand(g, n, 3)], typeOf(n))
+        }
+    }
+}
+
 function rewriteArrayPresizing(g: Graph, plans: ArrayPresizing[]): Map<number, number> {
     expectForm(g, 'rewriteArrayPresizing', undefined)
     const indices = new Map<number, number>()
@@ -1264,14 +1415,18 @@ export function rewriteInitializations(program: ValueTypes, host: AccessHost): (
         expectForm(g, 'rewriteInitializations', undefined)
         let allocation = false
         let calls = false
+        let keyed = false
+        let sized = false
         const counted = new Set<number>()
         for (const [id, n] of nodeEntries(g)) {
             if (n.op === NodeOp.rt && getLiteral(g, n, 1) === RtOp.arrayLiteral) allocation = true
+            if (n.op === NodeOp.setProp && getRef(n, 2)) keyed = true
             if (n.op === NodeOp.call) {
                 calls = true
                 const target = getNode(g, tailOf(g, getRef(n, 1)))
                 const receiver = getNode(g, getRef(n, 2))
                 if (target?.op === NodeOp.heapHandle && !getRef(target, 0) && receiver?.op === NodeOp.heapHandle) allocation = true
+                if (target?.op === NodeOp.heapHandle && !getRef(target, 0) && receiver?.op === NodeOp.heapHandle && countIds(n) === 4) sized = true
             }
             if (!lengthRead(g, id)) continue
             const owner = tailOf(g, getRef(n, 1))
@@ -1281,9 +1436,11 @@ export function rewriteInitializations(program: ValueTypes, host: AccessHost): (
         if (!presize && !counted.size) return
         const view = initializationView(g, program, instances)
         const arrays = presize ? planArrayPresizing(g, host, program, view) : []
+        const fills = sized && keyed ? planArrayFills(g, host, program, view) : []
         const filters = counted.size ? planFilterCounts(g, host, program, view, counted, arrays) : []
-        if (!view.charge(0) || (!arrays.length && !filters.length)) return
+        if (!view.charge(0) || (!arrays.length && !fills.length && !filters.length)) return
         const graph = withNodes(g, copyNodes(g))
+        rewriteArrayFills(graph, fills)
         const pushes = rewriteArrayPresizing(graph, arrays)
         for (const [id, index] of pushes) {
             const n = getNode(graph, id)!
