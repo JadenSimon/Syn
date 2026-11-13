@@ -8137,6 +8137,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         blocks: Set<number>
         sites: number[]
         from: number[]
+        nested: Set<number>
     }
     interface ColdPlan {
         select: number
@@ -8144,6 +8145,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         copied: Set<number>
         liveIns: number[]
         frontier: number[]
+        owned: Set<number>
     }
     function nodeRefs(n: GraphNode, out: number[]): void {
         for (let i = n.op === NodeOp.apply ? 1 : 0; i < countIds(n); i++) if (getRef(n, i)) out.push(getRef(n, i))
@@ -8190,6 +8192,17 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
                 ends.push(p)
             }
         }
+        const top = new Set<number>([graph.root])
+        const descend = [graph.root]
+        while (descend.length) {
+            for (const s of succ.get(descend.pop()!) ?? []) {
+                if (top.has(s)) continue
+                top.add(s)
+                descend.push(s)
+            }
+        }
+        const nested = new Set<number>()
+        for (const b of graph.blocks) if (!top.has(b.id)) nested.add(b.id)
         const regions = new Map<number, ColdRegion>()
         for (const b of graph.blocks) {
             if (!live.has(b.id)) continue
@@ -8206,7 +8219,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
                 const walk = [entry]
                 while (walk.length) for (const s of succ.get(walk.pop()!) ?? []) if (!blocks.has(s)) { blocks.add(s); walk.push(s) }
                 if ([...blocks].some(x => !panics.has(x))) continue
-                regions.set(entry, { entry, blocks, sites: [site], from: [b.id] })
+                regions.set(entry, { entry, blocks, sites: [site], from: [b.id], nested })
             }
         }
         return [...regions.values()]
@@ -8218,8 +8231,9 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         const root = getRef(getNode(graph, select)!, arm)
         const hot = new Set<number>()
         const hotCells = new Set<u32>()
+        const entered = new Set<number>()
         const reach: number[] = []
-        for (const b of graph.blocks) if (!region.blocks.has(b.id)) reach.push(b.bodyId, ...b.params)
+        for (const b of graph.blocks) if (!region.blocks.has(b.id) && !region.nested.has(b.id)) reach.push(b.bodyId, ...b.params)
         while (reach.length) {
             const id = reach.pop()!
             if (!id || id === root || hot.has(id)) continue
@@ -8227,6 +8241,11 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             const n = getNode(graph, id)
             if (!n) continue
             if (n.op === NodeOp.heapHandle && !getRef(n, 0) && identity(getLiteral(graph, n, 0) as u32, n)) hotCells.add(getLiteral(graph, n, 0) as u32)
+            const target = n.op === NodeOp.apply ? getRef(n, 0) : 0
+            if (region.nested.has(target) && !region.blocks.has(target) && !entered.has(target)) {
+                entered.add(target)
+                reach.push(getBlock(graph, target)!.bodyId, ...getBlock(graph, target)!.params)
+            }
             nodeRefs(n, reach)
         }
         const constant = new Map<number, boolean>()
@@ -8260,6 +8279,8 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         const copied = new Set<number>()
         const liveIns = new Set<number>()
         const frontier = new Set<number>()
+        const owned = new Set<number>()
+        const cold = (b: number) => region.blocks.has(b) || (region.nested.has(b) && !entered.has(b))
         const walk = [root]
         for (const b of region.blocks) walk.push(getBlock(graph, b)!.bodyId, ...getBlock(graph, b)!.params)
         while (walk.length) {
@@ -8268,11 +8289,17 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             copied.add(id)
             const n = getNode(graph, id)
             if (!n) continue
+            const target = n.op === NodeOp.apply ? getRef(n, 0) : 0
+            if (target && !region.blocks.has(target) && !owned.has(target)) {
+                intrinsics.assert(cold(target), `native: a cold region of ${graph.name} enters B${target}, which hot code enters too`)
+                owned.add(target)
+                walk.push(getBlock(graph, target)!.bodyId, ...getBlock(graph, target)!.params)
+            }
             const ordering = firstNonOrderingSlot(n)
             const visit = (r: number, token: boolean) => {
                 if (!r || copied.has(r)) return
                 const m = getNode(graph, r)
-                if (m?.op === NodeOp.startOf && !region.blocks.has(getRef(m, 0))) frontier.add(r)
+                if (m?.op === NodeOp.startOf && !cold(getRef(m, 0))) frontier.add(r)
                 else if (!hot.has(r) || m?.op === NodeOp.record || constantOf(r)) walk.push(r)
                 else if (token) frontier.add(r)
                 else liveIns.add(r)
@@ -8280,7 +8307,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             for (let i = n.op === NodeOp.apply ? 1 : 0; i < countIds(n); i++) visit(getRef(n, i), i < ordering)
             if (typeRefOf(n)) visit(typeRefOf(n), false)
         }
-        return { select, arm, copied, liveIns: [...liveIns], frontier: [...frontier] }
+        return { select, arm, copied, liveIns: [...liveIns], frontier: [...frontier], owned }
     }
     function perInvocation(cell: u32, n: GraphNode, frames: Map<u32, number>): boolean {
         if (frames.has(cell)) return true
@@ -8416,7 +8443,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         if (![...plan.copied].some(id => getNode(graph, id)?.op === NodeOp.call)) return why('no call'), false
         for (const id of plan.copied) {
             const op = getNode(graph, id)?.op
-            if (op === NodeOp.inlined || op === NodeOp.join || op === NodeOp.ret) return why(opName(op)), false
+            if (op === NodeOp.join) return why(opName(op)), false
         }
         return !plan.liveIns.some(id => recordTypeOf(graph, id)?.some(f => typeof f.type !== 'number'))
     }
@@ -8440,7 +8467,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             for (let i = 0; i < firstNonOrderingSlot(n); i++) if (frontier.has(getRef(n, i))) setRef(copy, i, entryToken)
             nodes.set(id, copy)
         }
-        for (const b of region.blocks) {
+        for (const b of [...region.blocks, ...plan.owned]) {
             const n = getNode(graph, b)
             if (n) nodes.set(b, copyNode(graph, n))
         }
@@ -8465,7 +8492,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             if (n.op === NodeOp.heapHandle && !getRef(n, 0) && !bound.has(getLiteral(graph, n, 0) as u32)) bound.set(getLiteral(graph, n, 0) as u32, id)
         }
         const root = getRef(getNode(graph, plan.select)!, plan.arm)
-        const blocks = [{ id: rootId, params, bodyId: root, bodyConst: 0 }, ...graph.blocks.filter(b => region.blocks.has(b.id)).map(b => ({ ...b, params: b.params.slice() }))]
+        const blocks = [{ id: rootId, params, bodyId: root, bodyConst: 0 }, ...graph.blocks.filter(b => region.blocks.has(b.id) || plan.owned.has(b.id)).map(b => ({ ...b, params: b.params.slice() }))]
         const cold = createGraph({ ids: graph.ids, literals: graph.literals, root: rootId, nodes, blocks, name, kinds: graph.kinds })
         const frames = new Map<u32, number>()
         const allocations = new Map<u32, Allocation>()
@@ -8514,15 +8541,19 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         if (!regions.length) return
         const identity = (cell: u32, n: GraphNode) => perInvocation(cell, n, traced.frames)
         const removed = new Set<number>()
+        const spans: number[][] = []
         let index = 0
         for (const region of regions) {
             const plans = region.sites.map((_, k) => coldPlan(graph, region, k, identity))
+            const span = [...region.blocks]
+            for (const plan of plans) span.push(...plan.owned)
+            spans.push(span)
             if (!plans.every(plan => outlinable(graph, plan))) continue
             plans.forEach((plan, k) => outlineSite(fn, code, traced, region, k, plan, index++))
-            for (const b of region.blocks) removed.add(b)
+            for (const b of span) removed.add(b)
         }
         if (!removed.size) return
-        for (const region of regions) if (![...region.blocks].every(b => removed.has(b))) for (const b of region.blocks) removed.delete(b)
+        for (const span of spans) if (!span.every(b => removed.has(b))) for (const b of span) removed.delete(b)
         setGraphBlocks(graph, graph.blocks.filter(b => !removed.has(b.id)))
         const after = reachableNodes(graph, traced.allocations)
         for (const id of nodeIds(graph)) if (!after.has(id)) deleteNode(graph, id)
