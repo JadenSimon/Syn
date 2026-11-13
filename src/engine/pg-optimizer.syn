@@ -5,7 +5,7 @@ import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp } from './rt'
 import { countedLoopShape, expectForm, firstNonOrderingSlot, type Graph, type GraphBlock, type GraphNode } from './lowering2'
-import { tailOf, withNodes, copyNodes, addAfter, afterOrderings, addCopy, putCopy, withOperand, addGraphBlock, addNode, countIds, countNodes, getBlock, getLiteral, getNode, getOperand, getRef, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast } from './graph-node'
+import { tailOf, withNodes, copyNodes, addAfter, afterOrderings, addCopy, putCopy, withOperand, addGraphBlock, addNode, blockOrder, countIds, countNodes, deleteNode, getBlock, getLiteral, getNode, getOperand, getRef, graphLoops, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast, tailPositions, type TailPosition } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
 import { AllocKind, constructorOf, emptyType, fixedField, fixedState, inhabited, listOf, regionRets, selfOf, usersOf, type AccessHost, type Location, type PlannedUnit, type Type, type UnitTypes, type ValueTypes } from './value-types'
 
@@ -2452,4 +2452,411 @@ export function relaxOrdering(g: Graph, facts: Map<number, Footprint>, stops: Se
         }
     }
     return relaxed
+}
+
+function returnedValues(g: Graph): Set<number> {
+    const positions = new Map<number, TailPosition[]>()
+    const preds = new Map<number, number[]>()
+    const returning = new Set<number>()
+    const work: number[] = []
+    for (const b of g.blocks) {
+        const tails = tailPositions(g, b.bodyId)
+        positions.set(b.id, tails)
+        for (const p of tails) {
+            const n = getNode(g, p.at)!
+            if (n.op === NodeOp.ret && !returning.has(b.id)) {
+                returning.add(b.id)
+                work.push(b.id)
+            }
+            if (n.op !== NodeOp.apply) continue
+            let from = preds.get(getRef(n, 0))
+            if (!from) preds.set(getRef(n, 0), from = [])
+            from.push(b.id)
+        }
+    }
+    while (work.length) {
+        for (const from of preds.get(work.pop()!) ?? []) {
+            if (returning.has(from)) continue
+            returning.add(from)
+            work.push(from)
+        }
+    }
+    const used = new Set<number>()
+    const passed = new Set<number>()
+    const ordered = (id: number): number => {
+        let at = id
+        while (true) {
+            const n = getNode(g, at)
+            if (n?.op !== NodeOp.rt || getRef(n, 1) || !rt.pureOps.has(getLiteral(g, n, 1))) return at
+            if (passed.has(at)) return 0
+            passed.add(at)
+            at = getRef(n, 0)
+        }
+    }
+    const walk: number[] = []
+    const enter = (p: TailPosition): void => {
+        const n = getNode(g, p.at)!
+        if (n.op !== NodeOp.ret && (n.op !== NodeOp.apply || !returning.has(getRef(n, 0)))) return
+        walk.push(p.at)
+        for (const id of p.orderings) walk.push(ordered(id))
+        for (const [select] of p.path) walk.push(getRef(getNode(g, select)!, 0))
+    }
+    for (const b of g.blocks) {
+        if (!returning.has(b.id)) continue
+        for (const p of positions.get(b.id)!) enter(p)
+    }
+    while (walk.length) {
+        const id = walk.pop()!
+        if (!id || used.has(id)) continue
+        used.add(id)
+        const n = getNode(g, id)
+        if (!n) continue
+        const first = firstNonOrderingSlot(n)
+        let i = 0
+        if (n.op === NodeOp.inlined) {
+            for (const p of tailPositions(g, getRef(n, 0))) enter(p)
+            i = 1
+        }
+        while (i < countIds(n)) {
+            walk.push(i < first ? ordered(getRef(n, i)) : getRef(n, i))
+            i++
+        }
+    }
+    return used
+}
+
+export function fuseConcats(g: Graph): void {
+    const concats = new Set<number>()
+    const adds = new Set<number>()
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op !== NodeOp.rt || getRef(n, 1)) continue
+        const op = getLiteral(g, n, 1)
+        if (op === RtOp.concat) concats.add(id)
+        if (op !== RtOp.addOrConcat) continue
+        concats.add(id)
+        adds.add(id)
+    }
+    if (!concats.size) return
+    const returned = returnedValues(g)
+    for (const c of [...concats]) {
+        if (returned.has(c)) continue
+        concats.delete(c)
+        adds.delete(c)
+    }
+    if (!concats.size) return
+    const users = nodeUsers(g, nodeIds(g))
+    const usesOf = (id: number): [number, number][] => users.get(id) ?? []
+    const paramSlot = new Map<number, [block: GraphBlock, index: number]>()
+    for (const b of g.blocks) {
+        let i = 0
+        while (i < b.params.length) {
+            paramSlot.set(b.params[i], [b, i])
+            i++
+        }
+    }
+    const targetParam = (u: number, s: number): number => {
+        const n = getNode(g, u)!
+        if (n.op !== NodeOp.apply || s === 0) return 0
+        return getBlock(g, getRef(n, 0))?.params[s - 1] ?? 0
+    }
+    const arrivals = (p: number): [number, number][] => {
+        const [b, i] = paramSlot.get(p)!
+        const out: [number, number][] = []
+        for (const [u, s] of usesOf(b.id)) {
+            if (s === 0 && getNode(g, u)!.op === NodeOp.apply && i + 1 < countIds(getNode(g, u)!)) out.push([u, i + 1])
+        }
+        return out
+    }
+    const params = new Set<number>()
+    const work: number[] = [...concats]
+    while (work.length) {
+        const v = work.pop()!
+        for (const [u, s] of usesOf(v)) {
+            const q = targetParam(u, s)
+            if (!q || params.has(q)) continue
+            params.add(q)
+            work.push(q)
+        }
+    }
+    const candidate = (id: number): boolean => concats.has(id) || params.has(id)
+    const stringy = (id: number): boolean => {
+        if (!id) return false
+        if (candidate(id)) return true
+        const n = getNode(g, id)
+        return n?.op === NodeOp.heapHandle && countIds(n) === 1 && !getRef(n, 0) && heap.isString(getLiteral(g, n, 0) as Handle)
+    }
+    const recheck = [...params, ...adds]
+    while (recheck.length) {
+        const v = recheck.pop()!
+        if (params.has(v) && arrivals(v).every(([u, s]) => stringy(getRef(getNode(g, u)!, s)))) continue
+        if (adds.has(v) && (stringy(getRef(getNode(g, v)!, 2)) || stringy(getRef(getNode(g, v)!, 3)))) continue
+        if (!params.delete(v) && !adds.delete(v)) continue
+        concats.delete(v)
+        for (const [u, s] of usesOf(v)) {
+            const q = targetParam(u, s)
+            if (q) recheck.push(q)
+            if (adds.has(u) && s >= 2) recheck.push(u)
+        }
+    }
+    const consumesState = (u: number, s: number): boolean => (concats.has(u) && s === 2) || params.has(targetParam(u, s))
+    const orderingOnly = (q: number): boolean => usesOf(q).every(([u, s]) => s < firstNonOrderingSlot(getNode(g, u)!))
+    const ignored = (u: number, s: number): boolean => {
+        if (s < firstNonOrderingSlot(getNode(g, u)!)) return true
+        const q = targetParam(u, s)
+        return !!q && !params.has(q) && orderingOnly(q)
+    }
+    const continuations = (v: number): [number, number][] => usesOf(v).filter(([u, s]) => consumesState(u, s))
+    const sole = (v: number): number => {
+        let only = 0
+        for (const [u, s] of usesOf(v)) {
+            if (ignored(u, s)) continue
+            if (only) return 0
+            only = u
+        }
+        return only
+    }
+    let chained = false
+    const sites = new Set<number>()
+    for (const c of concats) {
+        const n = getNode(g, c)!
+        const lhs = getRef(n, 2)
+        const rhs = getRef(n, 3)
+        if (candidate(lhs)) chained = true
+        if (stringy(lhs) && candidate(rhs) && sole(rhs) === c) sites.add(c)
+    }
+    if (!chained && !sites.size) return
+    const loops = graphLoops(g)
+    const regions = graphRegions(g)
+    const homeOf = (id: number): number => {
+        const param = paramSlot.get(id)
+        if (param) return param[0].id
+        const b = regions.blockOf.get(id)
+        return b === undefined || regions.shared.has(id) ? 0 : g.blocks[b].id
+    }
+    const reaches = (from: number, to: number, home: number): boolean => {
+        const seen = new Set<number>()
+        const work = [...loops.tailTargets.get(from) ?? []]
+        while (work.length) {
+            const b = work.pop()!
+            if (b === home || seen.has(b)) continue
+            if (b === to) return true
+            seen.add(b)
+            for (const t of loops.tailTargets.get(b) ?? []) work.push(t)
+        }
+        return false
+    }
+    const apart = (a: number, b: number, home: number): boolean => {
+        const at = homeOf(a)
+        const bt = homeOf(b)
+        if (at !== bt) return !reaches(at, bt, home) && !reaches(bt, at, home)
+        const ra = regions.of.get(a)
+        const rb = regions.of.get(b)
+        return ra !== undefined && rb !== undefined && !within(regions, ra, rb) && !within(regions, rb, ra)
+    }
+    const loopsOf = (b: number): number[] => loops.loopsOf.get(b) ?? []
+    const rootOf = (x: number): number => {
+        let at = x
+        while (!sites.has(at)) {
+            const lhs = getRef(getNode(g, at)!, 2)
+            if (params.has(lhs)) return 0
+            if (!concats.has(lhs)) return at
+            if (sole(lhs) !== at) return 0
+            at = lhs
+        }
+        return 0
+    }
+    const positions = new Map<number, Map<number, number>>()
+    const precedes = (b: number, x: number, y: number): boolean => {
+        let at = positions.get(b)
+        if (!at) {
+            const order = blockOrder(g, getBlock(g, b)!)
+            positions.set(b, at = new Map<number, number>())
+            let i = 0
+            while (i < order.length) {
+                at.set(order[i], i)
+                i++
+            }
+        }
+        const px = at.get(x)
+        const py = at.get(y)
+        return px !== undefined && py !== undefined && px < py
+    }
+    const rebased: [site: number, pieces: [user: number, slot: number, root: number][]][] = []
+    for (const c of sites) {
+        const n = getNode(g, c)!
+        const lhs = getRef(n, 2)
+        const end = getRef(n, 3)
+        const merge = paramSlot.get(end)?.[0].id ?? 0
+        const fixed = candidate(lhs)
+        const home = homeOf(lhs)
+        const homeLoops = loopsOf(home)
+        if (fixed && (!home || home === merge || sites.has(lhs))) continue
+        if (merge && homeOf(c) !== merge) continue
+        if (fixed && loopsOf(homeOf(c)).some(h => !homeLoops.includes(h))) continue
+        const region = paramSlot.has(lhs) ? regions.roots[regions.paramBlock.get(lhs)!] : regions.of.get(lhs) ?? -1
+        const pieces: [number, number, number][] = []
+        let ok = true
+        for (const [u, s] of merge ? arrivals(end) : [[c, 3] as [number, number]]) {
+            const piece = getRef(getNode(g, u)!, s)
+            let root = 0
+            if (candidate(piece)) {
+                const feeds = !merge || usesOf(piece).every(([w, k]) => ignored(w, k) || targetParam(w, k) === end)
+                root = feeds && concats.has(piece) ? rootOf(piece) : 0
+                if (!root) ok = false
+            }
+            const at = homeOf(root || u)
+            if (fixed && (!at || loopsOf(at).some(h => !homeLoops.includes(h)))) ok = false
+            if (fixed && root && ((at === home && !paramSlot.has(lhs) && !precedes(home, lhs, root)) || !within(regions, regions.of.get(root) ?? -1, region))) ok = false
+            pieces.push([u, s, root])
+        }
+        if (ok) rebased.push([c, pieces])
+    }
+    if (rebased.length) {
+        const edits = new Map<number, Operand[]>()
+        const operandsOf = (u: number): Operand[] => {
+            let ops = edits.get(u)
+            if (!ops) edits.set(u, ops = getOperands(g, getNode(g, u)!))
+            return ops
+        }
+        for (const [c, pieces] of rebased) {
+            const ops = getOperands(g, getNode(g, c)!)
+            for (const [u, s, root] of pieces) {
+                if (!root) {
+                    operandsOf(u)[s] = addNode(g, NodeOp.rt, [addNode(g, NodeOp.void, []), { literal: RtOp.concat }, ops[2], getOperands(g, getNode(g, u)!)[s]])
+                    continue
+                }
+                const at = getOperands(g, getNode(g, root)!)
+                const prefix = getNode(g, getRef(getNode(g, root)!, 2))
+                const empty = prefix?.op === NodeOp.heapHandle && countIds(prefix) === 1 && !getRef(prefix, 0) && getLiteral(g, prefix, 0) === heap.emptyStringHandle
+                operandsOf(root)[2] = empty ? ops[2] : addNode(g, NodeOp.rt, [at[0], { literal: RtOp.concat }, ops[2], at[2]])
+            }
+            for (const [u, s] of usesOf(c)) operandsOf(u)[s] = s < firstNonOrderingSlot(getNode(g, u)!) ? ops[0] : ops[3]
+        }
+        for (const [u, ops] of edits) putCopy(g, u, getNode(g, u)!, ops)
+        for (const [c] of rebased) deleteNode(g, c)
+        dirtyIndex(g)
+        fuseConcats(g)
+        return
+    }
+    if (!chained) return
+    const forked = new Set<number>()
+    for (const v of [...concats, ...params]) {
+        const uses = continuations(v)
+        if (!uses.length) continue
+        const home = homeOf(v)
+        const homeLoops = loopsOf(home)
+        let linear = home !== 0
+        for (const [u] of uses) {
+            const at = homeOf(u)
+            if (!at || loopsOf(at).some(h => !homeLoops.includes(h))) linear = false
+        }
+        let i = 0
+        while (linear && i < uses.length) {
+            let k = i + 1
+            while (linear && k < uses.length) {
+                if (!apart(uses[i][0], uses[k][0], home)) linear = false
+                k++
+            }
+            i++
+        }
+        if (!linear) forked.add(v)
+    }
+    const consumer = (u: number, s: number): number => concats.has(u) ? u : targetParam(u, s)
+    const parent = new Map<number, number>()
+    const root = (v: number): number => {
+        let at = v
+        while (parent.has(at)) at = parent.get(at)!
+        return at
+    }
+    const stateFed = new Set<number>()
+    for (const v of [...concats, ...params]) {
+        if (forked.has(v)) continue
+        for (const [u, s] of continuations(v)) {
+            const a = root(v)
+            const b = root(consumer(u, s))
+            if (a !== b) parent.set(a, b)
+        }
+    }
+    const feeding: number[] = [...concats].filter(c => !forked.has(c))
+    while (feeding.length) {
+        const v = feeding.pop()!
+        for (const [u, s] of continuations(v)) {
+            const q = targetParam(u, s)
+            if (!q || stateFed.has(q)) continue
+            stateFed.add(q)
+            if (!forked.has(q)) feeding.push(q)
+        }
+    }
+    const empty = (id: number): boolean => {
+        const n = getNode(g, id)
+        return n?.op === NodeOp.heapHandle && countIds(n) === 1 && !getRef(n, 0) && getLiteral(g, n, 0) === heap.emptyStringHandle
+    }
+    const counted = new Map<number, number>()
+    const piecesOf = (v: number): number => {
+        if (!candidate(v)) return empty(v) ? 0 : 1
+        let total = counted.get(v)
+        if (total !== undefined) return total
+        counted.set(v, Infinity)
+        if (params.has(v)) {
+            total = Infinity
+            if (!loops.loopMembers.has(paramSlot.get(v)![0].id)) for (const [u, s] of arrivals(v)) total = Math.min(total, piecesOf(getRef(getNode(g, u)!, s)))
+        } else {
+            const n = getNode(g, v)!
+            total = piecesOf(getRef(n, 2)) + (empty(getRef(n, 3)) ? 0 : 1)
+        }
+        counted.set(v, total)
+        return total
+    }
+    const worth = new Set<number>()
+    for (const c of concats) {
+        const lhs = getRef(getNode(g, c)!, 2)
+        if (candidate(lhs) && !forked.has(lhs) && (concats.has(lhs) || stateFed.has(lhs)) && piecesOf(c) >= 3) worth.add(root(c))
+    }
+    if (!worth.size) return
+    const fused = new Set<number>([...concats, ...params].filter(v => worth.has(root(v))))
+    const linked = (v: number): boolean => fused.has(v) && !forked.has(v)
+    const edits = new Map<number, Operand[]>()
+    const operandsOf = (u: number): Operand[] => {
+        let ops = edits.get(u)
+        if (!ops) edits.set(u, ops = getOperands(g, getNode(g, u)!))
+        return ops
+    }
+    const finishes = new Map<number, number>()
+    const finish = (v: number): number => {
+        let f = finishes.get(v)
+        if (!f) finishes.set(v, f = addNode(g, NodeOp.rt, [concats.has(v) ? v : addNode(g, NodeOp.void, []), { literal: RtOp.textFinish }, v]))
+        return f
+    }
+    const seed = (x: Operand): number => addNode(g, NodeOp.rt, [addNode(g, NodeOp.void, []), { literal: RtOp.handleof }, x])
+    const stateOf = (v: number): Operand => linked(v) ? v : seed(fused.has(v) ? finish(v) : v)
+    for (const c of concats) {
+        if (!fused.has(c)) continue
+        const ops = operandsOf(c)
+        ops[1] = { literal: RtOp.textAppend }
+        const order = typeof ops[0] === 'number' ? getNode(g, ops[0]) : undefined
+        if (order?.op === NodeOp.void && homeOf(c)) ops[0] = addNode(g, NodeOp.startOf, [homeOf(c)])
+        const lhs = getRef(getNode(g, c)!, 2)
+        if (stringy(lhs)) ops[2] = stateOf(lhs)
+        else {
+            const first = addNode(g, NodeOp.rt, [ops[0], { literal: RtOp.textAppend }, seed(addNode(g, NodeOp.heapHandle, [{ literal: heap.emptyStringHandle }])), ops[2]])
+            ops[0] = first
+            ops[2] = first
+        }
+        const rhs = getRef(getNode(g, c)!, 3)
+        if (fused.has(rhs)) ops[3] = finish(rhs)
+    }
+    for (const p of params) {
+        if (!fused.has(p)) continue
+        for (const [u, s] of arrivals(p)) operandsOf(u)[s] = stateOf(getRef(getNode(g, u)!, s))
+    }
+    for (const v of fused) {
+        for (const [u, s] of usesOf(v)) {
+            if (ignored(u, s)) continue
+            if (fused.has(u) && (s === 2 || s === 3)) continue
+            if (fused.has(targetParam(u, s))) continue
+            operandsOf(u)[s] = finish(v)
+        }
+    }
+    for (const [u, ops] of edits) putCopy(g, u, getNode(g, u)!, ops)
+    dirtyIndex(g)
 }
