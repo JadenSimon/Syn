@@ -3580,6 +3580,72 @@ function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Grap
     return expected
 }
 
+const ledgerFile = intrinsics.argv().find(a => a.startsWith('work-ledger:'))?.slice('work-ledger:'.length)
+const ledgerEvents: any[] = []
+const ledgerPlanned = new Map<PlannedUnit, number>()
+const ledgerLowered = new Map<number, [prepare: number, lower: number]>()
+
+function ledgerKey(graph: Graph): string {
+    return hostCrypto.createHash('sha1').update(JSON.stringify([graph.form ?? '', ...unitKey(graph)])).digest('hex').slice(0, 16)
+}
+
+function ledgerCaller(): string {
+    (Error as any).stackTraceLimit = 40
+    const lines = String(new Error().stack).split('\n')
+    const names: string[] = []
+    for (const line of lines.slice(1)) {
+        const m = /^\s*at (?:async )?([^\s(]+)/.exec(line)
+        if (!m) continue
+        const name = m[1].replace(/^Object\./, '')
+        if (name === 'ledgerCaller' || name === 'ledgerWork' || name === 'timed' || name === 'optimizeOnce' || name === 'normalizeGraph' || name === 'hostNormalize' || name.startsWith('<anon')) continue
+        names.push(name)
+        if (name === 'createNatives' || names.length >= 7) break
+    }
+    return names.join('<')
+}
+
+function ledgerWork(graph: Graph, kind: string, run: () => Graph): Graph {
+    if (!ledgerFile) return run()
+    const caller = ledgerCaller()
+    const nodesIn = countNodes(graph)
+    const keyIn = ledgerKey(graph)
+    const unitIn = graph.unit
+    const start = performance.now()
+    const out = run()
+    const ms = performance.now() - start
+    const refs = new Set<number>()
+    for (const n of allNodes(out)) {
+        const local = localSymbol(out, n)
+        if (local !== undefined) refs.add(local)
+    }
+    ledgerEvents.push({ k: 'w', kind, caller, unit: out.unit ?? unitIn, out: out.unit === undefined ? out : undefined, name: out.name ?? graph.name, nodesIn, nodesOut: countNodes(out), ms, keyIn, keyOut: ledgerKey(out), refs: [...refs] })
+    return out
+}
+
+function ledgerSplice(into: number, from: number): void {
+    if (ledgerFile) ledgerEvents.push({ k: 's', into, from, caller: ledgerCaller() })
+}
+
+function ledgerDrop(unit: number, why: string, into?: number): void {
+    if (ledgerFile) ledgerEvents.push({ k: 'd', unit, why, into })
+}
+
+function writeLedger(emitted: NativeUnit[]): void {
+    if (!ledgerFile) return
+    const lines: string[] = []
+    for (const e of ledgerEvents) {
+        if (e.out) {
+            e.unit = e.out.unit
+            e.out = undefined
+        }
+        lines.push(JSON.stringify(e))
+    }
+    lines.push(JSON.stringify({ k: 'e', units: emitted.map(u => u.symbol), lowered: [...ledgerLowered] }))
+    hostFs.writeFileSync(ledgerFile, lines.join('\n') + '\n')
+    ledgerEvents.length = 0
+    ledgerLowered.clear()
+}
+
 function createClock(target: Target): PhaseClock {
     const start = performance.now()
     const phases: Record<string, number> = { link: 0, bytecode: 0, typer: 0, cuts: 0, trace: 0, analysis: 0, plan: 0, resolve: 0, normalize: 0, inline: 0, effects: 0, records: 0, lower: 0, statics: 0, other: 0, prepareLower: 0, initializations: 0, lifetime: 0, drops: 0 }
@@ -3610,13 +3676,13 @@ function createClock(target: Target): PhaseClock {
         verifyDistinctNodes(graph, 'normalize:input')
         recordSnapshots(graph)
         const kind = opts?.firstPass ? NormalizeKind.first : NormalizeKind.again
-        if (!opts?.firstPass || target !== hostTarget) return timed('normalize', () => normalizeGraph(graph, kind, target), graph.name)
-        return timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeGraph(graph, kind, target)), graph.name)
+        if (!opts?.firstPass || target !== hostTarget) return ledgerWork(graph, opts?.firstPass ? 'first' : 'again', () => timed('normalize', () => normalizeGraph(graph, kind, target), graph.name))
+        return ledgerWork(graph, 'first', () => timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeGraph(graph, kind, target)), graph.name))
     }
     function optimize(graph: Graph): Graph {
-        return timed('normalize', () => target === hostTarget
+        return ledgerWork(graph, 'optimize', () => timed('normalize', () => target === hostTarget
             ? optimizeOnce(graph, 'optimized', () => normalizeGraph(graph, NormalizeKind.optimize, target))
-            : normalizeGraph(graph, NormalizeKind.optimize, target), graph.name)
+            : normalizeGraph(graph, NormalizeKind.optimize, target), graph.name))
     }
     return { start, phases, enterPhase, timed, normalize, optimize }
 }
@@ -4171,6 +4237,7 @@ function specializeUnit(program: ProgramGraph, symbol: number, calls: [caller: n
     const specialized = program.binder.intern(program.binder.derive(source, `${source.name || 'anon'}#s`))
     const graph = snapshotGraph(program.units.get(symbol)!)
     graph.unit = specialized
+    ledgerSplice(specialized, symbol)
     program.units.set(specialized, graph)
     if (program.discardable?.has(symbol)) program.discardable.add(specialized)
     program.abi.set(specialized, program.abi.get(symbol) ?? [])
@@ -4246,6 +4313,7 @@ export function hoistParamLoads(program: ProgramGraph, request: LoadParamsReques
 }
 
 function touchUnit(program: ProgramGraph, touched: Set<number>, symbol: number): void {
+    if (ledgerFile) ledgerEvents.push({ k: 't', unit: symbol, caller: ledgerCaller() })
     touched.add(symbol)
 }
 
@@ -5422,6 +5490,7 @@ function inlineSites(program: ProgramGraph, symbol: number, sites: Iterable<numb
         const callee = knownCallee(source, getNode(source, id)!)
         if (callee === undefined || !program.units.has(callee) || callee === symbol || program.noInline.has(callee) || !accept(id, callee)) continue
         graph ??= snapshotGraph(source)
+        ledgerSplice(symbol, callee)
         splice(graph, id, program.units.get(callee)!)
     }
     return graph
@@ -5530,7 +5599,7 @@ function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Tar
         recordSnapshots(graph)
         anchorBlockNils(graph)
         graph.form = undefined
-        graph = packageValueGraph(graph, target, entries)
+        graph = ledgerWork(graph, 'package', () => packageValueGraph(graph, target, entries))
         if (typeRecording()) scopeTypeNotes(graph)
         resolveNumberTypes(graph)
         return isJumbo(graph) ? graph : clock.optimize(graph)
@@ -5538,9 +5607,12 @@ function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Tar
 }
 
 function renormalize(graph: Graph, clock: PhaseClock): Graph {
+    const before = ledgerFile ? ledgerKey(graph) : undefined
     anchorBlockNils(graph)
     graph.form = undefined
-    return clock.normalize(graph)
+    const out = clock.normalize(graph)
+    if (before !== undefined) ledgerEvents[ledgerEvents.length - 1].keyPre = before
+    return out
 }
 
 function anchorBlockNils(graph: Graph): void {
@@ -5677,9 +5749,13 @@ function inlineSpecialized(program: ProgramGraph, touched: Set<number>, clock: P
     }
 }
 
-function prune(program: ProgramGraph): void {
-    const reached = reachUnits(program)
-    for (const symbol of program.units.keys()) if (!reached.has(symbol)) program.units.delete(symbol)
+function prune(program: ProgramGraph, visit?: (symbol: number) => void): void {
+    const reached = reachUnits(program, visit)
+    for (const symbol of program.units.keys()) {
+        if (reached.has(symbol)) continue
+        ledgerDrop(symbol, 'prune')
+        program.units.delete(symbol)
+    }
 }
 
 function refineProgramEffects(program: ProgramGraph, refined: Set<number>): void {
@@ -5712,7 +5788,7 @@ function refineProgramEffects(program: ProgramGraph, refined: Set<number>): void
     }
 }
 
-function reachUnits(program: ProgramGraph): Set<number> {
+function reachUnits(program: ProgramGraph, visit?: (symbol: number) => void): Set<number> {
     const reached = new Set<number>()
     const reaching = [...program.roots.values()]
     let indirect = false
@@ -5720,6 +5796,7 @@ function reachUnits(program: ProgramGraph): Set<number> {
         const symbol = reaching.pop()!
         if (reached.has(symbol)) continue
         reached.add(symbol)
+        if (visit) visit(symbol)
         const graph = program.units.get(symbol)!
         const seen = new Set<number>()
         const stack = graph.blocks.map(b => b.bodyId)
@@ -6528,7 +6605,10 @@ function programCallees(program: ProgramGraph): Map<number, number[]> {
 
 function mergeProgram(program: ProgramGraph): number {
     const aliases = mergeIdenticalUnits(program, [...program.units.keys()], programCallees(program))
-    for (const symbol of aliases.keys()) program.units.delete(symbol)
+    for (const [symbol, into] of aliases) {
+        ledgerDrop(symbol, 'merge', into)
+        program.units.delete(symbol)
+    }
     return aliases.size
 }
 
@@ -6544,9 +6624,10 @@ function passBoundary(program: ProgramGraph, pass: string): void {
 }
 
 function reoptimizeUnits(program: ProgramGraph, refined: Set<number>, clock: PhaseClock): void {
-    for (const [symbol, graph] of program.units) {
+    reachUnits(program, symbol => {
+        const graph = program.units.get(symbol)!
         if (graph.form === 'packaged' || refined.has(symbol)) program.units.set(symbol, clock.optimize(graph))
-    }
+    })
 }
 
 function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
@@ -6579,7 +6660,9 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
         step('specializeLiteralArgs', specializeLiteralArgs, touched)
         step('pruneDeadArgs', pruneDeadArgs, touched)
         verifySignatures('records', program.signatureRewrites, (symbol, position) => signaturePlanned(program, symbol, position), (symbol, position) => plannedWrites(program, symbol, position), SignatureFields, program.target.retRegs.length, symbol => program.units.get(symbol)?.name || `symbol ${symbol}`, signatureSlot)
-        for (const symbol of touched) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+        prune(program, symbol => {
+            if (touched.has(symbol)) program.units.set(symbol, renormalize(program.units.get(symbol)!, clock))
+        })
         const specialized = new Set(touched)
         touched.clear()
         const logged = program.signatureRewrites.length
@@ -6628,7 +6711,11 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const prepared = new Map<number, PreparedUnit>()
     const grows = new Map<number, number>()
     for (const scc of order) {
-        for (const symbol of scc) prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol), callee => grows.get(callee)), program.units.get(symbol)!.name))
+        for (const symbol of scc) {
+            const start = performance.now()
+            prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol), callee => grows.get(callee)), program.units.get(symbol)!.name))
+            if (ledgerFile) ledgerLowered.set(symbol, [performance.now() - start, 0])
+        }
         const members = new Set(scc)
         let shared = 0
         for (const symbol of scc) {
@@ -6652,7 +6739,10 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const lowered = new Map<number, NativeUnit>()
     function lower(symbol: number, continues?: (symbol: number) => boolean): NativeUnit {
         const unit = prepared.get(symbol)!
-        return clock.timed('lower', () => lowerUnit(program, symbol, unit, callee => clobbers.get(callee), continues, callee => endless.has(callee)), unit.name)
+        const start = performance.now()
+        const code = clock.timed('lower', () => lowerUnit(program, symbol, unit, callee => clobbers.get(callee), continues, callee => endless.has(callee)), unit.name)
+        if (ledgerFile) ledgerLowered.get(symbol)![1] += performance.now() - start
+        return code
     }
     function lowerContinuations(unit: NativeUnit): void {
         for (const [callee, homes] of unit.code.continued ?? []) {
@@ -7708,7 +7798,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     function companionReads(graph: Graph): void {
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op !== NodeOp.getProp || !getRef(n, 2)) continue
-            const object = getNode(graph, strippedAfter(graph, getRef(n, 1)))
+            const object = getNode(graph, tailOf(graph, getRef(n, 1)))
             if (object?.op !== NodeOp.heapHandle || getRef(object, 0)) continue
             const companion = companionOf(heap.deref(getLiteral(graph, object, 0) as intrinsics.Handle))
             if (companion === undefined) continue
@@ -7724,7 +7814,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         }
     }
     function freshCellOf(traced: FastTraced, ref: number): u32 | undefined {
-        const n = getNode(traced.graph, strippedAfter(traced.graph, ref))
+        const n = getNode(traced.graph, tailOf(traced.graph, ref))
         if (n?.op !== NodeOp.heapHandle || getRef(n, 0)) return
         const cell = getLiteral(traced.graph, n, 0) as u32
         return traced.allocations.has(cell) ? cell : undefined
@@ -7779,7 +7869,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
                 if (!keys.includes(key)) keys.push(key)
                 return true
             }
-            const source = n.op === NodeOp.rt ? getNode(graph, strippedAfter(graph, getRef(n, 3))) : undefined
+            const source = n.op === NodeOp.rt ? getNode(graph, tailOf(graph, getRef(n, 3))) : undefined
             if (source?.op !== NodeOp.heapHandle || getRef(source, 0)) return false
             const copied = keysAt(traced, shapes, getLiteral(graph, source, 0) as u32, getRef(n, 0))
             if (!copied) return false
@@ -7827,11 +7917,11 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         }
         for (const id of regions) if (!arrived.has(id)) arrive(0, getRef(getNode(graph, id)!, 0))
         function own(object: number): boolean {
-            const target = getNode(graph, strippedAfter(graph, object))
+            const target = getNode(graph, tailOf(graph, object))
             return target?.op === NodeOp.heapHandle && !getRef(target, 0) && getLiteral(graph, target, 0) === cell
         }
         function fresh(object: number): boolean {
-            const target = getNode(graph, strippedAfter(graph, object))
+            const target = getNode(graph, tailOf(graph, object))
             return target?.op === NodeOp.heapHandle && !getRef(target, 0) && traced.allocations.has(getLiteral(graph, target, 0) as u32)
         }
         function sameKey(n: GraphNode, slot: number): number {
@@ -7937,11 +8027,11 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         let prototyped: Set<number> | undefined
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.hasProperty) continue
-            const target = getNode(graph, strippedAfter(graph, getRef(n, 2)))
+            const target = getNode(graph, tailOf(graph, getRef(n, 2)))
             if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) continue
             const cell = getLiteral(graph, target, 0) as u32
             if (!traced.allocations.has(cell)) continue
-            const keyNode = getRef(n, 3) ? getNode(graph, strippedAfter(graph, getRef(n, 3))) : undefined
+            const keyNode = getRef(n, 3) ? getNode(graph, tailOf(graph, getRef(n, 3))) : undefined
             if (getRef(n, 3) && (keyNode?.op !== NodeOp.heapHandle || getRef(keyNode, 0))) continue
             const handle = keyNode ? getLiteral(graph, keyNode, 0) as intrinsics.Handle : heap.indexKey(getLiteral(graph, n, 3))
             const key = heap.isBoxedF64(handle) ? heap.indexKey(heap.unboxF64(handle)) : handle
@@ -7952,7 +8042,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
                     prototyped = new Set()
                     for (const m of allNodes(graph)) {
                         if (m.op !== NodeOp.rt || getLiteral(graph, m, 1) !== rt.Op.setPrototypeOf) continue
-                        const object = getNode(graph, strippedAfter(graph, getRef(m, 2)))
+                        const object = getNode(graph, tailOf(graph, getRef(m, 2)))
                         prototyped.add(object?.op === NodeOp.heapHandle && !getRef(object, 0) ? getLiteral(graph, object, 0) : 0)
                     }
                 }
@@ -7979,7 +8069,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     }
     function onlyIterated(graph: Graph, array: number): boolean {
         const aliases = new Set([array])
-        for (const [id, n] of nodeEntries(graph)) if (n.op === NodeOp.after && aliases.has(strippedAfter(graph, id))) aliases.add(id)
+        for (const [id, n] of nodeEntries(graph)) if (n.op === NodeOp.after && aliases.has(tailOf(graph, id))) aliases.add(id)
         const iterator = heap.fromJsSymbol(Symbol.iterator)
         const props = new Set<number>()
         for (const [id, n] of nodeEntries(graph)) {
@@ -7989,7 +8079,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             for (let i = 1; i < countIds(n); i++) {
                 if (!aliases.has(getRef(n, i)) || n.op === NodeOp.after) continue
                 if (props.has(id) && i === 1) continue
-                if (n.op === NodeOp.call && i === 2 && props.has(strippedAfter(graph, getRef(n, 1)))) continue
+                if (n.op === NodeOp.call && i === 2 && props.has(tailOf(graph, getRef(n, 1)))) continue
                 return false
             }
         }
@@ -8000,7 +8090,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         const shapes = freshShapes(traced)
         for (const [id, n] of nodeEntries(graph)) {
             if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.ownKeys) continue
-            const target = getNode(graph, strippedAfter(graph, getRef(n, 2)))
+            const target = getNode(graph, tailOf(graph, getRef(n, 2)))
             if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) continue
             const keys = keysAt(traced, shapes, getLiteral(graph, target, 0) as u32, getRef(n, 0))
             if (keys === undefined) throw `native: ${graph.name} enumerates an allocation whose keys are not statically known`
@@ -8542,14 +8632,6 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     function runtimeObjects() {
         return session.runtime!.objects
     }
-    function strippedAfter(graph: Graph, id: number): number {
-        let n = getNode(graph, id)
-        while (n?.op === NodeOp.after) {
-            id = getRef(n, countIds(n) - 1)
-            n = getNode(graph, id)
-        }
-        return id
-    }
     function dataSlot(object: intrinsics.Handle, key: intrinsics.Handle): intrinsics.Handle | undefined {
         for (let at = object; at; at = heap.getPrototypeOf(at)) {
             if (heap.isProxy(at) || heap.getPropertyProxy(at, key)) return
@@ -8581,7 +8663,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     function staticRead(traced: Traced, n: GraphNode): intrinsics.Handle | undefined {
         if (n.op !== NodeOp.getProp || getRef(n, 2)) return
         const graph = traced.graph
-        const target = getNode(graph, strippedAfter(graph, getRef(n, 1)))
+        const target = getNode(graph, tailOf(graph, getRef(n, 1)))
         if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) return
         const cell = getLiteral(graph, target, 0) as intrinsics.Handle
         if (!cell || heap.isNullishHandle(cell) || heap.isBoxedF64(cell) || heap.isString(cell) || traced.frames.has(cell as u32) || session.templateOf(cell) || traced.allocations?.has(cell as u32) || session.sealed.has(cell)) return
@@ -8773,8 +8855,8 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         for (const id of nodeIds(graph)) {
             const linked = getNode(graph, id)
             if (linked?.op !== NodeOp.rt || getLiteral(graph, linked, 1) !== rt.Op.setPrototypeOf) continue
-            const object = getNode(graph, strippedAfter(graph, getRef(linked, 2)))
-            const proto = getNode(graph, strippedAfter(graph, getRef(linked, 3)))
+            const object = getNode(graph, tailOf(graph, getRef(linked, 2)))
+            const proto = getNode(graph, tailOf(graph, getRef(linked, 3)))
             if (object?.op !== NodeOp.heapHandle || getRef(object, 0) || proto?.op !== NodeOp.heapHandle || getRef(proto, 0)) continue
             const cell = getLiteral(graph, object, 0) as intrinsics.Handle
             if (!traced.allocations.has(cell as u32)) continue
@@ -8868,7 +8950,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     }
     const spliceables = new Map<Function, Spliceable>()
     function taggedCallee(graph: Graph, n: GraphNode): Function | undefined {
-        const target = getNode(graph, strippedAfter(graph, getRef(n, 1)))
+        const target = getNode(graph, tailOf(graph, getRef(n, 1)))
         if (!target || getRef(target, 0)) return
         let linked: any
         if (target.op === NodeOp.localTarget) linked = functions[getLiteral(graph, target, 0)]
@@ -8946,7 +9028,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     ])
     function constantHandle(graph: Graph, n: GraphNode, slot: number): intrinsics.Handle | undefined {
         if (!getRef(n, slot)) return session.fromJsValue(getLiteral(graph, n, slot)) as intrinsics.Handle
-        const value = getNode(graph, strippedAfter(graph, getRef(n, slot)))
+        const value = getNode(graph, tailOf(graph, getRef(n, slot)))
         if (value?.op === NodeOp.heapHandle && !getRef(value, 0)) return getLiteral(graph, value, 0) as intrinsics.Handle
     }
     function foldRuntime(graph: Graph, n: GraphNode): GraphNode | undefined {
@@ -9202,7 +9284,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             const n = getNode(graph, id)
             if (!n) continue
             if (n.op === NodeOp.ret) {
-                const value = strippedAfter(graph, getRef(n, 1))
+                const value = tailOf(graph, getRef(n, 1))
                 const target = getNode(graph, value)
                 if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) return
                 leaves.push({ ret: id, value, cell: getLiteral(graph, target, 0) })
@@ -9286,7 +9368,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         return state.traced!.graph
     }
     binder.traceWith(traceUnit)
-    return { tracedOf, stateOf, lowerPanics, engineElements, heapValue, companions, checkInlinedReads, foldStatics, fixedSlot, strippedAfter, reachableNodes }
+    return { tracedOf, stateOf, lowerPanics, engineElements, heapValue, companions, checkInlinedReads, foldStatics, fixedSlot, reachableNodes }
 }
 
 type Tracer = ReturnType<typeof createTracer>
@@ -14135,7 +14217,20 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
             program.unplanned.add(unit.symbol!)
             return trapStub(session.runtime!, fn.name, sourceOfLinked(fn)!.compiled.paramCount, constructsOutOfLine(fn) || usesReceiver(fn))
         }
+        const resolveStart = performance.now()
         const graph = realizeUnit(fn)
+        if (ledgerFile) {
+            ledgerEvents.push({ k: 'r', unit: unit.symbol, name: fn.name, ms: performance.now() - resolveStart, nodes: countNodes(graph) })
+            const p = plannedUnit(fn) ?? { nodes: new Map(), calls: new Map(), fn, instances: [], slices: new Map(), codecs: new Map(), params: [], returns: undefined, allocations: new Map() } as any
+            const idOf = (x: PlannedUnit) => {
+                let id = ledgerPlanned.get(x)
+                if (id === undefined) ledgerPlanned.set(x, id = ledgerPlanned.size)
+                return id
+            }
+            const nodes = [...p.nodes].sort((a, b) => a[0] - b[0]).map(([id, r]) => `${id}=${repText(r)}`).join(' ')
+            const calls = [...p.calls].sort((a, b) => a[0] - b[0]).map(([id, set]) => `${id}->${[...set].map(idOf).join('|')}`).join(' ')
+            ledgerEvents.push({ k: 'p', unit: unit.symbol, pid: idOf(p), origin: p.fn.name, sig: unitSignatureText(p), nodes: textHash(nodes), calls, instances: p.instances.length, slices: textHash([...p.slices].map(([id, r]) => `${id}=${repText(r)}`).join(' ')), codecs: textHash(JSON.stringify([...p.codecs])) })
+        }
         if (flags.has(`resolved-debug:${fn.name}`)) console.log(dumpGraph(graph))
         if (indexCheck) verifyKinds(graph, 'realizeUnit')
         graph.name = fn.name
@@ -14907,6 +15002,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const merged = optimizeProgram(program, clock)
     if (lineageBefore) for (const [symbol, graph] of program.units) if (lineageBefore.has(symbol)) traceLineage(graph, lineageBefore.get(symbol)!)
     const emitted = timed('lower', () => lowerProgram(program, clock))
+    writeLedger(emitted)
     const cutting = pendingCuts
     pendingCuts = undefined
     if (cutting) timed('cuts', cutting)
