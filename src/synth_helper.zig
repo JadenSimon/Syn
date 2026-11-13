@@ -77,7 +77,8 @@ pub const SynthInstrumenter = struct {
     frames: std.ArrayListUnmanaged(Frame) = .{},
     class_or_obj_decl: NodeRef = 0,
     class_decl_static_block: NodeRef = 0,
-    tmp_binding: NodeRef = 0, // we use 1 (as a var) for the whole file, mostly to deal with sugar
+    tmp_binding: NodeRef = 0, // we use 1 (as a var) per variable scope, mostly to deal with sugar
+    tmp_scope: NodeRef = 0,
 
     assigned: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
     escapes: std.AutoArrayHashMapUnmanaged(SymbolRef, void) = .{},
@@ -123,11 +124,7 @@ pub const SynthInstrumenter = struct {
         if (v.needs_computation_symbol) prefix.appendRef(try v.createComputationSymbolPolyfill());
         if (v.needs_computation_helper) prefix.appendRef(try v.createComputationHelper());
         for (v.computation_meta.items) |stmt| prefix.appendRef(stmt);
-        if (v.tmp_binding != 0) {
-            const stmt = try v.factory.createLetVariable(v.tmp_binding, 0);
-            ast.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
-            prefix.appendRef(stmt);
-        }
+        if (v.tmp_binding != 0) prefix.appendRef(try v.createTmpDeclaration());
         if (prefix.head != 0) try v.prependStatements(prefix.head, prefix.prev);
 
         var opts: parser.PrinterOptions = printer_opt orelse .{
@@ -703,6 +700,25 @@ pub const SynthInstrumenter = struct {
         return ident;
     }
 
+    fn createTmpDeclaration(self: *@This()) !NodeRef {
+        const stmt = try self.factory.createLetVariable(self.tmp_binding, 0);
+        self.nodes.at(stmt).flags &= ~@intFromEnum(parser.NodeFlags.let); // var
+        return stmt;
+    }
+
+    fn visitTmpScope(self: *@This(), node: *const AstNode, ref: NodeRef) !NodeRef {
+        const save_tmp_binding = self.tmp_binding;
+        defer self.tmp_binding = save_tmp_binding;
+        self.tmp_binding = 0;
+        if (node.kind == .class_static_block_declaration) {
+            try self.visitChildren(node);
+        } else {
+            try self.visit(node, ref);
+        }
+        if (self.tmp_binding == 0) return 0;
+        return try self.createTmpDeclaration();
+    }
+
     fn getClassLikeTarget(self: *@This()) !NodeRef {
         std.debug.assert(self.class_or_obj_decl != 0);
         const n = self.nodes.at(self.class_or_obj_decl);
@@ -756,6 +772,9 @@ pub const SynthInstrumenter = struct {
             const save_rebindings = self.rebindings;
             defer self.rebindings = save_rebindings;
             self.rebindings = .{};
+            const save_tmp_scope = self.tmp_scope;
+            defer self.tmp_scope = save_tmp_scope;
+            self.tmp_scope = funcBodyRef(node);
             try self.visitChildren(node);
             try self.drainRebindings(funcBodyRef(node), 0);
             if (!self.instrumented.contains(ref)) return;
@@ -885,7 +904,7 @@ pub const SynthInstrumenter = struct {
                 }
                 self.nodes.at(t).next = self.nodes.at(ref).next;
             },
-            .block => {
+            .block, .class_static_block_declaration => {
                 const first = maybeUnwrapRef(self.nodes.at(ref)) orelse 0;
                 var head: NodeRef = 0;
                 var tail: NodeRef = 0;
@@ -1115,6 +1134,13 @@ pub const SynthInstrumenter = struct {
 
         if (!self.transforming) try self.collectEscapes(node, ref);
 
+        if (self.transforming and ref == self.tmp_scope) {
+            self.tmp_scope = 0;
+            const decl = try self.visitTmpScope(node, ref);
+            if (decl != 0) try self.rebindings.append(self.alloc, decl);
+            return;
+        }
+
         switch (node.kind) {
             .function_declaration,
             .function_expression,
@@ -1226,6 +1252,15 @@ pub const SynthInstrumenter = struct {
 
             .object_literal_expression,
             .class_declaration, .class_expression => try self.visitClassLike(node, ref),
+
+            .class_static_block_declaration => {
+                if (!self.transforming) return try self.visitChildren(node);
+                const decl = try self.visitTmpScope(node, ref);
+                if (decl == 0) return;
+                const start = self.rebindings.items.len;
+                try self.rebindings.append(self.alloc, decl);
+                try self.drainRebindings(ref, start);
+            },
 
             else => try self.visitChildren(node),
         }
