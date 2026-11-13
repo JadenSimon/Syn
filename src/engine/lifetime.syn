@@ -2,25 +2,75 @@
 
 import * as rt from './rt'
 import { expectForm, type Graph } from './lowering2'
-import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, NodeOp, nodeEntries, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
-import { constructorOf, FieldForm, listOf, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Type, type ValueTypes } from './value-types'
+import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, NodeOp, nodeEntries, opName, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
+import { AllocKind, constructorOf, FieldForm, listOf, mapOf, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Site, type Type, type ValueTypes } from './value-types'
 
 export interface LocalEnd {
     unit: Function
     value: number
     exits: [block: number, tail: number][]
+    objects: number[]
 }
 
 export interface FieldEnd {
     unit: Function
     write: number
+    objects: number[]
+}
+
+export interface Contained {
+    object: number
+    holder: number
+    key: number
+}
+
+export interface OwnedField {
+    key: number
+    inner: OwnedField[] | undefined
+}
+
+export interface HolderDrop {
+    unit: Function
+    value: number
+    exits: [block: number, tail: number][]
+    fields: OwnedField[]
+}
+
+export interface LifeBlock {
+    why: string
+    unit: Function
+    node: number
+    reached: boolean
+    objects?: number[]
+    alive?: number[]
+    via?: [location: Location, from: number][]
+    culprit?: number
+    at?: [unit: Function, node: number]
+    orderings?: number[]
+}
+
+export interface LifeReport {
+    blocks: LifeBlock[]
+    explain: (unit: Function, source: number, object: number) => LifeBlock | undefined
+    held: (unit: Function, node: number) => number[] | undefined
+    holders: Map<number, Location[]>
+    returnedBy: Map<number, number[]>
+    instancesOf: Map<Function, number[]>
+    reachers: (unit: Function) => Set<Function>
+    container: (object: number) => LifeBlock
+    standing: (object: number) => string | undefined
+    reached: (unit: Function, node: number) => boolean
 }
 
 export interface Lifetimes {
     locals: LocalEnd[]
     fields: FieldEnd[]
+    contained: Contained[]
+    holders: LocalEnd[]
+    drops: HolderDrop[]
     refused: Map<string, number>
     work: number
+    report?: LifeReport
 }
 
 interface Body {
@@ -33,7 +83,7 @@ interface Body {
     homes: Map<number, number>
     captured: Map<number, number[]>
     owned: Map<number, number[]>
-    leaked: Set<number>
+    leaked: Map<number, number>
     context: number[]
 }
 
@@ -46,6 +96,7 @@ interface Ending {
     end: LocalEnd
     own: number[]
     alive: number[]
+    blocks: Set<number>
 }
 
 const workPerNode = 256
@@ -56,18 +107,27 @@ function refsOf(type: Type): number[] {
 }
 
 function objectsOnly(type: Type): boolean {
-    return type.objects.length > 0 && !type.undefined && !type.null && !type.unknown && !type.bools && !type.literals.length && !type.range && !type.float && !type.functions.length && !type.closures.length && !type.strings.length
+    return !type.closures.length && !type.functions.length && refsOnly(type)
+}
+
+function refsOnly(type: Type): boolean {
+    return refsOf(type).length > 0 && !type.undefined && !type.null && !type.unknown && !type.bools && !type.literals.length && !type.range && !type.float && !type.strings.length
 }
 
 export function exitOrdering(g: Graph, p: TailPosition): number {
-    const found = p.orderings.slice()
-    const n = getNode(g, p.at)!
-    if (OrderedValues.has(n.op) && getRef(n, 0)) found.push(getRef(n, 0))
+    const found = exitOrderings(g, p)
     return found.length === 1 ? found[0] : 0
 }
 
-export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean): Lifetimes {
-    const out: Lifetimes = { locals: [], fields: [], refused: new Map(), work: 0 }
+function exitOrderings(g: Graph, p: TailPosition): number[] {
+    const found = p.orderings.slice()
+    const n = getNode(g, p.at)!
+    if (OrderedValues.has(n.op) && getRef(n, 0)) found.push(getRef(n, 0))
+    return found
+}
+
+export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean, report = false): Lifetimes {
+    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0 }
     const wanted = types.objects.map((_, id) => hooked(id))
     if (!wanted.includes(true)) return out
     const instancesOf = new Map<Function, number[]>()
@@ -84,10 +144,22 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     const refuse = (why: string) => {
         out.refused.set(why, (out.refused.get(why) ?? 0) + 1)
     }
+    const blocks: LifeBlock[] | undefined = report ? [] : undefined
+    let detail: LifeBlock | undefined
+    const blamed = (why: string, culprit: number | undefined, node: number, unit?: Function): string => {
+        if (!detail) return why
+        detail.culprit = culprit
+        detail.at = [unit ?? detail.unit, node]
+        return why
+    }
     const holders = new Map<number, Location[]>()
     const fieldsOf = new Map<number, Map<number, Location>>()
+    const captures = new Map<number, Set<number>>()
     for (const location of locations) {
-        for (const inner of refsOf(location.type)) listOf(holders, inner).push(location)
+        for (const inner of refsOf(location.type)) {
+            listOf(holders, inner).push(location)
+            if (types.objects[inner].kind === AllocKind.scope) setOf(captures, location.allocation).add(inner)
+        }
         if (location.handle === undefined) continue
         let byKey = fieldsOf.get(location.allocation)
         if (!byKey) fieldsOf.set(location.allocation, byKey = new Map())
@@ -181,7 +253,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         const nest = graphLoops(g)
         const { idom } = dominatorTree(v => v ? nest.tailTargets.get(v)!.slice() : [g.root], v => v === g.root ? [0] : nest.preds.get(v)!)
-        const body: Body = { g, instances, held, nodes, nest, idom, homes: new Map(), captured: new Map(), owned: new Map(), leaked: new Set(), context }
+        const body: Body = { g, instances, held, nodes, nest, idom, homes: new Map(), captured: new Map(), owned: new Map(), leaked: new Map(), context }
         for (const b of g.blocks) {
             const own: number[] = []
             const seen = new Set<number>()
@@ -214,7 +286,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 if ((n.op === NodeOp.setProp || n.op === NodeOp.store) && slot === 3 && !held.get(getRef(n, 1))?.length) leaks = true
                 if (rt.sliceOf(g, n) === rt.Op.sliceWrite && slot === 4 && !held.get(getRef(n, 2))?.length) leaks = true
                 if (!leaks) continue
-                for (const o of list) body.leaked.add(o)
+                for (const o of list) body.leaked.set(o, u)
             }
         }
         bodies.set(fn, body)
@@ -303,7 +375,8 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 const n = getNode(g, p.at)!
                 const leaving = n.op === NodeOp.ret || (n.op === NodeOp.apply && (getRef(n, 0) === home || !blocks.has(getRef(n, 0))))
                 if (leaving && (b !== home || creates[i])) {
-                    if (!exitOrdering(g, p)) return 'leaves where nothing is ordered'
+                    if (detail) detail.orderings = exitOrderings(g, p)
+                    if (!exitOrdering(g, p)) return blamed('leaves where nothing is ordered', undefined, p.at)
                     exits.push([b, i])
                 }
                 i++
@@ -315,12 +388,18 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
 
     function holdersOf(own: number[], owner: number): number[] | string {
         const alive = own.slice()
+        const via: [Location, number][] | undefined = detail ? [] : undefined
+        if (detail) detail.alive = alive
+        if (detail) detail.via = via
         let i = 0
         while (i < alive.length) {
-            if (types.objects[alive[i]].constant) return 'is held by an object that is never freed'
+            if (types.objects[alive[i]].constant) return blamed('is held by an object that is never freed', alive[i], 0)
             for (const location of holders.get(alive[i]) ?? []) {
                 if (i < own.length && owner && location.handle === owner) continue
-                if (!alive.includes(location.allocation)) alive.push(location.allocation)
+                if (alive.includes(location.allocation)) continue
+                if (captures.get(alive[i])?.has(location.allocation)) continue
+                alive.push(location.allocation)
+                if (via) via.push([location, i])
             }
             charge(1)
             i++
@@ -332,7 +411,10 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         for (const o of alive) {
             for (const fn of touchers(o)) {
                 if (!instancesOf.has(fn)) continue
-                if (bodyOf(fn).leaked.has(o)) return true
+                const at = bodyOf(fn).leaked.get(o)
+                if (at === undefined) continue
+                blamed('', o, at, fn)
+                return true
             }
         }
         return false
@@ -349,29 +431,50 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return false
     }
 
-    function localEnd(fn: Function, source: number, ended: Set<number>): Ending | string {
+    const leaving = new Map<number, number[] | string>()
+    function leavesWith(fn: Function, o: number): boolean {
+        let known = leaving.get(o)
+        if (known === undefined) leaving.set(o, known = holdersOf([o], 0))
+        if (typeof known === 'string') return true
+        const alive = known
+        for (const f of instancesOf.get(fn) ?? []) {
+            const instance = types.instances[f]
+            charge(1)
+            if (refsOf(instance.returns).some(x => alive.includes(x))) return true
+            if (instance.params.some(param => refsOf(param.type).some(x => alive.includes(x)))) return true
+        }
+        return false
+    }
+
+    function localEnd(fn: Function, source: number, ended: Set<number>, only?: number): Ending | string {
         const body = bodyOf(fn)
-        const own = body.held.get(source)
+        let own = body.held.get(source)
+        if (only !== undefined) own = own?.includes(only) ? [only] : undefined
         if (!own || operandHolds(body, source, own)) return ''
+        if (detail) detail.objects = own
+        if (detail) detail.reached = body.captured.has(source)
         for (const f of body.instances) {
             const type = types.typeAt(f, source)
-            if (type && !objectsOnly(type)) return 'may be absent'
+            if (type && !(only === undefined ? objectsOnly(type) : refsOnly(type))) return 'may be absent'
         }
         for (const o of own) {
-            if (!wanted[o]) return 'shares its value with an object that has no hook'
-            if (ended.has(o)) return 'ends at a field write'
+            if (!wanted[o] && o !== only) return blamed('shares its value with an object that has no hook', o, source)
+            if (ended.has(o)) return blamed('ends at a field write', o, source)
         }
         const alive = holdersOf(own, 0)
         if (typeof alive === 'string') return alive
         if (operandHolds(body, source, alive)) return 'is read from an object that holds it'
         for (const f of body.instances) {
             const instance = types.instances[f]
-            if (refsOf(instance.returns).some(o => alive.includes(o))) return alive.length > own.length ? 'is held by an object that is returned' : 'is returned'
+            const returned = refsOf(instance.returns).find(o => alive.includes(o))
+            if (returned !== undefined) return blamed(alive.length > own.length ? 'is held by an object that is returned' : 'is returned', returned, source)
             for (const param of instance.params) {
-                if (refsOf(param.type).some(o => alive.includes(o))) return alive.length > own.length ? 'is held by an object that is passed in' : 'is passed in'
+                const passed = refsOf(param.type).find(o => alive.includes(o))
+                if (passed !== undefined) return blamed(alive.length > own.length ? 'is held by an object that is passed in' : 'is passed in', passed, source)
             }
         }
-        if (body.context.some(o => alive.includes(o))) return 'is held by an object the closure captures'
+        const captured = body.context.find(o => alive.includes(o))
+        if (captured !== undefined) return blamed('is held by an object the closure captures', captured, source)
         if (leaks(alive)) return 'reaches a call or a store the analysis cannot see'
         const region = regionOf(body, source)
         if (typeof region === 'string') return region
@@ -379,14 +482,14 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             for (const id of body.nodes.get(o) ?? []) {
                 if (id === source) continue
                 const n = getNode(body.g, id)!
-                if (n.op === NodeOp.param) return 'is carried between blocks'
-                if (own.includes(o) && !operandHolds(body, id, alive)) return 'has a second source'
+                if (n.op === NodeOp.param) return blamed('is carried between blocks', o, id)
+                if (own.includes(o) && !operandHolds(body, id, alive)) return blamed('has a second source', o, id)
                 for (const b of body.captured.get(id) ?? []) {
-                    if (!region.blocks.has(b)) return own.includes(o) ? 'is used outside its region' : 'is held by an object used outside its region'
+                    if (!region.blocks.has(b)) return blamed(own.includes(o) ? 'is used outside its region' : 'is held by an object used outside its region', o, id)
                 }
             }
         }
-        return { end: { unit: fn, value: source, exits: region.exits }, own, alive }
+        return { end: { unit: fn, value: source, exits: region.exits, objects: own }, own, alive, blocks: region.blocks }
     }
 
     function heldByAnother(found: Ending[], at: number): boolean {
@@ -552,6 +655,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             if (type && type.unknown) return 'stores through an unknown holder'
         }
         const old: number[] = []
+        if (detail) detail.objects = old
         for (const h of targets) {
             const location = fieldsOf.get(h)?.get(key)
             if (!location) return 'stores to a field its holder does not have'
@@ -569,31 +673,8 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (typeof alive === 'string') return `replaces a value that ${alive}`
         if (leaks(alive)) return 'replaces a value that reaches a call or a store the analysis cannot see'
         for (const o of old) {
-            let store = 0
-            let storer: Function | undefined
-            for (const location of holders.get(o) ?? []) {
-                if (location.handle !== key) continue
-                let seen = false
-                for (const w of location.writers) {
-                    if (w.node < 0) continue
-                    const writer = bodyOf(w.unit)
-                    const x = getNode(writer.g, w.node)!
-                    if (x.op !== NodeOp.setProp) return 'replaces a value stored by something other than a field store'
-                    if (!writer.held.get(getRef(x, 3))?.includes(o)) continue
-                    seen = true
-                    if (store && (store !== w.node || storer !== w.unit)) return 'replaces a value that more than one store puts in a field'
-                    if (store) continue
-                    store = w.node
-                    storer = w.unit
-                    const made = makerOf(o, w.unit)
-                    if (!made || !madeAt(writer, w.unit, getRef(x, 3), made)) return 'replaces a value that is not made where it is stored'
-                    const from = sourceHome(writer, made)
-                    const to = homeOf(writer, w.node)
-                    if (from === undefined || to === undefined || !dominates(writer, from, to)) return 'replaces a value stored away from where it is made'
-                    if (followers(writer, w.node, to, from)[1].has(to)) return 'replaces a value stored in a loop it is made outside of'
-                }
-                if (!seen) return 'replaces a value that reaches a field through no store the analysis lists'
-            }
+            const stored = storedOnce(o, key)
+            if (stored) return `replaces a value ${stored}`
         }
         if (heldAcross(body, write, alive)) return 'replaces a value its own function still uses'
         const above = reachersOf(fn)
@@ -611,6 +692,36 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             }
         }
         return old
+    }
+
+    function storedOnce(o: number, key: number, holder?: number): string {
+        let store = 0
+        let storer: Function | undefined
+        for (const location of holders.get(o) ?? []) {
+            if (location.handle !== key) continue
+            if (holder !== undefined && location.allocation !== holder) continue
+            let seen = false
+            for (const w of location.writers) {
+                if (w.node < 0) continue
+                const writer = bodyOf(w.unit)
+                const x = getNode(writer.g, w.node)!
+                if (x.op !== NodeOp.setProp) return blamed('stored by something other than a field store', o, w.node, w.unit)
+                if (!writer.held.get(getRef(x, 3))?.includes(o)) continue
+                seen = true
+                if (store && (store !== w.node || storer !== w.unit)) return blamed('that more than one store puts in a field', o, w.node, w.unit)
+                if (store) continue
+                store = w.node
+                storer = w.unit
+                const made = makerOf(o, w.unit)
+                if (!made || !madeAt(writer, w.unit, getRef(x, 3), made)) return blamed('that is not made where it is stored', o, w.node, w.unit)
+                const from = sourceHome(writer, made)
+                const to = homeOf(writer, w.node)
+                if (from === undefined || to === undefined || !dominates(writer, from, to)) return blamed('stored away from where it is made', o, w.node, w.unit)
+                if (followers(writer, w.node, to, from)[1].has(to)) return blamed('stored in a loop it is made outside of', o, w.node, w.unit)
+            }
+            if (!seen) return 'that reaches a field through no store the analysis lists'
+        }
+        return ''
     }
 
     function makerOf(object: number, fn: Function): number {
@@ -641,6 +752,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     }
 
     const ended = new Set<number>()
+    const endings = new Map<number, Ending[]>()
     const writes = new Map<Function, Set<number>>()
     for (const location of locations) {
         if (location.handle === undefined || !location.type.objects.some(o => wanted[o])) continue
@@ -648,15 +760,25 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             if (w.node >= 0 && instancesOf.has(w.unit)) setOf(writes, w.unit).add(w.node)
         }
     }
+    const begin = (fn: Function, node: number) => {
+        if (blocks) detail = { why: '', unit: fn, node, reached: true }
+    }
+    const blocked = (why: string) => {
+        refuse(why)
+        if (!detail) return
+        detail.why = why
+        blocks!.push(detail)
+    }
     for (const [fn, nodes] of writes) {
         for (const write of nodes) {
+            begin(fn, write)
             const end = fieldEnd(fn, write)
             if (typeof end === 'string') {
-                refuse(`field write ${end}`)
+                blocked(`field write ${end}`)
                 continue
             }
             for (const o of end) ended.add(o)
-            out.fields.push({ unit: fn, write })
+            out.fields.push({ unit: fn, write, objects: end })
         }
     }
     const sources = new Map<Function, Set<number>>()
@@ -672,20 +794,744 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     for (const [fn, nodes] of sources) {
         const found: Ending[] = []
         for (const source of nodes) {
+            begin(fn, source)
             const end = localEnd(fn, source, ended)
             if (typeof end !== 'string') found.push(end)
-            else if (end) refuse(`local ${end}`)
+            else if (end) blocked(`local ${end}`)
         }
         while (found.length) {
             let at = 0
             while (at < found.length && heldByAnother(found, at)) at++
             if (at === found.length) {
-                for (const _ of found) refuse('local is held by an object that it holds')
+                for (const ending of found) {
+                    begin(fn, ending.end.value)
+                    if (detail) detail.objects = ending.own
+                    if (detail) detail.alive = ending.alive
+                    blocked('local is held by an object that it holds')
+                }
                 break
             }
             out.locals.push(found[at].end)
+            for (const o of found[at].own) listOf(endings, o).push(found[at])
             found.splice(at, 1)
         }
     }
+    const containers = new Map<number, Contained | string>()
+    function containerOf(o: number): Contained | string {
+        const known = containers.get(o)
+        if (known !== undefined) return known
+        const found = contain(o)
+        containers.set(o, found)
+        return found
+    }
+    function contain(o: number): Contained | string {
+        const all = holders.get(o)
+        if (!all) return 'is held by no object'
+        charge(all.length)
+        const links = captures.get(o)
+        const list = links ? all.filter(location => !links.has(location.allocation)) : all
+        if (!list.length) return 'is held only by a scope it holds'
+        const byHolder = new Map<number, Location[]>()
+        for (const location of list) {
+            if (location.allocation === o) return blamed('has a second holder', o, 0)
+            listOf(byHolder, location.allocation).push(location)
+        }
+        if (types.objects[o].kind === AllocKind.scope) return scoped(o, byHolder)
+        if (byHolder.size > 1) return compared(o, byHolder)
+        return heldBy(o, list)
+    }
+    function scoped(o: number, byHolder: Map<number, Location[]>): Contained | string {
+        let last: [holder: number, top: number] | undefined
+        for (const [h, list] of byHolder) {
+            if (list.length > 1 || list[0].handle === undefined) return blamed('is held by a closure through more than one link', h, 0)
+            const t = fateOf(h)
+            if (typeof t === 'string') return blamed('is held by a closure that has no end', h, 0)
+            if (!last || ordered(t, last[1]) === 'after') last = [h, t]
+        }
+        const [h, top] = last!
+        for (const [other] of byHolder) {
+            const t = fates.get(other) as number
+            if (t === top) continue
+            const order = ordered(t, top)
+            if (order === 'before') continue
+            if (order !== 'equal' || !sameEnds(t, top)) return blamed(`needs more than a comparison: two closures that hold it ${order === 'equal' ? 'end where the other ends' : 'end apart'}`, other, 0)
+        }
+        if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
+        return { object: o, holder: h, key: byHolder.get(h)![0].handle as number }
+    }
+    function sameEnds(a: number, b: number): boolean {
+        const x = endings.get(a)!
+        const y = endings.get(b)!
+        if (x.length !== 1 || y.length !== 1 || x[0].end.unit !== y[0].end.unit) return false
+        charge(x[0].end.exits.length + y[0].end.exits.length)
+        const key = (e: [number, number]) => `${e[0]}:${e[1]}`
+        const there = new Set(y[0].end.exits.map(key))
+        return x[0].end.exits.length === there.size && x[0].end.exits.every(e => there.has(key(e)))
+    }
+    function compared(o: number, byHolder: Map<number, Location[]>): Contained | string {
+        for (const [h, list] of byHolder) {
+            if (types.objects[h].constant && list.length === 1 && list[0].handle !== undefined) return { object: o, holder: h, key: list[0].handle as number }
+        }
+        let owner: Contained | undefined
+        let failed = 0
+        for (const [h, list] of byHolder) {
+            if (list.length === 1 && list[0].handle !== undefined && !list[0].writers.some(w => w.node >= 0 && makerOf(o, w.unit))) continue
+            const c = storedIn(o, list)
+            if (typeof c === 'string') {
+                if (!failed && !c.endsWith('not made where it is stored')) failed = h
+                continue
+            }
+            if (owner) return blamed('has a second holder that also stores it where it is made', c.holder, 0)
+            owner = c
+        }
+        if (!owner && failed) return storedIn(o, byHolder.get(failed)!)
+        if (!owner) return blamed('has a second holder, and no holder stores it where it is made', [...byHolder.keys()][1], 0)
+        const top = fateOf(owner.holder)
+        if (typeof top === 'string') return owner
+        const later: [holder: number, top: number][] = []
+        for (const [h] of byHolder) {
+            if (h === owner.holder) continue
+            const t = fateOf(h)
+            if (typeof t === 'string') return blamed('needs more than a comparison: a second holder has no end', h, 0)
+            const order = ordered(t, top)
+            if (order === 'before') continue
+            if (order !== 'after') return blamed(`needs more than a comparison: a second holder ${order === 'equal' ? 'ends where its holder ends' : 'ends apart from its holder'}`, h, 0)
+            later.push([h, t])
+        }
+        if (!later.length) return leaks([o]) ? 'reaches a call or a store the analysis cannot see' : owner
+        for (const [h, t] of later) {
+            if (!later.every(([other, u]) => other === h || ordered(u, t) === 'before')) continue
+            const list = byHolder.get(h)!
+            if (list.length > 1 || list[0].handle === undefined) return blamed('needs more than a comparison: the holder that ends last does not hold it in one named field', h, 0)
+            if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
+            return { object: o, holder: h, key: list[0].handle as number }
+        }
+        return blamed('needs more than a comparison: two second holders end after its holder', later[0][0], 0)
+    }
+    const inside = new Map<Ending, Map<Function, boolean>>()
+    function runsInside(fn: Function, e: Ending): boolean {
+        let memo = inside.get(e)
+        if (!memo) inside.set(e, memo = new Map())
+        const known = memo.get(fn)
+        if (known !== undefined) return known
+        memo.set(fn, false)
+        let found = false
+        for (const f of instancesOf.get(fn) ?? []) {
+            for (const site of types.instances[f].sites) {
+                charge(1)
+                if (site.instance === undefined) return false
+                found = true
+                if (site.unit !== e.end.unit) {
+                    if (!runsInside(site.unit, e)) return false
+                    continue
+                }
+                for (const b of bodyOf(site.unit).captured.get(site.node) ?? []) {
+                    if (!e.blocks.has(b)) return false
+                }
+            }
+        }
+        memo.set(fn, found)
+        return found
+    }
+    function orderOf(a: Ending, b: Ending): string {
+        if (a.end.unit !== b.end.unit) {
+            if (runsInside(a.end.unit, b)) return 'before'
+            if (runsInside(b.end.unit, a)) return 'after'
+            return 'apart'
+        }
+        for (const x of a.end.exits) {
+            if (b.end.exits.some(y => y[0] === x[0] && y[1] === x[1])) return 'equal'
+        }
+        charge(a.blocks.size + b.blocks.size)
+        const within = [...a.blocks].every(k => b.blocks.has(k))
+        const around = [...b.blocks].every(k => a.blocks.has(k))
+        if (within && around) return 'equal'
+        if (within) return 'before'
+        if (around) return 'after'
+        return 'apart'
+    }
+    function ordered(a: number, b: number): string {
+        if (a === b) return 'equal'
+        let order = ''
+        for (const x of endings.get(a)!) {
+            for (const y of endings.get(b)!) {
+                const next = orderOf(x, y)
+                if (order && next !== order) return 'apart'
+                order = next
+            }
+        }
+        return order
+    }
+    function heldBy(o: number, list: Location[]): Contained | string {
+        const location = list[0]
+        const holder = location.allocation
+        if (location.handle === undefined) return blamed('is held in an element', holder, 0)
+        if (list.length > 1) return blamed('is held in two fields of its holder', holder, 0)
+        if (types.objects[holder].constant) return { object: o, holder, key: location.handle as number }
+        if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
+        return storedIn(o, list)
+    }
+    function storedIn(o: number, list: Location[]): Contained | string {
+        const location = list[0]
+        const holder = location.allocation
+        if (location.handle === undefined) return blamed('is held in an element', holder, 0)
+        if (list.length > 1) return blamed('is held in two fields of its holder', holder, 0)
+        const stored = storedOnce(o, location.handle as number, holder)
+        if (stored) return `is a value ${stored}`
+        return { object: o, holder, key: location.handle as number }
+    }
+    function outlives(o: number, top: number): string {
+        for (const e of endings.get(top)!) {
+            const body = bodyOf(e.end.unit)
+            for (const f of body.instances) {
+                if (refsOf(types.instances[f].returns).includes(o)) return blamed('is returned from where its holder ends', o, e.end.value, e.end.unit)
+            }
+            for (const id of body.nodes.get(o) ?? []) {
+                charge(1)
+                for (const b of body.captured.get(id) ?? []) {
+                    if (!e.blocks.has(b)) return blamed('is used outside the region where its holder ends', o, id, e.end.unit)
+                }
+            }
+        }
+        return ''
+    }
+    const sourcesOf = (o: number): [Function, number][] => {
+        const found: [Function, number][] = []
+        const site = types.objects[o].site
+        if (instancesOf.has(site.unit)) found.push([site.unit, site.node])
+        for (const f of returnedBy.get(o) ?? []) {
+            for (const s of types.instances[f].sites) {
+                if (s.instance === undefined || !instancesOf.has(s.unit)) continue
+                if (!found.some(([u, n]) => u === s.unit && n === s.node)) found.push([s.unit, s.node])
+            }
+        }
+        return found
+    }
+    const fates = new Map<number, number | string>()
+    function fateOf(o: number): number | string {
+        const known = fates.get(o)
+        if (known !== undefined) return known
+        fates.set(o, 'is held in a cycle of holders')
+        let fate: number | string = endings.has(o) ? o : 'has no end of its own'
+        if (types.objects[o].constant) fate = 'is never freed'
+        else if (typeof fate === 'string' && !wanted[o]) {
+            for (const [fn, source] of sourcesOf(o)) {
+                if (leavesWith(fn, o)) continue
+                const end = localEnd(fn, source, ended, o)
+                if (typeof end === 'string') continue
+                out.holders.push(end.end)
+                listOf(endings, o).push(end)
+                fate = o
+            }
+        }
+        if (typeof fate === 'string' && !types.objects[o].constant) {
+            const c = containerOf(o)
+            const keeper = typeof c === 'string' ? undefined : (holders.get(c.holder) ?? []).find(location => location.allocation !== o && captures.get(c.holder)?.has(location.allocation))
+            if (typeof c === 'string') fate = c
+            else if (keeper) fate = blamed('is contained in a closure that a scope it holds keeps', keeper.allocation, 0)
+            else {
+                const top = fateOf(c.holder)
+                if (typeof top === 'string') fate = 'is contained in an object that does not end'
+                else fate = outlives(o, top) || top
+                if (typeof fate === 'number') out.contained.push(c)
+            }
+        }
+        fates.set(o, fate)
+        return fate
+    }
+    detail = undefined
+    types.objects.forEach((_, o) => {
+        if (wanted[o] && !endings.has(o)) fateOf(o)
+    })
+    const owners = new Map<number, Map<number, number[]>>()
+    for (const c of out.contained) listOf(mapOf(owners, c.holder), c.key).push(c.object)
+    const sameFields = (lists: OwnedField[][]): OwnedField[] | undefined => {
+        const text = JSON.stringify(lists[0])
+        return lists.every(list => JSON.stringify(list) === text) ? lists[0] : undefined
+    }
+    const ownedOf = new Map<number, OwnedField[]>()
+    function ownedFields(h: number): OwnedField[] {
+        const known = ownedOf.get(h)
+        if (known) return known
+        const fields: OwnedField[] = []
+        ownedOf.set(h, fields)
+        for (const [key, objects] of owners.get(h) ?? []) {
+            const location = fieldsOf.get(h)!.get(key)!
+            const inside = refsOf(location.type)
+            charge(inside.length)
+            if (!refsOnly(location.type) || (location.forms & FieldForm.absent)) continue
+            if (!inside.every(o => objects.includes(o))) continue
+            if (inside.every(o => wanted[o])) {
+                fields.push({ key, inner: undefined })
+                continue
+            }
+            if (inside.some(o => wanted[o])) continue
+            const inner = sameFields(inside.map(ownedFields))
+            if (inner?.length) fields.push({ key, inner })
+        }
+        fields.sort((a, b) => a.key - b.key)
+        return fields
+    }
+    const holderEnds = new Map<Function, Map<number, LocalEnd[]>>()
+    for (const end of out.holders) listOf(mapOf(holderEnds, end.unit), end.value).push(end)
+    for (const [fn, byValue] of holderEnds) {
+        for (const [value, list] of byValue) {
+            const held = bodyOf(fn).held.get(value)!
+            if (!held.every(h => list.some(e => e.objects.includes(h)))) continue
+            const fields = sameFields(held.map(ownedFields))
+            if (fields?.length) out.drops.push({ unit: fn, value, exits: list[0].exits, fields })
+        }
+    }
+    if (!blocks) return out
+    const container = (o: number): LifeBlock => {
+        const site = types.objects[o].site
+        begin(site.unit, site.node)
+        const c = contain(o)
+        if (typeof c === 'string') detail!.why = c
+        else detail!.culprit = c.holder
+        const top = typeof c === 'string' ? undefined : fates.get(c.holder)
+        if (typeof top === 'number') detail!.why = outlives(o, top)
+        return detail!
+    }
+    const standing = (o: number): string | undefined => {
+        const fate = fates.get(o)
+        return typeof fate === 'number' ? '' : fate
+    }
+    const explain = (fn: Function, source: number, object: number): LifeBlock | undefined => {
+        if (!instancesOf.has(fn)) return undefined
+        begin(fn, source)
+        const end = localEnd(fn, source, ended, object)
+        if (!end) return undefined
+        if (typeof end === 'string') detail!.why = `local ${end}`
+        return detail
+    }
+    const held = (fn: Function, node: number): number[] | undefined => instancesOf.has(fn) ? bodyOf(fn).held.get(node) : undefined
+    const reached = (fn: Function, node: number): boolean => instancesOf.has(fn) && bodyOf(fn).captured.has(node)
+    out.report = { blocks, explain, held, holders, returnedBy, instancesOf, reachers: reachersOf, container, standing, reached }
     return out
+}
+
+interface Fate {
+    why: string
+    place: string
+    chain: string[]
+    pass: boolean
+}
+
+export function reportLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean, where: (fn: Function, node: number | undefined) => string | undefined): string[] {
+    const start = performance.now()
+    const life = analyzeLifetimes(types, locations, host, hooked, true)
+    const passMs = performance.now() - start
+    const passWork = life.work
+    const facts = life.report
+    if (!facts) return ['LIFE no objects with a drop hook']
+    const instancesOf = facts.instancesOf
+    const graphOf = (fn: Function) => host.binder.graphOf(fn)
+    const holds = (fn: Function, node: number, object: number): boolean => !!facts.held(fn, node)?.includes(object)
+    const operandHolds = (fn: Function, node: number, object: number): boolean => {
+        const n = getNode(graphOf(fn), node)
+        if (!n) return false
+        let i = 1
+        while (i < countIds(n)) {
+            const ref = getRef(n, i)
+            if (ref && holds(fn, ref, object)) return true
+            i++
+        }
+        return false
+    }
+    const guards = new Map<Function, Map<number, number>>()
+    const guardOf = (fn: Function, node: number): number => {
+        let byNode = guards.get(fn)
+        if (!byNode) {
+            byNode = new Map()
+            guards.set(fn, byNode)
+            const g = graphOf(fn)
+            const entered = new Map<number, number>()
+            const unguarded: [block: number, at: number][] = []
+            for (const b of g.blocks) {
+                for (const p of tailPositions(g, b.bodyId)) {
+                    const cond = p.path.length ? getRef(getNode(g, p.path[p.path.length - 1][0])!, 0) : 0
+                    const n = getNode(g, p.at)!
+                    if (cond) byNode.set(p.at, cond)
+                    if (cond && n.op === NodeOp.apply && !entered.has(getRef(n, 0))) entered.set(getRef(n, 0), cond)
+                    if (!cond) unguarded.push([b.id, p.at])
+                }
+            }
+            for (const [b, at] of unguarded) {
+                const cond = entered.get(b)
+                if (cond) byNode.set(at, cond)
+            }
+        }
+        return byNode.get(node) ?? 0
+    }
+    const named = new Map<Function, Map<number, string>>()
+    const place = (fn: Function, node: number): string => {
+        const byNode = mapOf(named, fn)
+        const known = byNode.get(node)
+        if (known !== undefined) return known
+        const at = node ? where(fn, node) : undefined
+        let text = `${fn.name || '<anon>'} ${at}`
+        if (at === undefined) {
+            const n = node ? getNode(graphOf(fn), node) : undefined
+            let op = 'head'
+            if (n) op = n.op === NodeOp.rt ? `rt ${rt.opName(getLiteral(graphOf(fn), n, 1) as rt.Op)}` : opName(n.op)
+            const guard = n && (n.op === NodeOp.ret || n.op === NodeOp.apply) ? guardOf(fn, node) : 0
+            const under = guard ? where(fn, guard) : undefined
+            const head = under ? undefined : where(fn, undefined)
+            text = `${fn.name || '<anon>'} %${node} ${op}${under ? ` under ${under}` : ''}${head ? ` in the function at ${head}` : ''}`
+        }
+        byNode.set(node, text)
+        return text
+    }
+    const objectName = (o: number): string => `${types.objects[o].name}#${o}${types.objects[o].constant ? ' static' : ''}`
+    const objectText = (o: number): string => `${objectName(o)} made at ${place(types.objects[o].site.unit, types.objects[o].site.node)}`
+    const entries = (fn: Function, object: number, seen: Set<Function>, out: [Function, number][]): boolean => {
+        let found = false
+        for (const f of instancesOf.get(fn) ?? []) {
+            for (const site of types.instances[f].sites) {
+                if (seen.has(site.unit) || !instancesOf.has(site.unit)) continue
+                if (!operandHolds(site.unit, site.node, object)) continue
+                found = true
+                seen.add(site.unit)
+                if (entries(site.unit, object, seen, out)) continue
+                if (!out.some(([u, n]) => u === site.unit && n === site.node)) out.push([site.unit, site.node])
+            }
+        }
+        return found
+    }
+    const placesText = (list: [Function, number][]): string => {
+        const shown = list.slice(0, 3).map(([fn, node]) => place(fn, node)).join(' | ')
+        return list.length > 3 ? `${shown} | +${list.length - 3} more` : shown
+    }
+    const storeTexts = new Map<Location, Map<number, string>>()
+    const storesText = (location: Location, object: number): string => {
+        const byObject = mapOf(storeTexts, location)
+        const known = byObject.get(object)
+        if (known !== undefined) return known
+        const out: [Function, number][] = []
+        for (const w of location.writers) {
+            if (w.node < 0 || !instancesOf.has(w.unit) || !operandHolds(w.unit, w.node, object)) continue
+            if (entries(w.unit, object, new Set([w.unit]), out)) continue
+            if (!out.some(([u, n]) => u === w.unit && n === w.node)) out.push([w.unit, w.node])
+        }
+        const text = out.length ? placesText(out) : ''
+        byObject.set(object, text)
+        return text
+    }
+    const linkText = (location: Location, held: number): string => {
+        const stores = storesText(location, held)
+        return `${objectName(held)} in ${objectName(location.allocation)}.${location.key}${stores ? ` by ${stores}` : ' (no store)'}`
+    }
+    const chainOf = (b: LifeBlock, to: number): string[] => {
+        const links: string[] = []
+        const alive = b.alive
+        const own = b.objects
+        const via = b.via
+        if (!alive || !own || !via) return links
+        let j = alive.indexOf(to)
+        while (j >= own.length && j - own.length < via.length) {
+            const [location, k] = via[j - own.length]
+            links.unshift(linkText(location, alive[k]))
+            j = k
+        }
+        return links
+    }
+    const readFrom = (b: LifeBlock): number | undefined => {
+        const n = getNode(graphOf(b.unit), b.node)
+        const alive = b.alive
+        const own = b.objects
+        if (!n || !alive || !own) return undefined
+        let i = 1
+        while (i < countIds(n)) {
+            const ref = getRef(n, i)
+            const holder = ref ? alive.find(o => !own.includes(o) && holds(b.unit, ref, o)) : undefined
+            if (holder !== undefined) return holder
+            i++
+        }
+        return undefined
+    }
+    const returnsOf = (fn: Function, object: number): [Function, number][] => {
+        const out: [Function, number][] = []
+        for (const [id, n] of nodeEntries(graphOf(fn))) {
+            if (n.op === NodeOp.ret && getRef(n, 1) && holds(fn, getRef(n, 1), object)) out.push([fn, id])
+        }
+        return out
+    }
+    const staticText = (b: LifeBlock, c: number): string => {
+        const alive = b.alive
+        const own = b.objects
+        const via = b.via
+        if (!alive || !own || !via) return objectName(c)
+        const j = alive.indexOf(c)
+        if (j < own.length || j - own.length >= via.length) return objectName(c)
+        const [location, k] = via[j - own.length]
+        const stores = storesText(location, alive[k])
+        if (stores) return `${objectName(c)}.${location.key} by ${stores}`
+        const readers: [Function, number][] = []
+        for (const r of location.readers) {
+            if (r.node >= 0 && instancesOf.has(r.unit) && !readers.some(([u]) => u === r.unit)) readers.push([r.unit, r.node])
+        }
+        return `${objectName(c)}.${location.key}, set when the program loads${readers.length ? `, read at ${placesText(readers)}` : ''}`
+    }
+    const aliveOf = new Map<number, number[]>()
+    const closureOf = (o: number): number[] => {
+        const known = aliveOf.get(o)
+        if (known) return known
+        const alive = [o]
+        let i = 0
+        while (i < alive.length) {
+            for (const location of facts.holders.get(alive[i]) ?? []) {
+                if (!alive.includes(location.allocation)) alive.push(location.allocation)
+            }
+            i++
+        }
+        aliveOf.set(o, alive)
+        return alive
+    }
+    const exitAfter = (b: LifeBlock): string => {
+        if (!b.at) return ''
+        const g = graphOf(b.at[0])
+        const n = getNode(g, b.at[1])
+        if (!n || n.op !== NodeOp.ret) return n ? `, ${opName(n.op)}` : ''
+        const order = getNode(g, getRef(n, 0))
+        return `, the ret is ordered after ${order ? opName(order.op) : 'nothing'}`
+    }
+    const sourcesOf = (o: number): [Function, number][] => {
+        const out: [Function, number][] = []
+        const site = types.objects[o].site
+        if (instancesOf.has(site.unit)) out.push([site.unit, site.node])
+        for (const f of facts.returnedBy.get(o) ?? []) {
+            const callee = types.instances[f].unit
+            const fresh = callee === site.unit || facts.reachers(site.unit).has(callee)
+            for (const s of types.instances[f].sites) {
+                if (s.instance === undefined || !instancesOf.has(s.unit)) continue
+                if (out.some(([u, n]) => u === s.unit && n === s.node)) continue
+                if (!fresh && closureOf(o).some(h => operandHolds(s.unit, s.node, h))) continue
+                out.push([s.unit, s.node])
+            }
+        }
+        return out
+    }
+    const ended = new Map<number, [Function, number]>()
+    for (const end of life.locals) {
+        for (const o of end.objects) ended.set(o, [end.unit, end.value])
+    }
+    for (const end of life.fields) {
+        for (const o of end.objects) ended.set(o, [end.unit, end.write])
+    }
+    for (const c of life.contained) {
+        const site = types.objects[c.holder].site
+        if (!ended.has(c.object)) ended.set(c.object, [site.unit, site.node])
+    }
+    const merged = new Map<Function, Map<number, LifeBlock>>()
+    for (const b of facts.blocks) {
+        if (b.why.startsWith('local ')) mapOf(merged, b.unit).set(b.node, b)
+    }
+    const short = (why: string) => why.startsWith('local ') ? why.slice(6) : why
+    const passing = (why: string) => why.endsWith('is returned') || why.endsWith('that is returned') || why.endsWith('is passed in') || why.endsWith('that is passed in')
+    const fates = new Map<number, Fate[]>()
+    const stack: number[] = []
+    function fateOf(o: number): Fate[] {
+        const known = fates.get(o)
+        if (known) return known
+        if (stack.includes(o)) return [{ why: 'is held in a cycle of holders', place: objectText(o), chain: [], pass: false }]
+        stack.push(o)
+        const out: Fate[] = []
+        const add = (fate: Fate) => {
+            if (!out.some(f => f.why === fate.why && f.place === fate.place)) out.push(fate)
+        }
+        const standing = facts.standing(o)
+        const contained = standing === 'is contained in an object that does not end'
+        const forever = standing === 'is never freed'
+        const held = !!standing && !contained && !forever && facts.holders.has(o) && !standing.endsWith('not made where it is stored')
+        if (forever) add({ why: 'is held by an object that is never freed', place: objectText(o), chain: [], pass: false })
+        if (contained) {
+            const h = facts.container(o).culprit!
+            const link = linkText(facts.holders.get(o)![0], o)
+            for (const up of fateOf(h)) add({ why: up.why, place: up.place, chain: [link, ...up.chain], pass: up.pass })
+        }
+        if (held) {
+            const b = facts.container(o)
+            let at = objectText(o)
+            if (b.culprit !== undefined && b.culprit !== o) at = objectText(b.culprit)
+            else if (b.at) at = place(b.at[0], b.at[1])
+            add({ why: `is not contained: it ${b.why}`, place: at, chain: [linkText(facts.holders.get(o)![0], o)], pass: false })
+        }
+        for (const [fn, source] of contained || held || forever ? [] : sourcesOf(o)) {
+            if (getNode(graphOf(fn), source)?.op === NodeOp.static) {
+                add({ why: 'is the value of a module static, made on first use', place: objectText(o), chain: [], pass: false })
+                continue
+            }
+            const b = facts.explain(fn, source, o)
+            if (!b) continue
+            if (!b.reached) {
+                add({ why: 'is never made: its source is a node that no block reaches', place: place(fn, source), chain: [], pass: false })
+                continue
+            }
+            if (!b.why) {
+                if (!hooked(o)) {
+                    add({ why: 'is held by an object with no drop hook that ends here', place: `${place(fn, source)} (${objectName(o)})`, chain: [], pass: false })
+                    continue
+                }
+                const together = merged.get(fn)?.get(source)
+                if (!together) {
+                    add({ why: 'ends here alone, but the pass skips this source because another of its objects comes in through an operand', place: place(fn, source), chain: [], pass: false })
+                    continue
+                }
+                const culprit = together.culprit !== undefined ? ` ${objectName(together.culprit)}` : ''
+                const count = together.objects ? together.objects.length : 0
+                const why = count > 1 ? `ends here alone, but its source is decided for ${count} objects at once: ${short(together.why)}${culprit}` : short(together.why)
+                add({ why, place: place(fn, source), chain: [], pass: false })
+                continue
+            }
+            let c = b.culprit
+            if (b.why === 'local is read from an object that holds it') c = readFrom(b)
+            const never = b.why.endsWith('never freed')
+            if (c !== undefined && c !== o && !never && b.alive?.includes(c)) {
+                const links = chainOf(b, c)
+                const end = ended.get(c)
+                if (end) {
+                    add({ why: 'is held by an object that ends without dropping what it holds', place: `${place(end[0], end[1])} (${objectName(c)})`, chain: links, pass: false })
+                    continue
+                }
+                for (const up of fateOf(c)) add({ why: up.why, place: up.place, chain: [...links, ...up.chain], pass: up.pass })
+                continue
+            }
+            if (c !== undefined && never) {
+                add({ why: short(b.why), place: staticText(b, c), chain: chainOf(b, c), pass: false })
+                continue
+            }
+            if (passing(b.why) && (c === o || c === undefined)) {
+                const at = b.why.endsWith('returned') ? returnsOf(fn, o) : []
+                add({ why: short(b.why), place: at.length ? placesText(at) : place(fn, source), chain: [], pass: true })
+                continue
+            }
+            const at = b.at && b.at[1] ? place(b.at[0], b.at[1]) : place(fn, source)
+            let orderings = ''
+            if (b.why.endsWith('nothing is ordered') && b.orderings) orderings = ` (${b.orderings.length} orderings at the exit${exitAfter(b)})`
+            add({ why: `${short(b.why)}${orderings}`, place: at, chain: [], pass: false })
+        }
+        stack.pop()
+        let kept = out.filter(f => !f.pass)
+        if (!kept.length) kept = out
+        if (kept.some(f => f.chain.length)) kept = kept.filter(f => f.chain.length)
+        if (!kept.length) kept.push({ why: 'has no source that decides it', place: objectText(o), chain: [], pass: false })
+        fates.set(o, kept)
+        return kept
+    }
+    const reportStart = performance.now()
+    let wanted = 0
+    let phantoms = 0
+    let contained = 0
+    const inHolder = new Set(life.contained.map(c => c.object))
+    const live = new Set<number>()
+    const callees = new Map<number, [callee: number, site: Site][]>()
+    const work: number[] = []
+    types.instances.forEach((instance, f) => {
+        let root = !instance.sites.length
+        for (const s of instance.sites) {
+            if (s.instance === undefined) root = true
+            else listOf(callees, s.instance).push([f, s])
+        }
+        if (root) work.push(f)
+    })
+    while (work.length) {
+        const f = work.pop()!
+        if (live.has(f)) continue
+        live.add(f)
+        for (const [g, s] of callees.get(f) ?? []) {
+            if (!live.has(g) && facts.reached(s.unit, s.node)) work.push(g)
+        }
+    }
+    const phantom = (o: number): boolean => {
+        const made = types.objects[o]
+        if (!instancesOf.has(made.site.unit)) return false
+        if (!facts.reached(made.site.unit, made.site.node)) return true
+        const makers = made.instances ?? (made.instance === undefined ? [] : [made.instance])
+        return makers.length > 0 && !makers.some(f => live.has(f))
+    }
+    const stuck: number[] = []
+    const phantomLines: string[] = []
+    types.objects.forEach((_, id) => {
+        if (!hooked(id)) return
+        if (phantom(id)) {
+            phantoms++
+            phantomLines.push(`LIFE phantom ${objectText(id)}${ended.has(id) ? ' (has an end)' : ''}`)
+            return
+        }
+        wanted++
+        if (inHolder.has(id)) contained++
+        if (!ended.has(id)) stuck.push(id)
+    })
+    const causes = new Map<string, number[]>()
+    const sole = new Map<string, number[]>()
+    const examples = new Map<string, string[]>()
+    const objectLines: string[] = []
+    for (const o of stuck) {
+        objectLines.push(`LIFE object ${objectText(o)}`)
+        for (const [fn, source] of sourcesOf(o)) {
+            const b = merged.get(fn)?.get(source)
+            if (!b) continue
+            const others = b.objects && b.objects.length > 1 ? ` (with ${b.objects.length - 1} other objects)` : ''
+            const culprit = b.culprit !== undefined && b.culprit !== o ? ` for ${objectName(b.culprit)}` : ''
+            objectLines.push(`LIFE   refused at ${place(fn, source)}: ${short(b.why)}${others}${culprit}`)
+        }
+        const mine = fateOf(o)
+        for (const fate of mine) {
+            const key = `${fate.why} | ${fate.place}`
+            const members = listOf(causes, key)
+            if (members.includes(o)) continue
+            members.push(o)
+            if (mine.length === 1) listOf(sole, key).push(o)
+            const chain = fate.chain.length ? ` via ${fate.chain.join(' ; ')}` : ''
+            objectLines.push(`LIFE   fate ${key}${chain}`)
+            const shown = listOf(examples, key)
+            if (shown.length < 3) shown.push(`${objectText(o)}${chain}`)
+        }
+    }
+    const reportMs = performance.now() - reportStart
+    let refused = 0
+    for (const count of life.refused.values()) refused += count
+    let statics = 0
+    for (const end of life.locals) {
+        if (getNode(graphOf(end.unit), end.value)?.op === NodeOp.static) statics++
+    }
+    const endAt = new Map<number, [Function, number]>()
+    for (const end of [...life.locals, ...life.holders]) {
+        for (const o of end.objects) endAt.set(o, [end.unit, end.value])
+    }
+    for (const end of life.fields) {
+        for (const o of end.objects) endAt.set(o, [end.unit, end.write])
+    }
+    const holderOf = new Map<number, Contained>()
+    for (const c of life.contained) holderOf.set(c.object, c)
+    const containedLines: string[] = []
+    for (const c of life.contained) {
+        if (!hooked(c.object) || phantom(c.object)) continue
+        const links: string[] = []
+        let at: Contained | undefined = c
+        let top = c.object
+        while (at) {
+            links.push(linkText(facts.holders.get(at.object)![0], at.object))
+            top = at.holder
+            at = endAt.has(top) ? undefined : holderOf.get(top)
+        }
+        const end = endAt.get(top)
+        containedLines.push(`LIFE contained ${objectText(c.object)} via ${links.join(' ; ')} ; ${objectName(top)} ends at ${end ? place(end[0], end[1]) : 'no place'}`)
+    }
+    const lines: string[] = []
+    lines.push(`LIFE ${wanted} objects with a drop hook, ${wanted - stuck.length} with a proven end (${life.locals.length} local ends, ${life.fields.length} field writes, ${contained} contained in a holder that ends, ${life.holders.length} ends of holders with no hook), ${stuck.length} without; ${phantoms} more come only from nodes no block reaches and are not counted; ${refused} refusals; pass ${passWork} steps ${passMs.toFixed(1)}ms, report ${life.work - passWork} steps ${reportMs.toFixed(1)}ms, ${causes.size} causes; ${statics} local ends at a module static's first use`)
+    const ranked = [...causes].sort((a, b) => b[1].length - a[1].length)
+    let rank = 0
+    for (const [key, members] of ranked) {
+        rank++
+        const kinds = new Map<string, number>()
+        for (const o of members) kinds.set(types.objects[o].name, (kinds.get(types.objects[o].name) ?? 0) + 1)
+        lines.push(`LIFE cause ${rank}: ${members.length} objects (${[...kinds].map(([k, n]) => `${n} ${k}`).join(', ')}; ${sole.get(key)?.length ?? 0} with no other cause) | ${key}`)
+        for (const text of examples.get(key) ?? []) lines.push(`LIFE   e.g. ${text}`)
+    }
+    lines.push(...containedLines)
+    lines.push(...phantomLines)
+    lines.push(...objectLines)
+    return lines
 }

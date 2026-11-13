@@ -40,7 +40,7 @@ import {
 import { hostTarget, isFloatRegister, isSignedType, type Target } from './lowering'
 
 import type { CompiledSource, Construction, TraceSession } from './trace2'
-import { frameSize, sourcePosition, usedCaptures, type EmitResult } from './bytecode-emitter'
+import { ConstantKind, frameSize, memberTemplates, sourcePosition, usedCaptures, type EmitResult } from './bytecode-emitter'
 import * as propertyEval from './property-eval'
 import { recordSnapshots } from './records'
 import * as rt from './rt'
@@ -51,7 +51,7 @@ import { rewriteInitializations, planMissedLookups, planSmallSets, rewriteConsta
 import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut, dropHook } from './value-flow'
 import { type AccessHost, type Accesses, type Location, reflowDifferences, constantIndex, constantLiteral, cutArgument, cutCalls, listOf, mapOf, setOf, receiverValue, type MemberFacts, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, formText, inhabited, initOnly, type InstanceSignature, keyLabel, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, intFormatOf, machineNumberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, type PstackPlan, planUnits, shareClasses, shareUnits, isStringRep, addressRep, sameArgument, memberCount, createInterner, intern, type Atom, RepMember, repText, returnProjects, Representation, representationOf, sameRepresentation, type BoundaryRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
-import { analyzeLifetimes, exitOrdering, type Lifetimes } from './lifetime'
+import { analyzeLifetimes, exitOrdering, reportLifetimes, type Lifetimes, type OwnedField } from './lifetime'
 import { createBinder, isLocalStub, namedStub, type Binder, type Code, type Unit } from './program-graph'
 
 type usize = u32
@@ -12014,10 +12014,52 @@ function transformInitializations(accesses: Accesses, types: ValueTypes, host: A
     return accepted
 }
 
+const holderDrops = new Map<string, ((holder: any) => void) | undefined>()
+
+function hostKey(key: intrinsics.Handle): any {
+    const index = heap.keyIndex(key)
+    if (index !== undefined) return index
+    if (heap.isString(key)) return heap.stringToJs(key)
+    return heap.symbolToJs(key)
+}
+
+function holderDrop(fields: OwnedField[], at: number): ((holder: any) => void) | undefined {
+    const key = hostKey(fields[at].key as intrinsics.Handle)
+    const inner = fields[at].inner ? holderDrop(fields[at].inner!, 0) : undefined
+    const rest = at + 1 < fields.length ? holderDrop(fields, at + 1) : undefined
+    if (key === undefined || (fields[at].inner && !inner) || (at + 1 < fields.length && !rest)) return undefined
+    if (inner && rest) {
+        return (holder: any) => {
+            inner(holder[key])
+            rest(holder)
+        }
+    }
+    if (inner) {
+        return (holder: any) => {
+            inner(holder[key])
+        }
+    }
+    if (rest) {
+        return (holder: any) => {
+            holder[key][Symbol.drop]()
+            rest(holder)
+        }
+    }
+    return (holder: any) => {
+        holder[key][Symbol.drop]()
+    }
+}
+
+function holderDropOf(fields: OwnedField[]): ((holder: any) => void) | undefined {
+    const id = JSON.stringify(fields)
+    if (!holderDrops.has(id)) holderDrops.set(id, holderDrop(fields, 0))
+    return holderDrops.get(id)
+}
+
 function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): number {
     const key = { literal: heap.fromJsSymbol(Symbol.drop) }
     const fields = new Map<Function, number[]>()
-    const exits = new Map<Function, Map<number, Map<number, number[]>>>()
+    const exits = new Map<Function, Map<number, Map<number, [value: number, callee: Function | undefined][]>>>()
     const units = new Set<Function>()
     for (const end of ends.fields) {
         listOf(fields, end.unit).push(end.write)
@@ -12025,12 +12067,25 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
     }
     for (const end of ends.locals) {
         units.add(end.unit)
-        for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push(end.value)
+        for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, undefined])
+    }
+    for (const end of ends.drops) {
+        const callee = holderDropOf(end.fields)
+        if (!callee) {
+            const why = 'holder drop names a field by a symbol that has no value outside the heap'
+            ends.refused.set(why, (ends.refused.get(why) ?? 0) + 1)
+            continue
+        }
+        units.add(end.unit)
+        for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, callee])
     }
     let placed = 0
     const refuse = (fn: Function, why: string) => {
         let count = fields.get(fn)?.length ?? 0
         for (const end of ends.locals) {
+            if (end.unit === fn) count++
+        }
+        for (const end of ends.drops) {
             if (end.unit === fn) count++
         }
         ends.refused.set(why, (ends.refused.get(why) ?? 0) + count)
@@ -12043,9 +12098,10 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         const source = host.binder.graphOf(fn)
         const graph = withNodes(source, copyNodes(source))
         let count = 0
-        const drop = (order: number, value: number): number => {
-            const method = addNode(graph, NodeOp.getProp, [order, value, key])
+        const drop = (order: number, value: number, callee?: Function): number => {
             count++
+            if (callee) return addNode(graph, NodeOp.call, [order, addNode(graph, NodeOp.heapHandle, [{ literal: host.session.linkFunction(callee) }]), 0, value])
+            const method = addNode(graph, NodeOp.getProp, [order, value, key])
             return addNode(graph, NodeOp.call, [method, method, value])
         }
         for (const write of fields.get(fn) ?? []) {
@@ -12061,7 +12117,7 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
                 tail++
                 if (!values) return p.at
                 let order = exitOrdering(graph, p)
-                for (const value of values) order = drop(order, value)
+                for (const [value, callee] of values) order = drop(order, value, callee)
                 const n = getNode(graph, p.at)!
                 if (!OrderedValues.has(n.op)) return addNode(graph, NodeOp.after, [order, p.at])
                 return addCopy(graph, n, withOperand(graph, n, 0, order))
@@ -12103,11 +12159,94 @@ function hookWork(proto: intrinsics.Handle, host: AccessHost): HookWork {
     return HookWork.frees
 }
 
+function printLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, tracer: Tracer): void {
+    const hooks = new Map<intrinsics.Handle, boolean>()
+    const hooked = (id: number): boolean => {
+        const object = types.objects[id]
+        if (object.constant || object.state === undefined) return false
+        const proto = heap.getPrototypeOf(object.state)
+        let known = hooks.get(proto)
+        if (known === undefined) hooks.set(proto, known = !!dropHook(proto, host))
+        return known
+    }
+    const where = censusSources(host.binder, tracer)
+    console.log(reportLifetimes(types, locations, host, hooked, where).join('\n'))
+}
+
+function censusSources(binder: Binder, tracer: Tracer): (fn: Function, node: number | undefined) => string | undefined {
+    let outer: Map<EmitResult, string> | undefined
+    function outerSources(): Map<EmitResult, string> {
+        const out = new Map<EmitResult, string>()
+        const visit = (compiled: EmitResult, input: string) => {
+            if (out.has(compiled)) return
+            out.set(compiled, input)
+            compiled.constants.forEach((value, i) => {
+                if (compiled.constantKinds[i] === ConstantKind.nested_function) visit(value, input)
+            })
+            for (const member of memberTemplates(compiled)) visit(member, input)
+        }
+        for (const fn of binder.traced) {
+            const code = binder.codeOf(fn)
+            if (code && typeof code.input === 'string') visit(code.source.compiled, code.input)
+        }
+        return out
+    }
+    return (fn, node) => {
+        const code = binder.codeOf(fn)
+        if (!code) return
+        const compiled = code.source.compiled
+        let input = typeof code.input === 'string' ? code.input : undefined
+        if (input === undefined) {
+            outer ??= outerSources()
+            input = outer.get(compiled) ?? outer.get(compiled.origin ?? compiled) ?? (typeof code.input === 'string' ? undefined : outer.get(code.input))
+        }
+        return sourceLine(binder, tracer, fn, node, input?.split('\n'))
+    }
+}
+
+function sourceLine(binder: Binder, tracer: Tracer, fn: Function, node: number | undefined, lines: string[] | undefined): string | undefined {
+    const code = binder.codeOf(fn)!
+    if (node === undefined) {
+        const first = code.source.compiled.sourceMapping[0]
+        const at = first ? sourcePosition(code.source.compiled, first[0]) : undefined
+        if (!at || at.line === 0) return lines?.[0]
+        return `+${at.line} ${lines?.[at.line]?.trim() ?? ''}`
+    }
+    const accesses = tracer.tracedOf(fn).accesses
+    if (!accesses) return
+    const graph = binder.graphOf(fn)
+    const near = [node]
+    const n = getNode(graph, node)
+    if (n) {
+        let i = firstNonOrderingSlot(n)
+        while (i < countIds(n)) {
+            const ref = getRef(n, i)
+            if (ref) near.push(tailOf(graph, ref))
+            i++
+        }
+    }
+    for (const [id, m] of nodeEntries(graph)) {
+        let i = firstNonOrderingSlot(m)
+        while (i < countIds(m)) {
+            if (getRef(m, i) === node) near.push(id)
+            i++
+        }
+    }
+    for (const id of near) {
+        const pc = accesses.get(id)
+        if (pc === undefined) continue
+        const at = sourcePosition(code.source.compiled, pc)
+        if (!at) continue
+        const text = lines?.[at.line]?.trim() ?? ''
+        return `+${at.line}:${at.col + 1}${id === node ? '' : ` (near %${id})`} ${text}`
+    }
+}
+
 function printDrops(ends: Lifetimes, placed: number): void {
     if (!flags.has('drops')) return
     let refused = 0
     for (const count of ends.refused.values()) refused += count
-    console.log(`DROPS placed ${placed} (${ends.locals.length} locals, ${ends.fields.length} field writes), refused ${refused}, ${ends.work} steps`)
+    console.log(`DROPS placed ${placed} (${ends.locals.length} locals, ${ends.fields.length} field writes, ${ends.drops.length} holder drops), refused ${refused}, ${ends.work} steps`)
     for (const [why, count] of [...ends.refused].sort((a, b) => b[1] - a[1])) console.log(`DROPS refused ${count}: ${why}`)
 }
 
@@ -14590,6 +14729,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         return known === HookWork.other || (known === HookWork.frees && slabbed.has(id))
     }
     const ends = clock.timed('lifetime', () => analyzeLifetimes(valueTypes, accesses.locations, host, hooked))
+    if (flags.has('lifetime-census')) printLifetimes(valueTypes, accesses.locations, host, tracer)
     const placed = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer))
     printDrops(ends, placed)
     if (placed) {
