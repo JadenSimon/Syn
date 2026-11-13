@@ -1,7 +1,8 @@
 "use wrapped";
 
 import * as rt from './rt'
-import { expectForm, type Graph } from './lowering2'
+import { closureCallKey } from './heap'
+import { expectForm, type Graph, type GraphNode } from './lowering2'
 import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, NodeOp, nodeEntries, opName, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
 import { AllocKind, constructorOf, FieldForm, listOf, mapOf, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Site, type Type, type ValueTypes } from './value-types'
 
@@ -85,6 +86,7 @@ interface Body {
     owned: Map<number, number[]>
     leaked: Map<number, number>
     context: number[]
+    owners: Map<number, number>
 }
 
 interface Region {
@@ -97,6 +99,18 @@ interface Ending {
     own: number[]
     alive: number[]
     blocks: Set<number>
+}
+
+interface Kept {
+    object: number
+    holders: number[]
+    key: number
+}
+
+interface Walk {
+    memo: Map<Function, boolean>
+    active: Map<Function, number>
+    pending: Function[]
 }
 
 const workPerNode = 256
@@ -253,8 +267,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         const nest = graphLoops(g)
         const { idom } = dominatorTree(v => v ? nest.tailTargets.get(v)!.slice() : [g.root], v => v === g.root ? [0] : nest.preds.get(v)!)
-        const body: Body = { g, instances, held, nodes, nest, idom, homes: new Map(), captured: new Map(), owned: new Map(), leaked: new Map(), context }
+        const body: Body = { g, instances, held, nodes, nest, idom, homes: new Map(), captured: new Map(), owned: new Map(), leaked: new Map(), context, owners: new Map() }
         for (const b of g.blocks) {
+            for (const p of b.params) body.owners.set(p, b.id)
             const own: number[] = []
             const seen = new Set<number>()
             const work = [b.bodyId]
@@ -304,6 +319,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
 
     function sourceHome(body: Body, source: number): number | undefined {
         const n = getNode(body.g, source)!
+        if (n.op === NodeOp.param) return body.owners.get(source)
         if (OrderedValues.has(n.op)) return homeOf(body, source)
         const blocks = body.captured.get(source)
         if (!blocks?.length) return undefined
@@ -348,9 +364,10 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         const creates: boolean[] = []
         const outside = new Set<number>()
         const work: number[] = []
+        const carried = getNode(g, source)!.op === NodeOp.param
         for (const p of positions) {
             const roots = tailRoots(g, p)
-            const always = reaches(body, roots, source, home, true)
+            const always = carried || reaches(body, roots, source, home, true)
             if (!always && reaches(body, roots, source, home, false)) return 'is created on a condition'
             creates.push(always)
             const n = getNode(g, p.at)!
@@ -373,7 +390,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             while (i < leaves.length) {
                 const p = leaves[i]
                 const n = getNode(g, p.at)!
-                const leaving = n.op === NodeOp.ret || (n.op === NodeOp.apply && (getRef(n, 0) === home || !blocks.has(getRef(n, 0))))
+                const leaving = n.op === NodeOp.ret || (n.op === NodeOp.apply && (getRef(n, 0) === home || !blocks.has(getRef(n, 0))) && !passes(n, source))
                 if (leaving && (b !== home || creates[i])) {
                     if (detail) detail.orderings = exitOrderings(g, p)
                     if (!exitOrdering(g, p)) return blamed('leaves where nothing is ordered', undefined, p.at)
@@ -446,7 +463,128 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return false
     }
 
+    function passes(n: GraphNode, value: number): boolean {
+        let i = 1
+        while (i < countIds(n)) {
+            if (getRef(n, i) === value) return true
+            i++
+        }
+        return false
+    }
+
+    function handedTo(body: Body, value: number): number | string | undefined {
+        let into: number | undefined
+        for (const [u, slot] of usersOf(body.g).get(value) ?? []) {
+            const n = getNode(body.g, u)!
+            if (n.op !== NodeOp.apply || slot < 1) continue
+            const p = getBlock(body.g, getRef(n, 0))!.params[slot - 1]
+            if (into !== undefined && into !== p) return 'is handed to more than one block parameter'
+            into = p
+        }
+        return into
+    }
+
+    function fresh(fn: Function, value: number): boolean {
+        const held = heldOf(fn, value)
+        if (!held.length) return false
+        for (const o of held) {
+            const sources = sourcesOf(o)
+            charge(sources.length)
+            if (!sources.some(([u, node]) => u === fn && node === value)) return false
+        }
+        return true
+    }
+
+    const merged = new Map<Function, Map<string, Ending | string>>()
+    function mergedEnd(fn: Function, param: number, ended: Set<number>, only?: number): Ending | string {
+        const byParam = mapOf(merged, fn)
+        const id = `${param}:${only}`
+        const known = byParam.get(id)
+        if (known !== undefined) return known
+        byParam.set(id, 'is carried between blocks in a cycle of block parameters')
+        const end = mergedAt(fn, param, ended, only)
+        if (typeof end === 'string') byParam.delete(id)
+        else byParam.set(id, end)
+        return end
+    }
+
+    function chainOf(body: Body, fn: Function, value: number): number[] {
+        const chain = [value]
+        let at = tailOf(body.g, value)
+        while (true) {
+            const n = getNode(body.g, at)!
+            if (at !== value) chain.push(at)
+            if (n.op !== NodeOp.call) break
+            const callees = calls.get(fn)?.get(at)
+            if (!callees || !callees.every(c => returnsSelf(host.binder.graphOf(c)))) break
+            at = tailOf(body.g, getRef(n, 2))
+        }
+        return chain
+    }
+
+    function mergedAt(fn: Function, param: number, ended: Set<number>, only?: number): Ending | string {
+        const body = bodyOf(fn)
+        const g = body.g
+        const owner = getBlock(g, body.owners.get(param) ?? 0)
+        if (!owner) return 'is carried into a parameter of no block'
+        const k = owner.params.indexOf(param)
+        const group = new Map<number, number>()
+        for (const pred of body.nest.preds.get(owner.id) ?? []) {
+            const positions = tailPositions(g, getBlock(g, pred)!.bodyId)
+            charge(positions.length)
+            for (const p of positions) {
+                const n = getNode(g, p.at)!
+                if (n.op !== NodeOp.apply || getRef(n, 0) !== owner.id) continue
+                const arg = getRef(n, k + 1)
+                if (arg === param) continue
+                const chain = arg ? chainOf(body, fn, arg) : []
+                if (only !== undefined && !chain.some(x => heldOf(fn, x).includes(only))) continue
+                if (!chain.some(x => fresh(fn, x))) return blamed('is carried into a block parameter that also receives a value it does not own', undefined, p.at)
+                for (const x of chain) group.set(x, arg)
+            }
+        }
+        if (!group.size) return 'is carried between blocks without a fresh value'
+        for (const [member, arg] of group) {
+            const into = handedTo(body, member)
+            if (into !== undefined && into !== param) return blamed('is handed to more than one block parameter', undefined, member)
+            const home = sourceHome(body, member)
+            if (home === undefined || (body.captured.get(member) ?? []).some(b => b !== home)) return blamed('is used outside the block that hands it on', undefined, member)
+            for (const p of tailPositions(g, getBlock(g, home)!.bodyId)) {
+                const n = getNode(g, p.at)!
+                if (n.op === NodeOp.apply && getRef(n, 0) === owner.id && getRef(n, k + 1) === arg) continue
+                if (reaches(body, tailRoots(g, p), member, home, false)) return blamed('is handed to a block parameter on some paths only', undefined, p.at)
+            }
+        }
+        const next = handedTo(body, param)
+        if (typeof next === 'string') return next
+        if (next !== undefined && next !== param) return blamed('is handed on to another block parameter', undefined, param)
+        return endAt(fn, param, ended, only, new Set(group.keys()))
+    }
+
     function localEnd(fn: Function, source: number, ended: Set<number>, only?: number): Ending | string {
+        const body = bodyOf(fn)
+        const into = handedTo(body, forwardOf(body, fn, source))
+        if (typeof into === 'string') return into
+        if (into !== undefined) return mergedEnd(fn, into, ended, only)
+        return endAt(fn, source, ended, only, undefined)
+    }
+
+    function forwardOf(body: Body, fn: Function, value: number): number {
+        let at = value
+        while (true) {
+            let next = 0
+            for (const [u, slot] of usersOf(body.g).get(at) ?? []) {
+                const n = getNode(body.g, u)!
+                if (n.op !== NodeOp.call || slot !== 2) continue
+                const callees = calls.get(fn)?.get(u)
+                if (callees && callees.every(c => returnsSelf(host.binder.graphOf(c)))) next = u
+            }
+            if (!next) return at
+            at = next
+        }
+    }
+
+    function endAt(fn: Function, source: number, ended: Set<number>, only: number | undefined, group: Set<number> | undefined): Ending | string {
         const body = bodyOf(fn)
         let own = body.held.get(source)
         if (only !== undefined) own = own?.includes(only) ? [only] : undefined
@@ -480,7 +618,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (typeof region === 'string') return region
         for (const o of alive) {
             for (const id of body.nodes.get(o) ?? []) {
-                if (id === source) continue
+                if (id === source || group?.has(id)) continue
                 const n = getNode(body.g, id)!
                 if (n.op === NodeOp.param) return blamed('is carried between blocks', o, id)
                 if (own.includes(o) && !operandHolds(body, id, alive)) return blamed('has a second source', o, id)
@@ -724,6 +862,68 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return ''
     }
 
+    function storeIn(o: number, location: Location): Site | undefined {
+        let found: Site | undefined
+        charge(location.writers.length)
+        for (const w of location.writers) {
+            if (w.node < 0) return undefined
+            const g = host.binder.graphOf(w.unit)
+            const n = getNode(g, w.node)!
+            let value = 0
+            let into = 0
+            if (n.op === NodeOp.setProp) {
+                value = getRef(n, 3)
+                into = getRef(n, 1)
+            }
+            if (rt.sliceOf(g, n) === rt.Op.sliceWrite) {
+                value = getRef(n, 4)
+                into = getRef(n, 2)
+            }
+            if (!value) {
+                let i = 0
+                while (i < countIds(n)) {
+                    if (getRef(n, i) && heldAt(w.unit, getRef(n, i), o)) return undefined
+                    i++
+                }
+                continue
+            }
+            if (!heldAt(w.unit, value, o) || !heldAt(w.unit, into, location.allocation)) continue
+            if (found) return undefined
+            found = w
+        }
+        return found
+    }
+
+    const heldNodes = new Map<Function, Map<number, number[]>>()
+    function heldAt(fn: Function, node: number, o: number): boolean {
+        return heldOf(fn, node).includes(o)
+    }
+    function heldOf(fn: Function, node: number): number[] {
+        const body = bodies.get(fn)
+        if (body) return body.held.get(node) ?? []
+        const byNode = mapOf(heldNodes, fn)
+        const known = byNode.get(node)
+        if (known) return known
+        const found: number[] = []
+        byNode.set(node, found)
+        for (const f of instancesOf.get(fn) ?? []) {
+            charge(1)
+            const type = types.typeAt(f, node)
+            if (!type) continue
+            for (const x of refsOf(type)) {
+                if (!found.includes(x)) found.push(x)
+            }
+        }
+        return found
+    }
+
+    function blamedStore(why: string, o: number, holder: number, location: Location): string {
+        if (!detail) return why
+        const store = storeIn(o, location)
+        if (!store) return blamed(why, holder, 0)
+        return blamed(why, o, store.node, store.unit)
+    }
+
     function makerOf(object: number, fn: Function): number {
         const made = types.objects[object]
         if (made.site.unit === fn) return made.site.node
@@ -796,8 +996,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         for (const source of nodes) {
             begin(fn, source)
             const end = localEnd(fn, source, ended)
-            if (typeof end !== 'string') found.push(end)
-            else if (end) blocked(`local ${end}`)
+            if (typeof end !== 'string') {
+                if (!found.includes(end)) found.push(end)
+            } else if (end) blocked(`local ${end}`)
         }
         while (found.length) {
             let at = 0
@@ -816,31 +1017,80 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             found.splice(at, 1)
         }
     }
-    const containers = new Map<number, Contained | string>()
-    function containerOf(o: number): Contained | string {
+    const containers = new Map<number, Kept | string>()
+    function containerOf(o: number): Kept | string {
         const known = containers.get(o)
         if (known !== undefined) return known
         const found = contain(o)
         containers.set(o, found)
         return found
     }
-    function contain(o: number): Contained | string {
+    function contain(o: number): Kept | string {
         const all = holders.get(o)
         if (!all) return 'is held by no object'
         charge(all.length)
         const links = captures.get(o)
         const list = links ? all.filter(location => !links.has(location.allocation)) : all
         if (!list.length) return 'is held only by a scope it holds'
+        const scope = types.objects[o].kind === AllocKind.scope
         const byHolder = new Map<number, Location[]>()
+        const spans = new Map<number, number[]>()
+        const firsts = new Map<Function, Map<string, number>>()
         for (const location of list) {
             if (location.allocation === o) return blamed('has a second holder', o, 0)
+            const store = scope || list.length === 1 ? undefined : storeIn(o, location)
+            if (store) {
+                const seen = mapOf(firsts, store.unit)
+                const id = `${store.node}:${location.handle}`
+                const first = seen.get(id)
+                if (first === undefined) seen.set(id, location.allocation)
+                if (first !== undefined && !byHolder.has(location.allocation)) {
+                    listOf(spans, first).push(location.allocation)
+                    continue
+                }
+            }
             listOf(byHolder, location.allocation).push(location)
         }
-        if (types.objects[o].kind === AllocKind.scope) return scoped(o, byHolder)
-        if (byHolder.size > 1) return compared(o, byHolder)
-        return heldBy(o, list)
+        if (scope) return scoped(o, byHolder)
+        if (byHolder.size > 1) return compared(o, byHolder, spans)
+        const h = [...byHolder.keys()][0]
+        return heldBy(o, byHolder.get(h)!, spanOf(spans, h))
     }
-    function scoped(o: number, byHolder: Map<number, Location[]>): Contained | string {
+    function spanOf(spans: Map<number, number[]>, h: number): number[] {
+        const others = spans.get(h)
+        if (!others) return [h]
+        return [h, ...others]
+    }
+    const joined = new Map<string, number | string>()
+    function joinedFate(list: number[]): number | string {
+        if (list.length === 1) {
+            const top = fateOf(list[0])
+            return typeof top === 'string' ? 'is contained in an object that does not end' : top
+        }
+        const id = list.join(',')
+        const known = joined.get(id)
+        if (known !== undefined) return known
+        const all: Ending[] = []
+        let ends = 0
+        for (const h of list) {
+            const t = fateOf(h)
+            if (typeof t === 'string') continue
+            ends++
+            for (const e of endings.get(t)!) {
+                if (!all.includes(e)) all.push(e)
+            }
+        }
+        charge(list.length + all.length)
+        let found: number | string = 'is contained in an object that does not end'
+        if (ends && ends < list.length) found = 'needs more than a comparison: one store puts it in holders of which some have no end'
+        if (ends === list.length) {
+            found = -1 - joined.size
+            endings.set(found, all)
+        }
+        joined.set(id, found)
+        return found
+    }
+    function scoped(o: number, byHolder: Map<number, Location[]>): Kept | string {
         let last: [holder: number, top: number] | undefined
         for (const [h, list] of byHolder) {
             if (list.length > 1 || list[0].handle === undefined) return blamed('is held by a closure through more than one link', h, 0)
@@ -857,7 +1107,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             if (order !== 'equal' || !sameEnds(t, top)) return blamed(`needs more than a comparison: two closures that hold it ${order === 'equal' ? 'end where the other ends' : 'end apart'}`, other, 0)
         }
         if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
-        return { object: o, holder: h, key: byHolder.get(h)![0].handle as number }
+        return { object: o, holders: [h], key: byHolder.get(h)![0].handle as number }
     }
     function sameEnds(a: number, b: number): boolean {
         const x = endings.get(a)!
@@ -868,30 +1118,37 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         const there = new Set(y[0].end.exits.map(key))
         return x[0].end.exits.length === there.size && x[0].end.exits.every(e => there.has(key(e)))
     }
-    function compared(o: number, byHolder: Map<number, Location[]>): Contained | string {
+    function compared(o: number, byHolder: Map<number, Location[]>, spans: Map<number, number[]>): Kept | string {
         for (const [h, list] of byHolder) {
-            if (types.objects[h].constant && list.length === 1 && list[0].handle !== undefined) return { object: o, holder: h, key: list[0].handle as number }
+            if (!spans.has(h) && types.objects[h].constant && list.length === 1 && list[0].handle !== undefined) return { object: o, holders: [h], key: list[0].handle as number }
         }
-        let owner: Contained | undefined
+        let owner: Kept | undefined
         let failed = 0
         for (const [h, list] of byHolder) {
             if (list.length === 1 && list[0].handle !== undefined && !list[0].writers.some(w => w.node >= 0 && makerOf(o, w.unit))) continue
-            const c = storedIn(o, list)
+            const c = storedIn(o, list, spanOf(spans, h))
             if (typeof c === 'string') {
                 if (!failed && !c.endsWith('not made where it is stored')) failed = h
                 continue
             }
-            if (owner) return blamed('has a second holder that also stores it where it is made', c.holder, 0)
+            if (owner) return blamedStore('has a second holder that also stores it where it is made', o, h, list[0])
             owner = c
         }
-        if (!owner && failed) return storedIn(o, byHolder.get(failed)!)
-        if (!owner) return blamed('has a second holder, and no holder stores it where it is made', [...byHolder.keys()][1], 0)
-        const top = fateOf(owner.holder)
+        if (!owner && failed) return storedIn(o, byHolder.get(failed)!, spanOf(spans, failed))
+        if (!owner) {
+            const why = 'has a second holder, and no holder stores it where it is made'
+            if (!detail) return why
+            for (const [h, list] of byHolder) {
+                if (storeIn(o, list[0])) return blamedStore(why, o, h, list[0])
+            }
+            return blamed(why, [...byHolder.keys()][0], 0)
+        }
+        const top = joinedFate(owner.holders)
         if (typeof top === 'string') return owner
         const later: [holder: number, top: number][] = []
         for (const [h] of byHolder) {
-            if (h === owner.holder) continue
-            const t = fateOf(h)
+            if (h === owner.holders[0]) continue
+            const t = joinedFate(spanOf(spans, h))
             if (typeof t === 'string') return blamed('needs more than a comparison: a second holder has no end', h, 0)
             const order = ordered(t, top)
             if (order === 'before') continue
@@ -904,34 +1161,95 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             const list = byHolder.get(h)!
             if (list.length > 1 || list[0].handle === undefined) return blamed('needs more than a comparison: the holder that ends last does not hold it in one named field', h, 0)
             if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
-            return { object: o, holder: h, key: list[0].handle as number }
+            return { object: o, holders: spanOf(spans, h), key: list[0].handle as number }
         }
         return blamed('needs more than a comparison: two second holders end after its holder', later[0][0], 0)
     }
-    const inside = new Map<Ending, Map<Function, boolean>>()
+    const walks = new Map<Ending, Walk>()
     function runsInside(fn: Function, e: Ending): boolean {
-        let memo = inside.get(e)
-        if (!memo) inside.set(e, memo = new Map())
-        const known = memo.get(fn)
-        if (known !== undefined) return known
-        memo.set(fn, false)
+        let walk = walks.get(e)
+        if (!walk) walks.set(e, walk = { memo: new Map(), active: new Map(), pending: [] })
+        if (walk.active.size) return false
+        return insideFrom(fn, e, walk) >= 0
+    }
+    function insideFrom(fn: Function, e: Ending, walk: Walk): number {
+        const known = walk.memo.get(fn)
+        if (known !== undefined) return known ? Infinity : -1
+        const at = walk.active.get(fn)
+        if (at !== undefined) return at
+        const depth = walk.active.size
+        walk.active.set(fn, depth)
+        walk.pending.push(fn)
+        const mark = walk.pending.length - 1
+        let low = Infinity
         let found = false
+        let outside = false
         for (const f of instancesOf.get(fn) ?? []) {
             for (const site of types.instances[f].sites) {
                 charge(1)
-                if (site.instance === undefined) return false
+                if (outside) break
+                if (site.instance === undefined) {
+                    outside = true
+                    break
+                }
                 found = true
+                const through = closureInside(site, fn, e, walk)
+                if (through !== undefined) {
+                    if (through < low) low = through
+                    continue
+                }
                 if (site.unit !== e.end.unit) {
-                    if (!runsInside(site.unit, e)) return false
+                    const from = insideFrom(site.unit, e, walk)
+                    if (from < 0) outside = true
+                    if (from < low) low = from
                     continue
                 }
                 for (const b of bodyOf(site.unit).captured.get(site.node) ?? []) {
-                    if (!e.blocks.has(b)) return false
+                    if (!e.blocks.has(b)) outside = true
                 }
             }
         }
-        memo.set(fn, found)
-        return found
+        walk.active.delete(fn)
+        if (outside || !found || low >= depth) {
+            let i = mark
+            while (i < walk.pending.length) {
+                walk.memo.set(walk.pending[i], !outside && found)
+                i++
+            }
+            walk.pending.length = mark
+            return outside || !found ? -1 : Infinity
+        }
+        return low
+    }
+    function closureInside(site: Site, fn: Function, e: Ending, walk: Walk): number | undefined {
+        const n = getNode(host.binder.graphOf(site.unit), site.node)
+        if (!n || n.op !== NodeOp.call) return undefined
+        const list = heldOf(site.unit, getRef(n, 1))
+        let low: number | undefined
+        for (const c of list) {
+            const code = fieldsOf.get(c)?.get(closureCallKey as number)
+            if (!code) return undefined
+            if (!code.type.functions.includes(fn)) continue
+            const saved = detail
+            detail = undefined
+            const alone = endsAlone(c)
+            detail = saved
+            if (!alone) return undefined
+            for (const x of endings.get(c)!) {
+                charge(1)
+                if (x.end.unit === e.end.unit) {
+                    for (const b of x.blocks) {
+                        if (!e.blocks.has(b)) return undefined
+                    }
+                    if (low === undefined) low = Infinity
+                    continue
+                }
+                const from = insideFrom(x.end.unit, e, walk)
+                if (from < 0) return undefined
+                if (low === undefined || from < low) low = from
+            }
+        }
+        return low
     }
     function orderOf(a: Ending, b: Ending): string {
         if (a.end.unit !== b.end.unit) {
@@ -962,23 +1280,23 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         return order
     }
-    function heldBy(o: number, list: Location[]): Contained | string {
+    function heldBy(o: number, list: Location[], span: number[]): Kept | string {
         const location = list[0]
         const holder = location.allocation
         if (location.handle === undefined) return blamed('is held in an element', holder, 0)
         if (list.length > 1) return blamed('is held in two fields of its holder', holder, 0)
-        if (types.objects[holder].constant) return { object: o, holder, key: location.handle as number }
+        if (span.length === 1 && types.objects[holder].constant) return { object: o, holders: span, key: location.handle as number }
         if (leaks([o])) return 'reaches a call or a store the analysis cannot see'
-        return storedIn(o, list)
+        return storedIn(o, list, span)
     }
-    function storedIn(o: number, list: Location[]): Contained | string {
+    function storedIn(o: number, list: Location[], span: number[]): Kept | string {
         const location = list[0]
         const holder = location.allocation
         if (location.handle === undefined) return blamed('is held in an element', holder, 0)
         if (list.length > 1) return blamed('is held in two fields of its holder', holder, 0)
         const stored = storedOnce(o, location.handle as number, holder)
         if (stored) return `is a value ${stored}`
-        return { object: o, holder, key: location.handle as number }
+        return { object: o, holders: span, key: location.handle as number }
     }
     function outlives(o: number, top: number): string {
         for (const e of endings.get(top)!) {
@@ -995,7 +1313,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         return ''
     }
-    const sourcesOf = (o: number): [Function, number][] => {
+    function sourcesOf(o: number): [Function, number][] {
         const found: [Function, number][] = []
         const site = types.objects[o].site
         if (instancesOf.has(site.unit)) found.push([site.unit, site.node])
@@ -1007,33 +1325,42 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         return found
     }
+    const tried = new Set<number>()
+    function endsAlone(o: number): boolean {
+        if (endings.has(o)) return true
+        if (types.objects[o].constant || wanted[o] || tried.has(o)) return false
+        tried.add(o)
+        for (const [fn, source] of sourcesOf(o)) {
+            if (leavesWith(fn, o)) continue
+            const end = localEnd(fn, source, ended, o)
+            if (typeof end === 'string' || endings.get(o)?.includes(end)) continue
+            out.holders.push(end.end)
+            listOf(endings, o).push(end)
+        }
+        return endings.has(o)
+    }
     const fates = new Map<number, number | string>()
     function fateOf(o: number): number | string {
         const known = fates.get(o)
         if (known !== undefined) return known
         fates.set(o, 'is held in a cycle of holders')
-        let fate: number | string = endings.has(o) ? o : 'has no end of its own'
+        let fate: number | string = endsAlone(o) ? o : 'has no end of its own'
         if (types.objects[o].constant) fate = 'is never freed'
-        else if (typeof fate === 'string' && !wanted[o]) {
-            for (const [fn, source] of sourcesOf(o)) {
-                if (leavesWith(fn, o)) continue
-                const end = localEnd(fn, source, ended, o)
-                if (typeof end === 'string') continue
-                out.holders.push(end.end)
-                listOf(endings, o).push(end)
-                fate = o
-            }
-        }
         if (typeof fate === 'string' && !types.objects[o].constant) {
             const c = containerOf(o)
-            const keeper = typeof c === 'string' ? undefined : (holders.get(c.holder) ?? []).find(location => location.allocation !== o && captures.get(c.holder)?.has(location.allocation))
+            let keeper: Location | undefined
+            for (const h of typeof c === 'string' ? [] : c.holders) {
+                if (!keeper) keeper = (holders.get(h) ?? []).find(location => location.allocation !== o && captures.get(h)?.has(location.allocation))
+            }
             if (typeof c === 'string') fate = c
             else if (keeper) fate = blamed('is contained in a closure that a scope it holds keeps', keeper.allocation, 0)
             else {
-                const top = fateOf(c.holder)
-                if (typeof top === 'string') fate = 'is contained in an object that does not end'
+                const top = joinedFate(c.holders)
+                if (typeof top === 'string') fate = top
                 else fate = outlives(o, top) || top
-                if (typeof fate === 'number') out.contained.push(c)
+                if (typeof fate === 'number') {
+                    for (const h of c.holders) out.contained.push({ object: o, holder: h, key: c.key })
+                }
             }
         }
         fates.set(o, fate)
@@ -1088,8 +1415,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         begin(site.unit, site.node)
         const c = contain(o)
         if (typeof c === 'string') detail!.why = c
-        else detail!.culprit = c.holder
-        const top = typeof c === 'string' ? undefined : fates.get(c.holder)
+        else detail!.culprit = c.holders[0]
+        let top: number | string | undefined
+        if (typeof c !== 'string') top = c.holders.length > 1 ? joined.get(c.holders.join(',')) : fates.get(c.holders[0])
         if (typeof top === 'number') detail!.why = outlives(o, top)
         return detail!
     }
