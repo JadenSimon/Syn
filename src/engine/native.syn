@@ -7154,6 +7154,7 @@ interface ShapePlan {
     closureViews: Map<intrinsics.Handle, intrinsics.Handle[]>
     closureCodes: Map<intrinsics.Handle, intrinsics.Handle>
     absentKeys: Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>
+    scopeFrames: Map<string, intrinsics.Handle | undefined>
 }
 interface UnitPlan {
     unit: PlannedUnit
@@ -7265,6 +7266,37 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
         if (holdsUndefined) return addNode(graph, NodeOp.ne, [word, { literal: heap.undefinedWord }], Types.bool)
         return addNode(graph, NodeOp.literal, [{ literal: 1 }], Types.bool)
     }
+    function copiedRead(id: number, n: GraphNode): number {
+        const value = getRef(n, 4)
+        const read = value ? tailOf(graph, value) : 0
+        const r = read ? getNode(graph, read) : undefined
+        if (!r || rt.sliceOf(graph, r) !== rt.Op.sliceRead) return 0
+        const codec = codecs?.get(id)
+        const element = slices?.get(id)
+        const from = slices?.get(read)
+        if (!codec || codec !== codecs!.get(read) || codec.nullable === 'tag' || !element || !from || floatUnion(element) || !(element.encoded || codec.word) || !sameRep(element, from)) return 0
+        return read
+    }
+    const copies = new Map<number, number>()
+    const copied = new Map<number, boolean>()
+    for (const [id, n] of nodeEntries(graph)) {
+        if (rt.sliceOf(graph, n) !== rt.Op.sliceWrite) continue
+        const read = copiedRead(id, n)
+        if (!read) continue
+        copies.set(id, read)
+        copied.set(read, true)
+    }
+    if (copied.size) {
+        for (const [id, n] of nodeEntries(graph)) {
+            const last = countIds(n) - 1
+            for (let i = firstNonOrderingSlot(n); i <= last; i++) {
+                const x = getRef(n, i)
+                const read = x ? tailOf(graph, x) : 0
+                if (!copied.has(read) || (n.op === NodeOp.after && i === last) || (i === 4 && copies.get(id) === read)) continue
+                copied.set(read, false)
+            }
+        }
+    }
     for (const [id, n] of nodeEntries(graph)) {
         const op = rt.sliceOf(graph, n)
         if (op === undefined) continue
@@ -7291,6 +7323,14 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
         const ordering = getOperand(graph, n, 0)
         const data = getOperand(graph, n, 2)
         const at = scaled(3)
+        if (op === rt.Op.sliceRead && copied.get(id)) {
+            putNode(graph, id, NodeOp.after, [addNode(graph, NodeOp.load, [ordering, data, at], type)])
+            continue
+        }
+        if (op === rt.Op.sliceWrite && copied.get(copies.get(id) ?? 0)) {
+            putNode(graph, id, NodeOp.store, [ordering, data, at, getOperand(graph, n, 4)], type)
+            continue
+        }
         const rep = nodes?.get(id)
         const codec = codecs?.get(id)
         const integral = rep?.kind === 'number' && numberName(rep) !== 'f64'
@@ -9482,15 +9522,34 @@ function planFrames(types: ValueTypes, plan: ShapePlan, planned: Planned, binder
         const members = rep.shapes.map(shape => plan.shapes.get(shape)!)
         return [{ kind: 'ref', shape: members[0], members, encoded: false, union: false }]
     }
+    const scopes = new Map<string, intrinsics.Handle[]>()
     types.objects.forEach((object, id) => {
         const frame = frameOf(object)
         const shape = frame === undefined ? undefined : plan.inst.shapeOf(id)
-        const kinds = shape === undefined ? undefined : plan.bits.get(plan.shapes.get(shape)!)
+        if (shape === undefined) return
+        const frames = listOf(scopes, shape)
+        if (!frames.includes(frame!)) frames.push(frame!)
+        const kinds = plan.bits.get(plan.shapes.get(shape)!)
         if (!kinds?.tagged.size) return
         const prior = plan.bits.get(frame!)
         intrinsics.assert(!prior || prior.tagged === kinds.tagged, `native: frame @${frame} is viewed as planned shapes with different tagged fields`)
         plan.bits.set(frame!, { flags: new Set(), tagged: kinds.tagged })
     })
+    function slotOf(layout: propertyEval.Layout, key: intrinsics.Handle): string {
+        const at = layout.keys.indexOf(key)
+        if (at < 0) return ''
+        const tag = layout.tags[at]
+        return tag ? `${layout.offsets[at]}:${tag.offset}:${tag.bit}` : String(layout.offsets[at])
+    }
+    for (const [shape, frames] of scopes) {
+        const keys = propertyEval.dataKeys(plan.shapes.get(shape)!)
+        const first = propertyEval.recordLayout(frames[0], plan.embedded.fields, plan.bits)
+        const agree = frames.every(frame => {
+            const layout = propertyEval.recordLayout(frame, plan.embedded.fields, plan.bits)
+            return keys.every(key => slotOf(layout, key) === slotOf(first, key))
+        })
+        plan.scopeFrames.set(shape, agree ? frames[0] : undefined)
+    }
     const fixed = new Set(plan.shapes.values())
     const held = new Map<intrinsics.Handle, Map<string, Type[]>>()
     for (const object of types.objects) {
@@ -9522,7 +9581,9 @@ function planFrames(types: ValueTypes, plan: ShapePlan, planned: Planned, binder
 function soleShape(plan: ShapePlan, rep: Rep): intrinsics.Handle | undefined {
     if (memberCount(rep) !== 1) return
     if (rep.closure !== undefined) return rep.closure
-    return rep.shapes.length ? plan.shapes.get(rep.shapes[0]) : undefined
+    if (!rep.shapes.length) return
+    if (plan.scopeFrames.has(rep.shapes[0])) return plan.scopeFrames.get(rep.shapes[0])
+    return plan.shapes.get(rep.shapes[0])
 }
 
 function objectShapes(plan: ShapePlan, rep: Rep): intrinsics.Handle[] | undefined {
@@ -10429,22 +10490,19 @@ function coerceSlots(graph: Graph, id: number, slots: number[], to: (x: Operand,
     }
     if (changed) putCopy(graph, id, n, operands)
 }
-function numberWord(graph: Graph, ordering: Operand, f: Operand, boxed: boolean, integer?: Operand): [number, number] {
+function numberWord(graph: Graph, ordering: number, f: Operand, boxed: boolean, guarded: Set<number>, integer?: Operand): [number, number] {
     const cell = addNode(graph, NodeOp.pstack, [ordering, { literal: PstackFirst }, 0, { literal: 8 }])
     const stored = addNode(graph, NodeOp.store, [cell, cell, { literal: 0 }, f], Types.f64)
     const word = addNode(graph, NodeOp.or, [addNode(graph, NodeOp.encode, [cell, { literal: pstack0Base() }]), { literal: heap.pstackBoxWordTag ^ heap.pstackWordTag }], Types.vm_value)
     if (boxed) return [stored, word]
-    if (integer !== undefined) {
-        const low = addNode(graph, NodeOp.ge, [integer, { literal: -0x40000000 }], Types.bool)
-        const high = addNode(graph, NodeOp.lt, [integer, { literal: 0x40000000 }], Types.bool)
-        return [stored, addNode(graph, NodeOp.select, [addNode(graph, NodeOp.and, [low, high], Types.bool), addNode(graph, NodeOp.box, [integer], Types.vm_value), word])]
-    }
-    const whole = addNode(graph, NodeOp.convert, [f], Types.i64)
-    const integral = addNode(graph, NodeOp.eq, [addNode(graph, NodeOp.convert, [whole], Types.f64), f], Types.bool)
+    const whole = integer ?? addNode(graph, NodeOp.convert, [f], Types.i64)
     const low = addNode(graph, NodeOp.ge, [whole, { literal: -0x40000000 }], Types.bool)
     const high = addNode(graph, NodeOp.lt, [whole, { literal: 0x40000000 }], Types.bool)
-    const small = addNode(graph, NodeOp.and, [integral, addNode(graph, NodeOp.and, [low, high], Types.bool)], Types.bool)
-    return [stored, addNode(graph, NodeOp.select, [small, addNode(graph, NodeOp.box, [whole], Types.vm_value), word])]
+    const fits = addNode(graph, NodeOp.and, [low, high], Types.bool)
+    const small = integer !== undefined ? fits : addNode(graph, NodeOp.and, [addNode(graph, NodeOp.eq, [addNode(graph, NodeOp.convert, [whole], Types.f64), f], Types.bool), fits], Types.bool)
+    const chosen = insertNode(graph, makeNode(graph, NodeOp.select, [small, addNode(graph, NodeOp.box, [whole], Types.vm_value), addNode(graph, NodeOp.after, [stored, word])], Types.u64, NodeFlags.tail_only))
+    guarded.add(chosen)
+    return [ordering, chosen]
 }
 
 export function realizeRepresentations(graph: Graph, request: CodecRequest, tagParams: boolean): void {
@@ -10612,17 +10670,17 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         }
         return word
     }
-    function boxWord(ordering: Operand, f: Operand): number {
-        return addNode(graph, NodeOp.after, numberWord(graph, ordering, f, false))
+    function boxWord(ordering: number, f: Operand): number {
+        return numberWord(graph, ordering, f, false, guarded)[1]
     }
     function writeWord(id: number, n: GraphNode, x: number): void {
         const rep = records.get(x)!
         const tag = field(x, 2)
         const other = field(x, 1)
         let word: Operand
-        if (typeof tag !== 'number') word = tag.literal ? other : boxWord(getOperand(graph, n, 0), field(x, 0))
+        if (typeof tag !== 'number') word = tag.literal ? other : boxWord(getRef(n, 0), field(x, 0))
         else {
-            word = insertNode(graph, makeNode(graph, NodeOp.select, [addNode(graph, NodeOp.eq, [tag, { literal: 0 }], Types.bool), boxWord(getOperand(graph, n, 0), field(x, 0)), other], Types.u64, NodeFlags.tail_only))
+            word = insertNode(graph, makeNode(graph, NodeOp.select, [addNode(graph, NodeOp.eq, [tag, { literal: 0 }], Types.bool), boxWord(getRef(n, 0), field(x, 0)), other], Types.u64, NodeFlags.tail_only))
             reps.set(word, wordRep(rep))
             guarded.add(word)
         }
@@ -11013,6 +11071,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         }
     }
     if (guarded.size) splitGuardedSelects(graph, guarded)
+    guarded.clear()
     recordsRealized = true
     const absentRoot = graph.blocks[0]
     function f64Rep(rep: Rep | undefined): boolean {
@@ -11296,11 +11355,12 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         const converted = float ? value : typeof value === 'number' ? addNode(graph, NodeOp.convert, [value], Types.f64) : addNode(graph, NodeOp.literal, [value], Types.f64)
         const format = checked && typeof value === 'number' ? intFormatOf(factsOf(value)) : undefined
         const integer = format && (format.bits === 32 || format.signed) ? addNode(graph, NodeOp.convert, [value], Types.i64) : undefined
-        const [stored, word] = numberWord(graph, getRef(n, 0), converted, (floatSlot(id, value) && !integral) || (checked && typeof value !== 'number'), integer)
+        const [stored, word] = numberWord(graph, getRef(n, 0), converted, (floatSlot(id, value) && !integral) || (checked && typeof value !== 'number'), guarded, integer)
         putCopy(graph, id, n, [stored, ...getOperands(graph, n, 1, 3), word])
     }
     function returnedFloatWord(x: Operand, block: number): Operand {
-        return addNode(graph, NodeOp.after, numberWord(graph, addNode(graph, NodeOp.startOf, [block]), x, numberName(returns) === 'f64'))
+        const [stored, word] = numberWord(graph, addNode(graph, NodeOp.startOf, [block]), x, numberName(returns) === 'f64', guarded)
+        return guarded.has(word) ? word : addNode(graph, NodeOp.after, [stored, word])
     }
     function voidValue(x: number, T: intrinsics.Types, word: boolean): Operand {
         const n = getNode(graph, x)!
@@ -11560,8 +11620,14 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         return typeof a === 'number' ? a === b : typeof b !== 'number' && a.literal === b.literal
     }
     for (const [store, value] of request.tagWrites) coerceSlots(graph, store, [3], () => tagOf(value))
-    for (const [store, value] of request.wordWrites) coerceSlots(graph, store, [3], word => addNode(graph, NodeOp.select, [tagOf(value), word, { literal: heap.undefinedWord }]))
-    for (const [call, slot, value] of wordArguments) coerceSlots(graph, call, [slot], word => addNode(graph, NodeOp.select, [tagOf(value), word, { literal: heap.undefinedWord }]))
+    function wordOrUndefined(value: number, word: Operand): number {
+        if (typeof word !== 'number' || !guarded.has(word)) return addNode(graph, NodeOp.select, [tagOf(value), word, { literal: heap.undefinedWord }])
+        const chosen = insertNode(graph, makeNode(graph, NodeOp.select, [tagOf(value), word, { literal: heap.undefinedWord }], Types.u64, NodeFlags.tail_only))
+        guarded.add(chosen)
+        return chosen
+    }
+    for (const [store, value] of request.wordWrites) coerceSlots(graph, store, [3], word => wordOrUndefined(value, word))
+    for (const [call, slot, value] of wordArguments) coerceSlots(graph, call, [slot], word => wordOrUndefined(value, word))
     const tagFresh = graph.ids.next
     for (const [id, n] of nodeEntries(graph)) {
         if (id >= tagFresh) break
@@ -11654,6 +11720,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         }
         if (operands) putCopy(graph, id, n, operands)
     }
+    splitGuardedSelects(graph, guarded)
 }
 
 function taggedRecord(graph: Graph, float: boolean): number {
@@ -12344,6 +12411,13 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         }
         return out
     }
+    let scopeShapes: Set<intrinsics.Handle> | undefined
+    function verifyScopeReads(fn: Function, resolved: Resolution): void {
+        scopeShapes ??= new Set([...plan.scopeFrames.keys()].map(id => plan.shapes.get(id)!))
+        for (const [node, shape] of resolved.shapes) {
+            if (scopeShapes.has(shape)) throw `native: ${fn.name || "<anon>"} reads %${node}, a scope, as the planned shape ${describe(shape)}, not as the frame the scope is laid out in`
+        }
+    }
     const shapeIds = new Map<intrinsics.Handle, string>()
     for (const [id, handle] of plan.shapes) if (!shapeIds.has(handle)) shapeIds.set(handle, id)
     function sameLayout(a: intrinsics.Handle | undefined, b: intrinsics.Handle | undefined): boolean {
@@ -12997,6 +13071,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             const lineageBefore = typeRecording() && debugsTypes(fn.name) ? lineageSnapshot(graphOf(fn)) : undefined
             const resolved = resolveUnit(fn)
             const params = calleeParams(resolved)
+            verifyScopeReads(fn, resolved)
             const edges = callEdges(resolved, params)
             verifyResolved(fn, resolved, edges, 'resolve', false)
             const request = codecRequest(fn, resolved, params)
@@ -13371,7 +13446,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         if (!facts.has(shape)) facts.set(shape, new Map())
         facts.set(state, facts.get(shape)!)
     }
-    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys }
+    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map() }
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {

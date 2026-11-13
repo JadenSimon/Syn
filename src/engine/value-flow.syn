@@ -137,6 +137,7 @@ interface SummaryBuild {
     konsts: Map<number, number>
     tested: Set<number>
     narrowExprs: Map<number, Map<Guard, number>>
+    narrowSteps: Map<string, number>
     gateOf: Map<number, number>
     selects: number[]
     forwards: Map<number, Map<number, Map<number, number>>>
@@ -267,6 +268,10 @@ interface FlowState {
     fieldWatch: (number[] | undefined)[]
     originPending: (Map<number, number[]> | undefined)[]
     pickWatch: Map<number, number[]>
+    shareOf: Map<number, number>
+    sharers: Map<number, number[]>
+    groups: Map<number, number[]>
+    unmatched: Map<number, Set<number>>
     freshOwner: Map<number, Summary>
     definiteKeys: Map<number, Handle[]>
     slotKind: number[]
@@ -1097,13 +1102,13 @@ function drain(): void {
             const origin = origins[flow.slotSent[s]]
             flow.slotSent[s]++
             let l = chainFirst(flow.listeners, s)
-            if (l < 0) continue
             if (flow.why) flow.why.from = s
             while (l >= 0) {
                 deliver(l, origin)
                 l = chainAfter(flow.listeners, s, l)
             }
             if (flow.why) flow.why.from = -1
+            if (flow.groups.size) forward(s, origin)
         }
     }
     flow.queue.length = 0
@@ -1472,7 +1477,7 @@ function newSummary(fn: Function, g: Graph, id: number): Summary {
         fn, id, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false, returnsParam: false,
         local: undefined, width: 0, owned: [], regions: undefined, guards: new Map(), stores: [], siteCone: undefined, coneParams: 0, allocNodes: new Map(), retExpr: -1, blockGates: [], regionRets: new Map(), fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, lengthProofs: undefined, keyFacts: undefined, keyless: undefined, prover: undefined, facts: new Set(), keyFree: undefined, demands: undefined, kindIds: undefined, kindVecs: [],
-        build: { konsts: new Map(), tested: new Set(), narrowExprs: new Map(), gateOf: new Map(), selects: [], forwards: new Map(), remainders: undefined },
+        build: { konsts: new Map(), tested: new Set(), narrowExprs: new Map(), narrowSteps: new Map(), gateOf: new Map(), selects: [], forwards: new Map(), remainders: undefined },
     }
     flow.summaries.set(fn, s)
     const added = id > flow.summaryList.length
@@ -1987,6 +1992,8 @@ function testedRefs(s: Summary, cond: number, seen: Set<number>): void {
         if (!r) continue
         out.add(r)
         const m = getNode(g, tailOf(g, r))
+        const object = n.op === NodeOp.eq || n.op === NodeOp.ne ? matchedObject(g, n, i) : 0
+        if (object) out.add(object)
         if (m?.op === NodeOp.rt && getRef(m, 2)) out.add(getRef(m, 2))
         if (m?.op === NodeOp.typeof && getRef(m, 0)) out.add(getRef(m, 0))
         if ((m?.op === NodeOp.rem || m?.op === NodeOp.and) && getRef(m, 0)) out.add(getRef(m, 0))
@@ -2000,10 +2007,58 @@ interface Guard {
     picks: number[]
     protos?: number[]
     factor?: number
+    matches?: number[]
 }
 
 const noGuard: Guard = { flags: 0, lo: MinI64, hi: MaxU64, picks: [] }
 const deadGuard: Guard = { flags: GuardFlag.truthy | GuardFlag.falsy | GuardFlag.nullish, lo: MinI64, hi: MaxU64, picks: [] }
+const matchKeys: number[] = []
+const matchValues: number[] = []
+const matchEquals: boolean[] = []
+const matchIds = new Map<number, Map<number, number>>()
+
+function matchOf(key: number, t: number, equal: boolean): number {
+    let byValue = matchIds.get(key)
+    if (!byValue) matchIds.set(key, byValue = new Map())
+    const code = t * 2 + (equal ? 1 : 0)
+    const known = byValue.get(code)
+    if (known !== undefined) return known
+    const id = matchKeys.length
+    matchKeys.push(key)
+    matchValues.push(t)
+    matchEquals.push(equal)
+    byValue.set(code, id)
+    return id
+}
+
+function constantOperand(g: Graph, n: GraphNode, i: number): number {
+    const r = getRef(n, i)
+    if (!r) return literalScalar(getLiteral(g, n, i))
+    const m = getNode(g, tailOf(g, r))
+    if (!m || getRef(m, 0)) return -1
+    if (m.op === NodeOp.literal) return typeOf(m) === Types.f64 ? floatLiteral(getLiteral(g, m, 0)) : typeOf(m) === Types.bool ? truthScalar(getLiteral(g, m, 0) !== 0) : literalScalar(getLiteral(g, m, 0))
+    if (m.op !== NodeOp.heapHandle) return -1
+    const cell = getLiteral(g, m, 0)
+    if (cell === heap.nullHandle) return NULL
+    if (heap.isNullishHandle(cell as Handle)) return UNDEF
+    return heap.isString(cell as Handle) ? strScalar(cell) : -1
+}
+
+function matchedObject(g: Graph, n: GraphNode, side: number): number {
+    const r = getRef(n, side)
+    const m = r ? getNode(g, tailOf(g, r)) : undefined
+    if (m?.op !== NodeOp.getProp || getRef(m, 2) || !getRef(m, 1) || isIndexKey(getLiteral(g, m, 2))) return 0
+    return constantOperand(g, n, 1 - side) >= 0 ? tailOf(g, getRef(m, 1)) : 0
+}
+
+function fieldMatch(g: Graph, n: GraphNode, ref: number, equal: boolean): number {
+    for (let side = 0; side < 2; side++) {
+        if (matchedObject(g, n, side) !== ref) continue
+        const m = getNode(g, tailOf(g, getRef(n, side)))!
+        return matchOf(getLiteral(g, m, 2), constantOperand(g, n, 1 - side), equal)
+    }
+    return -1
+}
 
 function narrowed(s: Summary, ref: number, base: number, use: number): number {
     const regions = s.regions!
@@ -2015,12 +2070,24 @@ function narrowed(s: Summary, ref: number, base: number, use: number): number {
     if (!byGuard) build.narrowExprs.set(ref, byGuard = new Map())
     let e = byGuard.get(guard)
     if (e === undefined) {
-        e = guard.flags ? expr(s, ExprOp.narrow, 0, base, guard.lo, guard.flags, [base], guard.hi) : base
-        for (const pick of guard.picks) e = expr(s, ExprOp.pick, 0, e, pick & 1, pick >> 1, [e], 0)
-        for (const proto of guard.protos ?? []) e = expr(s, ExprOp.narrow, 0, e, Math.abs(proto), proto > 0 ? GuardFlag.hasProto : heap.isString(-proto as Handle) ? GuardFlag.lacksText : GuardFlag.lacksProto, [e], 0)
-        if (guard.factor) e = expr(s, ExprOp.narrow, 0, e, guard.factor, GuardFlag.multiple, [e], 0)
+        e = base
+        if (guard.flags) e = narrowStep(s, ExprOp.narrow, e, guard.lo, guard.flags, guard.hi)
+        for (const pick of guard.picks) e = narrowStep(s, ExprOp.pick, e, pick & 1, pick >> 1, 0)
+        for (const proto of guard.protos ?? []) e = narrowStep(s, ExprOp.narrow, e, Math.abs(proto), proto > 0 ? GuardFlag.hasProto : heap.isString(-proto as Handle) ? GuardFlag.lacksText : GuardFlag.lacksProto, 0)
+        if (guard.factor) e = narrowStep(s, ExprOp.narrow, e, guard.factor, GuardFlag.multiple, 0)
+        for (const match of guard.matches ?? []) e = narrowStep(s, ExprOp.pick, e, match + 2, matchKeys[match], 0)
         byGuard.set(guard, e)
     }
+    return e
+}
+
+function narrowStep(s: Summary, op: ExprOp, a: number, b: number, key: number, sub: number): number {
+    const steps = s.build!.narrowSteps
+    const code = `${op}:${a}:${b}:${key}:${sub}`
+    const known = steps.get(code)
+    if (known !== undefined) return known
+    const e = expr(s, op, 0, a, b, key, [a], sub)
+    steps.set(code, e)
     return e
 }
 
@@ -2082,13 +2149,18 @@ function meetGuard(a: Guard, b: Guard): Guard {
         if (!protos.includes(p)) protos.push(p)
     }
     const factor = lcm(a.factor ?? 1, b.factor ?? 1)
-    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length && protos.length === (a.protos ?? []).length && factor === (a.factor ?? 1)) return a
-    return guardOf(flags, lo, hi, picks, protos, factor)
+    const matches = (a.matches ?? []).slice()
+    for (const m of b.matches ?? []) {
+        if (!matches.includes(m)) matches.push(m)
+    }
+    if (flags === a.flags && lo === a.lo && hi === a.hi && picks.length === a.picks.length && protos.length === (a.protos ?? []).length && factor === (a.factor ?? 1) && matches.length === (a.matches ?? []).length) return a
+    return guardOf(flags, lo, hi, picks, protos, factor, matches)
 }
 
-function guardOf(flags: number, lo: number, hi: number, picks: number[], protos: number[], factor: number): Guard {
+function guardOf(flags: number, lo: number, hi: number, picks: number[], protos: number[], factor: number, matches: number[]): Guard {
     const guard: Guard = protos.length ? { flags, lo, hi, picks, protos } : { flags, lo, hi, picks }
     if (factor > 1) guard.factor = factor
+    if (matches.length) guard.matches = matches
     return guard
 }
 
@@ -2116,8 +2188,9 @@ function joinGuard(a: Guard, b: Guard): Guard {
         if (!protos.includes(p) && holdsProto(a, p)) protos.push(p)
     }
     const factor = gcd(a.factor ?? 1, b.factor ?? 1)
-    if (!flags && !picks.length && !protos.length && factor === 1) return noGuard
-    return guardOf(flags, lo, hi, picks, protos, factor)
+    const matches = (a.matches ?? []).filter(m => b.matches?.includes(m))
+    if (!flags && !picks.length && !protos.length && factor === 1 && !matches.length) return noGuard
+    return guardOf(flags, lo, hi, picks, protos, factor, matches)
 }
 
 function contradicts(flags: number): boolean {
@@ -2149,8 +2222,10 @@ function guardOn(s: Summary, cond: number, ref: number, yes: boolean, calls: boo
     const other = a === ref ? 1 : b === ref ? 0 : -1
     if (other < 0) {
         if (n.op !== NodeOp.eq && n.op !== NodeOp.ne) return noGuard
+        const match = fieldMatch(g, n, ref, equal)
+        if (match >= 0) return { flags: 0, lo: MinI64, hi: MaxU64, picks: [], matches: [match] }
         const factor = equal ? multipleOf(g, n, ref) : 1
-        if (factor > 1) return guardOf(0, MinI64, MaxU64, [], [], factor)
+        if (factor > 1) return guardOf(0, MinI64, MaxU64, [], [], factor, [])
         const machine = machineTypeofOf(s, a, ref) ? 1 : machineTypeofOf(s, b, ref) ? 0 : -1
         if (machine >= 0) {
             if (getRef(n, machine) || getLiteral(g, n, machine) !== Types.f64) return noGuard
@@ -2315,7 +2390,7 @@ function predicateGuard(s: Summary, call: GraphNode, ref: number, positive: bool
     for (let i = 3; i < countIds(call) && (i - 3) * 2 < table.length; i++) {
         if (getRef(call, i) !== ref) continue
         const guard = table[(i - 3) * 2 + (positive ? 0 : 1)]
-        if (guard.flags || guard.protos) return guard
+        if (guard.flags || guard.protos || guard.matches) return guard
     }
     return noGuard
 }
@@ -2356,7 +2431,7 @@ function tableOf(callee: Summary): Guard[] | null {
                 joined = joinGuard(joined, meetGuard(pathGuard(callee, p, r), own))
                 if (joined === noGuard) break
             }
-            table.push(joined.picks.length ? { flags: joined.flags, lo: joined.lo, hi: joined.hi, picks: [], protos: joined.protos } : joined)
+            table.push(joined.picks.length ? { flags: joined.flags, lo: joined.lo, hi: joined.hi, picks: [], protos: joined.protos, matches: joined.matches } : joined)
         }
     }
     callee.predicates = table
@@ -2986,7 +3061,9 @@ function wireExpr(inst: Instance, x: Expr, slot: number): void {
         case ExprOp.union:
             for (const a of x.args) listen(at(inst, a), ListenerKind.copy, slot, 0, 0)
         case ExprOp.narrow: listen(at(inst, x.a), ListenerKind.narrow, slot, x.key, x.b)
-        case ExprOp.pick: listen(at(inst, x.a), ListenerKind.pick, slot, x.key, x.b)
+        case ExprOp.pick:
+            if (x.b >= 2) return share(at(inst, x.a), slot, x.key, x.b)
+            listen(at(inst, x.a), ListenerKind.pick, slot, x.key, x.b)
         case ExprOp.member:
             listen(at(inst, x.a), ListenerKind.member, slot, x.key, x.key === dynKey ? at(inst, x.b) : 0)
         case ExprOp.call:
@@ -3531,7 +3608,7 @@ function hold(c: Confinement, origin: number): void {
     if (!confinable(origin) || c.held.size >= maxConfined) return release(c)
     c.held.add(origin)
     for (const r of c.reach) {
-        if (hasOrigin(r, origin)) return release(c)
+        if (holds(r, origin)) return release(c)
     }
     let watch = flow.holderWatch.get(origin)
     if (!watch) flow.holderWatch.set(origin, watch = [])
@@ -3597,12 +3674,12 @@ function confinement(inst: Instance, calls: number[], owner: number): Confinemen
     return flow.confinements[id]
 }
 
-function pickOrigin(target: number, origin: number, key: number, truthy: number): void {
+function pickOrigin(target: number, origin: number, key: number, test: number): void {
     const f = flow.originFields[origin].get(key)
-    if (f === undefined || !pickRejects(f, truthy)) return addOrigin(target, origin)
+    if (f === undefined || !pickRejects(f, test, origin)) return addOrigin(target, origin)
     let list = flow.pickWatch.get(f)
     if (!list) flow.pickWatch.set(f, list = [])
-    list.push(target, origin, truthy)
+    list.push(target, origin, test)
 }
 
 function boolLiteral(g: Graph, id: number): number {
@@ -3611,16 +3688,23 @@ function boolLiteral(g: Graph, id: number): number {
     return getLiteral(g, n, 0) ? 1 : 0
 }
 
-function pickRejects(f: number, truthy: number): boolean {
+function fieldConstant(f: number): number | undefined {
     let t = flow.slotConst[f]
     let e = chainFirst(flow.ins, f)
     while (e >= 0) {
         const from = flow.inFrom[e]
         const slot = from >= 0 ? from : -from - 1
-        if (flow.slotKind[slot] !== SlotKind.konst || flow.ins.last[slot] >= 0) return false
+        if (flow.slotKind[slot] !== SlotKind.konst || flow.ins.last[slot] >= 0) return undefined
         t = unite(t, flow.slotConst[slot])
         e = chainAfter(flow.ins, f, e)
     }
+    return t
+}
+
+function pickRejects(f: number, truthy: number, origin: number): boolean {
+    const t = fieldConstant(f)
+    if (t === undefined) return false
+    if (truthy >= 2) return matchRejects(f, t, origin, truthy - 2)
     const objects = flow.slotOrigins[f].length > 0
     const fl = scalars.flags[t]
     const falsy = !objects && !(fl & ~(ScalarFlag.undef | ScalarFlag.void | ScalarFlag.null | ScalarFlag.int | ScalarFlag.no)) && (!(fl & ScalarFlag.int) || (scalars.lo[t] === 0 && scalars.hi[t] === 0))
@@ -3628,12 +3712,184 @@ function pickRejects(f: number, truthy: number): boolean {
     return truthy ? falsy && (t !== NONE || objects) : truthyOnly
 }
 
+function matchable(origin: number, key: number): boolean {
+    const kind = flow.originKind[origin]
+    if ((kind !== OriginKind.fresh && kind !== OriginKind.created && kind !== OriginKind.static) || isScope(origin)) return false
+    let at = protoOf(origin)
+    while (at) {
+        if (heap.getOwnProperty(at, key as Handle)) return false
+        at = heap.getPrototypeOf(at)
+    }
+    return true
+}
+
+function matchRejects(f: number, t: number, origin: number, match: number): boolean {
+    if (!matchable(origin, matchKeys[match])) return false
+    const origins = flow.slotOrigins[f].slice()
+    let e = chainFirst(flow.ins, f)
+    while (e >= 0) {
+        const from = flow.inFrom[e]
+        for (const o of flow.slotOrigins[from >= 0 ? from : -from - 1]) origins.push(o)
+        e = chainAfter(flow.ins, f, e)
+    }
+    const value = (flow.fieldForms.get(f) ?? 0) & FieldForm.absent ? unite(t, UNDEF) : t
+    return foldCompare(NodeOp.eq, value, matchValues[match], origins, []) === (matchEquals[match] ? FALSE : TRUE)
+}
+
+function share(a: number, p: number, key: number, test: number): void {
+    const view = viewOf(a)
+    for (const origin of view) {
+        charge(1)
+        const f = flow.originFields[origin].get(key)
+        if (f !== undefined && pickRejects(f, test, origin)) return listen(a, ListenerKind.pick, p, key, test)
+    }
+    flow.slotOrigins[p] = view
+    flow.slotSent[p] = view.length
+    for (const origin of view) noteOrigin(p, origin)
+    flow.shareOf.set(p, a)
+    let list = flow.sharers.get(a)
+    if (!list) flow.sharers.set(a, list = [])
+    list.push(p, key, test)
+}
+
+function viewOf(a: number): number[] {
+    if (flow.shareOf.has(a)) return flow.slotOrigins[a]
+    let group = flow.groups.get(a)
+    if (!group) flow.groups.set(a, group = flow.slotOrigins[a].slice(0, flow.slotSent[a]))
+    return group
+}
+
+function forward(s: number, origin: number): void {
+    const group = flow.groups.get(s)
+    if (!group || group.length >= flow.slotSent[s]) return
+    charge(1)
+    screen(s, origin, -1)
+    group.push(origin)
+    pass(s, origin)
+}
+
+function screen(s: number, origin: number, passed: number): void {
+    const list = flow.sharers.get(s)
+    if (!list) return
+    let i = 0
+    while (i < list.length) {
+        const p = list[i]
+        const key = list[i + 1]
+        const test = list[i + 2]
+        i += 3
+        if (flow.shareOf.get(p) !== s) continue
+        if (key !== passed && flow.unmatched.get(key)?.has(origin)) passed = key
+        if (key !== passed) {
+            charge(1)
+            const f = flow.originFields[origin].get(key)
+            const t = f === undefined ? undefined : fieldConstant(f)
+            if (t === undefined || !matchable(origin, key)) {
+                passed = key
+                if (f !== undefined && !flow.step) unmatchable(origin, key)
+            } else if (matchRejects(f!, t, origin, test - 2)) {
+                materialize(p, s, key, test)
+                continue
+            }
+        }
+        if (frozen(p)) {
+            materialize(p, s, key, test)
+            continue
+        }
+        screen(p, origin, passed)
+    }
+}
+
+function pass(s: number, origin: number): void {
+    const list = flow.sharers.get(s)
+    if (!list) return
+    const count = list.length
+    let stale = false
+    let i = 0
+    while (i < count) {
+        const p = list[i]
+        i += 3
+        if (flow.shareOf.get(p) !== s) {
+            stale = true
+            continue
+        }
+        flow.slotSent[p] = flow.slotOrigins[p].length
+        noteOrigin(p, origin)
+        let l = chainFirst(flow.listeners, p)
+        while (l >= 0) {
+            deliver(l, origin)
+            l = chainAfter(flow.listeners, p, l)
+        }
+        pass(p, origin)
+    }
+    if (!stale || list.length !== count) return
+    let keep = 0
+    i = 0
+    while (i < count) {
+        if (flow.shareOf.get(list[i]) === s) {
+            list[keep++] = list[i]
+            list[keep++] = list[i + 1]
+            list[keep++] = list[i + 2]
+        }
+        i += 3
+    }
+    list.length = keep
+}
+
+function unmatchable(origin: number, key: number): void {
+    let set = flow.unmatched.get(key)
+    if (!set) flow.unmatched.set(key, set = new Set())
+    set.add(origin)
+}
+
+function materialize(p: number, s: number, key: number, test: number): void {
+    const group = flow.slotOrigins[p]
+    const own = group.slice()
+    for (const origin of own) flow.slotOriginSet.add(p * originSpan + origin)
+    flow.slotOrigins[p] = own
+    flow.shareOf.delete(p)
+    if (flow.sharers.has(p)) {
+        const sub = group.slice()
+        flow.groups.set(p, sub)
+        repoint(p, sub)
+    }
+    listen(s, ListenerKind.pick, p, key, test)
+}
+
+function repoint(p: number, group: number[]): void {
+    const list = flow.sharers.get(p)
+    if (!list) return
+    let i = 0
+    while (i < list.length) {
+        const q = list[i]
+        i += 3
+        if (flow.shareOf.get(q) !== p) continue
+        flow.slotOrigins[q] = group
+        repoint(q, group)
+    }
+}
+
+function holderOf(s: number): number {
+    let at = s
+    let up = flow.shareOf.get(at)
+    while (up !== undefined) {
+        at = up
+        up = flow.shareOf.get(at)
+    }
+    return at
+}
+
+function holds(r: number, origin: number): boolean {
+    if (!flow.shareOf.has(r)) return hasOrigin(r, origin)
+    const root = holderOf(r)
+    return hasOrigin(root, origin) && flow.slotOrigins[root].indexOf(origin, flow.slotOrigins[r].length) < 0
+}
+
 function recheckPicks(f: number): void {
     const list = flow.pickWatch.get(f)
     if (!list) return
     let keep = 0
     for (let i = 0; i < list.length; i += 3) {
-        if (pickRejects(f, list[i + 2])) {
+        if (pickRejects(f, list[i + 2], list[i + 1])) {
             list[keep++] = list[i]
             list[keep++] = list[i + 1]
             list[keep++] = list[i + 2]
@@ -5045,7 +5301,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotClass: new Map(),
         work: 0, traceMs: 0, budget: 0, totalNodes: 0, stepWork: 0,
         summaries: new Map(), summaryList: [], instances: [], instanceOf: new Map(),
-        originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(),
+        originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(), shareOf: new Map(), sharers: new Map(), groups: new Map(), unmatched: new Map(),
         freshOwner: new Map(),
         definiteKeys: new Map(),
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: new Set(), slotSent: [], listeners: { next: [], last: [] }, listenKind: [], listenTarget: [], listenKey: [], listenExtra: [], ins: { next: [], last: [] }, inFrom: [], slotConst: [], slotOpaque: new Set(),
@@ -5927,7 +6183,8 @@ function resolveUnit(list: number[]): UnitTypes {
     }
     const receivers = new Map<number, Type>()
     for (const x of s.exprs) {
-        if (x.op !== ExprOp.member || !x.node || s.exprs[x.a].op !== ExprOp.narrow || getNode(g, x.node)?.op !== NodeOp.getProp) continue
+        const object = s.exprs[x.a]
+        if (x.op !== ExprOp.member || !x.node || (object.op !== ExprOp.narrow && (object.op !== ExprOp.pick || object.b < 2)) || getNode(g, x.node)?.op !== NodeOp.getProp) continue
         const out = joinTypes(members.map(m => slotType(at(m, x.a))))
         if (out && inhabited(out)) receivers.set(x.node, out)
     }
@@ -6053,7 +6310,7 @@ function slotWithin(a: number, b: number): boolean {
     if (a === b) return true
     if (unite(flow.scalar[b], flow.scalar[a]) !== flow.scalar[b]) return false
     if (flow.slotOpaque.has(a) && !flow.slotOpaque.has(b)) return false
-    for (const origin of flow.slotOrigins[a]) if (!hasOrigin(b, origin)) return false
+    for (const origin of flow.slotOrigins[a]) if (!holds(b, origin)) return false
     return true
 }
 
@@ -8307,6 +8564,11 @@ function slotText(s: number): string {
     return parts.length ? parts.join(' | ') : 'never'
 }
 
+function pickText(x: Expr): string {
+    if (x.b < 2) return `${x.b ? '' : '!'}${keyText(x.key)}`
+    return `${keyText(x.key)} ${matchEquals[x.b - 2] ? '===' : '!=='} ${scalarText(matchValues[x.b - 2])}`
+}
+
 function keyText(key: number): string {
     if (key === elemKey) return '[elem]'
     if (isPosKey(key)) return `[#${posBase - key}]`
@@ -8332,7 +8594,7 @@ function exprText(s: Summary, e: number, depth: number): string {
         case ExprOp.store: return `${exprText(s, x.a, depth + 1)}${x.key === dynKey ? `[${exprText(s, x.args[0], depth + 1)}]` : keyText(x.key)} := ${exprText(s, x.b, depth + 1)}`
         case ExprOp.opaque: return `opaque%${x.node}`
         case ExprOp.narrow: return `narrow(${exprText(s, x.args[0], depth + 1)}, ${narrowText(x)})`
-        case ExprOp.pick: return `pick(${exprText(s, x.args[0], depth + 1)}, ${x.b ? '' : '!'}${keyText(x.key)})`
+        case ExprOp.pick: return `pick(${exprText(s, x.args[0], depth + 1)}, ${pickText(x)})`
     }
     return exprNames[x.op]
 }
@@ -8372,7 +8634,7 @@ function exprRule(s: Summary, e: number): string {
         case ExprOp.store: return `store ${exprRef(s, x.a)}${x.key === dynKey ? `[${exprRef(s, x.args[0])}]` : keyText(x.key)} := ${exprRef(s, x.b)}`
         case ExprOp.opaque: return `opaque${typed}`
         case ExprOp.narrow: return `narrow ${exprRef(s, x.args[0])} by ${narrowText(x)}`
-        case ExprOp.pick: return `pick ${exprRef(s, x.args[0])} ${x.b ? '' : '!'}${keyText(x.key)}`
+        case ExprOp.pick: return `pick ${exprRef(s, x.args[0])} ${pickText(x)}`
         case ExprOp.gate: return `gate ${exprRef(s, x.a)} on ${exprRef(s, x.b)}`
         case ExprOp.ntype: return `typeof ${exprRef(s, x.a)}`
     }
