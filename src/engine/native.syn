@@ -7324,7 +7324,9 @@ export function realizeSlices(graph: Graph, slices: Map<number, Rep> | undefined
             continue
         }
         if (op === rt.Op.slice && slab) {
-            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.malloc }, scaled(2)], rt.signatureOf(rt.Op.malloc).returns)
+            const bytes = scaled(2)
+            const block = addNode(graph, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.malloc }, bytes], rt.signatureOf(rt.Op.malloc).returns)
+            putNode(graph, id, NodeOp.after, [block, addNode(graph, NodeOp.mem, [block, bytes], Types.u64)])
             continue
         }
         if (op === rt.Op.slice) {
@@ -8142,9 +8144,8 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         }
     }
     interface ColdRegion {
-        entry: number
         blocks: Set<number>
-        sites: number[]
+        sites: SelectPath
         from: number[]
         nested: Set<number>
     }
@@ -8162,27 +8163,30 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
     }
     function coldRegions(graph: Graph): ColdRegion[] {
         if (!someNode(graph, n => n.op === NodeOp.panic || n.op === NodeOp.unreachable)) return []
+        const terminal = (id: number) => {
+            const op = getNode(graph, id)?.op
+            return op === NodeOp.panic || op === NodeOp.unreachable
+        }
         const succ = new Map<number, number[]>()
         const preds = new Map<number, number[]>()
         const live = new Set<number>()
         const panics = new Set<number>()
-        const applies = new Map<number, number[]>()
+        const tails = new Map<number, TailPosition[]>()
         for (const b of graph.blocks) {
             const out: number[] = []
-            const sites: number[] = []
-            for (const p of tailPositions(graph, b.bodyId)) {
+            const positions = tailPositions(graph, b.bodyId)
+            for (const p of positions) {
                 const n = getNode(graph, p.at)
                 if (n?.op === NodeOp.apply) {
                     out.push(getRef(n, 0))
-                    sites.push(p.at)
                     let list = preds.get(getRef(n, 0))
                     if (!list) preds.set(getRef(n, 0), list = [])
                     list.push(b.id)
-                } else if (n?.op !== NodeOp.panic && n?.op !== NodeOp.unreachable) live.add(b.id)
+                } else if (!terminal(p.at)) live.add(b.id)
                 else panics.add(b.id)
             }
             succ.set(b.id, out)
-            applies.set(b.id, sites)
+            tails.set(b.id, positions)
         }
         const work = [...live]
         while (work.length) {
@@ -8192,7 +8196,6 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
                 work.push(p)
             }
         }
-        if (live.size === graph.blocks.length) return []
         const ends = [...panics]
         while (ends.length) {
             for (const p of preds.get(ends.pop()!) ?? []) {
@@ -8212,31 +8215,44 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
         }
         const nested = new Set<number>()
         for (const b of graph.blocks) if (!top.has(b.id)) nested.add(b.id)
+        const doomedArms = new Map<number, boolean>()
+        const doomedArm = ([select, arm]: [number, number]) => {
+            const root = getRef(getNode(graph, select)!, arm)
+            let known = doomedArms.get(root)
+            if (known === undefined) {
+                known = tailPositions(graph, root).every(p => terminal(p.at))
+                doomedArms.set(root, known)
+            }
+            return known
+        }
         const regions = new Map<number, ColdRegion>()
         for (const b of graph.blocks) {
             if (!live.has(b.id)) continue
-            for (const site of applies.get(b.id)!) {
-                const entry = getRef(getNode(graph, site)!, 0)
-                if (live.has(entry)) continue
-                const known = regions.get(entry)
+            for (const p of tails.get(b.id)!) {
+                const n = getNode(graph, p.at)
+                const entry = n?.op === NodeOp.apply ? getRef(n, 0) : 0
+                if (entry ? live.has(entry) : !terminal(p.at)) continue
+                intrinsics.assert(p.path.length > 0, `native: live B${b.id} has a doomed tail outside any select arm`)
+                const site = entry ? p.path[p.path.length - 1] : p.path.find(doomedArm)!
+                const key = entry || getRef(getNode(graph, site[0])!, site[1])
+                const known = regions.get(key)
                 if (known) {
+                    if (known.sites.some(([select, arm]) => select === site[0] && arm === site[1])) continue
                     known.sites.push(site)
                     known.from.push(b.id)
                     continue
                 }
-                const blocks = new Set<number>([entry])
-                const walk = [entry]
+                const blocks = new Set<number>(entry ? [entry] : [])
+                const walk = [...blocks]
                 while (walk.length) for (const s of succ.get(walk.pop()!) ?? []) if (!blocks.has(s)) { blocks.add(s); walk.push(s) }
                 if ([...blocks].some(x => !panics.has(x))) continue
-                regions.set(entry, { entry, blocks, sites: [site], from: [b.id], nested })
+                regions.set(key, { blocks, sites: [site], from: [b.id], nested })
             }
         }
         return [...regions.values()]
     }
     function coldPlan(graph: Graph, region: ColdRegion, k: number, identity: (cell: u32, n: GraphNode) => boolean): ColdPlan {
-        const position = tailPositions(graph, getBlock(graph, region.from[k])!.bodyId).find(p => p.at === region.sites[k])!
-        intrinsics.assert(position.path.length > 0, `native: B${region.from[k]} transfers only into doomed blocks`)
-        const [select, arm] = position.path[position.path.length - 1]
+        const [select, arm] = region.sites[k]
         const root = getRef(getNode(graph, select)!, arm)
         const hot = new Set<number>()
         const hotCells = new Set<u32>()
@@ -8561,7 +8577,7 @@ function createTracer(binder: Binder, linker: Linker, image: ProgramImage, facts
             plans.forEach((plan, k) => outlineSite(fn, code, traced, region, k, plan, index++))
             for (const b of span) removed.add(b)
         }
-        if (!removed.size) return
+        if (!index) return
         for (const span of spans) if (!span.every(b => removed.has(b))) for (const b of span) removed.delete(b)
         setGraphBlocks(graph, graph.blocks.filter(b => !removed.has(b.id)))
         const after = reachableNodes(graph, traced.allocations)
@@ -12213,17 +12229,20 @@ function holderDropOf(fields: OwnedField[]): ((holder: any) => void) | undefined
     return holderDrops.get(id)
 }
 
-function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): number {
+function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): { placed: number, freed: Set<number> } {
     const key = { literal: heap.fromJsSymbol(Symbol.drop) }
     const fields = new Map<Function, number[]>()
     const exits = new Map<Function, Map<number, Map<number, [value: number, callee: Function | undefined][]>>>()
     const units = new Set<Function>()
+    const freeing = new Map<Function, number[]>()
     for (const end of ends.fields) {
         listOf(fields, end.unit).push(end.write)
+        listOf(freeing, end.unit).push(...end.objects)
         units.add(end.unit)
     }
     for (const end of ends.locals) {
         units.add(end.unit)
+        listOf(freeing, end.unit).push(...end.objects)
         for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, undefined])
     }
     for (const end of ends.drops) {
@@ -12234,9 +12253,11 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
             continue
         }
         units.add(end.unit)
+        listOf(freeing, end.unit).push(...end.objects)
         for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, callee])
     }
     let placed = 0
+    const freed = new Set<number>()
     const refuse = (fn: Function, why: string) => {
         let count = fields.get(fn)?.length ?? 0
         for (const end of ends.locals) {
@@ -12289,8 +12310,9 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         state.traced = { ...state.traced!, graph }
         host.binder.unitOf(fn).graph = graph
         placed += count
+        for (const o of freeing.get(fn) ?? []) freed.add(o)
     }
-    return placed
+    return { placed, freed }
 }
 
 function checkReflow(accesses: Accesses, extended: ValueTypes, host: AccessHost, roots: Function[]): void {
@@ -13240,7 +13262,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
     return { abiOf, realizeUnit, paramShapesOf, functionObjectOf, plannedUnit: (fn: Function) => planned.units.get(fn) }
 }
 
-function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: AccessHost, genericOf: (proto: intrinsics.Handle) => Generic | undefined, facts: Facts, members: MemberFacts): ShapePlan {
+function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: AccessHost, genericOf: (proto: intrinsics.Handle) => Generic | undefined, facts: Facts, members: MemberFacts, slab: Set<number>): ShapePlan {
     const { session } = binder
     const placedStatics = new Set<number>()
     const readonlyConstructions = new Set<intrinsics.Handle>()
@@ -13287,7 +13309,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             }
         }
     }
-    const { inst, plan, codecOf } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => binder.graphOf(fn), fn => binder.constructsOutOfLine(fn) || !!tracer.stateOf(binder.originOf(fn)).stubbed || binder.isRoot(fn), members)
+    const { inst, plan, codecOf } = planUnits(types, genericOf, state => placedStatics.has(state) || constructed.has(state), fn => binder.graphOf(fn), fn => binder.constructsOutOfLine(fn) || !!tracer.stateOf(binder.originOf(fn)).stubbed || binder.isRoot(fn), members, slab)
     const constructionBuffers = new Map<intrinsics.Handle, number[]>()
     for (const object of types.objects) {
         if (object.state === undefined || !constructed.has(object.state)) continue
@@ -14569,7 +14591,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
 
 function localizeProgram(program: ProgramGraph, binder: Binder, resolver: Resolver): void {
     const { functions } = binder
-    program.discardable = new Set([...program.units.keys()].filter(symbol => rt.pureImplementation(binder.originOf(functions[symbol]))))
+    program.discardable = new Set([...program.units.keys()].filter(symbol => rt.discardableImplementation(binder.originOf(functions[symbol]))))
     for (const graph of program.units.values()) localizeCalls(graph, program.image, program.units)
     for (const graph of program.units.values()) {
         for (const [id, n] of nodeEntries(graph)) {
@@ -14900,8 +14922,10 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     }
     const ends = clock.timed('lifetime', () => analyzeLifetimes(valueTypes, accesses.locations, host, hooked))
     if (flags.has('lifetime-census')) printLifetimes(valueTypes, accesses.locations, host, tracer)
-    const placed = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer))
+    const { placed, freed } = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer))
     printDrops(ends, placed)
+    const slab = new Set<number>()
+    for (const id of slabbed) if (freed.has(id)) slab.add(id)
     if (placed) {
         accesses = clock.timed('drops', () => accesses.extend())
         valueTypes = clock.timed('drops', () => valueTypes.extend(accesses))
@@ -14910,7 +14934,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     linker.linkHeldStatics(new Set(valueTypes.instances.filter(instance => instance.heldStatic).map(instance => instance.unit)))
     const members = memberFacts(valueTypes, accesses.locations, host, proto => genericOf(proto) ? classCutOf(proto) : undefined)
     const { plan, planned, reps } = clock.timed('plan', () => {
-        const plan = planShapes(valueTypes, binder, tracer, host, genericOf, facts, members)
+        const plan = planShapes(valueTypes, binder, tracer, host, genericOf, facts, members, slab)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
         for (const [state, layout] of plan.statics.layouts) image.placedLayouts.set(state, layout)
         const planned = bindPlannedUnits(plan, binder)

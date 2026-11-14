@@ -2583,6 +2583,8 @@ export function inlineBlocks(g: Graph) {
         const refs: number[] = []
         const continued = new Set<number>()
         const continuations = new Set<number>()
+        const made = new Set<number>()
+        const shared = new Set<number>()
         const jumped = new Set<number>()
         const jumpedBy = new Map<number, number>()
         const owners = new Map<number, number>()
@@ -2649,8 +2651,7 @@ export function inlineBlocks(g: Graph) {
             return sites
         }
         const siteBlocks = intrinsics.argv().includes('inline-debug') ? logInlinedBlocks() : undefined
-        function continuedAfter(from: number): Set<number> {
-            const values = new Set<number>()
+        function continuedValues(from: number, blocks: Set<number>, reached: boolean): Set<number> {
             const visited = new Set<number>()
             const targets = blockTargets(g, from)
             while (targets.length) {
@@ -2660,7 +2661,11 @@ export function inlineBlocks(g: Graph) {
                 const b = getBlock(g, target)
                 if (!b) continue
                 blockTargets(g, b.bodyId, targets)
-                if (!continuations.has(target)) continue
+            }
+            const values = new Set<number>()
+            for (const c of blocks) {
+                const b = getBlock(g, c)
+                if (!b || visited.has(c) !== reached) continue
                 const stack = [b.bodyId]
                 while (stack.length) {
                     const id = stack.pop()!
@@ -2863,6 +2868,7 @@ export function inlineBlocks(g: Graph) {
             }
             const rest = body
             let ahead: Set<number> | undefined
+            let apart: Set<number> | undefined
             const restarted = new Map<number, number>()
             function restart(id: number, decided: boolean): number {
                 if (!id || id === site || kept.has(id)) return id
@@ -2872,6 +2878,10 @@ export function inlineBlocks(g: Graph) {
                 const n = getNode(g, id)!
                 if (n.op === NodeOp.block || n.op === NodeOp.param) return id
                 if (!reaches(id) && anchoredElsewhere(id)) return id
+                if (!reaches(id) && shared.has(id)) {
+                    apart ??= continuedValues(rest, made, false)
+                    if (apart.has(id)) return id
+                }
                 let ops: Operand[] | undefined
                 const ordering = firstNonOrderingSlot(n)
                 const deciding = decided || (n.op === NodeOp.select && reaches(getRef(n, 0)))
@@ -2899,7 +2909,7 @@ export function inlineBlocks(g: Graph) {
                 const reached = reaches(id)
                 let moves = reached || !decided
                 if (!reached && continued.has(id)) {
-                    ahead ??= continuedAfter(rest)
+                    ahead ??= continuedValues(rest, continuations, true)
                     moves = ahead.has(id)
                 }
                 if (moves) {
@@ -2933,12 +2943,14 @@ export function inlineBlocks(g: Graph) {
             addGraphBlock(g, { id: blockId, params: [site], bodyId: body, bodyConst: 0 })
             owners.set(site, blockId)
             continuations.add(blockId)
+            made.add(blockId)
             const stack = [body]
             while (stack.length) {
                 const id = stack.pop()!
                 const n = id ? getNode(g, id) : undefined
                 if (!n || continued.has(id) || n.op === NodeOp.block) continue
                 continued.add(id)
+                shared.add(id)
                 for (let i = 0; i < countIds(n); i++) stack.push(getRef(n, i))
             }
         }
@@ -5414,27 +5426,54 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
 
     function eliminateUnusedPureValues(target: GraphBlock): boolean {
         const replacements = new Map<number, number>()
-        for (const id of findValues(target.id, NodeOp.load) ?? []) {
-            if (isResultUsed(id)) continue
-            replacements.set(id, getRef(getNode(g, id)!, 0))
-        }
-        for (const id of findValues(target.id, NodeOp.rt) ?? []) {
-            if (isResultUsed(id) || !rt.memorylessOps.has(getLiteral(g, getNode(g, id)!, 1))) continue
-            replacements.set(id, getRef(getNode(g, id)!, 0))
-        }
-        for (const id of findValues(target.id, NodeOp.call) ?? []) {
-            if (isResultUsed(id)) continue
-            const n = getNode(g, id)!
-            const summary = callSummary(g, n) ?? unknownCall
-            const [effect, writes] = summaryEffect(summary)
-            if (!summary.discardable && summary.traps) continue
-            if (!summary.discardable && effect > EffectRead && (writes & ~WritesStack) !== 0 && !writesUnread(target, id, n, writes)) continue
-            replacements.set(id, getRef(n, 0))
+        const dead: number[] = []
+        for (const op of [NodeOp.load, NodeOp.rt, NodeOp.call]) {
+            for (const id of findValues(target.id, op) ?? []) {
+                if (isResultUsed(id) || !droppableValue(target, id, getNode(g, id)!)) continue
+                replacements.set(id, getRef(getNode(g, id)!, 0))
+                dead.push(id)
+            }
         }
         if (!replacements.size) return false
+        const unused = new Set<number>()
+        const deadUsersOnly = (id: number): boolean => {
+            for (const u of indexedUsers(index, id)) {
+                if (usesForResult(u, id) && !replacements.has(u) && !unused.has(u)) return false
+            }
+            return true
+        }
+        let k = 0
+        while (k < dead.length) {
+            const n = getNode(g, dead[k])!
+            k++
+            let i = firstNonOrderingSlot(n)
+            while (i < countIds(n)) {
+                const id = getRef(n, i)
+                i++
+                if (!id || replacements.has(id) || unused.has(id)) continue
+                const m = getNode(g, id)!
+                const pure = PureOps.has(m.op) && m.op !== NodeOp.param && m.op !== NodeOp.block
+                if (!pure && m.op !== NodeOp.load && m.op !== NodeOp.rt && m.op !== NodeOp.call) continue
+                if (!deadUsersOnly(id)) continue
+                if (pure) unused.add(id)
+                else if (droppableValue(target, id, m)) replacements.set(id, getRef(m, 0))
+                else continue
+                dead.push(id)
+            }
+        }
         setBlockBody(g, target, replaceTransitive(target.bodyId, replacements))
         revisitBlock(target)
         return true
+    }
+
+    function droppableValue(target: GraphBlock, id: number, n: GraphNode): boolean {
+        if (n.op === NodeOp.load) return true
+        if (n.op === NodeOp.rt) return rt.memorylessOps.has(getLiteral(g, n, 1))
+        const summary = callSummary(g, n) ?? unknownCall
+        if (summary.discardable) return true
+        if (summary.traps) return false
+        const [effect, writes] = summaryEffect(summary)
+        return effect <= EffectRead || (writes & ~WritesStack) === 0 || writesUnread(target, id, n, writes)
     }
 
     function writesUnread(block: GraphBlock, call: number, n: GraphNode, writes: number): boolean {
@@ -6924,6 +6963,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
         }
         if (n.op !== NodeOp.mem) return
         const base = getNode(g, getRef(n, 0))
+        if (base?.op === NodeOp.rt && getLiteral(g, base, 1) === rt.Op.malloc) return () => {}
         if (base?.op !== NodeOp.load) return
         for (const a of indexedUsers(index, getRef(n, 0))) {
             const top = getNode(g, a)!
