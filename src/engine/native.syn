@@ -14,7 +14,7 @@ import * as syscalls from './syscalls'
 import { tagVmHandle, tagVmHandleNode } from './vm'
 import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
-    isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, indirectReach, EffectNone, EffectRead, EffectWrite,
+    isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, type LocalCallee, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, indirectReach, EffectNone, EffectRead, EffectWrite,
     printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, inlineRegions, inlineRegionAt, PstackMark, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
     joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, substitute, tailScalar, valueFacts, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
@@ -6710,10 +6710,22 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     nonvolatileArgs(program, prepared, continuations, located)
     permuteArgRegisters(program, prepared, continuations, located, order)
     const lowered = new Map<number, NativeUnit>()
-    function lower(symbol: number, continues?: (symbol: number) => boolean): NativeUnit {
+    function localCallees(symbol: number, continuing: boolean): Map<number, LocalCallee> {
+        const table = new Map<number, LocalCallee>()
+        for (const callee of located.callees.get(symbol)!) {
+            table.set(callee, {
+                name: program.units.get(callee)?.name,
+                clobbers: clobbers.get(callee),
+                continues: continuing && continuations.has(callee),
+                endless: endless.has(callee),
+            })
+        }
+        return table
+    }
+    function lower(symbol: number, continuing: boolean): NativeUnit {
         const unit = prepared.get(symbol)!
         const start = performance.now()
-        const code = clock.timed('lower', () => lowerUnit(program, symbol, unit, callee => clobbers.get(callee), continues, callee => endless.has(callee)), unit.name)
+        const code = clock.timed('lower', () => lowerUnit(program, symbol, unit, localCallees(symbol, continuing)), unit.name)
         if (ledgerFile) ledgerLowered.get(symbol)![1] += performance.now() - start
         return code
     }
@@ -6723,7 +6735,7 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
             const g = prepared.get(callee)!.prepared.g
             g.blocks[0].params.forEach((p, i) => putCopy(g, p, getNode(g, p)!, [{ literal: homes[i] }]))
             dirtyValues(g, g.blocks[0].params)
-            const code = lower(callee, symbol => continuations.has(symbol))
+            const code = lower(callee, true)
             lowered.set(callee, code)
             clobbers.set(callee, code.code.clobbers)
             lowerContinuations(code)
@@ -6732,7 +6744,7 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     for (const scc of order) {
         if (scc.length === 1 && continuations.has(scc[0])) continue
         for (const symbol of scc) {
-            lowered.set(symbol, lower(symbol, callee => continuations.has(callee)))
+            lowered.set(symbol, lower(symbol, true))
             lowerContinuations(lowered.get(symbol)!)
         }
         const members = new Set(scc)
@@ -6746,7 +6758,7 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
         }
         for (const symbol of scc) clobbers.set(symbol, shared)
     }
-    for (const symbol of continuations) if (!lowered.has(symbol)) lowered.set(symbol, lower(symbol))
+    for (const symbol of continuations) if (!lowered.has(symbol)) lowered.set(symbol, lower(symbol, false))
     return symbols.map(symbol => lowered.get(symbol)!)
 }
 
@@ -6765,9 +6777,14 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     const name = unitGraph.name ?? ''
     const lineageBefore = typeRecording() && debugsTypes(name) ? lineageSnapshot(unitGraph) : undefined
     const graph = rewriteTargets(unitGraph, image, program.roots.get(staticInitName) === symbol)
+    const poolValues = new Map<number, number>()
     for (const [id, n] of nodeEntries(graph)) {
-        if (n.op !== NodeOp.poolEntry || getDebugLabel(graph, id)) continue
-        const label = image.labels.get(getLiteral(unitGraph, n, 0))
+        if (n.op !== NodeOp.poolEntry) continue
+        const slot = getLiteral(unitGraph, n, 0)
+        const value = getRef(n, 0) || image.slotRelocations.has(slot) ? undefined : image.knownValue(slot)
+        if (value !== undefined) poolValues.set(slot, value)
+        if (getDebugLabel(graph, id)) continue
+        const label = image.labels.get(slot)
         if (label) setDebugLabel(graph, id, label)
     }
     if (isRoot) {
@@ -6781,7 +6798,7 @@ function prepareUnit(program: ProgramGraph, symbol: number, isRoot: boolean, ret
     const prepared = prepareLowering(graph, {
         debug, target: program.target, staticData, returnLocation, returnRecord,
         poolSlot: value => image.constantSlot(value),
-        poolValue: slot => image.slotRelocations.has(slot) ? undefined : image.knownValue(slot),
+        poolValues,
         floatSlot: value => image.floatSlot(value),
         regionSlot: (address, scale, addend) => image.regionSlot(regionAt(address), scale * address + addend, scale),
         rebaseSlot: (slot, value) => {
@@ -6813,10 +6830,10 @@ function refreshCallGrowth(graph: Graph, growsOf: (callee: number) => number | u
     }
 }
 
-function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, clobbersOf: (symbol: number) => Set<number> | undefined, continues?: (symbol: number) => boolean, endless?: (symbol: number) => boolean): NativeUnit {
+function lowerUnit(program: ProgramGraph, symbol: number, unit: PreparedUnit, callees: Map<number, LocalCallee>): NativeUnit {
     const image = program.image
     const { name, debug, prepared } = unit
-    const code = lowerPrepared(prepared, { debug, target: program.target, returnLocation: unit.returnLocation, returnRecord: unit.returnRecord, clobbersOf, continues, endless, nameOf: callee => program.units.get(callee)?.name })
+    const code = lowerPrepared(prepared, { debug, target: program.target, returnLocation: unit.returnLocation, returnRecord: unit.returnRecord, callees })
     if (debug || flags.has('listings')) {
         console.log(`--- ${name} listing ---\n`, code.listing)
         if (code.island?.length) console.log(`--- ${name} island ---\n` + code.island.map((slot, i) => `  ${i}: pool[${slot}] ${image.labels.get(slot) ?? ''} = 0x${BigInt.asUintN(64, BigInt(image.values[slot])).toString(16)}`).join('\n'))
@@ -6884,17 +6901,22 @@ function returnedRecords(program: ProgramGraph, sites: Map<number, [caller: numb
 interface PreparedSites {
     sites: Map<number, [caller: number, call: number, block: GraphBlock][]>
     entryIndex: (caller: number, value: number, block: GraphBlock) => number
+    callees: Map<number, Set<number>>
 }
 
 function preparedSites(prepared: Map<number, PreparedUnit>): PreparedSites {
     const sites = new Map<number, [caller: number, call: number, block: GraphBlock][]>()
+    const callees = new Map<number, Set<number>>()
     for (const [caller, unit] of prepared) {
         const g = unit.prepared.g
         const index = graphIndex(g)
+        const called = new Set<number>()
+        callees.set(caller, called)
         for (const b of g.blocks) {
             for (const id of findValues(index, b.id, NodeOp.call) ?? []) {
                 const callee = calledSymbol(g, getNode(g, id)!)
                 if (callee === undefined) continue
+                called.add(callee)
                 const list = sites.get(callee)
                 if (list) list.push([caller, id, b])
                 else sites.set(callee, [[caller, id, b]])
@@ -6927,7 +6949,7 @@ function preparedSites(prepared: Map<number, PreparedUnit>): PreparedSites {
         known.set(value, r)
         return r
     }
-    return { sites, entryIndex }
+    return { sites, entryIndex, callees }
 }
 
 function nonvolatileArgs(program: ProgramGraph, prepared: Map<number, PreparedUnit>, continuations: Set<number>, located: PreparedSites): void {
