@@ -133,6 +133,7 @@ export interface Assembler {
     bindLabel(id: number): void
     releaseLabel(id: number): void
     jump(id: number): void
+    dispatch(reg: number, cases: [key: number, label: number][], fallback: number): void
     jumpIfNonZero(reg: number, id: number): void
     jumpIfZero(reg: number, id: number): void
     br(reg: number): void
@@ -170,6 +171,42 @@ export function accessBytes(T: Ty): number {
     return 8
 }
 
+export function keyPieces(keys: number[]): [from: number, to: number, table: boolean][] {
+    const out: [number, number, boolean][] = []
+    function table(from: number, to: number): boolean {
+        const low = keys[from]
+        const span = keys[to - 1] - low
+        if (to - from < 4 || span > 0xFFF || Math.abs(low) >= 2 ** 18) return false
+        return span + 6 + (low ? 1 : 0) <= 2 * (to - from)
+    }
+    function split(from: number, to: number): boolean {
+        if (table(from, to)) {
+            out.push([from, to, true])
+            return true
+        }
+        const mark = out.length
+        if (to - from > 4) {
+            const mid = (from + to) / 2
+            let at = from + 1
+            let i = from + 2
+            while (i < to) {
+                const gap = keys[i] - keys[i - 1]
+                const best = keys[at] - keys[at - 1]
+                if (gap > best || (gap === best && Math.abs(i - mid) < Math.abs(at - mid))) at = i
+                i++
+            }
+            const left = split(from, at)
+            const right = split(at, to)
+            if (left || right) return true
+            out.length = mark
+        }
+        out.push([from, to, false])
+        return false
+    }
+    split(0, keys.length)
+    return out
+}
+
 // ============================================================================
 // aarch64
 // ============================================================================
@@ -192,12 +229,13 @@ const CondNames: Record<number, string> = {
 
 // FIXME: organize optionals into groups 
 interface AsmItem {
-    kind: 'insn' | 'label' | 'b' | 'cbnz' | 'cbz' | 'cset' | 'bcond'
+    kind: 'insn' | 'label' | 'b' | 'cbnz' | 'cbz' | 'cset' | 'bcond' | 'table'
     word: number
     text: string
     label: number  // branch target, or the label's own id
     reg: number    // for cbnz/cbz/cset
     cond: number   // for cset/bcond
+    tableItems?: AsmItem[]
     testBit?: number // final CBZ/CBNZ contraction to TBZ/TBNZ
     testedSrc?: number
     testedBits?: bigint
@@ -493,6 +531,85 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return kind === 'b' || kind === 'cbnz' || kind === 'cbz' || kind === 'bcond'
     }
 
+    function branchTargets(it: AsmItem, into: number[]): number[] {
+        if (it.tableItems) for (const inner of it.tableItems) branchTargets(inner, into)
+        else if (isBranch(it.kind)) into.push(it.label)
+        return into
+    }
+
+    function itemWords(it: AsmItem): number {
+        if (it.tableItems) return it.tableItems.length
+        return it.kind === 'label' ? 0 : 1
+    }
+
+    function dispatch(reg: number, cases: [number, number][], fallback: number): void {
+        const sorted = cases.slice().sort((a, b) => a[0] - b[0])
+        assert(sorted.length > 0 && reg !== scratchA, 'aarch64: dispatch needs keys and a value outside x16')
+        for (let i = 0; i < sorted.length; i++) {
+            assert(Number.isSafeInteger(sorted[i][0]) && (i === 0 || sorted[i][0] > sorted[i - 1][0]), `aarch64: dispatch key ${sorted[i][0]} is repeated or not an integer`)
+        }
+        function branch(cond: number, label: number): void {
+            push({ kind: 'bcond', word: 0, text: '', label, reg: -1, cond })
+        }
+        function jump(label: number): void {
+            push({ kind: 'b', word: 0, text: `b L${label}`, label, reg: -1, cond: -1 })
+        }
+        function cmp(key: number): void {
+            const immediate = arithImmediate(key)
+            if (immediate !== undefined) {
+                emitCmp(0xF100001F | immediate | (reg << 5), `cmp ${x(reg)}, #${key}`, { cmpLeft: reg })
+                return
+            }
+            movImm(scratchA, key)
+            emitCmp(0xEB00001F | (scratchA << 16) | (reg << 5), `cmp ${x(reg)}, ${x(scratchA)}`, { cmpLeft: reg, cmpRight: scratchA })
+        }
+        function emitTable(from: number, to: number, miss: number): void {
+            const low = sorted[from][0]
+            const span = sorted[to - 1][0] - low
+            const start = items.length
+            let index = reg
+            if (low) {
+                index = scratchA
+                if (low > 0) subImmRaw(scratchA, reg, low, false, false)
+                else addImmRaw(scratchA, reg, -low, false, false)
+            }
+            emitCmp(0xF100001F | (span << 10) | (index << 5), `cmp ${x(index)}, #${span}`, { cmpLeft: index })
+            branch(COND_HI, miss)
+            const offset = 12 - 4 * low
+            emit(0x10000000 | ((offset & 3) << 29) | (((offset >> 2) & 0x7FFFF) << 5) | scratchA, `adr ${x(scratchA)}, #${offset}`, { writes: [scratchA], reads: [] })
+            emit(0x8B000000 | (reg << 16) | (2 << 10) | (scratchA << 5) | scratchA, `add ${x(scratchA)}, ${x(scratchA)}, ${x(reg)}, lsl #2`, { writes: [scratchA], reads: [reg, scratchA] })
+            emit(0xD61F0000 | (scratchA << 5), `br ${x(scratchA)}`, { clobbers: true })
+            const labels = new Map(sorted.slice(from, to))
+            let key = low
+            while (key <= low + span) {
+                jump(labels.get(key) ?? fallback)
+                key++
+            }
+            const tableItems = items.splice(start)
+            items.push({ kind: 'table', word: 0, text: '', label: -1, reg, cond: -1, tableItems })
+            writebacks.clear()
+        }
+        const pieces = keyPieces(sorted.map(c => c[0]))
+        for (let p = 0; p < pieces.length; p++) {
+            const [from, to, table] = pieces[p]
+            if (!table) {
+                for (let i = from; i < to; i++) {
+                    cmp(sorted[i][0])
+                    branch(COND_EQ, sorted[i][1])
+                }
+                continue
+            }
+            if (p + 1 === pieces.length) {
+                emitTable(from, to, fallback)
+                return
+            }
+            const next = macroLabel++
+            emitTable(from, to, next)
+            push({ kind: 'label', word: 0, text: '', label: next, reg: -1, cond: -1 })
+        }
+        jump(fallback)
+    }
+
     // is `target` the very next thing, ignoring intervening labels?
     function fallsThroughTo(i: number, target: number): boolean {
         for (let j = i + 1; j < items.length; j++) {
@@ -640,7 +757,10 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
         const defs: number[] = []
         const entries = new Map<number, number>()
-        for (const it of items) if (it.kind !== 'label' && it.label !== undefined) entries.set(it.label, (entries.get(it.label) ?? 0) + 1)
+        for (const it of items) {
+            if (it.tableItems) for (const label of branchTargets(it, [])) entries.set(label, (entries.get(label) ?? 0) + 1)
+            else if (it.kind !== 'label' && it.label !== undefined) entries.set(it.label, (entries.get(it.label) ?? 0) + 1)
+        }
         const straight = (at: number) => {
             const it = items[at]
             if (it.kind === 'b') return items[at + 1]?.kind === 'label' && items[at + 1].label === it.label && entries.get(it.label) === 1
@@ -747,7 +867,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (!targets || targetsAt !== items.length) {
                 targetsAt = items.length
                 targets = new Set<number>()
-                for (const it of items) if (isBranch(it.kind)) targets.add(it.label)
+                for (const it of items) for (const label of branchTargets(it, [])) targets.add(label)
             }
             return targets.has(label)
         }
@@ -1294,7 +1414,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                 labelIndex.set(it.label, i)
                 addrOf.set(it.label, pc)
             } else {
-                pc++
+                pc += itemWords(it)
             }
         }
 
@@ -1324,11 +1444,20 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
                     if (delta >= -limit && delta < limit) it.label = label
                 }
             }
-            at++
+            if (it.tableItems) {
+                let slot = at
+                for (const t of it.tableItems) {
+                    const label = t.kind === 'b' ? forwarded(t.label) : -1
+                    const target = addrOf.get(label)
+                    if (target !== undefined && target - slot >= -(1 << 25) && target - slot < 1 << 25) t.label = label
+                    slot++
+                }
+            }
+            at += itemWords(it)
         }
 
         const refs = new Map<number, number>()
-        for (const it of items) if (isBranch(it.kind)) refs.set(it.label, (refs.get(it.label) ?? 0) + 1)
+        for (const it of items) for (const label of branchTargets(it, [])) refs.set(label, (refs.get(label) ?? 0) + 1)
         for (let i = 0; i < items.length; i++) hoistArmOver(i, refs)
 
         for (let i = items.length - 1; i >= 0; i--) {
@@ -1371,7 +1500,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             if (ret && !fallsThroughTo(i, items[i].label)) items[i] = { ...ret }
         }
         const targeted = new Set<number>()
-        for (const it of items) if (isBranch(it.kind)) targeted.add(it.label)
+        for (const it of items) for (const label of branchTargets(it, [])) targeted.add(label)
         for (let i = 1; i < items.length; i++) {
             const prev = items[i - 1]
             const ends = prev.kind === 'b' || (prev.kind === 'insn'
@@ -1383,10 +1512,13 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
     function mergeTails(): void {
         const RET = 0xD65F03C0
         let nextLabel = 0
-        for (const it of items) if (it.label >= nextLabel) nextLabel = it.label + 1
+        for (const it of items) {
+            if (it.label >= nextLabel) nextLabel = it.label + 1
+            for (const label of branchTargets(it, [])) if (label >= nextLabel) nextLabel = label + 1
+        }
         const isRet = (it: AsmItem) => it.kind === 'insn'
             && (it.word === RET || (it.word & 0xFFFFFC1F) >>> 0 === 0xD61F0000 || it.relocationKind === 'jump')
-        const stops = (it: AsmItem) => it.kind === 'label' || isBranch(it.kind) || isRet(it)
+        const stops = (it: AsmItem) => it.kind === 'label' || it.kind === 'table' || isBranch(it.kind) || isRet(it)
         const same = (a: AsmItem, b: AsmItem) => a.kind === b.kind && a.word === b.word
             && a.relocationKind === b.relocationKind && a.relocationTarget === b.relocationTarget
         interface TailEnd { start: number, end: number, explicit: boolean, ret: boolean }
@@ -1834,8 +1966,19 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         hoistShared()
         hoistArms()
         reuseValues(true)
-        const targets = new Set(items.filter(it => isBranch(it.kind)).map(it => it.label))
+        const targets = new Set<number>()
+        for (const it of items) for (const label of branchTargets(it, [])) targets.add(label)
         for (let i = 0; i < items.length; i++) if (foldGuardedSelect(i, targets)) i--
+        let tables = 0
+        while (tables < items.length) {
+            const it = items[tables]
+            if (it.tableItems) {
+                items.splice(tables, 1, ...it.tableItems)
+                tables += it.tableItems.length
+                continue
+            }
+            tables++
+        }
         if (verifiesRegisters) verifyItems()
 
         const addrOf = new Map<number, number>()
@@ -3157,7 +3300,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         for (let i = 0; i < items.length; i++) {
             const it = items[i]
             if (it.kind === 'label') at.set(it.label, i)
-            else if (isBranch(it.kind)) refs.set(it.label, (refs.get(it.label) ?? 0) + 1)
+            else for (const label of branchTargets(it, [])) refs.set(label, (refs.get(label) ?? 0) + 1)
         }
         for (let i = 0; i + 1 < items.length; i++) {
             const branch = items[i]
@@ -4363,6 +4506,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         jump: (id) => {
             push({ kind: 'b', word: 0, text: `b L${id}`, label: id, reg: -1, cond: -1 })
         },
+        dispatch,
         jumpIfNonZero: (reg, id) => {
             if (isFloat(reg)) return floatBranch(reg, id, true)
             push({ kind: 'cbnz', word: 0, text: '', label: id, reg, cond: -1 })
