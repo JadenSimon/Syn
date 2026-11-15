@@ -5,7 +5,7 @@ import * as heap from './heap'
 import * as rt from './rt'
 import { Op as RtOp } from './rt'
 import { countedLoopShape, expectForm, firstNonOrderingSlot, type Graph, type GraphBlock, type GraphNode } from './lowering2'
-import { tailOf, withNodes, copyNodes, addAfter, afterOrderings, addCopy, putCopy, withOperand, addGraphBlock, addNode, blockOrder, countIds, countNodes, deleteNode, getBlock, getLiteral, getNode, getOperand, getRef, graphLoops, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast, tailPositions, type TailPosition } from './graph-node'
+import { tailOf, withNodes, copyNodes, addAfter, afterOrderings, addCopy, putCopy, withOperand, addGraphBlock, addNode, blockOrder, blockTargets, countIds, countNodes, deleteNode, getBlock, getLiteral, getNode, getOperand, getRef, graphLoops, NodeOp, OrderedValues, putNode, regionUp, within, childRegion, typeOf, type Operand, type GraphRegions, nodeEntries, nodeIds, nodeUsers, getArgIds, getOperands, graphRegions, dirtyIndex, graphIndex, type GraphIndex, spreadsLast, tailOrderings, tailPositions, type TailPosition } from './graph-node'
 import { globals as builtinGlobals } from './builtins'
 import { AllocKind, constructorOf, emptyType, fixedField, fixedState, inhabited, listOf, regionRets, selfOf, usersOf, type AccessHost, type Location, type PlannedUnit, type Type, type UnitTypes, type ValueTypes } from './value-types'
 
@@ -1475,6 +1475,189 @@ export function initializer(g: Graph, proto: Handle): boolean {
         }
     }
     return true
+}
+
+export interface Constructed {
+    keys: Handle[]
+    read: Handle[]
+    whole: boolean
+}
+
+function hasAccessor(proto: Handle, key: Handle): boolean {
+    let at = proto
+    while (at) {
+        if (heap.isProxy(at) && heap.trapsKey(at, key)) return true
+        const descriptor = heap.getOwnProperty(at, key)
+        if (descriptor) return (heap.FullPropertyDescriptor(heap.resolveHeapCell(descriptor)).flags & (heap.PropFlags.has_getter | heap.PropFlags.has_setter)) !== 0
+        at = heap.getPrototypeOf(at)
+    }
+    return false
+}
+
+export function constructedKeys(g: Graph, proto: Handle, superKeys: (target: Handle) => Constructed | undefined): Constructed {
+    const out: Constructed = { keys: [], read: [], whole: false }
+    const self = selfOf(g)
+    if (!self) return out
+    const starts = new Map<number, number>()
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op !== NodeOp.startOf) continue
+        if (starts.has(getRef(n, 0))) return out
+        starts.set(getRef(n, 0), id)
+    }
+    const users = nodeUsers(g, nodeIds(g))
+    const mentioned = new Map<number, boolean>()
+    const mentions = (id: number): boolean => {
+        if (id === self) return true
+        if (!id) return false
+        const known = mentioned.get(id)
+        if (known !== undefined) return known
+        mentioned.set(id, false)
+        const n = getNode(g, id)
+        if (!n || OrderedValues.has(n.op)) return false
+        let slot = firstNonOrderingSlot(n)
+        while (slot < countIds(n)) {
+            if (mentions(getRef(n, slot))) {
+                mentioned.set(id, true)
+                return true
+            }
+            slot++
+        }
+        return false
+    }
+    const mentionedBesides = (n: GraphNode, skip: number): boolean => {
+        let slot = firstNonOrderingSlot(n)
+        while (slot < countIds(n)) {
+            if (slot !== skip && mentions(getRef(n, slot))) return true
+            slot++
+        }
+        return false
+    }
+    const read = new Set<Handle>()
+    let settled: Set<Handle> | undefined
+    let whole = true
+    const settle = (keys: Set<Handle>) => {
+        settled = settled ? new Set([...settled].filter(key => keys.has(key))) : new Set(keys)
+    }
+    const observe = (keys: Set<Handle>) => {
+        whole = false
+        settle(keys)
+    }
+    const chainOf = (p: TailPosition): Set<number> => {
+        const chain = new Set<number>()
+        const work = tailOrderings(g, p)
+        while (work.length) {
+            const id = work.pop()!
+            if (!id || chain.has(id)) continue
+            chain.add(id)
+            const n = getNode(g, id)!
+            let slot = 0
+            while (slot < firstNonOrderingSlot(n)) {
+                work.push(getRef(n, slot))
+                slot++
+            }
+        }
+        return chain
+    }
+    const walk = (start: number, chain: Set<number>, keys: Set<Handle>): boolean => {
+        let at = start
+        let seen = chain.has(start) ? 1 : 0
+        while (true) {
+            let next = 0
+            for (const [user, slot] of users.get(at) ?? []) {
+                if (!chain.has(user) || slot >= firstNonOrderingSlot(getNode(g, user)!)) continue
+                if (next && next !== user) {
+                    observe(keys)
+                    return false
+                }
+                next = user
+            }
+            if (!next) break
+            at = next
+            seen++
+            const n = getNode(g, at)!
+            if (n.op === NodeOp.after) continue
+            const receiver = n.op === NodeOp.getProp || n.op === NodeOp.setProp ? 1 : rt.calleeSlot(g, n) + 1
+            const own = receiver > 0 && tailOf(g, getRef(n, receiver)) === self
+            if (!own || mentionedBesides(n, receiver)) {
+                if (!mentionedBesides(n, -1)) continue
+                observe(keys)
+                return false
+            }
+            if (n.op === NodeOp.getProp || n.op === NodeOp.setProp) {
+                const key = getLiteral(g, n, 2) as Handle
+                if (getRef(n, 2) || hasAccessor(proto, key)) {
+                    observe(keys)
+                    return false
+                }
+                if (n.op === NodeOp.setProp) keys.add(key)
+                else if (!keys.has(key)) read.add(key)
+                continue
+            }
+            const target = getNode(g, tailOf(g, getRef(n, receiver - 1)))
+            const inner = target?.op === NodeOp.heapHandle && !getRef(target, 0) ? superKeys(getLiteral(g, target, 0) as Handle) : undefined
+            if (!inner?.whole) {
+                observe(keys)
+                return false
+            }
+            for (const key of inner.read) if (!keys.has(key)) read.add(key)
+            for (const key of inner.keys) keys.add(key)
+        }
+        if (seen === chain.size) return true
+        observe(keys)
+        return false
+    }
+    const order: number[] = []
+    const visited = new Set<number>([g.blocks[0].id])
+    const stack: [number, number[]][] = [[g.blocks[0].id, blockTargets(g, g.blocks[0].bodyId)]]
+    while (stack.length) {
+        const [id, targets] = stack[stack.length - 1]
+        const next = targets.pop()
+        if (next === undefined) {
+            order.push(id)
+            stack.pop()
+            continue
+        }
+        if (visited.has(next)) continue
+        visited.add(next)
+        stack.push([next, blockTargets(g, getBlock(g, next)!.bodyId)])
+    }
+    const entered = new Map<number, Set<Handle>>([[g.blocks[0].id, new Set()]])
+    const finished = new Set<number>()
+    let i = order.length - 1
+    while (i >= 0) {
+        const b = getBlock(g, order[i])!
+        i--
+        const entry = entered.get(b.id)
+        finished.add(b.id)
+        if (!entry) continue
+        for (const p of tailPositions(g, b.bodyId)) {
+            const leaf = getNode(g, p.at)!
+            if (leaf.op === NodeOp.panic || leaf.op === NodeOp.trap || leaf.op === NodeOp.unreachable) continue
+            const keys = new Set(entry)
+            if (!walk(starts.get(b.id) ?? 0, chainOf(p), keys)) continue
+            if (leaf.op === NodeOp.ret) {
+                if (tailOf(g, getRef(leaf, 1)) !== self) whole = false
+                settle(keys)
+                continue
+            }
+            if (leaf.op !== NodeOp.apply || mentionedBesides(leaf, 0)) {
+                observe(keys)
+                continue
+            }
+            const target = getRef(leaf, 0)
+            const known = entered.get(target)
+            if (finished.has(target)) {
+                if (!known || [...known].some(key => !keys.has(key))) return out
+                continue
+            }
+            entered.set(target, known ? new Set([...known].filter(key => keys.has(key))) : keys)
+        }
+    }
+    if (!settled) return out
+    out.keys = [...settled].filter(key => !read.has(key))
+    out.read = [...read]
+    out.whole = whole
+    return out
 }
 
 export function killedAfter(g: Graph, call: number, allocated: number, key: Handle, proto: Handle, self: boolean, regionOf: (id: number) => number | undefined): boolean {
