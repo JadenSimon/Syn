@@ -5,7 +5,7 @@
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
 import { ArithOps, BitwiseOps, CompareOps, debugsTypes, dumpGraph, firstNonOrderingSlot, type Graph, type GraphNode, noteType, NumericOps, typeName, typeRecording } from './lowering2'
-import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, within, resultType, setRef, typeOf, type GraphRegions, countNodes, nodeEntries, nodeIds, heapField, type Operand, stronglyConnected, spreadsLast, tailOf } from './graph-node'
+import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiteral, getNode, getRef, graphRegions, isThisParam, NodeOp, putCopy, regionUp, within, resultType, setRef, typeOf, type GraphRegions, type RegionTree, countNodes, nodeEntries, nodeIds, heapField, type Operand, stronglyConnected, spreadsLast, tailOf, mayHaveKinds, GraphKinds } from './graph-node'
 import { Op as RtOp, assignExcluded, bindingOf, calleeSlot, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
@@ -118,6 +118,14 @@ interface Summary {
     priorAsserts: Map<number, number>
     asserting: Map<number, boolean>
     predicates: Guard[] | null | undefined
+    posts: Guard[] | null | undefined
+    checks: Map<number, number[]> | undefined
+    checkUsers: Map<number, number[]>
+    derefs: Map<number, number[]> | undefined
+    halting: number[] | undefined
+    stopAt: Set<number> | undefined
+    stopped: Map<number, boolean>
+    inlines: boolean
     initializer: boolean | undefined
     bound: Bound | undefined
     proofs: pg.ProofScope | undefined
@@ -1515,7 +1523,7 @@ function newSummary(fn: Function, g: Graph, id: number): Summary {
     const s: Summary = {
         fn, id, g, name: fn.name || '<anon>', exprs: [], exprOf: new Map(), origins: new Map(),
         params: 0, hasThis: false, usesCtx: false, fresh, scopes: new Set(cells.frames), returnsFresh: false, returnsSlice: false, returnsParam: false,
-        local: undefined, width: 0, owned: [], regions: undefined, guards: new Map(), stores: [], siteCone: undefined, coneParams: 0, allocNodes: new Map(), retExpr: -1, blockGates: [], regionRets: new Map(), fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, initializer: undefined, bound: undefined, proofs: undefined, lengthProofs: undefined, keyFacts: undefined, keyless: undefined, prover: undefined, facts: new Set(), keyFree: undefined, demands: undefined, kindIds: undefined, kindVecs: [],
+        local: undefined, width: 0, owned: [], regions: undefined, guards: new Map(), stores: [], siteCone: undefined, coneParams: 0, allocNodes: new Map(), retExpr: -1, blockGates: [], regionRets: new Map(), fractionUses: undefined, priorAsserts: new Map(), asserting: new Map(), predicates: undefined, posts: undefined, checks: undefined, checkUsers: new Map(), derefs: undefined, halting: undefined, stopAt: undefined, stopped: new Map(), inlines: false, initializer: undefined, bound: undefined, proofs: undefined, lengthProofs: undefined, keyFacts: undefined, keyless: undefined, prover: undefined, facts: new Set(), keyFree: undefined, demands: undefined, kindIds: undefined, kindVecs: [],
         build: { konsts: new Map(), tested: new Set(), narrowExprs: new Map(), narrowSteps: new Map(), gateOf: new Map(), selects: [], forwards: new Map(), remainders: undefined },
     }
     flow.summaries.set(fn, s)
@@ -1638,7 +1646,7 @@ function operand(s: Summary, user: number, n: GraphNode, i: number): number {
     if (!ref) return konst(s, literalScalar(getLiteral(s.g, n, i)))
     const base = exprOfNode(s, ref)
     const region = s.regions ? demandRegion(s.regions, user, n, i) : -1
-    return region < 0 ? base : narrowed(s, tailOf(s.g, ref), base, region)
+    return region < 0 ? base : narrowed(s, tailOf(s.g, ref), base, region, user)
 }
 
 const numberOps = new Set<NodeOp>([NodeOp.load, NodeOp.convert, NodeOp.bitconvert, NodeOp.pstack, NodeOp.stackalloc, NodeOp.mem, NodeOp.crc32, NodeOp.frameAddress, NodeOp.pc, NodeOp.poolEntry])
@@ -1922,23 +1930,227 @@ enum GuardFlag {
 
 function computeRegions(s: Summary): GraphRegions {
     const g = s.g
-    const regions = graphRegions(g, charge, (n, i, id) => n.op === NodeOp.select ? armSlot(n, i) : i >= firstNonOrderingSlot(n) && priorAssert(s, id, n) !== 0, (n, id) => n.op === NodeOp.inlined ? priorAssert(s, id, n) : 0)
+    const calls = scanChecks(s)
+    const regions = graphRegions(g, charge, (n, i, id) => armSlot(n, i) || (i >= firstNonOrderingSlot(n) && priorAssert(s, id, n) !== 0), (n, id) => n.op === NodeOp.inlined ? priorAssert(s, id, n) : 0, s.halting ? (t, r) => stoppedRegion(s, t, r) : undefined)
     s.regions = regions
     const seenConds = new Set<number>()
     for (const id of regions.blockOf.keys()) {
         const n = getNode(g, id)!
         if (n.op === NodeOp.select) testedRefs(s, getRef(n, 0), seenConds)
     }
+    for (const id of calls) {
+        const r = regions.runs.get(id)
+        if (r === undefined) continue
+        const posts = callPosts(s, getNode(g, id)!)
+        if (!posts || posts === noreturnPosts) continue
+        if (!s.checks) s.checks = new Map()
+        const known = s.checks.get(r)
+        if (known) known.push(id)
+        else s.checks.set(r, [id])
+        checkedRefs(s, id)
+    }
     return regions
+}
+
+function scanChecks(s: Summary): number[] {
+    const g = s.g
+    const calls: number[] = []
+    const halting: number[] = []
+    const tails = new Map<number, boolean>()
+    for (const [id, n] of nodeEntries(g)) {
+        if (n.op === NodeOp.inlined && asserts(s, id, n)) s.inlines = true
+        if (n.op === NodeOp.ret && haltedBefore(g, id, tails, s.fresh)) halting.push(id)
+        if (n.op === NodeOp.after && exits(g, getRef(n, countIds(n) - 1)) && haltedBefore(g, id, tails, s.fresh)) halting.push(getRef(n, countIds(n) - 1))
+        if ((n.op === NodeOp.getProp || n.op === NodeOp.setProp) && getRef(n, 1)) deref(s, tailOf(g, getRef(n, 1)), id)
+        if (calleeSlot(g, n) < 0 || !passesValue(g, n)) continue
+        const fn = targetFunction(g, n, s.fresh)
+        if (fn && haltingGraph(graphFor(fn))) calls.push(id)
+    }
+    if (halting.length) s.halting = halting
+    return calls
+}
+
+function deref(s: Summary, object: number, user: number): void {
+    if (!s.derefs) s.derefs = new Map()
+    const known = s.derefs.get(object)
+    if (known) known.push(user)
+    else s.derefs.set(object, [user])
+}
+
+function passesValue(g: Graph, call: GraphNode): boolean {
+    const end = spreadsLast(call) ? countIds(call) - 1 : countIds(call)
+    let i = calleeSlot(g, call) + 2
+    while (i < end) {
+        const r = getRef(call, i)
+        const m = r ? getNode(g, tailOf(g, r)) : undefined
+        if (m && m.op !== NodeOp.literal && (m.op !== NodeOp.heapHandle || getRef(m, 0))) return true
+        i++
+    }
+    return false
+}
+
+const noreturnGraphs = new WeakMap<Graph, boolean>()
+
+function graphFor(fn: Function): Graph {
+    const traceStart = performance.now()
+    const g = flow.host.binder.graphOf(fn)
+    flow.traceMs += performance.now() - traceStart
+    return g
+}
+
+const haltingGraphs = new WeakMap<Graph, boolean>()
+
+function haltingGraph(g: Graph): boolean {
+    if (!mayHaveKinds(g, GraphKinds.halt)) return false
+    const known = haltingGraphs.get(g)
+    if (known !== undefined) return known
+    haltingGraphs.set(g, false)
+    const tails = new Map<number, boolean>()
+    const seen = new Set<number>()
+    let found = false
+    for (const block of g.blocks) {
+        const stack = block.bodyId ? [block.bodyId] : []
+        while (stack.length && !found) {
+            const id = stack.pop()!
+            const n = getNode(g, id)
+            if (!n || seen.has(id)) continue
+            seen.add(id)
+            charge(1)
+            if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.trap) found = true
+            else if (n.op === NodeOp.ret) found = haltedBefore(g, id, tails, undefined)
+            else if (n.op === NodeOp.after && exits(g, getRef(n, countIds(n) - 1))) found = haltedBefore(g, id, tails, undefined)
+            if (n.op === NodeOp.select) for (let i = 1; i < countIds(n); i++) stack.push(getRef(n, i))
+            if (n.op === NodeOp.after) stack.push(getRef(n, countIds(n) - 1))
+            if (n.op === NodeOp.inlined) stack.push(getRef(n, 0))
+            const end = n.op === NodeOp.after || n.op === NodeOp.ret ? firstNonOrderingSlot(n) : 0
+            let i = 0
+            while (i < end) {
+                if (spine(g, getRef(n, i))) stack.push(getRef(n, i))
+                i++
+            }
+        }
+        if (found) break
+    }
+    haltingGraphs.set(g, found)
+    return found
+}
+
+function spine(g: Graph, id: number): boolean {
+    const op = id ? getNode(g, id)?.op : undefined
+    return op === NodeOp.after || op === NodeOp.inlined || op === NodeOp.panic || op === NodeOp.unreachable || op === NodeOp.trap
+}
+
+function noreturnFn(fn: Function): boolean {
+    const g = graphFor(fn)
+    if (!mayHaveKinds(g, GraphKinds.halt)) return false
+    const known = noreturnGraphs.get(g)
+    if (known !== undefined) return known
+    noreturnGraphs.set(g, false)
+    const halted = new Map<number, boolean>()
+    let stops = true
+    for (const block of g.blocks) {
+        const stack = block.bodyId ? [block.bodyId] : []
+        while (stack.length && stops) {
+            const id = stack.pop()!
+            const n = getNode(g, id)
+            if (!n) continue
+            charge(1)
+            if (n.op === NodeOp.ret) stops = haltedBefore(g, id, halted, undefined)
+            else if (n.op === NodeOp.select) for (let i = 1; i < countIds(n); i++) stack.push(getRef(n, i))
+            else if (n.op === NodeOp.after && !haltedBefore(g, id, halted, undefined)) stack.push(getRef(n, countIds(n) - 1))
+        }
+    }
+    noreturnGraphs.set(g, stops)
+    return stops
+}
+
+function haltedBefore(g: Graph, id: number, memo: Map<number, boolean>, fresh: Set<number> | undefined): boolean {
+    const known = memo.get(id)
+    if (known !== undefined) return known
+    memo.set(id, false)
+    const n = getNode(g, id)!
+    let halted = false
+    const end = firstNonOrderingSlot(n)
+    let i = 0
+    while (i < end && !halted) {
+        const r = getRef(n, i)
+        const m = r ? getNode(g, r) : undefined
+        if (m) halted = halts(g, m, fresh) || (m.op === NodeOp.after && haltedBefore(g, r, memo, fresh))
+        i++
+    }
+    memo.set(id, halted)
+    return halted
+}
+
+function exits(g: Graph, id: number): boolean {
+    const op = id ? getNode(g, id)?.op : undefined
+    return op === NodeOp.ret || op === NodeOp.apply
+}
+
+function halts(g: Graph, n: GraphNode, fresh: Set<number> | undefined): boolean {
+    if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.trap) return true
+    if (calleeSlot(g, n) < 0) return false
+    const fn = targetFunction(g, n, fresh)
+    return fn !== undefined && noreturnFn(fn)
+}
+
+function stoppedRegion(s: Summary, t: GraphRegions, r: number): boolean {
+    if (!s.halting || r < 0) return false
+    if (!s.stopAt) {
+        const at = new Set<number>()
+        for (const c of s.halting) {
+            const region = t.runs.get(c)
+            if (region !== undefined) at.add(region)
+        }
+        s.stopAt = at
+    }
+    const known = s.stopped.get(r)
+    if (known !== undefined) return known
+    charge(1)
+    const dead = s.stopAt.has(r) || (t.depth[r] > 0 && stoppedRegion(s, t, t.parent[r]))
+    s.stopped.set(r, dead)
+    return dead
+}
+
+function checkedRefs(s: Summary, id: number): void {
+    const g = s.g
+    const call = getNode(g, id)!
+    const out = s.build!.tested
+    checkUser(s, id, id)
+    const end = spreadsLast(call) ? countIds(call) - 1 : countIds(call)
+    let i = calleeSlot(g, call) + 2
+    while (i < end) {
+        const r = getRef(call, i)
+        if (r) out.add(tailOf(g, r))
+        if (r) checkUser(s, tailOf(g, r), id)
+        i++
+    }
+}
+
+function checkUser(s: Summary, user: number, call: number): void {
+    const known = s.checkUsers.get(user)
+    if (known) known.push(call)
+    else s.checkUsers.set(user, [call])
+}
+
+function checksInput(s: Summary, user: number): boolean {
+    const calls = user ? s.checkUsers.get(user) : undefined
+    if (!calls) return false
+    for (const c of calls) {
+        const posts = callPosts(s, getNode(s.g, c)!)
+        if (posts && posts !== noreturnPosts) return true
+    }
+    return false
 }
 
 function priorAssert(s: Summary, id: number, n: GraphNode): number {
     const known = s.priorAsserts.get(id)
-    if (known !== undefined) return known
+    if (known !== undefined) return Math.max(0, known)
     s.priorAsserts.set(id, 0)
     charge(1)
     let found = 0
     if (n.op === NodeOp.inlined) found = Math.max(0, exitAssert(s, getRef(n, 0), new Set()))
+    if (n.op === NodeOp.select && s.inlines) found = armsAssert(s, n)
     const end = firstNonOrderingSlot(n)
     for (let i = 0; i < end && !found; i++) {
         const r = getRef(n, i)
@@ -1947,7 +2159,7 @@ function priorAssert(s: Summary, id: number, n: GraphNode): number {
         found = m.op === NodeOp.inlined && asserts(s, r, m) ? r : priorAssert(s, r, m)
     }
     s.priorAsserts.set(id, found)
-    return found
+    return Math.max(0, found)
 }
 
 function exitAssert(s: Summary, id: number, seen: Set<number>): number {
@@ -1957,13 +2169,17 @@ function exitAssert(s: Summary, id: number, seen: Set<number>): number {
     seen.add(id)
     if (n.op === NodeOp.panic || n.op === NodeOp.unreachable || n.op === NodeOp.trap) return -1
     const found = priorAssert(s, id, n)
+    if (n.op === NodeOp.select) return s.priorAsserts.get(id)!
     if (found) return found
     if (n.op === NodeOp.after) return exitAssert(s, getRef(n, countIds(n) - 1), seen)
     if (n.op === NodeOp.ret) return exitAssert(s, getRef(n, 1), seen)
-    if (n.op !== NodeOp.select) return 0
+    return 0
+}
+
+function armsAssert(s: Summary, n: GraphNode): number {
     let common = -1
     for (let i = 1; i < countIds(n); i++) {
-        const arm = exitAssert(s, getRef(n, i), seen)
+        const arm = exitAssert(s, getRef(n, i), new Set())
         if (arm === 0) return 0
         if (arm < 0) continue
         if (common < 0) common = arm
@@ -2132,12 +2348,12 @@ function fieldMatch(g: Graph, n: GraphNode, ref: number, equal: boolean): number
     return -1
 }
 
-function narrowed(s: Summary, ref: number, base: number, use: number): number {
+function narrowed(s: Summary, ref: number, base: number, use: number, user: number = 0): number {
     const regions = s.regions!
-    if (regions.depth[use] === 0 && regions.link[use] < 0) return base
     const build = s.build!
     if (!build.tested.has(ref)) return base
-    const guard = guardAt(s, ref, use)
+    if (regions.depth[use] === 0 && regions.link[use] < 0 && !s.checks && (flow.host.panicTrap || !s.derefs?.has(ref))) return base
+    const guard = guardAt(s, ref, use, user)
     let byGuard = build.narrowExprs.get(ref)
     if (!byGuard) build.narrowExprs.set(ref, byGuard = new Map())
     let e = byGuard.get(guard)
@@ -2163,28 +2379,73 @@ function narrowStep(s: Summary, op: ExprOp, a: number, b: number, key: number, s
     return e
 }
 
-function guardAt(s: Summary, ref: number, use: number): Guard {
+function guardAt(s: Summary, ref: number, use: number, user: number = 0): Guard {
+    if (user && s.checkUsers.has(user)) return inputGuard(s, ref, use, user)
     const regions = s.regions!
     let guards = s.guards.get(ref)
     if (!guards) s.guards.set(ref, guards = new Map())
-    const owner = regions.paramBlock.get(ref)
-    const home = owner !== undefined ? (owner === 0 ? -1 : regions.roots[owner]) : regions.shared.has(ref) ? -1 : regions.of.get(ref) ?? -1
+    const home = homeOf(regions, ref)
     const path: number[] = []
     let at = use
     while (at >= 0 && at !== home && !guards.has(at)) {
         path.push(at)
         at = regionUp(regions, at)
     }
-    let guard = at >= 0 && at !== home ? guards.get(at)! : noGuard
+    let guard = at >= 0 && at !== home ? guards.get(at)! : at >= 0 ? callsGuard(s, at, ref, noGuard, 0) : noGuard
     for (let i = path.length - 1; i >= 0; i--) {
-        const r = path[i]
-        charge(1)
-        if (regions.depth[r] > 0) {
-            const origin = getNode(s.g, regions.origin[r])!
-            if (origin.op !== NodeOp.select) guard = meetGuard(guard, assertGuard(s, priorAssert(s, regions.origin[r], origin), ref))
-            else guard = meetGuard(guard, guardOn(s, getRef(origin, 0), ref, regions.slot[r] === 1))
-        }
-        guards.set(r, guard)
+        guard = regionGuard(s, path[i], ref, guard, 0)
+        guards.set(path[i], guard)
+    }
+    return guard
+}
+
+function homeOf(regions: GraphRegions, ref: number): number {
+    const owner = regions.paramBlock.get(ref)
+    return owner !== undefined ? (owner === 0 ? -1 : regions.roots[owner]) : regions.shared.has(ref) ? -1 : regions.of.get(ref) ?? -1
+}
+
+function inputGuard(s: Summary, ref: number, use: number, user: number): Guard {
+    const regions = s.regions!
+    if (use < 0) return noGuard
+    if (use === homeOf(regions, ref)) return callsGuard(s, use, ref, noGuard, user)
+    const up = regionUp(regions, use)
+    return regionGuard(s, use, ref, up >= 0 ? guardAt(s, ref, up) : noGuard, user)
+}
+
+function regionGuard(s: Summary, r: number, ref: number, prior: Guard, user: number): Guard {
+    const regions = s.regions!
+    charge(1)
+    let guard = prior
+    if (regions.depth[r] > 0) {
+        const origin = getNode(s.g, regions.origin[r])!
+        if (origin.op !== NodeOp.select || regions.slot[r] === 0) guard = meetGuard(guard, assertGuard(s, priorAssert(s, regions.origin[r], origin), ref))
+        else guard = meetGuard(guard, guardOn(s, getRef(origin, 0), ref, regions.slot[r] === 1))
+    }
+    return callsGuard(s, r, ref, guard, user)
+}
+
+function derefGuard(s: Summary, r: number, ref: number, prior: Guard): Guard {
+    const users = flow.host.panicTrap ? undefined : s.derefs?.get(ref)
+    if (!users) return prior
+    for (const d of users) {
+        if (s.regions!.runs.get(d) === r) return meetGuard(prior, definedGuard)
+    }
+    return prior
+}
+
+function callsGuard(s: Summary, r: number, ref: number, prior: Guard, user: number): Guard {
+    const calls = s.checks?.get(r)
+    if (!calls) return derefGuard(s, r, ref, prior)
+    const own = user ? s.checkUsers.get(user) : undefined
+    let guard = derefGuard(s, r, ref, prior)
+    let input: boolean | undefined
+    for (const c of calls) {
+        if (own && own.includes(c)) continue
+        const post = callGuard(s, getNode(s.g, c)!, ref)
+        if (post === noGuard) continue
+        if (own && input === undefined) input = checksInput(s, user)
+        if (input) continue
+        guard = meetGuard(guard, post)
     }
     return guard
 }
@@ -2198,6 +2459,88 @@ function assertGuard(s: Summary, call: number, ref: number): Guard {
     }
     const prior = priorAssert(s, call, getNode(s.g, call)!)
     return prior ? meetGuard(guard, assertGuard(s, prior, ref)) : guard
+}
+
+const noreturnPosts: Guard[] = []
+const definedGuard: Guard = { flags: GuardFlag.notUndefined | GuardFlag.notNull, lo: MinI64, hi: MaxU64, picks: [] }
+
+function callGuard(s: Summary, call: GraphNode, ref: number): Guard {
+    const g = s.g
+    const first = calleeSlot(g, call) + 2
+    const end = spreadsLast(call) ? countIds(call) - 1 : countIds(call)
+    if (!passes(g, call, ref, first, end)) return noGuard
+    const posts = callPosts(s, call)
+    if (!posts || posts === noreturnPosts) return noGuard
+    let guard = noGuard
+    let i = first
+    while (i < end && i - first < posts.length) {
+        const r = getRef(call, i)
+        const id = r ? tailOf(g, r) : 0
+        if (id === ref) guard = meetGuard(guard, posts[i - first])
+        i++
+    }
+    return guard
+}
+
+function passes(g: Graph, call: GraphNode, ref: number, first: number, end: number): boolean {
+    let i = first
+    while (i < end) {
+        const r = getRef(call, i)
+        const id = r ? tailOf(g, r) : 0
+        if (id && id === ref) return true
+        i++
+    }
+    return false
+}
+
+function valueGuard(guard: Guard): Guard {
+    if (!guard.flags && !guard.protos && !guard.factor) return noGuard
+    return guardOf(guard.flags, guard.lo, guard.hi, [], guard.protos ?? [], guard.factor ?? 1, [])
+}
+
+function callPosts(s: Summary, call: GraphNode): Guard[] | null {
+    const callee = predicateCallee(s, call)
+    return callee && callee !== s ? postGuards(callee) : null
+}
+
+function postGuards(callee: Summary): Guard[] | null {
+    const known = callee.posts
+    if (known !== undefined) return known
+    if (callee.build) return null
+    callee.posts = null
+    if (callee.usesCtx) return null
+    const cg = callee.g
+    const regions = callee.regions!
+    const at: number[] = []
+    for (const [id, n] of nodeEntries(cg)) {
+        if (n.op !== NodeOp.ret || callee.regionRets.has(id)) continue
+        const region = demandRegion(regions, id, n, 1)
+        if (region >= 0 && stoppedRegion(callee, regions, region)) continue
+        at.push(region)
+    }
+    if (!at.length) {
+        callee.posts = noreturnPosts
+        return noreturnPosts
+    }
+    const rest = restOf(callee.fn)
+    const table: Guard[] = []
+    let narrows = false
+    for (const p of cg.blocks[0].params) {
+        if (isThisParam(getNode(cg, p)!)) continue
+        if (rest && table.length >= rest[0]) break
+        let joined = deadGuard
+        let k = 0
+        while (k < at.length && joined !== noGuard) {
+            charge(1)
+            joined = joinGuard(joined, at[k] < 0 ? noGuard : guardAt(callee, p, at[k]))
+            k++
+        }
+        const kept = joined.picks.length || joined.matches ? valueGuard(joined) : joined
+        if (kept !== noGuard) narrows = true
+        table.push(kept)
+    }
+    callee.posts = narrows ? table : null
+    return callee.posts
 }
 
 function lcm(a: number, b: number): number {
@@ -2461,15 +2804,19 @@ function predicateGuard(s: Summary, call: GraphNode, ref: number, positive: bool
 }
 
 function predicateCallee(s: Summary, call: GraphNode): Summary | undefined {
-    const g = s.g
+    const fn = targetFunction(s.g, call, s.fresh)
+    return fn ? summaryOf(fn) : undefined
+}
+
+function targetFunction(g: Graph, call: GraphNode, fresh: Set<number> | undefined): Function | undefined {
     const target = getRef(call, calleeSlot(g, call)) ? getNode(g, getRef(call, calleeSlot(g, call))) : undefined
     if (!target) return
     const host = flow.host
     let fn: Function | undefined
     if (target.op === NodeOp.localTarget) fn = host.binder.functions[getLiteral(g, target, 0)]
-    else if (target.op === NodeOp.heapHandle && !getRef(target, 0) && !s.fresh.has(getLiteral(g, target, 0))) fn = callableOf(getLiteral(g, target, 0))
+    else if (target.op === NodeOp.heapHandle && !getRef(target, 0) && fresh && !fresh.has(getLiteral(g, target, 0))) fn = callableOf(getLiteral(g, target, 0))
     if (!fn || !host.binder.traceable(fn)) return
-    return summaryOf(boundCallee(host, fn, call, g))
+    return boundCallee(host, fn, call, g)
 }
 
 function tableOf(callee: Summary): Guard[] | null {
@@ -2764,6 +3111,7 @@ function refineReturn(callee: Instance, target: number): number {
     const n = node ? getNode(from.summary.g, node) : undefined
     if (!n) return callee.ret
     from.summary.prover = from
+    if (!flow.host.panicTrap && derefed(from.summary, node)) return at(callee, b.ret)
     const args: number[] = []
     let recv = 0
     if (n.op === NodeOp.getProp && !getRef(n, 2)) {
@@ -2785,6 +3133,11 @@ function refineReturn(callee: Instance, target: number): number {
     const origin = b.recv < 0 && callee.summary.hasThis ? receiverQual(callee.qual) : 0
     const calls = pg.inBounds(boundScope(from.summary, origin, b.key), node, args[b.param], owner, b.key)
     return proven(from, calls, owner, callee, target) ? at(callee, b.ret) : callee.ret
+}
+
+function derefed(s: Summary, read: number): boolean {
+    const home = s.regions!.of.get(read)
+    return home !== undefined && (guardAt(s, read, home).flags & GuardFlag.notUndefined) !== 0
 }
 
 function buildSummary(s: Summary): void {
@@ -2912,7 +3265,7 @@ function regionGate(s: Summary, r: number): number {
         const select = getNode(s.g, regions.origin[r])!
         const cond = getRef(select, 0)
         const parent = regionGate(s, regions.parent[r])
-        if (select.op !== NodeOp.select) gate = parent
+        if (select.op !== NodeOp.select || regions.slot[r] === 0) gate = parent
         else if (cond) gate = expr(s, ExprOp.gate, 0, parent, exprOfNode(s, cond), regions.slot[r], [], 0)
         else gate = (getLiteral(s.g, select, 0) !== 0) === (regions.slot[r] === 1) ? parent : expr(s, ExprOp.konst, 0, NONE, 0, 0, [], 0)
     } else if (regions.link[r] >= 0) gate = regionGate(s, regions.link[r])
@@ -8306,17 +8659,23 @@ function extractCut(name: string, generator: string, self: number, proto: Handle
                 chain.push(g)
                 g = exprs[g].a
             }
+            const plain = (e: number): number => {
+                let v = e
+                while (exprs[v].op === ExprOp.narrow || exprs[v].op === ExprOp.pick) v = exprs[v].a
+                return v
+            }
             const equal: [number, number][] = []
             for (const c of chain) {
                 const cond = exprs[exprs[c].b]
                 const equality = exprs[c].key === 1 ? NodeOp.eq : NodeOp.ne
-                if (cond.op === ExprOp.cmp && cond.key === equality) equal.push([cond.a, cond.b])
+                if (cond.op === ExprOp.cmp && cond.key === equality) equal.push([plain(cond.a), plain(cond.b)])
             }
             const operand = (e: number): CutTerm[] => {
                 const terms = [termOf(at(here, e), ri, [])]
+                const v = plain(e)
                 for (const [a, b] of equal) {
-                    if (a === e) terms.push(termOf(at(here, b), ri, []))
-                    if (b === e) terms.push(termOf(at(here, a), ri, []))
+                    if (a === v) terms.push(termOf(at(here, b), ri, []))
+                    if (b === v) terms.push(termOf(at(here, a), ri, []))
                 }
                 return terms
             }
