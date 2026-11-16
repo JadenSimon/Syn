@@ -6,7 +6,7 @@ import type { Allocation, FastTraced } from './fast-trace'
 import { globals as builtinGlobals, markStacks, releaseStacks } from './builtins'
 import { assignOne } from './builtin/Object'
 import { reportPanic } from './builtin/Error'
-import { blockBytes, dropUnlessEmpty, releaseCounted, releaseUnlessEmpty, unlessSame, dropRecord } from './builtin/memory'
+import { blockBytes, dropUnlessEmpty, freeUnlessEmpty, releaseCounted, releaseUnlessEmpty, unlessSame, dropRecord } from './builtin/memory'
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
@@ -7204,7 +7204,6 @@ interface ShapePlan {
     closureCodes: Map<intrinsics.Handle, intrinsics.Handle>
     absentKeys: Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>
     scopeFrames: Map<string, intrinsics.Handle | undefined>
-    counted: Map<intrinsics.Handle, Set<intrinsics.Handle>>
 }
 interface UnitPlan {
     unit: PlannedUnit
@@ -12438,7 +12437,8 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
                 if (field.group !== undefined) {
                     const inner = ends.counted[field.group].fields
                     const released = linked(value, releaseUnlessEmpty, [last, value, counted(value, rt.Op.countedWrapper, [value])])
-                    order = inner && !groups.includes(field.group) ? releasedFields(released, released, value, inner, [...groups, field.group]) : released
+                    const emptied = inner && !groups.includes(field.group) ? releasedFields(released, released, value, inner, [...groups, field.group]) : released
+                    order = linked(emptied, freeUnlessEmpty, [released])
                     continue
                 }
                 order = field.inner ? releasedFields(value, last, value, field.inner, groups) : linked(value, dropUnlessEmpty, [last, value])
@@ -12448,7 +12448,7 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         const release = (order: number, value: number, group: number): number => {
             const last = linked(order, releaseCounted, [value, counted(value, rt.Op.countedWrapper, [value])])
             const inner = ends.counted[group].fields
-            return inner ? releasedFields(last, last, value, inner, [group]) : last
+            return linked(inner ? releasedFields(last, last, value, inner, [group]) : last, freeUnlessEmpty, [last])
         }
         return { drop, dropFields, counted, linked, release }
     }
@@ -12678,29 +12678,6 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
     return { placed, freed, answered }
 }
 
-function planCountedSlots(plan: ShapePlan, groups: Counted[]): void {
-    if (!groups.length) return
-    const shapeOf = new Map<number, string>()
-    for (const [id, sig] of plan.inst.shapes) {
-        for (const m of sig.members) shapeOf.set(m, id)
-    }
-    const slots = new Set<string>()
-    for (const group of groups) {
-        for (const location of group.locations) slots.add(`${location.allocation}:${location.key}`)
-    }
-    for (const group of groups) {
-        for (const location of group.locations) {
-            const id = shapeOf.get(location.allocation)
-            const shape = id === undefined ? undefined : plan.shapes.get(id)
-            if (id === undefined || shape === undefined) throw `native: counted slot ${location.key} of object ${location.allocation} has no planned shape`
-            for (const m of plan.inst.shapes.get(id)!.members) {
-                if (!slots.has(`${m}:${location.key}`)) throw `native: planned shape ${id} holds a counted slot ${location.key} for object ${location.allocation} and a plain one for object ${m}`
-            }
-            setOf(plan.counted, shape).add(location.handle!)
-        }
-    }
-}
-
 function checkReflow(accesses: Accesses, extended: ValueTypes, host: AccessHost, roots: Function[]): void {
     accesses.shadow((fresh, map) => {
         const differences = reflowDifferences(extended, analyzeTypes(fresh, host, roots), map)
@@ -12818,12 +12795,12 @@ function printDrops(ends: Lifetimes, placed: number, answered: number): void {
     for (const [why, count] of [...ends.refused].sort((a, b) => b[1] - a[1])) console.log(`DROPS refused ${count}: ${why}`)
 }
 
-function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number, slabShapes: Set<intrinsics.Handle>) {
+function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number, slabShapes: Set<intrinsics.Handle>, countedSites: Map<PlannedUnit, Map<number, number>>) {
     const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget, graphOf } = binder
     const { tracedOf, stateOf, reachableNodes } = tracer
     const slabIds = new Set<string>()
     for (const [id, shape] of plan.shapes) if (slabShapes.has(shape)) slabIds.add(id)
-    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values(), ...plan.statics.viewed]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys, counted: plan.counted }
+    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values(), ...plan.statics.viewed]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys }
     function abiOf(fn: Function): UnitAbi {
         return reps.abi.get(fn) ?? { mode: constructsOutOfLine(fn) || stateOf(originOf(fn)).stubbed ? 'keep' : 'encoded', returns: Types.u64, tags: [] }
     }
@@ -13133,7 +13110,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
             calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
-            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.pstacks.targets.get(plannedUnit), slab: slabShapes,
+            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.pstacks.targets.get(plannedUnit), slab: slabShapes, counted: plannedUnit && countedSites.get(plannedUnit),
         })
         if (regions) placePstackCallMarkers(result.graph, regions)
         plannedFunctionCalls(result.graph)
@@ -14057,7 +14034,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         if (!facts.has(shape)) facts.set(shape, new Map())
         facts.set(state, facts.get(shape)!)
     }
-    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map(), counted: new Map() }
+    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map() }
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {
@@ -15681,6 +15658,13 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     for (const id of slabbed) if (freed.has(id)) slab.add(id)
     const slabObjects = new Set<number>()
     for (const id of freed) if (clobbered.elements.has(id)) slabObjects.add(id)
+    const countedObjects = new Set<number>()
+    for (const group of ends.counted) {
+        for (const id of group.objects) {
+            intrinsics.assert(!record(id), `native: counted object O${id} is a record whose drop frees it, so its last release would free it twice`)
+            countedObjects.add(id)
+        }
+    }
     if (placed || answered) {
         accesses = clock.timed('drops', () => accesses.extend())
         valueTypes = clock.timed('drops', () => valueTypes.extend(accesses))
@@ -15690,7 +15674,6 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const members = memberFacts(valueTypes, accesses.locations, host, proto => genericOf(proto) ? classCutOf(proto) : undefined)
     const { plan, planned, reps } = clock.timed('plan', () => {
         const plan = planShapes(valueTypes, binder, tracer, host, genericOf, facts, members, slab)
-        planCountedSlots(plan, ends.counted)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
         for (const [state, layout] of plan.statics.layouts) image.placedLayouts.set(state, layout)
         const planned = bindPlannedUnits(plan, binder)
@@ -15737,12 +15720,42 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const shapeSlab = new Map<string, boolean>()
     valueTypes.objects.forEach((_, id) => {
         const shape = plan.inst.shapeOf(id)
-        if (shape !== undefined) shapeSlab.set(shape, (shapeSlab.get(shape) ?? true) && slabObjects.has(id))
+        if (shape !== undefined && !countedObjects.has(id)) shapeSlab.set(shape, (shapeSlab.get(shape) ?? true) && slabObjects.has(id))
     })
     const worded = wordedShapes(plan, planned)
     const slabShapes = new Set<intrinsics.Handle>()
     for (const [shape, all] of shapeSlab) if (all && plan.shapes.has(shape) && !worded.has(shape)) slabShapes.add(plan.shapes.get(shape)!)
-    const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot, slabShapes)
+    const unitOfInstance = new Map<number, PlannedUnit>()
+    for (const unit of planned.units.values()) {
+        for (const f of unit.instances) {
+            unitOfInstance.set(f, unit)
+        }
+    }
+    const siteUnits = (id: number): PlannedUnit[] => {
+        const object = valueTypes.objects[id]
+        const live = object.instances ?? (object.instance === undefined ? [] : [object.instance])
+        return live.flatMap(f => {
+            const unit = unitOfInstance.get(f)
+            return unit && unit.fn === object.site.unit ? [unit] : []
+        })
+    }
+    const countedSites = new Map<PlannedUnit, Map<number, number>>()
+    for (const id of countedObjects) {
+        const shape = plan.inst.shapeOf(id)
+        if (shape === undefined || !plan.shapes.has(shape)) throw `native: counted object O${id} has no planned shape to size its block`
+        if (worded.has(shape)) throw `native: counted object O${id} has planned shape ${shape}, which is held in encoded words, so its block on the slab cannot be referenced`
+        for (const unit of siteUnits(id)) {
+            mapOf(countedSites, unit).set(valueTypes.objects[id].site.node, id)
+        }
+    }
+    valueTypes.objects.forEach((object, id) => {
+        if (countedObjects.has(id)) return
+        for (const unit of siteUnits(id)) {
+            const other = countedSites.get(unit)?.get(object.site.node)
+            if (other !== undefined) throw `native: O${id} and counted O${other} are made by the same allocation %${object.site.node} of ${unit.fn.name}, which can only put both on the slab with a count or neither`
+        }
+    })
+    const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot, slabShapes, countedSites)
     image.functionObjects.of = resolver.functionObjectOf
     const program = compileProgram(binder, linker, tracer, resolver, plan, image, target, clock)
     if (typeDebug) program.explain = (symbol, param) => {

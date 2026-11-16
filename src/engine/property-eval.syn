@@ -19,7 +19,7 @@ import {
     addNode,
     withOperand,
     addCopy, retypeNode, insertNode, nodeUsers, getBlock, spreadsLast, allNodes, someNode, copyNodes, nodeEntries, nodeIds, makeNode, isThisParam, NodeFlags,
-    heapInterior, heapField, heapFieldCount, typeRefOf, getArgIds, setType, pushBlockParams, setBlockBody, orderingReaches, tailOf,
+    heapInterior, heapField, heapFieldCount, typeRefOf, getArgIds, setType, pushBlockParams, setBlockBody, orderingReaches, tailOf, anchorOf,
 } from './graph-node'
 import { snapshotField, snapshotKeys } from './heap-records'
 import { symbolOf, symbolValue, tagVmHandle, tagVmHandleNode, tagVmScalar, vmHandleNode, vmValue } from './vm'
@@ -43,7 +43,6 @@ export interface LayoutTable {
     views?: Map<Handle, Handle[]>
     codes?: Map<Handle, Handle>
     absent?: Map<Handle, Map<Handle, boolean>>
-    counted?: Map<Handle, Set<Handle>>
 }
 
 export interface Answer {
@@ -86,6 +85,7 @@ export interface ObjectRequest {
     wordsSlot?: (words: number[]) => number
     stacks?: Map<number, number>
     slab?: Set<Handle>
+    counted?: Map<number, number>
 }
 
 export interface UnionParam {
@@ -159,6 +159,8 @@ export interface Layout {
 }
 
 const wordBits = 32
+const countHeader = 8
+const countOffset = -4
 
 export function bitWord(slot: BitSlot): intrinsics.Types {
     return slot.shared ? Types.u32 : Types.u64
@@ -346,9 +348,10 @@ function resolveProperties(
         memory.set(id, pointerMemory(id, shape))
     }
     const byHandle = new Map<Handle, Memory>()
+    const countedMemory = new Set<Memory>()
     let initToken = 0
     let allocToken: number | undefined
-    function heapAllocate(size: number, zeroed: BitSlot[], stack: number, fields: Layout, slab: boolean): number {
+    function heapAllocate(size: number, zeroed: BitSlot[], stack: number, fields: Layout, slab: boolean, counted: boolean): number {
         let token = allocToken
         if (token === undefined) {
             if (!initToken) {
@@ -369,8 +372,10 @@ function resolveProperties(
         }
         inlineRegions(fields, 0)
         if (regions.length) operands.push({ literal: 0 }, ...regions)
-        const block = slab ? addNode(out, NodeOp.rt, [token, { literal: RtOp.malloc }, { literal: size }], signatureOf(RtOp.malloc).returns) : 0
-        const ptr = slab ? addNode(out, NodeOp.after, [block, addNode(out, NodeOp.mem, [block, { literal: size }], Types.u64)]) : addNode(out, NodeOp.pstack, operands)
+        const bytes = counted ? size + countHeader : size
+        const block = slab ? addNode(out, NodeOp.rt, [token, { literal: RtOp.malloc }, { literal: bytes }], signatureOf(RtOp.malloc).returns) : 0
+        const start = slab ? addNode(out, NodeOp.after, [block, addNode(out, NodeOp.mem, [block, { literal: bytes }], Types.u64)]) : addNode(out, NodeOp.pstack, operands)
+        const ptr = counted ? addNode(out, NodeOp.add, [start, { literal: countHeader }], Types.u64) : start
         let last = ptr
         for (const slot of zeroed) last = addNode(out, NodeOp.store, [last, ptr, { literal: slot.offset }, { literal: 0 }], bitWord(slot))
         if (allocToken !== undefined) allocToken = last
@@ -494,6 +499,51 @@ function resolveProperties(
         }
         return seen
     }
+    const blockPaths = new Map<number, Set<number>[]>()
+    function pathsOf(block: number): Set<number>[] {
+        const known = blockPaths.get(block)
+        if (known) return known
+        const paths: Set<number>[] = []
+        const walk = (id: number, parts: number[]): void => {
+            const n = getNode(source, id)
+            if (n?.op === NodeOp.select) {
+                let i = 1
+                while (i < countIds(n)) {
+                    walk(getRef(n, i), [...parts, getRef(n, 0)])
+                    i++
+                }
+                return
+            }
+            if (n?.op === NodeOp.after) {
+                const more = parts.slice()
+                let i = 0
+                while (i < countIds(n) - 1) {
+                    more.push(getRef(n, i))
+                    i++
+                }
+                walk(getRef(n, countIds(n) - 1), more)
+                return
+            }
+            const seen = new Set<number>()
+            const stack = [...parts, id]
+            while (stack.length) {
+                const at = stack.pop()!
+                if (!at || seen.has(at)) continue
+                const node = getNode(source, at)
+                if (!node) continue
+                seen.add(at)
+                let i = node.op === NodeOp.apply ? 1 : 0
+                while (i < countIds(node)) {
+                    stack.push(getRef(node, i))
+                    i++
+                }
+            }
+            paths.push(seen)
+        }
+        walk(getBlock(graph, block)!.bodyId, [])
+        blockPaths.set(block, paths)
+        return paths
+    }
     function plainFunction(shape: Handle): boolean {
         return heap.isCallable(shape) && !heap.getPropertyDescriptor(shape, heap.closureCallKey)
     }
@@ -527,8 +577,11 @@ function resolveProperties(
         if (!mem) {
             const reduced = reducedShape(handle)
             let ptr = 0
-            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst, fields, !!opts.slab?.has(handle))
+            const counted = !!opts.counted?.has(id)
+            if (counted && reduced) throw `property-eval: %${id} makes counted O${opts.counted!.get(id)}, whose shape is reduced away, so it has no block to hold its count`
+            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst, fields, counted || !!opts.slab?.has(handle), counted)
             mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false, origin: identity?.op === NodeOp.heapHandle && heapFieldCount(identity) ? id : undefined }
+            if (counted) countedMemory.add(mem)
             if (cell !== undefined) homes.set(cell, mem)
         }
         memory.set(id, mem)
@@ -660,52 +713,23 @@ function resolveProperties(
         const n = getNode(source, ref)
         return n?.op === NodeOp.heapHandle && countIds(n) === 1 && !getRef(n, 0) && getLiteral(runtime, n, 0) === heap.nullHandle
     }
-    const wraps = new Map<number, number>()
-    for (const [id, n] of nodeEntries(source)) {
-        if (n.op === NodeOp.rt && getLiteral(runtime, n, 1) === RtOp.countedWrap) wraps.set(strippedAfter(getRef(n, 2)), id)
+    function countedMemoryOf(id: number, value: number): Memory {
+        shape(value)
+        const mem = memory.get(value)
+        if (!mem || mem.reduced) throw `property-eval: %${id} counts %${value}, which has no memory of its own`
+        if (!mem.pointer && !countedMemory.has(mem)) throw `property-eval: %${id} counts %${value}, which was allocated without a count in front of it`
+        return mem
     }
-    const wrapperLoads = new Map<number, number>()
-    const unboxes = new Map<number, number>()
-    const wrapperValues = new Set<number>()
-    function strippedAfter(id: number): number {
-        let n = getNode(source, id)
-        while (n?.op === NodeOp.after) {
-            id = getRef(n, countIds(n) - 1)
-            n = getNode(source, id)
+    function countedBlockBytes(id: number, mem: Memory): number {
+        let bytes: number | undefined
+        for (const member of mem.members ?? [mem.shape]) {
+            const size = Math.max(layout(member).size, 8) + countHeader
+            if (bytes !== undefined && size !== bytes) throw `property-eval: %${id} frees a counted object whose shapes take blocks of different sizes`
+            bytes = size
         }
-        return id
-    }
-    function countedSlot(shape: Handle, key: Handle): boolean {
-        return !!opts.layouts.counted?.get(shape)?.has(key)
-    }
-    function countedOffset(shape: Handle, offset: number): boolean {
-        const keys = opts.layouts.counted?.get(shape)
-        if (!keys) return false
-        const fields = layout(shape)
-        const at = fields.offsets.indexOf(offset)
-        return at >= 0 && keys.has(fields.keys[at])
-    }
-    function wrapperOf(value: number): number {
-        const at = strippedAfter(value)
-        const wrapped = wraps.get(at)
-        if (wrapped !== undefined) {
-            wrapperValues.add(wrapped)
-            return wrapped
-        }
-        if (countedOp(at) === RtOp.countedUnbox) {
-            shape(at)
-            const boxed = unboxes.get(at)!
-            wrapperValues.add(boxed)
-            return boxed
-        }
-        if (getNode(source, at)?.op === NodeOp.getProp) evaluate(at)
-        const read = wrapperLoads.get(at)
-        if (read === undefined) throw `property-eval: %${value} goes into a counted slot, but it is neither wrapped nor read from a counted slot`
-        wrapperValues.add(read)
-        return read
+        return bytes!
     }
     function storeField(id: number, token: number, base: number, displacement: number, owner: Handle, offset: number, value: Operand, narrow: boolean): void {
-        if (countedOffset(owner, offset) && !(typeof value === 'number' ? wrapperValues.has(value) : value.literal === 0)) throw `property-eval: %${id} stores something other than a wrapper into a counted slot`
         const located = locate(owner, String(offset))
         const word = wordCodec(located)
         const rawFloat = located?.kind === 'f64' && !located.encoded
@@ -785,13 +809,14 @@ function resolveProperties(
         return memory.get(getRef(read, 1)) === mem && getLiteral(runtime, read, 2) === mem.keys[i]
     }
     const placedFinals = new Map<number, [final: number, before: number]>()
+    const placedMembers = new Map<number, number[]>()
     for (const [at, group] of placed) {
         allocToken = at
         const before = out.ids.next
         let final = at
+        const members: number[] = []
         try {
             for (let i = 0; i < group.length; i += 2) materialize(group[i], group[i + 1] as Handle)
-            const members: number[] = []
             for (let i = 0; i < group.length; i += 2) {
                 members.push(group[i])
                 embeddedWithin(group[i], members)
@@ -810,8 +835,82 @@ function resolveProperties(
             if (n && !hasNode(source, id)) setNode(source, id, copyNode(runtime, n))
         }
         placedFinals.set(at, [final, before])
+        placedMembers.set(at, members)
     }
     if (placedFinals.size) {
+        const objectUsers = nodeUsers(source, nodeIds(source))
+        const tokenUsers = new Map<number, number[]>()
+        for (const space of [source, out]) {
+            for (const [id, n] of nodeEntries(space)) {
+                if (n.op === NodeOp.ret) continue
+                const end = firstNonOrderingSlot(n)
+                for (let i = 0; i < end; i++) {
+                    const placedAt = placedFinals.get(getRef(n, i))
+                    if (!placedAt || id >= placedAt[1]) continue
+                    const list = tokenUsers.get(getRef(n, i))
+                    if (list) list.push(id)
+                    else tokenUsers.set(getRef(n, i), [id])
+                }
+            }
+        }
+        const anchors = new Map<number, number>()
+        const elsewhere = new Map<number, (id: number) => boolean>()
+        for (const [at, members] of placedMembers) {
+            if (!hasNode(graph, at)) continue
+            const block = anchorOf(graph, at, new Map(), anchors)
+            if (!block || !getBlock(graph, block)) continue
+            const paths = pathsOf(block)
+            const on = (id: number): number[] => {
+                const found: number[] = []
+                let p = 0
+                while (p < paths.length) {
+                    if (paths[p].has(id)) found.push(p)
+                    p++
+                }
+                return found
+            }
+            const used = new Set<number>()
+            let unplaced = false
+            for (const member of members) {
+                for (const [user] of objectUsers.get(member) ?? []) {
+                    const found = on(user)
+                    if (!found.length) unplaced = true
+                    for (const p of found) {
+                        used.add(p)
+                    }
+                }
+            }
+            if (unplaced || !used.size || used.size === paths.length) continue
+            const users = (tokenUsers.get(at) ?? []).map(on)
+            if (users.some(found => !found.length)) continue
+            const usersOn: number[][] = paths.map(() => [])
+            let u = 0
+            while (u < users.length) {
+                for (const p of users[u]) {
+                    usersOn[p].push(u)
+                }
+                u++
+            }
+            const moved = new Set<number>()
+            const reach: number[] = [...used]
+            while (reach.length) {
+                const p = reach.pop()!
+                for (const user of usersOn[p]) {
+                    if (moved.has(user)) continue
+                    moved.add(user)
+                    for (const q of users[user]) {
+                        if (used.has(q)) continue
+                        used.add(q)
+                        reach.push(q)
+                    }
+                }
+            }
+            if (used.size === paths.length) continue
+            elsewhere.set(at, (id: number) => {
+                const found = on(id)
+                return found.length > 0 && !found.some(p => used.has(p))
+            })
+        }
         for (const space of [source, out]) {
             for (const [id, n] of nodeEntries(space)) {
                 if (n.op === NodeOp.ret) continue
@@ -820,6 +919,7 @@ function resolveProperties(
                 for (let i = 0; i < end; i++) {
                     const placedAt = placedFinals.get(getRef(n, i))
                     if (!placedAt || id >= placedAt[1]) continue
+                    if (elsewhere.get(getRef(n, i))?.(id)) continue
                     ops ??= getOperands(space, n)
                     ops[i] = placedAt[0]
                 }
@@ -1326,13 +1426,9 @@ function resolveProperties(
             }
             const rawFloat = located?.kind === 'f64' && !located.encoded
             const word = wordCodec(located)
-            const raw = newId()
+            const load = newId()
             const signed = opts.answers?.get(id)?.signed
-            const counts = countedSlot(mem.shape, key)
-            if (counts && (word || located?.kind !== 'ref')) throw `property-eval: %${id} reads a counted slot whose payload is not a plain object reference`
-            putNode(out, raw, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : mem.narrow[at] ? narrowFieldType(located) : signed !== undefined ? signed ? Types.i64 : Types.u64 : native.intType(located) ?? Types.u64)
-            const load = counts ? addNode(out, NodeOp.load, [stable ? readonlyToken() : token, raw, { literal: 8 }], Types.u64) : raw
-            if (counts) wrapperLoads.set(id, raw)
+            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : mem.narrow[at] ? narrowFieldType(located) : signed !== undefined ? signed ? Types.i64 : Types.u64 : native.intType(located) ?? Types.u64)
             const tag = mem.tags[at]
             const tagRead = tag ? readBit(stable ? readonlyToken() : token, base, embedded ? tag.offset : mem.base + tag.offset, tag) : 0
             if (tagRead) fieldTags.set(id, tagRead)
@@ -1392,12 +1488,11 @@ function resolveProperties(
             return
         }
         const tag = mem.tags[at]
-        const stored = countedSlot(mem.shape, key) ? wrapperOf(value[0]) : value[0]
         if (tag) {
             const payload = newId()
-            storeField(payload, token, base, displacement, mem.shape, mem.offsets[at], stored || { literal: value[1] }, mem.narrow[at])
+            storeField(payload, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] }, mem.narrow[at])
             writeBit(id, payload, base, embedded ? tag.offset : mem.base + tag.offset, tag, tagValue(value[0], 1))
-        } else storeField(id, token, base, displacement, mem.shape, mem.offsets[at], stored || { literal: value[1] }, mem.narrow[at])
+        } else storeField(id, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] }, mem.narrow[at])
         const storedShape = value[0] ? storedFact(value[0]) : literalStored(mem.shape, key, value[1])
         if (storedShape !== undefined && !dead(id)) storeFact(mem.shape, String(mem.offsets[at]), storedShape, value[0])
     }
@@ -2326,10 +2421,9 @@ function resolveProperties(
     function unboxCounted(id: number, boxed: number): Handle | null | undefined {
         const s = shape(boxed)
         const held = memory.get(boxed)
-        if (!s || !held) throw `property-eval: %${id} unboxes a counted value whose wrapper points at no known object`
-        putNode(out, id, NodeOp.load, [readonlyToken(), held.ptr, { literal: 8 }], Types.u64)
+        if (!s || !held) throw `property-eval: %${id} unboxes a counted value that points at no known object`
+        putNode(out, id, NodeOp.after, [held.ptr])
         memory.set(id, { ...pointerMemory(id, s), union: held.union, members: held.members })
-        unboxes.set(id, held.ptr)
         return s
     }
     function loadShape(id: number, n: GraphNode): Handle | null | undefined {
@@ -3077,22 +3171,27 @@ function resolveProperties(
         const op = getLiteral(runtime, n, 1)
         const token = getRef(n, 0)
         if (op === RtOp.countedWrap) {
-            const item = getRef(n, 2)
-            const block = addNode(out, NodeOp.rt, [token, { literal: RtOp.malloc }, { literal: 16 }], Types.u64)
-            const count = addNode(out, NodeOp.store, [block, block, { literal: 0 }, { literal: 0 }], Types.u64)
-            const payload = addNode(out, NodeOp.store, [count, block, { literal: 8 }, item], Types.u64)
-            putNode(out, id, NodeOp.after, [payload, block])
+            const ptr = countedMemoryOf(id, getRef(n, 2)).ptr
+            putNode(out, id, NodeOp.store, [token, ptr, { literal: countOffset }, { literal: 0 }], Types.u32)
             continue
         }
         if (op === RtOp.countedRetain) {
-            const wrapper = wrapperOf(getRef(n, 2))
-            const count = addNode(out, NodeOp.load, [token, wrapper, { literal: 0 }], Types.u64)
-            putNode(out, id, NodeOp.store, [count, wrapper, { literal: 0 }, addNode(out, NodeOp.add, [count, { literal: 1 }], Types.u64)], Types.u64)
+            const ptr = countedMemoryOf(id, getRef(n, 2)).ptr
+            const count = addNode(out, NodeOp.load, [token, ptr, { literal: countOffset }], Types.u32)
+            putNode(out, id, NodeOp.store, [count, ptr, { literal: countOffset }, addNode(out, NodeOp.add, [count, { literal: 1 }], Types.u32)], Types.u32)
             continue
         }
-        if (op === RtOp.countedWrapper) putNode(out, id, NodeOp.after, [token, wrapperOf(getRef(n, 2))])
+        if (op === RtOp.countedWrapper) {
+            const ptr = countedMemoryOf(id, getRef(n, 2)).ptr
+            putNode(out, id, NodeOp.after, [token, addNode(out, NodeOp.sub, [ptr, { literal: -countOffset }], Types.u64)])
+        }
+        if (op === RtOp.countedFree) {
+            const mem = countedMemoryOf(id, getRef(n, 2))
+            const block = addNode(out, NodeOp.sub, [mem.ptr, { literal: countHeader }], Types.u64)
+            putNode(out, id, NodeOp.rt, [token, { literal: RtOp.mfree }, block, { literal: countedBlockBytes(id, mem) }], signatureOf(RtOp.mfree).returns)
+        }
         if (op === RtOp.freeable) putNode(out, id, NodeOp.after, [token, getRef(n, 2)])
-        if (op === RtOp.countedBox) putNode(out, id, NodeOp.after, [token, wrapperOf(getRef(n, 2))])
+        if (op === RtOp.countedBox) putNode(out, id, NodeOp.after, [token, getRef(n, 2)])
         if (op === RtOp.countedUnbox) shape(id)
     }
     for (const [id, n] of nodeEntries(source)) {
