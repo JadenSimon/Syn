@@ -6,7 +6,7 @@ import type { Allocation, FastTraced } from './fast-trace'
 import { globals as builtinGlobals, markStacks, releaseStacks } from './builtins'
 import { assignOne } from './builtin/Object'
 import { reportPanic } from './builtin/Error'
-import { blockBytes, dropUnlessEmpty, releaseCounted, releaseUnlessEmpty, unlessSame } from './builtin/memory'
+import { blockBytes, dropUnlessEmpty, releaseCounted, releaseUnlessEmpty, unlessSame, dropRecord } from './builtin/memory'
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
@@ -49,9 +49,9 @@ import { type CallEdge, indexCheck, primeIndexCheck, verifyAllocationTokens, ver
 import { AllocKind, elementDropGuard, FieldForm, nodesWithoutElementDrops } from './value-types'
 import { fuseConcats, rewriteInitializations, planMissedLookups, planSmallSets, rewriteConstantReads, rewritePrototypeTests, rewriteEqualReads, rewriteMissedLookups, rewriteSmallSets, planOrdering, relaxOrdering } from './pg-optimizer'
 import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut, dropHook } from './value-flow'
-import { type AccessHost, type Accesses, type Location, reflowDifferences, constantIndex, constantLiteral, cutArgument, cutCalls, listOf, mapOf, setOf, receiverValue, type MemberFacts, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, formText, inhabited, initOnly, type InstanceSignature, keyLabel, sameConstants, unionAll, constructedAllocation, constructionNode, dereferenceableRep, nullAddressed, nullHeld, numberKey, numberName, intFormatOf, machineNumberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, type PstackPlan, planUnits, shareClasses, shareUnits, isStringRep, addressRep, sameArgument, memberCount, createInterner, intern, type Atom, RepMember, repText, returnProjects, Representation, representationOf, sameRepresentation, type BoundaryRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
+import { type AccessHost, type Accesses, type Location, reflowDifferences, constantIndex, constantLiteral, cutArgument, cutCalls, listOf, mapOf, setOf, receiverValue, type MemberFacts, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, formText, inhabited, initOnly, type InstanceSignature, keyLabel, sameConstants, unionAll, constructedAllocation, constructionNode, dereferenceableRep, nullAddressed, nullHeld, numberKey, numberName, intFormatOf, machineNumberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, type PstackPlan, planUnits, interferingClobbers, shareClasses, shareUnits, isStringRep, addressRep, sameArgument, memberCount, createInterner, intern, type Atom, RepMember, repText, returnProjects, Representation, representationOf, sameRepresentation, type BoundaryRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
-import { analyzeLifetimes, exitOrdering, OwnedKind, reportLifetimes, type Counted, type CountedArg, type CountedOwned, type CountedRet, type CountedWrite, type FieldEnd, type Lifetimes, type OwnedField } from './lifetime'
+import { analyzeLifetimes, exitOrdering, OwnedKind, refsOrNullish, reportLifetimes, type Counted, type CountedArg, type CountedOwned, type CountedRet, type CountedWrite, type FieldEnd, type Lifetimes, type OwnedField } from './lifetime'
 import { createBinder, isLocalStub, namedStub, type Binder, type Code, type Unit } from './program-graph'
 
 type usize = u32
@@ -9771,6 +9771,25 @@ function repFact(shapes: Map<string, intrinsics.Handle>, rep: Rep, encoded: bool
     return { kind: 'word', encoded: true }
 }
 
+function wordedShapes(plan: ShapePlan, planned: Planned): Set<string> {
+    const out = new Set<string>()
+    const note = (rep: Rep | undefined): void => {
+        if (!rep) return
+        const representation = representationOf(rep).representation
+        if (rep.encoded || representation === Representation.tagged || representation === Representation.dynamic || representation === Representation.floatRecord) for (const shape of rep.shapes) out.add(shape)
+        note(rep.element)
+        note(rep.other)
+    }
+    for (const unit of planned.units.values()) {
+        for (const rep of unit.nodes.values()) note(rep)
+        for (const param of unit.params) note(param.rep)
+        note(unit.returns)
+        for (const rep of unit.slices.values()) note(rep)
+    }
+    for (const sig of plan.inst.shapes.values()) for (const [, rep] of sig.fields) note(rep)
+    return out
+}
+
 function plannedShape(plan: ShapePlan, rep: Rep): intrinsics.Handle | undefined {
     if (rep.kind === 'union') return rep.closure === undefined ? soleShape(plan, rep) : undefined
     if (rep.kind !== 'pointer') return
@@ -10625,6 +10644,7 @@ export interface CodecRequest {
     floatRecords: Map<number, Rep>
     wordBits: Set<number>
     observed: Set<number>
+    slab?: Set<string>
 }
 
 function coerceSlots(graph: Graph, id: number, slots: number[], to: (x: Operand, i: number) => Operand): void {
@@ -11249,6 +11269,8 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         } else if (n.op === NodeOp.store && typeOf(n) === Types.f64) coerceSlots(graph, id, [3], nan)
     }
     function encode(value: number): number {
+        const facts = factsOf(value)
+        if (facts && request.slab && facts.shapes.some(shape => request.slab!.has(shape))) throw compileError(`native: ${graph.name} encodes %${value} (${repText(facts)}) into a word, and objects of its shape come from the slab`, value)
         return addNode(graph, NodeOp.encode, [value, { literal: pstack0Base() }])
     }
     function decode(value: number): number {
@@ -11636,7 +11658,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
             coerceSlots(graph, id, [0], x => convert(x, wildcard))
         }
         else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && typeofTarget(id, getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(id, getRef(n, 2)) }])
-        else if (n.op === NodeOp.rt) coerceSlots(graph, id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), (x, i) => convert(x, operandTarget(getLiteral(graph, n, 1), i - 2)))
+        else if (n.op === NodeOp.rt) coerceSlots(graph, id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), (x, i) => convert(x, object(x) && rt.signatureOf(getLiteral(graph, n, 1)).params[i - 2] === Types.u64 ? pointer : operandTarget(getLiteral(graph, n, 1), i - 2)))
         else if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
             coerceSlots(graph, id, [0, 1].filter(at => inWord(getRef(n, 1 - at))), (x, i) => compared(x, factsOf(getRef(n, 1 - i))))
             coerceSlots(graph, id, [0, 1].filter(at => rawHeld(getRef(getNode(graph, id)!, 1 - at))), (x, i) => addressed(x, factsOf(getRef(getNode(graph, id)!, 1 - i))))
@@ -12300,8 +12322,58 @@ function transformInitializations(accesses: Accesses, types: ValueTypes, host: A
     return accepted
 }
 
-function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): { placed: number, freed: Set<number>, answered: number } {
-    const key = { literal: heap.fromJsSymbol(Symbol.drop) }
+function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer, record: (object: number) => boolean): { placed: number, freed: Set<number>, answered: number } {
+    const dropsIn = (graph: Graph) => {
+        const drop = (order: number, value: number): number => addNode(graph, NodeOp.rt, [order, { literal: rt.Op.drop }, value])
+        const dropFields = (order: number, holder: number, owned: OwnedField[]): number => {
+            for (const field of owned) {
+                const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
+                order = field.group !== undefined ? release(value, value, field.group) : field.inner ? dropFields(value, value, field.inner) : drop(value, value)
+            }
+            return order
+        }
+        const counted = (order: Operand, op: rt.Op, args: Operand[]): number => addNode(graph, NodeOp.rt, [order, { literal: op }, ...args], rt.signatureOf(op).returns)
+        const linked = (order: number, target: Function, args: Operand[]): number => addNode(graph, NodeOp.call, [order, addNode(graph, NodeOp.heapHandle, [{ literal: host.binder.session.linkFunction(target) }]), { literal: 0 }, ...args])
+        const releasedFields = (order: number, last: number, holder: number, owned: OwnedField[], groups: number[]): number => {
+            for (const field of owned) {
+                const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
+                if (field.group !== undefined) {
+                    const inner = ends.counted[field.group].fields
+                    const released = linked(value, releaseUnlessEmpty, [last, value, counted(value, rt.Op.countedWrapper, [value])])
+                    order = inner && !groups.includes(field.group) ? releasedFields(released, released, value, inner, [...groups, field.group]) : released
+                    continue
+                }
+                order = field.inner ? releasedFields(value, last, value, field.inner, groups) : linked(value, dropUnlessEmpty, [last, value])
+            }
+            return order
+        }
+        const release = (order: number, value: number, group: number): number => {
+            const last = linked(order, releaseCounted, [value, counted(value, rt.Op.countedWrapper, [value])])
+            const inner = ends.counted[group].fields
+            return inner ? releasedFields(last, last, value, inner, [group]) : last
+        }
+        return { drop, dropFields, counted, linked, release }
+    }
+    const records = new Map<number, Function>()
+    const recordOwned = new Map<number, number[]>()
+    const recordDrop = (o: number): void => {
+        if (!record(o) || records.has(o)) return
+        const fn = host.binder.derive(dropRecord, `${dropRecord.name}#${o}`)
+        const source = host.binder.graphOf(fn)
+        const graph = withNodes(source, copyNodes(source))
+        const self = host.binder.thisParamOf(graph)!
+        const [owned, objects] = ends.owned(o)
+        recordOwned.set(o, objects)
+        const { dropFields } = dropsIn(graph)
+        for (const [id, n] of nodeEntries(graph)) {
+            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.free) putCopy(graph, id, n, withOperand(graph, n, 0, dropFields(getRef(n, 0), self, owned)))
+        }
+        dirtyIndex(graph)
+        const state = tracer.stateOf(fn)
+        state.traced = { ...state.traced!, graph }
+        host.binder.unitOf(fn).graph = graph
+        records.set(o, fn)
+    }
     const fields = new Map<Function, FieldEnd[]>()
     const exits = new Map<Function, Map<number, Map<number, [value: number, fields: OwnedField[] | undefined][]>>>()
     const units = new Set<Function>()
@@ -12316,7 +12388,9 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         listOf(freeing, end.unit).push(...end.objects)
         for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, undefined])
     }
-    const guarded = accesses.dropElements(ends.droppable)
+    for (const end of [...ends.fields, ...ends.locals, ...ends.drops]) for (const o of end.objects) recordDrop(o)
+    if (ends.droppable.size) for (const o of ends.elements) recordDrop(o)
+    const guarded = accesses.dropElements(ends.droppable, records)
     for (const fn of guarded) units.add(fn)
     for (const end of ends.drops) {
         units.add(end.unit)
@@ -12365,10 +12439,6 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         ends.refused.set(why, (ends.refused.get(why) ?? 0) + count)
     }
     for (const fn of units) {
-        if (rewritten.has(fn)) {
-            refuse(fn, 'end sits in a function the initializations pass rewrote in this compile')
-            continue
-        }
         if (guarded.has(fn) && !fields.has(fn) && !exits.has(fn)) {
             if (!accesses.answerElements(fn)) {
                 refuse(fn, 'end needs a call the analysis only accepts by widening a type it already gave out')
@@ -12381,37 +12451,7 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         const source = host.binder.graphOf(fn)
         const graph = withNodes(source, copyNodes(source))
         let count = 0
-        const drop = (order: number, value: number): number => {
-            const method = addNode(graph, NodeOp.getProp, [order, value, key])
-            return addNode(graph, NodeOp.call, [method, method, value])
-        }
-        const dropFields = (order: number, holder: number, owned: OwnedField[]): number => {
-            for (const field of owned) {
-                const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
-                order = field.group !== undefined ? release(value, value, field.group) : field.inner ? dropFields(value, value, field.inner) : drop(value, value)
-            }
-            return order
-        }
-        const counted = (order: Operand, op: rt.Op, args: Operand[]): number => addNode(graph, NodeOp.rt, [order, { literal: op }, ...args], rt.signatureOf(op).returns)
-        const linked = (order: number, target: Function, args: Operand[]): number => addNode(graph, NodeOp.call, [order, addNode(graph, NodeOp.heapHandle, [{ literal: host.binder.session.linkFunction(target) }]), { literal: 0 }, ...args])
-        const releasedFields = (order: number, last: number, holder: number, owned: OwnedField[], groups: number[]): number => {
-            for (const field of owned) {
-                const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
-                if (field.group !== undefined) {
-                    const inner = ends.counted[field.group].fields
-                    const released = linked(value, releaseUnlessEmpty, [last, value, counted(value, rt.Op.countedWrapper, [value])])
-                    order = inner && !groups.includes(field.group) ? releasedFields(released, released, value, inner, [...groups, field.group]) : released
-                    continue
-                }
-                order = field.inner ? releasedFields(value, last, value, field.inner, groups) : linked(value, dropUnlessEmpty, [last, value])
-            }
-            return order
-        }
-        const release = (order: number, value: number, group: number): number => {
-            const last = linked(order, releaseCounted, [value, counted(value, rt.Op.countedWrapper, [value])])
-            const inner = ends.counted[group].fields
-            return inner ? releasedFields(last, last, value, inner, [group]) : last
-        }
+        const { drop, dropFields, counted, linked, release } = dropsIn(graph)
         const retarget = (from: number, to: number, skip: number[], ordering: boolean) => {
             for (const [id, n] of nodeEntries(graph)) {
                 if (skip.includes(id)) continue
@@ -12536,6 +12576,7 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         for (const o of freeing.get(fn) ?? []) freed.add(o)
     }
     if (ends.droppable.size) for (const o of ends.elements) freed.add(o)
+    for (const [o, objects] of recordOwned) if (freed.has(o)) for (const x of objects) freed.add(x)
     return { placed, freed, answered }
 }
 
@@ -12679,9 +12720,11 @@ function printDrops(ends: Lifetimes, placed: number, answered: number): void {
     for (const [why, count] of [...ends.refused].sort((a, b) => b[1] - a[1])) console.log(`DROPS refused ${count}: ${why}`)
 }
 
-function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number) {
+function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number, slabShapes: Set<intrinsics.Handle>) {
     const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget, graphOf } = binder
     const { tracedOf, stateOf, reachableNodes } = tracer
+    const slabIds = new Set<string>()
+    for (const [id, shape] of plan.shapes) if (slabShapes.has(shape)) slabIds.add(id)
     const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values(), ...plan.statics.viewed]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys, counted: plan.counted }
     function abiOf(fn: Function): UnitAbi {
         return reps.abi.get(fn) ?? { mode: constructsOutOfLine(fn) || stateOf(originOf(fn)).stubbed ? 'keep' : 'encoded', returns: Types.u64, tags: [] }
@@ -12988,10 +13031,11 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
             calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
-            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.pstacks.targets.get(plannedUnit),
+            contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.pstacks.targets.get(plannedUnit), slab: slabShapes,
         })
         if (regions) placePstackCallMarkers(result.graph, regions)
         plannedFunctionCalls(result.graph)
+        plannedFrees(result.graph, result.shapes)
         for (const [dispatch, read] of result.dispatches) {
             const rep = local?.nodes.get(read)
             if (rep && !local!.nodes.has(dispatch)) local!.nodes.set(dispatch, rep)
@@ -13021,6 +13065,10 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
                 putNode(graph, id, NodeOp.literal, [{ literal: local?.nodes.get(id)?.bools === 2 ? 1 : 0 }], Types.bool)
                 continue
             }
+            if (op === rt.Op.drop) {
+                plannedDrop(graph, id, n, local)
+                continue
+            }
             if (op !== rt.Op.div && op !== rt.Op.trunc) continue
             const name = numberName(local?.nodes.get(id))
             const integral = intFormatOf(local?.nodes.get(id)) !== undefined
@@ -13039,6 +13087,45 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             bigints.set(id, source)
         }
         if (bigints.size) substituteValues(graph, bigints)
+    }
+    function plannedFrees(graph: Graph, shapes: Map<number, intrinsics.Handle>): void {
+        for (const [id, n] of nodeEntries(graph)) {
+            if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.free) continue
+            const shape = shapes.get(getRef(n, 2))
+            if (shape === undefined || !slabShapes.has(shape)) {
+                putNode(graph, id, NodeOp.after, [getOperand(graph, n, 0)])
+                continue
+            }
+            const bytes = Math.max(propertyEval.recordLayout(shape, layouts.refinements, layouts.bits).size, 8)
+            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.mfree }, getOperand(graph, n, 2), { literal: bytes }], rt.signatureOf(rt.Op.mfree).returns)
+        }
+    }
+    const receiverFreed = new Map<Function, boolean>()
+    function freesReceiver(fn: Function): boolean {
+        let known = receiverFreed.get(fn)
+        if (known !== undefined) return known
+        const g = binder.graphOf(fn)
+        const self = thisParamOf(g)
+        known = someNode(g, m => m.op === NodeOp.rt && getLiteral(g, m, 1) === rt.Op.free && !!self && tailOf(g, getRef(m, 2)) === self)
+        receiverFreed.set(fn, known)
+        return known
+    }
+    function plannedDrop(graph: Graph, id: number, n: GraphNode, local: UnitPlan | undefined): void {
+        const units = local?.calls.get(id)
+        if (!units?.size) {
+            putNode(graph, id, NodeOp.after, [getOperand(graph, n, 0)])
+            return
+        }
+        const callee = planned.functions.get([...units][0])!
+        const target = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(originOf(callee)) }])
+        if (freesReceiver(callee)) {
+            putNode(graph, id, NodeOp.call, [getOperand(graph, n, 0), target, getOperand(graph, n, 2)], Types.u64)
+            return
+        }
+        const call = addNode(graph, NodeOp.call, [getOperand(graph, n, 0), target, getOperand(graph, n, 2)], Types.u64)
+        local!.calls.set(call, units)
+        local!.calls.delete(id)
+        putNode(graph, id, NodeOp.rt, [call, { literal: rt.Op.free }, getOperand(graph, n, 2)])
     }
     function plannedBigint(graph: Graph, id: number, n: GraphNode, local: UnitPlan | undefined, bigints: Map<number, Operand>): void {
         const x = getOperand(graph, n, 0)
@@ -13453,7 +13540,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         return {
             reps: values, params: local?.unit.params.map(param => param.rep) ?? [], returns: local?.unit.returns, abi: abiOf(fn), codecs: local?.codecs ?? new Map(),
             slices, pointers, encoded: resolved.encoded, calls, functionObject: functionObjectOf,
-            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, wordWrites: resolved.wordWrites, floatRecords: new Map(), wordBits: new Set(), observed: local?.unit.observed ?? new Set(),
+            tracked: local ? trackedTags(reps.tags, local.unit) : new Map(), fieldTags: resolved.fieldTags, tagWrites: resolved.tagWrites, wordWrites: resolved.wordWrites, floatRecords: new Map(), wordBits: new Set(), observed: local?.unit.observed ?? new Set(), slab: slabIds,
         }
     }
     function floatParams(unit: PlannedUnit): number[] {
@@ -15231,6 +15318,9 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         if (!location.writers.some(w => w.node >= 0 && replacing(w.unit))) continue
         for (const id of location.type.objects) slabbed.add(id)
     }
+    const clobbered = clock.timed('lifetime', () => interferingClobbers(valueTypes, accesses.locations, host))
+    for (const id of clobbered.holders) slabbed.add(id)
+    for (const id of clobbered.elements) slabbed.add(id)
     const hooks = new Map<intrinsics.Handle, HookWork>()
     const work = (id: number): HookWork => {
         const object = valueTypes.objects[id]
@@ -15241,11 +15331,24 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
         return known
     }
     const ownHook = (id: number): boolean => work(id) === HookWork.other || (work(id) === HookWork.frees && slabbed.has(id))
+    const wordHeld = new Set<number>()
+    if (clobbered.elements.size) {
+        for (const location of accesses.locations) {
+            if (refsOrNullish(location.type)) continue
+            for (const id of location.type.objects) if (clobbered.elements.has(id)) wordHeld.add(id)
+        }
+    }
+    const owns = (id: number): boolean => [...valueTypes.objects[id].fields.values()].some(field => field.type.objects.some(ownHook))
+    const candidate = (id: number): boolean => clobbered.elements.has(id) && work(id) === HookWork.none && (!wordHeld.has(id) || owns(id))
     const hookedElements = new Set<number>()
+    const inHooked = new Set<number>()
     for (const location of accesses.locations) {
         if (location.handle !== undefined || valueTypes.objects[location.allocation].kind !== AllocKind.buffer || !location.type.objects.length) continue
-        if (location.type.objects.every(ownHook)) hookedElements.add(location.allocation)
+        if (!location.type.objects.every(o => ownHook(o) || candidate(o))) continue
+        hookedElements.add(location.allocation)
+        for (const o of location.type.objects) inHooked.add(o)
     }
+    const record = (id: number): boolean => candidate(id) && inHooked.has(id)
     const holding = new Set<number>()
     if (hookedElements.size) {
         valueTypes.objects.forEach((object, id) => {
@@ -15254,13 +15357,15 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
             }
         })
     }
-    const hooked = (id: number): boolean => ownHook(id) || (work(id) === HookWork.frees && holding.has(id))
+    const hooked = (id: number): boolean => ownHook(id) || (work(id) === HookWork.frees && holding.has(id)) || record(id)
     const ends = clock.timed('lifetime', () => analyzeLifetimes(valueTypes, accesses.locations, host, hooked))
     if (flags.has('lifetime-census')) printLifetimes(valueTypes, accesses.locations, host, tracer)
-    const { placed, freed, answered } = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer))
+    const { placed, freed, answered } = clock.timed('drops', () => placeDrops(accesses, ends, rewritten, host, tracer, record))
     printDrops(ends, placed, answered)
     const slab = new Set<number>()
     for (const id of slabbed) if (freed.has(id)) slab.add(id)
+    const slabObjects = new Set<number>()
+    for (const id of freed) if (clobbered.elements.has(id)) slabObjects.add(id)
     if (placed || answered) {
         accesses = clock.timed('drops', () => accesses.extend())
         valueTypes = clock.timed('drops', () => valueTypes.extend(accesses))
@@ -15314,7 +15419,15 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     stepPlannedUnits(planned, new Map([...planned.units.values()].filter(unit => unit.reads.size).map(unit => [unit, (graph: Graph) => rewriteConstantReads(graph, unit.reads)])), plannedGraph)
     stepPlannedUnits(planned, new Map([...planned.units.values()].filter(unit => unit.equalReads.size).map(unit => [unit, (graph: Graph) => rewriteEqualReads(graph, unit.equalReads)])), plannedGraph)
     if (!typeDebug && !flags.has('cut-dump')) accesses.release()
-    const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot)
+    const shapeSlab = new Map<string, boolean>()
+    valueTypes.objects.forEach((_, id) => {
+        const shape = plan.inst.shapeOf(id)
+        if (shape !== undefined) shapeSlab.set(shape, (shapeSlab.get(shape) ?? true) && slabObjects.has(id))
+    })
+    const worded = wordedShapes(plan, planned)
+    const slabShapes = new Set<intrinsics.Handle>()
+    for (const [shape, all] of shapeSlab) if (all && plan.shapes.has(shape) && !worded.has(shape)) slabShapes.add(plan.shapes.get(shape)!)
+    const resolver = createResolver(binder, tracer, plan, planned, reps, facts, clock, image.wordsSlot, slabShapes)
     image.functionObjects.of = resolver.functionObjectOf
     const program = compileProgram(binder, linker, tracer, resolver, plan, image, target, clock)
     if (typeDebug) program.explain = (symbol, param) => {

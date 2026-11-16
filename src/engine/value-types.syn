@@ -96,7 +96,7 @@ export interface Accesses {
     returnRow(instance: number): number | undefined
     rowCount(): number
     replace(fn: Function, graph: Graph): boolean
-    dropElements(droppable: Set<number>): Set<Function>
+    dropElements(droppable: Set<number>, records: Map<number, Function>): Set<Function>
     answerElements(fn: Function): boolean
     refresh(): Accesses
     extend(): Accesses
@@ -972,6 +972,19 @@ function erasedLocations(state: TypesState, id: number): number[] | undefined {
     const locations = state.data.locations
     if (!ids.some(l => locations[l].writers.length && !erasableLocation(locations[l]))) return undefined
     return ids.filter(l => erasableLocation(locations[l]))
+}
+
+function storesNothing(types: ValueTypes, host: AccessHost, site: Site): boolean {
+    const g = host.binder.graphOf(site.unit)
+    const n = getNode(g, site.node)
+    if (!n) return false
+    let value = -1
+    if (n.op === NodeOp.setProp || n.op === NodeOp.store) value = getRef(n, 3)
+    else if (n.op === NodeOp.rt && rt.sliceOf(g, n) === rt.Op.sliceWrite) value = getRef(n, 4)
+    if (value < 0) return false
+    if (!value) return true
+    const type = types.typeAt(site.instance!, value)
+    return !!type && !type.unknown && !type.objects.length
 }
 
 function constructorStore(host: AccessHost, object: ObjectType, site: Site, known: Map<Graph, Map<number, boolean>>): boolean {
@@ -2097,6 +2110,211 @@ function sliceAllocators(types: ValueTypes, inst: Instantiations, graphOf: (fn: 
     return slab
 }
 
+export function interferingClobbers(types: ValueTypes, locations: Location[], host: AccessHost): { holders: Set<number>, elements: Set<number> } {
+    const found = new Set<number>()
+    const elements = new Set<number>()
+    const known = new Map<Graph, Map<number, boolean>>()
+    const candidates: [location: Location, clobbers: Site[], emptied: Site[]][] = []
+    for (const location of locations) {
+        if (!location.readers.length) continue
+        const object = types.objects[location.allocation]
+        if (object.constant) continue
+        if (location.handle === undefined) {
+            if (object.kind !== AllocKind.buffer || !location.type.objects.some(id => recordLike(types.objects[id]))) continue
+            const clobbers = elementWrites(types, host, location, object)
+            const emptied = clobbers.filter(w => !passesAny(types, host, w, location.type.objects))
+            if (emptied.length && emptied.length < clobbers.length) candidates.push([location, clobbers, emptied])
+            continue
+        }
+        if (object.kind === AllocKind.buffer) continue
+        if (!location.type.objects.some(id => types.objects[id].kind === AllocKind.buffer)) continue
+        const clobbers = location.writers.filter(w => w.node >= 0 && w.unit !== object.site.unit && !constructorStore(host, object, w, known))
+        const emptied = clobbers.filter(w => w.instance !== undefined && storesNothing(types, host, w))
+        if (emptied.length && emptied.length < clobbers.length) candidates.push([location, clobbers, emptied])
+    }
+    if (!candidates.length) return { holders: found, elements }
+    const callees = new Map<number, Map<number, number[]>>()
+    types.instances.forEach((instance, id) => {
+        for (const site of instance.sites) if (site.instance !== undefined) listOf(mapOf(callees, site.instance), site.node).push(id)
+    })
+    const allocated = new Map<number, number[]>()
+    types.objects.forEach((object, id) => {
+        for (const f of instancesOf(object)) listOf(allocated, f).push(id)
+    })
+    const held = new Set<number>()
+    const holders = new Map<number, number[]>()
+    const inner = new Map<number, number[]>()
+    for (const location of locations) {
+        for (const id of location.type.objects) {
+            held.add(id)
+            const list = listOf(holders, id)
+            if (!list.includes(location.allocation)) list.push(location.allocation)
+            listOf(inner, location.allocation).push(id)
+        }
+    }
+    const loops = new Map<Function, [nest: GraphLoops, places: Map<number, number>]>()
+    const loopsIn = (fn: Function): [GraphLoops, Map<number, number>] => {
+        let known = loops.get(fn)
+        if (known) return known
+        const g = host.binder.graphOf(fn)
+        const nest = graphLoops(g)
+        const headers = [...nest.loopMembers.keys()].sort((a, b) => nest.loopsOf.get(a)!.length - nest.loopsOf.get(b)!.length)
+        known = [nest, loopPlaces(g, nest, headers)]
+        loops.set(fn, known)
+        return known
+    }
+    const inside = (fn: Function, node: number, header: number): boolean => {
+        const [nest, places] = loopsIn(fn)
+        const place = places.get(node)
+        return place !== undefined && nest.loopsOf.get(place)!.includes(header)
+    }
+    const enclosing = new Map<number, [instance: number, header: number][]>()
+    const enclosingOf = (id: number): [number, number][] => {
+        let known = enclosing.get(id)
+        if (known) return known
+        known = []
+        enclosing.set(id, known)
+        for (const site of types.instances[id].sites) {
+            if (site.instance === undefined) continue
+            const [nest, places] = loopsIn(types.instances[site.instance].unit)
+            const place = places.get(site.node)
+            const found = place === undefined ? enclosingOf(site.instance) : [...nest.loopsOf.get(place)!.map(header => [site.instance!, header] as [number, number]), ...enclosingOf(site.instance)]
+            for (const loop of found) {
+                if (known.length < 8 && !known.some(k => k[0] === loop[0] && k[1] === loop[1])) known.push(loop)
+            }
+        }
+        return known
+    }
+    const iterations = new Map<string, [instances: Set<number>, units: Set<Function>]>()
+    const iterationOf = (id: number, header: number): [Set<number>, Set<Function>] => {
+        const key = `${id}:${header}`
+        let known = iterations.get(key)
+        if (known) return known
+        const unit = types.instances[id].unit
+        const reached = new Set<number>()
+        const units = new Set<Function>()
+        const work: number[] = []
+        for (const [node, list] of callees.get(id) ?? []) {
+            if (!inside(unit, node, header)) continue
+            for (const callee of list) work.push(callee)
+        }
+        while (work.length) {
+            const next = work.pop()!
+            if (reached.has(next)) continue
+            reached.add(next)
+            units.add(types.instances[next].unit)
+            for (const [, list] of callees.get(next) ?? []) for (const callee of list) work.push(callee)
+        }
+        known = [reached, units]
+        iterations.set(key, known)
+        return known
+    }
+    const outlives = (id: number, within: (instance: number | undefined, site: Site) => boolean): boolean => {
+        const seen = new Set<number>([id])
+        const work = [id]
+        while (work.length) {
+            const next = work.pop()!
+            for (const holder of holders.get(next) ?? []) {
+                if (seen.has(holder)) continue
+                seen.add(holder)
+                const object = types.objects[holder]
+                if (object.constant || !instancesOf(object).some(i => within(i, object.site))) return true
+                work.push(holder)
+            }
+        }
+        return false
+    }
+    for (const [location, clobbers, emptied] of candidates) {
+        const object = types.objects[location.allocation]
+        const own = location.type.objects
+        const contents = new Set<number>()
+        const pending = [...own]
+        while (pending.length) {
+            for (const id of inner.get(pending.pop()!) ?? []) {
+                if (contents.has(id)) continue
+                contents.add(id)
+                pending.push(id)
+            }
+        }
+        const tried = new Set<string>()
+        const loopsOf: [number, number][] = []
+        for (const w of emptied) {
+            const [nest, places] = loopsIn(w.unit)
+            const place = places.get(w.node)
+            const found = place === undefined ? enclosingOf(w.instance!) : [...nest.loopsOf.get(place)!.map(header => [w.instance!, header] as [number, number]), ...enclosingOf(w.instance!)]
+            for (const loop of found) loopsOf.push(loop)
+        }
+        for (const [f, header] of loopsOf) {
+            const key = `${f}:${header}`
+            if (tried.has(key) || tried.size >= 8) continue
+            tried.add(key)
+            const unit = types.instances[f].unit
+            const [reached, units] = iterationOf(f, header)
+            const within = (instance: number | undefined, site: Site): boolean => {
+                if (site.unit === unit && (instance === undefined || instance === f) && inside(unit, site.node, header)) return true
+                return instance === undefined ? units.has(site.unit) : reached.has(instance)
+            }
+            if (!emptied.some(w => within(w.instance, w)) || !clobbers.some(w => within(w.instance, w) && !emptied.includes(w))) continue
+            if (!location.readers.some(r => within(undefined, r))) continue
+            if (instancesOf(object).some(i => within(i, object.site)) && !outlives(location.allocation, within)) continue
+            let interferes = false
+            for (const instance of [f, ...reached]) {
+                for (const id of allocated.get(instance) ?? []) {
+                    if (interferes || id === location.allocation || own.includes(id) || contents.has(id) || !held.has(id)) continue
+                    const other = types.objects[id]
+                    if (instance === f && !(other.site.unit === unit && inside(unit, other.site.node, header))) continue
+                    if (!outlives(id, within)) continue
+                    interferes = true
+                }
+                if (interferes) break
+            }
+            if (!interferes) continue
+            if (location.handle !== undefined) found.add(location.allocation)
+            for (const id of location.handle === undefined ? [...own, ...contents] : []) if (recordLike(types.objects[id]) || (contents.has(id) && types.objects[id].kind !== AllocKind.buffer)) elements.add(id)
+            break
+        }
+    }
+    return { holders: found, elements }
+}
+
+function recordLike(object: ObjectType): boolean {
+    return object.kind === AllocKind.object && !object.constant && !object.native && !object.dynamic && !object.copied && object.function === undefined
+}
+
+function elementWrites(types: ValueTypes, host: AccessHost, location: Location, buffer: ObjectType): Site[] {
+    const out: Site[] = []
+    for (const w of location.writers) {
+        if (w.node < 0 || w.instance === undefined || w.unit === buffer.site.unit) continue
+        const g = host.binder.graphOf(w.unit)
+        const n = getNode(g, w.node)
+        if (!n || rt.sliceOf(g, n) !== rt.Op.sliceWrite) continue
+        const value = tailOf(g, getRef(n, 4))
+        const v = getNode(g, value)
+        if (v && rt.sliceOf(g, v) === rt.Op.sliceRead) continue
+        if (!getBlock(g, g.root)!.params.includes(value)) {
+            out.push(w)
+            continue
+        }
+        for (const site of types.instances[w.instance].sites) out.push(site.instance === undefined ? w : site)
+    }
+    return out
+}
+
+function passesAny(types: ValueTypes, host: AccessHost, site: Site, objects: number[]): boolean {
+    const g = host.binder.graphOf(site.unit)
+    const n = getNode(g, site.node)
+    if (!n || site.instance === undefined) return true
+    const target = rt.calleeSlot(g, n)
+    let i = firstNonOrderingSlot(n)
+    while (i < countIds(n)) {
+        const x = getRef(n, i)
+        const type = x && i !== target ? types.typeAt(site.instance, x) : undefined
+        if (type && (type.unknown || type.objects.some(id => objects.includes(id)))) return true
+        i++
+    }
+    return false
+}
+
 export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Generic | undefined, oneObject: (state: Handle) => boolean, graphOf: (fn: Function) => Graph, keepsReturn: (fn: Function) => boolean, memberFacts: MemberFacts, slabOwners: Set<number>): { inst: Instantiations, plan: Map<Function, PlannedUnit[]>, codecOf: (allocation: number, key: string) => SlotCodec } {
     const callSiteIds = createInterner()
     const callSites: CallSite[] = []
@@ -2170,6 +2388,16 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         return signatureOf(joined.params, joined.returns, created.get(find(members[0])))
     }
     const reads = memberReads(types, outgoing, graphOf, memberFacts)
+    const guardsOf = new Map<Function, number[]>()
+    const dropGuardsOf = (fn: Function): number[] => {
+        let known = guardsOf.get(fn)
+        if (known) return known
+        known = []
+        const g = graphOf(fn)
+        for (const [id] of nodeEntries(g)) if (elementDropGuard(g, id)) known.push(id)
+        guardsOf.set(fn, known)
+        return known
+    }
     let classOf = new Map<number, number>()
     const classKeys = createInterner()
     const initial = new Map<number, { signature: PlannedSignature, id: number }[]>()
@@ -2178,7 +2406,8 @@ export function planUnits(types: ValueTypes, genericOf: (proto: Handle) => Gener
         const tags = [...new Set(members.flatMap(f => [...storage.instances[f]]))].sort((a, b) => a - b)
         const joined = joinedOf(members)
         const slab = members.some(f => slabInstances.has(f)) ? [sliceSlab] : []
-        const known = listOf(initial, intern(classKeys, [types.instances[root].unit, ...tags, ...reads.atoms(members), ...slab]))
+        const guards = dropGuardsOf(types.instances[root].unit).map(id => `drop%${id}:${members.reduce((bools, f) => bools | (types.typeAt(f, id)?.bools ?? 0), 0)}`)
+        const known = listOf(initial, intern(classKeys, [types.instances[root].unit, ...tags, ...reads.atoms(members), ...slab, ...guards]))
         let entry = known.find(other => sameSignature(other.signature, joined))
         if (!entry) known.push(entry = { signature: joined, id: classCount++ })
         classOf.set(root, entry.id)
@@ -4306,6 +4535,21 @@ function pstackSummary(): PstackSummary {
     return { stacks: 0, need, escaped: 0 }
 }
 
+function loopPlaces(g: Graph, nest: GraphLoops, headers: number[]): Map<number, number> {
+    const innermost = new Map<number, number>()
+    if (!headers.length) return innermost
+    const demand = pstackDemand(g)
+    for (const header of headers) {
+        const members = nest.loopMembers.get(header)!
+        const before = pstackBefore(g, nest, header)
+        for (const id of pstackStaying(g, members)) {
+            const blocks = demand.get(id)
+            if (blocks && blocks.every(b => members.has(b) || !before.has(b))) innermost.set(id, header)
+        }
+    }
+    return innermost
+}
+
 export interface PstackPlan {
     regions: Map<PlannedUnit, [header: number, call: number, stacks: number[]][]>
     targets: Map<PlannedUnit, Map<number, number>>
@@ -4356,18 +4600,7 @@ export function planPstackRegions(types: ValueTypes, units: PlannedUnit[], graph
         const nest = graphLoops(g)
         const depthOf = (header: number) => nest.loopsOf.get(header)!.length
         const headers = [...nest.loopMembers.keys()].sort((a, b) => depthOf(a) - depthOf(b))
-        const innermost = new Map<number, number>()
-        if (headers.length) {
-            const demand = pstackDemand(g)
-            for (const header of headers) {
-                const members = nest.loopMembers.get(header)!
-                const before = pstackBefore(g, nest, header)
-                for (const id of pstackStaying(g, members)) {
-                    const blocks = demand.get(id)
-                    if (blocks && blocks.every(b => members.has(b) || !before.has(b))) innermost.set(id, header)
-                }
-            }
-        }
+        const innermost = loopPlaces(g, nest, headers)
         for (const f of unit.instances) {
             const u = instanceNode.get(f)!
             const loopNode = new Map<number, number>()
@@ -4702,6 +4935,7 @@ export function planPstackRegions(types: ValueTypes, units: PlannedUnit[], graph
     }
     const everyStack = (1 << PstackCount) - 1
     const repeated = new Array<number>(succ.length).fill(0)
+    repeated[0] = everyStack
     const chosen = new Map<PstackVerdict, number>()
     let i = sccs.length - 1
     while (i >= 0) {
