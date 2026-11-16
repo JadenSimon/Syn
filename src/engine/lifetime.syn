@@ -38,6 +38,7 @@ export interface HolderDrop {
     exits: [block: number, tail: number][]
     fields: OwnedField[]
     objects: number[]
+    holders: number[]
 }
 
 export interface CountedWrite {
@@ -80,6 +81,7 @@ export interface Counted {
     args: CountedArg[]
     rets: CountedRet[]
     owned: CountedOwned[]
+    hooked: boolean
 }
 
 enum SourceKind {
@@ -138,6 +140,7 @@ export interface Lifetimes {
     counted: Counted[]
     eternal: Set<number>
     owned: (object: number) => [fields: OwnedField[], objects: number[]]
+    dropOrder: (drops: number[][]) => number[]
 }
 
 interface Body {
@@ -204,7 +207,7 @@ function exitOrderings(g: Graph, p: TailPosition): number[] {
 }
 
 export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean, report = false): Lifetimes {
-    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [], counted: [], eternal: new Set(), owned: () => [[], []] }
+    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [], counted: [], eternal: new Set(), owned: () => [[], []], dropOrder: drops => drops.map((_, i) => i) }
     const wanted = types.objects.map((_, id) => hooked(id))
     if (!wanted.includes(true)) return out
     const instancesOf = new Map<Function, number[]>()
@@ -257,6 +260,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return lasting
     }
     types.objects.forEach((_, o) => eternalOf(o))
+    const holdsHooked = (o: number): boolean => [...fieldsOf.get(o)?.values() ?? []].some(location => pstackRefs(location.type).some(x => wanted[x]))
     const handed = new Map<number, Set<Function>>()
     const returnedBy = new Map<number, number[]>()
     const callers = new Map<Function, Set<Function>>()
@@ -1831,8 +1835,12 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         for (const o of objects) {
             if (eternal.has(o)) return blamed('holds an eternal', o, 0)
-            if (!wanted[o]) return blamed('holds an object that has no hook', o, 0)
-            if (ended.has(o) || localEnded.has(o)) return blamed('holds an object that already ends elsewhere', o, 0)
+            if (!wanted[o] && !holdsHooked(o)) return blamed('holds an object that has no hook and holds none', o, 0)
+            if (ended.has(o) || localEnded.has(o) || endings.has(o)) return blamed('holds an object that already ends elsewhere', o, 0)
+        }
+        const hooked = wanted[objects[0]]
+        for (const o of objects) {
+            if (wanted[o] !== hooked) return blamed('holds objects with a hook and objects without one', o, 0)
         }
         const holderSet = new Set<number>()
         for (const location of locations) {
@@ -1906,10 +1914,10 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 locals.push(local)
             }
         }
-        return { objects, locations, writes, locals, args: boxing.args, rets: boxing.rets, owned: boxing.owned }
+        return { objects, locations, writes, locals, args: boxing.args, rets: boxing.rets, owned: boxing.owned, hooked }
     }
     types.objects.forEach((object, o) => {
-        if (!wanted[o] || eternal.has(o) || grouped.has(o) || ended.has(o) || localEnded.has(o) || !holders.has(o)) return
+        if ((!wanted[o] && !holdsHooked(o)) || eternal.has(o) || grouped.has(o) || ended.has(o) || localEnded.has(o) || !holders.has(o)) return
         begin(object.site.unit, object.site.node)
         const group = countGroup(o)
         if (typeof group === 'string') {
@@ -1928,7 +1936,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             for (const location of group.locations) mapOf(countedKeys, location.allocation).set(location.handle as number, i)
             for (const o of group.objects) groupOf.set(o, i)
         })
-        for (const h of countedKeys.keys()) endsAlone(h)
+        for (const h of countedKeys.keys()) {
+            if (!groupOf.has(h)) endsAlone(h)
+        }
     }
     const inside = new Map<number, number[]>()
     if (groupOf.size) {
@@ -2140,12 +2150,58 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             const held = body.held.get(value)!
             if (!held.every(h => list.some(e => e.objects.includes(h)))) continue
             const fields = sameFields(held.map(ownedFields))?.filter(field => held.every(h => writtenBefore(body, h, field.key, list[0].exits)))
-            if (fields?.length) out.drops.push({ unit: fn, value, exits: list[0].exits, fields, objects: ownedObjects(held, fields, []) })
+            if (fields?.length) out.drops.push({ unit: fn, value, exits: list[0].exits, fields, objects: ownedObjects(held, fields, []), holders: held })
         }
     }
     for (const end of out.locals) {
         const fields = sameFields(end.objects.map(ownedFields))
-        if (fields?.length) out.drops.push({ unit: end.unit, value: end.value, exits: end.exits, fields, objects: ownedObjects(end.objects, fields, []) })
+        if (fields?.length) out.drops.push({ unit: end.unit, value: end.value, exits: end.exits, fields, objects: ownedObjects(end.objects, fields, []), holders: end.objects })
+    }
+    let inner: Map<number, number[]> | undefined
+    const within = (o: number): number[] => {
+        if (!inner) {
+            inner = new Map()
+            for (const location of locations) {
+                listOf(inner, location.allocation).push(...pstackRefs(location.type))
+            }
+        }
+        return inner.get(o) ?? []
+    }
+    const hookReach = (from: number[]): Set<number> => {
+        const walked = new Set<number>()
+        const pending = from.slice()
+        const next: number[] = []
+        while (pending.length) {
+            const o = pending.pop()!
+            if (walked.has(o)) continue
+            walked.add(o)
+            charge(1)
+            if (wanted[o]) next.push(...within(o))
+            else pending.push(...within(o))
+        }
+        const reached = new Set<number>()
+        while (next.length) {
+            const o = next.pop()!
+            if (reached.has(o)) continue
+            reached.add(o)
+            charge(1)
+            next.push(...within(o))
+        }
+        return reached
+    }
+    out.dropOrder = (drops: number[][]): number[] => {
+        if (drops.length < 2) return drops.map((_, i) => i)
+        const reached = drops.map(hookReach)
+        const reaches = (i: number, j: number): boolean => i !== j && drops[j].some(o => reached[i].has(o))
+        const left = drops.map((_, i) => i)
+        const order: number[] = []
+        while (left.length) {
+            let at = left.findIndex(j => !left.some(i => reaches(i, j)))
+            if (at < 0) at = 0
+            order.push(left[at])
+            left.splice(at, 1)
+        }
+        return order
     }
     if (!blocks) return out
     const container = (o: number): LifeBlock => {
