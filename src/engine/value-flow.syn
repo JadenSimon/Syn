@@ -353,7 +353,12 @@ interface FlowState {
     forkSeeds: Map<number, Map<number, number>>
     copyKeys: ContextKey[]
     guardSlots: Map<number, number[]>
+    elementWatch: Map<number, number[]>
+    elementWatched: Set<number>
+    hookedHolders: Set<number>
+    hookedOrigins: Map<number, boolean>
     droppable: Set<number> | undefined
+    answered: Set<number>
 }
 
 interface FlowStep {
@@ -1005,6 +1010,7 @@ function addOrigin(s: number, origin: number): void {
     flow.queue.push(s)
     noteOrigin(s, origin)
     if (flow.slotKind[s] === SlotKind.field) noteHolder(flow.slotOwner[s], origin)
+    if (flow.slotKind[s] === SlotKind.field) holdsHooked(flow.slotOwner[s], origin)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
@@ -1177,7 +1183,7 @@ function seedDrop(origin: number): void {
     const fn = dropHook(protoOf(origin), flow.host)
     if (!fn) return
     const s = summaryOf(fn)
-    const callee = flow.instances[instance(fn, s.hasThis ? qualOf(origin) : 0, -1, -1)]
+    const callee = flow.instances[instance(fn, 0, -1, -1)]
     if (s.hasThis) addOrigin(paramSlot(callee, -1), origin)
     let i = 0
     while (i < s.params) {
@@ -5083,6 +5089,46 @@ function rtKinds(inst: Instance, x: Expr, s: Summary, qual: number, subject: num
     return callKinds(inst, x, s, first)
 }
 
+function widenKinds(callSlot: number, fn: Function, target: number, recv: number, qual: number, kinds: number): boolean {
+    let e = chainFirst(flow.parts, callSlot)
+    while (e >= 0) {
+        const part = flow.partSlots[e]
+        e = chainAfter(flow.parts, callSlot, e)
+        const bind = flow.partBind.get(part)
+        if (!bind || bind.kind !== BindKind.call || bind.target !== target || bind.recv !== recv) continue
+        const callee = flow.instances[bind.callee]
+        if (callee.qual !== qual || callee.summary.fn !== fn || callee.kinds < 0 || flow.retired.has(callee.id)) continue
+        if (callee.kinds === kinds) return true
+        if (!callee.callers.every(c => c === callSlot)) continue
+        const byQual = flow.instanceOf.get(fn)!
+        const memo = qual * 16 * 65536
+        let known = byQual.get(memo + kinds + 1)
+        while (known !== undefined && flow.replaced.has(known)) known = flow.replaced.get(known)
+        if (known !== undefined && !flow.retired.has(known)) continue
+        byQual.delete(memo + callee.kinds + 1)
+        byQual.set(memo + kinds + 1, callee.id)
+        callee.kinds = kinds
+        rekindSigs(callee, callSlot)
+        return true
+    }
+    return false
+}
+
+function rekindSigs(callee: Instance, callSlot: number): void {
+    const inst = instOfSlot(callSlot)
+    const x = exprAt(callSlot)
+    const classed = paramDemands(callee.summary).classed
+    let i = 0
+    while (i < callee.summary.params && i < 16) {
+        const sig = callee.sigs[i]
+        if (flow.slotKind[sig] === SlotKind.sig) {
+            dirtyScalar(sig)
+            if ((classed & (1 << i)) && i < x.args.length) for (const origin of flow.slotOrigins[at(inst, x.args[i])]) if (classAdmits(sig, origin)) addOrigin(sig, origin)
+        }
+        i++
+    }
+}
+
 function hasBinding(slot: number, kind: BindKind, target: number, recv: number): boolean {
     let e = chainFirst(flow.parts, slot)
     while (e >= 0) {
@@ -5109,6 +5155,7 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     const perSite = (s.returnsFresh || s.returnsParam || singleFn(s, kinds, 0)) && (!s.hasThis || s.params > 0) && !held
     const qual = s.hasThis && !perSite ? qualOf(recv) : perSite ? qualified(OriginKind.site, 0, !s.hasThis && kind === OriginKind.fresh ? target : inst.qual, x.node, inst.summary) : !s.hasThis && kind === OriginKind.fresh ? target : held ? 0 : specializationSite(inst)
     if (perSite && s.hasThis && recv && specializes(recv)) flow.genericSites.add(qual)
+    if (kinds >= 0 && !flow.step && !flow.cut && widenKinds(callSlot, fn, target, recv, qual, kinds)) return
     const callee = flow.instances[instance(fn, qual, -1, -1, kinds)]
     if (keyCensus) noteKey(callee, callKey(s, qual, perSite, kind === OriginKind.fresh))
     addCaller(callee, callSlot)
@@ -5186,7 +5233,7 @@ function evalSlot(slot: number, value: (s: number) => number, originsOf: (s: num
             out = unite(out, truncated >= 0 ? truncated : foldCompare(x.key, operandNumber(inst, x, x.a, value, originsOf), operandNumber(inst, x, x.b, value, originsOf), originsOf(at(inst, x.a)), originsOf(at(inst, x.b)), x.a === x.b && !coerces(x)))
         }
         case ExprOp.call: if (rawCallee(value(at(inst, x.a)))) out = unite(out, opaqueScalar(inst.summary, x))
-        case ExprOp.rt: out = unite(out, rtScalar(inst, x, value, originsOf))
+        case ExprOp.rt: out = unite(out, rtScalar(inst, x, value, originsOf, slot))
         case ExprOp.member: {
             const f = scalars.flags[value(at(inst, x.a))]
             if (f & ScalarFlag.unknown) out = unite(out, UNKNOWN)
@@ -5351,7 +5398,7 @@ function onlyStrOrigins(origins: number[]): boolean {
     return true
 }
 
-function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[]): number {
+function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, originsOf: (s: number) => number[], slot: number): number {
     const op = x.a
     if (op === RtOp.typeof) return typeofScalar(at(inst, x.args[0]), value, originsOf)
     if (op === RtOp.toNumber) return coercedScalar(at(inst, x.args[0]), value, originsOf)
@@ -5368,33 +5415,61 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
     if (op === RtOp.paramCount || op === RtOp.restIndex) return I64
     if (op === RtOp.canDropElement) {
         const slots = listOf(flow.guardSlots, inst.id)
-        if (!slots.includes(at(inst, x.args[0]))) slots.push(at(inst, x.args[0]))
-        return droppableScalar(originsOf(at(inst, x.args[0])))
+        if (!slots.includes(slot)) slots.push(slot)
+        return droppableScalar(originsOf(at(inst, x.args[0])), slot)
     }
     return NONE
 }
 
-function dropElements(droppable: Set<number>): number {
+function dropElements(droppable: Set<number>): Set<Function> {
     flow.droppable = droppable
-    let retired = 0
+    const guarded = new Set<Function>()
     for (const [id, slots] of flow.guardSlots) {
-        if (flow.exported.instanceIndex.has(id) || flow.retired.has(id) || flow.instances[id].callers.length) continue
-        if (!slots.some(slot => droppableScalar(flow.slotOrigins[slot]) === TRUE)) continue
-        flow.retired.add(id)
-        retired++
+        if (flow.retired.has(id)) continue
+        const inst = flow.instances[id]
+        if (!slots.some(slot => droppableScalar(flow.slotOrigins[at(inst, exprAt(slot).args[0])], -1) !== flow.scalar[slot])) continue
+        flow.answered.add(id)
+        guarded.add(inst.summary.fn)
     }
-    return retired
+    return guarded
 }
 
-function droppableScalar(origins: number[]): number {
+function droppableScalar(origins: number[], slot: number): number {
     const droppable = flow.droppable
     if (!origins.length) return NONE
-    if (!droppable) return FALSE
+    if (!droppable) {
+        let hooked = false
+        for (const a of origins) {
+            if (slot >= 0) watchElements(a, slot)
+            if (flow.hookedHolders.has(a)) hooked = true
+        }
+        return hooked ? BOOL : FALSE
+    }
     for (const a of origins) {
         const id = flow.exported.allocOf.get(a)
         if (id === undefined || !droppable.has(id)) return FALSE
     }
     return TRUE
+}
+
+function watchElements(holder: number, slot: number): void {
+    const key = slot * originSpan + holder
+    if (flow.elementWatched.has(key)) return
+    flow.elementWatched.add(key)
+    listOf(flow.elementWatch, holder).push(slot)
+}
+
+function holdsHooked(holder: number, origin: number): void {
+    if (flow.hookedHolders.has(holder)) return
+    let hooked = flow.hookedOrigins.get(origin)
+    if (hooked === undefined) {
+        const kind = flow.originKind[origin]
+        hooked = (kind === OriginKind.fresh || kind === OriginKind.static || kind === OriginKind.created) && dropHook(protoOf(origin), flow.host) !== undefined
+        flow.hookedOrigins.set(origin, hooked)
+    }
+    if (!hooked) return
+    flow.hookedHolders.add(holder)
+    for (const slot of flow.elementWatch.get(holder) ?? []) dirtyScalar(slot)
 }
 
 function nullishScalar(slot: number, value: (s: number) => number, originsOf: (s: number) => number[]): number {
@@ -5647,7 +5722,7 @@ function exportInstances(): void {
     for (const [part, bind] of flow.partBind) {
         const callee = finalInstance(bind.callee)
         exported.bindsInto.set(callee, (exported.bindsInto.get(callee) ?? 0) + 1)
-        if (!deadCall(part, bind)) addEdge(exported.edges, part, callee)
+        if (!deadCall(part, bind) && !flow.retired.has(instOfSlot(part).id)) addEdge(exported.edges, part, callee)
     }
     for (const [slot, callees] of flow.runtimeBinds) for (const callee of callees) addEdge(exported.edges.has(callerInstance(slot).id) ? exported.edges : exported.runtimeOnly, slot, callee)
     const index = exported.instanceIndex
@@ -5688,7 +5763,10 @@ function edgesOf(id: number): [part: number, callee: number][] {
 
 function forcedInstance(inst: Instance): boolean {
     if (flow.retired.has(inst.id)) return false
-    return flow.rooted.has(inst.id) || flow.heldStatics.has(inst.id) || inst.callers.length > (flow.exported.bindsInto.get(inst.id) ?? 0)
+    if (flow.rooted.has(inst.id) || flow.heldStatics.has(inst.id)) return true
+    let callers = 0
+    for (const c of inst.callers) if (!retiredInstance(instOfSlot(c))) callers++
+    return callers > (flow.exported.bindsInto.get(inst.id) ?? 0)
 }
 
 function recordSites(recorded: Map<string, Site>, from: number, list: [part: number, callee: number][], resolve: boolean, sitesOf: (to: number) => Site[]): void {
@@ -5773,7 +5851,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
-        step: undefined, replaced: new Map(), retired: new Set(), forkSeeds: new Map(), copyKeys: [], guardSlots: new Map(), droppable: undefined,
+        step: undefined, replaced: new Map(), retired: new Set(), forkSeeds: new Map(), copyKeys: [], guardSlots: new Map(), elementWatch: new Map(), elementWatched: new Set(), hookedHolders: new Set(), hookedOrigins: new Map(), droppable: undefined, answered: new Set(),
     }
 }
 
@@ -6026,7 +6104,7 @@ interface Export {
     runtimeOnly: Map<number, [part: number, callee: number][]>
     bindsInto: Map<number, number>
     marks: ExportMarks | undefined
-    reach: Map<number, boolean>
+    reach: Set<number>
     created: Set<number>
 }
 
@@ -6390,9 +6468,9 @@ function exportOriginLocations(origin: number, observed: boolean): number | unde
 
 function fieldLocation(allocation: number, key: number, slot: number): Location {
     const readers: Site[] = []
-    for (const r of flow.fieldReaders.get(slot) ?? []) if (reachedInstance(flow.instances[flow.slotOwner[r]])) readers.push(slotSite(r))
+    for (const r of flow.fieldReaders.get(slot) ?? []) if (exportedIndex(flow.slotOwner[r]) !== undefined) readers.push(slotSite(r))
     const writers: Site[] = []
-    for (const w of flow.fieldWriters.get(slot) ?? []) if (w < 0 || reachedInstance(flow.instances[Math.floor(w / exprBits)])) writers.push(writerSite(w))
+    for (const w of flow.fieldWriters.get(slot) ?? []) if (w < 0 || exportedIndex(Math.floor(w / exprBits)) !== undefined) writers.push(writerSite(w))
     return { allocation, key: keyLabel(key), handle: key >= 0 ? key as Handle : undefined, type: slotType(slot), forms: flow.fieldForms.get(slot) ?? 0, storeTypes: (flow.fieldStoreTypes.get(slot) ?? []).slice(), readers, writers, stored: flow.fieldStored.has(slot) }
 }
 
@@ -6418,7 +6496,7 @@ function accessTotals(accessed: Map<number, number[]>): [reads: number, writes: 
     let reads = 0
     let writes = 0
     for (const [id, entries] of accessed) {
-        if (!reachedInstance(flow.instances[id])) continue
+        if (exportedIndex(id) === undefined) continue
         for (const entry of entries) {
             if (!flow.exported.locOf.has(entry < 0 ? -entry - 1 : entry)) continue
             if (entry < 0) writes++
@@ -6823,12 +6901,6 @@ function retiredInstance(inst: Instance): boolean {
     return flow.retired.has((inst.site ?? inst).id)
 }
 
-function reachedInstance(inst: Instance): boolean {
-    const whole = inst.site ?? inst
-    if (flow.retired.has(whole.id)) return false
-    return whole.callers.length > 0 || flow.rooted.has(whole.id) || flow.heldStatics.has(whole.id)
-}
-
 function retiredOrigin(origin: number): boolean {
     const creators = flow.originCreators.get(origin)
     return !!creators?.length && creators.every(id => flow.retired.has(id))
@@ -6836,34 +6908,55 @@ function retiredOrigin(origin: number): boolean {
 
 function replaceUnit(fn: Function, g: Graph): boolean {
     const start = flow.work
-    const replaced = resolveReplacement(fn, g, start)
+    const replaced = resolveReplacement(fn, g, start, false)
     flow.stepWork += flow.work - start
     return replaced
 }
 
-function resolveReplacement(fn: Function, g: Graph, start: number): boolean {
+function answerElements(fn: Function): boolean {
+    const start = flow.work
+    const old = flow.summaries.get(fn)
+    const answered = old !== undefined && resolveReplacement(fn, old.g, start, true)
+    flow.stepWork += flow.work - start
+    return answered
+}
+
+function resolveReplacement(fn: Function, g: Graph, start: number, answering: boolean): boolean {
     const old = flow.summaries.get(fn)
     if (!old) return false
     const olds: Instance[] = []
-    for (const entry of flow.exportedInstances) if (entry.inst.summary === old) olds.push(entry.inst)
-    if (!olds.length) return false
+    if (answering) {
+        for (const id of flow.answered) {
+            const inst = flow.instances[id]
+            if (inst.summary === old && !flow.retired.has(id)) olds.push(inst)
+        }
+    } else for (const entry of flow.exportedInstances) if (entry.inst.summary === old) olds.push(entry.inst)
+    const marks = flow.exported.marks!
+    const stale = new Set<number>()
+    if (!answering) for (const [, known] of flow.instanceOf.get(fn) ?? []) {
+        const inst = flow.instances[finalInstance(known)]
+        if (inst.summary !== old || flow.retired.has(inst.id) || flow.exported.instanceIndex.has(inst.id) || stale.has(inst.id) || olds.includes(inst)) continue
+        if (inst.callers.some(c => instOfSlot(c).id >= marks.instances)) olds.push(inst)
+        else if (!inst.callers.length) stale.add(inst.id)
+    }
+    if (!olds.length && !stale.size) return false
     const seeds = acceptedForks(olds)
     const forks = new Set<number>(seeds.keys())
     let nodes = 0
     let attempts = 0
     while (attempts < maxStepAttempts) {
         attempts++
-        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * olds.length, keys: flow.keyPending.length }
+        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * Math.max(olds.length, 1), keys: flow.keyPending.length }
         flow.step = step
-        const s = newSummary(fn, g, old.id)
+        const s = answering ? old : newSummary(fn, g, old.id)
         intrinsics.assert(sigWidth(s) === sigWidth(old), `value-flow: ${old.name} changed its signature in a rewrite`)
-        if (old.kindIds) {
+        if (old.kindIds && !answering) {
             s.kindIds = old.kindIds
             s.kindVecs = old.kindVecs
         }
         const demands = old.demands !== undefined && !sameDemands(paramDemands(s), old.demands)
         const owned: number[] = []
-        let origin = 1
+        let origin = answering ? step.origins : 1
         while (origin < step.origins) {
             if (flow.originOwner[origin] === old) {
                 flow.originOwner[origin] = s
@@ -6899,6 +6992,7 @@ function resolveReplacement(fn: Function, g: Graph, start: number): boolean {
                     created++
                 }
             }
+            for (const id of stale) flow.retired.add(id)
             for (const moved of owned) flow.exported.created.add(moved)
             flow.totalNodes += countNodes(g) - countNodes(old.g)
             flow.budget = Math.min(budgetFactor * flow.totalNodes, flow.cap)
@@ -6945,7 +7039,7 @@ function acceptedForks(olds: Instance[]): Map<number, number> {
 function freshExport(): Export {
     return {
         types: new Map(), allocations: [], allocOf: new Map(), fnObjects: new Map(), locations: [], locOf: new Map(), instanceIndex: new Map(), instances: [], slotTypes: new Map(), observed: undefined,
-        accessed: new Map(), touched: new Set(), edges: new Map(), runtimeOnly: new Map(), bindsInto: new Map(), marks: undefined, reach: new Map(), created: new Set(),
+        accessed: new Map(), touched: new Set(), edges: new Map(), runtimeOnly: new Map(), bindsInto: new Map(), marks: undefined, reach: new Set(), created: new Set(),
     }
 }
 
@@ -6981,7 +7075,7 @@ function exportMarks(): ExportMarks {
 
 function noteReach(inst: Instance): void {
     const whole = inst.site ?? inst
-    if (!flow.exported.reach.has(whole.id)) flow.exported.reach.set(whole.id, reachedInstance(whole))
+    flow.exported.reach.add(whole.id)
 }
 
 function sameAllocation(a: Allocation, b: Allocation): boolean {
@@ -7035,7 +7129,7 @@ function extendAccesses(): Accesses {
         binds++
         const callee = finalInstance(bind.callee)
         exported.bindsInto.set(callee, (exported.bindsInto.get(callee) ?? 0) + 1)
-        if (deadCall(part, bind)) continue
+        if (deadCall(part, bind) || flow.retired.has(instOfSlot(part).id)) continue
         const from = callerInstance(part).id
         if (from < marks.instances) {
             if (knownCall(from, part, callee, marks)) continue
@@ -7057,13 +7151,13 @@ function extendAccesses(): Accesses {
     }
     for (const from of callers) if (index.has(from)) for (const [, callee] of edgesOf(from)) visit(finalInstance(callee))
     for (let id = marks.instances; id < flow.instances.length; id++) if (!flow.instances[id].site && forcedInstance(flow.instances[id])) visit(id)
-    for (const [id] of exported.reach) if (!flow.instances[id].site && forcedInstance(flow.instances[id])) visit(id)
+    for (const id of exported.reach) if (!flow.instances[id].site && forcedInstance(flow.instances[id])) visit(id)
     while (work.length) {
         const id = work.pop()!
         for (const [, callee] of edgesOf(id)) visit(finalInstance(callee))
     }
     added.sort((a, b) => a - b)
-    const appended = flow.exportedInstances.length
+    let appended = flow.exportedInstances.length
     for (const id of added) {
         index.set(id, flow.exportedInstances.length)
         flow.exportedInstances.push({ inst: flow.instances[id], sites: [] })
@@ -7081,18 +7175,103 @@ function extendAccesses(): Accesses {
         const at = index.get(finalInstance(callee))
         if (at !== undefined) resited.add(at)
     }
+    const leaving: number[] = []
     for (const at of resited) {
         const entry = flow.exportedInstances[at]
         const sites = entry.sites.filter(site => !swapped.has(site.instance!))
         for (const site of fresh.get(at) ?? []) sites.push(site)
         sites.sort((a, b) => rankOf(a) - rankOf(b))
-        if (!sites.length && !forcedInstance(entry.inst)) throw `value-flow: ${entry.inst.summary.name} left the program in an extension`
+        if (!sites.length && !forcedInstance(entry.inst)) leaving.push(at)
         entry.sites = sites
     }
-    const moved = new Set<number>([...gone, ...revisited])
+    const left = new Set<number>()
+    while (leaving.length) {
+        const at = leaving.pop()!
+        if (left.has(at)) continue
+        left.add(at)
+        for (const [, callee] of edgesOf(flow.exportedInstances[at].inst.id)) {
+            const to = index.get(finalInstance(callee))
+            if (to === undefined || left.has(to)) continue
+            const entry = flow.exportedInstances[to]
+            entry.sites = entry.sites.filter(site => site.instance !== at)
+            resited.add(to)
+            if (!entry.sites.length && !forcedInstance(entry.inst)) leaving.push(to)
+        }
+    }
+    const allocations = new Set<number>()
+    const locations = new Set<number>()
+    const leftIds: number[] = []
+    if (left.size) {
+        for (const at of left) {
+            const id = flow.exportedInstances[at].inst.id
+            leftIds.push(id)
+            flow.retired.add(id)
+            index.delete(id)
+        }
+        const renumber: number[] = []
+        let at = 0
+        while (at < flow.exportedInstances.length) {
+            renumber.push(left.has(at) ? -1 : at)
+            at++
+        }
+        const kept = flow.exportedInstances.length - left.size
+        const holes = [...left].filter(hole => hole < kept).sort((a, b) => a - b)
+        const filled: number[] = []
+        let tail = flow.exportedInstances.length - 1
+        for (const hole of holes) {
+            while (left.has(tail)) tail--
+            renumber[tail] = hole
+            flow.exportedInstances[hole] = flow.exportedInstances[tail]
+            index.set(flow.exportedInstances[hole].inst.id, hole)
+            filled.push(hole)
+            tail--
+        }
+        flow.exportedInstances.length = kept
+        appended = Math.min(appended, kept)
+        exported.instances.length = appended
+        const renumbered = (site: Site): Site => {
+            if (site.instance === undefined || renumber[site.instance] === site.instance) return site
+            if (renumber[site.instance] < 0) throw `value-flow: ${site.unit.name} still names an instance that left the program in an extension`
+            return { ...site, instance: renumber[site.instance] }
+        }
+        const shifted = (i: number | undefined) => i !== undefined && renumber[i] !== i
+        const stale = (sites: Site[]) => sites.some(site => shifted(site.instance))
+        const moves = (set: Set<number>) => {
+            const out = [...set].filter(i => renumber[i] >= 0).map(i => renumber[i])
+            set.clear()
+            for (const i of out) set.add(i)
+        }
+        moves(swapped)
+        moves(resited)
+        for (const hole of filled) if (hole < appended) swapped.add(hole)
+        at = 0
+        while (at < kept) {
+            const entry = flow.exportedInstances[at]
+            if (stale(entry.sites)) {
+                entry.sites = entry.sites.map(renumbered)
+                resited.add(at)
+            }
+            at++
+        }
+        const staying = (site: Site) => site.instance === undefined || renumber[site.instance] >= 0
+        exported.locations.forEach((location, l) => {
+            if (!stale(location.readers) && !stale(location.writers)) return
+            const readers = location.readers.filter(staying).map(renumbered)
+            const writers = location.writers.filter(staying).map(renumbered)
+            exported.locations[l] = { ...location, readers, writers }
+            locations.add(l)
+        })
+        exported.allocations.forEach((allocation, id) => {
+            if (!shifted(allocation.instance) && !allocation.instances?.some(shifted)) return
+            const creator = allocation.instance === undefined || renumber[allocation.instance] < 0 ? undefined : renumber[allocation.instance]
+            const instances = allocation.instances?.filter(i => renumber[i] >= 0).map(i => renumber[i])
+            exported.allocations[id] = { ...allocation, instance: creator, instances }
+            allocations.add(id)
+        })
+    }
+    const moved = new Set<number>([...gone, ...revisited, ...leftIds])
     const origins = new Set<number>(exported.created)
     if (moved.size) for (const [origin, creators] of flow.originCreators) for (const c of creators) if (moved.has(c)) origins.add(origin)
-    const allocations = new Set<number>()
     const later: number[] = []
     for (const origin of origins) {
         const id = exported.allocOf.get(origin)
@@ -7110,11 +7289,8 @@ function extendAccesses(): Accesses {
     }
     later.sort((a, b) => a - b)
     for (const o of later) exportOrigin(o)
-    const flipped = [...moved]
-    for (const [id, before] of exported.reach) if (before !== reachedInstance(flow.instances[id])) flipped.push(id)
     const fields = new Set<number>(exported.touched)
-    for (const id of flipped) for (const entry of exported.accessed.get(id) ?? []) fields.add(entry < 0 ? -entry - 1 : entry)
-    const locations = new Set<number>()
+    for (const id of moved) for (const entry of exported.accessed.get(id) ?? []) fields.add(entry < 0 ? -entry - 1 : entry)
     for (const slot of fields) {
         const at = exported.locOf.get(slot)
         if (at === undefined) continue
@@ -7131,7 +7307,7 @@ function extendAccesses(): Accesses {
         if (allocation !== undefined) allocations.add(allocation)
     }
     const signed = new Set<number>([...swapped, ...resited])
-    for (const [id] of exported.reach) {
+    for (const id of exported.reach) {
         const at = index.get(id)
         if (at !== undefined && at < appended && exported.instances[at].heldStatic !== flow.heldStatics.has(id)) signed.add(at)
     }
@@ -7168,6 +7344,7 @@ function accessesOf(changes: AccessChanges | undefined): Accesses {
         rowCount: () => solvedFlow(solved).slotKind.length,
         replace: (fn: Function, graph: Graph) => withFlow(solvedFlow(solved), () => replaceUnit(fn, graph)),
         dropElements: (droppable: Set<number>) => withFlow(solvedFlow(solved), () => dropElements(droppable)),
+        answerElements: (fn: Function) => withFlow(solvedFlow(solved), () => answerElements(fn)),
         refresh: () => withFlow(solvedFlow(solved), exportAccesses),
         extend: () => withFlow(solvedFlow(solved), extendAccesses),
         shadow: (check: (fresh: Accesses, map: ExportMap) => void) => withFlow(solvedFlow(solved), () => shadowAccesses(check)),
