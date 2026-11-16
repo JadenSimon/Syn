@@ -1693,10 +1693,16 @@ function inlineCost(g: Graph, literals = new Set<number>()): number | undefined 
         folds.set(id, result)
         return result
     }
+    const words = new Set<string>()
     for (const id of reachable) {
         const n = getNode(g, id)!
         if (interpreted.has(n.op)) continue
         if (n.op !== NodeOp.literal && constant(id)) continue
+        if (n.op === NodeOp.store && !getRef(n, 2) && !getRef(n, 3) && typeOf(n) !== Types.f64 && typeOf(n) !== Types.f32) {
+            const word = `${getRef(n, 1)}:${Math.floor(getLiteral(g, n, 2) / 8)}`
+            if (words.has(word)) continue
+            words.add(word)
+        }
         if (n.op === NodeOp.call || n.op === NodeOp.pstack) {
             cost += 3
             continue
@@ -3980,7 +3986,7 @@ function createImage() {
         return at
     }
     const placedObjects = new Map<number, number>()
-    function placeScalar(view: DataView, offset: number, raw: number, codec: Codec | undefined, fail: (why: string) => never, name: string): void {
+    function placeScalar(view: DataView, offset: number, raw: number, codec: Codec | undefined, fail: (why: string) => never, name: string, narrow: boolean): void {
         if (codec?.kind === 'f64' && !codec.encoded) {
             view.setFloat64(offset, raw, true)
             return
@@ -3992,6 +3998,7 @@ function createImage() {
         if (!Number.isInteger(raw)) fail(`field ${name} holds ${raw}, which is not an integer`)
         if (codec?.encoded && !heap.smiRange(raw)) fail(`field ${name} holds ${raw} in a word that holds only smis`)
         if (codec?.encoded) view.setUint32(offset, Number(BigInt.asUintN(32, BigInt(raw) * BigInt(2))), true)
+        else if (narrow) view.setUint32(offset, Number(BigInt.asUintN(32, BigInt(raw))), true)
         else view.setBigUint64(offset, BigInt.asUintN(64, BigInt(raw)), true)
     }
     function placeObject(handle: intrinsics.Handle, allocated: (id: number) => number | undefined, fail: (why: string) => never, fields: StaticFields, codecs: (cell: number) => ConstructionCodecs | undefined, graph?: Graph, holder?: GraphNode): number {
@@ -4044,7 +4051,7 @@ function createImage() {
                     view.setBigUint64(offset, BigInt(allocated(id) ?? fail(`field ${heap.stringToJs(keys[i])} holds %${id}, which is not an allocation`)), true)
                     pointers.push({ offset, region: staticRegion(), scale: 1 })
                 }
-                else placeScalar(view, offset, raw, fields(target, offset), fail, heap.stringToJs(keys[i]))
+                else placeScalar(view, offset, raw, fields(target, offset), fail, heap.stringToJs(keys[i]), layout.narrow[i])
                 if (tag) setBit(tag)
             } else if (heap.isNullishHandle(slot) && tag) {
                 continue
@@ -9809,6 +9816,68 @@ function plannedMembers(plan: ShapePlan, rep: Rep): intrinsics.Handle[] | undefi
     return rep.shapes.map(shape => plan.shapes.get(shape)!)
 }
 
+function narrowRep(rep: Rep): boolean {
+    return rep.kind === 'number' && rep.format?.bits === 32 && !rep.nullable && !rep.bit && !rep.bools && !rep.encoded && rep.constant === undefined
+}
+
+function planNarrowFields(inst: Instantiations, units: Map<Function, PlannedUnit[]>, plain: (sig: ShapeSignature) => boolean): Map<string, Set<string>> {
+    const parent = new Map<string, string>()
+    function find(id: string): string {
+        let at = id
+        while (parent.has(at)) at = parent.get(at)!
+        return at
+    }
+    function link(rep: Rep | undefined): void {
+        if (!rep) return
+        const first = rep.shapes.length > 1 ? find(rep.shapes[0]) : undefined
+        let i = 1
+        while (i < rep.shapes.length) {
+            const other = find(rep.shapes[i])
+            if (other !== first) parent.set(other, first!)
+            i++
+        }
+        link(rep.element)
+        link(rep.other)
+    }
+    for (const list of units.values()) {
+        for (const unit of list) {
+            for (const param of unit.params) link(param.rep)
+            link(unit.returns)
+            for (const rep of unit.nodes.values()) link(rep)
+            for (const rep of unit.slices.values()) link(rep)
+            for (const rep of unit.receivers.values()) link(rep)
+            for (const rep of unit.returned.values()) link(rep)
+        }
+    }
+    for (const sig of inst.shapes.values()) {
+        for (const [, rep] of sig.fields) link(rep)
+    }
+    const shared = new Map<string, Set<string>>()
+    for (const [id, sig] of inst.shapes) {
+        const root = find(id)
+        const eligible = new Set<string>()
+        if (plain(sig)) {
+            for (const [k, rep] of sig.fields) {
+                if (narrowRep(rep)) eligible.add(k)
+            }
+        }
+        const known = shared.get(root)
+        if (!known) {
+            shared.set(root, eligible)
+            continue
+        }
+        for (const k of known) {
+            if (!eligible.has(k)) known.delete(k)
+        }
+    }
+    const out = new Map<string, Set<string>>()
+    for (const id of inst.shapes.keys()) {
+        const keys = shared.get(find(id))!
+        if (keys.size >= 2) out.set(id, keys)
+    }
+    return out
+}
+
 function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>, graphOf: (fn: Function) => Graph, fieldKey: (name: string) => intrinsics.Handle | undefined, taggable: (sig: ShapeSignature) => boolean): Map<string, number> {
     function shapesOf(rep: Rep | undefined): string[] | undefined {
         if (!rep) return
@@ -13819,14 +13888,20 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             intrinsics.assert(placed.every((key, i) => planned[i] === key), `native: planned shape ${id} does not start with the fields of the placed state @${state} of O${m} in their order`)
         }
     }
+    const narrowed = planNarrowFields(inst, plan, sig => sig.members.every(m => {
+        const object = types.objects[m]
+        return object.kind !== AllocKind.scope && object.function === undefined && !object.native
+    }))
     const bits = new Map<intrinsics.Handle, propertyEval.RecordBits>()
     for (const [id, sig] of inst.shapes) {
-        const kinds = { flags: new Set<intrinsics.Handle>(), tagged: new Set<intrinsics.Handle>() }
+        const kinds = { flags: new Set<intrinsics.Handle>(), tagged: new Set<intrinsics.Handle>(), narrow: new Set<intrinsics.Handle>() }
+        const narrow = narrowed.get(id)
         for (const [k, rep] of sig.fields) {
             if (rep.bit) kinds.flags.add(fieldKey(k)!)
             if (nullableNumber(rep)) kinds.tagged.add(fieldKey(k)!)
+            if (narrow?.has(k)) kinds.narrow.add(fieldKey(k)!)
         }
-        if (!kinds.flags.size && !kinds.tagged.size) continue
+        if (!kinds.flags.size && !kinds.tagged.size && !kinds.narrow.size) continue
         bits.set(handles.get(id)!, kinds)
         for (const m of sig.members) {
             const state = types.objects[m].state
@@ -13842,7 +13917,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             if (state === undefined || (!placedStatics.has(state) && !constructed.has(state) && types.objects[m].function === undefined && !taggableClosure(m))) continue
             const prior = bits.get(state)
             intrinsics.assert(prior?.shapeTag === undefined || prior.shapeTag === tag, `native: state @${state} belongs to planned shapes with different shape tags`)
-            bits.set(state, { flags: prior?.flags ?? new Set(), tagged: prior?.tagged ?? new Set(), shapeTag: tag })
+            bits.set(state, { flags: prior?.flags ?? new Set(), tagged: prior?.tagged ?? new Set(), shapeTag: tag, narrow: prior?.narrow })
         }
     }
     function firstField(shape: string): string | undefined {
@@ -13863,7 +13938,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             if (fields.nested[at] !== undefined || fields.flags[at]) return
             if (rep.kind !== 'buffer') {
                 const f = fact(rep, false)
-                if (f) known.set(offset, f)
+                if (f) known.set(offset, fields.narrow[at] && f.kind === 'int' ? { ...f, type: rep.format!.signed ? Types.i32 : Types.u32 } : f)
                 return
             }
             known.set(offset, { kind: 'int', encoded: false })
@@ -15297,7 +15372,7 @@ function printCompiled(program: ProgramGraph, facts: Facts, plan: ShapePlan, val
                 const tag = layout.tags[i]
                 if (inner !== undefined) fields.push(`${name} @${layout.offsets[i]} ${propertyEval.recordLayout(inner, plan.embedded.fields, plan.bits).size}B embedded ${describe(inner, names)}`)
                 else if (flag) fields.push(`${name} @${flag.offset} bit ${flag.bit}`)
-                else fields.push(`${name} @${layout.offsets[i]} 8B ${describeFact(known?.get(String(layout.offsets[i])), names)}${tag ? `, tag @${tag.offset} bit ${tag.bit}` : ''}`)
+                else fields.push(`${name} @${layout.offsets[i]} ${layout.narrow[i] ? 4 : 8}B ${describeFact(known?.get(String(layout.offsets[i])), names)}${tag ? `, tag @${tag.offset} bit ${tag.bit}` : ''}`)
                 i++
             }
             return `${layout.size}B: ${fields.join('; ')}`
