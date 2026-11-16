@@ -1,9 +1,10 @@
 "use wrapped";
 
+import * as intrinsics from './intrinsics'
 import * as rt from './rt'
 import { closureCallKey } from './heap'
 import { expectForm, type Graph, type GraphNode } from './lowering2'
-import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, isThisParam, NodeOp, nodeEntries, opName, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type SelectPath, type TailPosition } from './graph-node'
+import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, isThisParam, NodeOp, nodeEntries, opName, OrderedValues, stronglyConnected, tailOf, tailPositions, tailRoots, type GraphLoops, type SelectPath, type TailPosition } from './graph-node'
 import { AllocKind, constructorOf, elementDropGuard, FieldForm, listOf, mapOf, nodesUnderElementDrops, objectsOnly, pstackRefs, readsUndefined, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Site, type Type, type ValueTypes } from './value-types'
 
 export interface LocalEnd {
@@ -141,6 +142,7 @@ export interface Lifetimes {
     eternal: Set<number>
     owned: (object: number) => [fields: OwnedField[], objects: number[]]
     dropOrder: (drops: number[][]) => number[]
+    cyclic: Set<number>
 }
 
 interface Body {
@@ -207,7 +209,7 @@ function exitOrderings(g: Graph, p: TailPosition): number[] {
 }
 
 export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean, report = false): Lifetimes {
-    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [], counted: [], eternal: new Set(), owned: () => [[], []], dropOrder: drops => drops.map((_, i) => i) }
+    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [], counted: [], eternal: new Set(), owned: () => [[], []], dropOrder: drops => drops.map((_, i) => i), cyclic: new Set() }
     const wanted = types.objects.map((_, id) => hooked(id))
     if (!wanted.includes(true)) return out
     const instancesOf = new Map<Function, number[]>()
@@ -235,9 +237,11 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     const holders = new Map<number, Location[]>()
     const fieldsOf = new Map<number, Map<number, Location>>()
     const captures = new Map<number, Set<number>>()
+    const holds = new Map<number, number[]>()
     for (const location of locations) {
         for (const inner of pstackRefs(location.type)) {
             listOf(holders, inner).push(location)
+            listOf(holds, location.allocation).push(inner)
             if (types.objects[inner].kind === AllocKind.scope) setOf(captures, location.allocation).add(inner)
         }
         if (location.handle === undefined) continue
@@ -245,6 +249,16 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (!byKey) fieldsOf.set(location.allocation, byKey = new Map())
         byKey.set(location.handle as number, location)
     }
+    const within = (o: number): number[] => holds.get(o) ?? []
+    const cyclic = out.cyclic
+    for (const scc of stronglyConnected(holds.keys(), within)) {
+        if (scc.length === 1 && !within(scc[0]).includes(scc[0])) continue
+        for (const o of scc) {
+            cyclic.add(o)
+            wanted[o] = false
+        }
+    }
+    if (!wanted.includes(true)) return out
     const eternal = out.eternal
     const judged = new Map<number, boolean>()
     function eternalOf(o: number): boolean {
@@ -919,6 +933,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         for (const h of targets) {
             const location = fieldsOf.get(h)?.get(key)
             if (!location) return 'stores to a field its holder does not have'
+            if (cyclic.has(h)) return 'stores to a holder that can be part of a reference cycle'
             if (!objectsOnly(location.type) || (location.forms & FieldForm.absent)) return 'replaces a value that may be absent'
             for (const o of location.type.objects) {
                 if (eternal.has(o)) {
@@ -1608,7 +1623,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     const tried = new Set<number>()
     function endsAlone(o: number): boolean {
         if (endings.has(o)) return true
-        if (eternal.has(o) || wanted[o] || tried.has(o)) return false
+        if (eternal.has(o) || cyclic.has(o) || wanted[o] || tried.has(o)) return false
         tried.add(o)
         for (const [fn, source] of sourcesOf(o)) {
             if (leavesWith(fn, o)) continue
@@ -1626,7 +1641,8 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         fates.set(o, 'is held in a cycle of holders')
         let fate: number | string = endsAlone(o) ? o : 'has no end of its own'
         if (eternal.has(o)) fate = 'is eternal'
-        if (typeof fate === 'string' && !eternal.has(o)) {
+        if (cyclic.has(o)) fate = 'can be part of a reference cycle'
+        if (typeof fate === 'string' && !eternal.has(o) && !cyclic.has(o)) {
             const c = containerOf(o)
             let keeper: Location | undefined
             for (const h of typeof c === 'string' ? [] : c.holders) {
@@ -1835,6 +1851,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         for (const o of objects) {
             if (eternal.has(o)) return blamed('holds an eternal', o, 0)
+            if (cyclic.has(o)) return blamed('holds an object that can be part of a reference cycle', o, 0)
             if (!wanted[o] && !holdsHooked(o)) return blamed('holds an object that has no hook and holds none', o, 0)
             if (ended.has(o) || localEnded.has(o) || endings.has(o)) return blamed('holds an object that already ends elsewhere', o, 0)
         }
@@ -1917,7 +1934,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return { objects, locations, writes, locals, args: boxing.args, rets: boxing.rets, owned: boxing.owned, hooked }
     }
     types.objects.forEach((object, o) => {
-        if ((!wanted[o] && !holdsHooked(o)) || eternal.has(o) || grouped.has(o) || ended.has(o) || localEnded.has(o) || !holders.has(o)) return
+        if ((!wanted[o] && !holdsHooked(o)) || eternal.has(o) || cyclic.has(o) || grouped.has(o) || ended.has(o) || localEnded.has(o) || !holders.has(o)) return
         begin(object.site.unit, object.site.node)
         const group = countGroup(o)
         if (typeof group === 'string') {
@@ -2157,16 +2174,6 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         const fields = sameFields(end.objects.map(ownedFields))
         if (fields?.length) out.drops.push({ unit: end.unit, value: end.value, exits: end.exits, fields, objects: ownedObjects(end.objects, fields, []), holders: end.objects })
     }
-    let inner: Map<number, number[]> | undefined
-    const within = (o: number): number[] => {
-        if (!inner) {
-            inner = new Map()
-            for (const location of locations) {
-                listOf(inner, location.allocation).push(...pstackRefs(location.type))
-            }
-        }
-        return inner.get(o) ?? []
-    }
     const hookReach = (from: number[]): Set<number> => {
         const walked = new Set<number>()
         const pending = from.slice()
@@ -2196,8 +2203,8 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         const left = drops.map((_, i) => i)
         const order: number[] = []
         while (left.length) {
-            let at = left.findIndex(j => !left.some(i => reaches(i, j)))
-            if (at < 0) at = 0
+            const at = left.findIndex(j => !left.some(i => reaches(i, j)))
+            intrinsics.assert(at >= 0, 'lifetime: each drop left at an exit has hooks that reach what another one holds')
             order.push(left[at])
             left.splice(at, 1)
         }
