@@ -156,10 +156,12 @@ export interface Layout {
     tags: (BitSlot | undefined)[]
     zeroed: BitSlot[]
     size: number
+    shapeTag?: number
 }
 
 const wordBits = 32
-const countHeader = 8
+export const prefixBytes = 8
+const tagOffset = -8
 const countOffset = -4
 
 export function bitWord(slot: BitSlot): intrinsics.Types {
@@ -173,7 +175,7 @@ export function narrowFieldType(codec: native.Codec | undefined): intrinsics.Typ
 export function recordLayout(shape: Handle, refinements?: Map<Handle, Map<Handle, Handle>>, bits?: Map<Handle, RecordBits>): Layout {
     const fields = refinements?.get(shape)
     const kinds = bits?.get(shape)
-    const keys = kinds?.shapeTag !== undefined ? [heap.shapeTagKey, ...dataKeys(shape)] : dataKeys(shape)
+    const keys = dataKeys(shape)
     const offsets: number[] = []
     const narrow: boolean[] = []
     const nested: (Handle | undefined)[] = []
@@ -186,7 +188,17 @@ export function recordLayout(shape: Handle, refinements?: Map<Handle, Map<Handle
         narrow.push(half)
         if (inner === undefined && kinds?.flags.has(key)) continue
         if (half) continue
-        size += inner !== undefined ? recordLayout(inner, refinements, bits).size : 8
+        if (inner === undefined) {
+            size += 8
+            continue
+        }
+        const within = recordLayout(inner, refinements, bits)
+        if (within.shapeTag === undefined) {
+            size += within.size
+            continue
+        }
+        offsets[offsets.length - 1] = size + prefixBytes
+        size += prefixBytes + Math.max(within.size, 8)
     }
     let halves = 0
     let i = 0
@@ -225,7 +237,7 @@ export function recordLayout(shape: Handle, refinements?: Map<Handle, Map<Handle
         share(flags[i], false)
         share(tags[i], true)
     }
-    return { keys, offsets, narrow, nested, flags, tags, zeroed, size: base + 8 * Math.ceil(count / wordBits) }
+    return { keys, offsets, narrow, nested, flags, tags, zeroed, size: base + 8 * Math.ceil(count / wordBits), shapeTag: kinds?.shapeTag }
 }
 
 interface Memory extends Layout {
@@ -289,7 +301,6 @@ function resolveProperties(
         const excluded = assignExcluded(runtime, n)
         for (const key of dataKeys(from)) {
             if (excluded.includes(key)) continue
-            if (key === heap.shapeTagKey) continue
             const read = addNode(source, NodeOp.getProp, [token, getRef(n, 3), { literal: key }])
             token = addNode(source, NodeOp.setProp, [read, getRef(n, 2), { literal: key }, read])
         }
@@ -351,7 +362,7 @@ function resolveProperties(
     const countedMemory = new Set<Memory>()
     let initToken = 0
     let allocToken: number | undefined
-    function heapAllocate(size: number, zeroed: BitSlot[], stack: number, fields: Layout, slab: boolean, counted: boolean): number {
+    function heapAllocate(size: number, zeroed: BitSlot[], stack: number, fields: Layout, slab: boolean, prefixed: boolean): number {
         let token = allocToken
         if (token === undefined) {
             if (!initToken) {
@@ -359,23 +370,26 @@ function resolveProperties(
             }
             token = initToken
         }
-        const operands: Operand[] = [token, { literal: stack }, 0, { literal: size }]
+        const prefix = prefixed ? prefixBytes : 0
+        const bytes = size + prefix
+        const operands: Operand[] = [token, { literal: stack }, 0, { literal: bytes }]
         const regions: Operand[] = []
         function inlineRegions(of: Layout, base: number): void {
             for (let i = 0; i < of.nested.length; i++) {
                 const inner = of.nested[i]
                 if (inner === undefined) continue
                 const within = layout(inner)
-                if (of.offsets[i] && within.size) regions.push({ literal: base + of.offsets[i] }, { literal: within.size })
+                const front = within.shapeTag !== undefined ? prefixBytes : 0
+                const bytes = front ? Math.max(within.size, 8) : within.size
+                if (of.offsets[i] > front && bytes) regions.push({ literal: base + of.offsets[i] - front }, { literal: bytes + front })
                 inlineRegions(within, base + of.offsets[i])
             }
         }
-        inlineRegions(fields, 0)
+        inlineRegions(fields, prefix)
         if (regions.length) operands.push({ literal: 0 }, ...regions)
-        const bytes = counted ? size + countHeader : size
         const block = slab ? addNode(out, NodeOp.rt, [token, { literal: RtOp.malloc }, { literal: bytes }], signatureOf(RtOp.malloc).returns) : 0
         const start = slab ? addNode(out, NodeOp.after, [block, addNode(out, NodeOp.mem, [block, { literal: bytes }], Types.u64)]) : addNode(out, NodeOp.pstack, operands)
-        const ptr = counted ? addNode(out, NodeOp.add, [start, { literal: countHeader }], Types.u64) : start
+        const ptr = prefixed ? addNode(out, NodeOp.add, [start, { literal: prefixBytes }], Types.u64) : start
         let last = ptr
         for (const slot of zeroed) last = addNode(out, NodeOp.store, [last, ptr, { literal: slot.offset }, { literal: 0 }], bitWord(slot))
         if (allocToken !== undefined) allocToken = last
@@ -575,11 +589,11 @@ function resolveProperties(
             throw `property-eval: %${id} changes the shape of an object that lives in memory`
         }
         if (!mem) {
-            const reduced = reducedShape(handle)
+            const reduced = reducedShape(handle, opts.layouts.bits)
             let ptr = 0
             const counted = !!opts.counted?.has(id)
             if (counted && reduced) throw `property-eval: %${id} makes counted O${opts.counted!.get(id)}, whose shape is reduced away, so it has no block to hold its count`
-            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst, fields, counted || !!opts.slab?.has(handle), counted)
+            if (!reduced) ptr = heapAllocate(Math.max(fields.size, 8), fields.zeroed, opts.stacks?.get(id) ?? PstackFirst, fields, counted || !!opts.slab?.has(handle), counted || fields.shapeTag !== undefined)
             mem = { ...fields, ptr, base: 0, shape: handle, reduced, pointer: false, origin: identity?.op === NodeOp.heapHandle && heapFieldCount(identity) ? id : undefined }
             if (counted) countedMemory.add(mem)
             if (cell !== undefined) homes.set(cell, mem)
@@ -722,7 +736,7 @@ function resolveProperties(
     function countedBlockBytes(id: number, mem: Memory): number {
         let bytes: number | undefined
         for (const member of mem.members ?? [mem.shape]) {
-            const size = Math.max(layout(member).size, 8) + countHeader
+            const size = Math.max(layout(member).size, 8) + prefixBytes
             if (bytes !== undefined && size !== bytes) throw `property-eval: %${id} frees a counted object whose shapes take blocks of different sizes`
             bytes = size
         }
@@ -766,13 +780,10 @@ function resolveProperties(
         if (mem.reduced) return token
         const state = snapshotNode(id) ? getLiteral(runtime, snapshotNode(id)!, 1) as Handle : mem.shape
         const template = !!opts.layouts.fixedCodecs?.has(state)
+        if (mem.shapeTag !== undefined) token = addNode(out, NodeOp.store, [token, mem.ptr, { literal: mem.base + tagOffset }, { literal: mem.shapeTag }], countedMemory.has(mem) ? Types.u32 : Types.u64)
         for (let i = 0; i < mem.keys.length; i++) {
             if (mem.nested[i] !== undefined) continue
             if (opts.layouts.erased?.get(mem.shape)?.has(mem.keys[i])) continue
-            if (mem.keys[i] === heap.shapeTagKey) {
-                token = storeKey(mem, i, token, { literal: opts.layouts.bits?.get(mem.shape)?.shapeTag ?? heap.unboxF64(slotAt(mem.shape, heap.shapeTagKey)) }, { literal: 1 })
-                continue
-            }
             if (template || !heap.getOwnProperty(state, mem.keys[i])) {
                 if (opts.layouts.fixedCodecs?.has(mem.shape)) token = storeAbsent(mem, i, token)
                 continue
@@ -1250,7 +1261,7 @@ function resolveProperties(
         const at = fields.keys.indexOf(key)
         if (at < 0) return fields.keys.includes(heap.protoSlotKey) ? 'linked' : `inherited ${desc.slot0}`
         const fixed = opts.layouts.fixed?.get(shape)?.get(key)
-        return `field ${fields.offsets[at]} ${reducedShape(shape)} ${readonly(shape)} ${fixed ?? '-'} ${fields.nested[at] ?? '-'}`
+        return `field ${fields.offsets[at]} ${reducedShape(shape, opts.layouts.bits)} ${readonly(shape)} ${fixed ?? '-'} ${fields.nested[at] ?? '-'}`
     }
     function agrees(mem: Memory, key: Handle): boolean {
         return membersAgree(mem.members!, key)
@@ -1938,15 +1949,12 @@ function resolveProperties(
     function dispatchOf(id: number, mem: Memory, token: number): Union | undefined {
         const members = mem.members!
         const ids: number[] = []
-        let offset: number | undefined
         for (const member of members) {
-            const fields = layout(member)
-            const at = fields.keys.indexOf(heap.shapeTagKey)
-            if (at < 0 || (offset !== undefined && fields.offsets[at] !== offset)) return
-            offset = fields.offsets[at]
-            ids.push(heap.unboxF64(slotAt(member, heap.shapeTagKey)))
+            const shapeTag = layout(member).shapeTag
+            if (shapeTag === undefined) return
+            ids.push(shapeTag)
         }
-        const tag = addNode(out, NodeOp.load, [token, mem.ptr, { literal: mem.base + offset! }], Types.u32)
+        const tag = addNode(out, NodeOp.load, [token, mem.ptr, { literal: mem.base + tagOffset }], Types.u32)
         const union = { tag, ids, members }
         dispatchedObjects.set(id, union)
         return union
@@ -1976,7 +1984,7 @@ function resolveProperties(
         }
     }
     function pointerMemory(ptr: number, shape: Handle): Memory {
-        return { ...layout(shape), ptr, base: 0, shape, reduced: reducedShape(shape), pointer: true, address: [ptr, 0] }
+        return { ...layout(shape), ptr, base: 0, shape, reduced: reducedShape(shape, opts.layouts.bits), pointer: true, address: [ptr, 0] }
     }
     const derived = new Map<number, Handle | null | undefined>()
     const locations = new Map<number, [shape: Handle, path: string]>()
@@ -3191,7 +3199,7 @@ function resolveProperties(
         }
         if (op === RtOp.countedFree) {
             const mem = countedMemoryOf(id, getRef(n, 2))
-            const block = addNode(out, NodeOp.sub, [mem.ptr, { literal: countHeader }], Types.u64)
+            const block = addNode(out, NodeOp.sub, [mem.ptr, { literal: prefixBytes }], Types.u64)
             putNode(out, id, NodeOp.rt, [token, { literal: RtOp.mfree }, block, { literal: countedBlockBytes(id, mem) }], signatureOf(RtOp.mfree).returns)
         }
         if (op === RtOp.freeable) putNode(out, id, NodeOp.after, [token, getRef(n, 2)])
@@ -3374,7 +3382,7 @@ function resolveProperties(
     }
     const shapes = new Map<number, Handle>()
     for (const [id, mem] of memory) {
-        if (native.heldAsField(opts.layouts.codecs, mem.members ?? [mem.shape])) continue
+        if (native.heldAsField(opts.layouts.codecs, mem.members ?? [mem.shape], opts.layouts.bits)) continue
         shapes.set(id, mem.shape)
         const [ptr] = addressOf(mem)
         if (ptr) shapes.set(ptr, mem.shape)
@@ -3461,9 +3469,9 @@ function readonlyKeys(target: Handle, keys: Handle[]): boolean {
     return true
 }
 
-export function reducedShape(shape: Handle): boolean {
+export function reducedShape(shape: Handle, bits?: Map<Handle, RecordBits>): boolean {
     const keys = dataKeys(shape)
-    return keys.length === 1 && keys[0] !== heap.shapeTagKey && readonlyKeys(shape, keys)
+    return keys.length === 1 && bits?.get(shape)?.shapeTag === undefined && readonlyKeys(shape, keys)
 }
 
 export function dataKeys(target: Handle): Handle[] {

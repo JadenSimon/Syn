@@ -4007,8 +4007,10 @@ function createImage() {
         if (known !== undefined) return known
         const layout = placedLayouts.get(target) ?? propertyEval.recordLayout(target, undefined, recordBits)
         const keys = layout.keys
-        const bytes = new Uint8Array(layout.size)
-        const at = staticReserve(bytes.length)
+        const prefix = layout.shapeTag !== undefined ? propertyEval.prefixBytes : 0
+        const bytes = new Uint8Array(prefix ? Math.max(layout.size, 8) : layout.size)
+        const block = staticReserve(prefix + bytes.length)
+        const at = block + prefix
         placedObjects.set(target, at)
         const view = new DataView(bytes.buffer)
         const pointers: Relocation[] = []
@@ -4019,10 +4021,6 @@ function createImage() {
         }
         for (let i = 0; i < keys.length; i++) {
             const offset = layout.offsets[i]
-            if (keys[i] === heap.shapeTagKey) {
-                view.setBigUint64(offset, BigInt(recordBits.get(target)!.shapeTag!), true)
-                continue
-            }
             if (!heap.getOwnProperty(target, keys[i])) continue
             const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(heap.getOwnProperty(target, keys[i]))).slot0 as intrinsics.Handle
             const flag = layout.flags[i]
@@ -4074,8 +4072,13 @@ function createImage() {
                 pointers.push({ offset, region: staticRegion(), scale: 1 })
             } else fail(`field ${heap.stringToJs(keys[i])} holds an unsupported value`)
         }
+        if (prefix) {
+            const front = new Uint8Array(prefix)
+            new DataView(front.buffer).setUint32(0, layout.shapeTag!, true)
+            staticWrite(block, front)
+        }
         staticWrite(at, bytes, pointers)
-        if (!linked) staticRegions.push([at, bytes.length])
+        if (!linked) staticRegions.push([block, prefix + bytes.length])
         return at
     }
     return {
@@ -7196,6 +7199,7 @@ interface ShapePlan {
     embedded: PlannedEmbeddings
     layoutOf: (shape: string, elements: ElementReads) => number
     reducedShape: (shape: string) => boolean
+    tagOf: (shape: string) => number | undefined
     bits: Map<intrinsics.Handle, propertyEval.RecordBits>
     fixedStatic: (state: intrinsics.Handle, key: intrinsics.Handle) => boolean
     statics: StaticPlacement
@@ -7638,8 +7642,8 @@ export function intType(codec: Codec | undefined): intrinsics.Types | undefined 
     return codec?.kind === 'int' ? codec.type : undefined
 }
 
-export function heldAsField(facts: Facts | undefined, shapes: intrinsics.Handle[]): boolean {
-    return shapes.some(shape => propertyEval.reducedShape(shape) && !pointerField(facts && locate(facts, shape, '0')))
+export function heldAsField(facts: Facts | undefined, shapes: intrinsics.Handle[], bits?: Map<intrinsics.Handle, propertyEval.RecordBits>): boolean {
+    return shapes.some(shape => propertyEval.reducedShape(shape, bits) && !pointerField(facts && locate(facts, shape, '0')))
 }
 
 function pointerField(codec: Codec | undefined): boolean {
@@ -9577,7 +9581,7 @@ function sharePlannedUnits(plan: ShapePlan, planned: Planned, reps: Representati
         const abi = reps.abi.get(planned.functions.get(unit)!)!
         return [abi.mode, abi.returns, abi.tags.length, ...abi.tags, abi.mode === 'tagged' ? machineNumberName(unit.returns) : '']
     }
-    const shared = shareUnits(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, abiOf, fn => host.binder.graphOf(fn))
+    const shared = shareUnits(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, abiOf, fn => host.binder.graphOf(fn), plan.tagOf)
     for (const [unit, kept] of shared) {
         const list = planned.shared.get(kept)
         if (list) list.push(unit)
@@ -10501,7 +10505,7 @@ function chooseRepresentations(plan: ShapePlan, planned: Planned, binder: Binder
     function returnTaggable(unit: PlannedUnit): boolean {
         return nullableNumber(unit.returns) && !constructsOutOfLine(planned.functions.get(unit)!)
     }
-    const types = typeTable(planned, shareClasses(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, () => [], fn => binder.graphOf(fn)), program, tracedOf)
+    const types = typeTable(planned, shareClasses(plan.units, plan.layoutOf, plan.reducedShape, plan.embedded.sites, () => [], fn => binder.graphOf(fn), plan.tagOf), program, tracedOf)
     joinNullableNumbers(types)
     const tags = analyzeTags(plan, planned, tracedOf, returnTaggable, binder, types)
     for (const shape of plan.shapes.values()) {
@@ -13014,7 +13018,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             boxed: (intFormatOf(returned) !== undefined && worded && !returned.tested) || undefined,
             nullable: returned.nullable || undefined,
             bool: !!returned.bools || undefined,
-            decode: record !== undefined ? unionWord(value) ? pstack0Base() : undefined : (result !== undefined && !isStringRep(returned) && !numeric && !heldAsField(facts, members ?? [result]) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
+            decode: record !== undefined ? unionWord(value) ? pstack0Base() : undefined : (result !== undefined && !isStringRep(returned) && !numeric && !heldAsField(facts, members ?? [result], plan.bits) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
             target,
             targets: target === undefined ? reached?.map(unit => link(planned.functions.get(unit)!)) : undefined,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
@@ -13187,8 +13191,14 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
                 putNode(graph, id, NodeOp.after, [getOperand(graph, n, 0)])
                 continue
             }
-            const bytes = Math.max(propertyEval.recordLayout(shape, layouts.refinements, layouts.bits).size, 8)
-            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.mfree }, getOperand(graph, n, 2), { literal: bytes }], rt.signatureOf(rt.Op.mfree).returns)
+            const layout = propertyEval.recordLayout(shape, layouts.refinements, layouts.bits)
+            const bytes = Math.max(layout.size, 8)
+            if (layout.shapeTag === undefined) {
+                putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.mfree }, getOperand(graph, n, 2), { literal: bytes }], rt.signatureOf(rt.Op.mfree).returns)
+                continue
+            }
+            const block = addNode(graph, NodeOp.sub, [getOperand(graph, n, 2), { literal: propertyEval.prefixBytes }], Types.u64)
+            putNode(graph, id, NodeOp.rt, [getOperand(graph, n, 0), { literal: rt.Op.mfree }, block, { literal: bytes + propertyEval.prefixBytes }], rt.signatureOf(rt.Op.mfree).returns)
         }
     }
     const receiverFreed = new Map<Function, boolean>()
@@ -13556,7 +13566,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             const param = graph.blocks[0].params[index]
             const integral = intFormatOf(rep)?.signed === false && typeOf(getNode(graph, param)!) === Types.f64
             const shape = plannedShape(plan, rep)
-            const reduced = shape !== undefined && heldAsField(facts, [shape]) ? intType(locate(facts, shape, '0')) : undefined
+            const reduced = shape !== undefined && heldAsField(facts, [shape], plan.bits) ? intType(locate(facts, shape, '0')) : undefined
             const T = intFormatOf(rep)?.signed ? Types.i64 : unions.has(index) ? Types.vm_value : numberName(rep) === 'f64' ? Types.f64 : integral ? Types.u64 : reduced
             if (T !== undefined) out.set(param, T)
         }
@@ -13584,7 +13594,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         const slices = local?.slices ?? new Map<number, Rep>()
         const pointers = new Set(resolved.shapes.keys())
         for (const [id, rep] of values) {
-            if (!pointerOfShapes(rep) || heldAsField(facts, rep.shapes.map(shape => plan.shapes.get(shape)!))) continue
+            if (!pointerOfShapes(rep) || heldAsField(facts, rep.shapes.map(shape => plan.shapes.get(shape)!), plan.bits)) continue
             const op = getNode(graph, id)?.op
             if (op === NodeOp.load && rawSlice(slices, id)) pointers.add(id)
             else if (op === NodeOp.decode && slices.has(id)) pointers.add(id)
@@ -13809,8 +13819,6 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
     const absentKeys = new Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>()
     for (const [id, sig] of inst.shapes) {
         const shape = heap.makeObject((sig.proto ?? 0) as intrinsics.Handle)
-        const tag = shapeTags.get(id)
-        if (tag !== undefined) heap.setReadonlyProperty(shape, heap.shapeTagKey, heap.boxF64(tag) as intrinsics.Handle)
         const absent = new Map<intrinsics.Handle, boolean>()
         for (const k of sig.absent) {
             const key = fieldKey(k)
@@ -13861,7 +13869,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         return boxed
     }
     for (const [id, sig] of inst.shapes) {
-        const planned = propertyEval.dataKeys(handles.get(id)!).filter(key => key !== heap.shapeTagKey)
+        const planned = propertyEval.dataKeys(handles.get(id)!)
         for (const m of sig.members) {
             const state = types.objects[m].state
             if (state === undefined || (!placedStatics.has(state) && !constructed.has(state))) continue
@@ -13893,6 +13901,9 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         }
     }
     for (const [id, tag] of shapeTags) {
+        const handle = handles.get(id)!
+        const own = bits.get(handle)
+        bits.set(handle, { flags: own?.flags ?? new Set(), tagged: own?.tagged ?? new Set(), shapeTag: tag, narrow: own?.narrow })
         for (const m of inst.shapes.get(id)!.members) {
             const state = types.objects[m].state
             if (state === undefined || (!placedStatics.has(state) && !constructed.has(state) && types.objects[m].function === undefined && !taggableClosure(m))) continue
@@ -13906,7 +13917,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         const at = layout.offsets.findIndex((offset, i) => offset === 0 && !layout.flags[i])
         return at < 0 ? undefined : types.keyNames.get(layout.keys[at])
     }
-    const embeddings = planEmbeddings(types, inst, plan, fn => binder.graphOf(fn), host.allocatedAt!, firstField)
+    const embeddings = planEmbeddings(types, inst, plan, fn => binder.graphOf(fn), host.allocatedAt!, firstField, shape => shapeTags.has(shape))
     const embedded = new Map<intrinsics.Handle, Map<intrinsics.Handle, intrinsics.Handle>>()
     for (const [P, byKey] of embeddings.fields) embedded.set(handles.get(P)!, new Map([...byKey].map(([k, I]) => [types.keyHandles.get(k)!, handles.get(I)!])))
     for (const [id, sig] of inst.shapes) {
@@ -13974,7 +13985,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             const key = fieldKey(k)
             if (elements === 'all' || (key !== undefined && elements.has(key))) read.add(`${record.offsets[record.keys.indexOf(key!)]}/*`)
         }
-        const atoms: Atom[] = [sig.proto, shapeTags.get(id), sig.fields.length]
+        const atoms: Atom[] = [sig.proto, reducedPlanShape(id), sig.fields.length]
         for (const [k] of sig.fields) {
             const at = record.keys.indexOf(fieldKey(k)!)
             const addr = heap.getOwnProperty(handle, fieldKey(k)!)
@@ -13983,7 +13994,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
             const constant = types.keyHandles.has(k) ? fixedFields.get(handle)?.get(types.keyHandles.get(k)!) : undefined
             const flag = record.flags[at]
             const tag = record.tags[at]
-            atoms.push(k, readonly, inner !== undefined ? layoutOf(inner, elements) : undefined, constant, flag?.offset, flag?.bit, tag?.offset, tag?.bit)
+            atoms.push(k, readonly, inner !== undefined ? layoutOf(inner, elements) : undefined, inner !== undefined && shapeTags.has(inner), constant, flag?.offset, flag?.bit, tag?.offset, tag?.bit)
         }
         atoms.push(sig.constants.size)
         for (const [k, literal] of sig.constants) atoms.push(k, literal)
@@ -13999,7 +14010,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         return layout
     }
     function reducedPlanShape(shape: string): boolean {
-        return propertyEval.reducedShape(handles.get(shape)!)
+        return propertyEval.reducedShape(handles.get(shape)!, bits)
     }
     const constants = new Map<intrinsics.Handle, intrinsics.Handle>()
     for (const [state, id] of inst.constantShapes) constants.set(state, handles.get(id)!)
@@ -14038,7 +14049,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         if (!facts.has(shape)) facts.set(shape, new Map())
         facts.set(state, facts.get(shape)!)
     }
-    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map() }
+    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, tagOf: (shape: string) => shapeTags.get(shape), reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map() }
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {
