@@ -9,7 +9,7 @@ import { addNode, armSlot, opName, childRegion, countIds, demandRegion, getLiter
 import { Op as RtOp, assignExcluded, bindingOf, calleeSlot, coercingOps, elementType, floatArith, isDelete, opName as rtName, relationalOps, sliceOf, wordOps } from './rt'
 import { dataKeys } from './property-eval'
 import * as pg from './pg-optimizer'
-import { AllocKind, boundCallee, FieldForm, ordinaryPrototype, constantIndex, constructedAllocation, cutUnion, emptyType, inhabited, keyLabel as propertyLabel, listOf, mapOf, numberKey, regionRets, returnsSelf, usersOf, type AccessChanges, type ExportMap, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess, ContextKey, type ContextKeys } from './value-types'
+import { AllocKind, boundCallee, FieldForm, ordinaryPrototype, constantIndex, constructedAllocation, cutUnion, deadKey, emptyType, inhabited, keyLabel as propertyLabel, listOf, mapOf, numberKey, regionRets, returnsSelf, usersOf, type AccessChanges, type ExportMap, type AccessHost, type Generic, type Accesses, type Allocation, type InstanceSignature, type Location, type Site, type Type, type UnitTypes, type StorageAccess, ContextKey, type ContextKeys } from './value-types'
 
 type Handle = intrinsics.Handle
 
@@ -210,6 +210,7 @@ enum ListenerKind {
     kinds,
     reads,
     method,
+    freeable,
 }
 
 enum ArgClass {
@@ -372,6 +373,8 @@ interface FlowStep {
     start: number
     nodes: number
     keys: number
+    replacing: Map<number, number>
+    reflowing: Map<number, Instance>
 }
 
 interface PendingKey {
@@ -2860,6 +2863,13 @@ interface Bound {
     ret: number
     select: number
     arm: number
+    negative: BoundArm | undefined
+}
+
+interface BoundArm {
+    ret: number
+    select: number
+    arm: number
 }
 
 function proofScope(s: Summary): pg.ProofScope {
@@ -2959,6 +2969,7 @@ function storeWritesKeys(s: Summary, node: number): void {
     release(flow.confinements[keyFact(s, node)])
 }
 
+const countedOps = new Set<number>([RtOp.countedWrap, RtOp.countedRetain, RtOp.countedWrapper])
 const keyFreeRt = new Set<number>([...pg.pureRt, RtOp.slice, RtOp.sliceRead, RtOp.sliceWrite, RtOp.trunc])
 
 function keyFree(s: Summary): boolean {
@@ -3084,25 +3095,136 @@ function summarizeBounds(s: Summary, ids: number[], retArgs: number[]): void {
             const t = root ? getNode(g, root) : undefined
             if (t?.op !== NodeOp.startOf || getRef(t, 0) !== entry.id) continue
             const region = childRegion(regions, ru, select, arm)
-            const args: number[] = []
-            const gates: number[] = []
-            const all = s.exprs[s.retExpr].gates!
-            let k = 0
-            for (const id of ids) {
-                if (getNode(g, id)!.op !== NodeOp.ret || s.regionRets.has(id)) continue
-                if (!within(regions, regions.of.get(id) ?? -1, region, charge)) {
-                    args.push(retArgs[k])
-                    gates.push(all[k])
-                }
-                k++
-            }
-            if (args.length === retArgs.length) continue
-            const ret = expr(s, ExprOp.union, 0, 0, 0, 0, args, 0)
-            s.exprs[ret].gates = gates
-            s.bound = { param, recv, key: rel.key, ret, select, arm }
+            const ret = liveRets(s, ids, retArgs, [region], retArgs.length)
+            if (ret < 0) continue
+            const sign = negativeArm(s, select, rel.index)
+            const both = sign ? liveRets(s, ids, retArgs, [region, sign[2]], s.exprs[ret].args.length) : -1
+            const negative = both >= 0 ? { ret: both, select: sign![0], arm: sign![1] } : undefined
+            s.bound = { param, recv, key: rel.key, ret, select, arm, negative }
             return
         }
     }
+}
+
+function liveRets(s: Summary, ids: number[], retArgs: number[], dead: number[], limit: number): number {
+    const g = s.g
+    const regions = s.regions!
+    const args: number[] = []
+    const gates: number[] = []
+    const all = s.exprs[s.retExpr].gates!
+    let k = 0
+    for (const id of ids) {
+        if (getNode(g, id)!.op !== NodeOp.ret || s.regionRets.has(id)) continue
+        const r = regions.of.get(id) ?? -1
+        if (!dead.some(region => within(regions, r, region, charge))) {
+            args.push(retArgs[k])
+            gates.push(all[k])
+        }
+        k++
+    }
+    if (args.length >= limit) return -1
+    const ret = expr(s, ExprOp.union, 0, 0, 0, 0, args, 0)
+    s.exprs[ret].gates = gates
+    return ret
+}
+
+function negativeArm(s: Summary, select: number, index: number): [select: number, arm: number, region: number] | undefined {
+    const g = s.g
+    const regions = s.regions!
+    let r = regions.of.get(select) ?? -1
+    while (r >= 0) {
+        charge(1)
+        const origin = regions.origin[r]
+        const n = origin ? getNode(g, origin) : undefined
+        if (n?.op === NodeOp.select && countIds(n) === 3) {
+            const [id, positive] = pg.condition(g, getRef(n, 0), regions.slot[r] === 1)
+            const test = id ? getNode(g, id) : undefined
+            const tested = (test?.op === NodeOp.lt || test?.op === NodeOp.ge) && getRef(test, 0) === index && !getRef(test, 1) && getLiteral(g, test, 1) === 0
+            if (tested && (test!.op === NodeOp.lt) === positive) return undefined
+            if (tested) return [origin, 3 - regions.slot[r], childRegion(regions, regions.parent[r], origin, 3 - regions.slot[r])]
+        }
+        r = regionUp(regions, r)
+    }
+    return undefined
+}
+
+function nonNegative(inst: Instance, index: number): boolean {
+    const active = new Set<string>()
+    const fields = new Set<number>()
+    let left = 64
+    function lowerBound(site: Instance, e: number): number | undefined {
+        const code = `${site.id}:${e}`
+        if (active.has(code)) return Infinity
+        left--
+        if (left < 0) return undefined
+        const x = site.summary.exprs[e]
+        const n = x.node ? getNode(site.summary.g, x.node) : undefined
+        const T = n ? typeOf(n) : undefined
+        if (T === Types.u8 || T === Types.u16 || T === Types.u32 || T === Types.usize) return 0
+        if (x.op === ExprOp.konst) return (scalars.flags[x.a] & ~ScalarFlag.int) === 0 && scalars.flags[x.a] !== 0 ? scalars.lo[x.a] : undefined
+        if (x.op === ExprOp.narrow || x.op === ExprOp.pick) return lowerBound(site, x.a)
+        if (x.op === ExprOp.arith && x.key === NodeOp.add) {
+            const a = lowerBound(site, x.a)
+            const b = lowerBound(site, x.b)
+            if (a === undefined || b === undefined) return undefined
+            if ((a === Infinity && b < 0) || (b === Infinity && a < 0)) return undefined
+            return a + b
+        }
+        if (x.op === ExprOp.arith && x.key === NodeOp.sub) {
+            const a = lowerBound(site, x.a)
+            const b = site.summary.exprs[x.b]
+            if (a === undefined || a === Infinity || b.op !== ExprOp.konst || (scalars.flags[b.a] & ~ScalarFlag.int) !== 0) return undefined
+            return a - scalars.hi[b.a]
+        }
+        if (x.op === ExprOp.member && !x.b && x.key === heap.arrayLengthKey) return 0
+        if (x.op === ExprOp.member && !x.b) return fieldBound(site, x)
+        if (x.op !== ExprOp.union || !n || n.op !== NodeOp.param) return undefined
+        active.add(code)
+        defer finally {
+            active.delete(code)
+        }
+        let low = Infinity
+        for (const arg of x.args) {
+            const v = lowerBound(site, arg)
+            if (v === undefined) return undefined
+            if (v < low) low = v
+        }
+        return low
+    }
+    function fieldBound(site: Instance, x: Expr): number | undefined {
+        const origins = flow.slotOrigins[at(site, x.a)]
+        if (!origins.length) return undefined
+        let low = Infinity
+        for (const origin of origins) {
+            const f = flow.originFields[origin]?.get(x.key)
+            if (f === undefined || ((flow.fieldForms.get(f) ?? 0) & FieldForm.absent)) return undefined
+            if (fields.has(f)) continue
+            fields.add(f)
+            defer finally {
+                fields.delete(f)
+            }
+            const state = heapState(origin)
+            const own = state !== undefined ? heap.getOwnProperty(state, x.key as Handle) : 0
+            if (own) {
+                const slot = heap.FullPropertyDescriptor(heap.resolveHeapCell(own)).slot0 as Handle
+                if (!heap.isBoxedF64(slot) || intrinsics.getNanId(heap.unboxF64(slot))) return undefined
+                if (heap.unboxF64(slot) < low) low = heap.unboxF64(slot)
+            }
+            for (const w of flow.fieldWriters.get(f) ?? []) {
+                if (w < 0) return undefined
+                const writer = flow.instances[Math.floor(w / exprBits)]
+                const store = writer.summary.exprs[w % exprBits]
+                if (store.op !== ExprOp.store) return undefined
+                const v = lowerBound(writer, store.b)
+                if (v === undefined) return undefined
+                if (v < low) low = v
+            }
+        }
+        return low
+    }
+    const e = inst.summary.exprOf.get(index)
+    const low = e === undefined ? undefined : lowerBound(inst, e)
+    return low !== undefined && low !== Infinity && low >= 0
 }
 
 function refineReturn(callee: Instance, target: number): number {
@@ -3135,7 +3257,9 @@ function refineReturn(callee: Instance, target: number): number {
     if (!owner || !args[b.param]) return callee.ret
     const origin = b.recv < 0 && callee.summary.hasThis ? receiverQual(callee.qual) : 0
     const calls = pg.inBounds(boundScope(from.summary, origin, b.key), node, args[b.param], owner, b.key)
-    return proven(from, calls, owner, callee, target) ? at(callee, b.ret) : callee.ret
+    if (!proven(from, calls, owner, callee, target)) return callee.ret
+    if (b.negative && nonNegative(from, args[b.param])) return at(callee, b.negative.ret)
+    return at(callee, b.ret)
 }
 
 function derefed(s: Summary, read: number): boolean {
@@ -3333,6 +3457,8 @@ function instance(fn: Function, qual: number, lit: number, litParam: number, kin
         return id
     }
     const step = flow.step
+    const replacing = step?.replacing.get(known)
+    if (replacing !== undefined) return replacing
     if (!step || !step.forks.has(known)) return known
     let forked = step.forked.get(known)
     if (forked !== undefined) return forked
@@ -3685,6 +3811,10 @@ function wireRt(inst: Instance, x: Expr, slot: number): void {
         return addOrigin(slot, made)
     }
     if (op === RtOp.assign) return listen(at(inst, x.args[1]), ListenerKind.assignSource, slot, 0, slot)
+    if (op === RtOp.countedWrap) return bindAllocator(slot, RtOp.malloc)
+    if (op === RtOp.freeable) return listen(at(inst, x.args[0]), ListenerKind.freeable, slot, 0, 0)
+    if (op === RtOp.countedBox || op === RtOp.countedUnbox) return listen(at(inst, x.args[0]), ListenerKind.copy, slot, 0, 0)
+    if (countedOps.has(op)) return
     if (stringRt.has(op)) addOrigin(slot, strOrigin())
     const impl = bindingOf(op)?.impl
     if (pg.pureRt.has(op) && (!impl || !flow.host.binder.traceable(impl))) return
@@ -4001,6 +4131,7 @@ function deliver(l: number, origin: number): void {
         case ListenerKind.kinds: classChanged(target, deliveredClass(target, origin))
         case ListenerKind.reads: dirtyScalar(target)
         case ListenerKind.method: methodArrived(target, extra, origin)
+        case ListenerKind.freeable: if (flow.originKind[origin] !== OriginKind.static) addOrigin(target, origin)
     }
 }
 
@@ -4825,6 +4956,22 @@ function sameDemands(a: ParamDemands, b: ParamDemands): boolean {
     return true
 }
 
+function demandsChanged(a: ParamDemands, b: ParamDemands, olds: Instance[]): boolean {
+    if (sameDemands(a, b)) return false
+    if (!sameDemands({ ...a, identity: 0 }, { ...b, identity: 0 })) return true
+    const moved = a.identity ^ b.identity
+    let i = 0
+    while (i < 16) {
+        if (moved & (1 << i)) {
+            for (const inst of olds) {
+                if (i < inst.sigs.length && slotClassOf(inst.sigs[i]) & (ArgClass.function | ArgClass.many)) return true
+            }
+        }
+        i++
+    }
+    return false
+}
+
 function paramRooted(s: Summary, e: number, state: Uint8Array): boolean {
     if (e < 0) return false
     if (state[e]) return state[e] !== 2
@@ -5156,7 +5303,8 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     const qual = s.hasThis && !perSite ? qualOf(recv) : perSite ? qualified(OriginKind.site, 0, !s.hasThis && kind === OriginKind.fresh ? target : inst.qual, x.node, inst.summary) : !s.hasThis && kind === OriginKind.fresh ? target : held ? 0 : specializationSite(inst)
     if (perSite && s.hasThis && recv && specializes(recv)) flow.genericSites.add(qual)
     if (kinds >= 0 && !flow.step && !flow.cut && widenKinds(callSlot, fn, target, recv, qual, kinds)) return
-    const callee = flow.instances[instance(fn, qual, -1, -1, kinds)]
+    const prior = flow.step?.reflowing.get(inst.id)
+    const callee = flow.instances[(prior ? reflowedCallee(prior, callSlot, target, recv) : undefined) ?? instance(fn, qual, -1, -1, kinds)]
     if (keyCensus) noteKey(callee, callKey(s, qual, perSite, kind === OriginKind.fresh))
     addCaller(callee, callSlot)
     const classed = kinds >= 0 ? paramDemands(s).classed : 0
@@ -5179,6 +5327,19 @@ function bindCall(callSlot: number, target: number, recv: number): void {
     flow.partBind.set(part, { callee: callee.id, from, kind: BindKind.call, target, recv })
     if (cone) siteReturn(callee, inst, x, callSlot, part, cone)
     else copyEdge(from, part)
+}
+
+function reflowedCallee(prior: Instance, callSlot: number, target: number, recv: number): number | undefined {
+    const slot = at(prior, flow.slotIndex[ownerSlot(callSlot)])
+    let e = chainFirst(flow.parts, slot)
+    while (e >= 0) {
+        const bind = flow.partBind.get(flow.partSlots[e])
+        e = chainAfter(flow.parts, slot, e)
+        if (!bind || bind.kind !== BindKind.call || bind.target !== target || bind.recv !== recv) continue
+        const replacing = flow.step!.replacing.get(finalInstance(bind.callee))
+        if (replacing !== undefined) return replacing
+    }
+    return undefined
 }
 
 function fillMissing(): boolean {
@@ -5405,6 +5566,7 @@ function rtScalar(inst: Instance, x: Expr, value: (s: number) => number, origins
     if (op === RtOp.trunc) return value(at(inst, x.args[0]))
     if (stringRt.has(op)) return ANYSTR
     if (wordOps.has(op)) return numScalar(0, 2 ** 32 - 1)
+    if (countedOps.has(op)) return U64
     if (op === RtOp.hasPrototype) return prototypeScalar(inst, x, value, originsOf)
     if (op === RtOp.instanceof) {
         const proto = instanceofPrototype(inst.summary, x)
@@ -5674,6 +5836,7 @@ function deadCall(part: number, bind: Bind): boolean {
     const cs = callee.summary
     const open = (i: number) => i < callee.sigs.length && flow.slotKind[callee.sigs[i]] === SlotKind.sig
     if (bind.kind === BindKind.rt) {
+        if (x.op === ExprOp.rt && countedOps.has(x.a)) return false
         if (callee.kinds >= 0 && x.op === ExprOp.rt && rtKinds(inst, x, cs, bind.target, bind.recv) !== callee.kinds) return true
         const args = rtOperands(inst, x, part)
         let i = 0
@@ -5706,15 +5869,16 @@ function deadCall(part: number, bind: Bind): boolean {
     return false
 }
 
-function boundArm(bind: Bind | undefined, callee: number): [select: number, arm: number] | undefined {
+function boundArm(bind: Bind | undefined, callee: number): [select: number, arm: number][] | undefined {
     if (!bind || (bind.kind !== BindKind.call && bind.kind !== BindKind.virtual)) return undefined
     let to = bind.callee
     while (flow.replaced.has(to)) to = flow.replaced.get(to)!
     if (to !== callee) return undefined
     const bound = flow.instances[bind.callee]
     const b = bound.summary.bound
+    if (b?.negative && bind.from === at(bound, b.negative.ret)) return [[b.select, b.arm], [b.negative.select, b.negative.arm]]
     if (!b || bind.from !== at(bound, b.ret)) return undefined
-    return [b.select, b.arm]
+    return [[b.select, b.arm]]
 }
 
 function exportInstances(): void {
@@ -5782,7 +5946,7 @@ function recordSites(recorded: Map<string, Site>, from: number, list: [part: num
         const dead = boundArm(flow.partBind.get(part), callee)
         const known = recorded.get(k)
         if (known) {
-            if (known.dead && (!dead || known.dead[0] !== dead[0] || known.dead[1] !== dead[1])) known.dead = undefined
+            if (known.dead && deadKey(known.dead) !== deadKey(dead)) known.dead = undefined
             continue
         }
         const site: Site = { unit: owner.summary.fn, node: x.node, instance: caller, operand, dead }
@@ -6933,9 +7097,16 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
     } else for (const entry of flow.exportedInstances) if (entry.inst.summary === old) olds.push(entry.inst)
     const marks = flow.exported.marks!
     const stale = new Set<number>()
-    if (!answering) for (const [, known] of flow.instanceOf.get(fn) ?? []) {
-        const inst = flow.instances[finalInstance(known)]
-        if (inst.summary !== old || flow.retired.has(inst.id) || flow.exported.instanceIndex.has(inst.id) || stale.has(inst.id) || olds.includes(inst)) continue
+    const unexported: number[] = []
+    if (!answering) for (const [, known] of flow.instanceOf.get(fn) ?? []) unexported.push(finalInstance(known))
+    let made = marks.instances
+    while (!answering && made < flow.instances.length) {
+        if (flow.instances[made].summary === old) unexported.push(made)
+        made++
+    }
+    for (const id of unexported) {
+        const inst = flow.instances[id]
+        if (inst.site || inst.summary !== old || flow.retired.has(inst.id) || flow.exported.instanceIndex.has(inst.id) || stale.has(inst.id) || olds.includes(inst)) continue
         if (inst.callers.some(c => instOfSlot(c).id >= marks.instances)) olds.push(inst)
         else if (!inst.callers.length) stale.add(inst.id)
     }
@@ -6944,9 +7115,10 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
     const forks = new Set<number>(seeds.keys())
     let nodes = 0
     let attempts = 0
+    let callers: Instance[] = []
     while (attempts < maxStepAttempts) {
         attempts++
-        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * Math.max(olds.length, 1), keys: flow.keyPending.length }
+        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * Math.max(olds.length, 1), keys: flow.keyPending.length, replacing: new Map(), reflowing: new Map() }
         flow.step = step
         const s = answering ? old : newSummary(fn, g, old.id)
         intrinsics.assert(sigWidth(s) === sigWidth(old), `value-flow: ${old.name} changed its signature in a rewrite`)
@@ -6954,7 +7126,8 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
             s.kindIds = old.kindIds
             s.kindVecs = old.kindVecs
         }
-        const demands = old.demands !== undefined && !sameDemands(paramDemands(s), old.demands)
+        const demands = old.demands !== undefined && demandsChanged(old.demands, paramDemands(s), olds)
+        if (old.demands !== undefined && !demands) s.demands = old.demands
         const owned: number[] = []
         let origin = answering ? step.origins : 1
         while (origin < step.origins) {
@@ -6965,16 +7138,22 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
             origin++
         }
         const next = olds.map(inst => flow.instances[newInstance(s, inst.qual, inst.lit, inst.litParam, inst.kinds, inst)])
+        olds.forEach((inst, i) => step.replacing.set(inst.id, next[i].id))
+        const reflowed = callers.map(inst => {
+            step.reflowing.set(flow.instances.length, inst)
+            return flow.instances[newInstance(inst.summary, inst.qual, inst.lit, inst.litParam, inst.kinds, inst)]
+        })
+        for (const inst of callers) step.nodes += countNodes(inst.summary.g)
         settle()
         while (pullNumberMethods()) settle()
-        const returns = olds.some((inst, i) => !slotWithin(next[i].ret, inst.ret))
+        const returns = callers.length ? callers.some((inst, i) => !slotWithin(reflowed[i].ret, inst.ret)) : olds.some((inst, i) => !slotWithin(next[i].ret, inst.ret))
         const grown = frozenOriginFields(step)
         const fields = grown.length > 0
         const dynamics = changesDynamics(step)
         const widened = returns || fields || dynamics || demands
         flow.step = undefined
         nodes = step.nodes
-        if (stepsFlag) console.log(`STEP ${old.name} attempt ${attempts}: ret ${returns} fields ${fields} keyed ${dynamics} new ${flow.instances.length - step.instances} work ${flow.work - start} nodes ${nodes} blocked ${[...new Set(step.blocked)].slice(0, 6).map(whySlotText).join('; ')}`)
+        if (stepsFlag) console.log(`STEP ${old.name} attempt ${attempts}: callers ${callers.length} ret ${returns} fields ${fields} keyed ${dynamics} new ${flow.instances.length - step.instances} work ${flow.work - start} nodes ${nodes} blocked ${[...new Set(step.blocked)].slice(0, 6).map(whySlotText).join('; ')}`)
         if (!widened && !step.blocked.length) {
             let i = 0
             while (i < olds.length) {
@@ -6983,6 +7162,15 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
                 flow.retired.add(inst.id)
                 if (flow.rooted.has(inst.id)) flow.rooted.add(next[i].id)
                 if (flow.heldStatics.has(inst.id)) flow.heldStatics.add(next[i].id)
+                i++
+            }
+            i = 0
+            while (i < callers.length) {
+                const inst = callers[i]
+                flow.replaced.set(inst.id, reflowed[i].id)
+                flow.retired.add(inst.id)
+                if (flow.rooted.has(inst.id)) flow.rooted.add(reflowed[i].id)
+                if (flow.heldStatics.has(inst.id)) flow.heldStatics.add(reflowed[i].id)
                 i++
             }
             if (step.forked.size) {
@@ -7011,14 +7199,31 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
         flow.summaries.set(fn, old)
         flow.summaryList[old.id - 1] = old
         for (const cell of old.fresh) flow.freshOwner.set(cell, old)
-        if (widened) return false
+        const reached = returns && !answering && !callers.length && !fields && !dynamics && !demands ? callersOf(olds) : undefined
+        if (reached?.length) callers = reached
+        else if (widened) return false
         for (const slot of step.blocked) {
             const owner = flow.slotOwner[slot]
-            if (flow.slotKind[slot] !== SlotKind.sig || olds.some(inst => inst.id === owner)) return false
+            if (flow.slotKind[slot] !== SlotKind.sig || olds.some(inst => inst.id === owner) || callers.some(inst => inst.id === owner)) return false
+            for (const [shared, kept] of seeds) if (kept === owner) seeds.delete(shared)
             forks.add(owner)
         }
     }
     throw `value-flow: replacing ${old.name} did not settle in ${maxStepAttempts} attempts`
+}
+
+function callersOf(olds: Instance[]): Instance[] | undefined {
+    const out: Instance[] = []
+    for (const inst of olds) {
+        if (flow.rooted.has(inst.id) || flow.heldStatics.has(inst.id)) return
+        for (const slot of inst.callers) {
+            const from = instOfSlot(slot)
+            if (from.site) return
+            if (flow.retired.has(from.id) || olds.includes(from) || out.includes(from)) continue
+            out.push(from)
+        }
+    }
+    return out
 }
 
 function acceptedForks(olds: Instance[]): Map<number, number> {

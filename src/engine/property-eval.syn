@@ -43,6 +43,7 @@ export interface LayoutTable {
     views?: Map<Handle, Handle[]>
     codes?: Map<Handle, Handle>
     absent?: Map<Handle, Map<Handle, boolean>>
+    counted?: Map<Handle, Set<Handle>>
 }
 
 export interface Answer {
@@ -634,7 +635,52 @@ function resolveProperties(
         const n = getNode(source, ref)
         return n?.op === NodeOp.heapHandle && countIds(n) === 1 && !getRef(n, 0) && getLiteral(runtime, n, 0) === heap.nullHandle
     }
+    const wraps = new Map<number, number>()
+    for (const [id, n] of nodeEntries(source)) {
+        if (n.op === NodeOp.rt && getLiteral(runtime, n, 1) === RtOp.countedWrap) wraps.set(strippedAfter(getRef(n, 2)), id)
+    }
+    const wrapperLoads = new Map<number, number>()
+    const unboxes = new Map<number, number>()
+    const wrapperValues = new Set<number>()
+    function strippedAfter(id: number): number {
+        let n = getNode(source, id)
+        while (n?.op === NodeOp.after) {
+            id = getRef(n, countIds(n) - 1)
+            n = getNode(source, id)
+        }
+        return id
+    }
+    function countedSlot(shape: Handle, key: Handle): boolean {
+        return !!opts.layouts.counted?.get(shape)?.has(key)
+    }
+    function countedOffset(shape: Handle, offset: number): boolean {
+        const keys = opts.layouts.counted?.get(shape)
+        if (!keys) return false
+        const fields = layout(shape)
+        const at = fields.offsets.indexOf(offset)
+        return at >= 0 && keys.has(fields.keys[at])
+    }
+    function wrapperOf(value: number): number {
+        const at = strippedAfter(value)
+        const wrapped = wraps.get(at)
+        if (wrapped !== undefined) {
+            wrapperValues.add(wrapped)
+            return wrapped
+        }
+        if (countedOp(at) === RtOp.countedUnbox) {
+            shape(at)
+            const boxed = unboxes.get(at)!
+            wrapperValues.add(boxed)
+            return boxed
+        }
+        if (getNode(source, at)?.op === NodeOp.getProp) evaluate(at)
+        const read = wrapperLoads.get(at)
+        if (read === undefined) throw `property-eval: %${value} goes into a counted slot, but it is neither wrapped nor read from a counted slot`
+        wrapperValues.add(read)
+        return read
+    }
     function storeField(id: number, token: number, base: number, displacement: number, owner: Handle, offset: number, value: Operand): void {
+        if (countedOffset(owner, offset) && !(typeof value === 'number' ? wrapperValues.has(value) : value.literal === 0)) throw `property-eval: %${id} stores something other than a wrapper into a counted slot`
         const located = locate(owner, String(offset))
         const word = wordCodec(located)
         const rawFloat = located?.kind === 'f64' && !located.encoded
@@ -1254,9 +1300,13 @@ function resolveProperties(
             }
             const rawFloat = located?.kind === 'f64' && !located.encoded
             const word = wordCodec(located)
-            const load = newId()
+            const raw = newId()
             const signed = opts.answers?.get(id)?.signed
-            putNode(out, load, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : signed !== undefined ? signed ? Types.i64 : Types.u64 : native.intType(located) ?? Types.u64)
+            const counts = countedSlot(mem.shape, key)
+            if (counts && (word || located?.kind !== 'ref')) throw `property-eval: %${id} reads a counted slot whose payload is not a plain object reference`
+            putNode(out, raw, NodeOp.load, [stable ? readonlyToken() : token, base, { literal: displacement }], rawFloat ? Types.f64 : word ? Types.vm_value : signed !== undefined ? signed ? Types.i64 : Types.u64 : native.intType(located) ?? Types.u64)
+            const load = counts ? addNode(out, NodeOp.load, [stable ? readonlyToken() : token, raw, { literal: 8 }], Types.u64) : raw
+            if (counts) wrapperLoads.set(id, raw)
             const tag = mem.tags[at]
             const tagRead = tag ? readBit(stable ? readonlyToken() : token, base, embedded ? tag.offset : mem.base + tag.offset, tag) : 0
             if (tagRead) fieldTags.set(id, tagRead)
@@ -1316,11 +1366,12 @@ function resolveProperties(
             return
         }
         const tag = mem.tags[at]
+        const stored = countedSlot(mem.shape, key) ? wrapperOf(value[0]) : value[0]
         if (tag) {
             const payload = newId()
-            storeField(payload, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] })
+            storeField(payload, token, base, displacement, mem.shape, mem.offsets[at], stored || { literal: value[1] })
             writeBit(id, payload, base, embedded ? tag.offset : mem.base + tag.offset, tag, tagValue(value[0], 1))
-        } else storeField(id, token, base, displacement, mem.shape, mem.offsets[at], value[0] || { literal: value[1] })
+        } else storeField(id, token, base, displacement, mem.shape, mem.offsets[at], stored || { literal: value[1] })
         const storedShape = value[0] ? storedFact(value[0]) : literalStored(mem.shape, key, value[1])
         if (storedShape !== undefined && !dead(id)) storeFact(mem.shape, String(mem.offsets[at]), storedShape, value[0])
     }
@@ -2212,6 +2263,8 @@ function resolveProperties(
             if (forwarded !== undefined) return shape(forwarded)
         }
         if (n.op === NodeOp.load) return loadShape(id, n)
+        if (countedOp(id) === RtOp.countedBox) return shape(getRef(n, 2))
+        if (countedOp(id) === RtOp.countedUnbox) return unboxCounted(id, getRef(n, 2))
         if (n.op === NodeOp.call && opts.calls) {
             bindCall(id)
         }
@@ -2223,6 +2276,19 @@ function resolveProperties(
         if (n.op !== NodeOp.getProp && n.op !== NodeOp.call) return
         resolvePending(id)
         return boundShape(id)
+    }
+    function countedOp(id: number): number | undefined {
+        const n = getNode(source, id)
+        return n?.op === NodeOp.rt ? getLiteral(runtime, n, 1) as number : undefined
+    }
+    function unboxCounted(id: number, boxed: number): Handle | null | undefined {
+        const s = shape(boxed)
+        const held = memory.get(boxed)
+        if (!s || !held) throw `property-eval: %${id} unboxes a counted value whose wrapper points at no known object`
+        putNode(out, id, NodeOp.load, [readonlyToken(), held.ptr, { literal: 8 }], Types.u64)
+        memory.set(id, { ...pointerMemory(id, s), union: held.union, members: held.members })
+        unboxes.set(id, held.ptr)
+        return s
     }
     function loadShape(id: number, n: GraphNode): Handle | null | undefined {
         shape(getRef(n, 1))
@@ -2951,6 +3017,29 @@ function resolveProperties(
         }
         if (n.op !== NodeOp.getProp && n.op !== NodeOp.setProp) continue
         evaluate(id)
+    }
+    for (const [id, n] of nodeEntries(source)) {
+        if (n.op !== NodeOp.rt) continue
+        const op = getLiteral(runtime, n, 1)
+        const token = getRef(n, 0)
+        if (op === RtOp.countedWrap) {
+            const item = getRef(n, 2)
+            const block = addNode(out, NodeOp.rt, [token, { literal: RtOp.malloc }, { literal: 16 }], Types.u64)
+            const count = addNode(out, NodeOp.store, [block, block, { literal: 0 }, { literal: 0 }], Types.u64)
+            const payload = addNode(out, NodeOp.store, [count, block, { literal: 8 }, item], Types.u64)
+            putNode(out, id, NodeOp.after, [payload, block])
+            continue
+        }
+        if (op === RtOp.countedRetain) {
+            const wrapper = wrapperOf(getRef(n, 2))
+            const count = addNode(out, NodeOp.load, [token, wrapper, { literal: 0 }], Types.u64)
+            putNode(out, id, NodeOp.store, [count, wrapper, { literal: 0 }, addNode(out, NodeOp.add, [count, { literal: 1 }], Types.u64)], Types.u64)
+            continue
+        }
+        if (op === RtOp.countedWrapper) putNode(out, id, NodeOp.after, [token, wrapperOf(getRef(n, 2))])
+        if (op === RtOp.freeable) putNode(out, id, NodeOp.after, [token, getRef(n, 2)])
+        if (op === RtOp.countedBox) putNode(out, id, NodeOp.after, [token, wrapperOf(getRef(n, 2))])
+        if (op === RtOp.countedUnbox) shape(id)
     }
     for (const [id, n] of nodeEntries(source)) {
         if (n.op === NodeOp.static) shape(id)

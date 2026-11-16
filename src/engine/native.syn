@@ -6,7 +6,7 @@ import type { Allocation, FastTraced } from './fast-trace'
 import { globals as builtinGlobals, markStacks, releaseStacks } from './builtins'
 import { assignOne } from './builtin/Object'
 import { reportPanic } from './builtin/Error'
-import { blockBytes } from './builtin/memory'
+import { blockBytes, dropUnlessEmpty, releaseCounted, releaseUnlessEmpty, unlessSame } from './builtin/memory'
 import ts from 'typescript' // XXX: used for `api.zig`
 import * as intrinsics from './intrinsics'
 import * as heap from './heap'
@@ -51,7 +51,7 @@ import { fuseConcats, rewriteInitializations, planMissedLookups, planSmallSets, 
 import { classCuts, classCutAt, cutGeneric, cutClasses, cutClosure, cutInstanceField, cutRefScalar, cutScalarType, cutFilterType, type CutTerm, type CutGuard, type CutWrite, emptyTerm, guardAdmits, CutInputKind, EntryRole, cutDisplay, cutPositions, cutReadChain, cutTermText, cutText, fnCut, flowAccesses, rootParamType, type Cut, dropHook } from './value-flow'
 import { type AccessHost, type Accesses, type Location, reflowDifferences, constantIndex, constantLiteral, cutArgument, cutCalls, listOf, mapOf, setOf, receiverValue, type MemberFacts, cutReadType, cutTypeText, cutUnion, cutWithin, emptyType, formatType, formText, inhabited, initOnly, type InstanceSignature, keyLabel, sameConstants, unionAll, constructedAllocation, constructionNode, dereferenceableRep, numberKey, numberName, intFormatOf, machineNumberName, nonzeroLiteral, nullableNumber, floatUnion, elementWidth, type SlotCodec, analyzeTypes, checkTypes, dumpTypes, fixedField, fixedState, type Generic, type ElementReads, type Instantiations, planEmbeddings, planPstackRegions, type PstackPlan, planUnits, shareClasses, shareUnits, isStringRep, addressRep, sameArgument, memberCount, createInterner, intern, type Atom, RepMember, repText, returnProjects, Representation, representationOf, sameRepresentation, type BoundaryRepresentation, sameRep, shapeSignatureText, unitSignatureText, type PlannedUnit, type Rep, type ShapeSignature, type NativeParam, type NativeUnit, type ObjectType, type Site, type Type, type ValueTypes } from './value-types'
 import { snapshotField } from './heap-records'
-import { analyzeLifetimes, exitOrdering, reportLifetimes, type Lifetimes, type OwnedField } from './lifetime'
+import { analyzeLifetimes, exitOrdering, OwnedKind, reportLifetimes, type Counted, type CountedArg, type CountedOwned, type CountedRet, type CountedWrite, type FieldEnd, type Lifetimes, type OwnedField } from './lifetime'
 import { createBinder, isLocalStub, namedStub, type Binder, type Code, type Unit } from './program-graph'
 
 type usize = u32
@@ -7188,6 +7188,7 @@ interface ShapePlan {
     closureCodes: Map<intrinsics.Handle, intrinsics.Handle>
     absentKeys: Map<intrinsics.Handle, Map<intrinsics.Handle, boolean>>
     scopeFrames: Map<string, intrinsics.Handle | undefined>
+    counted: Map<intrinsics.Handle, Set<intrinsics.Handle>>
 }
 interface UnitPlan {
     unit: PlannedUnit
@@ -12216,12 +12217,12 @@ function transformInitializations(accesses: Accesses, types: ValueTypes, host: A
 
 function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function>, host: AccessHost, tracer: Tracer): { placed: number, freed: Set<number>, answered: number } {
     const key = { literal: heap.fromJsSymbol(Symbol.drop) }
-    const fields = new Map<Function, number[]>()
+    const fields = new Map<Function, FieldEnd[]>()
     const exits = new Map<Function, Map<number, Map<number, [value: number, fields: OwnedField[] | undefined][]>>>()
     const units = new Set<Function>()
     const freeing = new Map<Function, number[]>()
     for (const end of ends.fields) {
-        listOf(fields, end.unit).push(end.write)
+        listOf(fields, end.unit).push(end)
         listOf(freeing, end.unit).push(...end.objects)
         units.add(end.unit)
     }
@@ -12237,6 +12238,34 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         listOf(freeing, end.unit).push(...end.objects)
         for (const [block, tail] of end.exits) listOf(mapOf(mapOf(exits, end.unit), block), tail).push([end.value, end.fields])
     }
+    const countedWrites = new Map<Function, CountedWrite[]>()
+    const countedLocals = new Map<Function, number[]>()
+    const countedArgs = new Map<Function, CountedArg[]>()
+    const countedRets = new Map<Function, CountedRet[]>()
+    const countedOwned = new Map<Function, CountedOwned[]>()
+    const releases = new Map<Function, Map<number, Map<number, [value: number, group: number][]>>>()
+    const groupOf = new Map<CountedWrite | CountedOwned, number>()
+    ends.counted.forEach((group, i) => {
+        for (const fn of [...group.writes.map(w => w.unit), ...group.locals.map(l => l.unit), ...group.args.map(a => a.unit), ...group.rets.map(r => r.unit), ...group.owned.map(o => o.unit)]) {
+            if (rewritten.has(fn)) throw `native: counted slots need a store in ${fn.name}, which the initializations pass rewrote in this compile`
+            listOf(freeing, fn).push(...group.objects, ...group.owns ?? [])
+            units.add(fn)
+        }
+        for (const write of group.writes) {
+            listOf(countedWrites, write.unit).push(write)
+            groupOf.set(write, i)
+        }
+        for (const arg of group.args) listOf(countedArgs, arg.unit).push(arg)
+        for (const ret of group.rets) listOf(countedRets, ret.unit).push(ret)
+        for (const owned of group.owned) {
+            listOf(countedOwned, owned.unit).push(owned)
+            groupOf.set(owned, i)
+        }
+        for (const local of group.locals) {
+            listOf(countedLocals, local.unit).push(local.value)
+            for (const [block, tail] of local.exits) listOf(mapOf(mapOf(releases, local.unit), block), tail).push([local.value, i])
+        }
+    })
     let placed = 0
     let answered = 0
     const freed = new Set<number>()
@@ -12274,27 +12303,133 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         const dropFields = (order: number, holder: number, owned: OwnedField[]): number => {
             for (const field of owned) {
                 const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
-                order = field.inner ? dropFields(value, value, field.inner) : drop(value, value)
+                order = field.group !== undefined ? release(value, value, field.group) : field.inner ? dropFields(value, value, field.inner) : drop(value, value)
             }
             return order
         }
-        for (const write of fields.get(fn) ?? []) {
-            const n = getNode(graph, write)!
+        const counted = (order: Operand, op: rt.Op, args: Operand[]): number => addNode(graph, NodeOp.rt, [order, { literal: op }, ...args], rt.signatureOf(op).returns)
+        const linked = (order: number, target: Function, args: Operand[]): number => addNode(graph, NodeOp.call, [order, addNode(graph, NodeOp.heapHandle, [{ literal: host.binder.session.linkFunction(target) }]), { literal: 0 }, ...args])
+        const releasedFields = (order: number, last: number, holder: number, owned: OwnedField[], groups: number[]): number => {
+            for (const field of owned) {
+                const value = addNode(graph, NodeOp.getProp, [order, holder, { literal: field.key }])
+                if (field.group !== undefined) {
+                    const inner = ends.counted[field.group].fields
+                    const released = linked(value, releaseUnlessEmpty, [last, value, counted(value, rt.Op.countedWrapper, [value])])
+                    order = inner && !groups.includes(field.group) ? releasedFields(released, released, value, inner, [...groups, field.group]) : released
+                    continue
+                }
+                order = field.inner ? releasedFields(value, last, value, field.inner, groups) : linked(value, dropUnlessEmpty, [last, value])
+            }
+            return order
+        }
+        const release = (order: number, value: number, group: number): number => {
+            const last = linked(order, releaseCounted, [value, counted(value, rt.Op.countedWrapper, [value])])
+            const inner = ends.counted[group].fields
+            return inner ? releasedFields(last, last, value, inner, [group]) : last
+        }
+        const retarget = (from: number, to: number, skip: number[], ordering: boolean) => {
+            for (const [id, n] of nodeEntries(graph)) {
+                if (skip.includes(id)) continue
+                const last = n.op === NodeOp.after ? countIds(n) - 1 : OrderedValues.has(n.op) ? 1 : 0
+                let i = ordering ? 0 : last
+                const end = ordering ? last : countIds(n)
+                let operands: Operand[] | undefined
+                while (i < end) {
+                    if (getRef(n, i) === from) {
+                        operands ??= getOperands(graph, n)
+                        operands[i] = to
+                    }
+                    i++
+                }
+                if (operands) putCopy(graph, id, n, operands)
+            }
+        }
+        const owning = new Map<number, Map<number, [value: number, group: number][]>>()
+        for (const owned of countedOwned.get(fn) ?? []) {
+            let value = owned.value
+            if (owned.kind === OwnedKind.fresh) {
+                const wrap = counted(value, rt.Op.countedWrap, [value])
+                const retain = counted(wrap, rt.Op.countedRetain, [value])
+                retarget(value, retain, [wrap, retain], true)
+            } else {
+                value = counted({ literal: 0 }, rt.Op.countedUnbox, [owned.value])
+                retarget(owned.value, value, [value], false)
+            }
+            count++
+            for (const [block, tail] of owned.exits) listOf(mapOf(owning, block), tail).push([value, groupOf.get(owned)!])
+        }
+        for (const arg of countedArgs.get(fn) ?? []) {
+            const n = getNode(graph, arg.call)!
+            const value = getOperand(graph, n, arg.slot)
+            const order = counted(getOperand(graph, n, 0), rt.Op.countedRetain, [value])
+            const operands = getOperands(graph, n)
+            operands[0] = order
+            operands[arg.slot] = counted({ literal: 0 }, rt.Op.countedBox, [value])
+            putCopy(graph, arg.call, n, operands)
+            count++
+        }
+        for (const ret of countedRets.get(fn) ?? []) {
+            const n = getNode(graph, ret.ret)!
+            const value = getOperand(graph, n, 1)
+            let order = getOperand(graph, n, 0)
+            if (ret.wrap) order = counted(order, rt.Op.countedWrap, [value])
+            order = counted(order, rt.Op.countedRetain, [value])
+            const operands = getOperands(graph, n)
+            operands[0] = order
+            operands[1] = counted({ literal: 0 }, rt.Op.countedBox, [value])
+            putCopy(graph, ret.ret, n, operands)
+            count++
+        }
+        for (const end of fields.get(fn) ?? []) {
+            const n = getNode(graph, end.write)!
             const old = addNode(graph, NodeOp.getProp, [getOperand(graph, n, 0), getOperand(graph, n, 1), getOperand(graph, n, 2)])
             count++
-            putCopy(graph, write, n, withOperand(graph, n, 0, drop(old, old)))
+            if (!end.kept.length) {
+                putCopy(graph, end.write, n, withOperand(graph, n, 0, drop(old, old)))
+                continue
+            }
+            let item = old
+            for (const handle of end.kept) item = linked(item, unlessSame, [item, addNode(graph, NodeOp.heapHandle, [{ literal: handle }])])
+            putCopy(graph, end.write, n, withOperand(graph, n, 0, linked(item, dropUnlessEmpty, [item, counted(item, rt.Op.freeable, [item])])))
         }
-        for (const [block, tails] of exits.get(fn) ?? []) {
+        for (const write of countedWrites.get(fn) ?? []) {
+            const n = getNode(graph, write.write)!
+            const value = getOperand(graph, n, 3)
+            let order = getOperand(graph, n, 0)
+            if (write.wrap) order = counted(order, rt.Op.countedWrap, [value])
+            order = counted(order, rt.Op.countedRetain, [value])
+            if (write.release) {
+                const old = addNode(graph, NodeOp.getProp, [order, getOperand(graph, n, 1), getOperand(graph, n, 2)])
+                order = release(old, old, groupOf.get(write)!)
+            }
+            count++
+            putCopy(graph, write.write, n, withOperand(graph, n, 0, order))
+        }
+        for (const value of countedLocals.get(fn) ?? []) {
+            const retain = counted(value, rt.Op.countedRetain, [value])
+            retarget(value, retain, [retain], true)
+            count++
+        }
+        const blocks = new Set<number>([...exits.get(fn)?.keys() ?? [], ...releases.get(fn)?.keys() ?? [], ...owning.keys()])
+        for (const block of blocks) {
+            const tails = exits.get(fn)?.get(block)
+            const freeing = releases.get(fn)?.get(block)
+            const owned = owning.get(block)
             const b = getBlock(graph, block)!
             let tail = 0
             setBlockBody(graph, b, mapTailPositions(graph, b.bodyId, p => {
-                const values = tails.get(tail)
+                const values = tails?.get(tail)
+                const counts = freeing?.get(tail) || owned?.get(tail) ? [...freeing?.get(tail) ?? [], ...owned?.get(tail) ?? []] : undefined
                 tail++
-                if (!values) return p.at
+                if (!values && !counts) return p.at
                 let order = exitOrdering(graph, p)
-                for (const [value, owned] of values) {
+                for (const [value, owned] of values ?? []) {
                     count++
                     order = owned ? dropFields(order, value, owned) : drop(order, value)
+                }
+                for (const [value, group] of counts ?? []) {
+                    count++
+                    order = release(order, value, group)
                 }
                 const n = getNode(graph, p.at)!
                 if (!OrderedValues.has(n.op)) return addNode(graph, NodeOp.after, [order, p.at])
@@ -12303,6 +12438,7 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
         }
         dirtyIndex(graph)
         if (!accesses.replace(fn, graph)) {
+            if (countedWrites.has(fn) || countedLocals.has(fn) || countedArgs.has(fn) || countedRets.has(fn) || countedOwned.has(fn)) throw `native: ${fn.name} counts slots, but the analysis only accepts it by widening a type it already gave out`
             refuse(fn, 'end needs a call the analysis only accepts by widening a type it already gave out')
             continue
         }
@@ -12316,6 +12452,29 @@ function placeDrops(accesses: Accesses, ends: Lifetimes, rewritten: Set<Function
     }
     if (ends.droppable.size) for (const o of ends.elements) freed.add(o)
     return { placed, freed, answered }
+}
+
+function planCountedSlots(plan: ShapePlan, groups: Counted[]): void {
+    if (!groups.length) return
+    const shapeOf = new Map<number, string>()
+    for (const [id, sig] of plan.inst.shapes) {
+        for (const m of sig.members) shapeOf.set(m, id)
+    }
+    const slots = new Set<string>()
+    for (const group of groups) {
+        for (const location of group.locations) slots.add(`${location.allocation}:${location.key}`)
+    }
+    for (const group of groups) {
+        for (const location of group.locations) {
+            const id = shapeOf.get(location.allocation)
+            const shape = id === undefined ? undefined : plan.shapes.get(id)
+            if (id === undefined || shape === undefined) throw `native: counted slot ${location.key} of object ${location.allocation} has no planned shape`
+            for (const m of plan.inst.shapes.get(id)!.members) {
+                if (!slots.has(`${m}:${location.key}`)) throw `native: planned shape ${id} holds a counted slot ${location.key} for object ${location.allocation} and a plain one for object ${m}`
+            }
+            setOf(plan.counted, shape).add(location.handle!)
+        }
+    }
 }
 
 function checkReflow(accesses: Accesses, extended: ValueTypes, host: AccessHost, roots: Function[]): void {
@@ -12430,13 +12589,15 @@ function printDrops(ends: Lifetimes, placed: number, answered: number): void {
     let refused = 0
     for (const count of ends.refused.values()) refused += count
     console.log(`DROPS placed ${placed} (${ends.locals.length} locals, ${ends.fields.length} field writes, ${ends.drops.length} holder drops, ${ends.guards.size} element guards over ${ends.droppable.size} slices), ${answered} functions answer their element guards, refused ${refused}, ${ends.work} steps`)
+    const counted = (count: (group: Counted) => number) => ends.counted.reduce((sum, group) => sum + count(group), 0)
+    console.log(`DROPS counted ${counted(group => group.objects.length)} objects in ${counted(group => group.locations.length)} slots over ${ends.counted.length} groups, ${counted(group => group.writes.length)} stores (${counted(group => group.writes.filter(w => w.release).length)} replace), ${counted(group => group.locals.length)} locals, ${counted(group => group.args.length)} args, ${counted(group => group.rets.length)} returns, ${counted(group => group.owned.length)} owned`)
     for (const [why, count] of [...ends.refused].sort((a, b) => b[1] - a[1])) console.log(`DROPS refused ${count}: ${why}`)
 }
 
 function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned: Planned, reps: Representations, facts: Facts, clock: PhaseClock, wordsSlot: (words: number[]) => number) {
     const { session, functions, unitOf, originOf, constructsOutOfLine, link, isRoot, sourceOfLinked, usesReceiver, thisParamOf, calleeOf, codeOf, boundTarget, graphOf } = binder
     const { tracedOf, stateOf, reachableNodes } = tracer
-    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values(), ...plan.statics.viewed]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys }
+    const layouts: propertyEval.LayoutTable = { codecs: facts, fixedCodecs: new Set([...plan.shapes.values(), ...planned.frames.values(), ...plan.statics.viewed]), refinements: plan.embedded.fields, bits: plan.bits, fixed: plan.fixedFields, erased: plan.erasedFields, views: plan.closureViews, codes: plan.closureCodes, absent: plan.absentKeys, counted: plan.counted }
     function abiOf(fn: Function): UnitAbi {
         return reps.abi.get(fn) ?? { mode: constructsOutOfLine(fn) || stateOf(originOf(fn)).stubbed ? 'keep' : 'encoded', returns: Types.u64, tags: [] }
     }
@@ -13601,7 +13762,7 @@ function planShapes(types: ValueTypes, binder: Binder, tracer: Tracer, host: Acc
         if (!facts.has(shape)) facts.set(shape, new Map())
         facts.set(state, facts.get(shape)!)
     }
-    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map() }
+    return { units: plan, inst, shapes: handles, fixedFields, erasedFields, constants, embedded: { fields: embedded, sites, within: embeddings.within }, bits, layoutOf, reducedShape: reducedPlanShape, fixedStatic, statics: { placed: placedStatics, readonly: readonlyConstructions, codecs: constructionCodecs, shapeOf: staticShape, fields: staticFields, viewed, layouts: placedLayouts }, functionObjects, closureViews, closureCodes, absentKeys, scopeFrames: new Map(), counted: new Map() }
 }
 
 function localizeCalls(graph: Graph, image: ProgramImage, units: Map<number, Graph>): void {
@@ -15022,6 +15183,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const members = memberFacts(valueTypes, accesses.locations, host, proto => genericOf(proto) ? classCutOf(proto) : undefined)
     const { plan, planned, reps } = clock.timed('plan', () => {
         const plan = planShapes(valueTypes, binder, tracer, host, genericOf, facts, members, slab)
+        planCountedSlots(plan, ends.counted)
         for (const [shape, kinds] of plan.bits) image.recordBits.set(shape, kinds)
         for (const [state, layout] of plan.statics.layouts) image.placedLayouts.set(state, layout)
         const planned = bindPlannedUnits(plan, binder)

@@ -3,7 +3,7 @@
 import * as rt from './rt'
 import { closureCallKey } from './heap'
 import { expectForm, type Graph, type GraphNode } from './lowering2'
-import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, NodeOp, nodeEntries, opName, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
+import { countIds, countNodes, dominatorTree, getBlock, getNode, getRef, getLiteral, graphLoops, isThisParam, NodeOp, nodeEntries, opName, OrderedValues, tailOf, tailPositions, tailRoots, type GraphLoops, type TailPosition } from './graph-node'
 import { AllocKind, constructorOf, elementDropGuard, FieldForm, listOf, mapOf, nodesUnderElementDrops, objectsOnly, pstackRefs, readsUndefined, receiverValue, returnsSelf, setOf, usersOf, type AccessHost, type Location, type Site, type Type, type ValueTypes } from './value-types'
 
 export interface LocalEnd {
@@ -17,6 +17,7 @@ export interface FieldEnd {
     unit: Function
     write: number
     objects: number[]
+    kept: number[]
 }
 
 export interface Contained {
@@ -28,6 +29,7 @@ export interface Contained {
 export interface OwnedField {
     key: number
     inner: OwnedField[] | undefined
+    group?: number
 }
 
 export interface HolderDrop {
@@ -36,6 +38,63 @@ export interface HolderDrop {
     exits: [block: number, tail: number][]
     fields: OwnedField[]
     objects: number[]
+}
+
+export interface CountedWrite {
+    unit: Function
+    write: number
+    wrap: boolean
+    release: boolean
+}
+
+export enum OwnedKind {
+    param,
+    result,
+    fresh,
+}
+
+export interface CountedArg {
+    unit: Function
+    call: number
+    slot: number
+}
+
+export interface CountedRet {
+    unit: Function
+    ret: number
+    wrap: boolean
+}
+
+export interface CountedOwned {
+    unit: Function
+    value: number
+    exits: [block: number, tail: number][]
+    kind: OwnedKind
+}
+
+export interface Counted {
+    objects: number[]
+    locations: Location[]
+    writes: CountedWrite[]
+    locals: LocalEnd[]
+    args: CountedArg[]
+    rets: CountedRet[]
+    owned: CountedOwned[]
+}
+
+enum SourceKind {
+    read,
+    fresh,
+    param,
+    result,
+}
+
+interface Boxing {
+    params: Map<Function, Set<number>>
+    results: Set<Function>
+    args: CountedArg[]
+    rets: CountedRet[]
+    owned: CountedOwned[]
 }
 
 export interface LifeBlock {
@@ -76,6 +135,8 @@ export interface Lifetimes {
     droppable: Set<number>
     guards: Set<Function>
     elements: number[]
+    counted: Counted[]
+    eternal: Set<number>
 }
 
 interface Body {
@@ -142,7 +203,7 @@ function exitOrderings(g: Graph, p: TailPosition): number[] {
 }
 
 export function analyzeLifetimes(types: ValueTypes, locations: Location[], host: AccessHost, hooked: (object: number) => boolean, report = false): Lifetimes {
-    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [] }
+    const out: Lifetimes = { locals: [], fields: [], contained: [], holders: [], drops: [], refused: new Map(), work: 0, droppable: new Set(), guards: new Set(), elements: [], counted: [], eternal: new Set() }
     const wanted = types.objects.map((_, id) => hooked(id))
     if (!wanted.includes(true)) return out
     const instancesOf = new Map<Function, number[]>()
@@ -180,6 +241,21 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (!byKey) fieldsOf.set(location.allocation, byKey = new Map())
         byKey.set(location.handle as number, location)
     }
+    const eternal = out.eternal
+    const judged = new Map<number, boolean>()
+    function eternalOf(o: number): boolean {
+        const known = judged.get(o)
+        if (known !== undefined) return known
+        judged.set(o, false)
+        let lasting = types.objects[o].constant
+        const list = holders.get(o) ?? []
+        if (!lasting && list.length) lasting = list.every(location => eternalOf(location.allocation))
+        charge(1)
+        judged.set(o, lasting)
+        if (lasting) eternal.add(o)
+        return lasting
+    }
+    types.objects.forEach((_, o) => eternalOf(o))
     const handed = new Map<number, Set<Function>>()
     const returnedBy = new Map<number, number[]>()
     const callers = new Map<Function, Set<Function>>()
@@ -411,7 +487,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (detail) detail.via = via
         let i = 0
         while (i < alive.length) {
-            if (types.objects[alive[i]].constant) return blamed('is held by an object that is never freed', alive[i], 0)
+            if (eternal.has(alive[i])) return blamed('is held by an eternal', alive[i], 0)
             for (const location of holders.get(alive[i]) ?? []) {
                 if (i < own.length && owner && location.handle === owner) continue
                 if (i < own.length && location.allocation === inside && location.handle === undefined) continue
@@ -693,7 +769,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return [follows, later]
     }
 
-    function heldAcross(body: Body, at: number, alive: number[], incoming?: Set<number>): boolean {
+    function heldAcross(body: Body, at: number, alive: number[], incoming?: Set<number>, found?: number[]): boolean {
         const g = body.g
         const home = homeOf(body, at)
         if (home === undefined) return true
@@ -746,7 +822,10 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             while (i < countIds(n)) {
                 const x = getRef(n, i)
                 const list = x ? body.held.get(x) : undefined
-                if (list && list.some(o => alive.includes(o)) && !fresh(x, use)) return true
+                if (list && list.some(o => alive.includes(o)) && !fresh(x, use)) {
+                    if (!found) return true
+                    if (!found.includes(x)) found.push(x)
+                }
                 i++
             }
             return false
@@ -761,7 +840,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 if (!follows.has(id) && stale(id, b)) return true
             }
         }
-        return false
+        return !!found?.length
     }
 
     function settled(holder: number, key: number): boolean {
@@ -797,7 +876,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         return false
     }
 
-    function fieldEnd(fn: Function, write: number): number[] | string {
+    function fieldEnd(fn: Function, write: number): FieldEnd | string {
         const body = bodyOf(fn)
         const g = body.g
         const n = getNode(g, write)!
@@ -810,12 +889,19 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             if (type && type.unknown) return 'stores through an unknown holder'
         }
         const old: number[] = []
+        const kept: number[] = []
         if (detail) detail.objects = old
         for (const h of targets) {
             const location = fieldsOf.get(h)?.get(key)
             if (!location) return 'stores to a field its holder does not have'
             if (!objectsOnly(location.type) || (location.forms & FieldForm.absent)) return 'replaces a value that may be absent'
             for (const o of location.type.objects) {
+                if (eternal.has(o)) {
+                    const handle = types.objects[o].handle
+                    if (handle === undefined) return 'replaces an eternal that has no handle'
+                    if (!kept.includes(handle as number)) kept.push(handle as number)
+                    continue
+                }
                 if (!wanted[o]) return 'replaces a value that may have no hook'
                 if (!old.includes(o)) old.push(o)
             }
@@ -846,7 +932,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 }
             }
         }
-        return old
+        return { unit: fn, write, objects: old, kept }
     }
 
     function storedOnce(o: number, key: number, holder?: number): string {
@@ -994,8 +1080,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
                 blocked(`field write ${end}`)
                 continue
             }
-            for (const o of end) ended.add(o)
-            out.fields.push({ unit: fn, write, objects: end })
+            if (!end.objects.length) continue
+            for (const o of end.objects) ended.add(o)
+            out.fields.push(end)
         }
     }
     const sources = new Map<Function, Set<number>>()
@@ -1477,7 +1564,7 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     const tried = new Set<number>()
     function endsAlone(o: number): boolean {
         if (endings.has(o)) return true
-        if (types.objects[o].constant || wanted[o] || tried.has(o)) return false
+        if (eternal.has(o) || wanted[o] || tried.has(o)) return false
         tried.add(o)
         for (const [fn, source] of sourcesOf(o)) {
             if (leavesWith(fn, o)) continue
@@ -1494,8 +1581,8 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (known !== undefined) return known
         fates.set(o, 'is held in a cycle of holders')
         let fate: number | string = endsAlone(o) ? o : 'has no end of its own'
-        if (types.objects[o].constant) fate = 'is never freed'
-        if (typeof fate === 'string' && !types.objects[o].constant) {
+        if (eternal.has(o)) fate = 'is eternal'
+        if (typeof fate === 'string' && !eternal.has(o)) {
             const c = containerOf(o)
             let keeper: Location | undefined
             for (const h of typeof c === 'string' ? [] : c.holders) {
@@ -1519,6 +1606,345 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
     types.objects.forEach((_, o) => {
         if (wanted[o] && !endings.has(o)) fateOf(o)
     })
+    const localEnded = new Set<number>()
+    for (const end of out.locals) {
+        for (const o of end.objects) localEnded.add(o)
+    }
+    const byProto = new Map<number, number[]>()
+    types.objects.forEach((object, id) => {
+        if (object.kind === AllocKind.object && object.proto !== undefined) listOf(byProto, object.proto as number).push(id)
+    })
+    const grouped = new Set<number>()
+    function countedRead(fn: Function, value: number, inGroup: Set<Location>): boolean {
+        const g = host.binder.graphOf(fn)
+        const n = getNode(g, tailOf(g, value))
+        if (!n || n.op !== NodeOp.getProp || getRef(n, 2)) return false
+        const key = getLiteral(g, n, 2) as number
+        const holders = heldOf(fn, getRef(n, 1))
+        if (!holders.length) return false
+        for (const h of holders) {
+            const location = fieldsOf.get(h)?.get(key)
+            if (!location || !inGroup.has(location)) return false
+        }
+        return true
+    }
+    function countedWrite(w: Site, members: Set<number>, inGroup: Set<Location>, boxing: Boxing): CountedWrite | string {
+        const body = bodyOf(w.unit)
+        const g = body.g
+        const n = getNode(g, w.node)!
+        if (n.op !== NodeOp.setProp || getRef(n, 2)) return blamed('is stored by something other than a named field store', undefined, w.node, w.unit)
+        const key = getLiteral(g, n, 2) as number
+        const targets = body.held.get(getRef(n, 1)) ?? []
+        if (!targets.length) return blamed('is stored through a holder the analysis does not list', undefined, w.node, w.unit)
+        let allocated = 0
+        let first = 0
+        for (const h of targets) {
+            const location = fieldsOf.get(h)?.get(key)
+            if (!location || !inGroup.has(location)) return blamed('is stored through a holder whose slot is not counted', h, w.node, w.unit)
+            const object = types.objects[h]
+            if (object.site.unit === w.unit && location.writers.some(x => x.unit !== w.unit || x.node !== w.node)) return blamed('stores where its holder is allocated, into a slot something else also stores', h, w.node, w.unit)
+            if (object.site.unit === w.unit) allocated++
+            else if (constructorOf(object.proto, host) === w.unit && receiverValue(g, getRef(n, 1))) first++
+            else if (!settled(h, key)) return blamed('replaces a value that may be stored before a constructor sets the field', h, w.node, w.unit)
+        }
+        if ((allocated || first) && allocated + first !== targets.length) return blamed('is a first store for some holders and a replace for others', undefined, w.node, w.unit)
+        const value = getRef(n, 3)
+        const held = value ? body.held.get(value) ?? [] : []
+        if (!held.length) return blamed('stores a value the analysis does not list', undefined, w.node, w.unit)
+        for (const o of held) {
+            if (!members.has(o)) return blamed('stores an object outside the counted group', o, w.node, w.unit)
+        }
+        const release = !allocated && !first
+        const kind = countedSource(w.unit, value, members, inGroup, boxing, 0)
+        if (typeof kind === 'string') return kind
+        return { unit: w.unit, write: w.node, wrap: kind === SourceKind.fresh, release }
+    }
+    function countedSource(fn: Function, value: number, members: Set<number>, inGroup: Set<Location>, boxing: Boxing, depth: number): SourceKind | string {
+        const body = bodyOf(fn)
+        const held = value ? body.held.get(value) ?? [] : []
+        if (!held.length) return blamed('passes a value the analysis does not list', undefined, value, fn)
+        for (const o of held) {
+            if (!members.has(o)) return blamed('passes an object outside the counted group', o, value, fn)
+        }
+        if (countedRead(fn, value, inGroup)) return SourceKind.read
+        let made = true
+        for (const o of held) {
+            const at = makerOf(o, fn)
+            if (!at || types.objects[o].site.unit !== fn || !madeAt(body, fn, value, at)) made = false
+        }
+        if (made) return SourceKind.fresh
+        if (depth > 3) return blamed('passes a value through too many calls', undefined, value, fn)
+        const tail = tailOf(body.g, value)
+        const n = getNode(body.g, tail)!
+        if (n.op === NodeOp.param) {
+            const why = countedParam(fn, tail, members, inGroup, boxing, depth + 1)
+            return why ?? SourceKind.param
+        }
+        if (rt.calleeSlot(body.g, n) >= 0) {
+            const why = countedResult(fn, tail, members, inGroup, boxing, depth + 1)
+            return why ?? SourceKind.result
+        }
+        return blamed('stores a value it neither makes, receives nor reads from a counted slot', held[0], value, fn)
+    }
+    function countedParam(fn: Function, param: number, members: Set<number>, inGroup: Set<Location>, boxing: Boxing, depth: number): string | undefined {
+        if (boxing.params.get(fn)?.has(param)) return
+        const g = host.binder.graphOf(fn)
+        const params = getBlock(g, g.root)!.params.filter(p => !isThisParam(getNode(g, p)!))
+        const index = params.indexOf(param)
+        const receiver = isThisParam(getNode(g, param)!)
+        if (index < 0 && !receiver) return blamed('stores a value carried between blocks', undefined, param, fn)
+        setOf(boxing.params, fn).add(param)
+        let sites = 0
+        for (const f of instancesOf.get(fn) ?? []) {
+            for (const site of types.instances[f].sites) {
+                if (site.instance === undefined) return blamed('stores a value from a caller the analysis cannot see', undefined, param, fn)
+                const cg = host.binder.graphOf(site.unit)
+                const n = getNode(cg, site.node)
+                if (!n || rt.calleeSlot(cg, n) < 0) return blamed('stores a value from a call the analysis cannot see', undefined, site.node, site.unit)
+                const slot = receiver ? rt.calleeSlot(cg, n) + 1 : rt.calleeSlot(cg, n) + 2 + index
+                if (slot >= countIds(n)) return blamed('stores a parameter that a caller does not pass', undefined, site.node, site.unit)
+                sites++
+                if (boxing.args.some(a => a.unit === site.unit && a.call === site.node && a.slot === slot)) continue
+                const arg = getRef(n, slot)
+                const kind = countedSource(site.unit, arg, members, inGroup, boxing, depth)
+                if (typeof kind === 'string') return kind
+                if (kind === SourceKind.fresh) {
+                    const why = ownValue(site.unit, tailOf(cg, arg), OwnedKind.fresh, members, boxing)
+                    if (why) return why
+                }
+                boxing.args.push({ unit: site.unit, call: site.node, slot })
+            }
+        }
+        if (!sites) return blamed('stores a parameter of a function the host calls', undefined, param, fn)
+        return ownValue(fn, param, OwnedKind.param, members, boxing)
+    }
+    function countedResult(fn: Function, call: number, members: Set<number>, inGroup: Set<Location>, boxing: Boxing, depth: number): string | undefined {
+        const callees = calls.get(fn)?.get(call) ?? []
+        if (callees.length !== 1) return blamed('stores the result of a call that does not resolve to one function', undefined, call, fn)
+        const callee = callees[0]
+        if (boxing.results.has(callee)) return
+        boxing.results.add(callee)
+        for (const f of instancesOf.get(callee) ?? []) {
+            for (const site of types.instances[f].sites) {
+                if (site.instance === undefined) return blamed('returns to a caller the analysis cannot see', undefined, call, fn)
+                const why = ownValue(site.unit, site.node, OwnedKind.result, members, boxing)
+                if (why) return why
+            }
+        }
+        const g = host.binder.graphOf(callee)
+        for (const [id, n] of nodeEntries(g)) {
+            if (n.op !== NodeOp.ret) continue
+            const kind = countedSource(callee, getRef(n, 1), members, inGroup, boxing, depth)
+            if (typeof kind === 'string') return kind
+            boxing.rets.push({ unit: callee, ret: id, wrap: kind === SourceKind.fresh })
+        }
+    }
+    function ownValue(fn: Function, value: number, kind: OwnedKind, members: Set<number>, boxing: Boxing): string | undefined {
+        if (boxing.owned.some(o => o.unit === fn && o.value === value)) return
+        const body = bodyOf(fn)
+        const into = handedTo(body, value)
+        if (into !== undefined) return blamed('passes a value carried between blocks', undefined, value, fn)
+        const region = regionOf(body, value)
+        if (typeof region === 'string') return blamed(`passes a value that ${region}`, undefined, value, fn)
+        for (const b of body.captured.get(value) ?? []) {
+            if (!region.blocks.has(b)) return blamed('passes a value used outside its region', undefined, value, fn)
+        }
+        for (const f of body.instances) {
+            if (pstackRefs(types.instances[f].returns).some(o => members.has(o))) return blamed('passes a value in a function that returns one of its objects', undefined, value, fn)
+        }
+        boxing.owned.push({ unit: fn, value, exits: region.exits, kind })
+    }
+    function countedLocal(fn: Function, value: number, inGroup: Set<Location>, objects: number[]): LocalEnd | string {
+        const body = bodyOf(fn)
+        if (!countedRead(fn, value, inGroup)) return blamed('is held across a replace by a value that is not a read of a counted slot', undefined, value, fn)
+        const into = handedTo(body, value)
+        if (into !== undefined) return blamed('is held across a replace by a value carried between blocks', undefined, value, fn)
+        const region = regionOf(body, value)
+        if (typeof region === 'string') return blamed(`is held across a replace by a value that ${region}`, undefined, value, fn)
+        for (const b of body.captured.get(value) ?? []) {
+            if (!region.blocks.has(b)) return blamed('is held across a replace by a value used outside its region', undefined, value, fn)
+        }
+        for (const f of body.instances) {
+            if (pstackRefs(types.instances[f].returns).some(o => objects.includes(o))) return blamed('is held across a replace by a function that returns it', undefined, value, fn)
+        }
+        return { unit: fn, value, exits: region.exits, objects: body.held.get(value) ?? [] }
+    }
+    function countGroup(start: number): Counted | string {
+        const objects: number[] = []
+        const locations: Location[] = []
+        const inGroup = new Set<Location>()
+        const members = new Set<number>()
+        const work = [start]
+        while (work.length) {
+            const o = work.pop()!
+            if (members.has(o)) continue
+            members.add(o)
+            objects.push(o)
+            grouped.add(o)
+            for (const location of holders.get(o) ?? []) {
+                if (inGroup.has(location)) continue
+                inGroup.add(location)
+                locations.push(location)
+                for (const x of pstackRefs(location.type)) work.push(x)
+            }
+            charge(1)
+        }
+        for (const o of objects) {
+            if (eternal.has(o)) return blamed('holds an eternal', o, 0)
+            if (!wanted[o]) return blamed('holds an object that has no hook', o, 0)
+            if (ended.has(o) || localEnded.has(o)) return blamed('holds an object that already ends elsewhere', o, 0)
+        }
+        const holderSet = new Set<number>()
+        for (const location of locations) {
+            const holder = types.objects[location.allocation]
+            if (location.handle === undefined) return blamed('is held in an element', location.allocation, 0)
+            if (holder.kind !== AllocKind.object) return blamed('is held by something other than an object', location.allocation, 0)
+            if (eternal.has(location.allocation)) return blamed('is held by an eternal', location.allocation, 0)
+            if (!refsOnly(location.type) || (location.forms & FieldForm.absent)) return blamed('is held in a slot that may hold something other than an object', location.allocation, 0)
+            for (const r of location.readers) {
+                const reader = r.node < 0 ? undefined : getNode(host.binder.graphOf(r.unit), r.node)
+                if (!reader || reader.op !== NodeOp.getProp) return blamed('is read by something other than a field read', location.allocation, r.node, r.unit)
+            }
+            for (const other of byProto.get(holder.proto as number) ?? []) {
+                const slot = fieldsOf.get(other)?.get(location.handle as number)
+                if (slot && !inGroup.has(slot)) return blamed('shares its class with a holder whose slot is not counted', other, 0)
+            }
+            holderSet.add(location.allocation)
+        }
+        if (leaks([...objects, ...holderSet])) return 'reaches a call or a store the analysis cannot see'
+        const boxing: Boxing = { params: new Map(), results: new Set(), args: [], rets: [], owned: [] }
+        const writes: CountedWrite[] = []
+        for (const location of locations) {
+            for (const w of location.writers) {
+                if (w.node < 0) return blamed('is stored by a store the analysis does not list', location.allocation, 0)
+                if (writes.some(x => x.unit === w.unit && x.write === w.node)) continue
+                const write = countedWrite(w, members, inGroup, boxing)
+                if (typeof write === 'string') return write
+                if (write.wrap && writes.some(x => x.wrap && x.unit === write.unit && tailOf(bodyOf(x.unit).g, getRef(getNode(bodyOf(x.unit).g, x.write)!, 3)) === tailOf(bodyOf(write.unit).g, getRef(getNode(bodyOf(write.unit).g, write.write)!, 3)))) return blamed('makes a value that two stores of one function wrap', undefined, write.write, write.unit)
+                writes.push(write)
+            }
+        }
+        if (!writes.some(w => w.release)) return ''
+        const ownedAt = (fn: Function, value: number) => boxing.owned.some(o => o.unit === fn && o.value === tailOf(bodyOf(fn).g, value))
+        for (const write of writes) {
+            if (write.wrap && ownedAt(write.unit, getRef(getNode(bodyOf(write.unit).g, write.write)!, 3))) write.wrap = false
+        }
+        for (const ret of boxing.rets) {
+            const value = tailOf(bodyOf(ret.unit).g, getRef(getNode(bodyOf(ret.unit).g, ret.ret)!, 1))
+            if (ret.wrap && ownedAt(ret.unit, value)) ret.wrap = false
+            if (ret.wrap && writes.some(w => w.wrap && w.unit === ret.unit && tailOf(bodyOf(w.unit).g, getRef(getNode(bodyOf(w.unit).g, w.write)!, 3)) === value)) return blamed('makes a value that a store and a return of one function wrap', undefined, ret.ret, ret.unit)
+        }
+        const stale = new Map<Function, Set<number>>()
+        for (const write of writes) {
+            if (!write.release) continue
+            const found: number[] = []
+            heldAcross(bodyOf(write.unit), write.write, objects, undefined, found)
+            for (const x of found) setOf(stale, write.unit).add(x)
+            const above = reachersOf(write.unit)
+            const seen = new Set<Function>()
+            for (const o of [...objects, ...holderSet]) {
+                for (const user of touchers(o)) {
+                    if (seen.has(user) || !above.has(user) || !instancesOf.has(user)) continue
+                    seen.add(user)
+                    const frame = bodyOf(user)
+                    if (!objects.some(x => frame.nodes.has(x))) continue
+                    for (const [node, callees] of calls.get(user) ?? []) {
+                        if (!callees.some(t => t === write.unit || above.has(t))) continue
+                        const across: number[] = []
+                        heldAcross(frame, node, objects, undefined, across)
+                        for (const x of across) setOf(stale, user).add(x)
+                    }
+                }
+            }
+        }
+        const locals: LocalEnd[] = []
+        for (const [fn, values] of stale) {
+            for (const value of values) {
+                if (ownedAt(fn, value)) continue
+                const local = countedLocal(fn, value, inGroup, objects)
+                if (typeof local === 'string') return local
+                locals.push(local)
+            }
+        }
+        return { objects, locations, writes, locals, args: boxing.args, rets: boxing.rets, owned: boxing.owned }
+    }
+    types.objects.forEach((object, o) => {
+        if (!wanted[o] || eternal.has(o) || grouped.has(o) || ended.has(o) || localEnded.has(o) || !holders.has(o)) return
+        begin(object.site.unit, object.site.node)
+        const group = countGroup(o)
+        if (typeof group === 'string') {
+            if (group) blocked(`counted ${group}`)
+            return
+        }
+        out.counted.push(group)
+    })
+    detail = undefined
+    const countedKeys = new Map<number, Map<number, number>>()
+    const groupOf = new Map<number, number>()
+    if (out.counted.length) {
+        const counted = new Set(out.counted.flatMap(group => group.objects))
+        out.contained = out.contained.filter(c => !counted.has(c.object))
+        out.counted.forEach((group, i) => {
+            for (const location of group.locations) mapOf(countedKeys, location.allocation).set(location.handle as number, i)
+            for (const o of group.objects) groupOf.set(o, i)
+        })
+        for (const h of countedKeys.keys()) endsAlone(h)
+    }
+    const inside = new Map<number, number[]>()
+    if (groupOf.size) {
+        types.objects.forEach((_, o) => {
+            if (!wanted[o] || eternal.has(o) || groupOf.has(o) || ended.has(o) || localEnded.has(o)) return
+            const c = containerOf(o)            if (typeof c === 'string' || c.key === elementKey) return
+            const i = groupOf.get(c.holders[0])
+            if (i === undefined || !c.holders.every(h => groupOf.get(h) === i)) return
+            listOf(inside, i).push(o)
+        })
+    }
+    for (const [i, objects] of inside) {
+        if (releasedAcross(out.counted[i], objects)) continue
+        for (const o of objects) {
+            const c = containerOf(o) as Kept
+            for (const h of c.holders) out.contained.push({ object: o, holder: h, key: c.key })
+        }
+    }
+    function passesOn(fn: Function, exits: [number, number][], objects: number[]): boolean {
+        const body = bodyOf(fn)
+        for (const [block, tail] of exits) {
+            const n = getNode(body.g, tailPositions(body.g, getBlock(body.g, block)!.bodyId)[tail].at)!
+            let i = 1
+            while (i < countIds(n)) {
+                const x = getRef(n, i)
+                if (x && (body.held.get(x) ?? []).some(o => objects.includes(o))) return true
+                i++
+            }
+        }
+        return false
+    }
+    function releasedAcross(group: Counted, objects: number[]): boolean {
+        for (const write of group.writes) {
+            if (!write.release) continue
+            if (heldAcross(bodyOf(write.unit), write.write, objects)) return true
+            const above = reachersOf(write.unit)
+            for (const o of objects) {
+                for (const user of touchers(o)) {
+                    if (!above.has(user) || !instancesOf.has(user)) continue
+                    const frame = bodyOf(user)
+                    for (const [node, callees] of calls.get(user) ?? []) {
+                        if (callees.some(t => t === write.unit || above.has(t)) && heldAcross(frame, node, objects)) return true
+                    }
+                }
+            }
+        }
+        for (const end of [...group.locals, ...group.owned]) {
+            if (passesOn(end.unit, end.exits, objects)) return true
+        }
+        for (const location of group.locations) {
+            for (const ending of endings.get(location.allocation) ?? []) {
+                if (passesOn(ending.end.unit, ending.end.exits, objects)) return true
+            }
+        }
+        return false
+    }
     const owners = new Map<number, Map<number, number[]>>()
     for (const c of out.contained) listOf(mapOf(owners, c.holder), c.key).push(c.object)
     const sameFields = (lists: OwnedField[][]): OwnedField[] | undefined => {
@@ -1531,8 +1957,9 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         if (known) return known
         const fields: OwnedField[] = []
         ownedOf.set(h, fields)
+        for (const [key, group] of countedKeys.get(h) ?? []) fields.push({ key, inner: undefined, group })
         for (const [key, objects] of owners.get(h) ?? []) {
-            if (key === elementKey) continue
+            if (key === elementKey || countedKeys.get(h)?.has(key)) continue
             const location = fieldsOf.get(h)!.get(key)!
             const inside = pstackRefs(location.type)
             charge(inside.length)
@@ -1641,6 +2068,12 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
         }
         return ''
     }
+    for (const group of out.counted) {
+        const fields = sameFields(group.objects.map(ownedFields))
+        if (!fields?.length) continue
+        group.fields = fields
+        group.owns = ownedObjects(group.objects, fields, [])
+    }
     const holderEnds = new Map<Function, Map<number, LocalEnd[]>>()
     for (const end of out.holders) listOf(mapOf(holderEnds, end.unit), end.value).push(end)
     for (const [fn, byValue] of holderEnds) {
@@ -1650,6 +2083,10 @@ export function analyzeLifetimes(types: ValueTypes, locations: Location[], host:
             const fields = sameFields(held.map(ownedFields))
             if (fields?.length) out.drops.push({ unit: fn, value, exits: list[0].exits, fields, objects: ownedObjects(held, fields, []) })
         }
+    }
+    for (const end of out.locals) {
+        const fields = sameFields(end.objects.map(ownedFields))
+        if (fields?.length) out.drops.push({ unit: end.unit, value: end.value, exits: end.exits, fields, objects: ownedObjects(end.objects, fields, []) })
     }
     if (!blocks) return out
     const container = (o: number): LifeBlock => {
