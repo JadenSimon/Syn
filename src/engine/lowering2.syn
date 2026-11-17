@@ -1015,6 +1015,26 @@ export function rangeFacts(g: Graph, arrivalsOf: (block: GraphBlock) => [from: G
     return { range, le, lt, below, zeros }
 }
 
+export function decidedOperands(g: Graph, ix: gn.GraphIndex): (id: number, ref: number) => number | undefined {
+    const facts = new Map<number, Map<number, Facts | undefined>>()
+    const tails = new Map<number, TailPosition[]>()
+    const ranges = rangeFacts(g, block => gn.inboundApplies(g, ix, block).map(([from, app]): [GraphBlock, TailPosition] => {
+        let list = tails.get(from)
+        if (!list) tails.set(from, list = tailPositions(g, gn.getBlock(g, from)!.bodyId))
+        const found = list.filter(p => p.at === app)
+        const path = found[0].path.filter(([select, arm]) => found.every(p => p.path.some(([s, a]) => s === select && a === arm)))
+        return [gn.getBlock(g, from)!, { at: app, orderings: found[0].orderings, path }]
+    }))
+    return (id, ref) => {
+        const block = gn.getBlock(g, gn.holderOf(ix, id) ?? 0)
+        if (!block) return
+        let known = facts.get(block.id)
+        if (!known) facts.set(block.id, known = nodeFacts(g, block.bodyId))
+        const [lo, hi] = ranges.range(block, ref, 0, known.get(id) ?? [])
+        return lo === hi ? lo : undefined
+    }
+}
+
 export function isNumeric(g: Graph, id: number, entry: (param: number) => boolean, visiting = new Set<number>()): boolean {
     if (!id) return true
     const n = getNode(g, id)
@@ -11065,9 +11085,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
             if (!ref) return { id: 0, value: getLiteral(g, n, i) }
             const m = getNode(g, ref)
             if (m && FoldableOps.has(m.op)) return fold(ref, m)
-            if (compare && m?.op === NodeOp.after) {
+            if (m?.op === NodeOp.after) {
+                const at = lifted.length
                 for (let j = 0; j < countIds(m) - 1; j++) if (!isNilOrVoid(getRef(m, j))) lifted.push(getRef(m, j))
-                return operand(m, countIds(m) - 1, true)
+                const inner = operand(m, countIds(m) - 1, compare)
+                if (compare || !inner.id || getNode(g, inner.id)!.op === NodeOp.literal) return inner
+                lifted.length = at
             }
             if (compare && (m?.op !== NodeOp.literal || inlineableLiteral(costs, literalValue(g, m)))) {
                 const [id, value] = comparedValue(g, ref, 0)
@@ -11326,6 +11349,7 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     else if (left(0)) result = args[1]
                 } else if (n.op === NodeOp.sub || n.op === NodeOp.shl || n.op === NodeOp.shr || n.op === NodeOp.ushr) {
                     if (right(0)) result = args[0]
+                    else if (n.op === NodeOp.ushr && !args[1].id && args[1].value < 64 && (highBits(g, args[0].id, args[0].value) ?? 64) <= args[1].value) result = { id: 0, value: 0 }
                 } else if (n.op === NodeOp.and && (left(0) || right(0))) {
                     const discarded = left(0) ? args[1] : args[0]
                     if (unorderedValue(g, discarded.id, new Map())) result = { id: 0, value: 0 }
@@ -12564,6 +12588,8 @@ export function assignBlockSignatures(
     homes: SignatureHomes,
     carried: Set<number>,
     copies: (value: number) => number,
+    laidBefore: (from: number, to: number) => boolean,
+    settles: Set<number>,
 ): Map<number, number[]> {
     const parent = new Map<number, number>()
     const occupies = new Map<number, Set<number>>()
@@ -12602,6 +12628,7 @@ export function assignBlockSignatures(
     const edgeAt = new Map<string, number>()
     const arrivals = new Map<number, number[]>()
     const settled = new Map<number, boolean>()
+    const passedParam = new Set<number>()
     for (const [app, from] of applyOwner) {
         const n = getNode(g, app)
         const into = n ? getBlock(g, getRef(n, 0)) : undefined
@@ -12615,6 +12642,7 @@ export function assignBlockSignatures(
             const source = parent.has(a) ? a : parent.has(copy) ? copy : 0
             if (source && source !== a && crossing.has(a)) arrivals.set(q, [...arrivals.get(q) ?? [], a])
             if (source) {
+                passedParam.add(q)
                 if (source === q) continue
                 const key = `${source}:${q}`
                 const weight = getRef(n, 0) === from ? 2 : 1
@@ -12688,8 +12716,21 @@ export function assignBlockSignatures(
     for (const b of g.blocks) taken.set(b.id, new Set())
     const homeOf = new Map<number, number>()
     const spills: number[] = []
+    const inbound = new Map<number, number[]>()
+    for (const [app, from] of applyOwner) {
+        const n = getNode(g, app)
+        if (!n) continue
+        const list = inbound.get(getRef(n, 0))
+        if (list) list.push(from)
+        else inbound.set(getRef(n, 0), [from])
+    }
     for (const root of groups) {
         const where = occupies.get(root)!
+        if (where.size === 1 && members.get(root)!.length === 1 && !passedParam.has(root) && !crossing.has(root) && !wants.get(root)!.length) {
+            const block = [...where][0]
+            const from = inbound.get(block)
+            if (from?.length === 1 && laidBefore(from[0], block)) settles.add(root)
+        }
         const free = (r: number) => {
             for (const id of where) if (taken.get(id)!.has(r)) return false
             return true
@@ -15533,71 +15574,92 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
     return g
 }
 
-function pairedArmLoads(g: Graph, selectId: number, memo: ArmDemand): Set<number> {
-    const select = getNode(g, selectId)!
-    const before = demanded(g, getRef(select, 0), new Set(), memo)
-    const fields: number[] = []
-    for (const id of before) {
-        const n = getNode(g, id)!
-        if (n.op === NodeOp.load && getRef(n, 1) && !getRef(n, 2)) fields.push(id)
-    }
-    const out = new Set<number>()
-    if (!fields.length) return out
-    const calls: number[] = []
-    for (const id of before) {
-        const op = getNode(g, id)!.op
-        if (op === NodeOp.call || op === NodeOp.rt) calls.push(id)
-    }
-    for (const arm of armDemand(g, selectId, memo).arms) {
-        for (const id of arm) {
-            const n = getNode(g, id)!
-            if (before.has(id) || n.op !== NodeOp.load || !getRef(n, 1) || getRef(n, 2)) continue
-            if (calls.some(c => !reachesNode(g, getRef(n, 0), c))) continue
-            const type = typeOf(n)
-            const width = intrinsics.intrinsicBitWidth(type) / 8
-            if ((width !== 4 && width !== 8) || (width === 4 && lowering.isSignedType(type))) continue
-            const offset = getLiteral(g, n, 2)
-            if (offset < 0) continue
-            let reach = 0
-            let partner = 0
-            for (const f of fields) {
-                const m = getNode(g, f)!
-                if (getRef(m, 1) !== getRef(n, 1)) continue
-                const at = getLiteral(g, m, 2)
-                reach = Math.max(reach, at + intrinsics.intrinsicBitWidth(typeOf(m)) / 8)
-                if (getRef(m, 0) !== getRef(n, 0) || typeOf(m) !== type || Math.abs(at - offset) !== width) continue
-                const low = Math.min(at, offset)
-                if (low % width === 0 && low <= 63 * width) partner = f
-            }
-            if (!partner || offset + width > reach) continue
-            out.add(id)
-            if (isArgless(getNode(g, getRef(n, 1))!)) out.add(getRef(n, 1))
-        }
+function testedFields(g: Graph, cond: number): number[] {
+    const n = getNode(g, cond)!
+    if (n.op === NodeOp.load) return [cond]
+    if (!CompareOps.has(n.op)) return []
+    const out: number[] = []
+    for (let k = 0; k < 2; k++) {
+        const x = getRef(n, k)
+        if (!x) continue
+        const op = getNode(g, x)!.op
+        if (op === NodeOp.call || op === NodeOp.rt) return []
+        if (op === NodeOp.load) out.push(x)
     }
     return out
 }
 
+function pairWidth(g: Graph, n: GraphNode): number {
+    if (!getRef(n, 1) || getRef(n, 2)) return 0
+    const type = typeOf(n)
+    const width = intrinsics.intrinsicBitWidth(type) / 8
+    if (width === 8 || (width === 4 && !lowering.isSignedType(type))) return width
+    return 0
+}
+
+function armOnly(g: Graph, data: gn.BlockIndex, b: GraphBlock, top: number, id: number): boolean {
+    const seen = new Set<number>()
+    const stack = [id]
+    while (stack.length) {
+        const x = stack.pop()!
+        for (const u of data.users.get(x)!) {
+            if (u === b.bodyId && u !== top) return false
+            const n = getNode(g, u)!
+            if (n.op === NodeOp.select && getRef(n, 0) !== x) {
+                if (u !== top) return false
+                continue
+            }
+            if (u === top) return false
+            if (seen.has(u)) continue
+            seen.add(u)
+            stack.push(u)
+        }
+    }
+    return true
+}
+
+function speculableLoad(g: Graph, data: gn.BlockIndex, b: GraphBlock, top: number, partner: GraphNode, offset: number): number {
+    for (const id of data.ops.get(NodeOp.load)!) {
+        const n = getNode(g, id)!
+        if (getRef(n, 1) !== getRef(partner, 1) || getRef(n, 0) !== getRef(partner, 0) || getRef(n, 2)) continue
+        if (getLiteral(g, n, 2) !== offset || typeOf(n) !== typeOf(partner)) continue
+        if (armOnly(g, data, b, top, id)) return id
+    }
+    return 0
+}
+
+function currentBlockIndex(g: Graph, b: GraphBlock): gn.BlockIndex {
+    const ix = g.index
+    if (ix && b.index && !ix.stale.has(b.id) && gn.isIndexed(ix, b)) return b.index
+    return gn.scanBlock(g, b)
+}
+
 function pairSpeculatedLoads(g: Graph, costs: lowering.TargetCosts): boolean {
     if (!costs.loadPairs) return false
-    const index = graphIndex(g)
-    const memo: ArmDemand = new Map()
-    let headers: Map<number, Set<number>> | undefined
     let changed = false
     const count = g.blocks.length
     let i = 0
     while (i < count) {
         const b = g.blocks[i]
         i++
-        const loads = gn.findValues(index, b.id, NodeOp.load)
-        if (!loads || loads.length < 2) continue
         const body = getNode(g, b.bodyId)
         const top = body?.op === NodeOp.ret ? getRef(body, 1) : b.bodyId
         const select = getNode(g, top)
         if (select?.op !== NodeOp.select || countIds(select) !== 3) continue
-        const paired = pairedArmLoads(g, top, memo)
+        const paired = new Set<number>()
+        let data: gn.BlockIndex | undefined
+        for (const f of testedFields(g, getRef(select, 0))) {
+            const m = getNode(g, f)!
+            const width = pairWidth(g, m)
+            const offset = getLiteral(g, m, 2) - width
+            if (!width || offset < 0 || offset % width || offset > 63 * width) continue
+            data ??= currentBlockIndex(g, b)
+            const spec = speculableLoad(g, data, b, top, m, offset)
+            if (!spec) continue
+            paired.add(spec)
+            if (isArgless(getNode(g, getRef(m, 1))!)) paired.add(getRef(m, 1))
+        }
         if (!paired.size) continue
-        headers ??= graphLoops(g).loopMembers
-        if (headers.has(b.id)) continue
         const passed = withDependencies(g, paired)
         const params = new Set<number>()
         coveredRegion(g, countUses(g, b.bodyId), b.bodyId, params, passed)
@@ -16088,6 +16150,7 @@ function outlineLoopArms(g: Graph): Graph {
 function rotateLoops(g: Graph, costs: lowering.TargetCosts): Graph {
     const stats = intrinsics.argv().includes('rot-stats')
     const loops = graphLoops(g)
+    const arrivals = new Map<number, GraphNode[]>()
     for (const [hid, members] of loops.loopMembers) {
         const h = getBlock(g, hid)!
         const stay = loopStayArm(g, getNode(g, h.bodyId), members)
@@ -16099,8 +16162,10 @@ function rotateLoops(g: Graph, costs: lowering.TargetCosts): Graph {
         const [chain, size] = iterationCost(g, costs, hid, members, nested)
         if (Math.max(chain, size / IssueWidth) > MaxRotatedCycles) continue
         const rotated = rotateLoop(g, h, stay, members, loops.preds.get(hid)!)
+        if (rotated) arrivals.set(hid, [])
         if (stats && rotated) console.log(`rot-stats ${g.name} h=${hid} chain=${chain} size=${size} members=${members.size}`)
     }
+    if (arrivals.size) readArrivedLiterals(g, arrivals)
     return g
 }
 
@@ -16179,6 +16244,47 @@ function rotateLoop(g: Graph, h: GraphBlock, stay: number, members: Set<number>,
         if (entries.size) setBlockBody(g, b, replaceAll(g, b.bodyId, entries))
     }
     return true
+}
+
+function readArrivedLiterals(g: Graph, arrivals: Map<number, GraphNode[]>): void {
+    for (const b of g.blocks) {
+        for (const p of tailPositions(g, b.bodyId)) {
+            const n = getNode(g, p.at)!
+            if (n.op !== NodeOp.apply) continue
+            arrivals.get(getRef(n, 0))?.push(n)
+        }
+    }
+    for (const [hid, from] of arrivals) {
+        if (from.length) readEntryLiterals(g, getBlock(g, hid)!, from)
+    }
+}
+
+function readEntryLiterals(g: Graph, h: GraphBlock, arrivals: GraphNode[]): void {
+    const known = new Map<number, number>()
+    for (let i = 0; i < h.params.length; i++) {
+        const value = scalarOperand(g, arrivals[0], i + 1)
+        if (value === undefined) continue
+        let agreed = true
+        for (const app of arrivals) {
+            if (scalarOperand(g, app, i + 1) !== value) agreed = false
+        }
+        if (agreed) known.set(h.params[i], value)
+    }
+    if (!known.size) return
+    for (const id of blockValues(g, h.bodyId)) {
+        const n = getNode(g, id)!
+        if (!CompareOps.has(n.op) || comparesFloats(g, n)) continue
+        let operands: Operand[] | undefined
+        for (let i = 0; i < countIds(n); i++) {
+            const value = known.get(getRef(n, i))
+            if (value === undefined) continue
+            operands ??= getOperands(g, n)
+            operands[i] = { literal: value }
+        }
+        if (!operands) continue
+        putCopy(g, id, n, operands)
+        gn.dirtyBlock(g, h)
+    }
 }
 
 function decidedEntry(g: Graph, h: GraphBlock, tail: GraphNode, app: GraphNode): number {
@@ -18966,10 +19072,15 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         if (floats.has(id) || floats.has(getRef(n, 0)) || typeOf(n) === Types.f64) return 0
         return intrinsics.intrinsicBitWidth(typeOf(n)) === 64 ? getRef(n, 0) : 0
     }
+    const settles = new Set<number>()
+    const laidAt = new Map<number, number>()
+    for (let i = 0; i < analysis.blockOrder.length; i++) {
+        laidAt.set(analysis.blockOrder[i], i)
+    }
     const signatures = assignBlockSignatures(g, acrossCall, analysis.inArgPos, analysis.inStatePos, analysis.applyOwner, {
         volatiles, preserved, safeFor: safeVolatiles, rank: rankHomes,
         arrival: entryHomes, argHome: (call, i) => argHomes(call)[i], ret: fieldHome, project: (call, field) => callReturnRegs(call)[field] ?? -1, overflow: () => takeSlot(), accepts,
-    }, carried, copiedOperand)
+    }, carried, copiedOperand, (from, to) => laidAt.get(from)! < laidAt.get(to)!, settles)
     const SWAP = target.scratch[0]
     const LINK = OPEN + 1
     const SP = target.stackReg
@@ -19473,6 +19584,13 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             n = getNode(g, value)
         }
     }
+    const softHome = new Map<number, number>()
+    for (const p of settles) {
+        const at = paramAt.get(p)!
+        const home = sig.get(at[0])![at[1]]
+        if (!isSlot(home)) softHome.set(p, home)
+        sig.get(at[0])![at[1]] = OPEN
+    }
 
 
     function floatOperand(n: GraphNode, i: number): boolean {
@@ -19730,14 +19848,20 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
         transfer(dst, src)
     }
 
-    interface Handover { dst: number, id: number, konst: number, rank?: number, float?: boolean, settle?: (reg: number) => void }
+    interface Handover { dst: number, id: number, konst: number, rank?: number, float?: boolean, settle?: (reg: number) => void, hint?: number }
     function handOver(site: number, slots: Handover[], sequence: [number, () => void], elide = OPEN): number {
         const args: Move[] = []
         const consts: (Move & { float: boolean })[] = []
         const feeds = new Map<Handover, number>()
         let sequenced = false
         const landing = new Set<number>()
-        for (const s of slots) if (s.dst !== OPEN && s.dst !== LINK && !isSlot(s.dst)) landing.add(s.dst)
+        const aim = (s: Handover) => s.dst === OPEN ? s.hint ?? OPEN : s.dst
+        const lands = (h: number) => h !== OPEN && h !== LINK && !isSlot(h)
+        for (const s of slots) {
+            if (lands(aim(s))) {
+                landing.add(aim(s))
+            }
+        }
         const outerPending = pendingHomes
         defer pendingHomes = outerPending
         const pending = new Set(landing)
@@ -19758,7 +19882,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
                 const key = `${kind}${isSlot(s.dst) ? ' (dst slot)' : ''}`
                 handoverKinds.set(key, (handoverKinds.get(key) ?? 0) + 1)
             }
-            const want = s.dst === OPEN || s.dst === LINK || isSlot(s.dst) ? -1 : s.dst
+            const want = lands(aim(s)) ? aim(s) : -1
             if (removed >= 0) pending.add(removed)
             removed = want >= 0 && pending.delete(want) ? want : -1
             pendingHomes = pending
@@ -20271,6 +20395,7 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             slots.push({
                 dst: homes[i], id: getRef(n, i + 1), konst: getLiteral(g, n, i + 1), rank: i, float: floats.has(b.params[i]),
                 settle: (r: number) => { homes[i] = r },
+                hint: softHome.get(b.params[i]),
             })
         }
         const mark = code.length
@@ -20517,7 +20642,10 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             put(() => asm.bindLabel(piece.label))
             for (const f of piece.code) code.push(f)
         }
-        put(() => asm.bindLabel(b.id))
+        put(() => {
+            asm.bindLabel(b.id)
+            if (!pendingLabelRefs.has(b.id)) asm.releaseLabel(b.id)
+        })
         if (id === g.root) {
             const entry = sig.get(id)!
             for (let i = 0; i < b.params.length; i++) place(b.params[i], entry[i])
@@ -20530,6 +20658,11 @@ export function lowerPrepared(prepared: PreparedLowering, opts: LowerGraphOption
             continue
         }
         const homes = sig.get(id)!
+        for (let i = 0; i < b.params.length; i++) {
+            if (homes[i] !== OPEN) continue
+            const free = poolsOf(b.params[i]).active.find(r => !homes.includes(r))
+            homes[i] = free ?? takeSlot()
+        }
         for (let i = 0; i < b.params.length; i++) place(b.params[i], homes[i])
         emitTail(b.bodyId, b.bodyConst)
     }

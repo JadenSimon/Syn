@@ -397,6 +397,7 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
 
     function push(item: AsmItem): void {
         if (item.label >= 0 && isBranch(item.kind)) {
+            if (closedLabels.has(item.label)) throw `aarch64: branch to released label L${item.label}`
             labelRefs.set(item.label, (labelRefs.get(item.label) ?? 0) + 1)
         }
         items.push(item)
@@ -1706,12 +1707,12 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         return true
     }
 
-    function fuseArithmeticZeroBranch(dead: Set<number>): boolean {
-        const at = items.length - 1
+    function fuseZeroBranch(dead: Set<number>, at = items.length - 1): boolean {
         const branch = items[at]
         if (!branch || (branch.kind !== 'cbz' && branch.kind !== 'cbnz') || branch.testBit !== undefined) return false
         let reg = branch.reg
         let cond = branch.kind === 'cbz' ? COND_EQ : COND_NE
+        let spent = dead.has(reg)
         let before = at - 1
         const set = items[before]
         if (set?.kind === 'cset' && set.reg === reg && dead.has(reg)) {
@@ -1720,24 +1721,38 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const cmp = items[--before]
             if (cmp?.cmpZeroReg === undefined) return false
             reg = cmp.cmpZeroReg
+            spent = reg === set.reg || !!set.deadAfter?.has(reg)
             before--
         }
         const floor = Math.max(0, at - 16)
+        let read = false
         for (; before >= floor; before--) {
             const it = items[before]
+            if (straightItem(before)) continue
             if (it.kind !== 'insn' || it.setsFlags || it.clobbers || it.cond >= 0 || it.cselCond !== undefined) return false
             const defs: number[] = []
             if (!itemDefs(it, defs)) return false
             if (defs.includes(reg)) break
+            if (usesReg(it, reg)) read = true
         }
         if (before < floor) return false
-        const arithmetic = items[before]
-        if ((arithmetic.word & 31) !== reg || reg === XZR) return false
-        const top = arithmetic.word >>> 24
-        if (top !== 0x91 && top !== 0xD1 && top !== 0x8B && top !== 0xCB) return false
-        arithmetic.word = (arithmetic.word | 0x20000000) >>> 0
-        arithmetic.text = arithmetic.text.replace(/^(add|sub)/, '$1s')
-        arithmetic.setsFlags = true
+        const def = items[before]
+        if ((def.word & 31) !== reg || reg === XZR) return false
+        const top = def.word >>> 24
+        if (top === 0x91 || top === 0xD1 || top === 0x8B || top === 0xCB) {
+            def.word = (def.word | 0x20000000) >>> 0
+            def.text = def.text.replace(/^(add|sub)/, '$1s')
+            def.setsFlags = true
+        } else {
+            const tested = spent && !read ? testedBits(def) : undefined
+            const word = tested && singleBit(tested[1]) < 0 ? testWord(tested[0], tested[1]) : undefined
+            if (word === undefined) return false
+            items[before] = {
+                kind: 'insn', word, text: `tst ${x(tested![0])}, #${BigInt.asIntN(64, tested![1])}`, label: -1, reg: -1, cond: -1,
+                setsFlags: true, testedSrc: tested![0], testedBits: tested![1], deadAfter: def.deadAfter,
+            }
+            removedWrites.push(reg)
+        }
         if (set?.kind === 'cset') {
             inheritDead(branch, set)
             inheritDead(branch, items[at - 2])
@@ -2835,18 +2850,18 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         if (cond !== COND_EQ && cond !== COND_NE) return false
         const t = cmp.cmpZeroReg
         if (!dead.has(t) || (!set && (sel.cselRegs![1] === t || sel.cselRegs![2] === t))) return false
-        for (let at = last - 2; at >= 0 && items[at].kind === 'insn'; at--) {
+        for (let at = last - 2; at >= 0 && (items[at].kind === 'insn' || straightItem(at)); at--) {
             const mask = items[at]
+            if (mask.kind !== 'insn') continue
             const defs: number[] = []
             if (!itemDefs(mask, defs) || mask.setsFlags) return false
             if (!defs.includes(t)) continue
             const tested = testedBits(mask)
             if (!tested) return false
             const [src, bits] = tested
-            const encoded = logicalImmediate(bits)
-            if (encoded === undefined || !noInterference(at + 1, last - 1, t, src)) return false
-            cmp.word = Number.asUintN(32, 0xF2000000 | (((encoded >>> 12) & 1) << 22) | (((encoded >>> 6) & 0x3F) << 16)
-                | ((encoded & 0x3F) << 10) | (src << 5) | XZR)
+            const word = testWord(src, bits)
+            if (word === undefined || !noInterference(at + 1, last - 1, t, src)) return false
+            cmp.word = word
             cmp.text = `tst ${x(src)}, #${BigInt.asIntN(64, bits)}`
             cmp.cmpZeroReg = undefined
             cmp.setsFlags = true
@@ -3074,8 +3089,31 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
         }
         return users
     }
+    function straightEntry(at: number): number {
+        const it = items[at]
+        if (it?.kind !== 'label' || !closedLabels.has(it.label)) return -1
+        const refs = labelRefs.get(it.label) ?? 0
+        if (!refs) return at
+        const jump = items[at - 1]
+        return refs === 1 && jump?.kind === 'b' && jump.label === it.label ? at - 1 : -1
+    }
+
+    function straightItem(at: number): boolean {
+        const it = items[at]
+        if (it.kind === 'label') return straightEntry(at) >= 0
+        return it.kind === 'b' && straightEntry(at + 1) === at
+    }
+
+    function testWord(src: number, bits: bigint): number | undefined {
+        const encoded = logicalImmediate(bits)
+        if (encoded === undefined) return
+        return Number.asUintN(32, 0xF2000000 | (((encoded >>> 12) & 1) << 22) | (((encoded >>> 6) & 0x3F) << 16)
+            | ((encoded & 0x3F) << 10) | (src << 5) | XZR)
+    }
+
     function noInterference(from: number, to: number, index: number, source: number): boolean {
         for (let i = from; i < to; i++) {
+            if (straightItem(i)) continue
             const defs: number[] = []
             const uses: number[] = []
             if (!itemDefs(items[i], defs) || !itemUses(items[i], uses)) return false
@@ -4226,8 +4264,12 @@ export function createAarch64Assembler(syscallConvention = aarch64DarwinSyscall)
             const tail = items[items.length - 1]
             if (compactPendingZeroStores() && items[items.length - 1] !== tail) return
         }
-        if (emitterStep(fuseArithmeticZeroBranch, dead)) return
-        if (emitterStep(threadKnownBranch, dead)) return
+        if (emitterStep(fuseZeroBranch, dead)) return
+        const tail = items[items.length - 1]
+        if (emitterStep(threadKnownBranch, dead)) {
+            fuseZeroBranch(dead, items.lastIndexOf(tail))
+            return
+        }
         if (scaledConversion(dead)) return
 
         // TODO: optionally use CPU feature flags

@@ -16,7 +16,7 @@ import {
     Graph, GraphNode, LowerGraphResult, dumpGraph, floatValues, 
     isParam, lowerValueGraph, lowerPrepared, prepareLowering, type PreparedLowering, type LocalCallee, normalizeValueGraph, optimizePackaged, sweepBlocks, type CallOutcomes, type CallSummary, callSummary, encodeCallSummary, internCallSummary, unknownCall, indirectReach, EffectNone, EffectRead, EffectWrite,
     printOptimizeStats, pstackAllocates, pstackRebases, pstackTentative, inlineRegions, inlineRegionAt, PstackMark, placePstackMarkers, placePstackCallMarkers, resolvePstackTargets, PstackWildcard, PstackFirst, PstackCount, memAnalysis, type Mem, type MemAnalysis, type MemFlow, MemFresh, MemPre, WritesUnknown, WritesStack, pstackWrites, notePstackCell, CapturesAll, argBit, hasArg, maskArgs,
-    joinEffects, OrderedValues, firstNonOrderingSlot, splitGuardedSelects, substitute, tailScalar, valueFacts, type ValueFacts,
+    joinEffects, OrderedValues, firstNonOrderingSlot, decidedOperands, splitGuardedSelects, substitute, tailScalar, valueFacts, type ValueFacts,
     isJumbo, panicOrdering, packageValueGraph, resolveNumberTypes, type GraphBlock, typeName, NumericOps, returnRegisters, recordTypes, unifySlotTypes,
     paramSlot, typeDebugging, typeRecording, debugsTypes, scopeTypeNotes, warnTypeCache, noteType, noteLineage, resetTypeNotes, explainNumberClass, dumpNumberTypes, lineageSnapshot, traceLineage,
 } from './lowering2'
@@ -1267,7 +1267,13 @@ function writesStaticMemory(program: ProgramGraph): boolean {
     return false
 }
 
-function readOnlyStatics(program: ProgramGraph): Set<number> {
+function staticWordAt(address: number): number {
+    const word = new BigUint64Array(1)
+    if (!nativeCopier((ts as any).getArrayBufferPtr(word.buffer), address, 8)) throw 'native: failed to read static memory'
+    return Number(word[0])
+}
+
+function readOnlyStatics(program: ProgramGraph): { bases: Set<number>, slices: Map<number, number> } {
     const image = program.image
     const held = new Set<number>()
     for (const [, slot] of image.staticFields) held.add(slot)
@@ -1278,8 +1284,18 @@ function readOnlyStatics(program: ProgramGraph): Set<number> {
         bases.add(object.address)
         if (object.word !== undefined) words.add(object.word)
     }
-    if (!bases.size) return bases
+    const slices = new Map<number, number>()
+    if (!bases.size) return { bases, slices }
+    let low = Number.MAX_SAFE_INTEGER
+    let high = 0
+    for (const [base, size] of image.staticRegions) {
+        low = Math.min(low, base)
+        high = Math.max(high, base + size)
+    }
     const escaped = new Set<number>()
+    const baseLoads = new Map<number, (number | undefined)[]>()
+    const exposed: number[] = []
+    const demanded = new Set<number>()
     for (const symbol of reachUnits(program)) {
         const g = program.units.get(symbol)!
         const valueOf = (n: GraphNode, i: number): number | undefined => {
@@ -1294,8 +1310,19 @@ function readOnlyStatics(program: ProgramGraph): Set<number> {
             for (let i = 0; i < countIds(n); i++) {
                 const value = valueOf(n, i)
                 if (value === undefined) continue
+                const loaded = n.op === NodeOp.load && i === 1
                 if (words.has(value)) escaped.add(value)
-                if (bases.has(value) && (n.op !== NodeOp.load || i !== 1)) escaped.add(value)
+                if (bases.has(value)) {
+                    if (!loaded) escaped.add(value)
+                    if (!loaded) continue
+                    let list = baseLoads.get(value)
+                    if (!list) baseLoads.set(value, list = [])
+                    list.push(valueOf(n, 2))
+                    continue
+                }
+                if (value < low || value >= high) continue
+                if (loaded) demanded.add(value)
+                else exposed.push(value)
             }
         }
     }
@@ -1303,20 +1330,93 @@ function readOnlyStatics(program: ProgramGraph): Set<number> {
         if (object.word !== undefined && escaped.has(object.word)) escaped.add(object.address)
     }
     for (const address of escaped) bases.delete(address)
-    return bases
+    if (!demanded.size) return { bases, slices }
+    const sizes = new Map<number, number>()
+    for (const [base, size] of image.staticRegions) {
+        sizes.set(base, size)
+    }
+    const regionOf = (address: number): number | undefined => {
+        if (sizes.has(address)) return address
+        for (const [base, size] of sizes) {
+            if (address >= base && address < base + size) {
+                return base
+            }
+        }
+    }
+    const pointers = new Map<number, [at: number, target: number][]>()
+    const pointersIn = (region: number): [number, number][] => {
+        let list = pointers.get(region)
+        if (list) return list
+        pointers.set(region, list = [])
+        for (let at = region; at + 8 <= region + sizes.get(region)!; at++) {
+            if (relocatedWords.has(at)) {
+                list.push([at, staticWordAt(at)])
+            }
+        }
+        return list
+    }
+    const readOnlySlice = (slice: number): boolean => {
+        const size = sizes.get(slice)!
+        let slot: number | undefined
+        let owner: number | undefined
+        for (const base of bases) {
+            for (const [at, target] of pointersIn(base)) {
+                if (target < slice || target > slice + size) continue
+                if (slot !== undefined || target !== slice) return false
+                slot = at
+                owner = base
+            }
+        }
+        if (owner === undefined || slot === undefined) return false
+        for (const value of exposed) {
+            if (value >= slice && value <= slice + size) {
+                return false
+            }
+        }
+        const offset = slot - owner
+        for (const at of baseLoads.get(owner) ?? []) {
+            if (at === undefined) return false
+            if (at < offset + 8 && at + 16 > offset) return false
+        }
+        const seen = new Set<number>([owner])
+        const pending = [owner]
+        while (pending.length) {
+            const region = pending.pop()!
+            for (const [at, target] of pointersIn(region)) {
+                if (at !== slot && target >= slice && target <= slice + size) return false
+                const next = regionOf(target)
+                if (next === undefined || seen.has(next)) continue
+                seen.add(next)
+                pending.push(next)
+            }
+        }
+        return true
+    }
+    const candidates = new Set<number>()
+    for (const value of demanded) {
+        const region = regionOf(value)
+        if (region !== undefined && !bases.has(region)) candidates.add(region)
+    }
+    for (const slice of candidates) {
+        if (readOnlySlice(slice)) {
+            slices.set(slice, sizes.get(slice)!)
+        }
+    }
+    return { bases, slices }
 }
 
 function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
     const image = program.image
     const regions = constantRegions(program)
     const strings = mirroredStrings
-    const readOnly = readOnlyStatics(program)
+    const { bases: readOnly, slices } = readOnlyStatics(program)
     if (!regions.length && !strings.size && !readOnly.size) return
     const heapBase = strings.size ? runtimeHeapBase() : 0
     for (const symbol of reachUnits(program)) {
         const g = program.units.get(symbol)!
         const known = new Map<number, number | null>()
         const pointers = new Map<number, number>()
+        let decided: ((id: number, ref: number) => number | undefined) | undefined
         const operand = (n: GraphNode, i: number): number | undefined => getRef(n, i) ? constant(getRef(n, i)) : getLiteral(g, n, i)
         function constant(id: number): number | undefined {
             if (known.has(id)) return known.get(id) ?? undefined
@@ -1338,11 +1438,18 @@ function foldStaticLoads(program: ProgramGraph, touched: Set<number>): void {
                 const a = operand(n, 0), b = operand(n, 1)
                 if (a !== undefined && b !== undefined) value = a + b
             } else if (n?.op === NodeOp.load && typeOf(n) !== Types.vm_value && typeOf(n) !== Types.f64) {
-                const ptr = operand(n, 1), offset = operand(n, 2)
+                const ptr = operand(n, 1)
                 const size = Math.max(1, staticWidth(typeOf(n)) / 8)
+                const extent = ptr === undefined ? undefined : slices.get(ptr)
+                let offset = operand(n, 2)
+                if (offset === undefined && extent !== undefined) {
+                    decided ??= decidedOperands(g, graphIndex(g))
+                    offset = decided(id, getRef(n, 2))
+                }
+                const sliced = extent !== undefined && offset !== undefined && offset >= 0 && offset + size <= extent
                 const cell = ptr === undefined ? false : strings.has(ptr - heapBase) && offset !== undefined && offset + size <= heap.HeapString.sizeof
                 const relocation = ptr === undefined || offset === undefined ? undefined : relocatedWord(ptr + offset, size)
-                if (ptr !== undefined && offset !== undefined && relocation !== null && (cell || readOnly.has(ptr) || inStaticRegion(regions, ptr + offset, size))) {
+                if (ptr !== undefined && offset !== undefined && relocation !== null && (cell || sliced || readOnly.has(ptr) || inStaticRegion(regions, ptr + offset, size))) {
                     const bytes = new Uint8Array(8)
                     if (!nativeCopier((ts as any).getArrayBufferPtr(bytes.buffer), ptr + offset, size)) throw 'native: failed to read static memory'
                     const raw = new DataView(bytes.buffer).getBigUint64(0, true)
@@ -10079,28 +10186,36 @@ function planNarrowFields(inst: Instantiations, units: Map<Function, PlannedUnit
     for (const sig of inst.shapes.values()) {
         for (const [, rep] of sig.fields) link(rep)
     }
-    const shared = new Map<string, Set<string>>()
+    const eligible = new Map<string, Map<string, boolean>>()
     for (const [id, sig] of inst.shapes) {
         const root = find(id)
-        const eligible = new Set<string>()
-        if (plain(sig)) {
-            for (const [k, rep] of sig.fields) {
-                if (narrowRep(rep)) eligible.add(k)
-            }
+        let known = eligible.get(root)
+        if (!known) eligible.set(root, known = new Map())
+        for (const [k, rep] of sig.fields) {
+            known.set(k, known.get(k) !== false && plain(sig) && narrowRep(rep))
         }
-        const known = shared.get(root)
-        if (!known) {
-            shared.set(root, eligible)
-            continue
+    }
+    const candidates = new Map<string, Set<string>>()
+    const taken = new Map<string, Set<string>>()
+    for (const [id, sig] of inst.shapes) {
+        const root = find(id)
+        const known = eligible.get(root)!
+        const keys = new Set<string>()
+        for (const [k] of sig.fields) {
+            if (known.get(k)) keys.add(k)
         }
-        for (const k of known) {
-            if (!eligible.has(k)) known.delete(k)
+        candidates.set(id, keys)
+        if (keys.size < 2) continue
+        let group = taken.get(root)
+        if (!group) taken.set(root, group = new Set())
+        for (const k of keys) {
+            group.add(k)
         }
     }
     const out = new Map<string, Set<string>>()
-    for (const id of inst.shapes.keys()) {
-        const keys = shared.get(find(id))!
-        if (keys.size >= 2) out.set(id, keys)
+    for (const [id, keys] of candidates) {
+        const group = taken.get(find(id))
+        if (keys.size >= 2 || (keys.size && group && [...keys].some(k => group.has(k)))) out.set(id, keys)
     }
     return out
 }
