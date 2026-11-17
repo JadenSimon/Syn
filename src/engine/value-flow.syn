@@ -257,6 +257,7 @@ interface FlowState {
     coneParts: Set<number>
     kindWatch: Map<number, number[]>
     slotClass: Map<number, number>
+    slotProtos: Map<number, number[]>
     work: number
     traceMs: number
     budget: number
@@ -4212,7 +4213,7 @@ function deliver(l: number, origin: number): void {
         case ListenerKind.offset: if (flow.originKind[origin] === OriginKind.slice) addOrigin(target, origin)
         case ListenerKind.confine: confineOrigin(flow.confinements[target], key, origin)
         case ListenerKind.classed: if (classAdmits(target, origin)) addOrigin(target, origin)
-        case ListenerKind.kinds: classChanged(target, deliveredClass(target, origin))
+        case ListenerKind.kinds: kindsArrived(target, origin)
         case ListenerKind.reads: dirtyScalar(target)
         case ListenerKind.method: methodArrived(target, extra, origin)
         case ListenerKind.freeable: if (flow.originKind[origin] !== OriginKind.static) addOrigin(target, origin)
@@ -5008,9 +5009,10 @@ interface ParamDemands {
     classed: number
     identity: number
     classMasks: number[]
+    protos: number[][]
 }
 
-const noDemands: ParamDemands = { floats: 0, classed: 0, identity: 0, classMasks: [] }
+const noDemands: ParamDemands = { floats: 0, classed: 0, identity: 0, classMasks: [], protos: [] }
 
 function paramDemands(s: Summary): ParamDemands {
     if (s.demands) return s.demands
@@ -5018,10 +5020,16 @@ function paramDemands(s: Summary): ParamDemands {
     const floatWork: number[] = []
     const classWork: number[] = []
     const identityWork: number[] = []
+    const protoWork: number[] = []
     const rooted = new Uint8Array(s.exprs.length)
     for (const x of s.exprs) {
         if (x.op === ExprOp.ntype && x.a >= 0) floatWork.push(x.a)
         if (x.op === ExprOp.rt && x.a === RtOp.typeof && x.args.length) classWork.push(x.args[0], allClasses)
+        const tested = checkedPrototype(s, x)
+        if (tested > 0) {
+            classWork.push(x.args[0], ArgClass.object | ArgClass.unknown)
+            protoWork.push(x.args[0], tested)
+        }
         if ((x.op === ExprOp.call || x.op === ExprOp.member) && x.a >= 0) identityWork.push(x.a)
         if (!x.args.some(a => paramRooted(s, a, rooted))) continue
         const callee = staticCallee(s, x)
@@ -5030,14 +5038,82 @@ function paramDemands(s: Summary): ParamDemands {
         let i = 0
         while (i < x.args.length && i < 16) {
             if (inner.floats & (1 << i)) floatWork.push(x.args[i])
-            if (inner.classed & (1 << i)) classWork.push(x.args[i], inner.classMasks[i])
+            if (inner.classed & (1 << i)) classWork.push(x.args[i], inner.classMasks[i] & (firstProtoClass - 1))
+            const protos = inner.protos[i]
+            let k = 0
+            while (protos && k < protos.length) {
+                protoWork.push(x.args[i], protos[k])
+                k++
+            }
             i++
         }
     }
     const classMasks: number[] = []
     const classed = classedParams(s, classWork, classMasks)
-    s.demands = { floats: reachedParams(s, floatWork) | returnParams(s), classed, identity: reachedParams(s, identityWork), classMasks }
+    const protos = testedProtos(s, protoWork, classMasks)
+    s.demands = { floats: reachedParams(s, floatWork) | returnParams(s), classed, identity: reachedParams(s, identityWork), classMasks, protos }
     return s.demands
+}
+
+const firstProtoClass = 1024
+
+const maxProtoClasses = 20
+
+function checkedPrototype(s: Summary, x: Expr): number {
+    if (x.op !== ExprOp.rt || (x.a !== RtOp.instanceof && x.a !== RtOp.hasPrototype) || x.args.length < 2) return 0
+    return testedPrototype(s, getNode(s.g, x.node)!)
+}
+
+function testedProtos(s: Summary, work: number[], classMasks: number[]): number[][] {
+    const protos: number[][] = []
+    let w = 0
+    while (w < work.length) {
+        const reached = reachedParams(s, [work[w]])
+        let i = 0
+        while (i < 16) {
+            if ((reached & (1 << i)) && (classMasks[i] & ArgClass.object)) {
+                let list = protos[i]
+                if (!list) {
+                    list = []
+                    protos[i] = list
+                }
+                if (!list.includes(work[w + 1]) && list.length < maxProtoClasses) {
+                    classMasks[i] = classMasks[i] | firstProtoClass * 2 ** list.length
+                    list.push(work[w + 1])
+                }
+            }
+            i++
+        }
+        w += 2
+    }
+    return protos
+}
+
+function paramClass(origin: number, protos: number[] | undefined): number {
+    const c = originClass(origin)
+    if (c !== ArgClass.object || !protos) return c
+    if (chainHas(origin, protos[0] as Handle) < 0) return ArgClass.unknown
+    let at = protoOf(origin) as number
+    while (at) {
+        const k = protos.indexOf(at)
+        if (k >= 0) return firstProtoClass * 2 ** k
+        at = heap.getPrototypeOf(at as Handle) as number
+    }
+    return ArgClass.object
+}
+
+function argClass(slot: number, protos: number[] | undefined): number {
+    const m = slotClassOf(slot)
+    if (!protos || !(m & ArgClass.object)) return m
+    const origins = flow.slotOrigins[slot]
+    charge(origins.length)
+    let out = m & ~ArgClass.object
+    let i = 0
+    while (i < origins.length) {
+        out = out | paramClass(origins[i], protos)
+        i++
+    }
+    return out
 }
 
 function sameDemands(a: ParamDemands, b: ParamDemands): boolean {
@@ -5045,6 +5121,11 @@ function sameDemands(a: ParamDemands, b: ParamDemands): boolean {
     let i = 0
     while (i < a.classMasks.length || i < b.classMasks.length) {
         if (a.classMasks[i] !== b.classMasks[i]) return false
+        i++
+    }
+    i = 0
+    while (i < a.protos.length || i < b.protos.length) {
+        if ((a.protos[i] ?? []).join(',') !== (b.protos[i] ?? []).join(',')) return false
         i++
     }
     return true
@@ -5258,7 +5339,7 @@ function callKinds(inst: Instance, x: Expr, s: Summary, first: number = -1, args
     let i = 0
     while (i < s.params && i < 16) {
         const bit = 1 << i
-        const m = !(demanded & bit) ? 0 : i === 0 && first >= 0 ? first : i < args.length ? slotClassOf(at(inst, args[i])) : ArgClass.undefined
+        const m = !(demanded & bit) ? 0 : i === 0 && first >= 0 ? first : i < args.length ? argClass(at(inst, args[i]), d.protos[i]) : ArgClass.undefined
         vec.push(((d.floats & bit) ? m & ArgClass.float : 0) | ((d.classed & bit) ? m & d.classMasks[i] & ~(ArgClass.float | ArgClass.many) : 0) | ((d.identity & bit) ? m & (ArgClass.function | ArgClass.many) : 0))
         i++
     }
@@ -5287,6 +5368,7 @@ function watchKinds(callSlot: number, target: number, recv: number, s: Summary, 
                 listen(slot, ListenerKind.kinds, slot, 0, 0)
             }
             list.push(callSlot, target, recv)
+            if (paramDemands(s).protos[i] && !flow.slotProtos.has(slot)) watchProtos(slot)
         }
         i++
     }
@@ -5305,10 +5387,33 @@ function scalarClassChanged(slot: number, before: number, after: number): void {
     rekind(slot)
 }
 
+function watchProtos(slot: number): void {
+    const seen: number[] = []
+    const origins = flow.slotOrigins[slot]
+    charge(origins.length)
+    let i = 0
+    while (i < origins.length) {
+        const proto = protoOf(origins[i]) as number
+        if (originClass(origins[i]) === ArgClass.object && !seen.includes(proto)) seen.push(proto)
+        i++
+    }
+    flow.slotProtos.set(slot, seen)
+}
+
+function kindsArrived(slot: number, origin: number): void {
+    const seen = flow.slotProtos.get(slot)
+    const proto = seen && originClass(origin) === ArgClass.object ? protoOf(origin) as number : -1
+    if (proto < 0 || seen!.includes(proto)) return classChanged(slot, deliveredClass(slot, origin))
+    seen!.push(proto)
+    flow.slotClass.set(slot, flow.slotClass.get(slot)! | deliveredClass(slot, origin))
+    rekind(slot)
+}
+
 function classAdmits(sig: number, origin: number): boolean {
     const inst = flow.instances[flow.slotOwner[sig]]
-    const m = keptClasses(inst.summary, flow.slotIndex[sig], inst.summary.kindVecs[inst.kinds][flow.slotIndex[sig]])
-    return (m & ArgClass.unknown) !== 0 || (m & originClass(origin)) !== 0
+    const i = flow.slotIndex[sig]
+    const m = keptClasses(inst.summary, i, inst.summary.kindVecs[inst.kinds][i])
+    return (m & ArgClass.unknown) !== 0 || (m & paramClass(origin, paramDemands(inst.summary).protos[i])) !== 0
 }
 
 function rekind(slot: number): void {
@@ -5326,7 +5431,7 @@ function rekind(slot: number): void {
 
 function rtKinds(inst: Instance, x: Expr, s: Summary, qual: number, subject: number): number {
     if (flow.cut) return -1
-    const first = subject || !qual ? (subject ? originClass(subject) : 0) | (x.args.length ? scalarClass(flow.scalar[at(inst, x.args[0])]) : 0) : -1
+    const first = subject || !qual ? (subject ? paramClass(subject, paramDemands(s).protos[0]) : 0) | (x.args.length ? scalarClass(flow.scalar[at(inst, x.args[0])]) : 0) : -1
     return callKinds(inst, x, s, first)
 }
 
@@ -6109,6 +6214,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         coneParts: new Set(),
         kindWatch: new Map(),
         slotClass: new Map(),
+        slotProtos: new Map(),
         work: 0, traceMs: 0, budget: 0, totalNodes: 0, stepWork: 0,
         summaries: new Map(), summaryList: [], instances: [], instanceOf: new Map(),
         originKind: [OriginKind.none], originCell: [0], originQual: [0], originFn: [null], originProto: [undefined], originOwner: [undefined], originNode: [0], originIndex: new Map(), originFields: [new Map()], fieldWatch: [undefined], originPending: [undefined], pickWatch: new Map(), shareOf: new Map(), sharers: new Map(), groups: new Map(), unmatched: new Map(),
