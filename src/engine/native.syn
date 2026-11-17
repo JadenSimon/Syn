@@ -33,7 +33,7 @@ import {
     withOperand, retypeNode, isNullishValue, recordTypeAt, ordersNothing,
     type NodeSpace, allNodes, someNode, copyNodes, countNodes, nodeEntries, nodeIds,
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
-    FloatUnaryOps, rawOperand, rawContents, contextBound, internRaw, internedRaw, poolIndex, poolSlot, slotRef, createLiteralPool, type LiteralPool, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
+    FloatUnaryOps, rawOperand, rawContents, contextBound, internRaw, internedRaw, poolIndex, poolSlot, slotLiteral, slotRef, createLiteralPool, type LiteralPool, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
     inboundApplies, indexedValues, findValues, blockOps, holderOf, graphLayout, graphBytes, graphFloatsAt, readGraph, writeGraph, dominatorTree,
     graphLoops, type GraphLoops, graphRegions, type GraphRegions, stronglyConnected, mapTailPositions, tailOf, tailOrderings, tailPositions, tailRoots, type SelectPath, type TailPosition,
 } from './graph-node'
@@ -2855,6 +2855,7 @@ interface PhaseClock {
     timed<T>(next: string, run: () => T, unit?: string): T
     normalize(graph: Graph, opts?: { firstPass?: boolean }): Graph
     optimize(graph: Graph): Graph
+    binder?: Binder
 }
 
 export interface CompileError extends Error {
@@ -3288,7 +3289,7 @@ export function observeNormalize(observer: (file: string) => void): void {
     normalizeObserver = observer
 }
 
-export function computationKey(roots: Record<string, Function>, withData = false): string {
+export function computationKey(roots: Record<string, Function>, withData = false, stop?: (value: unknown) => string | undefined): string {
     const seen = new Set<unknown>()
     const sources = new Set<string>()
     const walk: unknown[] = Object.values(roots)
@@ -3312,6 +3313,8 @@ export function computationKey(roots: Record<string, Function>, withData = false
         return text
     }
     const describeObject = (value: any): string => {
+        const builtin = stop?.(value)
+        if (builtin !== undefined) return `builtin ${builtin}`
         if (typeof value === 'function') {
             walk.push(value)
             if (!intrinsics.hasComputation(value)) return `host function ${value.name}`
@@ -3378,6 +3381,66 @@ export function computationKey(roots: Record<string, Function>, withData = false
     const hash = hostCrypto.createHash('sha1')
     for (const source of [...sources].sort()) hash.update(source)
     return hash.digest('hex').slice(0, 16)
+}
+
+let builtinNames: Map<unknown, string> | undefined
+
+function builtinNameOf(value: unknown): string | undefined {
+    if (!builtinNames) {
+        builtinNames = new Map()
+        for (const [name, global] of Object.entries(builtinGlobals)) {
+            if (global !== null && (typeof global === 'object' || typeof global === 'function')) builtinNames.set(global, name)
+        }
+        for (const op of Object.values(rt.Op)) {
+            if (typeof op !== 'number') continue
+            const impl = rt.bindingOf(op)?.impl
+            if (impl && !builtinNames.has(impl)) builtinNames.set(impl, `rt.${rt.opName(op)}`)
+        }
+    }
+    return builtinNames.get(value)
+}
+
+const builtinSources = new Map<unknown, string>()
+
+function builtinSource(value: unknown): string {
+    const known = builtinSources.get(value)
+    if (known !== undefined) return known
+    const hash = hostCrypto.createHash('sha1')
+    const source = (v: any) => typeof v !== 'function' ? `${typeof v} ${String(v)}` : intrinsics.hasComputation(v) ? intrinsics.getComputation(v)[0] : `host function ${v.name}`
+    const fields = typeof value === 'function' ? [['', value]] : Object.entries(value as object).sort(([a], [b]) => a < b ? -1 : 1)
+    for (const [key, field] of fields) {
+        hash.update(`${key}\0${source(field)}\0`)
+    }
+    const text = hash.digest('hex').slice(0, 16)
+    builtinSources.set(value, text)
+    return text
+}
+
+const unitBuiltinKeys = new WeakMap<Unit, string>()
+
+function unitBuiltins(binder: Binder | undefined, graph: Graph): string {
+    const fn = graph.unit === undefined ? undefined : binder?.functions[graph.unit]
+    if (!fn) throw `compile cache: ${graph.name ?? 'anonymous'} is not a unit of the program being compiled`
+    const unit = binder!.unitOf(fn)
+    const known = unitBuiltinKeys.get(unit)
+    if (known !== undefined) return known
+    const names = new Set<string>()
+    const seen = new Set<unknown>([fn])
+    const work: Function[] = [fn]
+    while (work.length) {
+        const f = work.pop()!
+        if (!binder!.codeOf(f)) continue
+        for (const value of binder!.linkedValues(f)) {
+            const name = builtinNameOf(value)
+            if (name !== undefined) names.add(`${name} ${builtinSource(value)}`)
+            if (typeof value !== 'function' || !(value as any).shouldInline || seen.has(value)) continue
+            seen.add(value)
+            work.push(value)
+        }
+    }
+    const text = [...names].sort().join('\n')
+    unitBuiltinKeys.set(unit, text)
+    return text
 }
 
 let inputBuffer = new ArrayBuffer(1 << 20)
@@ -3749,6 +3812,10 @@ interface NormalizeNames {
     next: number
     literalFrom: number
     rawFrom: number
+    symbols: number[]
+    entries: number[]
+    handles: Map<number, number>
+    reaches: Set<number>
 }
 
 function rankOf(sorted: Uint32Array, id: number): number {
@@ -3762,6 +3829,29 @@ function rankOf(sorted: Uint32Array, id: number): number {
     return lo < sorted.length && sorted[lo] === id ? lo + 1 : 0
 }
 
+const fixedHandles = new Set<number>([heap.undefinedHandle, heap.nullHandle, heap.emptyStringHandle, heap.falseHandle, heap.trueHandle])
+const firstNamedHandle = 2 ** 24
+
+function reachOperand(n: GraphNode, i: number): boolean {
+    return n.op === NodeOp.indirectTarget && i === 3 && rawOperand(n, i)
+}
+
+function namedOperand(g: NodeSpace, n: GraphNode, i: number): boolean {
+    if (i !== 0 || slotRef(n.slots[0])) return false
+    if (n.op === NodeOp.localTarget || n.op === NodeOp.poolEntry) return true
+    return n.op === NodeOp.heapHandle && !fixedHandles.has(slotLiteral(g, n.slots[0]))
+}
+
+function canonicalName(names: number[], of: Map<number, number>, value: number): number {
+    let c = of.get(value)
+    if (c === undefined) {
+        c = names.length
+        of.set(value, c)
+        names.push(value)
+    }
+    return c
+}
+
 function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
     const pool = graph.literals
     const ids = new Uint32Array(countNodes(graph))
@@ -3772,10 +3862,15 @@ function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
     }
     ids.sort()
     const literalUses: [Uint32Array, number, number][] = []
-    const rawUses: [Uint32Array, number, number][] = []
+    const rawUses: [Uint32Array, number, number, boolean][] = []
+    const namedUses: [number, NodeOp, Uint32Array, number][] = []
+    const reachRanks = new Map<number, number>()
+    const plain = new Set<number>()
     const nodes = new Map<number, GraphNode>()
     for (const [id, n] of nodeEntries(graph)) {
         const slots = new Uint32Array(n.slots.length)
+        const rank = rankOf(ids, id)
+        const arity = countIds(n)
         let i = 0
         while (i < slots.length) {
             const slot = n.slots[i]
@@ -3787,17 +3882,81 @@ function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
                 slots[i] = refSlot(rank) as u32
             } else if (rawOperand(n, i)) {
                 if (at >= 0) throw `compile cache: ${graph.name} keeps a raw offset in the literal pool`
-                rawUses.push([slots, i, slot])
-            } else if (at >= 0) {
-                literalUses.push([slots, i, at])
+                const reach = reachOperand(n, i)
+                rawUses.push([slots, i, slot, reach])
+                if (reach) reachRanks.set(slot, Math.min(reachRanks.get(slot) ?? rank, rank))
+            } else if (namedOperand(graph, n, i)) {
+                namedUses.push([rank, n.op, slots, slot])
             } else {
-                slots[i] = slot
+                if (i < arity) plain.add(slotLiteral(graph, slot))
+                if (at >= 0) literalUses.push([slots, i, at])
+                else slots[i] = slot
             }
             i++
         }
         const copy = makeNodeFromSlots(n.op, slots, n.flags)
         copy.scratchFlags = n.scratchFlags
-        nodes.set(rankOf(ids, id), copy)
+        nodes.set(rank, copy)
+    }
+    const read = new Set<number>()
+    for (const [, , at, reach] of rawUses) {
+        if (reach || read.has(at)) continue
+        if (reachRanks.has(at)) throw `compile cache: ${graph.name} reads the raw words at ${at} both as a reach list and as other words`
+        read.add(at)
+        for (const word of rawContents(graph, at)) {
+            plain.add(word)
+        }
+    }
+    const symbols: number[] = []
+    const symbolOf = new Map<number, number>()
+    const symbol = (value: number): number => canonicalName(symbols, symbolOf, value)
+    const entries: number[] = []
+    const entryOf = new Map<number, number>()
+    const handles = new Map<number, number>()
+    const handleOf = new Map<number, number>()
+    let nextHandle = firstNamedHandle
+    const reachOrder = [...reachRanks].sort((a, b) => a[1] - b[1] || a[0] - b[0])
+    let r = 0
+    namedUses.sort((a, b) => a[0] - b[0])
+    for (const [rank, op, slots, slot] of namedUses) {
+        while (r < reachOrder.length && reachOrder[r][1] < rank) {
+            for (const word of rawContents(graph, reachOrder[r][0])) {
+                symbol(word)
+            }
+            r++
+        }
+        const value = slotLiteral(graph, slot)
+        if (op === NodeOp.localTarget) {
+            slots[0] = literalSlot(graph, symbol(value)) as u32
+            continue
+        }
+        if (op === NodeOp.poolEntry) {
+            slots[0] = literalSlot(graph, canonicalName(entries, entryOf, value)) as u32
+            continue
+        }
+        if (plain.has(value)) {
+            if (poolIndex(slot) >= 0) literalUses.push([slots, 0, poolIndex(slot)])
+            else slots[0] = slot
+            continue
+        }
+        let c = handleOf.get(value)
+        if (c === undefined) {
+            while (plain.has(nextHandle)) {
+                nextHandle += 8
+            }
+            if (nextHandle >= 2 ** 27) throw `compile cache: ${graph.name} holds more heap handles than the canonical range names`
+            c = nextHandle
+            nextHandle += 8
+            handleOf.set(value, c)
+            handles.set(c, slot)
+        }
+        slots[0] = literalSlot(graph, c) as u32
+    }
+    while (r < reachOrder.length) {
+        for (const word of rawContents(graph, reachOrder[r][0])) {
+            symbol(word)
+        }
+        r++
     }
     const literals = [...new Set(literalUses.map(use => use[2]))].sort((a, b) => a - b)
     const literalOf = new Map<number, number>()
@@ -3817,14 +3976,18 @@ function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
     const offsets = [...new Set(rawUses.map(use => use[2]))].sort((a, b) => a - b)
     const rawOf = new Map<number, number>()
     const raw = new Map<number, number>()
+    const reaches = new Set<number>()
     k = 0
     while (k < offsets.length) {
-        const words = rawContents(graph, offsets[k])
+        const real = rawContents(graph, offsets[k])
+        const reach = reachRanks.has(offsets[k])
+        const words = reach ? real.map(symbol) : real
         const at = named.raw.length
         rawOf.set(offsets[k], at)
         raw.set(at, offsets[k])
+        if (reach) reaches.add(at)
         named.raw.push(words.length, ...words)
-        if (internedRaw(graph, words) === offsets[k]) named.deferred.push(at)
+        if (internedRaw(graph, real) === offsets[k]) named.deferred.push(at)
         k++
     }
     for (const [slots, i, at] of rawUses) {
@@ -3847,17 +4010,28 @@ function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
         if (label !== undefined) setDebugLabel(canonical, k + 1, label)
         k++
     }
-    return [canonical, { ids, literals, raw, rawLength: named.raw.length, next: graph.ids.next, literalFrom: pool.values.length, rawFrom: pool.raw.length }]
+    return [canonical, { ids, literals, raw, rawLength: named.raw.length, next: graph.ids.next, literalFrom: pool.values.length, rawFrom: pool.raw.length, symbols, entries, handles, reaches }]
 }
 
 function mapNormalized(out: Graph, names: NormalizeNames, graph: Graph, into: LiteralPool, ids: intrinsics.IdSpace): Graph {
     const pool = graph.literals
     const count = names.ids.length
     const realId = (c: number) => c === 0 ? 0 : c <= count ? names.ids[c - 1] : names.next + c - count - 1
+    const realSymbol = (c: number): number => {
+        const real = names.symbols[c]
+        if (real === undefined) throw `compile cache: normalizing ${graph.name} names the call target ${c}, which its input does not hold`
+        return real
+    }
+    const realEntry = (c: number): number => {
+        const real = names.entries[c]
+        if (real === undefined) throw `compile cache: normalizing ${graph.name} names the pool entry ${c}, which its input does not hold`
+        return real
+    }
     const literalAt: number[] = []
     let k = names.literals.length
     while (k < out.literals.values.length) {
         const v = out.literals.values[k]
+        if (names.handles.has(v)) throw `compile cache: normalizing ${graph.name} moves the heap handle named ${v} into the literal pool`
         const known = pool.at.get(v)
         if (known !== undefined && known < names.literalFrom) {
             literalAt.push(known)
@@ -3868,11 +4042,17 @@ function mapNormalized(out: Graph, names: NormalizeNames, graph: Graph, into: Li
         }
         k++
     }
+    const reachNew = new Set<number>()
+    for (const n of allNodes(out)) {
+        if (reachOperand(n, 3) && n.slots[3] >= names.rawLength) reachNew.add(n.slots[3])
+    }
     const rawAt = new Map<number, number>()
     let o = names.rawLength
     while (o < out.literals.raw.length) {
-        const words = rawContents(out, o)
-        const interned = internedRaw(out, words) === o
+        const named = rawContents(out, o)
+        const words = reachNew.has(o) ? named.map(realSymbol) : named
+        if (!reachNew.has(o) && named.some(word => names.handles.has(word))) throw `compile cache: normalizing ${graph.name} moves a named heap handle into raw words`
+        const interned = internedRaw(out, named) === o
         const known = interned ? internedRaw(graph, words) : undefined
         if (known !== undefined && known < names.rawFrom) {
             rawAt.set(o, known)
@@ -3881,18 +4061,34 @@ function mapNormalized(out: Graph, names: NormalizeNames, graph: Graph, into: Li
             if (interned) into.deferred.push(into.raw.length)
             into.raw.push(words.length, ...words)
         }
-        o += words.length + 1
+        o += named.length + 1
     }
     if (into.raw.length >= 2 ** 27) throw `compile cache: raw offset ${into.raw.length} is past the inline literal range`
     const nodes = new Map<number, GraphNode>()
     for (const [id, n] of nodeEntries(out)) {
+        const arity = countIds(n)
         let i = 0
         while (i < n.slots.length) {
             const slot = n.slots[i]
             const at = poolIndex(slot)
-            if (slotRef(slot)) n.slots[i] = refSlot(realId(slotRef(slot))) as u32
-            else if (rawOperand(n, i)) n.slots[i] = (slot < names.rawLength ? names.raw.get(slot)! : rawAt.get(slot)!) as u32
-            else if (at >= 0) n.slots[i] = poolSlot(at < names.literals.length ? names.literals[at] : literalAt[at - names.literals.length]) as u32
+            const value = slotRef(slot) || rawOperand(n, i) || i >= arity ? 0 : slotLiteral(out, slot)
+            if (slotRef(slot)) {
+                n.slots[i] = refSlot(realId(slotRef(slot))) as u32
+            } else if (rawOperand(n, i)) {
+                const reach = reachOperand(n, i)
+                if (reach !== (slot < names.rawLength ? names.reaches.has(slot) : reachNew.has(slot))) throw `compile cache: normalizing ${graph.name} shares raw words between a reach list and other words`
+                n.slots[i] = (slot < names.rawLength ? names.raw.get(slot)! : rawAt.get(slot)!) as u32
+            } else if (n.op === NodeOp.localTarget && i === 0) {
+                n.slots[i] = literalSlot(graph, realSymbol(value)) as u32
+            } else if (n.op === NodeOp.poolEntry && i === 0) {
+                n.slots[i] = literalSlot(graph, realEntry(value)) as u32
+            } else if (n.op === NodeOp.heapHandle && i === 0 && names.handles.has(value)) {
+                n.slots[i] = names.handles.get(value)! as u32
+            } else if (i < arity && names.handles.has(value)) {
+                throw `compile cache: normalizing ${graph.name} moves the heap handle named ${value} out of a heap handle`
+            } else if (at >= 0) {
+                n.slots[i] = poolSlot(at < names.literals.length ? names.literals[at] : literalAt[at - names.literals.length]) as u32
+            }
             i++
         }
         nodes.set(realId(id), n)
@@ -3909,15 +4105,16 @@ function mapNormalized(out: Graph, names: NormalizeNames, graph: Graph, into: Li
     return mapped
 }
 
-function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Graph {
+function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target, binder?: Binder): Graph {
     if (!compileCache || normalizeMachinery === undefined || target !== hostTarget) return normalizeUncached(graph, kind, target)
     if (normalizeCheck || normalizeCapture !== undefined) return normalizeUncached(graph, kind, target)
     const s = compileCacheStats
     const start = performance.now()
+    const builtins = unitBuiltins(binder, graph)
     const [canonical, names] = nameNormalizeInput(graph)
     compileCacheBuffer = packGraph(canonical, kind, 0, 0, compileCacheBuffer)
     const hash = hostCrypto.createHash('sha256')
-        .update(`normalize ${normalizeMachinery} ${normalizeTarget?.key ?? 'host'} ${imageFlags.join(' ')}\n${graph.name ?? ''}\n`)
+        .update(`normalize ${normalizeMachinery} ${normalizeTarget?.key ?? 'host'} ${imageFlags.join(' ')}\n${graph.name ?? ''}\n${builtins}\n`)
         .update(new Uint8Array(compileCacheBuffer, 0, packedBytes(compileCacheBuffer)))
     for (const [id, label] of canonical.debugLabels) {
         hash.update(`${id}\0${label}\0`)
@@ -4169,15 +4366,16 @@ function createClock(target: Target): PhaseClock {
         verifyDistinctNodes(graph, 'normalize:input')
         recordSnapshots(graph)
         const kind = opts?.firstPass ? NormalizeKind.first : NormalizeKind.again
-        if (!opts?.firstPass || target !== hostTarget) return ledgerWork(graph, opts?.firstPass ? 'first' : 'again', () => timed('normalize', () => normalizeGraph(graph, kind, target), graph.name))
-        return ledgerWork(graph, 'first', () => timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeGraph(graph, kind, target)), graph.name))
+        if (!opts?.firstPass || target !== hostTarget) return ledgerWork(graph, opts?.firstPass ? 'first' : 'again', () => timed('normalize', () => normalizeGraph(graph, kind, target, clock.binder), graph.name))
+        return ledgerWork(graph, 'first', () => timed('normalize', () => optimizeOnce(graph, 'first', () => normalizeGraph(graph, kind, target, clock.binder)), graph.name))
     }
     function optimize(graph: Graph): Graph {
         return ledgerWork(graph, 'optimize', () => timed('normalize', () => target === hostTarget
-            ? optimizeOnce(graph, 'optimized', () => normalizeGraph(graph, NormalizeKind.optimize, target))
-            : normalizeGraph(graph, NormalizeKind.optimize, target), graph.name))
+            ? optimizeOnce(graph, 'optimized', () => normalizeGraph(graph, NormalizeKind.optimize, target, clock.binder))
+            : normalizeGraph(graph, NormalizeKind.optimize, target, clock.binder), graph.name))
     }
-    return { start, phases, enterPhase, timed, normalize, optimize }
+    const clock: PhaseClock = { start, phases, enterPhase, timed, normalize, optimize }
+    return clock
 }
 
 function createImage() {
@@ -14888,6 +15086,7 @@ function cutWorldOf(): CutWorld {
     const clock = createClock(hostTarget)
     const session = createTraceSession()
     const binder = createBinder(cutWorldRoots, session, clock)
+    clock.binder = binder
     const linker = createLinker(binder, image)
     const tracer = createTracer(binder, linker, image, new Map(), clock)
     const host = createAccessHost(binder, tracer)
@@ -16266,6 +16465,7 @@ function traceProgram(fns: Record<string, Function>, opts: CreateNativesOptions,
     const session = createTraceSession()
     Object.assign(session.globals, opts.globals)
     const binder = clock.timed('link', () => createBinder(fns, session, clock))
+    clock.binder = binder
     intrinsics.assert(binder.roots.size > 0)
     const linker = createLinker(binder, image)
     const { functions, roots } = binder
@@ -17628,23 +17828,43 @@ export async function suite() {
         if (inOrder !== reversed) harness.fail(`objects with the same fields in another order must give the same key: ${inOrder} ${reversed}`)
         if (inOrder === changed) harness.fail(`a changed field value must change the key: ${inOrder}`)
     })
+    harness.test('normalizeKeyNamesPoolEntries', () => {
+        function named(slot: number): [Graph, NormalizeNames, Graph, Uint8Array] {
+            const input = graphOf(NodeOp.poolEntry, slot).graph
+            const [canonical, names] = nameNormalizeInput(input)
+            const packed = packGraph(canonical, NormalizeKind.first, 0, 0, new ArrayBuffer(1 << 16))
+            return [input, names, canonical, new Uint8Array(packed, 0, packedBytes(packed))]
+        }
+        const [, , canonical, first] = named(12)
+        const [input, names, , second] = named(40)
+        if (sameBytes(first, second) >= 0) harness.fail('graphs whose pool entries are numbered differently must have the same normalize key')
+        const out = mapNormalized(canonical, names, input, input.literals, input.ids)
+        if (getLiteral(out, getNode(out, getRef(returned(out), 1))!, 0) !== 40) harness.fail('a replayed pool entry must name the entry of the compilation replaying it')
+    })
     harness.test('compileCacheAcrossProcesses', () => {
         const weights = new Map([[1, 10], [2, 20], [3, 30]])
         function weightOf(n: u32): number {
             return weights.get(n) ?? 0
         }
+        const padding = { seven: 70, eight: 80 }
+        function paddingOf(n: u32): number {
+            return n === 7 ? padding.seven : padding.eight
+        }
         if (flags.has('fatal-child')) {
-            const natives: any = createNatives({ weightOf })
+            if (hostProcess.env.SYN_TEST_PADDED_HEAP === '1') createNatives({ paddingOf })
             const s = compileCacheStats
+            const hits = s.hits
+            const misses = s.misses
+            const natives: any = createNatives({ weightOf })
             const listing = hostCrypto.createHash('sha256').update(natives.weightOf.units.map((unit: any) => unit.code.listing).join('\n')).digest('hex')
-            console.log(`weights ${[0, 1, 2, 3].map(n => Number(natives.weightOf(n))).join(' ')}; ${s.hits} hits, ${s.misses} misses, ${s.checked} checked; listing ${listing}`)
+            console.log(`weights ${[0, 1, 2, 3].map(n => Number(natives.weightOf(n))).join(' ')}; ${s.hits - hits} hits, ${s.misses - misses} misses, ${s.checked} checked; listing ${listing}`)
             return
         }
         const dir = `${hostProcess.getBuiltinModule('node:os').tmpdir()}/compile-cache-${hostProcess.pid}`
-        const run = (check: string): string => {
+        const run = (check: string, padded = false): string => {
             const engine = hostProcess.argv.indexOf('--engine')
             const args = [...hostProcess.argv.slice(2, engine + 1), 'native', ...intrinsics.argv().filter(a => runnerFlags.test(a) && !a.startsWith('only:')), 'in-process', 'only:compileCacheAcrossProcesses', 'fatal-child']
-            const exited = (globalThis as any).__spawnSync(hostProcess.argv[1], args, { ...hostProcess.env, SYN_CRASH_FD: '', SYN_CRASH_RESUME: '', SYN_COMPILE_CACHE: dir, SYN_COMPILE_CACHE_CHECK: check })
+            const exited = (globalThis as any).__spawnSync(hostProcess.argv[1], args, { ...hostProcess.env, SYN_CRASH_FD: '', SYN_CRASH_RESUME: '', SYN_COMPILE_CACHE: dir, SYN_COMPILE_CACHE_CHECK: check, SYN_TEST_PADDED_HEAP: padded ? '1' : '' })
             return `${exited.status} ${String(exited.stdout ?? '')} ${String(exited.stderr ?? '')}`
         }
         try {
@@ -17660,6 +17880,8 @@ export async function suite() {
             if (listing.exec(cold)?.[1] !== listing.exec(warm)?.[1]) harness.fail(`a process replaying normalize from the cache must emit the listing a compiling process emits: ${cold.slice(0, 300)} ${warm.slice(0, 300)}`)
             const buckets = hostFs.readdirSync(dir).filter((name: string) => /^[0-9a-f]{2}$/.test(name))
             const objects = buckets.flatMap((bucket: string) => hostFs.readdirSync(`${dir}/${bucket}`).filter((name: string) => /^[0-9a-f]{64}$/.test(name)).map((name: string) => `${dir}/${bucket}/${name}`))
+            const padded = run('', true)
+            if (!padded.includes(`weights 0 10 20 30; ${misses[1]} hits, 0 misses`)) harness.fail(`a process whose heap handles are numbered differently must replay every normalize from the cache: ${padded.slice(0, 300)}`)
             const bytes = new Uint8Array(hostFs.readFileSync(objects[0]))
             bytes[bytes.length >> 1] ^= 1
             hostFs.writeFileSync(objects[0], bytes)
@@ -17674,4 +17896,4 @@ export async function suite() {
     })
 }
 
-if (compileCache && imageFlags.every(flag => flag === 'native')) normalizeMachinery = computationKey({ normalizeGraph }, true)
+if (compileCache && imageFlags.every(flag => flag === 'native')) normalizeMachinery = computationKey({ normalizeGraph }, true, builtinNameOf)
