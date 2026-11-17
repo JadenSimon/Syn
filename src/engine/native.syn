@@ -33,7 +33,7 @@ import {
     withOperand, retypeNode, isNullishValue, recordTypeAt, ordersNothing,
     type NodeSpace, allNodes, someNode, copyNodes, countNodes, nodeEntries, nodeIds,
     heapInterior, heapField, heapFieldCount, heapFieldKey, heapFieldOperand,
-    FloatUnaryOps, rawOperand, rawContents, contextBound, internRaw, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
+    FloatUnaryOps, rawOperand, rawContents, contextBound, internRaw, internedRaw, poolIndex, poolSlot, slotRef, createLiteralPool, type LiteralPool, pushBlockParams, setBlockBody, setBlockConst, setBlockParam, setBlockParams, dirtyIndex, dirtyValues, graphIndex, indexedUsers, useSlot, type GraphIndex,
     inboundApplies, indexedValues, findValues, blockOps, holderOf, graphLayout, graphBytes, graphFloatsAt, readGraph, writeGraph, dominatorTree,
     graphLoops, type GraphLoops, graphRegions, type GraphRegions, stronglyConnected, mapTailPositions, tailOf, tailOrderings, tailPositions, tailRoots, type SelectPath, type TailPosition,
 } from './graph-node'
@@ -3741,44 +3741,236 @@ export function reportCompileCache(): void {
     }
 }
 
+interface NormalizeNames {
+    ids: Uint32Array
+    literals: number[]
+    raw: Map<number, number>
+    rawLength: number
+    next: number
+    literalFrom: number
+    rawFrom: number
+}
+
+function rankOf(sorted: Uint32Array, id: number): number {
+    let lo = 0
+    let hi = sorted.length
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (sorted[mid] < id) lo = mid + 1
+        else hi = mid
+    }
+    return lo < sorted.length && sorted[lo] === id ? lo + 1 : 0
+}
+
+function nameNormalizeInput(graph: Graph): [Graph, NormalizeNames] {
+    const pool = graph.literals
+    const ids = new Uint32Array(countNodes(graph))
+    let k = 0
+    for (const id of nodeIds(graph)) {
+        ids[k] = id
+        k++
+    }
+    ids.sort()
+    const literalUses: [Uint32Array, number, number][] = []
+    const rawUses: [Uint32Array, number, number][] = []
+    const nodes = new Map<number, GraphNode>()
+    for (const [id, n] of nodeEntries(graph)) {
+        const slots = new Uint32Array(n.slots.length)
+        let i = 0
+        while (i < slots.length) {
+            const slot = n.slots[i]
+            const ref = slotRef(slot)
+            const at = poolIndex(slot)
+            if (ref) {
+                const rank = rankOf(ids, ref)
+                if (!rank) throw `compile cache: ${graph.name} refers to %${ref}, which is not one of its nodes`
+                slots[i] = refSlot(rank) as u32
+            } else if (rawOperand(n, i)) {
+                if (at >= 0) throw `compile cache: ${graph.name} keeps a raw offset in the literal pool`
+                rawUses.push([slots, i, slot])
+            } else if (at >= 0) {
+                literalUses.push([slots, i, at])
+            } else {
+                slots[i] = slot
+            }
+            i++
+        }
+        const copy = makeNodeFromSlots(n.op, slots, n.flags)
+        copy.scratchFlags = n.scratchFlags
+        nodes.set(rankOf(ids, id), copy)
+    }
+    const literals = [...new Set(literalUses.map(use => use[2]))].sort((a, b) => a - b)
+    const literalOf = new Map<number, number>()
+    const named = createLiteralPool()
+    k = 0
+    while (k < literals.length) {
+        const v = pool.values[literals[k]]
+        if (pool.at.get(v) !== literals[k]) throw `compile cache: the literal pool holds ${v} twice`
+        literalOf.set(literals[k], k)
+        named.values.push(v)
+        named.at.set(v, k)
+        k++
+    }
+    for (const [slots, i, at] of literalUses) {
+        slots[i] = poolSlot(literalOf.get(at)!) as u32
+    }
+    const offsets = [...new Set(rawUses.map(use => use[2]))].sort((a, b) => a - b)
+    const rawOf = new Map<number, number>()
+    const raw = new Map<number, number>()
+    k = 0
+    while (k < offsets.length) {
+        const words = rawContents(graph, offsets[k])
+        const at = named.raw.length
+        rawOf.set(offsets[k], at)
+        raw.set(at, offsets[k])
+        named.raw.push(words.length, ...words)
+        if (internedRaw(graph, words) === offsets[k]) named.deferred.push(at)
+        k++
+    }
+    for (const [slots, i, at] of rawUses) {
+        slots[i] = rawOf.get(at)! as u32
+    }
+    const blocks: GraphBlock[] = []
+    for (const b of graph.blocks) {
+        const params = b.params.map(p => rankOf(ids, p))
+        if (!rankOf(ids, b.id) || params.includes(0) || (b.bodyId && !rankOf(ids, b.bodyId))) throw `compile cache: block %${b.id} of ${graph.name} names ids that are not its nodes`
+        blocks.push({ id: rankOf(ids, b.id), params, bodyId: rankOf(ids, b.bodyId), bodyConst: b.bodyConst })
+    }
+    if (graph.root && !rankOf(ids, graph.root)) throw `compile cache: the root of ${graph.name} is not one of its nodes`
+    const canonical = createGraph({
+        form: graph.form, ids: { next: ids.length + 1 }, literals: named, nodes, blocks, root: rankOf(ids, graph.root), epoch: graph.epoch,
+        name: graph.name, unit: graph.unit, level: graph.level, unswitch: graph.unswitch, kinds: graph.kinds,
+    })
+    k = 0
+    while (k < ids.length) {
+        const label = getDebugLabel(graph, ids[k])
+        if (label !== undefined) setDebugLabel(canonical, k + 1, label)
+        k++
+    }
+    return [canonical, { ids, literals, raw, rawLength: named.raw.length, next: graph.ids.next, literalFrom: pool.values.length, rawFrom: pool.raw.length }]
+}
+
+function mapNormalized(out: Graph, names: NormalizeNames, graph: Graph, into: LiteralPool, ids: intrinsics.IdSpace): Graph {
+    const pool = graph.literals
+    const count = names.ids.length
+    const realId = (c: number) => c === 0 ? 0 : c <= count ? names.ids[c - 1] : names.next + c - count - 1
+    const literalAt: number[] = []
+    let k = names.literals.length
+    while (k < out.literals.values.length) {
+        const v = out.literals.values[k]
+        const known = pool.at.get(v)
+        if (known !== undefined && known < names.literalFrom) {
+            literalAt.push(known)
+        } else {
+            literalAt.push(into.values.length)
+            if (!into.at.has(v)) into.at.set(v, into.values.length)
+            into.values.push(v)
+        }
+        k++
+    }
+    const rawAt = new Map<number, number>()
+    let o = names.rawLength
+    while (o < out.literals.raw.length) {
+        const words = rawContents(out, o)
+        const interned = internedRaw(out, words) === o
+        const known = interned ? internedRaw(graph, words) : undefined
+        if (known !== undefined && known < names.rawFrom) {
+            rawAt.set(o, known)
+        } else {
+            rawAt.set(o, into.raw.length)
+            if (interned) into.deferred.push(into.raw.length)
+            into.raw.push(words.length, ...words)
+        }
+        o += words.length + 1
+    }
+    if (into.raw.length >= 2 ** 27) throw `compile cache: raw offset ${into.raw.length} is past the inline literal range`
+    const nodes = new Map<number, GraphNode>()
+    for (const [id, n] of nodeEntries(out)) {
+        let i = 0
+        while (i < n.slots.length) {
+            const slot = n.slots[i]
+            const at = poolIndex(slot)
+            if (slotRef(slot)) n.slots[i] = refSlot(realId(slotRef(slot))) as u32
+            else if (rawOperand(n, i)) n.slots[i] = (slot < names.rawLength ? names.raw.get(slot)! : rawAt.get(slot)!) as u32
+            else if (at >= 0) n.slots[i] = poolSlot(at < names.literals.length ? names.literals[at] : literalAt[at - names.literals.length]) as u32
+            i++
+        }
+        nodes.set(realId(id), n)
+    }
+    const blocks = out.blocks.map(b => ({ id: realId(b.id), params: b.params.map(realId), bodyId: realId(b.bodyId), bodyConst: b.bodyConst }))
+    ids.next = realId(out.ids.next)
+    const mapped = createGraph({
+        form: out.form, ids, literals: into, nodes, blocks, root: realId(out.root), epoch: out.epoch,
+        debugLabels: into === pool ? graph.debugLabels : new Map(), name: graph.name, unit: graph.unit, level: out.level, unswitch: out.unswitch, kinds: out.kinds,
+    })
+    for (const [id, label] of out.debugLabels) {
+        setDebugLabel(mapped, realId(id), label)
+    }
+    return mapped
+}
+
 function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Graph {
     if (!compileCache || normalizeMachinery === undefined || target !== hostTarget) return normalizeUncached(graph, kind, target)
     if (normalizeCheck || normalizeCapture !== undefined) return normalizeUncached(graph, kind, target)
     const s = compileCacheStats
     const start = performance.now()
-    compileCacheBuffer = packGraph(graph, kind, 0, 0, compileCacheBuffer)
-    const key = hostCrypto.createHash('sha256')
+    const [canonical, names] = nameNormalizeInput(graph)
+    compileCacheBuffer = packGraph(canonical, kind, 0, 0, compileCacheBuffer)
+    const hash = hostCrypto.createHash('sha256')
         .update(`normalize ${normalizeMachinery} ${normalizeTarget?.key ?? 'host'} ${imageFlags.join(' ')}\n${graph.name ?? ''}\n`)
         .update(new Uint8Array(compileCacheBuffer, 0, packedBytes(compileCacheBuffer)))
-        .digest('hex')
+    for (const [id, label] of canonical.debugLabels) {
+        hash.update(`${id}\0${label}\0`)
+    }
+    const key = hash.digest('hex')
     const keyed = performance.now()
     s.keyMs += keyed - start
     const cached = compileCache.load(key)
     s.loadMs += performance.now() - keyed
-    if (cached && hostProcess.env.SYN_COMPILE_CACHE_CHECK !== '1') {
+    const checking = hostProcess.env.SYN_COMPILE_CACHE_CHECK === '1'
+    if (cached && !checking) {
         const decodeStart = performance.now()
-        const out = decodeNormalized(cached, graph)
+        const out = mapNormalized(decodeNormalized(cached, canonical), names, graph, graph.literals, graph.ids)
         s.loadMs += performance.now() - decodeStart
         s.hits++
         s.loaded += cached.byteLength
         return out
     }
-    const literalFrom = graph.literals.values.length
-    const rawFrom = graph.literals.raw.length
-    const out = normalizeUncached(graph, kind, target)
+    const out = normalizeUncached(canonical, kind, target)
     const ran = performance.now()
-    const bytes = encodeNormalized(out, kind, literalFrom, rawFrom)
+    const bytes = encodeNormalized(out, kind, names.literals.length, names.rawLength)
     if (cached) {
         s.checked++
         const at = sameBytes(cached, bytes)
         if (at >= 0) throw `compile cache: normalizing ${graph.name ?? 'anonymous'} gives bytes that differ from the cached ${key} at byte ${at} (${bytes.length}/${cached.length} bytes)`
-        return out
+    } else {
+        compileCache.save(key, bytes)
+        s.misses++
+        s.saved += bytes.byteLength
     }
-    compileCache.save(key, bytes)
-    s.misses++
-    s.saved += bytes.byteLength
-    s.saveMs += performance.now() - ran
-    return out
+    if (!checking) {
+        const mapped = mapNormalized(out, names, graph, graph.literals, graph.ids)
+        s.saveMs += performance.now() - ran
+        return mapped
+    }
+    const scratch: LiteralPool = { values: new Array(names.literalFrom), at: new Map(), raw: new Array(names.rawFrom), interned: new Map(), deferred: [] }
+    const mapped = mapNormalized(out, names, graph, scratch, { next: 0 })
+    const real = normalizeUncached(graph, kind, target)
+    compileCacheBuffer = packGraph(real, kind, names.literalFrom, names.rawFrom, compileCacheBuffer)
+    const expected = new Uint8Array(compileCacheBuffer, 0, packedBytes(compileCacheBuffer)).slice()
+    compileCacheBuffer = packGraph(mapped, kind, names.literalFrom, names.rawFrom, compileCacheBuffer)
+    const at = sameBytes(expected, new Uint8Array(compileCacheBuffer, 0, packedBytes(compileCacheBuffer)))
+    if (at >= 0) throw `compile cache: normalizing ${graph.name ?? 'anonymous'} through its canonical names differs from normalizing it in place at byte ${at} (${packedBytes(compileCacheBuffer)}/${expected.length} bytes)`
+    const labeled = [...names.ids]
+    let fresh = names.next
+    while (fresh < real.ids.next) {
+        labeled.push(fresh)
+        fresh++
+    }
+    for (const id of labeled) {
+        if (getDebugLabel(real, id) !== getDebugLabel(mapped, id)) throw `compile cache: normalizing ${graph.name ?? 'anonymous'} through its canonical names labels %${id} ${JSON.stringify(getDebugLabel(mapped, id))}, in place ${JSON.stringify(getDebugLabel(real, id))}`
+    }
+    return real
 }
 
 function encodeNormalized(out: Graph, kind: NormalizeKind, literalFrom: number, rawFrom: number): Uint8Array {
@@ -3787,9 +3979,9 @@ function encodeNormalized(out: Graph, kind: NormalizeKind, literalFrom: number, 
     const ids: number[] = []
     const texts: Uint8Array[] = []
     const encoder = new TextEncoder()
-    for (const id of [...nodeIds(out), ...out.blocks.map(b => b.id)]) {
-        const label = getDebugLabel(out, id)
-        if (label === undefined) continue
+    for (const [id, label] of out.debugLabels) {
+        {
+    }
         ids.push(id)
         texts.push(encoder.encode(label))
     }
@@ -16775,6 +16967,8 @@ function verifyImage(regions: ImageRegion[], relocations: ImageRelocation[], cod
                     else if (top === 0x92800000) moves.set(rd, BigInt.asUintN(64, ~(imm << shift)))
                     else if (top === 0xF2800000) moves.set(rd, ((moves.get(rd) ?? BigInt(0)) & ~(BigInt(0xFFFF) << shift)) | (imm << shift))
                     else continue
+                    const next = i + 8 <= end ? view.getUint32(i + 4, true) : 0
+                    if (((next & 0xFF800000) >>> 0) === 0xF2800000 && (next & 31) === rd) continue
                     const what = inRange(moves.get(rd)!)
                     if (what) throw `native: the image materializes an address of ${what} in an instruction at code+0x${(segment.offset + i).toString(16)}`
                 }
