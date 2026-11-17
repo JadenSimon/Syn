@@ -102,9 +102,9 @@ const sys_icache_invalidate = declareNative(
     [Types.u64, Types.u64], Types.u64,
 )
 
-function mapCodePage(len: usize): usize {
+function mapCodePage(len: usize, hint: usize): usize {
     const r = syscalls.mmap(
-        0, len,
+        hint, len,
         (syscalls.PROT_READ | syscalls.PROT_WRITE) as any,
         (syscalls.MAP_PRIVATE | syscalls.MAP_ANON) as any,
         -1 as any, 0,
@@ -278,6 +278,13 @@ function relocatedWord(address: number, size: number): Relocation | undefined | 
 }
 
 const guardBytes = 1 << 20
+const mappingNext = [0x4000_0000_0000, 0x4100_0000_0000, 0x4200_0000_0000, 0x4300_0000_0000, 0x4400_0000_0000]
+
+function mappingHint(kind: number, bytes: number): number {
+    const hint = mappingNext[kind]
+    mappingNext[kind] = hint + align(bytes, 1 << 14)
+    return hint
+}
 
 function protectNative(ptr: any, length: number, prot: number): void {
     const status = Number(nativeProtector(ptr, length, prot))
@@ -287,7 +294,7 @@ function protectNative(ptr: any, length: number, prot: number): void {
 function mapGuarded(bytes: number): number {
     getNativeBootstraps()
     const size = align(bytes, guardBytes)
-    const base = Number(nativeMapper(size + guardBytes))
+    const base = Number(nativeMapper(size + guardBytes, mappingHint(RegionKind.heap, size + guardBytes)))
     if (!base || base === -1) return 0
     protectNative(base + size, guardBytes, syscalls.PROT_NONE)
     return base
@@ -414,7 +421,7 @@ function mapPstackBlock(): number {
     const span = pstackSpan()
     intrinsics.assert(span * PstackCount - guardBytes <= heap.pstackWindowBytes, 'native: every pstack byte must be addressable by a pstack word')
     const reserved = heap.pstackWindowBytes + guardBytes
-    const base = Number(nativeMapper(reserved))
+    const base = Number(nativeMapper(reserved, mappingHint(RegionKind.pstack, reserved)))
     if (!base || base === -1) return 0
     let stack = 0
     while (stack < PstackCount) {
@@ -446,7 +453,7 @@ let slabHeadBlock = 0
 let slabRegion = -1
 function slabHeads(): number {
     if (slabHeadBlock) return slabHeadBlock
-    const base = Number(nativeMapper(1 << 14))
+    const base = Number(nativeMapper(1 << 14, mappingHint(RegionKind.slab, 1 << 14)))
     if (!base || base === -1) throw 'native: failed to map the slab heads'
     slabHeadBlock = base
     slabRegion = addRegion(RegionKind.slab, 0, base, 1 << 14)
@@ -1568,7 +1575,7 @@ function reserveCode(length: number): { page: CodePage, ptr: any } {
     let offset = page ? (page.used + 15) & ~15 : 0
     if (!page || offset + length > page.length) {
         const mappedLength = (Math.max(length, 4096) + 4095) & ~4095
-        const ptr = nativeMapper(mappedLength)
+        const ptr = nativeMapper(mappedLength, mappingHint(RegionKind.code, mappedLength))
         if (!ptr) throw 'failed to map native code page'
         page = { ptr, length: mappedLength, used: 0, sealed: false }
         codePages.push(page)
@@ -3151,7 +3158,8 @@ const nativeNormalizeOn = flags.has('native-l2') || normalizeWith !== undefined
 const normalizeCheck = flags.has('native-l2-check')
 const normalizeCacheDir = intrinsics.argv().find(a => a.startsWith('l2-cache:'))?.slice('l2-cache:'.length) ?? 'out/engine-cache/native-l2'
 const promotedImage = `${normalizeCacheDir}/promoted.img`
-const imageFlags = intrinsics.argv().filter(a => !/^(timeout|only|skip|baseline|gate-host|cpu-prof|heap-prof|coverage):|^(in-process|fatal-child)$|^native-l2|^l2-/.test(a))
+const runnerFlags = /^(timeout|only|skip|baseline|gate-host|cpu-prof|heap-prof|coverage):|^(in-process|fatal-child)$|^native-l2|^l2-/
+const imageFlags = intrinsics.argv().filter(a => !runnerFlags.test(a))
 const keptImages = 3
 const hostFs = hostProcess.getBuiltinModule('node:fs')
 const hostCrypto = hostProcess.getBuiltinModule('node:crypto')
@@ -3159,6 +3167,7 @@ const hostCrypto = hostProcess.getBuiltinModule('node:crypto')
 interface NormalizeTarget {
     run: (...args: number[]) => number
     file: string
+    key: string
 }
 
 let normalizeTarget: NormalizeTarget | undefined
@@ -3169,16 +3178,57 @@ export function observeNormalize(observer: (file: string) => void): void {
     normalizeObserver = observer
 }
 
-export function computationKey(roots: Record<string, Function>): string {
+export function computationKey(roots: Record<string, Function>, withData = false): string {
     const seen = new Set<unknown>()
     const sources = new Set<string>()
     const walk: unknown[] = Object.values(roots)
+    const argv = new Set(intrinsics.argv())
+    const described = new Map<unknown, string>()
     const methods = (owner: any) => {
         for (const key of Reflect.ownKeys(owner)) {
             const d = Object.getOwnPropertyDescriptor(owner, key)!
             walk.push('value' in d ? d.value : d.get)
             if (!('value' in d)) walk.push(d.set)
         }
+    }
+    const runnerFlag = (value: unknown) => typeof value === 'string' && argv.has(value) && runnerFlags.test(value)
+    const describe = (value: any): string => {
+        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return `${typeof value} ${Object.is(value, -0) ? '-0' : String(value)}`
+        const known = described.get(value)
+        if (known !== undefined) return known
+        described.set(value, 'cycle')
+        const text = describeObject(value)
+        described.set(value, text)
+        return text
+    }
+    const describeObject = (value: any): string => {
+        if (typeof value === 'function') {
+            walk.push(value)
+            if (!intrinsics.hasComputation(value)) return `host function ${value.name}`
+            return `function ${hostCrypto.createHash('sha1').update(intrinsics.getComputation(value)[0]).digest('hex')}`
+        }
+        const tag = Object.prototype.toString.call(value)
+        if (tag === '[object Module]') {
+            walk.push(value)
+            return 'module'
+        }
+        if (Array.isArray(value)) return `[${value.filter(x => !runnerFlag(x)).map(describe).join(', ')}]`
+        if (value instanceof Map) return `Map {${[...value].map(([k, v]) => `${describe(k)} => ${describe(v)}`).join(', ')}}`
+        if (value instanceof Set) return `Set {${[...value].filter(x => !runnerFlag(x)).map(describe).join(', ')}}`
+        if (value instanceof RegExp) return `RegExp /${value.source}/${value.flags}`
+        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+            const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+            return `${tag} ${hostCrypto.createHash('sha1').update(bytes).digest('hex')}`
+        }
+        const proto = Object.getPrototypeOf(value)
+        const owner = proto === null || proto === Object.prototype ? undefined : proto.constructor
+        if (owner !== undefined && (typeof owner !== 'function' || !intrinsics.hasComputation(owner))) return `host ${tag}`
+        if (owner !== undefined) walk.push(owner)
+        const fields = Reflect.ownKeys(value).map(key => {
+            const d = Object.getOwnPropertyDescriptor(value, key)!
+            return `${String(key)}: ${'value' in d ? describe(d.value) : `${describe(d.get)} / ${describe(d.set)}`}`
+        })
+        return `${owner === undefined ? '' : describe(owner)} {${fields.sort().join(', ')}}`
     }
     while (walk.length) {
         const v = walk.pop()
@@ -3189,6 +3239,7 @@ export function computationKey(roots: Record<string, Function>): string {
             methods(v)
             for (const [key, value] of Object.entries(v)) {
                 if (value === null || (typeof value !== 'object' && typeof value !== 'function')) sources.add(`${key} = ${String(value)}`)
+                else if (withData && typeof value === 'object') sources.add(`${key} = ${describe(value)}`)
             }
             continue
         }
@@ -3197,7 +3248,8 @@ export function computationKey(roots: Record<string, Function>): string {
         const narrowed = new Map(meta?.narrowedModules)
         const reads = [source]
         const read = (at: string, value: unknown) => {
-            if (value !== null && (typeof value === 'object' || typeof value === 'function')) walk.push(value)
+            if (withData && value !== null && typeof value === 'object' && Object.prototype.toString.call(value) !== '[object Module]') reads.push(`${at} = ${describe(value)}`)
+            else if (value !== null && (typeof value === 'object' || typeof value === 'function')) walk.push(value)
             else reads.push(`${at} = ${typeof value} ${String(value)}`)
         }
         for (const [i, capture] of captures.entries()) {
@@ -3442,16 +3494,18 @@ function nativeNormalizer(): NormalizeTarget {
     if (normalizeTarget) return normalizeTarget
     const start = performance.now()
     const file = normalizeWith ?? normalizeImage()
+    const image = new Uint8Array(hostFs.readFileSync(file))
+    const key = hostCrypto.createHash('sha256').update(image).digest('hex')
     let natives: any
     try {
-        natives = loadImage(new Uint8Array(hostFs.readFileSync(file)))
+        natives = loadImage(image)
     } catch (e) {
         throw `native-l2: the normalize image ${file} does not load: ${String(e).split('\n')[0]}`
     }
     const now = new Date()
     hostFs.utimesSync(file, now, now)
     nativeNormalizeStats.loadMs += performance.now() - start
-    normalizeTarget = { run: natives.nativeNormalize, file }
+    normalizeTarget = { run: natives.nativeNormalize, file, key }
     console.log(`native-l2 normalize ${file} [${(performance.now() - start).toFixed(0)}ms]`)
     return normalizeTarget
 }
@@ -3558,7 +3612,112 @@ export function reportNativeNormalize(): void {
 const normalizeCapture = intrinsics.argv().find(a => a.startsWith('l2-capture:'))?.slice('l2-capture:'.length)
 let normalizeCaptures = 0
 
+interface ObjectStore {
+    load(name: string): Uint8Array | undefined
+    save(name: string, bytes: Uint8Array): void
+}
+
+const compileCache: ObjectStore | undefined = (globalThis as any).__compileCache
+const compileCacheStats = { hits: 0, misses: 0, checked: 0, keyMs: 0, loadMs: 0, saveMs: 0, loaded: 0, saved: 0 }
+let compileCacheBuffer = new ArrayBuffer(1 << 20)
+let normalizeMachinery: string | undefined
+
+export function reportCompileCache(): void {
+    const s = compileCacheStats
+    if (!s.hits && !s.misses && !s.checked) return
+    console.log(`compile-cache normalize: ${s.hits} hits, ${s.misses} misses${s.checked ? `, ${s.checked} checked` : ''}; key ${s.keyMs.toFixed(0)}ms, load ${s.loadMs.toFixed(0)}ms, save ${s.saveMs.toFixed(0)}ms; read ${(s.loaded / 1048576).toFixed(1)}MB, wrote ${(s.saved / 1048576).toFixed(1)}MB`)
+    for (const key of Object.keys(s) as (keyof typeof s)[]) {
+        s[key] = 0
+    }
+}
+
 function normalizeGraph(graph: Graph, kind: NormalizeKind, target: Target): Graph {
+    if (!compileCache || normalizeMachinery === undefined || target !== hostTarget) return normalizeUncached(graph, kind, target)
+    if (normalizeCheck || normalizeCapture !== undefined) return normalizeUncached(graph, kind, target)
+    const s = compileCacheStats
+    const start = performance.now()
+    compileCacheBuffer = packGraph(graph, kind, 0, 0, compileCacheBuffer)
+    const key = hostCrypto.createHash('sha256')
+        .update(`normalize ${normalizeMachinery} ${normalizeTarget?.key ?? 'host'} ${imageFlags.join(' ')}\n${graph.name ?? ''}\n`)
+        .update(new Uint8Array(compileCacheBuffer, 0, packedBytes(compileCacheBuffer)))
+        .digest('hex')
+    const keyed = performance.now()
+    s.keyMs += keyed - start
+    const cached = compileCache.load(key)
+    s.loadMs += performance.now() - keyed
+    if (cached && hostProcess.env.SYN_COMPILE_CACHE_CHECK !== '1') {
+        const decodeStart = performance.now()
+        const out = decodeNormalized(cached, graph)
+        s.loadMs += performance.now() - decodeStart
+        s.hits++
+        s.loaded += cached.byteLength
+        return out
+    }
+    const literalFrom = graph.literals.values.length
+    const rawFrom = graph.literals.raw.length
+    const out = normalizeUncached(graph, kind, target)
+    const ran = performance.now()
+    const bytes = encodeNormalized(out, kind, literalFrom, rawFrom)
+    if (cached) {
+        s.checked++
+        const at = sameBytes(cached, bytes)
+        if (at >= 0) throw `compile cache: normalizing ${graph.name ?? 'anonymous'} gives bytes that differ from the cached ${key} at byte ${at} (${bytes.length}/${cached.length} bytes)`
+        return out
+    }
+    compileCache.save(key, bytes)
+    s.misses++
+    s.saved += bytes.byteLength
+    s.saveMs += performance.now() - ran
+    return out
+}
+
+function encodeNormalized(out: Graph, kind: NormalizeKind, literalFrom: number, rawFrom: number): Uint8Array {
+    compileCacheBuffer = packGraph(out, kind, literalFrom, rawFrom, compileCacheBuffer)
+    const graphBytes = packedBytes(compileCacheBuffer)
+    const ids: number[] = []
+    const texts: Uint8Array[] = []
+    const encoder = new TextEncoder()
+    for (const id of [...nodeIds(out), ...out.blocks.map(b => b.id)]) {
+        const label = getDebugLabel(out, id)
+        if (label === undefined) continue
+        ids.push(id)
+        texts.push(encoder.encode(label))
+    }
+    let textBytes = 0
+    for (const text of texts) {
+        textBytes += text.length
+    }
+    const bytes = new Uint8Array(graphBytes + 4 + ids.length * 8 + textBytes)
+    bytes.set(new Uint8Array(compileCacheBuffer, 0, graphBytes))
+    const view = new DataView(bytes.buffer)
+    view.setUint32(graphBytes, ids.length, true)
+    let at = graphBytes + 4 + ids.length * 8
+    for (let i = 0; i < ids.length; i++) {
+        view.setUint32(graphBytes + 4 + i * 8, ids[i], true)
+        view.setUint32(graphBytes + 8 + i * 8, texts[i].length, true)
+        bytes.set(texts[i], at)
+        at += texts[i].length
+    }
+    return bytes
+}
+
+function decodeNormalized(bytes: Uint8Array, shared: Graph): Graph {
+    const buffer = new Uint8Array(bytes).buffer
+    const graphBytes = packedBytes(buffer)
+    const out = unpackGraph(buffer.slice(0, graphBytes), shared)
+    const view = new DataView(buffer)
+    const count = view.getUint32(graphBytes, true)
+    const decoder = new TextDecoder()
+    let at = graphBytes + 4 + count * 8
+    for (let i = 0; i < count; i++) {
+        const length = view.getUint32(graphBytes + 8 + i * 8, true)
+        setDebugLabel(out, view.getUint32(graphBytes + 4 + i * 8, true), decoder.decode(new Uint8Array(buffer, at, length)))
+        at += length
+    }
+    return out
+}
+
+function normalizeUncached(graph: Graph, kind: NormalizeKind, target: Target): Graph {
     if (normalizeCapture !== undefined && target === hostTarget) {
         packInput(graph, kind)
         hostFs.mkdirSync(normalizeCapture, { recursive: true })
@@ -5493,10 +5652,7 @@ function knownCallee(source: Graph, n: GraphNode): number | undefined {
     const units = rawContents(source, reach)
     return units.length === 1 ? units[0] : undefined
 }
-const allocators = new WeakMap<Graph, boolean>()
 function returnsAllocation(g: Graph): boolean {
-    const known = allocators.get(g)
-    if (known !== undefined) return known
     const index = graphIndex(g)
     const mem = memAnalysis(g, index)
     let rets = 0
@@ -5511,9 +5667,7 @@ function returnsAllocation(g: Graph): boolean {
         }
         if (!fresh) break
     }
-    fresh = fresh && rets > 0
-    allocators.set(g, fresh)
-    return fresh
+    return fresh && rets > 0
 }
 function inlineAllocations(program: ProgramGraph, symbol: number, clock: PhaseClock): void {
     const source = program.units.get(symbol)!
@@ -16737,7 +16891,7 @@ export function loadImage(bytes: Uint8Array): Record<string, any> {
         if (pstack && !stacks) stacks = mapPstackBlock()
         if (pstack && !stacks) throw 'native: failed to map the image pstacks'
         const mapped = pstack ? stacks + region.index * pstackSpan()
-            : region.kind === RegionKind.heap ? mapGuarded(region.size) : Number(nativeMapper(align(region.size + slack, 4096)))
+            : region.kind === RegionKind.heap ? mapGuarded(region.size) : Number(nativeMapper(align(region.size + slack, 4096), mappingHint(region.kind, align(region.size + slack, 4096))))
         if (!mapped || mapped === -1) throw 'native: failed to map an image region'
         bases.push(region.kind === RegionKind.code ? mapped + (region.base & 4095) : mapped)
     }
@@ -16786,7 +16940,7 @@ function staticInitializerOf(linker: Linker, image: ProgramImage, keep: (fn: Fun
     const { staticFns, staticOrder } = linker
     if (!staticFns.length) return
     const size = Math.max(staticFns.length * 8, 1 << 12)
-    const table = Number(nativeMapper(size))
+    const table = Number(nativeMapper(size, mappingHint(RegionKind.table, size)))
     if (!table || table === -1) throw 'native: failed to map the static table'
     image.staticTable.base = table
     image.staticTable.region = addRegion(RegionKind.table, 0, table, size)
@@ -17035,4 +17189,57 @@ export async function suite() {
         const kept = keys.slice(-keptImages).flatMap(key => [`normalize-${key}.img`, `normalize-${key}.self.img`]).sort().join(' ')
         if (left !== kept) harness.fail(`retention must keep the ${keptImages} most recently used images and their files: kept ${left}`)
     })
+    harness.test('computationKeyIgnoresFieldOrder', () => {
+        function reader(weights: Record<string, number>): () => number {
+            return () => weights.light + weights.heavy
+        }
+        const inOrder = computationKey({ read: reader({ light: 1, heavy: 9 }) }, true)
+        const reversed = computationKey({ read: reader({ heavy: 9, light: 1 }) }, true)
+        const changed = computationKey({ read: reader({ light: 2, heavy: 9 }) }, true)
+        if (inOrder !== reversed) harness.fail(`objects with the same fields in another order must give the same key: ${inOrder} ${reversed}`)
+        if (inOrder === changed) harness.fail(`a changed field value must change the key: ${inOrder}`)
+    })
+    harness.test('compileCacheAcrossProcesses', () => {
+        const weights = new Map([[1, 10], [2, 20], [3, 30]])
+        function weightOf(n: u32): number {
+            return weights.get(n) ?? 0
+        }
+        if (flags.has('fatal-child')) {
+            const natives: any = createNatives({ weightOf })
+            const s = compileCacheStats
+            const listing = hostCrypto.createHash('sha256').update(natives.weightOf.units.map((unit: any) => unit.code.listing).join('\n')).digest('hex')
+            console.log(`weights ${[0, 1, 2, 3].map(n => Number(natives.weightOf(n))).join(' ')}; ${s.hits} hits, ${s.misses} misses, ${s.checked} checked; listing ${listing}`)
+            return
+        }
+        const dir = `${hostProcess.getBuiltinModule('node:os').tmpdir()}/compile-cache-${hostProcess.pid}`
+        const run = (check: string): string => {
+            const engine = hostProcess.argv.indexOf('--engine')
+            const args = [...hostProcess.argv.slice(2, engine + 1), 'native', ...intrinsics.argv().filter(a => !a.startsWith('only:')), 'in-process', 'only:compileCacheAcrossProcesses', 'fatal-child']
+            const exited = (globalThis as any).__spawnSync(hostProcess.argv[1], args, { ...hostProcess.env, SYN_CRASH_FD: '', SYN_CRASH_RESUME: '', SYN_COMPILE_CACHE: dir, SYN_COMPILE_CACHE_CHECK: check })
+            return `${exited.status} ${String(exited.stdout ?? '')} ${String(exited.stderr ?? '')}`
+        }
+        try {
+            const cold = run('')
+            const misses = /weights 0 10 20 30; 0 hits, (\d+) misses/.exec(cold)
+            if (!misses || misses[1] === '0') {
+                harness.fail(`a cold cache must compile and store every normalize: ${cold.slice(0, 300)}`)
+                return
+            }
+            const warm = run('')
+            if (!warm.includes(`weights 0 10 20 30; ${misses[1]} hits, 0 misses`)) harness.fail(`a second process must replay every normalize from the cache: ${warm.slice(0, 300)}`)
+            const listing = /listing ([0-9a-f]{64})/
+            if (listing.exec(cold)?.[1] !== listing.exec(warm)?.[1]) harness.fail(`a process replaying normalize from the cache must emit the listing a compiling process emits: ${cold.slice(0, 300)} ${warm.slice(0, 300)}`)
+            const objects = hostFs.readdirSync(dir).filter((name: string) => /^[0-9a-f]{64}$/.test(name))
+            const file = `${dir}/${objects[0]}`
+            const bytes = new Uint8Array(hostFs.readFileSync(file))
+            bytes[bytes.length - 1] ^= 1
+            hostFs.writeFileSync(file, bytes)
+            const checked = run('1')
+            if (!checked.includes('differ from the cached')) harness.fail(`the check mode must catch a cached object that differs from a fresh compile: ${checked.replace(/\s+/g, ' ').slice(0, 600)}`)
+        } finally {
+            hostFs.rmSync(dir, { recursive: true, force: true })
+        }
+    })
 }
+
+if (compileCache && imageFlags.every(flag => flag === 'native')) normalizeMachinery = computationKey({ normalizeGraph }, true)

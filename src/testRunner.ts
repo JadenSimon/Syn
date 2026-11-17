@@ -483,6 +483,7 @@ async function compileEngine(argv: string[]) {
         },
         __readBytes: (file: string) => new Uint8Array(fs.readFileSync(file)),
         __readDir: (dir: string) => fs.readdirSync(dir),
+        __compileCache: compileCache(),
         __spawnSync: (command: string, args: string[], env: Record<string, string>) => {
             const exited = spawnSync(...hostCommand(command, args), { env, encoding: 'utf8' })
             return { status: exited.status, signal: exited.signal, stdout: exited.stdout, stderr: exited.stderr }
@@ -819,13 +820,29 @@ function writeBaselines(bodies: Map<string, string[]>): void {
 
 const listingsMagic = 'SYNLIST1'
 const listingsLimit = 1000
+const compileCacheLimit = 100_000
 
 type ListedUnit = [name: string, listing: string]
 
-function listingsDir(): string | undefined {
-    const given = process.env.SYN_LISTINGS
+function storeDir(variable: string, name: string): string | undefined {
+    const given = process.env[variable]
     if (given === 'off') return undefined
-    return given || path.join(os.homedir(), '.syn', 'listings')
+    return given || path.join(os.homedir(), '.syn', name)
+}
+
+function listingsDir(): string | undefined {
+    return storeDir('SYN_LISTINGS', 'listings')
+}
+
+function compileCache(): { load: (name: string) => Uint8Array | undefined, save: (name: string, bytes: Uint8Array) => void } | undefined {
+    const dir = process.env.SYN_COMPILE_CACHE
+    if (!dir || dir === 'off') return undefined
+    return {
+        load: name => loadObject(dir, name),
+        save: (name, bytes) => {
+            storeObject(dir, name, bytes, compileCacheLimit)
+        },
+    }
 }
 
 function instructionText(line: string, pc: number): number {
@@ -981,7 +998,7 @@ function touchFile(file: string): boolean {
     }
 }
 
-function lockListings(dir: string): () => void {
+function lockStore(dir: string): () => void {
     const lock = path.join(dir, 'lock')
     const mine = path.join(dir, `.${process.pid}.lock`)
     const deadline = Date.now() + 30_000
@@ -1006,7 +1023,7 @@ function lockListings(dir: string): () => void {
                 removeFile(lock)
                 continue
             }
-            if (Date.now() > deadline) throw new Error(`listings: ${lock} has been held by pid ${holder} for over 30s`)
+            if (Date.now() > deadline) throw new Error(`store: ${lock} has been held by pid ${holder} for over 30s`)
             Atomics.wait(pause, 0, 0, 5)
         }
     } finally {
@@ -1014,14 +1031,18 @@ function lockListings(dir: string): () => void {
     }
 }
 
-function cleanListings(dir: string, limit: number): number {
+function storedObjects(names: string[]): string[] {
+    return names.filter(name => /^[0-9a-f]{64}$/.test(name))
+}
+
+function cleanStore(dir: string, limit: number): { cleaned: number, left: number } {
     const names = fs.readdirSync(dir)
     for (const name of names) {
         const writer = /^\.(\d+)\./.exec(name)
         if (writer && !alive(Number(writer[1]))) removeFile(path.join(dir, name))
     }
-    const objects = names.filter(name => /^[0-9a-f]{64}$/.test(name))
-    if (objects.length <= limit) return 0
+    const objects = storedObjects(names)
+    if (objects.length <= limit) return { cleaned: 0, left: objects.length }
     const aged: [number, string][] = []
     for (const name of objects) {
         const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false })
@@ -1030,24 +1051,48 @@ function cleanListings(dir: string, limit: number): number {
     aged.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1))
     const doomed = aged.slice(0, Math.floor(objects.length / 2))
     for (const [, name] of doomed) removeFile(path.join(dir, name))
-    return doomed.length
+    return { cleaned: doomed.length, left: objects.length - doomed.length }
+}
+
+const storeCounts = new Map<string, number>()
+
+function storeObject(dir: string, name: string, bytes: Uint8Array, limit: number): { written: boolean, cleaned: number } {
+    const file = path.join(dir, name)
+    if (touchFile(file)) return { written: false, cleaned: 0 }
+    fs.mkdirSync(dir, { recursive: true })
+    const temp = path.join(dir, `.${process.pid}.${name}`)
+    fs.writeFileSync(temp, bytes)
+    fs.renameSync(temp, file)
+    const known = storeCounts.get(dir)
+    const count = known === undefined ? storedObjects(fs.readdirSync(dir)).length : known + 1
+    storeCounts.set(dir, count)
+    if (count <= limit) return { written: true, cleaned: 0 }
+    const release = lockStore(dir)
+    try {
+        const { cleaned, left } = cleanStore(dir, limit)
+        storeCounts.set(dir, left)
+        return { written: true, cleaned }
+    } finally {
+        release()
+    }
+}
+
+function loadObject(dir: string, name: string): Uint8Array | undefined {
+    const file = path.join(dir, name)
+    let bytes: Buffer
+    try {
+        bytes = fs.readFileSync(file)
+    } catch (e: any) {
+        if (e.code === 'ENOENT') return undefined
+        throw e
+    }
+    touchFile(file)
+    return bytes
 }
 
 export function storeListings(dir: string, bytes: Buffer, limit = listingsLimit): { hash: string, written: boolean, cleaned: number } {
     const hash = crypto.createHash('sha256').update(bytes).digest('hex')
-    const file = path.join(dir, hash)
-    if (touchFile(file)) return { hash, written: false, cleaned: 0 }
-    fs.mkdirSync(dir, { recursive: true })
-    const release = lockListings(dir)
-    try {
-        if (touchFile(file)) return { hash, written: false, cleaned: 0 }
-        const temp = path.join(dir, `.${process.pid}.${hash}`)
-        fs.writeFileSync(temp, bytes)
-        fs.renameSync(temp, file)
-        return { hash, written: true, cleaned: cleanListings(dir, limit) }
-    } finally {
-        release()
-    }
+    return { hash, ...storeObject(dir, hash, bytes, limit) }
 }
 
 function loadListings(dir: string, given: string | undefined): ListedCase[] {

@@ -13,6 +13,7 @@ export interface Reifier {
     __readDir?: (dir: string) => string[]
     __spawnSync?: (command: string, args: string[], env: Record<string, string>) => { status: number | null, signal: string | null, stdout: string, stderr: string }
     __readBytes?: (file: string) => Uint8Array
+    __compileCache?: { load: (name: string) => Uint8Array | undefined, save: (name: string, bytes: Uint8Array) => void }
 }
 
 export type ResolveModule = (from: string, name: string) => [absPath: string, text: string | undefined] | undefined
@@ -68,6 +69,7 @@ function createSynContext(reifier: Reifier, extra: Record<string, unknown>) {
         __readDir: reifier.__readDir,
         __spawnSync: reifier.__spawnSync,
         __readBytes: reifier.__readBytes,
+        __compileCache: reifier.__compileCache,
         console: console,
         performance,
         process,
@@ -95,6 +97,7 @@ function installSynGlobals(reifier: Reifier, extra: Record<string, unknown>) {
         __readDir: reifier.__readDir,
         __spawnSync: reifier.__spawnSync,
         __readBytes: reifier.__readBytes,
+        __compileCache: reifier.__compileCache,
         v8,
         ...extra,
     })
