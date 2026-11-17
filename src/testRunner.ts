@@ -835,14 +835,30 @@ function listingsDir(): string | undefined {
 }
 
 function compileCache(): { load: (name: string) => Uint8Array | undefined, save: (name: string, bytes: Uint8Array) => void } | undefined {
-    const dir = process.env.SYN_COMPILE_CACHE
-    if (!dir || dir === 'off') return undefined
+    const given = process.env.SYN_COMPILE_CACHE
+    if (given === '' || given === 'off') return undefined
+    const dir = given ?? path.join(os.homedir(), '.syn', 'compile')
     return {
-        load: name => loadObject(dir, name),
+        load: name => {
+            const bytes = pendingObjects.get(name) ?? loadObject(dir, name)
+            if (!bytes) return undefined
+            const body = bytes.subarray(0, Math.max(0, bytes.length - 16))
+            if (objectDigest(body).equals(bytes.subarray(body.length))) return body
+            dropObject(dir, name)
+            return undefined
+        },
         save: (name, bytes) => {
-            storeObject(dir, name, bytes, compileCacheLimit)
+            const object = Buffer.concat([bytes, objectDigest(bytes)])
+            pendingObjects.set(name, object)
+            storeObjectLater(dir, name, object, compileCacheLimit, () => pendingObjects.delete(name))
         },
     }
+}
+
+const pendingObjects = new Map<string, Buffer>()
+
+function objectDigest(bytes: Uint8Array): Buffer {
+    return crypto.createHash('sha256').update(bytes).digest().subarray(0, 16)
 }
 
 function instructionText(line: string, pc: number): number {
@@ -1035,12 +1051,42 @@ function storedObjects(names: string[]): string[] {
     return names.filter(name => /^[0-9a-f]{64}$/.test(name))
 }
 
-function cleanStore(dir: string, limit: number): { cleaned: number, left: number } {
-    const names = fs.readdirSync(dir)
+function listNames(dir: string): string[] {
+    try {
+        return fs.readdirSync(dir)
+    } catch (e: any) {
+        if (e.code === 'ENOENT') return []
+        throw e
+    }
+}
+
+const storeBuckets = 256
+const openedStores = new Set<string>()
+
+function openStore(dir: string): void {
+    if (openedStores.has(dir)) return
+    openedStores.add(dir)
+    for (const name of storedObjects(listNames(dir))) {
+        const bucket = path.join(dir, name.slice(0, 2))
+        fs.mkdirSync(bucket, { recursive: true })
+        try {
+            fs.renameSync(path.join(dir, name), path.join(bucket, name))
+        } catch (e: any) {
+            if (e.code !== 'ENOENT') throw e
+        }
+    }
+}
+
+function removeDeadTemps(dir: string, names: string[]): void {
     for (const name of names) {
         const writer = /^\.(\d+)\./.exec(name)
         if (writer && !alive(Number(writer[1]))) removeFile(path.join(dir, name))
     }
+}
+
+function cleanStore(dir: string, limit: number): { cleaned: number, left: number } {
+    const names = fs.readdirSync(dir)
+    removeDeadTemps(dir, names)
     const objects = storedObjects(names)
     if (objects.length <= limit) return { cleaned: 0, left: objects.length }
     const aged: [number, string][] = []
@@ -1057,28 +1103,57 @@ function cleanStore(dir: string, limit: number): { cleaned: number, left: number
 const storeCounts = new Map<string, number>()
 
 function storeObject(dir: string, name: string, bytes: Uint8Array, limit: number): { written: boolean, cleaned: number } {
-    const file = path.join(dir, name)
+    openStore(dir)
+    const bucket = path.join(dir, name.slice(0, 2))
+    const file = path.join(bucket, name)
     if (touchFile(file)) return { written: false, cleaned: 0 }
-    fs.mkdirSync(dir, { recursive: true })
-    const temp = path.join(dir, `.${process.pid}.${name}`)
+    fs.mkdirSync(bucket, { recursive: true })
+    const temp = path.join(bucket, `.${process.pid}.${name}`)
     fs.writeFileSync(temp, bytes)
     fs.renameSync(temp, file)
-    const known = storeCounts.get(dir)
-    const count = known === undefined ? storedObjects(fs.readdirSync(dir)).length : known + 1
-    storeCounts.set(dir, count)
-    if (count <= limit) return { written: true, cleaned: 0 }
-    const release = lockStore(dir)
+    return { written: true, cleaned: countObject(bucket, limit) }
+}
+
+function storeObjectLater(dir: string, name: string, bytes: Uint8Array, limit: number, done: () => void): void {
+    openStore(dir)
+    const bucket = path.join(dir, name.slice(0, 2))
+    const temp = path.join(bucket, `.${process.pid}.${name}`)
+    fs.mkdirSync(bucket, { recursive: true })
+    fs.writeFile(temp, bytes, written => {
+        if (written) throw written
+        fs.rename(temp, path.join(bucket, name), renamed => {
+            done()
+            if (renamed) throw renamed
+            countObject(bucket, limit)
+        })
+    })
+}
+
+function countObject(bucket: string, limit: number): number {
+    const cap = Math.ceil(limit / storeBuckets)
+    let count = storeCounts.get(bucket)
+    if (count === undefined) {
+        const names = fs.readdirSync(bucket)
+        removeDeadTemps(bucket, names)
+        count = storedObjects(names).length
+    } else {
+        count++
+    }
+    storeCounts.set(bucket, count)
+    if (count <= cap) return 0
+    const release = lockStore(bucket)
     try {
-        const { cleaned, left } = cleanStore(dir, limit)
-        storeCounts.set(dir, left)
-        return { written: true, cleaned }
+        const { cleaned, left } = cleanStore(bucket, cap)
+        storeCounts.set(bucket, left)
+        return cleaned
     } finally {
         release()
     }
 }
 
-function loadObject(dir: string, name: string): Uint8Array | undefined {
-    const file = path.join(dir, name)
+function loadObject(dir: string, name: string): Buffer | undefined {
+    openStore(dir)
+    const file = path.join(dir, name.slice(0, 2), name)
     let bytes: Buffer
     try {
         bytes = fs.readFileSync(file)
@@ -1090,6 +1165,10 @@ function loadObject(dir: string, name: string): Uint8Array | undefined {
     return bytes
 }
 
+function dropObject(dir: string, name: string): void {
+    removeFile(path.join(dir, name.slice(0, 2), name))
+}
+
 export function storeListings(dir: string, bytes: Buffer, limit = listingsLimit): { hash: string, written: boolean, cleaned: number } {
     const hash = crypto.createHash('sha256').update(bytes).digest('hex')
     return { hash, ...storeObject(dir, hash, bytes, limit) }
@@ -1097,9 +1176,11 @@ export function storeListings(dir: string, bytes: Buffer, limit = listingsLimit)
 
 function loadListings(dir: string, given: string | undefined): ListedCase[] {
     if (!given) throw 'listings: expected a hash'
-    const found = /^[0-9a-f]{64}$/.test(given) ? [given] : fs.readdirSync(dir).filter(name => /^[0-9a-f]{64}$/.test(name) && name.startsWith(given))
+    openStore(dir)
+    const buckets = given.length >= 2 ? [given.slice(0, 2)] : listNames(dir).filter(name => /^[0-9a-f]{2}$/.test(name) && name.startsWith(given))
+    const found = buckets.flatMap(bucket => storedObjects(listNames(path.join(dir, bucket)))).filter(name => name.startsWith(given))
     if (found.length !== 1) throw `listings: ${found.length ? `${found.length} objects start with` : 'no object for'} ${given} in ${dir}`
-    return readListings(fs.readFileSync(path.join(dir, found[0])))
+    return readListings(fs.readFileSync(path.join(dir, found[0].slice(0, 2), found[0])))
 }
 
 function caseText(listed: ListedCase): string {
