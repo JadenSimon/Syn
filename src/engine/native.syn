@@ -370,6 +370,8 @@ function mirrorTypeDescriptor(td: number): void {
     let i: u32 = 0
     while (i < heap.layoutFieldCount(td as intrinsics.Handle)) {
         mirrorValue(heap.layoutKeyAt(td as intrinsics.Handle, i))
+        const kind = heap.layoutKindAt(td as intrinsics.Handle, i)
+        if (kind === heap.LayoutField.layout || kind === heap.LayoutField.embedded) mirrorValue(heap.layoutExtraAt(td as intrinsics.Handle, i))
         i++
     }
 }
@@ -2394,6 +2396,7 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>, discard
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.cellof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.stringOf, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
+rt.bind(rt.Op.objectOf, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => ctx.heapAddress(getOperand(g, n, 2)) })
 rt.bind(rt.Op.call, {
     lower: (g, n) => {
@@ -7716,7 +7719,11 @@ function recordObject(rep: Rep): Rep | undefined {
     return floatUnion(rep) && !isStringRep(rep.other) ? rep.other : undefined
 }
 
-const wordMembers = RepMember.string | RepMember.function
+const wordMembers = RepMember.string | RepMember.function | RepMember.dynamic
+
+function heapHandle(rep: Rep | undefined): boolean {
+    return rep?.kind === 'pointer' && rep.members === RepMember.dynamic && !rep.shapes.length && rep.closure === undefined && !rep.zero && !rep.encoded && (!rep.nullable || !!rep.null)
+}
 
 function unionWord(rep: Rep): boolean {
     return rep.kind === 'union' && !rep.float && (memberCount(rep) > 0 || !!rep.bools || !!rep.null) && !(rep.members & ~wordMembers)
@@ -10175,6 +10182,7 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
         return fieldAt(inst.shapes.get(target)!, heap.closureCallKey) >= 0
     }
     function agrees(graph: Graph, n: GraphNode, targets: string[]): boolean {
+        if (n.op === NodeOp.rt && (getLiteral(graph, n, 1) === rt.Op.cellof || getLiteral(graph, n, 1) === rt.Op.layoutOf)) return false
         if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof) return targets.every(target => callable(target) === callable(targets[0]))
         if (n.op === NodeOp.rt) return targets.every(target => chain(target) === chain(targets[0]))
         if (getRef(n, 2)) return false
@@ -10253,7 +10261,7 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
             }
             for (const n of allNodes(graph)) {
                 if (rt.calleeSlot(graph, n) >= 0) link(shapesOf(repAt(getRef(n, rt.calleeSlot(graph, n)))))
-                const access = n.op === NodeOp.getProp || n.op === NodeOp.setProp || (n.op === NodeOp.rt && (getLiteral(graph, n, 1) === rt.Op.hasPrototype || getLiteral(graph, n, 1) === rt.Op.typeof))
+                const access = n.op === NodeOp.getProp || n.op === NodeOp.setProp || (n.op === NodeOp.rt && (getLiteral(graph, n, 1) === rt.Op.hasPrototype || getLiteral(graph, n, 1) === rt.Op.typeof || getLiteral(graph, n, 1) === rt.Op.cellof || getLiteral(graph, n, 1) === rt.Op.layoutOf))
                 if (!access) continue
                 const targets = shapesOf(repAt(objectOf(n)))
                 link(targets)
@@ -10428,7 +10436,12 @@ function fieldStores(plan: ShapePlan, unit: PlannedUnit, graph: Graph, id: numbe
 }
 
 function analyzeTags(plan: ShapePlan, planned: Planned, tracedOf: (unit: PlannedUnit) => Graph, returnTaggable: (unit: PlannedUnit) => boolean, binder: Binder, types: TypeTable): TagFlow {
-    const { isRoot, sourceOfLinked } = binder
+    const { isRoot, sourceOfLinked, originOf } = binder
+    function wrappedValue(unit: PlannedUnit, graph: Graph, id: number, n: GraphNode): number {
+        if (n.op === NodeOp.rt && (getLiteral(graph, n, 1) === rt.Op.cellof || getLiteral(graph, n, 1) === rt.Op.layoutOf)) return getRef(n, 2)
+        if (n.op !== NodeOp.setProp) return 0
+        return [...unit.calls.get(id) ?? []].some(callee => originOf(callee.fn) === heap.setPointerProperty) ? getRef(n, 3) : 0
+    }
     const marked = new Set<number>()
     const dependents = new Map<number, [user: number, position?: number][]>()
     const leaves: number[] = []
@@ -10503,6 +10516,34 @@ function analyzeTags(plan: ShapePlan, planned: Planned, tracedOf: (unit: Planned
                     else byKey.set(key, [[unit, value]])
                 }
             })
+        }
+    }
+    for (const unit of planned.units.values()) {
+        const graph = tracedOf(unit)
+        for (const [id, n] of nodeEntries(graph)) {
+            const value = wrappedValue(unit, graph, id, n)
+            if (!value) continue
+            const at = graph.blocks[0].params.indexOf(value)
+            const rep = at < 0 ? unit.nodes.get(value) : unit.params[at]?.rep
+            if (rep?.kind !== 'pointer') continue
+            const reached = new Set(rep.shapes)
+            const pending = [...rep.shapes]
+            while (pending.length) {
+                const id = pending.pop()!
+                const shape = plan.shapes.get(id)
+                if (shape === undefined) continue
+                for (const key of plan.bits.get(shape)?.tagged ?? []) {
+                    demand([shape], key)
+                }
+                for (const [, field] of plan.inst.shapes.get(id)?.fields ?? []) {
+                    if (field.kind !== 'pointer') continue
+                    for (const inner of field.shapes) {
+                        if (reached.has(inner)) continue
+                        reached.add(inner)
+                        pending.push(inner)
+                    }
+                }
+            }
         }
     }
     for (const unit of planned.units.values()) {
@@ -11668,6 +11709,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         if (union(x)) return tagged
         if (inWord(x)) return isStringRep(factsOf(x)) ? { representation: Representation.string, width: 4 } : { representation: Representation.tagged, width: 4 }
         if (stringLiteral(x) || isStringRep(factsOf(x))) return string
+        if (heapHandle(factsOf(x))) return handle
         if (object(x)) return pointer
         if (encodedWord(x)) return address
         if (floats.has(tailOf(graph, x))) return float
@@ -11777,6 +11819,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         if (from.width === 4 && from.representation === Representation.string) return presentWord(x)
         if (from.width === 4 || from.representation === Representation.tagged) return x
         if (from.representation === Representation.string) return stringLiteral(x) || !factsOf(x)?.nullable ? tagVmHandleNode(graph, x) : presentString(x, tagVmHandleNode(graph, x))
+        if (from.representation === Representation.handle) return tagVmHandleNode(graph, x)
         if (from.representation === Representation.object) return encodeObject(x, rep)
         return addNode(graph, NodeOp.box, [x], Types.vm_value)
     }
@@ -11804,7 +11847,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         if (to.representation === Representation.f64) return addNode(graph, NodeOp.convert, [wordNumber(x)], Types.f64)
         if (to.representation === Representation.flag) return wordTruth(x)
         if (to.representation === Representation.integer) return wordNumber(x)
-        if (to.representation === Representation.string || to.representation === Representation.handle) return handleOf(x)
+        if (to.representation === Representation.string || to.representation === Representation.handle || heapHandle(rep)) return handleOf(x)
         if (rep?.zero) return addNode(graph, NodeOp.select, [x, decode(x), { literal: 0 }])
         if (shaped || pointerOfShapes(rep)) return decodeAddress(x, rep)
         throw `native: ${graph.name} passes union word %${x} into ${into} (${repText(rep)})`
@@ -11943,6 +11986,11 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
         if (rep?.kind === 'pointer') typeofKinds(id, x)
         return !!rep && union(x) && typeofKinds(id, x) !== 0
     }
+    function staticHandle(id: number, x: number): Operand {
+        const target = getNode(graph, tailOf(graph, x))
+        if (target?.op !== NodeOp.heapHandle || getRef(target, 0)) throw compileError(`native: ${graph.name} tests an object in the runtime heap against a prototype that is not a static object`, id)
+        return { literal: getLiteral(graph, target, 0) }
+    }
     function operandTarget(op: rt.Op, i: number): BoundaryRepresentation {
         return rt.signatureOf(op).params[i] === Types.handle ? handle : wildcard
     }
@@ -11976,6 +12024,7 @@ export function realizeRepresentations(graph: Graph, request: CodecRequest, tagP
             coerceSlots(graph, id, [0], x => convert(x, wildcard))
         }
         else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.typeof && typeofTarget(id, getRef(n, 2))) putCopy(graph, id, n, [...getOperands(graph, n, 0, 3), { literal: typeofKinds(id, getRef(n, 2)) }])
+        else if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.hasPrototype && ((factsOf(getRef(n, 2))?.members ?? 0) & RepMember.dynamic)) putCopy(graph, id, n, [...getOperands(graph, n, 0, 2), convert(getRef(n, 2), tagged, factsOf(getRef(n, 2))), staticHandle(id, getRef(n, 3))])
         else if (n.op === NodeOp.rt) coerceSlots(graph, id, Array.from({ length: countIds(n) - 2 }, (_, i) => i + 2), (x, i) => convert(x, object(x) && rt.signatureOf(getLiteral(graph, n, 1)).params[i - 2] === Types.u64 ? pointer : operandTarget(getLiteral(graph, n, 1), i - 2)))
         else if (n.op === NodeOp.eq || n.op === NodeOp.ne) {
             coerceSlots(graph, id, [0, 1].filter(at => inWord(getRef(n, 1 - at))), (x, i) => compared(x, factsOf(getRef(n, 1 - i))))
@@ -13269,6 +13318,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         if (plannedUnit?.blocks.size) pruneUnentered(traced.graph, plannedUnit, traced.allocations)
         plannedMachineOps(traced.graph, local)
         if (local) plannedRuntimeCalls(traced.graph, local)
+        if (local) widenedArguments(traced.graph, local)
         if (local) plannedWrappers(traced.graph, local)
         if (flags.has(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...plan.embedded.fields.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
@@ -13498,47 +13548,117 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         for (const [id, units] of floats) local.calls.set(id, units)
     }
     const layoutDescriptors = new Map<string, intrinsics.Handle>()
+    let objectProto: intrinsics.Handle | undefined
+    function plainProto(proto: intrinsics.Handle | undefined): boolean {
+        objectProto ??= heap.deref(heap.getPrototypeProperty(heap.deref(session.linkFunction(builtinGlobals.Object) as intrinsics.Handle)))
+        return !proto || proto === objectProto
+    }
     function layoutDescriptor(graph: Graph, id: number, shapeId: string): intrinsics.Handle {
         const shape = plan.shapes.get(shapeId)!
         const sig = plan.inst.shapes.get(shapeId)!
         const unsupported = (what: string) => compileError(`native: ${graph.name} needs a type descriptor for ${shapeSignatureText(sig)}, which cannot describe ${what} yet`, id)
-        if (sig.constants.size || sig.absent.size) throw unsupported('constant or absent fields')
+        if (sig.constants.size) throw unsupported('constant fields')
         const layout = propertyEval.recordLayout(shape, layouts.refinements, layouts.bits)
         intrinsics.assert(layout.keys.length === sig.fields.length, `native: planned shape ${shapeId} lays out ${layout.keys.length} keys for ${sig.fields.length} fields`)
         const fields: number[] = []
+        const extras: number[] = []
+        const nested: [at: number, inner: string][] = []
         let i = 0
         while (i < layout.keys.length) {
-            const rep = sig.fields[i][1]
+            const [name, rep] = sig.fields[i]
             const flag = layout.flags[i]
+            const tag = layout.tags[i]
+            const absent = sig.absent.has(name)
             const codec = locate(facts, shape, String(layout.offsets[i]))
-            if (layout.nested[i] !== undefined || layout.tags[i] || (codec?.kind !== 'f64' && codec?.encoded)) throw unsupported(`field ${sig.fields[i][0]}`)
+            const embedded = layout.nested[i] !== undefined
+            if ((codec?.kind !== 'f64' && codec?.encoded) || rep.null || rep.zero) throw unsupported(`field ${name}`)
+            if (absent && sig.nullish.has(name)) throw unsupported(`field ${name}, which may be absent and may also hold undefined,`)
+            if (nullableNumber(rep) && !tag) throw unsupported(`field ${name}, which may hold undefined without a presence bit,`)
             const signed = !!intFormatOf(rep)?.signed
-            if (flag) fields.push(heap.layoutField(flag.offset, heap.LayoutField.flag, flag.bit))
-            else if (rep.kind === 'number' && numberName(rep) === 'f64') fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.f64, 0))
-            else if (rep.kind === 'number' && layout.narrow[i]) fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i32 : heap.LayoutField.u32, 0))
-            else if (rep.kind === 'number') fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i64 : heap.LayoutField.u64, 0))
-            else if (isStringRep(rep) && !rep.nullable) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.string, 0))
-            else if ((rep.kind === 'pointer' || rep.kind === 'buffer') && !heap.isString(layout.keys[i])) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.pointer, 0))
-            else throw unsupported(`field ${sig.fields[i][0]} held as ${repText(rep, '?')}`)
+            if (flag && absent) throw unsupported(`field ${name}, which may be absent and is held as a bit,`)
+            if (flag) fields.push(heap.layoutField(flag.offset, heap.LayoutField.flag, flag.bit, false))
+            else if (rep.kind === 'number' && numberName(rep) === 'f64') fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.f64, 0, absent))
+            else if (rep.kind === 'number' && layout.narrow[i]) fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i32 : heap.LayoutField.u32, 0, absent))
+            else if (rep.kind === 'number') fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i64 : heap.LayoutField.u64, 0, absent))
+            else if (isStringRep(rep)) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.string, 0, absent))
+            else if ((rep.kind === 'pointer' || rep.kind === 'buffer') && !heap.isString(layout.keys[i])) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.pointer, 0, absent))
+            else if (rep.kind === 'pointer' && memberCount(rep) === 1 && rep.shapes.length === 1 && plan.shapes.has(rep.shapes[0])) {
+                const inner = plan.inst.shapes.get(rep.shapes[0])!
+                if (!plainProto(inner.proto)) throw unsupported(`field ${name}, which holds a ${inner.name} that reflection cannot hand back yet,`)
+                if (rep.nullable) throw unsupported(`field ${name}, which may hold undefined in place of a ${inner.name},`)
+                if (embedded && absent) throw unsupported(`field ${name}, which is embedded and may be absent,`)
+                fields.push(heap.layoutField(layout.offsets[i], embedded ? heap.LayoutField.embedded : heap.LayoutField.layout, 0, absent))
+                nested.push([i, rep.shapes[0]])
+            } else if (embedded) throw unsupported(`field ${name}`)
+            else throw unsupported(`field ${name} held as ${repText(rep, '?')}`)
+            extras.push(tag ? heap.layoutField(tag.offset, heap.LayoutField.flag, tag.bit, false) : 0)
             i++
         }
         const proto = (sig.proto ?? 0) as intrinsics.Handle
-        const content = [proto, ...layout.keys, ...fields].join(',')
+        const content = [proto, ...layout.keys, ...fields, ...extras, ...nested.map(([, inner]) => inner)].join(',')
         const known = layoutDescriptors.get(content)
         if (known !== undefined) return known
-        const td = heap.layoutTypeDescriptor(proto, layout.keys, fields)
+        const td = heap.layoutTypeDescriptor(proto, layout.keys, fields, extras)
         layoutDescriptors.set(content, td)
+        for (const [at, inner] of nested) {
+            heap.setLayoutExtra(td, at, layoutDescriptor(graph, id, inner))
+        }
         return td
     }
     function plannedWrappers(graph: Graph, local: UnitPlan): void {
         for (const [id, n] of nodeEntries(graph)) {
+            if (n.op === NodeOp.rt && getLiteral(graph, n, 1) === rt.Op.layoutOf) plannedLayout(graph, local, id, n)
             if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.cellof) continue
             const rep = local.nodes.get(getRef(n, 2))
-            const shape = wrappedShape(graph, id, rep)
+            if (heapHandle(rep)) continue
             intrinsics.assert([...local.calls.get(id) ?? []].some(unit => originOf(unit.fn) === heap.wrapPointer), `native: ${graph.name} %${id} wraps ${repText(rep)} without a bound heap wrapper`)
             const callee = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(heap.wrapPointer) }])
-            putNode(graph, id, NodeOp.call, [getOperand(graph, n, 0), callee, { literal: layoutDescriptor(graph, id, shape) }, getOperand(graph, n, 2)])
+            putNode(graph, id, NodeOp.call, [getOperand(graph, n, 0), callee, wrappedDescriptor(graph, id, getOperand(graph, n, 2), rep), getOperand(graph, n, 2)])
         }
+    }
+    function widenedArguments(graph: Graph, local: UnitPlan): void {
+        for (const [id, n] of nodeEntries(graph)) {
+            const callees = [...local.calls.get(id) ?? []]
+            const first = n.op === NodeOp.rt && rt.calleeSlot(graph, n) < 0 ? 2 : rt.argSlot(graph, n)
+            if (!callees.length || first < 0 || callees.some(unit => unit.params.some(param => param.receiver))) continue
+            let i = first
+            while (i < countIds(n)) {
+                const x = getRef(n, i)
+                const into = callees[0].params[i - first]?.rep
+                if (x && heapHandle(into) && pointerOfShapes(local.nodes.get(x))) putCopy(graph, id, getNode(graph, id)!, withOperand(graph, getNode(graph, id)!, i, widened(graph, local, id, x, into!)))
+                i++
+            }
+        }
+    }
+    function widened(graph: Graph, local: UnitPlan, id: number, x: number, into: Rep): Operand {
+        const target = getNode(graph, tailOf(graph, x))
+        if (target?.op === NodeOp.heapHandle && !getRef(target, 0)) return { literal: getLiteral(graph, target, 0) }
+        const callee = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(heap.wrapPointer) }])
+        const wrapped = addNode(graph, NodeOp.call, [addNode(graph, NodeOp.void, []), callee, wrappedDescriptor(graph, id, x, local.nodes.get(x)), x], Types.u32)
+        local.nodes.set(wrapped, into)
+        return wrapped
+    }
+    function plannedLayout(graph: Graph, local: UnitPlan, id: number, n: GraphNode): void {
+        const rep = local.nodes.get(getRef(n, 2))
+        if (!heapHandle(rep)) return putNode(graph, id, NodeOp.convert, [wrappedDescriptor(graph, id, getOperand(graph, n, 2), rep)], Types.u32)
+        intrinsics.assert([...local.calls.get(id) ?? []].some(unit => originOf(unit.fn) === heap.layoutDescriptorOf), `native: ${graph.name} %${id} reads the layout of ${repText(rep)} without a bound heap helper`)
+        const callee = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(heap.layoutDescriptorOf) }])
+        putNode(graph, id, NodeOp.call, [getOperand(graph, n, 0), callee, getOperand(graph, n, 2)])
+    }
+    function wrappedDescriptor(graph: Graph, id: number, ptr: Operand, rep: Rep | undefined): Operand {
+        if (rep?.kind !== 'pointer' || memberCount(rep) < 2 || rep.shapes.length !== memberCount(rep) || rep.nullable || !rep.shapes.every(shape => plan.shapes.has(shape))) return { literal: layoutDescriptor(graph, id, wrappedShape(graph, id, rep)) }
+        const shapes = rep.shapes
+        const tags = shapes.map(shape => plan.tagOf(shape))
+        if (tags.some(tag => tag === undefined)) throw compileError(`native: ${graph.name} hands ${repText(rep)} to a heap helper, but not every layout carries a shape tag`, id)
+        const tag = addNode(graph, NodeOp.load, [addNode(graph, NodeOp.void, []), ptr, { literal: -propertyEval.prefixBytes }], Types.u32)
+        let td: Operand = { literal: layoutDescriptor(graph, id, shapes[shapes.length - 1]) }
+        let i = shapes.length - 2
+        while (i >= 0) {
+            const same = addNode(graph, NodeOp.eq, [tag, { literal: tags[i]! }], Types.bool)
+            td = addNode(graph, NodeOp.select, [same, { literal: layoutDescriptor(graph, id, shapes[i]) }, td], Types.u32)
+            i--
+        }
+        return td
     }
     function wrappedShape(graph: Graph, id: number, rep: Rep | undefined): string {
         if (rep?.kind !== 'pointer' || memberCount(rep) !== 1 || rep.shapes.length !== 1 || rep.nullable || !plan.shapes.has(rep.shapes[0])) throw compileError(`native: ${graph.name} hands ${repText(rep, 'a literal')} to a heap helper, which only wraps one fixed layout`, id)

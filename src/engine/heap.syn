@@ -54,6 +54,8 @@ export function pstackOffset(word: number): number {
 bindHost(RtOp.handleof, (value: Handle): Handle => value)
 bindHost(RtOp.cellof, (value: Handle): Handle => value)
 bindHost(RtOp.stringOf, (handle: Handle): any => handle)
+bindHost(RtOp.objectOf, (handle: Handle, owner: any): any => handle)
+bindHost(RtOp.layoutOf, (value: Handle): Handle => layoutDescriptorOf(value))
 bindHost(RtOp.heapaddr, (handle: Handle): usize => (handle & ~boxedCellBit) as usize)
 
 export interface HeapAllocator {
@@ -976,8 +978,13 @@ export function strictEquals(lhs: any, rhs: any): boolean {
     const a = rt.handleof(lhs)
     const b = rt.handleof(rhs)
     if (a === b) return typeof lhs === typeof rhs
-    if (typeof lhs !== 'string' || typeof rhs !== 'string') return false
+    if (typeof lhs !== 'string' || typeof rhs !== 'string') return wrappedPair(lhs, rhs, a, b)
     return stringBytesEqual(a, b)
+}
+
+function wrappedPair(lhs: any, rhs: any, a: Handle, b: Handle): boolean {
+    if (typeof lhs !== 'object' || typeof rhs !== 'object') return false
+    return sameWrapper(a, b)
 }
 
 bindImpl(RtOp.strictEqual, strictEquals)
@@ -1810,6 +1817,8 @@ export enum LayoutField {
     flag = 6,
     string = 7,
     pointer = 8,
+    layout = 9,
+    embedded = 10,
 }
 
 interface NativeStruct {
@@ -1819,19 +1828,22 @@ interface NativeStruct {
 
 const NativeStruct = intrinsics.DefineStructView(reify NativeStruct)
 
-export function layoutField(offset: number, kind: LayoutField, bit: number): u32 {
+const absentField = 0x40000000
+
+export function layoutField(offset: number, kind: LayoutField, bit: number, absent: boolean): u32 {
     if (offset > 0xffff) throw `heap: a fixed layout field at offset ${offset} does not fit a type descriptor`
-    return offset | (kind << 16) | (bit << 24)
+    return offset | (kind << 16) | (bit << 24) | (absent ? absentField : 0)
 }
 
-export function layoutTypeDescriptor(proto: Handle, keys: Handle[], fields: u32[]): Handle {
-    if (keys.length * 2 > 255) throw `heap: a fixed layout with ${keys.length} fields does not fit a type descriptor`
-    const td = allocTypeDescriptor(BaseTypeKind.native_struct, 0, (keys.length * 2) as u8, 0, proto)
+export function layoutTypeDescriptor(proto: Handle, keys: Handle[], fields: u32[], extras: u32[]): Handle {
+    if (keys.length * 3 > 255) throw `heap: a fixed layout with ${keys.length} fields does not fit a type descriptor`
+    const td = allocTypeDescriptor(BaseTypeKind.native_struct, keys.length as u8, (keys.length * 3) as u8, 0, proto)
     const slots = resolveHeapCell(td) + TypeDescriptor.sizeof
     let i = 0
     while (i < keys.length) {
-        Intrinsics.store(slots, i * 8, keys[i], Types.u32)
-        Intrinsics.store(slots, i * 8 + 4, fields[i], Types.u32)
+        Intrinsics.store(slots, i * 12, keys[i], Types.u32)
+        Intrinsics.store(slots, i * 12 + 4, fields[i], Types.u32)
+        Intrinsics.store(slots, i * 12 + 8, extras[i], Types.u32)
         i++
     }
     return td
@@ -1841,26 +1853,101 @@ export function isLayoutTD(td: Handle): boolean {
     return TypeDescriptor(resolveHeapCell(td)).kind === BaseTypeKind.native_struct
 }
 
+export function layoutDescriptorOf(obj: Handle): Handle {
+    const td = typeDescriptorOf(obj)
+    return isLayoutTD(td) ? td : 0 as Handle
+}
+
 export function layoutFieldCount(td: Handle): u32 {
-    return Intrinsics.ushr(TypeDescriptor(resolveHeapCell(td)).extraSlots, 1, Types.u32)
+    return TypeDescriptor(resolveHeapCell(td)).variant
 }
 
 export function layoutKeyAt(td: Handle, i: u32): Handle {
-    return Intrinsics.load(resolveHeapCell(td), TypeDescriptor.sizeof + i * 8, Types.u32) as Handle
+    return Intrinsics.load(resolveHeapCell(td), TypeDescriptor.sizeof + i * 12, Types.u32) as Handle
 }
 
-export function layoutValueAt(cell: Handle, td: Handle, i: u32): any {
-    const field = Intrinsics.load(resolveHeapCell(td), TypeDescriptor.sizeof + i * 8 + 4, Types.u32)
+function layoutFieldAt(td: Handle, i: u32): u32 {
+    return Intrinsics.load(resolveHeapCell(td), TypeDescriptor.sizeof + i * 12 + 4, Types.u32)
+}
+
+export function layoutExtraAt(td: Handle, i: u32): u32 {
+    return Intrinsics.load(resolveHeapCell(td), TypeDescriptor.sizeof + i * 12 + 8, Types.u32)
+}
+
+export function setLayoutExtra(td: Handle, i: u32, value: u32): void {
+    Intrinsics.store(resolveHeapCell(td), TypeDescriptor.sizeof + i * 12 + 8, value, Types.u32)
+}
+
+export function layoutKindAt(td: Handle, i: u32): u32 {
+    return Intrinsics.and(Intrinsics.ushr(layoutFieldAt(td, i), 16, Types.u32), 0xff, Types.u32)
+}
+
+function layoutBit(ptr: u64, field: u32): boolean {
+    const offset = Intrinsics.and(field, 0xffff, Types.u32)
+    const bit = Intrinsics.and(Intrinsics.ushr(field, 24, Types.u32), 0x1f, Types.u32)
+    return Intrinsics.and(Intrinsics.ushr(Intrinsics.load(ptr, offset, Types.u32), bit, Types.u32), 1, Types.u32) !== 0
+}
+
+function layoutDefined(ptr: u64, td: Handle, i: u32): boolean {
+    const kind = layoutKindAt(td, i)
+    const offset = Intrinsics.and(layoutFieldAt(td, i), 0xffff, Types.u32)
+    if (kind === LayoutField.string) return Intrinsics.load(ptr, offset, Types.u32) !== 0
+    if (kind === LayoutField.pointer || kind === LayoutField.layout) return Intrinsics.load(ptr, offset, Types.u64) !== 0
+    if (kind === LayoutField.embedded) return true
+    const presence = layoutExtraAt(td, i)
+    if (presence) return layoutBit(ptr, presence)
+    return true
+}
+
+export function layoutHasField(cell: Handle, td: Handle, i: u32): boolean {
+    if (!Intrinsics.and(layoutFieldAt(td, i), absentField, Types.u32)) return true
+    return layoutDefined(NativeStruct(resolveHeapCell(cell)).ptr, td, i)
+}
+
+export function layoutValueAt(cell: Handle, td: Handle, i: u32, owner: any): any {
+    const field = layoutFieldAt(td, i)
     const ptr = NativeStruct(resolveHeapCell(cell)).ptr
     const offset = Intrinsics.and(field, 0xffff, Types.u32)
     const kind = Intrinsics.and(Intrinsics.ushr(field, 16, Types.u32), 0xff, Types.u32)
+    if (!layoutDefined(ptr, td, i)) return undefined
     if (kind === LayoutField.f64) return Intrinsics.load(ptr, offset, Types.f64)
     if (kind === LayoutField.i64) return Intrinsics.load(ptr, offset, Types.i64)
     if (kind === LayoutField.u32) return Intrinsics.load(ptr, offset, Types.u32)
     if (kind === LayoutField.i32) return Intrinsics.load(ptr, offset, Types.i32)
-    if (kind === LayoutField.flag) return Intrinsics.and(Intrinsics.ushr(Intrinsics.load(ptr, offset, Types.u32), Intrinsics.ushr(field, 24, Types.u32), Types.u32), 1, Types.u32) !== 0
+    if (kind === LayoutField.flag) return layoutBit(ptr, field)
     if (kind === LayoutField.string) return rt.stringOf(Intrinsics.load(ptr, offset, Types.u32) as Handle)
+    if (kind === LayoutField.layout) return rt.objectOf(wrapPointer(layoutExtraAt(td, i) as Handle, Intrinsics.load(ptr, offset, Types.u64)), owner)
+    if (kind === LayoutField.embedded) return rt.objectOf(wrapPointer(layoutExtraAt(td, i) as Handle, ptr + offset), owner)
     return Intrinsics.load(ptr, offset, Types.u64)
+}
+
+function ownDescriptorAt(obj: Handle, i: u32): Handle {
+    const dict = PropertyDict(resolveHeapCell(HeapObject(resolveHeapCell(obj)).properties))
+    return PropertyEntry(resolveHeapCell(dict.entries) + i * PropertyEntry.sizeof).descriptor
+}
+
+export function ownEnumerableAt(obj: Handle, i: u32): boolean {
+    return (FullPropertyDescriptor(resolveHeapCell(ownDescriptorAt(obj, i))).flags & PropFlags.enumerable) !== 0
+}
+
+export function ownValueAt(obj: Handle, i: u32, owner: any): any {
+    const word = FullPropertyDescriptor(resolveHeapCell(ownDescriptorAt(obj, i))).slot0 as u32
+    if (word === undefinedWord) return undefined
+    if (word === nullWord) return null
+    if (word === trueWord) return true
+    if (word === falseWord) return false
+    if (Intrinsics.and(word, 1, Types.u32) === 0) return Intrinsics.shr(Intrinsics.convert(word, Types.u32, Types.i32), 1, Types.i64)
+    const handle = Intrinsics.ushr(word, 1, Types.u32) as Handle
+    if (isBoxedF64(handle)) return unboxF64(handle)
+    if (isString(handle)) return rt.stringOf(handle)
+    return rt.objectOf(handle, owner)
+}
+
+function sameWrapper(a: Handle, b: Handle): boolean {
+    if (!isLayoutTD(typeDescriptorOf(a)) || !isLayoutTD(typeDescriptorOf(b))) return false
+    const x = NativeStruct(resolveHeapCell(a))
+    const y = NativeStruct(resolveHeapCell(b))
+    return x.td === y.td && x.ptr === y.ptr
 }
 
 export function wrapPointer(td: Handle, ptr: u64): Handle {

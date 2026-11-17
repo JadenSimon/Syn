@@ -194,6 +194,7 @@ enum FieldWatch {
     assign,
     keyed,
     named,
+    reflects,
 }
 
 enum ListenerKind {
@@ -215,6 +216,7 @@ enum ListenerKind {
     method,
     freeable,
     drops,
+    reflects,
 }
 
 enum ArgClass {
@@ -255,6 +257,8 @@ interface FlowState {
     roots: Function[]
     strOrigin: number
     dynamicOrigins: Set<number>
+    reflections: Map<number, number>
+    reflectedSources: Map<number, number>
     exportedInstances: Exported[]
     genericSites: Set<number>
     coneParts: Set<number>
@@ -1254,6 +1258,15 @@ function strOrigin(): number {
     return flow.strOrigin
 }
 
+function reflectionOf(source: number): number {
+    const known = flow.reflections.get(source)
+    if (known !== undefined) return known
+    const origin = originOf(OriginKind.created, 0, 0, 2 ** 40 + source, undefined)
+    flow.reflections.set(source, origin)
+    flow.reflectedSources.set(origin, source)
+    return origin
+}
+
 function qualOf(origin: number): number {
     return flow.originKind[origin] === OriginKind.str ? 0 : origin
 }
@@ -1310,7 +1323,25 @@ function fieldSeen(kind: FieldWatch, target: number, key: number, s: number): vo
         case FieldWatch.assign: assignField(target, key, s)
         case FieldWatch.keyed: if (key >= 0 || key === dynKey) readField(s, target)
         case FieldWatch.named: if (key === dynKey) keyedInto(s, target)
+        case FieldWatch.reflects: if ((key > 0 && heap.isString(key as Handle)) || key === dynKey || key === elemKey || isPosKey(key)) reflectField(s, target)
     }
+}
+
+function reflectField(field: number, target: number): void {
+    heldInit(field)
+    listen(field, ListenerKind.reflects, target, 1, 0)
+}
+
+function reflectedFrom(target: number, origin: number, held: number): void {
+    const kind = flow.originKind[origin]
+    if (kind === OriginKind.str) return
+    const source = flow.reflectedSources.get(origin)
+    if (held) return addOrigin(target, source === undefined ? reflectionOf(origin) : origin)
+    if (source !== undefined) return source < 0 ? addOrigin(target, origin) : reflectedFrom(target, source, 0)
+    if (kind !== OriginKind.fresh && kind !== OriginKind.created && kind !== OriginKind.static) return addOrigin(target, reflectionOf(-1))
+    const state = heapState(origin)
+    if (state !== undefined && heap.isOrdinaryObject(state)) for (const key of dataKeys(state)) fieldSlot(origin, key as number)
+    watchFields(origin, FieldWatch.reflects, target)
 }
 
 function keyedRead(origin: number, target: number): void {
@@ -1409,12 +1440,15 @@ function heldStatic(init: Function): number {
     return id
 }
 
-function readField(field: number, target: number): void {
+function heldInit(field: number): void {
     const init = flow.heldInits.get(field)
-    if (init) {
-        flow.heldInits.delete(field)
-        copyEdge(flow.instances[heldStatic(init)].ret, field)
-    }
+    if (!init) return
+    flow.heldInits.delete(field)
+    copyEdge(flow.instances[heldStatic(init)].ret, field)
+}
+
+function readField(field: number, target: number): void {
+    heldInit(field)
     copyEdge(field, target)
     if ((flow.fieldForms.get(field) ?? 0) & FieldForm.absent) addConst(target, VOID)
     fieldReader(field, target)
@@ -3886,6 +3920,7 @@ function wireRt(inst: Instance, x: Expr, slot: number): void {
     if (op === RtOp.countedBox || op === RtOp.countedUnbox) return listen(at(inst, x.args[0]), ListenerKind.copy, slot, 0, 0)
     if (countedOps.has(op)) return
     if (stringRt.has(op)) addOrigin(slot, strOrigin())
+    if (op === RtOp.objectOf) return listen(at(inst, x.args[1]), ListenerKind.reflects, slot, 0, 0)
     if (op === RtOp.truthy || op === RtOp.falsy) return
     const impl = bindingOf(op)?.impl
     if (pg.pureRt.has(op) && (!impl || !flow.host.binder.traceable(impl))) return
@@ -3998,7 +4033,12 @@ function bindRt(inst: Instance, x: Expr, slot: number, impl: Function, qual: num
     addCaller(callee, slot)
     const classed = kinds >= 0 ? paramDemands(s).classed : 0
     const params = callee.summary.params
+    const words = x.op === ExprOp.rt && x.a === RtOp.hasPrototype
     for (let i = 0; i < x.args.length && i < params; i++) {
+        if (words) {
+            addConst(callee.sigs[i], typeRange(Types.u32))
+            continue
+        }
         if (i === 0 && subject) {
             addOrigin(callee.sigs[0], subject)
             addIn(callee.sigs[0], -at(inst, x.args[0]) - 1)
@@ -4224,6 +4264,7 @@ function deliver(l: number, origin: number): void {
         case ListenerKind.method: methodArrived(target, extra, origin)
         case ListenerKind.freeable: if (flow.originKind[origin] !== OriginKind.static) addOrigin(target, origin)
         case ListenerKind.drops: dropArrived(target, origin)
+        case ListenerKind.reflects: reflectedFrom(target, origin, key)
     }
 }
 
@@ -4643,6 +4684,8 @@ function instOfSlot(slot: number): Instance {
 }
 
 function chainHas(origin: number, proto: Handle): number {
+    const source = flow.reflectedSources.get(origin)
+    if (source !== undefined) return source < 0 ? -1 : chainHas(source, proto)
     const kind = flow.originKind[origin]
     const cell = flow.originCell[origin]
     if (kind === OriginKind.str) return 0
@@ -5965,7 +6008,9 @@ function typeofScalar(slot: number, value: (s: number) => number, originsOf: (s:
     if (f & ScalarFlag.null) names.push(heap.typeNames.object as number)
     for (const a of originsOf(slot)) {
         const k = flow.originKind[a]
-        const name = (k === OriginKind.str ? heap.typeNames.string : originHostFn(a) ? heap.typeNames.function : heap.typeNames.object) as number
+        const source = flow.reflectedSources.get(a) ?? a
+        if (source < 0 && !names.includes(heap.typeNames.function as number)) names.push(heap.typeNames.function as number)
+        const name = (k === OriginKind.str ? heap.typeNames.string : source >= 0 && originHostFn(source) ? heap.typeNames.function : heap.typeNames.object) as number
         if (!names.includes(name)) names.push(name)
     }
     names.sort((a, b) => a - b)
@@ -6284,7 +6329,7 @@ export function flowAccesses(roots: Function[], host: AccessHost): Accesses {
 
 function freshFlow(roots: Function[], host: AccessHost): FlowState {
     return {
-        host, roots, strOrigin: -1, dynamicOrigins: new Set(),
+        host, roots, strOrigin: -1, dynamicOrigins: new Set(), reflections: new Map(), reflectedSources: new Map(),
         exportedInstances: [],
         genericSites: new Set(),
         coneParts: new Set(),
@@ -6449,6 +6494,7 @@ function solve(): number {
     while (pullNumberMethods()) settle()
     const discovery = performance.now()
     if (bindDynamic()) settle()
+    if (bindReflected()) settle()
     if (bindWrappers()) settle()
     return discovery
 }
@@ -6478,6 +6524,40 @@ function bindDynamic(): boolean {
     return view.bound
 }
 
+function bindReflected(): boolean {
+    if (!flow.reflectedSources.size) return false
+    for (const origin of flow.reflectedSources.keys()) {
+        flow.dynamicOrigins.add(origin)
+    }
+    const reflected = (object: number) => flow.reflectedSources.has(object)
+    const held = (object: number) => flow.originKind[object] !== OriginKind.str && !flow.dynamicOrigins.has(object)
+    let bound = false
+    for (const inst of flow.instances) {
+        if (inst.site) continue
+        const s = inst.summary
+        for (const e of s.owned) {
+            const x = s.exprs[e]
+            if (x.op === ExprOp.member && flow.slotOrigins[at(inst, x.a)].some(reflected) && !flow.slotOrigins[at(inst, x.a)].some(held)) throw `value-flow: ${s.name} %${x.node} reads a property of an object handed back by reflection`
+            if (x.op !== ExprOp.cmp || (x.key !== NodeOp.eq && x.key !== NodeOp.ne)) continue
+            const a = flow.slotOrigins[at(inst, x.a)]
+            const b = flow.slotOrigins[at(inst, x.b)]
+            if (!a.some(reflected) && !b.some(reflected)) continue
+            if ((a.some(reflected) && b.some(held)) || (b.some(reflected) && a.some(held))) throw `value-flow: ${s.name} %${x.node} compares an object handed back by reflection with an object outside the runtime heap`
+            if (!a.some(object => flow.originKind[object] !== OriginKind.str) || !b.some(object => flow.originKind[object] !== OriginKind.str)) continue
+            const slot = at(inst, e)
+            if (flow.stringSite[slot] === 0) continue
+            flow.stringSite[slot] = 0
+            bindStringRt(inst, x, slot, RtOp.strictEqual, 0)
+            bound = true
+        }
+        for (const e of s.stores) {
+            const x = s.exprs[e]
+            if (x.op === ExprOp.store && flow.slotOrigins[at(inst, x.a)].some(reflected)) throw `value-flow: ${s.name} %${x.node} writes a property of an object handed back by reflection`
+        }
+    }
+    return bound
+}
+
 function wrapsLayout(origin: number): boolean {
     const kind = flow.originKind[origin]
     if (kind !== OriginKind.fresh && kind !== OriginKind.site && kind !== OriginKind.static) return false
@@ -6489,10 +6569,22 @@ function bindWrappers(): boolean {
     for (const inst of flow.instances) {
         if (inst.site) continue
         const s = inst.summary
+        for (const sig of inst.sigs) {
+            const origins = flow.slotOrigins[sig]
+            if (!origins.some(origin => flow.dynamicOrigins.has(origin)) || !origins.some(wrapsLayout)) continue
+            rootRuntime(heap.wrapPointer, [Types.u32, Types.u64])
+            bound = true
+        }
         for (const e of s.owned) {
             const x = s.exprs[e]
-            if (x.op !== ExprOp.rt || x.a !== RtOp.cellof) continue
-            if (!flow.slotOrigins[at(inst, x.args[0])].some(wrapsLayout)) continue
+            if (x.op !== ExprOp.rt || (x.a !== RtOp.cellof && x.a !== RtOp.layoutOf)) continue
+            const origins = flow.slotOrigins[at(inst, x.args[0])]
+            if (x.a === RtOp.layoutOf && origins.some(origin => flow.dynamicOrigins.has(origin))) {
+                bindRuntime(at(inst, e), heap.layoutDescriptorOf, [Types.u32])
+                bound = true
+            }
+            if (x.a !== RtOp.cellof) continue
+            if (!origins.some(wrapsLayout)) continue
             bindRuntime(at(inst, e), heap.wrapPointer, [Types.u32, Types.u64])
             bound = true
         }
@@ -6500,7 +6592,7 @@ function bindWrappers(): boolean {
     return bound
 }
 
-function bindRuntime(slot: number, fn: Function, params: intrinsics.Types[]): void {
+function rootRuntime(fn: Function, params: intrinsics.Types[]): number {
     const callee = instance(fn, 0, -1, -1)
     flow.rooted.add(callee)
     let i = 0
@@ -6508,6 +6600,11 @@ function bindRuntime(slot: number, fn: Function, params: intrinsics.Types[]): vo
         addConst(flow.instances[callee].sigs[i], typeRange(params[i]))
         i++
     }
+    return callee
+}
+
+function bindRuntime(slot: number, fn: Function, params: intrinsics.Types[]): void {
+    const callee = rootRuntime(fn, params)
     let list = flow.runtimeBinds.get(slot)
     if (!list) flow.runtimeBinds.set(slot, list = [])
     if (!list.includes(callee)) list.push(callee)
@@ -7124,6 +7221,7 @@ function impossibleExpr(inst: Instance, e: number, memo: Map<number, boolean>): 
     if (x.op === ExprOp.arith || x.op === ExprOp.cmp) dead = operand(x.a) || operand(x.b)
     if (x.op === ExprOp.narrow || x.op === ExprOp.pick || x.op === ExprOp.ntype) dead = operand(x.a)
     if ((x.op === ExprOp.narrow || x.op === ExprOp.pick) && emptySlot(at(inst, e))) dead = true
+    if (x.op === ExprOp.rt && x.a === RtOp.objectOf && emptySlot(at(inst, e))) dead = true
     memo.set(e, dead)
     return dead
 }
