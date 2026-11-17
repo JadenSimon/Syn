@@ -359,6 +359,12 @@ function mirrorTypeDescriptor(td: number): void {
     if (mirroredCells.has(td)) return
     mirrorRaw(td)
     mirrorValue(heap.prototypeOfTD(td as intrinsics.Handle))
+    if (!heap.isLayoutTD(td as intrinsics.Handle)) return
+    let i: u32 = 0
+    while (i < heap.layoutFieldCount(td as intrinsics.Handle)) {
+        mirrorValue(heap.layoutKeyAt(td as intrinsics.Handle, i))
+        i++
+    }
 }
 function mirrorValue(handle: number): void {
     if (heap.isTypeDescriptor(handle as intrinsics.Handle)) mirrorTypeDescriptor(handle)
@@ -2379,6 +2385,7 @@ function classifyEffects(units: Map<number, Graph>, tagged: Set<number>, discard
 }
 
 rt.bind(rt.Op.handleof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
+rt.bind(rt.Op.cellof, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.stringOf, { lower: (g, n) => makeNode(g, NodeOp.convert, [getOperand(g, n, 2)], Types.u32) })
 rt.bind(rt.Op.heapaddr, { lower: (g, n, ctx) => ctx.heapAddress(getOperand(g, n, 2)) })
 rt.bind(rt.Op.call, {
@@ -10099,7 +10106,7 @@ function planShapeTags(inst: Instantiations, units: Map<Function, PlannedUnit[]>
 
 const narrowUndefined = 2 ** 32
 
-const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty, heap.deleteHandleProperty])
+const runtimeHeapAccessors = new Set<Function>([heap.getIntProperty, heap.getFloatProperty, heap.getHandleProperty, heap.setIntProperty, heap.setFloatProperty, heap.setHandleProperty, heap.deleteHandleProperty, heap.getPointerProperty, heap.setPointerProperty])
 
 interface UnitClass {
     units: PlannedUnit[]
@@ -13048,7 +13055,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             boxed: (intFormatOf(returned) !== undefined && worded && !returned.tested) || undefined,
             nullable: returned.nullable || undefined,
             bool: !!returned.bools || undefined,
-            decode: record !== undefined ? unionWord(value) ? pstack0Base() : undefined : (result !== undefined && !isStringRep(returned) && !numeric && !heldAsField(facts, members ?? [result], plan.bits) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
+            decode: record !== undefined ? unionWord(value) ? pstack0Base() : undefined : (result !== undefined && !isStringRep(returned) && !numeric && unit.returns.kind !== 'number' && !heldAsField(facts, members ?? [result], plan.bits) && calleeAbi.mode !== 'raw' && (calleeAbi.mode === 'encoded' || unionWord(returned) || worded)) || boxedFloat ? pstack0Base() : undefined,
             target,
             targets: target === undefined ? reached?.map(unit => link(planned.functions.get(unit)!)) : undefined,
             returns: calleeAbi.mode === 'raw' ? Types.u64 : calleeAbi.returns === Types.u64 ? undefined : calleeAbi.returns,
@@ -13084,6 +13091,7 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         if (plannedUnit?.blocks.size) pruneUnentered(traced.graph, plannedUnit, traced.allocations)
         plannedMachineOps(traced.graph, local)
         if (local) plannedRuntimeCalls(traced.graph, local)
+        if (local) plannedWrappers(traced.graph, local)
         if (flags.has(`pe-input:${name}`)) {
             const refined = (s: intrinsics.Handle) => [...plan.embedded.fields.get(s) ?? []].map(([k, v]) => `${heap.isString(k) ? heap.stringToJs(k) : k}:${describe(v)}`).join(',')
             const shapes = [...paramShapesOf(fn)].map(([i, s]) => `${i}=${describe(s)} refined=${refined(s)}`).join(' ')
@@ -13145,13 +13153,14 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         }
         resolvePstackTargets(traced.graph, plannedUnit && planned.pstacks.targets.get(plannedUnit))
         const dynamic = local ? runtimeHeapSites(local, traced.graph) : undefined
+        const wrapped = dynamic && wrappedStores(local!, traced.graph, dynamic)
         const regions = plannedUnit && planned.pstacks.regions.get(plannedUnit)
         if (regions) placePstackMarkers(traced.graph, regions)
         if (plannedUnit?.prototypeTests.size) rewritePrototypeTests(traced.graph, plannedUnit.prototypeTests)
         verifyTraced(traced, 'resolve:input')
         const result = propertyEval.placeObjects(traced.graph, {
             session, frames: frameShapes, params, layouts, answers: local ? plannedAnswers(local.unit, local.nodes) : undefined, embedded: embeddedSites(plannedUnit, traced.graph),
-            calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
+            calls: site => plannedCall(traced.graph, fn, local, bound, site), dynamic, wrapped, allocationShapes, readonly: plan.statics.readonly, statics: plan.statics.placed, allocations: traced.allocations, rawReturns: abiOf(fn).mode !== 'encoded',
             contextShape: planned.contexts.get(fn), unionParams: unionParamBases(fn), bound: cold, forwardedKey, tupleKeys, wordsSlot, stacks: plannedUnit && planned.pstacks.targets.get(plannedUnit), slab: slabShapes, counted: plannedUnit && countedSites.get(plannedUnit),
         })
         if (regions) placePstackCallMarkers(result.graph, regions)
@@ -13309,6 +13318,62 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
         for (const [node, from] of moves.compared) local.calls.set(node, compares.get(from)!)
         for (const id of moves.dropped) local.calls.delete(id)
         for (const [id, units] of floats) local.calls.set(id, units)
+    }
+    const layoutDescriptors = new Map<string, intrinsics.Handle>()
+    function layoutDescriptor(graph: Graph, id: number, shapeId: string): intrinsics.Handle {
+        const shape = plan.shapes.get(shapeId)!
+        const sig = plan.inst.shapes.get(shapeId)!
+        const unsupported = (what: string) => compileError(`native: ${graph.name} needs a type descriptor for ${shapeSignatureText(sig)}, which cannot describe ${what} yet`, id)
+        if (sig.constants.size || sig.absent.size) throw unsupported('constant or absent fields')
+        const layout = propertyEval.recordLayout(shape, layouts.refinements, layouts.bits)
+        intrinsics.assert(layout.keys.length === sig.fields.length, `native: planned shape ${shapeId} lays out ${layout.keys.length} keys for ${sig.fields.length} fields`)
+        const fields: number[] = []
+        let i = 0
+        while (i < layout.keys.length) {
+            const rep = sig.fields[i][1]
+            const flag = layout.flags[i]
+            const codec = locate(facts, shape, String(layout.offsets[i]))
+            if (layout.nested[i] !== undefined || layout.tags[i] || (codec?.kind !== 'f64' && codec?.encoded)) throw unsupported(`field ${sig.fields[i][0]}`)
+            const signed = !!intFormatOf(rep)?.signed
+            if (flag) fields.push(heap.layoutField(flag.offset, heap.LayoutField.flag, flag.bit))
+            else if (rep.kind === 'number' && numberName(rep) === 'f64') fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.f64, 0))
+            else if (rep.kind === 'number' && layout.narrow[i]) fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i32 : heap.LayoutField.u32, 0))
+            else if (rep.kind === 'number') fields.push(heap.layoutField(layout.offsets[i], signed ? heap.LayoutField.i64 : heap.LayoutField.u64, 0))
+            else if (isStringRep(rep) && !rep.nullable) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.string, 0))
+            else if ((rep.kind === 'pointer' || rep.kind === 'buffer') && !heap.isString(layout.keys[i])) fields.push(heap.layoutField(layout.offsets[i], heap.LayoutField.pointer, 0))
+            else throw unsupported(`field ${sig.fields[i][0]} held as ${repText(rep, '?')}`)
+            i++
+        }
+        const proto = (sig.proto ?? 0) as intrinsics.Handle
+        const content = [proto, ...layout.keys, ...fields].join(',')
+        const known = layoutDescriptors.get(content)
+        if (known !== undefined) return known
+        const td = heap.layoutTypeDescriptor(proto, layout.keys, fields)
+        layoutDescriptors.set(content, td)
+        return td
+    }
+    function plannedWrappers(graph: Graph, local: UnitPlan): void {
+        for (const [id, n] of nodeEntries(graph)) {
+            if (n.op !== NodeOp.rt || getLiteral(graph, n, 1) !== rt.Op.cellof) continue
+            const rep = local.nodes.get(getRef(n, 2))
+            const shape = wrappedShape(graph, id, rep)
+            intrinsics.assert([...local.calls.get(id) ?? []].some(unit => originOf(unit.fn) === heap.wrapPointer), `native: ${graph.name} %${id} wraps ${repText(rep)} without a bound heap wrapper`)
+            const callee = addNode(graph, NodeOp.heapHandle, [{ literal: session.linkFunction(heap.wrapPointer) }])
+            putNode(graph, id, NodeOp.call, [getOperand(graph, n, 0), callee, { literal: layoutDescriptor(graph, id, shape) }, getOperand(graph, n, 2)])
+        }
+    }
+    function wrappedShape(graph: Graph, id: number, rep: Rep | undefined): string {
+        if (rep?.kind !== 'pointer' || memberCount(rep) !== 1 || rep.shapes.length !== 1 || rep.nullable || !plan.shapes.has(rep.shapes[0])) throw compileError(`native: ${graph.name} hands ${repText(rep, 'a literal')} to a heap helper, which only wraps one fixed layout`, id)
+        return rep.shapes[0]
+    }
+    function wrappedStores(local: UnitPlan, graph: Graph, dynamic: Map<number, Function>): Map<number, intrinsics.Handle> {
+        const out = new Map<number, intrinsics.Handle>()
+        for (const [id, fn] of dynamic) {
+            if (fn !== heap.setPointerProperty) continue
+            const value = getRef(getNode(graph, id)!, 3)
+            out.set(id, layoutDescriptor(graph, id, wrappedShape(graph, value, local.nodes.get(value))))
+        }
+        return out
     }
     function runtimeHeapSites(local: UnitPlan, graph: Graph): Map<number, Function> | undefined {
         const out = new Map<number, Function>()
