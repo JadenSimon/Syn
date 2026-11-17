@@ -7597,10 +7597,12 @@ function optimizeValueGraph(g: Graph, costs: lowering.TargetCosts) {
                     const s = getLiteral(g, n, 1)
                     if (!Number.isSafeInteger(s) || s <= 0 || (stride && stride !== s)) return
                     const uses = indexedUsers(index, u)
-                    if (uses.size !== 1) return
+                    if (!uses.size) return
                     stride = s
                     steps.push([carrier.block, u])
-                    if (!feed(carrier, u, [...uses][0], true)) return
+                    for (const use of uses) {
+                        if (!feed(carrier, u, use, true)) return
+                    }
                     continue
                 }
                 if (!feed(carrier, q, u, carrier.stepped)) return
@@ -15221,13 +15223,14 @@ function withDependencies(g: Graph, roots: Set<number>): Set<number> {
     return new Set([...roots, ...out])
 }
 
+function regionParams(b: GraphBlock, params: Set<number>, passed: Set<number>): number[] {
+    const order = [...b.params, ...passed]
+    return [...params].sort((x, y) => order.indexOf(x) - order.indexOf(y))
+}
+
 function shareArmValues(g: Graph): boolean {
     let changed = false
     const memo: ArmDemand = new Map()
-    function sorted(b: GraphBlock, params: Set<number>, passed: Set<number>): number[] {
-        const order = [...b.params, ...passed]
-        return [...params].sort((x, y) => order.indexOf(x) - order.indexOf(y))
-    }
     for (let i = 0; i < g.blocks.length; i++) {
         const b = g.blocks[i]
         const body = getNode(g, b.bodyId)
@@ -15237,7 +15240,7 @@ function shareArmValues(g: Graph): boolean {
         if (passed.size) {
             const params = new Set<number>()
             coveredRegion(g, countUses(g, b.bodyId), b.bodyId, params, passed)
-            setBlockBody(g, b, moveRegion(g, sorted(b, params, passed), b.bodyId))
+            setBlockBody(g, b, moveRegion(g, regionParams(b, params, passed), b.bodyId))
             changed = true
             continue
         }
@@ -15257,7 +15260,7 @@ function shareArmValues(g: Graph): boolean {
                     visit(arm)
                     continue
                 }
-                setRef(n, k, moveRegion(g, sorted(b, params, passed), arm))
+                setRef(n, k, moveRegion(g, regionParams(b, params, passed), arm))
                 gn.dirtyBlock(g, b)
                 changed = true
             }
@@ -15528,6 +15531,80 @@ function hoistSharedArms(g: Graph, costs: lowering.TargetCosts): Graph {
         setBlockBody(g, b, process(b.bodyId, new Set(), b.id))
     }
     return g
+}
+
+function pairedArmLoads(g: Graph, selectId: number, memo: ArmDemand): Set<number> {
+    const select = getNode(g, selectId)!
+    const before = demanded(g, getRef(select, 0), new Set(), memo)
+    const fields: number[] = []
+    for (const id of before) {
+        const n = getNode(g, id)!
+        if (n.op === NodeOp.load && getRef(n, 1) && !getRef(n, 2)) fields.push(id)
+    }
+    const out = new Set<number>()
+    if (!fields.length) return out
+    const calls: number[] = []
+    for (const id of before) {
+        const op = getNode(g, id)!.op
+        if (op === NodeOp.call || op === NodeOp.rt) calls.push(id)
+    }
+    for (const arm of armDemand(g, selectId, memo).arms) {
+        for (const id of arm) {
+            const n = getNode(g, id)!
+            if (before.has(id) || n.op !== NodeOp.load || !getRef(n, 1) || getRef(n, 2)) continue
+            if (calls.some(c => !reachesNode(g, getRef(n, 0), c))) continue
+            const type = typeOf(n)
+            const width = intrinsics.intrinsicBitWidth(type) / 8
+            if ((width !== 4 && width !== 8) || (width === 4 && lowering.isSignedType(type))) continue
+            const offset = getLiteral(g, n, 2)
+            if (offset < 0) continue
+            let reach = 0
+            let partner = 0
+            for (const f of fields) {
+                const m = getNode(g, f)!
+                if (getRef(m, 1) !== getRef(n, 1)) continue
+                const at = getLiteral(g, m, 2)
+                reach = Math.max(reach, at + intrinsics.intrinsicBitWidth(typeOf(m)) / 8)
+                if (getRef(m, 0) !== getRef(n, 0) || typeOf(m) !== type || Math.abs(at - offset) !== width) continue
+                const low = Math.min(at, offset)
+                if (low % width === 0 && low <= 63 * width) partner = f
+            }
+            if (!partner || offset + width > reach) continue
+            out.add(id)
+            if (isArgless(getNode(g, getRef(n, 1))!)) out.add(getRef(n, 1))
+        }
+    }
+    return out
+}
+
+function pairSpeculatedLoads(g: Graph, costs: lowering.TargetCosts): boolean {
+    if (!costs.loadPairs) return false
+    const index = graphIndex(g)
+    const memo: ArmDemand = new Map()
+    let headers: Map<number, Set<number>> | undefined
+    let changed = false
+    const count = g.blocks.length
+    let i = 0
+    while (i < count) {
+        const b = g.blocks[i]
+        i++
+        const loads = gn.findValues(index, b.id, NodeOp.load)
+        if (!loads || loads.length < 2) continue
+        const body = getNode(g, b.bodyId)
+        const top = body?.op === NodeOp.ret ? getRef(body, 1) : b.bodyId
+        const select = getNode(g, top)
+        if (select?.op !== NodeOp.select || countIds(select) !== 3) continue
+        const paired = pairedArmLoads(g, top, memo)
+        if (!paired.size) continue
+        headers ??= graphLoops(g).loopMembers
+        if (headers.has(b.id)) continue
+        const passed = withDependencies(g, paired)
+        const params = new Set<number>()
+        coveredRegion(g, countUses(g, b.bodyId), b.bodyId, params, passed)
+        setBlockBody(g, b, moveRegion(g, regionParams(b, params, passed), b.bodyId))
+        changed = true
+    }
+    return changed
 }
 
 function isolateSelectArms(g: Graph): Graph {
@@ -17663,7 +17740,7 @@ export function expandValueGraph(g: Graph, target: lowering.Target, regionSlot?:
 
 export function prepareValueGraph(g: Graph, target: lowering.Target, regionSlot?: RegionSlot, grows?: PstackGrowth): Graph {
     g = expandValueGraph(g, target, regionSlot, grows)
-    g = runPipeline('shape', g, target.costs, [mergeConstantStores, countdownCopyLoops, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, sweepBlocks, testBranchConjunctions, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, reduceIndexChecks, splitScaledShifts, shareLiterals]).graph
+    g = runPipeline('shape', g, target.costs, [mergeConstantStores, countdownCopyLoops, detachRecordOrdering, outlineBlocks, rotateLoops, cloneExits, branchCostlySelects, shareArmValues, splitTailSelects, hoistSharedArms, outlineLoopArms, isolateSelectArms, pairSpeculatedLoads, sweepBlocks, testBranchConjunctions, resolveNumberTypes, machineTypes, narrowTypes, reuseSteppedIndex, reduceConstantMultiplies, reduceSignedWindows, reduceRangeChecks, reduceIndexChecks, splitScaledShifts, shareLiterals]).graph
     g.form = 'lowerable'
     if (intrinsics.argv().includes('check-heap-handles')) checkHeapHandles(g)
     return g
