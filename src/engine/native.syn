@@ -1885,6 +1885,7 @@ export function sameLayout(a: intrinsics.Handle | undefined, b: intrinsics.Handl
 
 export interface CreateNativesOptions {
     globals?: Record<string, any>
+    failures?: CompileError[]
 }
 
 const EffectNames = ['readnone', 'readonly', 'writes']
@@ -2855,13 +2856,17 @@ interface PhaseClock {
     timed<T>(next: string, run: () => T, unit?: string): T
     normalize(graph: Graph, opts?: { firstPass?: boolean }): Graph
     optimize(graph: Graph): Graph
+    keep(graph: Graph, run: () => Graph, kept?: Graph): Graph
     binder?: Binder
+    failures?: CompileError[]
+    failed?: Map<number, string>
 }
 
 export interface CompileError extends Error {
     stage?: string
     unit?: string
     node?: number
+    cascade?: string
 }
 
 function compileError(message: string, node: number): CompileError {
@@ -2875,6 +2880,26 @@ function stagedError(e: unknown, stage: string, unit: string | undefined): Compi
     error.stage ??= stage
     error.unit ??= unit
     return error
+}
+
+function keepFailure(clock: PhaseClock, e: unknown, stage: string, graph: Graph): void {
+    const error = stagedError(e, stage, graph.name)
+    const failed = clock.failed!
+    for (const n of allNodes(graph)) {
+        const callee = calledSymbol(graph, n)
+        if (callee === undefined || !failed.has(callee)) continue
+        error.cascade ??= failed.get(callee)
+    }
+    clock.failures!.push(error)
+}
+
+function failedStub(clock: PhaseClock, graph: Graph, symbol: number | undefined): Graph {
+    if (symbol !== undefined) clock.failed!.set(symbol, graph.name ?? `symbol ${symbol}`)
+    const stub = trapStub(graph, graph.name ?? '', 0, false)
+    const params = graph.blocks[0].params.map(p => addCopy(stub, getNode(graph, p)!))
+    setGraphBlocks(stub, [{ ...stub.blocks[0], params }])
+    stub.unit = symbol
+    return stub
 }
 
 const LeafOps = new Set([NodeOp.heapHandle, NodeOp.localTarget, NodeOp.poolEntry])
@@ -4346,7 +4371,7 @@ function writeLedger(emitted: NativeUnit[]): void {
     ledgerLowered.clear()
 }
 
-function createClock(target: Target): PhaseClock {
+function createClock(target: Target, failures?: CompileError[]): PhaseClock {
     const start = performance.now()
     const phases: Record<string, number> = { link: 0, bytecode: 0, typer: 0, cuts: 0, trace: 0, analysis: 0, plan: 0, resolve: 0, normalize: 0, inline: 0, effects: 0, records: 0, lower: 0, statics: 0, other: 0, prepareLower: 0, initializations: 0, lifetime: 0, drops: 0 }
     let phase = 'other'
@@ -4384,7 +4409,22 @@ function createClock(target: Target): PhaseClock {
             ? optimizeOnce(graph, 'optimized', () => normalizeGraph(graph, NormalizeKind.optimize, target, clock.binder))
             : normalizeGraph(graph, NormalizeKind.optimize, target, clock.binder), graph.name))
     }
-    const clock: PhaseClock = { start, phases, enterPhase, timed, normalize, optimize }
+    let keeping = false
+    function keep(graph: Graph, run: () => Graph, kept?: Graph): Graph {
+        if (!failures || keeping) return run()
+        keeping = true
+        try {
+            return run()
+        } catch (e) {
+            keepFailure(clock, e, 'normalize', graph)
+            return kept ?? failedStub(clock, graph, graph.unit)
+        } finally {
+            keeping = false
+        }
+    }
+    const clock: PhaseClock = failures
+        ? { start, phases, enterPhase, timed, normalize: (graph, opts) => keep(graph, () => normalize(graph, opts)), optimize: graph => keep(graph, () => optimize(graph)), keep, failures, failed: new Map() }
+        : { start, phases, enterPhase, timed, normalize, optimize, keep }
     return clock
 }
 
@@ -6305,7 +6345,7 @@ function paramArrivals(graph: Graph): Arrivals {
 }
 
 function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Target): Graph {
-    return clock.timed('normalize', () => {
+    return clock.keep(graph, () => clock.timed('normalize', () => {
         const entries = new Set(original.blocks.map(b => b.id))
         recordSnapshots(graph)
         graph.form = undefined
@@ -6313,7 +6353,7 @@ function repackage(graph: Graph, original: Graph, clock: PhaseClock, target: Tar
         if (typeRecording()) scopeTypeNotes(graph)
         resolveNumberTypes(graph)
         return isJumbo(graph) ? graph : clock.optimize(graph)
-    }, graph.name)
+    }, graph.name), original)
 }
 
 function renormalize(graph: Graph, clock: PhaseClock): Graph {
@@ -7306,6 +7346,11 @@ function optimizeProgram(program: ProgramGraph, clock: PhaseClock): number {
     function step<T>(pass: string, run: (program: ProgramGraph, ...args: any[]) => T, ...args: any[]): T {
         const result = run(program, ...args)
         passBoundary(program, pass)
+        if (clock.failed) {
+            for (const symbol of clock.failed.keys()) {
+                program.noInline.add(symbol)
+            }
+        }
         return result
     }
     passBoundary(program, '(start)')
@@ -7367,7 +7412,10 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     for (const graph of program.units.values()) {
         for (const n of allNodes(graph)) {
             const callee = calledSymbol(graph, n)
-            if (callee !== undefined && program.unplanned.has(callee)) throw `native: ${graph.name || 'anonymous'} calls ${program.units.get(callee)!.name || `symbol ${callee}`}, which the plan never entered`
+            if (callee === undefined || !program.unplanned.has(callee)) continue
+            const unplanned = `native: ${graph.name || 'anonymous'} calls ${program.units.get(callee)!.name || `symbol ${callee}`}, which the plan never entered`
+            if (!clock.failures) throw unplanned
+            keepFailure(clock, unplanned, 'lower', graph)
         }
     }
     const roots = new Set(program.roots.values())
@@ -7381,10 +7429,20 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     const clobbers = new Map<number, Set<number>>()
     const prepared = new Map<number, PreparedUnit>()
     const grows = new Map<number, number>()
+    const prepare = (symbol: number) => clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol), callee => grows.get(callee)), program.units.get(symbol)!.name)
+    function keptPrepare(symbol: number): PreparedUnit {
+        try {
+            return prepare(symbol)
+        } catch (e) {
+            keepFailure(clock, e, 'prepareLower', program.units.get(symbol)!)
+            program.units.set(symbol, failedStub(clock, program.units.get(symbol)!, symbol))
+            return prepare(symbol)
+        }
+    }
     for (const scc of order) {
         for (const symbol of scc) {
             const start = performance.now()
-            prepared.set(symbol, clock.timed('prepareLower', () => prepareUnit(program, symbol, roots.has(symbol), returnLocations.get(symbol), returnRecords.get(symbol), callee => grows.get(callee)), program.units.get(symbol)!.name))
+            prepared.set(symbol, clock.failures ? keptPrepare(symbol) : prepare(symbol))
             if (ledgerFile) ledgerLowered.set(symbol, [performance.now() - start, 0])
         }
         const members = new Set(scc)
@@ -7398,10 +7456,24 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
         }
         for (const symbol of scc) grows.set(symbol, shared)
     }
-    verifyCallClasses('lowerable', new Map([...prepared].map(([symbol, unit]) => [symbol, unit.prepared.g])), symbol => prepared.get(symbol)!.prepared.floats, (g, n) => {
+    const verifyCalls = () => verifyCallClasses('lowerable', new Map([...prepared].map(([symbol, unit]) => [symbol, unit.prepared.g])), symbol => prepared.get(symbol)!.prepared.floats, (g, n) => {
         const t = getNode(g, getRef(n, 1))
         return t?.op === NodeOp.localTarget ? getLiteral(g, t, 0) : undefined
     }, typeDebugging() ? (symbol, x) => explainNumberClass(prepared.get(symbol)!.prepared.g, prepared.get(symbol)!.prepared.floats, x).map(line => `    ${line}`).join('\n') : undefined, typeDebugging() ? (symbol, param) => `abi ${program.abi.get(symbol)?.join(' ') ?? '?'}; ${program.explain?.(symbol, param) ?? 'no plan'}` : undefined)
+    if (!clock.failures) verifyCalls()
+    while (clock.failures) {
+        try {
+            verifyCalls()
+            break
+        } catch (e) {
+            const unit = (e as CompileError).unit
+            const symbol = symbols.find(s => program.units.get(s)!.name === unit && !clock.failed!.has(s))
+            if (symbol === undefined) throw e
+            keepFailure(clock, e, 'lower', program.units.get(symbol)!)
+            program.units.set(symbol, failedStub(clock, program.units.get(symbol)!, symbol))
+            prepared.set(symbol, prepare(symbol))
+        }
+    }
     const endless = new Set(symbols.filter(symbol => !someNode(prepared.get(symbol)!.prepared.g, n => n.op === NodeOp.ret)))
     const continuations = new Set(symbols.filter(symbol => endless.has(symbol) && free.has(symbol) && sites.get(symbol)?.length === 1))
     const located = preparedSites(prepared)
@@ -7427,13 +7499,23 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
         if (ledgerFile) ledgerLowered.get(symbol)![1] += performance.now() - start
         return code
     }
+    function keptLower(symbol: number, continuing: boolean): NativeUnit {
+        try {
+            return lower(symbol, continuing)
+        } catch (e) {
+            keepFailure(clock, e, 'lower', program.units.get(symbol)!)
+            program.units.set(symbol, failedStub(clock, program.units.get(symbol)!, symbol))
+            prepared.set(symbol, prepare(symbol))
+            return lower(symbol, continuing)
+        }
+    }
     function lowerContinuations(unit: NativeUnit): void {
         for (const [callee, homes] of unit.code.continued ?? []) {
             if (!continuations.has(callee) || lowered.has(callee)) continue
             const g = prepared.get(callee)!.prepared.g
             g.blocks[0].params.forEach((p, i) => putCopy(g, p, getNode(g, p)!, [{ literal: homes[i] }]))
             dirtyValues(g, g.blocks[0].params)
-            const code = lower(callee, true)
+            const code = clock.failures ? keptLower(callee, true) : lower(callee, true)
             lowered.set(callee, code)
             clobbers.set(callee, code.code.clobbers)
             lowerContinuations(code)
@@ -7442,7 +7524,7 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
     for (const scc of order) {
         if (scc.length === 1 && continuations.has(scc[0])) continue
         for (const symbol of scc) {
-            lowered.set(symbol, lower(symbol, true))
+            lowered.set(symbol, clock.failures ? keptLower(symbol, true) : lower(symbol, true))
             lowerContinuations(lowered.get(symbol)!)
         }
         const members = new Set(scc)
@@ -7456,7 +7538,7 @@ function lowerProgram(program: ProgramGraph, clock: PhaseClock): NativeUnit[] {
         }
         for (const symbol of scc) clobbers.set(symbol, shared)
     }
-    for (const symbol of continuations) if (!lowered.has(symbol)) lowered.set(symbol, lower(symbol, false))
+    for (const symbol of continuations) if (!lowered.has(symbol)) lowered.set(symbol, clock.failures ? keptLower(symbol, false) : lower(symbol, false))
     return symbols.map(symbol => lowered.get(symbol)!)
 }
 
@@ -13938,6 +14020,10 @@ function createResolver(binder: Binder, tracer: Tracer, plan: ShapePlan, planned
             const rep = local?.nodes.get(read)
             if (rep && !local!.nodes.has(dispatch)) local!.nodes.set(dispatch, rep)
         }
+        for (const [read, value] of result.unboxedNumbers) {
+            const rep = local?.nodes.get(read)
+            if (rep && !rep.nullable && !local!.nodes.has(value)) local!.nodes.set(value, rep)
+        }
         const fieldTags = new Map<number, Operand>([...sliceTags?.reads ?? [], ...result.tags])
         for (const id of result.present) if (!fieldTags.has(id)) fieldTags.set(id, { literal: 1 })
         return { graph: result.graph, shapes: result.shapes, encoded: result.encoded, fieldTags, tagWrites: sliceTags?.writes ?? new Map(), wordWrites: sliceTags?.words ?? new Map(), local, callees: bound }
@@ -15993,6 +16079,21 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
         }
         return clock.normalize(graph, { firstPass: true })
     }
+    const stubbed = new Set<number>()
+    function keptUnit(fn: Function): Graph {
+        const symbol = unitOf(fn).symbol!
+        const kept = clock.failures!.length
+        try {
+            const graph = compileUnit(fn)
+            if (clock.failures!.length > kept) clock.failed!.set(symbol, fn.name)
+            return graph
+        } catch (e) {
+            clock.failures!.push(stagedError(e, 'resolve', fn.name))
+            clock.failed!.set(symbol, fn.name)
+            stubbed.add(symbol)
+            return trapStub(session.runtime!, fn.name, sourceOfLinked(fn)!.compiled.paramCount, constructsOutOfLine(fn) || usesReceiver(fn))
+        }
+    }
     const init = staticInitializerOf(linker, image, plannedUnit, fn => abiOf(fn).mode === 'raw')
     if (init) {
         roots.set(staticInitName, link(init))
@@ -16006,7 +16107,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
         next = order.length
         const graphs = new Map<Function, Graph>()
         outlined.length = 0
-        for (const fn of flags.has('reverse-units') ? [...wave].reverse() : wave) graphs.set(fn, compileUnit(fn))
+        for (const fn of flags.has('reverse-units') ? [...wave].reverse() : wave) graphs.set(fn, clock.failures ? keptUnit(fn) : compileUnit(fn))
         for (const [fn, piece] of outlined) {
             graphs.set(fn, clock.normalize(piece, { firstPass: true }))
             wave.push(fn)
@@ -16016,7 +16117,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
             linkRuntimeCalls(graph)
             if (indexCheck) verifyKinds(graph, 'linkRuntimeCalls')
             const symbol = unitOf(fn).symbol!
-            const planned = plannedUnit(fn)
+            const planned = stubbed.has(symbol) ? undefined : plannedUnit(fn)
             const abi = resolver.abiOf(fn)
             graph.unit = symbol
             program.units.set(symbol, graph)
@@ -16028,7 +16129,7 @@ function compileProgram(binder: Binder, linker: Linker, tracer: Tracer, resolver
                 intrinsics.assert(graph.blocks[0].params.length >= abi.signature.params.length, `native: ${graph.name || 'anonymous'} enters with ${graph.blocks[0].params.length} params, but its signature plans ${abi.signature.params.length}`)
                 program.signatures.set(symbol, abi.signature)
             }
-            if ((originOf(fn) as any).shouldNotInline || program.unplanned.has(symbol)) program.noInline.add(symbol)
+            if ((originOf(fn) as any).shouldNotInline || program.unplanned.has(symbol) || clock.failed?.has(symbol)) program.noInline.add(symbol)
             if ((originOf(fn) as any).shouldInline) program.alwaysInline.add(symbol)
             if (constructsOutOfLine(fn)) program.constructors.add(symbol)
             if (planned && abi.mode === 'tagged') program.tagged.add(symbol)
@@ -17040,7 +17141,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     nativeObserver?.(`compile ${Object.keys(fns).join(', ')}`)
     getNativeBootstraps()
     const target = hostTarget
-    const clock = createClock(target)
+    const clock = createClock(target, opts.failures)
     pendingCuts = undefined
     const program = traceProgram(fns, opts, clock, target)
     if (flags.has('graph-prints')) for (const [symbol, graph] of program.units) console.log(`GRAPH ${symbol} ${graph.name} ${countNodes(graph)} ${textHash(dumpGraph(graph))}`)
@@ -17051,6 +17152,7 @@ export function createNatives(fns: Record<string, Function>, opts: CreateNatives
     const merged = optimizeProgram(program, clock)
     if (lineageBefore) for (const [symbol, graph] of program.units) if (lineageBefore.has(symbol)) traceLineage(graph, lineageBefore.get(symbol)!)
     const emitted = timed('lower', () => lowerProgram(program, clock))
+    if (opts.failures?.length) throw opts.failures[0]
     writeLedger(emitted)
     const cutting = pendingCuts
     pendingCuts = undefined
