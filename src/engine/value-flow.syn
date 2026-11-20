@@ -329,6 +329,10 @@ interface FlowState {
     fieldStoreTypes: Map<number, number[]>
     fieldReaders: Map<number, number[]>
     fieldWriters: Map<number, number[]>
+    fieldSources: Map<number, number[]>
+    throughReaders: Map<number, number[]>
+    directFields: Set<number>
+    throughSeen: Set<number>
     fieldStored: Set<number>
     originSeen: number[]
     originCopied: Set<number>
@@ -386,6 +390,8 @@ interface FlowStep {
     keys: number
     replacing: Map<number, number>
     reflowing: Map<number, Instance>
+    through: Map<number, number[]>
+    seen: number[]
 }
 
 interface PendingKey {
@@ -969,6 +975,7 @@ function block(s: number): void {
 function markOpaque(s: number): void {
     if (flow.slotOpaque.has(s)) return
     if (frozen(s)) return block(s)
+    directField(s)
     flow.slotOpaque.add(s)
     dirtyScalar(s)
     const confined = flow.confineSlots.get(s)
@@ -993,12 +1000,14 @@ function addConst(s: number, t: number): void {
     const next = unite(flow.slotConst[s], t)
     if (next === flow.slotConst[s]) return
     if (frozen(s)) return block(s)
+    directField(s)
     flow.slotConst[s] = next
     dirtyScalar(s)
     if (flow.pickWatch.size && flow.slotKind[s] === SlotKind.field) recheckPicks(s)
 }
 
-function addIn(s: number, from: number): void {
+function addIn(s: number, from: number, copied = false): void {
+    if (!copied) directField(s)
     if (frozen(s) && !flow.step!.ins.has(s)) flow.step!.ins.set(s, flow.ins.last[s])
     chained(flow.ins, s)
     flow.inFrom.push(from)
@@ -1012,12 +1021,13 @@ function hasOrigin(s: number, origin: number): boolean {
     return flow.slotOriginSet.has(s * originSpan + origin)
 }
 
-function addOrigin(s: number, origin: number): void {
+function addOrigin(s: number, origin: number, copied = false): void {
     if (hasOrigin(s, origin)) return
     if (frozen(s)) {
         if (stepsFlag) console.log(`BLOCK origin ${whySlotText(s)} += ${originText(origin)}`)
         return block(s)
     }
+    if (!copied) directField(s)
     flow.slotOriginSet.add(s * originSpan + origin)
     if (flow.why && whyTracks(flow.why, origin)) flow.why.causes.set(s * 4194304 + origin, flow.why.from)
     if (flow.slotOrigins[s] === noOrigins) flow.slotOrigins[s] = [origin]
@@ -1090,8 +1100,86 @@ function storeSlot(inst: Instance, e: number): number {
 }
 
 function copyEdge(from: number, to: number): void {
-    addIn(to, from)
+    addIn(to, from, true)
     listen(from, ListenerKind.copy, to, 0, 0)
+    if (flow.slotKind[to] === SlotKind.field) addSource(to, from)
+}
+
+const slotSpan = 16777216
+
+function throughState(field: number): void {
+    const step = flow.step
+    if (!step || field >= step.slots || step.through.has(field)) return
+    step.through.set(field, [flow.fieldSources.get(field)?.length ?? 0, flow.throughReaders.get(field)?.length ?? 0, flow.directFields.has(field) ? 1 : 0])
+}
+
+function passThrough(target: number, s: number): boolean {
+    intrinsics.assert(target < slotSpan && s < slotSpan, `value-flow: slot ${Math.max(target, s)} does not fit a read-through key`)
+    const key = target * slotSpan + s
+    if (flow.throughSeen.has(key)) return false
+    flow.throughSeen.add(key)
+    if (flow.step && target < flow.step.slots) flow.step.seen.push(key)
+    return true
+}
+
+function readThrough(field: number, target: number): void {
+    if (flow.slotKind[target] === SlotKind.field) return copyEdge(field, target)
+    addIn(target, -field - 1)
+    passOrigins(field, target)
+}
+
+function passOrigins(field: number, target: number): void {
+    const fields = [field]
+    while (fields.length) {
+        const f = fields.pop()!
+        if (!passThrough(target, f)) continue
+        if (flow.directFields.has(f)) {
+            listen(f, ListenerKind.copy, target, 0, 0)
+            continue
+        }
+        throughState(f)
+        let readers = flow.throughReaders.get(f)
+        if (!readers) flow.throughReaders.set(f, readers = [])
+        readers.push(target)
+        const sources = flow.fieldSources.get(f)
+        if (!sources) continue
+        let i = 0
+        while (i < sources.length) {
+            const from = sources[i]
+            i++
+            if (flow.slotKind[from] === SlotKind.field) fields.push(from)
+            else if (passThrough(target, from)) listen(from, ListenerKind.copy, target, 0, 0)
+        }
+    }
+}
+
+function addSource(field: number, from: number): void {
+    throughState(field)
+    let sources = flow.fieldSources.get(field)
+    if (!sources) flow.fieldSources.set(field, sources = [])
+    sources.push(from)
+    const readers = flow.throughReaders.get(field)
+    if (!readers || flow.directFields.has(field)) return
+    let i = 0
+    while (i < readers.length) {
+        const r = readers[i]
+        i++
+        if (flow.slotKind[from] === SlotKind.field) passOrigins(from, r)
+        else if (passThrough(r, from)) listen(from, ListenerKind.copy, r, 0, 0)
+    }
+}
+
+function directField(s: number): void {
+    if (flow.slotKind[s] !== SlotKind.field || flow.directFields.has(s)) return
+    throughState(s)
+    flow.directFields.add(s)
+    const readers = flow.throughReaders.get(s)
+    if (!readers) return
+    let i = 0
+    while (i < readers.length) {
+        listen(s, ListenerKind.copy, readers[i], 0, 0)
+        i++
+    }
 }
 
 function partOf(target: number, key: number): number {
@@ -1449,7 +1537,7 @@ function heldInit(field: number): void {
 
 function readField(field: number, target: number): void {
     heldInit(field)
-    copyEdge(field, target)
+    readThrough(field, target)
     if ((flow.fieldForms.get(field) ?? 0) & FieldForm.absent) addConst(target, VOID)
     fieldReader(field, target)
 }
@@ -4301,7 +4389,7 @@ function deliver(l: number, origin: number): void {
     const key = flow.listenKey[l]
     const extra = flow.listenExtra[l]
     switch (flow.listenKind[l]) {
-        case ListenerKind.copy: addOrigin(target, origin)
+        case ListenerKind.copy: addOrigin(target, origin, true)
         case ListenerKind.member: resolveMember(origin, key, target, extra)
         case ListenerKind.store: resolveStore(origin, key, flow.instances[Math.floor(target / exprBits)], target % exprBits, extra)
         case ListenerKind.callTarget: callTarget(target, origin)
@@ -6401,7 +6489,7 @@ function freshFlow(roots: Function[], host: AccessHost): FlowState {
         slotKind: [], slotOwner: [], slotIndex: [], slotOrigins: [], slotOriginSet: new Set(), slotSent: [], listeners: { next: [], last: [] }, listenKind: [], listenTarget: [], listenKey: [], listenExtra: [], ins: { next: [], last: [] }, inFrom: [], slotConst: [], slotOpaque: new Set(),
         queue: [], storeSlots: new Map(), constSlots: new Map(), missing: [], gateWaits: new Map(),
         scalar: [], users: { next: [], last: [] }, userSlot: [], scalarQueue: [], scalarQueued: [], scalarChanges: new Map(), scalarCyclic: new Set(), dirtyBy: [], changedBy: [], originMask: [], stringSite: [],
-        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], unboundTests: new Set(), keyPending: [], parts: { next: [], last: [] }, partSlots: [], partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
+        fieldForms: new Map(), fieldStoreTypes: new Map(), fieldReaders: new Map(), fieldWriters: new Map(), fieldSources: new Map(), throughReaders: new Map(), directFields: new Set(), throughSeen: new Set(), fieldStored: new Set(), originSeen: [0], originCopied: new Set(), heldInits: new Map(), heldStatics: new Set(), rtPending: [], unboundTests: new Set(), keyPending: [], parts: { next: [], last: [] }, partSlots: [], partBind: new Map(), rooted: new Set(), originCreators: new Map(), originSeeds: new Map(), seedList: [], setterKeys: new Set(), runtimeBinds: new Map(), heldWrites: new Map(), plainKeys: new Map(), holders: new Map(), holderWatch: new Map(), confinements: [], confineKeys: new Map(), confineSlots: new Map(), lengthFacts: new Map(),
         exported: freshExport(),
         cut: undefined, cap: Infinity,
         why: whyFlag ? whyQuery(whyFlag) : undefined,
@@ -7366,7 +7454,10 @@ function resolveUnit(list: number[]): UnitTypes {
     }
     const receivers = new Map<number, Type>()
     for (const x of s.exprs) {
-        if (x.op !== ExprOp.member || !x.node || getNode(g, x.node)?.op !== NodeOp.getProp) continue
+        const access = x.node ? getNode(g, x.node)?.op : undefined
+        if (x.op === ExprOp.member && access !== NodeOp.getProp) continue
+        if (x.op === ExprOp.store && access !== NodeOp.setProp) continue
+        if (x.op !== ExprOp.member && x.op !== ExprOp.store) continue
         let object = s.exprs[x.a]
         while (object.op === ExprOp.pick && object.b < 2) object = s.exprs[object.a]
         if (object.op !== ExprOp.narrow && object.op !== ExprOp.pick) continue
@@ -7593,7 +7684,7 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
     let callers: Instance[] = []
     while (attempts < maxStepAttempts) {
         attempts++
-        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * Math.max(olds.length, 1), keys: flow.keyPending.length, replacing: new Map(), reflowing: new Map() }
+        const step: FlowStep = { slots: flow.slotKind.length, origins: flow.originKind.length, instances: flow.instances.length, blocked: [], forks, forked: new Map(seeds), ins: new Map(), start, nodes: nodes + countNodes(g) * Math.max(olds.length, 1), keys: flow.keyPending.length, replacing: new Map(), reflowing: new Map(), through: new Map(), seen: [] }
         flow.step = step
         const s = answering ? old : newSummary(fn, g, old.id)
         intrinsics.assert(sigWidth(s) === sigWidth(old), `value-flow: ${old.name} changed its signature in a rewrite`)
@@ -7667,6 +7758,16 @@ function resolveReplacement(fn: Function, g: Graph, start: number, answering: bo
             id++
         }
         for (const [slot, last] of step.ins) chainTruncate(flow.ins, slot, last)
+        for (const [field, [sources, readers, direct]] of step.through) {
+            const known = flow.fieldSources.get(field)
+            if (known) known.length = sources
+            const through = flow.throughReaders.get(field)
+            if (through) through.length = readers
+            if (!direct) flow.directFields.delete(field)
+        }
+        for (const key of step.seen) {
+            flow.throughSeen.delete(key)
+        }
         flow.keyPending.length = step.keys
         for (const [k, origin] of flow.originIndex) if (origin >= step.origins) flow.originIndex.delete(k)
         for (const field of grown) flow.originFields[flow.slotOwner[field]].delete(flow.slotIndex[field])
